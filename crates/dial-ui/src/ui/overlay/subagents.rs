@@ -440,10 +440,10 @@ impl SubagentsOverlay {
                 return OverlayEvent::Action(format!("subagent-message:{id}\n{body}"));
             }
             KeyCode::Backspace => {
-                if let Some(draft) = self.compose.as_mut() {
-                    if let Some((start, _)) = draft.grapheme_indices(true).next_back() {
-                        draft.truncate(start);
-                    }
+                if let Some(draft) = self.compose.as_mut()
+                    && let Some((start, _)) = draft.grapheme_indices(true).next_back()
+                {
+                    draft.truncate(start);
                 }
             }
             KeyCode::Char(c) if plain(key) => {
@@ -679,9 +679,15 @@ impl SubagentsOverlay {
     }
 
     pub fn draw(&mut self, frame: &mut Frame, ctx: &DrawCtx) {
-        let extra = status_counts(&self.agents);
         // The panel's inner area starts one cell inside the border, unless the box is too small.
         let area = frame.area();
+        // Counts share the top border with the title; drop the least urgent ones until they fit.
+        let room = usize::from(area.width).saturating_sub(text::width("Workers") + 6);
+        let extra = fit_counts(
+            &status_counts(&self.agents, &sep(ctx.theme)),
+            &sep(ctx.theme),
+            room,
+        );
         let inset = u16::from(area.width >= 5 && area.height >= 5);
         self.origin.set((area.x + inset, area.y + inset));
         panel(
@@ -762,7 +768,10 @@ impl SubagentsOverlay {
         let room = w.saturating_sub(used + 2);
         if !parts.is_empty() && room >= 6 {
             spans.push(Span::styled(
-                format!("  {}", text::ellipsize(&parts.join(" · "), room, theme.ascii())),
+                format!(
+                    "  {}",
+                    text::ellipsize(&parts.join(&sep(theme)), room, theme.ascii())
+                ),
                 theme.fg(Tok::Dim),
             ));
         }
@@ -775,7 +784,7 @@ impl SubagentsOverlay {
             .iter()
             .map(|route| text::one_line(route).trim().to_owned())
             .collect::<Vec<_>>()
-            .join(" · ");
+            .join(&sep(theme));
         filled(
             vec![Span::styled(
                 format!(" roles: {}", text::clip(&joined, w.saturating_sub(8))),
@@ -800,7 +809,10 @@ impl SubagentsOverlay {
                 if query.is_empty() {
                     return Line::default();
                 }
-                (format!(" filter: {query}  · Esc clear search"), Tok::Dim)
+                (
+                    format!(" filter: {query}{}Esc clear search", sep(theme)),
+                    Tok::Dim,
+                )
             }
         };
         filled(
@@ -814,12 +826,23 @@ impl SubagentsOverlay {
         let updown = arrows(ctx.theme, Axis::Vertical);
         let mut segments: Vec<String> = match self.tab {
             Tab::Agents => {
+                // Narrow footers drop hints from the end, so the order is priority order.
                 let scroll = !self.wide.get() && self.inspector;
-                let mut s = vec![
-                    format!("{updown} select"),
-                    format!("PgUp/PgDn {}", if scroll { "scroll" } else { "page" }),
-                    "Enter open".to_owned(),
-                ];
+                let mut s = Vec::new();
+                if self.selected_agent().is_some() {
+                    s.push(format!("{updown} select"));
+                    s.push("Enter open".to_owned());
+                    if !self.wide.get() {
+                        s.push(
+                            if self.inspector {
+                                "Tab roster"
+                            } else {
+                                "Tab details"
+                            }
+                            .to_owned(),
+                        );
+                    }
+                }
                 // Only offer what the selected worker can do right now.
                 if let Some(agent) = self.selected_agent() {
                     if agent.cancellable {
@@ -831,38 +854,40 @@ impl SubagentsOverlay {
                         s.push("m continue".to_owned());
                     }
                 }
+                if self.selected_agent().is_some() {
+                    s.push(format!(
+                        "PgUp/PgDn {}",
+                        if scroll { "scroll" } else { "page" }
+                    ));
+                }
                 if !self.agents.is_empty() {
-                    s.push("t tree".to_owned());
                     s.push("/ search".to_owned());
+                    s.push("t tree".to_owned());
                 }
                 s.push("r roles".to_owned());
-                if !self.wide.get() {
-                    s.push(
-                        if self.inspector {
-                            "Tab roster"
-                        } else {
-                            "Tab details"
-                        }
-                        .to_owned(),
-                    );
-                }
                 s
             }
-            Tab::Activity => vec![
-                format!("{updown} select"),
-                "Enter open".to_owned(),
-                "f filter".to_owned(),
-                "s scope".to_owned(),
-                format!(
-                    "Space {}",
-                    if self.follow {
-                        "pause follow"
-                    } else {
-                        "follow"
-                    }
-                ),
-                "/ search".to_owned(),
-            ],
+            Tab::Activity => {
+                let mut s = Vec::new();
+                if !self.activity_rows().is_empty() {
+                    s.push(format!("{updown} select"));
+                    s.push("Enter open".to_owned());
+                }
+                s.extend([
+                    "f filter".to_owned(),
+                    "s scope".to_owned(),
+                    format!(
+                        "Space {}",
+                        if self.follow {
+                            "pause follow"
+                        } else {
+                            "follow"
+                        }
+                    ),
+                    "/ search".to_owned(),
+                ]);
+                s
+            }
         };
         segments.push(format!(
             "1/2 {} tabs",
@@ -980,7 +1005,10 @@ impl SubagentsOverlay {
         {
             let arrow = if ascii { "<-" } else { "↳" };
             left.push(Span::styled(
-                format!("  {arrow} {}", text::ellipsize(&self.name_of(parent), 16, ascii)),
+                format!(
+                    "  {arrow} {}",
+                    text::ellipsize(&self.name_of(parent), 16, ascii)
+                ),
                 theme.fg(Tok::Dim),
             ));
         }
@@ -991,7 +1019,7 @@ impl SubagentsOverlay {
                 theme.fg(Tok::Accent),
             ));
         }
-        let badge = badge_of(agent);
+        let badge = badge_of(agent, theme);
         let left_w: usize = left.iter().map(|s| text::width(&s.content)).sum();
         let room = w.saturating_sub(left_w + 2);
         let badge = if room >= 4 {
@@ -1030,14 +1058,14 @@ impl SubagentsOverlay {
                 };
                 let mut d = format!("{lead} {}", text::one_line(current));
                 if let Some((n, max)) = retry {
-                    d.push_str(&format!(" · retry {n}/{max}"));
+                    d.push_str(&format!("{}retry {n}/{max}", sep(theme)));
                 }
                 d
             }
             (AgentStatus::Failed, Some(current), _) => {
                 format!("failed: {}", text::one_line(current))
             }
-            _ => metrics(agent, epoch_ms()).join(" · "),
+            _ => metrics(agent, epoch_ms()).join(&sep(theme)),
         };
         let detail_tok = match agent.status {
             AgentStatus::Waiting => Tok::Warning,
@@ -1046,7 +1074,10 @@ impl SubagentsOverlay {
         };
         let detail = filled(
             vec![Span::styled(
-                format!("   {}", text::ellipsize(&detail, w.saturating_sub(4), ascii)),
+                format!(
+                    "   {}",
+                    text::ellipsize(&detail, w.saturating_sub(4), ascii)
+                ),
                 theme.fg(detail_tok),
             )],
             w,
@@ -1094,10 +1125,13 @@ impl SubagentsOverlay {
             Span::styled(format!(" {glyph} "), theme.fg(glyph_tok)),
             Span::styled(status_phrase(agent.status).to_owned(), theme.fg(glyph_tok)),
         ];
-        let badge = badge_of(agent);
+        let badge = badge_of(agent, theme);
         if !badge.is_empty() {
             status.push(Span::styled(
-                format!("  {}", text::ellipsize(&badge, w.saturating_sub(20).max(4), ascii)),
+                format!(
+                    "  {}",
+                    text::ellipsize(&badge, w.saturating_sub(20).max(4), ascii)
+                ),
                 theme.fg(Tok::Muted),
             ));
         }
@@ -1152,7 +1186,7 @@ impl SubagentsOverlay {
         }
 
         lines.push(heading("Usage", w, theme));
-        let usage = usage_rows(agent, w);
+        let usage = usage_rows(agent, w, theme);
         if usage.is_empty() {
             lines.push(field(" No usage reported yet.", w, theme));
         }
@@ -1208,15 +1242,14 @@ impl SubagentsOverlay {
     fn activity_lines(&self, w: usize, h: usize, theme: &Theme) -> Vec<Line<'static>> {
         let rows = self.activity_rows();
         let pos = self.activity_pos(rows.len());
+        let dot = sep(theme);
         let mut status = format!(
-            " showing {} · {} · {} event{}",
-            self.activity_filter.label(),
-            self.activity_scope.label(),
+            " {}{dot}{} shown",
+            activity_phrase(self.activity_filter, &self.activity_scope),
             rows.len(),
-            if rows.len() == 1 { "" } else { "s" }
         );
         if !self.follow {
-            status.push_str(" · paused");
+            status.push_str(&format!("{dot}paused"));
         }
         let mut out = vec![filled(
             vec![Span::styled(
@@ -1312,6 +1345,11 @@ impl SubagentsOverlay {
     }
 }
 
+/// The list separator in the theme's glyph set: ` · `, or ` - ` in ASCII.
+fn sep(theme: &Theme) -> String {
+    format!(" {} ", theme.sym(Sym::Dot))
+}
+
 fn plain(key: &KeyEvent) -> bool {
     !key.modifiers
         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
@@ -1348,7 +1386,7 @@ fn kind_tok(kind: ActivityKind) -> Tok {
     }
 }
 
-fn badge_of(agent: &AgentEntry) -> String {
+fn badge_of(agent: &AgentEntry, theme: &Theme) -> String {
     let role = if agent.role.is_empty() || agent.role == "unknown" {
         None
     } else {
@@ -1360,11 +1398,123 @@ fn badge_of(agent: &AgentEntry) -> String {
         Some(agent.model.as_str())
     };
     match (role, model) {
-        (Some(role), Some(model)) => format!("{role} · {model}"),
+        (Some(role), Some(model)) => format!("{role}{}{model}", sep(theme)),
         (Some(role), None) => role.to_owned(),
         (None, Some(model)) => model.to_owned(),
         (None, None) => agent.agent.clone(),
     }
+}
+
+/// Panel title counts: `5 workers · 1 needs input · 4 running`. Buckets with no workers are left
+/// out, and the attention buckets come first.
+fn status_counts(agents: &[AgentEntry], sep: &str) -> String {
+    if agents.is_empty() {
+        return "none yet".to_owned();
+    }
+    let count = |status: AgentStatus| agents.iter().filter(|a| a.status == status).count();
+    let total = agents.len();
+    let mut parts = vec![format!(
+        "{total} worker{}",
+        if total == 1 { "" } else { "s" }
+    )];
+    for (status, label) in [
+        (AgentStatus::Waiting, "needs input"),
+        (AgentStatus::Failed, "failed"),
+        (AgentStatus::Running, "running"),
+    ] {
+        let n = count(status);
+        // "3 workers · 3 running" says the same thing twice; the total alone is enough then.
+        if n > 0 && n < total {
+            parts.push(format!("{n} {label}"));
+        } else if n == total {
+            parts.push(label.to_owned());
+        }
+    }
+    parts.join(sep)
+}
+
+/// `counts` (joined by `sep`) with trailing parts dropped until it fits in `room` cells.
+fn fit_counts(counts: &str, sep: &str, room: usize) -> String {
+    let mut parts: Vec<&str> = counts.split(sep).collect();
+    while parts.len() > 1 && text::width(&parts.join(sep)) > room {
+        parts.pop();
+    }
+    let joined = parts.join(sep);
+    if text::width(&joined) > room {
+        String::new()
+    } else {
+        joined
+    }
+}
+
+/// Activity status line: `all events from all workers · 12 shown`.
+fn activity_phrase(filter: ActivityFilter, scope: &ActivityScope) -> String {
+    let what = match filter {
+        ActivityFilter::All => "all events",
+        ActivityFilter::Errors => "errors",
+        ActivityFilter::Responses => "responses",
+        ActivityFilter::Tools => "tool calls",
+        ActivityFilter::Messages => "messages",
+    };
+    let from = match scope {
+        ActivityScope::All => "all workers",
+        ActivityScope::Selected(_) => "the selected worker",
+        ActivityScope::Subtree(_) => "the selected worker and its children",
+    };
+    format!("{what} from {from}")
+}
+
+/// Inspector status line in words the operator acts on.
+fn status_phrase(status: AgentStatus) -> &'static str {
+    match status {
+        AgentStatus::Running => "running",
+        AgentStatus::Waiting => "needs your input",
+        AgentStatus::Done => "done",
+        AgentStatus::Failed => "failed",
+        AgentStatus::Cancelled => "cancelled",
+    }
+}
+
+/// Usage facts the worker has actually reported; zero counters and unknown values are omitted.
+fn usage_rows(agent: &AgentEntry, w: usize, theme: &Theme) -> Vec<(&'static str, String)> {
+    let mut rows = Vec::new();
+    if let Some(ms) = agent.elapsed_ms.filter(|ms| *ms > 0) {
+        rows.push(("elapsed", duration(ms)));
+    }
+    if let Some(cost) = agent.cost_usd {
+        rows.push(("cost", money(cost)));
+    }
+    match (agent.tokens_in, agent.tokens_out) {
+        (None, None) => {}
+        (i, o) => rows.push((
+            "tokens",
+            format!(
+                "in {}{}out {}",
+                i.map_or("?".into(), compact),
+                sep(theme),
+                o.map_or("?".into(), compact)
+            ),
+        )),
+    }
+    if let Some((used, window)) = agent.context.filter(|(_, window)| *window > 0) {
+        let bar = gauge(used, window, w);
+        let bar = if theme.ascii() {
+            bar.replace('█', "#").replace('░', "-")
+        } else {
+            bar
+        };
+        rows.push(("context", bar));
+    }
+    for (label, n) in [
+        ("steps", agent.steps),
+        ("requests", agent.requests),
+        ("tool calls", agent.tool_calls),
+    ] {
+        if n > 0 {
+            rows.push((label, n.to_string()));
+        }
+    }
+    rows
 }
 
 /// Muted metrics line: cost, time, requests, tools, tokens, context, and age.

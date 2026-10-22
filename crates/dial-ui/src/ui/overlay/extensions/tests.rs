@@ -195,24 +195,46 @@ fn a_failed_page_stops_automatic_paging() {
 }
 
 #[test]
-fn zz_dump() {
-    use crate::ui::overlay::settings::testkit::{Rig, render, screen, status_preview};
-    let ascii = Rig::with_theme(crate::ui::theme::Theme::dark().with_glyphs(crate::ui::theme::Glyphs::Ascii));
-    let rig = Rig::new();
-    for (name, filled) in [("empty", false), ("rows", true)] {
-        for (w, h, r) in [(120u16, 30u16, &rig), (100, 24, &rig), (60, 20, &rig), (38, 16, &ascii)] {
-            let ctx = DrawCtx { theme: &r.theme, keys: &r.keys, status: &r.status, preview_status: &status_preview };
-            let mut o = ExtensionsOverlay::new();
-            if filled {
-                let mut a = row("github", Origin::Curated, State::Available);
-                a.summary = "Issues, pull requests and code search on GitHub".into();
-                a.tags = vec!["official".into()];
-                let mut b = row("memory-server-with-long-name", Origin::Installed, State::Failing);
-                b.summary = "Knowledge graph memory".into();
-                o.browser.set_rows(Tab::Mcp, vec![a, b, row("fs", Origin::Installed, State::Enabled)]);
-            }
-            let buf = render(w, h, |f| o.draw(f, &ctx));
-            println!("==== {name} {w}x{h}\n{}", screen(&buf));
-        }
+fn empty_tabs_wrap_their_way_forward_and_hints_skip_unavailable_actions() {
+    use crate::ui::overlay::settings::testkit::{Rig, render, rows, status_preview};
+    let ascii = Rig::with_theme(
+        crate::ui::theme::Theme::dark().with_glyphs(crate::ui::theme::Glyphs::Ascii),
+    );
+    let ctx = DrawCtx {
+        theme: &ascii.theme,
+        keys: &ascii.keys,
+        status: &ascii.status,
+        preview_status: &status_preview,
+    };
+    let mut overlay = ExtensionsOverlay::new();
+    let screen = rows(&render(38, 16, |f| overlay.draw(f, &ctx))).join("\n");
+    let flat = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+    // The whole empty message is readable, never clipped at the edge.
+    assert!(flat.contains("search the catalog."), "{screen}");
+    // Nothing is selected and no next page is pending: no row actions or paging are offered.
+    for absent in [
+        "t test",
+        "x remove",
+        "loads more",
+        "Enter details",
+        "0 shown",
+    ] {
+        assert!(!screen.contains(absent), "{absent}: {screen}");
     }
+    // An installed MCP server offers test, disable and remove, which its keys really do.
+    overlay
+        .browser
+        .set_rows(Tab::Mcp, vec![row("fs", Origin::Installed, State::Enabled)]);
+    let rig = Rig::new();
+    let ctx = DrawCtx {
+        theme: &rig.theme,
+        keys: &rig.keys,
+        status: &rig.status,
+        preview_status: &status_preview,
+    };
+    let screen = rows(&render(160, 20, |f| overlay.draw(f, &ctx))).join("\n");
+    assert!(
+        screen.contains("t test") && screen.contains("e disable") && screen.contains("x remove"),
+        "{screen}"
+    );
 }

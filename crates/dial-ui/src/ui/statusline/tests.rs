@@ -964,3 +964,39 @@ fn workers_segment_shows_running_out_of_total_and_hides_when_idle() {
     };
     assert!(!plain(&render(&cfg_with(StatusPreset::Default), &idle, 160)).contains("workers"));
 }
+
+#[test]
+fn narrow_lines_drop_whole_segments_instead_of_leaving_stubs() {
+    let cfg = UiConfig::default();
+    let data = StatusData {
+        provider: "local".into(),
+        model: "qwen3.5-9b".into(),
+        project_path: "/work/projects/atlas".into(),
+        branch: "main".into(),
+        context_window: 32_768,
+        ..StatusData::default()
+    };
+    for width in 20..=80u16 {
+        let line = plain(&render(&cfg, &data, width));
+        // A path is either recognisable (its last component whole) or absent.
+        if line.contains('…') && !line.contains("qwen") {
+            continue;
+        }
+        let path_stub = line
+            .split(['╭', '─', '·', ' '])
+            .any(|part| part.starts_with('…') && !part.ends_with("atlas"));
+        assert!(!path_stub, "{width}: {line:?}");
+        if line.contains("atlas") {
+            assert!(
+                line.contains("qwen3.5-9b"),
+                "path outlived the model: {line:?}"
+            );
+        }
+    }
+    // Before the model name is cut, its provider prefix goes.
+    let line = plain(&render(&cfg, &data, 24));
+    assert!(
+        line.contains("qwen3.5-9b") && !line.contains("local/"),
+        "{line:?}"
+    );
+}

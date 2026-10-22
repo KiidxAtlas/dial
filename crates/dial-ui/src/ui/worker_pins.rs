@@ -204,8 +204,9 @@ pub fn rows(
         .iter()
         .filter(|a| !a.status.is_finished())
         .collect();
-    // Input requests must not disappear behind running workers in a collapsed block.
-    active.sort_by_key(|agent| agent.status != AgentStatus::Waiting);
+    // Input requests must not disappear behind running workers in a collapsed block; this is the
+    // same attention order the hub roster uses.
+    active.sort_by_key(|agent| agent.status.attention());
     if active.is_empty() {
         return Vec::new();
     }
@@ -259,7 +260,11 @@ fn worker_rows(
     let elapsed_ms = agent.elapsed_ms.unwrap_or(0);
     let waiting = agent.status == AgentStatus::Waiting;
     let state = if waiting { Tok::Warning } else { Tok::Accent };
-    let marker = if waiting { "!" } else { theme.spinner(tick) };
+    let marker = if waiting {
+        theme.sym(Sym::Warn)
+    } else {
+        theme.spinner(tick)
+    };
     // Status comes before free-form names/tasks so requests for input survive narrow widths.
     let mut head = vec![
         Span::styled(
@@ -268,10 +273,13 @@ fn worker_rows(
         ),
         Span::styled(text::one_line(display_name(agent)), theme.fg(Tok::Accent)),
     ];
-    head.push(Span::styled(
-        format!(" · step {}", agent.steps),
-        theme.fg(Tok::Dim),
-    ));
+    // A step counter only means something once the worker has taken one.
+    if agent.steps > 0 {
+        head.push(Span::styled(
+            format!(" · step {}", agent.steps),
+            theme.fg(Tok::Dim),
+        ));
+    }
     if !live && elapsed_ms >= ELAPSED_MARKER_MS {
         head.push(Span::styled(
             format!(" · {}", clock(elapsed_ms)),

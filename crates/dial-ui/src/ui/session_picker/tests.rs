@@ -439,7 +439,6 @@ fn empty_project_points_to_all_projects_and_search_shows_a_hint() {
     );
 }
 
-
 #[test]
 fn empty_catalogue_offers_the_way_forward_instead_of_a_search_prompt() {
     let theme = Theme::dark();
@@ -453,7 +452,10 @@ fn empty_catalogue_offers_the_way_forward_instead_of_a_search_prompt() {
         // The whole message survives narrow widths by wrapping, never an ellipsis.
         let flat = shown.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(flat.contains("every project."), "{cols}x{height}: {shown}");
-        assert!(!shown.contains('…') && !shown.contains("..."), "{cols}x{height}: {shown}");
+        assert!(
+            !shown.contains('…') && !shown.contains("..."),
+            "{cols}x{height}: {shown}"
+        );
         assert!(rows.iter().all(|row| text::line_width(row) <= cols));
     }
     // A typed query with no hits still keeps the search line so it can be edited.
@@ -487,7 +489,10 @@ fn footer_hints_fit_whole_and_only_offer_actions_the_selection_allows() {
     assert!(!shown.contains("Ctrl+D"), "{shown}");
     p.handle(&key(KeyCode::Down, KeyModifiers::NONE), 24);
     let shown = actions(&p);
-    assert!(!shown.contains("Ctrl+R") && !shown.contains("Ctrl+D"), "{shown}");
+    assert!(
+        !shown.contains("Ctrl+R") && !shown.contains("Ctrl+D"),
+        "{shown}"
+    );
     // Hints never end in a cut-off word: each one is dropped whole when it does not fit.
     for cols in [38, 44, 60, 80, 100, 120] {
         for row in p.rows(cols, 24, &theme) {

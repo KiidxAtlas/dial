@@ -62,18 +62,22 @@ fn mcp_identity_status_evidence_and_bounds() {
                     if state == ToolState::Failed {
                         assert!(rendered.contains("failed"));
                     }
-                    // Frameless like every other work row: the gutter glyph leads the header.
-                    for row in &rows {
-                        let row: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
-                        assert!(
-                            !row.contains(['╭', '╮', '╰', '╯', '│'])
-                                && !row.starts_with("+ ")
-                                && !row.trim_end().ends_with(['|', '+']),
-                            "MCP cards draw no frame: {row:?}"
-                        );
+                    // A service frame: titled top edge naming MCP and the server, sides, bottom.
+                    let lines = plain(&rows);
+                    let (top, bottom) = (&lines[0], lines.last().unwrap());
+                    let (tl, bl, side) = if ascii {
+                        ('+', '+', '|')
+                    } else {
+                        ('╭', '╰', '│')
+                    };
+                    assert!(top.starts_with(tl) && top.contains("MCP"), "{top:?}");
+                    assert!(bottom.starts_with(bl), "{bottom:?}");
+                    for row in &lines[1..lines.len() - 1] {
+                        assert!(row.starts_with(side) && row.ends_with(side), "{row:?}");
                     }
+                    assert_eq!(rows[1].spans[0].style.bg, theme.bg(Tok::PanelBg).bg);
                     if state == ToolState::Failed {
-                        let glyph = &rows[0].spans[0];
+                        let glyph = &rows[1].spans[1];
                         assert_eq!(glyph.style.fg, theme.fg(Tok::Error).fg);
                     }
                 }
@@ -172,16 +176,23 @@ fn narrow_mcp_headers_drop_timing_before_the_target() {
         1.1,
     );
     let rows = plain(&tool_rows(&t, 38, &ctx_for(&theme, &ui, false)));
-    let head = &rows[0];
     assert!(
-        head.contains("search") && head.contains("docs") && head.contains("migration"),
-        "server, action and the whole target stay: {head:?}"
+        rows[0].contains("MCP : docs"),
+        "server named in the frame: {rows:?}"
     );
-    assert!(head.starts_with('x') && head.contains("failed"), "{head:?}");
+    let head = &rows[1];
+    assert!(
+        head.contains("search") && head.contains("migration"),
+        "action and the whole target stay: {head:?}"
+    );
+    assert!(
+        head.starts_with("| x") && head.contains("failed"),
+        "{head:?}"
+    );
     assert!(!head.contains("1.10s"), "timing gives way first: {head:?}");
     // With room, everything is shown.
     let wide = plain(&tool_rows(&t, 100, &ctx_for(&theme, &ui, false)));
-    assert!(wide[0].contains("failed") && wide[0].contains("1.10s"));
+    assert!(wide[1].contains("failed") && wide[1].contains("1.10s"));
 }
 
 #[test]

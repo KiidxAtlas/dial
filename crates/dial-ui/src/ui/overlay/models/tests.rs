@@ -1836,7 +1836,7 @@ fn wide_rows_show_price_per_million_and_speed_and_the_numbers_line_shows_use() {
     // A model without price or recorded use shows dashes, never an estimate.
     o.cursor = names(&o).iter().position(|n| n == "llama3").unwrap();
     let screen = draw(&mut o, &rig, 140, 24);
-    assert!(screen.contains("price -"), "{screen}");
+    assert!(screen.contains("no price listed"), "{screen}");
     assert!(screen.contains("no recorded requests"), "{screen}");
 
     // Narrow panes drop the new columns rather than squeezing the names.
@@ -1944,19 +1944,46 @@ fn picking_the_memory_role_from_roles_lands_in_the_memory_group() {
 }
 
 #[test]
-fn zz_dump() {
-    let ascii = Rig::with_theme(crate::ui::theme::Theme::dark().with_glyphs(crate::ui::theme::Glyphs::Ascii));
+fn detail_lines_skip_unknown_values_and_groups_skip_zero_counts() {
     let rig = Rig::new();
-    let no_roles = || vec![RoleStatus { role: "main", assigned: None, effective: None, source: RoleSource::Main }];
-    for (name, mk) in [
-        ("full", Box::new(overlay) as Box<dyn Fn() -> ModelOverlay>),
-        ("none", Box::new(move || ModelOverlay::new(None, no_roles(), Scope::Global))),
-        ("empty", Box::new(move || ModelOverlay::new(Some(Discovery { models: vec![], providers: vec![] }), no_roles(), Scope::Global))),
-        ("roles", Box::new(|| { let mut o = overlay(); o.show_roles(); o })),
-    ] {
-        for (w, h, r) in [(120u16, 40u16, &rig), (100, 24, &rig), (60, 20, &rig), (38, 16, &ascii)] {
-            let mut o = mk();
-            println!("==== {name} {w}x{h}\n{}", draw(&mut o, r, w, h));
-        }
-    }
+    let mut o = overlay();
+    let shown = draw(&mut o, &rig, 120, 40);
+    // llama3 reports no capabilities, context or price: one phrase, no wall of "unknown".
+    let detail = shown
+        .lines()
+        .find(|l| l.contains("ollama/llama3") && l.contains("available") && !l.contains('›'))
+        .unwrap_or_else(|| panic!("{shown}"));
+    assert!(detail.contains("capabilities not reported"), "{detail}");
+    assert!(!detail.contains("unknown"), "{detail}");
+    // Empty groups show no count rather than a column of zeros.
+    let favorites = shown.lines().find(|l| l.contains("Favorites")).unwrap();
+    assert!(!favorites.contains(" 0 "), "{favorites}");
+}
+
+#[test]
+fn footer_advertises_only_keys_that_do_something() {
+    let rig = Rig::new();
+    let no_roles = || {
+        vec![RoleStatus {
+            role: "main",
+            assigned: None,
+            effective: None,
+            source: RoleSource::Main,
+        }]
+    };
+    // Still scanning: nothing can be set, filtered or sorted yet.
+    let mut scanning = ModelOverlay::new(None, no_roles(), Scope::Global);
+    let shown = draw(&mut scanning, &rig, 120, 30);
+    let footer = shown.lines().rev().find(|l| l.contains("close")).unwrap();
+    assert!(
+        !footer.contains("set main") && !footer.contains("F2"),
+        "{footer}"
+    );
+    assert!(footer.contains("F5 rescan"), "{footer}");
+    // A search with no hits: Enter has nothing to act on.
+    let mut o = overlay();
+    o.type_text("zzzz-no-model");
+    let shown = draw(&mut o, &rig, 120, 30);
+    let footer = shown.lines().rev().find(|l| l.contains("Esc")).unwrap();
+    assert!(!footer.contains("set main"), "{footer}");
 }

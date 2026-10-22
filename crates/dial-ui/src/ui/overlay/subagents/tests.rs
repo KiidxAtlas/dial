@@ -286,7 +286,7 @@ fn wide_layout_shows_roster_inspector_and_tabs() {
     };
     let buffer = render(120, 28, |frame| hub.draw(frame, &ctx));
     let text: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
-    assert!(text.contains("1 Agents"), "{text}");
+    assert!(text.contains("1 Workers"), "{text}");
     assert!(text.contains("2 Activity"), "{text}");
     assert!(text.contains("task-1-name"), "{text}");
     assert!(text.contains("Recent activity"), "{text}");
@@ -308,11 +308,11 @@ fn narrow_layout_shows_roster_until_tab_opens_the_inspector() {
     let narrow = render(60, 24, |frame| hub.draw(frame, &ctx));
     let text: String = narrow.content().iter().map(|cell| cell.symbol()).collect();
     assert!(text.contains("task-1-name"), "{text}");
-    assert!(!text.contains("Recent activity"), "{text}");
+    assert!(!text.contains("Usage"), "{text}");
     hub.handle(&key(KeyCode::Tab), &keys);
     let opened = render(60, 60, |frame| hub.draw(frame, &ctx));
     let text: String = opened.content().iter().map(|cell| cell.symbol()).collect();
-    assert!(text.contains("Recent activity"), "{text}");
+    assert!(text.contains("Usage"), "{text}");
 }
 
 #[test]
@@ -374,7 +374,7 @@ fn activity_tab_renders_its_table() {
     };
     let buffer = render(100, 20, |frame| hub.draw(frame, &ctx));
     let text: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
-    assert!(text.contains("filter all"), "{text}");
+    assert!(text.contains("all events from all workers"), "{text}");
     assert!(text.contains("boom"), "{text}");
 }
 
@@ -439,7 +439,9 @@ fn click_selects_a_card_and_a_second_click_opens_it() {
 #[test]
 fn wheel_scrolls_the_inspector_only_over_its_pane() {
     let mut hub = SubagentsOverlay::new();
-    hub.set_snapshot(snapshot(vec![agent("task-1", AgentStatus::Running)]));
+    let mut long = agent("task-1", AgentStatus::Running);
+    long.task = "word ".repeat(400);
+    hub.set_snapshot(snapshot(vec![long]));
     draw_at(&mut hub, 120, 40);
     let inside = 1 + hub.roster_w.get() + 2;
     assert!(!hub.wheel_over_inspector(3, 2, true));
@@ -580,4 +582,271 @@ fn narrow_roster_page_keys_move_selection_and_backspace_removes_graphemes() {
     hub.search = Some("cafe\u{301}".into());
     hub.handle(&key(KeyCode::Backspace), &keys);
     assert_eq!(hub.search.as_deref(), Some("caf"));
+}
+
+fn screen(hub: &mut SubagentsOverlay, theme: &Theme, width: u16, height: u16) -> Vec<String> {
+    use crate::{llm::model_config::UiConfig, ui::status::StatusData};
+    use ratatui::{Terminal, backend::TestBackend, text::Line};
+    let keys = keymap();
+    let status = StatusData::default();
+    let preview = |_: &UiConfig, _: u16| Line::default();
+    let ctx = DrawCtx {
+        theme,
+        keys: &keys,
+        status: &status,
+        preview_status: &preview,
+    };
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal.draw(|frame| hub.draw(frame, &ctx)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    (0..height)
+        .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+        .collect()
+}
+
+/// Five workers like the review sheet: four running, the last one waiting on the operator.
+fn review_roster() -> HubSnapshot {
+    let agents = (1..=5)
+        .map(|n| AgentEntry {
+            id: format!("task-{n}"),
+            name: if n == 5 {
+                "Needs your direction".into()
+            } else {
+                format!("Worker {n}")
+            },
+            agent: "worker".into(),
+            task: "Preserve public APIs while improving the execution path".into(),
+            status: if n == 5 {
+                AgentStatus::Waiting
+            } else {
+                AgentStatus::Running
+            },
+            current: Some("Inspecting affected callers".into()),
+            cancellable: true,
+            steerable: true,
+            ..Default::default()
+        })
+        .collect();
+    HubSnapshot {
+        agents,
+        totals: Totals {
+            running: 5,
+            total: 5,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+#[test]
+fn workers_needing_input_or_failed_sort_above_running_ones_and_stay_there() {
+    let mut hub = SubagentsOverlay::new();
+    let mut failed = agent("broke", AgentStatus::Failed);
+    failed.cancellable = false;
+    hub.set_snapshot(snapshot(vec![
+        agent("a", AgentStatus::Running),
+        failed.clone(),
+        agent("b", AgentStatus::Running),
+        agent("ask", AgentStatus::Waiting),
+    ]));
+    let ids: Vec<&str> = hub.agents().iter().map(|a| a.id.as_str()).collect();
+    assert_eq!(ids, ["ask", "broke", "a", "b"]);
+    // A worker that starts waiting later jumps up; the others keep their relative order.
+    hub.set_snapshot(snapshot(vec![
+        agent("a", AgentStatus::Running),
+        failed,
+        agent("b", AgentStatus::Waiting),
+        agent("ask", AgentStatus::Running),
+    ]));
+    let ids: Vec<&str> = hub.agents().iter().map(|a| a.id.as_str()).collect();
+    assert_eq!(ids, ["b", "broke", "ask", "a"]);
+}
+
+#[test]
+fn page_and_home_end_keys_move_the_roster_selection_in_every_layout() {
+    let keys = keymap();
+    let theme = Theme::dark();
+    let workers: Vec<AgentEntry> = (0..20)
+        .map(|i| agent(&format!("w{i:02}"), AgentStatus::Running))
+        .collect();
+    for (width, height) in [(120, 40), (60, 20), (38, 16)] {
+        let mut hub = SubagentsOverlay::new();
+        hub.set_snapshot(snapshot(workers.clone()));
+        screen(&mut hub, &theme, width, height);
+        let order = ids_in_roster_order(&hub);
+        let page = hub.roster_page();
+        hub.handle(&key(KeyCode::PageDown), &keys);
+        assert_eq!(
+            hub.selected.as_deref(),
+            Some(order[page].as_str()),
+            "PageDown at {width}x{height}"
+        );
+        hub.handle(&key(KeyCode::End), &keys);
+        assert_eq!(hub.selected.as_deref(), order.last().map(String::as_str));
+        hub.handle(&key(KeyCode::PageUp), &keys);
+        assert_eq!(
+            hub.selected.as_deref(),
+            Some(order[order.len() - 1 - page].as_str())
+        );
+        hub.handle(&key(KeyCode::Home), &keys);
+        assert_eq!(hub.selected.as_deref(), Some(order[0].as_str()));
+        // The selected card stays on screen after paging.
+        hub.handle(&key(KeyCode::PageDown), &keys);
+        hub.handle(&key(KeyCode::PageDown), &keys);
+        let name = format!("{}-name", hub.selected.clone().unwrap());
+        let shown = screen(&mut hub, &theme, width, height).join("\n");
+        assert!(shown.contains(&name), "{width}x{height}: {shown}");
+    }
+}
+
+#[test]
+fn narrow_inspector_pages_scroll_it_and_clamp_at_the_end() {
+    let keys = keymap();
+    let theme = Theme::dark();
+    let mut hub = SubagentsOverlay::new();
+    let mut busy = agent("busy", AgentStatus::Running);
+    busy.task = "word ".repeat(80);
+    hub.set_snapshot(snapshot(vec![busy]));
+    hub.handle(&key(KeyCode::Tab), &keys);
+    screen(&mut hub, &theme, 60, 20);
+    let max = hub.inspector_max.get();
+    assert!(max > 0, "the long task must overflow");
+    hub.handle(&key(KeyCode::PageDown), &keys);
+    assert!(hub.inspector_scroll > 0);
+    for _ in 0..20 {
+        hub.handle(&key(KeyCode::PageDown), &keys);
+    }
+    assert_eq!(hub.inspector_scroll, max, "scrolling stops at the end");
+    hub.handle(&key(KeyCode::Home), &keys);
+    assert_eq!(hub.inspector_scroll, 0);
+    hub.handle(&key(KeyCode::End), &keys);
+    assert_eq!(hub.inspector_scroll, max);
+    // One PageUp from the end moves back immediately (no hidden overscroll to unwind).
+    hub.handle(&key(KeyCode::PageUp), &keys);
+    assert!(hub.inspector_scroll < max);
+}
+
+#[test]
+fn activity_home_and_end_jump_and_end_resumes_following() {
+    let keys = keymap();
+    let mut hub = SubagentsOverlay::new();
+    hub.set_snapshot(HubSnapshot {
+        agents: vec![agent("task-1", AgentStatus::Done)],
+        activity: (0..30)
+            .map(|i| event("task-1", ActivityKind::Tool, &format!("read {i}"), None))
+            .collect(),
+        ..Default::default()
+    });
+    hub.handle(&key(KeyCode::Char('2')), &keys);
+    hub.handle(&key(KeyCode::Home), &keys);
+    assert_eq!(hub.activity_pos(30), 0);
+    assert!(!hub.follow);
+    hub.handle(&key(KeyCode::End), &keys);
+    assert_eq!(hub.activity_pos(30), 29);
+    assert!(hub.follow);
+}
+
+#[test]
+fn title_counts_once_and_the_tab_row_does_not_repeat_them() {
+    let theme = Theme::dark();
+    let mut hub = SubagentsOverlay::new();
+    hub.set_snapshot(review_roster());
+    let shown = screen(&mut hub, &theme, 120, 40);
+    assert!(
+        shown[0].contains("5 workers · 1 needs input · 4 running"),
+        "{}",
+        shown[0]
+    );
+    assert!(!shown[1].contains("running"), "tab row: {}", shown[1]);
+    assert_eq!(
+        status_counts(&review_roster().agents[..4], " · "),
+        "4 workers · running"
+    );
+    assert_eq!(status_counts(&[], " · "), "none yet");
+}
+
+#[test]
+fn inspector_omits_unreported_usage_and_empty_details() {
+    let theme = Theme::dark();
+    let mut hub = SubagentsOverlay::new();
+    hub.set_snapshot(review_roster());
+    let shown = screen(&mut hub, &theme, 120, 40).join("\n");
+    assert!(shown.contains("No usage reported yet."), "{shown}");
+    for noise in [
+        "unknown",
+        "steps 0",
+        "requests   0",
+        "none yet",
+        "isolation",
+        "transcript",
+    ] {
+        assert!(!shown.contains(noise), "{noise:?} in {shown}");
+    }
+    // Real values still show.
+    let mut used = agent("used", AgentStatus::Running);
+    used.isolation = Some("worktree feat/x".into());
+    hub.set_snapshot(snapshot(vec![used]));
+    let shown = screen(&mut hub, &theme, 120, 40).join("\n");
+    for value in [
+        "elapsed",
+        "$0.01",
+        "in 1.2k",
+        "worktree feat/x",
+        "tool calls",
+    ] {
+        assert!(shown.contains(value), "missing {value}: {shown}");
+    }
+}
+
+#[test]
+fn the_waiting_worker_is_first_and_its_card_says_what_it_needs() {
+    let theme = Theme::dark();
+    let mut hub = SubagentsOverlay::new();
+    hub.set_snapshot(review_roster());
+    assert_eq!(hub.selected.as_deref(), Some("task-5"));
+    let shown = screen(&mut hub, &theme, 120, 40).join("\n");
+    assert!(shown.contains("needs input:"), "{shown}");
+    assert!(shown.contains("Needs your input"), "{shown}");
+}
+
+#[test]
+fn clipped_roster_text_ends_in_an_ellipsis_and_ascii_has_no_unicode() {
+    let mut hub = SubagentsOverlay::new();
+    hub.set_snapshot(review_roster());
+    let shown = screen(&mut hub, &Theme::dark(), 120, 40);
+    let clipped = shown
+        .iter()
+        .filter_map(|line| line.split('│').next())
+        .filter(|left| left.contains("Preserve public"))
+        .all(|left| left.trim_end().ends_with('…'));
+    assert!(clipped, "{}", shown.join("\n"));
+    let ascii = Theme::dark().with_glyphs(crate::ui::theme::Glyphs::Ascii);
+    for (w, h) in [(120, 40), (60, 20), (38, 16)] {
+        let shown = screen(&mut hub, &ascii, w, h).join("");
+        let stray: String = shown
+            .chars()
+            .filter(|c| !c.is_ascii() && !"─│╭╮╰╯".contains(*c))
+            .collect();
+        assert!(stray.is_empty(), "{w}x{h} non-ASCII {stray:?}");
+    }
+}
+
+#[test]
+fn footer_offers_only_actions_the_selected_worker_supports() {
+    let rig = Rig::new();
+    let ctx = DrawCtx {
+        theme: &rig.theme,
+        keys: &rig.keys,
+        status: &rig.status,
+        preview_status: &preview,
+    };
+    let mut hub = SubagentsOverlay::new();
+    hub.set_snapshot(snapshot(vec![agent("done", AgentStatus::Done)]));
+    let footer = hub.footer(&ctx);
+    assert!(!footer.iter().any(|s| s == "x cancel"), "{footer:?}");
+    assert!(footer.iter().any(|s| s == "m continue"), "{footer:?}");
+    hub.set_snapshot(snapshot(vec![agent("live", AgentStatus::Running)]));
+    let footer = hub.footer(&ctx);
+    assert!(footer.iter().any(|s| s == "x cancel"), "{footer:?}");
+    assert!(footer.iter().any(|s| s == "m message"), "{footer:?}");
 }

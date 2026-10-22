@@ -651,10 +651,25 @@ fn main() -> anyhow::Result<()> {
             light,
         );
         let sessions: Vec<SessionInfo> = [
-            ("a1", "Fix flaky retry in the HTTP client", 6, "2026-01-02T09:00:00Z"),
-            ("b2", "Explain the build pipeline", 2, "2026-01-01T12:00:00Z"),
+            (
+                "a1",
+                "Fix flaky retry in the HTTP client",
+                6,
+                "2026-01-02T09:00:00Z",
+            ),
+            (
+                "b2",
+                "Explain the build pipeline",
+                2,
+                "2026-01-01T12:00:00Z",
+            ),
             ("c3", "", 0, "2025-12-20T08:00:00Z"),
-            ("d4", "Migrate settings storage to TOML", 14, "2025-11-03T16:00:00Z"),
+            (
+                "d4",
+                "Migrate settings storage to TOML",
+                14,
+                "2025-11-03T16:00:00Z",
+            ),
         ]
         .into_iter()
         .map(|(id, title, requests, updated)| SessionInfo {
@@ -710,7 +725,12 @@ fn main() -> anyhow::Result<()> {
             models: vec![
                 entry("local", "qwen3.5-9b", "Local MLX", true),
                 entry("ollama", "llama3.2", "Ollama", true),
-                entry("lm-studio", "gemma-3-12b", "LM Studio · loads on first use", true),
+                entry(
+                    "lm-studio",
+                    "gemma-3-12b",
+                    "LM Studio · loads on first use",
+                    true,
+                ),
                 entry("openai", "gpt-5-mini", "OpenAI (cached, unverified)", false),
             ],
             providers: vec![

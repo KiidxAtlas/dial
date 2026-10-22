@@ -80,9 +80,9 @@ impl Shell {
                     app.config.thinking_auto,
                 ));
                 let now = if app.config.thinking_auto {
-                    "auto"
+                    "auto".to_owned()
                 } else {
-                    level
+                    level.to_string()
                 };
                 Some(picker(
                     "Thinking effort",

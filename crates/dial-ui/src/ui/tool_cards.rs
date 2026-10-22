@@ -120,17 +120,52 @@ pub(super) fn tool_rows(t: &Tool, w: u16, ctx: &TranscriptCtx) -> Rows {
     }
 }
 
-/// MCP calls read like every other work row: the service-local action takes the verb column and
-/// the server that answered sits beside it as a quiet source label, so the call stays attributable
-/// without a frame competing with the answer.
+/// MCP is a service boundary, not a status: keep the status glyph and evidence inside an
+/// identifiable service frame even after the call settles. Native calls remain quiet rows.
 fn mcp_card(t: &Tool, server: &str, action: &str, w: usize, ctx: &TranscriptCtx) -> Rows {
-    card_with(
-        t,
-        w,
-        ctx,
-        text::one_line(action),
-        Some(text::one_line(server)),
-    )
+    let theme = ctx.theme;
+    let fill = theme.bg(Tok::PanelBg);
+    let border = theme.fg(Tok::SectionConnect).patch(fill);
+    let (tl, tr, bl, br, h, v) = if theme.ascii() {
+        ("+", "+", "+", "+", "-", "|")
+    } else {
+        ("╭", "╮", "╰", "╯", "─", "│")
+    };
+    // At tiny widths retain the identity, without overflowing or subtracting past zero.
+    if w < 6 {
+        return vec![fitted(
+            vec![Span::styled(format!("MCP {server}"), border)],
+            w,
+            theme,
+        )];
+    }
+    let inner = w - 4;
+    let separator = if theme.ascii() { ":" } else { "·" };
+    let title = text::clip(
+        &format!(" MCP {separator} {} ", text::one_line(server)),
+        w - 2,
+    );
+    let mut rows = vec![Line::from(Span::styled(
+        format!("{tl}{title}{}{tr}", h.repeat(w - 2 - text::width(&title))),
+        border,
+    ))];
+    // The server is already in the frame title, so the inner row names only the action.
+    for mut row in card_with(t, inner, ctx, text::one_line(action)) {
+        let used = text::line_width(&row);
+        let mut spans = vec![Span::styled(format!("{v} "), border)];
+        for span in &mut row.spans {
+            span.style = fill.patch(row.style).patch(span.style);
+        }
+        spans.extend(row.spans);
+        spans.push(Span::styled(" ".repeat(inner.saturating_sub(used)), fill));
+        spans.push(Span::styled(format!(" {v}"), border));
+        rows.push(Line::from(spans));
+    }
+    rows.push(Line::from(Span::styled(
+        format!("{bl}{}{br}", h.repeat(w - 2)),
+        border,
+    )));
+    rows
 }
 
 /// Width of the verb column, so targets line up down the transcript.
@@ -324,18 +359,11 @@ fn write_preview(t: &Tool, inner: usize, ctx: &TranscriptCtx) -> Option<(Rows, u
 /// right edge), then, when it says something, the body hanging off a `└` under the verb: the diff
 /// for edits, the new lines for writes, output for commands, the first error lines for failures.
 fn card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Rows {
-    card_with(t, w, ctx, verb(t), None)
+    card_with(t, w, ctx, verb(t))
 }
 
-/// A card whose verb column reads `verb_text`; `source` names who answered (an MCP server) in a
-/// quiet label beside it.
-fn card_with(
-    t: &Tool,
-    w: usize,
-    ctx: &TranscriptCtx,
-    verb_text: String,
-    source: Option<String>,
-) -> Rows {
+/// A card whose verb column reads `verb_text` (an MCP call's service-local action).
+fn card_with(t: &Tool, w: usize, ctx: &TranscriptCtx, verb_text: String) -> Rows {
     let theme = ctx.theme;
     let mark = ellipsis(theme);
     let (glyph, glyph_style) = tool_glyph(t, ctx);
@@ -350,8 +378,7 @@ fn card_with(
     let sep = format!(" {} ", theme.sym(Sym::Dot));
     let lead = gutter_span(glyph, glyph_style);
     let lead_w: usize = lead.iter().map(|s| text::width(&s.content)).sum();
-    let source_w = source.as_deref().map_or(0, |s| text::width(s) + 2);
-    let left_fixed = lead_w + VERB_W.max(text::width(&verb_text)) + 1 + source_w;
+    let left_fixed = lead_w + VERB_W.max(text::width(&verb_text)) + 1;
     // Narrow rows give up timing, then a status the gutter glyph already shows, before the target.
     let mut facts = facts(t, theme);
     let want = text::width(&full_target).min(TARGET_MIN);
@@ -385,10 +412,6 @@ fn card_with(
         verb_style,
     ));
     head.push(Span::raw(" "));
-    if let Some(source) = source {
-        head.push(Span::styled(source, theme.fg(Tok::Dim)));
-        head.push(Span::raw("  "));
-    }
     head.push(Span::styled(target_text, theme.fg(Tok::Muted)));
     if right_w > 0 {
         let used: usize = head.iter().map(|s| text::width(&s.content)).sum();

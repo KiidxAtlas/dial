@@ -366,12 +366,18 @@ impl ExtensionsOverlay {
                 ctx.theme.fg(Tok::Muted),
             )));
             let catalog = browser.catalog(browser.tab());
+            let shown = browser.visible(browser.tab()).len();
+            let mut status = Vec::new();
+            if catalog.loading {
+                status.push(format!("Loading {}…", browser.tab().label()));
+            } else if !catalog.message.trim().is_empty() {
+                status.push(crate::ui::text::one_line(&catalog.message));
+            }
+            if shown > 0 {
+                status.push(format!("{shown} shown"));
+            }
             lines.push(Line::from(Span::styled(
-                format!(
-                    " {} · {} shown",
-                    catalog.message,
-                    browser.visible(browser.tab()).len()
-                ),
+                format!(" {}", status.join(" · ")),
                 ctx.theme.fg(Tok::Dim),
             )));
 
@@ -399,12 +405,29 @@ impl ExtensionsOverlay {
                         }
                     }
                 } else if rows.is_empty() {
-                    let empty = if browser.query().is_empty() {
-                        "No catalog entries. r refreshes; / then Enter searches; Marketplaces tab: a adds an index."
+                    let empty = if catalog.loading {
+                        "Loading the catalog…".to_owned()
+                    } else if !browser.query().is_empty() {
+                        "No matches on this tab. Left/Right checks the other tabs; Esc clears the search.".to_owned()
+                    } else if browser.tab() == Tab::Marketplaces {
+                        "No marketplaces yet. Press a to add a plugin index, or r to refresh."
+                            .to_owned()
                     } else {
-                        "No matches on this tab. Left/Right checks the other tabs; Esc clears the search."
+                        format!(
+                            "Nothing listed under {} yet. Press r to refresh, or / to search the catalog.",
+                            browser.tab().label()
+                        )
                     };
-                    lines.push(Line::from(Span::styled(empty, ctx.theme.fg(Tok::Muted))));
+                    // Wrapped so the way forward is never clipped at narrow widths.
+                    for row in crate::ui::text::wrap_words(&empty, w.saturating_sub(2).max(1))
+                        .into_iter()
+                        .take(body_h.max(1))
+                    {
+                        lines.push(Line::from(Span::styled(
+                            format!(" {row}"),
+                            ctx.theme.fg(Tok::Muted),
+                        )));
+                    }
                 } else {
                     let start = cursor.saturating_sub(body_h.saturating_sub(1));
                     for (i, row) in rows.iter().enumerate().skip(start).take(body_h) {
@@ -427,28 +450,38 @@ impl ExtensionsOverlay {
                 } else {
                     "close"
                 };
-                let mut items = vec![
-                    (
-                        pair_label(ctx.keys, Action::TabPrev, Action::TabNext),
-                        "tabs".to_owned(),
-                    ),
-                    ("/".to_owned(), "search".to_owned()),
-                    ("r".to_owned(), "refresh".to_owned()),
-                    ("↓".to_owned(), "loads more".to_owned()),
-                    (ctx.keys.label(Action::SelectConfirm), enter_label(browser)),
-                    ("v".to_owned(), "details".to_owned()),
-                    (
-                        pair_label(ctx.keys, Action::SelectUp, Action::SelectDown),
-                        "move".to_owned(),
-                    ),
-                    ("t".to_owned(), "test".to_owned()),
-                    ("e".to_owned(), "enable".to_owned()),
-                    ("x".to_owned(), "remove".to_owned()),
-                    (ctx.keys.label(Action::SelectCancel), esc.to_owned()),
-                ];
-                if browser.tab() == Tab::Marketplaces {
-                    items.insert(5, ("a".to_owned(), "add".to_owned()));
+                // Most useful first; the footer drops hints before the last (the way out) when
+                // space runs short. Row actions appear only when they apply to the selection.
+                let mut items = Vec::new();
+                if browser.selected().is_some() {
+                    items.push((ctx.keys.label(Action::SelectConfirm), enter_label(browser)));
                 }
+                for (key, label) in [('t', "test"), ('e', "enable"), ('x', "remove")] {
+                    if let Some(intent) = primary_intent(browser, key) {
+                        let label = match (&intent, label) {
+                            (Intent::ToggleMcp { enable: false, .. }, _)
+                            | (Intent::ToggleMarketplace { enable: false, .. }, _) => "disable",
+                            (_, label) => label,
+                        };
+                        items.push((key.to_string(), label.to_owned()));
+                    }
+                }
+                if browser.tab() == Tab::Marketplaces {
+                    items.push(("a".to_owned(), "add".to_owned()));
+                }
+                items.push((
+                    pair_label(ctx.keys, Action::TabPrev, Action::TabNext),
+                    "tabs".to_owned(),
+                ));
+                items.push(("/".to_owned(), "search".to_owned()));
+                if browser.selected().is_some() && enter_install(browser).is_some() {
+                    items.push(("v".to_owned(), "details".to_owned()));
+                }
+                items.push(("r".to_owned(), "refresh".to_owned()));
+                if catalog.more {
+                    items.push(("↓".to_owned(), "loads more".to_owned()));
+                }
+                items.push((ctx.keys.label(Action::SelectCancel), esc.to_owned()));
                 items
             };
             lines.push(key_footer(ctx.theme, &hints, w));

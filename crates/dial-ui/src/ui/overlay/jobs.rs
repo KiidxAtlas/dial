@@ -129,13 +129,18 @@ impl JobsOverlay {
             return OverlayEvent::Close;
         }
         let last = self.jobs.len().saturating_sub(1);
+        let page = self.list_h.get().max(1);
         if keys.matches(Action::SelectUp, key) {
             self.cursor = self.cursor.saturating_sub(1);
         } else if keys.matches(Action::SelectDown, key) {
             self.cursor = (self.cursor + 1).min(last);
         } else if keys.matches(Action::SelectPageUp, key) {
-            self.cursor = 0;
+            self.cursor = self.cursor.saturating_sub(page);
         } else if keys.matches(Action::SelectPageDown, key) {
+            self.cursor = (self.cursor + page).min(last);
+        } else if key.code == KeyCode::Home && key.modifiers.is_empty() {
+            self.cursor = 0;
+        } else if key.code == KeyCode::End && key.modifiers.is_empty() {
             self.cursor = last;
         } else if keys.matches(Action::SelectConfirm, key)
             && let Some(job) = self.jobs.get(self.cursor)
@@ -190,11 +195,16 @@ impl JobsOverlay {
     pub fn draw(&mut self, frame: &mut Frame, ctx: &DrawCtx) {
         let extra = match &self.attached {
             Some(name) => format!("attached to {name}"),
-            None => match self.jobs.len() {
-                0 => "none running".to_owned(),
-                1 => "1 process".to_owned(),
-                n => format!("{n} processes"),
-            },
+            None => {
+                let running = self.jobs.iter().filter(|job| job.running).count();
+                let exited = self.jobs.len() - running;
+                match (running, exited) {
+                    (0, 0) => "none yet".to_owned(),
+                    (r, 0) => format!("{r} running"),
+                    (0, e) => format!("{e} exited"),
+                    (r, e) => format!("{r} running {} {e} exited", ctx.theme.sym(Sym::Dot)),
+                }
+            }
         };
         panel(
             frame,
@@ -229,19 +239,26 @@ impl JobsOverlay {
             // A pending message (an input error, "has exited") replaces the header.
             match (&self.message, job) {
                 (Some(_), _) => message(&mut out),
-                (None, Some(job)) => out.push(filled(
-                    vec![Span::styled(
-                        format!(
-                            " {} · {} · {}",
-                            job.mode,
-                            text::one_line(&job.status),
-                            text::one_line(&job.command)
-                        ),
-                        theme.fg(Tok::Muted),
-                    )],
-                    w,
-                    Style::default(),
-                )),
+                (None, Some(job)) => {
+                    let dot = theme.sym(Sym::Dot);
+                    out.push(filled(
+                        vec![Span::styled(
+                            text::ellipsize(
+                                &format!(
+                                    " {} {dot} {} {dot} {}",
+                                    job.mode,
+                                    text::one_line(&job.status),
+                                    text::one_line(&job.command)
+                                ),
+                                w,
+                                theme.ascii(),
+                            ),
+                            theme.fg(Tok::Muted),
+                        )],
+                        w,
+                        Style::default(),
+                    ))
+                }
                 (None, None) => out.push(Line::default()),
             }
             for row in 0..h.saturating_sub(2) {
@@ -266,18 +283,25 @@ impl JobsOverlay {
             return out;
         }
         if self.jobs.is_empty() {
-            out.push(filled(
-                vec![Span::styled(
-                    " No background processes. The agent starts them with the bg tool.".to_owned(),
-                    theme.fg(Tok::Muted),
-                )],
-                w,
-                Style::default(),
-            ));
+            for line in text::wrap_words(
+                "No background processes yet. Servers, watchers and other long-running commands the agent starts appear here.",
+                w.saturating_sub(2).max(1),
+            ) {
+                out.push(filled(
+                    vec![Span::styled(format!(" {line}"), theme.fg(Tok::Muted))],
+                    w,
+                    Style::default(),
+                ));
+            }
         }
         let list_h = h.saturating_sub(3).max(1);
         self.list_h.set(list_h);
         let scroll = (self.cursor + 1).saturating_sub(list_h);
+        let ascii = theme.ascii();
+        // Columns shrink on narrow panels; the command takes what is left and ends in an ellipsis.
+        let name_w = (w / 4).clamp(8, 20);
+        let mode_w = if w >= 60 { 10 } else { 0 };
+        let status_w = (w / 6).clamp(7, 14);
         for (index, job) in self.jobs.iter().enumerate().skip(scroll).take(list_h) {
             let selected = index == self.cursor;
             let fill = if selected {
@@ -286,33 +310,41 @@ impl JobsOverlay {
                 Style::default()
             };
             let (dot, tok) = if job.running {
-                ("●", Tok::Success)
+                (theme.sym(Sym::Working), Tok::Success)
             } else {
-                ("○", Tok::Muted)
+                (theme.sym(Sym::Dot), Tok::Muted)
             };
             let pointer = if selected {
                 theme.sym(Sym::Pointer)
             } else {
                 " "
             };
+            let mut meta = String::new();
+            if mode_w > 0 {
+                meta.push_str(&pad(&job.mode, mode_w, ascii));
+            }
+            meta.push_str(&pad(&text::one_line(&job.status), status_w, ascii));
+            if job.terminal && w >= 60 {
+                meta.push_str("pty ");
+            }
+            let used = 3 + 2 + name_w + text::width(&meta);
             out.push(filled(
                 vec![
                     Span::styled(format!(" {pointer} "), theme.fg(Tok::Accent).patch(fill)),
                     Span::styled(format!("{dot} "), theme.fg(tok).patch(fill)),
                     Span::styled(
-                        format!("{:<16} ", job.name),
+                        pad(&job.name, name_w, ascii),
                         theme.fg(Tok::Text).patch(fill),
                     ),
+                    Span::styled(meta, theme.fg(Tok::Muted).patch(fill)),
                     Span::styled(
-                        format!(
-                            "{:<9} {:<12} {}",
-                            job.mode,
-                            text::one_line(&job.status),
-                            if job.terminal { "pty " } else { "" }
+                        text::ellipsize(
+                            &text::one_line(&job.command),
+                            w.saturating_sub(used),
+                            ascii,
                         ),
-                        theme.fg(Tok::Muted).patch(fill),
+                        theme.fg(Tok::Dim).patch(fill),
                     ),
-                    Span::styled(text::one_line(&job.command), theme.fg(Tok::Dim).patch(fill)),
                 ],
                 w,
                 fill,
@@ -323,13 +355,30 @@ impl JobsOverlay {
         }
         message(&mut out);
         out.truncate(h.saturating_sub(1));
-        let segments = vec![
-            hint(ctx.keys, Action::SelectConfirm, "attach"),
-            hint(ctx.keys, Action::SelectCancel, "close"),
-        ];
+        let mut segments = Vec::new();
+        if let Some(job) = self.jobs.get(self.cursor) {
+            // The action comes first: narrow footers drop hints from the middle.
+            segments.push(hint(
+                ctx.keys,
+                Action::SelectConfirm,
+                if job.running { "attach" } else { "view output" },
+            ));
+            segments.push(format!(
+                "{} select",
+                super::settings::arrows(theme, super::settings::Axis::Vertical)
+            ));
+        }
+        segments.push(hint(ctx.keys, Action::SelectCancel, "close"));
         out.push(hint_line(theme, &segments, w));
         out
     }
+}
+
+/// `value` clipped with an ellipsis to `n - 1` cells, then padded to `n` (one cell of gap).
+fn pad(value: &str, n: usize, ascii: bool) -> String {
+    let clipped = text::ellipsize(value, n.saturating_sub(1), ascii);
+    let gap = n.saturating_sub(text::width(&clipped));
+    format!("{clipped}{}", " ".repeat(gap))
 }
 
 /// One emulated terminal row, with the job's cursor drawn as a reversed cell.

@@ -622,9 +622,9 @@ impl GitOverlay {
                 let placeholder = if self.editing {
                     "  ▌"
                 } else if self.changes.iter().any(|c| c.area == Area::Staged) {
-                    "  c writes the message for the staged files"
+                    "  c to write it"
                 } else {
-                    "  stage files with space, then c writes a message"
+                    "  stage with space, then c"
                 };
                 lines.push(vec![Span::styled(placeholder, muted)]);
             } else {
