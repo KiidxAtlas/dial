@@ -93,3 +93,81 @@ fn terminal_size_leaves_room_for_the_frame() {
     assert_eq!(JobsOverlay::terminal_size(80, 24), (78, 20));
     assert_eq!(JobsOverlay::terminal_size(1, 1), (1, 1));
 }
+
+fn draw_rows(
+    overlay: &mut JobsOverlay,
+    theme: &crate::ui::theme::Theme,
+    w: u16,
+    h: u16,
+) -> Vec<String> {
+    use super::super::settings::testkit::{render, rows};
+    use crate::{llm::model_config::UiConfig, ui::status::StatusData};
+    let keys = Keymap::defaults();
+    let status = StatusData::default();
+    let preview = |_: &UiConfig, _: u16| Line::default();
+    let ctx = DrawCtx {
+        theme,
+        keys: &keys,
+        status: &status,
+        preview_status: &preview,
+    };
+    rows(&render(w, h, |frame| overlay.draw(frame, &ctx)))
+}
+
+#[test]
+fn page_keys_step_by_a_screen_and_home_end_jump() {
+    let keys = Keymap::defaults();
+    let theme = crate::ui::theme::Theme::dark();
+    let mut overlay = JobsOverlay::new();
+    overlay.set_jobs((0..30).map(|i| row(&format!("job{i}"), true)).collect());
+    draw_rows(&mut overlay, &theme, 80, 12);
+    let page = overlay.list_h.get();
+    assert!(page > 1 && page < 29);
+    let press = |o: &mut JobsOverlay, code| {
+        o.handle(&Event::Key(key(code, KeyModifiers::NONE)), &keys);
+    };
+    press(&mut overlay, KeyCode::PageDown);
+    assert_eq!(overlay.cursor, page);
+    press(&mut overlay, KeyCode::End);
+    assert_eq!(overlay.cursor, 29);
+    press(&mut overlay, KeyCode::PageUp);
+    assert_eq!(overlay.cursor, 29 - page);
+    press(&mut overlay, KeyCode::Home);
+    assert_eq!(overlay.cursor, 0);
+}
+
+#[test]
+fn narrow_rows_end_long_commands_in_an_ellipsis_and_exited_jobs_offer_output() {
+    let theme = crate::ui::theme::Theme::dark();
+    let mut overlay = JobsOverlay::new();
+    let mut long = row("a-very-long-server-name", false);
+    long.command = "cargo watch -x 'run --release -- --port 8080 --verbose'".into();
+    overlay.set_jobs(vec![long]);
+    for width in [38u16, 60, 120] {
+        let shown = draw_rows(&mut overlay, &theme, width, 12);
+        let row = shown.iter().find(|l| l.contains("a-very")).unwrap();
+        if width < 80 {
+            assert!(row.trim_end().ends_with('…'), "{width}: {row}");
+        }
+        assert!(shown[0].contains("1 exited"), "{}", shown[0]);
+        assert!(shown.join("\n").contains("view output"), "{shown:?}");
+    }
+    let ascii = crate::ui::theme::Theme::dark().with_glyphs(crate::ui::theme::Glyphs::Ascii);
+    let shown = draw_rows(&mut overlay, &ascii, 60, 12).join("");
+    assert!(
+        !shown
+            .chars()
+            .any(|c| !c.is_ascii() && !"─│╭╮╰╯".contains(c)),
+        "{shown}"
+    );
+}
+
+#[test]
+fn empty_list_explains_what_appears_here() {
+    let theme = crate::ui::theme::Theme::dark();
+    let mut overlay = JobsOverlay::new();
+    let shown = draw_rows(&mut overlay, &theme, 38, 16).join("\n");
+    assert!(shown.contains("none yet"), "{shown}");
+    assert!(shown.contains("No background"), "{shown}");
+    assert!(!shown.contains("attach"), "nothing to attach to: {shown}");
+}

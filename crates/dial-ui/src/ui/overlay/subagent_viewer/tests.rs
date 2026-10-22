@@ -435,3 +435,77 @@ fn draw_shows_tool_output_only_when_tool_cards_are_expanded() {
         10,
     );
 }
+
+#[test]
+fn home_and_end_jump_without_a_draft_and_edit_with_one() {
+    let keys = Keymap::defaults();
+    let now = Instant::now();
+    let mut view = viewer(None, false);
+    view.geometry = (100, 10);
+    view.key(&key(KeyCode::Home), &keys, now);
+    assert_eq!((view.scroll.top, view.scroll.follow), (0, false));
+    view.key(&key(KeyCode::End), &keys, now);
+    assert!(view.scroll.follow);
+    type_text(&mut view, &keys, "hi");
+    view.key(&key(KeyCode::Home), &keys, now);
+    assert!(
+        view.scroll.follow,
+        "Home moves the draft cursor, not the view"
+    );
+    assert_eq!(view.draft.text, "hi");
+}
+
+#[test]
+fn footer_hides_scroll_keys_while_typing_and_cancel_when_not_cancellable() {
+    let theme = Theme::dark();
+    let keys = Keymap::defaults();
+    let status = StatusData::default();
+    let preview = |_: &UiConfig, _: u16| Line::default();
+    let ctx = DrawCtx {
+        theme: &theme,
+        keys: &keys,
+        status: &status,
+        preview_status: &preview,
+    };
+    let text = |rows: Vec<Line<'static>>| -> String {
+        rows.iter().map(|l| l.to_string() + "\n").collect()
+    };
+    let mut view = viewer(None, true);
+    view.agent = Some(agent(AgentStatus::Done));
+    let idle = text(view.footer(200, &ctx));
+    assert!(idle.contains("j/k scroll"), "{idle}");
+    assert!(!idle.contains("cancel worker"), "{idle}");
+    view.agent = Some(AgentEntry {
+        cancellable: true,
+        steerable: true,
+        ..agent(AgentStatus::Running)
+    });
+    assert!(text(view.footer(200, &ctx)).contains("x cancel worker"));
+    type_text(&mut view, &keys, "go");
+    let typing = text(view.footer(200, &ctx));
+    assert!(!typing.contains("j/k scroll"), "{typing}");
+    assert!(
+        !typing.contains("x cancel"),
+        "x types while drafting: {typing}"
+    );
+    assert!(typing.contains("Enter send"), "{typing}");
+}
+
+#[test]
+fn a_waiting_worker_shows_the_warning_glyph_not_a_spinner() {
+    let theme = Theme::dark();
+    let keys = Keymap::defaults();
+    let status = StatusData::default();
+    let preview = |_: &UiConfig, _: u16| Line::default();
+    let ctx = DrawCtx {
+        theme: &theme,
+        keys: &keys,
+        status: &status,
+        preview_status: &preview,
+    };
+    let mut view = viewer(None, false);
+    view.agent = Some(agent(AgentStatus::Waiting));
+    let header = view.header(80, &ctx).to_string();
+    assert!(header.contains(theme.sym(Sym::Warn)), "{header}");
+    assert!(header.contains("needs your input"), "{header}");
+}

@@ -543,3 +543,44 @@ fn isolation_and_missing_model_recovery_have_their_own_visible_rows() {
         );
     }
 }
+
+#[test]
+fn tight_homes_keep_only_warnings_beside_the_selected_action() {
+    let theme = Theme::dark();
+    let safe = info_without_recent();
+    let rows = plain(&render(
+        &safe,
+        80,
+        &theme,
+        View {
+            selected: Some(2),
+            max_rows: 3,
+            live: true,
+            ..View::default()
+        },
+    ));
+    assert!(rows.iter().any(|row| row.contains(STARTERS[2])), "{rows:?}");
+    assert!(
+        !rows.iter().any(|row| row.contains("sandbox")),
+        "a safe sandbox is not worth a row when space is this tight: {rows:?}"
+    );
+    let mut risky = safe;
+    risky.sandbox = "off".into();
+    let rows = plain(&render(
+        &risky,
+        80,
+        &theme,
+        View {
+            selected: Some(2),
+            max_rows: 3,
+            live: true,
+            ..View::default()
+        },
+    ));
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("sandbox") && row.contains("off")),
+        "{rows:?}"
+    );
+    assert!(rows.iter().any(|row| row.contains(STARTERS[2])), "{rows:?}");
+}

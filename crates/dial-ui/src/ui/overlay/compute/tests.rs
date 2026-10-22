@@ -115,7 +115,7 @@ fn active_rows_are_green_even_when_selected_and_show_large_memory() {
         "36.51 GB",
         "loading",
         "Owner: background",
-        "x remove/stop",
+        "x stop",
     ] {
         assert!(shown.contains(expected), "missing {expected}: {shown}");
     }
@@ -238,4 +238,47 @@ fn banners_carry_success_or_error_tone() {
         style_of(&buffer, "stop failed").and_then(|style| style.fg),
         rig.theme.fg(Tok::Error).fg
     );
+}
+
+#[test]
+fn home_end_and_page_keys_move_the_cursor_within_the_list() {
+    let keys = Keymap::defaults();
+    let mut overlay = ComputeOverlay::new();
+    overlay.update(fixture());
+    let last = overlay.items().len() - 1;
+    overlay.handle(&key(KeyCode::End), &keys);
+    assert_eq!(overlay.cursor, last);
+    overlay.handle(&key(KeyCode::Home), &keys);
+    assert_eq!(overlay.cursor, 0);
+    overlay.handle(&key(KeyCode::PageDown), &keys);
+    assert_eq!(
+        overlay.cursor, last,
+        "a page past the end stops at the last row"
+    );
+    overlay.handle(&key(KeyCode::PageUp), &keys);
+    assert_eq!(overlay.cursor, 0);
+}
+
+#[test]
+fn hints_name_what_x_and_enter_do_on_the_selected_row() {
+    let rig = Rig::new();
+    let mut overlay = ComputeOverlay::new();
+    overlay.update(fixture());
+    let ctx = DrawCtx {
+        theme: &rig.theme,
+        keys: &rig.keys,
+        status: &rig.status,
+        preview_status: &status_preview,
+    };
+    // A control row: Enter runs it and x does nothing, so x is not offered.
+    let shown = rows(&render(150, 35, |frame| overlay.draw(frame, &ctx))).join("\n");
+    assert!(shown.contains("Enter run"), "{shown}");
+    assert!(
+        !shown.contains("x stop") && !shown.contains("x remove"),
+        "{shown}"
+    );
+    overlay.tab = 2;
+    overlay.cursor = 3;
+    let shown = rows(&render(150, 35, |frame| overlay.draw(frame, &ctx))).join("\n");
+    assert!(shown.contains("x remove"), "{shown}");
 }

@@ -1,7 +1,7 @@
 //! Live compute, organized by models, jobs, services and tools.
 use super::{
     DrawCtx, OverlayEvent,
-    settings::{filled, fit, panel, selected_fill, typed_char},
+    settings::{Axis, arrows, filled, fit, panel, selected_fill, typed_char},
 };
 use crate::ui::{
     chrome::{self, Section},
@@ -332,6 +332,14 @@ impl ComputeOverlay {
             self.cursor = self.cursor.saturating_sub(1);
         } else if keys.matches(Action::SelectDown, key) {
             self.cursor = (self.cursor + 1).min(count.saturating_sub(1));
+        } else if keys.matches(Action::SelectPageUp, key) {
+            self.cursor = self.cursor.saturating_sub(10);
+        } else if keys.matches(Action::SelectPageDown, key) {
+            self.cursor = (self.cursor + 10).min(count.saturating_sub(1));
+        } else if key.code == crossterm::event::KeyCode::Home && key.modifiers.is_empty() {
+            self.cursor = 0;
+        } else if key.code == crossterm::event::KeyCode::End && key.modifiers.is_empty() {
+            self.cursor = count.saturating_sub(1);
         } else if keys.matches(Action::SelectConfirm, key) {
             if let Some(target) = self.menu.clone() {
                 if let Target::Job(state) = &target {
@@ -560,7 +568,7 @@ impl ComputeOverlay {
                                 Tok::Muted,
                             ));
                             rows.push(ListRow::Text(
-                                " > Stop / unload process".into(),
+                                format!(" {} Stop / unload process", ctx.theme.sym(Sym::Pointer)),
                                 Tok::Accent,
                             ));
                         }
@@ -587,7 +595,11 @@ impl ComputeOverlay {
                                 } else {
                                     " "
                                 },
-                                if item.active { "● " } else { "○ " },
+                                if item.active {
+                                    format!("{} ", ctx.theme.sym(Sym::RadioOn))
+                                } else {
+                                    format!("{} ", ctx.theme.sym(Sym::RadioOff))
+                                },
                                 item.label
                             ),
                             if item.active {
@@ -601,7 +613,11 @@ impl ComputeOverlay {
                     }
                     if items.is_empty() {
                         rows.push(ListRow::Text(
-                            "No live items in this section.".into(),
+                            if self.snapshot.is_null() {
+                                "Reading live compute status…".into()
+                            } else {
+                                "Nothing is running in this section.".into()
+                            },
                             Tok::Muted,
                         ));
                     }
@@ -671,21 +687,48 @@ impl ComputeOverlay {
                 if output.len() < h {
                     let confirm = ctx.keys.label(Action::SelectConfirm);
                     let cancel = ctx.keys.label(Action::SelectCancel);
-                    let hints: Vec<(&str, &str)> = if self.confirm.is_some() {
-                        vec![(confirm.as_str(), "confirm"), (cancel.as_str(), "cancel")]
-                    } else {
-                        vec![
-                            ("←→/Tab", "section"),
-                            ("↑↓", "select"),
-                            (confirm.as_str(), "details"),
-                            ("x", "remove/stop"),
-                            // Esc steps back out of an item's menu, and closes from the list.
-                            (
-                                cancel.as_str(),
-                                if self.menu.is_some() { "back" } else { "close" },
-                            ),
-                        ]
+                    let sideways = format!("{}/Tab", arrows(ctx.theme, Axis::Horizontal));
+                    let updown = arrows(ctx.theme, Axis::Vertical);
+                    // What `x` and Enter do depends on the row under the cursor.
+                    let target = match &self.menu {
+                        Some(target) => Some(target.clone()),
+                        None => self
+                            .items()
+                            .get(self.cursor)
+                            .map(|item| item.target.clone()),
                     };
+                    let x_label = match &target {
+                        Some(Target::Job(_)) if self.menu.is_none() => Some("remove"),
+                        Some(Target::Process(_)) => Some("stop"),
+                        _ => None,
+                    };
+                    let enter_label = match (&self.menu, &target) {
+                        (Some(_), _) => Some("choose"),
+                        (None, Some(Target::Control(_))) => Some("run"),
+                        (None, Some(Target::Job(_) | Target::Process(_))) => Some("details"),
+                        _ => None,
+                    };
+                    let mut hints: Vec<(&str, &str)> = Vec::new();
+                    if self.confirm.is_some() {
+                        hints.push((confirm.as_str(), "confirm"));
+                        hints.push((cancel.as_str(), "cancel"));
+                    } else {
+                        if self.menu.is_none() {
+                            hints.push((sideways.as_str(), "section"));
+                        }
+                        hints.push((updown.as_str(), "select"));
+                        if let Some(label) = enter_label {
+                            hints.push((confirm.as_str(), label));
+                        }
+                        if let Some(label) = x_label {
+                            hints.push(("x", label));
+                        }
+                        // Esc steps back out of an item's menu, and closes from the list.
+                        hints.push((
+                            cancel.as_str(),
+                            if self.menu.is_some() { "back" } else { "close" },
+                        ));
+                    }
                     let mut spans = vec![Span::raw(" ")];
                     spans.extend(chrome::key_hint_spans(ctx.theme, &hints));
                     output.push(Line::from(fit(spans, w)));

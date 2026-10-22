@@ -1748,11 +1748,7 @@ impl Composer {
                 vec![Span::styled(
                     format!(
                         "{blank_pointer} {}",
-                        text::ellipsize(
-                            option.detail(),
-                            w.saturating_sub(prefix),
-                            theme.ascii()
-                        )
+                        text::ellipsize(option.detail(), w.saturating_sub(prefix), theme.ascii())
                     ),
                     theme.fg(Tok::Muted),
                 )],

@@ -400,7 +400,15 @@ fn capability_detail(theme: &Theme, entry: &ModelEntry) -> String {
     if !entry.supports_chat() && !entry.is_embedding() {
         return format!("{} · no compatible Dial role", entry.metadata.kind.label());
     }
-    let details = capabilities(entry)
+    let capabilities = capabilities(entry);
+    // Providers often report nothing at all; one phrase says so instead of a row of "unknown".
+    if capabilities
+        .iter()
+        .all(|(_, _, supported)| supported.is_none())
+    {
+        return "capabilities not reported".to_owned();
+    }
+    capabilities
         .iter()
         .map(|(icon, name, supported)| {
             format!(
@@ -414,12 +422,7 @@ fn capability_detail(theme: &Theme, entry: &ModelEntry) -> String {
             )
         })
         .collect::<Vec<_>>()
-        .join("  ");
-    if entry.metadata.kind == ModelKind::Unknown {
-        format!("kind unknown  {details}")
-    } else {
-        details
-    }
+        .join("  ")
 }
 
 fn capability_cell(theme: &Theme, entry: &ModelEntry, width: usize) -> String {
@@ -536,7 +539,7 @@ fn price_cell(entry: &ModelEntry) -> String {
 
 fn price_detail(entry: &ModelEntry) -> String {
     let Some(p) = pricing(entry) else {
-        return "price -".into();
+        return "no price listed".into();
     };
     if p.prompt == 0.0 && p.completion == 0.0 {
         return "price free".into();
@@ -697,6 +700,15 @@ fn provider_glyph(theme: &Theme, state: &str) -> (String, Tok) {
         "auth-required" => (theme.sym(Sym::Warn).to_owned(), Tok::Warning),
         "disabled" => (theme.sym(Sym::RadioOff).to_owned(), Tok::Dim),
         _ => (theme.sym(Sym::Cross2).to_owned(), Tok::Error),
+    }
+}
+
+/// A group count, blank when zero so empty groups do not read as a column of zeros.
+fn nonzero(count: usize) -> String {
+    if count == 0 {
+        String::new()
+    } else {
+        count.to_string()
     }
 }
 
@@ -2075,7 +2087,7 @@ impl ModelOverlay {
         match &self.discovery {
             None => " Scanning providers and models…".to_owned(),
             Some(d) if d.models.is_empty() => {
-                " No models yet. Start LM Studio's local API server or Ollama, then press F5 or Ctrl+R to rescan. Press Enter to set up a provider and view connection details, or open Get models to download a model."
+                " No models yet. Press Enter to set up a provider: add an API key, or connect LM Studio or Ollama and press F5 to rescan. Get models downloads a model to run on this machine."
                     .to_owned()
             }
             Some(_) if self.group == Group::Memory && self.search.is_empty() && self.show == ShowFilter::Any => {
@@ -2295,7 +2307,7 @@ impl ModelOverlay {
             line(
                 &Group::Favorites,
                 "Favorites".to_owned(),
-                self.count_in(&Group::Favorites).to_string(),
+                nonzero(self.count_in(&Group::Favorites)),
                 None,
                 self,
             ),
@@ -2305,7 +2317,7 @@ impl ModelOverlay {
             line(
                 &Group::Memory,
                 "Memory".to_owned(),
-                self.count_in(&Group::Memory).to_string(),
+                nonzero(self.count_in(&Group::Memory)),
                 None,
                 self,
             ),
@@ -2315,7 +2327,7 @@ impl ModelOverlay {
             line(
                 &Group::Download,
                 "Get models".to_owned(),
-                self.downloads.installed_count().to_string(),
+                nonzero(self.downloads.installed_count()),
                 None,
                 self,
             ),
@@ -2685,24 +2697,26 @@ impl ModelOverlay {
             format!("  {}", capability_detail(theme, entry)),
             theme.fg(Tok::Muted),
         ));
-        let context = entry.selection.context_window.map_or_else(
-            || "context unknown".to_owned(),
-            |c| format!("context {}", fmt_context(c)),
-        );
+        // Unknown values are left out rather than spelled as "unknown".
+        let context = entry
+            .selection
+            .context_window
+            .map(|c| format!("context {}", fmt_context(c)));
         let max_output = entry
             .metadata
             .max_output_tokens
-            .map(|tokens| format!(", max output {}", fmt_context(tokens)))
-            .unwrap_or_default();
+            .map(|tokens| format!("max output {}", fmt_context(tokens)));
+        let facts = context
+            .into_iter()
+            .chain(max_output)
+            .chain([
+                state_of(entry).to_owned(),
+                if is_local(entry) { "local" } else { "cloud" }.to_owned(),
+            ])
+            .collect::<Vec<_>>()
+            .join(&format!(" {} ", theme.sym(Sym::Dot)));
         first.push(Span::styled(
-            format!(
-                "  {} {context}{max_output}  {} {}  {} {}",
-                theme.sym(Sym::Dot),
-                theme.sym(Sym::Dot),
-                state_of(entry),
-                theme.sym(Sym::Dot),
-                if is_local(entry) { "local" } else { "cloud" }
-            ),
+            format!("  {} {facts}", theme.sym(Sym::Dot)),
             theme.fg(Tok::Muted),
         ));
         if !entry.available {
@@ -2764,7 +2778,7 @@ impl ModelOverlay {
         };
         let dot = theme.sym(Sym::Dot);
         let usage = match self.usage_of(entry) {
-            None => "speed -  avg cost -  (no recorded requests)".to_owned(),
+            None => "no recorded requests".to_owned(),
             Some(usage) => {
                 let speed = &usage.speed;
                 let mut parts = vec![match speed.median_tok_per_s {
@@ -2876,32 +2890,46 @@ impl ModelOverlay {
         if self.nothing_discovered() {
             return vec![
                 hint(keys, Action::SelectConfirm, "set up a provider"),
+                self.groups_hint(keys),
+                "F5 rescan".to_owned(),
+                hint(keys, Action::SelectCancel, "close"),
+            ];
+        }
+        if self.discovery.is_none() {
+            // Still scanning: nothing to pick, filter or sort yet.
+            return vec![
+                "F5 rescan".to_owned(),
                 hint(keys, Action::SelectCancel, "close"),
             ];
         }
         let memory = self.group == Group::Memory;
         // The footer keeps whole hints while they fit, so the most useful come first.
         vec![
-            hint(
-                keys,
-                Action::SelectConfirm,
-                if self.target_role.is_some() {
-                    "assign"
-                } else if memory {
-                    "set memory"
-                } else if self.highlighted().is_some_and(ModelEntry::is_embedding) {
-                    "set embedding"
-                } else {
-                    "set main"
-                },
-            ),
+            if self.highlighted().is_none() {
+                // An empty view has nothing for Enter to act on.
+                String::new()
+            } else {
+                hint(
+                    keys,
+                    Action::SelectConfirm,
+                    if self.target_role.is_some() {
+                        "assign"
+                    } else if memory {
+                        "set memory"
+                    } else if self.highlighted().is_some_and(ModelEntry::is_embedding) {
+                        "set embedding"
+                    } else {
+                        "set main"
+                    },
+                )
+            },
             if memory {
                 "Ctrl+G get memory models".to_owned()
             } else {
                 String::new()
             },
-            format!("F2 show {}", self.show.label()),
-            format!("F3 sort {}", self.sort.label()),
+            "F2 filter".to_owned(),
+            "F3 sort".to_owned(),
             "Ctrl+F favorite".to_owned(),
             self.groups_hint(keys),
             format!(

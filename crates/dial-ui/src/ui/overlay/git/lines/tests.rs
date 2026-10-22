@@ -131,41 +131,91 @@ fn selection_stages_only_the_marked_line() {
 }
 
 #[test]
-fn zz_dump() {
-    use crate::ui::overlay::settings::testkit::{Rig, render, screen, status_preview};
+fn narrow_layouts_keep_the_file_name_files_and_way_out_visible() {
     use crate::ui::overlay::DrawCtx;
+    use crate::ui::overlay::settings::testkit::{Rig, render, rows, status_preview};
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path();
     git(root, &["init", "-q"]);
     git(root, &["config", "user.email", "t@example.com"]);
     git(root, &["config", "user.name", "t"]);
-    std::fs::create_dir_all(root.join("src/ui/overlay")).unwrap();
-    std::fs::write(root.join("f.txt"), "one\ntwo\nthree\nfour\nfive\n").expect("write");
-    std::fs::write(root.join("src/ui/overlay/providers_with_long_name.rs"), "fn a() {}\n").expect("write");
+    std::fs::create_dir_all(root.join("src/deep/dir")).expect("mkdir");
+    std::fs::write(root.join("src/deep/dir/changed_file.rs"), "one\n").expect("write");
     git(root, &["add", "."]);
-    git(root, &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "init"]);
-    std::fs::write(root.join("f.txt"), "one\nTWO\nthree\nFOUR\nfive\n").expect("write");
-    std::fs::write(root.join("src/ui/overlay/providers_with_long_name.rs"), "fn a() { println!(\"hello world this is a long line\"); }\n").expect("write");
-    std::fs::write(root.join("new.md"), "new\n").expect("write");
-    git(root, &["add", "f.txt"]);
-    let ascii = Rig::with_theme(crate::ui::theme::Theme::dark().with_glyphs(crate::ui::theme::Glyphs::Ascii));
+    git(
+        root,
+        &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "init"],
+    );
+    std::fs::write(root.join("src/deep/dir/changed_file.rs"), "two\n").expect("write");
+    let mut overlay = GitOverlay::open(
+        crate::git_panel::Repo::new(root, &crate::config::types::Config::default()),
+        None,
+    )
+    .expect("overlay opens");
+    let ascii = Rig::with_theme(
+        crate::ui::theme::Theme::dark().with_glyphs(crate::ui::theme::Glyphs::Ascii),
+    );
     let rig = Rig::new();
-    let mut overlay = GitOverlay::open(crate::git_panel::Repo::new(root, &crate::config::types::Config::default()), None).expect("opens");
-    for (w, h, r) in [(120u16, 30u16, &rig), (100, 24, &rig), (60, 20, &rig), (38, 16, &ascii)] {
-        let ctx = DrawCtx { theme: &r.theme, keys: &r.keys, status: &r.status, preview_status: &status_preview };
-        println!("==== {w}x{h}\n{}", screen(&render(w, h, |f| overlay.draw(f, &ctx))));
+    for (w, h, r) in [(120u16, 30u16, &rig), (60, 20, &rig), (38, 16, &ascii)] {
+        let ctx = DrawCtx {
+            theme: &r.theme,
+            keys: &r.keys,
+            status: &r.status,
+            preview_status: &status_preview,
+        };
+        let screen = rows(&render(w, h, |f| overlay.draw(f, &ctx)));
+        let all = screen.join("\n");
+        // The diff header names the file even when the pane is narrow.
+        assert!(screen[1].contains("changed_file.rs"), "{w}x{h}\n{all}");
+        // Routine `diff --git`/`index` lines repeat the header and are not drawn.
+        assert!(
+            !all.contains("diff --git") && !all.contains("index "),
+            "{all}"
+        );
+        // No empty staging group, and the way out is always offered.
+        assert!(!all.to_lowercase().contains("staged (0)"), "{all}");
+        assert!(screen[usize::from(h) - 2].contains("Esc close"), "{all}");
+        if w < 100 {
+            // The stacked file list reaches the file instead of repeating the branch.
+            assert!(
+                all.contains("changed_file.rs") && !all.contains("HEAD "),
+                "{all}"
+            );
+        }
     }
-    std::fs::write(root.join("f.txt"), "one\ntwo\nthree\nfour\nfive\n").expect("write");
+}
+
+#[test]
+fn a_clean_tree_says_so_and_does_not_offer_staging() {
+    use crate::ui::overlay::DrawCtx;
+    use crate::ui::overlay::settings::testkit::{Rig, render, screen, status_preview};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "t@example.com"]);
+    git(root, &["config", "user.name", "t"]);
+    std::fs::write(root.join("f.txt"), "one\n").expect("write");
     git(root, &["add", "."]);
-    git(root, &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "clean"]);
-    std::fs::write(root.join("src/ui/overlay/providers_with_long_name.rs"), "fn a() {}\n").expect("write");
-    git(root, &["add", "."]);
-    git(root, &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "clean2"]);
-    git(root, &["rm", "-q", "--cached", "new.md"]);
-    std::fs::remove_file(root.join("new.md")).unwrap();
-    let mut clean = GitOverlay::open(crate::git_panel::Repo::new(root, &crate::config::types::Config::default()), None).expect("opens");
-    for (w, h, r) in [(100u16, 24u16, &rig), (38, 16, &ascii)] {
-        let ctx = DrawCtx { theme: &r.theme, keys: &r.keys, status: &r.status, preview_status: &status_preview };
-        println!("==== clean {w}x{h}\n{}", screen(&render(w, h, |f| clean.draw(f, &ctx))));
-    }
+    git(
+        root,
+        &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "init"],
+    );
+    let mut overlay = GitOverlay::open(
+        crate::git_panel::Repo::new(root, &crate::config::types::Config::default()),
+        None,
+    )
+    .expect("overlay opens");
+    let rig = Rig::new();
+    let ctx = DrawCtx {
+        theme: &rig.theme,
+        keys: &rig.keys,
+        status: &rig.status,
+        preview_status: &status_preview,
+    };
+    let shown = screen(&render(120, 30, |f| overlay.draw(f, &ctx)));
+    assert!(shown.contains("working tree is clean"), "{shown}");
+    assert!(
+        !shown.contains("stage") && !shown.contains("c commit"),
+        "{shown}"
+    );
 }

@@ -826,7 +826,11 @@ fn busy_and_queue_edit_hints_respect_literal_control_precedence() {
             hints[1],
             format!(
                 "editing queued message ({})",
-                if follow_up { "send after turn" } else { "send now" }
+                if follow_up {
+                    "send after turn"
+                } else {
+                    "send now"
+                }
             )
         );
         assert!(hints.iter().any(|h| h == "Esc cancel edit"));
@@ -3284,4 +3288,77 @@ fn a_narrow_send_choice_keeps_confirmation_and_escape_visible_before_navigation_
         shown.contains("Enter confirm") && shown.contains("Esc cancel"),
         "{shown}"
     );
+}
+
+#[test]
+fn the_band_send_choice_is_its_own_panel_with_whole_labels_at_every_width() {
+    let mut env = Env::new();
+    env.ui.composer_shape = ComposerShape::Band;
+    for glyphs in [
+        crate::ui::theme::Glyphs::Unicode,
+        crate::ui::theme::Glyphs::Ascii,
+    ] {
+        env.theme = Theme::dark().with_glyphs(glyphs);
+        let mut c = composer();
+        c.set_busy(true);
+        c.set_draft("a new direction");
+        press(&mut c, &env, KeyCode::Enter);
+        assert!(c.choice_open());
+        for width in [38u16, 60, 100] {
+            let view = c.view(width, &env.ctx());
+            let rows = lines(&view.rows);
+            assert!(
+                view.rows
+                    .iter()
+                    .all(|row| text::line_width(row) <= width as usize),
+                "{width}: {rows:?}"
+            );
+            // Labels are never cut; details yield first.
+            for label in [BusyChoice::Auto.label(), BusyChoice::AfterTurn.label()] {
+                assert!(
+                    rows.iter().any(|row| row.contains(label)),
+                    "{width}: {rows:?}"
+                );
+            }
+            // The panel title stands apart from the options and is never cut.
+            assert!(rows[0].contains("Dial is still working"), "{rows:?}");
+            // A blank surface row separates the panel from the activity/input rows below it.
+            let last_option = rows
+                .iter()
+                .rposition(|row| row.contains(BusyChoice::AfterTurn.label()))
+                .unwrap();
+            let gap = rows[last_option + 1..]
+                .iter()
+                .position(|row| row.trim().is_empty());
+            assert!(gap.is_some_and(|gap| gap <= 1), "{width}: {rows:?}");
+        }
+    }
+}
+
+#[test]
+fn placeholders_shorten_to_a_whole_phrase_instead_of_being_cut() {
+    let mut env = Env::new();
+    env.ui.composer_shape = ComposerShape::Band;
+    let c = composer();
+    for width in [12u16, 20, 30, 36, 60] {
+        let rows = lines(&c.home_view(width, &env.ctx()).rows).join("\n");
+        assert!(
+            PLACEHOLDERS.iter().any(|p| rows.contains(p)) || width < 16,
+            "{width}: {rows}"
+        );
+        assert!(!rows.contains("describe what to\n"), "{width}: {rows}");
+    }
+}
+
+#[test]
+fn the_queue_footer_keeps_its_keys_before_the_management_command_when_narrow() {
+    let env = Env::new();
+    let mut c = composer();
+    c.set_busy(true);
+    c.set_draft("later");
+    c.submit_queued(true);
+    let submit = env.keys.label(Action::Submit);
+    let rows = screen(&c, &env, 40).join("\n");
+    assert!(rows.contains(&format!("{submit} stop or keep")), "{rows}");
+    assert!(rows.contains("queued to send after turn: later"), "{rows}");
 }

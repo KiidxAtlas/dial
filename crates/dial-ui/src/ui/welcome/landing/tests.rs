@@ -185,3 +185,40 @@ fn ascii_mode_keeps_the_launch_graphic_and_context_ascii() {
     );
     assert!(plain(&view.rows).iter().all(|line| line.is_ascii()));
 }
+
+#[test]
+fn tiny_launch_screens_keep_a_margin_and_name_the_project_whole() {
+    let theme = Theme::dark().with_glyphs(crate::ui::theme::Glyphs::Ascii);
+    let keys = Keymap::defaults();
+    let ui = UiConfig::default();
+    let status = StatusData::default();
+    let composer = Composer::new(vec![], 100);
+    let mut info = info();
+    info.project = "~/projects/atlas".into();
+    info.branch = "main".into();
+    for width in [30u16, 38, 43] {
+        let input = composer.home_view(
+            content_width(width),
+            &ComposerCtx {
+                theme: &theme,
+                keys: &keys,
+                ui: &ui,
+                status: &status,
+            },
+        );
+        let view = frame(&info, width, 16, &theme, View::default(), input, vec![]);
+        let rows = plain(&view.rows);
+        assert!(view.cursor.1 >= 1, "{width}: the input is inset");
+        assert!(
+            rows.iter()
+                .all(|row| !row.starts_with('|') && text::width(row) <= width as usize),
+            "{width}: {rows:?}"
+        );
+        let place = rows
+            .iter()
+            .find(|row| row.contains("local-model"))
+            .expect("place row");
+        assert!(place.contains("atlas"), "{width}: {place:?}");
+        assert!(!place.contains("..."), "no mid-word cut: {place:?}");
+    }
+}

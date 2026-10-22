@@ -447,6 +447,15 @@ impl SubagentViewer {
             self.scroll_by(self.page());
             return OverlayEvent::None;
         }
+        // Home/End jump only while there is no draft; with text they move the editor cursor.
+        if empty && key.modifiers.is_empty() && matches!(key.code, KeyCode::Home | KeyCode::End) {
+            if key.code == KeyCode::Home {
+                self.scroll.to_top();
+            } else {
+                self.scroll.to_bottom();
+            }
+            return OverlayEvent::None;
+        }
         if keys.matches(Action::SubagentsHub, key) {
             return OverlayEvent::Action("subagent-hub".to_owned());
         }
@@ -627,10 +636,12 @@ impl SubagentViewer {
             );
         };
         let (glyph, glyph_style) = match agent.status {
-            AgentStatus::Running | AgentStatus::Waiting => (
+            AgentStatus::Running => (
                 theme.spinner(ctx.status.tick).to_owned(),
                 fx::pulse(theme, ctx.status.tick),
             ),
+            // A worker blocked on the operator must not look busy.
+            AgentStatus::Waiting => (theme.sym(Sym::Warn).to_owned(), theme.fg(Tok::Warning)),
             AgentStatus::Done => (theme.sym(Sym::Check).to_owned(), theme.fg(Tok::Success)),
             AgentStatus::Failed => (theme.sym(Sym::Cross2).to_owned(), theme.fg(Tok::Error)),
             AgentStatus::Cancelled => (theme.sym(Sym::Cross2).to_owned(), theme.fg(Tok::Muted)),
@@ -644,7 +655,11 @@ impl SubagentViewer {
                 theme.fg(Tok::Accent).add_modifier(Modifier::BOLD),
             ),
         ];
-        let mut facts = vec![agent.agent.clone(), agent.status.label().to_owned()];
+        // The panel title already names the status; repeat it here only when it asks for action.
+        let mut facts = vec![agent.agent.clone()];
+        if agent.status == AgentStatus::Waiting {
+            facts.push("needs your input".to_owned());
+        }
         if !agent.model.is_empty() {
             facts.push(agent.model.clone());
         }
@@ -670,7 +685,7 @@ impl SubagentViewer {
             .as_ref()
             .map(|agent| text::one_line(&agent.task))
             .unwrap_or_default();
-        let clipped = text::clip(&task, width.saturating_sub(4));
+        let clipped = text::ellipsize(&task, width.saturating_sub(4), theme.ascii());
         filled(
             vec![
                 Span::styled("   ", theme.fg(Tok::Dim)),
@@ -696,7 +711,10 @@ impl SubagentViewer {
             ));
         }
         let route = route(self.agent.as_ref());
-        let mut spans = vec![Span::styled("› ", theme.fg(Tok::Accent))];
+        let mut spans = vec![Span::styled(
+            format!("{} ", theme.sym(Sym::Prompt)),
+            theme.fg(Tok::Accent),
+        )];
         if self.draft.text.is_empty() {
             let placeholder = match route {
                 Route::Steer => "Message worker — delivered at its next step".to_owned(),
@@ -723,24 +741,38 @@ impl SubagentViewer {
         } else {
             "clear draft".to_owned()
         };
-        let segments = vec![
-            "j/k scroll".to_owned(),
-            "PgUp/PgDn page".to_owned(),
-            "g/G top/latest".to_owned(),
-            hint(
-                ctx.keys,
-                Action::ToolsExpand,
-                if self.expanded {
-                    "collapse tools"
-                } else {
-                    "expand tools"
-                },
-            ),
-            hint(ctx.keys, Action::Submit, "send"),
-            "x cancel".to_owned(),
-            hint(ctx.keys, Action::SelectCancel, &esc),
-            "Left Left hub".to_owned(),
-        ];
+        let mut segments = Vec::new();
+        // Scroll keys type into the draft once it has text, so they are offered only without one.
+        if self.draft.text.is_empty() {
+            segments.push(format!(
+                "{}/j/k scroll",
+                super::settings::arrows(theme, super::settings::Axis::Vertical)
+            ));
+            segments.push("PgUp/PgDn page".to_owned());
+            segments.push("g/G top/latest".to_owned());
+        }
+        segments.push(hint(
+            ctx.keys,
+            Action::ToolsExpand,
+            if self.expanded {
+                "collapse tools"
+            } else {
+                "expand tools"
+            },
+        ));
+        let verb = match route {
+            Route::Steer => Some("send"),
+            Route::Resume => Some("continue"),
+            Route::Unavailable(_) => None,
+        };
+        if let Some(verb) = verb.filter(|_| !self.draft.text.is_empty()) {
+            segments.push(hint(ctx.keys, Action::Submit, verb));
+        }
+        if self.draft.text.is_empty() && self.agent.as_ref().is_some_and(|a| a.cancellable) {
+            segments.push("x cancel worker".to_owned());
+        }
+        segments.push(hint(ctx.keys, Action::SubagentsHub, "all workers"));
+        segments.push(hint(ctx.keys, Action::SelectCancel, &esc));
         rows.push(hint_line(theme, &segments, width));
         rows
     }

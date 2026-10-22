@@ -1121,16 +1121,21 @@ impl ProviderOverlay {
             .count();
         let mut out: Vec<Line<'static>> = Vec::with_capacity(h);
         if show_header {
-            out.push(Line::from(fit(vec![Span::styled(
-                format!(" {}", match &self.mode {
-                    Mode::List => "Providers Dial can use. Enter opens the actions for the highlighted one.",
-                    Mode::Menu(_) => "Actions",
-                    Mode::Key { .. } => "API key",
-                    Mode::Confirm(_, removal) => removal.title(),
-                    Mode::Wizard(_) => "Add provider",
-                    Mode::Headers { .. } => "HTTP header rows",
-                }),
-                theme.fg(Tok::Muted))], w)));
+            let header = match &self.mode {
+                Mode::List if w >= 74 => {
+                    "Providers Dial can use. Enter opens the actions for the highlighted one."
+                }
+                Mode::List => "Enter opens a provider's actions.",
+                Mode::Menu(_) => "Actions",
+                Mode::Key { .. } => "API key",
+                Mode::Confirm(_, removal) => removal.title(),
+                Mode::Wizard(_) => "Add provider",
+                Mode::Headers { .. } => "HTTP header rows",
+            };
+            out.push(Line::from(fit(
+                vec![Span::styled(format!(" {header}"), theme.fg(Tok::Muted))],
+                w,
+            )));
         }
         let entries = self.entries();
         let body: Vec<Line<'static>> = match &self.mode {
@@ -1214,8 +1219,15 @@ impl ProviderOverlay {
         self.scroll = self.scroll.min(total.saturating_sub(rows));
         let overflow = total > rows;
         let list_w = w.saturating_sub(usize::from(overflow));
-        let label_w = (list_w / 3).clamp(8, 26);
-        let chip_w = 16;
+        // Narrow panes keep what needs attention: the state and the next step. The model count
+        // and the key column give way first.
+        let compact = list_w < 76;
+        let label_w = if compact {
+            (list_w / 3).clamp(8, 18)
+        } else {
+            (list_w / 3).clamp(8, 26)
+        };
+        let chip_w = if compact { 14 } else { 16 };
         let mut lines = Vec::new();
         for y in 0..rows.min(total) {
             let index = self.scroll + y;
@@ -1259,24 +1271,33 @@ impl ProviderOverlay {
                     ),
                     chip.style.patch(fill),
                 ));
-                let count = if entry.models == 0 {
-                    String::new()
-                } else {
-                    format!(
-                        "{} {}",
-                        entry.models,
-                        if entry.models == 1 { "model" } else { "models" }
-                    )
-                };
-                spans.push(Span::styled(
-                    text::pad(&count, 11),
-                    theme.fg(Tok::Muted).patch(fill),
-                ));
-                let (key, ktok) = self.key_status(theme, entry);
-                spans.push(Span::styled(key, theme.fg(ktok).patch(fill)));
-                if let Some(action) = self.next_action(entry) {
+                if !compact {
+                    let count = if entry.models == 0 {
+                        String::new()
+                    } else {
+                        format!(
+                            "{} {}",
+                            entry.models,
+                            if entry.models == 1 { "model" } else { "models" }
+                        )
+                    };
                     spans.push(Span::styled(
-                        format!("  → {action}"),
+                        text::pad(&count, 11),
+                        theme.fg(Tok::Muted).patch(fill),
+                    ));
+                }
+                let action = self.next_action(entry);
+                if !compact || action.is_none() {
+                    let (key, ktok) = self.key_status(theme, entry);
+                    spans.push(Span::styled(key, theme.fg(ktok).patch(fill)));
+                }
+                if let Some(action) = action {
+                    spans.push(Span::styled(
+                        format!(
+                            "{}{} {action}",
+                            if compact { "" } else { "  " },
+                            theme.sym(Sym::Pointer)
+                        ),
                         theme
                             .fg(Tok::Accent)
                             .add_modifier(Modifier::BOLD)
@@ -1385,19 +1406,21 @@ impl ProviderOverlay {
             } else {
                 Style::default()
             };
-            let radio = if selected {
-                theme.sym(Sym::RadioOn)
+            // Actions run on Enter; a pointer marks the highlighted one (radio marks would read
+            // as a setting that is switched on).
+            let pointer = if selected {
+                theme.sym(Sym::Pointer)
             } else {
-                theme.sym(Sym::RadioOff)
+                " "
             };
-            lines.push(filled(
-                vec![
-                    Span::styled(format!("    {radio} "), theme.fg(Tok::Accent).patch(fill)),
-                    Span::styled(label.clone(), theme.fg(Tok::Text).patch(fill)),
-                ],
-                w,
-                fill,
-            ));
+            let mut spans = vec![
+                Span::styled(format!("   {pointer} "), theme.fg(Tok::Accent).patch(fill)),
+                Span::styled(label.clone(), theme.fg(Tok::Text).patch(fill)),
+            ];
+            if selected {
+                chrome::select_spans(theme, &mut spans);
+            }
+            lines.push(filled(spans, w, fill));
         }
         lines
     }
@@ -1624,7 +1647,6 @@ impl ProviderOverlay {
                         "remove"
                     },
                 ),
-                hint(Action::SelectConfirm, "remove"),
                 hint(Action::SelectCancel, "cancel"),
             ],
             Mode::Wizard(w) => vec![

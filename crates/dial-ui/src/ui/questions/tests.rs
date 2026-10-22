@@ -106,3 +106,58 @@ fn short_question_frames_keep_the_current_choice_visible_and_respect_zero_size()
         }
     }
 }
+
+fn request(count: usize, header: Option<&str>) -> QuestionRequest {
+    QuestionRequest {
+        question_id: "q".into(),
+        generation: 1,
+        session_id: "s".into(),
+        owner_task_id: None,
+        questions: (0..count)
+            .map(|index| Question {
+                id: format!("q{index}"),
+                question: format!("Pick {index}?"),
+                header: header.map(str::to_owned),
+                options: vec![QuestionOption {
+                    label: "yes".into(),
+                    description: None,
+                    preview: None,
+                }],
+                multi: false,
+                recommended: None,
+            })
+            .collect(),
+        timeout_seconds: 0,
+        notify: false,
+    }
+}
+
+#[test]
+fn a_single_question_has_no_counter_and_hints_only_working_keys() {
+    let single = request(1, None);
+    let rows = Dialog::new(&single, Path::new("/tmp")).rows(80, 30);
+    assert_eq!(rows[0], "Question");
+    assert!(!rows.last().unwrap().contains("← back"), "{rows:?}");
+    let titled = request(1, Some("Scope"));
+    assert_eq!(
+        Dialog::new(&titled, Path::new("/tmp")).rows(80, 30)[0],
+        "Scope"
+    );
+
+    let multi = request(2, Some("Scope"));
+    let keys = Keymap::defaults();
+    let mut dialog = Dialog::new(&multi, Path::new("/tmp"));
+    let rows = dialog.rows(80, 30);
+    assert_eq!(rows[0], "Question 1/2 · Scope");
+    assert!(rows.iter().any(|row| row.contains("→ next")), "{rows:?}");
+    assert!(!rows.iter().any(|row| row.contains("← back")), "{rows:?}");
+    dialog.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &keys);
+    dialog.key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &keys);
+    let rows = dialog.rows(80, 30);
+    assert_eq!(rows[0], "Question 2/2 · Scope");
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("← back") && row.contains("→ done")),
+        "{rows:?}"
+    );
+}
