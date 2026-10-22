@@ -15,7 +15,15 @@ fn resume_requires_the_exact_execution_contract_and_one_active_owner() {
     let recorder = Recorder::open(&path, contract(), false).unwrap();
     assert!(Recorder::open(&path, contract(), true).is_err());
     drop(recorder);
-    assert!(Recorder::open(&path, contract(), true).is_ok());
+    // flock ownership belongs to the open file description: a test elsewhere in this process that
+    // forks a child can hold a duplicate of the lock fd until the child execs. Allow that window.
+    let reopened = (0..200).find_map(|_| {
+        Recorder::open(&path, contract(), true).ok().or_else(|| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            None
+        })
+    });
+    drop(reopened.expect("resume succeeds once the previous owner is released"));
     let mut changed = contract();
     changed.executable_sha256 = "different-build".into();
     assert!(Recorder::open(&path, changed, true).is_err());
