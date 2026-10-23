@@ -33,7 +33,7 @@ pub fn schema() -> Value {
     json!({"type":"function","function":{"name":"solve","description":"Try bounded independent candidate patches in isolated copies, run identical explicit checks, and apply the smallest passing patch only if source is unchanged. Requires operator enablement and approval. No check means no verified winner.","parameters":{"type":"object","properties":{
         "goal":{"type":"string"},"allowed_paths":{"type":"array","items":{"type":"string"},"minItems":1,"description":"Exact relative files permitted to change; no directories or globs."},
         "candidates":{"type":"array","items":{"type":"string"},"minItems":1,"description":"Independent candidate approaches; each receives the same goal and original snapshot."},
-        "checks":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"object","properties":{"command":{"type":"string"},"timeout_secs":{"type":"integer","minimum":0,"maximum":600,"description":"0 means unlimited."}},"required":["command"],"additionalProperties":false}}},"required":["goal","allowed_paths","candidates","checks"],"additionalProperties":false}}})
+        "checks":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"object","properties":{"command":{"type":"string"},"timeout_secs":{"type":"integer","minimum":0,"maximum":600,"description":"Defaults to 300; 0 means unlimited."}},"required":["command"],"additionalProperties":false}}},"required":["goal","allowed_paths","candidates","checks"],"additionalProperties":false}}})
 }
 
 pub fn escalation_schema() -> Value {
@@ -56,8 +56,9 @@ struct Check {
     #[serde(default = "check_timeout")]
     timeout_secs: u64,
 }
+/// Same default as an ordinary `bash` call, so a hung verifier cannot stall `solve` indefinitely.
 fn check_timeout() -> u64 {
-    0
+    300
 }
 
 impl SearchRequest {

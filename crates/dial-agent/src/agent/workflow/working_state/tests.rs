@@ -99,7 +99,7 @@ fn historical_replace_contract_is_compatible_but_other_changes_are_not() {
         json!({"role":"tool","tool_call_id":"w","content":"historical result"}),
     ];
     assert!(
-        contracts::project_history(&history, &[current.clone()], &registry)
+        contracts::project_history(&history, std::slice::from_ref(&current), &registry)
             .unwrap()
             .is_none()
     );

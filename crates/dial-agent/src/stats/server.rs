@@ -32,6 +32,7 @@ pub fn serve(user_dir: PathBuf, port: u16) -> Result<()> {
 
 /// Serves requests on `listener` until it fails. Connections are handled one at a time.
 pub fn serve_listener(listener: TcpListener, user_dir: PathBuf) -> Result<()> {
+    let port = listener.local_addr()?.port();
     for incoming in listener.incoming() {
         let mut stream = match incoming {
             Ok(stream) => stream,
@@ -41,6 +42,8 @@ pub fn serve_listener(listener: TcpListener, user_dir: PathBuf) -> Result<()> {
             }
         };
         stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+        // One client that never reads must not stall the single-threaded accept loop.
+        stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
         // Read until the header block ends: one read can return only part of a request, and
         // answering with bytes still queued makes the kernel reset the connection.
         let mut request = Vec::new();
@@ -63,7 +66,11 @@ pub fn serve_listener(listener: TcpListener, user_dir: PathBuf) -> Result<()> {
             .next()
             .and_then(|l| l.split_whitespace().nth(1))
             .unwrap_or("/");
-        let (status, content_type, body) = route(&user_dir, target);
+        let (status, content_type, body) = if loopback_host(&line, port) {
+            route(&user_dir, target)
+        } else {
+            ("403 Forbidden", TEXT, "unexpected Host header\n".to_owned())
+        };
         let response = format!(
             "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n{body}",
             body.len()
@@ -71,6 +78,30 @@ pub fn serve_listener(listener: TcpListener, user_dir: PathBuf) -> Result<()> {
         let _ = stream.write_all(response.as_bytes());
     }
     bail!("stats dashboard listener stopped")
+}
+
+/// Only loopback host names reach the routes: a page on another origin whose DNS name rebinds
+/// to 127.0.0.1 sends its own name as `Host`, so it cannot read session transcripts.
+fn loopback_host(request: &str, port: u16) -> bool {
+    request
+        .lines()
+        .skip(1)
+        .take_while(|line| !line.is_empty())
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("host")
+                .then(|| value.trim())
+        })
+        .is_some_and(|host| {
+            // The port may be omitted; when present it must be this listener's.
+            let name = match host.rsplit_once(':') {
+                Some((name, given)) if given == port.to_string() => name,
+                Some(_) => return false,
+                None => host,
+            };
+            name == "127.0.0.1" || name.eq_ignore_ascii_case("localhost")
+        })
 }
 
 /// Maps a request target (`/path?query`) to `(status, content type, body)`.

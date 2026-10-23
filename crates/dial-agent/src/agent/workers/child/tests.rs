@@ -167,6 +167,38 @@ fn tools_outside_the_allowlist_and_nested_tasks_are_refused() {
     assert!(asked.is_empty());
 }
 
+#[test]
+fn isolated_children_are_not_offered_tools_bound_to_another_root() {
+    struct Bound(std::path::PathBuf);
+    impl Tool for Bound {
+        fn name(&self) -> &str {
+            "codebase_memory"
+        }
+        fn schema(&self) -> Value {
+            json!({"type":"function","function":{"name":"codebase_memory","parameters":{"type":"object","properties":{}}}})
+        }
+        fn needs_approval(&self, _: &Value) -> bool {
+            false
+        }
+        fn serves_root(&self, root: &std::path::Path) -> bool {
+            root == self.0
+        }
+        fn call(&self, _: &ToolContext, _: &Value) -> ToolOutput {
+            unreachable!()
+        }
+    }
+    let project = std::path::Path::new("/project");
+    let mut ext = Registry::new();
+    ext.register(Arc::new(Bound(project.into())));
+    let offered = |root: &str| {
+        let mut names: Vec<String> = ["read", "codebase_memory"].map(str::to_owned).into();
+        drop_root_bound(&mut names, &ext, std::path::Path::new(root));
+        names
+    };
+    assert_eq!(offered("/project"), ["read", "codebase_memory"]);
+    assert_eq!(offered("/tmp/isolated-copy"), ["read"]);
+}
+
 #[cfg(unix)]
 #[test]
 fn rewritten_child_reads_recheck_schema_and_path_authority() {

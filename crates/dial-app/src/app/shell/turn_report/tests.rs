@@ -58,6 +58,23 @@ fn interrupted_turn_names_unreversible_effects_and_resume() {
 }
 
 #[test]
+fn failed_turn_names_its_failure_class() {
+    let summary = json!({
+        "outcome": "failed",
+        "error": "model server returned HTTP 429: too many requests",
+        "error_class": "rate_limited",
+        "changed_files": [],
+        "open_tasks": 0
+    });
+    let text = render(&summary).expect("failures produce a report");
+    assert!(
+        text.starts_with("Outcome: failed (rate limited)\n"),
+        "{text}"
+    );
+    assert!(!text.contains("HTTP 429"), "{text}");
+}
+
+#[test]
 fn stale_checks_and_long_file_lists_are_marked() {
     let files: Vec<String> = (0..10).map(|i| format!("f{i}.rs")).collect();
     let summary = json!({

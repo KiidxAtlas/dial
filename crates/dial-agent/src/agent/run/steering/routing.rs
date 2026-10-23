@@ -176,7 +176,7 @@ impl Agent<'_> {
                     llm::usage::Purpose::Judgment,
                     &chat,
                     ui,
-                    self.config.worker_timeout_secs.min(30).max(1),
+                    self.config.worker_timeout_secs.clamp(1, 30),
                 )
                 .and_then(|text| decision(&text))
             };

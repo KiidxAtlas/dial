@@ -709,6 +709,9 @@ impl Tool for MemoryTool {
     fn name(&self) -> &str {
         self.name
     }
+    fn serves_root(&self, root: &std::path::Path) -> bool {
+        root == self.memory.root
+    }
     fn schema(&self) -> Value {
         let scope = json!({"type":"string","enum":["project","global"]});
         let bounded = json!({"limit":{"type":"integer","minimum":1,"maximum":50,"default":8},"max_bytes":{"type":"integer","minimum":256,"maximum":24576,"default":6000}});

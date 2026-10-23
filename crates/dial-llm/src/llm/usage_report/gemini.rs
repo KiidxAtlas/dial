@@ -1,7 +1,7 @@
 //! Gemini CLI (Cloud Code Assist) quota usage.
 //!
-//! The shared helpers at the bottom (timestamps, status thresholds, JSON field readers) are
-//! also used by the Antigravity usage module.
+//! The shared helpers at the bottom (month arithmetic, JSON field readers) are also used by the
+//! Antigravity and Cursor usage modules.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -11,9 +11,8 @@ use std::sync::atomic::AtomicBool;
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
-use super::{
-    UsageAmount, UsageLimit, UsageReport, UsageScope, UsageStatus, UsageUnit, UsageWindow,
-};
+use super::common::{days_from_civil, parse_iso_ms_lenient};
+use super::{UsageAmount, UsageLimit, UsageReport, UsageScope, UsageUnit, UsageWindow};
 use crate::llm::oauth::{self, util};
 
 const ID: &str = "google-gemini-cli";
@@ -241,7 +240,7 @@ fn current_tier_metadata(load: Option<&Value>) -> BTreeMap<String, String> {
 
 fn quota_window(reset_time: Option<&str>) -> UsageWindow {
     let resets_at_ms = reset_time
-        .and_then(parse_iso_ms)
+        .and_then(parse_iso_ms_lenient)
         .and_then(|ms| u64::try_from(ms).ok());
     match resets_at_ms {
         Some(ms) => UsageWindow {
@@ -296,17 +295,6 @@ pub(super) fn flow_base_url(id: &str) -> Result<String> {
     Ok(flow.base_url.trim_end_matches('/').to_owned())
 }
 
-/// Usage status from a used fraction.
-pub(super) fn usage_status_for(used_fraction: f64) -> UsageStatus {
-    if used_fraction >= 1.0 {
-        UsageStatus::Exhausted
-    } else if used_fraction >= 0.9 {
-        UsageStatus::Warning
-    } else {
-        UsageStatus::Ok
-    }
-}
-
 /// Optional string field. Absent or `null` is `None`; any other type is an error.
 pub(super) fn opt_str<'a>(object: &'a Map<String, Value>, key: &str) -> Result<Option<&'a str>> {
     match object.get(key) {
@@ -327,113 +315,6 @@ pub(super) fn opt_f64(object: &Map<String, Value>, key: &str) -> Result<Option<f
     }
 }
 
-/// ISO-8601 / RFC 3339 timestamp to Unix ms (`Date.parse` for the shapes Google sends):
-/// `YYYY-MM-DD`, optionally followed by `T`/space, `HH:MM[:SS[.fff]]`, and `Z` or `±HH[:MM]`.
-/// Missing offsets are treated as UTC. Fractions beyond milliseconds are truncated.
-pub(super) fn parse_iso_ms(text: &str) -> Option<i64> {
-    let bytes = text.trim().as_bytes();
-    let mut at = 0;
-    let year = digits(bytes, &mut at, 4)?;
-    eat(bytes, &mut at, b'-')?;
-    let month = digits(bytes, &mut at, 2)?;
-    eat(bytes, &mut at, b'-')?;
-    let day = digits(bytes, &mut at, 2)?;
-    if !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month) {
-        return None;
-    }
-
-    let (mut hour, mut minute, mut second, mut millis, mut offset_min) = (0, 0, 0, 0, 0);
-    if at < bytes.len() {
-        if !matches!(bytes[at], b'T' | b't' | b' ') {
-            return None;
-        }
-        at += 1;
-        hour = digits(bytes, &mut at, 2)?;
-        eat(bytes, &mut at, b':')?;
-        minute = digits(bytes, &mut at, 2)?;
-        if bytes.get(at).copied() == Some(b':') {
-            at += 1;
-            second = digits(bytes, &mut at, 2)?;
-            if matches!(bytes.get(at).copied(), Some(b'.' | b',')) {
-                at += 1;
-                let start = at;
-                while bytes.get(at).is_some_and(u8::is_ascii_digit) {
-                    at += 1;
-                }
-                if at == start {
-                    return None;
-                }
-                for k in 0..3 {
-                    let digit = if start + k < at {
-                        i64::from(bytes[start + k] - b'0')
-                    } else {
-                        0
-                    };
-                    millis = millis * 10 + digit;
-                }
-            }
-        }
-        match bytes.get(at).copied() {
-            None => {}
-            Some(b'Z' | b'z') => at += 1,
-            Some(sign @ (b'+' | b'-')) => {
-                at += 1;
-                let offset_hours = digits(bytes, &mut at, 2)?;
-                if bytes.get(at).copied() == Some(b':') {
-                    at += 1;
-                }
-                let offset_minutes = digits(bytes, &mut at, 2)?;
-                let total = offset_hours * 60 + offset_minutes;
-                offset_min = if sign == b'-' { -total } else { total };
-            }
-            Some(_) => return None,
-        }
-    }
-    if at != bytes.len() || hour > 23 || minute > 59 || second > 59 {
-        return None;
-    }
-    let days = days_from_civil(year, month, day);
-    Some(
-        (days * 86_400 + hour * 3_600 + minute * 60 + second) * 1_000 + millis
-            - offset_min * 60_000,
-    )
-}
-
-fn digits(bytes: &[u8], at: &mut usize, count: usize) -> Option<i64> {
-    let slice = bytes.get(*at..*at + count)?;
-    if !slice.iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    *at += count;
-    Some(
-        slice
-            .iter()
-            .fold(0, |acc, b| acc * 10 + i64::from(b - b'0')),
-    )
-}
-
-fn eat(bytes: &[u8], at: &mut usize, want: u8) -> Option<()> {
-    if bytes.get(*at).copied() == Some(want) {
-        *at += 1;
-        Some(())
-    } else {
-        None
-    }
-}
-
-fn is_leap(year: i64) -> bool {
-    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
-}
-
-fn days_in_month(year: i64, month: i64) -> i64 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        _ if is_leap(year) => 29,
-        _ => 28,
-    }
-}
-
 /// `Date.prototype.setUTCMonth(getUTCMonth() + 1)` on a Unix ms value. Day overflow rolls into
 /// the following month, matching JavaScript (Jan 31 → Mar 3 in a non-leap year).
 pub(super) fn add_one_month_ms(ms: i64) -> Option<i64> {
@@ -442,7 +323,12 @@ pub(super) fn add_one_month_ms(ms: i64) -> Option<i64> {
     let time = ms.rem_euclid(DAY);
     let (year, month, day) = civil_from_days(days);
     let total = year * 12 + (month - 1) + 1;
-    let first = days_from_civil(total.div_euclid(12), total.rem_euclid(12) + 1, 1);
+    let first = i64::try_from(days_from_civil(
+        total.div_euclid(12),
+        total.rem_euclid(12) + 1,
+        1,
+    ))
+    .ok()?;
     first
         .checked_add(day - 1)?
         .checked_mul(DAY)?
@@ -461,17 +347,6 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = yoe + era * 400 + i64::from(month <= 2);
     (year, month, day)
-}
-
-/// Days since 1970-01-01 (proleptic Gregorian). `day` may overflow the month linearly.
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let mp = (month + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
 }
 
 #[cfg(test)]

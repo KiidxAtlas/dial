@@ -965,26 +965,18 @@ impl Agent<'_> {
                         trajectory: None,
                     }));
                 }
+                // Only a fallback that actually took over retries here. Without one, the error
+                // continues to the shared failure arm below, so every provider failure is recorded
+                // and carries the same recovery guidance whichever class it had.
                 Err(error)
                     if !self.hermetic
                         && error.downcast_ref::<llm::errors::ThinkingLoop>().is_none()
-                        && crate::llm::fallback::should_fallback(&error) =>
+                        && crate::llm::fallback::should_fallback(&error)
+                        && self.fail_over(backend, &error, ui) =>
                 {
-                    if self.fail_over(backend, &error, ui) {
-                        max_tokens = backend.output_budget(h.max_tokens);
-                        budget.give_back();
-                        return Ok(crate::agent::run::engine::Tick::Again);
-                    }
-                    self.save_request_policy(None,json!({"state":"generation failed","elapsed_ms":started.elapsed().as_millis()}),ui)?;
-                    crate::telemetry::request_failed(
-                        self.config,
-                        self.hermetic,
-                        self.session.id(),
-                        backend.model_label(),
-                        started.elapsed(),
-                        &error,
-                    );
-                    return Err(error).map(crate::agent::run::engine::Tick::Finished);
+                    max_tokens = backend.output_budget(h.max_tokens);
+                    budget.give_back();
+                    return Ok(crate::agent::run::engine::Tick::Again);
                 }
                 Err(error)
                     if !self.hermetic
@@ -1914,10 +1906,10 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                     ui.tool_timing(&call.name, seconds);
                     tool_seconds = seconds;
                     self.settled(call, &out);
-                    if call.name == "task" {
-                        if let Some(data) = &out.data {
-                            self.efficiency_metrics.worker_results(data);
-                        }
+                    if call.name == "task"
+                        && let Some(data) = &out.data
+                    {
+                        self.efficiency_metrics.worker_results(data);
                     }
                     self.observe_tool_routing(call, &out);
                     ui.tool_result_with_id(&call.id, &call.name, &out);

@@ -121,7 +121,10 @@ pub fn ellipsize(text: &str, max: usize, ascii: bool) -> String {
         return text.to_owned();
     }
     let mark = if ascii { "..." } else { "…" };
-    let room = max.saturating_sub(width(mark));
+    if max < width(mark) {
+        return clip(mark, max);
+    }
+    let room = max - width(mark);
     format!("{}{mark}", clip(text, room))
 }
 
@@ -132,7 +135,10 @@ pub fn ellipsize_start(text: &str, max: usize, ascii: bool) -> String {
         return text.to_owned();
     }
     let mark = if ascii { "..." } else { "…" };
-    let room = max.saturating_sub(width(mark));
+    if max < width(mark) {
+        return clip(mark, max);
+    }
+    let room = max - width(mark);
     let mut kept: Vec<&str> = Vec::new();
     let mut used = 0;
     for grapheme in text.graphemes(true).rev() {
@@ -208,7 +214,9 @@ pub fn wrap_words(text: &str, max: usize) -> Vec<String> {
                 }
                 let mut piece = String::new();
                 for g in word.graphemes(true) {
-                    if width(&piece) + width(g) > max {
+                    // As in `wrap`: a grapheme wider than a whole row becomes `?`.
+                    let g = if width(g) > max { "?" } else { g };
+                    if !piece.is_empty() && width(&piece) + width(g) > max {
                         rows.push(std::mem::take(&mut piece));
                     }
                     piece.push_str(g);

@@ -170,7 +170,7 @@ fn history_recorded_before_an_additive_builtin_property_stays_valid() {
         .remove("output");
     let old = identities(&[before], &registry)["grep"].clone();
     let history = vec![json!({"role":"assistant","dial_tool_contracts":{"id":old}})];
-    validate_history(&history, &[current.clone()], &registry).unwrap();
+    validate_history(&history, std::slice::from_ref(&current), &registry).unwrap();
     let mut changed = current;
     changed["function"]["parameters"]["properties"]["pattern"]["type"] = json!("integer");
     let mut other = history;
@@ -322,10 +322,10 @@ fn web_search_history_recorded_before_added_providers_stays_valid() {
     let old = identities(&[before.clone()], &Registry::new())["web_search"].clone();
     assert_ne!(
         old,
-        identities(&[current.clone()], &Registry::new())["web_search"]
+        identities(std::slice::from_ref(&current), &Registry::new())["web_search"]
     );
     let history = vec![json!({"role":"assistant","dial_tool_contracts":{"id":old}})];
-    validate_history(&history, &[current.clone()], &registry).unwrap();
+    validate_history(&history, std::slice::from_ref(&current), &registry).unwrap();
 
     let mut changed = before;
     changed["function"]["parameters"]["properties"]["query"]["type"] = json!("integer");

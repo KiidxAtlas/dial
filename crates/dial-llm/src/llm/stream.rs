@@ -50,6 +50,63 @@ impl std::fmt::Display for StalledStream {
 
 impl std::error::Error for StalledStream {}
 
+/// The I/O kind of a read failure, looking through ureq's wrapping. A connection lost inside a
+/// compressed body arrives as `Other` around `Decompress("gzip", <the real error>)`, which would
+/// otherwise fail the turn instead of reconnecting like any other dropped stream. Corrupt data
+/// keeps its own kind (`InvalidData`/`InvalidInput`) and stays non-retryable.
+pub(super) fn disconnect_kind(error: &std::io::Error) -> ErrorKind {
+    let mut current = error;
+    for _ in 0..4 {
+        if current.kind() != ErrorKind::Other {
+            break;
+        }
+        let Some(inner) = current.get_ref() else {
+            break;
+        };
+        current = if let Some(io) = inner.downcast_ref::<std::io::Error>() {
+            io
+        } else if let Some(ureq::Error::Decompress(_, io) | ureq::Error::Io(io)) =
+            inner.downcast_ref::<ureq::Error>()
+        {
+            io
+        } else {
+            break;
+        };
+    }
+    current.kind()
+}
+
+/// Classify a failed read of a framed (non-SSE) reply body the way [`read_events_with_progress`] does:
+/// silence past the idle limit is a [`StalledStream`], a dropped connection an [`IncompleteStream`], and
+/// anything else a redacted response error. Both typed errors classify as transient, so retry applies.
+pub(super) fn frame_read_error(
+    error: std::io::Error,
+    patience: &Patience,
+    auth: Option<&str>,
+) -> anyhow::Error {
+    if patience
+        .remaining()
+        .is_some_and(|remaining| remaining.is_zero())
+        || error.kind() == ErrorKind::TimedOut
+        || error.to_string().to_ascii_lowercase().contains("timeout")
+    {
+        return StalledStream.into();
+    }
+    if matches!(
+        disconnect_kind(&error),
+        ErrorKind::UnexpectedEof
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::BrokenPipe
+    ) {
+        return IncompleteStream(
+            "reading chat stream: connection disconnected before the model finished",
+        )
+        .into();
+    }
+    super::response_error(error.into(), auth)
+}
+
 /// Read SSE from `reader`, handing every `data:` payload to `on_data`, until it
 /// returns `Ok(true)` (stream finished) or the reader reaches EOF. Comments,
 /// keep-alives and other fields (`event:`, `id:`, `retry:`) are skipped. Multiple
@@ -148,7 +205,7 @@ fn read_events_impl(
                     return Err(stall_error().into());
                 }
                 if matches!(
-                    error.kind(),
+                    disconnect_kind(&error),
                     ErrorKind::UnexpectedEof
                         | ErrorKind::ConnectionReset
                         | ErrorKind::ConnectionAborted

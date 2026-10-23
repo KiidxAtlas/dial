@@ -434,27 +434,6 @@ fn discard_moved_copy(dst: &Path, streams_created: bool) {
     let _ = fs::remove_file(dst);
 }
 
-fn private_dir(dir: &Path) -> Result<()> {
-    let mut builder = fs::DirBuilder::new();
-    builder.recursive(true);
-    match platform_fs::create_dir_owner_only(&builder, dir) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            let opened = platform_fs::open_dir_nofollow(dir)
-                .with_context(|| format!("opening existing directory {}", dir.display()))?;
-            ensure!(
-                opened.metadata()?.is_dir(),
-                "{} is not a directory",
-                dir.display()
-            );
-            // Tighten a directory that already existed with looser permissions (best effort; we may not own it).
-            let _ = platform_fs::set_owner_only(dir);
-        }
-        Err(e) => return Err(e).with_context(|| format!("creating {}", dir.display())),
-    }
-    Ok(())
-}
-
 struct RawLine {
     consumed: usize,
     terminated: bool,
@@ -770,7 +749,7 @@ impl Session {
         origin: &ImportOrigin,
     ) -> Result<Session> {
         let dir = layout.sessions_dir();
-        private_dir(&dir)?;
+        crate::platform::atomic::private_dir(&dir)?;
         let ms = now_ms();
         let started = origin.started.clone().unwrap_or_else(|| iso(ms));
         let id = random_hex(8);
@@ -1060,11 +1039,6 @@ impl Session {
         Ok(s)
     }
 
-    /// Newest session file for this project, if any.
-    pub fn latest(layout: &Layout) -> Result<Option<PathBuf>> {
-        Ok(session_files(&layout.sessions_dir())?.into_iter().next())
-    }
-
     /// Pinned sessions first (picker order). For "latest" selections use `list_newest`.
     pub fn list(layout: &Layout, limit: usize) -> Result<Vec<SessionInfo>> {
         let pinned = session_pins::load(&layout.user_dir)?;
@@ -1306,7 +1280,7 @@ impl Session {
             .context("session header is not an object")?
             .insert("cwd".to_owned(), json!(target.project_root));
         let dir = target.sessions_dir();
-        private_dir(&dir)?;
+        crate::platform::atomic::private_dir(&dir)?;
         let name = src.file_name().context("session path has no file name")?;
         let dst = dir.join(name);
         let mut out =
@@ -1321,6 +1295,9 @@ impl Session {
             out.sync_all()
         })();
         drop(out);
+        // The caller deletes the old session next, so the new directory entry must be durable.
+        #[cfg(unix)]
+        let written = written.and_then(|()| fs::File::open(&dir).and_then(|d| d.sync_all()));
         if let Err(err) = written {
             discard_moved_copy(&dst, false);
             return Err(err).context("writing moved session");
@@ -1392,8 +1369,13 @@ impl Session {
             &tmp,
         )
         .with_context(|| format!("creating {}", tmp.display()))?;
-        platform_fs::try_lock_journal(&out, true).context("claiming rewritten session writer")?;
         let written = (|| -> io::Result<u64> {
+            platform_fs::try_lock_journal(&out, true).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("claiming rewritten session writer: {error}"),
+                )
+            })?;
             out.write_all(header.to_string().as_bytes())?;
             out.write_all(b"\n")?;
             let copied = io::copy(&mut src_reader, &mut out)?;
@@ -3468,7 +3450,7 @@ fn query_terms(query: &str) -> Vec<String> {
 }
 
 fn open_index(layout: &Layout) -> Result<Connection> {
-    private_dir(&layout.state_dir)?;
+    crate::platform::atomic::private_dir(&layout.state_dir)?;
     let db = layout.state_dir.join("sessions.sqlite3");
     let conn = Connection::open(&db).with_context(|| format!("opening {}", db.display()))?;
     conn.busy_timeout(Duration::from_secs(10))?;

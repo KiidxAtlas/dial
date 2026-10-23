@@ -88,7 +88,7 @@ fn runtime_inputs(executable: &Path) -> Option<(Workspace, VerificationInputs, B
     // discovering a new matching file on a later snapshot changes the path set and its digest.
     let started = Instant::now();
     for (count, entry) in fs::read_dir(root.join("lib")).ok()?.enumerate() {
-        if count >= MAX_ENTRIES || started.elapsed() > MAX_TIME {
+        if count >= MAX_ENTRIES || started.elapsed() > budget(MAX_TIME) {
             return None;
         }
         let entry = entry.ok()?;

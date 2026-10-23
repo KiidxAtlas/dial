@@ -2,6 +2,7 @@
 //!
 //! Reads `GET {base}/api/billing/limits`: per-pool (Standard credits / Droid Core) × per-window
 //! percent-used limits, plus the extra usage balance when present.
+use super::common::{parse_iso_ms, to_number, usage_status};
 use super::types::{
     UsageAmount, UsageLimit, UsageReport, UsageScope, UsageStatus, UsageUnit, UsageWindow,
 };
@@ -173,89 +174,6 @@ fn parse_limits(payload: &Value, fetched_at_ms: u64) -> Result<UsageReport> {
         notes: Vec::new(),
         metadata: Default::default(),
     })
-}
-
-/// Numeric JSON value or numeric string (finite only).
-pub(super) fn to_number(value: &Value) -> Option<f64> {
-    let number = match value {
-        Value::Number(n) => n.as_f64()?,
-        Value::String(s) => s.trim().parse::<f64>().ok()?,
-        _ => return None,
-    };
-    number.is_finite().then_some(number)
-}
-
-/// Status from a used fraction: >=1 exhausted, >=0.9 warning, else ok.
-pub(super) fn usage_status(used_fraction: f64) -> UsageStatus {
-    if used_fraction >= 1.0 {
-        UsageStatus::Exhausted
-    } else if used_fraction >= 0.9 {
-        UsageStatus::Warning
-    } else {
-        UsageStatus::Ok
-    }
-}
-
-/// `YYYY-MM-DDTHH:MM:SS[.fraction](Z|±HH:MM)` -> Unix milliseconds.
-pub(super) fn parse_iso_ms(text: &str) -> Option<u64> {
-    let (date, rest) = text.trim().split_once('T')?;
-    let mut parts = date.splitn(3, '-');
-    let year: i64 = parts.next()?.parse().ok()?;
-    let month: i64 = parts.next()?.parse().ok()?;
-    let day: i64 = parts.next()?.parse().ok()?;
-    let zone_at = rest.find(['Z', '+', '-'])?;
-    let (clock, zone) = rest.split_at(zone_at);
-    let (hms, fraction) = clock.split_once('.').unwrap_or((clock, ""));
-    let mut clock_parts = hms.split(':');
-    let hour: i64 = clock_parts.next()?.parse().ok()?;
-    let minute: i64 = clock_parts.next()?.parse().ok()?;
-    let second: i64 = clock_parts.next()?.parse().ok()?;
-    if clock_parts.next().is_some() {
-        return None;
-    }
-    let millis: i64 = if fraction.is_empty() {
-        0
-    } else {
-        fraction
-            .chars()
-            .chain(std::iter::repeat('0'))
-            .take(3)
-            .collect::<String>()
-            .parse()
-            .ok()?
-    };
-    let offset_minutes: i128 = match zone {
-        "Z" => 0,
-        _ => {
-            let sign: i128 = match zone.as_bytes().first()? {
-                b'+' => 1,
-                b'-' => -1,
-                _ => return None,
-            };
-            let (oh, om) = zone[1..].split_once(':')?;
-            let oh = i128::from(oh.parse::<i64>().ok()?);
-            let om = i128::from(om.parse::<i64>().ok()?);
-            sign * (oh * 60 + om)
-        }
-    };
-    let seconds = days_from_civil(year, month, day) * 86_400
-        + i128::from(hour) * 3_600
-        + i128::from(minute) * 60
-        + i128::from(second)
-        - offset_minutes * 60;
-    u64::try_from(seconds * 1_000 + i128::from(millis)).ok()
-}
-
-/// Proleptic Gregorian date -> days since 1970-01-01 (H. Hinnant).
-/// Wide arithmetic: the fields are arbitrary parsed i64s, so intermediate products must not overflow.
-fn days_from_civil(year: i64, month: i64, day: i64) -> i128 {
-    let (year, month, day) = (i128::from(year), i128::from(month), i128::from(day));
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y.div_euclid(400);
-    let year_of_era = y - era * 400;
-    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
 }
 
 #[cfg(test)]

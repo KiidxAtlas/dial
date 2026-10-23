@@ -1,4 +1,20 @@
-use super::TurnSteps;
+use super::{FAILURE_CAUSE_CHARS, TurnSteps, failure_cause};
+
+#[test]
+fn a_failed_turn_saves_its_cause_without_the_generic_recovery_advice() {
+    let error = anyhow::anyhow!("model server returned HTTP 529: overloaded")
+        .context("reading chat stream")
+        .context(crate::agent::run::failure_guidance::PROVIDER_RECOVERY);
+    assert_eq!(
+        failure_cause(&error),
+        "reading chat stream: model server returned HTTP 529: overloaded"
+    );
+    let long = anyhow::anyhow!("x".repeat(5_000));
+    assert_eq!(
+        failure_cause(&long).chars().count(),
+        FAILURE_CAUSE_CHARS + 1
+    );
+}
 
 #[test]
 fn initial_repair_and_stop_hook_rounds_share_one_finite_budget() {

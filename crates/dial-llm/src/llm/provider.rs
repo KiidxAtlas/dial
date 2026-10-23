@@ -152,6 +152,45 @@ pub fn anthropic_url(base_url: &str, allow_insecure: bool) -> Result<String> {
     Ok(format!("{prefix}/messages"))
 }
 
+/// Which exchange function carries a request; derived from the configured [`ApiProtocol`] by
+/// [`Wire::of`] so a new protocol must be routed deliberately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wire {
+    ChatCompletions,
+    Anthropic,
+    /// ChatGPT subscription backend (Codex Responses over WebSocket or HTTP).
+    Codex,
+    /// Responses API over HTTP.
+    Responses,
+    Gemini,
+    Ollama,
+    /// Everything served through `llm::transports`.
+    Transport,
+}
+
+impl Wire {
+    fn of(protocol: ApiProtocol) -> Self {
+        match protocol {
+            ApiProtocol::ChatCompletions => Self::ChatCompletions,
+            ApiProtocol::Anthropic => Self::Anthropic,
+            ApiProtocol::Responses => Self::Responses,
+            ApiProtocol::Gemini => Self::Gemini,
+            ApiProtocol::Ollama => Self::Ollama,
+            ApiProtocol::Bedrock
+            | ApiProtocol::Vertex
+            | ApiProtocol::VertexAnthropic
+            | ApiProtocol::AzureResponses
+            | ApiProtocol::Copilot
+            | ApiProtocol::CloudCodeAssist
+            | ApiProtocol::Antigravity
+            | ApiProtocol::GitlabDuo
+            | ApiProtocol::FactoryDroid
+            | ApiProtocol::DevinAgent
+            | ApiProtocol::Cursor => Self::Transport,
+        }
+    }
+}
+
 /// Validate a provider without contacting it (for config loading).
 pub fn validate(kind: &ProviderKind, allow_insecure: bool) -> Result<()> {
     match kind {
@@ -1299,7 +1338,7 @@ impl Backend {
             profile.local_server = local_server;
         }
         self.tool_template_notice(req, on_notice);
-        let (url, auth, model, protocol, codex_account_id) = match &self.kind {
+        let (url, auth, model, wire, codex_account_id) = match &self.kind {
             ProviderKind::Apple => unreachable!("handled above"),
             ProviderKind::ChatGpt { model, .. } => {
                 ensure!(
@@ -1318,7 +1357,7 @@ impl Backend {
                     url,
                     Some(token.as_str()),
                     model,
-                    2,
+                    Wire::Codex,
                     Some(account_id.as_str()),
                 )
             }
@@ -1335,7 +1374,7 @@ impl Backend {
                     format!("{}/messages", llm::anthropic::BASE_URL),
                     anthropic_token.as_ref().map(|t| t.as_str()),
                     model,
-                    1,
+                    Wire::Anthropic,
                     None,
                 )
             }
@@ -1516,33 +1555,12 @@ impl Backend {
                     "endpoint providers cannot load LoRA adapters"
                 );
                 let base_url = grant_route.as_deref().unwrap_or(base_url.as_str());
+                let protocol = self.protocol.unwrap_or(ApiProtocol::ChatCompletions);
                 (
-                    match self.protocol.unwrap_or(ApiProtocol::ChatCompletions) {
-                        ApiProtocol::ChatCompletions => {
-                            endpoint_url(base_url, self.allow_insecure)?
-                        }
-                        ApiProtocol::Anthropic => anthropic_url(base_url, self.allow_insecure)?,
-                        ApiProtocol::Responses => {
-                            endpoint_url(base_url, self.allow_insecure)?
-                                .trim_end_matches("/chat/completions")
-                                .to_owned()
-                                + "/responses"
-                        }
-                        _ => {
-                            endpoint_url(base_url, self.allow_insecure)?;
-                            base_url.trim_end_matches('/').to_owned()
-                        }
-                    },
+                    llm::transports::route_url(protocol, base_url, self.allow_insecure)?,
                     endpoint_key.as_deref(),
                     model,
-                    match self.protocol.unwrap_or(ApiProtocol::ChatCompletions) {
-                        ApiProtocol::ChatCompletions => 0,
-                        ApiProtocol::Anthropic => 1,
-                        ApiProtocol::Responses => 3,
-                        ApiProtocol::Gemini => 4,
-                        ApiProtocol::Ollama => 5,
-                        _ => 6,
-                    },
+                    Wire::of(protocol),
                     None,
                 )
             }
@@ -1554,35 +1572,12 @@ impl Backend {
                     "endpoint providers cannot load LoRA adapters"
                 );
                 let base_url = grant_route.as_deref().unwrap_or(base_url.as_str());
+                let protocol = self.protocol.unwrap_or(ApiProtocol::Anthropic);
                 (
-                    match self.protocol {
-                        None | Some(ApiProtocol::Anthropic) => {
-                            anthropic_url(base_url, self.allow_insecure)?
-                        }
-                        Some(ApiProtocol::ChatCompletions) => {
-                            endpoint_url(base_url, self.allow_insecure)?
-                        }
-                        Some(ApiProtocol::Responses) => {
-                            endpoint_url(base_url, self.allow_insecure)?
-                                .trim_end_matches("/chat/completions")
-                                .to_owned()
-                                + "/responses"
-                        }
-                        Some(_) => {
-                            endpoint_url(base_url, self.allow_insecure)?;
-                            base_url.trim_end_matches('/').to_owned()
-                        }
-                    },
+                    llm::transports::route_url(protocol, base_url, self.allow_insecure)?,
                     endpoint_key.as_deref(),
                     model,
-                    match self.protocol {
-                        None | Some(ApiProtocol::Anthropic) => 1,
-                        Some(ApiProtocol::ChatCompletions) => 0,
-                        Some(ApiProtocol::Responses) => 3,
-                        Some(ApiProtocol::Gemini) => 4,
-                        Some(ApiProtocol::Ollama) => 5,
-                        Some(_) => 6,
-                    },
+                    Wire::of(protocol),
                     None,
                 )
             }
@@ -1690,51 +1685,52 @@ impl Backend {
                     .iter()
                     .map(|(name, value)| (name.as_str(), value.as_str()))
             }));
-            let result = if protocol == 2 {
-                let endpoint = llm::responses::Endpoint {
-                    url,
-                    token: auth.unwrap(),
-                    account_id: Some(
-                        active_account
-                            .as_deref()
-                            .or(codex_account_id)
-                            .context("Codex backend has no pinned account")?,
-                    ),
-                    model,
-                    headers: &[],
-                };
-                let websocket = if self.codex_websocket {
-                    llm::codex_ws::exchange(
-                        endpoint,
-                        req,
-                        timeout_secs,
-                        &mut on_text,
-                        Arc::clone(&interrupt),
-                        profile.as_ref(),
-                        self.prompt_cache_key.as_deref(),
-                        on_event,
-                        self.session_id.as_deref().unwrap_or("codex-default"),
-                    )
-                } else {
-                    Ok(None)
-                };
-                match websocket {
-                    Ok(Some(reply)) => Ok(reply),
-                    Ok(None) => llm::responses::exchange_codex(
-                        endpoint,
-                        req,
-                        timeout_secs,
-                        &mut on_text,
-                        Arc::clone(&interrupt),
-                        profile.as_ref(),
-                        self.prompt_cache_key.as_deref(),
-                        on_event,
-                        self.session_id.as_deref(),
-                    ),
-                    Err(error) => Err(error),
+            let result = match wire {
+                Wire::Codex => {
+                    let endpoint = llm::responses::Endpoint {
+                        url,
+                        token: auth.unwrap(),
+                        account_id: Some(
+                            active_account
+                                .as_deref()
+                                .or(codex_account_id)
+                                .context("Codex backend has no pinned account")?,
+                        ),
+                        model,
+                        headers: &[],
+                    };
+                    let websocket = if self.codex_websocket {
+                        llm::codex_ws::exchange(
+                            endpoint,
+                            req,
+                            timeout_secs,
+                            &mut on_text,
+                            Arc::clone(&interrupt),
+                            profile.as_ref(),
+                            self.prompt_cache_key.as_deref(),
+                            on_event,
+                            self.session_id.as_deref().unwrap_or("codex-default"),
+                        )
+                    } else {
+                        Ok(None)
+                    };
+                    match websocket {
+                        Ok(Some(reply)) => Ok(reply),
+                        Ok(None) => llm::responses::exchange_codex(
+                            endpoint,
+                            req,
+                            timeout_secs,
+                            &mut on_text,
+                            Arc::clone(&interrupt),
+                            profile.as_ref(),
+                            self.prompt_cache_key.as_deref(),
+                            on_event,
+                            self.session_id.as_deref(),
+                        ),
+                        Err(error) => Err(error),
+                    }
                 }
-            } else if protocol == 1 {
-                anthropic_exchange(
+                Wire::Anthropic => anthropic_exchange(
                     llm::Endpoint {
                         headers: &headers,
                         url,
@@ -1747,9 +1743,8 @@ impl Backend {
                     Arc::clone(&interrupt),
                     profile.as_ref(),
                     on_event,
-                )
-            } else if protocol == 3 {
-                llm::responses::exchange_api(
+                ),
+                Wire::Responses => llm::responses::exchange_api(
                     llm::Endpoint {
                         headers: &headers,
                         url,
@@ -1763,38 +1758,38 @@ impl Backend {
                     profile.as_ref(),
                     self.prompt_cache_key.as_deref(),
                     on_event,
-                )
-            } else if protocol == 4 || protocol == 5 {
-                let endpoint = llm::Endpoint {
-                    headers: &headers,
-                    url,
-                    auth,
-                    model,
-                };
-                if protocol == 4 {
-                    llm::gemini::exchange(
-                        endpoint,
-                        req,
-                        timeout_secs,
-                        &mut on_text,
-                        Arc::clone(&interrupt),
-                        profile.as_ref(),
-                        on_event,
-                    )
-                } else {
-                    llm::ollama::exchange(
-                        endpoint,
-                        req,
-                        timeout_secs,
-                        &mut on_text,
-                        Arc::clone(&interrupt),
-                        profile.as_ref(),
-                        Some(self.context_capacity()),
-                        on_event,
-                    )
+                ),
+                Wire::Gemini | Wire::Ollama => {
+                    let endpoint = llm::Endpoint {
+                        headers: &headers,
+                        url,
+                        auth,
+                        model,
+                    };
+                    if wire == Wire::Gemini {
+                        llm::gemini::exchange(
+                            endpoint,
+                            req,
+                            timeout_secs,
+                            &mut on_text,
+                            Arc::clone(&interrupt),
+                            profile.as_ref(),
+                            on_event,
+                        )
+                    } else {
+                        llm::ollama::exchange(
+                            endpoint,
+                            req,
+                            timeout_secs,
+                            &mut on_text,
+                            Arc::clone(&interrupt),
+                            profile.as_ref(),
+                            Some(self.context_capacity()),
+                            on_event,
+                        )
+                    }
                 }
-            } else if protocol == 6 {
-                llm::transports::exchange(
+                Wire::Transport => llm::transports::exchange(
                     &llm::transports::Route {
                         protocol: self.protocol.unwrap_or(ApiProtocol::ChatCompletions),
                         base_url: url,
@@ -1817,9 +1812,8 @@ impl Backend {
                     Arc::clone(&interrupt),
                     profile.as_ref(),
                     on_event,
-                )
-            } else {
-                exchange(
+                ),
+                Wire::ChatCompletions => exchange(
                     llm::Endpoint {
                         headers: &headers,
                         url,
@@ -1835,7 +1829,7 @@ impl Backend {
                         reasoning_guard: None,
                         on_event,
                     },
-                )
+                ),
             };
             let result = result.map_err(|error| resolved_headers.redact(error));
             if interrupted() {

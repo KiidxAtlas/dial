@@ -126,6 +126,7 @@ pub(super) fn exchange(
     headers.extend(route.headers.iter().copied());
     let local = super::host_of(route.base_url).is_some_and(|host| super::is_local_host(&host));
     let patience = Patience::for_stream(timeout, local);
+    let stream_patience = patience.clone();
     let mut response = super::send_prepared_with_headers(
         &url,
         None,
@@ -157,7 +158,13 @@ pub(super) fn exchange(
             Ok(0) => break,
             Ok(n) => n,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(super::response_error(error.into(), route.auth)),
+            Err(error) => {
+                return Err(super::stream::frame_read_error(
+                    error,
+                    &stream_patience,
+                    route.auth,
+                ));
+            }
         };
         total += read;
         ensure!(
@@ -166,6 +173,8 @@ pub(super) fn exchange(
             super::MAX_STREAM_BYTES
         );
         for (flags, payload) in frames.push(&chunk[..read])? {
+            // Silence is judged per decoded frame, as it is for SSE events.
+            stream_patience.mark_event();
             let emits = match state.feed(flags, &payload) {
                 Ok(emits) => emits,
                 Err(error) if state.rejected_internal => {

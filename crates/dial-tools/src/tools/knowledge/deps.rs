@@ -813,8 +813,11 @@ fn authorize(ws: &Workspace, package: &Package) -> Result<PathBuf, String> {
     }
 }
 
+/// Inclusive 1-based line range.
+type LineRange = (usize, usize);
+
 /// `path:N-M` or `path:N` (N to N+199).
-fn split_range(input: &str) -> Result<(&str, Option<(usize, usize)>), String> {
+fn split_range(input: &str) -> Result<(&str, Option<LineRange>), String> {
     let Some((path, selector)) = input.rsplit_once(':') else {
         return Ok((input, None));
     };
@@ -926,7 +929,7 @@ fn clip(line: &str) -> &str {
 fn excerpt(
     root: &Path,
     file: &Path,
-    range: Option<(usize, usize)>,
+    range: Option<LineRange>,
     out: &mut String,
 ) -> Result<(), String> {
     let rel = relative(root, file);

@@ -25,6 +25,23 @@ fn query_param_picks_first_matching_key() {
 }
 
 #[test]
+fn only_loopback_host_names_reach_the_routes() {
+    let request = |host: &str| format!("GET /api/stats HTTP/1.1\r\nHost: {host}\r\n\r\n");
+    assert!(loopback_host(&request("127.0.0.1:4100"), 4100));
+    assert!(loopback_host(&request("LocalHost:4100"), 4100));
+    assert!(!loopback_host(&request("evil.example:4100"), 4100));
+    assert!(!loopback_host(&request("127.0.0.1:4101"), 4100));
+    assert!(loopback_host(&request("127.0.0.1"), 4100));
+    assert!(!loopback_host(&request("evil.example"), 4100));
+    assert!(!loopback_host("GET / HTTP/1.1\r\n\r\n", 4100));
+    // A header after the blank line is body text, not a header.
+    assert!(!loopback_host(
+        "GET / HTTP/1.1\r\n\r\nHost: 127.0.0.1:4100\r\n",
+        4100
+    ));
+}
+
+#[test]
 fn trace_route_refuses_paths_outside_sessions_tree() {
     let home = tempfile::tempdir().unwrap();
     let user_dir = home.path();

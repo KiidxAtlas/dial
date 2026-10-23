@@ -1,4 +1,5 @@
 use super::*;
+use crate::llm::usage_report::UsageStatus;
 use serde_json::json;
 
 /// 2027-01-15T08:00:00Z, a fixed clock for fixtures.

@@ -78,6 +78,11 @@ matched-success work on the existing repeated-run contracts; it does not reward 
 
 Compare repeated runs with the same fixture revision and model using
 `python3 examples/benchmarks/compare.py before.json after.json` (CLI report envelopes are accepted).
+Machine reports (`dial benchmark --profiles`) are also accepted. When a report contains multiple
+configurations, select them explicitly with `--baseline-configuration NAME` and
+`--candidate-configuration NAME`; the comparator never silently chooses the best configuration.
+Single-configuration machine reports need no selector. Repetition-prefixed case IDs must match
+between the selected reports; use `reliability.py` for repeated-trial consistency analysis.
 Reports record case categories, outcome-check counts, failed/unavailable check indices, and a
 hash of the task/verification contract without retaining prompt text. `file_equals` checks exact
 content, including trailing whitespace. Metric-only and manual-review cases are not counted as

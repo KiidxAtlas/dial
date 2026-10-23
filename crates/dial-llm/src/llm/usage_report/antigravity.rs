@@ -8,7 +8,8 @@ use std::sync::atomic::AtomicBool;
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
-use super::gemini::{opt_str, parse_iso_ms};
+use super::common::parse_iso_ms_lenient;
+use super::gemini::opt_str;
 use super::types::{
     UsageAmount, UsageLimit, UsageReport, UsageScope, UsageStatus, UsageUnit, UsageWindow,
 };
@@ -684,7 +685,7 @@ fn infer_window_descriptors(infos: &[QuotaInfo], now: i64) -> Vec<Option<Descrip
             info.api_provider.as_deref().unwrap_or(""),
             info.tier.as_deref().unwrap_or("")
         );
-        let reset = info.reset_time.as_deref().and_then(parse_iso_ms);
+        let reset = info.reset_time.as_deref().and_then(parse_iso_ms_lenient);
         groups.entry(key).or_default().push((index, reset));
     }
     for entries in groups.values() {
@@ -780,7 +781,7 @@ fn build_window(
     reset_time: Option<&str>,
     descriptor: Option<&Descriptor>,
 ) -> Option<UsageWindow> {
-    let resets_at = reset_time.and_then(parse_iso_ms);
+    let resets_at = reset_time.and_then(parse_iso_ms_lenient);
     if descriptor.is_none() && resets_at.is_none() {
         return None;
     }

@@ -69,3 +69,16 @@ fn word_wrap_breaks_on_spaces_and_hard_splits_long_words() {
     assert_eq!(wrap_words("abcdefgh", 3), vec!["abc", "def", "gh"]);
     assert_eq!(wrap_words("a\n\nb", 5), vec!["a", "", "b"]);
 }
+
+#[test]
+fn tiny_widths_never_exceed_their_cell_limit() {
+    for max in 0..4 {
+        for ascii in [false, true] {
+            assert!(width(&ellipsize("abcdef", max, ascii)) <= max);
+            assert!(width(&ellipsize_start("abcdef", max, ascii)) <= max);
+        }
+    }
+    // A wide grapheme that cannot fit a one-cell row becomes `?`, with no empty first row.
+    assert_eq!(wrap_words("界界", 1), vec!["?", "?"]);
+    assert!(wrap_words("ab界cd", 2).iter().all(|row| width(row) <= 2));
+}

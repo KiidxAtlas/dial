@@ -450,6 +450,9 @@ impl Tool for HistoryTool {
     fn name(&self) -> &str {
         "code_history"
     }
+    fn serves_root(&self, root: &std::path::Path) -> bool {
+        root == self.history.root
+    }
     fn schema(&self) -> Value {
         crate::runtime::schema::tool_schema(
             self.name(),

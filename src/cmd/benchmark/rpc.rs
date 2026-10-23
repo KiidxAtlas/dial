@@ -482,8 +482,10 @@ pub fn run_configured(
         || metrics.tool_calls > 0
         || metrics.turns_completed > 0
         || metrics.compactions > 0;
-    if result.is_err() && !ledger_read && active_before_snapshot {
-        if let Ok(state) = request(
+    if result.is_err()
+        && !ledger_read
+        && active_before_snapshot
+        && let Ok(state) = request(
             &mut input,
             &rx,
             u64::MAX,
@@ -491,11 +493,11 @@ pub fn run_configured(
             json!({}),
             Some(Instant::now() + Duration::from_secs(2)),
             &mut metrics,
-        ) {
-            ledger_read = true;
-            apply_ledger(&mut metrics, read_ledger(&state));
-            retain_efficiency(&mut metrics, &state, None);
-        }
+        )
+    {
+        ledger_read = true;
+        apply_ledger(&mut metrics, read_ledger(&state));
+        retain_efficiency(&mut metrics, &state, None);
     }
     metrics.elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     metrics.agent_succeeded = result.is_ok();

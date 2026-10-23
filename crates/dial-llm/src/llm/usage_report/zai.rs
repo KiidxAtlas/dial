@@ -7,9 +7,8 @@
 //! The grant's access key is sent raw in `Authorization` (no Bearer prefix). The last week of model
 //! usage is fetched best-effort and kept as a JSON string in `metadata["model_usage"]`.
 
-use super::types::{
-    UsageAmount, UsageLimit, UsageReport, UsageScope, UsageStatus, UsageUnit, UsageWindow,
-};
+use super::common::usage_status;
+use super::types::{UsageAmount, UsageLimit, UsageReport, UsageScope, UsageUnit, UsageWindow};
 use crate::llm::oauth::{self, util};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
@@ -239,17 +238,6 @@ fn percentage_fraction(percentage: Option<f64>) -> Option<f64> {
     percentage.map(|percentage| (percentage / 100.0).clamp(0.0, 1.0))
 }
 
-/// Standard quota status thresholds.
-fn status_for(used_fraction: f64) -> UsageStatus {
-    if used_fraction >= 1.0 {
-        UsageStatus::Exhausted
-    } else if used_fraction >= 0.9 {
-        UsageStatus::Warning
-    } else {
-        UsageStatus::Ok
-    }
-}
-
 /// Absolute counters, or an explicit fraction. Without an explicit fraction the fraction is
 /// derived from `used / limit` (capped at 1).
 fn build_amount(
@@ -398,7 +386,7 @@ fn build_limit(item: &LimitItem) -> Option<UsageLimit> {
         }
         _ => return None,
     };
-    let status = amount.used_fraction.map(status_for);
+    let status = amount.used_fraction.map(usage_status);
     let window_id = window.id.clone();
     Some(UsageLimit {
         id,

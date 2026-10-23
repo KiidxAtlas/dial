@@ -14,12 +14,17 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 impl Shell {
-    pub(super) fn save_history(&self, app: &App) {
-        let _ = settings_store::save_history(
+    pub(super) fn save_history(&mut self, app: &App) {
+        if let Err(error) = settings_store::save_history(
             &app.layout,
             &self.composer.history(),
             self.ui.history_limit,
-        );
+        ) {
+            self.note(
+                "History",
+                format!("could not save input history: {error:#}"),
+            );
+        }
     }
 
     /// `Alt+Shift+A`: the transcript of the most recently active running worker. Repeated presses

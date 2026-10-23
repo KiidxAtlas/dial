@@ -5,6 +5,41 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 
 ## [Unreleased]
 
+### Fixed
+- A connection lost while a gzip-compressed model response was being decoded (`gzip decompression failed: Peer disconnected`) is retried like any other dropped stream instead of failing the turn or the subagent. Corrupt compressed data still fails. Applies to chat streams, Ollama and Bedrock (`stream::disconnect_kind`).
+- Subagents running in an isolated copy are no longer offered `codebase_memory`, `code_history` or the memory tools (`recall`, `retain`, `forget`, `memory_update`, `memory_history`, `memory_import`). They are bound to the parent project's folder, so every call from a copy failed. Tools declare this with `Tool::serves_root`.
+- Interrupting a `bg wait` no longer ends the turn with "Stopped: `bg` ended with uncertain effects". A wait only watches a job that keeps running, so it reports no effects.
+- A fallback-class provider failure (rate limit, quota, auth, transient) with no fallback model to switch to now ends the turn like every other provider failure: it is recorded and carries the same recovery guidance.
+- MCP servers that send a request (for example `ping` or sampling) on an open tool-call stream get their answer immediately instead of the call stalling until the stream closes. A failure to store the full MCP result now keeps the result and notes the storage error.
+- `glob` patterns with many `**` segments no longer take exponential time on paths that do not match.
+- `notebook` edits count as workspace changes: they advance the turn's mutation tracking like `edit`, and are serialized with other document commits to the same file.
+- Worktree creation that carries uncommitted changes keeps untracked symlinks as symlinks and writes its temporary patch to an exclusive, unpredictable file.
+- Clipboard reads and writes in `computer` give up after 10 seconds instead of hanging on a stalled helper. When a helper is installed but fails (for example `xclip` without a display), that error is reported instead of a later "not installed" one.
+- Cancelling or timing out a skill-package `git` command also stops its transport helpers (`git-remote-https`, `ssh`).
+- Moving a stream journal never replaces an existing destination file. Moving a session syncs the new directory entry before the old session is deleted.
+- Provider errors: per-minute token throttles without a status code back off instead of compacting history, Cloudflare origin errors (520–524) and 408/409/425 are retried as transient, and custom-header redaction keeps typed stream errors retryable.
+- The stats dashboard answers only `localhost`/`127.0.0.1` Host headers on its port and stops writes to stalled clients after 5 seconds.
+- Text clipping and wrapping never exceed very narrow cell widths. The subagent viewer replays long transcripts in bounded chunks instead of reading the whole file per poll.
+- Failures to save input history, the investigation ledger or a tool-denial journal entry are reported instead of silently dropped.
+- `dial update --version v` is rejected as an invalid tag instead of failing later with a 404.
+- Notebook edits on Unix no longer overwrite a notebook that another writer replaced just before the commit; the original is restored if publishing fails.
+- The built-in shell no longer leaves `.tmp/dial-shell-*.sh` scripts behind when a command fails to start (Unix).
+- GitHub `pr_diff` caching is bounded to 64 entries. A diff served after a failed refresh is labelled with its age and the failure, a cancelled refresh reports the cancellation instead of an old diff, and argument combinations `pr_diff` rejects are no longer answered from the cache.
+- jj file paths containing quotes, backslashes, control or non-ASCII characters are passed as valid jj string literals.
+- MCP resource and prompt listings fetched while the server announced a change are no longer cached as current.
+- Large `@file` autocomplete no longer piles up stale ranking threads while typing. A crashed git or learning status probe is reported instead of hidden.
+- `dial sessions export|rename|share` resolve an id prefix without listing every session. `dial update` bounds the new binary's `--version` output and stops its process group after 20 seconds.
+- Build info reports a dirty tree when untracked source files exist.
+- A skill import started right after another one finished waits up to 2 seconds for the import lock instead of failing with "another skill import is running".
+- A slow or stalled browser sign-in callback can no longer keep sign-in waiting past cancel or timeout (5 second total read deadline).
+- A corrupt Anthropic credential file shows an error in `/usage` instead of reading as signed out.
+- Devin and Cursor model streams that go silent after their first frame now fail as a retryable stall after the idle limit instead of waiting indefinitely, and a long, steadily streaming reply is no longer cut off by the first-event limit.
+
+### Changed
+- A failed turn saves its cause and error class in the turn summary (`turn_summary.error`, `turn_summary.error_class`), so the failure can still be diagnosed from the session after the transcript is gone. The turn report names the class, for example `Outcome: failed (rate limited)`.
+- `solve` checks without `timeout_secs` now stop after 300 seconds instead of running unbounded (`0` still means unlimited).
+- Background `/tan` jobs are interrupted when their registry is dropped, and the dispatch notice no longer promises that the job reports back to the session.
+
 ## [0.1.19] - 2026-10-22
 
 ### Added

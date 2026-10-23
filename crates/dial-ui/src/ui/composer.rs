@@ -268,6 +268,8 @@ pub struct Composer {
     autocomplete_tx: std::sync::mpsc::Sender<AutocompleteResult>,
     /// Bumped whenever the candidate lists change; background results from older generations are dropped.
     candidates_generation: u64,
+    /// Latest background-ranking request; a worker whose request is no longer the latest stops.
+    rank_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
     history_provider: Option<HistoryProvider>,
     menu: Option<Menu>,
     /// The exact draft the user dismissed the menu/ghost on; editing the text ends the dismissal.
@@ -337,6 +339,7 @@ impl Composer {
             autocomplete_rx,
             autocomplete_tx,
             candidates_generation: 0,
+            rank_epoch: std::sync::Arc::default(),
             words: WordModel::default(),
             word_store: None,
             word_completion: true,
@@ -1381,6 +1384,13 @@ impl Composer {
         self.menu.as_ref().is_some_and(|menu| menu.pending)
     }
 
+    /// Marks every outstanding background ranking as stale and returns the new latest request id.
+    fn supersede_rankings(&self) -> u64 {
+        self.rank_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1
+    }
+
     fn refresh(&mut self) {
         if self
             .dismissed
@@ -1391,7 +1401,10 @@ impl Composer {
         }
         self.poll_autocomplete();
         match self.menu_query() {
-            None => self.menu = None,
+            None => {
+                self.supersede_rankings();
+                self.menu = None;
+            }
             Some((query, start))
                 if self
                     .menu
@@ -1399,6 +1412,7 @@ impl Composer {
                     .is_some_and(|m| m.query == query && m.file_start == start) => {}
             Some((query, file_start)) => {
                 let query = query.to_owned();
+                let epoch = self.supersede_rankings();
                 let arguments = if file_start.is_none() {
                     self.argument_entries(&query)
                 } else {
@@ -1414,9 +1428,13 @@ impl Composer {
                     let tx = self.autocomplete_tx.clone();
                     let generation = self.candidates_generation;
                     let worker_query = query.clone();
+                    let latest = std::sync::Arc::clone(&self.rank_epoch);
                     std::thread::spawn(move || {
-                        let matches = rank(&files, &worker_query);
-                        let _ = tx.send((generation, worker_query, file_start, matches));
+                        let superseded =
+                            || latest.load(std::sync::atomic::Ordering::Relaxed) != epoch;
+                        if let Some(matches) = rank_until(&files, &worker_query, &superseded) {
+                            let _ = tx.send((generation, worker_query, file_start, matches));
+                        }
                     });
                     (Vec::new(), true)
                 } else {
@@ -2811,6 +2829,20 @@ fn group_of(command: &CommandEntry) -> &'static str {
 /// Name matches lead description-only matches; within either field, prefixes lead word starts,
 /// then subsequences. Fuzzy score breaks ties and supplies highlight positions.
 fn rank(commands: &[CommandEntry], query: &str) -> Vec<Match> {
+    rank_until(commands, query, &|| false).unwrap_or_default()
+}
+
+/// How many candidates a ranking scores between checks of its cancellation flag.
+const RANK_CANCEL_STRIDE: usize = 256;
+
+/// `rank`, but gives up (returning `None`) once `cancelled` reports true, checked before the first
+/// candidate and then every `RANK_CANCEL_STRIDE` candidates, so a superseded query stops early.
+fn rank_until(
+    commands: &[CommandEntry],
+    query: &str,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<Vec<Match>> {
+    let stopped = std::cell::Cell::new(false);
     let lower = query.to_lowercase();
     let tier = |value: &str| {
         if lower.is_empty() {
@@ -2832,6 +2864,13 @@ fn rank(commands: &[CommandEntry], query: &str) -> Vec<Match> {
         .iter()
         .enumerate()
         .filter_map(|(index, command)| {
+            if stopped.get() {
+                return None;
+            }
+            if index % RANK_CANCEL_STRIDE == 0 && cancelled() {
+                stopped.set(true);
+                return None;
+            }
             let name = text::fuzzy(query, &command.name);
             let desc = text::fuzzy(query, &command.description);
             if name.is_none() && desc.is_none() {
@@ -2853,6 +2892,9 @@ fn rank(commands: &[CommandEntry], query: &str) -> Vec<Match> {
             ))
         })
         .collect();
+    if stopped.get() {
+        return None;
+    }
     if lower.is_empty() {
         // Nothing typed yet: everyday commands first, grouped (models, setup, sessions, …), each
         // group led by what people reach for first; then everything else, grouped the same way.
@@ -2874,7 +2916,7 @@ fn rank(commands: &[CommandEntry], query: &str) -> Vec<Match> {
     } else {
         scored.sort_by_key(|a| std::cmp::Reverse(a.0));
     }
-    scored.into_iter().map(|(_, m)| m).collect()
+    Some(scored.into_iter().map(|(_, m)| m).collect())
 }
 
 /// Stable per-session accent token (FNV-1a, so it does not change between runs or builds).

@@ -113,9 +113,9 @@ fn execute(
 /// `pr_diff`, served from the PR-diff cache when a key can be derived from `args`.
 fn pr_diff(ws: &Workspace, args: &Value, cancel: &AtomicBool) -> Result<ToolOutput, String> {
     match super::gh_cache::pr_diff_key(ws.root(), args) {
-        Some(key) => {
-            super::gh_cache::cached(&key, || super::gh_pr_diff::run("pr_diff", ws, args, cancel))
-        }
+        Some(key) => super::gh_cache::cached(&key, cancel, || {
+            super::gh_pr_diff::run("pr_diff", ws, args, cancel)
+        }),
         None => super::gh_pr_diff::run("pr_diff", ws, args, cancel),
     }
 }

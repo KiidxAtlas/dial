@@ -437,11 +437,16 @@ fn format_timeout(timeout: Duration) -> String {
     }
 }
 
+/// Output kept from one pipe; only a preview is ever shown.
+const CAPTURE_LIMIT: u64 = 1 << 20;
+
 pub(super) fn read_in_background<R: Read + Send + 'static>(mut pipe: R) -> Receiver<String> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let mut buffer = Vec::new();
-        let _ = pipe.read_to_end(&mut buffer);
+        let _ = (&mut pipe).take(CAPTURE_LIMIT).read_to_end(&mut buffer);
+        // Keep draining past the limit so a chatty child never blocks on a full pipe.
+        let _ = std::io::copy(&mut pipe, &mut std::io::sink());
         let _ = tx.send(String::from_utf8_lossy(&buffer).into_owned());
     });
     rx

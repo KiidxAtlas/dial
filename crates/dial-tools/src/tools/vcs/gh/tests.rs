@@ -99,7 +99,7 @@ fn pr_diff_cache_hit_serves_without_calling_gh() {
         &json!({"pr": "77001", "repo": "octo/repo"}),
     )
     .unwrap();
-    super::super::gh_cache::cached(&key, || {
+    super::super::gh_cache::cached(&key, &cancel, || {
         Ok(ToolOutput {
             execution: Default::default(),
             text: "seeded".into(),
@@ -147,7 +147,7 @@ fn pr_push_invalidates_the_cached_pr_diff() {
         &json!({"pr": "77003", "repo": "octo/repo"}),
     )
     .unwrap();
-    super::super::gh_cache::cached(&key, || {
+    super::super::gh_cache::cached(&key, &cancel, || {
         Ok(ToolOutput {
             execution: Default::default(),
             text: "old".into(),
@@ -157,7 +157,7 @@ fn pr_push_invalidates_the_cached_pr_diff() {
     })
     .unwrap();
     let _ = quiet(&ws, &json!({"op": "pr_push", "pr": "77003"}), &cancel);
-    let refilled = super::super::gh_cache::cached(&key, || {
+    let refilled = super::super::gh_cache::cached(&key, &cancel, || {
         Ok(ToolOutput {
             execution: Default::default(),
             text: "new".into(),

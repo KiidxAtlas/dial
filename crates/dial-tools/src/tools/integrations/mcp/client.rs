@@ -88,8 +88,8 @@ pub(super) struct Shared {
     stderr_done: AtomicBool,
     /// Answer to `roots/list`.
     roots: Vec<PathBuf>,
-    /// Where signals for the supervisor go, tagged with this connection's epoch.
-    signals: Option<(u64, Sender<(u64, Signal)>)>,
+    /// Where signals for the supervisor go.
+    signals: Option<Sender<Signal>>,
 }
 
 pub(super) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -99,7 +99,7 @@ pub(super) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Shared {
-    pub(super) fn new(roots: Vec<PathBuf>, signals: Option<(u64, Sender<(u64, Signal)>)>) -> Self {
+    pub(super) fn new(roots: Vec<PathBuf>, signals: Option<Sender<Signal>>) -> Self {
         Shared {
             state: Mutex::default(),
             stderr: Mutex::default(),
@@ -130,8 +130,8 @@ impl Shared {
     }
 
     fn signal(&self, signal: Signal) {
-        if let Some((epoch, sender)) = &self.signals {
-            let _ = sender.send((*epoch, signal));
+        if let Some(sender) = &self.signals {
+            let _ = sender.send(signal);
         }
     }
 
@@ -577,13 +577,13 @@ impl Client {
                 thread::Builder::new()
                     .name(format!("mcp-{}-post", self.server))
                     .spawn(move || {
-                        let mut answers = Vec::new();
+                        // Answer server requests while the POST stream is still open: a server
+                        // may hold its final reply until it has this answer.
                         let result = remote.post(&message, timeout, &mut |reply| {
-                            answers.extend(shared.handle(&reply));
+                            if let Some(answer) = shared.handle(&reply) {
+                                let _ = remote.post(&answer, NOTIFY_TIMEOUT, &mut |_| {});
+                            }
                         });
-                        for answer in answers {
-                            let _ = remote.post(&answer, NOTIFY_TIMEOUT, &mut |_| {});
-                        }
                         match result {
                             Err(error)
                                 if error.downcast_ref::<super::http::SessionEnded>().is_some() =>

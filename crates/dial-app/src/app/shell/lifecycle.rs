@@ -368,18 +368,10 @@ impl Shell {
                     .display_name()
                     .trim_start_matches(&format!("{}/", selection.provider))
                     .to_owned(),
-                project: {
-                    let root = app.layout.project_root.display().to_string();
-                    match std::env::var("HOME") {
-                        Ok(home)
-                            if !home.is_empty()
-                                && (root == home || root.starts_with(&format!("{home}/"))) =>
-                        {
-                            format!("~{}", &root[home.len()..])
-                        }
-                        _ => root,
-                    }
-                },
+                project: crate::ui::statusline::tilde(
+                    &app.layout.project_root.display().to_string(),
+                    std::env::var("HOME").ok().as_deref(),
+                ),
                 tips,
                 recent,
                 resume_hint: format!(

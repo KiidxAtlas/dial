@@ -370,58 +370,135 @@ fn clipboard_candidates(_write: bool) -> Vec<(&'static str, Vec<&'static str>)> 
     Vec::new()
 }
 
-fn run_clipboard(program: &str, args: &[&str], stdin: Option<&str>) -> Result<String, String> {
-    use std::io::Write;
+/// Clipboard helpers normally answer at once; a stalled selection owner must not hang the call.
+const CLIPBOARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Largest clipboard text read back.
+const CLIPBOARD_MAX_BYTES: u64 = 16 << 20;
+
+/// Why one clipboard helper did not produce a result.
+enum ClipboardFailure {
+    /// The helper is not installed; another candidate may still work.
+    Missing(String),
+    /// The helper ran and failed; its message beats any later "not installed" error.
+    Failed(String),
+}
+
+/// Runs one helper with a deadline. Only the leader is killed on timeout: writers such as
+/// `xclip -i` and `wl-copy` fork a server that must outlive them to keep owning the selection.
+fn run_clipboard(
+    program: &str,
+    args: &[&str],
+    stdin: Option<&str>,
+    timeout: std::time::Duration,
+) -> Result<String, ClipboardFailure> {
+    use std::io::{Read, Write};
     use std::process::{Command, Stdio};
+    let failed = |error: std::io::Error| ClipboardFailure::Failed(format!("{program}: {error}"));
+    let reading = stdin.is_none();
+    let piped_if = |yes: bool| if yes { Stdio::piped() } else { Stdio::null() };
     let mut child = Command::new(program)
         .args(args)
-        .stdin(if stdin.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(if stdin.is_some() {
-            Stdio::null()
-        } else {
-            Stdio::piped()
-        })
-        .stderr(if stdin.is_some() {
-            Stdio::null()
-        } else {
-            Stdio::piped()
-        })
+        .stdin(piped_if(!reading))
+        .stdout(piped_if(reading))
+        .stderr(piped_if(reading))
         .spawn()
-        .map_err(|e| format!("{program}: {e}"))?;
-    let written = match (stdin, child.stdin.take()) {
-        (Some(text), Some(mut pipe)) => pipe.write_all(text.as_bytes()),
-        _ => Ok(()),
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => {
+                ClipboardFailure::Missing(format!("{program}: {error}"))
+            }
+            _ => failed(error),
+        })?;
+    let writer = match (stdin, child.stdin.take()) {
+        (Some(text), Some(mut pipe)) => {
+            let text = text.to_owned();
+            Some(std::thread::spawn(move || pipe.write_all(text.as_bytes())))
+        }
+        _ => None,
     };
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("{program}: {e}"))?;
-    written.map_err(|e| format!("{program}: {e}"))?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-    } else {
-        Err(format!(
-            "{program} exited with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
+    // Reads past `limit` are drained so an oversized helper still exits instead of blocking.
+    let capture = |pipe: Option<Box<dyn Read + Send>>, limit: u64| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                (&mut pipe).take(limit).read_to_end(&mut bytes)?;
+                std::io::copy(&mut pipe, &mut std::io::sink())?;
+            }
+            Ok::<_, std::io::Error>(bytes)
+        })
+    };
+    let stdout = capture(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+        CLIPBOARD_MAX_BYTES + 1,
+    );
+    let stderr = capture(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+        64 * 1024,
+    );
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(failed)? {
+            break status;
+        }
+        if started.elapsed() > timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ClipboardFailure::Failed(format!(
+                "{program} did not finish within {} seconds",
+                timeout.as_secs()
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let join = |handle: std::thread::JoinHandle<std::io::Result<Vec<u8>>>| {
+        handle
+            .join()
+            .unwrap_or_else(|_| Err(std::io::Error::other("reader panicked")))
+    };
+    let output = join(stdout).map_err(failed)?;
+    let errors = join(stderr).unwrap_or_default();
+    if let Some(writer) = writer {
+        writer
+            .join()
+            .unwrap_or_else(|_| Err(std::io::Error::other("writer panicked")))
+            .map_err(failed)?;
     }
+    if !status.success() {
+        return Err(ClipboardFailure::Failed(format!(
+            "{program} exited with {status}: {}",
+            String::from_utf8_lossy(&errors).trim()
+        )));
+    }
+    if output.len() as u64 > CLIPBOARD_MAX_BYTES {
+        return Err(ClipboardFailure::Failed(format!(
+            "clipboard text exceeds {} MiB",
+            CLIPBOARD_MAX_BYTES >> 20
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output).into_owned())
 }
 
 fn clipboard_run(write: bool, stdin: Option<&str>) -> ComputerResult<String> {
-    let mut last_error = None;
+    let (mut failed, mut missing) = (None, None);
     for (program, args) in clipboard_candidates(write) {
-        match run_clipboard(program, &args, stdin) {
+        match run_clipboard(program, &args, stdin, CLIPBOARD_TIMEOUT) {
             Ok(text) => return Ok(text),
-            Err(error) => last_error = Some(error),
+            Err(ClipboardFailure::Failed(error)) => {
+                failed.get_or_insert(error);
+            }
+            Err(ClipboardFailure::Missing(error)) => {
+                missing.get_or_insert(error);
+            }
         }
     }
-    Err(ComputerError::tool(last_error.unwrap_or_else(|| {
-        "Clipboard is not supported on this platform".to_owned()
-    })))
+    Err(ComputerError::tool(failed.or(missing).unwrap_or_else(
+        || "Clipboard is not supported on this platform".to_owned(),
+    )))
 }
 
 fn clipboard_read() -> ComputerResult<Value> {

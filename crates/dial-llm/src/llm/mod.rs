@@ -1010,11 +1010,12 @@ fn redact(text: &str, auth: Option<&str>) -> String {
     }
 }
 
-/// Only explicitly classified incomplete streams survive as retryable errors.
+/// Only explicitly classified incomplete or stalled streams survive as retryable errors.
 /// Other post-response failures are redacted and never become transport errors.
 fn response_error(error: anyhow::Error, auth: Option<&str>) -> anyhow::Error {
     if error.downcast_ref::<Interrupted>().is_some()
         || error.downcast_ref::<stream::IncompleteStream>().is_some()
+        || error.downcast_ref::<stream::StalledStream>().is_some()
         || error.downcast_ref::<responses::TerminalFailure>().is_some()
         || error
             .downcast_ref::<anthropic::IncompleteStream>()
@@ -1044,39 +1045,37 @@ fn http_error(
         hints.delay = retry::body_delay(&body.data);
     }
     let retry_after = hints.delay;
-    // Servers wrap the useful sentence in JSON; show that instead of a one-line blob.
+    // Parse the body once; servers wrap the useful sentence in JSON, which reads better than a
+    // one-line blob. A truncated body is never trusted for the message or type.
+    let parsed = serde_json::from_slice::<serde_json::Value>(&body.data).ok();
     let message = if body.truncated {
         None
     } else {
-        serde_json::from_slice::<serde_json::Value>(&body.data)
-            .ok()
-            .and_then(|value| {
-                value
-                    .pointer("/error/message")
-                    .or_else(|| value.get("error"))
-                    .or_else(|| value.get("message"))
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::trim)
-                    .filter(|m| !m.is_empty())
-                    .map(str::to_owned)
-            })
+        parsed.as_ref().and_then(|value| {
+            value
+                .pointer("/error/message")
+                .or_else(|| value.get("error"))
+                .or_else(|| value.get("message"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .map(str::to_owned)
+        })
     };
     let error_type = if body.truncated {
         None
     } else {
-        serde_json::from_slice::<serde_json::Value>(&body.data)
-            .ok()
-            .and_then(|value| {
-                value
-                    .pointer("/error/type")
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|kind| {
-                        !kind.is_empty()
-                            && kind.len() <= 64
-                            && kind.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-                    })
-                    .map(str::to_owned)
-            })
+        parsed.as_ref().and_then(|value| {
+            value
+                .pointer("/error/type")
+                .and_then(serde_json::Value::as_str)
+                .filter(|kind| {
+                    !kind.is_empty()
+                        && kind.len() <= 64
+                        && kind.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                })
+                .map(str::to_owned)
+        })
     };
     // Redact the whole text first so truncation can never leave a partial credential behind.
     let mut excerpt = match &message {
@@ -1158,8 +1157,8 @@ fn http_error(
     }
     // Classify from the whole (possibly truncated) body, including error codes the excerpt drops,
     // before any custom-header redaction can withhold it.
-    let code = serde_json::from_slice::<serde_json::Value>(&body.data)
-        .ok()
+    let code = parsed
+        .as_ref()
         .and_then(|value| {
             value
                 .pointer("/error/code")

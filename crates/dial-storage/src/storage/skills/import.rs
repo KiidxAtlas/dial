@@ -9,14 +9,30 @@ const MANIFEST: &str = ".dial-import.json";
 const MAX_TOTAL: usize = 8 * 1024 * 1024;
 type Files = BTreeMap<PathBuf, Vec<u8>>;
 
-// Serialize installers targeting the same root. Dry runs remain entirely read-only.
+/// How long an installer waits for another one on the same root before giving up.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+// Serialize installers targeting the same root. Dry runs remain entirely read-only. A short wait
+// covers a released lock whose descriptor a just-forked process still holds until its exec.
 pub(super) fn lock_root(root: &Path, file: &str, label: &str) -> Result<std::fs::File> {
     fs::create_dir_all(root)?;
     let mut options = fs::OpenOptions::new();
     options.create(true).truncate(false).write(true);
     let file = crate::platform::fs::open_nofollow(&options, &root.join(file))?;
-    fs2::FileExt::try_lock_exclusive(&file).context(label.to_string())?;
-    Ok(file)
+    let started = std::time::Instant::now();
+    loop {
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => return Ok(file),
+            Err(error)
+                if (error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.raw_os_error() == fs2::lock_contended_error().raw_os_error())
+                    && started.elapsed() < LOCK_WAIT =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(error) => return Err(error).context(label.to_string()),
+        }
+    }
 }
 #[derive(Serialize, Deserialize)]
 struct Origin {

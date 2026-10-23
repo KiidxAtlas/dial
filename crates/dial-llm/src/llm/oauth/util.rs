@@ -451,11 +451,36 @@ impl Callback {
     }
 }
 
+/// Longest a client may take to deliver its request head. The per-read socket timeout alone lets a
+/// client that dribbles one byte at a time hold [`Callback::wait`] past its own cancel/timeout.
+const REDIRECT_READ_BUDGET: Duration = Duration::from_secs(5);
+
 fn read_redirect(stream: &mut TcpStream, path: &str) -> Result<HashMap<String, String>> {
+    read_redirect_within(stream, path, REDIRECT_READ_BUDGET)
+}
+
+fn read_redirect_within(
+    stream: &mut TcpStream,
+    path: &str,
+    budget: Duration,
+) -> Result<HashMap<String, String>> {
+    let deadline = Instant::now() + budget;
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 1024];
     loop {
-        let n = stream.read(&mut chunk)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        ensure!(!remaining.is_zero(), "OAuth callback request timed out");
+        stream.set_read_timeout(Some(remaining))?;
+        let n = stream.read(&mut chunk).map_err(|e| {
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) {
+                anyhow::anyhow!("OAuth callback request timed out")
+            } else {
+                e.into()
+            }
+        })?;
         if n == 0 {
             break;
         }

@@ -546,30 +546,14 @@ fn parse_pairs(raw: &str) -> Vec<(String, String)> {
         .filter_map(|pair| {
             let (key, value) = pair.split_once('=')?;
             let key = key.trim();
-            (!key.is_empty()).then(|| (key.to_owned(), percent_decode(value.trim())))
+            (!key.is_empty()).then(|| {
+                (
+                    key.to_owned(),
+                    crate::stats::server::percent_decode(value.trim()),
+                )
+            })
         })
         .collect()
-}
-
-fn percent_decode(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%'
-            && i + 2 < bytes.len()
-            && let Some(byte) = std::str::from_utf8(&bytes[i + 1..i + 3])
-                .ok()
-                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
-        {
-            out.push(byte);
-            i += 3;
-            continue;
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn validate_endpoint(url: &str) -> Result<()> {

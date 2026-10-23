@@ -188,12 +188,10 @@ fn onboard(app: &mut App, shell: &mut Shell, session: Option<&Session>) -> Resul
         } else {
             "The selected provider cannot be used yet (missing credentials?). Set it up in Providers."
         });
-        let which = destination.take().unwrap_or_else(|| {
-            if providers_first {
-                Which::Providers
-            } else {
-                Which::Models
-            }
+        let which = destination.take().unwrap_or(if providers_first {
+            Which::Providers
+        } else {
+            Which::Models
         });
         let secondary_panel = !providers_first && !matches!(which, Which::Models);
         let outcome = shell.run_overlay(app, None, which)?;

@@ -216,6 +216,13 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// Whether this tool can serve a session rooted at `root`. Tools bound to one project's
+    /// state (caches, change history) return false for other roots, such as an isolated worker's
+    /// copy, so they are not offered where every call would fail.
+    fn serves_root(&self, _root: &std::path::Path) -> bool {
+        true
+    }
+
     /// Write explicit interactive keyboard input to a user-attached PTY owned by this tool.
     fn attach_user_pty(&self, _name: &str, _bytes: &[u8]) -> Result<usize, String> {
         Err("this tool does not own interactive PTY jobs".into())

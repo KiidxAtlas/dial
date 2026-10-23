@@ -65,8 +65,7 @@ struct JobState {
 }
 impl JobState {
     fn status(&self) -> Value {
-        self.body
-            .read(|n| n.result.data.clone().unwrap_or(Value::Null))
+        body_status(&self.body)
     }
     fn running(&self) -> bool {
         self.body.read(|n| {
@@ -89,9 +88,12 @@ struct ControlJob {
     finished: AtomicBool,
 }
 
+fn body_status(body: &crate::runtime::Body) -> Value {
+    body.read(|n| n.result.data.clone().unwrap_or(Value::Null))
+}
+
 fn job_status(job: &ControlJob) -> Value {
-    job.body
-        .read(|n| n.result.data.clone().unwrap_or(Value::Null))
+    body_status(&job.body)
 }
 
 /// Publish the terminal result before exposing completion to control handles or releasing a lease.
@@ -850,7 +852,7 @@ impl LiveTasks {
             let wake_signals = signals.clone();
             let wake_interruptible = interruptible.clone();
             let wake_active = active_tool.clone();
-            self.team.enlist(
+            let enlisted = self.team.enlist(
                 &id,
                 &job.label,
                 Box::new(move || {
@@ -868,10 +870,22 @@ impl LiveTasks {
                         tool.cancel_operation();
                     }
                 }),
-            )?;
+            );
+            // Settle this job alone, as for a transcript failure: a batch error would leave a
+            // phantom running worker and hide jobs this batch already started.
+            if let Err(error) = enlisted {
+                let why = error.to_string();
+                body.settle(
+                    why.clone(),
+                    Some(json!({"id":id,"status":"failed"})),
+                    crate::runtime::Phase::Failed,
+                );
+                result.push(json!({"id":id,"status":"failed","result":why}));
+                continue;
+            }
             self.registry
                 .lock()
-                .map_err(|_| "peer registry poisoned")?
+                .unwrap_or_else(|e| e.into_inner())
                 .insert(id.clone(), control.clone());
             let team = self.team.clone();
             let spawned = thread::Builder::new()

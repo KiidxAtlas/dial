@@ -1,6 +1,8 @@
 use super::*;
 use serde_json::json;
 
+static NO_CANCEL: AtomicBool = AtomicBool::new(false);
+
 fn key(repo: &str, number: u64) -> CacheKey {
     CacheKey {
         repo: repo.into(),
@@ -26,7 +28,7 @@ fn entries_are_fresh_then_stale_then_dropped() {
     assert!(matches!(lookup_at(&k, t0 + SOFT_TTL), Lookup::Fresh(o) if o.text == "diff"));
     assert!(matches!(
         lookup_at(&k, t0 + SOFT_TTL + Duration::from_secs(1)),
-        Lookup::Stale(o) if o.text == "diff"
+        Lookup::Stale { output: o, .. } if o.text == "diff"
     ));
     assert!(matches!(
         lookup_at(&k, t0 + HARD_TTL + Duration::from_secs(1)),
@@ -40,13 +42,13 @@ fn hit_skips_fill_and_miss_fills_once() {
     let k = key("cache-test/hit", 2);
     let t0 = Instant::now();
     let mut fills = 0;
-    let first = cached_at(&k, t0, || {
+    let first = cached_at(&k, t0, &NO_CANCEL, || {
         fills += 1;
         Ok(out("one"))
     })
     .unwrap();
     assert_eq!(first.text, "one");
-    let second = cached_at(&k, t0, || {
+    let second = cached_at(&k, t0, &NO_CANCEL, || {
         fills += 1;
         Ok(out("two"))
     })
@@ -61,9 +63,13 @@ fn stale_entries_refresh_and_fall_back_when_refresh_fails() {
     let t0 = Instant::now();
     store_at(&k, &out("old"), t0);
     let later = t0 + SOFT_TTL + Duration::from_secs(1);
-    let fallback = cached_at(&k, later, || Err("network".into())).unwrap();
-    assert_eq!(fallback.text, "old");
-    let refreshed = cached_at(&k, later, || Ok(out("new"))).unwrap();
+    let fallback = cached_at(&k, later, &NO_CANCEL, || Err("network".into())).unwrap();
+    assert!(
+        fallback
+            .text
+            .starts_with("old\n[served from cache, age 301s; refresh failed: network]")
+    );
+    let refreshed = cached_at(&k, later, &NO_CANCEL, || Ok(out("new"))).unwrap();
     assert_eq!(refreshed.text, "new");
     assert!(matches!(lookup_at(&k, later), Lookup::Fresh(o) if o.text == "new"));
 }
@@ -72,7 +78,7 @@ fn stale_entries_refresh_and_fall_back_when_refresh_fails() {
 fn errors_are_not_cached() {
     let k = key("cache-test/error", 4);
     let t0 = Instant::now();
-    let result = cached_at(&k, t0, || Ok(ToolOutput::err("boom"))).unwrap();
+    let result = cached_at(&k, t0, &NO_CANCEL, || Ok(ToolOutput::err("boom"))).unwrap();
     assert!(result.is_error);
     assert!(matches!(lookup_at(&k, t0), Lookup::Miss));
 }
@@ -161,4 +167,48 @@ fn pr_diff_key_normalizes_repo_host_and_view() {
         }
     );
     assert!(pr_diff_key(Path::new("/w"), &json!({"repo": "octo/repo"})).is_none());
+}
+
+#[test]
+fn stale_hit_notes_error_results_and_cancellation_is_not_masked() {
+    let k = key("cache-test/stale-note", 6);
+    let t0 = Instant::now();
+    store_at(&k, &out("old"), t0);
+    let later = t0 + SOFT_TTL + Duration::from_secs(10);
+    let served = cached_at(&k, later, &NO_CANCEL, || Ok(ToolOutput::err("auth failed"))).unwrap();
+    assert_eq!(
+        served.text,
+        "old\n[served from cache, age 310s; refresh failed: auth failed]"
+    );
+    assert!(!served.is_error);
+
+    let cancelled = AtomicBool::new(true);
+    let result = cached_at(&k, later, &cancelled, || Err("[cancelled]".into()));
+    assert_eq!(result.unwrap_err(), "[cancelled]");
+}
+
+#[test]
+fn cache_is_capped_and_evicts_the_oldest() {
+    let t0 = Instant::now();
+    let mut cache = HashMap::new();
+    for i in 0..(MAX_ENTRIES as u64 + 5) {
+        let entry = Entry {
+            output: out("x"),
+            stored: t0 + Duration::from_millis(i),
+        };
+        insert_capped(&mut cache, key("cap", i), entry);
+    }
+    assert_eq!(cache.len(), MAX_ENTRIES);
+    assert!(!cache.contains_key(&key("cap", 0)));
+    assert!(cache.contains_key(&key("cap", MAX_ENTRIES as u64 + 4)));
+}
+
+#[test]
+fn pr_diff_key_is_none_for_arguments_the_op_rejects() {
+    let w = Path::new("/w");
+    assert!(pr_diff_key(w, &json!({"pr": 5, "all": true, "file": 2})).is_none());
+    assert!(pr_diff_key(w, &json!({"pr": "pr://5/diff/3", "all": true})).is_none());
+    assert!(pr_diff_key(w, &json!({"pr": "pr://octo/repo/5", "repo": "other/repo"})).is_none());
+    assert!(pr_diff_key(w, &json!({"pr": 5, "all": "yes"})).is_none());
+    assert!(pr_diff_key(w, &json!({"pr": "pr://octo/repo/5", "repo": "Octo/Repo"})).is_some());
 }

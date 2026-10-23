@@ -65,6 +65,37 @@ class ComparisonTests(unittest.TestCase):
         result = compare({"report": report()}, {"report": report()})
         self.assertTrue(result["correctness_nonregressing"])
 
+    def test_machine_reports_require_unambiguous_selection(self):
+        machine = {"machine_benchmark": {"configurations": [
+            {"configuration": {"name": "raw"}, "report": report(elapsed=100)},
+            {"configuration": {"name": "dial"}, "report": report(elapsed=50)},
+        ]}}
+        with self.assertRaisesRegex(ValueError, "select a machine configuration"):
+            compare(machine, machine)
+        result = compare(machine, machine, "raw", "dial")
+        self.assertEqual(result["matched_success_latency_ratio"], 0.5)
+        with self.assertRaisesRegex(ValueError, "unknown machine configuration"):
+            compare(machine, machine, "missing", "dial")
+        with self.assertRaisesRegex(ValueError, "requires a machine benchmark"):
+            compare(report(), report(), "raw")
+        machine["machine_benchmark"]["configurations"].pop()
+        self.assertTrue(compare(machine, machine)["correctness_nonregressing"])
+        machine["machine_benchmark"]["configurations"] *= 2
+        with self.assertRaisesRegex(ValueError, "unique"):
+            compare(machine, machine, "raw", "raw")
+
+    def test_outcome_check_counts_are_part_of_the_verification_contract(self):
+        candidate = report()
+        candidate["cases"][0]["evidence"]["outcome_checks"] = 0
+        with self.assertRaisesRegex(ValueError, "verification contracts differ"):
+            compare(report(), candidate)
+
+    def test_malformed_report_envelopes_are_rejected(self):
+        for payload in ({"report": None}, {"machine_benchmark": None},
+                        {"configurations": [None]}, {"configurations": []}):
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                compare(payload, report())
+
     def test_metric_only_cases_are_not_coding_successes(self):
         measured = report()
         measured["cases"][0]["evidence"] = {

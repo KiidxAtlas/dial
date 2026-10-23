@@ -3,6 +3,7 @@ use crate::llm::connect::MAX_FRAME_PAYLOAD;
 use crate::llm::model_config::ApiProtocol;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
+use std::time::Duration;
 
 fn serve(bodies: Vec<Vec<u8>>) -> (String, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -359,4 +360,111 @@ fn large_history_invalid_argument_is_context_overflow() {
     let small = json!({"role": "user", "content": "hi"});
     let kept = large_history_overflow(anyhow::anyhow!(internal), &[small, now], "cascade", "scope");
     assert!(!crate::llm::errors::is_context_overflow(&kept));
+}
+
+/// Serve the auth call, then a chat reply whose frames arrive `pause` apart. With `stall`, the
+/// connection then goes silent for `stall` instead of ending the stream.
+fn serve_paced(
+    frames: Vec<Vec<u8>>,
+    pause: Duration,
+    stall: Option<Duration>,
+) -> (String, std::thread::JoinHandle<()>) {
+    let mut jwt = Enc::default();
+    jwt.string(1, "jwt-1");
+    let auth_body = jwt.0;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        read_request(&mut stream);
+        let head = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/connect+proto\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            auth_body.len()
+        );
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.write_all(&auth_body).unwrap();
+        drop(stream);
+        let (mut stream, _) = listener.accept().unwrap();
+        read_request(&mut stream);
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/connect+proto\r\nconnection: close\r\n\r\n",
+            )
+            .unwrap();
+        for frame in frames {
+            // The client may give up mid-stream; later writes then fail harmlessly.
+            if stream.write_all(&frame).is_err() || stream.flush().is_err() {
+                return;
+            }
+            std::thread::sleep(pause);
+        }
+        if let Some(stall) = stall {
+            std::thread::sleep(stall);
+        }
+    });
+    (format!("http://{addr}"), handle)
+}
+
+fn text_frame(text: &str) -> Vec<u8> {
+    let mut message = Enc::default();
+    message.string(1, "m1");
+    message.string(3, text);
+    frame(0, &message.0).unwrap()
+}
+
+fn paced_exchange(base: &str) -> (Result<Reply>, std::time::Duration) {
+    crate::llm::cancel::Patience::with_test_idle_limit(Duration::from_millis(300));
+    let chat = Chat {
+        messages: vec![json!({"role":"user","content":"hi"})],
+        tools: Vec::new(),
+        temperature: 0.0,
+        max_tokens: 100,
+        seed: None,
+    };
+    let started = std::time::Instant::now();
+    let result = exchange(
+        &route(base, "swe-1-6"),
+        &chat,
+        1,
+        &mut None,
+        Arc::new(AtomicBool::new(false)),
+        None,
+        &mut |_| true,
+    );
+    (result, started.elapsed())
+}
+
+#[test]
+fn a_reply_that_keeps_producing_frames_outlives_the_idle_limit() {
+    // 14 frames 150 ms apart: longer than the 1.5 s first-event budget, never silent for 300 ms.
+    let mut frames: Vec<Vec<u8>> = (0..14).map(|_| text_frame("x")).collect();
+    frames.push(frame(FLAG_END_STREAM, b"{}").unwrap());
+    let (base, server) = serve_paced(frames, Duration::from_millis(150), None);
+    let (result, elapsed) = paced_exchange(&base);
+    server.join().unwrap();
+    assert_eq!(result.unwrap().text, "x".repeat(14));
+    assert!(elapsed > Duration::from_millis(1800), "{elapsed:?}");
+}
+
+#[test]
+fn silence_after_a_frame_is_a_transient_stall_not_an_unbounded_wait() {
+    let (base, server) = serve_paced(
+        vec![text_frame("x")],
+        Duration::from_millis(10),
+        Some(Duration::from_secs(4)),
+    );
+    let (result, elapsed) = paced_exchange(&base);
+    let error = result.unwrap_err();
+    assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+    assert!(
+        error
+            .downcast_ref::<crate::llm::stream::StalledStream>()
+            .is_some(),
+        "{error:#}"
+    );
+    assert_eq!(
+        crate::llm::errors::classify(&error),
+        crate::llm::errors::ErrorClass::Transient
+    );
+    server.join().unwrap();
 }

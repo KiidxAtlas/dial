@@ -153,9 +153,9 @@ impl Directory {
     }
     fn validate_location(&self, ws: &Workspace, target: &Path) -> Result<(), String> {
         let current = Self::open(ws, target, false, None)?;
-        if crate::platform::fs::identity(&self.file).ok()
-            != crate::platform::fs::identity(&current.file).ok()
-        {
+        let held = crate::platform::fs::identity(&self.file).map_err(|e| e.to_string())?;
+        let now = crate::platform::fs::identity(&current.file).map_err(|e| e.to_string())?;
+        if held != now {
             return Err(format!(
                 "{} parent directory changed during transaction",
                 ws.rel(target)

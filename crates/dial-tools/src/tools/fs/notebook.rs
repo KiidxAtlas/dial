@@ -24,6 +24,22 @@ use std::{
 };
 const MAX: usize = 8 * 1024 * 1024;
 const PAGE: usize = 16 * 1024;
+/// Test-only seam: runs a closure at named points of the Unix publish protocol so a test can inject
+/// a concurrent writer deterministically. Compiled out of non-test builds.
+#[cfg(all(test, unix))]
+type Hook = Box<dyn Fn(&str)>;
+#[cfg(all(test, unix))]
+thread_local! {
+    static HOOK: std::cell::RefCell<Option<Hook>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(all(test, unix))]
+fn test_hook(stage: &str) {
+    HOOK.with(|h| {
+        if let Some(f) = h.borrow().as_ref() {
+            f(stage);
+        }
+    });
+}
 static NEXT: AtomicU64 = AtomicU64::new(1);
 #[derive(Default)]
 pub struct Notebook {
@@ -493,6 +509,10 @@ impl Notebook {
         if bytes.len() > MAX {
             return Err("updated notebook exceeds 8 MiB".into());
         }
+        // Serialize with other in-process document commits of this path, like `edit`/`write`.
+        let _lease =
+            crate::tools::edit::document_transaction::Lease::acquire([loaded.path.clone()])?;
+        crate::tools::exec::execution::before_commit()?;
         let stage_name = PathBuf::from(format!(
             ".dial-notebook-{}-{}",
             std::process::id(),
@@ -600,21 +620,59 @@ impl Notebook {
             }
             #[cfg(unix)]
             {
-                let stage = std::ffi::CString::new(stage_name.as_os_str().as_bytes())
-                    .map_err(|e| e.to_string())?;
-                let target = std::ffi::CString::new(loaded.name.as_os_str().as_bytes())
-                    .map_err(|e| e.to_string())?;
-                if unsafe {
-                    libc::renameat(
-                        loaded.dir.as_raw_fd(),
-                        stage.as_ptr(),
-                        loaded.dir.as_raw_fd(),
-                        target.as_ptr(),
-                    )
-                } < 0
-                {
-                    return Err(std::io::Error::last_os_error().to_string());
+                // Same protocol as `edit_transaction`: capture the original under a private name,
+                // verify what was captured, install the replacement by exclusive link (never
+                // overwriting a racing writer), and roll back by exclusive link.
+                let backup = PathBuf::from(format!(
+                    ".dial-notebook-backup-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                #[cfg(test)]
+                test_hook("before-capture");
+                at::rename(&loaded.dir, &loaded.name, &backup)
+                    .map_err(|e| format!("capturing notebook original: {e}"))?;
+                let captured_matches = (|| -> Result<bool, String> {
+                    let mut captured =
+                        crate::platform::fs::open_beneath_handle(&loaded.dir, &backup)
+                            .map_err(|e| e.to_string())?;
+                    let id = identity(&captured)?;
+                    let mut bytes = Vec::new();
+                    (&mut captured)
+                        .take(MAX as u64 + 1)
+                        .read_to_end(&mut bytes)
+                        .map_err(|e| e.to_string())?;
+                    Ok(id == loaded.identity && bytes == loaded.raw.as_bytes())
+                })();
+                let restore = |reason: String| -> String {
+                    match at::link(&loaded.dir, &backup, &loaded.name) {
+                        Ok(()) => {
+                            let _ = at::unlink(&loaded.dir, &backup);
+                            reason
+                        }
+                        Err(restore) => format!(
+                            "{reason}; restoring original failed: {restore}; original retained as {}",
+                            backup.display()
+                        ),
+                    }
+                };
+                match captured_matches {
+                    Ok(true) => {}
+                    Ok(false) => return Err(restore("notebook changed during publication".into())),
+                    Err(error) => {
+                        return Err(restore(format!(
+                            "verifying captured notebook original failed: {error}"
+                        )));
+                    }
                 }
+                #[cfg(test)]
+                test_hook("before-install");
+                if let Err(error) = at::link(&loaded.dir, &stage_name, &loaded.name) {
+                    return Err(restore(format!("publishing notebook failed: {error}")));
+                }
+                let _ = at::unlink(&loaded.dir, &stage_name);
+                at::unlink(&loaded.dir, &backup)
+                    .map_err(|e| format!("notebook committed but backup cleanup failed: {e}"))?;
             }
             Ok(())
         })();
@@ -629,6 +687,8 @@ impl Notebook {
             unsafe { libc::unlinkat(loaded.dir.as_raw_fd(), n.as_ptr(), 0) };
         }
         result?;
+        // Report the committed path so the turn advances its mutation epoch, as edits do.
+        crate::tools::exec::execution::committed([loaded.path.clone()]);
         ctx.workspace.store().forget(&loaded.path);
         seen.retain(|(p, _, _), _| p != &loaded.path);
         loaded.dir.sync_all().map_err(|error| format!("notebook changes were committed, but directory durability sync failed: {error}; inspect the current notebook before retrying"))?;
@@ -652,9 +712,6 @@ impl Tool for Notebook {
     }
     fn needs_approval(&self, a: &Value) -> bool {
         a.get("action").and_then(Value::as_str) != Some("read")
-    }
-    fn may_modify_workspace(&self, _: &Value) -> bool {
-        false
     }
     fn manages_workspace_serialization(&self) -> bool {
         true
@@ -685,3 +742,44 @@ pub fn tools(config: &Config) -> Vec<Arc<dyn Tool>> {
         Vec::new()
     }
 }
+#[cfg(unix)]
+mod at {
+    //! Name-relative directory operations on a pinned directory handle.
+    use super::*;
+    fn cstr(path: &std::path::Path) -> std::io::Result<std::ffi::CString> {
+        std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+    }
+    fn check(code: libc::c_int) -> std::io::Result<()> {
+        if code < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+    pub(super) fn rename(
+        dir: &File,
+        from: &std::path::Path,
+        to: &std::path::Path,
+    ) -> std::io::Result<()> {
+        let (from, to) = (cstr(from)?, cstr(to)?);
+        let fd = dir.as_raw_fd();
+        check(unsafe { libc::renameat(fd, from.as_ptr(), fd, to.as_ptr()) })
+    }
+    /// Hard-links `from` as `to`; fails with `AlreadyExists` instead of replacing `to`.
+    pub(super) fn link(
+        dir: &File,
+        from: &std::path::Path,
+        to: &std::path::Path,
+    ) -> std::io::Result<()> {
+        let (from, to) = (cstr(from)?, cstr(to)?);
+        let fd = dir.as_raw_fd();
+        check(unsafe { libc::linkat(fd, from.as_ptr(), fd, to.as_ptr(), 0) })
+    }
+    pub(super) fn unlink(dir: &File, name: &std::path::Path) -> std::io::Result<()> {
+        let name = cstr(name)?;
+        check(unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) })
+    }
+}
+#[cfg(test)]
+mod tests;

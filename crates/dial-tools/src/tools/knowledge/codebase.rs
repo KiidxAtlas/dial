@@ -1402,6 +1402,9 @@ impl Tool for CodebaseTool {
     fn name(&self) -> &str {
         "codebase_memory"
     }
+    fn serves_root(&self, root: &std::path::Path) -> bool {
+        root == self.cache.root
+    }
     fn schema(&self) -> Value {
         crate::runtime::schema::tool_schema(
             self.name(),

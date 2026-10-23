@@ -1,4 +1,5 @@
 use super::*;
+use crate::llm::usage_report::common::parse_iso_ms_lenient as parse_iso_ms;
 use serde_json::json;
 use std::sync::atomic::AtomicBool;
 
@@ -103,7 +104,7 @@ fn plan_rails_use_dashboard_percentages() {
     assert_eq!(auto.amount.unit, UsageUnit::Percent);
     assert_eq!(auto.amount.used, Some(40.0));
     assert_eq!(auto.amount.used_fraction, Some(0.4));
-    assert_eq!(auto.status, Some(usage_status_for(0.4)));
+    assert_eq!(auto.status, Some(usage_status(0.4)));
     let api = report
         .limits
         .iter()

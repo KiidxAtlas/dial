@@ -547,16 +547,12 @@ fn only_worker_launches_need_approval() {
 
 #[test]
 fn role_follows_the_agent_type() {
-    let builtin_role = |name: &str| role_for_agent(builtin(name).unwrap(), false);
+    let builtin_role = |name: &str| role_for_agent(builtin(name).unwrap());
     assert_eq!(builtin_role("scout"), "small");
     assert_eq!(builtin_role("reviewer"), "tester");
     assert_eq!(builtin_role("planner"), "planner");
     assert_eq!(builtin_role("worker"), "task");
     assert_eq!(builtin_role("test-runner"), "tester");
-    assert_eq!(role_for_agent(builtin("scout").unwrap(), true), "small");
-    assert_eq!(role_for_agent(builtin("worker").unwrap(), true), "task");
-    assert_eq!(role_for_agent(builtin("reviewer").unwrap(), true), "tester");
-    assert_eq!(role_for_agent(builtin("planner").unwrap(), true), "planner");
 }
 
 #[test]

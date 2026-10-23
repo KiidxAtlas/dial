@@ -1,5 +1,8 @@
 //! Anthropic subscription OAuth for the official Messages API.
-use super::{auth::SecretToken, oauth::util::run_opener};
+use super::{
+    auth::SecretToken,
+    oauth::util::{decode, run_opener},
+};
 use crate::config::settings_store::{locked, locked_cancellable, locked_for, write_private};
 use anyhow::{Context, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -65,25 +68,6 @@ fn encode(value: &str) -> String {
         })
         .collect()
 }
-fn decode(value: &str) -> Result<String> {
-    let mut out = Vec::new();
-    let bytes = value.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            ensure!(i + 2 < bytes.len(), "invalid Anthropic OAuth callback");
-            out.push(
-                u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3])?, 16)
-                    .context("invalid OAuth callback escape")?,
-            );
-            i += 3;
-        } else {
-            out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
-            i += 1;
-        }
-    }
-    String::from_utf8(out).context("invalid UTF-8 in OAuth callback")
-}
 fn cancelled(cancel: &AtomicBool) -> Result<()> {
     ensure!(
         !cancel.load(Ordering::SeqCst),
@@ -101,7 +85,12 @@ fn save(dir: &Path, state: &State) -> Result<()> {
     write_private(&dir.join(FILE), &serde_json::to_vec(state)?)
 }
 pub fn signed_in(dir: &Path) -> bool {
-    load(dir).ok().is_some_and(|s| s.tokens.is_some())
+    signed_in_checked(dir).unwrap_or(false)
+}
+/// Like [`signed_in`], but a missing credential file is `Ok(false)` while an unreadable or corrupt
+/// one is an error, so callers that report status can say why instead of showing "not signed in".
+pub fn signed_in_checked(dir: &Path) -> Result<bool> {
+    Ok(load(dir)?.tokens.is_some())
 }
 fn authorization_url(redirect: &str, state: &str, verifier: &str) -> String {
     format!(

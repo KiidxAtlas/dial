@@ -23,6 +23,8 @@ pub(super) struct StatusCache<T> {
     pub(super) at: Option<Instant>,
     pub(super) worker: Option<JoinHandle<T>>,
     pub(super) value: T,
+    /// The last worker panic, kept until reported; the previous value stays on screen meanwhile.
+    pub(super) failure: Option<String>,
 }
 
 impl<T: Default> Default for StatusCache<T> {
@@ -31,19 +33,27 @@ impl<T: Default> Default for StatusCache<T> {
             at: None,
             worker: None,
             value: T::default(),
+            failure: None,
         }
     }
 }
 
 impl<T: Send + 'static> StatusCache<T> {
+    /// The pending worker failure, once, so the caller can report it.
+    pub(super) fn take_failure(&mut self) -> Option<String> {
+        self.failure.take()
+    }
+
     pub(super) fn refresh(&mut self, ttl: Duration, query: impl FnOnce() -> T + Send + 'static) {
         if self
             .worker
             .as_ref()
             .is_some_and(|worker| worker.is_finished())
         {
-            if let Ok(value) = self.worker.take().unwrap().join() {
-                self.value = value;
+            match self.worker.take().map(JoinHandle::join) {
+                Some(Ok(value)) => self.value = value,
+                Some(Err(_)) => self.failure = Some("status worker panicked".into()),
+                None => {}
             }
             self.at = Some(Instant::now());
         }

@@ -83,7 +83,7 @@ fn relocation_refuses_a_preexisting_stream_journal_and_leaves_it_untouched() {
     assert!(!orphan.is_empty());
     let target_project = tempfile::tempdir().unwrap();
     let target = Layout::with_user_dir(target_project.path(), e._home.path().join("dial")).unwrap();
-    private_dir(&target.sessions_dir()).unwrap();
+    crate::platform::atomic::private_dir(&target.sessions_dir()).unwrap();
     let dst = target.sessions_dir().join(src.file_name().unwrap());
     let dst_streams = crate::runtime::stream_journal::path(&dst);
     fs::write(&dst_streams, &orphan).unwrap();
@@ -114,7 +114,7 @@ fn empty_session_relocation_cannot_adopt_an_orphan_stream_journal() {
     );
     let target_project = tempfile::tempdir().unwrap();
     let target = Layout::with_user_dir(target_project.path(), e._home.path().join("dial")).unwrap();
-    private_dir(&target.sessions_dir()).unwrap();
+    crate::platform::atomic::private_dir(&target.sessions_dir()).unwrap();
     let dst = target.sessions_dir().join(src.file_name().unwrap());
     let streams = crate::runtime::stream_journal::path(&dst);
     fs::write(&streams, b"unrelated journal\n").unwrap();
@@ -128,7 +128,7 @@ fn empty_session_relocation_cannot_adopt_an_orphan_stream_journal() {
 fn discarding_a_moved_copy_removes_only_stream_journals_the_move_created() {
     let e = env();
     let dir = e.layout.sessions_dir();
-    private_dir(&dir).unwrap();
+    crate::platform::atomic::private_dir(&dir).unwrap();
     let dst = dir.join("moved.jsonl");
     let streams = crate::runtime::stream_journal::path(&dst);
     fs::write(&dst, b"moved\n").unwrap();
@@ -875,7 +875,7 @@ fn share_records_are_the_active_branch_without_abandoned_or_internal_records() {
 fn list_is_newest_first_with_titles_and_counts() {
     let e = env();
     assert!(Session::list(&e.layout, 10).unwrap().is_empty());
-    assert!(Session::latest(&e.layout).unwrap().is_none());
+    assert!(Session::list_newest(&e.layout, 1).unwrap().is_empty());
     let mut ids = Vec::new();
     for i in 0..3 {
         let mut s = new_session(&e);
@@ -900,7 +900,10 @@ fn list_is_newest_first_with_titles_and_counts() {
     assert!(list[0].title.chars().count() <= TITLE_CHARS + 1 && list[0].title.ends_with('…'));
     assert!(list[0].started.ends_with('Z'));
     assert_eq!(Session::list(&e.layout, 2).unwrap().len(), 2);
-    assert_eq!(Session::latest(&e.layout).unwrap().unwrap(), list[0].path);
+    assert_eq!(
+        Session::list_newest(&e.layout, 1).unwrap()[0].path,
+        list[0].path
+    );
     // Pins reorder the picker list only; "latest" selections still get the newest session.
     session_pins::toggle(&e.layout.user_dir, &ids[0]).unwrap();
     assert_eq!(Session::list(&e.layout, 10).unwrap()[0].id, ids[0]);
@@ -1156,7 +1159,7 @@ fn truncated_or_corrupt_tail_is_skipped_and_healed_on_next_append() {
 fn ids_from_disk_never_reach_paths_and_oversized_lines_are_skipped() {
     let e = env();
     let dir = e.layout.sessions_dir();
-    private_dir(&dir).unwrap();
+    crate::platform::atomic::private_dir(&dir).unwrap();
     let path = dir.join("20260101T000000000Z_abc123.jsonl");
     let huge = "y".repeat(MAX_LINE + 10);
     let body = format!(
@@ -1361,7 +1364,7 @@ fn journal_message(id: &str, parent: Option<&str>, text: &str) -> String {
 }
 
 fn write_journal(dir: &Path, name: &str, body: &[u8]) -> PathBuf {
-    private_dir(dir).unwrap();
+    crate::platform::atomic::private_dir(dir).unwrap();
     let path = dir.join(name);
     fs::write(&path, body).unwrap();
     path

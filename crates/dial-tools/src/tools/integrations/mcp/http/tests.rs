@@ -144,3 +144,54 @@ fn stalled_legacy_stream_is_closed_at_its_lifetime() {
         .expect("the listener releases a stalled stream at its lifetime");
     assert!(shared.is_closed());
 }
+
+#[test]
+fn redirects_never_forward_credentials_or_session_ids() {
+    use std::io::Write;
+    let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    target.set_nonblocking(true).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let location = format!("http://{}/redirected", target.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = BufReader::new(&mut socket);
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+        }
+        write!(socket, "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+    });
+    let http = Http::new("redirect", &url, &McpServerConfig::default(), None).unwrap();
+    *http.session.lock().unwrap() = Some("private-session".into());
+    let error = http
+        .post_once(
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+            Duration::from_secs(2),
+            &mut |_| panic!("redirect is not an MCP response"),
+            &[("X-Api-Key".into(), "private-token".into())],
+        )
+        .unwrap_err();
+    server.join().unwrap();
+    assert!(error.to_string().contains("307"), "{error}");
+    assert_eq!(
+        target.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn authorization_errors_preserve_the_http_status() {
+    let auth = Auth::new("test", &McpServerConfig::default(), None).unwrap();
+    for status in [401, 403] {
+        let error = auth.refused(status, Some("Bearer"));
+        assert_eq!(error.downcast_ref::<AuthRequired>().unwrap().1, status);
+        assert!(error.to_string().contains(&format!("HTTP {status}")));
+    }
+}

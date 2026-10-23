@@ -183,13 +183,15 @@ impl<'a> Agent<'a> {
         if matches!(kind, crate::storage::repair_evidence::CheckKind::Behavioral) {
             self.behavioral_checks.push(passed);
         }
-        let _ = self.record(
+        if let Err(error) = self.record(
             self.cur_step,
             "verification",
             json!({
                 "command":truncate(command, 200),"exit":exit,"passed":passed,"category":kind
             }),
-        );
+        ) {
+            ui.notice(&format!("check result was not recorded: {error:#}"));
+        }
         if self.hermetic {
             return;
         }
@@ -242,11 +244,15 @@ impl<'a> Agent<'a> {
         })();
         if let Err(error) = captured {
             self.repair_tracker.clear();
-            let _ = self.record(
+            if let Err(record_error) = self.record(
                 self.cur_step,
                 "repair_evidence_unavailable",
                 json!({"error":format!("{error:#}")}),
-            );
+            ) {
+                ui.notice(&format!(
+                    "repair evidence was not recorded: {error:#}; {record_error:#}"
+                ));
+            }
         }
     }
 

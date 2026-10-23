@@ -671,3 +671,141 @@ fn http_credential_failures_are_clear_and_config_needs_exactly_one_transport() {
             .is_err()
     );
 }
+
+/// A streamable-HTTP server whose `tools/call` stream sends a `ping` request and holds the final
+/// reply until that ping is answered on a separate POST (or gives up after a few seconds).
+fn ping_first_server() -> String {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::sync::mpsc;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!(
+        "http://127.0.0.1:{}/mcp",
+        listener.local_addr().unwrap().port()
+    );
+    let (answered, answer) = mpsc::channel::<()>();
+    let answer = Arc::new(std::sync::Mutex::new(answer));
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let (answered, answer) = (answered.clone(), answer.clone());
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut stream = stream;
+                let (mut length, mut get) = (0usize, false);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    get |= line.starts_with("GET ");
+                    if let Some(v) = line.to_lowercase().strip_prefix("content-length:") {
+                        length = v.trim().parse().unwrap();
+                    }
+                }
+                let head = |status: &str, ctype: &str, extra: &str| {
+                    format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\n{extra}Connection: close\r\n"
+                    )
+                };
+                if get {
+                    let _ = stream.write_all(
+                        format!(
+                            "{}Content-Length: 0\r\n\r\n",
+                            head("405 Method Not Allowed", "text/plain", "")
+                        )
+                        .as_bytes(),
+                    );
+                    return;
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let message: Value = serde_json::from_slice(&body).unwrap();
+                let id = message["id"].clone();
+                let fixed =
+                    |stream: &mut std::net::TcpStream, ctype: &str, extra: &str, body: String| {
+                        let _ = stream.write_all(
+                            format!(
+                                "{}Content-Length: {}\r\n\r\n{body}",
+                                head("200 OK", ctype, extra),
+                                body.len()
+                            )
+                            .as_bytes(),
+                        );
+                    };
+                match message["method"].as_str() {
+                    Some("initialize") => fixed(&mut stream, "application/json", "Mcp-Session-Id: s\r\n",
+                        json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"p","version":"1"}}}).to_string()),
+                    Some("tools/list") => fixed(&mut stream, "application/json", "",
+                        json!({"jsonrpc":"2.0","id":id,"result":{"tools":[{"name":"hello","description":"d","inputSchema":{"type":"object"}}]}}).to_string()),
+                    Some("tools/call") => {
+                        let _ = stream.write_all(format!("{}\r\n", head("200 OK", "text/event-stream", "")).as_bytes());
+                        let ping = json!({"jsonrpc":"2.0","id":"srv-1","method":"ping"});
+                        let _ = stream.write_all(format!("event: message\ndata: {ping}\n\n").as_bytes());
+                        let _ = stream.flush();
+                        let got = answer.lock().unwrap().recv_timeout(Duration::from_secs(3));
+                        if got.is_ok() {
+                            let done = json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":"after ping"}]}});
+                            let _ = stream.write_all(format!("event: message\ndata: {done}\n\n").as_bytes());
+                        }
+                    }
+                    _ => {
+                        if message["id"] == "srv-1" && message.get("result").is_some() {
+                            let _ = answered.send(());
+                        }
+                        let _ = stream.write_all(format!("{}Content-Length: 0\r\n\r\n", head("202 Accepted", "text/plain", "")).as_bytes());
+                    }
+                }
+            });
+        }
+    });
+    url
+}
+
+#[test]
+fn server_requests_on_an_open_call_stream_are_answered_before_it_closes() {
+    let server = McpServerConfig {
+        url: Some(ping_first_server()),
+        program: Default::default(),
+        args: vec![],
+        timeout_secs: 20,
+        ..McpServerConfig::default()
+    };
+    let loaded = load(&config_with(vec![("ping", server)]));
+    assert!(loaded.notices.is_empty(), "{:?}", loaded.notices);
+    let out = call(&loaded, "mcp__ping__hello", json!({}));
+    assert!(
+        !out.is_error && out.text.contains("after ping"),
+        "{}",
+        out.text
+    );
+}
+
+#[test]
+fn listing_fetched_before_an_invalidation_is_not_cached() {
+    let mut listing = Listing::default();
+    let before = listing.generation;
+    listing.reset();
+    listing.store(before, |cache| {
+        cache.resources = Some(json!({"stale": true}))
+    });
+    assert!(
+        listing.resources.is_none(),
+        "reconnect must beat an in-flight list"
+    );
+
+    let loaded = load_fake();
+    let session = &loaded.sessions[0];
+    let before = session.listing.lock().generation;
+    session.on_signal(Signal::PromptsChanged);
+    let after = session.listing.lock().generation;
+    assert_ne!(before, after);
+    session
+        .listing
+        .lock()
+        .store(before, |cache| cache.prompts = Some(json!({"stale": true})));
+    assert!(session.listing.lock().prompts.is_none());
+    session
+        .listing
+        .lock()
+        .store(after, |cache| cache.prompts = Some(json!({"fresh": true})));
+    assert!(session.listing.lock().prompts.is_some());
+}

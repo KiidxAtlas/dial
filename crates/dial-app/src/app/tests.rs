@@ -2067,3 +2067,21 @@ fn pending_favorite_rejects_stale_scope_model_preferences_and_scan() {
     config.model_favorites.clear();
     assert!(!pending.current(&config, Scope::Global, 7));
 }
+
+#[test]
+fn panicking_status_worker_keeps_the_stale_value_and_reports_once() {
+    let mut cache = StatusCache::<String> {
+        value: "stale".into(),
+        ..Default::default()
+    };
+    cache.refresh(Duration::ZERO, || panic!("probe failed"));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !cache.worker.as_ref().unwrap().is_finished() {
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    cache.refresh(Duration::from_secs(5), || "unused".into());
+    assert_eq!(cache.value, "stale");
+    assert!(cache.take_failure().is_some());
+    assert!(cache.take_failure().is_none());
+}

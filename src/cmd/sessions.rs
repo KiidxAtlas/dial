@@ -3,28 +3,36 @@ use crate::args::{Cli, SessionCommand};
 use crate::overlay::overlay;
 use anyhow::{Result, bail};
 use dial::config::{paths::Layout, types::Config};
-use dial::storage::session::Session;
+use dial::storage::session::{Session, SessionInfo};
 use std::path::PathBuf;
 
-pub(crate) fn run(layout: &Layout, all: bool, action: &Option<SessionCommand>) -> Result<()> {
-    let mut sessions = if all {
+/// The single session `id` names: an id-prefix lookup that parses only matching journals, or the
+/// all-projects listing when `all` asks for it. Missing and ambiguous prefixes are errors.
+fn resolve_prefix(layout: &Layout, all: bool, id: &str) -> Result<SessionInfo> {
+    let mut matching = if all {
         Session::list_all(layout, usize::MAX)?
+            .into_iter()
+            .filter(|s| s.id.starts_with(id))
+            .collect()
     } else {
-        Session::list_by_activity(layout, usize::MAX)?
-    };
-    // Activity order in both views: the most recently written session first.
-    sessions.sort_by(|a, b| b.updated.cmp(&a.updated));
+        Session::find_prefix(layout, id)?
+    }
+    .into_iter();
+    let info = matching
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no session matching {id:?}"))?;
+    if matching.next().is_some() {
+        bail!("session prefix {id:?} is ambiguous; use a longer id");
+    }
+    Ok(info)
+}
+
+pub(crate) fn run(layout: &Layout, all: bool, action: &Option<SessionCommand>) -> Result<()> {
     if let Some(action) = action {
         let id = match action {
             SessionCommand::Export { id, .. } | SessionCommand::Rename { id, .. } => id,
         };
-        let mut matching = sessions.iter().filter(|s| s.id.starts_with(id));
-        let info = matching
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("no session matching {id:?}"))?;
-        if matching.next().is_some() {
-            bail!("session prefix {id:?} is ambiguous; use a longer id");
-        }
+        let info = &resolve_prefix(layout, all, id)?;
         let mut session = match action {
             SessionCommand::Rename { .. } => Session::open(&info.path)?,
             SessionCommand::Export { .. } => Session::read(&info.path)?,
@@ -52,6 +60,13 @@ pub(crate) fn run(layout: &Layout, all: bool, action: &Option<SessionCommand>) -
             }
         }
     } else {
+        let mut sessions = if all {
+            Session::list_all(layout, usize::MAX)?
+        } else {
+            Session::list_by_activity(layout, usize::MAX)?
+        };
+        // Activity order in both views: the most recently written session first.
+        sessions.sort_by(|a, b| b.updated.cmp(&a.updated));
         let shown = if all {
             sessions.len()
         } else {
@@ -87,19 +102,12 @@ pub(crate) fn share(
     whole_journal: bool,
 ) -> Result<()> {
     let config = Config::load(layout, Some(overlay(cli)?))?;
-    let sessions = Session::list_newest(layout, usize::MAX)?;
     let selected = if let Some(id) = id {
-        let mut matches = sessions.iter().filter(|session| session.id.starts_with(id));
-        let session = matches
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("no session matching {id:?}"))?;
-        if matches.next().is_some() {
-            bail!("session prefix {id:?} is ambiguous; use a longer id");
-        }
-        session
+        resolve_prefix(layout, false, id)?
     } else {
-        sessions
-            .first()
+        Session::list_newest(layout, 1)?
+            .into_iter()
+            .next()
             .ok_or_else(|| anyhow::anyhow!("there are no sessions to share"))?
     };
     // Default: the active branch. Abandoned branches and internal records stay local.

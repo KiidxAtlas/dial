@@ -11,9 +11,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Map, Value};
 
+use super::common::{parse_iso_ms, usage_status, usage_status_opt};
 use super::types::{
     UsageAmount, UsageLimit, UsageReport, UsageResetCreditDetail, UsageResetCredits, UsageScope,
-    UsageStatus, UsageUnit, UsageWindow,
+    UsageUnit, UsageWindow,
 };
 use crate::llm::anthropic_oauth;
 use crate::llm::oauth::util::{self, Body, now_ms};
@@ -39,7 +40,7 @@ const USAGE_KEYS: [&str; 7] = [
 ];
 
 pub(super) fn fetch(user_dir: &Path, cancel: &Arc<AtomicBool>) -> Result<Option<UsageReport>> {
-    if !anthropic_oauth::signed_in(user_dir) {
+    if !anthropic_oauth::signed_in_checked(user_dir)? {
         return Ok(None);
     }
     let token = anthropic_oauth::access_token(user_dir, Arc::clone(cancel))?;
@@ -464,7 +465,7 @@ fn bucket_limit(spec: &BucketSpec<'_>, bucket: Bucket) -> UsageLimit {
             resets_at_ms: bucket.resets_at_ms,
             reset_label: None,
         }),
-        status: usage_status(amount.used_fraction),
+        status: Some(usage_status_opt(amount.used_fraction)),
         amount,
         notes: Vec::new(),
     }
@@ -481,16 +482,6 @@ fn percent_amount(percent: f64) -> UsageAmount {
         remaining_fraction: Some((1.0 - fraction).max(0.0)),
         unit: UsageUnit::Percent,
     }
-}
-
-/// Status band for a used fraction: ok below 90%, warning below 100%, exhausted at 100%+.
-pub(super) fn usage_status(used_fraction: Option<f64>) -> Option<UsageStatus> {
-    Some(match used_fraction {
-        None => UsageStatus::Unknown,
-        Some(fraction) if fraction >= 1.0 => UsageStatus::Exhausted,
-        Some(fraction) if fraction >= 0.9 => UsageStatus::Warning,
-        Some(_) => UsageStatus::Ok,
-    })
 }
 
 fn parse_bucket(value: Option<&Value>) -> Option<Bucket> {
@@ -671,7 +662,7 @@ fn extra_limit(extra: Extra) -> UsageLimit {
                     remaining_fraction: Some(remaining / limit),
                     unit: UsageUnit::Usd,
                 },
-                usage_status(Some(fraction)),
+                Some(usage_status(fraction)),
             )
         }
     };
@@ -960,75 +951,6 @@ fn number(value: Option<&Value>) -> Option<f64> {
         _ => return None,
     };
     parsed.is_finite().then_some(parsed)
-}
-
-/// Parses an ISO-8601 timestamp with an explicit zone (`Z` or `±HH:MM`) into Unix milliseconds.
-pub(super) fn parse_iso_ms(text: &str) -> Option<u64> {
-    let text = text.trim();
-    let (date, time) = text.split_once(['T', 't', ' '])?;
-    let mut parts = date.split('-');
-    let year: i64 = parts.next()?.parse().ok()?;
-    let month: u32 = parts.next()?.parse().ok()?;
-    let day: u32 = parts.next()?.parse().ok()?;
-    if parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return None;
-    }
-    let (clock, offset_minutes) = split_zone(time)?;
-    let mut fields = clock.split(':');
-    let hour: i64 = fields.next()?.parse().ok()?;
-    let minute: i64 = fields.next()?.parse().ok()?;
-    let seconds = fields.next()?;
-    if fields.next().is_some() {
-        return None;
-    }
-    let (second_text, fraction) = seconds.split_once('.').unwrap_or((seconds, ""));
-    let second: i64 = second_text.parse().ok()?;
-    if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) || !(0..=60).contains(&second) {
-        return None;
-    }
-    let millis: u64 = if fraction.is_empty() {
-        0
-    } else {
-        let digits: String = fraction.chars().take(3).collect();
-        if !digits.chars().all(|ch| ch.is_ascii_digit()) {
-            return None;
-        }
-        format!("{digits:0<3}").parse().ok()?
-    };
-    let days = days_from_civil(year, month, day);
-    let total =
-        days * 86_400 + i128::from(hour) * 3_600 + i128::from(minute) * 60 + i128::from(second)
-            - i128::from(offset_minutes) * 60;
-    u64::try_from(total)
-        .ok()?
-        .checked_mul(1_000)?
-        .checked_add(millis)
-}
-
-fn split_zone(time: &str) -> Option<(&str, i64)> {
-    if let Some(clock) = time.strip_suffix(['Z', 'z']) {
-        return Some((clock, 0));
-    }
-    let index = time.rfind(['+', '-'])?;
-    let (clock, offset) = time.split_at(index);
-    let sign = if offset.starts_with('-') { -1 } else { 1 };
-    let mut parts = offset[1..].split(':');
-    let hours: i64 = parts.next()?.parse().ok()?;
-    let minutes: i64 = parts.next().unwrap_or("0").parse().ok()?;
-    Some((clock, sign * hours.checked_mul(60)?.checked_add(minutes)?))
-}
-
-/// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's algorithm).
-fn days_from_civil(year: i64, month: u32, day: u32) -> i128 {
-    let year = i128::from(year);
-    let year = if month <= 2 { year - 1 } else { year };
-    let era = (if year >= 0 { year } else { year - 399 }) / 400;
-    let year_of_era = year - era * 400;
-    let month = i128::from(month);
-    let day_of_year =
-        (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + i128::from(day) - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
 }
 
 #[cfg(test)]

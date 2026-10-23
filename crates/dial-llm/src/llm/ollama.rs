@@ -694,7 +694,7 @@ fn read_ndjson(
                     .into());
                 }
                 if matches!(
-                    error.kind(),
+                    super::stream::disconnect_kind(&error),
                     ErrorKind::UnexpectedEof
                         | ErrorKind::ConnectionReset
                         | ErrorKind::ConnectionAborted
