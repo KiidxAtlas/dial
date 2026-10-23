@@ -204,7 +204,7 @@ fn foreign_root_image_and_prose_examples_do_not_block_relocation() {
     let reopened = Session::open(&path).unwrap();
     assert_eq!(
         reopened.messages()[0]["dial_images"][0]["snapshot"]["root"],
-        json!(foreign.path())
+        json!(foreign.path().canonicalize().unwrap())
     );
     assert!(
         foreign_store
