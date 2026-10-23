@@ -689,21 +689,32 @@ fn context_updates_before_stream_callbacks_and_reconciles_reported_usage() {
 
 #[test]
 fn background_waits_keep_the_ui_pumping() {
-    struct CountingUi(usize);
+    struct CountingUi {
+        count: usize,
+        heartbeat: mpsc::Sender<()>,
+    }
     impl Ui for CountingUi {
         fn heartbeat(&mut self) {
-            self.0 += 1;
+            self.count += 1;
+            let _ = self.heartbeat.send(());
         }
     }
     let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        thread::sleep(Duration::from_millis(200));
-        let _ = tx.send(());
+    let (heartbeat, observed) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        // Keep the operation pending until the UI actually pumps, rather than
+        // racing a fixed sleep against the test thread's scheduling.
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        tx.send(()).unwrap();
     });
-    let mut ui = CountingUi(0);
+    let mut ui = CountingUi {
+        count: 0,
+        heartbeat,
+    };
     receive_with_heartbeat(&rx, &mut ui).unwrap();
+    worker.join().unwrap();
     assert!(
-        ui.0 >= 1,
+        ui.count >= 1,
         "the UI must repaint while the operation is pending"
     );
 }
