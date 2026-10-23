@@ -173,6 +173,9 @@ pub(super) fn exchange(
             super::MAX_STREAM_BYTES
         );
         for (flags, payload) in frames.push(&chunk[..read])? {
+            if interrupt.load(Ordering::SeqCst) {
+                return Err(Interrupted.into());
+            }
             // Silence is judged per decoded frame, as it is for SSE events.
             stream_patience.mark_event();
             let emits = match state.feed(flags, &payload) {
@@ -204,6 +207,13 @@ pub(super) fn exchange(
                 }
             }
         }
+    }
+    frames.finish()?;
+    if !state.ended {
+        return Err(super::stream::IncompleteStream(
+            "Devin stream ended before its completion trailer",
+        )
+        .into());
     }
     Ok(state.finish(&scope))
 }
@@ -389,9 +399,10 @@ fn unary_payload(body: &[u8]) -> Result<Cow<'_, [u8]>> {
     if Fields::parse(body).is_ok() {
         return Ok(Cow::Borrowed(body));
     }
-    Ok(Cow::Owned(gunzip(body).context(
-        "Devin response is neither protobuf nor gzipped protobuf",
-    )?))
+    Ok(Cow::Owned(
+        super::connect::gunzip_limited(body, super::MAX_RESPONSE_BYTES)
+            .context("Devin response is neither protobuf nor gzipped protobuf")?,
+    ))
 }
 
 fn session_token(api_key: &str) -> String {
@@ -818,6 +829,8 @@ fn carrier<'a>(msg: &'a Value, scope: &str) -> Option<&'a Value> {
 #[derive(Default)]
 struct Stream {
     message_id: String,
+    ended: bool,
+    decoded_bytes: usize,
     text: String,
     thinking: String,
     signature: String,
@@ -858,12 +871,17 @@ impl Stream {
     }
 
     fn feed(&mut self, flags: u8, payload: &[u8]) -> Result<Vec<Emit>> {
+        ensure!(!self.ended, "Devin frame received after completion trailer");
         let raw: Cow<'_, [u8]> = if flags & FLAG_COMPRESSED != 0 {
             Cow::Owned(gunzip(payload)?)
         } else {
             Cow::Borrowed(payload)
         };
+        super::connect::account_payload(&mut self.decoded_bytes, raw.len())?;
         if flags & FLAG_END_STREAM != 0 {
+            let terminal: Value =
+                serde_json::from_slice(&raw).context("invalid Devin completion trailer")?;
+            ensure!(terminal.is_object(), "invalid Devin completion trailer");
             let trailer = String::from_utf8_lossy(&raw);
             if let Some(failure) = trailer_error(trailer.trim()) {
                 // A pre-output `invalid_argument` "internal error" may be large-history overflow.
@@ -881,6 +899,11 @@ impl Stream {
                 }
                 bail!("{}", failure.formatted);
             }
+            ensure!(
+                terminal.get("error").is_none(),
+                "invalid Devin error trailer"
+            );
+            self.ended = true;
             return Ok(Vec::new());
         }
         let message = Fields::parse(&raw)?;

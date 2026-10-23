@@ -1215,6 +1215,36 @@ fn local_generation_progress_stall_is_still_recovered() {
 }
 
 #[test]
+fn repeated_generation_telemetry_does_not_hide_a_stall() {
+    let mut config = Config::default();
+    config.request_recovery.silence_secs = 1;
+    let progress = json!({"dial_progress":{"phase":"generating","output_tokens":3}});
+    let stale = json!({"dial_progress":{"phase":"processing","processed_tokens":0}});
+    let late = json!({"choices":[{"delta":{"content":"too late"},"finish_reason":"stop"}]});
+    let (text, outcome, requests) = scripted_turn(
+        &config,
+        vec![
+            crate::llm::fake::Script::SseSlow {
+                pieces: vec![
+                    format!("data: {progress}\n\n"),
+                    format!("data: {stale}\n\n"),
+                    format!("data: {progress}\n\n"),
+                    format!("data: {late}\n\ndata: [DONE]\n\n"),
+                ],
+                pause: Duration::from_millis(450),
+            },
+            sse_reply("resumed"),
+        ],
+        "hi",
+    );
+    assert_eq!(
+        (text.as_str(), outcome),
+        ("resumed", TurnOutcome::Completed)
+    );
+    assert_eq!(requests.len(), 2);
+}
+
+#[test]
 fn silence_watch_is_armed_for_remote_streams_and_only_generating_local_ones() {
     assert!(silence_watch_armed(false, false));
     assert!(silence_watch_armed(false, true));

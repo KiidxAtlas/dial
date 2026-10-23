@@ -30,43 +30,41 @@ pub fn token_path(user_dir: &Path) -> PathBuf {
 }
 
 /// Returns the relay token, creating it on first use. Every relay and the extension share it.
-/// The file is owner-only on unix; on Windows it inherits the per-user profile permissions.
+/// Files and directories are owner-private on Unix and Windows; unsafe existing paths are refused.
 pub fn load_or_create_token(user_dir: &Path) -> io::Result<String> {
     let path = token_path(user_dir);
-    if let Ok(existing) = std::fs::read_to_string(&path) {
-        let token = existing.trim();
-        if is_valid_token(token) {
-            return Ok(token.to_owned());
+    crate::platform::atomic::private_dir(path.parent().expect("token has a parent"))
+        .map_err(private_io_error)?;
+    if let Some(existing) =
+        crate::platform::atomic::read_private(&path).map_err(private_io_error)?
+    {
+        if let Ok(existing) = std::str::from_utf8(&existing) {
+            let token = existing.trim();
+            if is_valid_token(token) {
+                return Ok(token.to_owned());
+            }
         }
     }
     let random: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
     let token = crate::hex(&random);
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
     write_private(&path, token.as_bytes())?;
     Ok(token)
 }
 
-/// Writes a file that holds relay secrets: replaced atomically, owner-only on unix.
+/// Publishes relay secrets with owner-only protection established before writing any bytes.
 pub(in crate::browser_relay) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    crate::platform::atomic::write_replacing(path, bytes)?;
-    restrict_to_owner(path)
+    crate::platform::atomic::write_private(path, bytes).map_err(private_io_error)
+}
+
+pub(in crate::browser_relay) fn private_io_error(error: anyhow::Error) -> io::Error {
+    match error.downcast::<io::Error>() {
+        Ok(error) => error,
+        Err(error) => io::Error::other(error),
+    }
 }
 
 fn is_valid_token(token: &str) -> bool {
     token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
-#[cfg(unix)]
-fn restrict_to_owner(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-}
-
-#[cfg(not(unix))]
-fn restrict_to_owner(_path: &Path) -> io::Result<()> {
-    Ok(())
 }
 
 /// Relays started in this process, by port. The browser tool starts at most one per port.

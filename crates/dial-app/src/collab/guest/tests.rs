@@ -10,7 +10,9 @@ fn message(role: &str, text: &str) -> Value {
 fn snapshot_frames(log: &[Value]) -> Vec<Value> {
     let entries: Arc<Vec<Arc<str>>> =
         Arc::new(log.iter().map(|m| Arc::from(m.to_string())).collect());
-    let mut frames = vec![json!({"t": "welcome", "proto": 1002, "readOnly": true})];
+    let mut frames = vec![
+        json!({"t": "welcome", "proto": crate::collab::protocol::COLLAB_PROTO, "readOnly": true}),
+    ];
     frames
         .extend(snapshot_chunks(entries).map(|text| serde_json::from_str::<Value>(&text).unwrap()));
     frames
@@ -67,7 +69,9 @@ fn partial_snapshot_does_not_replace_a_complete_replica() {
         replica.apply(&frame);
     }
     // A reconnect starts a new welcome; its first chunk is not final yet.
-    replica.apply(&json!({"t": "welcome", "proto": 1002, "readOnly": true}));
+    replica.apply(
+        &json!({"t": "welcome", "proto": crate::collab::protocol::COLLAB_PROTO, "readOnly": true}),
+    );
     let partial =
         json!({"t": "snapshot-chunk", "entries": [message("user", "new")], "final": false});
     assert_eq!(replica.apply(&partial), Change::None);

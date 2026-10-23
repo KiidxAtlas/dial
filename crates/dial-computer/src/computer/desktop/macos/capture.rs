@@ -20,7 +20,7 @@ use super::{
     super::{
         error::{CoreResult, DesktopError},
         frame::{FrameGeometry, MAX_COMPOSITE_PIXELS, compose},
-        types::{DesktopDisplay, DesktopWindow, DisplaySelector, Target},
+        types::{DesktopDisplay, DesktopWindow, DesktopWindowSnapshot, DisplaySelector, Target},
     },
     ax,
 };
@@ -113,6 +113,14 @@ impl MacCapture {
         reason = "keeps discovery on the backend capture object"
     )]
     pub(super) fn windows(&self) -> CoreResult<Vec<DesktopWindow>> {
+        Ok(self.window_snapshot()?.windows)
+    }
+
+    #[allow(
+        clippy::unused_self,
+        reason = "keeps discovery on the backend capture object"
+    )]
+    pub(super) fn window_snapshot(&self) -> CoreResult<DesktopWindowSnapshot> {
         window_snapshot(None)
     }
 
@@ -128,6 +136,7 @@ impl MacCapture {
         };
         let id = id.parse::<u32>().map_err(|_| missing())?;
         window_snapshot(Some(id))?
+            .windows
             .into_iter()
             .next()
             .ok_or_else(missing)
@@ -278,7 +287,7 @@ type WindowDictionary = CFDictionary<CFString, CFType>;
 
 /// Reads each window from one immutable Quartz snapshot; individual xcap
 /// property getters would re-enumerate the whole desktop for every field.
-fn window_snapshot(target: Option<u32>) -> CoreResult<Vec<DesktopWindow>> {
+fn window_snapshot(target: Option<u32>) -> CoreResult<DesktopWindowSnapshot> {
     if !capture_permission() {
         return Err(DesktopError::permission_denied(
             "macOS Screen Recording permission is not granted for this process",
@@ -297,21 +306,10 @@ fn window_snapshot(target: Option<u32>) -> CoreResult<Vec<DesktopWindow>> {
     let active_pid = NSWorkspace::sharedWorkspace()
         .frontmostApplication()
         .and_then(|app| u32::try_from(app.processIdentifier()).ok());
-    let mut result = Vec::with_capacity(snapshot.len().min(MAX_LISTED_WINDOWS));
-    let mut active = Vec::new();
     // SAFETY: This copy-rule snapshot remains alive and is never mutated.
-    for dictionary in unsafe { snapshot.iter_unchecked() } {
-        if result.len() == MAX_LISTED_WINDOWS {
-            break;
-        }
-        let Some((id, window)) = window_metadata(dictionary) else {
-            continue;
-        };
-        if window.pid.is_some() && window.pid == active_pid {
-            active.push(id);
-        }
-        result.push(window);
-    }
+    let metadata =
+        unsafe { snapshot.iter_unchecked() }.filter_map(|dictionary| window_metadata(dictionary));
+    let (mut listing, active) = collect_windows(metadata, target, active_pid);
     let focused = active_pid
         .and_then(|pid| libc::pid_t::try_from(pid).ok())
         .and_then(ax::focused_window_id);
@@ -324,11 +322,45 @@ fn window_snapshot(target: Option<u32>) -> CoreResult<Vec<DesktopWindow>> {
     };
     if let Some(focused) = focused {
         let id = focused.to_string();
-        if let Some(window) = result.iter_mut().find(|window| window.id == id) {
+        if let Some(window) = listing.windows.iter_mut().find(|window| window.id == id) {
             window.focused = true;
         }
     }
-    Ok(result)
+    Ok(listing)
+}
+
+/// Applies the discovery cap only after metadata safety filtering, and only
+/// for enumeration. Keeping this policy independent of Quartz allows fixtures
+/// to exercise exact-cap and explicit-ID behavior without desktop access.
+fn collect_windows(
+    metadata: impl IntoIterator<Item = (u32, DesktopWindow)>,
+    target: Option<u32>,
+    active_pid: Option<u32>,
+) -> (DesktopWindowSnapshot, Vec<u32>) {
+    let mut windows = Vec::new();
+    let mut active = Vec::new();
+    let mut truncated = false;
+    for (id, window) in metadata {
+        if target.is_some_and(|target| target != id) {
+            continue;
+        }
+        if target.is_none() && windows.len() == MAX_LISTED_WINDOWS {
+            truncated = true;
+            break;
+        }
+        if window.pid.is_some() && window.pid == active_pid {
+            active.push(id);
+        }
+        windows.push(window);
+    }
+    (
+        DesktopWindowSnapshot {
+            windows,
+            truncated,
+            limit: target.is_none().then_some(MAX_LISTED_WINDOWS),
+        },
+        active,
+    )
 }
 
 fn window_value<'a>(dictionary: &'a WindowDictionary, key: &CFString) -> Option<&'a CFType> {

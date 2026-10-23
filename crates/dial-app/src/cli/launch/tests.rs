@@ -27,6 +27,26 @@ fn tools_and_skills_map_to_allowlists() {
 }
 
 #[test]
+fn candidate_names_carry_through_to_agent_validation() {
+    let settings = crate::cli::tool_flags::apply_for_launch(
+        &crate::cli::tool_flags::ToolFlagArgs {
+            tools: Some("mcp__demo__FetchItem".into()),
+            ..Default::default()
+        },
+        &mut toml::Table::new(),
+        &[],
+        &[],
+    )
+    .unwrap();
+    let launch = agent_launch(&settings, &ModelFlags::default());
+    assert_eq!(
+        launch.deferred_tools,
+        ["mcp__demo__FetchItem".into()].into()
+    );
+    assert_eq!(launch.tools.unwrap(), launch.deferred_tools);
+}
+
+#[test]
 fn no_tools_and_no_skills_withhold_everything_optional() {
     let settings = EffectiveSettings {
         tools: Some(Vec::new()),

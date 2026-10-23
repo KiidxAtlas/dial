@@ -198,14 +198,18 @@ impl<W: std::io::Write + Send + 'static + std::os::windows::io::AsRawHandle> Que
             }
         }
     }
+    /// Stops accepting input without waiting. The worker drains all accepted bytes, then
+    /// drops the owned writer to signal EOF. Callers can continue servicing output and
+    /// cancellation while delivery completes.
+    pub fn close(&self) {
+        let (lock, ready, _) = &*self.state;
+        let mut state = lock.lock().unwrap_or_else(|p| p.into_inner());
+        state.closed = true;
+        ready.notify_all();
+    }
     /// Closes the queue, drains accepted bytes, then drops the owned writer to signal EOF.
     pub fn finish(&self, timeout: Duration) -> io::Result<bool> {
-        let (lock, ready, _) = &*self.state;
-        {
-            let mut state = lock.lock().unwrap_or_else(|p| p.into_inner());
-            state.closed = true;
-            ready.notify_all();
-        }
+        self.close();
         if !self.wait_until_drained(timeout)? {
             self.cancel_worker();
             return Ok(false);
@@ -279,3 +283,6 @@ impl<W: std::io::Write + Send + 'static + std::os::windows::io::AsRawHandle> Dro
         self.cancel_worker();
     }
 }
+
+#[cfg(all(test, windows))]
+mod tests;

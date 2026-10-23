@@ -87,7 +87,7 @@ fn relocation_never_replaces_an_existing_destination() {
 fn future_stream_versions_are_preserved_and_refused_before_append() {
     let root = tempfile::tempdir().unwrap();
     let session = root.path().join("future.jsonl");
-    let bytes = b"{\"schema_version\":2,\"kind\":\"future\"}\n";
+    let bytes = b"{\"schema_version\":3,\"kind\":\"future\"}\n";
     std::fs::write(path(&session), bytes).unwrap();
     assert!(recover(&session).is_err());
     assert!(Journal::open(&session).is_err());

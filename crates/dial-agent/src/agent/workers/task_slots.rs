@@ -40,5 +40,38 @@ pub(in crate::agent) fn acquire(config: &Config, interrupt: &AtomicBool) -> Opti
     })
 }
 
+/// The calling thread's slot nesting, handed to a thread that runs one descendant while this
+/// thread blocks waiting for it. A scoped thread starts with no depth of its own, so without this
+/// a serial child of a worker could not run when the project ceiling is already full: its parent
+/// holds the only slot and is idle until the child ends. Only hand it to a thread whose parent
+/// waits for it alone; concurrent siblings must each take their own slot.
+pub(in crate::agent) struct Lineage(usize);
+
+pub(in crate::agent) fn lineage() -> Lineage {
+    Lineage(DEPTH.with(Cell::get))
+}
+
+impl Lineage {
+    /// Borrow the parent's slot on this thread until the guard drops.
+    pub(in crate::agent) fn enter(self) -> Borrowed {
+        DEPTH.with(|depth| depth.set(depth.get() + self.0));
+        Borrowed {
+            depth: self.0,
+            _thread_bound: std::marker::PhantomData,
+        }
+    }
+}
+
+pub(in crate::agent) struct Borrowed {
+    depth: usize,
+    _thread_bound: std::marker::PhantomData<*const ()>,
+}
+
+impl Drop for Borrowed {
+    fn drop(&mut self) {
+        DEPTH.with(|depth| depth.set(depth.get().saturating_sub(self.depth)));
+    }
+}
+
 #[cfg(test)]
 mod tests;

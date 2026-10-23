@@ -15,8 +15,8 @@ pub(in crate::agent) fn canonical_name<'a>(name: &'a str, catalog: &[String]) ->
         "run_command" | "shell" | "Bash" => "bash",
         "search_files" | "Grep" => "grep",
         "find_files" | "Glob" => "glob",
-        "fetch_url" => "web_fetch",
-        "search_web" => "web_search",
+        "fetch_url" | "WebFetch" => "web_fetch",
+        "search_web" | "WebSearch" => "web_search",
         _ => bare,
     };
     if catalog.iter().any(|n| n == target) {
@@ -31,6 +31,7 @@ pub(in crate::agent) fn normalize(name: &str, schema: &Value, args: &mut Value) 
     let aliases: &[(&str, &str)] = match name {
         "read" => &[
             ("file_path", "path"),
+            ("filePath", "path"),
             ("filepath", "path"),
             ("filename", "path"),
             ("start_line", "offset"),
@@ -39,16 +40,26 @@ pub(in crate::agent) fn normalize(name: &str, schema: &Value, args: &mut Value) 
         "write" => &[
             ("file_path", "path"),
             ("filepath", "path"),
+            ("filePath", "path"),
             ("filename", "path"),
             ("text", "content"),
         ],
         "edit" => &[
             ("file_path", "path"),
+            ("filePath", "path"),
+            ("oldString", "old_string"),
+            ("newString", "new_string"),
+            ("replaceAll", "replace_all"),
             ("old_string", "old"),
             ("new_string", "new"),
             ("patch", "input"),
         ],
-        "bash" => &[("cmd", "command"), ("timeout_secs", "timeout")],
+        "bash" => &[
+            ("cmd", "command"),
+            ("timeout_secs", "timeout"),
+            ("workdir", "cwd"),
+            ("working_dir", "cwd"),
+        ],
         "grep" => &[
             ("regex", "pattern"),
             ("query", "pattern"),

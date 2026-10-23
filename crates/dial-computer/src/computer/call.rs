@@ -213,9 +213,16 @@ pub fn render_call_chain(chain: &[ComputerCallStep]) -> String {
         .join(".")
 }
 
-/// Renders one argument as a JavaScript literal. JSON is a valid JS literal, so `serde_json` output is used directly.
+/// Renders JSON data without interpreting object keys as JavaScript syntax.
 pub fn render_run_arg(value: &Value) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| "undefined".into())
+    let json = value.to_string();
+    if value.is_object() || value.is_array() {
+        // Object literals give `__proto__` special semantics, even when quoted.
+        // Parsing also preserves these keys in nested objects and arrays.
+        format!("JSON.parse({})", Value::String(json))
+    } else {
+        json
+    }
 }
 
 /// Renders a function invocation with the requested run scope and positional arguments.

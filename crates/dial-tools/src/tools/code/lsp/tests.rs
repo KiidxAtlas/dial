@@ -4,7 +4,7 @@
 
 use crate::config::tools::lsp::LspConfig;
 
-use super::client::{Client, ServerOptions, Timeouts};
+use super::client::{Client, ServerOptions, Timeouts, UnsettledRequest};
 use super::framing::{read_message, write_message};
 use super::*;
 use crate::config::tools::lsp::LspServerConfig;
@@ -251,19 +251,17 @@ fn server_errors_timeouts_and_exits_become_errors() {
         "{error}"
     );
 
-    let error = client
-        .request("test/never", Value::Null)
-        .unwrap_err()
-        .to_string();
+    let error = client.request("test/never", Value::Null).unwrap_err();
+    assert!(error.is::<UnsettledRequest>(), "{error:#}");
+    let error = format!("{error:#}");
     assert!(error.contains("did not answer test/never"), "{error}");
     wait_until("cancel notification", || {
         methods(&log).contains(&"$/cancelRequest".to_string())
     });
 
-    let error = client
-        .request("test/hangup", Value::Null)
-        .unwrap_err()
-        .to_string();
+    let error = client.request("test/hangup", Value::Null).unwrap_err();
+    assert!(error.is::<UnsettledRequest>(), "{error:#}");
+    let error = format!("{error:#}");
     assert!(error.contains("exited"), "{error}");
     wait_until("client to notice the exit", || !client.is_alive());
     assert!(
@@ -400,7 +398,7 @@ impl Harness {
         let (counter, collected) = (Arc::clone(&starts), Arc::clone(&logs));
         let tool = LspTool::with_launcher(
             &config,
-            Box::new(move |_server, root| {
+            Box::new(move |_server, root, _cancel| {
                 counter.fetch_add(1, Ordering::SeqCst);
                 if let Some(error) = error {
                     anyhow::bail!(error);
@@ -861,13 +859,16 @@ fn merged_workspace_edits_keep_every_server_edit_in_one_document_list() {
 
 // ---- write-through ownership and format-on-write ----
 
-type Launcher =
-    Box<dyn Fn(&super::servers::Resolved, &Path) -> anyhow::Result<Client> + Send + Sync>;
+type Launcher = Box<
+    dyn Fn(&super::servers::Resolved, &Path, &dyn Fn() -> bool) -> anyhow::Result<Client>
+        + Send
+        + Sync,
+>;
 
 /// Starts every server with a fake transport and keeps each server's transcript, in start order.
 fn recording_launcher(logs: &Arc<Mutex<Vec<Log>>>) -> Launcher {
     let collected = Arc::clone(logs);
-    Box::new(move |_server, root| {
+    Box::new(move |_server, root, _cancel| {
         let (client, log) = fake_client(root, fast());
         collected.lock().push(log);
         Ok(client)

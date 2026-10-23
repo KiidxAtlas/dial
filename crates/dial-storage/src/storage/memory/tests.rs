@@ -46,6 +46,12 @@ fn redaction_preserves_safe_text_around_sensitive_spans() {
 }
 
 #[test]
+fn overlapping_redaction_spans_cover_the_longer_span() {
+    let redacted = redact_spans("api_key: sk-abcdefghijklmnopqrstuvwxyz123456,leftover99 ok");
+    assert_eq!(redacted, "api_key: [redacted] ok");
+}
+
+#[test]
 fn atomic_write_replaces_without_leftovers() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("sub/file.txt");

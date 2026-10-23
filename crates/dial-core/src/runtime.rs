@@ -90,6 +90,25 @@ pub struct Node {
     pub presentation: Option<presentation::Presentation>,
 }
 
+/// Worker shards expose only this UTF-8 tail; complete answers live in result/artifact records.
+pub(super) const WORKER_TAIL_LIMIT: usize = 16 * 1024;
+
+/// Drop complete leading characters until at most `limit` bytes remain.
+fn tail(text: &str, limit: usize) -> &str {
+    let mut cut = text.len().saturating_sub(limit);
+    while !text.is_char_boundary(cut) {
+        cut += 1;
+    }
+    &text[cut..]
+}
+
+/// Apply the same bounded-tail operation to live state and recovered journal frames.
+fn append_tail(target: &mut String, text: &str, retain_bytes: usize) {
+    let cut = target.len() - tail(target, retain_bytes).len();
+    target.drain(..cut);
+    target.push_str(text);
+}
+
 #[derive(Debug, Clone)]
 pub struct Body(Arc<Mutex<Node>>, Option<stream_journal::Journal>);
 impl Body {
@@ -178,37 +197,29 @@ impl Body {
         if text.is_empty() {
             return;
         }
-        if self.read(|node| node.kind == "worker") {
-            self.update(|node| {
-                if node.result.phase != Phase::Running {
-                    return false;
-                }
-                node.result.text.push_str(text);
-                // Worker shards show a bounded tail; final answers live in result/artifact records.
-                const LIMIT: usize = 16 * 1024;
-                if node.result.text.len() > LIMIT {
-                    let mut cut = node.result.text.len() - LIMIT;
-                    while !node.result.text.is_char_boundary(cut) {
-                        cut += 1;
-                    }
-                    node.result.text.drain(..cut);
-                }
-                true
-            });
-            return;
-        }
         let mut node = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if node.result.phase != Phase::Running {
             return;
         }
         let revision = node.result.revision.saturating_add(1);
+        let retain_bytes =
+            (node.kind == "worker").then(|| WORKER_TAIL_LIMIT.saturating_sub(text.len()));
+        let text = if retain_bytes.is_some() {
+            tail(text, WORKER_TAIL_LIMIT)
+        } else {
+            text
+        };
         if let Some(journal) = &self.1 {
-            journal.text(&node.id, revision, text);
+            journal.text_tail(&node.id, revision, text, retain_bytes);
             if journal.check().is_err() {
                 return;
             }
         }
-        node.result.text.push_str(text);
+        if let Some(retain_bytes) = retain_bytes {
+            append_tail(&mut node.result.text, text, retain_bytes);
+        } else {
+            node.result.text.push_str(text);
+        }
         node.result.revision = revision;
     }
     pub fn correlate(&self, call_id: &str) {

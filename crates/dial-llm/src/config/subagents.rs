@@ -18,7 +18,7 @@ pub const AGENTS: &[AgentSpec] = &[
     AgentSpec {
         name: "scout",
         description: "read-only investigation: find and read code, run read-only commands, report facts",
-        prompt: "Investigate with your tools and finish with a concise, factual answer that cites file paths and line numbers. You cannot modify files.",
+        prompt: "Answer the assigned question using supplied evidence first; inspect only what is missing or stale. Stop when the question is answered. Return concise facts with file paths and line numbers, evidence gaps and any implementation handoff. You cannot modify files.",
         tools: &["read", "glob", "grep", "bash", "skill"],
         spawns: &[],
         max_steps: 0,
@@ -36,7 +36,7 @@ pub const AGENTS: &[AgentSpec] = &[
     AgentSpec {
         name: "planner",
         description: "read-only: study the code and return an implementation plan (files, steps, risks, verification)",
-        prompt: "Produce an implementation plan for the task. Read the relevant code first, then answer with the goal, the files to change and what changes in each, ordered steps, risks, and how to verify the result. Do not write the implementation. You cannot modify files.",
+        prompt: "Plan the assigned outcome using supplied evidence and relevant code. Stop research when the implementation path is known. Return owned files, shared interfaces, ordered changes, risks and checks with an owner; cite evidence instead of copying it. Do not implement or modify files.",
         tools: &["read", "glob", "grep", "skill"],
         spawns: &[],
         max_steps: 0,
@@ -45,7 +45,7 @@ pub const AGENTS: &[AgentSpec] = &[
     AgentSpec {
         name: "worker",
         description: "carries out a change: can write and edit files and run commands (each change asks for approval)",
-        prompt: "Implement the assigned slice end to end using existing project conventions. Reuse current evidence and batch coherent edits. Preserve other agents' work and approval boundaries. Run the assigned or relevant project checks once the slice is ready; report changed files, results and any unresolved prerequisites.",
+        prompt: "Implement the assigned slice end to end using existing conventions and current evidence. Batch coherent edits; preserve others' work and approval boundaries. Honor the assigned check owner; run only your checks after relevant edits settle, leaving shared verification to its owner. Diagnose failures before repair and rerun. Report changed behavior, files, observed results and unresolved prerequisites briefly.",
         tools: &["read", "glob", "grep", "bash", "edit", "write", "skill"],
         spawns: &[],
         max_steps: 0,
@@ -54,7 +54,7 @@ pub const AGENTS: &[AgentSpec] = &[
     AgentSpec {
         name: "test-runner",
         description: "make and run tests under the direction of the main agent",
-        prompt: "Your only purpose is to make and run tests under the direction of the main agent. Discover existing tests, write new tests when asked, run the test suite, and report pass/fail results with clear evidence. Use the project's test framework (cargo test for Rust, pytest for Python). Report failures with exact error messages and file:line references. Do not modify source code unless explicitly asked; your job is tests only.",
+        prompt: "Make and run the assigned tests using the project's framework and supplied evidence. Wait for relevant edits to settle; honor the agreed check ownership instead of duplicating another agent's run. Diagnose failures from actual output and report exact errors and file:line references. Rerun after repairs or changed inputs, not unchanged success. Modify tests only when asked, and source only with explicit authorization. Report observed results and unverified gaps concisely.",
         tools: &["read", "glob", "grep", "bash", "edit", "write", "skill"],
         spawns: &[],
         max_steps: 0,

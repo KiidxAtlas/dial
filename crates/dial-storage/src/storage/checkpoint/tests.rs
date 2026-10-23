@@ -322,6 +322,82 @@ fn tampered_manifest_cannot_restore_outside_the_root() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn rollback_refuses_replacement_symlinks_without_touching_their_targets() {
+    use std::os::unix::fs::symlink;
+
+    // Test both overwrite and deletion restores, in the project and an attached root.
+    for existed in [false, true] {
+        for added in [false, true] {
+            let fx = Fixture::new();
+            let extra = tempfile::tempdir().unwrap();
+            let cp = fx.open();
+            let root = if added {
+                let root = fs::canonicalize(extra.path()).unwrap();
+                cp.set_added_roots(std::slice::from_ref(&root));
+                root
+            } else {
+                fx.root()
+            };
+            let a = root.join("a.txt");
+            let b = root.join("b.txt");
+            if existed {
+                fs::write(&a, "original a").unwrap();
+            }
+            fs::write(&b, "unrelated b").unwrap();
+            cp.begin_turn("edit a").unwrap();
+            cp.before_write(&a).unwrap();
+            fs::write(&a, "changed a").unwrap();
+            fs::remove_file(&a).unwrap();
+            symlink(&b, &a).unwrap();
+
+            let report = cp.rollback(1).unwrap();
+            assert!(report.restored.is_empty() && report.removed.is_empty());
+            assert!(report.warnings.iter().any(|w| w.contains("different file")));
+            assert_eq!(fs::read_to_string(&b).unwrap(), "unrelated b");
+            assert!(fs::symlink_metadata(&a).unwrap().file_type().is_symlink());
+            assert_eq!(cp.list().len(), 1, "refused restore stays retryable");
+
+            fs::remove_file(&a).unwrap();
+            fs::write(&a, "changed a").unwrap();
+            let retry = cp.rollback(1).unwrap();
+            assert!(retry.warnings.is_empty(), "{:?}", retry.warnings);
+            if existed {
+                assert_eq!(fs::read_to_string(&a).unwrap(), "original a");
+            } else {
+                assert!(!a.exists());
+            }
+            assert_eq!(fs::read_to_string(&b).unwrap(), "unrelated b");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn rollback_preserves_canonicalized_symlink_capture() {
+    use std::os::unix::fs::symlink;
+
+    let fx = Fixture::new();
+    let cp = fx.open();
+    fx.write("b.txt", "original b");
+    symlink(fx.path("b.txt"), fx.path("a.txt")).unwrap();
+    let turn = cp.begin_turn("edit through symlink").unwrap();
+    cp.before_write(&fx.path("a.txt")).unwrap();
+    fx.write("a.txt", "changed b");
+    assert_eq!(cp.changed_files(turn), ["b.txt"]);
+    let report = cp.rollback(1).unwrap();
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert_eq!(report.restored, ["b.txt"]);
+    assert_eq!(fx.read("b.txt").as_deref(), Some("original b"));
+    assert!(
+        fs::symlink_metadata(fx.path("a.txt"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
 #[test]
 fn oversized_files_are_skipped_with_a_warning() {
     let fx = Fixture::new();

@@ -355,3 +355,60 @@ fn concise_guidance_preserves_visual_rules_and_operator_owned_content() {
         build(false, None, Some(&template))
     );
 }
+
+/// Changing task evidence must not rewrite the cacheable policy or duplicate its execution rules.
+/// This checks assembly boundaries, not whether a model follows the policy.
+#[test]
+fn task_evidence_changes_leave_policy_bytes_and_tool_gating_stable() {
+    let harness: Harness = serde_json::from_str("{}").unwrap();
+    for (lean, concise, one_call) in [
+        (false, false, false),
+        (false, true, false),
+        (true, false, false),
+        (true, false, true),
+    ] {
+        for delegated in [false, true] {
+            let tools = if delegated {
+                names(&["read", "edit", "task"])
+            } else {
+                names(&["read", "edit"])
+            };
+            let build = |evidence: &str| {
+                system_messages(Inputs {
+                    cwd: Path::new("/work"),
+                    harness: &harness,
+                    soul: None,
+                    overrides: (None, None),
+                    context: &[],
+                    skills: String::new(),
+                    memory: evidence.into(),
+                    tools: &tools,
+                    discoverable: &[],
+                    edit_mode: EditMode::default(),
+                    template: None,
+                    lean,
+                    concise_guidance: concise,
+                    one_call,
+                    worked_example: false,
+                })
+                .unwrap()
+            };
+            let before = build("Fixture evidence: failing check in owned module");
+            let after = build("Fixture evidence: repaired module; check passed");
+            assert_eq!(
+                serde_json::to_vec(&before[..2]).unwrap(),
+                serde_json::to_vec(&after[..2]).unwrap(),
+                "task evidence belongs outside frozen/stable policy bands"
+            );
+            assert_ne!(before.last(), after.last());
+            let policy = before[0]["content"].as_str().unwrap();
+            assert_eq!(policy.matches(FOCUSED_WORK).count(), 1);
+            let delegation = if lean || concise || one_call {
+                LEAN_DELEGATION_RULES
+            } else {
+                DELEGATION_RULES
+            };
+            assert_eq!(policy.ends_with(delegation), delegated);
+        }
+    }
+}

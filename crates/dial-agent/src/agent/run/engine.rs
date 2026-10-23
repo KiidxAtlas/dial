@@ -26,6 +26,12 @@ pub(in crate::agent) struct Engine {
     /// edits, reads or todos. A cycle steers the model and never ends the turn.
     cycles: mutation_cycles::MutationCycles,
     length_nudges: u32,
+    length_stalled: u32,
+    // Brent's online cycle detector: constant memory, no recent-history eviction horizon.
+    length_anchor: Option<u64>,
+    length_power: u64,
+    length_distance: u64,
+    length_cycle: bool,
     /// Consecutive failures per (tool, recovery kind); a tool's success clears its entries. The
     /// first failure gets compact feedback, a repeat the full diagnose-first contract. Kept across
     /// continuations and compaction, like the other failure counters.
@@ -67,10 +73,63 @@ impl Engine {
     ) -> guard::LengthAction {
         let action =
             guard::recover_from_length(requested, window, prompt, reply, self.length_nudges);
-        if matches!(action, guard::LengthAction::Nudge { .. }) {
-            self.length_nudges += 1;
+        if let guard::LengthAction::Nudge { partial, .. } = &action {
+            use std::hash::{Hash, Hasher};
+            const MAX_STALLED: u32 = 8;
+            let advancing = partial.as_ref().is_some_and(|text| {
+                let mut hash = std::collections::hash_map::DefaultHasher::new();
+                for word in text.split_whitespace() {
+                    word.hash(&mut hash);
+                }
+                let fingerprint = hash.finish();
+                if self.length_cycle {
+                    return false;
+                }
+                let Some(anchor) = self.length_anchor else {
+                    self.length_anchor = Some(fingerprint);
+                    self.length_power = 1;
+                    return true;
+                };
+                self.length_distance = self.length_distance.saturating_add(1);
+                if anchor == fingerprint {
+                    // Once a recurrence is observed, changing partial fragments cannot hide it.
+                    // Require a usable nontruncated reply within the remaining stall allowance.
+                    self.length_cycle = true;
+                    return false;
+                }
+                if self.length_distance >= self.length_power {
+                    self.length_anchor = Some(fingerprint);
+                    self.length_power = self.length_power.saturating_mul(2);
+                    self.length_distance = 0;
+                }
+                true
+            });
+            if advancing {
+                self.length_stalled = 0;
+                self.length_nudges = 0;
+            } else {
+                self.length_stalled += 1;
+                if self.length_stalled >= MAX_STALLED {
+                    return guard::LengthAction::Incomplete("Stopped with incomplete work: repeated output truncation made no progress after bounded recovery. No partial tool calls were executed; completed effects and the conversation are kept; no completion was recorded.".into());
+                }
+            }
+            self.length_nudges = self.length_nudges.saturating_add(1);
         }
         action
+    }
+    /// A usable, nontruncated answer or tool call re-arms length recovery. Empty or malformed
+    /// replies do not hide an ongoing stall by alternating with truncated generations.
+    pub fn length_recovered(&mut self, reply: &crate::llm::Reply) {
+        if !reply.dropped_tool_call()
+            && (!reply.text.trim().is_empty() || !reply.tool_calls.is_empty())
+        {
+            self.length_stalled = 0;
+            self.length_nudges = 0;
+            self.length_anchor = None;
+            self.length_power = 0;
+            self.length_distance = 0;
+            self.length_cycle = false;
+        }
     }
     /// One lifecycle driver for foreground and worker adapters. Adapters supply admission,
     /// role-specific request preparation and persistence; they never own a second retry loop.
@@ -241,3 +300,6 @@ mod tests;
 
 #[cfg(test)]
 mod evidence_tests;
+
+#[cfg(test)]
+mod length_tests;

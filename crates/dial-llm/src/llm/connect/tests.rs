@@ -66,3 +66,37 @@ fn optional_uint_distinguishes_missing_usage_from_explicit_zero() {
     assert_eq!(fields.uint_opt(2), None);
     assert_eq!(fields.uint(2), 0);
 }
+
+#[test]
+fn incomplete_frame_eof_is_retryable() {
+    let wire = frame(0, b"payload").unwrap();
+    for end in 1..wire.len() {
+        let mut frames = Frames::default();
+        frames.push(&wire[..end]).unwrap();
+        let error = frames.finish().unwrap_err();
+        assert_eq!(
+            super::super::errors::classify(&error),
+            super::super::errors::ErrorClass::Transient
+        );
+    }
+    let mut frames = Frames::default();
+    frames.push(&wire).unwrap();
+    frames.finish().unwrap();
+}
+
+#[test]
+fn gzip_expansion_is_bounded_and_exact_limit_is_valid() {
+    let packed = gzip(&vec![b'x'; MAX_FRAME_PAYLOAD + 1]).unwrap();
+    assert!(gunzip(&packed).unwrap_err().to_string().contains("cap"));
+    let packed = gzip(b"1234").unwrap();
+    assert_eq!(gunzip_limited(&packed, 4).unwrap(), b"1234");
+    assert!(gunzip_limited(&packed, 3).is_err());
+}
+
+#[test]
+fn decoded_response_accounting_rejects_cumulative_expansion() {
+    let mut total = super::super::MAX_STREAM_BYTES - 3;
+    account_payload(&mut total, 3).unwrap();
+    assert!(account_payload(&mut total, 1).is_err());
+    assert_eq!(total, super::super::MAX_STREAM_BYTES);
+}

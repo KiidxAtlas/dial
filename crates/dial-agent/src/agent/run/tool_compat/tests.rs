@@ -68,3 +68,26 @@ fn structural_repair_is_schema_directed_and_preserves_invalid_conflicts() {
     normalize("extension", &schema, &mut args);
     assert!(args.get("nullable").is_some());
 }
+
+#[test]
+fn common_client_spellings_map_only_onto_declared_properties() {
+    let catalog = vec!["web_fetch".into(), "web_search".into(), "edit".into()];
+    assert_eq!(canonical_name("WebFetch", &catalog), "web_fetch");
+    assert_eq!(
+        canonical_name("functions.WebSearch", &catalog),
+        "web_search"
+    );
+    assert_eq!(canonical_name("WebFetch", &["read".into()]), "WebFetch");
+    let schema = json!({"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["path","old_string","new_string"],"additionalProperties":false});
+    let mut args = json!({"filePath":"a","oldString":"x","newString":"y","replaceAll":"true"});
+    normalize("edit", &schema, &mut args);
+    assert_eq!(
+        args,
+        json!({"path":"a","old_string":"x","new_string":"y","replace_all":true})
+    );
+    assert!(crate::agent::run::calls::validate(&schema, &args).is_ok());
+    let schema = json!({"type":"object","properties":{"command":{"type":"string"},"cwd":{"type":"string"}},"required":["command"],"additionalProperties":false});
+    let mut args = json!({"command":"ls","workdir":"src"});
+    normalize("bash", &schema, &mut args);
+    assert_eq!(args, json!({"command":"ls","cwd":"src"}));
+}

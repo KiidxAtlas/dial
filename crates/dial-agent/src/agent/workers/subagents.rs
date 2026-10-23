@@ -574,25 +574,40 @@ impl Job<'_> {
     /// assignment. The child cannot see the parent's conversation, so the brief carries what it needs.
     pub fn brief(&self) -> String {
         let mut out = String::new();
-        // The current request leads: once a newer instruction exists, the session's first goal is
-        // historical context and must not frame the assignment.
+        // Only elide automatic background when its exact text is already present in
+        // explicit inputs. Never summarize or truncate operator-authored task/context.
+        let explicit = [
+            &*self.prompt,
+            &*self.solution_space,
+            self.shared_context.as_deref().unwrap_or(""),
+        ];
+        let covered =
+            |text: &str| !text.is_empty() && explicit.iter().any(|input| input.contains(text));
+        // The current request still takes precedence even when represented by a reference.
         match (&self.handoff.current_instruction, &self.handoff.goal) {
             (Some(current), goal) => {
-                out.push_str(&format!(
-                    "Parent's current request (background for your assignment; it takes precedence):\n{current}\n\n"
-                ));
-                if let Some(goal) = goal.as_ref().filter(|goal| *goal != current) {
+                if covered(current) {
+                    out.push_str("Parent's current request is included in the assignment/context below; it takes precedence.\n\n");
+                } else {
+                    out.push_str(&format!(
+                        "Parent's current request (background for your assignment; it takes precedence):\n{current}\n\n"
+                    ));
+                }
+                if let Some(goal) = goal
+                    .as_ref()
+                    .filter(|goal| *goal != current && !covered(goal))
+                {
                     out.push_str(&format!(
                         "Session-start context (historical, may be unrelated to the current request):\n{goal}\n\n"
                     ));
                 }
             }
-            (None, Some(goal)) => {
+            (None, Some(goal)) if !covered(goal) => {
                 out.push_str(&format!(
                     "Parent goal (background, not your assignment):\n{goal}\n\n"
                 ));
             }
-            (None, None) => {}
+            _ => {}
         }
         if !self.handoff.todos.is_empty() {
             out.push_str("Parent open todos:\n");
@@ -602,6 +617,25 @@ impl Job<'_> {
             out.push('\n');
         }
         if let Some(state) = &self.handoff.working_state {
+            // Working-state goals often repeat the request verbatim. Keep every other
+            // field (especially constraints and evidence references) unchanged.
+            let mut state_value = serde_json::from_str::<Value>(state).ok();
+            if let Some(fields) = state_value.as_mut().and_then(Value::as_object_mut) {
+                let duplicate = fields
+                    .get("goal")
+                    .and_then(Value::as_str)
+                    .is_some_and(|goal| {
+                        covered(goal)
+                            || self.handoff.current_instruction.as_deref() == Some(goal)
+                            || self.handoff.goal.as_deref() == Some(goal)
+                    });
+                if duplicate {
+                    fields.remove("goal");
+                }
+            }
+            let state = state_value
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| state.clone());
             out.push_str(&format!(
                 "Parent working state (recorded claims, not verified):\n{state}\n\n"
             ));
@@ -2715,10 +2749,14 @@ fn run_serial(
         announce_start(direct.ui, job, total);
         let body = worker_body(direct.ui, job, role);
         let (tx, rx) = mpsc::channel();
+        // The controller waits on this one child, so the child runs under the slot of the worker
+        // that is delegating (if any) instead of needing a second one at a full ceiling.
+        let lineage = crate::agent::workers::task_slots::lineage();
         std::thread::scope(|scope| {
             let own = &mut own;
             let main = &mut *main;
             scope.spawn(move || {
+                let _borrowed = lineage.enter();
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let mut remote =
                         Remote(tx.clone(), body.clone(), job.index, env.interrupt.clone());

@@ -69,6 +69,8 @@ pub struct Blocked {
 pub struct EffectiveSettings {
     /// Resolved `--tools` allowlist (after `--no-tools` handling). `None` means unchanged.
     pub tools: Option<Vec<String>>,
+    /// Candidate provider names requiring exact registry validation by `Agent::set_launch`.
+    pub deferred_tools: Vec<String>,
     /// Resolved `--add-dir` paths, for the workspace once it accepts extra roots.
     pub add_dirs: Vec<PathBuf>,
     /// Resolved `--system-prompt` text (file contents or literal).
@@ -87,7 +89,7 @@ pub struct EffectiveSettings {
     pub notes: Vec<Blocked>,
 }
 
-/// Canonical tool names known to Dial, plus caller-supplied extension and operator names.
+/// Canonical tool names known to Dial, plus caller-supplied registered and operator names.
 pub fn known_tool_names(extra: &[String]) -> Vec<String> {
     let mut out: Vec<String> = BUILTIN.iter().map(|s| (*s).to_owned()).collect();
     out.extend(default_tools());
@@ -180,8 +182,10 @@ fn string_array(items: &[String]) -> toml::Value {
 /// Fold the flags into `overlay` (a config layer) and return the effective settings.
 ///
 /// `base_integrations` is the current `integrations` list, needed for `--no-lsp` alone.
-/// `extra_known_tools` are operator (`[tools.*]`) and extension tool names that are valid
-/// for `--tools` in addition to Dial's built-in catalog.
+/// `extra_known_tools` are operator (`[tools.*]`) names and exact names from an already
+/// discovered extension/MCP catalog. Configuration keys for servers or extensions are
+/// not tool names: callers must not infer names from prefixes or start providers just
+/// to validate flags. Unknown names remain errors until an authoritative catalog is available.
 pub fn apply(
     args: &ToolFlagArgs,
     overlay: &mut toml::Table,
@@ -258,6 +262,36 @@ pub fn apply(
         });
     }
 
+    Ok(out)
+}
+
+/// Resolve flags for a launch that will call `Agent::set_launch` after normal provider
+/// registration. Unknown API-valid identifiers are candidates, not accepted tools:
+/// the launch must carry `deferred_tools` through to the agent before any model request.
+/// This performs no provider discovery, process startup, or prefix-based authorization.
+pub fn apply_for_launch(
+    args: &ToolFlagArgs,
+    overlay: &mut toml::Table,
+    base_integrations: &[String],
+    extra_known_tools: &[String],
+) -> Result<EffectiveSettings> {
+    let known = known_tool_names(extra_known_tools);
+    let deferred: Vec<String> = args.tools.as_deref().map_or_else(Vec::new, |csv| {
+        normalize_tool_names(csv, &known)
+            .into_iter()
+            .filter(|name| {
+                !known.contains(name)
+                    && name.len() <= 64
+                    && name
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+            })
+            .collect()
+    });
+    let mut extra = extra_known_tools.to_vec();
+    extra.extend(deferred.iter().cloned());
+    let mut out = apply(args, overlay, base_integrations, &extra)?;
+    out.deferred_tools = deferred;
     Ok(out)
 }
 

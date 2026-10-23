@@ -6,7 +6,7 @@ use crate::config::memory_backend::{EmbeddingMode, MemoryBackendId, SemanticConf
 
 use super::semantic_store::{
     Fact, MAX_CONTENT_BYTES, MAX_SOURCE_BYTES, Saved, Store, estimate_tokens, fit_budget, fuse,
-    nearest, query_tokens,
+    query_tokens,
 };
 use super::{
     Driver, FactRef, MemoryModelRunner, Operation, SaveInput, clean, files::PrivateDirectory, now,
@@ -669,8 +669,7 @@ fn ranked(
     }
     let mut mode = "lexical";
     if let Some(vector) = vector {
-        let rows = store.vectors(&vector.model)?;
-        lists.push(nearest(&vector.vector, &rows, candidates));
+        lists.push(store.nearest(&vector.model, &vector.vector, candidates)?);
         mode = "hybrid";
     }
     let mut facts = Vec::new();

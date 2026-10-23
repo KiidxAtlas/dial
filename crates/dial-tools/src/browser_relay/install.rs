@@ -31,7 +31,7 @@ pub fn extension_dir(user_dir: &Path) -> PathBuf {
 /// Writes the extension files and `relay-config.js` for a relay on `port`. Returns the folder.
 pub fn install(user_dir: &Path, port: u16) -> io::Result<PathBuf> {
     let dir = extension_dir(user_dir);
-    std::fs::create_dir_all(&dir)?;
+    crate::platform::atomic::private_dir(&dir).map_err(super::private_io_error)?;
     let token = super::load_or_create_token(user_dir)?;
     for (name, body) in FILES {
         crate::platform::atomic::write_replacing(&dir.join(name), body.as_bytes())?;

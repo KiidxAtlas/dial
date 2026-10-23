@@ -87,6 +87,14 @@ impl Backend for MacosBackend {
         self.capture.windows()
     }
 
+    fn window(&mut self, id: &str) -> CoreResult<DesktopWindow> {
+        self.capture.window(id)
+    }
+
+    fn window_snapshot(&mut self) -> CoreResult<super::types::DesktopWindowSnapshot> {
+        self.capture.window_snapshot()
+    }
+
     fn capture(
         &mut self,
         target: &Target,

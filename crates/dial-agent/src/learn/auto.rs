@@ -47,11 +47,28 @@ pub fn lock_file(path: &Path) -> Result<File> {
 /// Foreground sessions hold `compute.lock` shared, so any number of local-model and Laya sessions
 /// run together. Only background training/maintenance takes it exclusively, and it yields first.
 pub fn compute_lock(layout: &Layout) -> Result<File> {
+    compute_lock_cancellable(layout, || false)?.context("compute wait cancelled")
+}
+
+/// Wait for foreground admission without trapping a protocol actor in a blocking flock.
+/// Cancellation is ordinary control flow; dropping the request also clears its yield marker.
+pub fn compute_lock_cancellable(
+    layout: &Layout,
+    cancelled: impl Fn() -> bool,
+) -> Result<Option<File>> {
     let _request = super::compute::Request::foreground(&layout.user_dir)?;
     let file = lock_file(&layout.user_dir.join("compute.lock"))?;
-    if fs2::FileExt::try_lock_shared(&file).is_err() {
-        eprintln!("dial: waiting for local compute (a background improvement job is yielding)");
-        fs2::FileExt::lock_shared(&file)?;
+    loop {
+        if cancelled() {
+            return Ok(None);
+        }
+        match fs2::FileExt::try_lock_shared(&file) {
+            Ok(()) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(error) => return Err(error.into()),
+        }
     }
     super::compute::register(
         &layout.user_dir,
@@ -60,7 +77,7 @@ pub fn compute_lock(layout: &Layout) -> Result<File> {
         &layout.state_dir,
         "",
     )?;
-    Ok(file)
+    Ok(Some(file))
 }
 
 /// Persistent operator stop: checked between cases and inside training subprocess polling.

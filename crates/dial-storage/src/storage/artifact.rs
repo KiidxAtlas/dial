@@ -581,6 +581,7 @@ pub fn uris(text: &str) -> Vec<&str> {
 
 #[cfg(test)]
 mod tests;
+pub(crate) mod transfer;
 
 #[cfg(all(test, unix))]
 mod security_tests;

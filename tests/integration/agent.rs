@@ -20,6 +20,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod length_recovery;
+
 fn system_text(request: &Value) -> String {
     request["messages"]
         .as_array()
@@ -51,6 +53,7 @@ enum Reply {
     DroppedCall,
     Calls(Vec<(&'static str, Value)>),
     Cut,
+    LengthCall(&'static str, Value),
     Think { reasoning: String, pause: Duration },
 }
 
@@ -884,6 +887,11 @@ fn answer(
             say(&text)
         }
         Reply::Cut => (json!({"role":"assistant","content":""}), "length"),
+        Reply::LengthCall(name, args) => (
+            json!({"role":"assistant","tool_calls":[{"index":0,"id":"cut_call","type":"function",
+            "function":{"name":name,"arguments":args.to_string()}}]}),
+            "length",
+        ),
         Reply::Call(name, args) => (
             json!({"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function",
             "function":{"name":name,"arguments":args.to_string()}}]}),

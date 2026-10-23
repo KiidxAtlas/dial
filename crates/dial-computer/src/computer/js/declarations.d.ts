@@ -266,8 +266,9 @@ interface ComputerDesktop extends ComputerInputTarget {
 		/** Read the live native ownership state, including revocation by interruption. */
 		state(): Promise<{ active: boolean }>;
 	};
+	/** Fresh native snapshot; macOS lists at most 48 on-screen, shareable windows. Returns an array; filter-resolution errors report whether the snapshot was truncated. */
 	windows(filter?: ComputerWindowFilter): Promise<ComputerWindowInfo[]>;
-	/** Resolve exactly one window by id (`"74"` or `74`) or filter; ambiguous filters throw listing candidates. */
+	/** Filters resolve from a fresh bounded enumeration; explicit IDs use targeted native lookup, bypassing the macOS listing cap but preserving on-screen/shareability and permission checks. Candidates may disappear before the next call. */
 	window(selector: string | number | ComputerWindowFilter): Promise<ComputerWindow>;
 	focusedWindow(): Promise<ComputerWindow | null>;
 	/** Element under a global desktop coordinate. */
@@ -315,7 +316,7 @@ declare const computer: ComputerDesktop & {
 		fn: (scope: ComputerRunScope, ...args: unknown[]) => R | Promise<R>,
 		options?: ComputerRunOptions,
 	): Promise<Awaited<R>>;
-	/** Run a JavaScript function body in the persistent computer runtime. */
+	/** Run a JavaScript function body with desktop, wait, and assert globals, not Eval's computer global. */
 	run<R = unknown>(code: string, options?: ComputerRunOptions): Promise<R>;
 	/** Return native backend capabilities and permission state. */
 	capabilities(): Promise<ComputerCapabilities | undefined>;

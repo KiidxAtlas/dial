@@ -54,6 +54,10 @@ const WHEEL_LINES: isize = 3;
 pub struct Conversation {
     transcript: Transcript,
     replay: Replay,
+    /// Provisional public prose, kept separate so the authoritative assistant message
+    /// can replace it without replaying or cloning the settled conversation.
+    streaming: Transcript,
+    pending_revision: u64,
     /// First transcript block of each message record: `entries[i]` is entry `i`.
     entries: Vec<usize>,
     /// Bytes consumed so far. Always ends on a complete line.
@@ -96,7 +100,7 @@ impl Conversation {
             };
         }
         if len <= self.offset {
-            return false;
+            return self.follow_pending(path);
         }
         // Bounded per poll: a long transcript is replayed over several polls instead of
         // blocking one paint. A single record longer than the chunk is still read whole.
@@ -117,7 +121,7 @@ impl Conversation {
         self.behind = behind;
         // A record still being written has no newline yet; it is read on a later poll.
         let Some(end) = complete.map(|i| i + 1) else {
-            return false;
+            return self.follow_pending(path);
         };
         for line in bytes[..end].split(|byte| *byte == b'\n') {
             self.record(line);
@@ -126,6 +130,22 @@ impl Conversation {
         self.identity = identity;
         if self.head.len() < HEAD {
             self.head = read_range(&mut file, 0, self.offset.min(HEAD as u64)).unwrap_or_default();
+        }
+        self.revision += 1;
+        self.follow_pending(path);
+        true
+    }
+
+    fn follow_pending(&mut self, path: &Path) -> bool {
+        let Some((revision, text)) =
+            crate::agent::workers::child_transcript::pending_assistant(path, self.pending_revision)
+        else {
+            return false;
+        };
+        self.pending_revision = revision;
+        self.streaming = Transcript::new();
+        if !text.is_empty() {
+            self.streaming.assistant_delta(&text);
         }
         self.revision += 1;
         true
@@ -149,15 +169,24 @@ impl Conversation {
         let Ok(value) = serde_json::from_slice::<Value>(line) else {
             return;
         };
-        if value["type"] == "message" {
-            let first = self.replay.push(&mut self.transcript, &value["message"]);
-            self.entries.push(first);
+        match value["type"].as_str() {
+            // Older archives may contain delta records. Do not display their raw
+            // fragments: only authoritative messages and cumulative safe snapshots.
+            Some("message") => {
+                if value["message"]["role"] == "assistant" {
+                    self.streaming = Transcript::new();
+                }
+                let first = self.replay.push(&mut self.transcript, &value["message"]);
+                self.entries.push(first);
+            }
+            _ => {}
         }
     }
 
     /// The worker has ended: tools that never reported a result are marked interrupted.
     fn finish(&mut self) {
         self.transcript.finish_turn();
+        self.streaming.finish_turn();
         self.revision += 1;
     }
 
@@ -639,10 +668,11 @@ impl SubagentViewer {
             tools_expanded: self.expanded,
             expand_key: &ctx.keys.label(Action::ToolsExpand),
         };
-        let (rows, anchors) = self
+        let (mut rows, anchors) = self
             .conversation
             .transcript
             .document(width, &transcript_ctx);
+        rows.extend(self.conversation.streaming.document(width, &transcript_ctx).0);
         self.cache = Some(Cache { key, rows, anchors });
     }
 

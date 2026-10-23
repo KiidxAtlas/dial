@@ -106,6 +106,19 @@ pub trait Backend: Send {
     fn capabilities(&mut self) -> DesktopCapabilities;
     fn displays(&mut self) -> CoreResult<Vec<DesktopDisplay>>;
     fn windows(&mut self) -> CoreResult<Vec<DesktopWindow>>;
+    fn window(&mut self, id: &str) -> CoreResult<DesktopWindow> {
+        self.windows()?
+            .into_iter()
+            .find(|window| window.id == id)
+            .ok_or_else(|| DesktopError::window_not_found(format!("window '{id}' was not found")))
+    }
+    fn window_snapshot(&mut self) -> CoreResult<super::types::DesktopWindowSnapshot> {
+        Ok(super::types::DesktopWindowSnapshot {
+            windows: self.windows()?,
+            truncated: false,
+            limit: None,
+        })
+    }
     /// Explicit display keyboard input must establish the focused surface's
     /// real global monitor, not infer it from window-relative coordinates.
     fn focused_keyboard_window(&mut self) -> CoreResult<DesktopWindow> {

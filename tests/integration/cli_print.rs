@@ -1054,3 +1054,5 @@ fn rpc_initialization_preserves_the_actor_failure_cause() {
         "initialization must not infer"
     );
 }
+
+mod rpc_lifecycle;

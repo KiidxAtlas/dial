@@ -8,7 +8,8 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeSet, HashMap},
+    cmp::Ordering,
+    collections::{BTreeSet, BinaryHeap, HashMap},
     time::Duration,
 };
 
@@ -103,15 +104,45 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// Ids of the `limit` rows most similar to `query`; rows of another dimension are ignored.
-pub fn nearest(query: &[f32], rows: &[(i64, Vec<f32>)], limit: usize) -> Vec<i64> {
-    let mut scored: Vec<(i64, f32)> = rows
-        .iter()
-        .filter(|(_, vector)| vector.len() == query.len())
-        .map(|(id, vector)| (*id, cosine(query, vector)))
-        .collect();
-    scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(b.0.cmp(&a.0)));
-    scored.into_iter().take(limit).map(|(id, _)| id).collect()
+/// Heap ordering puts the worst retained match first: lower cosine, then older id.
+/// `total_cmp` preserves the previous full-sort behavior, including non-finite scores.
+#[derive(Debug)]
+struct VectorMatch {
+    id: i64,
+    score: f32,
+}
+
+impl PartialEq for VectorMatch {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for VectorMatch {}
+
+impl PartialOrd for VectorMatch {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for VectorMatch {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .score
+            .total_cmp(&self.score)
+            .then(other.id.cmp(&self.id))
+    }
+}
+
+fn keep_nearest(heap: &mut BinaryHeap<VectorMatch>, candidate: VectorMatch, limit: usize) {
+    if heap.len() < limit {
+        heap.push(candidate);
+    } else if let Some(mut worst) = heap.peek_mut()
+        && candidate < *worst
+    {
+        *worst = candidate;
+    }
 }
 
 /// Rough token cost of one rendered fact: four bytes per token plus fixed framing.
@@ -147,7 +178,7 @@ fn encode(vector: &[f32]) -> Vec<u8> {
 
 fn decode(bytes: &[u8], dimensions: usize) -> Result<Vec<f32>> {
     ensure!(
-        bytes.len() == dimensions * 4,
+        dimensions.checked_mul(4) == Some(bytes.len()),
         "corrupt embedding row: stored bytes do not match its dimensions"
     );
     Ok(bytes
@@ -428,26 +459,41 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Live facts that have a vector for `model`, newest first, bounded by `MAX_VECTOR_ROWS`.
-    pub fn vectors(&self, model: &str) -> Result<Vec<(i64, Vec<f32>)>> {
+    /// Exact top-k over the newest `MAX_VECTOR_ROWS` live facts for `model`.
+    /// Rows are decoded one at a time; only `limit` scores and ids survive the scan.
+    /// Memory is O(one vector's dimensions + limit), not O(rows * dimensions).
+    pub fn nearest(&self, model: &str, query: &[f32], limit: usize) -> Result<Vec<i64>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let mut statement = self.conn.prepare(
             "SELECT f.id, e.vector, e.dimensions FROM facts f
              JOIN embeddings e ON e.content_hash=f.content_hash AND e.model=?1
              WHERE f.forgotten=0 ORDER BY f.id DESC LIMIT ?2",
         )?;
-        let rows = statement.query_map(params![model, MAX_VECTOR_ROWS as i64], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        })?;
-        let mut vectors = Vec::new();
-        for row in rows {
-            let (id, bytes, dimensions) = row?;
-            vectors.push((id, decode(&bytes, dimensions as usize)?));
+        let mut rows = statement.query(params![model, MAX_VECTOR_ROWS as i64])?;
+        let mut heap = BinaryHeap::with_capacity(limit.min(MAX_VECTOR_ROWS));
+        while let Some(row) = rows.next()? {
+            let id = row.get(0)?;
+            let bytes = row.get_ref(1)?;
+            let dimensions = row.get::<_, i64>(2)?;
+            let vector = decode(bytes.as_blob()?, dimensions as usize)?;
+            if vector.len() == query.len() {
+                keep_nearest(
+                    &mut heap,
+                    VectorMatch {
+                        id,
+                        score: cosine(query, &vector),
+                    },
+                    limit,
+                );
+            }
         }
-        Ok(vectors)
+        Ok(heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|item| item.id)
+            .collect())
     }
 
     /// Live facts with no cached vector for `model`, as (id, content).
@@ -586,3 +632,6 @@ impl Store {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod vector_tests;

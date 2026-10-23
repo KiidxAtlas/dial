@@ -14,10 +14,13 @@
 //! Rename previews remain read-only. Applied edits are validated as one observer-backed text
 //! transaction; ordered file create/rename/delete operations share the same snapshots and rollback. Directory resources require the explicit rename_file workflow.
 use crate::config::tools::lsp::LspConfig;
+use crate::runtime::execution::Effects;
 
 mod client;
 mod format;
 mod framing;
+#[cfg(all(test, unix))]
+mod reliability_tests;
 mod servers;
 #[cfg(all(test, unix))]
 mod tests;
@@ -300,7 +303,7 @@ fn start_for_changes(
         {
             continue;
         }
-        match (tool.launch)(&resolved, ws.root()) {
+        match (tool.launch)(&resolved, ws.root(), &|| false) {
             Ok(client) => {
                 let client = Arc::new(client);
                 let (kept, duplicate) = {
@@ -456,14 +459,17 @@ impl Action {
 }
 
 /// Starts a language server for `Resolved` in the given workspace root.
-type BoxedLauncher = Box<dyn Fn(&Resolved, &Path) -> anyhow::Result<Client> + Send + Sync>;
-type Launcher = Arc<dyn Fn(&Resolved, &Path) -> anyhow::Result<Client> + Send + Sync>;
+type BoxedLauncher =
+    Box<dyn Fn(&Resolved, &Path, &dyn Fn() -> bool) -> anyhow::Result<Client> + Send + Sync>;
+type Launcher =
+    Arc<dyn Fn(&Resolved, &Path, &dyn Fn() -> bool) -> anyhow::Result<Client> + Send + Sync>;
 
 pub struct LspTool {
     servers: Servers,
     launch: Launcher,
     /// One live client per language, started on first use.
     running: Mutex<HashMap<String, Arc<Client>>>,
+    starting: Mutex<Option<Arc<AtomicBool>>>,
     actions: Mutex<HashMap<String, CachedAction>>,
     next_action: AtomicU64,
     session_id: u64,
@@ -577,8 +583,8 @@ impl LspTool {
     pub fn new(config: &LspConfig) -> Self {
         let mut tool = Self::with_launcher(
             config,
-            Box::new(|server, root| {
-                Client::spawn(
+            Box::new(|server, root, cancel| {
+                Client::spawn_cancellable(
                     &server.language,
                     &server.program,
                     &server.args,
@@ -588,6 +594,7 @@ impl LspTool {
                         settings: server.settings.clone(),
                         init_options: server.init_options.clone(),
                     },
+                    cancel,
                 )
             }),
         );
@@ -601,6 +608,7 @@ impl LspTool {
             servers: Servers::new(config),
             launch: Arc::from(launch),
             running: Mutex::new(HashMap::new()),
+            starting: Mutex::new(None),
             actions: Mutex::new(HashMap::new()),
             next_action: AtomicU64::new(1),
             session_id: NEXT_SESSION.fetch_add(1, Ordering::Relaxed),
@@ -618,7 +626,12 @@ impl LspTool {
     }
 
     /// The live client for `server`'s language, starting (or restarting a dead) one if needed.
-    fn client(&self, ctx: &ToolContext, server: &Resolved) -> Result<Arc<Client>, String> {
+    fn client(
+        &self,
+        ctx: &ToolContext,
+        server: &Resolved,
+        cancel: &AtomicBool,
+    ) -> Result<Arc<Client>, String> {
         let ws = ctx.workspace;
         let existing = lock(&self.running).get(&server.language).cloned();
         if let Some(client) = existing {
@@ -633,13 +646,30 @@ impl LspTool {
         // A formerly live server can die after needs_approval was evaluated. Gate the actual
         // lazy spawn, not just the caller's initially predicted action.
         ctx.authorize_mutation("lsp", &[], true)?;
-        let client = (self.launch)(server, ws.root()).map_err(|e| {
+        let startup_cancel = Arc::new(AtomicBool::new(false));
+        *lock(&self.starting) = Some(Arc::clone(&startup_cancel));
+        if let Err(error) = check_cancel(cancel) {
+            lock(&self.starting).take();
+            return Err(error);
+        }
+        let launched = (self.launch)(server, ws.root(), &|| {
+            startup_cancel.load(Ordering::Acquire) || cancel.load(Ordering::Acquire)
+        });
+        let mut starting = lock(&self.starting);
+        // Keep the start token registered until the client is visible to cancellation.
+        // Cancellation takes this same lock before snapshotting the running clients.
+        starting.take();
+        let client = launched.map_err(|e| {
             format!(
                 "could not start the {} language server ({}): {e:#}",
                 server.language,
                 server.program.display()
             )
         })?;
+        if startup_cancel.load(Ordering::Acquire) || cancel.load(Ordering::Acquire) {
+            client.terminate();
+            return Err("LSP startup cancelled".into());
+        }
         let client = Arc::new(client);
         lock(&self.running).insert(server.language.clone(), Arc::clone(&client));
         Ok(client)
@@ -692,7 +722,7 @@ impl LspTool {
         let mut started: Vec<(Resolved, Arc<Client>, Vec<usize>)> =
             Vec::with_capacity(resolved.len());
         for (server, indices) in resolved.into_iter().zip(routed) {
-            let client = self.client(ctx, &server)?;
+            let client = self.client(ctx, &server, cancel)?;
             started.push((server, client, indices));
         }
 
@@ -803,7 +833,13 @@ impl LspTool {
         ))
     }
 
-    fn run(&self, ctx: &ToolContext, args: &Value, cancel: &AtomicBool) -> Result<String, String> {
+    fn run(
+        &self,
+        ctx: &ToolContext,
+        args: &Value,
+        cancel: &AtomicBool,
+        effects: &mut Effects,
+    ) -> Result<String, String> {
         let ws = ctx.workspace;
         if let Some(owner) = &self.write_owner {
             bind_write_owner(ws, owner);
@@ -882,7 +918,7 @@ impl LspTool {
             action,
             Action::CodeActionResolve | Action::CodeActionApply | Action::ExecuteCommand
         ) {
-            return self.run_cached(ctx, args, &abs, language, action, cancel);
+            return self.run_cached(ctx, args, &abs, language, action, cancel, effects);
         }
         // Startup/reload can execute project code too, so own the workspace barrier before it.
         let _workspace = workspace_lock(ws, cancel)?;
@@ -906,7 +942,7 @@ impl LspTool {
             }
         }
         check_cancel(cancel)?;
-        let client = self.client(ctx, &server)?;
+        let client = self.client(ctx, &server, cancel)?;
         check_cancel(cancel)?;
         if action == Action::Reload {
             return Ok(
@@ -1104,6 +1140,7 @@ impl LspTool {
         language: &str,
         operation: Action,
         cancel: &AtomicBool,
+        effects: &mut Effects,
     ) -> Result<String, String> {
         let ws = ctx.workspace;
         let id = req_str(args, "action_id")?;
@@ -1162,7 +1199,14 @@ impl LspTool {
             lock(&self.actions).insert(id.to_owned(), cached.clone());
             let result = cached.client.request("workspace/executeCommand", json!({
                 "command": name, "arguments": arguments,
-            })).map_err(|e| format!("command may have executed before failure: {e:#}; external effects are not transactional"))?;
+            })).map_err(|e| {
+                if e.downcast_ref::<client::UnsettledRequest>().is_some() {
+                    *effects = Effects::Unknown;
+                    format!("command may have executed before failure: {e:#}; external effects are not transactional")
+                } else {
+                    format!("command failed with a terminal response: {e:#}; external effects are not transactional")
+                }
+            })?;
             return Ok(json!({"executed_command": name, "result": result,
                 "limitations": "Separate approved unsandboxed operation; direct server filesystem/process/network effects cannot be rolled back. workspace/applyEdit requests remain refused."}).to_string());
         }
@@ -1530,6 +1574,9 @@ impl Tool for LspTool {
     }
 
     fn cancel_operation(&self) {
+        if let Some(cancel) = lock(&self.starting).as_ref() {
+            cancel.store(true, Ordering::Release);
+        }
         let clients: Vec<Arc<Client>> = lock(&self.running).values().cloned().collect();
         for client in clients {
             client.cancel_pending_requests();
@@ -1541,6 +1588,7 @@ impl Tool for LspTool {
             servers: self.servers.clone(),
             launch: Arc::clone(&self.launch),
             running: Mutex::new(HashMap::new()),
+            starting: Mutex::new(None),
             actions: Mutex::new(HashMap::new()),
             next_action: AtomicU64::new(1),
             session_id: NEXT_SESSION.fetch_add(1, Ordering::Relaxed),
@@ -1553,10 +1601,7 @@ impl Tool for LspTool {
     }
 
     fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
-        match self.run(ctx, args, &AtomicBool::new(false)) {
-            Ok(text) => ToolOutput::ok(text),
-            Err(message) => ToolOutput::err(message),
-        }
+        self.call_streaming(ctx, args, &|_| {}, &AtomicBool::new(false))
     }
 
     fn call_streaming(
@@ -1566,9 +1611,11 @@ impl Tool for LspTool {
         _on_event: &(dyn Fn(ToolEvent) + Sync),
         cancel: &AtomicBool,
     ) -> ToolOutput {
-        match self.run(ctx, args, cancel) {
+        let mut effects = Effects::Known;
+        let output = match self.run(ctx, args, cancel, &mut effects) {
             Ok(text) => ToolOutput::ok(text),
             Err(message) => ToolOutput::err(message),
-        }
+        };
+        output.with_effects(effects)
     }
 }

@@ -26,7 +26,8 @@ use std::{
 };
 use tungstenite::{Message, WebSocket, client::IntoClientRequest, stream::MaybeTlsStream};
 
-type Socket = WebSocket<MaybeTlsStream<TcpStream>>;
+mod setup;
+type Socket = WebSocket<MaybeTlsStream<setup::Transport>>;
 /// Steering commands queued for one active response.
 const STEER_QUEUE: usize = 8;
 /// Longest quiet period a cached socket is trusted for. The backend evicts idle sockets without
@@ -301,9 +302,12 @@ pub(super) fn exchange(
         Some(session) => session,
         None if SSE_ONLY.lock().contains(&socket_key) => return Ok(None),
         // A failed handshake can select SSE immediately: no response data has been delivered.
-        None => match connect(endpoint, session_key, timeout) {
+        None => match connect(endpoint, session_key, timeout, &interrupt) {
             Ok(socket) => Session::new(socket),
             Err(error) => {
+                if error.downcast_ref::<Interrupted>().is_some() {
+                    return Err(error);
+                }
                 if let Some(tungstenite::Error::Http(response)) =
                     error.downcast_ref::<tungstenite::Error>()
                     && matches!(response.status().as_u16(), 200 | 404 | 405 | 426)
@@ -348,11 +352,12 @@ pub(super) fn exchange(
                 // The server continues from input this request cannot line up with: a fresh
                 // socket drops that queue and the full transcript carries the steering.
                 let _ = session.socket.close(None);
-                session = match connect(endpoint, session_key, timeout) {
+                session = match connect(endpoint, session_key, timeout, &interrupt) {
                     Ok(socket) => Session::new(socket),
-                    Err(_) => {
-                        return Ok(None);
+                    Err(error) if error.downcast_ref::<Interrupted>().is_some() => {
+                        return Err(error);
                     }
+                    Err(_) => return Ok(None),
                 };
                 outgoing = Some(body.clone());
             }
@@ -363,7 +368,6 @@ pub(super) fn exchange(
             _ => body.clone(),
         });
     }
-    set_poll_timeout(&mut session.socket);
     let (tx, rx) = std::sync::mpsc::sync_channel(STEER_QUEUE);
     LIVE.lock().insert(session_key.to_owned(), tx);
     let mut run = Run {
@@ -398,17 +402,20 @@ pub(super) fn exchange(
         for (_, _, ticket) in run.pending.drain(..) {
             let _ = ticket.send(SteerOutcome::Uncertain);
         }
-        session = match connect(endpoint, session_key, timeout) {
+        session = match connect(endpoint, session_key, timeout, &interrupt) {
             Ok(socket) => Session::new(socket),
-            Err(_) => {
+            Err(error) => {
                 LIVE.lock().remove(session_key);
                 while let Ok(command) = rx.try_recv() {
                     let _ = command.outcome.send(SteerOutcome::Rejected);
                 }
-                return Ok(None);
+                return if error.downcast_ref::<Interrupted>().is_some() {
+                    Err(error)
+                } else {
+                    Ok(None)
+                };
             }
         };
-        set_poll_timeout(&mut session.socket);
         run = Run {
             pending: VecDeque::new(),
             accepted: Vec::new(),
@@ -503,20 +510,11 @@ fn chained(body: &Value, previous: Option<&str>, input: Vec<Value>) -> Value {
     request
 }
 
-fn set_poll_timeout(socket: &mut Socket) {
+fn transport(socket: &mut Socket) -> &mut setup::Transport {
     match socket.get_mut() {
-        MaybeTlsStream::Plain(stream) => {
-            stream
-                .set_read_timeout(Some(Duration::from_millis(100)))
-                .ok();
-        }
-        MaybeTlsStream::Rustls(stream) => {
-            stream
-                .sock
-                .set_read_timeout(Some(Duration::from_millis(100)))
-                .ok();
-        }
-        _ => {}
+        MaybeTlsStream::Plain(stream) => stream,
+        MaybeTlsStream::Rustls(stream) => &mut stream.sock,
+        _ => unreachable!("connect rejects unsupported TLS transports"),
     }
 }
 
@@ -576,6 +574,38 @@ fn stream(
     rx: &Receiver<SteerCommand>,
     run: &mut Run,
     timeout: u64,
+    interrupt: &Arc<AtomicBool>,
+    on_text: &mut Option<&mut dyn FnMut(&str) -> bool>,
+    on_event: &mut dyn FnMut(&StreamEvent) -> bool,
+) -> Result<Reply> {
+    let patience = super::Patience::for_stream(timeout, false);
+    transport(socket).bind(Arc::clone(interrupt), patience.clone());
+    let result = stream_bound(
+        socket, outgoing, full, attach, rx, run, &patience, interrupt, on_text, on_event,
+    );
+    transport(socket).detach();
+    // TLS/tungstenite wrap transport errors; restore the request's typed outcome before
+    // socket-error classification can trigger replay or pin this session to SSE.
+    if result.is_err() {
+        if interrupt.load(Ordering::Relaxed) {
+            return Err(Interrupted.into());
+        }
+        if patience.remaining().is_some_and(|left| left.is_zero()) {
+            return Err(super::stream::StalledStream.into());
+        }
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stream_bound(
+    socket: &mut Socket,
+    outgoing: Option<&Value>,
+    full: &Value,
+    attach: &HashSet<String>,
+    rx: &Receiver<SteerCommand>,
+    run: &mut Run,
+    patience: &super::Patience,
     interrupt: &AtomicBool,
     on_text: &mut Option<&mut dyn FnMut(&str) -> bool>,
     on_event: &mut dyn FnMut(&StreamEvent) -> bool,
@@ -598,13 +628,15 @@ fn stream(
         })?;
     }
     let mut received = false;
-    let patience = super::Patience::for_stream(timeout, false);
     let mut acc = super::responses::Accumulator::default();
     let mut bytes = 0usize;
     let mut content_seen = false;
     loop {
         if interrupt.load(Ordering::Relaxed) {
             return Err(Interrupted.into());
+        }
+        if patience.remaining().is_some_and(|left| left.is_zero()) {
+            return Err(super::stream::StalledStream.into());
         }
         while let Ok(command) = rx.try_recv() {
             let (Some(id), Some(items)) = (
@@ -736,7 +768,10 @@ fn connect(
     endpoint: super::responses::Endpoint<'_>,
     session_id: &str,
     timeout: u64,
+    interrupt: &Arc<AtomicBool>,
 ) -> Result<Socket> {
+    let budget = setup::Budget::new(timeout, Arc::clone(interrupt));
+    budget.remaining()?;
     let mut url = url::Url::parse(endpoint.url)?;
     url.set_scheme(if url.scheme() == "https" { "wss" } else { "ws" })
         .map_err(|_| anyhow::anyhow!("invalid Codex WebSocket scheme"))?;
@@ -767,9 +802,8 @@ fn connect(
     request
         .headers_mut()
         .insert("x-client-request-id", session_id.parse()?);
-    // Connect and handshake must not block past the request timeout; tungstenite's own
-    // `connect` has neither a TCP connect nor a handshake deadline.
-    let limit = (timeout > 0).then(|| Duration::from_secs(timeout));
+    // One elapsed budget spans resolution, all TCP addresses, TLS and HTTP upgrade.
+    // System DNS and an in-flight blocking TCP connect cannot be preempted here.
     let host = url.host_str().context("Codex WebSocket URL has no host")?;
     let host = host.trim_start_matches('[').trim_end_matches(']');
     let port = url
@@ -777,11 +811,14 @@ fn connect(
         .context("Codex WebSocket URL has no port")?;
     let mut tcp = None;
     let mut last_error = None;
-    for addr in (host, port).to_socket_addrs()? {
-        let attempt = match limit {
-            Some(limit) => TcpStream::connect_timeout(&addr, limit),
+    let addresses = (host, port).to_socket_addrs();
+    budget.remaining()?;
+    for addr in addresses? {
+        let attempt = match budget.remaining()? {
+            Some(remaining) => TcpStream::connect_timeout(&addr, remaining),
             None => TcpStream::connect(addr),
         };
+        budget.remaining()?;
         match attempt {
             Ok(stream) => {
                 tcp = Some(stream);
@@ -796,16 +833,26 @@ fn connect(
         (None, None) => bail!("Codex WebSocket host resolved to no addresses"),
     };
     tcp.set_nodelay(true)?;
-    tcp.set_read_timeout(limit)?;
-    tcp.set_write_timeout(limit)?;
-    let (socket, _) = tungstenite::client_tls_with_config(request, tcp, None, None).map_err(
-        |error| match error {
-            tungstenite::handshake::HandshakeError::Failure(error) => anyhow::Error::from(error),
-            tungstenite::handshake::HandshakeError::Interrupted(_) => {
-                anyhow::anyhow!("Codex WebSocket handshake interrupted")
-            }
-        },
-    )?;
+    let tcp = setup::Transport::new(tcp, Some(budget));
+    let result = tungstenite::client_tls_with_config(request, tcp, None, None);
+    // Preserve the typed cancellation signal, not a generic handshake/SSE fallback error.
+    if interrupt.load(Ordering::Relaxed) {
+        return Err(Interrupted.into());
+    }
+    let (mut socket, _) = result.map_err(|error| match error {
+        tungstenite::handshake::HandshakeError::Failure(error) => anyhow::Error::from(error),
+        tungstenite::handshake::HandshakeError::Interrupted(_) => {
+            anyhow::anyhow!("Codex WebSocket handshake interrupted")
+        }
+    })?;
+    let tcp = match socket.get_mut() {
+        MaybeTlsStream::Plain(tcp) => tcp,
+        MaybeTlsStream::Rustls(tls) => &mut tls.sock,
+        _ => bail!("unsupported Codex WebSocket TLS transport"),
+    };
+    tcp.finish()?;
+    tcp.set_read_timeout(None)?;
+    tcp.set_write_timeout((timeout > 0).then(|| Duration::from_secs(timeout)))?;
     Ok(socket)
 }
 

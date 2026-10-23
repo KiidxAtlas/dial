@@ -176,8 +176,19 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
     )?;
     mode.merge_into_overlay(&mut table);
     let base = Config::load(&layout, Some(table.clone()))?;
-    let tool_settings =
-        dial::cli::tool_flags::apply(&cli.tool_flags, &mut table, &base.integrations, &[])?;
+    let extra_known_tools: Vec<String> = base.tools.keys().cloned().collect();
+    let apply_tools =
+        if cli.command.is_none() || matches!(cli.command, Some(Command::Rpc | Command::Acp)) {
+            dial::cli::tool_flags::apply_for_launch
+        } else {
+            dial::cli::tool_flags::apply
+        };
+    let tool_settings = apply_tools(
+        &cli.tool_flags,
+        &mut table,
+        &base.integrations,
+        &extra_known_tools,
+    )?;
     if !tool_settings.blocked.is_empty() {
         let reasons: Vec<String> = tool_settings
             .blocked
@@ -205,11 +216,13 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
         .map(|mode| mode.route);
     if matches!(cli.command, Some(Command::Rpc)) || route == Some(dial::cli::cli_modes::Route::Rpc)
     {
-        return dial::rpc::run(layout, config.for_coding());
+        mode.validate_protocol("RPC")?;
+        return dial::rpc::run_with_launch(layout, config.for_coding(), launch);
     }
     if matches!(cli.command, Some(Command::Acp)) || route == Some(dial::cli::cli_modes::Route::Acp)
     {
-        return dial::acp::run(layout, config.for_coding());
+        mode.validate_protocol("ACP")?;
+        return dial::acp::run_with_launch(layout, config.for_coding(), launch);
     }
     if let Some(Command::Benchmark {
         manifest,

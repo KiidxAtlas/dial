@@ -7,11 +7,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use serde_json::{Value, json};
 
-use crate::computer::desktop::DesktopSession;
 use crate::computer::desktop::types::DesktopSessionOptions;
+use crate::computer::desktop::{CancelReason, DesktopSession};
 use crate::computer::rpc::{ComputerError, ComputerResult, desktop_error, dispatch};
 
 const MAX_FRAME: usize = crate::runtime::json_transport::MAX_FRAME;
@@ -121,6 +121,50 @@ struct State {
 
 struct Inner {
     state: Mutex<State>,
+    /// One run at a time owns the shared worker and native session. Cleanup of
+    /// run N (retire/cancel) must finish before run N+1 is admitted, or it would
+    /// invalidate the next run's native work.
+    gate: Mutex<bool>,
+    gate_wake: Condvar,
+}
+
+/// Held for the whole run, including its native-session cleanup.
+struct RunGate(Arc<Inner>);
+
+impl Drop for RunGate {
+    fn drop(&mut self) {
+        *self.0.gate.lock() = false;
+        self.0.gate_wake.notify_one();
+    }
+}
+
+/// Waits for the previous run while staying responsive to abort, close and the
+/// request's own timeout. A run that never holds the gate never touches the
+/// shared session.
+fn acquire_gate(
+    inner: &Arc<Inner>,
+    signal: &AbortSignal,
+    deadline: Instant,
+) -> ComputerResult<RunGate> {
+    let mut busy = inner.gate.lock();
+    loop {
+        if signal.is_aborted() {
+            return Err(ComputerError::abort(ABORTED));
+        }
+        if inner.state.lock().status == Status::Closed {
+            return Err(closed_error());
+        }
+        if Instant::now() >= deadline {
+            return Err(ComputerError::tool(
+                "Computer is busy with another run; timed out waiting for it to finish",
+            ));
+        }
+        if !*busy {
+            *busy = true;
+            return Ok(RunGate(Arc::clone(inner)));
+        }
+        inner.gate_wake.wait_for(&mut busy, POLL);
+    }
 }
 
 impl Drop for Inner {
@@ -153,6 +197,8 @@ impl ComputerSupervisor {
                     next_id: 0,
                     next_gen: 0,
                 }),
+                gate: Mutex::new(false),
+                gate_wake: Condvar::new(),
             }),
         }
     }
@@ -164,6 +210,14 @@ impl ComputerSupervisor {
         signal: &AbortSignal,
     ) -> ComputerResult<Value> {
         let inner = &self.inner;
+        if signal.is_aborted() {
+            return Err(ComputerError::abort(ABORTED));
+        }
+        let _gate = acquire_gate(
+            inner,
+            signal,
+            Instant::now() + Duration::from_millis(request.timeout_ms),
+        )?;
         if signal.is_aborted() {
             return Err(ComputerError::abort(ABORTED));
         }
@@ -253,8 +307,10 @@ impl ComputerSupervisor {
         if let Some(session) = session {
             if result.is_ok() && !aborted {
                 session.retire();
+            } else if aborted {
+                session.cancel_for(CancelReason::RunAborted);
             } else {
-                session.cancel();
+                session.cancel_for(CancelReason::RunFailed);
             }
         }
         result
@@ -349,7 +405,7 @@ impl ComputerSupervisor {
         }
 
         if let Some(session) = session {
-            session.cancel();
+            session.cancel_for(CancelReason::SessionClosed);
             let (tx, rx) = flume::bounded(1);
             let closing = Arc::clone(&session);
             std::thread::spawn(move || {
@@ -811,18 +867,28 @@ fn spawn_native(inner: &Arc<Inner>, generation: u64, message: &Value) {
         let Some(worker) = st.worker.as_ref().filter(|w| w.generation == generation) else {
             return;
         };
-        (st.session.clone(), worker.stopped.clone())
+        (
+            st.session.as_ref().map(|session| session.admit()),
+            worker.stopped.clone(),
+        )
     };
+    // These boundaries only invalidate tokens/revoke control; they never wait
+    // for the native worker. Apply them in protocol order before admitting the
+    // next request, while slow native operations remain independently threaded.
+    let boundary = matches!(method.as_str(), "retire" | "cancel" | "releaseControl");
+    let boundary_result = boundary.then(|| match session.as_ref() {
+        Some(session) => dispatch(session, &method, args.clone()),
+        None => Err(ComputerError::tool(NO_SESSION)),
+    });
     let inner = Arc::clone(inner);
     std::thread::spawn(move || {
         if stopped.is_aborted() {
             return;
         }
-        let result = match session {
-            // Cancelling the captured session stops operations already in flight.
+        let result = boundary_result.unwrap_or_else(|| match session {
             Some(session) => dispatch(&session, &method, args),
             None => Err(ComputerError::tool(NO_SESSION)),
-        };
+        });
         let reply = match result {
             Ok(value) => json!({"type": "native-result", "id": id, "ok": true, "value": value}),
             Err(error) => json!({
@@ -1001,7 +1067,7 @@ fn cancel_run(inner: &Arc<Inner>, id: u64) {
         guard.session.clone()
     };
     if let Some(session) = session {
-        session.cancel();
+        session.cancel_for(CancelReason::RunAborted);
     }
 }
 
@@ -1034,7 +1100,7 @@ fn terminate_inner(inner: &Arc<Inner>, error: ComputerError, only_gen: Option<u6
         let _ = run.reply.send(Err(error.clone()));
     }
     if let Some(session) = session {
-        session.cancel();
+        session.cancel_for(CancelReason::WorkerTerminated);
     }
     if let Some(worker) = worker {
         worker.stop();

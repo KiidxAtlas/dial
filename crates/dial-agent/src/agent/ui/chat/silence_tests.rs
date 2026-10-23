@@ -20,3 +20,27 @@ fn provider_backoff_is_not_a_silent_stall() {
         Duration::from_secs(119)
     ));
 }
+
+#[test]
+fn telemetry_requires_advancing_phase_or_token_counts() {
+    let mut watch = TelemetryProgress::default();
+    let mut value = llm::ModelProgress::new(llm::InferencePhase::Generating);
+    value.output_tokens = Some(3);
+    assert!(watch.observe(&value));
+    assert!(!watch.observe(&value));
+    value.tokens_per_second = Some(0.5);
+    value.eta_secs = Some(12.0);
+    assert!(!watch.observe(&value));
+    value.output_tokens = None;
+    assert!(!watch.observe(&value));
+    value.output_tokens = Some(2);
+    assert!(!watch.observe(&value));
+    value.output_tokens = Some(4);
+    assert!(watch.observe(&value));
+    value.phase = llm::InferencePhase::Processing;
+    assert!(!watch.observe(&value));
+    value.phase = llm::InferencePhase::Generating;
+    assert!(!watch.observe(&value));
+    // A new attempt owns fresh marks, so its first report is progress again.
+    assert!(TelemetryProgress::default().observe(&value));
+}

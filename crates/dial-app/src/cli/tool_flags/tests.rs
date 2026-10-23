@@ -78,6 +78,92 @@ fn tools_flag_sets_harness_allowlist_and_integrations() {
 }
 
 #[test]
+fn configured_custom_tools_are_accepted_without_executing_the_program() {
+    let config: crate::config::types::Config = toml::from_str(
+        r#"
+        [tools.LocalCheck]
+        program = "/not/a/real/program"
+        "#,
+    )
+    .unwrap();
+    let extra: Vec<String> = config.tools.keys().cloned().collect();
+    let args = ToolFlagArgs {
+        tools: Some("READ,LocalCheck,LocalCheck".into()),
+        ..Default::default()
+    };
+    let mut overlay = toml::Table::new();
+    let out = apply(&args, &mut overlay, &config.integrations, &extra).unwrap();
+    assert_eq!(out.tools, Some(vec!["read".into(), "LocalCheck".into()]));
+    assert_eq!(overlay["harness"]["tools"][1].as_str(), Some("LocalCheck"));
+
+    let invalid = ToolFlagArgs {
+        tools: Some("LocalCheck,localcheck,not_configured".into()),
+        ..Default::default()
+    };
+    let mut untouched = toml::Table::new();
+    let error = apply(&invalid, &mut untouched, &config.integrations, &extra)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("localcheck, not_configured"), "{error}");
+    assert!(untouched.is_empty());
+}
+
+#[test]
+fn dynamic_tools_require_exact_discovered_names_not_server_prefixes() {
+    let discovered = vec!["mcp__demo__FetchItem".into(), "extension_lookup".into()];
+    let args = ToolFlagArgs {
+        tools: Some("mcp__demo__FetchItem,extension_lookup".into()),
+        ..Default::default()
+    };
+    let out = apply(&args, &mut toml::Table::new(), &[], &discovered).unwrap();
+    assert_eq!(out.tools, Some(discovered.clone()));
+
+    for name in [
+        "mcp__demo__invented",
+        "mcp__other__FetchItem",
+        "extension_invented",
+    ] {
+        let invalid = ToolFlagArgs {
+            tools: Some(name.into()),
+            ..Default::default()
+        };
+        assert!(apply(&invalid, &mut toml::Table::new(), &[], &discovered).is_err());
+    }
+    // A syntactically plausible name without discovery is not proof of registration.
+    assert!(apply(&args, &mut toml::Table::new(), &[], &[]).is_err());
+}
+
+#[test]
+fn launch_defers_only_api_valid_unknown_identifiers() {
+    let args = ToolFlagArgs {
+        tools: Some("READ,mcp__demo__FetchItem,extension_lookup".into()),
+        ..Default::default()
+    };
+    let out = apply_for_launch(&args, &mut toml::Table::new(), &[], &[]).unwrap();
+    assert_eq!(
+        out.deferred_tools,
+        vec!["mcp__demo__FetchItem", "extension_lookup"]
+    );
+    assert_eq!(out.tools.unwrap()[0], "read");
+    for name in ["bad.name".to_owned(), "x".repeat(65)] {
+        let invalid = ToolFlagArgs {
+            tools: Some(name),
+            ..Default::default()
+        };
+        let mut overlay = toml::Table::new();
+        assert!(apply_for_launch(&invalid, &mut overlay, &[], &[]).is_err());
+        assert!(overlay.is_empty());
+    }
+    let disabled = ToolFlagArgs {
+        no_tools: true,
+        ..Default::default()
+    };
+    let out = apply_for_launch(&disabled, &mut toml::Table::new(), &[], &[]).unwrap();
+    assert_eq!(out.tools, Some(vec![]));
+    assert!(out.deferred_tools.is_empty());
+}
+
+#[test]
 fn no_tools_alone_empties_allowlist() {
     let args = ToolFlagArgs {
         no_tools: true,

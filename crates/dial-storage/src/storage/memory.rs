@@ -297,6 +297,8 @@ pub(crate) fn redact_spans(text: &str) -> String {
     let mut cursor = 0;
     for (begin, end) in spans {
         if begin < cursor {
+            // Overlapping spans merge: a later span may reach past the one already redacted.
+            cursor = cursor.max(end);
             continue;
         }
         output.push_str(&text[cursor..begin]);

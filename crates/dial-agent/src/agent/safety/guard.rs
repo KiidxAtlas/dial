@@ -719,6 +719,8 @@ pub enum LengthAction {
         partial: Option<String>,
         message: String,
     },
+    /// Recovery made no progress within its own bound, independent of the tool-step budget.
+    Incomplete(String),
 }
 
 /// Double the output budget, bounded by what the context window can still spare for the answer.
@@ -742,9 +744,8 @@ pub fn recover_from_length(
     if let Some(max_tokens) = larger_budget(current, window, prompt_tokens) {
         return LengthAction::Retry { max_tokens };
     }
-    // Past the nudge limit the nudge gets stronger instead of ending the turn. Nudged replies are
-    // refunded only a bounded number of times per turn (`StepBudget::FREE_RETRIES`); after that each
-    // one is charged to `harness.max_steps`, which remains the bound on this loop.
+    // The shared engine bounds nonproductive nudges independently of the productive step budget.
+    // Useful partial answers can continue without imposing a total work limit.
     let escalated = nudges >= MAX_LENGTH_NUDGES;
     let nudge = |partial: Option<String>, text: &str| LengthAction::Nudge {
         partial,

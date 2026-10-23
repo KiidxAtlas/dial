@@ -29,6 +29,7 @@ use std::{
 
 pub use applications::{Application, ApplicationOpenOptions, ApplicationQuery};
 use backend::{Backend, DeliveryMode, Modifiers, MouseButton, PointerEvent};
+pub(crate) use control::CancelReason;
 use control::{CancellationSource, InputLease, OperationToken};
 use error::CoreResult;
 pub use error::DesktopError;
@@ -47,6 +48,8 @@ enum Response {
     Capabilities(DesktopCapabilities),
     Displays(Vec<DesktopDisplay>),
     Windows(Vec<DesktopWindow>),
+    Window(DesktopWindow),
+    WindowSnapshot(DesktopWindowSnapshot),
     Capture(DesktopCapture),
     Observation(DesktopObservation),
     Applications(Vec<Application>),
@@ -74,6 +77,13 @@ enum Request {
         reply: Reply,
     },
     ListWindows {
+        reply: Reply,
+    },
+    GetWindow {
+        id: String,
+        reply: Reply,
+    },
+    ListWindowSnapshot {
         reply: Reply,
     },
     Capture {
@@ -243,6 +253,8 @@ impl Request {
             Self::Capabilities { reply }
             | Self::ListDisplays { reply }
             | Self::ListWindows { reply }
+            | Self::GetWindow { reply, .. }
+            | Self::ListWindowSnapshot { reply }
             | Self::Capture { reply, .. }
             | Self::CaptureRegion { reply, .. }
             | Self::Observe { reply, .. }
@@ -378,15 +390,11 @@ impl Worker {
     }
 
     fn window(&mut self, target: &Target) -> CoreResult<DesktopWindow> {
-        let windows = self.backend()?.windows()?;
         match target {
-            Target::Window(id) => windows
-                .into_iter()
-                .find(|window| window.id == *id)
-                .ok_or_else(|| {
-                    DesktopError::window_not_found(format!("window '{id}' was not found"))
-                }),
-            Target::Desktop | Target::Display(_) => windows
+            Target::Window(id) => self.backend()?.window(id),
+            Target::Desktop | Target::Display(_) => self
+                .backend()?
+                .windows()?
                 .into_iter()
                 .find(|window| window.focused)
                 .ok_or_else(|| DesktopError::window_not_found("no focused window was found")),
@@ -585,6 +593,10 @@ impl Worker {
             .then(|| InputLease::acquire(token))
             .transpose()?;
         token.check()?;
+        if request.is_mutation() {
+            // From here native input/focus may change, even if it later fails.
+            token.mark_mutation_started();
+        }
         // A full capture replaces coordinates only if it completes in its
         // original generation. Keep the previous frame by move, not by
         // cloning an atlas.
@@ -622,6 +634,10 @@ impl Worker {
             }
             Request::ListDisplays { .. } => Ok(Response::Displays(self.backend()?.displays()?)),
             Request::ListWindows { .. } => Ok(Response::Windows(self.backend()?.windows()?)),
+            Request::GetWindow { id, .. } => Ok(Response::Window(self.backend()?.window(id)?)),
+            Request::ListWindowSnapshot { .. } => {
+                Ok(Response::WindowSnapshot(self.backend()?.window_snapshot()?))
+            }
             Request::Capture { target, caps, .. } => {
                 Ok(Response::Capture(self.capture_full(target, caps, token)?))
             }
@@ -1140,7 +1156,8 @@ impl SessionCore {
             .map_err(|_| DesktopError::internal("native desktop worker stopped unexpectedly"))
             .and_then(|()| {
                 rxr.recv_timeout(OPERATION_TIMEOUT).map_err(|e| {
-                    self.cancellation.cancel();
+                    self.cancellation
+                        .cancel_with(CancelReason::OperationTimeout);
                     DesktopError::timeout(format!("native desktop operation did not complete: {e}"))
                 })
             });
@@ -1149,7 +1166,7 @@ impl SessionCore {
     }
 
     fn close(&self) -> CoreResult<()> {
-        self.cancellation.cancel();
+        self.cancellation.cancel_with(CancelReason::SessionClosed);
         // The waits below can each block for `CLOSE_TIMEOUT`, and every other
         // caller needs this lock to observe `closed`, so take the handles out
         // and wait without holding it.
@@ -1186,7 +1203,7 @@ impl SessionCore {
 
 impl Drop for SessionCore {
     fn drop(&mut self) {
-        self.cancellation.cancel();
+        self.cancellation.cancel_with(CancelReason::SessionDropped);
         let lifecycle = self.lifecycle.get_mut();
         if let Some(tx) = lifecycle.tx.take() {
             let (reply, _) = flume::bounded(1);
@@ -1218,13 +1235,19 @@ fn unexpected<T>() -> CoreResult<T> {
 /// work and stops the worker.
 pub struct DesktopSession {
     core: Arc<SessionCore>,
+    /// Admission-time token for a native RPC; only the owning handle cancels on drop.
+    admitted: Option<OperationToken>,
 }
 
 impl Drop for DesktopSession {
     fn drop(&mut self) {
         // A running call can retain SessionCore after the session handle dies.
         // Cancel that work now rather than waiting for the last Arc to disappear.
-        self.core.cancellation.cancel();
+        if self.admitted.is_none() {
+            self.core
+                .cancellation
+                .cancel_with(CancelReason::SessionDropped);
+        }
     }
 }
 
@@ -1232,6 +1255,7 @@ impl DesktopSession {
     pub fn new(options: Option<DesktopSessionOptions>) -> CoreResult<Self> {
         Ok(Self {
             core: SessionCore::new(DisplaySelector::parse(options.and_then(|o| o.display))),
+            admitted: None,
         })
     }
 
@@ -1252,8 +1276,27 @@ impl DesktopSession {
         }
     }
 
+    /// Bind delayed RPC execution to the generation that admitted it, rather
+    /// than whichever generation happens to be current when its thread runs.
+    pub(crate) fn admit(&self) -> Self {
+        Self {
+            core: Arc::clone(&self.core),
+            admitted: Some(self.operation_token()),
+        }
+    }
+
+    fn operation_token(&self) -> OperationToken {
+        self.admitted
+            .clone()
+            .unwrap_or_else(|| self.core.cancellation.token())
+    }
+
+    pub(crate) fn check_admission(&self) -> CoreResult<()> {
+        self.operation_token().check()
+    }
+
     fn run(&self, make: impl FnOnce(Reply) -> Request) -> CoreResult<Response> {
-        self.core.call(self.core.cancellation.token(), make)
+        self.core.call(self.operation_token(), make)
     }
 
     fn unit(&self, make: impl FnOnce(Reply) -> Request) -> CoreResult<()> {
@@ -1284,6 +1327,23 @@ impl DesktopSession {
     pub fn list_windows(&self) -> CoreResult<Vec<DesktopWindow>> {
         match self.run(|reply| Request::ListWindows { reply })? {
             Response::Windows(v) => Ok(v),
+            _ => unexpected(),
+        }
+    }
+
+    pub fn window(&self, id: &str) -> CoreResult<DesktopWindow> {
+        match self.run(|reply| Request::GetWindow {
+            id: id.to_owned(),
+            reply,
+        })? {
+            Response::Window(window) => Ok(window),
+            _ => unexpected(),
+        }
+    }
+
+    pub fn window_snapshot(&self) -> CoreResult<DesktopWindowSnapshot> {
+        match self.run(|reply| Request::ListWindowSnapshot { reply })? {
+            Response::WindowSnapshot(snapshot) => Ok(snapshot),
             _ => unexpected(),
         }
     }
@@ -1413,7 +1473,7 @@ impl DesktopSession {
     /// calling this method.
     pub fn acquire_control(&self) -> CoreResult<DesktopControlState> {
         let c = Arc::clone(&self.core);
-        let token = c.cancellation.token();
+        let token = self.operation_token();
         token.check()?;
         if c.lifecycle.lock().closed {
             return Err(DesktopError::closed());
@@ -1436,6 +1496,11 @@ impl DesktopSession {
         DesktopControlState {
             active: self.core.cancellation.control_active(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn token_for_test(&self) -> OperationToken {
+        self.core.cancellation.token()
     }
 
     /// Retire queued work from a completed helper without revoking task control.
@@ -1676,11 +1741,17 @@ impl DesktopSession {
     /// Immediately cancel operations submitted before this call. Later
     /// operations may proceed.
     pub fn cancel(&self) {
-        self.core.cancellation.cancel();
+        self.cancel_for(CancelReason::Cancelled);
+    }
+
+    /// Like [`Self::cancel`], recording who ended the work so cancelled
+    /// operations can report it.
+    pub(crate) fn cancel_for(&self, reason: CancelReason) {
+        self.core.cancellation.cancel_with(reason);
     }
 
     pub fn close(&self) -> CoreResult<()> {
-        self.cancel();
+        self.cancel_for(CancelReason::SessionClosed);
         self.core.close()
     }
 }

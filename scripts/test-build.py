@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -194,6 +195,70 @@ class InstallDevTests(unittest.TestCase):
         with self.assertRaisesRegex(self.module.InstallError, "does not match the build"):
             self.module.install(self.build, self.destinations, "20250101-000000", replace=corrupting_replace)
         self.assertEqual(self.bin.read_bytes(), b"old bin")
+        self.assertEqual(self.install.read_bytes(), b"old install")
+        self.assertEqual(self.cargo.read_bytes(), b"old cargo")
+
+    def test_post_install_verification_exception_restores_every_location(self):
+        compare = self.module.filecmp.cmp
+
+        def failing_compare(source, destination, **kwargs):
+            if source == self.build and destination == self.install:
+                raise OSError("injected verification read failure")
+            return compare(source, destination, **kwargs)
+
+        with mock.patch.object(self.module.filecmp, "cmp", side_effect=failing_compare):
+            with self.assertRaisesRegex(self.module.InstallError, "verifying .*injected verification read failure") as raised:
+                self.module.install(self.build, self.destinations, "20250101-000000")
+        self.assertIsInstance(raised.exception.__cause__, OSError)
+        self.assertIn("previous binaries restored", str(raised.exception))
+        self.assertEqual(self.bin.read_bytes(), b"old bin")
+        self.assertEqual(self.install.read_bytes(), b"old install")
+        self.assertEqual(self.cargo.read_bytes(), b"old cargo")
+
+    def test_post_install_failure_removes_new_destinations(self):
+        compare = self.module.filecmp.cmp
+        for failure in (False, OSError("injected verification failure")):
+            with self.subTest(failure=failure):
+                self.install.unlink(missing_ok=True)
+
+                def failing_compare(source, destination, **kwargs):
+                    if source == self.build and destination == self.cargo:
+                        if isinstance(failure, OSError):
+                            raise failure
+                        return failure
+                    return compare(source, destination, **kwargs)
+
+                with mock.patch.object(self.module.filecmp, "cmp", side_effect=failing_compare):
+                    with self.assertRaises(self.module.InstallError):
+                        self.module.install(self.build, self.destinations, "20250101-000000")
+                self.assertFalse(self.install.exists())
+                self.assertEqual(self.bin.read_bytes(), b"old bin")
+                self.assertEqual(self.cargo.read_bytes(), b"old cargo")
+
+    def test_verification_and_restoration_errors_are_both_reported(self):
+        compare = self.module.filecmp.cmp
+        replace = os.replace
+
+        def failing_compare(source, destination, **kwargs):
+            if source == self.build:
+                raise OSError("injected verification failure")
+            return compare(source, destination, **kwargs)
+
+        def failing_restore(source, destination):
+            if destination == self.bin and ".bak-" in source.name:
+                raise OSError("injected restoration failure")
+            return replace(source, destination)
+
+        with mock.patch.object(self.module.filecmp, "cmp", side_effect=failing_compare), \
+                mock.patch.object(self.module.os, "replace", side_effect=failing_restore):
+            with self.assertRaises(self.module.InstallError) as raised:
+                self.module.install(self.build, self.destinations, "20250101-000000", replace=replace)
+        message = str(raised.exception)
+        self.assertIn("injected verification failure", message)
+        self.assertIn(f"{self.bin}: injected restoration failure", message)
+        self.assertNotIn("previous binaries restored", message)
+        self.assertEqual(self.bin.read_bytes(), BINARY)
+        self.assertEqual(self.bin.with_name("dial.bak-20250101-000000").read_bytes(), b"old bin")
         self.assertEqual(self.install.read_bytes(), b"old install")
         self.assertEqual(self.cargo.read_bytes(), b"old cargo")
 
