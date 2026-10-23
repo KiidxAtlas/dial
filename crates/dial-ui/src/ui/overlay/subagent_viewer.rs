@@ -672,7 +672,12 @@ impl SubagentViewer {
             .conversation
             .transcript
             .document(width, &transcript_ctx);
-        rows.extend(self.conversation.streaming.document(width, &transcript_ctx).0);
+        rows.extend(
+            self.conversation
+                .streaming
+                .document(width, &transcript_ctx)
+                .0,
+        );
         self.cache = Some(Cache { key, rows, anchors });
     }
 
