@@ -53,6 +53,19 @@ fn secret_named_environment_values_are_replaced_literally() {
 }
 
 #[test]
+fn multiline_environment_secrets_are_replaced_as_whole_values() {
+    let secret = "literal secret spans\nmultiple lines of prose";
+    let env = env_secrets([
+        ("AUTH_TOKEN".to_owned(), secret.to_owned()),
+        ("EMPTY_SECRET".to_owned(), "         \n".to_owned()),
+    ]);
+    assert_eq!(env, vec![secret.to_owned()]);
+    let (out, count) = redact_with(&format!("Before\n{secret}\nAfter"), &env);
+    assert_eq!(count, 1);
+    assert_eq!(out.unwrap(), "Before\n[REDACTED:EnvSecret]\nAfter");
+}
+
+#[test]
 fn json_values_are_walked_and_counted() {
     let gh = format!("github_pat_{}", "x".repeat(40));
     let mut value = serde_json::json!({"a":[gh.clone(), {"b": format!("say {gh}")}], "n": 3});
