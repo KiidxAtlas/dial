@@ -235,7 +235,9 @@ fn silent_tls_handshake_can_be_cancelled() {
     let (cancelled_tx, cancelled_rx) = std::sync::mpsc::channel();
     let server = std::thread::spawn(move || {
         let (mut tcp, _) = listener.accept().unwrap();
-        tcp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        // Native certificate loading happens before ClientHello and can be slow
+        // on a cold macOS keychain; the cancellation bound is measured separately.
+        tcp.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
         let mut buf = [0; 4096];
         assert!(tcp.read(&mut buf).unwrap() > 0); // TLS ClientHello, no server TLS reply.
         cancelled_tx.send(Instant::now()).unwrap();
@@ -286,7 +288,10 @@ fn streaming_loopback(
         MaybeTlsStream::Plain(setup::Transport::new(tcp, None)),
     )
     .unwrap();
-    let _limit = super::super::cancel::TestIdleLimitScope::enter(Some(Duration::from_millis(250)));
+    // Cancellation and idle expiry are separate contracts. A loaded runner can
+    // delay the server's cancellation past the short idle-test deadline.
+    let idle_limit = (!cancel).then_some(Duration::from_millis(250));
+    let _limit = super::super::cancel::TestIdleLimitScope::enter(idle_limit);
     let body = json!({"model":"m","input":[user("hello")]});
     let (_tx, rx) = std::sync::mpsc::sync_channel(STEER_QUEUE);
     let mut run = Run {
