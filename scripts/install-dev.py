@@ -113,11 +113,15 @@ def install(build, destinations, stamp, replace=os.replace):
         detail = "; ".join(failures) or "previous binaries restored"
         raise InstallError(f"activating {current} failed ({error}); {detail}") from error
 
-    for dest in destinations:
-        if not filecmp.cmp(build, dest, shallow=False):
-            failures = restore(destinations, backups)
-            detail = "; ".join(failures) or "previous binaries restored"
-            raise InstallError(f"{dest} does not match the build after install; {detail}")
+    try:
+        for dest in destinations:
+            current = dest
+            if not filecmp.cmp(build, dest, shallow=False):
+                raise OSError("does not match the build after install")
+    except OSError as error:
+        failures = restore(activated, backups)
+        detail = "; ".join(failures) or "previous binaries restored"
+        raise InstallError(f"verifying {current} failed ({error}); {detail}") from error
     return backups
 
 

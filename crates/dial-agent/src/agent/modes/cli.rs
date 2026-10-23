@@ -19,6 +19,8 @@ const FINISH: &str = "finish";
 pub struct Launch {
     /// `--tools`: hard allowlist of tool names. `None` leaves tools unrestricted.
     pub tools: Option<BTreeSet<String>>,
+    /// Candidate provider names to validate against the actual startup registry.
+    pub deferred_tools: BTreeSet<String>,
     /// `--skills` / `--no-skills`: visible skill names. `None` leaves skills unrestricted;
     /// `Some(empty)` withholds the catalog and the skill tools.
     pub skills: Option<BTreeSet<String>>,
@@ -84,6 +86,17 @@ impl Agent<'_> {
     /// before the next model request. Explicit prompt text replaces the discovered
     /// override; an absent value keeps whatever discovery found.
     pub fn set_launch(&mut self, launch: Launch) -> Result<()> {
+        let unknown: Vec<&str> = launch
+            .deferred_tools
+            .iter()
+            .filter(|name| !self.ext.contains(name) && !self.config.tools.contains_key(*name))
+            .map(String::as_str)
+            .collect();
+        anyhow::ensure!(
+            unknown.is_empty(),
+            "unknown tool(s) for --tools after provider registration: {}",
+            unknown.join(", ")
+        );
         if let Some(text) = &launch.system_prompt {
             self.parts.overrides.0 = Some(text.clone());
         }

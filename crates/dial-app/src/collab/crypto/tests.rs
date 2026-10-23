@@ -78,11 +78,14 @@ fn sender_windows_reject_old_epoch_replays_after_newer_epoch() {
 #[test]
 fn identical_ciphertext_replay_is_caught_by_sequence_not_iv() {
     let key = RoomKey::new(&[4u8; 32]).unwrap();
-    let sealed = key.seal(br#"{"t":"prompt","seq":9}"#).unwrap();
+    let sealed = key.seal(br#"{"t":"prompt","transportSeq":9}"#).unwrap();
     let mut windows = SenderWindows::default();
     assert!(windows.accept("sender", 9));
     // The relay can redeliver the same ciphertext; decryption still succeeds, so the
     // sequence check is what rejects it.
-    assert_eq!(key.open(&sealed).unwrap(), br#"{"t":"prompt","seq":9}"#);
+    assert_eq!(
+        key.open(&sealed).unwrap(),
+        br#"{"t":"prompt","transportSeq":9}"#
+    );
     assert!(!windows.accept("sender", 9));
 }

@@ -103,3 +103,107 @@ fn scan_ignores_unrelated_files() {
     fs::write(parent.join("bad.jsonl"), "not json\n").unwrap();
     assert!(scan(&layout, "s").is_empty());
 }
+
+#[test]
+fn pending_prose_redacts_split_credentials_only_at_whole_value_boundaries() {
+    const CHILD: &str = "DIAL_PENDING_REDACTION_TEST_CHILD";
+    const ENV_SECRET: &str = "literal secret spans\nmultiple lines of prose";
+    if std::env::var_os(CHILD).is_none() {
+        // Secret collection reads the process environment. Use an isolated test
+        // process rather than mutating global environment under parallel tests.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("pending_prose_redacts_split_credentials_only_at_whole_value_boundaries")
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .env("DIAL_TEST_AUTH_TOKEN", ENV_SECRET)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let sink = ChildTranscript::create(&layout(dir.path()), "s", "redaction", json!({})).unwrap();
+    let path = sink.path.clone();
+    let initial = fs::read(&path).unwrap();
+    let vendor = format!("sk-ant-{}", "a1".repeat(24));
+    let pem = "-----BEGIN PRIVATE KEY-----\nSENSITIVEPEMPAYLOAD\nSECONDPEMLINE\n-----END PRIVATE KEY-----";
+    let text = format!("Public update. {vendor}\n{pem}\n{ENV_SECRET}\nDone.");
+    for chunk in text.as_bytes().chunks(7) {
+        sink.assistant_stream(Some(std::str::from_utf8(chunk).unwrap()))
+            .unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            initial,
+            "no provisional fragments ever reach disk"
+        );
+    }
+    let (revision, snapshot) = pending_assistant(&path, 0).unwrap();
+    assert!(snapshot.contains("Public update."));
+    for secret in [
+        &vendor[..],
+        "SENSITIVEPEMPAYLOAD",
+        "SECONDPEMLINE",
+        ENV_SECRET,
+    ] {
+        assert!(!snapshot.contains(secret), "{snapshot}");
+    }
+    assert!(
+        pending_assistant(&path, revision).is_none(),
+        "unchanged revisions avoid copying/redacting"
+    );
+    sink.finish(json!({"status":"cancelled"})).unwrap();
+    let durable = fs::read_to_string(&path).unwrap();
+    for secret in [
+        &vendor[..],
+        "a1a1a1a1",
+        "SENSITIVEPEMPAYLOAD",
+        "SECONDPEMLINE",
+        "literal secret spans",
+    ] {
+        assert!(!durable.contains(secret), "{durable}");
+    }
+    assert_eq!(messages(&path).unwrap().len(), 1);
+    assert_eq!(pending_assistant(&path, 0).unwrap().1, "");
+    drop(sink);
+    assert!(
+        pending_assistant(&path, 0).is_none(),
+        "drop removes registry entries"
+    );
+}
+
+#[test]
+fn pending_prose_is_bounded_discardable_and_recovers_on_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let sink = ChildTranscript::create(&layout(dir.path()), "s", "bounded", json!({})).unwrap();
+    let path = sink.path.clone();
+    sink.assistant_stream(Some(&"x".repeat(MAX_RECORD)))
+        .unwrap();
+    assert_eq!(sink.pending.lock().unwrap().text.len(), MAX_RECORD);
+    sink.assistant_stream(Some("overflow")).unwrap();
+    for _ in 0..10 {
+        sink.assistant_stream(Some(&"y".repeat(MAX_RECORD)))
+            .unwrap();
+    }
+    assert!(sink.pending.lock().unwrap().text.len() < MAX_RECORD);
+    assert!(pending_assistant(&path, 0).unwrap().1.contains("truncated"));
+    sink.assistant_stream(None).unwrap();
+    sink.assistant_stream(Some("Discarded attempt")).unwrap();
+    sink.assistant_stream(None).unwrap();
+    sink.assistant_stream(Some("Partial response retained on drop"))
+        .unwrap();
+    drop(sink);
+    let loaded = messages(&path).unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0]["content"], "Partial response retained on drop");
+    assert!(
+        !fs::read_to_string(&path)
+            .unwrap()
+            .contains("Discarded attempt")
+    );
+    assert!(pending_assistant(&path, 0).is_none());
+}

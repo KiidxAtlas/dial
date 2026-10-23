@@ -524,7 +524,9 @@ fn read_request_limit_with<R: BufRead>(
             .map_or(buffer.len(), |at| at + 1);
         let ended = buffer[used - 1] == b'\n';
         if !oversized {
-            if bytes.len().saturating_add(used) > limit + 1 {
+            // Only a real line terminator is exempt from the payload limit. Reserving an
+            // unconditional extra byte also accepts oversized requests ending at EOF.
+            if bytes.len().saturating_add(used - usize::from(ended)) > limit {
                 oversized = true;
                 bytes.clear();
             } else {
@@ -599,6 +601,7 @@ fn stop_owned_tasks(agent: &mut Agent<'_>, ui: &mut RpcUi) {
 struct QueryProjection {
     state: Value,
     messages: Value,
+    cursor: crate::storage::session::MessageCursor,
 }
 
 impl Default for QueryProjection {
@@ -606,6 +609,7 @@ impl Default for QueryProjection {
         Self {
             state: Value::Null,
             messages: json!([]),
+            cursor: Default::default(),
         }
     }
 }
@@ -620,11 +624,26 @@ fn state_projection(agent: &Agent<'_>) -> Value {
         "metrics":agent.metrics(),"efficiency":agent.efficiency_report(),"speculation":agent.speculation_stats(),"tree":agent.session().execution_tree()})
 }
 
-fn query_snapshot(agent: &Agent<'_>) -> QueryProjection {
-    QueryProjection {
-        state: state_projection(agent),
-        messages: json!(agent.session().messages()),
+fn query_snapshot(agent: &Agent<'_>, projection: &mut QueryProjection) {
+    projection.state = state_projection(agent);
+    refresh_messages(agent.session(), projection);
+}
+
+fn refresh_messages(session: &Session, projection: &mut QueryProjection) {
+    let delta = session.message_delta(&mut projection.cursor, false);
+    let messages = projection
+        .messages
+        .as_array_mut()
+        .expect("message projection is an array");
+    if delta.reset {
+        messages.clear();
     }
+    messages.extend(
+        delta
+            .messages
+            .into_iter()
+            .map(|message| message.into_owned()),
+    );
 }
 
 /// Reply to a `state` query: the cached projection plus the live busy flag. Never includes messages.
@@ -723,12 +742,29 @@ fn speak_reply(live: &Mutex<LiveState>, out: &Sender, text: &str) {
 
 /// Run a persistent agent. Control requests received during inference can abort, steer or approve.
 pub fn run(layout: Layout, config: Config) -> Result<()> {
-    run_control(layout, config, false)
+    run_with_launch(layout, config, crate::agent::modes::Launch::default())
 }
-pub(crate) fn run_acp(layout: Layout, config: Config) -> Result<()> {
-    run_control(layout, config, true)
+/// Run with process-scoped CLI restrictions, validated after provider registration.
+pub fn run_with_launch(
+    layout: Layout,
+    config: Config,
+    launch: crate::agent::modes::Launch,
+) -> Result<()> {
+    run_control(layout, config, false, launch)
 }
-fn run_control(layout: Layout, config: Config, acp: bool) -> Result<()> {
+pub(crate) fn run_acp(
+    layout: Layout,
+    config: Config,
+    launch: crate::agent::modes::Launch,
+) -> Result<()> {
+    run_control(layout, config, true, launch)
+}
+fn run_control(
+    layout: Layout,
+    config: Config,
+    acp: bool,
+    launch: crate::agent::modes::Launch,
+) -> Result<()> {
     config.require_model()?;
     layout.ensure_project_outside_storage()?;
     let interrupt = Arc::new(AtomicBool::new(false));
@@ -793,11 +829,15 @@ fn run_control(layout: Layout, config: Config, acp: bool) -> Result<()> {
                 None,
                 flag.clone(),
             )?;
+            agent.set_launch(launch)?;
             agent.begin_session_lifecycle();
             if let Some(path) = std::env::var_os("DIAL_BENCHMARK_ADAPTER") {
                 agent.set_benchmark_adapter(std::path::Path::new(&path))?;
             }
-            *worker_query_cache.lock().unwrap_or_else(|p| p.into_inner()) = query_snapshot(&agent);
+            query_snapshot(
+                &agent,
+                &mut worker_query_cache.lock().unwrap_or_else(|p| p.into_inner()),
+            );
             let mut ui = RpcUi {
                 out: worker_out.clone(),
                 approvals: approval_rx,
@@ -884,8 +924,10 @@ fn run_control(layout: Layout, config: Config, acp: bool) -> Result<()> {
                             || messages != projected_messages
                         {
                             projected_messages = messages;
-                            *worker_query_cache.lock().unwrap_or_else(|p| p.into_inner()) =
-                                query_snapshot(&agent);
+                            query_snapshot(
+                                &agent,
+                                &mut worker_query_cache.lock().unwrap_or_else(|p| p.into_inner()),
+                            );
                         }
                         continue;
                     }
@@ -910,25 +952,28 @@ fn run_control(layout: Layout, config: Config, acp: bool) -> Result<()> {
                             .next(),
                         None | Some("status" | "queue")
                     );
-                if compute.is_none()
-                    && config.compute_locks
-                    && (memory_compute
-                        || (config.requires_compute_lock()
-                            && matches!(
-                                request["method"].as_str(),
-                                Some("send" | "live_listen" | "compact" | "task_start")
-                            )))
-                {
-                    compute = Some(crate::learn::auto::compute_lock(&layout)?);
-                    crate::learn::compute::register(
-                        &layout.user_dir,
-                        "session",
-                        &layout.project_root,
-                        &config.state_dir,
-                        &config.model,
-                    )?;
-                }
                 let result = (|| -> Result<Value> {
+                    if compute.is_none()
+                        && config.compute_locks
+                        && (memory_compute
+                            || (config.requires_compute_lock()
+                                && matches!(
+                                    request["method"].as_str(),
+                                    Some("send" | "live_listen" | "compact" | "task_start")
+                                )))
+                    {
+                        compute = crate::learn::auto::compute_lock_cancellable(&layout, || {
+                            flag.load(Ordering::SeqCst) || worker_out.unavailable()
+                        })?;
+                        anyhow::ensure!(compute.is_some(), "compute wait cancelled");
+                        crate::learn::compute::register(
+                            &layout.user_dir,
+                            "session",
+                            &layout.project_root,
+                            &config.state_dir,
+                            &config.model,
+                        )?;
+                    }
                     let method = request["method"].as_str().unwrap_or("");
                     if acp
                         && !matches!(
@@ -1258,8 +1303,10 @@ fn run_control(layout: Layout, config: Config, acp: bool) -> Result<()> {
                 if request["method"] == "close_session" {
                     worker_closing.store(false, Ordering::SeqCst);
                 }
-                *worker_query_cache.lock().unwrap_or_else(|p| p.into_inner()) =
-                    query_snapshot(&agent);
+                query_snapshot(
+                    &agent,
+                    &mut worker_query_cache.lock().unwrap_or_else(|p| p.into_inner()),
+                );
                 if !worker_closing.load(Ordering::SeqCst) {
                     active.store(false, Ordering::SeqCst);
                 }
@@ -1292,10 +1339,6 @@ fn run_control(layout: Layout, config: Config, acp: bool) -> Result<()> {
     #[cfg(windows)]
     let stdin_reader = crate::platform::io::duplicate_stdin_reader()?;
     let (input_tx, input_rx) = mpsc::sync_channel(8);
-    let input_cancel = out.writer.cancellation();
-    let input_failed = out.failed.clone();
-    let input_failure = out.failure.clone();
-    let reader_maintenance = maintenance_control.clone();
     thread::spawn(move || {
         #[cfg(unix)]
         let stdin = std::io::stdin();
@@ -1322,14 +1365,8 @@ fn run_control(layout: Layout, config: Config, acp: bool) -> Result<()> {
                 },
             );
             let finished = !matches!(&line, Ok(Some(_)));
-            if finished {
-                reader_maintenance.cancel();
-                if let Err(error) = &line {
-                    let _ = input_failure.set(format!("control stdin failed: {error}"));
-                    input_failed.store(true, Ordering::SeqCst);
-                }
-                input_cancel.disconnect();
-            }
+            // EOF is a FIFO marker, not a broken output transport. The controller must
+            // consume every preceding line before beginning cancellation and cleanup.
             if input_tx.send(line).is_err() || finished {
                 break;
             }

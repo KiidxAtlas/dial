@@ -83,7 +83,7 @@ lint:
 	$(CARGO) clippy --locked --workspace --all-targets $(CARGO_FEATURE_FLAGS) -- -D clippy::correctness -D clippy::suspicious
 
 test-drivers:
-	DIAL_TEST_PYTHON="$(PYTHON)" $(NODE) --test crates/dial-tools/src/tools/net/browser/driver.test.cjs crates/dial-tools/src/tools/exec/eval/driver.test.cjs
+	DIAL_TEST_PYTHON="$(PYTHON)" $(NODE) --test crates/dial-tools/src/tools/net/browser/driver.test.cjs crates/dial-tools/src/tools/exec/eval/driver.test.cjs assets/collab-web/viewer.test.cjs
 
 test-python:
 	HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 $(PYTHON) -m pytest -rs python/test_*.py

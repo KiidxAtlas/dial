@@ -71,12 +71,17 @@ enum Failure {
 
 enum Event {
     Reply(Result<Value, Failure>),
-    Progress(String),
+}
+
+struct Waiter {
+    reply: Sender<Event>,
+    /// Progress is lossy: retain only the newest update, independently of the terminal reply.
+    progress: Option<Arc<Mutex<Option<(Instant, String)>>>>,
 }
 
 #[derive(Default)]
 struct State {
-    pending: HashMap<u64, Sender<Event>>,
+    pending: HashMap<u64, Waiter>,
     closed: Option<String>,
 }
 
@@ -116,7 +121,9 @@ impl Shared {
             let first = state.closed.is_none();
             let reason = state.closed.get_or_insert(reason).clone();
             for (_, waiter) in state.pending.drain() {
-                let _ = waiter.send(Event::Reply(Err(Failure::Closed(reason.clone()))));
+                let _ = waiter
+                    .reply
+                    .send(Event::Reply(Err(Failure::Closed(reason.clone()))));
             }
             first
         };
@@ -138,14 +145,17 @@ impl Shared {
     /// Fails one waiting request (a remote POST that broke below JSON-RPC).
     fn fail(&self, id: u64, text: String) {
         if let Some(waiter) = lock(&self.state).pending.remove(&id) {
-            let _ = waiter.send(Event::Reply(Err(Failure::Transport(text))));
+            let _ = waiter
+                .reply
+                .send(Event::Reply(Err(Failure::Transport(text))));
         }
     }
 
     fn stderr_tail(&self) -> String {
         let tail = lock(&self.stderr);
         let text = String::from_utf8_lossy(&tail);
-        let text = text.trim();
+        // Server output reaches the model through errors: drop terminal escapes.
+        let text = super::tool::strip_controls(text.trim());
         let skip = text.chars().count().saturating_sub(STDERR_QUOTE);
         text.chars().skip(skip).collect()
     }
@@ -175,7 +185,10 @@ impl Shared {
                         .and_then(Value::as_str)
                         .unwrap_or("unknown error");
                     let code = error.get("code").and_then(Value::as_i64).unwrap_or(0);
-                    Err(Failure::Rpc(format!("{text} (code {code})")))
+                    Err(Failure::Rpc(format!(
+                        "{} (code {code})",
+                        super::tool::strip_controls(text)
+                    )))
                 } else {
                     match message.get("result") {
                         Some(result) => Ok(result.clone()),
@@ -185,7 +198,7 @@ impl Shared {
                     }
                 };
                 if let Some(waiter) = lock(&self.state).pending.remove(&id) {
-                    let _ = waiter.send(Event::Reply(outcome));
+                    let _ = waiter.reply.send(Event::Reply(outcome));
                 }
                 None
             }
@@ -199,8 +212,10 @@ impl Shared {
                 let Some(token) = params.get("progressToken").and_then(Value::as_u64) else {
                     return;
                 };
-                if let Some(waiter) = lock(&self.state).pending.get(&token) {
-                    let _ = waiter.send(Event::Progress(progress_text(params)));
+                if let Some(waiter) = lock(&self.state).pending.get(&token)
+                    && let Some(progress) = &waiter.progress
+                {
+                    *lock(progress) = Some((Instant::now(), progress_text(params)));
                 }
             }
             "notifications/tools/list_changed" => self.signal(Signal::ToolsChanged),
@@ -491,12 +506,19 @@ impl Client {
             }
         }
         let (reply_tx, reply_rx) = mpsc::channel();
+        let latest_progress = progress.map(|_| Arc::new(Mutex::new(None)));
         {
             let mut state = lock(&self.shared.state);
             if let Some(reason) = &state.closed {
                 return Err(self.closed_error(reason));
             }
-            state.pending.insert(id, reply_tx);
+            state.pending.insert(
+                id,
+                Waiter {
+                    reply: reply_tx,
+                    progress: latest_progress.clone(),
+                },
+            );
         }
         let message = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         if let Err(error) = self.send(message, timeout) {
@@ -525,18 +547,21 @@ impl Client {
                 Ok(Event::Reply(Err(Failure::Transport(text)))) => {
                     return Err(anyhow!(text).context(RequestEffects(Effects::Unknown)));
                 }
-                Ok(Event::Progress(text)) => {
-                    // Progress shows the server is working; it restarts the inactivity clock.
-                    deadline = (!timeout.is_zero()).then(|| Instant::now() + timeout);
-                    if let Some(progress) = progress {
-                        progress(&text);
-                    }
-                }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
                     return Err(self
                         .closed_error("the connection is closed")
                         .context(RequestEffects(Effects::Unknown)));
+                }
+            }
+            // The reply channel contains terminal replies only; progress cannot queue ahead of
+            // settlement or block the transport reader, even when the callback is slow.
+            let update = latest_progress.as_ref().and_then(|slot| lock(slot).take());
+            if let Some((received, text)) = update {
+                // Use arrival time, not callback time: stale progress cannot extend a timeout.
+                deadline = (!timeout.is_zero()).then(|| received + timeout);
+                if let Some(progress) = progress {
+                    progress(&text);
                 }
             }
             // Checked on every wake-up: steady progress must not starve cancel or the deadline.
@@ -734,3 +759,6 @@ fn read_loop(stdout: impl Read, shared: &Shared, replies: &Sender<String>) {
     }
     shared.close("its output closed (the process exited)".into());
 }
+
+#[cfg(test)]
+mod tests;

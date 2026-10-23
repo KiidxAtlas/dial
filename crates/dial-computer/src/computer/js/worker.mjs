@@ -104,10 +104,6 @@ function native(method, args = {}) {
 	});
 }
 
-/** Sends a native operation the host applies without replying. */
-function nativeFireAndForget(method, args = {}) {
-	writeLine({ type: "native", id: `native-${nativeInstance}-${++nativeSeq}`, method, args });
-}
 
 function settleNative(message) {
 	const entry = pendingNative.get(message.id);
@@ -122,11 +118,12 @@ function createNativeSession() {
 	return {
 		capabilities: () => native("capabilities"),
 		listDisplays: () => native("listDisplays"),
-		listWindows: () => native("listWindows"),
+		listWindows: diagnostics => native("listWindows", { diagnostics }),
+		getWindow: id => native("getWindow", { id }),
 		capture: (target, caps) => native("capture", { target, caps }),
 		captureRegion: (target, region, caps) => native("captureRegion", { target, region, caps }),
-		cancel: () => nativeFireAndForget("cancel"),
-		retire: () => nativeFireAndForget("retire"),
+		cancel: reason => native("cancel", { reason }),
+		retire: () => native("retire"),
 		listApplications: options => native("listApplications", { options }),
 		openApplication: (id, options) => native("openApplication", { id, options }),
 		menuItems: (target, path) => native("menuItems", { target, path }),
@@ -135,7 +132,7 @@ function createNativeSession() {
 		holdKeys: (target, keys, options) => native("holdKeys", { target, keys, options }),
 		holdMouse: (target, x, y, options) => native("holdMouse", { target, x, y, options }),
 		acquireControl: () => native("acquireControl"),
-		releaseControl: () => nativeFireAndForget("releaseControl"),
+		releaseControl: () => native("releaseControl"),
 		controlState: () => native("controlState"),
 		bringToCurrentSpace: windowId => native("bringToCurrentSpace", { windowId }),
 		click: (target, x, y, opts) => native("click", { target, x, y, opts }),
@@ -234,6 +231,41 @@ function matchesFilter(window, filter) {
 		(!app || window.app.toLocaleLowerCase().includes(app)) &&
 		(!title || window.title.toLocaleLowerCase().includes(title))
 	);
+}
+
+let windowSnapshotSeq = 0;
+
+/** Lists windows and stamps the snapshot so resolution errors can be compared across calls and workers. */
+async function listWindowSnapshot(session, signal, runtimeIdentity) {
+	const listing = await nativeCall(signal, () => session.listWindows(true));
+	return {
+		...listing,
+		seq: ++windowSnapshotSeq,
+		at: new Date().toISOString(),
+		worker: `${process.pid}/${nativeInstance.slice(0, 8)}`,
+		runtime: runtimeIdentity ?? "unreported build",
+	};
+}
+
+/** Explains what a window listing can see, so an absent window is not mistaken for a closed one. */
+function describeWindowSnapshot(snapshot) {
+	const scope =
+		process.platform === "darwin"
+			? "on-screen shareable windows only; hidden, minimized or other-Space windows may be absent"
+			: "top-level windows the native backend reports; hidden or minimized windows may be absent";
+	const completeness = snapshot.truncated
+		? `truncated at ${snapshot.limit} windows; explicit window(id) lookup bypasses this listing cap`
+		: "not truncated";
+	return `(window snapshot #${snapshot.seq} at ${snapshot.at} from worker ${snapshot.worker} listed ${snapshot.windows.length} window(s); ${completeness}; runtime: ${snapshot.runtime}, ${process.version}; scope: ${scope}. windows() and window(filter) share this source; window(id) uses targeted native lookup with the same safety filters; compare snapshot sequence, worker identity and runtime build when investigating changes.)`;
+}
+
+/** Points scripts that use the Eval-only `computer` global at the run-scope `desktop` facade. */
+function hintWrongGlobal(error) {
+	if (error?.name === "ReferenceError" && error.message === "computer is not defined") {
+		error.message +=
+			"; direct computer run code uses the `desktop` global (for example `await desktop.windows()`). `computer.*` exists only in Eval code.";
+	}
+	return error;
 }
 
 function guardRun(context, method) {
@@ -1233,7 +1265,10 @@ class ComputerRuntime {
 			const finalRewritten = rewriteFinalExpression(stripped);
 			const returned = finalRewritten !== null && compiles(rewriteImports(finalRewritten));
 			const imported = rewriteImports(returned ? finalRewritten : stripped);
-			const publish = !isScriptSource(imported);
+			// Rewriting a top-level return can make `await (...)` parse as a
+			// synchronous call to an identifier named await. Preserve the original
+			// source's requirement for an async body (including generated fn runs).
+			const publish = !isScriptSource(rewriteImports(stripped)) || !isScriptSource(imported);
 			const source = demoteTopLevelLexicals(imported, publish);
 			const body = `${source}\n//# sourceURL=${filename}`;
 			const value = publish ? await new AsyncFunction(body)() : (0, eval)(body);
@@ -1580,8 +1615,11 @@ class ComputerWorkerCore {
 				return;
 			case "revoke-control":
 				this.#active?.ac.abort(new ToolAbortError("Computer control revoked"));
-				this.#session?.cancel();
-				this.#transport.send({ type: "control-revoked", id: message.id });
+				Promise.resolve(this.#session?.cancel("control_released")).then(() => {
+					this.#transport.send({ type: "control-revoked", id: message.id });
+				}).catch(error => {
+					this.#transport.send({ type: "control-revoked", id: message.id, error: errorPayload(error) });
+				});
 				return;
 			case "tool-reply":
 				this.#deliverToolReply(message.id, message.reply);
@@ -1623,11 +1661,11 @@ class ComputerWorkerCore {
 		this.#active = active;
 		// Cancel synchronously while this run owns the native session, including
 		// fire-and-forget operations still pending when the script returns.
-		let nativeCancelled = false;
+		let nativeCancellation;
 		const onNativeCancel = () => {
 			if (this.#active === active && this.#session) {
-				this.#session.cancel();
-				nativeCancelled = true;
+				nativeCancellation = this.#session.cancel(timeoutSignal.aborted ? "run_timeout" : "run_aborted");
+				nativeCancellation.catch(() => undefined);
 			}
 		};
 		signal.addEventListener("abort", onNativeCancel, { once: true });
@@ -1696,14 +1734,20 @@ class ComputerWorkerCore {
 				signal.removeEventListener("abort", onCancel);
 			}
 		} catch (error) {
-			failure = { error };
+			failure = { error: hintWrongGlobal(error) };
 		} finally {
 			// Successful completion retires outstanding native work but keeps an explicitly acquired grant; errors revoke it.
 			signal.removeEventListener("abort", onNativeCancel);
-			if (failure === undefined && !signal.aborted) this.#session?.retire();
-			else if (!nativeCancelled) this.#session?.cancel();
-			runAc.abort(new ToolAbortError("Computer run ended"));
-			if (this.#active?.id === message.id) this.#active = null;
+			// The host dispatches native calls on threads. Await cleanup before
+			// publishing a result, otherwise late retirement can cancel the NEXT run.
+			try {
+				if (nativeCancellation) await nativeCancellation;
+				else if (failure === undefined && !signal.aborted) await this.#session?.retire();
+				else await this.#session?.cancel("run_failed");
+			} finally {
+				runAc.abort(new ToolAbortError("Computer run ended"));
+				if (this.#active?.id === message.id) this.#active = null;
+			}
 		}
 		if (failure !== undefined) {
 			this.#transport.send({ type: "result", id: message.id, ok: false, error: errorPayload(failure.error) });
@@ -1889,20 +1933,26 @@ class ComputerWorkerCore {
 				},
 			},
 			windows: async filter => {
-				const { signal } = getContext();
-				return (await nativeCall(signal, () => session.listWindows())).filter(window => matchesFilter(window, filter));
+				const { signal, snapshot } = getContext();
+				return (await listWindowSnapshot(session, signal, snapshot.runtimeIdentity)).windows.filter(window => matchesFilter(window, filter));
 			},
 			window: async selector => {
-				const { signal } = getContext();
-				const windows = await nativeCall(signal, () => session.listWindows());
-				const matches =
-					typeof selector === "string" || typeof selector === "number"
-						? windows.filter(window => window.id === String(selector))
-						: windows.filter(window => matchesFilter(window, selector));
-				if (matches.length === 0) throw new ToolError(`no window matches ${JSON.stringify(selector)}`);
+				const context = getContext();
+				if (typeof selector === "string" || typeof selector === "number") {
+					const window = await nativeCall(context.signal, () => session.getWindow(String(selector)));
+					return makeWin(window);
+				}
+				const snapshot = await listWindowSnapshot(session, context.signal, context.snapshot.runtimeIdentity);
+				const windows = snapshot.windows;
+				const matches = windows.filter(window => matchesFilter(window, selector));
+				if (matches.length === 0) {
+					throw new ToolError(`no window matches ${JSON.stringify(selector)} ${describeWindowSnapshot(snapshot)}`);
+				}
 				if (matches.length > 1) {
 					const candidates = matches.map(window => `${window.id} ${window.app} ${JSON.stringify(window.title)}`).join("\n");
-					throw new ToolError(`multiple windows match ${JSON.stringify(selector)}:\n${candidates}`);
+					throw new ToolError(
+						`multiple windows match ${JSON.stringify(selector)}:\n${candidates}\n${describeWindowSnapshot(snapshot)}`,
+					);
 				}
 				return makeWin(matches[0]);
 			},

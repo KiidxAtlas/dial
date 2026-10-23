@@ -167,6 +167,7 @@ pub(super) fn exchange(
     let mut frames = Frames::default();
     let mut chunk = vec![0u8; 16 * 1024];
     let mut total = 0usize;
+    let mut decoded_bytes = 0usize;
     'read: loop {
         if interrupt.load(Ordering::SeqCst) {
             return Err(Interrupted.into());
@@ -195,15 +196,19 @@ pub(super) fn exchange(
         for (flags, payload) in frames.push(&chunk[..read])? {
             // Silence is judged per decoded frame, as it is for SSE events.
             stream_patience.mark_event();
-            if flags & FLAG_END_STREAM != 0 {
-                trailer_error(&payload)?;
-                break 'read;
-            }
             let payload = if flags & FLAG_COMPRESSED != 0 {
                 gunzip(&payload)?
             } else {
                 payload
             };
+            super::connect::account_payload(&mut decoded_bytes, payload.len())?;
+            if interrupt.load(Ordering::SeqCst) {
+                return Err(Interrupted.into());
+            }
+            if flags & FLAG_END_STREAM != 0 {
+                trailer_error(&payload)?;
+                break 'read;
+            }
             for emit in session.feed(&payload)? {
                 match emit {
                     Emit::Text(text) => {

@@ -538,3 +538,134 @@ fn a_waiting_worker_shows_the_warning_glyph_not_a_spinner() {
     assert!(header.contains(theme.sym(Sym::Warn)), "{header}");
     assert!(header.contains("needs your input"), "{header}");
 }
+
+/// A real ChildTranscript producer feeds the actual incremental viewer and terminal
+/// renderer. Set DIAL_SUBAGENT_FRAME to save the completed terminal buffer for inspection.
+#[test]
+fn producer_stream_is_visible_live_settled_and_reopened_without_duplicates() {
+    use crate::agent::workers::child_transcript::{ChildTranscript, scan};
+    let dir = tempfile::tempdir().unwrap();
+    let layout = Layout {
+        project_root: dir.path().join("project"),
+        project_dir: dir.path().join("project/.dial"),
+        user_dir: dir.path().join("user"),
+        state_dir: dir.path().join("state"),
+    };
+    let sink = ChildTranscript::create(&layout, "s1", "w1", json!({"job":"w1"})).unwrap();
+    let path = scan(&layout, "s1")[0].path.clone();
+    sink.record(&json!({"role":"user", "content":"Inspect the event pipeline."}))
+        .unwrap();
+    sink.assistant_stream(None).unwrap();
+    sink.assistant_stream(Some("The event ")).unwrap();
+    sink.assistant_stream(Some("pipeline is connected."))
+        .unwrap();
+
+    let theme = Theme::dark();
+    let keys = Keymap::defaults();
+    let status = StatusData::default();
+    let preview = |_: &UiConfig, _: u16| Line::default();
+    let ctx = DrawCtx {
+        theme: &theme,
+        keys: &keys,
+        status: &status,
+        preview_status: &preview,
+    };
+    let render = |view: &mut SubagentViewer| -> String {
+        let mut terminal = Terminal::new(TestBackend::new(100, 28)).unwrap();
+        terminal.draw(|frame| view.draw(frame, &ctx)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(100)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>() + "\n")
+            .collect()
+    };
+    let mut view = viewer(None, false);
+    view.agent = Some(AgentEntry {
+        transcript: Some(path.clone()),
+        ..agent(AgentStatus::Running)
+    });
+    assert!(view.conversation.follow(&path));
+    let live = render(&mut view);
+    assert_eq!(
+        live.matches("The event pipeline is connected.").count(),
+        1,
+        "{live}"
+    );
+    assert_eq!(
+        view.conversation.entries.len(),
+        1,
+        "deltas are not message entries"
+    );
+    assert!(
+        !view.conversation.follow(&path),
+        "unchanged polls do not replay prose"
+    );
+
+    // A credential and multiline PEM arrive in pieces, but only a whole-value
+    // redacted snapshot crosses into the actual terminal renderer. Disk stays unchanged.
+    let durable_before = fs::read(&path).unwrap();
+    sink.assistant_stream(None).unwrap();
+    let secret = format!("sk-ant-{}", "z9".repeat(24));
+    let private = format!(
+        "Public progress. {secret}\n-----BEGIN PRIVATE KEY-----\nPRIVATEPAYLOAD\n-----END PRIVATE KEY-----"
+    );
+    for chunk in private.as_bytes().chunks(5) {
+        sink.assistant_stream(Some(std::str::from_utf8(chunk).unwrap()))
+            .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), durable_before);
+    }
+    assert!(view.conversation.follow(&path));
+    let safe = render(&mut view);
+    assert!(safe.contains("Public progress."), "{safe}");
+    assert!(!safe.contains(&secret), "{safe}");
+    assert!(!safe.contains("PRIVATEPAYLOAD"), "{safe}");
+    sink.assistant_stream(None).unwrap();
+    sink.assistant_stream(Some("The event pipeline is connected."))
+        .unwrap();
+
+    sink.record(&json!({"role":"assistant", "content":"The event pipeline is connected."}))
+        .unwrap();
+    sink.finish(json!({"status":"done", "result":"The event pipeline is connected."}))
+        .unwrap();
+    assert!(view.conversation.follow(&path));
+    view.agent.as_mut().unwrap().status = AgentStatus::Done;
+    view.conversation.finish();
+    let settled = render(&mut view);
+    assert_eq!(
+        settled.matches("The event pipeline is connected.").count(),
+        1,
+        "{settled}"
+    );
+    view.conversation = Conversation::default();
+    view.conversation.follow(&path);
+    view.conversation.finish();
+    view.cache = None;
+    let reopened = render(&mut view);
+    assert_eq!(
+        settled, reopened,
+        "reopen reproduces the settled terminal buffer"
+    );
+    if let Some(path) = std::env::var_os("DIAL_SUBAGENT_FRAME") {
+        fs::write(path, &reopened).unwrap();
+    }
+
+    // Steering/guidance discard is an explicit reset, not an extra assistant turn.
+    sink.assistant_stream(None).unwrap();
+    sink.assistant_stream(Some("Obsolete attempt")).unwrap();
+    view.conversation.follow(&path);
+    assert!(render(&mut view).contains("Obsolete attempt"));
+    sink.assistant_stream(None).unwrap();
+    sink.assistant_stream(Some("Partial answer survives disconnect"))
+        .unwrap();
+    sink.finish(json!({"status":"failed"})).unwrap();
+    view.conversation.follow(&path);
+    let failed = render(&mut view);
+    assert!(!failed.contains("Obsolete attempt"));
+    assert!(failed.contains("Partial answer survives disconnect"));
+    view.conversation = Conversation::default();
+    view.conversation.follow(&path);
+    view.cache = None;
+    assert!(render(&mut view).contains("Partial answer survives disconnect"));
+}

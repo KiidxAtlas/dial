@@ -1,5 +1,6 @@
 use super::*;
 use serde_json::json;
+mod relocation_artifacts;
 #[test]
 fn streamed_observations_survive_reopen_before_any_final_reply() {
     let e = env();
@@ -1687,4 +1688,74 @@ fn oversized_compaction_prefix_recovers_the_complete_message_after_reopen() {
     assert_eq!(messages[1]["content"], "prefix-answer");
     let uri = crate::storage::artifact::uris(stored)[0];
     assert_eq!(artifact_text(&path, uri), big);
+}
+
+#[test]
+fn message_deltas_visit_only_new_bodies_as_history_grows() {
+    let mut session = Session::ephemeral();
+    let mut archive_cursor = MessageCursor::default();
+    let mut view_cursor = MessageCursor::default();
+    let mut archive = Vec::new();
+    let mut view = Vec::new();
+    let mut visited = 0;
+    for n in 0..512 {
+        session.append(user(&format!("turn {n}"))).unwrap();
+        for (cursor, out, archived) in [
+            (&mut archive_cursor, &mut archive, true),
+            (&mut view_cursor, &mut view, false),
+        ] {
+            let delta = session.message_delta(cursor, archived);
+            assert_eq!(delta.reset, n == 0);
+            assert_eq!(delta.messages.len(), 1);
+            assert!(matches!(delta.messages[0], std::borrow::Cow::Borrowed(_)));
+            visited += delta.messages.len();
+            if delta.reset {
+                out.clear();
+            }
+            out.extend(delta.messages.into_iter().map(|m| m.into_owned()));
+            assert!(session.message_delta(cursor, archived).messages.is_empty());
+        }
+    }
+    assert_eq!(
+        visited, 1024,
+        "two projections must visit 2N bodies, not N(N+1)"
+    );
+    assert_eq!(archive, session.archived_messages());
+    assert_eq!(view, session.messages());
+    session.set_control_state(json!({"turn":512})).unwrap();
+    assert!(
+        session
+            .message_delta(&mut view_cursor, false)
+            .messages
+            .is_empty()
+    );
+    session.compact("summary".into(), 2).unwrap();
+    assert!(!session.message_delta(&mut archive_cursor, true).reset);
+    let delta = session.message_delta(&mut view_cursor, false);
+    assert!(delta.reset);
+    assert_eq!(
+        delta
+            .messages
+            .into_iter()
+            .map(|m| m.into_owned())
+            .collect::<Vec<_>>(),
+        session.messages()
+    );
+    session.rewind(1).unwrap();
+    for (cursor, archived) in [(&mut archive_cursor, true), (&mut view_cursor, false)] {
+        let delta = session.message_delta(cursor, archived);
+        assert!(delta.reset);
+        assert_eq!(
+            delta
+                .messages
+                .into_iter()
+                .map(|m| m.into_owned())
+                .collect::<Vec<_>>(),
+            if archived {
+                session.archived_messages()
+            } else {
+                session.messages()
+            }
+        );
+    }
 }

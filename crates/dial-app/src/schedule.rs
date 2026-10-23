@@ -219,45 +219,102 @@ fn watch_set(patterns: &[String]) -> Result<globset::GlobSet> {
 /// Refuse incomplete coverage, including traversal/metadata errors and more than 20,000 matches.
 pub fn fingerprint(root: &Path, patterns: &[String]) -> Result<[u8; 32]> {
     let set = watch_set(patterns)?;
-    let mut files = Vec::new();
-    for entry in ignore::WalkBuilder::new(root).follow_links(false).build() {
-        let entry = entry.context("watch coverage incomplete: traversing project files")?;
-        if let Some(error) = entry.error() {
-            bail!(
-                "watch coverage incomplete: ignore rules for {}: {error}",
-                entry.path().display()
-            );
-        }
-        let relative = entry
-            .path()
-            .strip_prefix(root)
-            .context("watch coverage incomplete: path outside project")?;
-        if !entry.file_type().is_some_and(|t| t.is_file()) || !set.is_match(relative) {
-            continue;
-        }
-        ensure!(
-            files.len() < MAX_WATCHED_FILES,
-            "watch coverage incomplete: more than {MAX_WATCHED_FILES} matching files; narrow --watch"
-        );
-        let meta = entry.metadata().with_context(|| {
-            format!(
-                "watch coverage incomplete: reading {}",
-                entry.path().display()
-            )
-        })?;
-        let modified = meta
-            .modified()
-            .with_context(|| {
-                format!(
-                    "watch coverage incomplete: modification time of {}",
-                    entry.path().display()
-                )
-            })?
-            .duration_since(UNIX_EPOCH)
-            .context("watch coverage incomplete: modification time predates Unix epoch")?
-            .as_nanos();
-        files.push((relative.to_path_buf(), meta.len(), modified));
+    fingerprints(root, &[&set]).pop().expect("one watch set")
+}
+
+/// Share directory traversal and metadata reads, but retain coverage limits and failures per set.
+fn fingerprints(root: &Path, sets: &[&globset::GlobSet]) -> Vec<Result<[u8; 32]>> {
+    fingerprints_with_walk(root, sets, MAX_WATCHED_FILES, || {
+        ignore::WalkBuilder::new(root).follow_links(false).build()
+    })
+}
+
+fn fingerprints_with_walk(
+    root: &Path,
+    sets: &[&globset::GlobSet],
+    limit: usize,
+    walk: impl FnOnce() -> ignore::Walk,
+) -> Vec<Result<[u8; 32]>> {
+    let mut files: Vec<Result<Vec<_>>> = sets.iter().map(|_| Ok(Vec::new())).collect();
+    if sets.is_empty() {
+        return Vec::new();
     }
+    let coverage = (|| -> Result<()> {
+        for entry in walk() {
+            let entry = entry.context("watch coverage incomplete: traversing project files")?;
+            if let Some(error) = entry.error() {
+                bail!(
+                    "watch coverage incomplete: ignore rules for {}: {error}",
+                    entry.path().display()
+                );
+            }
+            let relative = entry
+                .path()
+                .strip_prefix(root)
+                .context("watch coverage incomplete: path outside project")?;
+            if !entry.file_type().is_some_and(|t| t.is_file()) {
+                continue;
+            }
+            let matching: Vec<_> = sets
+                .iter()
+                .enumerate()
+                .filter_map(|(index, set)| {
+                    (files[index].is_ok() && set.is_match(relative)).then_some(index)
+                })
+                .collect();
+            if matching.is_empty() {
+                continue;
+            }
+            let metadata = (|| -> Result<_> {
+                let meta = entry.metadata().with_context(|| {
+                    format!(
+                        "watch coverage incomplete: reading {}",
+                        entry.path().display()
+                    )
+                })?;
+                let modified = meta
+                    .modified()
+                    .with_context(|| {
+                        format!(
+                            "watch coverage incomplete: modification time of {}",
+                            entry.path().display()
+                        )
+                    })?
+                    .duration_since(UNIX_EPOCH)
+                    .context("watch coverage incomplete: modification time predates Unix epoch")?
+                    .as_nanos();
+                Ok((relative.to_path_buf(), meta.len(), modified))
+            })();
+            for index in matching {
+                let matched = files[index].as_mut().expect("active watch set");
+                if matched.len() >= limit {
+                    files[index] = Err(anyhow::anyhow!(
+                        "watch coverage incomplete: more than {limit} matching files; narrow --watch"
+                    ));
+                } else {
+                    match &metadata {
+                        Ok(file) => matched.push(file.clone()),
+                        Err(error) => files[index] = Err(anyhow::anyhow!("{error:#}")),
+                    }
+                }
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = coverage {
+        for result in &mut files {
+            if result.is_ok() {
+                *result = Err(anyhow::anyhow!("{error:#}"));
+            }
+        }
+    }
+    files
+        .into_iter()
+        .map(|files| files.map(hash_files))
+        .collect()
+}
+
+fn hash_files(mut files: Vec<(PathBuf, u64, u128)>) -> [u8; 32] {
     files.sort();
     let mut hash = Sha256::new();
     for (path, len, modified) in files {
@@ -267,7 +324,7 @@ pub fn fingerprint(root: &Path, patterns: &[String]) -> Result<[u8; 32]> {
         hash.update(len.to_le_bytes());
         hash.update(modified.to_le_bytes());
     }
-    Ok(hash.finalize().into())
+    hash.finalize().into()
 }
 
 pub struct Store {
@@ -1485,6 +1542,23 @@ impl EntryErrors {
     }
 }
 
+fn needs_watch_check(
+    entry: &Entry,
+    scheduler: &Scheduler,
+    errors: &EntryErrors,
+    dirty: &HashSet<String>,
+    everything_dirty: bool,
+) -> bool {
+    !entry.watch.is_empty()
+        && (everything_dirty
+            || dirty.contains(&entry.id)
+            || scheduler
+                .watches
+                .get(&entry.id)
+                .is_none_or(|watch| watch.baseline.is_none() || watch.pending.is_some())
+            || errors.retry_due(&entry.id))
+}
+
 /// The scheduler loop. Only one per project runs: a second instance fails fast on the lock.
 /// Watch/fingerprint failures and invalid entries are isolated to their entry. Only an
 /// uncertain process-ownership outcome (`RunFailure::Active`) stops the scheduler, because
@@ -1618,7 +1692,8 @@ pub fn run(
                 }
             }
         }
-        for entry in &entries {
+        let mut checked: HashMap<String, Result<[u8; 32]>> = HashMap::new();
+        for (index, entry) in entries.iter().enumerate() {
             if stop.load(Ordering::Acquire) {
                 break;
             }
@@ -1635,14 +1710,30 @@ pub fn run(
             let before = if entry.watch.is_empty() {
                 None
             } else {
-                let state = scheduler.watches.get(&entry.id);
-                let needs_check = everything_dirty
-                    || dirty.contains(&entry.id)
-                    || state
-                        .is_none_or(|watch| watch.baseline.is_none() || watch.pending.is_some())
-                    || errors.retry_due(&entry.id);
+                let needs_check =
+                    needs_watch_check(entry, &scheduler, &errors, &dirty, everything_dirty);
                 if needs_check {
-                    match fingerprint(root, &entry.watch) {
+                    if !checked.contains_key(&entry.id) {
+                        let selected: Vec<_> = entries[index..]
+                            .iter()
+                            .filter(|entry| {
+                                needs_watch_check(
+                                    entry,
+                                    &scheduler,
+                                    &errors,
+                                    &dirty,
+                                    everything_dirty,
+                                )
+                            })
+                            .collect();
+                        let sets: Vec<_> = selected.iter().map(|entry| &globs[&entry.id]).collect();
+                        checked = selected
+                            .iter()
+                            .map(|entry| entry.id.clone())
+                            .zip(fingerprints(root, &sets))
+                            .collect();
+                    }
+                    match checked.remove(&entry.id).expect("selected watch set") {
                         Ok(fp) => {
                             errors.recovered(&entry.id);
                             Some(fp)
@@ -1655,7 +1746,10 @@ pub fn run(
                 } else if errors.current.contains_key(&entry.id) {
                     continue;
                 } else {
-                    state.and_then(|watch| watch.baseline)
+                    scheduler
+                        .watches
+                        .get(&entry.id)
+                        .and_then(|watch| watch.baseline)
                 }
             };
             dirty.remove(&entry.id);
@@ -1663,6 +1757,9 @@ pub fn run(
                 continue;
             };
             eprintln!("dial schedule: running {} ({reason:?})", entry.id);
+            // A child may edit any watched file. Later entries need a fresh shared snapshot,
+            // not results computed before this run (including when no watcher is available).
+            checked.clear();
             match run_entry(
                 &exe,
                 root,
@@ -1753,3 +1850,6 @@ pub fn run(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod fingerprint_tests;

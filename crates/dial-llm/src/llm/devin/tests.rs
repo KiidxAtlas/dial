@@ -468,3 +468,68 @@ fn silence_after_a_frame_is_a_transient_stall_not_an_unbounded_wait() {
     );
     server.join().unwrap();
 }
+
+#[test]
+fn clean_eof_discards_incomplete_text_tools_and_frames() {
+    let mut call = Enc::default();
+    call.string(1, "c1");
+    call.string(2, "read");
+    call.string(3, "{\"path\":");
+    let mut message = Enc::default();
+    message.message(6, &call);
+    let mut stopped = Enc::default();
+    stopped.uint(5, 1);
+    let mut partial_trailer = text_frame("partial");
+    partial_trailer.extend_from_slice(&[FLAG_END_STREAM, 0, 0]);
+    let mut complete_then_partial = frame(FLAG_END_STREAM, b"{}").unwrap();
+    complete_then_partial.extend_from_slice(&[0, 0]);
+    for body in [
+        Vec::new(),
+        text_frame("partial"),
+        frame(0, &message.0).unwrap(),
+        frame(0, &stopped.0).unwrap(),
+        partial_trailer,
+        complete_then_partial,
+    ] {
+        let mut jwt = Enc::default();
+        jwt.string(1, "jwt-1");
+        let (base, server) = serve(vec![jwt.0, body]);
+        let (result, _) = paced_exchange(&base);
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<super::super::stream::IncompleteStream>()
+                .is_some(),
+            "{error:#}"
+        );
+        assert_eq!(
+            super::super::errors::classify(&error),
+            ErrorClass::Transient
+        );
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn completion_trailer_must_be_valid_and_final() {
+    for invalid in [b"".as_slice(), b"not json", b"[]", b"{\"error\":{}}"] {
+        assert!(Stream::default().feed(FLAG_END_STREAM, invalid).is_err());
+    }
+    let mut stream = Stream::default();
+    stream
+        .feed(FLAG_END_STREAM | FLAG_COMPRESSED, &gzip(b"{}").unwrap())
+        .unwrap();
+    assert!(stream.ended);
+    assert!(stream.feed(0, &[]).is_err());
+}
+
+#[test]
+fn devin_counts_decoded_frames_and_rejects_gzip_expansion() {
+    let mut stream = Stream {
+        decoded_bytes: super::super::MAX_STREAM_BYTES,
+        ..Default::default()
+    };
+    assert!(stream.feed(FLAG_COMPRESSED, &gzip(b"x").unwrap()).is_err());
+    let packed = gzip(&vec![0; MAX_FRAME_PAYLOAD + 1]).unwrap();
+    assert!(Stream::default().feed(FLAG_COMPRESSED, &packed).is_err());
+}

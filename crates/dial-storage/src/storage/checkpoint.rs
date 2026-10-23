@@ -687,7 +687,7 @@ impl Checkpoints {
     }
 
     /// Where `entry` lives now: (target path, the root it belongs to). Refuses unsafe relative
-    /// paths, directories no longer attached, and paths that now resolve into another root.
+    /// paths, detached directories, and any redirection from the recorded canonical path.
     fn target_of(&self, entry: &Entry) -> Result<(PathBuf, PathBuf)> {
         let rel = Path::new(&entry.rel);
         ensure!(
@@ -705,10 +705,14 @@ impl Checkpoints {
                 root.clone()
             }
         };
-        let (target, root, _) = self.resolve(&base.join(rel))?;
+        let (target, root, resolved_rel) = self.resolve(&base.join(rel))?;
         ensure!(
             root == entry.root,
             "checkpoint path now resolves into another workspace directory"
+        );
+        ensure!(
+            resolved_rel == entry.rel,
+            "checkpoint path now resolves to a different file; not touching it"
         );
         Ok((target, base))
     }

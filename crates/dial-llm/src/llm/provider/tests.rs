@@ -1023,6 +1023,90 @@ fn endpoint_key_is_read_at_each_dispatch_not_at_construction() {
 }
 
 #[test]
+fn endpoint_retry_resolves_rotated_or_removed_key_without_stale_fallback() {
+    for anthropic in [false, true] {
+        for replacement in [Some("sk-replacement"), None] {
+            let dir = tempfile::tempdir().unwrap();
+            let server = fake::serve(vec![
+                fake::json(
+                    503,
+                    &json!({"error": {"message": "temporarily unavailable"}}),
+                ),
+                if anthropic {
+                    fake::json(
+                        200,
+                        &json!({
+                            "id": "msg_test", "type": "message", "role": "assistant",
+                            "content": [{"type": "text", "text": "retried"}],
+                            "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 1}
+                        }),
+                    )
+                } else {
+                    ok("retried")
+                },
+            ]);
+            let base = format!("{}/v1", server.url);
+            llm::catalog::save_credential(dir.path(), &base, "sk-original").unwrap();
+            let kind = if anthropic {
+                anthropic_endpoint(&base)
+            } else {
+                endpoint(&base)
+            };
+            let mut remote = backend(kind).with_credential_source(dir.path(), &base, None);
+            let mut changed = false;
+            let mut notices = Vec::new();
+            let reply = remote
+                .chat_with_control_events(
+                    None,
+                    &request(),
+                    llm::Limits {
+                        timeout_secs: 5,
+                        interrupt: Arc::new(AtomicBool::new(false)),
+                    },
+                    None,
+                    &mut |notice| notices.push(notice.to_owned()),
+                    &mut |event| {
+                        if matches!(event, llm::StreamEvent::Retry { waiting: true }) {
+                            match replacement {
+                                Some(key) => {
+                                    llm::catalog::save_credential(dir.path(), &base, key).unwrap()
+                                }
+                                None => llm::catalog::remove_credential(dir.path(), &base).unwrap(),
+                            }
+                            changed = true;
+                        }
+                        true
+                    },
+                )
+                .unwrap();
+            assert!(changed);
+            assert_eq!(reply.text, "retried");
+            let requests = server.requests();
+            assert_eq!(requests.len(), 2);
+            let name = if anthropic {
+                "x-api-key"
+            } else {
+                "authorization"
+            };
+            let expected = |key: &str| {
+                if anthropic {
+                    key.to_owned()
+                } else {
+                    format!("Bearer {key}")
+                }
+            };
+            assert!(
+                header(&requests[0], name).as_deref() == Some(expected("sk-original").as_str())
+            );
+            assert!(header(&requests[1], name) == replacement.map(expected));
+            for secret in ["sk-original", "sk-replacement", "sk-secret", "anth-secret"] {
+                assert!(!notices.iter().any(|notice| notice.contains(secret)));
+            }
+        }
+    }
+}
+
+#[test]
 fn endpoint_streams_when_a_callback_is_given() {
     let chunk = |c: &str| {
         format!(

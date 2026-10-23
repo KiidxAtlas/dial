@@ -291,6 +291,8 @@ struct Entry {
 struct ActiveView {
     branch: Vec<usize>,
     messages: Vec<usize>,
+    archived: Vec<usize>,
+    revision: u64,
     compaction: Option<usize>,
     control: Option<usize>,
     /// Control state merged along the branch: a `state` entry replaces it, a `patch` entry
@@ -299,6 +301,22 @@ struct ActiveView {
     maintenance_revision: Option<usize>,
     // Corrupt/forward/missing parent links may change meaning when an id is added.
     extendable: bool,
+}
+
+/// Position in a caller-owned message projection. Reuse only with the same projection kind.
+#[derive(Default)]
+pub struct MessageCursor {
+    session: String,
+    branch_revision: u64,
+    compaction: Option<String>,
+    count: usize,
+    tail: Option<String>,
+}
+
+/// Only newly appended messages, or the complete replacement after a branch/view change.
+pub struct MessageDelta<'a> {
+    pub reset: bool,
+    pub messages: Vec<std::borrow::Cow<'a, Value>>,
 }
 
 pub struct Session {
@@ -1244,10 +1262,10 @@ impl Session {
         })
     }
 
-    /// Copies this journal into `target`'s sessions directory with the header cwd rewritten,
-    /// then opens the copy as its writer. The caller swaps the copy in and calls `remove_file`
-    /// on the old session. On failure the copy and its stream journal are removed and `self` is
-    /// untouched.
+    /// Copies this journal, stream supplement and referenced project-local artifacts into `target`,
+    /// with the header cwd rewritten, then opens the copy as its writer. The caller swaps the copy
+    /// in and calls `remove_file` on the old session. Failure removes the copied journals and leaves
+    /// the source untouched; reusable immutable imports may remain in the target artifact store.
     pub fn relocate_to(&self, target: &Layout) -> Result<Session> {
         self.relocate_with(target, Session::open)
     }
@@ -1304,6 +1322,49 @@ impl Session {
         }
         if let Err(error) = crate::runtime::stream_journal::copy(src, &dst) {
             discard_moved_copy(&dst, false);
+            return Err(error);
+        }
+        let transfer = (|| -> Result<()> {
+            let source_root = artifact_root(src)?;
+            let mut references = HashSet::new();
+            let mut reader = BufReader::new(File::open(&dst)?);
+            let mut line = Vec::new();
+            // Use the normal journal reader's admission bounds. Malformed/torn/oversized rows
+            // are not live dependencies; all admitted rows count, not just the active branch.
+            while let Some(raw) = read_bounded_line(&mut reader, &mut line)? {
+                if raw.terminated
+                    && !raw.oversized
+                    && let Ok(value) = serde_json::from_slice::<Value>(&line)
+                {
+                    crate::storage::artifact::transfer::collect_references(
+                        &value,
+                        &source_root,
+                        &mut references,
+                    );
+                }
+            }
+            // Replay joins split append deltas and keeps nodes from inactive branches too.
+            for node in crate::runtime::stream_journal::recover(&dst)? {
+                crate::storage::artifact::transfer::collect_references(
+                    &serde_json::to_value(node)?,
+                    &source_root,
+                    &mut references,
+                );
+            }
+            if !references.is_empty() {
+                let source = crate::storage::artifact::ArtifactStore::new(&source_root)?;
+                let destination =
+                    crate::storage::artifact::ArtifactStore::new(&artifact_root(&dst)?)?;
+                for uri in references {
+                    source
+                        .transfer_to(&destination, &uri)
+                        .with_context(|| format!("transferring moved session artifact {uri}"))?;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = transfer {
+            discard_moved_copy(&dst, true);
             return Err(error);
         }
         reopen(dst.as_path()).inspect_err(|_| discard_moved_copy(&dst, true))
@@ -1614,6 +1675,52 @@ impl Session {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Incrementally read an archive (`archived`) or model-visible history without cloning old
+    /// bodies. Immutable entry ids validate the tail; branch rebuilds and compaction invalidate
+    /// the appropriate projection. Control/runtime-only appends leave both projections intact.
+    pub fn message_delta<'a>(
+        &'a self,
+        cursor: &mut MessageCursor,
+        archived: bool,
+    ) -> MessageDelta<'a> {
+        use std::borrow::Cow;
+        let indices = if archived {
+            &self.active.archived
+        } else {
+            &self.active.messages
+        };
+        let compaction = (!archived)
+            .then_some(self.active.compaction)
+            .flatten()
+            .map(|i| self.entries[i].id.clone());
+        let reset = cursor.session != self.id
+            || cursor.branch_revision != self.active.revision
+            || cursor.compaction != compaction
+            || cursor.count > indices.len()
+            || cursor.count.checked_sub(1).is_some_and(|last| {
+                cursor.tail.as_deref() != Some(self.entries[indices[last]].id.as_str())
+            });
+        let mut messages = Vec::new();
+        if reset && !archived {
+            if let Some(prefix) = self.compaction_prefix() {
+                messages.extend(prefix.iter().map(Cow::Borrowed));
+            } else if let Some(summary) = self.view().0 {
+                messages.push(Cow::Owned(Self::compaction_message(summary)));
+            }
+        }
+        for &i in &indices[if reset { 0 } else { cursor.count }..] {
+            if let Kind::Message(message) = &self.entries[i].kind {
+                messages.push(Cow::Borrowed(message));
+            }
+        }
+        cursor.session.clone_from(&self.id);
+        cursor.branch_revision = self.active.revision;
+        cursor.compaction = compaction;
+        cursor.count = indices.len();
+        cursor.tail = indices.last().map(|&i| self.entries[i].id.clone());
+        MessageDelta { reset, messages }
     }
 
     /// Original conversation input/output only: synthetic compaction/reset prefixes and
@@ -2297,7 +2404,10 @@ impl Session {
                     self.active.control = Some(i);
                     apply_control_entry(&mut self.active.control_state, m);
                 }
-                Kind::Message(_) => self.active.messages.push(i),
+                Kind::Message(_) => {
+                    self.active.messages.push(i);
+                    self.active.archived.push(i);
+                }
                 Kind::Compaction { .. } | Kind::ContextReset { .. } => self.rebuild_view(),
                 _ => {}
             }
@@ -2667,6 +2777,7 @@ impl Session {
     /// Rebuild only after loading or changing branches. Keep the same missing-parent and
     /// cycle behavior as walking the persisted tree directly.
     fn rebuild_active(&mut self) {
+        self.active.revision += 1;
         self.active.branch.clear();
         self.active.control = None;
         self.active.control_state = Value::Null;
@@ -2693,6 +2804,15 @@ impl Session {
             cur = parent;
         }
         self.active.branch.reverse();
+        self.active.archived = self
+            .active
+            .branch
+            .iter()
+            .copied()
+            .filter(
+                |&i| matches!(&self.entries[i].kind, Kind::Message(m) if m["role"] != "dial_state"),
+            )
+            .collect();
         self.active.control = self.active.branch.iter().rev().copied().find(
             |&i| matches!(&self.entries[i].kind, Kind::Message(m) if m["role"] == "dial_state"),
         );

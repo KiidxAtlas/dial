@@ -5,10 +5,14 @@
 //! `status` record closes the file. Lines are redacted and bounded, and readers only touch the
 //! tail of a file so the viewer never loads a whole transcript.
 
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{
+    Arc, LazyLock, Mutex, Weak,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -22,10 +26,51 @@ pub const MAX_RECORD: usize = 256 * 1024;
 /// Bytes read from the end of a transcript when the viewer loads it.
 pub const TAIL_BYTES: u64 = 2 * 1024 * 1024;
 
+#[derive(Default)]
+struct PendingAssistant {
+    revision: u64,
+    text: String,
+    overflow: bool,
+}
+
+impl PendingAssistant {
+    fn changed(&mut self) {
+        static REVISION: AtomicU64 = AtomicU64::new(1);
+        self.revision = REVISION.fetch_add(1, Ordering::Relaxed);
+    }
+    fn clear(&mut self) {
+        self.text.clear();
+        self.overflow = false;
+        self.changed();
+    }
+}
+
+type PendingRegistry = HashMap<PathBuf, Weak<Mutex<PendingAssistant>>>;
+static PENDING: LazyLock<Mutex<PendingRegistry>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Process-local public prose, redacted as one cumulative value before crossing into
+/// the UI. No raw fragments are written to disk, even when a credential spans tokens.
+pub fn pending_assistant(path: &Path, since: u64) -> Option<(u64, String)> {
+    let pending = PENDING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(path)?
+        .upgrade()?;
+    let pending = pending.lock().unwrap_or_else(|e| e.into_inner());
+    if pending.revision == since {
+        return None;
+    }
+    let revision = pending.revision;
+    let mut value = json!({"text":pending.text});
+    drop(pending);
+    redact_value(&mut value);
+    Some((revision, value["text"].as_str().unwrap_or("").to_owned()))
+}
 /// Append-only writer for one child job.
 pub struct ChildTranscript {
     path: PathBuf,
     file: Mutex<File>,
+    pending: Arc<Mutex<PendingAssistant>>,
 }
 
 impl ChildTranscript {
@@ -51,16 +96,38 @@ impl ChildTranscript {
         let transcript = Self {
             path,
             file: Mutex::new(file),
+            pending: Arc::new(Mutex::new(PendingAssistant::default())),
         };
         let mut header = header;
         redact_value(&mut header);
         header["type"] = json!("header");
         transcript.write_line(&header)?;
+        transcript
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .changed();
+        PENDING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(transcript.path.clone(), Arc::downgrade(&transcript.pending));
         Ok(transcript)
     }
 
     /// Appends one archived conversation message, redacted and bounded.
     pub fn record(&self, message: &Value) -> Result<()> {
+        // Serialize assistant commit with process-local snapshot publication. The
+        // authoritative message replaces the pending prose only after a successful write.
+        if message["role"] == "assistant" {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            self.write_message(message)?;
+            pending.clear();
+            return Ok(());
+        }
+        self.write_message(message)
+    }
+
+    fn write_message(&self, message: &Value) -> Result<()> {
         let mut value = message.clone();
         redact_value(&mut value);
         let line = serde_json::to_string(&value)?;
@@ -74,12 +141,43 @@ impl ChildTranscript {
         self.write_line(&json!({"type": "message", "message": value}))
     }
 
+    /// Accumulate public assistant prose in memory only. `None` discards a superseded
+    /// attempt. Keep the whole bounded value for existing multiline/env redaction;
+    /// overflow replaces all prose rather than retaining a cut credential prefix.
+    pub fn assistant_stream(&self, text: Option<&str>) -> Result<()> {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        match text {
+            None => pending.clear(),
+            Some(text) if !pending.overflow => {
+                if pending.text.len().saturating_add(text.len()) > MAX_RECORD {
+                    pending.text = "[assistant stream truncated: record limit exceeded]".into();
+                    pending.overflow = true;
+                } else {
+                    pending.text.push_str(text);
+                }
+                pending.changed();
+            }
+            Some(_) => {}
+        }
+        Ok(())
+    }
+
+    fn flush_pending(&self) -> Result<()> {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if !pending.text.is_empty() {
+            self.write_message(&json!({"role":"assistant", "content":pending.text}))?;
+            pending.clear();
+        }
+        Ok(())
+    }
+
     pub fn execution_contract(&self, tools: &[String], model: &str) -> Result<()> {
         self.write_line(&json!({"type":"execution_contract", "tools":tools, "model":model}))
     }
 
     /// Closes the transcript with its final status.
     pub fn finish(&self, status: Value) -> Result<()> {
+        self.flush_pending()?;
         let mut status = status;
         redact_value(&mut status);
         let mut record = json!({"type": "status"});
@@ -101,6 +199,17 @@ impl ChildTranscript {
         // Persist call intent before effects, and completed results before continuation.
         file.sync_data()?;
         Ok(())
+    }
+}
+
+impl Drop for ChildTranscript {
+    fn drop(&mut self) {
+        // Recover interrupted prose through the same whole-message redaction boundary.
+        let _ = self.flush_pending();
+        PENDING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.path);
     }
 }
 

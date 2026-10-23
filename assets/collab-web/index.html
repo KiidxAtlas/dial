@@ -4,7 +4,7 @@
 <header><h1>Dial session</h1><div id="status">Connecting…</div></header><main id="transcript"></main>
 <script type="module">
 const status=document.querySelector('#status'), transcript=document.querySelector('#transcript');
-const PROTO=1002, RETRY_BASE_MS=1000, RETRY_MAX_MS=30000;
+const PROTO=1003, RETRY_BASE_MS=1000, RETRY_MAX_MS=30000;
 const b64=s=>{s=s.replace(/-/g,'+').replace(/_/g,'/');return Uint8Array.from(atob(s+'='.repeat((4-s.length%4)%4)),c=>c.charCodeAt(0))};
 function fail(message){status.textContent=message;status.className='error'}
 function setStatus(message){status.textContent=message;status.className=''}
@@ -19,9 +19,9 @@ try {
   const secretBytes=b64(secret);if(secretBytes.length!==32&&secretBytes.length!==48)throw Error('Invalid room key.');
   const key=await crypto.subtle.importKey('raw',secretBytes.slice(0,32),{name:'AES-GCM'},false,['encrypt','decrypt']);
   const socketUrl=`${u.protocol}//${u.host}/r/${match[1]}?role=guest`;
-  // Host epoch and sequence persist across reconnects: the host's numbers only move forward.
-  const wire={epoch:null,lastSeq:0};
-  let attempt=0, ended=false;
+  // Retain replay history across reconnects, but let a recreated host use a fresh epoch.
+  const sequences=new Map();
+  let attempt=0, ended=false, retryMissingRoom=false;
   const add=(kind,text)=>{const el=document.createElement('article');el.textContent=`${kind}: ${text}`;transcript.append(el)};
   const describe=entry=>entry?.type||entry?.role||'Entry';
   const renderAll=entries=>{transcript.replaceChildren();for(const entry of entries)add(describe(entry),JSON.stringify(entry))};
@@ -64,33 +64,52 @@ try {
     window.scrollTo(0,document.body.scrollHeight);
   };
   const receive=async(data,replica)=>{
-    const bytes=new Uint8Array(data);if(bytes.length<20)throw Error('Short frame');
+    const bytes=new Uint8Array(data);if(bytes.length<32)throw Error('Short frame');
     const plain=await crypto.subtle.decrypt({name:'AES-GCM',iv:bytes.slice(4,16),tagLength:128},key,bytes.slice(16));
     const frame=JSON.parse(new TextDecoder().decode(plain));
-    // Only host frames, from one host epoch, in strictly increasing sequence, are applied.
-    if(!frame||frame.role!=='host'||typeof frame.epoch!=='string')return;
-    if(wire.epoch===null)wire.epoch=frame.epoch;
-    if(frame.epoch!==wire.epoch||!Number.isSafeInteger(frame.seq)||frame.seq<=wire.lastSeq)return;
-    wire.lastSeq=frame.seq;
+    // Authenticate before touching replay state. One host epoch per connection; sequence
+    // history survives reconnects so captured frames cannot restart an old snapshot.
+    // transportSeq is never the entry's zero-based log seq (which resets independently).
+    // Legacy frames without transportSeq are intentionally rejected; hello advertises v1003.
+    if(ended||!frame||frame.role!=='host'||typeof frame.epoch!=='string'||!Number.isSafeInteger(frame.transportSeq)||frame.transportSeq<=0)return;
+    if(replica.epoch!==null&&frame.epoch!==replica.epoch)return;
+    if(frame.transportSeq<=(sequences.get(frame.epoch)??0))return;
+    if(!sequences.has(frame.epoch)&&sequences.size>=1024)sequences.delete(sequences.keys().next().value);
+    sequences.set(frame.epoch,frame.transportSeq);replica.epoch=frame.epoch;
+    retryMissingRoom=false;
     apply(frame,replica);
   };
   const connect=()=>{
     // Replica state is per connection; the next welcome always supplies a complete snapshot.
-    const replica={staging:null,live:false,entries:[]};
+    const replica={epoch:null,staging:null,live:false,entries:[]};
     const ws=new WebSocket(socketUrl);ws.binaryType='arraybuffer';
     // Decryption is asynchronous, so every frame joins one chain and is reduced in arrival order.
     let chain=Promise.resolve();
     ws.onopen=async()=>{
-      setStatus('Connected · end-to-end encrypted');
-      ws.send(await seal({t:'hello',proto:PROTO,name:'web viewer',role:'guest',epoch:randomEpoch(),seq:1}));
+      try{
+        const hello=await seal({t:'hello',proto:PROTO,name:'web viewer',role:'guest',epoch:randomEpoch(),transportSeq:1});
+        if(ended||ws.readyState!==WebSocket.OPEN)return;
+        setStatus('Connected · end-to-end encrypted');ws.send(hello);
+      }catch(error){ended=true;fail(String(error));ws.close();}
     };
     ws.onmessage=event=>{
-      if(typeof event.data==='string'){try{const control=JSON.parse(event.data);if(control.t==='room-closed'){ended=true;setStatus('Host ended this session')}}catch{}return;}
-      chain=chain.then(()=>receive(event.data,replica)).catch(error=>add('Frame unavailable',String(error)));
-    };
-    ws.onerror=()=>fail('Relay connection failed.');
-    ws.onclose=()=>{
       if(ended)return;
+      // The relay's unauthenticated room-closed hint also accompanies transient host
+      // drops. Only an encrypted bye or a fatal close code ends the session.
+      if(typeof event.data==='string'){try{const control=JSON.parse(event.data);if(control.t==='room-closed')retryMissingRoom=true;}catch{}return;}
+      chain=chain.then(()=>receive(event.data,replica)).then(()=>{if(ended)ws.close();}).catch(error=>{
+        ended=true;fail(`Frame unavailable: ${String(error)}`);ws.close();
+      });
+    };
+    ws.onerror=()=>{if(!ended)fail('Relay connection failed.');};
+    ws.onclose=async event=>{
+      // WebCrypto may still be opening the final bye when the close event arrives.
+      await chain;
+      if(ended)return;
+      const reasons={4001:'room closed',4004:'no such room',4009:'a host is already connected for this room',4029:'room is full'};
+      const retryRoom=event.code===4001||(event.code===4004&&retryMissingRoom);
+      if(retryRoom)retryMissingRoom=true;
+      else if(reasons[event.code]){ended=true;fail(`Session unavailable: ${reasons[event.code]}`);return;}
       const delay=Math.min(RETRY_MAX_MS,RETRY_BASE_MS*2**attempt);attempt+=1;
       setStatus(`Disconnected; reconnecting in ${Math.round(delay/1000)}s`);
       setTimeout(connect,delay);

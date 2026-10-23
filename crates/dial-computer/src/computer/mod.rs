@@ -128,6 +128,16 @@ fn action_policy(action: &ComputerAction) -> Policy {
     }
 }
 
+/// Whether an action can deliver input, so an abort needs the partial-effects warning. Read-only
+/// runs cannot: the worker refuses every mutating helper there.
+fn action_may_send_input(action: &ComputerAction) -> bool {
+    match action {
+        ComputerAction::Capabilities | ComputerAction::Close => false,
+        ComputerAction::Call { chain, .. } => !is_read_only_computer_call(chain).unwrap_or(false),
+        ComputerAction::Run { read_only, .. } => *read_only != Some(true),
+    }
+}
+
 fn parse_action(args: &Value) -> Result<ComputerAction, String> {
     serde_json::from_value(args.clone())
         .map_err(|error| format!("computer received invalid arguments: {error}"))
@@ -378,7 +388,17 @@ fn capture_frame(coordinate_safe: bool) -> (u32, u32) {
 }
 
 fn snapshot_value(snapshot: &ComputerSessionSnapshot) -> ComputerResult<Value> {
-    serde_json::to_value(snapshot).map_err(|error| ComputerError::internal(error.to_string()))
+    use std::hash::{Hash, Hasher};
+    let mut value = serde_json::to_value(snapshot)
+        .map_err(|error| ComputerError::internal(error.to_string()))?;
+    let mut source = std::collections::hash_map::DefaultHasher::new();
+    include_str!("js/worker.mjs").hash(&mut source);
+    value["runtimeIdentity"] = json!(format!(
+        "dial-{} / worker-source-{:016x}",
+        env!("CARGO_PKG_VERSION"),
+        source.finish()
+    ));
+    Ok(value)
 }
 
 /// Run `f` with an abort signal that trips when `cancel` is set. The watcher thread ends with `f`,
@@ -464,6 +484,7 @@ impl Computer {
             Err(error) => return ToolOutput::err(error),
         };
         let read_only = action_policy(&action) == Policy::Read;
+        let may_send_input = action_may_send_input(&action);
         let is_run = matches!(
             action,
             ComputerAction::Run { .. } | ComputerAction::Call { .. }
@@ -478,10 +499,7 @@ impl Computer {
         let value = match result {
             Ok(value) => value,
             Err(error) if error.is_abort => {
-                return ToolOutput::err(format!(
-                    "Computer action was aborted before it finished ({}). Input already sent may have taken effect; observe the current state before acting again.",
-                    error.message
-                ));
+                return ToolOutput::err(abort_message(may_send_input, &error.message));
             }
             Err(error) => return ToolOutput::err(error.message),
         };
@@ -510,33 +528,68 @@ impl Computer {
                 return ToolOutput::err(format!("computer returned a malformed result: {error}"));
             }
         };
-        let text = cap_inline(run_text(&run.displays), |full| {
+        run_tool_output(run, read_only, |full| {
             ctx.workspace
                 .artifacts()
                 .and_then(|store| store.retain(full).ok())
-        });
-        let image = run.displays.iter().rev().find_map(|content| match content {
-            ComputerContent::Image { data, mime_type } => Some((data, mime_type)),
-            ComputerContent::Text { .. } => None,
-        });
-        let mut data = json!({
-            "text": text,
-            "readOnly": read_only,
-            "screenshots": run.screenshots,
-            "value": run.return_value,
-            "capabilities": run.capabilities,
-        });
-        if let Some((image, mime_type)) = image {
-            data["artifact"] =
-                json!({"data": image, "encoding": "base64", "media_type": mime_type});
-        }
-        ToolOutput {
-            execution: Default::default(),
-            text,
-            is_error: false,
-            data: Some(data),
-        }
+        })
     }
+}
+
+/// Builds the direct-tool result. `data.text` stays the script's display output, which the Eval
+/// helper re-displays itself; only the model-visible `text` falls back to the returned value, so
+/// a script that returns without printing is not an empty reply.
+fn run_tool_output(
+    run: ComputerRunOk,
+    read_only: bool,
+    save: impl Fn(&str) -> Option<String>,
+) -> ToolOutput {
+    let display_text = cap_inline(run_text(&run.displays), &save);
+    let visible = if display_text.is_empty() {
+        cap_inline(render_return_value(run.return_value.as_ref()), &save)
+    } else {
+        display_text.clone()
+    };
+    let image = run.displays.iter().rev().find_map(|content| match content {
+        ComputerContent::Image { data, mime_type } => Some((data, mime_type)),
+        ComputerContent::Text { .. } => None,
+    });
+    let mut data = json!({
+        "text": display_text,
+        "readOnly": read_only,
+        "screenshots": run.screenshots,
+        "value": run.return_value,
+        "capabilities": run.capabilities,
+    });
+    if let Some((image, mime_type)) = image {
+        data["artifact"] = json!({"data": image, "encoding": "base64", "media_type": mime_type});
+    }
+    ToolOutput {
+        execution: Default::default(),
+        text: visible,
+        is_error: false,
+        data: Some(data),
+    }
+}
+
+fn render_return_value(value: Option<&Value>) -> String {
+    match value {
+        None => String::new(),
+        Some(Value::String(text)) => text.clone(),
+        Some(other) => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
+    }
+}
+
+/// Abort wording for the outer tool: only actions that can send input warn about partial effects.
+fn abort_message(may_send_input: bool, detail: &str) -> String {
+    if may_send_input {
+        return format!(
+            "Computer action was aborted before it finished ({detail}). Input already sent may have taken effect; observe the current state before acting again."
+        );
+    }
+    format!(
+        "Computer action was aborted before it finished ({detail}). No native mutation was requested through the desktop facade."
+    )
 }
 
 impl Tool for Computer {

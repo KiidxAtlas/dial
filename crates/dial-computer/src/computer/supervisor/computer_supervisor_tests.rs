@@ -160,3 +160,152 @@ fn computer_stale_generation_replies_are_discarded() {
     );
     assert_eq!(reply.try_recv().unwrap().unwrap(), json!("current"));
 }
+
+fn gate_inner() -> Arc<Inner> {
+    Arc::clone(&ComputerSupervisor::new().inner)
+}
+
+#[test]
+fn computer_sequential_runs_never_inherit_previous_cleanup() {
+    let inner = gate_inner();
+    let session = DesktopSession::new(None).unwrap();
+    for _ in 0..3 {
+        let gate = acquire_gate(
+            &inner,
+            &AbortSignal::new(),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+        let token = session.token_for_test();
+        assert!(token.check().is_ok());
+        session.retire();
+        assert!(token.check().is_err());
+        drop(gate);
+    }
+}
+
+#[test]
+fn computer_overlapping_run_waits_for_cleanup_before_snapshotting_native_work() {
+    let inner = gate_inner();
+    let session = Arc::new(DesktopSession::new(None).unwrap());
+    let gate = acquire_gate(
+        &inner,
+        &AbortSignal::new(),
+        Instant::now() + Duration::from_secs(1),
+    )
+    .unwrap();
+    let waiter = {
+        let (inner, session) = (Arc::clone(&inner), Arc::clone(&session));
+        std::thread::spawn(move || {
+            let _gate = acquire_gate(
+                &inner,
+                &AbortSignal::new(),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+            session.token_for_test().check()
+        })
+    };
+    std::thread::sleep(Duration::from_millis(100));
+    session.retire();
+    drop(gate);
+    assert!(waiter.join().unwrap().is_ok());
+}
+
+#[test]
+fn computer_rejected_overlapping_run_leaves_active_run_untouched() {
+    let inner = gate_inner();
+    let session = DesktopSession::new(None).unwrap();
+    let _gate = acquire_gate(
+        &inner,
+        &AbortSignal::new(),
+        Instant::now() + Duration::from_secs(1),
+    )
+    .unwrap();
+    let active = session.token_for_test();
+
+    let abort = AbortSignal::new();
+    abort.abort();
+    let error = acquire_gate(&inner, &abort, Instant::now() + Duration::from_secs(1))
+        .err()
+        .unwrap();
+    assert!(error.is_abort);
+    let started = Instant::now();
+    let error = acquire_gate(
+        &inner,
+        &AbortSignal::new(),
+        started + Duration::from_millis(60),
+    )
+    .err()
+    .unwrap();
+    assert!(error.message.contains("busy"), "{error}");
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(
+        active.check().is_ok(),
+        "rejected runs must not cancel the session"
+    );
+}
+
+#[test]
+fn computer_gate_wait_observes_close_and_abort_promptly() {
+    let supervisor = ComputerSupervisor::new();
+    let inner = Arc::clone(&supervisor.inner);
+    let _gate = acquire_gate(
+        &inner,
+        &AbortSignal::new(),
+        Instant::now() + Duration::from_secs(1),
+    )
+    .unwrap();
+    let signal = AbortSignal::new();
+    let waiter = {
+        let (inner, signal) = (Arc::clone(&inner), signal.clone());
+        std::thread::spawn(move || {
+            acquire_gate(&inner, &signal, Instant::now() + Duration::from_secs(30))
+                .err()
+                .unwrap()
+        })
+    };
+    std::thread::sleep(Duration::from_millis(50));
+    signal.abort();
+    assert!(waiter.join().unwrap().is_abort);
+
+    let waiter = {
+        let inner = Arc::clone(&inner);
+        std::thread::spawn(move || {
+            acquire_gate(
+                &inner,
+                &AbortSignal::new(),
+                Instant::now() + Duration::from_secs(30),
+            )
+            .err()
+            .unwrap()
+        })
+    };
+    std::thread::sleep(Duration::from_millis(50));
+    let started = Instant::now();
+    supervisor.close().unwrap();
+    assert_eq!(waiter.join().unwrap().message, CLOSED);
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[cfg(unix)]
+#[test]
+fn native_lifecycle_boundaries_apply_at_admission_before_next_request() {
+    for method in ["retire", "cancel", "releaseControl"] {
+        let supervisor = fake_worker("import time; time.sleep(30)");
+        let session = Arc::new(DesktopSession::new(None).unwrap());
+        supervisor.inner.state.lock().session = Some(session.clone());
+        let delayed = session.admit();
+        spawn_native(
+            &supervisor.inner,
+            1,
+            &json!({
+                "id": "boundary", "method": method, "args": {}
+            }),
+        );
+        // No scheduling/wait loop: the boundary must already have taken effect
+        // when the protocol reader is ready to admit the next message.
+        assert!(delayed.check_admission().is_err(), "{method}");
+        assert!(session.admit().check_admission().is_ok(), "{method}");
+    }
+}

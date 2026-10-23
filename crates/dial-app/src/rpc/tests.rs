@@ -19,10 +19,37 @@ fn complete_request_without_final_newline_is_accepted() {
     assert_eq!(serde_json::from_slice::<Value>(&next).unwrap()["id"], 2);
 }
 #[test]
+fn request_limit_is_identical_with_a_newline_or_eof() {
+    const LIMIT: usize = 16;
+    for capacity in [1, 7, 64] {
+        for terminated in [false, true] {
+            for length in [LIMIT - 1, LIMIT, LIMIT + 1] {
+                let mut bytes = vec![b'x'; length];
+                if terminated {
+                    bytes.push(b'\n');
+                }
+                let mut input =
+                    std::io::BufReader::with_capacity(capacity, std::io::Cursor::new(bytes));
+                let result = read_request_limit(&mut input, LIMIT).unwrap().unwrap();
+                assert_eq!(
+                    result.is_ok(),
+                    length <= LIMIT,
+                    "capacity={capacity}, terminated={terminated}, length={length}"
+                );
+                if let Ok(payload) = result {
+                    assert_eq!(payload, vec![b'x'; length]);
+                }
+                assert!(read_request_limit(&mut input, LIMIT).unwrap().is_none());
+            }
+        }
+    }
+}
+#[test]
 fn state_reply_reads_only_the_state_projection() {
     let projection = QueryProjection {
         state: json!({"session_id":"s1","tree":[]}),
         messages: json!([{"role":"user","content":"large history"}]),
+        cursor: Default::default(),
     };
     let reply = state_reply(&projection, true).unwrap();
     assert_eq!(reply, json!({"session_id":"s1","tree":[],"busy":true}));
@@ -126,4 +153,40 @@ fn node_metadata_ignores_text_growth_and_tracks_every_other_field() {
     node.result.data = None;
     node.result.phase = Phase::Completed;
     assert_ne!(node_metadata(&node), before);
+}
+
+#[test]
+fn cached_history_refresh_is_incremental_and_preserves_old_busy_snapshot() {
+    let mut session = Session::ephemeral();
+    let mut projection = QueryProjection::default();
+    session
+        .append(json!({"role":"user","content":"first"}))
+        .unwrap();
+    refresh_messages(&session, &mut projection);
+    let old_body = projection.messages[0]["content"].as_str().unwrap().as_ptr();
+    session
+        .append(json!({"role":"assistant","content":"second"}))
+        .unwrap();
+    assert_eq!(projection.messages.as_array().unwrap().len(), 1);
+    refresh_messages(&session, &mut projection);
+    assert_eq!(projection.messages, json!(session.messages()));
+    assert_eq!(
+        old_body,
+        projection.messages[0]["content"].as_str().unwrap().as_ptr()
+    );
+    session
+        .append(json!({"role":"user","content":"abandoned"}))
+        .unwrap();
+    refresh_messages(&session, &mut projection);
+    session.rewind(1).unwrap();
+    session
+        .append(json!({"role":"user","content":"replacement"}))
+        .unwrap();
+    refresh_messages(&session, &mut projection);
+    assert_eq!(projection.messages, json!(session.messages()));
+    session.compact("summary".into(), 1).unwrap();
+    refresh_messages(&session, &mut projection);
+    assert_eq!(projection.messages, json!(session.messages()));
+    refresh_messages(&Session::ephemeral(), &mut projection);
+    assert_eq!(projection.messages, json!([]));
 }

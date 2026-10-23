@@ -86,6 +86,31 @@ pub(in crate::agent) fn silence_exceeded(
         && idle.as_secs() >= limit_secs
 }
 
+/// High-water marks: repeated status/rate reports are not evidence of inference progress.
+#[derive(Default)]
+struct TelemetryProgress {
+    phase: u8,
+    processed: u64,
+    output: u64,
+}
+
+impl TelemetryProgress {
+    fn observe(&mut self, value: &llm::ModelProgress) -> bool {
+        let phase = match value.phase {
+            llm::InferencePhase::Loading => 1,
+            llm::InferencePhase::Processing => 2,
+            llm::InferencePhase::Generating => 3,
+        };
+        let processed = value.processed_tokens.unwrap_or(0);
+        let output = value.output_tokens.unwrap_or(0);
+        let advanced = phase > self.phase || processed > self.processed || output > self.output;
+        self.phase = self.phase.max(phase);
+        self.processed = self.processed.max(processed);
+        self.output = self.output.max(output);
+        advanced
+    }
+}
+
 /// Guarded attempts for a detected thinking/response loop, including the first.
 pub(in crate::agent) const THINKING_LOOP_MAX_ATTEMPTS: u32 = 3;
 /// Thinking-loop redirect notice, appended only to the re-sampled request.
@@ -335,6 +360,7 @@ pub(in crate::agent) fn chat_attempt_with_ui(
         let mut last_tick = Instant::now();
         let mut last_progress = Instant::now();
         let mut generating = false;
+        let mut telemetry = TelemetryProgress::default();
         // True while the provider waits out a retry delay (`Retry { waiting: true }`).
         let mut backing_off = false;
         let mut stalled = None;
@@ -379,6 +405,7 @@ pub(in crate::agent) fn chat_attempt_with_ui(
                     });
                     last_progress = Instant::now();
                     generating = false;
+                    telemetry = TelemetryProgress::default();
                     backing_off = waiting;
                     if waiting {
                         partial_text.clear();
@@ -410,8 +437,10 @@ pub(in crate::agent) fn chat_attempt_with_ui(
                         llm::InferencePhase::Processing => RequestPhase::Processing,
                         llm::InferencePhase::Generating => RequestPhase::Generating,
                     });
-                    generating = value.phase == llm::InferencePhase::Generating;
-                    last_progress = Instant::now();
+                    generating |= value.phase == llm::InferencePhase::Generating;
+                    if telemetry.observe(&value) {
+                        last_progress = Instant::now();
+                    }
                     if let Some(context) = &mut context {
                         let (tokens, estimated) = context.telemetry(&value);
                         ui.context_usage(tokens, estimated);
@@ -421,6 +450,7 @@ pub(in crate::agent) fn chat_attempt_with_ui(
                         ui.model_progress(&progress.value);
                     }
                 }
+                Ok(ChatEvent::Text(text) | ChatEvent::Reasoning(text)) if text.is_empty() => {}
                 Ok(ChatEvent::Text(text)) => {
                     if rules.as_deref_mut().is_some_and(|m| !m.text(&text, false)) {
                         cancel_request.store(true, Ordering::SeqCst);
@@ -467,7 +497,6 @@ pub(in crate::agent) fn chat_attempt_with_ui(
                     }
                 }
                 Ok(ChatEvent::Notice(notice)) => {
-                    last_progress = Instant::now();
                     ui.notice(&notice);
                 }
                 Ok(ChatEvent::Reasoning(text)) => {
@@ -528,8 +557,8 @@ pub(in crate::agent) fn chat_attempt_with_ui(
                     {
                         header.reset();
                     }
-                    last_progress = Instant::now();
-                    if !delta.is_empty() {
+                    if !delta.is_empty() || (!generating && !name.is_empty()) {
+                        last_progress = Instant::now();
                         generating = true;
                         ui.request_phase(RequestPhase::Generating);
                     }

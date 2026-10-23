@@ -15,7 +15,15 @@ use std::{
 use crate::platform;
 
 pub fn run(layout: Layout, config: Config) -> Result<()> {
-    crate::rpc::run_acp(layout, config)
+    run_with_launch(layout, config, crate::agent::modes::Launch::default())
+}
+/// Run with the same process-scoped CLI restrictions as the RPC actor.
+pub fn run_with_launch(
+    layout: Layout,
+    config: Config,
+    launch: crate::agent::modes::Launch,
+) -> Result<()> {
+    crate::rpc::run_acp(layout, config, launch)
 }
 
 struct Pending {

@@ -47,6 +47,15 @@ pub struct DesktopWindow {
     pub focused: bool,
 }
 
+/// A bounded discovery listing; explicit ID lookup is not limited by this cap.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopWindowSnapshot {
+    pub windows: Vec<DesktopWindow>,
+    pub truncated: bool,
+    pub limit: Option<usize>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DesktopCapture {

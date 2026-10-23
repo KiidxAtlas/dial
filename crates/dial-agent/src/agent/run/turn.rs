@@ -1201,8 +1201,12 @@ impl Agent<'_> {
                         budget.refund();
                         return Ok(crate::agent::run::engine::Tick::Again);
                     }
+                    crate::agent::safety::guard::LengthAction::Incomplete(message) => {
+                        return self.stop_turn(ui, message, step + 1).map(crate::agent::run::engine::Tick::Finished);
+                    }
                 }
             }
+            engine.length_recovered(&reply);
             if recovering_output {
                 self.metrics.truncated_recoveries += 1;
                 recovering_output = false;

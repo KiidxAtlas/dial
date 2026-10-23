@@ -248,3 +248,56 @@ fn computer_independent_kernel_handles_contend_and_release() {
     drop(second);
     std::fs::remove_file(path).expect("remove test lock");
 }
+
+#[test]
+fn computer_cancellation_reports_reason_and_mutation_start() {
+    let source = CancellationSource::default();
+    let read = source.token();
+    let write = source.token();
+    write.mark_mutation_started();
+    source.cancel_with(CancelReason::RunAborted);
+    let read_error = read.check().unwrap_err().message;
+    assert!(read_error.contains("was aborted"), "{read_error}");
+    assert!(
+        read_error.contains("native mutation not started"),
+        "{read_error}"
+    );
+    assert!(!read_error.contains("may be partial"), "{read_error}");
+    let write_error = write.check().unwrap_err().message;
+    assert!(write_error.contains("was aborted"), "{write_error}");
+    assert!(
+        write_error.contains("input may be partial"),
+        "{write_error}"
+    );
+}
+
+#[test]
+fn computer_retirement_is_attributed_and_never_blamed_on_approval() {
+    let source = CancellationSource::default();
+    let token = source.token();
+    source.retire();
+    let message = token.check().unwrap_err().message;
+    assert!(message.contains("already finished"), "{message}");
+    assert!(!message.to_lowercase().contains("approv"), "{message}");
+}
+
+#[test]
+fn computer_evicted_cancellation_reason_is_unknown() {
+    let source = CancellationSource::default();
+    let old = source.token();
+    for _ in 0..=REASON_HISTORY {
+        source.retire();
+    }
+    let message = old.check().unwrap_err().message;
+    assert!(message.contains("not recorded"), "{message}");
+    // Tokens issued after the bumps still resolve their own reason.
+    let fresh = source.token();
+    source.cancel_with(CancelReason::EmergencyStop);
+    assert!(
+        fresh
+            .check()
+            .unwrap_err()
+            .message
+            .contains("emergency stop")
+    );
+}

@@ -21,6 +21,31 @@ fn interactive() -> LaunchContext {
 }
 
 #[test]
+fn protocol_launch_rejects_agent_modes_instead_of_ignoring_intent() {
+    for args in [
+        vec!["--plan"],
+        vec!["--plan", "planner"],
+        vec!["--plan-yolo"],
+        vec!["--prewalk"],
+        vec!["--advisor"],
+        vec!["--external-thinking"],
+    ] {
+        let flags = resolve(&parse(&args), interactive()).unwrap();
+        for protocol in ["RPC", "ACP"] {
+            let error = flags.validate_protocol(protocol).unwrap_err().to_string();
+            assert!(error.contains(args[0]), "{error}");
+            assert!(error.contains(protocol), "{error}");
+        }
+    }
+    let flags = resolve(
+        &parse(&["--hide-thinking", "--no-extensions"]),
+        interactive(),
+    )
+    .unwrap();
+    assert!(flags.validate_protocol("RPC").is_ok());
+}
+
+#[test]
 fn goal_objective_is_trimmed_and_required() {
     assert_eq!(normalize_goal("  ship it  ").unwrap(), "ship it");
     let err = normalize_goal("   ").unwrap_err().to_string();

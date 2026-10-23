@@ -97,11 +97,11 @@ fn frames_are_stamped_and_sequence_checked() {
     let value: Value = serde_json::from_str(&stamped).unwrap();
     assert_eq!(value["role"], "guest");
     assert_eq!(value["epoch"], "epoch");
-    assert_eq!(value["seq"], 7);
+    assert_eq!(value["transportSeq"], 7);
     assert_eq!(value["t"], "prompt");
     let empty: Value =
         serde_json::from_str(&stamp_frame(Role::Host, "e", 1, "{}").unwrap()).unwrap();
-    assert_eq!(empty["seq"], 1);
+    assert_eq!(empty["transportSeq"], 1);
     assert!(stamp_frame(Role::Host, "e", 1, "[]").is_none());
 
     let mut windows = SenderWindows::default();
@@ -109,9 +109,52 @@ fn frames_are_stamped_and_sequence_checked() {
     assert!(accept_sequenced(&mut windows, Role::Host, &value));
     assert!(!accept_sequenced(&mut windows, Role::Host, &value));
     // A frame reflected back from the other role is refused even when it is fresh.
-    let reflected = serde_json::json!({"role": "host", "epoch": "h", "seq": 1, "t": "prompt"});
+    let reflected =
+        serde_json::json!({"role": "host", "epoch": "h", "transportSeq": 1, "t": "prompt"});
     assert!(!accept_sequenced(&mut windows, Role::Host, &reflected));
     assert!(accept_sequenced(&mut windows, Role::Guest, &reflected));
+}
+
+#[test]
+fn encrypted_entries_keep_log_indices_independent_of_transport_and_reset() {
+    use crate::collab::protocol::{frame, pack_envelope, unpack_envelope};
+
+    let key = RoomKey::new(&[7; 32]).unwrap();
+    let mut windows = SenderWindows::default();
+    let frames = [
+        frame::reset().to_string(),
+        frame::entry_json(0, r#"{"type":"first"}"#),
+        frame::notice("control between entries").to_string(),
+        frame::entry_json(1, r#"{"type":"second"}"#),
+        frame::reset().to_string(),
+        frame::entry_json(0, r#"{"type":"replacement"}"#),
+    ];
+    for (index, text) in frames.iter().enumerate() {
+        let transport_seq = index as u64 + 1;
+        let stamped = stamp_frame(Role::Host, "host", transport_seq, text).unwrap();
+        assert_eq!(
+            stamped.matches("\"seq\":").count(),
+            usize::from(text.contains("\"seq\":"))
+        );
+        let sealed = key.seal(stamped.as_bytes()).unwrap();
+        let envelope = pack_envelope(0, &sealed);
+        let (peer, payload) = unpack_envelope(&envelope).unwrap();
+        assert_eq!(peer, 0);
+        let opened: Value = serde_json::from_slice(&key.open(payload).unwrap()).unwrap();
+        assert_eq!(opened["transportSeq"], transport_seq);
+        let original: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(opened["seq"], original["seq"]);
+        assert_eq!(opened["entry"], original["entry"]);
+        assert!(accept_sequenced(&mut windows, Role::Guest, &opened));
+        assert!(!accept_sequenced(&mut windows, Role::Guest, &opened));
+    }
+    // A log index must never substitute for a missing or invalid transport sequence.
+    for frame in [
+        serde_json::json!({"role":"host","epoch":"legacy","seq":1,"t":"entry"}),
+        serde_json::json!({"role":"host","epoch":"zero","transportSeq":0,"seq":1,"t":"entry"}),
+    ] {
+        assert!(!accept_sequenced(&mut windows, Role::Guest, &frame));
+    }
 }
 
 #[test]

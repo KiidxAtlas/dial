@@ -24,6 +24,10 @@ enum Frame {
         id: String,
         revision: u64,
         text: String,
+        /// Absent in legacy/unbounded appends. Keep this many trailing bytes of the old
+        /// worker text before appending; the incoming text is already capped at a UTF-8 boundary.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retain_bytes: Option<usize>,
     },
 }
 #[derive(Debug)]
@@ -259,11 +263,23 @@ impl Journal {
         });
     }
     pub fn text(&self, id: &str, revision: u64, text: &str) {
+        self.text_tail(id, revision, text, None);
+    }
+    pub(super) fn text_tail(
+        &self,
+        id: &str,
+        revision: u64,
+        text: &str,
+        retain_bytes: Option<usize>,
+    ) {
         self.append(Frame::Append {
-            schema_version: 1,
+            // Tail retention changes replay semantics: v1 readers must refuse it rather
+            // than silently treating the bounded delta as an ordinary append.
+            schema_version: if retain_bytes.is_some() { 2 } else { 1 },
             id: id.into(),
             revision,
             text: text.into(),
+            retain_bytes,
         });
     }
     pub fn check(&self) -> Result<(), String> {
@@ -400,7 +416,7 @@ fn scan(session: &Path) -> anyhow::Result<(Vec<Node>, bool)> {
         }
         if let Ok(version) = serde_json::from_slice::<Version>(&bytes) {
             anyhow::ensure!(
-                version.schema_version <= 1,
+                version.schema_version <= 2,
                 "unsupported stream journal version {}; source was preserved",
                 version.schema_version
             );
@@ -413,12 +429,27 @@ fn scan(session: &Path) -> anyhow::Result<(Vec<Node>, bool)> {
                 nodes.insert(node.id.clone(), *node);
             }
             Frame::Append {
-                id, revision, text, ..
+                id,
+                revision,
+                text,
+                retain_bytes,
+                ..
             } => {
                 if let Some(node) = nodes.get_mut(&id)
+                    && node.result.phase == super::Phase::Running
                     && revision == node.result.revision.saturating_add(1)
                 {
-                    node.result.text.push_str(&text);
+                    if let Some(retain_bytes) = retain_bytes {
+                        if node.kind != "worker"
+                            || retain_bytes > super::WORKER_TAIL_LIMIT
+                            || text.len() > super::WORKER_TAIL_LIMIT - retain_bytes
+                        {
+                            continue;
+                        }
+                        super::append_tail(&mut node.result.text, &text, retain_bytes);
+                    } else {
+                        node.result.text.push_str(&text);
+                    }
                     node.result.revision = revision;
                 }
             }
@@ -449,3 +480,6 @@ pub fn recover(session: &Path) -> anyhow::Result<Vec<Node>> {
 
 #[cfg(test)]
 mod reclamation_tests;
+
+#[cfg(test)]
+mod worker_tail_tests;

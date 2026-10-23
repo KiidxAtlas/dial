@@ -408,6 +408,7 @@ fn provider_judgment_budget_preserves_explicit_profiles_and_reasoning() {
             &mut ProviderBackend {
                 config: &config,
                 usage: None,
+                cancel: Arc::new(AtomicBool::new(false)),
             },
             "test-judge",
             &question(),
@@ -426,4 +427,83 @@ fn provider_judgment_budget_preserves_explicit_profiles_and_reasoning() {
         assert_eq!(config.active_model_profile().unwrap().max_tokens, limit);
         assert_eq!(config.active_model_profile().unwrap().thinking, Some(true));
     }
+}
+
+#[test]
+fn provider_judgment_cancelled_before_startup_skips_backend_configuration() {
+    // An invalid provider would fail during make_backend if cancellation did not gate startup.
+    let config = Config {
+        provider: Some("not-a-provider".into()),
+        ..Default::default()
+    };
+    let mut backend = ProviderBackend {
+        config: &config,
+        usage: None,
+        cancel: Arc::new(AtomicBool::new(true)),
+    };
+    let error = backend.answer(&question(), false).err().unwrap();
+    assert!(error.to_string().contains("cancelled"), "{error:#}");
+    let error = backend.answer(&question(), true).err().unwrap();
+    assert!(error.to_string().contains("cancelled"), "{error:#}");
+}
+
+#[test]
+fn turn_cancellation_interrupts_in_flight_provider_judgment() {
+    use std::io::{Read, Write};
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let server_cancel = cancel.clone();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut chunk = [0; 4096];
+        loop {
+            let count = stream.read(&mut chunk).unwrap();
+            assert!(count > 0, "client closed before completing the request");
+            request.extend_from_slice(&chunk[..count]);
+            if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                let length: usize = crate::llm::fake::header(&request, "content-length")
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                if request.len() >= end + 4 + length {
+                    break;
+                }
+            }
+        }
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+        // Cancel only after the provider has received the complete judgment request.
+        server_cancel.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_secs(3));
+    });
+    let home = tempfile::tempdir().unwrap();
+    let mut config: Config = serde_json::from_value(json!({
+        "provider": "lm-studio",
+        "model": "test-judge",
+        "endpoint": {"base_url": format!("http://{address}/v1")},
+        "worker_timeout_secs": 10
+    }))
+    .unwrap();
+    config.user_dir = home.path().to_path_buf();
+    let started = Instant::now();
+    let result = judge_turn_thinking(&config, home.path(), "fix a parser", None, cancel);
+    let elapsed = started.elapsed();
+    server.join().unwrap();
+    let error = result.unwrap_err();
+    assert!(error.to_string().contains("interrupt"), "{error:#}");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "cancellation took {elapsed:?}"
+    );
 }

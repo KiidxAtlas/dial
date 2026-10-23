@@ -10,6 +10,7 @@
 
 use super::framing::{read_message, write_message};
 use super::text::{path_from_uri, read_source, uri_from_path};
+use crate::runtime::process::ProcessGroup;
 use anyhow::{Result, anyhow, bail};
 use globset::GlobBuilder;
 use serde_json::{Value, json};
@@ -82,8 +83,22 @@ impl fmt::Display for RpcError {
 }
 
 impl std::error::Error for RpcError {}
+/// The transport accepted a request, but no terminal server reply settled it.
+#[derive(Debug)]
+pub struct UnsettledRequest;
 
-type Reply = Result<Value, RpcError>;
+impl fmt::Display for UnsettledRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("language-server request settlement is unknown")
+    }
+}
+impl std::error::Error for UnsettledRequest {}
+
+enum RequestFailure {
+    Terminal(RpcError),
+    Cancelled,
+}
+type Reply = Result<Value, RequestFailure>;
 
 #[derive(Default)]
 struct Diagnostics {
@@ -179,11 +194,28 @@ impl Shared {
         }
     }
 
-    /// Queue a frame and wait for the writer thread to deliver it.
-    fn send(&self, message: &Value) -> io::Result<()> {
+    fn send_cancellable(
+        &self,
+        message: &Value,
+        cancel: Option<&dyn Fn() -> bool>,
+    ) -> io::Result<()> {
         let (ack, done) = mpsc::channel();
         self.enqueue(message, Some(ack))?;
-        match done.recv_timeout(WRITE_TIMEOUT) {
+        let deadline = Instant::now() + WRITE_TIMEOUT;
+        let response = loop {
+            if cancel.is_some_and(|cancel| cancel()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "LSP startup cancelled",
+                ));
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            match done.recv_timeout(left.min(Duration::from_millis(20))) {
+                Err(RecvTimeoutError::Timeout) if Instant::now() < deadline => continue,
+                response => break response,
+            }
+        };
+        match response {
             Ok(result) => result,
             Err(RecvTimeoutError::Timeout) => Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -246,7 +278,7 @@ impl Shared {
                     }),
                     None => Ok(message.get("result").cloned().unwrap_or(Value::Null)),
                 };
-                let _ = tx.send(reply);
+                let _ = tx.send(reply.map_err(RequestFailure::Terminal));
             }
             (None, None) => {}
         }
@@ -402,7 +434,7 @@ pub struct Client {
     cancellations: AtomicU64,
     docs: Mutex<HashMap<PathBuf, OpenDoc>>,
     clock: AtomicU64,
-    child: Mutex<Option<Child>>,
+    child: Mutex<Option<ProcessGroup>>,
     timeouts: Timeouts,
     /// Set once the handshake succeeded; only then does shutdown speak the protocol.
     ready: bool,
@@ -410,6 +442,7 @@ pub struct Client {
 
 impl Client {
     /// Start `program` with `args` in `root`, run the handshake with `options`, and return the client.
+    #[cfg(test)]
     pub fn spawn(
         name: &str,
         program: &Path,
@@ -418,6 +451,21 @@ impl Client {
         timeouts: Timeouts,
         options: ServerOptions,
     ) -> Result<Self> {
+        Self::spawn_cancellable(name, program, args, root, timeouts, options, &|| false)
+    }
+
+    pub fn spawn_cancellable(
+        name: &str,
+        program: &Path,
+        args: &[String],
+        root: &Path,
+        timeouts: Timeouts,
+        options: ServerOptions,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Self> {
+        if cancel() {
+            bail!("LSP startup cancelled");
+        }
         let mut command = Command::new(program);
         command
             .args(args)
@@ -432,7 +480,7 @@ impl Client {
             kill_group(&mut child);
             bail!("{name}: could not attach to the server's stdio");
         };
-        Self::connect(
+        Self::connect_cancellable(
             name,
             root,
             Box::new(stdout),
@@ -440,11 +488,13 @@ impl Client {
             Some(child),
             timeouts,
             options,
+            cancel,
         )
     }
 
     /// Run the handshake over an existing stream pair with `options`. Dropping the client tears the server down:
     /// `shutdown`, `exit`, then a kill of `child` (and its process group) if it lingers.
+    #[cfg(test)]
     pub fn connect(
         name: &str,
         root: &Path,
@@ -453,6 +503,22 @@ impl Client {
         child: Option<Child>,
         timeouts: Timeouts,
         options: ServerOptions,
+    ) -> Result<Self> {
+        Self::connect_cancellable(name, root, input, output, child, timeouts, options, &|| {
+            false
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn connect_cancellable(
+        name: &str,
+        root: &Path,
+        input: Box<dyn Read + Send>,
+        output: Box<dyn Write + Send>,
+        child: Option<Child>,
+        timeouts: Timeouts,
+        options: ServerOptions,
+        cancel: &dyn Fn() -> bool,
     ) -> Result<Self> {
         let root_uri = uri_from_path(root);
         let (queue, outgoing) = mpsc::channel();
@@ -493,16 +559,22 @@ impl Client {
             cancellations: AtomicU64::new(0),
             docs: Mutex::new(HashMap::new()),
             clock: AtomicU64::new(0),
-            child: Mutex::new(child),
+            child: Mutex::new(child.map(ProcessGroup::new)),
             timeouts,
             ready: false,
         };
-        client.initialize(root, &root_uri, &options)?;
+        client.initialize(root, &root_uri, &options, cancel)?;
         client.ready = true;
         Ok(client)
     }
 
-    fn initialize(&self, root: &Path, root_uri: &str, options: &ServerOptions) -> Result<()> {
+    fn initialize(
+        &self,
+        root: &Path,
+        root_uri: &str,
+        options: &ServerOptions,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<()> {
         let name = root
             .file_name()
             .and_then(|n| n.to_str())
@@ -553,7 +625,8 @@ impl Client {
         if !options.init_options.is_null() {
             params["initializationOptions"] = options.init_options.clone();
         }
-        let initialized = self.request_within("initialize", params, self.timeouts.initialize)?;
+        let initialized =
+            self.request_cancellable("initialize", params, self.timeouts.initialize, Some(cancel))?;
         let capabilities = initialized
             .get("capabilities")
             .cloned()
@@ -569,11 +642,12 @@ impl Client {
             );
         }
         *lock(&self.capabilities) = capabilities;
-        self.notify("initialized", json!({}))?;
+        self.notify_cancellable("initialized", json!({}), Some(cancel))?;
         if !options.settings.is_null() {
-            self.notify(
+            self.notify_cancellable(
                 "workspace/didChangeConfiguration",
                 json!({"settings": options.settings}),
+                Some(cancel),
             )?;
         }
         Ok(())
@@ -623,7 +697,7 @@ impl Client {
     pub fn status(&self) -> Value {
         json!({
             "name": self.name(), "root": self.root, "alive": self.is_alive(), "busy": self.is_busy(),
-            "process_id": lock(&self.child).as_ref().map(Child::id),
+            "process_id": lock(&self.child).as_ref().map(|group| group.child.id()),
             "open_documents": lock(&self.docs).iter().map(|(path, doc)| {
                 json!({"path": path, "version": doc.version})
             }).collect::<Vec<_>>(),
@@ -662,29 +736,51 @@ impl Client {
 
     /// Explicit lifecycle shutdown, also used before an approved reload.
     pub fn stop(&self) {
-        if self.is_alive() {
+        if self.ready && self.is_alive() {
             if self.ready {
                 let _ = self.request_within("shutdown", Value::Null, self.timeouts.shutdown);
             }
             let _ = self.notify("exit", Value::Null);
         }
         self.shared.close();
-        let Some(mut child) = lock(&self.child).take() else {
+        let Some(child) = lock(&self.child).take() else {
             return;
         };
-        let deadline = Instant::now() + self.timeouts.shutdown;
-        while Instant::now() < deadline {
-            if matches!(child.try_wait(), Ok(Some(_))) {
-                return;
+        if self.ready {
+            let deadline = Instant::now() + self.timeouts.shutdown;
+            while Instant::now() < deadline {
+                if matches!(child.exited(), Ok(true)) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
             }
-            thread::sleep(Duration::from_millis(20));
         }
-        kill_group(&mut child);
+        // Drop kills descendants before reaping the leader, including an already-exited leader.
+        drop(child);
+    }
+
+    /// Abandon startup without waiting for protocol writes or a shutdown reply.
+    pub fn terminate(&self) {
+        self.shared.close();
+        let child = lock(&self.child).take();
+        drop(child); // ProcessGroup terminates descendants and reaps the reserved leader.
     }
 
     pub fn notify(&self, method: &str, params: Value) -> Result<()> {
+        self.notify_cancellable(method, params, None)
+    }
+
+    fn notify_cancellable(
+        &self,
+        method: &str,
+        params: Value,
+        cancel: Option<&dyn Fn() -> bool>,
+    ) -> Result<()> {
         self.shared
-            .send(&json!({"jsonrpc": "2.0", "method": method, "params": params}))
+            .send_cancellable(
+                &json!({"jsonrpc": "2.0", "method": method, "params": params}),
+                cancel,
+            )
             .map_err(|e| anyhow!("{} is not accepting messages: {e}", self.name))
     }
 
@@ -694,10 +790,7 @@ impl Client {
         self.cancellations.fetch_add(1, Ordering::AcqRel);
         let pending = std::mem::take(&mut *lock(&self.shared.pending));
         for (id, reply) in pending {
-            let _ = reply.send(Err(RpcError {
-                code: -32800,
-                message: "LSP operation cancelled".into(),
-            }));
+            let _ = reply.send(Err(RequestFailure::Cancelled));
             self.shared.send_nowait(
                 &json!({"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": id}}),
             );
@@ -710,7 +803,12 @@ impl Client {
         let generation = self.cancellations.load(Ordering::Acquire);
         loop {
             match self.request_within(method, params.clone(), self.timeouts.request) {
-                Err(error) if attempt < RETRIES && is_retryable(&error) && self.is_alive() => {
+                Err(error)
+                    if method != "workspace/executeCommand"
+                        && attempt < RETRIES
+                        && is_retryable(&error)
+                        && self.is_alive() =>
+                {
                     attempt += 1;
                     thread::sleep(Duration::from_millis(100 * u64::from(attempt)));
                     if self.cancellations.load(Ordering::Acquire) != generation {
@@ -723,6 +821,16 @@ impl Client {
     }
 
     fn request_within(&self, method: &str, params: Value, limit: Duration) -> Result<Value> {
+        self.request_cancellable(method, params, limit, None)
+    }
+
+    fn request_cancellable(
+        &self,
+        method: &str,
+        params: Value,
+        limit: Duration,
+        cancel: Option<&dyn Fn() -> bool>,
+    ) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel();
         {
@@ -733,26 +841,45 @@ impl Client {
             pending.insert(id, tx);
         }
         let message = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        if let Err(e) = self.shared.send(&message) {
+        if let Err(e) = self.shared.send_cancellable(&message, cancel) {
             lock(&self.shared.pending).remove(&id);
-            bail!("{} is not accepting messages: {e}", self.name);
+            return Err(
+                anyhow!("{} is not accepting messages: {e}", self.name).context(UnsettledRequest)
+            );
         }
-        match rx.recv_timeout(limit) {
+        let deadline = Instant::now() + limit;
+        let response = loop {
+            if cancel.is_some_and(|cancel| cancel()) {
+                lock(&self.shared.pending).remove(&id);
+                return Err(anyhow!("{} {method} cancelled", self.name).context(UnsettledRequest));
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(left.min(Duration::from_millis(20))) {
+                Err(RecvTimeoutError::Timeout) if Instant::now() < deadline => continue,
+                response => break response,
+            }
+        };
+        match response {
             Ok(Ok(result)) => Ok(result),
-            Ok(Err(rpc)) => Err(rpc.into()),
+            Ok(Err(RequestFailure::Cancelled)) => {
+                Err(anyhow!("{} {method} cancelled", self.name).context(UnsettledRequest))
+            }
+            Ok(Err(RequestFailure::Terminal(rpc))) => Err(rpc.into()),
             Err(RecvTimeoutError::Timeout) => {
                 lock(&self.shared.pending).remove(&id);
                 self.shared.send_nowait(
                     &json!({"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": id}}),
                 );
-                bail!(
+                Err(anyhow!(
                     "{} did not answer {method} within {}s",
                     self.name,
                     limit.as_secs().max(1)
                 )
+                .context(UnsettledRequest))
             }
             Err(RecvTimeoutError::Disconnected) => {
-                bail!("{} exited while handling {method}", self.name)
+                Err(anyhow!("{} exited while handling {method}", self.name)
+                    .context(UnsettledRequest))
             }
         }
     }

@@ -388,6 +388,34 @@ pub fn resolve(args: &ModeArgs, ctx: LaunchContext) -> Result<ModeFlags> {
 }
 
 impl ModeFlags {
+    /// Protocol actors do not implement interactive startup modes. Reject intent rather than
+    /// silently losing it when dispatch hands off only the process-scoped `Launch` restrictions.
+    pub fn validate_protocol(&self, protocol: &str) -> Result<()> {
+        let mut unsupported = Vec::new();
+        if self.plan_mode || self.plan_model.is_some() || self.plan_yolo.is_some() {
+            unsupported.push("--plan/--plan-yolo");
+        }
+        if self.prewalk.is_some() {
+            unsupported.push("--prewalk");
+        }
+        if self.goal.is_some() {
+            unsupported.push("--goal");
+        }
+        if self.advisor {
+            unsupported.push("--advisor");
+        }
+        if self.external_thinking {
+            unsupported.push("--external-thinking");
+        }
+        if !unsupported.is_empty() {
+            bail!(
+                "{} cannot be used with {protocol}; use an interactive session for launch modes",
+                unsupported.join(", ")
+            );
+        }
+        Ok(())
+    }
+
     /// Merge this flag set's config overlay into an existing overlay table.
     pub fn merge_into_overlay(&self, overlay: &mut toml::Table) {
         crate::config::merge_overlay(overlay, self.overlay.clone());

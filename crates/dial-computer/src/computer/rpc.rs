@@ -510,11 +510,26 @@ fn clipboard_write(text: &str) -> ComputerResult<Value> {
     Ok(Value::Null)
 }
 
+/// `listWindows` keeps its array response unless `diagnostics: true` requests
+/// a snapshot object (`windows`, `truncated`, `limit`). `getWindow` resolves an
+/// explicit ID without imposing the discovery listing cap.
 pub fn dispatch(session: &DesktopSession, method: &str, args: Value) -> ComputerResult<Value> {
+    session.check_admission().map_err(desktop_error)?;
     match method {
         "capabilities" => ok(session.capabilities()),
         "listDisplays" => ok(session.list_displays()),
+        "listWindows" if args.get("diagnostics").and_then(Value::as_bool) == Some(true) => {
+            ok(session.window_snapshot())
+        }
         "listWindows" => ok(session.list_windows()),
+        "getWindow" => {
+            #[derive(Deserialize)]
+            struct Args {
+                id: String,
+            }
+            let a: Args = parse(method, args)?;
+            ok(session.window(&a.id))
+        }
         "listApplications" => {
             let a: ListApplicationsArgs = parse(method, args)?;
             ok(session.list_applications(a.options))
@@ -558,7 +573,20 @@ pub fn dispatch(session: &DesktopSession, method: &str, args: Value) -> Computer
             Ok(Value::Null)
         }
         "cancel" => {
-            session.cancel();
+            use crate::computer::desktop::CancelReason;
+            let reason = match args.get("reason").and_then(Value::as_str) {
+                Some("run_timeout") => CancelReason::RunTimeout,
+                Some("run_aborted") => CancelReason::RunAborted,
+                Some("run_failed") => CancelReason::RunFailed,
+                Some("control_released") => CancelReason::ControlReleased,
+                None => CancelReason::Cancelled,
+                Some(reason) => {
+                    return Err(ComputerError::tool(format!(
+                        "unknown cancellation reason: {reason}"
+                    )));
+                }
+            };
+            session.cancel_for(reason);
             Ok(Value::Null)
         }
         "capture" => {

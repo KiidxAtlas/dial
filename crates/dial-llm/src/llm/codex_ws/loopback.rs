@@ -82,7 +82,7 @@ fn cached_socket_broken_pipe_replays_on_a_fresh_socket_without_pinning_sse() {
         model: "gpt-test",
         headers: &[],
     };
-    let socket = connect(endpoint, &key, 5).unwrap();
+    let socket = connect(endpoint, &key, 5, &Arc::new(AtomicBool::new(false))).unwrap();
     let MaybeTlsStream::Plain(tcp) = socket.get_ref() else {
         panic!("loopback connection should not use TLS");
     };
@@ -114,7 +114,8 @@ fn idle_cached_socket_is_replaced_before_sending() {
         model: "gpt-test",
         headers: &[],
     };
-    let mut idle = Session::new(connect(endpoint, &key, 5).unwrap());
+    let mut idle =
+        Session::new(connect(endpoint, &key, 5, &Arc::new(AtomicBool::new(false))).unwrap());
     idle.idle_since = Instant::now() - MAX_IDLE_REUSE - Duration::from_secs(1);
     SESSIONS.lock().insert(socket_key.clone(), idle);
     assert_eq!(run_exchange(endpoint, &key).unwrap().text, "ok");
@@ -450,6 +451,11 @@ fn interrupt_and_fatal_event_do_not_disable_websockets() {
         let url = format!("http://{addr}/codex/responses");
         let key = format!("loopback-nontransport-{addr}");
         let server = std::thread::spawn(move || {
+            if interrupted {
+                listener.set_nonblocking(true).unwrap();
+                assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+                return;
+            }
             let (stream, _) = listener.accept().unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
@@ -530,7 +536,8 @@ fn failed_steering_commit_replays_on_fresh_websocket_without_disabling_it() {
         headers: &[],
     };
     let mut chat = chat();
-    let mut session = Session::new(connect(endpoint, &key, 5).unwrap());
+    let mut session =
+        Session::new(connect(endpoint, &key, 5, &Arc::new(AtomicBool::new(false))).unwrap());
     session.last_request =
         Some(super::super::responses::request_codex(endpoint.model, &chat, None).unwrap());
     session.last_response_id = Some("r1".into());

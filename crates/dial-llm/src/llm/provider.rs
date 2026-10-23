@@ -1628,6 +1628,22 @@ impl Backend {
             } else {
                 None
             };
+            // Keep first-dispatch preparation unchanged, but never reuse a key across backoff:
+            // removal must resolve to no auth, not fall back to the previous attempt's key.
+            let retry_endpoint_key = if attempt > 1 {
+                self.endpoint_api_key()?
+            } else {
+                None
+            };
+            let auth = if attempt > 1
+                && matches!(
+                    self.kind,
+                    ProviderKind::Endpoint { .. } | ProviderKind::AnthropicEndpoint { .. }
+                ) {
+                retry_endpoint_key.as_deref()
+            } else {
+                auth
+            };
             let auth = refreshed_access
                 .as_ref()
                 .map(|(_, token)| token.as_str())

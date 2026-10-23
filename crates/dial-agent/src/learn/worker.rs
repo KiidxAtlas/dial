@@ -295,12 +295,20 @@ fn run_command_handoff(
         }
         #[cfg(windows)]
         {
-            match stdin.try_write(&input.as_bytes()[sent..]) {
-                Ok(count) => sent += count,
-                Err(error)
-                    if error.kind() == io::ErrorKind::WouldBlock
-                        || error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error).context("writing subprocess input"),
+            if sent < input.len() {
+                match stdin.try_write(&input.as_bytes()[sent..]) {
+                    Ok(count) => sent += count,
+                    Err(error)
+                        if error.kind() == io::ErrorKind::WouldBlock
+                            || error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => return Err(error).context("writing subprocess input"),
+                }
+            }
+            // EOF must precede child exit: the Python worker reads its request to EOF.
+            // Closing only the queue lets its worker deliver accepted bytes while this
+            // loop keeps draining output and checking cancellation/deadlines.
+            if sent == input.len() {
+                stdin.close();
             }
         }
         if !out_done {
@@ -340,12 +348,6 @@ fn run_command_handoff(
         ensure!(
             stdin.delivered_bytes() == input.len(),
             "subprocess exited before consuming its full request"
-        );
-        ensure!(
-            stdin
-                .finish(Duration::from_secs(2))
-                .context("finishing subprocess input")?,
-            "timed out finishing subprocess input"
         );
     }
     let status = status.context("subprocess has no exit status")?;
@@ -1046,3 +1048,6 @@ pub fn choose_layers(scores: &[f64], coverage: f64, min: u32, max: u32) -> u32 {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod input_tests;

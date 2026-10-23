@@ -9,10 +9,11 @@
 //!   `{"t":"peer-joined"|"peer-left","peer":N}`, relay→guest `{"t":"room-closed"}`.
 //!
 //! Sealed payloads are JSON frames (see [`frame`] helpers). Every sealed frame is stamped by its
-//! socket with `role` (`host`|`guest`), a random per-socket `epoch` and a monotonic `seq`, which
-//! receivers check with a replay window before acting (`super::crypto::SenderWindows`). Dial frames
-//! carry Dial's own session records, so clients speaking other protocol versions are refused
-//! at `hello` instead of silently misrendering.
+//! socket with `role` (`host`|`guest`), a random per-socket `epoch` and a monotonic `transportSeq`,
+//! which receivers check with a replay window before acting (`super::crypto::SenderWindows`).
+//! Entry `seq` remains the zero-based log index, independent of transport/control frames and resets.
+//! Version 1003 requires `transportSeq`; legacy ambiguous `seq` stamps are not accepted. Clients
+//! speaking other protocol versions are refused at `hello` instead of silently misrendering.
 use super::crypto::{ROOM_ID_BYTES, ROOM_KEY_BYTES, WRITE_TOKEN_BYTES, random_bytes};
 use anyhow::{Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -20,7 +21,7 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 
 /// Wire protocol version carried in `hello`/`welcome`; the host rejects mismatches.
-pub const COLLAB_PROTO: u64 = 1002;
+pub const COLLAB_PROTO: u64 = 1003;
 /// Plaintext envelope prefix length.
 pub const ENVELOPE_HEADER_LENGTH: usize = 4;
 /// Upper bound for one replicated entry/node payload before shrinking.

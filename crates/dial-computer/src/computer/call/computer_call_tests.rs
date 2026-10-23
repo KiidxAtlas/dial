@@ -49,7 +49,7 @@ fn computer_call_renders_literals() {
         render_computer_call(&[step("click", vec![json!(10), json!({"button": "left"})])]).unwrap();
     assert_eq!(
         rendered,
-        r#"return await desktop.click(10, {"button":"left"});"#
+        r#"return await desktop.click(10, JSON.parse("{\"button\":\"left\"}"));"#
     );
     let two =
         render_computer_call(&[step("window", vec![json!(3)]), step("raise", vec![])]).unwrap();

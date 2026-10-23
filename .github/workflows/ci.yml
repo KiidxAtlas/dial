@@ -48,6 +48,8 @@ jobs:
         run: bash scripts/test-install.sh
       - name: Test local build and update commands
         run: python3 scripts/test-build.py
+      - name: Test focused Windows contract runner
+        run: python3 scripts/test-windows-contract.py
       - name: Check packaging metadata consistency
         run: python3 scripts/test-packaging.py && python3 scripts/check-packaging.py
       - name: Verify Linux sandbox enforcement
@@ -150,6 +152,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Test contract runner selection and empty-filter rejection
+        run: python scripts/test-windows-contract.py
       - name: Install pinned Rust
         run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@v2

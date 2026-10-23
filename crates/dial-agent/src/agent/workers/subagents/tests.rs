@@ -72,10 +72,10 @@ fn handoff_brief_leads_with_the_current_request_and_labels_the_first_goal_as_his
     Handoff::capture(&control, &[]).apply(&mut request.jobs);
     let brief = request.jobs[0].brief();
     assert!(brief.starts_with("Parent's current request"));
-    assert!(
-        brief.find("fix the CSS regression").unwrap()
-            < brief.find("explain the repo layout").unwrap()
-    );
+    // The exact request already appears in the explicit assignment; its precedence
+    // is retained by reference rather than copying the assignment ahead of history.
+    assert!(brief.contains("included in the assignment/context below; it takes precedence"));
+    assert_eq!(brief.matches("fix the CSS regression").count(), 1);
     assert!(brief.contains("Session-start context (historical"));
     assert!(!brief.contains("Parent goal (background"));
 
@@ -813,4 +813,23 @@ fn sync_results_receive_separate_model_visible_acceptance_metadata() {
         assert!(content.contains("blocked: missing service"));
         assert_eq!(note["dial_transient"], true);
     }
+}
+
+#[test]
+fn handoff_dedup_preserves_distinct_parent_constraints_and_explicit_inputs() {
+    let config = config(&[]);
+    let args = json!({"task":"Repair parser", "solution_space":"Parser only", "context":"Repair parser\nNever edit auth\nNever edit auth"});
+    let mut request = parse(&args, &config).unwrap();
+    Handoff::capture(&json!({
+        "current_instruction":"Repair parser; never change signatures",
+        "original_goal":"Retain compatibility",
+        "working_state":{"goal":"Retain compatibility", "constraints":["Never edit auth"], "evidence":["artifact://evidence"]}
+    }), &[]).apply(&mut request.jobs);
+    let brief = request.jobs[0].brief();
+    assert!(brief.contains("Repair parser; never change signatures"));
+    assert!(brief.contains(args["context"].as_str().unwrap()));
+    assert!(brief.contains("artifact://evidence"));
+    // The independent constraint field remains even if explicit context repeats it.
+    assert!(brief.contains("\"constraints\":[\"Never edit auth\"]"));
+    assert_eq!(brief.matches("Retain compatibility").count(), 1);
 }

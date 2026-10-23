@@ -42,3 +42,36 @@ fn clipboard_helpers_are_bounded_and_failures_are_classified() {
         Err(ClipboardFailure::Failed(_))
     ));
 }
+
+#[test]
+fn delayed_admitted_requests_cannot_cross_lifecycle_boundaries() {
+    for method in ["retire", "cancel", "releaseControl"] {
+        let session = DesktopSession::new(None).unwrap();
+        let delayed = session.admit();
+        let (resume, wait) = std::sync::mpsc::channel();
+        let old = std::thread::spawn(move || {
+            wait.recv().unwrap();
+            // Both direct desktop calls and non-worker RPCs must reject stale work.
+            assert!(
+                delayed
+                    .list_displays()
+                    .unwrap_err()
+                    .message
+                    .contains("cancelled")
+            );
+            dispatch(&delayed, "controlState", Value::Null).unwrap_err()
+        });
+        dispatch(&session.admit(), method, Value::Null).unwrap();
+        let live = session.admit();
+        assert_eq!(
+            dispatch(&live, "controlState", Value::Null).unwrap()["active"],
+            false
+        );
+        resume.send(()).unwrap();
+        let error = old.join().unwrap();
+        assert!(error.is_abort, "{method}: {error}");
+        drop(live);
+        // Dropping an admitted handle must not cancel other live requests.
+        assert!(dispatch(&session.admit(), "controlState", Value::Null).is_ok());
+    }
+}

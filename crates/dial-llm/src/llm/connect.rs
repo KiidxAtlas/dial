@@ -34,6 +34,15 @@ impl Frames {
         }
         Ok(out)
     }
+
+    pub(super) fn finish(&self) -> Result<()> {
+        if !self.buf.is_empty() {
+            return Err(
+                super::stream::IncompleteStream("Connect stream ended inside a frame").into(),
+            );
+        }
+        Ok(())
+    }
 }
 
 pub(super) fn frame(flags: u8, payload: &[u8]) -> Result<Vec<u8>> {
@@ -52,9 +61,36 @@ pub(super) fn gzip(data: &[u8]) -> Result<Vec<u8>> {
 }
 
 pub(super) fn gunzip(data: &[u8]) -> Result<Vec<u8>> {
+    gunzip_limited(data, MAX_FRAME_PAYLOAD)
+}
+
+/// Bound expanded bytes, not just the compressed representation.
+pub(super) fn gunzip_limited(data: &[u8], limit: usize) -> Result<Vec<u8>> {
+    let mut decoder = flate2::read::GzDecoder::new(data);
     let mut out = Vec::new();
-    flate2::read::GzDecoder::new(data).read_to_end(&mut out)?;
-    Ok(out)
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        let read = decoder.read(&mut chunk)?;
+        if read == 0 {
+            return Ok(out);
+        }
+        ensure!(
+            read <= limit.saturating_sub(out.len()),
+            "expanded Connect payload exceeds {limit}-byte cap"
+        );
+        out.extend_from_slice(&chunk[..read]);
+    }
+}
+
+/// Wire-byte limits alone do not bound decoded gzip streams.
+pub(super) fn account_payload(total: &mut usize, len: usize) -> Result<()> {
+    ensure!(
+        len <= super::MAX_STREAM_BYTES.saturating_sub(*total),
+        "decoded Connect stream exceeds {}-byte cap",
+        super::MAX_STREAM_BYTES
+    );
+    *total += len;
+    Ok(())
 }
 
 /// Protobuf wire-format encoder for request bodies.

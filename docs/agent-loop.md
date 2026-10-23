@@ -22,6 +22,12 @@ on hosted models. Full tool policy and workflow rules remain in place. This redu
 reporting prose without enabling the lean local tool profile: offered schemas, loadable-tool
 descriptions, visual-verification guidance, operator instructions, custom templates and project
 context are unchanged. Disabling efficiency restores the full built-in delivery/delegation prose.
+Built-in guidance asks agents to reuse visible evidence, stop research once the change is known,
+and recover from actual diagnostics rather than repeat failed calls. Delegation handoffs carry the
+outcome, owned scope, shared interfaces, evidence references and checks with an owner. Shared
+builds/checks wait for relevant edits to settle; repairs or changed inputs still need rechecking.
+These are prompt policies, not enforced scheduling or proof of live-model compliance; they do not
+add model requests, enable delegation automatically, or change tool and approval permissions.
 For an unlimited foreground output setting, the model's advertised output ceiling is bounded by
 the context remaining beside the current prompt; it is not reserved in full before admission.
 Explicit output limits and the compaction policy's response reserve remain authoritative.

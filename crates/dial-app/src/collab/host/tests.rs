@@ -85,3 +85,67 @@ fn steering_queue_bounds_prompts_and_coalesces_aborts() {
         Err(Refusal::Busy)
     );
 }
+
+#[test]
+fn publishing_is_incremental_and_resets_rewritten_history() {
+    let mut session = Session::ephemeral();
+    session
+        .append(json!({"role":"user","content":"first"}))
+        .unwrap();
+    let mut entries = Arc::new(vec![Arc::from(bounded_json(
+        &session.archived_messages()[0],
+    ))]);
+    let mut cursor = None;
+    let mut frames = Vec::new();
+    publish_entries(&mut entries, &mut cursor, &session, |text| {
+        frames.push(text)
+    });
+    assert!(frames.is_empty(), "startup snapshot must not be replayed");
+    let snapshot = entries.clone();
+    for n in 0..128 {
+        session
+            .append(json!({"role":"assistant","content":format!("answer {n}")}))
+            .unwrap();
+        publish_entries(&mut entries, &mut cursor, &session, |text| {
+            frames.push(text)
+        });
+        assert_eq!(frames.len(), n + 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&frames[n]).unwrap()["seq"],
+            n + 1
+        );
+    }
+    assert_eq!(snapshot.len(), 1, "queued snapshots remain immutable");
+    assert!(
+        Arc::ptr_eq(&snapshot[0], &entries[0]),
+        "old serialized bodies are shared"
+    );
+    session.compact("summary".into(), 1).unwrap();
+    publish_entries(&mut entries, &mut cursor, &session, |text| {
+        frames.push(text)
+    });
+    assert_eq!(frames.len(), 128, "compaction does not rewrite the archive");
+    session
+        .append(json!({"role":"user","content":"abandoned"}))
+        .unwrap();
+    publish_entries(&mut entries, &mut cursor, &session, |_| {});
+    session.rewind(1).unwrap();
+    session
+        .append(json!({"role":"user","content":"replacement"}))
+        .unwrap();
+    frames.clear();
+    publish_entries(&mut entries, &mut cursor, &session, |text| {
+        frames.push(text)
+    });
+    assert_eq!(
+        serde_json::from_str::<Value>(&frames[0]).unwrap()["t"],
+        "reset"
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .map(|text| serde_json::from_str::<Value>(text).unwrap())
+            .collect::<Vec<_>>(),
+        session.archived_messages()
+    );
+}

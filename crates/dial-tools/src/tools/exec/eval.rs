@@ -64,7 +64,7 @@ impl EvalTool {
             if cancelled {
                 self.cancel_operation();
             }
-            return Ok(json!({"cancelled":cancelled,"namespace_discarded":true}));
+            return Ok(json!({"cancelled":cancelled,"namespace_discarded":cancelled}));
         }
         if !matches!(action, "eval" | "reset" | "status") {
             return Err(format!("unsupported eval action {action:?}"));
@@ -236,3 +236,6 @@ impl Tool for EvalTool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -120,6 +120,53 @@ fn training_rejects_ineligible_models_and_respects_pause_and_control_lock() {
     assert!(store.get_meta("last_cycle_attempt").unwrap().is_none());
 }
 #[test]
+fn foreground_compute_wait_cancels_while_background_lease_is_held() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    fs::create_dir(&project).unwrap();
+    let layout = Layout::with_user_dir(&project, root.path().join("user")).unwrap();
+    let lease = lock_file(&layout.user_dir.join("compute.lock")).unwrap();
+    lease.lock_exclusive().unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = cancel.clone();
+    let worker_layout = layout.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let result =
+            compute_lock_cancellable(&worker_layout, || worker_cancel.load(Ordering::SeqCst));
+        tx.send(result.map(|lease| lease.is_none())).unwrap();
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !super::super::compute::foreground_pending(&layout.user_dir).unwrap() {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(
+        rx.try_recv().is_err(),
+        "lease must still exclude foreground compute"
+    );
+    cancel.store(true, Ordering::SeqCst);
+    assert!(
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+            .unwrap()
+    );
+    worker.join().unwrap();
+    assert!(!super::super::compute::foreground_pending(&layout.user_dir).unwrap());
+    assert!(!layout.user_dir.join("compute-owner.json").exists());
+    drop(lease);
+    assert!(
+        compute_lock_cancellable(&layout, || false)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
 fn foreground_sessions_share_compute_but_exclude_background_work() {
     let root = tempfile::tempdir().unwrap();
     let project = root.path().join("project");

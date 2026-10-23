@@ -5,6 +5,7 @@
 //! until its held input and focus have been restored.
 use std::{
     cell::{Cell, RefCell},
+    collections::VecDeque,
     marker::PhantomData,
     rc::Rc,
     sync::{
@@ -28,9 +29,59 @@ mod windows;
 #[cfg(dial_desktop_macos)]
 pub(crate) use macos::SYNTHETIC_EVENT_TAG;
 
+/// Why a generation of desktop work was invalidated. Recorded when the
+/// generation is bumped so a cancelled operation can say who ended it instead
+/// of guessing. `Unknown` means the record was evicted, not that no one acted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CancelReason {
+    /// A computer run ended normally and retired its outstanding work.
+    Retired,
+    /// A plain session cancel with no more specific caller.
+    Cancelled,
+    /// A computer run ended with an error.
+    RunFailed,
+    /// The host aborted a computer run.
+    RunAborted,
+    RunTimeout,
+    /// The computer worker was discarded (crash, bad frame, timeout, restart).
+    WorkerTerminated,
+    SessionClosed,
+    SessionDropped,
+    /// Explicit task control was relinquished.
+    ControlReleased,
+    /// The user's emergency stop key was pressed.
+    EmergencyStop,
+    /// The caller gave up waiting for the native worker.
+    OperationTimeout,
+    Unknown,
+}
+
+impl CancelReason {
+    pub(crate) const fn describe(self) -> &'static str {
+        match self {
+            Self::Retired => "the computer run that issued it had already finished",
+            Self::Cancelled => "the desktop session was cancelled",
+            Self::RunFailed => "the computer run that issued it failed",
+            Self::RunAborted => "the computer run that issued it was aborted",
+            Self::RunTimeout => "the computer run exceeded its execution timeout",
+            Self::WorkerTerminated => "the computer worker was terminated",
+            Self::SessionClosed => "the desktop session was closed",
+            Self::SessionDropped => "the desktop session was dropped",
+            Self::ControlReleased => "desktop control was released",
+            Self::EmergencyStop => "the emergency stop key was pressed",
+            Self::OperationTimeout => "a native desktop operation timed out",
+            Self::Unknown => "the cancellation source was not recorded",
+        }
+    }
+}
+
+/// Recent generation -> reason records; older tokens report `Unknown`.
+const REASON_HISTORY: usize = 64;
+
 #[derive(Default)]
 struct CancellationState {
     generation: AtomicU64,
+    reasons: Mutex<VecDeque<(u64, CancelReason)>>,
     state: Mutex<Option<Arc<ControlLease>>>,
     wake: Condvar,
     #[cfg(dial_desktop_linux)]
@@ -45,6 +96,7 @@ impl CancellationSource {
         OperationToken {
             source: self.clone(),
             generation: self.0.generation.load(Ordering::Acquire),
+            mutation_started: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -52,23 +104,50 @@ impl CancellationSource {
     /// lease.
     pub(crate) fn retire(&self) {
         let _state = self.0.state.lock();
-        self.0.generation.fetch_add(1, Ordering::AcqRel);
+        self.bump(CancelReason::Retired);
+    }
+
+    /// Aborts current/queued work and revokes any explicit task ownership.
+    #[cfg(test)]
+    pub(crate) fn cancel(&self) {
+        self.cancel_with(CancelReason::Cancelled);
+    }
+
+    pub(crate) fn cancel_with(&self, reason: CancelReason) {
+        let lease = {
+            let mut state = self.0.state.lock();
+            self.bump(reason);
+            state.take()
+        };
+        drop(lease);
+    }
+
+    /// Invalidates the current generation; the caller holds the state lock so
+    /// waiters cannot miss the wake-up.
+    fn bump(&self, reason: CancelReason) {
+        {
+            // Publish the reason under the same lock readers use before they
+            // can observe the incremented generation without its provenance.
+            let mut reasons = self.0.reasons.lock();
+            let previous = self.0.generation.fetch_add(1, Ordering::AcqRel);
+            if reasons.len() == REASON_HISTORY {
+                reasons.pop_front();
+            }
+            reasons.push_back((previous, reason));
+        }
         self.0.wake.notify_all();
         #[cfg(dial_desktop_linux)]
         self.0.async_wake.notify_waiters();
     }
 
-    /// Aborts current/queued work and revokes any explicit task ownership.
-    pub(crate) fn cancel(&self) {
-        let lease = {
-            let mut state = self.0.state.lock();
-            self.0.generation.fetch_add(1, Ordering::AcqRel);
-            self.0.wake.notify_all();
-            #[cfg(dial_desktop_linux)]
-            self.0.async_wake.notify_waiters();
-            state.take()
-        };
-        drop(lease);
+    fn reason_for(&self, generation: u64) -> CancelReason {
+        self.0
+            .reasons
+            .lock()
+            .iter()
+            .rev()
+            .find(|(recorded, _)| *recorded == generation)
+            .map_or(CancelReason::Unknown, |(_, reason)| *reason)
     }
 
     pub(crate) fn acquire_control(&self, token: &OperationToken) -> CoreResult<()> {
@@ -86,7 +165,7 @@ impl CancellationSource {
     pub(crate) fn release_control(&self) {
         // A release is also a generation boundary: queued work authorized by the
         // relinquished grant must never execute under a later acquisition.
-        self.cancel();
+        self.cancel_with(CancelReason::ControlReleased);
     }
 
     pub(crate) fn control_active(&self) -> bool {
@@ -101,7 +180,7 @@ pub(super) struct EmergencyStop(Weak<CancellationState>);
 impl EmergencyStop {
     fn cancel(&self) {
         if let Some(source) = self.0.upgrade() {
-            CancellationSource(source).cancel();
+            CancellationSource(source).cancel_with(CancelReason::EmergencyStop);
         }
     }
 }
@@ -110,6 +189,9 @@ impl EmergencyStop {
 pub(crate) struct OperationToken {
     source: CancellationSource,
     generation: u64,
+    /// Shared by clones of this token: set once native mutation dispatch
+    /// began. It does not prove input was delivered, only that it may have been.
+    mutation_started: Arc<AtomicBool>,
 }
 
 impl OperationToken {
@@ -125,14 +207,37 @@ impl OperationToken {
         }
     }
 
+    /// Records that the native layer is about to dispatch a mutation.
+    pub(crate) fn mark_mutation_started(&self) {
+        self.mutation_started.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn mutation_started(&self) -> bool {
+        self.mutation_started.load(Ordering::Acquire)
+    }
+
     pub(crate) fn check(&self) -> CoreResult<()> {
         if self.source.0.generation.load(Ordering::Acquire) == self.generation {
             Ok(())
         } else {
-            Err(DesktopError::cancelled(
-                "desktop operation cancelled; input may be partial; inspect before retrying",
-            ))
+            Err(self.cancelled_error())
         }
+    }
+
+    /// An operation cancelled before its own mutation dispatch must not claim
+    /// partial input. Earlier operations of the same script may have mutated,
+    /// so the text stays scoped to this operation.
+    fn cancelled_error(&self) -> DesktopError {
+        let reason = self.source.reason_for(self.generation).describe();
+        DesktopError::cancelled(if self.mutation_started() {
+            format!(
+                "desktop operation cancelled: {reason}; native input may be partial; inspect before retrying"
+            )
+        } else {
+            format!(
+                "desktop operation cancelled: {reason}; native mutation not started for this operation"
+            )
+        })
     }
 
     #[cfg(dial_desktop_linux)]

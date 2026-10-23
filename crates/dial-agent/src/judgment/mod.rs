@@ -220,8 +220,8 @@ const THINKING_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 const CACHE_MAX_ROWS: u64 = 5000;
 
 /// Judge one user turn's reasoning effort for `thinking = "auto"`: the judge role, the persistent cache
-/// under `user_dir` when it can be opened, and one judge call on a cache miss. `cancel` interrupts a
-/// Laya judgment, including waiting for its service to start.
+/// under `user_dir` when it can be opened, and one judge call on a cache miss. `cancel` interrupts
+/// either provider, including waiting for the Laya service to start.
 pub fn judge_turn_thinking(
     main: &Config,
     user_dir: &std::path::Path,
@@ -265,6 +265,7 @@ pub fn judge_turn_thinking(
         &mut ProviderBackend {
             config: &judge,
             usage,
+            cancel,
         },
         &model,
         prompt,
@@ -277,10 +278,16 @@ pub fn judge_turn_thinking(
 pub struct ProviderBackend<'a> {
     pub config: &'a Config,
     pub usage: Option<&'a crate::llm::usage::Scope>,
+    pub cancel: Arc<AtomicBool>,
 }
 
 impl Backend for ProviderBackend<'_> {
     fn answer(&mut self, question: &Question<'_>, retry: bool) -> Result<Answer> {
+        // This also gates the retry after an invalid choice, before backend startup.
+        ensure!(
+            !self.cancel.load(std::sync::atomic::Ordering::SeqCst),
+            "thinking judgment cancelled"
+        );
         let request = Chat {
             messages: vec![
                 json!({"role": "system", "content": SYSTEM}),
@@ -305,8 +312,14 @@ impl Backend for ProviderBackend<'_> {
                     .for_purpose(crate::llm::usage::Purpose::Judgment),
             ));
         }
-        let result: Result<Reply> =
-            backend.chat(None, &request, self.config.worker_timeout_secs, None);
+        let result: Result<Reply> = backend.chat_with_control(
+            None,
+            &request,
+            self.config.worker_timeout_secs,
+            None,
+            &mut |_| {},
+            self.cancel.clone(),
+        );
         // Price must come from the backend that made the call, so read it before releasing.
         let cost_usd = result
             .as_ref()

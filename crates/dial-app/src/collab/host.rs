@@ -14,7 +14,7 @@ use super::protocol::{
 };
 use super::registry::{self, HostRecord};
 use super::socket::{Role, SnapshotCharge, Socket, SocketEvent, SocketOptions};
-use crate::storage::session::Session;
+use crate::storage::session::{MessageCursor, Session};
 use anyhow::{Result, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Value, json};
@@ -89,6 +89,34 @@ struct GuestPeer {
     writable: bool,
 }
 
+/// Update the replicated projection independently of transport. Reconcile the startup snapshot
+/// once; subsequent syncs serialize only newly archived messages.
+fn publish_entries(
+    entries: &mut Arc<Vec<Arc<str>>>,
+    cursor: &mut Option<MessageCursor>,
+    session: &Session,
+    mut send: impl FnMut(String),
+) {
+    let initial = cursor.is_none();
+    let delta = session.message_delta(cursor.get_or_insert_default(), true);
+    let startup_matches = initial
+        && entries.len() <= delta.messages.len()
+        && entries
+            .iter()
+            .zip(&delta.messages)
+            .all(|(old, new)| &**old == bounded_json(new).as_str());
+    let skip = if startup_matches { entries.len() } else { 0 };
+    if delta.reset && !startup_matches {
+        send(frame::reset().to_string());
+        *entries = Arc::default();
+    }
+    for message in delta.messages.into_iter().skip(skip) {
+        let json: Arc<str> = Arc::from(bounded_json(&message));
+        send(frame::entry_json(entries.len(), &json));
+        Arc::make_mut(entries).push(json);
+    }
+}
+
 pub struct Host {
     socket: Socket,
     link: String,
@@ -98,6 +126,7 @@ pub struct Host {
     /// Bounded JSON of every archived message, in order. This is the replicated log. Snapshot
     /// streams share this allocation; appends copy it only while a stream still reads the old one.
     entries: Arc<Vec<Arc<str>>>,
+    message_cursor: Option<MessageCursor>,
     guests: BTreeMap<u32, GuestPeer>,
     steering: Vec<Steer>,
     /// Local collab-directory record (user dir, record), kept current with the guest count.
@@ -156,6 +185,7 @@ impl Host {
             write_token,
             allow_steering,
             entries: Arc::new(entries),
+            message_cursor: None,
             guests: BTreeMap::new(),
             steering: Vec::new(),
             published: None,
@@ -177,31 +207,14 @@ impl Host {
     /// Append messages archived since the last publish and broadcast them to every peer. A rewind
     /// that shrank or rewrote the archive resets every guest's log, then replays the current one.
     pub fn publish_new(&mut self, session: &Session) {
-        let messages = session.archived_messages();
-        if self.diverged(&messages) {
-            self.socket.send(&frame::reset(), 0);
-            self.entries = Arc::default();
-        }
-        if messages.len() <= self.entries.len() {
-            return;
-        }
-        for message in &messages[self.entries.len()..] {
-            let json: Arc<str> = Arc::from(bounded_json(message));
-            self.socket
-                .send_text(frame::entry_json(self.entries.len(), &json), 0);
-            Arc::make_mut(&mut self.entries).push(json);
-        }
-    }
-
-    /// True when the archive no longer extends the published log: it shrank, or its last published
-    /// entry changed. Comparing only the tail keeps this cheap for long sessions.
-    fn diverged(&self, messages: &[Value]) -> bool {
-        match self.entries.len().checked_sub(1) {
-            None => false,
-            Some(last) => messages
-                .get(last)
-                .is_none_or(|message| bounded_json(message).as_str() != &*self.entries[last]),
-        }
+        publish_entries(
+            &mut self.entries,
+            &mut self.message_cursor,
+            session,
+            |text| {
+                self.socket.send_text(text, 0);
+            },
+        );
     }
 
     /// Process pending relay events. Returns notices for the host transcript.

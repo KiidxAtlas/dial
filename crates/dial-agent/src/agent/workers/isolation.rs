@@ -174,26 +174,28 @@ impl Merge {
     }
 }
 
-/// Identity and streamed hashes, not two complete in-memory copies of project contents.
-/// Symlinks and excluded paths retain the copier's policy; limits are unchanged.
-fn snapshot(
+/// A shared metadata walk keeps preflight and hashed snapshots on the same exclusion and
+/// size policies. Preflight retains only names: copied inodes cannot reuse source hashes.
+fn scan<T, P>(
     root: &Path,
-    baseline: Option<&Snapshot>,
+    preserved: Option<&BTreeMap<PathBuf, P>>,
     limits: &crate::config::task::TaskConfig,
-) -> Result<Snapshot> {
-    fn walk(
+    mut visit: impl FnMut(&Path, &Path, Identity) -> Result<T>,
+) -> Result<BTreeMap<PathBuf, T>> {
+    fn walk<T, P>(
         root: &Path,
         dir: &Path,
-        out: &mut Snapshot,
-        baseline: Option<&Snapshot>,
+        out: &mut BTreeMap<PathBuf, T>,
+        preserved: Option<&BTreeMap<PathBuf, P>>,
         remaining: &mut usize,
         limits: &crate::config::task::TaskConfig,
+        visit: &mut impl FnMut(&Path, &Path, Identity) -> Result<T>,
     ) -> Result<()> {
         for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
             let path = entry?.path();
             // Preserve copied source that was tracked under an ignored bin directory, even
             // before the private Git baseline exists (or when isolation_git is disabled).
-            let preserved_source = baseline.is_some_and(|tree| {
+            let preserved_source = preserved.is_some_and(|tree| {
                 path.strip_prefix(root).ok().is_some_and(|relative| {
                     tree.range(relative.to_path_buf()..)
                         .next()
@@ -210,7 +212,7 @@ fn snapshot(
             let meta = fs::symlink_metadata(&path)
                 .with_context(|| format!("reading metadata for {}", path.display()))?;
             if meta.is_dir() {
-                walk(root, &path, out, baseline, remaining, limits)?;
+                walk(root, &path, out, preserved, remaining, limits, visit)?;
             } else if meta.is_file() {
                 let relative = path.strip_prefix(root)?.to_path_buf();
                 ensure!(
@@ -233,25 +235,63 @@ fn snapshot(
                     limits.isolation_source_bytes - *remaining
                 );
                 let identity = Identity::of(&meta, platform_fs::path_identity(&path)?);
-                let stamp = match baseline.and_then(|tree| tree.get(&relative)) {
-                    Some(previous) if previous.identity == identity => previous.clone(),
-                    _ => stamp(&path)?.context("snapshot file disappeared")?,
-                };
-                ensure!(
-                    stamp.identity == identity,
-                    "file changed while snapshotting {}",
-                    path.display()
-                );
-                *remaining -= stamp.identity.size as usize;
-                out.insert(relative, stamp);
+                let size = identity.size as usize;
+                let value = visit(&path, &relative, identity)?;
+                *remaining -= size;
+                out.insert(relative, value);
             }
         }
         Ok(())
     }
-    let mut out = Snapshot::new();
+    let mut out = BTreeMap::new();
     let mut remaining = limits.isolation_source_bytes;
-    walk(root, root, &mut out, baseline, &mut remaining, limits)?;
+    walk(
+        root,
+        root,
+        &mut out,
+        preserved,
+        &mut remaining,
+        limits,
+        &mut visit,
+    )?;
     Ok(out)
+}
+
+/// Metadata-only preflight bounds the source before a backend copies or mounts it.
+fn preflight(
+    root: &Path,
+    limits: &crate::config::task::TaskConfig,
+) -> Result<BTreeMap<PathBuf, ()>> {
+    scan::<_, ()>(root, None, limits, |_, _, _| Ok(()))
+}
+
+/// Identity and streamed hashes, not two complete in-memory copies of project contents.
+fn snapshot(
+    root: &Path,
+    baseline: Option<&Snapshot>,
+    limits: &crate::config::task::TaskConfig,
+) -> Result<Snapshot> {
+    snapshot_preserving(root, baseline, baseline, limits)
+}
+
+fn snapshot_preserving<P>(
+    root: &Path,
+    baseline: Option<&Snapshot>,
+    preserved: Option<&BTreeMap<PathBuf, P>>,
+    limits: &crate::config::task::TaskConfig,
+) -> Result<Snapshot> {
+    scan(root, preserved, limits, |path, relative, identity| {
+        let value = match baseline.and_then(|tree| tree.get(relative)) {
+            Some(previous) if previous.identity == identity => previous.clone(),
+            _ => stamp(path)?.context("snapshot file disappeared")?,
+        };
+        ensure!(
+            value.identity == identity,
+            "file changed while snapshotting {}",
+            path.display()
+        );
+        Ok(value)
+    })
 }
 
 fn stamp(path: &Path) -> Result<Option<FileStamp>> {
@@ -297,6 +337,8 @@ fn stamp(path: &Path) -> Result<Option<FileStamp>> {
             ) == identity,
         "file changed while hashing"
     );
+    #[cfg(test)]
+    startup_tests::record_hash(bytes);
     Ok(Some(FileStamp {
         identity,
         hash: digest.finalize().into(),
@@ -381,7 +423,7 @@ impl Isolated {
         preference: Preference,
     ) -> Result<Self> {
         // Bound source scanning before copying any tree; a failure here leaves nothing copied.
-        let source_snapshot = snapshot(project.root(), None, config).context(
+        let source_paths = preflight(project.root(), config).context(
             "isolation preflight failed before any copy was made; no files were copied and the project is unchanged",
         )?;
         let selection = backend::select(preference, |candidate| {
@@ -436,10 +478,12 @@ impl Isolated {
                 root = work;
             }
         }
-        // The source snapshot is the baseline for ProjFS: walking the instance would read every placeholder.
+        // Hash the actual worker baseline once. ProjFS must hash the source instead: walking
+        // its instance would hydrate every placeholder. Overlay still hashes its mounted view
+        // so concurrent source changes cannot silently reuse stale preflight content.
         let before = match kind {
             Backend::ProjFs => snapshot(project.root(), None, config)?,
-            _ => snapshot(&root, Some(&source_snapshot), config)?,
+            _ => snapshot_preserving(&root, None, Some(&source_paths), config)?,
         };
         // The overlay's lower layer and the worktree's copied ignored files already provide
         // dependencies, so only the plain copies need the dependency copy.
@@ -653,3 +697,6 @@ fn release_link(link: Option<worktree::Link>, merge: &mut Merge) {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod startup_tests;

@@ -820,13 +820,13 @@ fn stamp_frame(role: Role, epoch: &str, seq: u64, text: &str) -> Option<String> 
     let rest = text.strip_prefix('{')?;
     let separator = if rest.trim_start() == "}" { "" } else { "," };
     Some(format!(
-        "{{\"role\":\"{}\",\"epoch\":\"{epoch}\",\"seq\":{seq}{separator}{rest}",
+        "{{\"role\":\"{}\",\"epoch\":\"{epoch}\",\"transportSeq\":{seq}{separator}{rest}",
         role.as_str()
     ))
 }
 
 /// Authenticate a decrypted frame's sender. Only the peer role is accepted, and each
-/// `(epoch, seq)` pair at most once inside the replay window. Callers must have opened the frame.
+/// `(epoch, transportSeq)` pair at most once inside the replay window. Callers must have opened the frame.
 fn accept_sequenced(windows: &mut SenderWindows, local: Role, frame: &Value) -> bool {
     let sender = match local {
         Role::Host => Role::Guest,
@@ -835,7 +835,7 @@ fn accept_sequenced(windows: &mut SenderWindows, local: Role, frame: &Value) -> 
     if frame["role"].as_str() != Some(sender.as_str()) {
         return false;
     }
-    match (frame["epoch"].as_str(), frame["seq"].as_u64()) {
+    match (frame["epoch"].as_str(), frame["transportSeq"].as_u64()) {
         (Some(epoch), Some(seq)) => windows.accept(epoch, seq),
         _ => false,
     }
