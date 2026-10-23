@@ -7,12 +7,14 @@ use std::{
 };
 
 thread_local! { static DEPTH: Cell<usize> = const { Cell::new(0) }; }
+/// Tracks this thread's nesting depth, so it must be dropped on the thread that acquired it.
 pub(in crate::agent) struct Slot {
     _permit: Option<crate::agent::model::provider_slots::Slot>,
+    _thread_bound: std::marker::PhantomData<*const ()>,
 }
 impl Drop for Slot {
     fn drop(&mut self) {
-        DEPTH.with(|depth| depth.set(depth.get() - 1));
+        DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
     }
 }
 pub(in crate::agent) fn acquire(config: &Config, interrupt: &AtomicBool) -> Option<Slot> {
@@ -32,7 +34,10 @@ pub(in crate::agent) fn acquire(config: &Config, interrupt: &AtomicBool) -> Opti
         None
     };
     DEPTH.with(|depth| depth.set(depth.get() + 1));
-    Some(Slot { _permit: permit })
+    Some(Slot {
+        _permit: permit,
+        _thread_bound: std::marker::PhantomData,
+    })
 }
 
 #[cfg(test)]

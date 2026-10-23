@@ -121,6 +121,25 @@ pub struct Session {
 struct Listing {
     resources: Option<Value>,
     prompts: Option<Value>,
+    /// Bumped whenever a notice or reconnect invalidates the cache, so a list fetched before the
+    /// bump is not stored over the newer state.
+    generation: u64,
+}
+
+impl Listing {
+    /// Runs `set` only if nothing invalidated the cache since `generation` was read.
+    fn store(&mut self, generation: u64, set: impl FnOnce(&mut Self)) {
+        if self.generation == generation {
+            set(self);
+        }
+    }
+
+    /// Drops both cached listings (a reconnect) and invalidates in-flight fetches.
+    fn reset(&mut self) {
+        self.resources = None;
+        self.prompts = None;
+        self.generation += 1;
+    }
 }
 
 impl Session {
@@ -196,13 +215,16 @@ impl Session {
         listen(self, signals)?;
         let old = std::mem::replace(&mut *self.client.lock(), client.clone());
         drop(old);
-        *self.listing.lock() = Listing::default();
+        self.listing.lock().reset();
         Ok(client)
     }
 
     /// Resources and resource templates, from cache when the server has not announced a change.
     pub fn resources(self: &Arc<Self>) -> Result<Value> {
-        let cached = self.listing.lock().resources.clone();
+        let (cached, generation) = {
+            let listing = self.listing.lock();
+            (listing.resources.clone(), listing.generation)
+        };
         if let Some(cached) = cached {
             return Ok(cached);
         }
@@ -212,20 +234,27 @@ impl Session {
             "resources": list_all(&client, "resources/list", "resources", timeout)?,
             "templates": list_all(&client, "resources/templates/list", "resourceTemplates", timeout)?,
         });
-        self.listing.lock().resources = Some(listing.clone());
+        self.listing
+            .lock()
+            .store(generation, |cache| cache.resources = Some(listing.clone()));
         Ok(listing)
     }
 
     /// Prompts, from cache when the server has not announced a change.
     pub fn prompts(self: &Arc<Self>) -> Result<Value> {
-        let cached = self.listing.lock().prompts.clone();
+        let (cached, generation) = {
+            let listing = self.listing.lock();
+            (listing.prompts.clone(), listing.generation)
+        };
         if let Some(cached) = cached {
             return Ok(cached);
         }
         let client = self.client()?;
         let listing =
             json!({"prompts": list_all(&client, "prompts/list", "prompts", self.timeout())?});
-        self.listing.lock().prompts = Some(listing.clone());
+        self.listing
+            .lock()
+            .store(generation, |cache| cache.prompts = Some(listing.clone()));
         Ok(listing)
     }
 
@@ -277,8 +306,14 @@ impl Session {
     fn on_signal(&self, signal: Signal) {
         let mut listing = self.listing.lock();
         match signal {
-            Signal::ResourcesChanged | Signal::ResourceUpdated => listing.resources = None,
-            Signal::PromptsChanged => listing.prompts = None,
+            Signal::ResourcesChanged | Signal::ResourceUpdated => {
+                listing.resources = None;
+                listing.generation += 1;
+            }
+            Signal::PromptsChanged => {
+                listing.prompts = None;
+                listing.generation += 1;
+            }
             Signal::ToolsChanged | Signal::Closed => {}
         }
     }
@@ -312,12 +347,12 @@ fn list_all(client: &Client, method: &str, key: &str, timeout: Duration) -> Resu
 /// Routes a session's signals: list-changed and resource-updated notices invalidate its cache,
 /// and a closed transport triggers recovery. The thread holds only a weak reference, so dropping
 /// the session (its tools) stops the server.
-fn listen(session: &Arc<Session>, signals: mpsc::Receiver<(u64, Signal)>) -> Result<()> {
+fn listen(session: &Arc<Session>, signals: mpsc::Receiver<Signal>) -> Result<()> {
     let weak: Weak<Session> = Arc::downgrade(session);
     thread::Builder::new()
         .name(format!("mcp-{}-signals", session.name))
         .spawn(move || {
-            for (_, signal) in signals {
+            for signal in signals {
                 let Some(session) = weak.upgrade() else {
                     return;
                 };
@@ -600,9 +635,9 @@ fn open(
     user_dir: &Path,
     deadline: Option<Instant>,
     cancel: &dyn Fn() -> bool,
-) -> Result<(Client, mpsc::Receiver<(u64, Signal)>)> {
+) -> Result<(Client, mpsc::Receiver<Signal>)> {
     let (tx, rx) = mpsc::channel();
-    let shared = Shared::new(vec![root.to_path_buf()], Some((0, tx)));
+    let shared = Shared::new(vec![root.to_path_buf()], Some(tx));
     let client = if let Some(url) = &server.url {
         let oauth = Arc::new(oauth::TokenSource::load(user_dir, name)?);
         let remote = Arc::new(http::Http::new(name, url, server, Some(oauth))?);

@@ -3,6 +3,7 @@ use std::sync::atomic::AtomicBool;
 use serde_json::json;
 
 use super::*;
+use crate::llm::usage_report::UsageStatus;
 
 #[test]
 fn iso_timestamps_parse_with_zone() {
@@ -182,4 +183,16 @@ fn fetch_without_credentials_is_none() {
     let dir = tempfile::tempdir().unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
     assert!(fetch(dir.path(), &cancel).unwrap().is_none());
+}
+
+#[test]
+fn fetch_with_corrupt_credentials_surfaces_the_error() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("anthropic-subscription.json"), b"{not json").unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let error = fetch(dir.path(), &cancel).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("credentials are invalid"),
+        "{error:#}"
+    );
 }

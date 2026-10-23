@@ -17,7 +17,9 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use super::gh_common::{GH_TIMEOUT, clip, default_gh_host, gh, gh_json, strings, valid_repo};
+use super::gh_common::{
+    GH_TIMEOUT, clip, default_gh_host, gh, gh_json, split_repo_ref, strings, valid_repo,
+};
 use crate::tools::{ToolOutput, Workspace, opt_str};
 
 const SEARCH_LIMIT_DEFAULT: u64 = 10;
@@ -584,18 +586,6 @@ impl SearchScope {
             qualifier: Some(format!("repo:{slug}")),
             host: host.map(str::to_owned),
         })
-    }
-}
-
-/// Split `[HOST/]OWNER/REPO`; any other shape is taken whole as the slug.
-fn split_repo_ref(repo: &str) -> (Option<&str>, &str) {
-    let Some(first) = repo.find('/') else {
-        return (None, repo);
-    };
-    let rest = &repo[first + 1..];
-    match rest.find('/') {
-        Some(second) if !rest[second + 1..].contains('/') => (Some(&repo[..first]), rest),
-        _ => (None, repo),
     }
 }
 

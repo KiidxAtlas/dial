@@ -126,3 +126,14 @@ fn inprocess_config_name_round_trips() {
     assert_eq!(backend, ShellBackend::InProcess);
     assert_eq!(serde_json::to_string(&backend).unwrap(), "\"inprocess\"");
 }
+
+#[test]
+fn configured_zero_cap_means_no_deadline_and_explicit_timeouts_are_capped() {
+    assert_eq!(effective_timeout(None, 0), 0);
+    assert_eq!(effective_timeout(None, 60), 60);
+    assert_eq!(effective_timeout(None, 900), DEFAULT_BASH_TIMEOUT_SECS);
+    assert_eq!(effective_timeout(Some(0), 0), 0);
+    assert_eq!(effective_timeout(Some(0), 120), 120);
+    assert_eq!(effective_timeout(Some(1000), 0), 1000);
+    assert_eq!(effective_timeout(Some(1000), 120), 120);
+}

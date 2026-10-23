@@ -182,7 +182,16 @@ fn text_arg(args: &Value, key: &str) -> Result<Option<String>, String> {
         .map(str::to_owned))
 }
 
-fn pr_diff(ws: &Workspace, args: &Value, cancel: &AtomicBool) -> Result<ToolOutput, String> {
+/// A validated `pr_diff` request: the PR, the optional explicit repo and the selected view.
+pub(super) struct PrDiffRequest {
+    pub repo: Option<String>,
+    pub number: u64,
+    pub view: PrDiffView,
+}
+
+/// Validate `pr_diff` arguments exactly as the op does, without running `gh`. The cache keys on
+/// this too, so a call the op would reject can never be answered from a cached entry.
+pub(super) fn parse_request(args: &Value) -> Result<PrDiffRequest, String> {
     let pr = pr_reference(args)?;
 
     let all = opt_bool(args, "all")?;
@@ -215,22 +224,30 @@ fn pr_diff(ws: &Workspace, args: &Value, cancel: &AtomicBool) -> Result<ToolOutp
         (Some(arg), _) => Some(arg),
         (None, url) => url,
     };
+    Ok(PrDiffRequest {
+        repo,
+        number: pr.number,
+        view,
+    })
+}
+
+fn pr_diff(ws: &Workspace, args: &Value, cancel: &AtomicBool) -> Result<ToolOutput, String> {
+    let PrDiffRequest { repo, number, view } = parse_request(args)?;
     let resolved = resolve_repo(ws, repo.as_deref(), cancel)?;
     let repo = match resolved.host {
         Some(host) => format!("{host}/{}", resolved.slug),
         None => resolved.slug,
     };
 
-    let text = fetch_unified(ws, &repo, pr.number, cancel)?;
+    let text = fetch_unified(ws, &repo, number, cancel)?;
     let rendered = match view {
         PrDiffView::All => text,
-        PrDiffView::Summary => render_summary(&repo, pr.number, &parse_unified(&text)),
+        PrDiffView::Summary => render_summary(&repo, number, &parse_unified(&text)),
         PrDiffView::File(index) => {
             let files = parse_unified(&text);
             if index == 0 || index > files.len() {
                 return Err(format!(
                     "pr://{repo}/{number}/diff/{index} is out of range; PR has {count} file{plural}. Use pr://{repo}/{number}/diff to list available indices.",
-                    number = pr.number,
                     count = files.len(),
                     plural = plural(files.len()),
                 ));

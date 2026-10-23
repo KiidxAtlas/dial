@@ -368,8 +368,10 @@ fn machine_case_contract_is_identical_across_strict_variants_and_ignores_ambient
 
 #[test]
 fn review_experiment_pins_measured_model_at_both_isolation_points() {
-    let mut config = Config::default();
-    config.model = "measured".into();
+    let mut config = Config {
+        model: "measured".into(),
+        ..Config::default()
+    };
     config.verification.review.enabled = true;
     config.model_roles.insert(
         "coach".into(),

@@ -89,8 +89,10 @@ fn missing_disabled_and_install_launcher_mcp_prerequisites_are_unavailable_witho
 
 #[test]
 fn delegation_uses_builtin_agents_and_selected_model_not_operator_presets() {
-    let mut config = Config::default();
-    config.model = "same-model".into();
+    let mut config = Config {
+        model: "same-model".into(),
+        ..Config::default()
+    };
     config
         .subagents
         .insert("ambient".into(), "not benchmark evidence".into());

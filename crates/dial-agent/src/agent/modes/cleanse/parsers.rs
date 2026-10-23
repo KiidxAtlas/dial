@@ -200,7 +200,7 @@ fn normalize_file(raw: &str, cwd: &Path, root: &Path) -> Option<String> {
         return None;
     }
     let value = value.strip_prefix("file://").unwrap_or(value);
-    let decoded = percent_decode(value);
+    let decoded = crate::stats::server::percent_decode(value);
     let path = Path::new(&decoded);
     let candidates = if path.is_absolute() {
         vec![path.to_path_buf()]
@@ -213,27 +213,6 @@ fn normalize_file(raw: &str, cwd: &Path, root: &Path) -> Option<String> {
         let text = rel_string(rel);
         (!text.is_empty()).then_some(text)
     })
-}
-
-fn percent_decode(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hex = std::str::from_utf8(&bytes[i + 1..i + 3])
-                .ok()
-                .and_then(|hex| u8::from_str_radix(hex, 16).ok());
-            if let Some(byte) = hex {
-                out.push(byte);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Removes ANSI CSI escapes and control characters other than newline and tab.

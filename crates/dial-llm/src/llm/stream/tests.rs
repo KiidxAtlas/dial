@@ -53,6 +53,35 @@ fn connection_loss_and_timeouts_are_classified_as_incomplete_streams() {
 }
 
 #[test]
+fn a_disconnect_inside_gzip_decoding_is_an_incomplete_stream() {
+    struct Gzip(ErrorKind);
+    impl Read for Gzip {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            let inner = std::io::Error::new(self.0, "Peer disconnected");
+            Err(std::io::Error::other(ureq::Error::Decompress(
+                "gzip", inner,
+            )))
+        }
+    }
+    let lost = read_events(Gzip(ErrorKind::UnexpectedEof), 1024, 1024, far(), |_| {
+        Ok(false)
+    })
+    .unwrap_err();
+    assert!(
+        lost.downcast_ref::<IncompleteStream>().is_some(),
+        "{lost:#}"
+    );
+    let corrupt = read_events(Gzip(ErrorKind::InvalidData), 1024, 1024, far(), |_| {
+        Ok(false)
+    })
+    .unwrap_err();
+    assert!(
+        corrupt.downcast_ref::<IncompleteStream>().is_none(),
+        "{corrupt:#}"
+    );
+}
+
+#[test]
 fn sse_framing_tolerates_comments_crlf_and_other_fields() {
     let raw = b": keepalive\r\n\r\nevent: message\r\nid: 7\r\nretry: 10\r\ndata: {\"a\":1}\r\n\r\ndata:{\"b\":2}\n\n: ping\ndata: [DONE]\n\ndata: ignored-after-done\n";
     assert_eq!(events(raw).unwrap(), ["{\"a\":1}", "{\"b\":2}", "[DONE]"]);

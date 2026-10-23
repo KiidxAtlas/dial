@@ -97,7 +97,6 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
         Some(Command::Schedule { action }) => {
             return cmd::schedule::run(&cli, &layout, action);
         }
-        Some(Command::Update { version }) => return cmd::update::run(version.as_deref()),
         Some(Command::Setup) => {
             return setup::run(
                 &layout,

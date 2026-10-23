@@ -39,7 +39,7 @@ fn invoked_counts_are_separate_from_offers_and_per_tool() {
     trace.record_invoked("bash");
     assert_eq!(trace.invoked.get("bash"), Some(&2));
     assert_eq!(trace.offered.get("bash"), Some(&1));
-    assert!(trace.invoked.get("find").is_none());
+    assert!(!trace.invoked.contains_key("find"));
 }
 
 fn sse_reply(text: &str) -> crate::llm::fake::Script {

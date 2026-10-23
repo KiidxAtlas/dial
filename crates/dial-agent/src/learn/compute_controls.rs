@@ -123,7 +123,8 @@ pub fn action(user: &Path, state: Option<&str>, action: &str) -> Result<String> 
         _ => {}
     }
     let state = state_path(user, state.context("select a job")?)?;
-    let store = Store::open_read_only(&state)?;
+    // Fails early when the job's state does not exist; the worker's control lock decides whether it runs.
+    Store::open_read_only(&state)?;
     if action == "remove" {
         settings_store::write_private(&state.join("improvement.stop"), b"stop")?;
         // Disable future scheduling, but retain sessions, checkpoints and admitted adapters.
@@ -169,7 +170,6 @@ pub fn action(user: &Path, state: Option<&str>, action: &str) -> Result<String> 
         super::improve::SETTINGS_PATH
     );
     super::auto::resume(&state)?;
-    let _ = store; // The existing worker's control lock is the authority for whether it is running.
     let writable = Store::open(&state, &config.model, &config.use_case, &config.harness)?;
     writable.set_meta("auto_enabled", "true")?;
     super::auto::start_cycle(&layout, &config, &writable)?.ensure_started(&state)?;

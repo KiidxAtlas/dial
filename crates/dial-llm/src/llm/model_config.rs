@@ -307,6 +307,20 @@ impl ResolvedHeaders<'_> {
                 .unwrap()
                 .into();
         }
+        if error.is::<super::stream::StalledStream>() {
+            return error
+                .downcast::<super::stream::StalledStream>()
+                .unwrap()
+                .into();
+        }
+        if let Some(classified) = error.downcast_ref::<super::errors::Classified>() {
+            // In-stream errors keep their class so retry, compaction and fallback still apply.
+            return super::errors::Classified::new(
+                classified.class.clone(),
+                "model request failed; details withheld to protect custom headers",
+            )
+            .into();
+        }
         if error.is::<super::responses::TerminalFailure>() {
             return error
                 .downcast::<super::responses::TerminalFailure>()

@@ -151,7 +151,8 @@ fn temp_path(target: &Path) -> PathBuf {
     dir.join(format!(".{name}.{}.{nanos}.tmp", std::process::id()))
 }
 
-const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
+/// Read-side twin of [`PRIVATE_LIMIT`]: what may be published may be read back.
+const MAX_FILE_BYTES: u64 = PRIVATE_LIMIT as u64;
 
 pub fn private_dir(dir: &Path) -> Result<()> {
     validate_private_path(dir)?;

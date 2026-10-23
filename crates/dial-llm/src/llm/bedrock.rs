@@ -840,7 +840,7 @@ pub(super) fn exchange(
                         return Err(super::stream::StalledStream.into());
                     }
                     if matches!(
-                        io.kind(),
+                        super::stream::disconnect_kind(io),
                         std::io::ErrorKind::UnexpectedEof
                             | std::io::ErrorKind::ConnectionReset
                             | std::io::ErrorKind::ConnectionAborted

@@ -20,7 +20,11 @@ pub(super) fn render(summary: &Value) -> Option<String> {
     if files.is_empty() && !stopped {
         return None;
     }
-    let mut lines = vec![format!("Outcome: {outcome}")];
+    // The full cause is printed just above the report; the class says what kind of failure it was.
+    let mut lines = vec![match summary["error_class"].as_str() {
+        Some(class) => format!("Outcome: {outcome} ({})", class.replace('_', " ")),
+        None => format!("Outcome: {outcome}"),
+    }];
     lines.push(if files.is_empty() {
         "Changed: no files".to_owned()
     } else {

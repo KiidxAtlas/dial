@@ -369,7 +369,8 @@ pub fn register_repair(
 /// Restore sealed tests only after the agent finishes. A solver-written test cannot replace them.
 pub fn verify(root: &Path, files: &BTreeMap<String, String>, command: &str) -> bool {
     let run = || -> Result<bool> {
-        let workspace = Workspace::new(root)?;
+        // Validates `root` before any verification bytes are written.
+        Workspace::new(root)?;
         for (path, content) in files {
             ensure!(valid_path(path), "invalid verification path");
             // Refuse all symlink components before writing any verification bytes.
@@ -386,7 +387,6 @@ pub fn verify(root: &Path, files: &BTreeMap<String, String>, command: &str) -> b
             }
             fs::write(probe, content)?;
         }
-        let _ = workspace;
         Ok(Check::Command {
             command: command.into(),
             expect_stdout: None,

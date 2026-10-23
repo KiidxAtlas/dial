@@ -928,9 +928,9 @@ fn bash_adopted_job_is_awaited_until_it_is_killed() {
     assert!(tool.awaited_work().is_empty());
 }
 
-/// A new user message (steering) ends a `bg wait` as an ordinary result: the job keeps running and
-/// the effects are not unknown, so the agent continues with the message instead of stopping the
-/// turn. A hard interrupt still aborts the wait.
+/// Ending a `bg wait` never leaves unknown effects: the job keeps running. A new user message
+/// (steering) ends it as an ordinary result so the agent continues with the message; a hard
+/// interrupt still aborts it, but without the "uncertain effects" stop that refuses further calls.
 #[cfg(unix)]
 #[test]
 fn steering_ends_a_wait_cleanly_and_a_hard_interrupt_still_aborts_it() {
@@ -961,12 +961,18 @@ fn steering_ends_a_wait_cleanly_and_a_hard_interrupt_still_aborts_it() {
 
     let hard = CallSignals::new();
     hard.interrupt_waits();
-    let aborted = scope(&hard, || bg(&tool, &ws, wait.clone()));
+    let aborted = scope(&hard, || {
+        crate::tools::exec::execution::run(&AtomicBool::new(false), || bg(&tool, &ws, wait.clone()))
+    });
     assert!(aborted.is_error, "{}", aborted.text);
     assert!(
-        aborted.text.contains("cancelled waiting"),
+        aborted.text.contains("cancelled waiting") && !aborted.text.contains("Effects unknown"),
         "{}",
         aborted.text
+    );
+    assert_eq!(
+        (aborted.execution.status, aborted.execution.effects),
+        (Some(crate::tools::ToolStatus::Aborted), Effects::None)
     );
     let _ = bg(&tool, &ws, json!({"action": "kill", "name": "svc"}));
 }

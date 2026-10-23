@@ -57,9 +57,13 @@ impl<'a> Agent<'a> {
             Ok(decision) => {
                 let summary = crate::agent::model::laya::summary(PHASE, &decision.answers);
                 let record = json!({"status":"ready","mode":"advisory","phase":PHASE,"checkpoint":decision.health.checkpoint,"device":decision.health.device,"answers":decision.answers,"latency_ms":decision.elapsed_ms,"calibration":"raw; not calibrated in Dial","summary":summary});
-                let _ = self.record(self.cur_step, "laya_decision", record.clone());
+                if let Err(error) = self.record(self.cur_step, "laya_decision", record.clone()) {
+                    ui.notice(&format!("Laya decision was not recorded: {error:#}"));
+                }
                 state["laya"] = record;
-                let _ = self.session.set_control_state(state);
+                if let Err(error) = self.session.set_control_state(state) {
+                    ui.notice(&format!("Laya state was not saved: {error:#}"));
+                }
                 ui.laya_activity(
                     "advice",
                     &format!(
@@ -91,12 +95,16 @@ impl<'a> Agent<'a> {
                     "unavailable"
                 };
                 state["laya"] = json!({"status":status,"phase":PHASE,"reason":reason,"retry_after":retry_after});
-                let _ = self.session.set_control_state(state);
-                let _ = self.record(
+                if let Err(error) = self.session.set_control_state(state) {
+                    ui.notice(&format!("Laya state was not saved: {error:#}"));
+                }
+                if let Err(error) = self.record(
                     self.cur_step,
                     "laya_unavailable",
                     json!({"phase":PHASE,"reason":reason}),
-                );
+                ) {
+                    ui.notice(&format!("Laya outcome was not recorded: {error:#}"));
+                }
                 ui.laya_activity(
                     status,
                     &format!(

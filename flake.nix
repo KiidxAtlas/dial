@@ -14,6 +14,8 @@
             # Single source of truth: the workspace version every crate in this source tree compiles with.
             version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
             src = self;
+            # Nix removes .git from the source; carry the flake's commit into release metadata.
+            env.DIAL_BUILD_REVISION = self.rev or (pkgs.lib.removeSuffix "-dirty" (self.dirtyRev or "unknown"));
             cargoLock.lockFile = ./Cargo.lock;
             # Only the `dial` binary package of the workspace is shipped.
             cargoBuildFlags = [ "-p" "dial" ];

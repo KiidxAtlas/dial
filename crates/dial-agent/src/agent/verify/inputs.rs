@@ -17,6 +17,22 @@ const MAX_ENTRIES: usize = 4096;
 const MAX_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_TIME: Duration = Duration::from_millis(250);
 
+// Wall-clock allowance for a capture. Tests pin it on their own thread: a huge value keeps a loaded
+// machine from making a probe and the run it predicts disagree; zero proves exhaustion is unknown.
+#[cfg(test)]
+thread_local! {
+    pub(in crate::agent::verify) static TIME_OVERRIDE: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn budget(limit: Duration) -> Duration {
+    #[cfg(test)]
+    if let Some(forced) = TIME_OVERRIDE.with(|forced| forced.get()) {
+        return forced;
+    }
+    limit
+}
+
 #[derive(Clone, Copy)]
 enum IdentityKind {
     Content,
@@ -32,10 +48,10 @@ impl IdentityKind {
     }
 
     fn time(self) -> Duration {
-        match self {
+        budget(match self {
             Self::Content => MAX_TIME,
             Self::InstalledRuntime => Duration::from_secs(1),
-        }
+        })
     }
 }
 
@@ -177,7 +193,7 @@ impl Capture<'_> {
                     }
                     size += count as u64;
                     self.bytes += count as u64;
-                    if self.bytes > MAX_BYTES || self.started.elapsed() > MAX_TIME {
+                    if self.bytes > MAX_BYTES || self.started.elapsed() > self.kind.time() {
                         return None;
                     }
                     hash.update(&buffer[..count]);

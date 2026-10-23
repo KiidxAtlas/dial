@@ -173,6 +173,36 @@ fn quota_exhaustion_differs_from_throttles() {
 }
 
 #[test]
+fn statusless_per_minute_token_throttles_back_off_instead_of_compacting() {
+    let text = |t: &str| classify_text(None, t, None, None);
+    assert_eq!(
+        text("Rate limit reached: too many tokens per minute"),
+        ErrorClass::RateLimited { retry_after: None }
+    );
+    assert_eq!(
+        text("too many tokens per minute, limit 30000"),
+        ErrorClass::RateLimited { retry_after: None }
+    );
+    // Without a per-minute window the same wording is still a full context.
+    assert_eq!(
+        text("too many tokens in prompt"),
+        ErrorClass::ContextOverflow
+    );
+    assert_eq!(
+        http(400, "token limit exceeded"),
+        ErrorClass::ContextOverflow
+    );
+}
+
+#[test]
+fn cloudflare_origin_failures_are_transient() {
+    for status in 520..=524 {
+        assert_eq!(http(status, "error code: 52x"), ErrorClass::Transient);
+    }
+    assert_eq!(http(501, "not implemented"), ErrorClass::Fatal);
+}
+
+#[test]
 fn google_retry_delay_separates_throttle_from_quota() {
     let delay = Some(Duration::from_secs(12));
     let throttle = r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"Resource has been exhausted, please retry later.","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"12s"}]}}"#;
@@ -256,6 +286,26 @@ fn class_survives_context_and_redaction_wrappers() {
     ))
     .context("provider request failed");
     assert!(is_context_overflow(&error));
+}
+
+#[test]
+fn custom_header_redaction_keeps_typed_stream_errors_retryable() {
+    use super::super::model_config::{HeaderValue, RequestHeader, resolve_headers};
+    let rows = vec![RequestHeader {
+        name: "x-team".into(),
+        value: HeaderValue::Literal("alpha".into()),
+    }];
+    let headers = resolve_headers(&rows).unwrap();
+    let overloaded = headers.redact(anyhow::Error::new(Classified::new(
+        ErrorClass::RateLimited { retry_after: None },
+        "overloaded: alpha",
+    )));
+    assert_eq!(classify(&overloaded).label(), "rate_limited");
+    assert!(!format!("{overloaded:#}").contains("alpha"));
+    let stalled = headers.redact(anyhow::Error::new(super::super::stream::StalledStream));
+    assert_eq!(classify(&stalled), ErrorClass::Transient);
+    let other = headers.redact(anyhow::anyhow!("echoed alpha"));
+    assert_eq!(classify(&other).label(), "fatal");
 }
 
 #[test]

@@ -461,12 +461,12 @@ impl Chord {
                     code = other.chars().next().map(KeyCode::Char)
                 }
                 other
-                    if other.starts_with('f')
-                        && other[1..]
-                            .parse::<u8>()
-                            .is_ok_and(|n| (1..=24).contains(&n)) =>
+                    if let Some(n) = other
+                        .strip_prefix('f')
+                        .and_then(|digits| digits.parse::<u8>().ok())
+                        .filter(|n| (1..=24).contains(n)) =>
                 {
-                    code = Some(KeyCode::F(other[1..].parse().unwrap_or(1)));
+                    code = Some(KeyCode::F(n));
                 }
                 "" => {
                     return Err(format!(

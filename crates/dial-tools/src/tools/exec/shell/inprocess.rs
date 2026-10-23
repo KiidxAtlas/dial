@@ -110,45 +110,18 @@ pub(super) fn run(
     let stopped = cancelled || timed_out || capture_error.is_some();
     let abandoned = stopped && !shell.terminate();
     // Collect what the script wrote; a stuck descendant may keep the pipe open, so this is bounded.
-    let grace = Instant::now();
-    while !eof && capture_error.is_none() && grace.elapsed() < Duration::from_millis(300) {
-        match drain_pipe(
-            &mut reader,
-            &mut capture,
-            &mut spool,
-            &mut artifact_error,
-            on_output,
-        ) {
-            Ok(closed) => eof = closed,
-            Err(error) => {
-                capture_error = Some(format!("reading command output: {error}"));
-                break;
-            }
-        }
-        if !eof {
-            waiter
-                .wait(
-                    Some(&reader),
-                    None::<&Child>,
-                    Some(Duration::from_millis(300).saturating_sub(grace.elapsed())),
-                )
-                .map_err(|e| format!("waiting for command output: {e}"))?;
-        }
-    }
-    if !eof && capture_error.is_none() {
-        capture_error = Some(
-            "pipe did not reach EOF within the 300ms cleanup grace; output may be incomplete"
-                .to_string(),
-        );
-    }
+    drain_after_exit(
+        &mut reader,
+        &mut capture,
+        &mut spool,
+        &mut artifact_error,
+        &mut capture_error,
+        &mut eof,
+        &waiter,
+        on_output,
+    )?;
 
-    let mut text = capture.finish();
-    if text.is_empty() {
-        text.push_str("(no output)");
-    }
-    if !text.ends_with('\n') {
-        text.push('\n');
-    }
+    let mut text = captured_text(capture);
     let code = shell.code();
     let success = code == Some(0) && !timed_out && !cancelled;
     if cancelled {
@@ -163,29 +136,7 @@ pub(super) fn run(
     if abandoned {
         text.push_str("[in-process shell did not stop (a builtin that never yields cannot be interrupted); it was abandoned and may keep using CPU until Dial exits]\n");
     }
-    if let Some(spool) = spool {
-        match spool.finish() {
-            Ok(uri) => {
-                let completeness = if capture_error.is_some() {
-                    "partial"
-                } else {
-                    "complete"
-                };
-                text.push_str(&format!("[{completeness} output: {uri}]\n"));
-            }
-            Err(error) => {
-                artifact_error = Some(format!("saving complete command output artifact: {error}"));
-            }
-        }
-    }
-    if let Some(error) = &capture_error {
-        text.push_str(&format!("[output capture error: {error}]\n"));
-    }
-    if let Some(error) = &artifact_error {
-        text.push_str(&format!(
-            "[output artifact error: {error}; inline output retained]\n"
-        ));
-    }
+    append_output_notes(&mut text, spool, &capture_error, &mut artifact_error);
     let output = ToolOutput {
         execution: Default::default(),
         data: None,

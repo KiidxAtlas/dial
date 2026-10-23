@@ -61,7 +61,7 @@ const RESULT_BUDGET: usize = 14_000;
 
 /// Default specialist follows the base agent purpose, including custom definitions.
 /// Implementation workers use task; an assigned specialist wins over task in model_routes.
-fn role_for_agent(spec: &AgentSpec, _custom: bool) -> &'static str {
+fn role_for_agent(spec: &AgentSpec) -> &'static str {
     match spec.name {
         "reviewer" | "test-runner" => "tester",
         "planner" => "planner",
@@ -770,7 +770,6 @@ fn parse_job<'c>(
     let mut allowed_tools = None;
     let mut custom_steps = None;
     let mut autoload: &[String] = &[];
-    let custom = builtin(requested).is_none();
     let (spec, preset, kind) = match builtin(requested) {
         Some(spec) => (spec, None, spec.name),
         None => match config.subagents.get_key_value(requested) {
@@ -872,7 +871,7 @@ fn parse_job<'c>(
         label,
         kind,
         spec,
-        role: role_for_agent(spec, custom),
+        role: role_for_agent(spec),
         model_routes: Vec::new(),
         preset,
         allowed_tools,
@@ -1382,7 +1381,7 @@ enum Message {
         cancel: Arc<AtomicBool>,
         reply: mpsc::Sender<Result<(), String>>,
     },
-    Done(usize, Outcome),
+    Done(usize, Box<Outcome>),
     ToolStarted(usize, Weak<dyn crate::tools::integrations::ext::Tool>),
     ToolFinished(usize),
     Notice(String),
@@ -2470,7 +2469,7 @@ impl Report {
 
     fn finish(mut self, outcome: Outcome) {
         self.reported = true;
-        let _ = self.tx.send(Message::Done(self.index, outcome));
+        let _ = self.tx.send(Message::Done(self.index, Box::new(outcome)));
     }
 }
 
@@ -2479,7 +2478,10 @@ impl Drop for Report {
         if !self.reported {
             let _ = self.tx.send(Message::Done(
                 self.index,
-                Outcome::failed(0, "subagent worker panicked before reporting its outcome"),
+                Box::new(Outcome::failed(
+                    0,
+                    "subagent worker panicked before reporting its outcome",
+                )),
             ));
         }
     }
@@ -2632,7 +2634,7 @@ fn pump_messages(
                 if let Some(job) = jobs.iter().find(|job| job.index == index) {
                     announce_end(direct.ui, job, &outcome);
                 }
-                outcomes[index] = Some(outcome);
+                outcomes[index] = Some(*outcome);
             }
         }
     }
@@ -2735,7 +2737,7 @@ fn run_serial(
                 let outcome =
                     result.unwrap_or_else(|_| Outcome::failed(0, "subagent crashed unexpectedly"));
                 finish_worker(&body, &outcome);
-                let _ = tx.send(Message::Done(job.index, outcome));
+                let _ = tx.send(Message::Done(job.index, Box::new(outcome)));
             });
             pump_messages(&rx, env, &[job], &mut direct, outcomes);
         });

@@ -471,7 +471,9 @@ impl Agent<'_> {
         if experience::screen_record(&ledger).is_ok() {
             let mut control = self.session.control_state();
             control["investigation_ledger"] = ledger;
-            let _ = self.session.set_control_state(control);
+            if let Err(error) = self.session.set_control_state(control) {
+                ui.notice(&format!("investigation ledger was not saved: {error:#}"));
+            }
         }
     }
     pub(in crate::agent) fn finish_experience(&mut self, ui: &mut dyn Ui) {

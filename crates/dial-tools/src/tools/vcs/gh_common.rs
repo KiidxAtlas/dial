@@ -11,7 +11,7 @@ use crate::tools::Workspace;
 
 pub(super) const GH_TIMEOUT: Duration = Duration::from_secs(120);
 /// Model-facing cut for command output; the complete text goes to an artifact.
-const MAX_OUTPUT: usize = 20 * 1024;
+pub(super) const MAX_OUTPUT: usize = 20 * 1024;
 
 /// Captured result of one `gh` invocation (stdout and stderr are untrimmed).
 struct GhRun {
@@ -177,6 +177,15 @@ pub(super) fn gh_json(
 
 /// Cut long output for the model; the complete text goes to an artifact when a store exists.
 pub(super) fn clip(ws: &Workspace, text: String) -> String {
+    clip_with_hint(
+        ws,
+        text,
+        "narrow the request with `repo`, `path`, `limit` or a smaller range",
+    )
+}
+
+/// [`clip`] with a caller-specific `hint` for when no artifact store can retain the full text.
+pub(super) fn clip_with_hint(ws: &Workspace, text: String, hint: &str) -> String {
     if text.len() <= MAX_OUTPUT {
         return text;
     }
@@ -187,12 +196,24 @@ pub(super) fn clip(ws: &Workspace, text: String) -> String {
     let full = match ws.artifacts().map(|store| store.retain(&text)) {
         Some(Ok(uri)) => format!("full output ({} bytes): {uri}", text.len()),
         Some(Err(error)) => format!("full output could not be retained: {error:#}"),
-        None => "narrow the request with `repo`, `path`, `limit` or a smaller range".to_owned(),
+        None => hint.to_owned(),
     };
     format!(
         "{}\n[output cut at {MAX_OUTPUT} bytes; {full}]",
         &text[..end]
     )
+}
+
+/// Split `[HOST/]OWNER/REPO`; any other shape is taken whole as the slug.
+pub(super) fn split_repo_ref(repo: &str) -> (Option<&str>, &str) {
+    let Some(first) = repo.find('/') else {
+        return (None, repo);
+    };
+    let rest = &repo[first + 1..];
+    match rest.find('/') {
+        Some(second) if !rest[second + 1..].contains('/') => (Some(&repo[..first]), rest),
+        _ => (None, repo),
+    }
 }
 
 /// Convert `&str` literals to the owned argument vector `gh` expects.

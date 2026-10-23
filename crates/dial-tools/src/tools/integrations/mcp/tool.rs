@@ -122,14 +122,14 @@ impl McpTool {
 }
 
 /// Appends a pointer to the complete protocol result when the workspace can store artifacts.
+/// The remote call already ran, so a storage failure keeps the rendered result and says so.
 fn retain_result(ctx: &ToolContext, mut output: ToolOutput, result: &Value) -> ToolOutput {
     if let Some(store) = ctx.workspace.artifacts() {
-        match store.retain(&result.to_string()) {
-            Ok(uri) => output
-                .text
-                .push_str(&format!("\n[Complete MCP protocol result: {uri}]")),
-            Err(e) => return ToolOutput::err(format!("retaining MCP result: {e:#}")),
-        }
+        let note = match store.retain(&result.to_string()) {
+            Ok(uri) => format!("\n[Complete MCP protocol result: {uri}]"),
+            Err(e) => format!("\n[complete MCP protocol result could not be retained: {e:#}]"),
+        };
+        output.text.push_str(&note);
     }
     output
 }

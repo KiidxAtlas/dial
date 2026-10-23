@@ -11,7 +11,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use regex::Regex;
 use serde_json::{Map, Value, json};
 
-use super::gh_common::{GH_TIMEOUT, default_gh_host, gh, gh_json, strings, valid_repo};
+use super::gh_common::{
+    GH_TIMEOUT, default_gh_host, gh, gh_json, split_repo_ref, strings, valid_repo,
+};
 use crate::tools::{ToolOutput, Workspace, opt_str};
 
 /// Poll cadence for the first minute of a watch, then the slower cadence.
@@ -126,23 +128,8 @@ struct RepoRef<'a> {
 
 /// `[HOST/]OWNER/REPO`; anything with another shape is taken as a bare slug.
 fn repo_ref(repo: &str) -> RepoRef<'_> {
-    let Some(first) = repo.find('/') else {
-        return RepoRef {
-            host: None,
-            slug: repo,
-        };
-    };
-    let after = first + 1;
-    match repo[after..].find('/') {
-        Some(offset) if !repo[after + offset + 1..].contains('/') => RepoRef {
-            host: Some(&repo[..first]),
-            slug: &repo[after..],
-        },
-        _ => RepoRef {
-            host: None,
-            slug: repo,
-        },
-    }
+    let (host, slug) = split_repo_ref(repo);
+    RepoRef { host, slug }
 }
 
 /// `gh api` endpoints carry no host, so a known host is passed with `--hostname`.

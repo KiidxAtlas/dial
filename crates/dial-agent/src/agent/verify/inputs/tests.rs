@@ -99,3 +99,15 @@ fn installed_runtime_identity_detects_replacement_with_preserved_size_and_mtime(
     fs::rename(&replacement, &path).unwrap();
     assert_ne!(snapshot(), before);
 }
+
+#[test]
+fn an_exhausted_time_budget_is_unknown_never_a_snapshot() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("a"), "one").unwrap();
+    let workspace = Workspace::new(root.path()).unwrap();
+    assert!(capture(&workspace, &declared(&["a"])).is_some());
+    TIME_OVERRIDE.with(|forced| forced.set(Some(Duration::ZERO)));
+    let exhausted = capture(&workspace, &declared(&["a"]));
+    TIME_OVERRIDE.with(|forced| forced.set(None));
+    assert!(exhausted.is_none());
+}

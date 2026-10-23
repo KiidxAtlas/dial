@@ -4,8 +4,11 @@
 //! with fsmonitor, external diff drivers, textconv and pagers switched off, because repository
 //! configuration is untrusted. Approved commits/pushes honour the repository's hooks and signing
 //! unless `git.bypass_hooks` is set, which the output then says. Reads need no approval;
-//! anything that changes the repository or reaches the network does. There is deliberately no
-//! force-push, reset, clean, rebase or checkout of paths: those stay with `bash`.
+//! anything that changes the repository or reaches the network does, except the read-only `gh`
+//! queries (`pr_view`, `pr_checks`, `issue_view`), which are in `READS` and run unapproved. There
+//! is deliberately no force-push, reset, clean, rebase or checkout of paths: those stay with
+//! `bash`.
+use super::gh_common::clip_with_hint;
 use crate::config::types::Config;
 use crate::tools::integrations::ext::{Tool, ToolContext, ToolEvent};
 use crate::tools::{ToolOutput, Workspace, opt_bool, opt_str, opt_u64, req_str, tool_schema};
@@ -17,7 +20,6 @@ use std::{
     time::Duration,
 };
 
-const MAX_OUTPUT: usize = 20 * 1024;
 /// Hard ceiling on captured bytes; pipes are still drained past it so git never sees SIGPIPE.
 const MAX_CAPTURE: usize = 64 * 1024 * 1024;
 const MAX_MESSAGE: usize = 8 * 1024;
@@ -101,26 +103,6 @@ fn one_path(ws: &Workspace, input: &str) -> Result<String, String> {
         .map_err(|_| format!("path {input:?} is outside the workspace"))?;
     let text = rel.to_string_lossy().into_owned();
     Ok(if text.is_empty() { ".".into() } else { text })
-}
-
-/// Cut long output for the model; the complete text goes to an artifact when a store exists.
-fn clip(text: String, ws: &Workspace) -> String {
-    if text.len() <= MAX_OUTPUT {
-        return text;
-    }
-    let end = (0..=MAX_OUTPUT)
-        .rev()
-        .find(|&i| text.is_char_boundary(i))
-        .unwrap_or(0);
-    let full = match ws.artifacts().map(|store| store.retain(&text)) {
-        Some(Ok(uri)) => format!("full output ({} bytes): {uri}", text.len()),
-        Some(Err(error)) => format!("full output could not be retained: {error:#}"),
-        None => "narrow the request with `path`, `limit` or a smaller range".to_owned(),
-    };
-    format!(
-        "{}\n[output cut at {MAX_OUTPUT} bytes; {full}]",
-        &text[..end]
-    )
 }
 
 /// Hook/signing-sensitive invocation: whether repository hooks may run for this call.
@@ -339,10 +321,10 @@ pub(crate) fn worktree_add(
 
 /// Create `path` on the new branch `branch` from `HEAD` and carry the source checkout's uncommitted
 /// changes into it: tracked edits, staged or not, are applied as one binary
-/// patch, and untracked files are copied. Returns whether anything was carried over.
+/// patch, and untracked files are copied (symlinks as links). Returns whether anything was carried over.
 pub fn worktree_add_keep_changes(root: &Path, path: &Path, branch: &str) -> Result<bool, String> {
     worktree_add(root, path, branch, "HEAD")?;
-    match carry_changes(root, path, branch) {
+    match carry_changes(root, path) {
         Ok(carried) => Ok(carried),
         Err(error) => {
             // Roll back the registered worktree and its new branch so a retry is not blocked.
@@ -353,7 +335,7 @@ pub fn worktree_add_keep_changes(root: &Path, path: &Path, branch: &str) -> Resu
     }
 }
 
-fn carry_changes(root: &Path, path: &Path, branch: &str) -> Result<bool, String> {
+fn carry_changes(root: &Path, path: &Path) -> Result<bool, String> {
     let top = repo_toplevel(root)?;
     let patch = run_checked(
         &top,
@@ -380,35 +362,39 @@ fn carry_changes(root: &Path, path: &Path, branch: &str) -> Result<bool, String>
         return Ok(false);
     }
     if !patch.is_empty() {
-        let patch_file = std::env::temp_dir().join(format!(
-            "dial-wt-{}-{}.patch",
-            std::process::id(),
-            hash_branch(branch)
-        ));
-        std::fs::write(&patch_file, patch.as_bytes()).map_err(|e| e.to_string())?;
-        let applied = run_checked(
+        // A private, exclusively created file: the patch holds the whole uncommitted diff.
+        let mut patch_file = tempfile::Builder::new()
+            .prefix("dial-wt-")
+            .suffix(".patch")
+            .tempfile()
+            .map_err(|e| e.to_string())?;
+        std::io::Write::write_all(&mut patch_file, patch.as_bytes()).map_err(|e| e.to_string())?;
+        run_checked(
             path,
-            &["apply", "--binary", &patch_file.to_string_lossy()],
+            &["apply", "--binary", &patch_file.path().to_string_lossy()],
             true,
-        );
-        let _ = std::fs::remove_file(&patch_file);
-        applied?;
+        )?;
     }
     for name in untracked {
         let (from, to) = (top.join(name), path.join(name));
         if let Some(parent) = to.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        std::fs::copy(&from, &to).map_err(|e| format!("copying {name}: {e}"))?;
+        copy_untracked(&from, &to).map_err(|e| format!("copying {name}: {e}"))?;
     }
     Ok(true)
 }
 
-fn hash_branch(branch: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    branch.hash(&mut hasher);
-    hasher.finish()
+/// Copies one untracked entry. A symlink stays a symlink: following it would copy content from
+/// outside the repository, and a directory link cannot be copied as a file.
+fn copy_untracked(from: &Path, to: &Path) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(from)?.file_type().is_symlink() {
+        #[cfg(unix)]
+        return std::os::unix::fs::symlink(std::fs::read_link(from)?, to);
+        #[cfg(not(unix))]
+        return Ok(());
+    }
+    std::fs::copy(from, to).map(drop)
 }
 
 /// Remove a registered worktree. A dirty or locked worktree is refused unless `force`.
@@ -582,7 +568,7 @@ fn jj_dispatch(
             let message = commit_message(args)?;
             let mut a = strings(&["commit", "-m", message]);
             if args.get("paths").is_some_and(|p| !p.is_null()) {
-                a.extend(paths(ws, args)?.into_iter().map(|p| format!("file:{p:?}")));
+                a.extend(paths(ws, args)?.into_iter().map(|p| jj_file(&p)));
             }
             jj(a)
         }
@@ -592,7 +578,28 @@ fn jj_dispatch(
 
 /// A workspace path as a literal jj fileset (`file:"..."`), never a revset or option.
 fn jj_path(ws: &Workspace, input: &str) -> Result<String, String> {
-    Ok(format!("file:{:?}", one_path(ws, input)?))
+    Ok(jj_file(&one_path(ws, input)?))
+}
+
+/// `file:"<path>"` with the path as a jj string literal. jj's literal grammar accepts raw UTF-8
+/// plus the escapes `\" \\ \t \r \n \0 \e \xHH`; Rust's `{:?}` would emit `\u{..}`, which jj rejects.
+fn jj_file(path: &str) -> String {
+    let mut out = String::from("file:\"");
+    for c in path.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '\n' => out.push_str("\\n"),
+            '\0' => out.push_str("\\0"),
+            '\x1b' => out.push_str("\\e"),
+            c if c.is_ascii_control() => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn commit_message(args: &Value) -> Result<&str, String> {
@@ -796,7 +803,11 @@ fn dispatch(
             other => return Err(format!("unknown git action {other:?}")),
         }
     };
-    let mut text = clip(text.trim_end().to_owned(), ws);
+    let mut text = clip_with_hint(
+        ws,
+        text.trim_end().to_owned(),
+        "narrow the request with `path`, `limit` or a smaller range",
+    );
     if text.is_empty() {
         text = "(no output)".to_owned();
     }

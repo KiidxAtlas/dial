@@ -450,15 +450,18 @@ impl Checkpoints {
         self.record_revision(&mut inner, &resolved, root.clone(), rel.clone());
         let owner = one_line(owner);
         if let Some(manifest) = inner.current.as_mut()
-            && let Some(entry) = manifest
+            && let Some(index) = manifest
                 .entries
-                .iter_mut()
-                .find(|entry| entry.rel == rel && entry.root == root)
-            && !entry.writers.contains(&owner)
+                .iter()
+                .position(|entry| entry.rel == rel && entry.root == root)
+            && !manifest.entries[index].writers.contains(&owner)
         {
-            entry.writers.push(owner);
-            let saved = manifest.clone();
+            // Persist first: a failed write must leave the attribution unrecorded so a retry
+            // writes it again, as `record_first_write` does.
+            let mut saved = manifest.clone();
+            saved.entries[index].writers.push(owner);
             write_manifest(&self.dir, &saved)?;
+            *manifest = saved;
         }
         Ok(())
     }

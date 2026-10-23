@@ -133,6 +133,56 @@ struct ChildJournal {
     failed: bool,
 }
 
+/// The private child's memory authority: its namespace (the private session id), the history
+/// generation of the branch, and the branch leaf as revision.
+fn child_memory_authority(
+    namespace: &str,
+    session: &crate::storage::session::Session,
+) -> crate::storage::memory_backend::MemoryAuthority {
+    crate::storage::memory_backend::MemoryAuthority {
+        session_id: namespace.to_owned(),
+        branch_id: format!(
+            "{namespace}:history:{}",
+            session.context_history_generation()
+        ),
+        revision: session.branch_leaf().unwrap_or(namespace).to_owned(),
+        task_depth: 1,
+    }
+}
+
+/// Number of archived history messages in `messages`: the journal cursor after a replay is reset.
+fn history_len<'a>(messages: impl IntoIterator<Item = &'a Value>) -> usize {
+    messages
+        .into_iter()
+        .filter(|message| crate::storage::transcript::is_history(message))
+        .count()
+}
+
+/// The callback gate's standing block reason, if it has latched one.
+fn gate_blocked(
+    gate: Option<&std::sync::Mutex<crate::agent::safety::rules::CallbackGate<'_>>>,
+) -> Option<String> {
+    gate.and_then(|gate| {
+        gate.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .blocked()
+            .map(str::to_owned)
+    })
+}
+
+/// Run `call` through the callback gate; `Some(reason)` when it must be refused.
+fn gate_intercept(
+    gate: Option<&std::sync::Mutex<crate::agent::safety::rules::CallbackGate<'_>>>,
+    root: &Path,
+    call: &llm::ToolCall,
+) -> Option<String> {
+    gate.and_then(|gate| {
+        gate.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .intercept(root, call)
+    })
+}
+
 struct ChildBackends {
     cancellation: crate::runtime::cancellation::SessionCancellation,
     namespace: String,
@@ -176,17 +226,7 @@ impl ChildBackends {
         let memory = env
             .memory
             .map(|parent| {
-                let authority = crate::storage::memory_backend::MemoryAuthority {
-                    session_id: session.id().to_owned(),
-                    branch_id: format!(
-                        "{}:history:{}",
-                        session.id(),
-                        session.context_history_generation()
-                    ),
-                    revision: session.branch_leaf().unwrap_or(session.id()).to_owned(),
-                    task_depth: 1,
-                };
-                let runtime = parent.for_child(authority)?;
+                let runtime = parent.for_child(child_memory_authority(session.id(), &session))?;
                 runtime.bind_owner_cancel(env.interrupt.clone());
                 Ok::<_, anyhow::Error>(runtime)
             })
@@ -320,21 +360,7 @@ impl ChildBackends {
     }
 
     fn memory_authority(&self) -> crate::storage::memory_backend::MemoryAuthority {
-        let journal = self.journal.borrow();
-        crate::storage::memory_backend::MemoryAuthority {
-            session_id: self.namespace.clone(),
-            branch_id: format!(
-                "{}:history:{}",
-                self.namespace,
-                journal.session.context_history_generation()
-            ),
-            revision: journal
-                .session
-                .branch_leaf()
-                .unwrap_or(&self.namespace)
-                .to_owned(),
-            task_depth: 1,
-        }
+        child_memory_authority(&self.namespace, &self.journal.borrow().session)
     }
 
     fn observe_memory(&self) -> Result<crate::storage::memory_backend::MemoryAuthority> {
@@ -573,14 +599,8 @@ fn child_role_chat(
         model_override,
         children,
         |backend, role_config, same| {
-            let mut output = backend.output_budget(request.max_tokens);
-            if let Some(limit) = backend
-                .model_profile()
-                .and_then(|profile| profile.max_tokens)
-                .filter(|limit| *limit > 0)
-            {
-                output = output.min(limit);
-            }
+            let output =
+                crate::agent::model::backend::profile_capped_output(backend, request.max_tokens);
             let mut normalized;
             let request = if request.max_tokens == output {
                 request
@@ -626,6 +646,13 @@ fn child_role_chat(
             let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let provider_rewrite = child_provider_request(&env, request, observer)?;
             let provider_request = provider_rewrite.as_ref().unwrap_or(request);
+            // Side requests share the provider ceiling with the main child requests; a
+            // single-slot local server would otherwise serve them concurrently.
+            let Some(_provider_slot) =
+                crate::agent::model::provider_slots::acquire(role_config, env.interrupt)
+            else {
+                return Err(llm::Interrupted.into());
+            };
             let started = std::time::Instant::now();
             let reply = crate::agent::chat_with_ui(
                 backend,
@@ -692,6 +719,37 @@ struct ChildMemoryRunner<'a, 'b, 'c, 'd> {
     mutates: bool,
     receipts: std::collections::BTreeMap<u64, (crate::llm::usage::ExternalUsageReceipt, bool)>,
     next_receipt: u64,
+}
+
+impl<'a, 'b, 'c, 'd> ChildMemoryRunner<'a, 'b, 'c, 'd> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        env: Env<'a>,
+        backend: &'b mut Backend,
+        adapter: Option<&'b Path>,
+        steps: &'b mut u32,
+        budget: u32,
+        observer: &'b std::cell::RefCell<&'c mut (dyn Approver + 'd)>,
+        children: &'b ChildBackends,
+        call: Option<&'b llm::ToolCall>,
+        mutates: bool,
+        capture: bool,
+    ) -> Self {
+        Self {
+            env,
+            backend,
+            adapter,
+            steps,
+            budget,
+            observer,
+            children,
+            call,
+            capture,
+            mutates,
+            receipts: Default::default(),
+            next_receipt: 0,
+        }
+    }
 }
 
 impl ChildMemoryRunner<'_, '_, '_, '_> {
@@ -790,14 +848,7 @@ impl crate::storage::memory_backend::MemoryModelRunner for ChildMemoryRunner<'_,
             self.children,
             |backend, config, _| {
                 let window = child_window(Env { config, ..self.env }, backend);
-                let mut output = backend.output_budget(output);
-                if let Some(cap) = backend
-                    .model_profile()
-                    .and_then(|profile| profile.max_tokens)
-                    .filter(|cap| *cap > 0)
-                {
-                    output = output.min(cap);
-                }
+                let output = crate::agent::model::backend::profile_capped_output(backend, output);
                 let chat = Chat {
                     messages: vec![
                         json!({"role":"system","content":system}),
@@ -1031,20 +1082,18 @@ fn child_compaction_memory(
         .session
         .archived_user_assistant_messages();
     let observer = std::cell::RefCell::new(&mut *approver);
-    let mut runner = ChildMemoryRunner {
+    let mut runner = ChildMemoryRunner::new(
         env,
         backend,
         adapter,
         steps,
         budget,
-        observer: &observer,
+        &observer,
         children,
-        call: None,
-        mutates: job.spec.mutates,
-        capture: false,
-        receipts: Default::default(),
-        next_receipt: 0,
-    };
+        None,
+        job.spec.mutates,
+        false,
+    );
     let result = memory.compaction_context(&authority, &archive, &mut runner);
     drop(runner);
     match result {
@@ -1186,11 +1235,7 @@ fn rollover_child(
     journal.rollover_source_leaf = outcome.source_leaf.clone();
     journal.control_call = None;
     journal.reminder = None;
-    journal.cursor = candidate
-        .messages
-        .iter()
-        .filter(|message| crate::storage::transcript::is_history(message))
-        .count();
+    journal.cursor = history_len(&candidate.messages);
     *request = candidate;
     drop(journal);
     if let Some(error) = outcome.durability_error {
@@ -1360,12 +1405,7 @@ fn settle_child_exploration(
             )?;
             journal.exploration.active = None;
             journal.exploration.completed = true;
-            journal.cursor = journal
-                .session
-                .messages()
-                .iter()
-                .filter(|message| crate::storage::transcript::is_history(message))
-                .count();
+            journal.cursor = history_len(&journal.session.messages());
             if let Some(error) = commit.durability_error {
                 anyhow::bail!(
                     "{error}; private rewind applied but acknowledgement failed; continuation stopped"
@@ -1520,10 +1560,7 @@ fn compact_child(
         );
         0
     } else {
-        source.messages[prepared.first_kept..]
-            .iter()
-            .filter(|message| crate::storage::transcript::is_history(message))
-            .count()
+        history_len(&source.messages[prepared.first_kept..])
     };
     let mut journal = children.journal.borrow_mut();
     if let Err(error) =
@@ -1534,11 +1571,7 @@ fn compact_child(
         journal.failed = true;
         return Err(error.context("private child compaction journal failed; continuation stopped"));
     }
-    journal.cursor = candidate
-        .messages
-        .iter()
-        .filter(|message| crate::storage::transcript::is_history(message))
-        .count();
+    journal.cursor = history_len(&candidate.messages);
     drop(journal);
     observer.borrow_mut().notice(&format!(
         "Child context compacted via {:?}: retained {} complete history messages.",
@@ -1641,6 +1674,16 @@ pub(in crate::agent) fn run(
     backend.set_usage_scope(prior);
     backend.restore_cache_namespace(previous_namespace);
     result
+}
+
+/// An isolated copy has its own root; tools bound to the parent's project state (codebase
+/// memory, change history) would refuse every call there, so they are not offered at all.
+fn drop_root_bound(
+    names: &mut Vec<String>,
+    ext: &crate::tools::integrations::ext::Registry,
+    root: &Path,
+) {
+    names.retain(|name| ext.get(name).is_none_or(|tool| tool.serves_root(root)));
 }
 
 fn run_inner(
@@ -1758,6 +1801,7 @@ fn run_inner(
             !crate::agent::workflow::exploration::TOOL_NAMES.contains(&name.as_str())
         });
     }
+    drop_root_bound(&mut names, env.ext, env.workspace.root());
     names.sort();
     names.dedup();
     if approver.live_coordination()
@@ -1912,20 +1956,7 @@ fn run_inner(
                         .unwrap_or(&job.prompt)
                         .to_owned();
                 let observer = std::cell::RefCell::new(&mut *approver);
-                let mut runner = ChildMemoryRunner {
-                    env,
-                    backend,
-                    adapter,
-                    steps: &mut steps,
-                    budget,
-                    observer: &observer,
-                    children,
-                    call: None,
-                    mutates: job.spec.mutates,
-                    capture: false,
-                    receipts: Default::default(),
-                    next_receipt: 0,
-                };
+                let mut runner = ChildMemoryRunner::new(env, backend, adapter, &mut steps, budget, &observer, children, None, job.spec.mutates, false);
                 prepared_recall = memory.prepare_prompt(&authority, &current, &mut runner)?;
                 // Child context is rebuilt on every request, so it carries every fact already
                 // shown on this branch plus any new ones recall found for the current instruction.
@@ -2371,6 +2402,7 @@ fn run_inner(
             Err(error) => return Ok(crate::agent::run::engine::Tick::Finished(Outcome::provider_failed(steps, &error))),
         };
         if let Some(prepared) = prepared_recall.take() {
+            // `false` means a newer branch or recall superseded this one: nothing to publish.
             let _ = prepared.commit(&children.memory_authority());
         }
         if reply.finish_reason == "length" {
@@ -3023,20 +3055,7 @@ fn run_inner(
             let result = (|| -> Result<()> {
                 let authority = children.observe_memory()?;
                 let observer = std::cell::RefCell::new(&mut *approver);
-                let mut runner = ChildMemoryRunner {
-                    env,
-                    backend,
-                    adapter,
-                    steps: &mut steps,
-                    budget,
-                    observer: &observer,
-                    children,
-                    call: Some(origin),
-                    mutates: job.spec.mutates,
-                    capture: false,
-                    receipts: Default::default(),
-                    next_receipt: 0,
-                };
+                let mut runner = ChildMemoryRunner::new(env, backend, adapter, &mut steps, budget, &observer, children, Some(origin), job.spec.mutates, false);
                 memory.maintain(&authority, &mut runner)
             })();
             if let Err(error) = result {
@@ -3261,6 +3280,11 @@ fn capture_child_memory(
     *context.steps += 1;
     let provider_rewrite = child_provider_request(&env, &request, &observer)?;
     let provider_request = provider_rewrite.as_ref().unwrap_or(&request);
+    let Some(_provider_slot) =
+        crate::agent::model::provider_slots::acquire(env.config, env.interrupt)
+    else {
+        return Err(llm::Interrupted.into());
+    };
     let started = std::time::Instant::now();
     let previous_scope = context.backend.set_usage_scope(
         env.usage
@@ -3403,20 +3427,18 @@ fn capture_child_memory(
     {
         let authority = context.children.observe_memory()?;
         let observer = std::cell::RefCell::new(&mut *approver);
-        let mut runner = ChildMemoryRunner {
+        let mut runner = ChildMemoryRunner::new(
             env,
-            backend: context.backend,
-            adapter: context.adapter,
-            steps: context.steps,
-            budget: context.budget,
-            observer: &observer,
-            children: context.children,
-            call: Some(&origin),
-            mutates: job.spec.mutates,
-            capture: true,
-            receipts: Default::default(),
-            next_receipt: 0,
-        };
+            context.backend,
+            context.adapter,
+            context.steps,
+            context.budget,
+            &observer,
+            context.children,
+            Some(&origin),
+            job.spec.mutates,
+            true,
+        );
         memory.maintain(&authority, &mut runner)?;
     }
     anyhow::ensure!(
@@ -3556,11 +3578,7 @@ fn call_tool_inner(
             return refuse("private context transition already staged; further unstarted calls and callbacks are refused".into());
         }
     }
-    if let Some(reason) = callback_gate.and_then(|gate| {
-        gate.lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .intercept(env.workspace.root(), call)
-    }) {
+    if let Some(reason) = gate_intercept(callback_gate, env.workspace.root(), call) {
         return refuse(reason);
     }
     if call.name == "task" {
@@ -3679,12 +3697,7 @@ fn call_tool_inner(
         if !job.spec.mutates {
             return Err("denied: read-only subagent cannot execute a native mutation".into());
         }
-        if let Some(reason) = callback_gate.and_then(|gate| {
-            gate.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .blocked()
-                .map(str::to_owned)
-        }) {
+        if let Some(reason) = gate_blocked(callback_gate) {
             return Err(reason);
         }
         let scope = if tool == "read" {
@@ -3714,11 +3727,7 @@ fn call_tool_inner(
             paths,
             unbounded,
         )?;
-        if let Some(reason) = callback_gate.and_then(|gate| {
-            gate.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .intercept(env.workspace.root(), &observed)
-        }) {
+        if let Some(reason) = gate_intercept(callback_gate, env.workspace.root(), &observed) {
             return Err(reason);
         }
         Ok(())
@@ -3751,12 +3760,7 @@ fn call_tool_inner(
                     &approver,
                     callback_gate,
                 );
-                if let Some(reason) = callback_gate.and_then(|gate| {
-                    gate.lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .blocked()
-                        .map(str::to_owned)
-                }) {
+                if let Some(reason) = gate_blocked(callback_gate) {
                     output.is_error = true;
                     output.text.push_str(&format!("\n[{reason}]"));
                 }
@@ -3836,11 +3840,7 @@ fn call_tool_inner(
             ) {
                 return refuse(denial.message().into());
             }
-            if let Some(reason) = callback_gate.and_then(|gate| {
-                gate.lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .intercept(env.workspace.root(), &rewritten)
-            }) {
+            if let Some(reason) = gate_intercept(callback_gate, env.workspace.root(), &rewritten) {
                 return refuse(reason);
             }
             &rewritten
@@ -3866,12 +3866,7 @@ fn call_tool_inner(
                     "code-mode callbacks are blocked after an authorized completed edit preview failure",
                 );
             }
-            if let Some(reason) = callback_gate.and_then(|gate| {
-                gate.lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .blocked()
-                    .map(str::to_owned)
-            }) {
+            if let Some(reason) = gate_blocked(callback_gate) {
                 return ToolOutput::err(reason);
             }
             callbacks += 1;
@@ -4159,20 +4154,18 @@ fn call_tool_inner(
                 .as_ref()
                 .context("selected child memory backend is not active")?;
             let authority = context.children.observe_memory()?;
-            let mut runner = ChildMemoryRunner {
+            let mut runner = ChildMemoryRunner::new(
                 env,
-                backend: context.backend,
-                adapter: context.adapter,
-                steps: context.steps,
-                budget: context.budget,
-                observer: &approver,
-                children: context.children,
-                call: Some(call),
-                mutates: job.spec.mutates,
-                capture: context.capture,
-                receipts: Default::default(),
-                next_receipt: 0,
-            };
+                context.backend,
+                context.adapter,
+                context.steps,
+                context.budget,
+                &approver,
+                context.children,
+                Some(call),
+                job.spec.mutates,
+                context.capture,
+            );
             *context.children.memory_pending.borrow_mut() = Some(call.clone());
             let data = memory.execute_tool(&authority, &call.name, &call.arguments, &mut runner)?;
             Ok(ToolOutput {
@@ -4186,12 +4179,7 @@ fn call_tool_inner(
     } else {
         execute(env, call, Some(&authorize_mutation), Some(&confirm))
     };
-    if let Some(reason) = callback_gate.and_then(|gate| {
-        gate.lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .blocked()
-            .map(str::to_owned)
-    }) {
+    if let Some(reason) = gate_blocked(callback_gate) {
         output.is_error = true;
         output.text.push_str(&format!("\n[{reason}]"));
     }
@@ -4252,6 +4240,11 @@ fn semantic_find(
             *context.steps += 1;
             let chat = crate::agent::semantic_chat(&request, env.harness.max_tokens);
             let mut keep_going = |_: &str| !env.interrupt.load(Ordering::SeqCst);
+            let Some(_provider_slot) =
+                crate::agent::model::provider_slots::acquire(env.config, env.interrupt)
+            else {
+                return Err(llm::Interrupted.into());
+            };
             let started = std::time::Instant::now();
             let previous_scope = context.backend.set_usage_scope(
                 env.usage

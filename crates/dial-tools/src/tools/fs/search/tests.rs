@@ -640,3 +640,19 @@ fn capped_lines_pages_suggest_files_mode_and_default_output_is_unchanged() {
     assert!(per_file.contains("per_file_cap="), "{per_file}");
     assert!(per_file.contains("output=\"files\""), "{per_file}");
 }
+
+#[test]
+fn many_double_star_segments_match_in_bounded_time() {
+    let glob = Glob::new("**/*/**/*/**/*/**/*/**/*/**/*/**/x").unwrap();
+    let deep = vec!["d"; 60].join("/") + "/y";
+    let started = std::time::Instant::now();
+    assert!(!glob.matches(&deep));
+    assert!(glob.matches(&(vec!["d"; 60].join("/") + "/x")));
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    // Semantics: `**` takes zero or more whole segments, `*` exactly one.
+    let glob = Glob::new("src/**/*.rs").unwrap();
+    assert!(glob.matches("src/a.rs") && glob.matches("src/a/b/c.rs"));
+    assert!(!glob.matches("src") && !glob.matches("lib/a.rs"));
+    let glob = Glob::new("a/*/b").unwrap();
+    assert!(glob.matches("a/x/b") && !glob.matches("a/b") && !glob.matches("a/x/y/b"));
+}

@@ -650,6 +650,32 @@ fn repeated_silence_reports_incomplete_without_erasing_the_task_or_files() {
     );
 }
 
+/// With no fallback model to take over, a fallback-class provider failure ends the turn the same
+/// way every other provider failure does: with the recovery guidance, and with its cause and
+/// class saved in the turn summary so the failure stays diagnosable after the transcript is gone.
+#[test]
+fn a_provider_failure_without_a_fallback_keeps_its_cause_in_the_turn_summary() {
+    let server = serve(vec![Reply::Http(401, "invalid api key")]);
+    let e = env(&server.url, "auto");
+    let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let Err(error) = a.turn("Answer the question", &mut Recorder::default()) else {
+        panic!("a rejected credential must fail the turn");
+    };
+    assert!(
+        format!("{error:#}").contains("no tools were dispatched from this failed response"),
+        "{error:#}"
+    );
+    let summary = a.session().control_state()["turn_summary"].clone();
+    assert_eq!(summary["outcome"], "failed", "{summary}");
+    assert_eq!(summary["error_class"], "auth", "{summary}");
+    let cause = summary["error"].as_str().unwrap_or_default();
+    assert!(
+        cause.contains("HTTP 401") && !cause.contains("Recovery state"),
+        "{summary}"
+    );
+    assert_eq!(server.requests.lock().len(), 1);
+}
+
 /// Request-local contract/task guidance is deliberately outside the reusable history prefix.
 fn conversation_messages(request: &Value) -> Vec<Value> {
     request["messages"]

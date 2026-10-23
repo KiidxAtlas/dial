@@ -11,7 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{Result, bail};
 use serde_json::{Map, Value};
 
-use super::gemini::{add_one_month_ms, flow_base_url, parse_iso_ms, usage_status_for};
+use super::common::{parse_iso_ms_lenient, to_number, usage_status};
+use super::gemini::{add_one_month_ms, flow_base_url};
 use super::{UsageAmount, UsageLimit, UsageReport, UsageScope, UsageUnit, UsageWindow};
 use crate::llm::oauth::{self, util};
 
@@ -135,15 +136,6 @@ fn combine(legacy: Option<UsageReport>, summary: Option<UsageReport>) -> Option<
     }
 }
 
-/// Number from a JSON value (`toNumber`): finite numbers and numeric strings.
-fn to_number(value: &Value) -> Option<f64> {
-    match value {
-        Value::Number(number) => number.as_f64().filter(|n| n.is_finite()),
-        Value::String(text) => text.trim().parse::<f64>().ok().filter(|n| n.is_finite()),
-        _ => None,
-    }
-}
-
 fn field(object: &Map<String, Value>, key: &str) -> Option<f64> {
     object.get(key).and_then(to_number)
 }
@@ -162,7 +154,7 @@ fn parse_timestamp(value: &Value) -> Option<i64> {
         };
         return Some(ms as i64);
     }
-    value.as_str().and_then(parse_iso_ms)
+    value.as_str().and_then(parse_iso_ms_lenient)
 }
 
 /// Reset time from end-of-cycle keys, else start-of-cycle plus one month.
@@ -288,7 +280,7 @@ fn parse_plan_rails(bucket: &Map<String, Value>) -> PlanRails {
 }
 
 fn window_limit(id: &str, label: &str, window: &UsageWindow, amount: UsageAmount) -> UsageLimit {
-    let status = amount.used_fraction.map(usage_status_for);
+    let status = amount.used_fraction.map(usage_status);
     UsageLimit {
         id: id.to_owned(),
         label: label.to_owned(),

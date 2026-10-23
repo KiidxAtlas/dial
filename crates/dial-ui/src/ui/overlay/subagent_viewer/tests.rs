@@ -94,6 +94,35 @@ fn tail_applies_appended_records_and_waits_for_the_newline() {
 }
 
 #[test]
+fn a_long_transcript_is_replayed_over_bounded_polls() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("child.jsonl");
+    // Each record is ~1 MiB, so six of them exceed one poll's chunk.
+    let line = record(&json!({"role": "user", "content": "x".repeat(1 << 20)}));
+    for _ in 0..6 {
+        append(&path, &line);
+    }
+    let mut conversation = Conversation::default();
+    assert!(conversation.follow(&path));
+    assert!(conversation.entries.len() < 6, "first poll is bounded");
+    assert!(conversation.is_behind());
+    while conversation.is_behind() {
+        assert!(conversation.follow(&path));
+    }
+    assert_eq!(conversation.entries.len(), 6);
+    assert!(!conversation.follow(&path), "nothing new");
+
+    // One record longer than the chunk is still read whole rather than stalling.
+    append(
+        &path,
+        &record(&json!({"role": "user", "content": "y".repeat(5 << 20)})),
+    );
+    assert!(conversation.follow(&path));
+    assert_eq!(conversation.entries.len(), 7);
+    assert!(!conversation.is_behind());
+}
+
+#[test]
 fn tail_is_incremental_and_reloads_on_truncation_replacement_and_rewrite() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("child.jsonl");

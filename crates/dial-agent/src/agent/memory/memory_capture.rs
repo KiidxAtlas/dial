@@ -168,12 +168,9 @@ impl Agent<'_> {
                 .context("capture backend missing")?;
             backend.set_usage_scope(Some(capture.scope.clone()));
             let execution = {
-                let output = backend.output_budget(self.version.harness.max_tokens).min(
-                    backend
-                        .model_profile()
-                        .and_then(|profile| profile.max_tokens)
-                        .filter(|limit| *limit > 0)
-                        .unwrap_or(u32::MAX),
+                let output = crate::agent::model::backend::profile_capped_output(
+                    &backend,
+                    self.version.harness.max_tokens,
                 );
                 let window = self.budget_window().min(config.context_window).min(
                     backend

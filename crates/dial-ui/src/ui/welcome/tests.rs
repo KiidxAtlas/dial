@@ -473,7 +473,7 @@ fn short_homes_window_the_selected_action_instead_of_cutting_it_off() {
                 info()
             };
             let mut home = Home::new(info.clone(), vec!["s1".into(), "s2".into()], false);
-            for i in 0..items(&info) {
+            for (i, starter) in STARTERS.iter().enumerate().take(items(&info)) {
                 assert!(home.down());
                 for budget in 1..=14 {
                     let rows = home.rows(80, budget, &theme);
@@ -489,7 +489,7 @@ fn short_homes_window_the_selected_action_instead_of_cutting_it_off() {
                             panic!("selection {i}, budget {budget}: {:?}", plain(&rows))
                         });
                     let expected = if first_visit {
-                        STARTERS[i]
+                        *starter
                     } else {
                         info.recent[i].0.as_str()
                     };

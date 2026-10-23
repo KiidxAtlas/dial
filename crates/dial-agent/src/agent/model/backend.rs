@@ -44,6 +44,18 @@ impl Default for Runtime {
     }
 }
 
+/// `requested` output tokens (0 = provider-resolved) as `backend` will send them, capped by the
+/// active profile's explicit `max_tokens`. Role and side requests use this so a profile limit
+/// also bounds a caller's fixed budget.
+pub(crate) fn profile_capped_output(backend: &Backend, requested: u32) -> u32 {
+    let output = backend.output_budget(requested);
+    backend
+        .model_profile()
+        .and_then(|profile| profile.max_tokens)
+        .filter(|limit| *limit > 0)
+        .map_or(output, |limit| output.min(limit))
+}
+
 pub fn make_backend(config: &Config) -> Result<Backend> {
     config.require_model()?;
     let subscription_auth = crate::config::paths::subscription_auth_dir(&config.user_dir)?;

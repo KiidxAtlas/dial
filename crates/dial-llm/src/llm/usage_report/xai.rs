@@ -3,7 +3,7 @@
 //! Two billing shapes are read from `cli-chat-proxy.grok.com/v1/billing`:
 //! the legacy weekly credits shape (`?format=credits`) and the unified-billing monthly included
 //! quota (default URL). Accounts may expose both, and both are reconciled.
-use super::factory::{parse_iso_ms, to_number, usage_status};
+use super::common::{parse_iso_ms, to_number, usage_status};
 use super::types::{
     UsageAmount, UsageLimit, UsageReport, UsageScope, UsageStatus, UsageUnit, UsageWindow,
 };

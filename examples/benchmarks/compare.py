@@ -1,15 +1,40 @@
 #!/usr/bin/env python3
-"""Compare direct Dial benchmark reports; report analysis is not new model-quality proof."""
+"""Compare Dial benchmark reports; report analysis is not new model-quality proof."""
 import argparse
 import json
 import statistics
 from pathlib import Path
 
 
-def direct_report(payload):
+def direct_report(payload, configuration=None):
     if not isinstance(payload, dict):
         raise ValueError("expected a benchmark report object")
-    return payload.get("report", payload)
+    report = payload.get("report", payload)
+    if not isinstance(report, dict):
+        raise ValueError("expected a benchmark report object")
+    machine = report.get("machine_benchmark", report)
+    if not isinstance(machine, dict):
+        raise ValueError("expected a machine benchmark report object")
+    if "configurations" not in machine:
+        if configuration is not None:
+            raise ValueError("configuration selection requires a machine benchmark report")
+        return report
+    entries = machine["configurations"]
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("expected nonempty machine configurations")
+    if any(not isinstance(entry, dict) or not isinstance(entry.get("configuration"), dict)
+           or not isinstance(entry.get("report"), dict) for entry in entries):
+        raise ValueError("expected machine configuration and report objects")
+    names = [entry["configuration"]["name"] for entry in entries]
+    if any(not isinstance(name, str) or not name for name in names) or len(names) != len(set(names)):
+        raise ValueError("configuration names must be nonempty and unique")
+    if configuration is None:
+        if len(entries) != 1:
+            raise ValueError("select a machine configuration explicitly; available: " + ", ".join(names))
+        return entries[0]["report"]
+    if configuration not in names:
+        raise ValueError(f"unknown machine configuration: {configuration}; available: " + ", ".join(names))
+    return entries[names.index(configuration)]["report"]
 
 
 def evidence(case):
@@ -92,8 +117,9 @@ def totals(cases):
     }
 
 
-def compare(baseline, candidate):
-    baseline, candidate = direct_report(baseline), direct_report(candidate)
+def compare(baseline, candidate, baseline_configuration=None, candidate_configuration=None):
+    baseline = direct_report(baseline, baseline_configuration)
+    candidate = direct_report(candidate, candidate_configuration)
     for name, report in (("baseline", baseline), ("candidate", candidate)):
         reason = invalid_reason(report)
         if reason:
@@ -101,7 +127,7 @@ def compare(baseline, candidate):
     before, after = indexed(baseline), indexed(candidate)
     if baseline["suite"] != candidate["suite"] or before.keys() != after.keys():
         raise ValueError("reports must contain the same suite and case IDs")
-    if any(before[key]["checks_total"] != after[key]["checks_total"] or evidence(before[key]).get("contract_sha256") != evidence(after[key]).get("contract_sha256") or evidence(before[key]).get("categories", before[key].get("categories", [])) != evidence(after[key]).get("categories", after[key].get("categories", [])) for key in before):
+    if any(before[key]["checks_total"] != after[key]["checks_total"] or evidence(before[key]).get("outcome_checks") != evidence(after[key]).get("outcome_checks") or evidence(before[key]).get("contract_sha256") != evidence(after[key]).get("contract_sha256") or evidence(before[key]).get("categories", before[key].get("categories", [])) != evidence(after[key]).get("categories", after[key].get("categories", [])) for key in before):
         raise ValueError("case verification contracts differ")
     regressions = [key for key in before if checked_success(before[key]) and not checked_success(after[key])]
     matched = [key for key in before if checked_success(before[key]) and checked_success(after[key])]
@@ -127,9 +153,12 @@ def main():
     parser.add_argument("baseline", type=Path)
     parser.add_argument("candidate", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--baseline-configuration", help="Configuration name in the baseline machine report")
+    parser.add_argument("--candidate-configuration", help="Configuration name in the candidate machine report")
     args = parser.parse_args()
     try:
-        report = compare(json.loads(args.baseline.read_text()), json.loads(args.candidate.read_text()))
+        report = compare(json.loads(args.baseline.read_text()), json.loads(args.candidate.read_text()),
+                         args.baseline_configuration, args.candidate_configuration)
     except (ValueError, KeyError, TypeError, OSError) as error:
         parser.error(str(error))
     text = json.dumps(report, indent=2) + "\n"

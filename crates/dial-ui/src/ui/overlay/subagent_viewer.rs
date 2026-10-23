@@ -62,11 +62,15 @@ pub struct Conversation {
     identity: (u64, u64),
     /// The first bytes of the file as they were read, to catch an in-place rewrite.
     head: Vec<u8>,
+    /// A capped read left complete records unread; they are replayed on the next poll.
+    behind: bool,
     revision: u64,
 }
 
 /// Leading bytes compared on every poll to detect a rewrite that kept the same inode and size.
 const HEAD: usize = 256;
+/// Most bytes of new records replayed by one poll.
+const CHUNK: u64 = 4 << 20;
 
 impl Conversation {
     pub fn revision(&self) -> u64 {
@@ -94,11 +98,25 @@ impl Conversation {
         if len <= self.offset {
             return false;
         }
-        let Ok(bytes) = read_range(&mut file, self.offset, len) else {
+        // Bounded per poll: a long transcript is replayed over several polls instead of
+        // blocking one paint. A single record longer than the chunk is still read whole.
+        let chunk_end = len.min(self.offset.saturating_add(CHUNK));
+        let Ok(mut bytes) = read_range(&mut file, self.offset, chunk_end) else {
             return false;
         };
+        let mut complete = bytes.iter().rposition(|byte| *byte == b'\n');
+        let mut behind = chunk_end < len;
+        if complete.is_none() && behind {
+            let Ok(rest) = read_range(&mut file, self.offset, len) else {
+                return false;
+            };
+            bytes = rest;
+            complete = bytes.iter().rposition(|byte| *byte == b'\n');
+            behind = false;
+        }
+        self.behind = behind;
         // A record still being written has no newline yet; it is read on a later poll.
-        let Some(end) = bytes.iter().rposition(|byte| *byte == b'\n').map(|i| i + 1) else {
+        let Some(end) = complete.map(|i| i + 1) else {
             return false;
         };
         for line in bytes[..end].split(|byte| *byte == b'\n') {
@@ -141,6 +159,11 @@ impl Conversation {
     fn finish(&mut self) {
         self.transcript.finish_turn();
         self.revision += 1;
+    }
+
+    /// Whether complete records remain beyond what was replayed so far.
+    fn is_behind(&self) -> bool {
+        self.behind
     }
 }
 
@@ -354,7 +377,7 @@ impl SubagentViewer {
                 .agent
                 .as_ref()
                 .is_some_and(|agent| agent.status.is_finished());
-            if finished && !self.finished_applied {
+            if finished && !self.finished_applied && !self.conversation.is_behind() {
                 self.conversation.finish();
                 self.finished_applied = true;
             } else if !finished {

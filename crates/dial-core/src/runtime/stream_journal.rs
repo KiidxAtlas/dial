@@ -123,7 +123,7 @@ pub fn relocate(source: &Path, destination: &Path) -> std::io::Result<()> {
     let mut writer = live
         .as_ref()
         .map(|writer| writer.lock().unwrap_or_else(|poison| poison.into_inner()));
-    match std::fs::rename(&source, &destination) {
+    match publish_no_replace(&source, &destination) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
         Ok(()) => {}
@@ -136,6 +136,28 @@ pub fn relocate(source: &Path, destination: &Path) -> std::io::Result<()> {
         writers.insert(destination, Arc::downgrade(live));
     }
     Ok(())
+}
+/// Moves `source` to `destination` without ever replacing an existing destination: `rename`
+/// silently overwrites on Unix, so a file created after the caller's check would be lost. A hard
+/// link fails atomically when the name exists and keeps the inode an open writer appends to.
+/// Filesystems without hard links fall back to a checked rename.
+fn publish_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    let exists = || {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "stream archive destination exists",
+        )
+    };
+    match std::fs::hard_link(source, destination) {
+        Ok(()) => std::fs::remove_file(source).inspect_err(|_| {
+            // Leave the journal under its original name only.
+            let _ = std::fs::remove_file(destination);
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(exists()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(error),
+        Err(_) if destination.exists() => Err(exists()),
+        Err(_) => std::fs::rename(source, destination),
+    }
 }
 impl Journal {
     #[cfg(any(test, feature = "test-support"))]

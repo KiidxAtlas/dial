@@ -6,10 +6,10 @@
 //! wider than the limit (parents waiting on children waiting on the parents' slots).
 //!
 //! Remote providers are unlimited unless `task.provider_concurrency.<provider>` sets a cap. A local
-//! model server (Dial's own runtime, or an endpoint on this machine or the LAN) is one shared
-//! resource: it takes one request at a time unless `task.provider_concurrency.<provider>` raises
-//! that, e.g. for a llama.cpp server started with several `--parallel` slots. Parallel requests on
-//! a single-slot server would also evict each other's prompt cache.
+//! model server is one shared resource. Dial's own runtime always takes one request at a time; an
+//! endpoint on this machine or the LAN does too unless `task.provider_concurrency.<provider>`
+//! raises that, e.g. for a llama.cpp server started with several `--parallel` slots. Parallel
+//! requests on a single-slot server would also evict each other's prompt cache.
 use crate::config::types::Config;
 use std::{
     collections::HashMap,

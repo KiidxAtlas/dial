@@ -3425,3 +3425,31 @@ fn independent_messages_are_taken_separately_and_unread_ones_survive_the_turn() 
     c.set_busy(false);
     assert_eq!(c.queued_messages(), [("never read".into(), true)]);
 }
+
+#[test]
+fn ranking_stops_early_once_superseded() {
+    let entries: Vec<CommandEntry> = (0..=SYNC_RANK_LIMIT)
+        .map(|i| CommandEntry {
+            name: format!("dir/{i}.txt"),
+            description: String::new(),
+            kind: CommandKind::File,
+            args_hint: None,
+        })
+        .collect();
+    let checks = std::cell::Cell::new(0usize);
+    let stale_after_first = || {
+        checks.set(checks.get() + 1);
+        checks.get() > 1
+    };
+    assert!(rank_until(&entries, "txt", &stale_after_first).is_none());
+    assert_eq!(
+        checks.get(),
+        2,
+        "a superseded ranking must stop at the next check"
+    );
+    assert!(rank_until(&entries, "txt", &|| true).is_none());
+    assert_eq!(
+        rank_until(&entries, "txt", &|| false).map(|m| m.len()),
+        Some(entries.len())
+    );
+}

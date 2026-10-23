@@ -46,9 +46,10 @@ fn release_tag(version: Option<&str>) -> Result<String> {
             format!("v{version}")
         };
         ensure!(
-            tag[1..]
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+')),
+            tag.len() > 1
+                && tag[1..]
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+')),
             "invalid version tag"
         );
         return Ok(tag);
@@ -148,7 +149,6 @@ pub fn run(version: Option<&str>) -> Result<()> {
     let install_dir = executable
         .parent()
         .context("running executable has no parent directory")?;
-    #[cfg(unix)]
     let _install_lock = lock_install_dir(install_dir)?;
     let temp = tempfile::tempdir_in(install_dir)
         .context("creating same-filesystem update staging directory")?;
@@ -157,6 +157,9 @@ pub fn run(version: Option<&str>) -> Result<()> {
     } else {
         temp.path().join("dial.new")
     };
+    // Only a staged file outside `temp` needs its own cleanup (Windows stages beside the exe).
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut _staged_cleanup = StagedCleanup(cfg!(windows).then(|| staged.clone()));
     #[cfg(windows)]
     {
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&archive))?;
@@ -202,10 +205,10 @@ pub fn run(version: Option<&str>) -> Result<()> {
     }
     let output = run_version_check(&staged).context("checking downloaded executable")?;
     ensure!(
-        output.status.success(),
+        output.success,
         "downloaded executable failed its --version check"
     );
-    let actual_version = String::from_utf8_lossy(&output.stdout);
+    let actual_version = &output.stdout;
     let expected = tag.trim_start_matches('v');
     ensure!(
         actual_version
@@ -249,6 +252,8 @@ try {
             .env("DIAL_UPDATE_VERSION", tag.trim_start_matches('v'))
             .spawn()
             .context("starting atomic Windows installer")?;
+        // The installer script now owns the staged file.
+        _staged_cleanup.0 = None;
         println!(
             "Verified Dial {}. It will activate after this process exits; previous binary is backed up at {}.",
             tag.trim_start_matches('v'),
@@ -273,44 +278,58 @@ try {
     Ok(())
 }
 
-/// Runs `path --version` in its own process group with a deadline. A binary that never answers is
-/// killed with its group, so a stuck download cannot hang the update.
-fn run_version_check(path: &Path) -> Result<std::process::Output> {
-    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
-    let mut command = std::process::Command::new(path);
-    command
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let child = dial::platform::process::spawn_group(&mut command)
-        .with_context(|| format!("starting {}", path.display()))?;
-    let pid = child.id();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
-    });
-    match rx.recv_timeout(TIMEOUT) {
-        Ok(output) => Ok(output?),
-        Err(_) => {
-            let _ = dial::platform::process::kill_group(pid);
-            bail!(
-                "{} did not answer --version within {}s",
-                path.display(),
-                TIMEOUT.as_secs()
-            )
+/// Removes a staged executable that lives outside the staging directory unless the update took
+/// ownership of it, so a failed check does not leave an unverified binary beside the install.
+struct StagedCleanup(Option<std::path::PathBuf>);
+
+impl Drop for StagedCleanup {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = fs::remove_file(path);
         }
     }
 }
 
+/// What a `--version` probe reported; stdout is capped by `run_version_check`.
+struct VersionOutput {
+    success: bool,
+    stdout: String,
+}
+
+/// Runs `path --version` in its own process group with a deadline and a bounded output capture.
+/// A binary that never answers, floods its pipes, or leaves a grandchild holding them open is
+/// stopped with its group, so an untrusted download cannot hang or exhaust the update.
+fn run_version_check(path: &Path) -> Result<VersionOutput> {
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+    const OUTPUT_CAP: usize = 64 * 1024;
+    let mut command = std::process::Command::new(path);
+    command.arg("--version");
+    let finished = dial::runtime::process::run_with_control(
+        command,
+        None,
+        dial::runtime::process::Policy::bounded(TIMEOUT, OUTPUT_CAP),
+        &|| false,
+        &mut |_, _| {},
+    )
+    .map_err(anyhow::Error::msg)?;
+    ensure!(
+        !finished.timed_out,
+        "{} did not answer --version within {}s",
+        path.display(),
+        TIMEOUT.as_secs()
+    );
+    Ok(VersionOutput {
+        success: finished.success(),
+        stdout: String::from_utf8_lossy(&finished.stdout).into_owned(),
+    })
+}
+
 /// Exclusive lease on an install directory, so two `dial update` runs cannot interleave their
 /// activation. Released when dropped.
-#[cfg(unix)]
 struct InstallLock {
     _file: fs::File,
 }
 
-#[cfg(unix)]
 fn lock_install_dir(dir: &Path) -> Result<InstallLock> {
     use fs2::FileExt;
     let path = dir.join(".dial-update.lock");
@@ -405,8 +424,9 @@ fn sync_dir(dir: &Path) -> Result<()> {
 fn verify_version(path: &Path, expected: &str) -> Result<()> {
     let output = run_version_check(path)?;
     ensure!(
-        output.status.success()
-            && String::from_utf8_lossy(&output.stdout)
+        output.success
+            && output
+                .stdout
                 .lines()
                 .any(|line| dial_version_token(line) == Some(expected)),
         "{} does not report Dial {expected} from --version",

@@ -51,3 +51,28 @@ fn rejects_links_and_oversized_bundles() {
     assert!(run(&layout, &source, Scope::User, false, false).unwrap()[0].contains("64 KiB"));
     assert!(discover(&layout).is_empty());
 }
+
+#[test]
+fn lock_root_waits_out_a_briefly_held_lock_but_not_a_held_one() {
+    let root = tempfile::tempdir().unwrap();
+    // A separate open file description conflicts like another process (or a just-spawned child
+    // that still shares the descriptor) would.
+    let holder = lock_root(root.path(), ".import.lock", "first").unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        drop(holder);
+    });
+    let started = std::time::Instant::now();
+    let second = lock_root(root.path(), ".import.lock", "busy").unwrap();
+    assert!(started.elapsed() >= std::time::Duration::from_millis(100));
+    release.join().unwrap();
+    let error = lock_root(
+        root.path(),
+        ".import.lock",
+        "another skill import is running",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("another skill import is running"), "{error}");
+    drop(second);
+}

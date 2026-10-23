@@ -1,6 +1,7 @@
 //! Sign in with ChatGPT for Dial's own public OAuth registration. Credentials never enter config,
 //! model history, or API-key storage. Protected atomic records and a process lock serialize refresh.
 use super::auth::SecretToken;
+use super::oauth::util::decode;
 #[cfg(any(test, feature = "test-support"))]
 use crate::config::settings_store::locked;
 use crate::config::settings_store::{locked_cancellable, write_private};
@@ -235,26 +236,6 @@ fn form(fields: &[(&str, &str)]) -> String {
         .map(|(k, v)| format!("{}={}", encode(k), encode(v)))
         .collect::<Vec<_>>()
         .join("&")
-}
-fn decode(s: &str) -> Result<String> {
-    let mut out = Vec::new();
-    let b = s.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' {
-            ensure!(i + 2 < b.len(), "invalid OAuth callback encoding");
-            let h = std::str::from_utf8(&b[i + 1..i + 3])?;
-            out.push(
-                u8::from_str_radix(h, 16)
-                    .map_err(|_| anyhow::anyhow!("invalid OAuth callback encoding"))?,
-            );
-            i += 3;
-        } else {
-            out.push(if b[i] == b'+' { b' ' } else { b[i] });
-            i += 1;
-        }
-    }
-    String::from_utf8(out).map_err(|_| anyhow::anyhow!("invalid OAuth callback encoding"))
 }
 struct Attempt {
     state: String,

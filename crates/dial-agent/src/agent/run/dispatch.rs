@@ -440,11 +440,13 @@ impl<'a> Agent<'a> {
             });
             match result {
                 Err(reason) => {
-                    let _ = self.record(
+                    if let Err(error) = self.record(
                         self.cur_step,
                         "tool_denied",
                         json!({"name":call.name,"hook":true}),
-                    );
+                    ) {
+                        ui.notice(&format!("tool denial was not journaled: {error:#}"));
+                    }
                     return ToolOutput {
                         execution: Default::default(),
                         data: None,
@@ -571,7 +573,10 @@ impl<'a> Agent<'a> {
         }
         if let Err(denial) = self.authorize_call(call, ui) {
             *approval_denied = true;
-            let _ = self.record(self.cur_step, "tool_denied", json!({"name":call.name}));
+            if let Err(error) = self.record(self.cur_step, "tool_denied", json!({"name":call.name}))
+            {
+                ui.notice(&format!("tool denial was not journaled: {error:#}"));
+            }
             return denied(denial.message());
         }
         if self.interrupt.load(Ordering::SeqCst) {

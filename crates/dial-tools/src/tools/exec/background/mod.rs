@@ -371,9 +371,9 @@ impl Background {
                 || super::signals::wait_interrupted()
             {
                 self.interrupt.store(false, Ordering::Release);
-                // A new user message (steering) ends a pure wait with nothing to undo: the job
-                // keeps running under bg. Reporting it as aborted marked the result as having
-                // unknown effects, which stopped the turn before the new message was answered.
+                // Waiting only observes: the job keeps running under bg either way, so neither
+                // ending has effects to inspect. Unknown effects would stop the turn with a
+                // misleading "uncertain effects" report and refuse further calls.
                 if !hard_cancel && super::signals::steering_requested() {
                     return Ok(ToolOutput::ok(format!(
                         "stopped waiting for {name} because a new user message arrived; {name} is still running under bg (use output or wait to check it again)"
@@ -383,7 +383,8 @@ impl Background {
                 return Ok(ToolOutput::err(format!(
                     "cancelled waiting for {name}; background process remains managed by bg"
                 ))
-                .with_status(crate::tools::ToolStatus::Aborted));
+                .with_status(crate::tools::ToolStatus::Aborted)
+                .with_effects(crate::tools::surface::outcome::Effects::None));
             }
             let snap = self.table().snapshot(name)?;
             if snap.pid != initial_pid {

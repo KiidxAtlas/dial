@@ -171,7 +171,7 @@ fn large_output_drains_fully_and_spills_to_an_artifact() {
         "large output must not fail: {}",
         &show.text[show.text.len().saturating_sub(300)..]
     );
-    assert!(show.text.len() < MAX_OUTPUT + 1024);
+    assert!(show.text.len() < crate::tools::vcs::gh_common::MAX_OUTPUT + 1024);
     let uris = crate::storage::artifact::uris(&show.text);
     assert_eq!(
         uris.len(),
@@ -273,6 +273,31 @@ fn worktree_add_keep_changes_carries_tracked_and_untracked_edits() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn worktree_add_keep_changes_keeps_untracked_symlinks_as_links() {
+    let (_dir, ws) = repo();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("secret.txt"), "outside\n").unwrap();
+    std::os::unix::fs::symlink(
+        outside.path().join("secret.txt"),
+        ws.root().join("file-link"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(outside.path(), ws.root().join("dir-link")).unwrap();
+    let holder = tempfile::tempdir().unwrap();
+    let wt = holder.path().join("links");
+    assert!(worktree_add_keep_changes(ws.root(), &wt, "links").unwrap());
+    for name in ["file-link", "dir-link"] {
+        let meta = std::fs::symlink_metadata(wt.join(name)).unwrap();
+        assert!(meta.file_type().is_symlink(), "{name} stays a link");
+    }
+    assert_eq!(
+        std::fs::read_link(wt.join("file-link")).unwrap(),
+        outside.path().join("secret.txt")
+    );
+}
+
 #[test]
 fn clean_source_checkout_reverts_tracked_edits_and_removes_untracked_files() {
     let (_dir, ws) = repo();
@@ -284,4 +309,14 @@ fn clean_source_checkout_reverts_tracked_edits_and_removes_untracked_files() {
         "one\n"
     );
     assert!(!ws.root().join("new.txt").exists());
+}
+
+#[test]
+fn jj_file_escapes_as_a_jj_string_literal() {
+    assert_eq!(jj_file("src/a.rs"), r#"file:"src/a.rs""#);
+    assert_eq!(
+        jj_file("we\"ird\\na\u{e9}me.rs"),
+        "file:\"we\\\"ird\\\\na\u{e9}me.rs\""
+    );
+    assert_eq!(jj_file("a\tb\n\u{1b}\u{1}"), r#"file:"a\tb\n\e\x01""#);
 }

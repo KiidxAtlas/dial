@@ -5,9 +5,9 @@ use crate::config::types::Outcome;
 
 fn pairs(parent_better: usize, candidate_better: usize, ties: usize) -> Vec<(f64, f64)> {
     let mut out = Vec::new();
-    out.extend(std::iter::repeat((90.0, 10.0)).take(parent_better));
-    out.extend(std::iter::repeat((10.0, 90.0)).take(candidate_better));
-    out.extend(std::iter::repeat((50.0, 50.0)).take(ties));
+    out.extend(std::iter::repeat_n((90.0, 10.0), parent_better));
+    out.extend(std::iter::repeat_n((10.0, 90.0), candidate_better));
+    out.extend(std::iter::repeat_n((50.0, 50.0), ties));
     out
 }
 

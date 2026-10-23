@@ -40,6 +40,16 @@ impl Shell {
             if let Some(notice) = self.composer.take_word_notice() {
                 self.note("Word completion", notice);
             }
+            for (label, failure) in [
+                ("Git status", self.git.cache.take_failure()),
+                ("Git files", self.git.files.take_failure()),
+                ("Learning status", self.learning.cache.take_failure()),
+            ] {
+                if let Some(failure) = failure {
+                    self.note(label, failure);
+                    dirty = true;
+                }
+            }
             for notice in crate::collab::room::pump()
                 .into_iter()
                 .chain(crate::llm::oauth::take_notice())
@@ -87,6 +97,10 @@ impl Shell {
             crate::app::commands::commit::poll(self);
             self.poll_improve_watch();
             if crate::app::commands::extensions_browser::poll(self, app, agent) {
+                dirty = true;
+            }
+            for note in agent.finished_tan_jobs() {
+                self.note("Tan", note);
                 dirty = true;
             }
             if self.poll_voice() {

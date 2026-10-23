@@ -288,16 +288,34 @@ fn match_class(pattern: &[char], c: char) -> Option<usize> {
     None
 }
 
+/// Matches path segments against pattern segments in O(pattern × path): `reach[i]` says the
+/// pattern prefix seen so far can end before path segment `i`. Recursing over every `**` skip
+/// was exponential in the number of `**` segments on a failing match.
 fn match_segments(pattern: &[Vec<char>], path: &[Vec<char>]) -> bool {
-    match pattern.split_first() {
-        None => path.is_empty(),
-        Some((first, rest)) if first.iter().eq(['*', '*'].iter()) => {
-            (0..=path.len()).any(|skip| match_segments(rest, &path[skip..]))
+    let mut reach = vec![false; path.len() + 1];
+    reach[0] = true;
+    for segment in pattern {
+        let mut next = vec![false; path.len() + 1];
+        if segment.iter().eq(['*', '*'].iter()) {
+            // `**` consumes zero or more whole segments.
+            let mut reachable = false;
+            for (slot, &here) in next.iter_mut().zip(&reach) {
+                reachable |= here;
+                *slot = reachable;
+            }
+        } else {
+            for (i, name) in path.iter().enumerate() {
+                if reach[i] && match_segment(segment, name) {
+                    next[i + 1] = true;
+                }
+            }
         }
-        Some((first, rest)) => path
-            .split_first()
-            .is_some_and(|(name, tail)| match_segment(first, name) && match_segments(rest, tail)),
+        if !next.contains(&true) {
+            return false;
+        }
+        reach = next;
     }
+    reach[path.len()]
 }
 
 /// Compiled glob: brace alternatives, each a list of segments.
@@ -337,7 +355,7 @@ impl Glob {
             let mut segments: Vec<Vec<char>> = Vec::new();
             for segment in alt.split('/').filter(|s| !s.is_empty()) {
                 let chars: Vec<char> = segment.chars().collect();
-                // Adjacent `**` segments are equivalent to one; collapsing keeps matching linear-ish.
+                // Adjacent `**` segments are equivalent to one.
                 if chars == ['*', '*'] && segments.last().is_some_and(|l| l == &chars) {
                     continue;
                 }

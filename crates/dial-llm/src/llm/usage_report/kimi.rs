@@ -3,7 +3,7 @@
 //! The `GET {base}/usages` payload carries a weekly `usage` summary, `limits` rows with
 //! per-window durations, and `usages` aggregate ratios. Rows are normalized into
 //! [`UsageLimit`]s.
-use super::factory::{parse_iso_ms, to_number, usage_status};
+use super::common::{parse_iso_ms, to_number, usage_status};
 use super::types::{
     UsageAmount, UsageLimit, UsageReport, UsageScope, UsageStatus, UsageUnit, UsageWindow,
 };

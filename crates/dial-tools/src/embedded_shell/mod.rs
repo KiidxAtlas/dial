@@ -58,6 +58,30 @@ pub fn invocation(scratch: &Path, script: &str) -> io::Result<(PathBuf, Vec<Stri
     ))
 }
 
+/// Removes the script file an [`invocation`] wrote, given the host command line (`HOST_ARG <path>`
+/// somewhere in it, possibly wrapped by a sandbox launcher). Callers use it when the host will
+/// never run (command construction or spawn failed), because only the host deletes the file.
+/// Only files carrying [`SCRIPT_PREFIX`] are touched.
+pub fn discard_script<S: AsRef<std::ffi::OsStr>>(args: impl IntoIterator<Item = S>) {
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg.as_ref() != HOST_ARG {
+            continue;
+        }
+        if let Some(path) = args.next() {
+            let path = Path::new(path.as_ref());
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(SCRIPT_PREFIX))
+            {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        return;
+    }
+}
+
 /// Runs a script file as the embedded shell host and returns the process exit code.
 #[cfg(feature = "embedded-shell")]
 pub fn run_host(script_path: &Path) -> i32 {

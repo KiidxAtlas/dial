@@ -131,6 +131,14 @@ impl<'a> Agent<'a> {
             ),
             Err(_) => ("failed".to_string(), 0),
         };
+        // A failed turn keeps its cause in the journal; the transcript alone loses it on resume.
+        let (error, error_class) = match &result {
+            Err(error) => (
+                Value::from(failure_cause(error)),
+                Value::from(crate::llm::errors::classify(error).label()),
+            ),
+            Ok(_) => (Value::Null, Value::Null),
+        };
         crate::telemetry::turn(
             self.config,
             self.hermetic,
@@ -140,7 +148,7 @@ impl<'a> Agent<'a> {
             turn_clock.elapsed(),
         );
         let edit = self.step_checks.status();
-        let summary = json!({"outcome":outcome,"steps":steps,"checkpoint_turn":self.step_checks.turn,"changed_files":changed_files,"open_tasks":self.todo.tasks().iter().filter(|task| task.status.is_open()).count(),"recorded_checks":state["reliability"]["verification_results"],"checks_current":self.step_checks.checks_current(),"evidence":state["completion_evidence"],"uncheckpointed_shell_commands":edit["uncheckpointed_shell_commands"],"uncheckpointed_extension_calls":edit["uncheckpointed_extension_calls"],"review":"/review-file","undo":"/undo"});
+        let summary = json!({"outcome":outcome,"steps":steps,"error":error,"error_class":error_class,"checkpoint_turn":self.step_checks.turn,"changed_files":changed_files,"open_tasks":self.todo.tasks().iter().filter(|task| task.status.is_open()).count(),"recorded_checks":state["reliability"]["verification_results"],"checks_current":self.step_checks.checks_current(),"evidence":state["completion_evidence"],"uncheckpointed_shell_commands":edit["uncheckpointed_shell_commands"],"uncheckpointed_extension_calls":edit["uncheckpointed_extension_calls"],"review":"/review-file","undo":"/undo"});
         observed.completion(&summary);
         let mut control = self.session.control_state();
         control["turn_summary"] = summary;
@@ -1177,6 +1185,20 @@ impl TurnSteps {
         self.spent = self.spent.saturating_add(run_steps);
         self.spent
     }
+}
+
+/// Characters of a failed turn's cause kept in its saved summary.
+const FAILURE_CAUSE_CHARS: usize = 600;
+
+/// The diagnostic chain of a failed turn, without the generic recovery advice every provider
+/// failure carries, bounded so the saved summary stays small.
+fn failure_cause(error: &anyhow::Error) -> String {
+    let chain: Vec<String> = error
+        .chain()
+        .map(ToString::to_string)
+        .filter(|cause| cause != crate::agent::run::failure_guidance::PROVIDER_RECOVERY)
+        .collect();
+    crate::agent::window::prompt::truncate_chars(&chain.join(": "), FAILURE_CAUSE_CHARS)
 }
 
 #[cfg(test)]

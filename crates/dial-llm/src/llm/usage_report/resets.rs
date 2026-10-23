@@ -11,7 +11,7 @@ use anyhow::{Result, anyhow, bail};
 
 use super::claude::{self, JUNIPER_PROGRAM};
 use super::codex;
-use super::factory::parse_iso_ms;
+use super::common::parse_iso_ms;
 use super::fetch;
 use super::types::{UsageReport, UsageResetCreditDetail, UsageResetCredits};
 use crate::llm::oauth::util;

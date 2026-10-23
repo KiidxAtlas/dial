@@ -66,6 +66,24 @@ fn relocation_updates_all_publishers_and_owner_removal_refuses_stale_writes() {
 }
 
 #[test]
+fn relocation_never_replaces_an_existing_destination() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.jsonl");
+    let destination = root.path().join("archive.jsonl");
+    std::fs::write(&source, "source").unwrap();
+    // Created after `relocate`'s early check would have run: the publish step itself refuses.
+    std::fs::write(&destination, "other").unwrap();
+    let error = publish_no_replace(&source, &destination).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), "source");
+    assert_eq!(std::fs::read_to_string(&destination).unwrap(), "other");
+    std::fs::remove_file(&destination).unwrap();
+    publish_no_replace(&source, &destination).unwrap();
+    assert!(!source.exists());
+    assert_eq!(std::fs::read_to_string(&destination).unwrap(), "source");
+}
+
+#[test]
 fn future_stream_versions_are_preserved_and_refused_before_append() {
     let root = tempfile::tempdir().unwrap();
     let session = root.path().join("future.jsonl");

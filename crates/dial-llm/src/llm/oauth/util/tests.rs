@@ -116,3 +116,26 @@ fn callback_accepts_only_matching_state() {
     client.join().unwrap();
     assert_eq!(fields["code"], "good");
 }
+
+#[test]
+fn read_redirect_gives_up_on_a_client_that_dribbles_bytes() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let client = std::thread::spawn(move || {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        // One byte every 50ms never completes the head, and every individual read succeeds.
+        for byte in b"GET /cb?code=x HTTP/1.1".iter().cycle().take(400) {
+            if stream.write_all(&[*byte]).is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    });
+    let (mut server, _) = listener.accept().unwrap();
+    let started = Instant::now();
+    let error = read_redirect_within(&mut server, "/cb", Duration::from_millis(300)).unwrap_err();
+    assert!(error.to_string().contains("timed out"), "{error:#}");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    drop(server);
+    client.join().unwrap();
+}

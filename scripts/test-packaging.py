@@ -84,6 +84,7 @@ class ReleaseBuildIdentityTests(unittest.TestCase):
             env.pop("GIT_DIR", None)
             env.pop("GIT_WORK_TREE", None)
             env.pop("DIAL_BUILD_REVISION", None)
+            env.pop("OUT_DIR", None)
             for revision, accepted in [(None, False), ("unknown", False), ("not-a-hash", False),
                                        ("0123456789abcdef0123456789abcdef01234567", True)]:
                 with self.subTest(revision=revision):
@@ -95,6 +96,16 @@ class ReleaseBuildIdentityTests(unittest.TestCase):
                     self.assertEqual(result.returncode == 0, accepted, result.stderr)
                     if accepted:
                         self.assertIn(f"cargo:rustc-env=DIAL_BUILD_REVISION={revision}", result.stdout)
+            for profile in ["debug", "local", "profiling", "release"]:
+                for target in [root / "target", root / "target" / "aarch64-apple-darwin"]:
+                    with self.subTest(profile=profile, target=target):
+                        case_env = env.copy()
+                        case_env["OUT_DIR"] = str(target / profile / "build" / "dial-build-info-test" / "out")
+                        result = subprocess.run([str(executable)], cwd=root, env=case_env,
+                                                capture_output=True, text=True)
+                        self.assertEqual(result.returncode == 0, profile != "release", result.stderr)
+                        if profile != "release":
+                            self.assertIn(f"cargo:rustc-env=DIAL_BUILD_PROFILE={profile}", result.stdout)
 
 
 if __name__ == "__main__":

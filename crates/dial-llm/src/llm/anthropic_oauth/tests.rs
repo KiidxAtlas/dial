@@ -151,3 +151,17 @@ fn malformed_token_responses_are_rejected_and_keep_previous_refresh() {
     assert!(tokens(&json!({"access_token":"new"}), None).is_err());
     assert!(tokens(&json!({"refresh_token":"refresh"}), None).is_err());
 }
+
+#[test]
+fn signed_in_distinguishes_missing_from_corrupt_credentials() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(!signed_in(dir.path()));
+    assert!(!signed_in_checked(dir.path()).unwrap());
+    write_private(&dir.path().join(FILE), b"{not json").unwrap();
+    assert!(!signed_in(dir.path()));
+    let error = signed_in_checked(dir.path()).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("credentials are invalid"),
+        "{error:#}"
+    );
+}

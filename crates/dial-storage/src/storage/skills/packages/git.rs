@@ -84,21 +84,23 @@ fn resolve_local(url: &str, base: &Path) -> String {
 }
 
 fn run_git(args: &[&str], cwd: &Path, cancel: &AtomicBool) -> Result<String> {
-    let mut child = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(args)
         .current_dir(cwd)
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                anyhow!("git is required to install skill packages; install Git and try again")
-            } else {
-                anyhow!("starting git: {error}")
-            }
-        })?;
+        .stderr(Stdio::piped());
+    // Its own process group, so a timeout or cancel also stops transport helpers
+    // (`git-remote-https`, `ssh`) that would otherwise keep the output pipes open.
+    let mut child = crate::platform::process::spawn_group(&mut command).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            anyhow!("git is required to install skill packages; install Git and try again")
+        } else {
+            anyhow!("starting git: {error}")
+        }
+    })?;
     let stdout = spawn_reader(child.stdout.take());
     let stderr = spawn_reader(child.stderr.take());
     let started = Instant::now();
@@ -107,12 +109,12 @@ fn run_git(args: &[&str], cwd: &Path, cancel: &AtomicBool) -> Result<String> {
             break status;
         }
         if cancel.load(Ordering::SeqCst) {
-            let _ = child.kill();
+            let _ = crate::platform::process::kill_group(child.id());
             let _ = child.wait();
             bail!("cancelled while running git {}", args[0]);
         }
         if started.elapsed() > GIT_TIMEOUT {
-            let _ = child.kill();
+            let _ = crate::platform::process::kill_group(child.id());
             let _ = child.wait();
             bail!(
                 "git {} timed out after {} seconds",

@@ -1,25 +1,30 @@
 //! In-memory TTL cache for `github` PR-diff reads.
 //!
 //! Within the soft TTL an entry is served directly. Past it the read is refetched, and a failed
-//! refetch serves the stale entry. Past the hard TTL the entry is dropped. `gh.rs` routing calls
+//! refetch serves the stale entry with a note saying so (never when the call was cancelled). Past
+//! the hard TTL the entry is dropped, and the map holds at most [`MAX_ENTRIES`] (oldest evicted). `gh.rs` routing calls
 //! `cached` for `pr_diff` and `invalidate_for_op` after `pr_create`, `pr_push` and `pr_checkout`.
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use serde_json::Value;
 
 use super::gh_common::parse_repo_ref;
-use super::gh_pr_diff::{PrDiffView, parse_pr_url};
+use super::gh_pr_diff::{PrDiffView, parse_pr_url, parse_request};
 use crate::tools::ToolOutput;
 
 /// Default soft TTL: entries younger than this are served directly.
 const SOFT_TTL: Duration = Duration::from_secs(300);
 /// Default hard TTL: entries older than this are dropped.
 const HARD_TTL: Duration = Duration::from_secs(604_800);
+
+/// Most entries kept; storing past this evicts the oldest (diffs can be large).
+const MAX_ENTRIES: usize = 64;
 
 /// Identity of one cached PR-diff view, keyed on (repo, kind, number). This cache only stores
 /// `pr-diff` rows, so `variant` (`summary`, `file:<index>` or `all`) takes the kind's place
@@ -43,7 +48,7 @@ static CACHE: LazyLock<Mutex<HashMap<CacheKey, Entry>>> =
 /// Cache state for one key at a given instant.
 enum Lookup {
     Fresh(ToolOutput),
-    Stale(ToolOutput),
+    Stale { output: ToolOutput, stored: Instant },
     Miss,
 }
 
@@ -61,7 +66,7 @@ fn lookup_at(key: &CacheKey, now: Instant) -> Lookup {
     if age <= SOFT_TTL {
         Lookup::Fresh(output)
     } else {
-        Lookup::Stale(output)
+        Lookup::Stale { output, stored }
     }
 }
 
@@ -70,7 +75,8 @@ fn store_at(key: &CacheKey, output: &ToolOutput, now: Instant) {
     if output.is_error {
         return;
     }
-    CACHE.lock().insert(
+    insert_capped(
+        &mut CACHE.lock(),
         key.clone(),
         Entry {
             output: output.clone(),
@@ -79,28 +85,57 @@ fn store_at(key: &CacheKey, output: &ToolOutput, now: Instant) {
     );
 }
 
-/// Serve `key` from the cache, or run `fill` and cache its successful result.
+/// Insert `entry`, then evict the oldest entries while the map exceeds [`MAX_ENTRIES`].
+fn insert_capped(cache: &mut HashMap<CacheKey, Entry>, key: CacheKey, entry: Entry) {
+    cache.insert(key, entry);
+    while cache.len() > MAX_ENTRIES {
+        let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.stored)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        cache.remove(&oldest);
+    }
+}
+
+/// Serve `key` from the cache, or run `fill` and cache its successful result. `cancel` is the
+/// call's cancellation flag: a cancelled refresh is reported, never papered over with stale text.
 pub(super) fn cached(
     key: &CacheKey,
+    cancel: &AtomicBool,
     fill: impl FnOnce() -> Result<ToolOutput, String>,
 ) -> Result<ToolOutput, String> {
-    cached_at(key, Instant::now(), fill)
+    cached_at(key, Instant::now(), cancel, fill)
 }
 
 fn cached_at(
     key: &CacheKey,
     now: Instant,
+    cancel: &AtomicBool,
     fill: impl FnOnce() -> Result<ToolOutput, String>,
 ) -> Result<ToolOutput, String> {
     match lookup_at(key, now) {
         Lookup::Fresh(output) => Ok(output),
-        Lookup::Stale(stale) => match fill() {
-            Ok(fresh) if !fresh.is_error => {
-                store_at(key, &fresh, now);
-                Ok(fresh)
-            }
-            _ => Ok(stale),
-        },
+        Lookup::Stale { output, stored } => {
+            let failure = match fill() {
+                Ok(fresh) if !fresh.is_error => {
+                    store_at(key, &fresh, now);
+                    return Ok(fresh);
+                }
+                other if cancel.load(Ordering::Acquire) => return other,
+                Ok(error) => error.text,
+                Err(error) => error,
+            };
+            let age = now.saturating_duration_since(stored).as_secs();
+            let mut stale = output;
+            stale.text.push_str(&format!(
+                "\n[served from cache, age {age}s; refresh failed: {}]",
+                failure.trim()
+            ));
+            Ok(stale)
+        }
         Lookup::Miss => {
             let fresh = fill()?;
             store_at(key, &fresh, now);
@@ -152,54 +187,27 @@ fn pr_number(text: &str) -> Option<u64> {
         .or_else(|| parse_pr_url(text).map(|target| target.number))
 }
 
-/// Cache key for a `pr_diff` call, or `None` when `pr` is missing or unreadable (the op then runs
-/// uncached and reports its own error).
+/// Cache key for a `pr_diff` call, or `None` when the op would reject its arguments (it then runs
+/// uncached and reports its own error, which a cached entry must never mask).
 pub(super) fn pr_diff_key(checkout: &Path, args: &Value) -> Option<CacheKey> {
-    let pr = match &args["pr"] {
-        Value::String(text) => text.trim().to_owned(),
-        Value::Number(number) => number.to_string(),
-        _ => return None,
-    };
-    let (number, url_repo, url_view) = match pr.parse::<u64>() {
-        Ok(number) => (number, None, None),
-        Err(_) => {
-            let target = parse_pr_url(&pr)?;
-            (target.number, target.repo, Some(target.view))
-        }
-    };
-    let repo_arg = args["repo"]
-        .as_str()
-        .map(str::trim)
-        .filter(|repo| !repo.is_empty());
-    let repo = url_repo
-        .or_else(|| repo_arg.map(str::to_owned))
+    let request = parse_request(args).ok()?;
+    let repo = request
+        .repo
         .map(|repo| {
             parse_repo_ref(&repo)
                 .map(|parsed| parsed.qualified())
                 .unwrap_or(repo)
         })
-        .unwrap_or_default();
-    // The current checkout's repo depends on the workspace, so key those entries by its root.
-    let repo = if repo.is_empty() {
-        checkout.display().to_string()
-    } else {
-        repo
-    };
-    let view = if args["all"].as_bool() == Some(true) {
-        PrDiffView::All
-    } else if let Some(index) = args["file"].as_u64() {
-        PrDiffView::File(index as usize)
-    } else {
-        url_view.unwrap_or(PrDiffView::Summary)
-    };
-    let variant = match view {
+        // The current checkout's repo depends on the workspace, so key those entries by its root.
+        .unwrap_or_else(|| checkout.display().to_string());
+    let variant = match request.view {
         PrDiffView::Summary => "summary".to_owned(),
         PrDiffView::File(index) => format!("file:{index}"),
         PrDiffView::All => "all".to_owned(),
     };
     Some(CacheKey {
         repo,
-        number,
+        number: request.number,
         variant,
     })
 }

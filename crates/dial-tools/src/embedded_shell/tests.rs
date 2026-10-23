@@ -45,3 +45,19 @@ fn run_host_reports_missing_script_as_usage_error() {
     let dir = scratch();
     assert_eq!(run_host(&dir.path().join("missing.sh")), 2);
 }
+
+#[test]
+fn discard_script_removes_only_dial_script_files() {
+    let dir = scratch();
+    let (_, args) = invocation(dir.path(), "echo hi").unwrap();
+    let path = PathBuf::from(&args[1]);
+    assert!(path.exists());
+    // A sandbox launcher may put other arguments before the host command line.
+    discard_script(["bwrap", "--x"].map(String::from).into_iter().chain(args));
+    assert!(!path.exists());
+
+    let other = dir.path().join("keep.sh");
+    fs::write(&other, "x").unwrap();
+    discard_script([HOST_ARG.to_owned(), other.display().to_string()]);
+    assert!(other.exists());
+}

@@ -219,6 +219,11 @@ fn built_in_python_reuses_without_input_declarations_and_tracks_external_edits()
         );
         return;
     }
+    // The runtime snapshot has a wall-clock budget (the stdlib is thousands of files), so on a
+    // loaded machine the probe below and the run it predicts could otherwise disagree. Suspend the
+    // budget on this thread; budget exhaustion itself is covered in `inputs::tests`.
+    crate::agent::verify::inputs::TIME_OVERRIDE
+        .with(|forced| forced.set(Some(std::time::Duration::from_secs(3600))));
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("app.py"), "value = 1\n").unwrap();
     let output = std::process::Command::new("python3")
@@ -226,8 +231,10 @@ fn built_in_python_reuses_without_input_declarations_and_tracks_external_edits()
         .output()
         .unwrap();
     assert!(output.status.success());
-    let mut config = Config::default();
-    config.python = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+    let config = Config {
+        python: PathBuf::from(String::from_utf8(output.stdout).unwrap().trim()),
+        ..Config::default()
+    };
     assert!(config.verification.inputs.is_empty());
     let mut agent = hermetic_agent(&config, root.path());
     // Exercise the normal development sandbox: the strict hermetic helper excludes user runtimes.

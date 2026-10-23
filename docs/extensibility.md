@@ -259,6 +259,9 @@ sign-in (protected-resource and authorization-server discovery, dynamic client r
 via `/mcp login <name>`. Streamable HTTP with JSON or SSE replies and session ids is supported. `transport = "sse"` selects
 the legacy HTTP+SSE transport: the event stream opens first, its `endpoint` event names where
 requests are POSTed (it must stay on the server's origin), and replies arrive on that stream.
+HTTP redirects are refused: configure the final endpoint URL so credentials and session IDs are
+never forwarded to an unvalidated destination. OAuth refresh retries apply to HTTP 401 only;
+HTTP 403 retains its status instead of being reported as an expired token.
 
 **MCP discovery and install.** `/extensions` (MCP tab) immediately shows the curated list and loads
 the first page from the official MCP registry, Smithery, npm and GitHub in the background (read

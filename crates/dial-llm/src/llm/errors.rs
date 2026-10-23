@@ -219,7 +219,11 @@ fn classify_text(
 ) -> ErrorClass {
     // Throttle statuses are never context overflows; "too many tokens per minute" is a TPM throttle.
     let throttled = matches!(status, Some(429 | 529));
-    let token_overflow = !throttled && OVERFLOW.is_match(text);
+    // Bare token-budget wording is a throttle when it names a per-minute window, with or without
+    // a status: stream error events carry none.
+    let per_minute = PER_MINUTE_WINDOW.is_match(text) || TPM_RPM_THROTTLE.is_match(text);
+    let budget = TOKEN_BUDGET.is_match(text);
+    let token_overflow = !throttled && (OVERFLOW.is_match(text) || (budget && !per_minute));
     if token_overflow {
         return ErrorClass::ContextOverflow;
     }
@@ -229,7 +233,7 @@ fn classify_text(
     if !throttled && (GENERIC_LIMIT.is_match(text) || OVERFLOW_NO_BODY.is_match(text)) {
         return ErrorClass::ContextOverflow;
     }
-    let throttle = rolling_throttle(text, retry_after);
+    let throttle = rolling_throttle(text, retry_after) || (budget && per_minute);
     let quota = !throttle && is_usage_limit_text(text);
     match status {
         Some(401) => {
@@ -248,7 +252,6 @@ fn classify_text(
         }
         Some(402) => return ErrorClass::QuotaExhausted { reset_at },
         Some(429) => {
-            let throttle = rolling_throttle(text, retry_after);
             return if quota && !CONCURRENT_LIMIT.is_match(text) && !throttle {
                 ErrorClass::QuotaExhausted { reset_at }
             } else {
@@ -260,7 +263,8 @@ fn classify_text(
         Some(_) if LLAMA_NO_JINJA.is_match(text) => return ErrorClass::Fatal,
         Some(500) if LLAMA_TOOL_PARSE.is_match(text) => return ErrorClass::Fatal,
         Some(400) if GENERATION_NAN.is_match(text) => return ErrorClass::Transient,
-        Some(408 | 409 | 425 | 500 | 502 | 503 | 504) => return ErrorClass::Transient,
+        // 520-524 are Cloudflare origin failures (unknown error, down, unreachable, timeout).
+        Some(408 | 409 | 425 | 500 | 502 | 503 | 504 | 520..=524) => return ErrorClass::Transient,
         Some(_) => return ErrorClass::Fatal,
         None => {}
     }
@@ -338,8 +342,6 @@ static OVERFLOW: LazyLock<RegexSet> = LazyLock::new(|| {
         r"(?i)context window exceeds limit",    // MiniMax
         r"(?i)exceeded model token limit",      // Kimi
         r"(?i)context[_ ]length[_ ]exceeded",   // OpenAI code, generic
-        r"(?i)too many tokens",
-        r"(?i)token limit exceeded",
         r"(?i)request_too_large[^\n]*\btokens?\b",
         r"(?i)\btokens?\b[^\n]*request_too_large",
         r"(?i)model_context_window_exceeded", // z.ai finish reason
@@ -352,6 +354,10 @@ static OVERFLOW: LazyLock<RegexSet> = LazyLock::new(|| {
         r"(?i)input validation error.*(inputs|tokens).*must be <=", // TGI
     ])
 });
+
+/// Token-budget wording shared by context overflows and per-minute token throttles.
+static TOKEN_BUDGET: LazyLock<RegexSet> =
+    LazyLock::new(|| set(&[r"(?i)too many tokens", r"(?i)token limit exceeded"]));
 
 /// Numeric limit wording that media budgets share; never vetoes a payload rejection.
 static GENERIC_LIMIT: LazyLock<Regex> = LazyLock::new(|| one(r"(?i)exceeds the limit of \d+"));

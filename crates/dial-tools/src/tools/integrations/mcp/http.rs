@@ -79,16 +79,16 @@ fn is_timeout(error: &std::io::Error) -> bool {
         )
 }
 
-/// The server wants authorization dial does not have (HTTP 401 without static credentials).
+/// The server wants authorization dial does not have (HTTP 401/403 without static credentials).
 #[derive(Debug)]
-pub struct AuthRequired(pub String);
+pub struct AuthRequired(pub String, pub u16);
 
 impl std::fmt::Display for AuthRequired {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "MCP server `{0}` requires authorization (HTTP 401); run `/mcp login {0}` to sign in",
-            self.0
+            "MCP server `{0}` requires authorization (HTTP {1}); run `/mcp login {0}` to sign in",
+            self.0, self.1
         )
     }
 }
@@ -162,7 +162,7 @@ impl Auth {
         }
         *self.challenge.lock().unwrap_or_else(|e| e.into_inner()) =
             Some(challenge.unwrap_or("").to_owned());
-        anyhow::Error::new(AuthRequired(self.server.clone()))
+        anyhow::Error::new(AuthRequired(self.server.clone(), status))
     }
 
     /// After a 401 that carried `stale`: refresh the grant unless another request already did.
@@ -183,6 +183,8 @@ impl Auth {
 pub fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .http_status_as_error(false)
+        // Redirects must not forward custom credentials or session IDs to an unvalidated URL.
+        .max_redirects(0)
         .build()
         .into()
 }
@@ -569,7 +571,9 @@ impl Remote for Http {
         let (headers, sent) = self.auth.headers();
         match self.post_once(message, timeout, sink, &headers) {
             Err(error)
-                if error.downcast_ref::<AuthRequired>().is_some()
+                if error
+                    .downcast_ref::<AuthRequired>()
+                    .is_some_and(|error| error.1 == 401)
                     && sent
                         .as_deref()
                         .is_some_and(|stale| self.auth.refresh(stale)) =>

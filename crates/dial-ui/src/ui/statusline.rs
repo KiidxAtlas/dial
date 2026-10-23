@@ -801,7 +801,8 @@ fn short_model(model: &str) -> String {
     model.to_owned()
 }
 
-fn tilde(path: &str, home: Option<&str>) -> String {
+/// Show `path` relative to `home` as `~/…`; a trailing `/` on `home` is ignored.
+pub fn tilde(path: &str, home: Option<&str>) -> String {
     let Some(home) = home
         .map(|h| h.trim_end_matches('/'))
         .filter(|h| !h.is_empty())

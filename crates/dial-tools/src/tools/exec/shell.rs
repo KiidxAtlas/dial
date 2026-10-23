@@ -263,6 +263,99 @@ fn drain_pipe(
     Ok(false)
 }
 
+/// After the process (group) is dead, collects what it wrote. A process that escaped may still hold
+/// the pipe, so the wait is bounded by a 300ms grace; missing EOF is reported as a capture error.
+#[allow(clippy::too_many_arguments)]
+fn drain_after_exit<R: Read + crate::platform::io::Pipe>(
+    reader: &mut R,
+    capture: &mut Capture,
+    spool: &mut Option<crate::storage::artifact::ArtifactSpool>,
+    artifact_error: &mut Option<String>,
+    capture_error: &mut Option<String>,
+    eof: &mut bool,
+    waiter: &crate::platform::wake::Waiter,
+    on_output: &(dyn Fn(&[u8]) + Sync),
+) -> Result<(), String> {
+    const GRACE: Duration = Duration::from_millis(300);
+    let grace = Instant::now();
+    while !*eof && capture_error.is_none() && grace.elapsed() < GRACE {
+        match drain_pipe(reader, capture, spool, artifact_error, on_output) {
+            Ok(closed) => *eof = closed,
+            Err(error) => {
+                *capture_error = Some(format!("reading command output: {error}"));
+                break;
+            }
+        }
+        if !*eof {
+            waiter
+                .wait(
+                    Some(&*reader),
+                    None::<&Child>,
+                    Some(GRACE.saturating_sub(grace.elapsed())),
+                )
+                .map_err(|e| format!("waiting for command output: {e}"))?;
+        }
+    }
+    if !*eof && capture_error.is_none() {
+        *capture_error = Some(
+            "pipe did not reach EOF within the 300ms cleanup grace; output may be incomplete"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// The captured stream as result text: `(no output)` when empty, always newline-terminated.
+fn captured_text(capture: Capture) -> String {
+    let mut text = capture.finish();
+    if text.is_empty() {
+        text.push_str("(no output)");
+    }
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text
+}
+
+/// Finishes the artifact spool and appends the `[complete|partial output: uri]` block plus any
+/// capture/artifact error lines. A failed spool finish becomes the artifact error.
+fn append_output_notes(
+    text: &mut String,
+    spool: Option<crate::storage::artifact::ArtifactSpool>,
+    capture_error: &Option<String>,
+    artifact_error: &mut Option<String>,
+) {
+    if let Some(spool) = spool {
+        match spool.finish() {
+            Ok(uri) => {
+                let completeness = if capture_error.is_some() {
+                    "partial"
+                } else {
+                    "complete"
+                };
+                text.push_str(&format!("[{completeness} output: {uri}]\n"));
+            }
+            Err(error) => {
+                *artifact_error = Some(format!("saving complete command output artifact: {error}"));
+            }
+        }
+    }
+    if let Some(error) = capture_error {
+        text.push_str(&format!("[output capture error: {error}]\n"));
+    }
+    if let Some(error) = artifact_error {
+        text.push_str(&format!(
+            "[output artifact error: {error}; inline output retained]\n"
+        ));
+    }
+}
+
+/// Deletes the one-shot script an embedded-shell command line refers to. The host removes it when
+/// it runs; a command that is never spawned would otherwise leak it into the scratch directory.
+pub(in crate::tools) fn discard_unspawned_script(spawn: &std::process::Command) {
+    crate::embedded_shell::discard_script(spawn.get_args());
+}
+
 /// The sandboxed bash's PATH on Unix: Homebrew or /usr/local, the Command Line Tools, then the system bins.
 #[cfg(not(windows))]
 fn bash_path() -> String {
@@ -326,9 +419,21 @@ pub(in crate::tools) fn bash_tool(
     bash_tool_streaming(ws, args, timeout_secs, &|_| {}, &AtomicBool::new(false))
 }
 
+/// The deadline for one command: `requested` is the model's `timeout` argument, `cap` the
+/// configured maximum (0 = no cap and, per the documented contract, no deadline for an omitted
+/// timeout). An explicit 0 asks for the cap itself; 0 as result means no deadline.
+fn effective_timeout(requested: Option<u64>, cap: u64) -> u64 {
+    match requested {
+        None => DEFAULT_BASH_TIMEOUT_SECS.min(cap),
+        Some(0) => cap,
+        Some(requested) if cap == 0 => requested,
+        Some(requested) => requested.min(cap),
+    }
+}
+
 /// Executes the platform-native shell with bounded live chunks, artifact capture, and cooperative cancellation.
 /// The callback runs before the final result, on the calling thread, with at most 16 KiB.
-/// Cancellation is checked at least every pipe-drain pass (maximum 256 KiB / 20 ms poll).
+/// Cancellation is checked at least once per wait slice (100 ms) and after every pipe-drain pass (at most 256 KiB).
 /// Artifact failures retain inline output and exit status, but make the tool result an error.
 /// Cleanup waits up to 300ms for pipe EOF; a saved stream without EOF is labeled partial.
 pub fn bash_tool_streaming(
@@ -485,12 +590,7 @@ fn run_bash(
         )));
     }
     let requested_timeout = opt_u64(args, "timeout")?;
-    let timeout_secs = match requested_timeout {
-        None => DEFAULT_BASH_TIMEOUT_SECS.min(timeout_secs),
-        Some(0) => timeout_secs,
-        Some(requested) if timeout_secs == 0 => requested,
-        Some(requested) => requested.min(timeout_secs),
-    };
+    let timeout_secs = effective_timeout(requested_timeout, timeout_secs);
 
     if cancel.load(Ordering::Acquire) {
         return Ok(ToolOutput::err("[cancelled before command started]\n"));
@@ -511,13 +611,23 @@ fn run_bash(
         None,
         exchange.as_ref().map(|exchange| exchange.path()),
     )?;
-    let (mut reader, writer) = io::pipe().map_err(|e| format!("creating output pipe: {e}"))?;
-    let writer_err = writer
-        .try_clone()
-        .map_err(|e| format!("creating output pipe: {e}"))?;
-    spawn.stdin(Stdio::null()).stdout(writer).stderr(writer_err);
-    let child = crate::platform::process::spawn_group(&mut spawn)
-        .map_err(|e| format!("starting sandboxed shell: {e}"))?;
+    let spawned = (|| {
+        let (reader, writer) = io::pipe().map_err(|e| format!("creating output pipe: {e}"))?;
+        let writer_err = writer
+            .try_clone()
+            .map_err(|e| format!("creating output pipe: {e}"))?;
+        spawn.stdin(Stdio::null()).stdout(writer).stderr(writer_err);
+        let child = crate::platform::process::spawn_group(&mut spawn)
+            .map_err(|e| format!("starting sandboxed shell: {e}"))?;
+        Ok::<_, String>((reader, child))
+    })();
+    let (mut reader, child) = match spawned {
+        Ok(started) => started,
+        Err(error) => {
+            discard_unspawned_script(&spawn);
+            return Err(error);
+        }
+    };
     // The Command owns the pipe's write ends; release them so EOF is observable.
     drop(spawn);
 
@@ -625,47 +735,19 @@ fn run_bash(
         .child
         .wait()
         .map_err(|e| format!("reaping command: {e}"))?;
-    // Everything in the group is dead; collect what it wrote. A process that
-    // escaped the group may still hold the pipe, so the wait is bounded.
-    let grace = Instant::now();
-    while !eof && capture_error.is_none() && grace.elapsed() < Duration::from_millis(300) {
-        match drain_pipe(
-            &mut reader,
-            &mut capture,
-            &mut spool,
-            &mut artifact_error,
-            on_output,
-        ) {
-            Ok(closed) => eof = closed,
-            Err(error) => {
-                capture_error = Some(format!("reading command output: {error}"));
-                break;
-            }
-        }
-        if !eof {
-            waiter
-                .wait(
-                    Some(&reader),
-                    None::<&std::process::Child>,
-                    Some(Duration::from_millis(300).saturating_sub(grace.elapsed())),
-                )
-                .map_err(|e| format!("waiting for command output: {e}"))?;
-        }
-    }
-    if !eof && capture_error.is_none() {
-        capture_error = Some(
-            "pipe did not reach EOF within the 300ms cleanup grace; output may be incomplete"
-                .to_string(),
-        );
-    }
+    // Everything in the group is dead; collect what it wrote.
+    drain_after_exit(
+        &mut reader,
+        &mut capture,
+        &mut spool,
+        &mut artifact_error,
+        &mut capture_error,
+        &mut eof,
+        &waiter,
+        on_output,
+    )?;
 
-    let mut text = capture.finish();
-    if text.is_empty() {
-        text.push_str("(no output)");
-    }
-    if !text.ends_with('\n') {
-        text.push('\n');
-    }
+    let mut text = captured_text(capture);
     let success = status.success() && !timed_out && !cancelled;
     if cancelled {
         text.push_str("[cancelled; process group killed]\n");
@@ -682,29 +764,7 @@ fn run_bash(
     if !success && text.contains("Operation not permitted") && text.contains("/tmp/") {
         text.push_str("[sandbox: /tmp is outside the project and not writable; use $TMPDIR, a scratch directory inside the project]\n");
     }
-    if let Some(spool) = spool {
-        match spool.finish() {
-            Ok(uri) => {
-                let completeness = if capture_error.is_some() {
-                    "partial"
-                } else {
-                    "complete"
-                };
-                text.push_str(&format!("[{completeness} output: {uri}]\n"));
-            }
-            Err(error) => {
-                artifact_error = Some(format!("saving complete command output artifact: {error}"));
-            }
-        }
-    }
-    if let Some(error) = &capture_error {
-        text.push_str(&format!("[output capture error: {error}]\n"));
-    }
-    if let Some(error) = &artifact_error {
-        text.push_str(&format!(
-            "[output artifact error: {error}; inline output retained]\n"
-        ));
-    }
+    append_output_notes(&mut text, spool, &capture_error, &mut artifact_error);
     let mut state_error = None;
     if let (Some(name), Some(sessions), Some(exchange)) =
         (session, sessions.as_mut(), exchange.as_ref())
@@ -887,23 +947,6 @@ fn git_for_windows_bash(bin_dirs: impl IntoIterator<Item = PathBuf>) -> Option<P
     })
 }
 
-/// One-line description of the shell `bash` commands run in, for the start-up banner.
-pub fn shell_label(backend: ShellBackend) -> String {
-    let runner = resolve_runner(
-        backend,
-        find_system_bash(),
-        cfg!(feature = "embedded-shell"),
-        cfg!(windows),
-    );
-    match runner {
-        Ok(Runner::Bash(path)) => format!("bash ({})", path.display()),
-        Ok(Runner::PowerShell) => "PowerShell".into(),
-        Ok(Runner::Embedded) => "built-in shell".into(),
-        Ok(Runner::InProcess) => "in-process shell (sandbox off only)".into(),
-        Err(error) => format!("unavailable ({error})"),
-    }
-}
-
 /// Writes `script` for the built-in shell and returns the host program and its arguments.
 fn embedded_invocation(
     scratch: &Path,
@@ -912,19 +955,29 @@ fn embedded_invocation(
 ) -> Result<(String, Vec<String>), String> {
     let (program, mut args) = crate::embedded_shell::invocation(scratch, script)
         .map_err(|e| format!("preparing the built-in shell: {e}"))?;
-    if let Some(state) = state {
-        args.push(
-            state
+    let prepared = (|| {
+        if let Some(state) = state {
+            args.push(
+                state
+                    .to_str()
+                    .ok_or("shell state path is not UTF-8")?
+                    .to_owned(),
+            );
+        }
+        Ok::<_, String>(
+            program
                 .to_str()
-                .ok_or("shell state path is not UTF-8")?
+                .ok_or("Dial executable path is not UTF-8")?
                 .to_owned(),
-        );
+        )
+    })();
+    match prepared {
+        Ok(program) => Ok((program, args)),
+        Err(error) => {
+            crate::embedded_shell::discard_script(&args);
+            Err(error)
+        }
     }
-    let program = program
-        .to_str()
-        .ok_or("Dial executable path is not UTF-8")?
-        .to_owned();
-    Ok((program, args))
 }
 
 /// Background PTYs alone retain a new private terminal session through the sandbox.
@@ -1056,10 +1109,17 @@ fn shell_command_with_state(
             let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
             let sandbox = ws.sandbox.clone().unwrap_or_else(Sandbox::detect);
             let policy = ws.sandbox_policy();
-            spawn = if let Some(fd) = owned_terminal {
-                sandbox.command_with_owned_terminal(&ws.root, &policy, &program, &arg_refs, fd)?
+            let built = if let Some(fd) = owned_terminal {
+                sandbox.command_with_owned_terminal(&ws.root, &policy, &program, &arg_refs, fd)
             } else {
-                sandbox.command_with_policy(&ws.root, &policy, &program, &arg_refs)?
+                sandbox.command_with_policy(&ws.root, &policy, &program, &arg_refs)
+            };
+            spawn = match built {
+                Ok(spawn) => spawn,
+                Err(error) => {
+                    crate::embedded_shell::discard_script(&args);
+                    return Err(error);
+                }
             };
             if strict {
                 spawn

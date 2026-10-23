@@ -49,6 +49,21 @@ fn rerun_if_exists(path: &Path) {
     }
 }
 
+fn profile() -> String {
+    // Cargo's PROFILE collapses custom profiles to `debug` or `release`. OUT_DIR is
+    // <target>/<profile>/build/<package-hash>/out, including cross-target builds.
+    env::var_os("OUT_DIR")
+        .and_then(|out| {
+            Path::new(&out)
+                .ancestors()
+                .nth(3)
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| env::var("PROFILE").expect("Cargo build profile"))
+}
+
 fn main() {
     for name in ["DIAL_BUILD_REVISION", "SOURCE_DATE_EPOCH"] {
         println!("cargo:rerun-if-env-changed={name}");
@@ -91,7 +106,8 @@ fn main() {
     );
     // A shipped binary without its commit makes bug reports and version checks useless. Dev and
     // local-profile builds keep the fallback for vendored sources without a Git checkout.
-    if env::var("PROFILE").as_deref() == Ok("release") {
+    let profile = profile();
+    if profile == "release" {
         assert!(
             revision != "unknown",
             "release builds need a revision: build from a Git checkout or set DIAL_BUILD_REVISION"
@@ -105,9 +121,18 @@ fn main() {
         "HEAD",
         "--",
     ];
+    let untracked = git(&[
+        &["ls-files", "--others", "--exclude-standard", "--"][..],
+        INPUTS,
+    ]
+    .concat())
+    .filter(|output| output.status.success())
+    .map(|output| !output.stdout.iter().all(u8::is_ascii_whitespace));
     let dirty =
         match git(&[&diff_args[..], INPUTS].concat()).and_then(|output| output.status.code()) {
-            Some(0) => "false",
+            // Untracked source files change the build too, and `git diff` never lists them.
+            Some(0) if untracked == Some(true) => "true",
+            Some(0) if untracked == Some(false) => "false",
             Some(1) => "true",
             _ => "unknown",
         };
@@ -128,7 +153,7 @@ fn main() {
         ("DIRTY", dirty.into()),
         ("EPOCH", epoch.to_string()),
         ("TARGET", env::var("TARGET").unwrap()),
-        ("PROFILE", env::var("PROFILE").unwrap()),
+        ("PROFILE", profile),
     ] {
         println!("cargo:rustc-env=DIAL_BUILD_{name}={value}");
     }

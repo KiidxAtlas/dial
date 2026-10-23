@@ -79,8 +79,10 @@ fn bridge_rejects_oversize_upload_before_network() {
 fn every_browser_action_requires_approval_and_policy_applies_before_startup() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = crate::tools::Workspace::new(dir.path()).unwrap();
-    let mut config = Config::default();
-    config.state_dir = dir.path().join("state");
+    let mut config = Config {
+        state_dir: dir.path().join("state"),
+        ..Config::default()
+    };
     config.sandbox.mode = SandboxMode::Strict;
     let tool = tools(&config).pop().unwrap();
     for action in [
@@ -561,8 +563,10 @@ fn chromium_approved_localhost_without_manual_allowlist() {
     let dir = tempfile::tempdir().unwrap();
     let app = LocalApp::start();
     let workspace = crate::tools::Workspace::new(dir.path()).unwrap();
-    let mut config = Config::default();
-    config.state_dir = dir.path().join("state");
+    let mut config = Config {
+        state_dir: dir.path().join("state"),
+        ..Config::default()
+    };
     config.sandbox.mode = SandboxMode::Dev;
     config.sandbox.allow_network = true;
     config.browser.playwright_module = std::env::var("DIAL_PLAYWRIGHT").unwrap();
@@ -682,8 +686,10 @@ fn chromium_end_to_end_sandboxed() {
     let dir = tempfile::tempdir().unwrap();
     let app = LocalApp::start();
     let workspace = crate::tools::Workspace::new(dir.path()).unwrap();
-    let mut config = Config::default();
-    config.state_dir = dir.path().join("state");
+    let mut config = Config {
+        state_dir: dir.path().join("state"),
+        ..Config::default()
+    };
     config.sandbox.mode = SandboxMode::Dev;
     config.sandbox.allow_network = true;
     config.browser.auto_localhost = false;
@@ -784,8 +790,10 @@ fn builtin_runtime_end_to_end_sandboxed() {
     let dir = tempfile::tempdir().unwrap();
     let app = LocalApp::start();
     let workspace = crate::tools::Workspace::new(dir.path()).unwrap();
-    let mut config = Config::default();
-    config.state_dir = dir.path().join("state");
+    let mut config = Config {
+        state_dir: dir.path().join("state"),
+        ..Config::default()
+    };
     config.sandbox.mode = SandboxMode::Dev;
     config.sandbox.allow_network = true;
     config.browser.auto_localhost = false;

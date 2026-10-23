@@ -9,7 +9,7 @@ use std::sync::atomic::AtomicBool;
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Map, Value};
 
-use super::claude::usage_status;
+use super::common::usage_status_opt;
 use super::types::{
     UsageAmount, UsageLimit, UsageReport, UsageResetCreditDetail, UsageResetCredits, UsageScope,
     UsageStatus, UsageUnit, UsageWindow,
@@ -519,7 +519,7 @@ fn window_limit(
 /// A window at 100% is still usable (Warning, not Exhausted) when the request is allowed or the
 /// plan is funded by paid credits.
 fn meter_status(fraction: Option<f64>, meter: Meter, credit_overage: bool) -> Option<UsageStatus> {
-    let status = usage_status(fraction);
+    let status = Some(usage_status_opt(fraction));
     let still_usable = (credit_overage && meter.limit_reached == Some(true))
         || (meter.allowed == Some(true) && meter.limit_reached == Some(false));
     if matches!(status, Some(UsageStatus::Exhausted)) && still_usable {
