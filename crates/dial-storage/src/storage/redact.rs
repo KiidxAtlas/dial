@@ -196,7 +196,7 @@ fn env_secrets(vars: impl IntoIterator<Item = (String, String)>) -> Vec<String> 
             let upper = name.to_ascii_uppercase();
             SECRET_ENV_NAMES.iter().any(|needle| upper.contains(needle))
                 && value.len() >= 8
-                && !value.chars().any(char::is_whitespace)
+                && !value.trim().is_empty()
                 && !value.starts_with('/')
         })
         .map(|(_, value)| value)
