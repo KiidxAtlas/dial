@@ -204,12 +204,16 @@ pub fn shape_output(driver: &Value, cap: usize) -> Value {
             "\n[value truncated in page: preview of {total_chars} characters total]"
         ));
     }
-    json!({
+    let mut result = json!({
         "text": text,
         "truncated": over_cap || page_truncated,
         "total_bytes": total_bytes,
         "cap_bytes": cap,
-    })
+    });
+    if let Some(settlement) = driver.get("network_settlement") {
+        result["network_settlement"] = settlement.clone();
+    }
+    result
 }
 
 fn optional_str(args: &Value, key: &str) -> Result<Option<String>, String> {

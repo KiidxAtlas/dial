@@ -48,3 +48,52 @@ fn cancellation_interrupts_background_model_calls_without_retry() {
     drop(lease);
     assert!(!can_yield());
 }
+
+#[test]
+fn budget_expiry_interrupts_background_requests_without_retry() {
+    for compute_locks in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            user_dir: root.path().join("user"),
+            state_dir: root.path().join("state"),
+            compute_locks,
+            ..Default::default()
+        };
+        config.improve.daily_compute_minutes = 1;
+        let lease = Background::acquire(&config).unwrap();
+        let mut backend = crate::llm::provider::Backend::new(
+            crate::llm::provider::ProviderKind::Local {
+                model_dir: "unused".into(),
+            },
+            std::path::PathBuf::new(),
+            5,
+        );
+        let mut calls = 0;
+        let started = std::time::Instant::now();
+        let result: Result<()> = background_call(&config, &mut backend, |_, cancel| {
+            calls += 1;
+            super::super::resources::record_usage(&config.user_dir, 60)?;
+            while !cancel.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(2) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            ensure!(
+                cancel.load(Ordering::SeqCst),
+                "budget cancellation was not forwarded"
+            );
+            Err(crate::llm::Interrupted.into())
+        });
+        assert!(
+            result
+                .unwrap_err()
+                .downcast_ref::<super::super::auto::BudgetReached>()
+                .is_some()
+        );
+        assert_eq!(calls, 1);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(lease);
+        assert!(!can_yield());
+        assert!(!background_active());
+        let file = super::super::auto::lock_file(&config.user_dir.join("compute.lock")).unwrap();
+        file.try_lock_exclusive().unwrap();
+    }
+}

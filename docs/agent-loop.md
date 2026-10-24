@@ -22,12 +22,16 @@ on hosted models. Full tool policy and workflow rules remain in place. This redu
 reporting prose without enabling the lean local tool profile: offered schemas, loadable-tool
 descriptions, visual-verification guidance, operator instructions, custom templates and project
 context are unchanged. Disabling efficiency restores the full built-in delivery/delegation prose.
-Built-in guidance asks agents to reuse visible evidence, stop research once the change is known,
-and recover from actual diagnostics rather than repeat failed calls. Delegation handoffs carry the
-outcome, owned scope, shared interfaces, evidence references and checks with an owner. Shared
-builds/checks wait for relevant edits to settle; repairs or changed inputs still need rechecking.
-These are prompt policies, not enforced scheduling or proof of live-model compliance; they do not
-add model requests, enable delegation automatically, or change tool and approval permissions.
+Built-in guidance asks agents to scale effort to uncertainty, impact and reversibility, reuse
+visible evidence, and implement once the path is supported. New or contradictory evidence can
+reopen investigation; successful edits alone do not prove correctness. Isolated tests with test
+doubles are permitted but cannot substitute for live integration evidence. Failed checks require
+diagnosis, not weakened assertions. Preview instructions follow the configured browser/server
+capabilities rather than naming unavailable tools. Delegation handoffs carry the outcome, owned
+scope, shared interfaces, evidence references and checks with an owner. Shared builds/checks wait
+for relevant edits to settle; repairs or changed inputs still need rechecking. These are prompt
+policies, not enforced scheduling or proof of live-model compliance; they do not add model
+requests, enable delegation automatically, or change tool and approval permissions.
 For an unlimited foreground output setting, the model's advertised output ceiling is bounded by
 the context remaining beside the current prompt; it is not reserved in full before admission.
 Explicit output limits and the compaction policy's response reserve remain authoritative.
@@ -47,9 +51,16 @@ filled from prompt estimates. Model, purpose, worker and turn attribution remain
 
 Overflow recovery uses a fit-only compaction target: the request only needs to fit the model's context window and output reserve, even when the normal auto-continue threshold would pause the turn. Compaction preserves complete assistant/tool groups while tolerating orphan or duplicated tool-call records in irregular imported history.
 
-Portable summaries update the previous committed summary with newly summarized history instead of summarizing the summary as transcript. A cut within a user turn gets a distinct turn-prefix summary, while the recent suffix remains verbatim. Read and modified file lists carry forward between compactions. Summarizer input is divided at message boundaries, conservatively discounted against the selected summarizer window, and a rejected window is halved and replanned. Single messages too large for a window are clamped with an explicit omission marker.
+Portable summaries update the previous committed summary with newly summarized history instead of summarizing the summary as transcript. A cut within a user turn gets a distinct turn-prefix summary, while the recent suffix remains verbatim. Every subsequent turn-prefix or branch window explicitly integrates the prior output using the original format. Update instructions prioritize active goals, constraints, unresolved work, material decisions and evidence provenance while allowing duplicate or obsolete details to be consolidated. File-operation lists carry forward as attempted targets from call arguments, explicitly not proof of successful reads or modifications; legacy list tags remain readable. Summarizer input is divided at message boundaries, conservatively discounted against the selected summarizer window, and a rejected window is halved and replanned. Single messages too large for a window are clamped with an explicit omission marker.
 
 Parent and child conversations share reply recovery in `agent/turn_recovery.rs`. Empty answers and action-only stops get at most three continuation attempts, and malformed or mixed stalled replies share an eight-attempt bound. Productive work remains unlimited when `max_steps = 0`. Exhausted recovery leaves work incomplete, preserves completed effects, and never records completion. Quotes, code examples and optional future work do not restart a finished report; no classifier request is required. A completed `finish` must contain a report rather than a promise to act.
+
+After successful worker inference, delivered request-only harness notes are retired even when
+buried in history; failed requests retain them for retry. Operator instructions, coordination,
+marked context/evidence and safety guidance remain. A worker's reserved final summary request
+may retain tool schemas for provider-history compatibility, but cannot dispatch structured tool
+calls, text-form calls or recoverable inline edits. Such attempts end incomplete with an explicit
+unexecuted-call diagnostic and any available findings; they do not gain extra execution budget.
 
 Background worker findings arrive once in the parent's next request with status, a bounded report and a reference to the complete artifact. Typed assignments, rule state and result data remain in the execution journal rather than being repeated in the model-facing summary. Use the delivered findings before repeating a worker's investigation. Todos are optional progress bookkeeping. `done` needs no finding/evidence payload and does not run a verification round. Accepted completion reconciles pending progress; explicit blockers and running work remain completion prerequisites. Plain final replies and explicit `finish` share these prerequisites and the final configured verification/repair pipeline. A failed check cannot become a completed turn, and unfinished replies share bounded reply recovery rather than a separate todo-reminder budget. Routine inspection does not force a separate todo-only request; the configured reasoning-recovery plan gate still applies when it is needed.
 
@@ -176,6 +187,13 @@ Execution metadata stays separate from tool payload and display text. Document t
 
 ## Coding workflow
 
+The [prompt and core-behavior index](../crates/dial-agent/src/agent/prompts/README.md)
+is the navigation entry point for instruction changes. Shared built-in wording lives in
+`agent/prompts/{system,compaction,recovery,modes}`; runtime owners still select and assemble
+it and enforce permissions, budgets and completion. Existing operator overrides and public
+instruction paths are preserved. Tool-specific contracts and domain prompt renderers stay
+with their owners and are linked from that index.
+
 Dial's default system guidance is Dial's own design: engineering principles, tool policy, scope/research/implementation/verification, and delivery.
 It reuses current evidence, groups coherent edits, discourages repeated baseline checks and
 routine narration, and verifies after the change rather than after each micro-edit. Dial retains
@@ -184,6 +202,34 @@ Custom operator guidance, fixed-prompt overrides and appended prompts remain sup
 Prompt assembly tests and scripted harness checks do not establish reduced looping in a model;
 use the [efficiency benchmark](benchmarks.md#measuring-efficiency) for live-model comparisons. Rebuild/restart
 Dial to use source changes; existing custom/admitted operator guidance is not overwritten.
+
+The prompt/orchestration audit added regression coverage for independent browser/server tool
+offers across full, lean, concise and one-call profiles; delivered-note retirement across requests;
+reserved-summary zero dispatch; three-window summary folding; and failed/denied file-operation
+provenance. These establish request assembly and runtime admission behavior, not model reasoning
+quality. For model comparisons, hold model, tool permissions, fixtures and budgets constant and
+repeat the existing `efficiency.toml` and `tool-effectiveness.toml` suites. Gate on independent
+task outcomes and preserved constraints before comparing latency, tokens, failures or redundant
+calls. Do not optimize call counts at the expense of correctness or infer a quality improvement
+from prompt length alone.
+
+The centralized-policy review keeps guidance proportional to the task: one-call mode
+limits tool use rather than requiring it, and recovery can end in a direct answer or a
+concrete blocker without manufacturing work. Repeated-call detection establishes call
+identity, not equal results or unchanged external state. Its notices identify quoted data
+as untrusted and render it with native Rust formatting, so placeholder-looking content
+in a tool name, argument, call ID or result is not recursively substituted. Reused results
+are explicitly not fresh observations. These wording changes do not relax duplicate-call
+admission, approvals, retry caps or verification requirements.
+
+Optional planning/goal prompts should reuse current evidence, scale plans to actual
+deliverables, permit legitimate regression-test changes without weakening acceptance,
+and stop honestly for missing permission or prerequisites. Summary prompts preserve
+failures, uncertainty, unresolved requests and approval restrictions while discarding
+obsolete detail; a summary or worker claim is not promoted into verified evidence.
+There is no extra prompt framework or model call in this path. Behavioral tests cover
+assembly and literal evidence preservation; real-model outcome/cost improvements still
+require the controlled comparisons above.
 
 ## Focused verification, completion and tool output
 

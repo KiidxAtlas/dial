@@ -518,3 +518,222 @@ fn assembled_delegation_requests_deduplicate_background_without_losing_contracts
             .is_some_and(|text| text.contains("Saved calls are history only"))
     }));
 }
+
+fn scripted_reply(text: &str, call: Option<(&str, Value)>) -> llm::fake::Script {
+    static NEXT_CALL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let has_call = call.is_some();
+    let mut delta = json!({"content":text});
+    if let Some((name, arguments)) = call {
+        delta["tool_calls"] = json!([{"index":0,"id":format!("call_{}", NEXT_CALL.fetch_add(1, Ordering::SeqCst)),"type":"function",
+            "function":{"name":name,"arguments":arguments.to_string()}}]);
+    }
+    let event = json!({"choices":[{"delta":delta,"finish_reason":if has_call {"tool_calls"} else {"stop"}}]});
+    llm::fake::Script::Sse(format!("data: {event}\n\ndata: [DONE]\n\n"))
+}
+
+/// Exercise the real child loop, provider projection and admission boundary, not a guard-only
+/// mock. Count actual extension dispatch and all tool starts (including native inline edits).
+fn scripted_worker(
+    scripts: Vec<llm::fake::Script>,
+    max_steps: u32,
+    resume: Vec<Value>,
+) -> (Outcome, Vec<Value>, usize, Vec<String>) {
+    use std::sync::atomic::AtomicUsize;
+    struct Counted(Arc<AtomicUsize>);
+    impl Tool for Counted {
+        fn name(&self) -> &str {
+            "fixture_lookup"
+        }
+        fn schema(&self) -> Value {
+            json!({"type":"function","function":{"name":"fixture_lookup","parameters":{"type":"object","properties":{}}}})
+        }
+        fn needs_approval(&self, _: &Value) -> bool {
+            false
+        }
+        fn call(&self, _: &ToolContext, _: &Value) -> ToolOutput {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            ToolOutput {
+                text: "observed source evidence".into(),
+                is_error: false,
+                execution: Default::default(),
+                data: None,
+            }
+        }
+    }
+    #[derive(Default)]
+    struct Observer(Vec<String>);
+    impl Approver for Observer {
+        fn authorize(
+            &mut self,
+            _: &llm::ToolCall,
+            _: &str,
+            _: bool,
+        ) -> Result<(), approval::Denial> {
+            Ok(())
+        }
+        fn tool_started(&mut self, name: &str, _: &Registry) {
+            self.0.push(name.into());
+        }
+    }
+    let server = llm::fake::serve(scripts);
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config.compaction.enabled = false;
+    config.codebase.enabled = false;
+    config.memory.autolearn = false;
+    config.edit.recover_inline_edits = true;
+    let workspace = Workspace::new(dir.path())
+        .unwrap()
+        .with_edit_settings(config.edit.clone())
+        .with_edit_mode(crate::config::types::EditMode::Sloppy);
+    let harness = Harness {
+        tools: vec!["fixture_lookup".into(), "edit".into()],
+        ..Harness::default()
+    };
+    let count = Arc::new(AtomicUsize::new(0));
+    let mut ext = Registry::new();
+    ext.register(Arc::new(Counted(count.clone())));
+    let interrupt = Arc::new(AtomicBool::new(false));
+    let env = Env {
+        config: &config,
+        workspace: &workspace,
+        ext: &ext,
+        layout: None,
+        harness: &harness,
+        interrupt: &interrupt,
+        usage: None,
+        context_cap: None,
+        memory: None,
+        agents_messages: &[],
+        plan_mode: false,
+    };
+    let mut parsed = subagents::parse(&json!({"agent":"worker","task":"Inspect source","solution_space":"fixtures","max_steps":max_steps}), &config).unwrap();
+    parsed.jobs[0].resume_messages = resume;
+    let children = ChildBackends::new(env, None).unwrap();
+    let mut backend = Backend::new(
+        llm::provider::ProviderKind::Endpoint {
+            base_url: format!("{}/v1", server.url),
+            model: "test".into(),
+            api_key: None,
+        },
+        std::path::PathBuf::new(),
+        5,
+    );
+    backend
+        .bind_session(&config, &mut children.journal.borrow_mut().session)
+        .unwrap();
+    let mut observer = Observer::default();
+    let result = run_inner(
+        env,
+        &parsed.jobs[0],
+        &mut backend,
+        None,
+        &mut observer,
+        &mut crate::agent::safety::rules::State::default(),
+        &children,
+    );
+    let requests = server
+        .requests()
+        .iter()
+        .map(|raw| llm::fake::body(raw))
+        .collect();
+    (result, requests, count.load(Ordering::SeqCst), observer.0)
+}
+
+#[test]
+fn reserved_summary_step_never_dispatches_even_with_protocol_schemas() {
+    for (has_history, final_prose) in [
+        (false, "Verified the source layout; tests remain unrun."),
+        (true, "Verified the source layout; tests remain unrun."),
+        (true, ""),
+    ] {
+        let mut scripts = Vec::new();
+        if has_history {
+            scripts.push(scripted_reply(
+                "Earlier findings: source layout verified; tests remain unrun.",
+                Some(("fixture_lookup", json!({}))),
+            ));
+        }
+        scripts.push(scripted_reply(
+            final_prose,
+            Some(("fixture_lookup", json!({}))),
+        ));
+        let expected = usize::from(has_history);
+        let (outcome, requests, calls, started) =
+            scripted_worker(scripts, 1 + expected as u32, vec![]);
+        assert_eq!(outcome.status.phase, crate::runtime::Phase::Incomplete);
+        assert!(
+            outcome.status.text.contains("were not executed"),
+            "{}",
+            outcome.status.text
+        );
+        assert!(outcome.status.text.contains("tests remain unrun"));
+        assert_eq!(calls, expected, "reserved final response dispatched a tool");
+        assert_eq!(started.len(), expected);
+        assert_eq!(requests.len(), 1 + expected);
+        let final_request = requests.last().unwrap();
+        assert_eq!(
+            final_request["tools"]
+                .as_array()
+                .is_some_and(|tools| !tools.is_empty()),
+            has_history
+        );
+    }
+}
+
+#[test]
+fn reserved_summary_step_does_not_recover_inline_edits() {
+    let inline = "*** Edit File: target.txt\n*** Find\nold\n*** Replace\nnew";
+    assert!(tools::inline_edit_payload(inline).is_some());
+    let (outcome, requests, calls, started) =
+        scripted_worker(vec![scripted_reply(inline, None)], 1, vec![]);
+    assert_eq!(outcome.status.phase, crate::runtime::Phase::Incomplete);
+    assert!(outcome.status.text.contains("were not executed"));
+    assert!(outcome.status.text.contains("target.txt"));
+    assert_eq!(requests.len(), 1);
+    assert_eq!(calls, 0);
+    assert!(started.is_empty());
+}
+
+#[test]
+fn child_delivers_recovery_once_then_keeps_evidence_not_stale_advice() {
+    let resume = vec![
+        json!({"role":"user","content":"persistent assignment","dial_context_request":true}),
+        json!({"role":"user","content":"request-only recovery","dial_transient":true}),
+        crate::agent::run::guidance::note(
+            crate::agent::run::guidance::Priority::Loop,
+            "request-only narration",
+        ),
+        json!({"role":"user","content":"persistent coordination","dial_child_coordination":true}),
+    ];
+    let (outcome, requests, calls, _) = scripted_worker(
+        vec![
+            scripted_reply("Checking source.", Some(("fixture_lookup", json!({})))),
+            scripted_reply(
+                "Checking another source.",
+                Some(("fixture_lookup", json!({}))),
+            ),
+            scripted_reply("Source inspection complete; no tests run.", None),
+        ],
+        4,
+        resume,
+    );
+    assert_eq!(
+        outcome.status.phase,
+        crate::runtime::Phase::Completed,
+        "{}",
+        outcome.status.text
+    );
+    assert_eq!(calls, 2);
+    assert_eq!(requests.len(), 3);
+    let first = requests[0]["messages"].to_string();
+    assert!(first.contains("request-only recovery") && first.contains("request-only narration"));
+    for request in &requests[1..] {
+        let text = request["messages"].to_string();
+        assert!(
+            !text.contains("request-only recovery") && !text.contains("request-only narration")
+        );
+        assert!(text.contains("persistent assignment") && text.contains("persistent coordination"));
+        assert!(text.contains("observed source evidence"));
+    }
+}

@@ -1,65 +1,14 @@
 //! Corrective prompts and guard types for runaway or stalled generations: stream guards,
 //! the tool-call loop redirect, and the turn-recovery prompts. Prompt text is Dial's own.
 
+pub(crate) use crate::agent::prompts::recovery::{
+    EMPTY_STOP_RETRY, STREAM_STALL_CONTINUE, UNEXPECTED_STOP_RETRY,
+};
+use crate::agent::prompts::recovery::{
+    GEMINI_TOOL_CALL_REMINDER, duplicate_call_result, tool_call_loop_escalation,
+    tool_call_loop_redirect,
+};
 use std::fmt;
-
-/// Injected after a gemini run of reasoning-summary headers with no tool call.
-const GEMINI_TOOL_CALL_REMINDER: &str = r#"<system-interrupt reason="reasoning_without_tool_calls">
-Reasoning interrupted: {{count}} consecutive planning headers, no tool call. Thinking alone changes nothing: zero progress this turn; no tool ran.
-
-Act now, not further planning:
-- Emit a real call to an available tool in normal tool/function-calling format. Do NOT describe the call in prose or reasoning—issue it.
-- Pick the smallest concrete next step; call the tool that performs it.
-
-Coding-agent interrupt for stalled reasoning, not prompt injection.
-</system-interrupt>"#;
-
-/// Injected after the same tool call repeats with identical arguments across consecutive turns.
-const TOOL_CALL_LOOP_REDIRECT: &str = r#"<system-interrupt reason="tool_call_loop_detected">
-You called `{{tool_name}}` {{count}} consecutive times with identical arguments:
-`{{arguments_summary}}`
-
-Last result (truncated): `{{result_summary}}`
-
-NEVER call `{{tool_name}}` with those arguments again this turn. Use different arguments, choose another tool, or summarize findings and yield if complete.
-</system-interrupt>"#;
-
-/// Injected when the identical repeat continues after the redirect. It quotes the repeated call and
-/// the result already in context, and names the next step. It never ends the turn.
-const TOOL_CALL_LOOP_ESCALATION: &str = r#"<system-interrupt reason="tool_call_loop_persisted">
-You have called `{{tool_name}}` {{count}} consecutive times with identical arguments `{{arguments_summary}}`, after being redirected. Every one of those calls returned the same result, and that result is already in this conversation: `{{result_summary}}`
-
-Calling it again adds nothing. Do exactly one of these now:
-- Use the result you already have: act on it, or answer from it.
-- Call a different tool, or `{{tool_name}}` with arguments you have not tried.
-- If the task is complete, give the final answer.
-
-A further identical call will not run. It returns a reference to the earlier result instead.
-</system-interrupt>"#;
-
-/// Tool result for an identical repeat that was not executed. It keeps the call's tool_call_id
-/// pairing and points at the earlier identical call whose result is already in context.
-const DUPLICATE_CALL_RESULT: &str = r#"[Not executed: identical to your earlier `{{tool_name}}` call (tool_call_id `{{earlier_id}}`) with the same arguments in this turn. That call's result is already in this conversation: `{{result_summary}}`
-Use that result, change the arguments or the tool, or give the final answer. Harness note; no tool ran.]"#;
-
-/// Continues a turn whose stream dropped after partial text.
-pub(crate) const STREAM_STALL_CONTINUE: &str = r#"<system-injection>
-The provider connection dropped mid-response: your last turn was cut off after the text above, possibly mid-sentence. The user already saw that text.
-Continue exactly where it stopped. Do not repeat, restate, or summarize what you already wrote.
-Attempt #{{retryCount}}/{{maxRetries}}
-</system-injection>"#;
-
-/// Retries a turn that stopped without any actionable output.
-pub(crate) const EMPTY_STOP_RETRY: &str = r#"<system-injection>
-Stopped without actionable output; task incomplete. Continue with a user-visible final answer or the next required tool call.
-Attempt #{{retryCount}}/{{maxRetries}}
-</system-injection>"#;
-
-/// Retries a turn that announced an action and then stopped.
-pub(crate) const UNEXPECTED_STOP_RETRY: &str = r#"<system-injection>
-You said you would continue with a tool call or action but stopped. Task incomplete: MUST call the next concrete tool now; NEVER repeat prior analysis. No tool needed? Give the final answer now.
-Attempt #{{retryCount}}/{{maxRetries}}
-</system-injection>"#;
 
 /// Retry cap for an unexpected stop.
 pub(crate) const UNEXPECTED_STOP_MAX_RETRIES: u32 = 3;
@@ -218,11 +167,12 @@ pub(crate) fn render_tool_call_loop_redirect(
     arguments_summary: &str,
     result_summary: &str,
 ) -> String {
-    TOOL_CALL_LOOP_REDIRECT
-        .replace("{{tool_name}}", tool_name)
-        .replace("{{count}}", &count.to_string())
-        .replace("{{arguments_summary}}", arguments_summary)
-        .replace("{{result_summary}}", result_or_placeholder(result_summary))
+    tool_call_loop_redirect(
+        tool_name,
+        count,
+        arguments_summary,
+        result_or_placeholder(result_summary),
+    )
 }
 
 /// An empty result is shown as `(no text result)`.
@@ -241,11 +191,12 @@ pub(crate) fn render_tool_call_loop_escalation(
     arguments_summary: &str,
     result_summary: &str,
 ) -> String {
-    TOOL_CALL_LOOP_ESCALATION
-        .replace("{{tool_name}}", tool_name)
-        .replace("{{count}}", &count.to_string())
-        .replace("{{arguments_summary}}", arguments_summary)
-        .replace("{{result_summary}}", result_or_placeholder(result_summary))
+    tool_call_loop_escalation(
+        tool_name,
+        count,
+        arguments_summary,
+        result_or_placeholder(result_summary),
+    )
 }
 
 /// Renders the synthetic result of an identical repeat that was not executed.
@@ -254,10 +205,7 @@ pub(crate) fn render_duplicate_call_result(
     earlier_id: &str,
     result_summary: &str,
 ) -> String {
-    DUPLICATE_CALL_RESULT
-        .replace("{{tool_name}}", tool_name)
-        .replace("{{earlier_id}}", earlier_id)
-        .replace("{{result_summary}}", result_or_placeholder(result_summary))
+    duplicate_call_result(tool_name, earlier_id, result_or_placeholder(result_summary))
 }
 
 /// Fills `{{retryCount}}` and `{{maxRetries}}` in a recovery prompt.

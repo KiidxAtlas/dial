@@ -5,18 +5,13 @@
 //! in the session's control state, so later turns and rebuilt agents stay on the target until
 //! `/prewalk restart` or a model change. Nudges are request-local `dial_transient` messages.
 
+use crate::agent::prompts::modes::prewalk::{CHECKLIST, CONTINUE, PLAN_NUDGE};
 use crate::agent::{Agent, Ui, make_backend};
 use crate::llm::model_config::ModelSelection;
 use crate::llm::provider::Backend;
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-
-const PLAN_NUDGE: &str = "STOP: In NEXT reply, before further exploration, write complete plan. Enough known; do not defer.\n\nPlan first; explicit, comprehensive; reference for remainder:\n- Remaining execution-order steps: exact files, symbols, commands, checks.\n- Risks, edge cases; verify each landed: specific commands, expected outputs. NEVER modify tests or verification assets to pass checks.\n- Already done, brief; prevent repetition.\n\nThorough, concrete. Tools may verify details only after plan.\n\nThen, same reply and only after complete plan, use todo tool to capture 5–9 items: one per MEANINGFUL step; each concrete target + verification. Only code-changing or code-verifying steps; exclude reporting, bookkeeping, cleanup-ceremony, release-note items. Todo serves task, not reverse: reality/item conflict → fix actual problem, not checklist.\n\nCheckpoint, not final answer: after todo list, continue task; do not stop on plan alone.";
-
-const CHECKLIST: &str = "Before task complete, verify:\n\n- Consistency: If a pattern, signature, or check changed in one place, grep every other call site or duplicate copy needing identical change. A fix at only some matching sites fails.\n- Scope: If diff exceeds the minimal issue-resolving change, confirm behavior unchanged outside the reported issue. Prefer the smallest correct diff over a broader rewrite.\n- Verification: Run the issue's full test module or file, not only the expected-to-flip test. A sibling-test-breaking change fails.\n\nDo not claim task complete until all three checks done.";
-
-const CONTINUE: &str = "Continue task now; do not end turn here.";
 
 /// Session-scoped prewalk state. Persisted under the `"modes"` control-state key.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]

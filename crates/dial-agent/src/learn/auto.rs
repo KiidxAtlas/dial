@@ -88,11 +88,16 @@ pub fn check_stop(config: &Config) -> Result<()> {
     );
     // A running background job also stops when today's compute budget is spent.
     if super::compute::background_active() {
-        let used = super::resources::used_today_checked(&config.user_dir)?
-            + super::compute::lease_elapsed_secs();
-        if super::resources::budget_left(&config.improve, used) == Some(0) {
-            return Err(BudgetReached.into());
-        }
+        check_compute_budget(config, super::compute::lease_elapsed_secs())?;
+    }
+    Ok(())
+}
+
+/// Also used by request watchers, which cannot read the owning thread's lease clock.
+pub(super) fn check_compute_budget(config: &Config, elapsed_secs: u64) -> Result<()> {
+    let used = super::resources::used_today_checked(&config.user_dir)?.saturating_add(elapsed_secs);
+    if super::resources::budget_left(&config.improve, used) == Some(0) {
+        return Err(BudgetReached.into());
     }
     Ok(())
 }

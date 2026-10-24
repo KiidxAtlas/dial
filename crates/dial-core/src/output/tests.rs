@@ -54,14 +54,33 @@ fn stalled_reader_spills_to_disk_then_drains_everything_in_order() {
 
 #[test]
 fn closed_reader_fails_and_raises_the_interrupt() {
-    let (reader, writer_fd) = pipe_pair();
+    // A concurrently spawned child can inherit a pipe reader between pipe() and drop().
+    // Shut down a socket endpoint instead: shutdown also affects inherited duplicates, so
+    // this fixture guarantees a disconnected peer under parallel process-spawning tests.
+    let (reader, writer_fd) = std::os::unix::net::UnixStream::pair().unwrap();
+    reader.shutdown(std::net::Shutdown::Both).unwrap();
     drop(reader);
-    let pipe = Pipe::spawn(writer_fd, 1024, 1024 * 1024).unwrap();
-    let mut writer = StdoutWriter::over(pipe);
+    let mut out = File::from(OwnedFd::from(writer_fd));
+    assert_eq!(
+        out.write(b"probe").unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+    let pipe = Pipe::spawn(out, 1024, 1024 * 1024).unwrap();
+    let mut writer = StdoutWriter::over(pipe.clone());
     let interrupt = Arc::new(AtomicBool::new(false));
     writer.set_interrupt(interrupt.clone());
     writer.text(b"hello\n").unwrap();
-    let error = writer.drain(Some(Duration::from_secs(10))).unwrap_err();
+    let result = writer.drain(Some(Duration::from_secs(10)));
+    let state = pipe.lock();
+    assert!(
+        result.is_err(),
+        "drain returned success: busy={}, memory={}, failure={:?}",
+        state.busy,
+        state.memory.len(),
+        state.failure
+    );
+    drop(state);
+    let error = result.unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
     assert!(interrupt.load(Ordering::SeqCst));
     assert!(writer.failed() && writer.text(b"more").is_err());

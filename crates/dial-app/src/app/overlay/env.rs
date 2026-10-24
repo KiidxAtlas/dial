@@ -264,16 +264,7 @@ impl OverlayEnv<'_> {
         scope: Scope,
     ) {
         if let ActiveOverlay::ModelSettings(settings) = overlay {
-            let mut updates: Vec<_> = changes
-                .iter()
-                .map(|change| match change {
-                    Change::Set { path, value } => Change::Set {
-                        path: path.clone(),
-                        value: value.clone(),
-                    },
-                    Change::Remove { path } => Change::Remove { path: path.clone() },
-                })
-                .collect();
+            let mut updates = changes.to_vec();
             updates.push(Change::Set {
                 path: "model_profile".into(),
                 value: toml::Value::String(settings.name.clone()),

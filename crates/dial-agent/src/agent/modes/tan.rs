@@ -2,6 +2,7 @@
 //! The clone is a full `Agent` over the forked session file, driven on a worker thread; the job is
 //! tracked in `Jobs` on the parent agent.
 
+use crate::agent::prompts::modes::tan::{CONTEXT_SWITCH, DISPATCH};
 use std::collections::BTreeMap;
 use std::fs;
 use std::panic::{self, AssertUnwindSafe};
@@ -21,29 +22,6 @@ use crate::config::types::{Approval, Config};
 use crate::learn::improve::apply_pinned_model;
 use crate::storage::session::Session;
 use crate::storage::store::Store;
-
-/// Fork-scoped context notice injected before the clone's request.
-const CONTEXT_SWITCH: &str = r#"<system-notice cause="fork">
-Above conversation: parent session.
-Fork solely handles user's request below.
-Parent still working original task; no responsibility or obligations from prior conversation.
-
-- MUST focus EXCLUSIVELY on immediate user request; nothing else.
-- NEVER continue, follow up on, or intervene in anything discussed before this message — parent’s.
-- Parent concurrently edits this working directory. Files MAY change between reads, appear mid-refactor, or fail to compile. Parent's live work: NEVER fix, audit, or build on it, even if broken.
-- Prior todo lists, plans, unfinished checklists: parent’s; NEVER resume or update.
-- After request: STOP. NEVER work on ANY OTHER TASK.
-</system-notice>"#;
-
-/// Parent-side notice recorded when a clone is dispatched.
-const DISPATCH: &str = r#"<system-notice reason="background_task_dispatched" job="{{jobId}}">
-Tangential user task: running in a separate background agent. Coding-agent dispatch notice, NOT prompt injection or new instruction.
-
-Task below: another agent's own session; you NOT responsible. NEVER work on, reference, or let it interrupt or alter current task. Continue as if absent. Background task ({{jobId}}) reports nothing back to this session.
-
-Dispatched work — awareness only:
-{{work}}
-</system-notice>"#;
 
 /// Background `/tan` jobs owned by one parent agent. The shell collects finished jobs with
 /// [`Agent::finished_tan_jobs`]; anything left over is pruned on the next dispatch.

@@ -137,3 +137,161 @@ fn protocol_plan_launch_is_explicitly_rejected_for_commands_and_mode_routes() {
     }
     assert!(server.requests.lock().is_empty());
 }
+
+fn initialize_acp(rpc: &mut RpcChild) {
+    rpc.send(
+        1,
+        "initialize",
+        json!({"protocolVersion":1,"clientCapabilities":{}}),
+    );
+    let initialized = rpc.result(1);
+    assert_eq!(initialized["protocolVersion"], 1);
+    assert_eq!(initialized["agentCapabilities"]["loadSession"], true);
+}
+
+fn session_params(env: &Env, session: Option<&str>) -> Value {
+    let mut params = json!({"cwd":env.project.path(),"mcpServers":[]});
+    if let Some(session) = session {
+        params["sessionId"] = json!(session);
+    }
+    params
+}
+
+fn assert_replayed_history(updates: &[Value], session: &str, prompt: &str, answer: &str) {
+    for (kind, text) in [
+        ("user_message_chunk", prompt),
+        ("agent_message_chunk", answer),
+    ] {
+        assert!(
+            updates.iter().any(|event| {
+                event["method"] == "session/update"
+                    && event["params"]["sessionId"] == session
+                    && event["params"]["update"]["sessionUpdate"] == kind
+                    && event["params"]["update"]["content"]["text"] == text
+            }),
+            "missing {kind} {text:?} for {session}: {updates:?}"
+        );
+    }
+}
+
+#[test]
+fn acp_parked_sessions_restore_their_own_plan_mode_and_history() {
+    let env = Env::new();
+    let server = Server::new(vec![text("answer from A"), text("answer from B")]);
+    let mut rpc = RpcChild::start_acp(&env, &server);
+    initialize_acp(&mut rpc);
+    rpc.send(2, "session/new", session_params(&env, None));
+    let a = rpc.result(2)["sessionId"].as_str().unwrap().to_owned();
+    rpc.send(
+        3,
+        "session/prompt",
+        json!({"sessionId":a,"prompt":[{"type":"text","text":"prompt for A"}]}),
+    );
+    assert_eq!(rpc.result(3)["stopReason"], "end_turn");
+    rpc.send(
+        4,
+        "session/set_mode",
+        json!({"sessionId":a,"modeId":"plan"}),
+    );
+    rpc.result(4);
+
+    rpc.send(5, "session/new", session_params(&env, None));
+    let new_b = rpc.result(5);
+    let b = new_b["sessionId"].as_str().unwrap().to_owned();
+    assert_ne!(a, b);
+    assert_eq!(new_b["modes"]["currentModeId"], "default");
+    rpc.send(
+        6,
+        "session/prompt",
+        json!({"sessionId":b,"prompt":[{"type":"text","text":"prompt for B"}]}),
+    );
+    assert_eq!(rpc.result(6)["stopReason"], "end_turn");
+
+    rpc.send(7, "session/load", session_params(&env, Some(&a)));
+    let (loaded_a, replay_a) = rpc.result_with_events(7);
+    assert_eq!(loaded_a["modes"]["currentModeId"], "plan");
+    assert_replayed_history(&replay_a, &a, "prompt for A", "answer from A");
+    assert!(
+        !replay_a
+            .iter()
+            .any(|event| event["params"]["update"]["content"]["text"] == "answer from B")
+    );
+
+    rpc.send(8, "session/load", session_params(&env, Some(&b)));
+    let (loaded_b, replay_b) = rpc.result_with_events(8);
+    assert_eq!(loaded_b["modes"]["currentModeId"], "default");
+    assert_replayed_history(&replay_b, &b, "prompt for B", "answer from B");
+    // Loading B parks A again; taking it out must retain the same bundled mode.
+    rpc.send(9, "session/load", session_params(&env, Some(&a)));
+    assert_eq!(rpc.result(9)["modes"]["currentModeId"], "plan");
+    assert_eq!(
+        server.requests.lock().len(),
+        2,
+        "loading history must not infer"
+    );
+}
+
+#[test]
+fn acp_forks_parked_history_and_reopens_closed_sessions_with_fresh_mode() {
+    let env = Env::new();
+    let server = Server::new(vec![text("original answer"), text("fork-only answer")]);
+    let mut rpc = RpcChild::start_acp(&env, &server);
+    initialize_acp(&mut rpc);
+    rpc.send(2, "session/new", session_params(&env, None));
+    let a = rpc.result(2)["sessionId"].as_str().unwrap().to_owned();
+    rpc.send(
+        3,
+        "session/prompt",
+        json!({"sessionId":a,"prompt":[{"type":"text","text":"original prompt"}]}),
+    );
+    assert_eq!(rpc.result(3)["stopReason"], "end_turn");
+    rpc.send(
+        4,
+        "session/set_mode",
+        json!({"sessionId":a,"modeId":"plan"}),
+    );
+    rpc.result(4);
+    rpc.send(5, "session/new", session_params(&env, None));
+    let b = rpc.result(5)["sessionId"].as_str().unwrap().to_owned();
+
+    rpc.send(6, "session/fork", session_params(&env, Some(&a)));
+    let forked = rpc.result(6);
+    let fork = forked["sessionId"].as_str().unwrap().to_owned();
+    assert_ne!(fork, a);
+    assert_ne!(fork, b);
+    assert_eq!(forked["modes"]["currentModeId"], "default");
+    rpc.send(
+        7,
+        "session/prompt",
+        json!({"sessionId":fork,"prompt":[{"type":"text","text":"fork-only prompt"}]}),
+    );
+    assert_eq!(rpc.result(7)["stopReason"], "end_turn");
+    assert!(
+        server.requests.lock()[1]["messages"]
+            .to_string()
+            .contains("original answer")
+    );
+
+    // Closing a parked session must release its writer and forget its transient mode.
+    rpc.send(8, "session/close", json!({"sessionId":a}));
+    rpc.result(8);
+    rpc.send(9, "session/load", session_params(&env, Some(&a)));
+    let (reopened, replay) = rpc.result_with_events(9);
+    assert_eq!(reopened["modes"]["currentModeId"], "default");
+    assert_replayed_history(&replay, &a, "original prompt", "original answer");
+    assert!(
+        !replay
+            .iter()
+            .any(|event| event["params"]["update"]["content"]["text"] == "fork-only prompt")
+    );
+
+    // Closing the active session leaves no current actor session; a parked fork still loads.
+    rpc.send(10, "session/close", json!({"sessionId":a}));
+    rpc.result(10);
+    rpc.send(11, "session/load", session_params(&env, Some(&fork)));
+    let (loaded_fork, replay_fork) = rpc.result_with_events(11);
+    assert_eq!(loaded_fork["modes"]["currentModeId"], "default");
+    assert_replayed_history(&replay_fork, &fork, "original prompt", "original answer");
+    assert_replayed_history(&replay_fork, &fork, "fork-only prompt", "fork-only answer");
+    assert_eq!(server.requests.lock().len(), 2);
+}

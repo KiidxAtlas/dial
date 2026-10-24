@@ -176,15 +176,23 @@ pub fn background_call_controlled<T>(
             return call(backend, external.cloned().unwrap_or(cancel));
         }
         let preempt = Arc::new(AtomicBool::new(false));
+        let leased_since = LEASED_SINCE.with(|since| *since.borrow());
         let result = std::thread::scope(|scope| {
             let (done, rx) = mpsc::channel::<()>();
             let flag = cancel.clone();
             let yielded = preempt.clone();
-            scope.spawn(move || {
+            let watcher = scope.spawn(move || -> Result<()> {
                 loop {
                     if external.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
                         flag.store(true, Ordering::SeqCst);
                         break;
+                    }
+                    if let Some(since) = leased_since
+                        && let Err(error) =
+                            super::auto::check_compute_budget(config, since.elapsed().as_secs())
+                    {
+                        flag.store(true, Ordering::SeqCst);
+                        return Err(error);
                     }
                     if (paused(&config.user_dir)
                         || (config.compute_locks
@@ -202,9 +210,14 @@ pub fn background_call_controlled<T>(
                         break;
                     }
                 }
+                Ok(())
             });
             let result = call(backend, cancel);
             drop(done);
+            if let Err(error) = watcher.join().expect("background compute watcher panicked") {
+                backend.release();
+                return Err(error);
+            }
             result
         });
         if !preempt.load(Ordering::SeqCst) {

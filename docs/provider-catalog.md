@@ -201,6 +201,15 @@ to an API key. A partial or failed response never releases its tool calls. Dial 
 accounts created by Dial's older login flow must sign in again. Legacy
 `https://api.openai.com/v1` ChatGPT endpoint settings are migrated to the Codex backend on load.
 
+`retry.rotate_accounts` permits automatic ChatGPT failover only for unbound requests with
+portable history. A successful account selection stays pinned on that backend for subsequent
+requests. Session/cache identities and native Responses history are account-scoped: Dial refuses
+automatic cross-account replay rather than sending incompatible history or silently discarding it.
+For those conversations, explicitly select another allowed account and start a clean chat (or
+explicitly rebind portable history). Rotation also requires compatible cached model capabilities
+unless an explicit configured model profile supplies the request contract. Account allowlists and
+native replay validation still apply.
+
 Dial combines the account model list with visible models in a recent local Codex model metadata
 cache, when present, so newly released models can appear before the account list catches up.
 Those additions are labeled **Codex catalog**; their first completed request verifies account access.

@@ -3453,3 +3453,229 @@ fn ranking_stops_early_once_superseded() {
         Some(entries.len())
     );
 }
+
+#[test]
+fn trimming_history_rebases_the_browsed_entry_and_restores_the_draft() {
+    let mut c = Composer::new((0..10).map(|i| format!("entry {i}")).collect(), 10);
+    c.set_draft("unsent draft");
+    c.browse_history(true);
+    assert_eq!(c.draft(), "entry 9");
+    c.set_history_limit(2);
+    c.browse_history(true);
+    assert_eq!(c.draft(), "entry 8");
+    c.browse_history(false);
+    assert_eq!(c.draft(), "entry 9");
+    c.browse_history(false);
+    assert_eq!(c.draft(), "unsent draft");
+}
+
+#[test]
+fn trimming_away_the_browsed_entry_keeps_navigation_in_bounds() {
+    let mut c = Composer::new((0..10).map(|i| format!("entry {i}")).collect(), 10);
+    c.set_draft("unsent draft");
+    for _ in 0..10 {
+        c.browse_history(true);
+    }
+    assert_eq!(c.draft(), "entry 0");
+    c.set_history_limit(2);
+    c.browse_history(true);
+    assert_eq!(c.draft(), "entry 8");
+    c.browse_history(false);
+    assert_eq!(c.draft(), "entry 9");
+    c.browse_history(false);
+    assert_eq!(c.draft(), "unsent draft");
+}
+
+#[test]
+fn collapsed_paste_clear_undo_submits_the_exact_payload() {
+    let mut env = Env::new();
+    env.keys.rebind(Action::EditorUndo, &["F8"]).unwrap();
+    let mut c = Composer::new(vec![], 10);
+    let payload = "界🙂 café\n".repeat(30);
+    c.handle_paste(&payload);
+    ctrl(&mut c, &env, 'c');
+    assert!(c.draft().is_empty());
+    press(&mut c, &env, KeyCode::F(8));
+    assert_eq!(c.expanded_draft(), payload);
+    assert_eq!(
+        press(&mut c, &env, KeyCode::Enter),
+        ComposerEvent::Submit(payload)
+    );
+    assert!(
+        c.pastes.is_empty(),
+        "sending releases this draft's metadata"
+    );
+    assert!(
+        !c.editor.can_undo(),
+        "sent drafts are recalled from history"
+    );
+}
+
+#[test]
+fn collapsed_paste_replacement_redo_and_branch_keep_only_recoverable_payloads() {
+    let mut env = Env::new();
+    env.keys.rebind(Action::EditorUndo, &["F8"]).unwrap();
+    env.keys.rebind(Action::EditorRedo, &["F9"]).unwrap();
+    let mut c = Composer::new(vec![], 10);
+    let payload = "payload\n".repeat(30);
+    c.handle_paste(&payload);
+    c.set_draft("replacement");
+    press(&mut c, &env, KeyCode::F(8));
+    assert_eq!(c.expanded_draft(), payload);
+    press(&mut c, &env, KeyCode::F(9));
+    assert_eq!(c.expanded_draft(), "replacement");
+    press(&mut c, &env, KeyCode::F(8));
+    press(&mut c, &env, KeyCode::F(8));
+    assert!(c.draft().is_empty());
+    typed(&mut c, &env, "branch");
+    assert!(
+        c.pastes.is_empty(),
+        "branching discarded the only marker in redo"
+    );
+    press(&mut c, &env, KeyCode::F(9));
+    assert_eq!(c.draft(), "branch");
+
+    c.handle_paste(&payload);
+    for index in 0..110 {
+        c.set_draft(&format!("replacement {index}"));
+    }
+    assert!(
+        c.pastes.is_empty(),
+        "evicted undo snapshots release payloads"
+    );
+}
+
+fn wait_for_history_lookup(c: &mut Composer) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while c.autocomplete_pending() {
+        c.poll_autocomplete();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "history lookup did not finish"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+fn start_history_lookup_now(c: &mut Composer) {
+    if let Some((_, _, due)) = &mut c.history_lookup.pending {
+        *due = std::time::Instant::now();
+    }
+    c.poll_autocomplete();
+}
+
+#[test]
+fn history_provider_search_finds_matches_older_than_500_prompts() {
+    let env = Env::new();
+    let mut history = vec!["older unique needle".to_owned()];
+    history.extend((0..600).map(|index| format!("recent prompt {index}")));
+    let mut c = Composer::new(history.clone(), 10);
+    let (tx, rx) = std::sync::mpsc::channel();
+    c.set_history_provider(Some(std::sync::Arc::new(move |query, limit| {
+        tx.send(query.to_owned()).unwrap();
+        history
+            .iter()
+            .rev()
+            .filter(|entry| entry.to_lowercase().contains(&query.to_lowercase()))
+            .take(limit)
+            .cloned()
+            .collect()
+    })));
+    ctrl(&mut c, &env, 'r');
+    c.handle_paste("NEEDLE");
+    start_history_lookup_now(&mut c);
+    wait_for_history_lookup(&mut c);
+    assert_eq!(rx.try_iter().collect::<Vec<_>>(), ["NEEDLE"]);
+    assert_eq!(c.search_matches().len(), 1);
+    press(&mut c, &env, KeyCode::Enter);
+    assert_eq!(c.draft(), "older unique needle");
+}
+
+#[test]
+fn slow_history_provider_serializes_queries_and_rejects_stale_results() {
+    let env = Env::new();
+    let mut c = Composer::new(vec![], 10);
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    c.set_history_provider(Some(std::sync::Arc::new(move |query, _| {
+        started_tx.send(query.to_owned()).unwrap();
+        release_rx
+            .lock()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+        vec![format!("{query} result")]
+    })));
+    ctrl(&mut c, &env, 'r');
+    c.handle_paste("slow");
+    start_history_lookup_now(&mut c);
+    assert_eq!(
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap(),
+        "slow"
+    );
+    // Input completes while the provider is blocked; only the newest request remains queued.
+    c.handle_paste(" intermediate");
+    c.handle_paste(" latest");
+    start_history_lookup_now(&mut c);
+    assert_eq!(
+        c.search.as_ref().unwrap().query.text,
+        "slow intermediate latest"
+    );
+    assert!(
+        started_rx.try_recv().is_err(),
+        "no second thread while the first is blocked"
+    );
+    release_tx.send(()).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        c.poll_autocomplete();
+        assert!(
+            c.search.as_ref().unwrap().entries.is_empty(),
+            "stale response must never become visible"
+        );
+        if let Ok(query) = started_rx.try_recv() {
+            assert_eq!(query, "slow intermediate latest");
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    release_tx.send(()).unwrap();
+    wait_for_history_lookup(&mut c);
+    assert_eq!(
+        c.search.as_ref().unwrap().entries,
+        ["slow intermediate latest result"]
+    );
+}
+
+#[test]
+fn dismissed_history_search_does_not_apply_a_late_provider_response() {
+    let env = Env::new();
+    let mut c = Composer::new(vec!["local".into()], 10);
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    c.set_history_provider(Some(std::sync::Arc::new(move |_, _| {
+        started_tx.send(()).unwrap();
+        release_rx
+            .lock()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+        vec!["late result".into()]
+    })));
+    c.set_draft("keep draft");
+    ctrl(&mut c, &env, 'r');
+    start_history_lookup_now(&mut c);
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    press(&mut c, &env, KeyCode::Esc);
+    release_tx.send(()).unwrap();
+    wait_for_history_lookup(&mut c);
+    assert!(c.search.is_none());
+    assert_eq!(c.draft(), "keep draft");
+}

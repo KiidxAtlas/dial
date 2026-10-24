@@ -1668,7 +1668,7 @@ fn completion_nudge_is_sent_once_and_never_saved_to_history() {
         .unwrap();
     assert_eq!(report.outcome, TurnOutcome::Completed);
     let requests = server.requests.lock();
-    let nudge = "You said you would continue with a tool call or action but stopped";
+    let nudge = "The response announced further action but stopped";
     let sent_with_nudge = requests
         .iter()
         .filter(|r| r["messages"].to_string().contains(nudge))
@@ -2519,7 +2519,7 @@ fn unfinished_todos_continue_into_real_edits_and_completion() {
     assert!(
         server.requests.lock()[2]["messages"]
             .to_string()
-            .contains("You said you would continue with a tool call or action but stopped")
+            .contains("The response announced further action but stopped")
     );
     assert_eq!(
         server.requests.lock().len(),
@@ -4061,7 +4061,7 @@ fn prewalk_switches_to_small_after_the_first_write_and_keeps_it_for_later_turns(
         );
         assert!(has_message_starting(
             &main_requests[0],
-            "STOP: In NEXT reply"
+            "Before implementation,"
         ));
     }
     {
@@ -4074,7 +4074,7 @@ fn prewalk_switches_to_small_after_the_first_write_and_keeps_it_for_later_turns(
         assert_eq!(side_requests[0]["model"], "side-model");
         assert!(has_message_starting(
             &side_requests[0],
-            "Before task complete, verify:"
+            "Before claiming completion,"
         ));
     }
     assert!(

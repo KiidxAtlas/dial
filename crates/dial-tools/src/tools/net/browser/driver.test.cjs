@@ -5,10 +5,10 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const source = fs.readFileSync(require('node:path').join(__dirname,'driver.cjs'),'utf8');
-function harness() {
+function harness({realTimers = false} = {}) {
   const timers = new Set(), frames = [];
   const stdout = { writableNeedDrain:false,writableLength:0,write(line,callback) { frames.push(JSON.parse(line));callback();return true; } };
-  const context = vm.createContext({ Buffer, setTimeout(fn) {timers.add(fn);return fn;},clearTimeout(fn) {timers.delete(fn);},
+  const context = vm.createContext({ Buffer, setTimeout: realTimers ? setTimeout : (fn) => {timers.add(fn);return fn;},clearTimeout: realTimers ? clearTimeout : (fn) => {timers.delete(fn);},
     require(name) { return name === 'node:readline' ? {createInterface(){return {on(){}};}} : {chromium:{}}; },
     process:{env:{DIAL_PLAYWRIGHT:'external-operator-module'},stdout,stderr:{write(){}},on(){},stdin:{on(){}},exit(){}},
   });
@@ -16,6 +16,19 @@ function harness() {
   context.fakeRequest = {postDataBuffer(){return null;},url(){return 'https://example.com/flood';},method(){return 'GET';},headers(){return {};} };
   return {run(code){return vm.runInContext(code,context);},timers,frames,stdout};
 }
+test('post-action settlement is bounded even with unlimited action time', async () => {
+  const h = harness({realTimers:true});
+  h.run('activeHttp = 1');
+  const start = Date.now();
+  const result = await h.run('settleRequests(null)');
+  assert.equal(result.settled, false);
+  assert.equal(result.pending, 1);
+  assert(Date.now() - start < 3000);
+});
+test('an idle operation reports settled rather than a network failure', async () => {
+  const h = harness({realTimers:true});
+  assert.equal((await h.run('settleRequests(null)')).settled, true);
+});
 test('idle pages cannot queue network callbacks',async () => {
   const h=harness();
   await assert.rejects(h.run('http(fakeRequest)'),/paused between approved operations/);

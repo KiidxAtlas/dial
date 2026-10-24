@@ -171,3 +171,179 @@ fn completion_is_visible_before_pumping_and_an_early_ack_is_not_redelivered() {
         crate::runtime::Phase::Failed
     );
 }
+
+#[test]
+fn transcript_persistence_policy_applies_while_live_and_after_every_terminal_phase() {
+    use crate::agent::workers::child_transcript::{messages, scan};
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(project.path(), home.path().to_owned()).unwrap();
+    let historic = create_transcript(
+        true,
+        Some(&layout),
+        "parent",
+        "historic",
+        json!({"id":"historic"}),
+    )
+    .unwrap()
+    .unwrap();
+    historic
+        .record(&json!({"role":"assistant","content":"historic answer"}))
+        .unwrap();
+    historic.finish(json!({"status":"done"})).unwrap();
+    let historic_path = scan(&layout, "parent")[0].path.clone();
+    let historic_bytes = std::fs::read(&historic_path).unwrap();
+    for persist in [false, true] {
+        for status in ["done", "cancelled", "failed", "incomplete"] {
+            let id = format!("{persist}-{status}");
+            let sink = create_transcript(
+                persist,
+                Some(&layout),
+                "parent",
+                &id,
+                json!({"id":id,"status":"running"}),
+            )
+            .unwrap();
+            assert_eq!(sink.is_some(), persist);
+            let retained = scan(&layout, "parent")
+                .into_iter()
+                .find(|entry| entry.header["id"] == id);
+            assert_eq!(
+                retained.is_some(),
+                persist,
+                "live capture follows the policy"
+            );
+            if let Some(sink) = &sink {
+                sink.record(&json!({"role":"assistant","content":"candidate answer"}))
+                    .unwrap();
+                sink.finish(json!({"status":status})).unwrap();
+            }
+            // Durable capture must not control the worker UI's runtime history.
+            let tree = crate::runtime::Tree::default();
+            let body = tree.start("worker", &id, None);
+            let value =
+                json!({"id":id,"status":status,"result":"candidate answer","data":{"candidate":7}});
+            settle_result(&body, &value);
+            assert_eq!(body_status(&body)["data"]["candidate"], 7);
+            assert_eq!(
+                body.read(|node| node.result.phase),
+                crate::runtime::Phase::from_status(status)
+            );
+            drop(sink);
+            let retained = scan(&layout, "parent")
+                .into_iter()
+                .find(|entry| entry.header["id"] == id);
+            assert_eq!(
+                retained.is_some(),
+                persist,
+                "terminal capture follows the policy"
+            );
+            if let Some(retained) = retained {
+                assert_eq!(retained.status.unwrap()["status"], status);
+                assert_eq!(
+                    messages(&retained.path).unwrap()[0]["content"],
+                    "candidate answer"
+                );
+            }
+            assert_eq!(std::fs::read(&historic_path).unwrap(), historic_bytes);
+        }
+    }
+    assert!(
+        create_transcript(true, None, "parent", "no-storage", json!({}))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn isolated_conflict_publishes_incomplete_and_preserves_candidate_and_parent_bytes() {
+    struct NoTools;
+    impl Approver for NoTools {
+        fn authorize(&mut self, _: &ToolCall, _: &str, _: bool) -> Result<(), Denial> {
+            panic!("this test does not execute tools")
+        }
+    }
+    for conflict in [false, true] {
+        let project = tempfile::tempdir().unwrap();
+        let parent_path = project.path().join("source.txt");
+        std::fs::write(&parent_path, b"original\0bytes").unwrap();
+        let workspace = Workspace::new(project.path()).unwrap();
+        let mut config = Config::default();
+        config.isolation.backend = crate::config::isolation::Preference::Copy;
+        let request = subagents::parse(&json!({"agent":"worker","task":"edit source","solution_space":"source only","isolation":"copy"}), &config).unwrap();
+        let registry = Registry::new();
+        let harness = Harness::default();
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let env = Env {
+            config: &config,
+            workspace: &workspace,
+            ext: &registry,
+            layout: None,
+            harness: &harness,
+            interrupt: &interrupt,
+            usage: None,
+            context_cap: None,
+            memory: None,
+            plan_mode: false,
+            agents_messages: &[],
+        };
+        let candidate = json!({"answer":"candidate", "count":7});
+        let outcome = subagents::run_job(env, &request.jobs[0], &mut NoTools, |env, _| {
+            std::fs::write(env.workspace.root().join("source.txt"), b"worker\0bytes").unwrap();
+            if conflict {
+                std::fs::write(&parent_path, b"parent\0bytes").unwrap();
+            }
+            let mut outcome = Outcome::incomplete(3, "unused");
+            outcome.status = subagents::Status::done(candidate.to_string());
+            outcome.data = Some(candidate.clone());
+            outcome
+        });
+        let expected = if conflict { "incomplete" } else { "done" };
+        assert_eq!(outcome.status.wire(), expected);
+        assert_eq!(outcome.data.as_ref(), Some(&candidate));
+        let isolation = outcome.isolation.as_ref().unwrap();
+        assert!(isolation.errors.is_empty());
+        assert_eq!(isolation.conflicts.is_empty(), !conflict);
+        assert_eq!(
+            std::fs::read(&parent_path).unwrap(),
+            if conflict {
+                b"parent\0bytes"
+            } else {
+                b"worker\0bytes"
+            }
+        );
+        if conflict {
+            assert!(outcome.status.text.contains("computation completed"));
+            assert!(outcome.status.text.contains("integration is incomplete"));
+            let recovery = isolation.kept.as_ref().unwrap();
+            assert_eq!(
+                std::fs::read(recovery.join("source.txt")).unwrap(),
+                b"worker\0bytes"
+            );
+        }
+        // The live publication boundary must not promote a candidate result to success.
+        let mut tasks = LiveTasks::default();
+        let body = tasks.tree.start("worker", "isolated", None);
+        tasks.jobs.insert(
+            "task-1".into(),
+            JobState {
+                body: body.clone(),
+                interrupt: interrupt.clone(),
+                worker: None,
+                active_tool: Arc::default(),
+                delivered: false,
+            },
+        );
+        let value = json!({"id":"task-1","status":outcome.status.wire(),"result":outcome.status.text,"data":outcome.data,"isolation":isolation});
+        settle_result(&body, &value);
+        let published = tasks.status(Some("task-1")).unwrap();
+        assert_eq!(published["status"], expected);
+        assert_eq!(published["data"], candidate);
+        assert_eq!(body.read(|node| node.result.phase), outcome.status.phase);
+        if conflict {
+            assert_eq!(published["isolation"]["conflicts"][0], "source.txt");
+            assert!(published["isolation"]["recovery_location"].is_string());
+            std::fs::remove_dir_all(isolation.kept.as_ref().unwrap()).unwrap();
+        }
+    }
+}

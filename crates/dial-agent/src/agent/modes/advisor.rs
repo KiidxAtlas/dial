@@ -1,6 +1,7 @@
 //! Opt-in advisor: a live per-round coach review plus an evidence-grounded completion review with
 //! bounded repair opportunities. Both reuse the `coach` role through escalation's request path.
 
+use crate::agent::prompts::modes::advisor::ROUND_QUESTION;
 use std::collections::VecDeque;
 
 use crate::agent::run::guidance::{self, Priority};
@@ -16,7 +17,6 @@ const MAX_REVIEWS: u32 = 2;
 const MAX_ROUND_EVIDENCE: usize = 6;
 const MAX_ROUND_REVIEWS: u32 = 24;
 const MAX_NOTE_CHARS: usize = 600;
-const ROUND_QUESTION: &str = "Review the latest tool round against the goal. Return ONLY JSON: {\"severity\":\"none|aside|concern|blocker\",\"note\":\"one or two sentences\"}. none = on track (empty note). aside = minor observation. concern = a likely mistake or missing check to address soon. blocker = the work cannot be correct as it stands (wrong target, broken requirement, claim contradicted by the evidence). Use blocker sparingly and only when the supplied evidence supports it. Missing evidence is uncertainty, not a blocker. Avoid style commentary and widening scope. You cannot certify correctness.";
 
 fn selected_review(
     config: &crate::config::types::IndependentReviewConfig,

@@ -95,7 +95,7 @@ pub(super) fn run(
         "session" => session(shell, app, agent, args),
         "delete" => delete_current(shell, app, agent),
         "pin" => pin_current(shell, app, agent),
-        "move" => move_current(shell, agent, args),
+        "move" => move_current(shell, app, agent, args),
         "restart" => restart(shell),
         _ => return None,
     };
@@ -340,25 +340,29 @@ fn match_account<'a>(
 /// Relocate this session into another directory's project (`/move`). The journal is copied
 /// with its header cwd rewritten and the original removed, then the live tool workspace is
 /// re-rooted to the new directory through `Agent::reroot_workspace`.
-fn move_current(shell: &mut Shell, agent: &mut Agent<'_>, args: &str) -> Result<Step> {
+fn move_current(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) -> Result<Step> {
     if args.is_empty() {
         shell.note("Move", "Usage: /move <path>");
         return Ok(Step::Done);
     }
-    match move_session(agent, args)? {
+    let (outcome, config) = move_project(app, agent, args)?;
+    match outcome {
         MoveOutcome::Moved(root) => {
             shell.stop_loop_for_session_change();
             shell.note(
                 "Move",
                 format!("Moved to {}. Tools now operate there.", root.display()),
-            )
+            );
+            return Ok(Step::Rebuild(Box::new(
+                config.expect("moved project validated"),
+            )));
         }
         MoveOutcome::Refused(reason) => shell.note("Move", reason),
     }
     Ok(Step::Done)
 }
 
-/// Whether [`move_session`] moved the session, or refused and left it where it was.
+/// Whether the project transition moved the session, or refused and left it where it was.
 pub(super) enum MoveOutcome {
     /// The session now lives in this project root.
     Moved(PathBuf),
@@ -369,7 +373,33 @@ pub(super) enum MoveOutcome {
 /// Relocate this session into the directory `args` names: the journal is copied with its header
 /// cwd rewritten and the original removed, then the live tool workspace is re-rooted through
 /// `Agent::reroot_workspace`. Refusals come back as [`MoveOutcome::Refused`], never as success.
+pub(super) fn move_project(
+    app: &App,
+    agent: &mut Agent<'_>,
+    args: &str,
+) -> Result<(MoveOutcome, Option<crate::config::types::Config>)> {
+    let mut config = None;
+    let outcome = move_session_checked(agent, args, |target| {
+        config = Some(crate::config::settings_store::load_session_config(
+            target,
+            &app.overlay,
+            app.models.borrow().as_ref(),
+        )?);
+        Ok(())
+    })?;
+    Ok((outcome, config))
+}
+
+#[cfg(test)]
 pub(super) fn move_session(agent: &mut Agent<'_>, args: &str) -> Result<MoveOutcome> {
+    move_session_checked(agent, args, |_| Ok(()))
+}
+
+fn move_session_checked(
+    agent: &mut Agent<'_>,
+    args: &str,
+    validate: impl FnOnce(&Layout) -> Result<()>,
+) -> Result<MoveOutcome> {
     let current = agent
         .layout()
         .ok_or_else(|| anyhow::anyhow!("agent has no project layout"))?
@@ -401,10 +431,26 @@ pub(super) fn move_session(agent: &mut Agent<'_>, args: &str) -> Result<MoveOutc
             current.project_root.display()
         )));
     }
+    validate(&target).context("destination settings invalid; session not moved")?;
     let moved = agent.session().relocate_to(&target)?;
-    let old = agent.swap_session(moved);
-    agent.reroot_workspace(&target)?;
-    old.remove_file()?;
+    agent.cancel_background_compaction();
+    let old = std::mem::replace(agent.session_mut(), moved);
+    if let Err(error) = agent.reroot_workspace(&target) {
+        let failed = std::mem::replace(agent.session_mut(), old);
+        let cleanup = failed.remove_file();
+        return Err(match cleanup {
+            Ok(()) => error.context("session not moved; original workspace retained"),
+            Err(cleanup) => error.context(format!("session not moved; original retained, but copied journal cleanup failed: {cleanup:#}")),
+        });
+    }
+    // The new journal and workspace are authoritative now. A source cleanup failure is
+    // reported, not returned as a failed move after publication.
+    if let Err(error) = old.remove_file() {
+        eprintln!(
+            "dial: session moved to {}, but source journal cleanup failed: {error:#}",
+            target.project_root.display()
+        );
+    }
     Ok(MoveOutcome::Moved(target.project_root.clone()))
 }
 
@@ -718,3 +764,6 @@ fn stats_command(shell: &mut Shell, app: &App, args: &str) -> Result<Step> {
     shell.note("Stats", stats::render_text(&report));
     Ok(Step::Done)
 }
+
+#[cfg(test)]
+mod relocation_tests;

@@ -390,6 +390,7 @@ pub fn call_controlled(
                 tracking: Some(config),
             },
             &mut || {
+                super::auto::check_stop(config)?;
                 if super::compute::background_active()
                     && (super::compute::paused(&config.user_dir)
                         || (config.compute_locks
@@ -619,6 +620,7 @@ pub fn train(config: &Config, active: &Version, output_dir: &Path) -> Result<Pat
         loop {
             let input = request.to_string();
             let mut requested = None;
+            let mut budget_stop = None;
             let output = run_command_handoff(
                 &config.python,
                 &[config
@@ -634,7 +636,18 @@ pub fn train(config: &Config, active: &Version, output_dir: &Path) -> Result<Pat
                     tracking: Some(config),
                 },
                 &mut || {
-                    if super::compute::paused(&config.user_dir)
+                    if budget_stop.is_none() {
+                        match super::auto::check_stop(config) {
+                            Err(error)
+                                if error.downcast_ref::<super::auto::BudgetReached>().is_some() =>
+                            {
+                                budget_stop = Some(error);
+                            }
+                            result => result?,
+                        }
+                    }
+                    if budget_stop.is_some()
+                        || super::compute::paused(&config.user_dir)
                         || (config.compute_locks
                             && super::compute::foreground_pending(&config.user_dir)?)
                     {
@@ -643,6 +656,9 @@ pub fn train(config: &Config, active: &Version, output_dir: &Path) -> Result<Pat
                         }
                         let since = requested.get_or_insert_with(Instant::now);
                         if since.elapsed() >= YIELD_GRACE {
+                            if let Some(error) = budget_stop.take() {
+                                return Err(error);
+                            }
                             return Err(super::compute::Preempted.into());
                         }
                     }
@@ -658,6 +674,11 @@ pub fn train(config: &Config, active: &Version, output_dir: &Path) -> Result<Pat
                     Ok(())
                 },
             );
+            // A cooperative worker may checkpoint and exit before the grace expires.
+            // Budget exhaustion ends this cycle; never reacquire or retry it as preemption.
+            if let Some(error) = budget_stop {
+                return Err(error);
+            }
             let output = match output {
                 Ok(output) => output,
                 Err(error) if error.downcast_ref::<super::compute::Preempted>().is_some() => {

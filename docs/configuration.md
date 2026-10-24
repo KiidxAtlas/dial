@@ -210,6 +210,11 @@ num_layers = 4
 max_seq_length = 8192
 ```
 
+Fresh LoRA training accepts ranks 1–128. Warm-start training can resume a validated composed
+adapter with rank up to 1024; its saved layout supplies the effective rank and target keys.
+Model identity, tensor shapes and finite weights are still validated before training. This allows
+admitted adapter mixtures to continue learning without relaxing the fresh-adapter limit.
+
 Verification reuse is enabled automatically for the exact built-in isolated Python AST check,
 without an input declaration, when Dial recognizes a conventional Unix CPython installation.
 It hashes the source and inherited environment and snapshots runtime directory membership and

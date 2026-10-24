@@ -383,7 +383,13 @@ impl Http {
                 break result;
             }
         };
-        if !self.sse {
+        // The optional GET stream may be unsupported or end normally, but an explicit
+        // session termination invalidates POST requests too and must reach the supervisor.
+        let session_ended = result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.downcast_ref::<SessionEnded>().is_some());
+        if !self.sse && !session_ended {
             return;
         }
         let error = result
@@ -443,6 +449,9 @@ impl Http {
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_owned);
                 return Err(self.auth.refused(status, challenge.as_deref()));
+            }
+            if status == 404 && self.session().is_some() {
+                return Err(anyhow::Error::new(SessionEnded(self.server.clone())));
             }
             let is_sse = response
                 .headers()

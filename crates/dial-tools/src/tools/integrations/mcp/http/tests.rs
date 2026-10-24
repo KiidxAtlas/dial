@@ -195,3 +195,48 @@ fn authorization_errors_preserve_the_http_status() {
         assert!(error.to_string().contains(&format!("HTTP {status}")));
     }
 }
+
+#[test]
+fn streamable_get_session_termination_closes_the_shared_connection() {
+    use std::io::Write;
+    for known_session in [false, true] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(&mut socket);
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let http = Arc::new(Http::new("expired", &url, &McpServerConfig::default(), None).unwrap());
+        if known_session {
+            *http.session.lock().unwrap() = Some("expired-session".into());
+        }
+        let (signals, received) = mpsc::channel();
+        let shared = Arc::new(Shared::new(Vec::new(), Some(signals)));
+        http.listen(shared.clone(), None);
+        server.join().unwrap();
+        assert_eq!(shared.is_closed(), known_session);
+        if known_session {
+            assert!(matches!(
+                received.try_recv(),
+                Ok(super::super::Signal::Closed)
+            ));
+        } else {
+            assert!(received.try_recv().is_err());
+        }
+    }
+}

@@ -388,9 +388,11 @@ pub fn command_line(server: &McpServerConfig) -> String {
 /// Whether a setting name holds a credential, so its value is masked and never echoed.
 pub fn looks_secret(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
-    ["key", "token", "secret", "password"]
-        .iter()
-        .any(|word| key.contains(word))
+    key == "openapi_mcp_headers"
+        || key == "authorization"
+        || ["key", "token", "secret", "password"]
+            .iter()
+            .any(|word| key.contains(word))
 }
 
 /// `<user_dir>/mcp`, where package caches are redirected so nothing lands in a global cache.

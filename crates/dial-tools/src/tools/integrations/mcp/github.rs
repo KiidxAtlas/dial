@@ -293,19 +293,36 @@ fn blocked(reason: impl Into<String>) -> Install {
 /// A GitHub API request. Rate limiting is reported as such, with how to raise the limit.
 fn api_get(base: &str, url: &str, what: &str) -> Result<fetch::Reply> {
     let auth = token(base).map(|token| format!("Bearer {token}"));
-    let mut headers = vec![
+    api_get_as(url, what, auth.as_deref())
+}
+
+/// [`api_get`] with an explicit `Authorization` value. A token GitHub rejects (401: expired,
+/// revoked or mistyped) is dropped and the request repeated anonymously, because search and
+/// repository reads work without one; a stale token in the environment must not hide every
+/// GitHub listing.
+fn api_get_as(url: &str, what: &str, auth: Option<&str>) -> Result<fetch::Reply> {
+    let headers = [
         ("Accept", "application/vnd.github+json"),
         ("X-GitHub-Api-Version", "2022-11-28"),
     ];
-    if let Some(auth) = &auth {
-        headers.push(("Authorization", auth.as_str()));
+    let mut anonymous = true;
+    let mut reply = match auth {
+        Some(auth) => {
+            anonymous = false;
+            let [accept, version] = headers;
+            fetch::get(url, &[accept, version, ("Authorization", auth)], what)?
+        }
+        None => fetch::get(url, &headers, what)?,
+    };
+    if reply.status == 401 && !anonymous {
+        reply = fetch::get(url, &headers, what)?;
+        anonymous = true;
     }
-    let reply = fetch::get(url, &headers, what)?;
     if matches!(reply.status, 403 | 429) {
         bail!(
             "{what} hit GitHub's rate limit{}",
-            if auth.is_none() {
-                "; set GITHUB_TOKEN or GH_TOKEN to raise it"
+            if anonymous {
+                "; set a valid GITHUB_TOKEN or GH_TOKEN to raise it"
             } else {
                 ""
             }

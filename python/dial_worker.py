@@ -986,13 +986,16 @@ def train(request):
 
 
 def train_in(request, scratch):
+    model_name = string(request, "model")
+    bounds = {"iters": (1, 10000), "batch_size": (1, 16), "num_layers": (1, 256),
+              "rank": (1, MAX_ADAPTER_RANK if request.get("resume_adapter") is not None else 128),
+              "max_seq_length": (32, 8192)}
+    values = {key: integer(request, key, *limits) for key, limits in bounds.items()}
+    # A resume rank is only a request hint: resume_layout validates the saved model,
+    # keys, shapes and finite tensors before replacing it with the adapter's own rank.
     import numpy as np
     from mlx_lm.lora import CONFIG_DEFAULTS, train_model
     from mlx_lm.tuner.datasets import CacheDataset
-    model_name = string(request, "model")
-    bounds = {"iters": (1, 10000), "batch_size": (1, 16), "num_layers": (1, 256),
-              "rank": (1, 128), "max_seq_length": (32, 8192)}
-    values = {key: integer(request, key, *limits) for key, limits in bounds.items()}
     train_records, valid_records = read_datasets(string(request, "train_data"), string(request, "valid_data"))
     require(min(len(train_records), len(valid_records)) >= values["batch_size"],
             "each dataset needs at least batch_size records")

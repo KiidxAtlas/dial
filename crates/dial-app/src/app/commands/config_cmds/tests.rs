@@ -46,7 +46,9 @@ fn written(changes: &[Change]) -> Vec<String> {
     changes
         .iter()
         .map(|change| match change {
-            Change::Set { path, .. } | Change::Remove { path } => path.clone(),
+            Change::Set { path, .. } | Change::Insert { path, .. } | Change::Remove { path } => {
+                path.clone()
+            }
         })
         .collect()
 }

@@ -1106,6 +1106,129 @@ fn endpoint_retry_resolves_rotated_or_removed_key_without_stale_fallback() {
     }
 }
 
+// All account/transport fixtures are local; these tests never refresh a token or contact ChatGPT.
+fn rotation_backend(dir: &Path, url: &str) -> Backend {
+    llm::chatgpt::test_account(dir, false);
+    let path = dir.join("chatgpt-accounts.json");
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let mut other = state["accounts"]["oaiapp_test"].clone();
+    other["subject"] = json!("oaiapp_other");
+    other["tokens"]["access_token"] = json!(llm::chatgpt::test_access("oaiapp_other"));
+    state["accounts"]["oaiapp_other"] = other;
+    crate::config::settings_store::write_private(&path, state.to_string().as_bytes()).unwrap();
+    let mut remote = backend(ProviderKind::ChatGpt {
+        user_dir: dir.into(),
+        model: "account-model".into(),
+    })
+    .with_account("oaiapp_test".into());
+    remote.chatgpt_url = Some(url.into());
+    remote
+}
+
+fn codex_rotation_success() -> Script {
+    Script::Sse(format!(
+        "data: {}\n\n",
+        json!({"type":"response.completed","response":{"status":"completed","output":[
+            {"type":"message","id":"msg_rotated","role":"assistant","content":[{"type":"output_text","text":"rotated"}]}
+        ]}})
+    ))
+}
+
+#[test]
+fn chatgpt_portable_failover_pins_backend_and_replays_next_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = fake::serve(vec![
+        fake::json(401, &json!({"error":{"message":"rejected"}})),
+        codex_rotation_success(),
+        codex_rotation_success(),
+    ]);
+    let mut remote = rotation_backend(dir.path(), &server.url);
+    // Constructors generate transport affinity IDs even without an owning session.
+    // Such an ID must not make a portable request look persistently bound.
+    assert!(remote.session_id().is_some());
+    assert!(!remote.session_bound);
+    let mut chat = request();
+    let reply = remote.chat(None, &chat, 5, None).unwrap();
+    assert_eq!(reply.text, "rotated");
+    assert!(!reply.provider_content.is_empty());
+    assert_eq!(remote.account_id(), Some("oaiapp_other"));
+    chat.messages.push(llm::assistant_message(&reply));
+    chat.messages
+        .push(json!({"role":"user","content":"continue"}));
+    remote.chat(None, &chat, 5, None).unwrap();
+    let requests = server.requests();
+    assert_eq!(requests.len(), 3);
+    for (raw, expected) in requests
+        .iter()
+        .zip(["oaiapp_test", "oaiapp_other", "oaiapp_other"])
+    {
+        assert_eq!(header(raw, "chatgpt-account-id").as_deref(), Some(expected));
+        assert_eq!(
+            header(raw, "authorization"),
+            Some(format!("Bearer {}", llm::chatgpt::test_access(expected)))
+        );
+    }
+}
+
+#[test]
+fn chatgpt_failover_refuses_bound_cache_and_existing_native_history() {
+    for binding in ["session", "cache", "native"] {
+        let dir = tempfile::tempdir().unwrap();
+        let server = fake::serve(vec![fake::json(
+            401,
+            &json!({"error":{"message":"rejected"}}),
+        )]);
+        let mut remote = rotation_backend(dir.path(), &server.url);
+        let mut chat = request();
+        match binding {
+            "session" => remote = remote.with_session_id("existing-session"),
+            "cache" => remote.prompt_cache_key = Some("existing-namespace".into()),
+            "native" => {
+                let scope = llm::model_config::native_replay_scope(
+                    "responses",
+                    &server.url,
+                    None,
+                    Some("oaiapp_test"),
+                    None,
+                    &[],
+                );
+                chat.messages.push(json!({"role":"assistant","content":"prior reply",
+                    "dial_provider_content":[{"type":"dial_response_item","scope":scope,
+                        "item":{"type":"reasoning","id":"rs_A","summary":[],"encrypted_content":"opaque-A"}}]}));
+            }
+            _ => unreachable!(),
+        }
+        let error = remote.chat(None, &chat, 5, None).unwrap_err();
+        assert!(
+            error.to_string().contains("account failover refused"),
+            "{error:#}"
+        );
+        assert_eq!(remote.account_id(), Some("oaiapp_test"));
+        assert_eq!(
+            server.requests().len(),
+            1,
+            "must not dispatch as B: {binding}"
+        );
+    }
+}
+
+#[test]
+fn chatgpt_failover_preserves_account_allowlist() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = fake::serve(vec![fake::json(
+        401,
+        &json!({"error":{"message":"rejected"}}),
+    )]);
+    let mut remote = rotation_backend(dir.path(), &server.url);
+    let mut config = crate::config::types::Config::default();
+    config.chatgpt_allowed_accounts = Some(["oaiapp_test".to_owned()].into());
+    remote = remote.with_steering(&config);
+    assert!(remote.chat(None, &request(), 5, None).is_err());
+    assert_eq!(remote.account_id(), Some("oaiapp_test"));
+    assert_eq!(server.requests().len(), 1);
+}
+
 #[test]
 fn endpoint_streams_when_a_callback_is_given() {
     let chunk = |c: &str| {

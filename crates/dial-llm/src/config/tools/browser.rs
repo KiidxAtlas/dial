@@ -14,6 +14,7 @@ pub struct BrowserConfig {
     /// Permit provisioning a missing pinned runtime. Off uses only installed/cached prerequisites.
     pub allow_install: bool,
     pub chromium_executable: Option<String>,
+    /// Overall operation cap in seconds; 0 explicitly opts into unlimited waits.
     pub timeout_secs: u64,
     /// Launch Chromium headless (default). Headed mode keeps the same sandbox and egress bridge.
     pub headless: bool,
@@ -42,7 +43,7 @@ impl Default for BrowserConfig {
             playwright_module: String::new(),
             allow_install: true,
             chromium_executable: None,
-            timeout_secs: 0,
+            timeout_secs: 30,
             headless: true,
             cdp_url: None,
             allow_attach: false,

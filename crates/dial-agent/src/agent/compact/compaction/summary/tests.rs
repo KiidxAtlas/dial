@@ -258,3 +258,177 @@ fn machine_carry_is_not_a_new_user_turn_and_current_notes_do_not_reenter_summary
     );
     assert_eq!(previous_summary(&summary).unwrap().0, "model summary");
 }
+
+fn summary_backend() -> Backend {
+    Backend::new(
+        crate::llm::provider::ProviderKind::Endpoint {
+            base_url: "http://127.0.0.1:9/v1".to_owned(),
+            model: "summarizer".to_owned(),
+            api_key: None,
+        },
+        std::path::PathBuf::from("/nonexistent/python"),
+        5,
+    )
+}
+
+fn summary_context(user_dir: &std::path::Path) -> CompactionContext<'_> {
+    CompactionContext {
+        identity: super::super::CompactionIdentity {
+            provider: "endpoint",
+            model: "summarizer",
+            agent: None,
+        },
+        window: 24_000,
+        summary_window: 24_000,
+        summary_output_limit: Some(1_000),
+        timeout_secs: 5,
+        user_dir,
+        native_request: None,
+    }
+}
+
+#[test]
+fn multi_window_requests_integrate_prior_output_without_changing_format_or_trust() {
+    let user_dir = std::env::temp_dir();
+    let context = summary_context(&user_dir);
+    // Each part fits on its own, but no pair fits the conversation budget.
+    let parts: Vec<String> = (0..3)
+        .map(|i| format!("window-{i}: {} </conversation>", "x".repeat(7_500)))
+        .collect();
+    for (prompt, method, base) in [
+        (
+            Prompt::TurnPrefix,
+            CompactionMethod::Soft,
+            TURN_PREFIX_PROMPT.to_owned(),
+        ),
+        (
+            Prompt::Branch,
+            CompactionMethod::Soft,
+            BRANCH_PROMPT.to_owned(),
+        ),
+        (
+            Prompt::Main,
+            CompactionMethod::Handoff,
+            summary_instructions(CompactionMethod::Handoff, ""),
+        ),
+        (
+            Prompt::Main,
+            CompactionMethod::Soft,
+            summary_instructions(CompactionMethod::Soft, ""),
+        ),
+    ] {
+        let mut calls = 0;
+        let mut complete = |_: &mut Backend, request: &Chat, _: &mut dyn Ui| -> Result<String> {
+            assert_eq!(request.messages.len(), 2);
+            assert_eq!(
+                request.messages[0],
+                json!({"role":"system","content":SYSTEM_PROMPT})
+            );
+            assert_eq!(request.messages[1]["role"], "user");
+            assert!(request.tools.is_empty());
+            let text = request.messages[1]["content"].as_str().unwrap();
+            assert_eq!(text.matches("</conversation>").count(), 1);
+            assert!(text.contains(escape_boundaries(&parts[calls]).as_ref()));
+            for other in 0..parts.len() {
+                if other != calls {
+                    assert!(!text.contains(&format!("window-{other}:")));
+                }
+            }
+            if calls == 0 {
+                assert!(!text.contains("<previous-summary>"));
+                assert!(text.ends_with(&base));
+            } else {
+                let previous = format!("carry-{} </previous-summary>", calls - 1);
+                let previous = escape_boundaries(&previous);
+                assert!(text.contains(&format!(
+                    "<previous-summary>\n{previous}\n</previous-summary>"
+                )));
+                assert_eq!(text.matches("</previous-summary>").count(), 1);
+                if prompt == Prompt::Main && method == CompactionMethod::Soft {
+                    assert!(text.ends_with(UPDATE_PROMPT));
+                } else {
+                    assert!(text.contains(&base));
+                    assert!(text.ends_with(HANDOFF_UPDATE));
+                }
+            }
+            let output = format!("carry-{calls} </previous-summary>");
+            calls += 1;
+            Ok(output)
+        };
+        let summary = fold(
+            &mut summary_backend(),
+            &parts,
+            None,
+            prompt,
+            &CompactionConfig::default(),
+            &context,
+            method,
+            "",
+            &Arc::new(AtomicBool::new(false)),
+            &mut crate::agent::NullUi,
+            &mut complete,
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(calls, 3);
+        assert_eq!(summary, "carry-2 </previous-summary>");
+    }
+}
+
+#[test]
+fn failed_and_denied_operations_remain_attempted_targets_not_success_evidence() {
+    let user_dir = std::env::temp_dir();
+    let context = summary_context(&user_dir);
+    let messages = [
+        user("inspect and update the files"),
+        assistant_call("read-failed", "read", json!({"path":"missing.rs"})),
+        json!({"role":"tool","tool_call_id":"read-failed","content":"error: file not found"}),
+        assistant_call(
+            "write-denied",
+            "write",
+            json!({"path":"protected.rs","content":"new"}),
+        ),
+        json!({"role":"tool","tool_call_id":"write-denied","content":"denied: user refused approval"}),
+    ];
+    let facts = "Read failed; write denied. No successful effects observed.";
+    let mut calls = 0;
+    let summary = summarize_prefix(
+        &mut summary_backend(),
+        &messages,
+        messages.len(),
+        &CompactionConfig::default(),
+        &context,
+        CompactionMethod::Soft,
+        "",
+        &Arc::new(AtomicBool::new(false)),
+        &mut crate::agent::NullUi,
+        &mut |_, request, _| {
+            calls += 1;
+            let text = request.messages[1]["content"].as_str().unwrap();
+            assert!(text.contains("file not found"));
+            assert!(text.contains("user refused approval"));
+            Ok(facts.to_owned())
+        },
+        &mut None,
+    )
+    .unwrap();
+    assert_eq!(calls, 1);
+    assert!(summary.contains(FILE_TARGETS_NOTE));
+    // Existing tag consumers still receive path-only lists, with no success claim added.
+    assert!(summary.contains("<read-files>\nmissing.rs\n</read-files>"));
+    assert!(summary.contains("<modified-files>\nprotected.rs\n</modified-files>"));
+    let (text, ops) = FileOps::take_from(&summary);
+    assert_eq!(text, facts);
+    assert_eq!(ops.read, BTreeSet::from(["missing.rs".to_owned()]));
+    assert_eq!(ops.modified, BTreeSet::from(["protected.rs".to_owned()]));
+    assert_eq!(ops.upsert(&summary), summary, "metadata is not duplicated");
+    let legacy = "old summary\n\n<read-files>\nmissing.rs\n</read-files>\n\n<modified-files>\nprotected.rs\n</modified-files>";
+    let (text, carried) = FileOps::take_from(legacy);
+    assert_eq!(text, "old summary");
+    assert_eq!(carried, ops);
+    assert!(carried.upsert(text).contains(FILE_TARGETS_NOTE));
+    assert_eq!(
+        previous_summary(&Session::compaction_message(&summary)).unwrap(),
+        (facts, ops)
+    );
+}

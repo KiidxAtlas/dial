@@ -697,6 +697,14 @@ impl LspTool {
         ws.check_protected_mutation(&from)?;
         ws.check_protected_mutation(&to)?;
         let pairs = rename_pairs(ws, &from, &to)?;
+        // Startup and willRenameFiles can run project code or wait while external writers act.
+        // Capture before either, including sources a server does not return text edits for.
+        let snapshot = Snapshot::capture(ws)?;
+        let units = if from.is_dir() {
+            vec![(from.clone(), to.clone())]
+        } else {
+            pairs.clone()
+        };
 
         // Files no server understands need no request; configured-but-missing servers still error.
         // Each server is asked only about the pairs it is responsible for.
@@ -742,7 +750,9 @@ impl LspTool {
             }
             server_edits.push(merge_workspace_edits(&values)?);
         }
-        let snapshot = Snapshot::capture(ws)?;
+        for (source, _) in &pairs {
+            snapshot.validate(ws, source)?;
+        }
         let sources: Vec<(&Client, &Value)> = started
             .iter()
             .zip(&server_edits)
@@ -778,16 +788,15 @@ impl LspTool {
             .first()
             .map(|(server, _, _)| server.language.clone())
             .unwrap_or_default();
+        // Approval may itself wait; revalidate even sources absent from the text-edit plan.
+        for (source, _) in &pairs {
+            snapshot.validate(ws, source)?;
+        }
         let mut notes = plan.commit(ws, &snapshot)?.join("\n");
         if let Some((_, client, _)) = started.first() {
             notes.push_str(&synchronize_applied(self, client, &plan, &language));
         }
 
-        let units: Vec<(PathBuf, PathBuf)> = if from.is_dir() {
-            vec![(from.clone(), to.clone())]
-        } else {
-            pairs.clone()
-        };
         // The moves are file mutations: record each target as created and each source as removed
         // before any of them happens, so `/undo` can restore them with the text edits.
         let observed = pairs.iter().try_for_each(|(source, target)| {
@@ -1362,8 +1371,15 @@ fn rename_pairs(ws: &Workspace, from: &Path, to: &Path) -> Result<Vec<(PathBuf, 
     if from == to {
         return Err("source and destination paths are identical".into());
     }
-    if to.exists() {
-        return Err(format!("destination already exists: {}", ws.rel(to)));
+    match std::fs::symlink_metadata(to) {
+        Ok(_) => return Err(format!("destination already exists: {}", ws.rel(to))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect destination {}: {error}",
+                ws.rel(to)
+            ));
+        }
     }
     if from.is_file() {
         return Ok(vec![(from.to_path_buf(), to.to_path_buf())]);
@@ -1413,8 +1429,9 @@ fn collect_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
     Ok(())
 }
 
-/// Moves each `(source, target)` unit in order. A failed move reverses the completed ones and
-/// reports any reversal that also failed, so callers know exactly what remains on disk.
+/// Moves each `(source, target)` unit without replacing existing names, including on rollback.
+/// A failed move reverses completed ones and reports any reversal that also failed; a recreated
+/// source is preserved and the moved original remains at the reported target for recovery.
 fn move_units(units: &[(PathBuf, PathBuf)]) -> Result<(), String> {
     let mut done: Vec<&(PathBuf, PathBuf)> = Vec::new();
     for unit in units {
@@ -1422,7 +1439,9 @@ fn move_units(units: &[(PathBuf, PathBuf)]) -> Result<(), String> {
         if let Err(error) = move_one(source, target) {
             let mut stuck = Vec::new();
             for (undo_source, undo_target) in done.iter().rev().map(|unit| (&unit.0, &unit.1)) {
-                if let Err(restore) = std::fs::rename(undo_target, undo_source) {
+                if let Err(restore) =
+                    crate::platform::fs::rename_noreplace(undo_target, undo_source)
+                {
                     stuck.push(format!("{}: {restore}", undo_target.display()));
                 }
             }
@@ -1446,7 +1465,7 @@ fn move_one(source: &Path, target: &Path) -> std::io::Result<()> {
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::rename(source, target)
+    crate::platform::fs::rename_noreplace(source, target)
 }
 
 /// Merges every server's `WorkspaceEdit` into one `documentChanges` list, so `Plan::prepare`

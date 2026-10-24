@@ -71,6 +71,17 @@ pub(in crate::app) fn refresh_overlay(env: &mut OverlayEnv<'_>, overlay: &mut Ac
             && let Ok(config) = env.app.reload()
         {
             crate::app::commands::extensions_browser::refresh(panel, env.app.layout(), &config);
+        } else if let Some(query) = panel.catalog_search_due(Instant::now()) {
+            match env.app.reload() {
+                Ok(config) => crate::app::commands::extensions_browser::fetch_catalog(
+                    panel,
+                    env.app.layout(),
+                    &config,
+                    crate::ui::overlay::extensions::model::Tab::Mcp,
+                    query,
+                ),
+                Err(error) => panel.banner(format!("could not read settings: {error:#}")),
+            }
         }
     }
     if let ActiveOverlay::Models(models) = &mut *overlay

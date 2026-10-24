@@ -336,6 +336,9 @@ pub struct Backend {
     credential: Option<CredentialSource>,
     /// Stable conversation identity for provider proxy attribution and live steering.
     session_id: Option<String>,
+    /// A generated transport correlation ID is not a persistent conversation binding.
+    /// Set only when an owner supplies a session ID or binds session state.
+    session_bound: bool,
     codex_websocket: bool,
     image_notices: llm::images::NoticeTracker,
     /// The llama.cpp tool-template notice was shown in this conversation.
@@ -404,6 +407,7 @@ impl Backend {
             usage_scope: None,
             account_id,
             session_id: llm::factory_droid::new_request_id().ok(),
+            session_bound: false,
             prompt_cache_key: None,
             session_identity_error,
             oauth: None,
@@ -458,6 +462,7 @@ impl Backend {
             self.wire = Default::default();
         }
         self.session_id = Some(session_id);
+        self.session_bound = true;
         self
     }
 
@@ -516,6 +521,7 @@ impl Backend {
             self.wire = Default::default();
         }
         self.session_id = Some(session.id().to_owned());
+        self.session_bound = true;
         use sha2::{Digest, Sha256};
         let mut state = session.control_state();
         if !state.is_object() {
@@ -1898,8 +1904,42 @@ impl Backend {
                                 && allowed.is_none_or(|set| set.contains(&account.client_id))
                         })
                 {
+                    // A request does not own the persistent session/role binding. Changing only
+                    // its auth would stamp B-owned history into an A-bound conversation. An
+                    // operator must explicitly select/rebind a clean session instead.
+                    if self.session_bound
+                        || self.prompt_cache_key.is_some()
+                        || llm::responses::has_native_history(req)
+                    {
+                        return Err(error.context(
+                            "ChatGPT account failover refused: this request has a session/cache identity or native replay history; explicitly select another allowed account and start a clean chat (or rebind portable history) before retrying",
+                        ));
+                    }
+                    // The request was prepared using this profile. Failover must not silently
+                    // change capabilities, image handling or token budgets halfway through it.
+                    if self
+                        .steering_config
+                        .as_ref()
+                        .and_then(|config| config.active_model_profile())
+                        .is_none()
+                    {
+                        let candidate_profile = llm::chatgpt::scoped_model_profile(
+                            user_dir,
+                            Some(&candidate.client_id),
+                            model,
+                        )?;
+                        ensure!(
+                            serde_json::to_value(&candidate_profile)?
+                                == serde_json::to_value(&self.profile)?,
+                            "ChatGPT account failover requires a different model profile; explicitly select the account and rebuild the backend before retrying"
+                        );
+                    }
                     tried_accounts.insert(candidate.client_id.clone());
                     active_account = Some(candidate.client_id);
+                    // Unbound portable requests have no external identity to reconcile. Pin
+                    // the backend as well as this attempt, even if the next attempt fails:
+                    // the next request must not revert to the rejected account.
+                    self.account_id = active_account.clone();
                     on_notice(
                         "ChatGPT credential was rejected or quota exhausted; retrying with another signed-in account",
                     );

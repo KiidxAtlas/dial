@@ -15,9 +15,10 @@ use crate::ui::{
     theme::{Theme, Tok},
 };
 use crossterm::event::{Event, KeyEventKind};
+#[cfg(test)]
+use model::JobProgress;
 use model::{
-    Browser, Form, FormKind, Intent, Job, JobProgress, Origin, Row, SharedCatalog, SharedProgress,
-    State, Tab,
+    Browser, Form, FormKind, Intent, Job, Origin, Row, SharedCatalog, SharedProgress, State, Tab,
 };
 use ratatui::{
     Frame,
@@ -25,16 +26,20 @@ use ratatui::{
     text::{Line, Span},
     widgets::Paragraph,
 };
+use std::time::{Duration, Instant};
 
 pub struct ExtensionsOverlay {
     pub browser: Browser,
-    /// Written by the install worker; mirrored into `browser` on each tick.
-    progress: Option<SharedProgress>,
+    /// Keep every admitted request subscribed until its result arrives, including when a
+    /// later request is rejected while an earlier install is still running.
+    progress: Vec<(SharedProgress, bool)>,
     /// Pending catalog fetches, started by the command controller.
     catalogs: Vec<(Tab, SharedCatalog)>,
     catalog_job: bool,
     /// Set when a finished install may have changed what is installed; the app refreshes rows.
     needs_refresh: bool,
+    /// When the search text last changed and has not been sent to the MCP catalogs yet.
+    query_edited: Option<Instant>,
 }
 
 impl Default for ExtensionsOverlay {
@@ -47,17 +52,38 @@ impl ExtensionsOverlay {
     pub fn new() -> Self {
         Self {
             browser: Browser::new(),
-            progress: None,
+            progress: Vec::new(),
             catalogs: Vec::new(),
             catalog_job: false,
             needs_refresh: false,
+            query_edited: None,
         }
     }
 
-    pub fn attach_catalog(&mut self, tab: Tab, listing: SharedCatalog) {
+    /// Pause after the last keystroke before the MCP catalogs are searched while typing.
+    pub const SEARCH_PAUSE: Duration = Duration::from_millis(500);
+
+    /// Follow a background catalog fetch for `tab` and `query`, replacing any still pending for it.
+    pub fn attach_catalog(&mut self, tab: Tab, query: String, listing: SharedCatalog) {
         self.catalogs.retain(|(pending, _)| *pending != tab);
-        self.browser.begin_catalog(tab, String::new(), 1);
+        self.browser.begin_catalog(tab, query, 1);
         self.catalogs.push((tab, listing));
+    }
+
+    /// The MCP query to search the catalogs for once typing has paused for [`Self::SEARCH_PAUSE`],
+    /// so a server missing from the loaded rows is found without pressing Enter. Waits while a
+    /// listing is still loading, so the newest text is searched once it lands.
+    pub fn catalog_search_due(&mut self, now: Instant) -> Option<String> {
+        let edited = self.query_edited?;
+        if now.saturating_duration_since(edited) < Self::SEARCH_PAUSE
+            || self.browser.catalog(Tab::Mcp).loading
+        {
+            return None;
+        }
+        self.query_edited = None;
+        self.browser
+            .catalog_search_pending()
+            .then(|| self.browser.query().trim().to_owned())
     }
 
     fn apply_catalogs(&mut self) {
@@ -76,62 +102,53 @@ impl ExtensionsOverlay {
         }
     }
 
-    /// Follow the progress of the install started by the app. Replaces any earlier job view.
+    /// Follow a request without losing an earlier worker's form or completion.
     pub fn attach(&mut self, progress: SharedProgress) {
-        self.progress = Some(progress);
-        self.browser.job = Job::Idle;
-        self.needs_refresh = false;
+        self.progress
+            .push((progress, std::mem::take(&mut self.catalog_job)));
     }
 
     /// Mirror the worker's progress into the view. Called once per UI tick.
     pub fn tick(&mut self) {
         self.apply_catalogs();
-        let Some(shared) = &self.progress else {
-            return;
-        };
-        let (snapshot, form, catalog) = match shared.lock() {
-            Ok(mut guard) => {
-                let form = guard.form.take();
-                let catalog = guard.catalog.take();
-                (guard.clone(), form, catalog)
-            }
-            Err(_) => return,
-        };
-        if let Some(form) = form {
-            self.browser.form = Some(form);
-        }
-        if let Some(update) = catalog {
-            self.catalog_job = true;
-            self.browser.apply_catalog(update);
-        }
-        let JobProgress {
-            label,
-            lines,
-            result,
-            ..
-        } = snapshot;
-        match (label, result) {
-            (Some(label), None) => {
-                if !matches!(self.browser.job, Job::Running { .. }) {
-                    self.browser.start_job(label);
+        for (shared, mut catalog_job) in std::mem::take(&mut self.progress) {
+            let snapshot = match shared.lock() {
+                Ok(mut guard) => {
+                    let snapshot = guard.clone();
+                    guard.form = None;
+                    guard.catalog = None;
+                    Some(snapshot)
                 }
-                if let Job::Running { lines: shown, .. } = &mut self.browser.job {
-                    *shown = lines;
-                }
+                Err(_) => None,
+            };
+            let Some(snapshot) = snapshot else {
+                self.progress.push((shared, catalog_job));
+                continue;
+            };
+            if let Some(form) = snapshot.form {
+                self.browser.form = Some(form);
             }
-            (label, Some((ok, message))) => {
-                if !matches!(self.browser.job, Job::Done { .. }) {
-                    if let (Some(label), false) =
-                        (label, matches!(self.browser.job, Job::Running { .. }))
-                    {
-                        self.browser.start_job(label);
-                    }
+            if let Some(update) = snapshot.catalog {
+                catalog_job = true;
+                self.browser.apply_catalog(update);
+            }
+            match (snapshot.label, snapshot.result) {
+                (label, Some((ok, message))) => {
+                    self.browser
+                        .start_job(label.unwrap_or_else(|| "Extensions".into()));
                     self.browser.finish_job(ok, message);
-                    self.needs_refresh = !self.catalog_job;
-                    self.catalog_job = false;
+                    self.needs_refresh |= !catalog_job;
+                }
+                (label, None) => {
+                    if let Some(label) = label {
+                        self.browser.job = Job::Running {
+                            label,
+                            lines: snapshot.lines,
+                        };
+                    }
+                    self.progress.push((shared, catalog_job));
                 }
             }
-            (None, None) => {}
         }
     }
 
@@ -156,6 +173,21 @@ impl ExtensionsOverlay {
 
     /// Route one key. Returns an action for the app or the controller to run.
     pub fn handle(&mut self, event: &Event, keys: &Keymap) -> OverlayEvent {
+        if let Event::Paste(text) = event {
+            // Single-line fields accept literal text only; pasted control characters never
+            // navigate, submit, or become terminal control sequences.
+            if let Some(form) = self.browser.form.as_mut() {
+                for c in text.chars().filter(|c| !c.is_control()) {
+                    form.push(c);
+                }
+            } else if self.browser.confirm.is_none() && self.browser.searching() {
+                for c in text.chars().filter(|c| !c.is_control()) {
+                    self.browser.push_query(c);
+                }
+                self.query_edited = Some(Instant::now());
+            }
+            return OverlayEvent::None;
+        }
         let Event::Key(key) = event else {
             return OverlayEvent::None;
         };
@@ -182,22 +214,44 @@ impl ExtensionsOverlay {
             return OverlayEvent::None;
         }
 
+        // Navigation leaves the text field but retains its filter. Printable bindings
+        // (such as vim-style j/k) remain search text rather than triggering actions.
+        if b.searching()
+            && typed_char(key).is_none()
+            && (keys.matches(Action::SelectUp, key)
+                || keys.matches(Action::SelectDown, key)
+                || keys.matches(Action::SelectPageUp, key)
+                || keys.matches(Action::SelectPageDown, key)
+                || keys.matches(Action::TabNext, key)
+                || keys.matches(Action::TabPrev, key)
+                || matches!(
+                    key.code,
+                    crossterm::event::KeyCode::Home | crossterm::event::KeyCode::End
+                ))
+        {
+            b.end_search();
+        }
+
         if b.searching() {
             if keys.matches(Action::SelectCancel, key) {
                 b.clear_search();
             } else if keys.matches(Action::SelectConfirm, key) {
                 b.end_search();
                 let tab = b.tab();
-                if !matches!(tab, Tab::Plugins | Tab::Marketplaces) {
+                let catalog = b.catalog(tab);
+                if !matches!(tab, Tab::Plugins | Tab::Marketplaces)
+                    && !catalog.loading
+                    && (catalog.page == 0 || catalog.query.trim() != b.query().trim())
+                {
                     let query = b.query().to_owned();
-                    self.catalogs.retain(|(pending, _)| *pending != tab);
-                    self.catalog_job = true;
-                    return action(&b.begin_catalog(tab, query, 1));
+                    return self.browse(tab, query, 1);
                 }
             } else if key.code == crossterm::event::KeyCode::Backspace {
                 b.pop_query();
+                self.query_edited = Some(Instant::now());
             } else if let Some(c) = typed_char(key) {
                 b.push_query(c);
+                self.query_edited = Some(Instant::now());
             }
             return OverlayEvent::None;
         }
@@ -252,6 +306,10 @@ impl ExtensionsOverlay {
                     None => OverlayEvent::None,
                 };
             }
+            if b.catalog_search_pending() && b.visible(Tab::Mcp).is_empty() {
+                let query = b.query().to_owned();
+                return self.browse(Tab::Mcp, query, 1);
+            }
             b.toggle_details();
             return OverlayEvent::None;
         }
@@ -270,9 +328,7 @@ impl ExtensionsOverlay {
                     return self.load_next_page();
                 }
                 let query = b.query().to_owned();
-                self.catalogs.retain(|(pending, _)| *pending != tab);
-                self.catalog_job = true;
-                action(&b.begin_catalog(tab, query, 1))
+                self.browse(tab, query, 1)
             }
             Some('a') if b.tab() == Tab::Marketplaces => {
                 b.form = Some(Form::marketplace());
@@ -315,13 +371,19 @@ impl ExtensionsOverlay {
         let b = &mut self.browser;
         let tab = b.tab();
         let state = b.catalog(tab);
-        if state.loading || !state.more {
+        if state.loading || !state.more || state.query.trim() != b.query().trim() {
             return OverlayEvent::None;
         }
         let (query, page) = (state.query.clone(), state.page + 1);
+        self.browse(tab, query, page)
+    }
+
+    /// Request one catalog page for `tab`, replacing any fetch still pending for it.
+    fn browse(&mut self, tab: Tab, query: String, page: usize) -> OverlayEvent {
         self.catalogs.retain(|(pending, _)| *pending != tab);
         self.catalog_job = true;
-        action(&b.begin_catalog(tab, query, page))
+        self.query_edited = None;
+        action(&self.browser.begin_catalog(tab, query, page))
     }
 
     pub fn banner(&mut self, message: impl Into<String>) {
@@ -346,12 +408,15 @@ impl ExtensionsOverlay {
 
             // Search line.
             let search = if browser.searching() {
+                let mut search = format!("/ {}_", browser.query());
                 let summary = browser.match_summary();
-                if summary.is_empty() {
-                    format!("/ {}_", browser.query())
-                } else {
-                    format!("/ {}_  · {}", browser.query(), summary)
+                if !summary.is_empty() {
+                    search.push_str(&format!("  · {summary}"));
                 }
+                if browser.catalog_search_pending() {
+                    search.push_str("  · searching every MCP catalog when you pause, or Enter now");
+                }
+                search
             } else if browser.query().is_empty() {
                 "/ to search".to_string()
             } else {
@@ -407,6 +472,11 @@ impl ExtensionsOverlay {
                 } else if rows.is_empty() {
                     let empty = if catalog.loading {
                         "Loading the catalog…".to_owned()
+                    } else if browser.catalog_search_pending() {
+                        format!(
+                            "Nothing loaded matches \"{}\". The official registry, Smithery, npm and GitHub are searched when you pause typing, or press Enter.",
+                            browser.query().trim()
+                        )
                     } else if !browser.query().is_empty() {
                         "No matches on this tab. Left/Right checks the other tabs; Esc clears the search.".to_owned()
                     } else if browser.tab() == Tab::Marketplaces {
@@ -442,6 +512,21 @@ impl ExtensionsOverlay {
                     ("Tab".to_owned(), "next".to_owned()),
                     (ctx.keys.label(Action::SelectCancel), "cancel".to_owned()),
                 ]
+            } else if browser.searching() {
+                vec![
+                    (
+                        pair_label(ctx.keys, Action::SelectUp, Action::SelectDown),
+                        "browse results".to_owned(),
+                    ),
+                    (
+                        ctx.keys.label(Action::SelectConfirm),
+                        "finish search".to_owned(),
+                    ),
+                    (
+                        ctx.keys.label(Action::SelectCancel),
+                        "clear search".to_owned(),
+                    ),
+                ]
             } else {
                 let esc = if browser.details_open {
                     "back"
@@ -453,6 +538,10 @@ impl ExtensionsOverlay {
                 // Most useful first; the footer drops hints before the last (the way out) when
                 // space runs short. Row actions appear only when they apply to the selection.
                 let mut items = Vec::new();
+                items.push((
+                    pair_label(ctx.keys, Action::SelectUp, Action::SelectDown),
+                    "select".to_owned(),
+                ));
                 if browser.selected().is_some() {
                     items.push((ctx.keys.label(Action::SelectConfirm), enter_label(browser)));
                 }
@@ -727,11 +816,14 @@ fn row_line(
         Span::raw("  "),
         chip,
         Span::raw(" ".repeat(chip_pad)),
-        Span::styled(row.summary.clone(), theme.fg(Tok::Muted)),
     ];
     for tag in &row.tags {
         spans.push(Span::styled(format!(" #{tag}"), theme.fg(Tok::Dim)));
     }
+    spans.push(Span::styled(
+        format!("  {}", crate::ui::text::one_line(&row.summary)),
+        theme.fg(Tok::Muted),
+    ));
     let style: Style = if selected {
         chrome::selected_style(theme)
     } else {

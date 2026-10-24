@@ -2403,13 +2403,18 @@ pub(in crate::agent) fn run_job(
     };
     if isolation.interrupted {
         outcome.status = Status::interrupted();
-    } else if !isolation.errors.is_empty()
-        && outcome.status.phase == crate::runtime::Phase::Completed
-    {
-        outcome.status = Status::failed(format!(
-            "worker finished, but isolated changes encountered merge errors; see isolation metadata\n\nWorker answer:\n{}",
-            outcome.status.text
-        ));
+    } else if outcome.status.phase == crate::runtime::Phase::Completed {
+        if !isolation.errors.is_empty() {
+            outcome.status = Status::failed(format!(
+                "worker computation completed, but isolated integration encountered merge errors; see isolation metadata\n\nWorker answer:\n{}",
+                outcome.status.text
+            ));
+        } else if !isolation.conflicts.is_empty() {
+            outcome.status = Status::incomplete(format!(
+                "worker computation completed, but isolated integration is incomplete due to parent conflicts; see isolation metadata and recovery_location\n\nWorker answer:\n{}",
+                outcome.status.text
+            ));
+        }
     }
     approver.notice(&isolation.describe());
     outcome.isolation = Some(isolation);

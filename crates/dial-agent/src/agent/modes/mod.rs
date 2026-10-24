@@ -106,19 +106,28 @@ impl Agent<'_> {
     /// from the workspace root, so only the system prompt, which embeds the cwd, needs a rebuild.
     /// Checkpoints are rebound to the target project so later edits snapshot the new root.
     pub fn reroot_workspace(&mut self, target: &crate::config::paths::Layout) -> Result<()> {
-        self.workspace = self.workspace.reroot(&target.project_root)?;
-        self.layout = Some(target.clone());
-        if self.checkpoints.is_some() {
+        let mut workspace = self.workspace.reroot(&target.project_root)?;
+        let checkpoints = if self.checkpoints.is_some() {
             let checkpoints = std::sync::Arc::new(crate::storage::checkpoint::Checkpoints::new(
                 target.checkpoints_dir().join(self.session.id()),
                 target.project_root.clone(),
             )?);
-            self.workspace = self.workspace.clone().with_observer(std::sync::Arc::new(
-                super::CheckpointObserver(checkpoints.clone()),
-            ));
-            self.checkpoints = Some(checkpoints);
+            workspace = workspace.with_observer(std::sync::Arc::new(super::CheckpointObserver(
+                checkpoints.clone(),
+            )));
+            Some(checkpoints)
+        } else {
+            None
+        };
+        let dirs = workspace.additional_roots().to_vec();
+        if let Some(checkpoints) = &checkpoints {
+            checkpoints.set_added_roots(&dirs);
         }
-        self.persist_workspace_roots()?;
+        // All fallible setup and the durable root write precede live publication.
+        self.session.set_additional_dirs(&dirs)?;
+        self.workspace = workspace;
+        self.layout = Some(target.clone());
+        self.checkpoints = checkpoints;
         self.rebuild_system();
         Ok(())
     }

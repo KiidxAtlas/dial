@@ -137,3 +137,44 @@ fn steering_drops_stale_advice_without_losing_protocol_findings_or_safety() {
     reset_for_steering(&mut pending);
     assert_eq!(pending, [result, context, safety]);
 }
+
+#[test]
+fn delivered_notes_retire_across_requests_even_when_buried_behind_tool_history() {
+    let mut messages = history();
+    let protected = vec![
+        json!({"role":"developer","content":"operator","dial_transient":true}),
+        json!({"role":"user","content":"coordination","dial_child_coordination":true}),
+        json!({"role":"user","content":"memory","dial_memory_context":true,"dial_transient":true}),
+        json!({"role":"user","content":"rules","dial_portable_rules":true,"dial_transient":true}),
+        json!({"role":"user","content":"evidence","dial_evidence":{"artifact":"artifact://proof"},"dial_transient":true}),
+        json!({"role":"user","content":"persistent"}),
+        note(Priority::Safety, "enforced boundary"),
+    ];
+    messages.extend(protected.clone());
+    messages.push(
+        json!({"role":"user","content":"continue after premature stop","dial_transient":true}),
+    );
+    messages.push(note(Priority::Loop, "old narration warning"));
+    // A later tool result buries both notes outside cap's trailing transient segment.
+    messages.push(json!({"role":"assistant","content":"checked","tool_calls":[{"id":"2"}]}));
+    messages.push(json!({"role":"tool","tool_call_id":"2","content":"current evidence"}));
+    let undelivered = messages.clone();
+    retire_delivered(&mut messages, false);
+    assert_eq!(
+        messages, undelivered,
+        "failed inference must preserve advice for retry"
+    );
+    retire_delivered(&mut messages, true);
+    assert!(!contents(&messages).contains(&"continue after premature stop"));
+    assert!(!contents(&messages).contains(&"old narration warning"));
+    for context in &protected {
+        assert!(messages.contains(context));
+    }
+    assert!(contents(&messages).contains(&"current evidence"));
+    // Request two selects only its fresh advice; request three cannot inherit it.
+    messages.push(note(Priority::Review, "fresh review"));
+    cap(&mut messages);
+    assert_eq!(messages.last().unwrap()["content"], "fresh review");
+    retire_delivered(&mut messages, true);
+    assert!(!contents(&messages).contains(&"fresh review"));
+}

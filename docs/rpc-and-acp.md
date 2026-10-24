@@ -60,6 +60,13 @@ sessions are not concurrently writable. ACP does not advertise unsupported files
 capabilities. Both automation transports use bounded serialized stdout and stop honestly on stalled
 or broken consumers instead of reporting partially delivered success.
 
+The implementation keeps the controller (`rpc.rs`) separate from the agent-owning actor
+(`rpc/actor.rs`). Only the actor mutates sessions or performs model/tool work; the controller
+serves cached queries, routes approvals and questions, and initiates cancellation/cleanup.
+Each parked ACP session owns its tools and plan mode in one record, so switching and closing
+cannot leave independently keyed execution state behind. This separation does not change wire
+methods, approval authority, queue limits or cancellation deadlines.
+
 ACP renders `notice`, `background` and `fatal` events as unchanged `agent_message_chunk` text. Each chunk also carries standard `_meta.dial` with `event` and, only when present, `kind`, `lane`, `tokens`, `name` and `replace`, so clients can tell sources apart. This is metadata preservation only; ACP does not implement client-side replacement of background output.
 
 ACP correlates tool calls and final results by the RPC `call_id`, not the tool name, so overlapping

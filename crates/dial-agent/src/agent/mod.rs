@@ -8,6 +8,7 @@ pub mod base;
 pub mod compact;
 pub mod memory;
 pub mod model;
+pub(crate) mod prompts;
 pub mod run;
 pub mod safety;
 pub mod tool_trace;

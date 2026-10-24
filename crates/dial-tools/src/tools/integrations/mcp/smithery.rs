@@ -664,31 +664,9 @@ pub fn normalize_qualified_name(name: &str) -> String {
     }
 }
 
-/// Lowercase slug of the qualified name, `mcp-server` when empty.
+/// Use the catalog's single bare-key naming policy for every MCP installer.
 pub fn to_config_name(qualified_name: &str) -> String {
-    let lowered = qualified_name.to_lowercase();
-    let lowered = lowered.trim_start_matches('@');
-    let mut out = String::new();
-    let mut previous_dash = false;
-    for c in lowered.chars() {
-        let keep = c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '.' | '-');
-        let c = if keep { c } else { '-' };
-        if c == '-' {
-            if previous_dash {
-                continue;
-            }
-            previous_dash = true;
-        } else {
-            previous_dash = false;
-        }
-        out.push(c);
-    }
-    let name = out.trim_matches('-');
-    if name.is_empty() {
-        "mcp-server".to_owned()
-    } else {
-        name.to_owned()
-    }
+    super::catalog::config_name(qualified_name)
 }
 
 /// `base`, or `base-2`…`base-999`, or `base-<millis>`, whichever is first free.
@@ -791,8 +769,9 @@ fn to_server(config: &Value) -> Result<McpServerConfig> {
     serde_json::from_value(server).context("Smithery produced an invalid MCP server config.")
 }
 
+/// Install without replacing a server another operation saved after discovery/health checking.
 pub fn config_change(name: &str, server: &McpServerConfig) -> Result<Change> {
-    Ok(Change::Set {
+    Ok(Change::Insert {
         path: format!("mcp.{name}"),
         value: toml::Value::try_from(server)?,
     })

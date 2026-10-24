@@ -169,3 +169,40 @@ fn declared_runner_diagnosis_requires_launch_facts_and_preserves_app_errors() {
         CheckStatus::CodeFailed
     );
 }
+
+#[test]
+fn rust_single_test_targets_are_not_hidden_by_empty_targets() {
+    use crate::runtime::{execution::ProcessOutcome, tool_output::ToolOutput};
+    let check = FocusedCheck {
+        name: "workspace tests".into(),
+        command: "cargo test --workspace".into(),
+        timeout_secs: 1,
+    };
+    let completed = |text: &str| {
+        ToolOutput::ok(text.into()).with_process(ProcessOutcome {
+            started: true,
+            exit_code: Some(0),
+            signal: None,
+            timed_out: false,
+            cancelled: false,
+            output_complete: true,
+        })
+    };
+    for text in [
+        "running 1 test\ntest only_test ... ok\nrunning 0 tests\n",
+        "running 0 tests\nrunning 1 test\ntest only_test ... ok\n",
+        "running 1 test\ntest only_test ... ok\n",
+    ] {
+        assert!(!zero_tests(text), "{text}");
+        assert_eq!(
+            classify(&check, &completed(text), false),
+            CheckStatus::Passed
+        );
+    }
+    let empty = "running 0 tests\nrunning 0 tests\n";
+    assert!(zero_tests(empty));
+    assert_eq!(
+        classify(&check, &completed(empty), false),
+        CheckStatus::Unverified
+    );
+}

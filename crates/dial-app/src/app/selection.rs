@@ -91,7 +91,7 @@ pub(super) fn next_favorite(
 /// The settings path a change writes.
 pub(super) fn change_path(change: &Change) -> &str {
     match change {
-        Change::Set { path, .. } | Change::Remove { path } => path,
+        Change::Set { path, .. } | Change::Insert { path, .. } | Change::Remove { path } => path,
     }
 }
 

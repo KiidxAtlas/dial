@@ -63,6 +63,11 @@ Duplicate content is detected by a content hash and returns the existing fact.
 
 The improvement loop uses verified trajectories, sealed evaluation gates, rollback monitoring, and compute leases. Foreground/local learning settings are independent from background scheduling. Background cycles are on by default (`improve.background = true`) and still wait for idle compute, AC power, the daily budget, and any `/compute` pause. Set `improve.background = false` to run cycles only through `dial improve cycle`. Endpoint-model background learning additionally requires a positive `improve.max_daily_usd` budget. A zero dollar budget is a hard stop for background cloud cycles, not an unlimited allowance. `improve.daily_compute_minutes` governs local background compute separately (zero means unlimited local compute).
 
+Local background operations check that compute budget while running, not just between operations.
+Training requests a cooperative checkpoint/pause on budget exhaustion and uses the existing bounded
+termination path if the worker does not settle. Exhaustion ends the cycle rather than retrying as
+ordinary foreground preemption; recorded usage and active lease time both count toward the limit.
+
 Repository-derived practice tasks are sourced from local git history and tests when available; generated curriculum tasks remain a separate source. Evaluation snapshots stay isolated from training trajectories. Manually registered repository tasks remain available for curated cases.
 
 Review usage and cycle reports after enabling background work. API-equivalent subscription usage is not invoice cost; only observed priced API usage can enforce a dollar ceiling reliably. Unpriced requests must not be treated as free.

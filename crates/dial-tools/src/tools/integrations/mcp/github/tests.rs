@@ -184,3 +184,50 @@ fn a_repository_without_a_package_links_to_itself() {
 fn tokens_are_never_sent_to_other_hosts() {
     assert!(token("http://127.0.0.1:9").is_none());
 }
+
+/// Loopback host answering 401 to any request carrying `Authorization` and 200 otherwise,
+/// counting signed requests.
+fn serve_rejecting_tokens() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    let signed = std::sync::Arc::new(AtomicUsize::new(0));
+    let seen = signed.clone();
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let Ok(clone) = stream.try_clone() else {
+                continue;
+            };
+            let mut reader = BufReader::new(clone);
+            let mut authorized = false;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                authorized |= line.to_ascii_lowercase().starts_with("authorization:");
+            }
+            let (status, body) = if authorized {
+                seen.fetch_add(1, Ordering::SeqCst);
+                ("401 Unauthorized", r#"{"message":"Bad credentials"}"#)
+            } else {
+                ("200 OK", r#"{"total_count":0,"items":[]}"#)
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    (format!("http://{addr}"), signed)
+}
+
+#[test]
+fn a_rejected_token_falls_back_to_an_anonymous_request() {
+    let (base, signed) = serve_rejecting_tokens();
+    let url = format!("{base}/search/repositories?q=supabase");
+    let reply = api_get_as(&url, "GitHub search", Some("Bearer stale")).expect("anonymous retry");
+    assert_eq!(reply.status, 200);
+    assert_eq!(signed.load(std::sync::atomic::Ordering::SeqCst), 1);
+}

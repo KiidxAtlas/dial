@@ -78,7 +78,13 @@ An index is one JSON document:
 
 ## Marketplaces and /extensions
 
-`/extensions` is the one place to find and install MCP servers, plugins and skills. Its tabs are MCP servers, Plugins, Skills and Marketplaces. Listings load in the background when the browser opens, and `/` then Enter searches every MCP source. Adding, refreshing or searching an index installs nothing. Installing is one Enter (or `i`) followed by a confirmation, and removing, disabling and installing always wait for that confirmation.
+`/extensions` is the one place to find and install MCP servers, plugins and skills. Its tabs are MCP servers, Plugins, Skills and Marketplaces. Listings load in the background when the browser opens. Press `/` to type a filter; MCP catalogs are searched when typing pauses, or immediately with Enter. Arrow keys leave the search field with the filter retained: Up/Down select results and Left/Right switch tabs. Page Up/Down and Home/End also navigate results; `/` resumes editing and Esc clears the filter. Enter in the search field finishes searching, without installing or re-fetching an already loaded query. On a result, Enter (or `i`) requests installation and then waits for confirmation. Adding, refreshing or searching an index installs nothing; removing, disabling and installing always wait for confirmation.
+
+Search and setup fields accept pasted text without submitting it; single-line fields discard control characters. A rejected catalog request clears its loading state, and earlier install progress and setup forms remain subscribed until completion.
+
+MCP result tags appear before descriptions so credential requirements are visible while browsing. Declared API key/token requirements are distinguished from optional credentials and ordinary required settings. `auth unknown` means the listing does not establish the server's authentication requirements, not that it is key-free. Smithery's platform API key is distinguished from the server's own settings. Open details with `v` for declared inputs and metadata limitations; no credential values are displayed in these labels.
+
+Installed/imported MCP command displays omit arguments and remote URLs because either may carry credentials; the saved execution configuration is unchanged. Installations recheck name availability under the settings locks and refuse conflicts rather than overwrite a server installed by another session. Smithery names use the same bare-key normalization as other MCP catalogs.
 
 A marketplace is a named index of plugins and skills. Dial bundles three curated skill catalogs:
 
@@ -238,8 +244,10 @@ Path permission rules apply to `git` `paths`. Default prompt commands `/review`,
 it; a file in `.dial/commands/` with the same name replaces them. The former `commit` prompt command is now `/commit-work`, since `/commit` is the commit command that generates the message and commits.
 
 **Budgets.** `[budget] max_session_cost_usd` and `max_turn_cost_usd` stop a turn between model
-requests. They rely on catalog pricing and reported usage, so a model without a known price is never
-stopped by them (`/cost` shows whether pricing is available).
+requests. A turn's observed-cost allowance is shared across automatic verification repairs,
+stop-hook continuations and auxiliary work; continuations do not reset it. These are observed-cost
+boundaries, not invoice ceilings: missing pricing/usage and in-flight requests can add charges.
+A model without known pricing cannot be stopped by an estimated charge (`/cost` shows pricing availability).
 
 **Custom agents.** `[agents.<name>]` with `base` (`scout`, `reviewer` or `planner`), `prompt`,
 optional `description`, `tools` (can only narrow the base's tools) and `max_steps`. Writers are not

@@ -690,6 +690,20 @@ pub(super) struct Endpoint<'a> {
     pub headers: &'a [(&'a str, &'a str)],
 }
 
+/// Native replay is account/endpoint-owned, including encrypted compaction state.
+pub(super) fn has_native_history(chat: &Chat) -> bool {
+    chat.messages.iter().any(|message| {
+        !message["dial_compaction_model"].is_null()
+            || message["dial_provider_content"]
+                .as_array()
+                .is_some_and(|items| {
+                    items
+                        .iter()
+                        .any(|item| item["type"] == "dial_response_item")
+                })
+    })
+}
+
 /// Both transports must verify and stamp the same native-history ownership.
 pub(super) fn validate_history(endpoint: Endpoint<'_>, chat: &Chat) -> Result<String> {
     let replay_scope = super::model_config::native_replay_scope(
@@ -881,14 +895,17 @@ fn exchange_inner(
                 )
             })
         {
-            bail!(
-                "ChatGPT plan usage is unavailable or its shared allowance is exhausted; review Dial in ChatGPT Settings > Usage"
-            );
+            return Err(super::errors::Classified::new(
+                super::errors::ErrorClass::QuotaExhausted { reset_at: None },
+                "ChatGPT plan usage is unavailable or its shared allowance is exhausted; review Dial in ChatGPT Settings > Usage",
+            ).into());
         }
         if codex_account_id.is_some() && matches!(status, 401 | 403) {
-            bail!(
-                "ChatGPT sign-in or plan permission expired; Continue with ChatGPT in /providers"
-            );
+            return Err(super::errors::Classified::new(
+                super::errors::ErrorClass::Auth,
+                "ChatGPT sign-in or plan permission expired; Continue with ChatGPT in /providers",
+            )
+            .into());
         }
         return Err(super::http_error(status, &bytes, Some(token), delay));
     }

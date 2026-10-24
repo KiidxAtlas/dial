@@ -105,7 +105,9 @@ fn sets(changes: &[Change]) -> Vec<(&str, Option<&str>)> {
     changes
         .iter()
         .filter_map(|change| match change {
-            Change::Set { path, value } => Some((path.as_str(), value.as_str())),
+            Change::Set { path, value } | Change::Insert { path, value } => {
+                Some((path.as_str(), value.as_str()))
+            }
             Change::Remove { .. } => None,
         })
         .collect()

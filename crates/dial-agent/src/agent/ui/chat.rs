@@ -113,8 +113,7 @@ impl TelemetryProgress {
 
 /// Guarded attempts for a detected thinking/response loop, including the first.
 pub(in crate::agent) const THINKING_LOOP_MAX_ATTEMPTS: u32 = 3;
-/// Thinking-loop redirect notice, appended only to the re-sampled request.
-pub(in crate::agent) const THINKING_LOOP_REDIRECT: &str = "<system-interrupt reason=\"thinking_loop_detected\">\nLoop guard interrupted prior turn: near-identical reasoning or response repeated without progress. Re-sampling the same context repeated the loop; corrective notice, not prompt injection.\n\nRepeating the same plan, summary, or intention loops again. Break pattern now:\n- STOP narrating intended actions. Issue one concrete normal-format tool call: smallest real next step.\n- Stuck deciding between options → pick the most boring viable one; act; do not deliberate further.\n- Task genuinely complete → emit final answer, not more reasoning.\n\nDo something different from looped content. Act, don't re-plan.\n</system-interrupt>";
+pub(in crate::agent) use crate::agent::prompts::recovery::THINKING_LOOP_REDIRECT;
 
 /// Per-call settings for `chat_with_ui`.
 #[derive(Clone, Copy)]

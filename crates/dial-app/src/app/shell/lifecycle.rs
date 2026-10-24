@@ -43,6 +43,7 @@ impl Shell {
             .unwrap_or_default();
         let commands = context::discover_commands(&app.layout);
         let mut shell = Shell {
+            files: super::file_discovery::Files::new(),
             loop_mode: Default::default(),
             runtime: Default::default(),
             pending_result: None,
@@ -151,6 +152,15 @@ impl Shell {
 
     /// Observe disk on a bounded timer. A running agent only receives a pending snapshot.
     pub(in crate::app) fn refresh_resources(&mut self, app: &App, force: bool, busy: bool) -> bool {
+        let mut files_changed = false;
+        self.files.request(&app.layout.project_root);
+        if let Some(listing) = self.files.poll() {
+            self.composer.set_files(listing.paths);
+            if let Some(diagnostic) = listing.diagnostic {
+                self.note("File completion", diagnostic);
+            }
+            files_changed = true;
+        }
         let signalled = self.resources.events.as_ref().is_some_and(|events| {
             events
                 .dirty
@@ -161,11 +171,11 @@ impl Shell {
             _ => RESOURCE_TTL,
         };
         if !force && !signalled && self.resources.at.elapsed() < interval {
-            return false;
+            return files_changed;
         }
         self.resources.at = Instant::now();
         let mut diagnostics = Vec::new();
-        let mut changed = false;
+        let mut changed = files_changed;
         match settings_fingerprint(&app.layout) {
             Ok(stamp) if force || self.resources.settings != Some(stamp) => {
                 self.resources.settings = Some(stamp);
@@ -292,22 +302,7 @@ impl Shell {
 
     pub(super) fn refresh_commands(&mut self, app: &App) {
         self.refresh_command_resources(app);
-        let paths = ignore::WalkBuilder::new(&app.layout.project_root)
-            .follow_links(false)
-            .require_git(false)
-            .build()
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
-            .filter_map(|entry| {
-                entry
-                    .path()
-                    .strip_prefix(&app.layout.project_root)
-                    .ok()
-                    .map(|p| p.to_string_lossy().into_owned())
-            })
-            .filter(|path| !path.chars().any(|c| c.is_control() || c.is_whitespace()))
-            .collect();
-        self.composer.set_files(paths);
+        self.files.request(&app.layout.project_root);
     }
 
     /// Home screen and, for a resumed session, its earlier conversation.
@@ -400,6 +395,33 @@ impl Shell {
         }
     }
 
+    pub(in crate::app) fn after_project_change(&mut self, app: &App) {
+        self.pending_config = None;
+        self.resources = ResourceWatch {
+            at: Instant::now() - RESOURCE_TTL,
+            settings: None,
+            resources: None,
+            events: resource_events(&app.layout),
+            diagnostic: None,
+            reload: settings_store::SettingsReload::new(&app.layout, &app.overlay, &app.config),
+        };
+        self.composer
+            .set_project_root(app.layout.project_root.clone());
+        self.composer.set_files(Vec::new());
+        self.git = Git::default();
+        self.status.branch.clear();
+        self.title = format!(
+            "dial · {}",
+            app.layout
+                .project_root
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+        );
+        self.home = None;
+        self.refresh_commands(app);
+    }
+
     pub(in crate::app) fn after_adopt(&mut self, app: &App) {
         super::paint::update_model_status(&mut self.status, &mut self.home, &app.config);
         self.teach_changed(app);
@@ -417,6 +439,7 @@ impl Shell {
     }
 
     pub(in crate::app) fn finish(&mut self) -> Option<String> {
+        self.files.stop();
         self.auth_job.take();
         // A read-out or microphone capture must not outlive the shell.
         self.stop_speech();

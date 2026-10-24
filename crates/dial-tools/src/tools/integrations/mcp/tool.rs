@@ -99,12 +99,11 @@ impl McpTool {
         cancel: &dyn Fn() -> bool,
         progress: &dyn Fn(&str),
     ) -> ToolOutput {
-        let arguments = if args.is_object() {
-            args.clone()
-        } else {
-            json!({})
-        };
-        let params = json!({"name": self.remote.name, "arguments": arguments});
+        if !args.is_object() {
+            return ToolOutput::err("MCP tool arguments must be a JSON object")
+                .with_effects(Effects::None);
+        }
+        let params = json!({"name": self.remote.name, "arguments": args});
         let client = match self.session.client_until(cancel) {
             Ok(client) => client,
             Err(error) => return ToolOutput::err(format!("{error:#}")).with_effects(Effects::None),

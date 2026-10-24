@@ -248,8 +248,33 @@ struct Choice {
     selected: usize,
 }
 
-/// Returns history entries matching a prefix, up to a limit.
+/// Returns newest-first history entries matching a case-insensitive substring, up to a limit.
 type HistoryProvider = std::sync::Arc<dyn Fn(&str, usize) -> Vec<String> + Send + Sync>;
+
+/// One in-flight lookup and one replaceable, debounced request: slow providers never block input
+/// or grow a thread per keystroke. Results are collected by the existing autocomplete poll loop.
+struct HistoryLookup {
+    tx: std::sync::mpsc::Sender<(u64, Vec<String>)>,
+    rx: std::sync::mpsc::Receiver<(u64, Vec<String>)>,
+    epoch: u64,
+    query: Option<String>,
+    pending: Option<(u64, String, std::time::Instant)>,
+    running: bool,
+}
+
+impl HistoryLookup {
+    fn new() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        Self {
+            tx,
+            rx,
+            epoch: 0,
+            query: None,
+            pending: None,
+            running: false,
+        }
+    }
+}
 
 pub struct Composer {
     editor: Editor,
@@ -271,6 +296,7 @@ pub struct Composer {
     /// Latest background-ranking request; a worker whose request is no longer the latest stops.
     rank_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
     history_provider: Option<HistoryProvider>,
+    history_lookup: HistoryLookup,
     menu: Option<Menu>,
     /// The exact draft the user dismissed the menu/ghost on; editing the text ends the dismissal.
     dismissed: Option<String>,
@@ -286,7 +312,7 @@ pub struct Composer {
     choice: Option<Choice>,
     queue_notice: Option<String>,
     exit_armed: bool,
-    /// `(placeholder, full text)` for collapsed pastes still referenced by the draft.
+    /// Payloads referenced by the draft, saved draft, undo/redo or bounded kill rings.
     pastes: Vec<(String, String)>,
     paste_count: usize,
     /// Keep pasted-image files alive for the session because message expansion happens after submit.
@@ -335,6 +361,7 @@ impl Composer {
             files: std::sync::Arc::new(Vec::new()),
             argument_completions: Vec::new(),
             history_provider: None,
+            history_lookup: HistoryLookup::new(),
             double_left: DoubleTap::default(),
             autocomplete_rx,
             autocomplete_tx,
@@ -359,6 +386,10 @@ impl Composer {
 
     pub fn set_history_provider(&mut self, provider: Option<HistoryProvider>) {
         self.history_provider = provider;
+        self.history_lookup.epoch = self.history_lookup.epoch.wrapping_add(1);
+        self.history_lookup.pending = None;
+        self.history_lookup.query = None;
+        self.refresh_history_search();
     }
 
     /// Attach an image from the platform clipboard and insert its quoted path in the draft.
@@ -393,7 +424,7 @@ impl Composer {
         self.saved_draft = None;
         self.exit_armed = false;
         self.dismissed = None;
-        self.pastes.clear();
+        self.prune_pastes();
         self.choice = None;
         // Replacing the draft abandons an in-progress queue edit: put the original back, never drop it.
         self.restore_queued_edit();
@@ -428,6 +459,11 @@ impl Composer {
         if self.history_limit != 0 {
             let excess = self.history.len().saturating_sub(self.history_limit);
             self.history.drain(..excess);
+            // Browsing indexes refer to the old history. Rebase surviving entries and clamp
+            // removed ones to the oldest remaining entry without losing the saved draft.
+            if let Some(index) = self.history_index {
+                self.history_index = Some(index.saturating_sub(excess));
+            }
         }
     }
 
@@ -677,7 +713,7 @@ impl Composer {
             stage: SteerStage::Pending,
             untaken: true,
         });
-        self.clear();
+        self.finish_draft();
         self.queue_notice = None;
         ComposerEvent::None
     }
@@ -766,6 +802,7 @@ impl Composer {
             search.query.insert(&clean.replace('\n', " "));
             search.selected = 0;
             search.scroll = 0;
+            self.refresh();
             return;
         }
         let lines = clean.trim_end_matches('\n').split('\n').count();
@@ -847,11 +884,7 @@ impl Composer {
             return ComposerEvent::Action(action);
         }
         if keys.matches(Action::HistorySearch, &key) {
-            let entries = self
-                .history_provider
-                .as_ref()
-                .map(|provider| provider("", 500))
-                .unwrap_or_else(|| self.history.iter().rev().take(500).cloned().collect());
+            let entries = self.history.iter().rev().take(500).cloned().collect();
             self.search = Some(Search {
                 query: Editor::default(),
                 entries,
@@ -960,13 +993,9 @@ impl Composer {
         if self.editor.text.trim().is_empty() {
             return ComposerEvent::None;
         }
-        let draft = std::mem::take(&mut self.editor.text);
-        self.editor.cursor = 0;
-        let sent = expand_pastes(&draft, &self.pastes);
+        let sent = expand_pastes(&self.editor.text, &self.pastes);
         self.learn_words(&sent);
-        self.pastes.clear();
-        self.history_index = None;
-        self.saved_draft = None;
+        self.finish_draft();
         // Sending an edited queue item consumes it; the original is intentionally not restored.
         self.editing_queue = None;
         self.push_history(sent.clone());
@@ -996,7 +1025,7 @@ impl Composer {
         let follow_up = edit.as_ref().map_or(follow_up, |edit| edit.follow_up);
         let index = edit.map_or(self.queued.len(), |edit| edit.index.min(self.queued.len()));
         self.queued.insert(index, (sent, follow_up));
-        self.clear();
+        self.finish_draft();
         self.queue_notice = None;
         ComposerEvent::None
     }
@@ -1376,12 +1405,15 @@ impl Composer {
                 changed = true;
             }
         }
+        changed |= self.refresh_history_search();
         changed
     }
 
     /// Whether a background ranking is outstanding, so the event loop must wake to collect it.
     pub fn autocomplete_pending(&self) -> bool {
         self.menu.as_ref().is_some_and(|menu| menu.pending)
+            || self.history_lookup.pending.is_some()
+            || self.history_lookup.running
     }
 
     /// Marks every outstanding background ranking as stale and returns the new latest request id.
@@ -1391,7 +1423,73 @@ impl Composer {
             + 1
     }
 
+    /// A successful send ends this draft's recovery lifetime. History keeps the expanded message;
+    /// a marker typed in a later draft must not resurrect a previously submitted payload.
+    fn finish_draft(&mut self) {
+        self.editing_queue = None;
+        self.editor = Editor::default();
+        self.pastes.clear();
+        self.clear();
+    }
+
+    fn prune_pastes(&mut self) {
+        self.pastes.retain(|(marker, _)| {
+            self.editor.references(marker)
+                || self
+                    .saved_draft
+                    .as_ref()
+                    .is_some_and(|draft| draft.references(marker))
+        });
+    }
+
+    fn refresh_history_search(&mut self) -> bool {
+        let query = self.search.as_ref().map(|search| search.query.text.clone());
+        let lookup = &mut self.history_lookup;
+        if lookup.query != query {
+            lookup.epoch = lookup.epoch.wrapping_add(1);
+            lookup.query = query.clone();
+            lookup.pending = query
+                .filter(|_| self.history_provider.is_some())
+                .map(|query| {
+                    (
+                        lookup.epoch,
+                        query,
+                        std::time::Instant::now() + std::time::Duration::from_millis(75),
+                    )
+                });
+        }
+        let mut changed = false;
+        while let Ok((epoch, entries)) = lookup.rx.try_recv() {
+            lookup.running = false;
+            if epoch == lookup.epoch
+                && let Some(search) = &mut self.search
+            {
+                search.entries = entries;
+                search.selected = 0;
+                search.scroll = 0;
+                changed = true;
+            }
+        }
+        if !lookup.running
+            && lookup
+                .pending
+                .as_ref()
+                .is_some_and(|(_, _, due)| *due <= std::time::Instant::now())
+            && let Some(provider) = self.history_provider.clone()
+            && let Some((epoch, query, _)) = lookup.pending.take()
+        {
+            lookup.running = true;
+            let tx = lookup.tx.clone();
+            std::thread::spawn(move || {
+                let entries = provider(&query, 500);
+                let _ = tx.send((epoch, entries));
+            });
+        }
+        changed
+    }
+
     fn refresh(&mut self) {
+        self.prune_pastes();
         if self
             .dismissed
             .as_deref()

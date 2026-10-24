@@ -1042,7 +1042,22 @@ fn an_empty_stop_is_retried_with_a_nudge_instead_of_ending_the_turn() {
     );
     assert_eq!((text.as_str(), outcome), ("done", TurnOutcome::Completed));
     assert_eq!(requests.len(), 2);
-    assert!(sent_messages(&requests[1]).contains("Stopped without actionable output"));
+    let expected = crate::agent::safety::stream_guards::render_retry_prompt(
+        crate::agent::safety::stream_guards::EMPTY_STOP_RETRY,
+        1,
+        crate::agent::safety::stream_guards::EMPTY_STOP_MAX_RETRIES,
+    );
+    assert!(
+        crate::llm::fake::body(&requests[1])["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| {
+                message["content"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(&expected))
+            })
+    );
 }
 
 #[test]
@@ -1055,7 +1070,22 @@ fn an_announced_action_without_a_tool_call_is_retried() {
     );
     assert_eq!((text.as_str(), outcome), ("Done.", TurnOutcome::Completed));
     assert_eq!(requests.len(), 2);
-    assert!(sent_messages(&requests[1]).contains("You said you would continue"));
+    let expected = crate::agent::safety::stream_guards::render_retry_prompt(
+        crate::agent::safety::stream_guards::UNEXPECTED_STOP_RETRY,
+        1,
+        crate::agent::safety::stream_guards::UNEXPECTED_STOP_MAX_RETRIES,
+    );
+    assert!(
+        crate::llm::fake::body(&requests[1])["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| {
+                message["content"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(&expected))
+            })
+    );
 }
 
 #[test]

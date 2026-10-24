@@ -92,6 +92,30 @@ pub(in crate::agent) fn reset_for_steering(messages: &mut Vec<Value>) {
     });
 }
 
+/// Plain, request-only harness text, not marked context, evidence or coordination. Share the
+/// identity rule with coalescing so a note cannot become persistent merely by being merged.
+pub(in crate::agent) fn is_plain_note(message: &Value) -> bool {
+    message["role"] == "user"
+        && message["dial_transient"] == true
+        && message["content"].is_string()
+        && message.as_object().is_some_and(|object| {
+            object
+                .keys()
+                .all(|key| !key.starts_with("dial_") || key == "dial_transient" || is_marker(key))
+        })
+}
+
+/// Retire delivered request-only notes before new feedback is appended. Match note identity,
+/// not tail indices: projection/compaction can move notes and tool traffic can bury them.
+/// Failed transport is not delivery. Safety boundaries and specially marked data remain.
+pub(in crate::agent) fn retire_delivered(messages: &mut Vec<Value>, delivered: bool) {
+    if delivered {
+        messages.retain(|message| {
+            !is_plain_note(message) || Priority::of(message) == Some(Priority::Safety)
+        });
+    }
+}
+
 /// Keep only the highest-priority advisory note among this request's trailing transient
 /// messages and return the dropped ones. Stored history before the tail is never touched.
 pub(in crate::agent) fn cap(messages: &mut Vec<Value>) -> Vec<Value> {

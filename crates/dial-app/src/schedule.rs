@@ -491,11 +491,37 @@ impl Store {
             .and_then(|t| toml::from_str(&t).ok())
             .unwrap_or_default()
     }
-    fn load_baselines(&self) -> HashMap<String, [u8; 32]> {
+    fn load_baselines(&self) -> HashMap<String, SavedBaseline> {
         fs::read_to_string(self.baseline_path())
             .ok()
             .and_then(|t| toml::from_str(&t).ok())
             .unwrap_or_default()
+    }
+    fn load_scheduler(&self) -> Scheduler {
+        let mut scheduler = Scheduler {
+            last_run: self.load_state(),
+            ..Default::default()
+        };
+        for (id, saved) in self.load_baselines() {
+            let fingerprint = match saved {
+                SavedBaseline::Legacy(fp) => fp,
+                SavedBaseline::Bound {
+                    fingerprint,
+                    definition,
+                } => {
+                    scheduler.definitions.insert(id.clone(), definition);
+                    fingerprint
+                }
+            };
+            scheduler.watches.insert(
+                id,
+                Watch {
+                    baseline: Some(fingerprint),
+                    pending: None,
+                },
+            );
+        }
+        scheduler
     }
     fn write_atomic(&self, path: PathBuf, text: &str) -> Result<()> {
         fs::create_dir_all(&self.dir)?;
@@ -506,10 +532,18 @@ impl Store {
         Ok(())
     }
     fn save_state(&self, scheduler: &Scheduler) {
-        let baselines: HashMap<String, [u8; 32]> = scheduler
+        let baselines: HashMap<String, SavedBaseline> = scheduler
             .watches
             .iter()
-            .filter_map(|(id, watch)| watch.baseline.map(|fp| (id.clone(), fp)))
+            .filter_map(|(id, watch)| {
+                Some((
+                    id.clone(),
+                    SavedBaseline::Bound {
+                        fingerprint: watch.baseline?,
+                        definition: scheduler.definitions.get(id)?.clone(),
+                    },
+                ))
+            })
             .collect();
         let write = || -> Result<()> {
             // A torn state file would make every interval schedule look overdue, so writes are atomic.
@@ -550,6 +584,17 @@ pub enum Reason {
     Changed,
 }
 
+// Old fingerprint-only files remain readable; their definitions are bound on first load.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum SavedBaseline {
+    Legacy([u8; 32]),
+    Bound {
+        fingerprint: [u8; 32],
+        definition: Entry,
+    },
+}
+
 #[derive(Default)]
 struct Watch {
     baseline: Option<[u8; 32]>,
@@ -561,9 +606,24 @@ struct Watch {
 pub struct Scheduler {
     pub last_run: HashMap<String, u64>,
     watches: HashMap<String, Watch>,
+    definitions: HashMap<String, Entry>,
 }
 
 impl Scheduler {
+    fn reconcile(&mut self, fresh: &[Entry]) {
+        self.watches.retain(|id, _| {
+            fresh.iter().any(|entry| {
+                entry.id == *id && self.definitions.get(id).is_none_or(|old| old == entry)
+            })
+        });
+        self.last_run
+            .retain(|id, _| fresh.iter().any(|entry| entry.id == *id));
+        self.definitions = fresh
+            .iter()
+            .map(|entry| (entry.id.clone(), entry.clone()))
+            .collect();
+    }
+
     pub fn due(
         &mut self,
         entry: &Entry,
@@ -1582,22 +1642,7 @@ pub fn run(
     })?;
     let exe = std::env::current_exe()?;
     let root = &layout.project_root;
-    let mut scheduler = Scheduler {
-        last_run: store.load_state(),
-        watches: store
-            .load_baselines()
-            .into_iter()
-            .map(|(id, fp)| {
-                (
-                    id,
-                    Watch {
-                        baseline: Some(fp),
-                        pending: None,
-                    },
-                )
-            })
-            .collect(),
-    };
+    let mut scheduler = store.load_scheduler();
     let events = if once {
         None
     } else {
@@ -1612,7 +1657,6 @@ pub fn run(
             }
         }
     };
-    let mut definitions: HashMap<String, Entry> = HashMap::new();
     let mut globs: HashMap<String, globset::GlobSet> = HashMap::new();
     let mut entries: Vec<Entry> = Vec::new();
     let mut stamp = None;
@@ -1634,21 +1678,10 @@ pub fn run(
                             eprintln!("dial schedule: {problem}");
                         }
                     }
-                    scheduler.watches.retain(|id, _| {
-                        fresh
-                            .iter()
-                            .any(|entry| entry.id == *id && definitions.get(id) == Some(entry))
-                    });
-                    scheduler
-                        .last_run
-                        .retain(|id, _| fresh.iter().any(|entry| entry.id == *id));
+                    scheduler.reconcile(&fresh);
                     errors
                         .current
                         .retain(|id, _| fresh.iter().any(|entry| entry.id == *id));
-                    definitions = fresh
-                        .iter()
-                        .map(|entry| (entry.id.clone(), entry.clone()))
-                        .collect();
                     // Entries were validated, so their watch sets compile.
                     globs = fresh
                         .iter()

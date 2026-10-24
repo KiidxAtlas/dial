@@ -2,6 +2,12 @@
 
 The prompt editor is a grapheme-aware multiline editor whose editing operations are keymap `Action`s, so bindings remain inspectable and rebindable. Consecutive typing is coalesced into undo units; kill operations feed a bounded kill ring with yank and yank-pop. Word movement and deletion are implemented by the editor. Long bracketed pastes are represented by a draft placeholder and expanded on submit, so the visible prompt does not need to render an unbounded payload.
 
+Collapsed-paste payloads survive draft replacement, clear, undo and redo. They are retained only while their marker is recoverable from the current or saved history-browsing draft, the editor's bounded undo/redo history, or its bounded kill ring; unreachable payloads are discarded during refresh.
+
+Successful submission or queueing ends that draft's undo/redo and paste-payload lifetime. History retains the expanded prompt; a placeholder typed into a later draft cannot resurrect a previously sent payload.
+
+`Ctrl+R` searches recent in-memory prompts immediately and queries the configured history provider with the entered case-insensitive substring (up to 500 matching results, not just the newest 500 prompts). Provider lookups are debounced and serialized off the input thread, with only the newest pending query retained. Responses from dismissed searches, older queries or replaced providers are ignored. While a lookup runs, existing matches remain usable.
+
 Autocomplete candidates are ranked on worker threads and delivered back to the composer tagged with the originating query. Results are only applied while that query still matches the active menu. Refresh project candidates outside keystroke handling with `Composer::set_files` and `Composer::set_commands`.
 
 Image file paths explicitly pasted into a prompt are recognized during user-message expansion and converted into integrity-checked local image references. Clipboard image paste uses platform clipboard utilities and stores temporary image files for the lifetime needed by submission. The LLM image layer verifies references and applies model-specific resizing before inference. Tool-originated image references remain constrained by the project permission rules.
