@@ -81,6 +81,7 @@ knowledge::{codebase, provenance}}` paths that the binary and tests use.
 | `run` | turn loop, engine driver, tool-call dispatch, tool exposure, call summaries |
 | `model` | backends and routing, Laya, local model profiles |
 | `window` | context window, prompt assembly, request prefix |
+| `prompts` | shared built-in instruction sources, grouped by purpose; ownership index in `prompts/README.md` |
 | `compact` | compaction and compaction runtime |
 | `verify` | focused verification, repair, completion and auto-escalation |
 | `safety` | approvals and safety rules |
@@ -92,6 +93,11 @@ knowledge::{codebase, provenance}}` paths that the binary and tests use.
 
 `modes/` (goal, plan review, ratchet, loop runner and others) stays at the `agent` root and is
 mounted by `agent/mod.rs`.
+
+Start at [the prompt and core-behavior index](crates/dial-agent/src/agent/prompts/README.md)
+when changing instructions. Shared wording lives in `agent/prompts`; assembly, runtime
+selection, safety enforcement and budgets remain in their domain owners. Lower-layer
+tool contracts and self-contained domain prompts are linked there, not duplicated.
 
 ## Dependency boundaries
 

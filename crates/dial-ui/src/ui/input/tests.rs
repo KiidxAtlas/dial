@@ -106,3 +106,36 @@ fn a_stalled_burst_ending_in_enter_submits_but_an_inner_line_break_stays() {
         Some("\n")
     );
 }
+
+#[test]
+fn command_enter_respects_bracketed_paste_protection() {
+    let now = Instant::now();
+    for buffered in [false, true] {
+        let mut guard = PasteGuard::default();
+        guard.pasted(now);
+        assert_eq!(
+            guard.text_for_draft_key(key(KeyCode::Enter), buffered, now, "/exit"),
+            Some(""),
+            "a pasted slash command must not execute from its trailing Enter"
+        );
+        assert_eq!(
+            guard.text_for_draft_key(key(KeyCode::Enter), buffered, now + PASTE_SETTLE, "/exit"),
+            None,
+            "an intentional Enter after settling still submits"
+        );
+    }
+}
+
+#[test]
+fn buffered_typed_command_enter_submits_but_multiline_draft_keeps_newline() {
+    let now = Instant::now();
+    let mut guard = PasteGuard::default();
+    assert_eq!(
+        guard.text_for_draft_key(key(KeyCode::Enter), true, now, "/settings"),
+        None
+    );
+    assert_eq!(
+        guard.text_for_draft_key(key(KeyCode::Enter), true, now, "/settings\nmore"),
+        Some("\n")
+    );
+}

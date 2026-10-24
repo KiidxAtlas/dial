@@ -22,7 +22,7 @@ Output-limit recovery has its own no-progress bound, even when `max_steps = 0`. 
 
 ## Isolation and results
 
-A worker may request `isolation: "copy"` to work in a private project copy. A successful isolated run merges its edits; failed or interrupted work is retained as a recovery copy. Conflicts and merge errors are reported separately from structured results. Always inspect isolation metadata before relying on a worker's edits.
+A worker may request `isolation: "copy"` to work in a private project copy. A successful isolated run merges its edits; failed or interrupted work is retained as a recovery copy. Completed computation is not completed integration: parent conflicts make the task `incomplete`, and merge errors make it `failed`. Nonconflicting files may already have merged. The candidate structured result remains intact, with conflicts, applied paths, errors and recovery location reported separately in isolation metadata. Always inspect that metadata before relying on a worker's edits.
 
 ### Isolation backends
 
@@ -62,6 +62,10 @@ Synchronous task results retain the complete typed job report before creating te
 Use `action: "start"` to start a live task, then `status`, `wait`, or `cancel` with its id. Live workers and the parent talk through the `message` tool, offered whenever `task` is (it reports an empty roster or an unknown recipient when no worker is live): `to` takes a live job id or label, `parent` (from a worker), or `all` (a broadcast to the other live workers); omit `to` to list reachable recipients. Each message is at most 32 KiB. A recipient's mailbox holds at most `[task].inbox_limit` undelivered messages (default 256); a full mailbox refuses the message explicitly, and a broadcast reports each refusal. Messages are plain text with no authority: they never approve actions or widen a worker's tools. A recipient receives a message, labelled with its sender, at its next model request. The parent's pending messages surface at its next model step; an idle parent is not woken. A message to a finished or unknown worker is refused, and messages still unread when a worker finishes are discarded. `task_message` remains the RPC form of the same send. Completed task records and transcripts may be retained in the state directory according to `[task].persist`; do not put secrets in task prompts or messages.
 
 Worker outcome payloads carry the shared `runtime::Phase` rather than a separate status enum. Incompletion stays incomplete in runtime nodes, cards and protocol events. Task-tool results preserve legacy `done`/`cancelled` spellings for compatibility; new execution nodes use `completed`/`interrupted`. Archived child tool results persist tool-owned presentation and the complete redacted evidence separately from model-facing retrieval pointers.
+
+Busy-input routing acknowledges independent work only after confirming worker startup. If startup fails before a worker launches, explicitly independent input is deferred until after the active turn; automatically split input falls back to steering. A worker that actually started is never replayed through that fallback.
+
+`[task].persist = false` skips durable child conversation capture for newly started workers throughout their lifetime, including while live and after interruption or failure, and disables resume. Runtime status, progress and results remain in the current session's worker UI; the archived transcript view is unavailable for these workers. This does not delete historical transcripts or isolation recovery copies, and does not disable ordinary result artifacts or the parent session's own history. With `persist = true`, available session storage retains redacted transcripts for live viewing and continuation.
 
 ## Continuing a retained worker
 

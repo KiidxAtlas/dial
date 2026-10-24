@@ -99,16 +99,12 @@ impl Shell {
             control.note_input();
         }
         let buffered = poll(Duration::ZERO).unwrap_or(false);
-        // A burst of keys typed as `/settings` + Enter must submit the command, not insert a line
-        // break: the guard only covers Enter when the draft could be an unbracketed multi-line paste.
-        let command_enter = key.code == KeyCode::Enter
-            && key.modifiers.is_empty()
-            && crate::ui::input::enter_submits_command(&self.composer.draft());
-        let guarded = if command_enter {
-            None
-        } else {
-            self.paste_guard.text_for_key(key, buffered, Instant::now())
-        };
+        let guarded = self.paste_guard.text_for_draft_key(
+            key,
+            buffered,
+            Instant::now(),
+            &self.composer.draft(),
+        );
         if let Some(text) = guarded {
             self.composer.handle_paste(text);
             return ComposerEvent::None;

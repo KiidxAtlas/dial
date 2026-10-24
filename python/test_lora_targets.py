@@ -45,6 +45,50 @@ class Model(nn.Module):
 
 
 class AdapterTests(unittest.TestCase):
+    def test_training_entry_accepts_validated_composed_ranks_only_on_resume(self):
+        from unittest.mock import patch
+        import dial_worker as worker
+
+        class Validated(Exception):
+            pass
+
+        for rank in (129, worker.MAX_ADAPTER_RANK):
+            with self.subTest(rank=rank), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                model = Model(("q_proj",))
+                keys, ids = query_targets(model, 1)
+                expected = expected_weights(model, ids, rank)
+                parameters = {"rank": rank, "scale": 1.0, "dropout": 0.0, "keys": keys}
+                adapter = worker.write_adapter(root / "adapter", "test", 1, parameters,
+                                               {name: mx.zeros(shape) for name, shape in expected.items()})
+                request = {"model": "test", "iters": 1, "batch_size": 1, "num_layers": 1,
+                           "rank": rank, "max_seq_length": 32, "train_data": "train",
+                           "valid_data": "valid", "output_dir": str(root / "output")}
+                with self.assertRaisesRegex(RequestError, "rank"):
+                    worker.train_in(request, root)
+                request["resume_adapter"] = str(adapter)
+                resume = worker.resume_layout
+
+                def validated(*args):
+                    count, own, shapes, weights = resume(*args)
+                    self.assertEqual((count, own["rank"], own["scale"]), (1, rank, 20.0))
+                    self.assertEqual(shapes, expected)
+                    self.assertTrue(Path(weights).is_file())
+                    raise Validated
+
+                with patch.object(worker, "read_datasets", return_value=([{}], [{}])), \
+                     patch.object(worker, "resolve_model", return_value="test"), \
+                     patch.object(worker, "load_base", return_value=(model, None)), \
+                     patch.object(worker, "render_records", side_effect=lambda records, _: records), \
+                     patch.object(worker, "resume_layout", side_effect=validated):
+                    with self.assertRaises(Validated):
+                        worker.train_in(request, root)
+                    # The higher request bound must not bypass actual tensor validation.
+                    mx.save_safetensors(str(adapter / "adapters.safetensors"),
+                                        {name: mx.zeros((1,)) for name in expected})
+                    with self.assertRaisesRegex(RequestError, "shape"):
+                        worker.train_in(request, root)
+
     def test_training_pause_restores_optimizer_rng_and_batch_cursor(self):
         self.check_training_pause("sft", 2)
 

@@ -232,6 +232,18 @@ impl Editor {
         self.jump = None;
     }
 
+    /// Whether text can return through the buffer, undo/redo or the bounded kill ring.
+    /// Compound inputs use this to retain payloads only while their markers are recoverable.
+    pub(super) fn references(&self, marker: &str) -> bool {
+        self.text.contains(marker)
+            || self
+                .undo
+                .iter()
+                .chain(&self.redo)
+                .any(|s| s.text.contains(marker))
+            || self.kills.ring.iter().any(|text| text.contains(marker))
+    }
+
     /// Insert at the cursor as one undo unit.
     pub fn insert(&mut self, text: &str) {
         let clean = sanitize(text);

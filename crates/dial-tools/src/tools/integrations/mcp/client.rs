@@ -444,7 +444,7 @@ impl Client {
     pub fn has_capability(&self, capability: &str) -> bool {
         lock(&self.capabilities)
             .get(capability)
-            .is_some_and(|value| !value.is_null())
+            .is_some_and(Value::is_object)
     }
 
     /// Whether `resources.subscribe` was declared.

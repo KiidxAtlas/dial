@@ -279,5 +279,7 @@ fn install_summary_names_the_command_or_the_blocker() {
 fn secret_names_are_detected_loosely() {
     assert!(looks_secret("SLACK_BOT_TOKEN"));
     assert!(looks_secret("apiKey"));
+    assert!(looks_secret("OPENAPI_MCP_HEADERS"));
+    assert!(looks_secret("Authorization"));
     assert!(!looks_secret("GITLAB_API_URL"));
 }

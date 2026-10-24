@@ -205,3 +205,71 @@ fn refuses_symlink_and_hardlink_targets() {
     fs::hard_link(outside.path(), &l.config_files()[0]).unwrap();
     assert!(save(&l, Scope::Global, &[]).is_err());
 }
+
+#[test]
+fn stale_insert_refuses_the_whole_batch_and_preserves_existing_bytes() {
+    let (_home, _project, layout) = fixture();
+    let install = |program: &str| Change::Insert {
+        path: "mcp.notes".into(),
+        value: toml::Value::try_from(crate::config::types::McpServerConfig {
+            program: program.into(),
+            ..Default::default()
+        })
+        .unwrap(),
+    };
+    let stale = install("stale-server");
+    save_config(&layout, Scope::Global, &[install("winner-server")]).unwrap();
+    let before = fs::read(&layout.config_files()[0]).unwrap();
+    let error = save_config(
+        &layout,
+        Scope::Global,
+        &[
+            Change::Set {
+                path: "model".into(),
+                value: "must-not-publish".into(),
+            },
+            stale,
+        ],
+    )
+    .err()
+    .unwrap();
+    assert!(error.to_string().contains("already configured"));
+    assert_eq!(fs::read(&layout.config_files()[0]).unwrap(), before);
+    assert!(save_config(&layout, Scope::Project, &[install("project-racer")]).is_err());
+    assert!(!layout.config_files()[1].exists());
+}
+
+#[test]
+fn concurrent_inserts_have_exactly_one_winner() {
+    let (_home, _project, layout) = fixture();
+    let barrier = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = [Scope::Global, Scope::Project]
+            .into_iter()
+            .map(|layer| {
+                let barrier = &barrier;
+                let layout = &layout;
+                scope.spawn(move || {
+                    barrier.wait();
+                    save(
+                        layout,
+                        layer,
+                        &[Change::Insert {
+                            path: "mcp.notes".into(),
+                            value: toml::Value::Table(Default::default()),
+                        }],
+                    )
+                    .is_ok()
+                })
+            })
+            .collect();
+        assert_eq!(
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .filter(|won| *won)
+                .count(),
+            1
+        );
+    });
+}

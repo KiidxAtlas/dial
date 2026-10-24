@@ -114,6 +114,24 @@ fn settle_result(body: &crate::runtime::Body, value: &Value) {
         crate::runtime::Phase::from_status(value["status"].as_str().unwrap_or("failed")),
     );
 }
+/// Persistence is opt-in for the whole worker lifetime, not just successful completion.
+/// Runtime nodes remain available even when no durable conversation is captured.
+fn create_transcript(
+    persist: bool,
+    layout: Option<&Layout>,
+    session: &str,
+    id: &str,
+    header: Value,
+) -> anyhow::Result<Option<Arc<super::child_transcript::ChildTranscript>>> {
+    layout
+        .filter(|_| persist)
+        .map(|layout| {
+            super::child_transcript::ChildTranscript::create(layout, session, id, header)
+                .map(Arc::new)
+        })
+        .transpose()
+}
+
 #[derive(Clone)]
 pub struct LiveTaskControl {
     jobs: LiveJobs,
@@ -749,6 +767,7 @@ impl LiveTasks {
             let lease = match resume.take() {
                 Some(saved) => Some(saved.lease),
                 None => layout
+                    .filter(|_| config.task.persist)
                     .map(|layout| {
                         crate::agent::workers::worker_resume::lease(layout, &session_id, &id)
                     })
@@ -808,31 +827,27 @@ impl LiveTasks {
             let workspace = workspace.clone();
             let ext = ext.clone();
             let layout = layout.cloned();
-            let transcript = match &layout {
-                Some(layout) => {
-                    let mut header = status.clone();
-                    header["started"] = json!(agent_timestamp());
-                    header["resume_contract"] = resume_contract.clone();
-                    match crate::agent::workers::child_transcript::ChildTranscript::create(
-                        layout,
-                        &session_id,
-                        &id,
-                        header,
-                    ) {
-                        Ok(sink) => Some(Arc::new(sink)),
-                        Err(e) => {
-                            let why = format!("{e:#}");
-                            body.settle(
-                                why.clone(),
-                                Some(json!({"id":id,"status":"failed"})),
-                                crate::runtime::Phase::Failed,
-                            );
-                            result.push(json!({"id":id,"status":"failed","result":why}));
-                            continue;
-                        }
-                    }
+            let mut header = status.clone();
+            header["started"] = json!(agent_timestamp());
+            header["resume_contract"] = resume_contract.clone();
+            let transcript = match create_transcript(
+                config.task.persist,
+                layout.as_ref(),
+                &session_id,
+                &id,
+                header,
+            ) {
+                Ok(sink) => sink,
+                Err(e) => {
+                    let why = format!("{e:#}");
+                    body.settle(
+                        why.clone(),
+                        Some(json!({"id":id,"status":"failed"})),
+                        crate::runtime::Phase::Failed,
+                    );
+                    result.push(json!({"id":id,"status":"failed","result":why}));
+                    continue;
                 }
-                None => None,
             };
             self.team.set_limit(config.task.inbox_limit);
             let interrupt = Arc::new(AtomicBool::new(false));

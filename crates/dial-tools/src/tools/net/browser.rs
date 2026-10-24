@@ -32,6 +32,7 @@ mod bwrap;
 mod cmux;
 mod discover;
 mod external;
+mod network;
 mod orphans;
 mod profile;
 mod run;
@@ -365,7 +366,14 @@ impl BrowserTool {
                 .ok_or("browser request must be an object")?
                 .extend(fields);
         }
-        request["timeout_ms"] = json!(remaining.as_millis() as u64);
+        // Let Playwright return its actionability diagnostic before the transport watchdog.
+        // A stuck renderer still hits the outer deadline and retires the session.
+        let millis = remaining.as_millis() as u64;
+        request["timeout_ms"] = json!(if millis == 0 {
+            0
+        } else {
+            millis.saturating_sub((millis / 5).min(2000)).max(1)
+        });
         if let Some(files) = upload_files {
             request["upload_files"] = files;
         }
@@ -375,19 +383,20 @@ impl BrowserTool {
         permit_requested_localhost(&mut session.allowed_hosts, &self.config, args)?;
         session.last_used = Instant::now();
         request["websocket_endpoints"] = json!(ws::websocket_endpoints(&session.allowed_hosts));
-        let result = session.process.request(request, remaining, |event| {
-            bridge(
-                event,
-                remaining_timeout(end)?,
-                &session.allowed_hosts,
-                self.interrupt.clone(),
-            )
-        });
+        let result = network::exchange(
+            &mut session.process,
+            request,
+            remaining,
+            &session.allowed_hosts,
+            &self.interrupt,
+        );
         let mut result = match result {
             Ok(result) => result,
             Err(error) => {
                 slot.take();
-                return Err(error);
+                return Err(format!(
+                    "Browser transport failed: {error}. Action effects may already have occurred; inspect the page before retrying."
+                ));
             }
         };
         // An ordinary Playwright/action error preserves the tab and its evidence. Only

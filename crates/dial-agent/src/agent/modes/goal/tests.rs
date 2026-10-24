@@ -52,6 +52,27 @@ fn workspace() -> tempfile::TempDir {
 }
 
 #[test]
+fn rendering_preserves_literal_template_markers_in_objective() {
+    let mut state = State::default();
+    state.start(
+        "Check <tag> & {{objective}} {{tokensUsed}} {{tokenBudget}} {{remainingTokens}} {{timeUsedSeconds}}",
+        Some(100),
+    );
+    state.account(12, 3);
+    let goal = state.goal.as_ref().unwrap();
+    for template in [GOAL_MODE_ACTIVE, CONTINUATION, BUDGET_LIMIT] {
+        let prompt = render(template, goal);
+        assert!(prompt.contains("<objective>\nCheck &lt;tag&gt; &amp; {{objective}} {{tokensUsed}} {{tokenBudget}} {{remainingTokens}} {{timeUsedSeconds}}\n</objective>"));
+        assert!(prompt.contains("Tokens used: 12"));
+        assert!(prompt.contains("Token budget: 100"));
+        if template != BUDGET_LIMIT {
+            assert!(prompt.contains("Tokens remaining: 88"));
+        }
+        assert!(prompt.contains("Time used: 3 seconds"));
+    }
+}
+
+#[test]
 fn launch_modes_start_the_goal_and_set_launch_state() {
     let config = Config::default();
     let dir = tempfile::tempdir().unwrap();

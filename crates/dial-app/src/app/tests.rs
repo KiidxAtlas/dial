@@ -1393,7 +1393,7 @@ fn selecting_a_local_model_clears_the_remote_endpoint_and_a_new_remote_adds_its_
     let helper = selection_changes(&config, &remote, "small").unwrap();
     assert!(
         helper.iter().all(|c| match c {
-            Change::Set { path, .. } | Change::Remove { path } =>
+            Change::Set { path, .. } | Change::Insert { path, .. } | Change::Remove { path } =>
                 path.starts_with("model_roles.small."),
         }),
         "a helper role must not touch the main model"

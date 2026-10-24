@@ -24,9 +24,21 @@ pub enum Scope {
     Global,
     Project,
 }
+#[derive(Clone)]
 pub enum Change {
-    Set { path: String, value: toml::Value },
-    Remove { path: String },
+    Set {
+        path: String,
+        value: toml::Value,
+    },
+    /// Insert only when neither settings layer has a value at this path. Checked under both locks;
+    /// a conflict refuses the entire batch without publishing any changes.
+    Insert {
+        path: String,
+        value: toml::Value,
+    },
+    Remove {
+        path: String,
+    },
 }
 
 // Compatibility exports; publication mechanics and private path policy have a neutral owner.
@@ -132,7 +144,7 @@ fn changed_document(path: &Path, changes: &[Change]) -> Result<toml::Table> {
     };
     for change in changes {
         let (path, value) = match change {
-            Change::Set { path, value } => (path, Some(value)),
+            Change::Set { path, value } | Change::Insert { path, value } => (path, Some(value)),
             Change::Remove { path } => (path, None),
         };
         let parts: Vec<_> = path.split('.').collect();
@@ -142,6 +154,16 @@ fn changed_document(path: &Path, changes: &[Change]) -> Result<toml::Table> {
                     .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')),
             "settings path must contain dotted bare table keys"
         );
+        if matches!(change, Change::Insert { .. }) {
+            let mut existing = doc.get(parts[0]);
+            for part in &parts[1..] {
+                existing = existing.and_then(|value| value.get(*part));
+            }
+            ensure!(
+                existing.is_none(),
+                "settings path `{path}` is already configured; no changes saved"
+            );
+        }
         // `edit_mode` moved to `[edit] mode`: write the canonical key and drop the legacy one so
         // validation does not reject the write and no duplicate remains.
         if path == "edit_mode" {
@@ -154,15 +176,35 @@ fn changed_document(path: &Path, changes: &[Change]) -> Result<toml::Table> {
     Ok(doc)
 }
 
-pub fn save(layout: &Layout, scope: Scope, changes: &[Change]) -> Result<()> {
-    layout.ensure_project_outside_storage()?;
-    let path = layout.config_files()[if scope == Scope::Global { 0 } else { 1 }].clone();
-    let _lock = locked(&path)?;
-    let doc = changed_document(&path, changes)?;
-    write_private(&path, toml::to_string_pretty(&doc)?.as_bytes())
+// Used by every publication path; previews check the same precondition without reserving it.
+fn check_other_layer_inserts(layout: &Layout, scope: Scope, changes: &[Change]) -> Result<()> {
+    let inserts: Vec<_> = changes
+        .iter()
+        .filter(|change| matches!(change, Change::Insert { .. }))
+        .cloned()
+        .collect();
+    if !inserts.is_empty() {
+        let other = &layout.config_files()[usize::from(scope == Scope::Global)];
+        changed_document(other, &inserts)?;
+    }
+    Ok(())
 }
 
-/// Re-read, apply Set and Remove, validate the future merged configuration, then atomically save.
+pub fn save(layout: &Layout, scope: Scope, changes: &[Change]) -> Result<()> {
+    layout.ensure_project_outside_storage()?;
+    let files = layout.config_files();
+    let selected = usize::from(scope == Scope::Project);
+    let inserts = changes
+        .iter()
+        .any(|change| matches!(change, Change::Insert { .. }));
+    let _lock = locked(&files[if inserts { 0 } else { selected }])?;
+    let _project_lock = inserts.then(|| locked(&files[1])).transpose()?;
+    check_other_layer_inserts(layout, scope, changes)?;
+    let doc = changed_document(&files[selected], changes)?;
+    write_private(&files[selected], toml::to_string_pretty(&doc)?.as_bytes())
+}
+
+/// Re-read, apply changes (including insert preconditions), validate, then atomically save.
 pub fn save_config(
     layout: &Layout,
     scope: Scope,
@@ -272,10 +314,14 @@ fn save_config_with_project_resets(
     layout.ensure_project_outside_storage()?;
     let files = layout.config_files();
     let selected = if scope == Scope::Global { 0 } else { 1 };
-    // Always lock global before project when both are involved.
-    let _lock = locked(&files[selected])?;
+    // Conditional inserts inspect both layers, always locking global before project.
+    let inserts = changes
+        .iter()
+        .any(|change| matches!(change, Change::Insert { .. }));
     let reset_project = scope == Scope::Global && !project_resets.is_empty();
-    let _project_lock = reset_project.then(|| locked(&files[1])).transpose()?;
+    let both = inserts || reset_project;
+    let _lock = locked(&files[if both { 0 } else { selected }])?;
+    let _project_lock = both.then(|| locked(&files[1])).transpose()?;
     let (layers, config) = prepare_config(layout, scope, changes, project_resets)?;
     let selected_bytes = toml::to_string_pretty(&layers[selected])?;
     if reset_project {
@@ -311,6 +357,7 @@ fn prepare_config(
 ) -> Result<([toml::Table; 2], crate::config::types::Config)> {
     layout.ensure_project_outside_storage()?;
     let selected = if scope == Scope::Global { 0 } else { 1 };
+    check_other_layer_inserts(layout, scope, changes)?;
     let mut layers: [toml::Table; 2] = Default::default();
     for (index, path) in layout.config_files().iter().enumerate() {
         let edits = if index == selected { changes } else { &[] };

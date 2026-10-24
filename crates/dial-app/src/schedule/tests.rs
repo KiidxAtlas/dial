@@ -223,3 +223,57 @@ fn filesystem_events_report_relative_changed_paths() {
         );
     }
 }
+
+#[test]
+fn persisted_watch_restart_detects_changes_instead_of_rebaselining() {
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(root.path(), home.path().join("dial")).unwrap();
+    let store = Store::new(&layout).unwrap();
+    let e = entry(None, &["*.rs"]);
+    let mut scheduler = Scheduler::default();
+    scheduler.reconcile(std::slice::from_ref(&e));
+    scheduler.ran(&e, 10, Some([1; 32]));
+    store.save_state(&scheduler);
+    let mut restored = store.load_scheduler();
+    restored.reconcile(std::slice::from_ref(&e));
+    assert_eq!(restored.due(&e, 20, || Some([2; 32])), None);
+    assert_eq!(
+        restored.due(&e, 20 + DEBOUNCE_SECS, || Some([2; 32])),
+        Some(Reason::Changed)
+    );
+    // A definition edited while stopped must not inherit its old baseline.
+    let mut edited = e.clone();
+    edited.watch = vec!["*.toml".into()];
+    let mut restored = store.load_scheduler();
+    restored.reconcile(std::slice::from_ref(&edited));
+    assert_eq!(restored.due(&edited, 30, || Some([3; 32])), None);
+    assert_eq!(restored.due(&edited, 40, || Some([3; 32])), None);
+    // Live edits have the same invalidation semantics as edits between restarts.
+    restored.reconcile(std::slice::from_ref(&e));
+    assert_eq!(restored.due(&e, 50, || Some([1; 32])), None);
+}
+
+#[test]
+fn legacy_fingerprint_state_survives_initial_definition_load_and_migrates() {
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(root.path(), home.path().join("dial")).unwrap();
+    let store = Store::new(&layout).unwrap();
+    let e = entry(None, &["*.rs"]);
+    let legacy = HashMap::from([(e.id.clone(), [1u8; 32])]);
+    store
+        .write_atomic(store.baseline_path(), &toml::to_string(&legacy).unwrap())
+        .unwrap();
+    let mut restored = store.load_scheduler();
+    restored.reconcile(std::slice::from_ref(&e));
+    assert_eq!(restored.due(&e, 10, || Some([2; 32])), None);
+    assert_eq!(
+        restored.due(&e, 10 + DEBOUNCE_SECS, || Some([2; 32])),
+        Some(Reason::Changed)
+    );
+    store.save_state(&restored);
+    assert!(
+        matches!(store.load_baselines().get(&e.id), Some(SavedBaseline::Bound { definition, .. }) if definition == &e)
+    );
+}

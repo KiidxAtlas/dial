@@ -218,7 +218,7 @@ fn mcp(shell: &mut Shell, app: &App, agent: Option<&mut Agent<'_>>, args: &str) 
             if config.mcp.contains_key(&name) {
                 bail!("MCP server {name} already exists; remove it first.");
             }
-            let change = Change::Set {
+            let change = Change::Insert {
                 path: format!("mcp.{name}"),
                 value: toml::Value::try_from(&server)?,
             };

@@ -269,7 +269,7 @@ pub(in crate::agent) fn zero_tests(output: &str) -> bool {
         .filter_map(|line| {
             line.trim()
                 .strip_prefix("running ")
-                .and_then(|v| v.strip_suffix(" tests"))
+                .and_then(|v| v.strip_suffix(" tests").or_else(|| v.strip_suffix(" test")))
                 .and_then(|v| v.parse::<u64>().ok())
         })
         .peekable();

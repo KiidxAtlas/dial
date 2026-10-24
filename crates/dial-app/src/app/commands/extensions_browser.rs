@@ -79,18 +79,31 @@ pub(crate) fn refresh(panel: &mut ExtensionsOverlay, layout: &Layout, config: &C
     panel.set_snapshot(rows.mcp, rows.plugins, rows.skills, rows.marketplaces);
     // Listings are fetched in the background; the rows above already show what is cached.
     for tab in [Tab::Mcp, Tab::Plugins, Tab::Skills] {
-        let listing = SharedCatalog::default();
-        let config = config.clone();
-        let layout = layout.clone();
-        let shared = listing.clone();
-        thread::spawn(move || {
-            let update = catalog_update(&Endpoints::live(), &layout, &config, tab, "", 1);
-            if let Ok(mut slot) = shared.lock() {
-                *slot = Some(update);
-            }
-        });
-        panel.attach_catalog(tab, listing);
+        fetch_catalog(panel, layout, config, tab, String::new());
     }
+}
+
+/// Fetch page 1 of `tab`'s catalog for `query` on a background thread; the overlay applies it on
+/// a later tick, replacing any fetch still pending for that tab.
+pub(crate) fn fetch_catalog(
+    panel: &mut ExtensionsOverlay,
+    layout: &Layout,
+    config: &Config,
+    tab: Tab,
+    query: String,
+) {
+    let listing = SharedCatalog::default();
+    let config = config.clone();
+    let layout = layout.clone();
+    let shared = listing.clone();
+    let search = query.clone();
+    thread::spawn(move || {
+        let update = catalog_update(&Endpoints::live(), &layout, &config, tab, &search, 1);
+        if let Ok(mut slot) = shared.lock() {
+            *slot = Some(update);
+        }
+    });
+    panel.attach_catalog(tab, query, listing);
 }
 
 fn skill_rows(layout: &Layout, config: &Config) -> Vec<Row> {
@@ -192,17 +205,13 @@ fn mcp_rows(config: &Config, home: Option<&Path>) -> Vec<Row> {
         })
         .collect();
     for item in CURATED.iter().filter(|c| !config.mcp.contains_key(c.id)) {
-        let needs = item.env.iter().any(|(_, _, required)| *required);
+        let candidate = catalog::curated_candidate(item, &config.user_dir, &config.project_root);
+        let (requirements, credential_details) = credential_metadata(&candidate);
         let mut details = vec![
             format!("runs: {} {}", item.runtime, item.args.join(" ")),
             format!("needs: {} on PATH", item.runtime),
         ];
-        details.extend(item.env.iter().map(|(key, description, required)| {
-            format!(
-                "{} {key}: {description}",
-                if *required { "needs" } else { "optional" }
-            )
-        }));
+        details.extend(credential_details);
         details.push(format!(
             "installs to: {}",
             mcp_cache_dir(&config.user_dir).display()
@@ -212,10 +221,9 @@ fn mcp_rows(config: &Config, home: Option<&Path>) -> Vec<Row> {
             id: item.id.into(),
             title: item.title.into(),
             summary: item.summary.into(),
-            tags: vec![
-                "curated".into(),
-                if needs { "needs values" } else { "no key" }.into(),
-            ],
+            tags: std::iter::once("curated".to_owned())
+                .chain(requirements)
+                .collect(),
             origin: Origin::Curated,
             state: State::Available,
             details,
@@ -255,20 +263,27 @@ fn mcp_rows(config: &Config, home: Option<&Path>) -> Vec<Row> {
     rows
 }
 
+// Display-only summaries deliberately omit arbitrary arguments and URL components: even a path
+// segment or unnamed positional argument can be a credential. Execution uses the original config.
 fn server_summary(server: &McpServerConfig) -> String {
-    match &server.url {
-        Some(url) => url.clone(),
-        None => server.program.display().to_string(),
+    if server.url.is_some() {
+        "remote MCP endpoint (URL hidden)".into()
+    } else {
+        server
+            .program
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
 fn server_command(server: &McpServerConfig) -> String {
-    match &server.url {
-        Some(url) => url.clone(),
-        None => std::iter::once(server.program.display().to_string())
-            .chain(server.args.iter().cloned())
-            .collect::<Vec<_>>()
-            .join(" "),
+    let summary = server_summary(server);
+    if server.url.is_none() && !server.args.is_empty() {
+        format!("{summary} ({} arguments hidden)", server.args.len())
+    } else {
+        summary
     }
 }
 
@@ -395,6 +410,7 @@ pub(crate) struct InstallJob {
     outcome: Receiver<Outcome>,
     progress: SharedProgress,
     scope: Scope,
+    intent: Intent,
 }
 
 /// An intent the overlay asked for. The main loop starts it, because starting needs `App`.
@@ -411,6 +427,7 @@ pub(crate) fn queue(slot: &mut Option<Pending>, intent: Intent, scope: Scope) ->
     if slot.is_some() {
         fail(
             &progress,
+            &intent,
             "another extension change is still starting".into(),
         );
     } else {
@@ -423,8 +440,19 @@ pub(crate) fn queue(slot: &mut Option<Pending>, intent: Intent, scope: Scope) ->
     progress
 }
 
-fn fail(progress: &SharedProgress, message: String) {
+fn fail(progress: &SharedProgress, intent: &Intent, message: String) {
     if let Ok(mut shown) = progress.lock() {
+        if let Intent::CatalogBrowse { tab, query, page } = intent {
+            shown.catalog = Some(CatalogUpdate {
+                tab: *tab,
+                query: query.clone(),
+                page: *page,
+                rows: Vec::new(),
+                more: false,
+                message: String::new(),
+                error: Some(message.clone()),
+            });
+        }
         shown.label = None;
         shown.result = Some((false, message));
     }
@@ -440,13 +468,20 @@ fn start(job: &mut Option<InstallJob>, pending: Pending, app: &App) {
     if job.is_some() {
         fail(
             &progress,
+            &intent,
             "another extension change is still running".into(),
         );
         return;
     }
     let config = match app.reload() {
         Ok(config) => config,
-        Err(error) => return fail(&progress, format!("could not read settings: {error:#}")),
+        Err(error) => {
+            return fail(
+                &progress,
+                &intent,
+                format!("could not read settings: {error:#}"),
+            );
+        }
     };
     if let Ok(mut shown) = progress.lock() {
         *shown = JobProgress {
@@ -457,6 +492,7 @@ fn start(job: &mut Option<InstallJob>, pending: Pending, app: &App) {
     let layout = app.layout().clone();
     let (tx, rx) = channel();
     let worker = progress.clone();
+    let job_intent = intent.clone();
     thread::spawn(move || {
         let outcome = match run(&layout, &config, &intent, &worker) {
             Ok(outcome) => outcome,
@@ -466,12 +502,16 @@ fn start(job: &mut Option<InstallJob>, pending: Pending, app: &App) {
                 changes: Vec::new(),
             },
         };
+        if !outcome.ok {
+            fail(&worker, &intent, outcome.message.clone());
+        }
         let _ = tx.send(outcome);
     });
     *job = Some(InstallJob {
         outcome: rx,
         progress,
         scope,
+        intent: job_intent,
     });
 }
 
@@ -504,6 +544,9 @@ pub(crate) fn step(
             changes: Vec::new(),
         },
     };
+    if !outcome.ok {
+        fail(&running.progress, &running.intent, outcome.message.clone());
+    }
     let job = job.take()?;
     Some(Finished {
         ok: outcome.ok,
@@ -1036,14 +1079,88 @@ fn is_secret_key(key: &str) -> bool {
     catalog::looks_secret(key)
 }
 
+/// Credential declarations are separate from install readiness: a runnable command is not proof
+/// that a server needs no authentication. Both initial curated rows and catalog results use this
+/// mapping, without inspecting configured values or rendering them.
+fn credential_metadata(candidate: &Candidate) -> (Vec<String>, Vec<String>) {
+    let mut tags = Vec::new();
+    let mut details = Vec::new();
+    let required_secret = candidate
+        .inputs
+        .iter()
+        .any(|input| input.required && input.secret);
+    let optional_secret = candidate
+        .inputs
+        .iter()
+        .any(|input| !input.required && input.secret);
+    if candidate.origin() == Source::Smithery {
+        tags.push("Smithery key required".into());
+        tags.push("server auth unknown".into());
+        details.push("Smithery platform API key: required to install through Smithery; this is separate from the server's own credentials.".into());
+        details.push("Server credentials and configuration: unknown until Smithery loads the settings on install.".into());
+    } else {
+        if required_secret {
+            tags.push("API key/token required".into());
+            details.push(
+                "Credentials: required secret input declared (API key, token or other credential)."
+                    .into(),
+            );
+        }
+        if optional_secret {
+            tags.push("API key/token optional".into());
+            details.push("Credentials: optional secret input declared.".into());
+        }
+        if candidate.origin() != Source::Curated && !required_secret {
+            tags.push("auth unknown".into());
+            details.push("Authentication requirements: unknown beyond the declared inputs. Listing metadata may omit credentials, remote authentication or settings checked on install; no API-key-free guarantee.".into());
+        } else if !required_secret && !optional_secret {
+            tags.push("no key declared".into());
+            details.push("Credentials: none declared by the curated entry; this is not a guarantee that upstream authentication requirements cannot change.".into());
+        }
+    }
+    if candidate
+        .inputs
+        .iter()
+        .any(|input| input.required && !input.secret)
+    {
+        tags.push("configuration required".into());
+        details.push("Configuration: required non-secret input declared; this is separate from an API key or token.".into());
+    }
+    details.extend(candidate.inputs.iter().map(|input| {
+        format!(
+            "{} {} {}: {}",
+            if input.required {
+                "required"
+            } else {
+                "optional"
+            },
+            if input.secret {
+                "credential"
+            } else {
+                "configuration"
+            },
+            input.key,
+            input.description
+        )
+    }));
+    (tags, details)
+}
+
 /// A catalog row for one merged candidate. Smithery-first rows open their settings form; every
 /// other remote row installs from `i` through [`catalog::resolve`], and curated rows by id.
 fn candidate_row(candidate: &Candidate) -> Row {
-    let mut tags: Vec<String> = candidate
-        .sources
-        .iter()
-        .map(|source| source.label().to_owned())
-        .collect();
+    let (requirements, credential_details) = credential_metadata(candidate);
+    // The first source is used by install routing. Requirements come next so long summaries and
+    // multiple listing badges cannot hide the credential status.
+    let mut tags = vec![candidate.origin().label().to_owned()];
+    tags.extend(requirements);
+    tags.extend(
+        candidate
+            .sources
+            .iter()
+            .skip(1)
+            .map(|source| source.label().to_owned()),
+    );
     tags.extend(candidate.badges.iter().cloned());
     let state = if candidate.origin() == Source::Smithery {
         Some("settings on install")
@@ -1051,13 +1168,8 @@ fn candidate_row(candidate: &Candidate) -> Row {
         Some("checked on install")
     } else if !candidate.installable() {
         Some("manual setup")
-    } else if candidate.inputs.iter().any(|input| input.required) {
-        Some("needs values")
-    } else if matches!(candidate.origin(), Source::Npm | Source::Github) {
-        // These listings do not declare settings, so "no key" would be a guess.
-        None
     } else {
-        Some("no key")
+        None
     };
     tags.extend(state.map(str::to_owned));
     let origin = if candidate.origin() == Source::Curated {
@@ -1071,14 +1183,7 @@ fn candidate_row(candidate: &Candidate) -> Row {
         candidate.install_summary()
     };
     let mut details = vec![format!("install: {install}")];
-    details.extend(candidate.inputs.iter().map(|input| {
-        format!(
-            "{} {}: {}",
-            if input.required { "needs" } else { "optional" },
-            input.key,
-            input.description
-        )
-    }));
+    details.extend(credential_details);
     if let Some(repository) = &candidate.repository {
         details.push(format!("repository: {repository}"));
     }

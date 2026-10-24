@@ -117,18 +117,7 @@ pub(in crate::agent) fn looks_like_overflow(error: &anyhow::Error) -> bool {
 /// note's position, so the model reads one harness note per request instead of a stack of
 /// competing instructions. Advisory notes are capped first by `run::guidance::cap`.
 pub(in crate::agent) fn coalesce_harness_notes(messages: &mut Vec<Value>, start: usize) {
-    let plain = |message: &Value| {
-        message["role"] == "user"
-            && message["dial_transient"] == true
-            && message["content"].is_string()
-            && message.as_object().is_some_and(|object| {
-                object.keys().all(|key| {
-                    !key.starts_with("dial_")
-                        || key == "dial_transient"
-                        || crate::agent::run::guidance::is_marker(key)
-                })
-            })
-    };
+    let plain = crate::agent::run::guidance::is_plain_note;
     let Some(first) = (start..messages.len()).find(|&index| plain(&messages[index])) else {
         return;
     };

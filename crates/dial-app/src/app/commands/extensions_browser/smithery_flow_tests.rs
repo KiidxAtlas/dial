@@ -246,13 +246,9 @@ fn smithery_deploy_connects_a_direct_server_and_reports_its_tools() {
         "{}",
         out.message
     );
+    assert!(out.message.contains("Saved as `notes`"), "{}", out.message);
     assert!(
-        out.message.contains("Saved as `acme-notes`"),
-        "{}",
-        out.message
-    );
-    assert!(
-        matches!(&out.changes[..], [Change::Set { path, .. }] if path.as_str() == "mcp.acme-notes")
+        matches!(&out.changes[..], [Change::Insert { path, .. }] if path.as_str() == "mcp.notes")
     );
 }
 

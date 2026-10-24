@@ -174,3 +174,21 @@ fn progress_flood_eventually_times_out_and_removes_waiter() {
     cancelled.recv_timeout(Duration::from_secs(2)).unwrap();
     assert!(lock(&client.shared.state).pending.is_empty());
 }
+
+#[test]
+fn capability_exposure_requires_a_capability_object() {
+    let (client, _, _) = progress_client(false);
+    for malformed in [
+        Value::Null,
+        json!(false),
+        json!(true),
+        json!("tools"),
+        json!([]),
+    ] {
+        *lock(&client.capabilities) = json!({"tools": malformed});
+        assert!(!client.has_capability("tools"));
+    }
+    *lock(&client.capabilities) = json!({"tools": {"listChanged": false}});
+    assert!(client.has_capability("tools"));
+    assert!(!client.has_capability("prompts"));
+}

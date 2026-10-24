@@ -103,6 +103,29 @@ fn handshake_follows_every_page_and_exposes_prefixed_tools() {
 }
 
 #[test]
+fn malformed_tool_arguments_are_rejected_without_remote_effects() {
+    let loaded = load_fake();
+    for args in [
+        Value::Null,
+        json!([]),
+        json!("text"),
+        json!(42),
+        json!(true),
+    ] {
+        let output = call(&loaded, "mcp__fake__echo", args);
+        assert!(output.is_error);
+        assert!(output.text.contains("must be a JSON object"));
+        assert_eq!(
+            output.execution.effects,
+            crate::runtime::execution::Effects::None
+        );
+    }
+    let output = call(&loaded, "mcp__fake__echo", json!({"text": "still works"}));
+    assert!(!output.is_error);
+    assert!(output.text.contains("still works"));
+}
+
+#[test]
 fn server_read_only_hints_never_bypass_approval() {
     let loaded = load_fake();
     let approval = |name: &str| tool(&loaded, name).needs_approval(&json!({}));
@@ -179,9 +202,9 @@ fn results_map_text_errors_and_other_content() {
         big.text.len()
     );
 
-    // Arguments that are not an object are sent as an empty object.
+    // An explicit empty object is valid for tools without parameters.
     assert_eq!(
-        call(&loaded, "mcp__fake__bare", Value::Null).text,
+        call(&loaded, "mcp__fake__bare", json!({})).text,
         "bare args: {}"
     );
 }

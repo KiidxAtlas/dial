@@ -16,7 +16,7 @@ function send(value) {
   return new Promise((resolve, reject) => process.stdout.write(line, error => error ? reject(error) : resolve()));
 }
 const callbacks = new Map();
-let callbackId = 0, browser, context, nextTab = 1, operationId = 0, operationDeadline = null, pendingBytes = 0;
+let callbackId = 0, browser, context, nextTab = 1, operationId = 0, operationDeadline = null, pendingBytes = 0, activeHttp = 0;
 let attached = false, tracing = false, wsEndpoints = [];
 function finishCallback(id, error, result) {
   const callback = callbacks.get(id);
@@ -30,16 +30,18 @@ function cancelPending(reason) {
   for (const id of callbacks.keys()) finishCallback(id, new Error(reason));
 }
 async function settleRequests(deadline) {
-  const end = deadline;
+  const end = Math.min(deadline ?? Infinity, Date.now() + 1000);
   let quietSince = 0;
-  while (end === null || Date.now() < end) {
-    if (callbacks.size === 0) {
+  while (Date.now() < end) {
+    if (activeHttp === 0) {
       if (!quietSince) quietSince=Date.now();
-      if (Date.now()-quietSince >= 100) return;
+      if (Date.now()-quietSince >= 100) return {settled:true};
     } else quietSince=0;
     await new Promise(resolve=>setTimeout(resolve,10));
   }
-  cancelPending('browser network settlement deadline exceeded');
+  const pending = activeHttp;
+  cancelPending('browser post-action network settlement budget exhausted');
+  return {settled:false, pending, note:'Action completed; background network did not settle within its separate budget. This is not proof of application success. Inspect the page before retrying any action.'};
 }
 const tabs = new Map();
 // UTF-16 slicing that never leaves a lone high surrogate: Rust rejects lone surrogates in JSON strings.
@@ -54,14 +56,34 @@ function tabEvents(tab, after) {
   const events = EVENT_CHANNELS.flatMap(channel => tab[channel].filter(event => event.seq > since).map(event => ({channel, ...event})));
   return {events: events.sort((a,b) => a.seq - b.seq), last_seq: tab.seq};
 }
-function http(request) {
-  if (!operationId) return Promise.reject(new Error('browser networking is paused between approved operations'));
-  if (callbacks.size >= MAX_PENDING) return Promise.reject(new Error('browser pending request budget exceeded'));
+async function http(request) {
+  if (!operationId) throw new Error('browser networking is paused between approved operations');
+  if (activeHttp >= MAX_PENDING) throw new Error('browser pending request budget exceeded');
+  const owner = operationId;
+  activeHttp++;
+  try {
+    const started = await startHttp(request);
+    while (operationId === owner) {
+      const reply = await requestCallback({callback:'http_poll', job:started.job});
+      if (reply.done) {
+        if (reply.error) throw new Error(reply.error);
+        return reply.value;
+      }
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    throw new Error('approved browser operation finished');
+  } finally { activeHttp--; }
+}
+function startHttp(request) {
   const body = request.postDataBuffer();
   if (body && body.length > 1024 * 1024) return Promise.reject(new Error('request body exceeds 1 MiB'));
+  return requestCallback({callback:'http', url:request.url(), method:request.method(), headers:request.headers(), body:body ? body.toString('base64') : ''});
+}
+function requestCallback(fields) {
+  if (!operationId) return Promise.reject(new Error('browser networking is paused between approved operations'));
   const id = ++callbackId;
   const expiresAt = operationDeadline ?? Date.now() + CALLBACK_TTL_MS;
-  const event = { callback:'http', callback_id:id, operation_id:operationId, expires_at_ms:expiresAt, url:request.url(), method:request.method(), headers:request.headers(), body:body ? body.toString('base64') : '' };
+  const event = {...fields, callback_id:id, operation_id:operationId, expires_at_ms:expiresAt};
   const bytes = Buffer.byteLength(JSON.stringify(event));
   if (pendingBytes + bytes > MAX_PENDING_BYTES) return Promise.reject(new Error('browser pending request byte budget exceeded'));
   return new Promise((resolve, reject) => {
@@ -494,7 +516,10 @@ readline.createInterface({input:process.stdin}).on('line', line => {
     operationDeadline = deadline;
     try {
       const result = await run(request);
-      if (request.action !== 'initialize') await settleRequests(deadline);
+      if (request.action !== 'initialize') {
+        const settlement = await settleRequests(deadline);
+        if (!settlement.settled) result.network_settlement = settlement;
+      }
       await send({id:request.id,result});
     }
     catch (error) {

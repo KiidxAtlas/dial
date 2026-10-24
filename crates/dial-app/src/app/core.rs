@@ -112,6 +112,14 @@ impl App {
         Ok(agent)
     }
 
+    /// Commit the authoritative project at the agent-free rebuild boundary.
+    pub(super) fn adopt_project(&mut self, layout: Layout, config: Config) -> bool {
+        let changed = self.layout.project_root != layout.project_root;
+        self.layout = layout;
+        self.adopt(config);
+        changed
+    }
+
     /// Adopt a freshly loaded, validated configuration and keep the per-model store in step.
     pub(super) fn adopt(&mut self, config: Config) {
         self.config = config.for_coding();
@@ -179,7 +187,9 @@ impl App {
             models.adopt_paths(
                 &merged,
                 changes.iter().map(|change| match change {
-                    Change::Set { path, .. } | Change::Remove { path } => path.as_str(),
+                    Change::Set { path, .. }
+                    | Change::Insert { path, .. }
+                    | Change::Remove { path } => path.as_str(),
                 }),
             );
             if let Some(role) = role {

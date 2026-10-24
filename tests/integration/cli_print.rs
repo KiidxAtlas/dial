@@ -608,9 +608,17 @@ impl Drop for RpcChild {
 }
 impl RpcChild {
     fn start(env: &Env, server: &Server) -> Self {
+        let rpc = Self::start_transport(env, server, "rpc");
+        assert_eq!(rpc.next()["event"], "ready");
+        rpc
+    }
+    fn start_acp(env: &Env, server: &Server) -> Self {
+        Self::start_transport(env, server, "acp")
+    }
+    fn start_transport(env: &Env, server: &Server, transport: &str) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_dial"))
             .args([
-                "rpc",
+                transport,
                 "--endpoint",
                 &server.url,
                 "--model",
@@ -636,14 +644,12 @@ impl RpcChild {
                 }
             }
         });
-        let rpc = Self {
+        Self {
             child,
             input,
             events,
             pending: Default::default(),
-        };
-        assert_eq!(rpc.next()["event"], "ready");
-        rpc
+        }
     }
     fn next(&self) -> Value {
         self.events
@@ -654,24 +660,34 @@ impl RpcChild {
         writeln!(
             self.input,
             "{}",
-            json!({"id":id,"method":method,"params":params})
+            json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
         )
         .unwrap();
         self.input.flush().unwrap();
     }
     fn result(&self, id: u64) -> Value {
+        self.result_with_events(id).0
+    }
+    fn result_with_events(&self, id: u64) -> (Value, Vec<Value>) {
         if let Some(event) = self.pending.borrow_mut().remove(&id) {
             assert!(event.get("error").is_none(), "{event}");
-            return event["result"].clone();
+            return (event["result"].clone(), Vec::new());
         }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut updates = Vec::new();
         loop {
-            let event = self.next();
+            let event = self
+                .events
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .unwrap_or_else(|error| panic!("RPC response {id} timeout/disconnect: {error}"));
             if event["id"] == id {
                 assert!(event.get("error").is_none(), "{event}");
-                return event["result"].clone();
+                return (event["result"].clone(), updates);
             }
             if let Some(other) = event["id"].as_u64() {
                 self.pending.borrow_mut().insert(other, event);
+            } else {
+                updates.push(event);
             }
         }
     }

@@ -930,6 +930,9 @@ impl<'a> Agent<'a> {
             }
             result = resumed;
         }
+        // All fallible continuation work above is captured in `result`. Restore ownership before
+        // final persistence, so a failed completion-evidence write cannot strand the backend.
+        self.backend = Some(backend);
         // Hooks and late verification may invalidate an earlier accepted candidate. Strict
         // requirements are checked again at final settlement without launching extra processes.
         if let Ok(report) = &mut result
@@ -982,7 +985,6 @@ impl<'a> Agent<'a> {
                 report.outcome == TurnOutcome::Completed && !report.interrupted
             })),
         });
-        self.backend = Some(backend);
         self.session.repair_incomplete_tools()?;
         if let Ok(report) = &result {
             let mut state = self.session.control_state();

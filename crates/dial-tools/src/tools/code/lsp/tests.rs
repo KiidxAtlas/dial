@@ -55,6 +55,10 @@ fn publish(out: &mut UnixStream, uri: &Value, text: &str) {
 
 /// A language server that echoes positions, so tests can see exactly what the client sent.
 fn serve(stream: UnixStream, log: Log) {
+    serve_with_rename(stream, log, || Value::Null);
+}
+
+fn serve_with_rename(stream: UnixStream, log: Log, mut rename: impl FnMut() -> Value) {
     let mut out = stream.try_clone().unwrap();
     let mut input = BufReader::new(stream);
     while let Ok(Some(message)) = read_message(&mut input) {
@@ -67,10 +71,12 @@ fn serve(stream: UnixStream, log: Log) {
             continue;
         };
         match (method, id) {
+            ("workspace/willRenameFiles", Some(id)) => reply(&mut out, &id, rename()),
             ("initialize", Some(id)) => reply(
                 &mut out,
                 &id,
-                json!({"capabilities": {"documentFormattingProvider": true}}),
+                json!({"capabilities": {"documentFormattingProvider": true,
+                    "workspace": {"fileOperations": {"willRename": {"filters": [{"pattern": {"glob": "**/*"}}]}}}}}),
             ),
             ("initialized", None) => {
                 let _ = write_message(
@@ -841,6 +847,157 @@ fn rename_directories_expand_to_files_and_skip_git() {
     );
 }
 
+/// Real framing with a deterministic mutation while willRenameFiles is outstanding.
+fn rename_tool(hook: impl Fn() -> Value + Send + Sync + 'static) -> LspTool {
+    let hook = Arc::new(hook);
+    LspTool::with_launcher(
+        &fake_config(false),
+        Box::new(move |_, root, _| {
+            let (ours, theirs) = UnixStream::pair().unwrap();
+            let hook = Arc::clone(&hook);
+            thread::spawn(move || serve_with_rename(theirs, Log::default(), || hook()));
+            Client::connect(
+                "fake",
+                root,
+                Box::new(ours.try_clone().unwrap()),
+                Box::new(ours),
+                None,
+                fast(),
+                ServerOptions::default(),
+            )
+        }),
+    )
+}
+
+fn reference_edit(path: &Path) -> Value {
+    json!({"changes": {text::uri_from_path(path): [{
+        "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}},
+        "newText": "new"
+    }]}})
+}
+
+#[test]
+fn rename_file_refuses_sources_changed_during_will_rename_even_without_text_edits() {
+    for edits in [false, true] {
+        let (_dir, ws) = project();
+        let source = ws.root().join("a.fk");
+        let reference = ws.root().join("ref.fk");
+        std::fs::write(&source, "old").unwrap();
+        std::fs::write(&reference, "old").unwrap();
+        let changed = source.clone();
+        let edit = reference_edit(&reference);
+        let tool = rename_tool(move || {
+            std::fs::write(&changed, "external change").unwrap();
+            if edits { edit.clone() } else { Value::Null }
+        });
+        let out = run_as(
+            &tool,
+            &ws,
+            json!({"action": "rename_file", "path": "a.fk", "new_name": "b.fk"}),
+        );
+        assert!(out.is_error, "{}", out.text);
+        assert!(
+            out.text.contains("changed since the server request"),
+            "{}",
+            out.text
+        );
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), "external change");
+        assert_eq!(std::fs::read_to_string(&reference).unwrap(), "old");
+        assert!(!ws.root().join("b.fk").exists());
+    }
+}
+
+#[test]
+fn rename_file_refuses_cross_file_edits_changed_during_will_rename() {
+    let (_dir, ws) = project();
+    let source = ws.root().join("a.fk");
+    let reference = ws.root().join("ref.fk");
+    std::fs::write(&source, "source").unwrap();
+    std::fs::write(&reference, "old").unwrap();
+    let changed = reference.clone();
+    let edit = reference_edit(&reference);
+    let tool = rename_tool(move || {
+        std::fs::write(&changed, "external reference change").unwrap();
+        edit.clone()
+    });
+    let out = run_as(
+        &tool,
+        &ws,
+        json!({"action": "rename_file", "path": "a.fk", "new_name": "b.fk"}),
+    );
+    assert!(out.is_error, "{}", out.text);
+    assert!(
+        out.text.contains("changed since the server request"),
+        "{}",
+        out.text
+    );
+    assert_eq!(std::fs::read_to_string(source).unwrap(), "source");
+    assert_eq!(
+        std::fs::read_to_string(reference).unwrap(),
+        "external reference change"
+    );
+    assert!(!ws.root().join("b.fk").exists());
+}
+
+struct DestinationAppears(PathBuf);
+
+impl crate::tools::WriteObserver for DestinationAppears {
+    fn before_write(&self, path: &Path) -> anyhow::Result<()> {
+        if path == self.0 {
+            std::fs::write(path, "external destination")?;
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn rename_file_destination_appearing_at_install_preserves_both_and_reverts_edits() {
+    let (_dir, ws) = project();
+    let source = ws.root().join("a.fk");
+    let target = ws.root().join("b.fk");
+    let reference = ws.root().join("ref.fk");
+    std::fs::write(&source, "source").unwrap();
+    std::fs::write(&reference, "old").unwrap();
+    let edit = reference_edit(&reference);
+    let tool = rename_tool(move || edit.clone());
+    let ws = ws.with_observer(Arc::new(DestinationAppears(target.clone())));
+    let out = run_as(
+        &tool,
+        &ws,
+        json!({"action": "rename_file", "path": "a.fk", "new_name": "b.fk"}),
+    );
+    assert!(out.is_error, "{}", out.text);
+    assert!(
+        out.text.contains("text edits were restored"),
+        "{}",
+        out.text
+    );
+    assert_eq!(std::fs::read_to_string(source).unwrap(), "source");
+    assert_eq!(
+        std::fs::read_to_string(target).unwrap(),
+        "external destination"
+    );
+    assert_eq!(std::fs::read_to_string(reference).unwrap(), "old");
+}
+
+#[test]
+fn rename_moves_reverse_completed_units_without_replacing_external_destinations() {
+    let (_dir, ws) = project();
+    let a = ws.root().join("a");
+    let b = ws.root().join("b");
+    let c = ws.root().join("c");
+    let d = ws.root().join("d");
+    std::fs::write(&a, "a").unwrap();
+    std::fs::write(&c, "c").unwrap();
+    std::fs::write(&d, "external").unwrap();
+    let error = move_units(&[(a.clone(), b.clone()), (c.clone(), d.clone())]).unwrap_err();
+    assert!(error.contains("moved files were restored"), "{error}");
+    assert_eq!(std::fs::read_to_string(a).unwrap(), "a");
+    assert!(!b.exists());
+    assert_eq!(std::fs::read_to_string(c).unwrap(), "c");
+    assert_eq!(std::fs::read_to_string(d).unwrap(), "external");
+}
+
 #[test]
 fn merged_workspace_edits_keep_every_server_edit_in_one_document_list() {
     assert_eq!(merge_workspace_edits(&[Value::Null]).unwrap(), Value::Null);
@@ -1091,4 +1248,22 @@ fn resource_operation_description_matches_the_approved_transactions() {
     assert!(!description.contains("Resource create/rename/delete operations are refused"));
     assert!(tool.needs_approval(&json!({"action": "rename"})));
     assert!(tool.needs_approval(&json!({"action": "code_action_apply"})));
+}
+
+#[test]
+fn rename_move_rollback_does_not_replace_a_recreated_source() {
+    let (_dir, ws) = project();
+    let source = ws.root().join("source");
+    let target = ws.root().join("target");
+    std::fs::write(&source, "original").unwrap();
+    // The failed second move creates a parent at the first source name, simulating another
+    // writer recreating that name after it was moved. Rollback must not replace even an empty dir.
+    let error = move_units(&[
+        (source.clone(), target.clone()),
+        (ws.root().join("missing"), source.join("nested")),
+    ])
+    .unwrap_err();
+    assert!(error.contains("could not restore"), "{error}");
+    assert!(source.is_dir());
+    assert_eq!(std::fs::read_to_string(target).unwrap(), "original");
 }

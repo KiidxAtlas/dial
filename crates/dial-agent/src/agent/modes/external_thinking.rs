@@ -4,9 +4,7 @@
 //! blocks are removed by `strip_scratchpad` before the reply is shown or stored.
 
 use crate::agent::Agent;
-
-/// System-prompt addition that routes private reasoning into one `<scratchpad>` block.
-pub const INSTRUCTION: &str = "Reason privately before answering. Put all scratch reasoning inside one <scratchpad>...</scratchpad> block at the start of your reply. Text outside that block is shown to the user.";
+pub use crate::agent::prompts::modes::external_thinking::INSTRUCTION;
 
 const OPEN: &str = "<scratchpad>";
 const CLOSE: &str = "</scratchpad>";

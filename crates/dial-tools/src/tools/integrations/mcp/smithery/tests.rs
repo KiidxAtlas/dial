@@ -92,7 +92,8 @@ fn browsing_keeps_nuxt_without_details_and_follows_provider_pagination() {
 
 #[test]
 fn config_names_follow_slug_rules() {
-    assert_eq!(to_config_name("@Acme/My Notes!"), "acme-my-notes");
+    assert_eq!(to_config_name("@Acme/My Notes!"), "my-notes");
+    assert_eq!(to_config_name("@acme/notes.v2"), "notes-v2");
     assert_eq!(to_config_name("@@"), "mcp-server");
     assert_eq!(normalize_qualified_name("acme/x"), "@acme/x");
     assert_eq!(unique_name("a", |n| n == "a"), "a-2");

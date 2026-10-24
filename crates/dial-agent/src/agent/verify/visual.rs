@@ -39,8 +39,7 @@ fn rendered_file(path: &Path) -> bool {
         Some("html" | "htm" | "css" | "scss" | "sass" | "less" | "jsx" | "tsx" | "vue" | "svelte")
     )
 }
-
-pub const INITIAL_GUIDANCE: &str = "Visual evidence may help this task. Decide what needs to be seen and inspect it proactively, without waiting for the user to ask for screenshots. For a site, discover/load browser, open the actual relevant page or approved local preview, and capture a baseline before visual edits when available. For a desktop GUI program, run its real command. Inspect supplied images with read when needed. After edits, capture and inspect the updated result. DOM/source text and a passing build do not show appearance. Preserve browser/network approvals and report unavailable rendering or image input honestly; NEVER stand in a stubbed GUI library for the real program.";
+pub use crate::agent::prompts::recovery::INITIAL_GUIDANCE;
 
 #[derive(Default)]
 pub struct Review {

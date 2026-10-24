@@ -60,6 +60,19 @@ fn split_args(text: &str, instruction: &str) -> Value {
     })
 }
 
+/// Transport success is not startup success: live task creation can return a settled failure.
+/// Keep this validation inside the existing new-live-job guard so partial launches are never replayed.
+fn started_worker(result: Value) -> Result<Value> {
+    ensure!(
+        result.as_array().is_some_and(|jobs| {
+            !jobs.is_empty() && jobs.iter().all(|job| job["status"] == "running")
+        }),
+        "independent worker startup did not succeed: {}",
+        crate::agent::workers::live_tasks::model_summary(&result)
+    );
+    Ok(result)
+}
+
 impl Agent<'_> {
     /// Whether a separate worker may be started right now.
     fn can_split_now(&self) -> bool {
@@ -99,7 +112,10 @@ impl Agent<'_> {
                 continue;
             }
             let before = self.live_tasks.running_ids();
-            match self.start_subagents(&split_args(&text, &instruction), ui) {
+            match self
+                .start_subagents(&split_args(&text, &instruction), ui)
+                .and_then(started_worker)
+            {
                 Ok(result) => {
                     self.record(self.cur_step, "message_routed", json!({
                         "route":"split", "message":text, "reason":"user chose an independent worker", "workers":result,
@@ -197,7 +213,10 @@ impl Agent<'_> {
             if choice.route == Route::Split {
                 if can_split {
                     let before = self.live_tasks.running_ids();
-                    match self.start_subagents(&split_args(&text, instruction), ui) {
+                    match self
+                        .start_subagents(&split_args(&text, instruction), ui)
+                        .and_then(started_worker)
+                    {
                         Ok(result) => {
                             self.record(self.cur_step, "message_routed", json!({
                                 "route":"split", "message":text, "reason":choice.reason, "workers":result,

@@ -24,6 +24,28 @@ impl PasteGuard {
         self.bracketed = true;
     }
 
+    /// Applies the command Enter shortcut without bypassing bracketed-paste protection.
+    /// Buffered typed commands submit immediately; a pasted command's trailing Enter does not.
+    pub fn text_for_draft_key(
+        &mut self,
+        key: KeyEvent,
+        buffered: bool,
+        now: Instant,
+        draft: &str,
+    ) -> Option<&'static str> {
+        let bracketed = self.bracketed && self.until.is_some_and(|until| now < until);
+        if key.kind != KeyEventKind::Release
+            && key.code == KeyCode::Enter
+            && key.modifiers.is_empty()
+            && enter_submits_command(draft)
+            && !bracketed
+        {
+            *self = Self::default();
+            return None;
+        }
+        self.text_for_key(key, buffered, now)
+    }
+
     /// Buffered printable keys can be an unbracketed paste. A line break followed by more
     /// buffered input is a paste's newline; an Enter with nothing queued after it submits, even
     /// when the keys before it were queued behind a stalled loop. A bracketed paste's trailing

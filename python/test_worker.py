@@ -273,5 +273,17 @@ class SensitivityHelperTests(unittest.TestCase):
             layer_scores({"layers.0.q_proj.lora_b": -1.0}, 2)
 
 
+class TrainingBoundaryTests(unittest.TestCase):
+    def test_training_entry_rejects_invalid_ranks_before_loading_runtime(self):
+        from dial_worker import train_in
+        for resume, ranks in ((None, (129, 1024)), ("adapter", (0, 1025, True, 2.5))):
+            for rank in ranks:
+                request = {"model": "test", "iters": 1, "batch_size": 1,
+                           "num_layers": 1, "rank": rank, "max_seq_length": 32,
+                           "resume_adapter": resume}
+                with self.subTest(resume=resume, rank=rank), self.assertRaisesRegex(RequestError, "rank"):
+                    train_in(request, "unused")
+
+
 if __name__ == "__main__":
     unittest.main()

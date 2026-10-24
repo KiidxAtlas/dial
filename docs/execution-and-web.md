@@ -75,6 +75,15 @@ All native file commits take reentrant writer leases for their canonical documen
 
 Overlapping edits, ambiguous insertion boundaries, whole-file replacements and projected documents require a fresh read. External editors and overlapping additional roots are still protected by exact source-identity checks; the lease does not claim to coordinate arbitrary external programs. Multi-file transaction rollback and observer behavior remain in `edit_transaction.rs`.
 
+LSP file/directory rename captures its source snapshot before asking servers for `willRenameFiles`
+edits, then validates the move sources and returned edit targets against that baseline. Forward
+moves and rollback use atomic no-replace operations: a destination created while the request or
+approval is pending is preserved, and rollback never overwrites a recreated source. Recovery failures
+are reported rather than hidden. Supported implementations use native Linux, macOS and Windows
+namespace primitives; unsupported platforms refuse instead of falling back to replacing rename.
+These guarantees do not imply crash durability or protection against arbitrary ancestor-directory
+replacement by unrelated processes.
+
 ## Debug adapters and MCP lifecycle notifications
 
 `[dap.<id>]` defines an operator-owned adapter executable. The `dap` integration exposes
@@ -105,6 +114,26 @@ readiness, then open its HTTP URL. Foreground `bash` kills servers at its deadli
 Browser failures show the underlying network refusal before Chromium's generic error. Networking is
 paused between approved browser operations. Python and
 Poppler must also be installed when using kernel/PDF capabilities.
+
+Built-in Chromium operations have a 30-second overall deadline by default, including startup and
+network settlement. A missing or non-actionable click target must not wait indefinitely. Set
+`[browser] timeout_secs` to a larger value (up to 3600) for slower operations; an explicit configured
+value of `0` retains unlimited waits. Per-call `timeout` can shorten, but not exceed, a nonzero
+configured cap; per-call `0` still uses that cap. Existing configurations explicitly saving `0`
+must be updated to enable the deadline. Deadline/cancellation failures may retire Dial's owned
+browser session; inspect current tabs before further actions and never blindly retry a click that
+may already have taken effect.
+
+Action errors (for example, a selector that never becomes actionable) retain Playwright's diagnostic
+and preserve the tab. The action deadline leaves a small response margin before the outer watchdog;
+only transport failure/cancellation or an unresponsive action requires session retirement.
+After a successful action, background HTTP gets a separate settlement budget of at most one second,
+even when the action timeout is unlimited. If it expires, the result includes
+`network_settlement: { settled: false, pending, note }`: the action completed, but application-level
+success has not been established. Inspect the page rather than repeating the action.
+HTTP jobs are operation-owned, limited to 16 outstanding jobs and 2 MiB of queued request data,
+and cancelled/joined before the operation returns. Their network waits do not block reading driver
+completion/error messages. They retain the same guarded host, redirect and body-size policies.
 
 Browser `run` executes an async function body in the page realm: use DOM globals such as `document`,
 `assert(condition, message)` and `await sleep(ms)`, and `return` a JSON-serializable result.

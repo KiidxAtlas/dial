@@ -57,7 +57,7 @@ pub(super) fn drive(app: &mut App, shell: &mut Shell, session: Option<Session>) 
     // changed settings still match what it loaded.
     let mut resident = None;
     loop {
-        let step = {
+        let (step, layout) = {
             let mut agent = app.make_agent(session)?;
             if let Some(server) = resident.take() {
                 agent.adopt_resident_server(server);
@@ -115,13 +115,17 @@ pub(super) fn drive(app: &mut App, shell: &mut Shell, session: Option<Session>) 
             plan_carry = agent.plan_carry();
             permission_rules = Some(agent.permission_rules().to_vec());
             session_cost = agent.session_cost();
-            step
+            (step, agent.layout().cloned())
         };
         shell.session_id = session.id().to_owned();
         match step? {
             Step::Quit | Step::Done => break,
             Step::Rebuild(config) => {
-                app.adopt(*config);
+                let project_changed =
+                    app.adopt_project(layout.unwrap_or_else(|| app.layout.clone()), *config);
+                if project_changed {
+                    shell.after_project_change(app);
+                }
                 shell.after_adopt(app);
                 // Removing a model/provider layer can leave a valid but unconfigured setup.
                 // Select a usable replacement without discarding the held session snapshots.

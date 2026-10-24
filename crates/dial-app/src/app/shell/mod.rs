@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 pub(in crate::app) mod busy;
 mod checkpoint_review;
 pub(in crate::app) mod command;
+mod file_discovery;
 pub(in crate::app) mod help;
 pub(in crate::app) mod improve;
 pub(in crate::app) mod input;
@@ -61,6 +62,7 @@ pub(super) const STATUS_TTL: Duration = Duration::from_secs(2);
 pub(super) const PAINT_EVERY: Duration = Duration::from_millis(40);
 
 pub(super) struct Shell {
+    files: file_discovery::Files,
     pub(super) loop_mode: crate::agent::modes::loop_runner::LoopMode,
     pub(super) runtime: crate::runtime::Tree,
     pub(super) pending_result: Option<crate::runtime::Body>,

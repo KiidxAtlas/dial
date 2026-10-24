@@ -199,20 +199,53 @@ fn tool_specific_rules_follow_the_offered_tools() {
     );
 }
 
+/// Preview guidance must not require a capability absent from the configured catalog.
+/// Test assembly across independent browser/server offers, not the wording of either rule.
+#[test]
+fn preview_rules_require_their_own_capabilities() {
+    for lean in [false, true] {
+        for one_call in [false, true] {
+            for concise in [false, true] {
+                for browser in [false, true] {
+                    for background in [false, true] {
+                        let mut tools = names(&["read", "edit", "bash"]);
+                        if browser {
+                            tools.push("browser".into());
+                        }
+                        if background {
+                            tools.push("bg".into());
+                        }
+                        let policy = scoped_guidance(
+                            &Offer {
+                                tools: &tools,
+                                lean,
+                                one_call,
+                            },
+                            concise,
+                        );
+                        assert_eq!(policy.contains(PREVIEW_RULES), browser);
+                        assert_eq!(policy.contains(PREVIEW_SERVER_RULES), browser && background);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// One-call operation asks for single calls and drops every instruction that needs a second call
 /// in the same response; the batching rules stay for every other route.
 #[test]
 fn one_call_guidance_replaces_batching() {
     let tools = names(&["read", "grep", "edit", "bash", "todo"]);
     let one = guidance_for(&tools, true, true);
-    assert!(one.contains("Make exactly one tool call per response"));
+    assert!(one.contains(LEAN_ONE_CALL));
     assert!(!one.contains("MUST batch"), "{one}");
     assert!(!one.contains("never alone"), "{one}");
     assert!(one.contains("3. Plan: use `todo` only for substantial multi-step work.\n"));
     for lean in [false, true] {
         let batching = guidance_for(&tools, lean, false);
         assert!(batching.contains("MUST batch independent calls"));
-        assert!(!batching.contains("Make exactly one tool call per response"));
+        assert!(!batching.contains(LEAN_ONE_CALL));
     }
     // One-call operation always uses the lean sections, which carry the same safety contracts.
     assert_eq!(guidance_for(&tools, false, true), one);

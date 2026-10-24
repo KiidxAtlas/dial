@@ -3,6 +3,9 @@ use std::fs::{DirBuilder, File, Metadata, OpenOptions};
 use std::io;
 use std::path::Path;
 
+mod rename;
+pub use rename::rename_noreplace;
+
 /// Native clone where supported; ordinary copying is the portable fallback.
 pub fn copy_on_write(source: &Path, dest: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]

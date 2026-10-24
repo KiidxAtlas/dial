@@ -570,6 +570,18 @@ impl Browser {
             .collect()
     }
 
+    /// Whether the MCP tab's query has not been sent to the catalogs yet. Typing only filters
+    /// the rows already loaded (the first browse page), so a server missing from them may still
+    /// be listed; the catalogs are searched when the query is confirmed.
+    pub fn catalog_search_pending(&self) -> bool {
+        let needle = self.query.trim().to_lowercase();
+        let state = self.catalog(Tab::Mcp);
+        self.tab == Tab::Mcp
+            && !needle.is_empty()
+            && !state.loading
+            && state.query.trim().to_lowercase() != needle
+    }
+
     /// Match counts for every tab while a query is active, e.g. "MCP servers 1 · Plugins 0".
     /// Empty when no query is set.
     pub fn match_summary(&self) -> String {
@@ -622,6 +634,7 @@ impl Browser {
     /// Open search. Typing filters every tab live.
     pub fn start_search(&mut self) {
         self.searching = true;
+        self.details_open = false;
     }
 
     /// Leave search, keeping the filter applied.

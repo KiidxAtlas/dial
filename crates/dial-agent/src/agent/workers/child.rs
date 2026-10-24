@@ -2024,8 +2024,8 @@ fn run_inner(
         if let Some(guidance) = rule_catalog.guidance(rule_state, &rule_agent) {
             messages.push(guidance);
         }
-        // The last allowed request is a reserved summary step: no tools are offered, so the worker
-        // reports what it found instead of ending with only the exhaustion message.
+        // The last allowed request is a reserved summary step. Schemas may remain for provider
+        // history compatibility, but the response must not dispatch tools (enforced below).
         let summary_step = budget != 0 && steps + 1 == budget;
         // Tool-free only when the history carries no tool traffic: providers reject tool blocks without
         // declared tools, so a history with tool calls keeps the offered schemas for this final request.
@@ -2271,6 +2271,7 @@ fn run_inner(
         }
         record_child_request(env, &children.namespace, backend, &result, started);
         messages = request.messages;
+        crate::agent::run::guidance::retire_delivered(&mut messages, result.is_ok());
         if !text_only {
             schemas = request.tools;
         }
@@ -2451,6 +2452,32 @@ fn run_inner(
             // `false` means a newer branch or recall superseded this one: nothing to publish.
             let _ = prepared.commit(&children.memory_authority());
         }
+        // Schemas retained for protocol history are not permission to act on the reserved
+        // summary request. Stop before recovery, inline-edit conversion or tool admission.
+        if summary_step
+            && (!reply.tool_calls.is_empty()
+                || reply.dropped_tool_call()
+                || looks_like_text_call(&reply.text, &names)
+                || (env.workspace.edit_mode() == crate::config::types::EditMode::Sloppy
+                    && env.workspace.edit_settings().recover_inline_edits
+                    && names.iter().any(|name| name == "edit")
+                    && tools::inline_edit_payload(&reply.text).is_some()))
+        {
+            let mut reason = format!(
+                "used all {} steps without a final answer; tools requested on the reserved summary step were not executed",
+                job.max_steps
+            );
+            let findings = if reply.text.trim().is_empty() {
+                last_written_findings(&messages)
+            } else {
+                Some(reply.text.as_str())
+            };
+            if let Some(text) = findings {
+                reason.push_str("; last findings (unverified):\n");
+                reason.push_str(&clip_evidence(text, 4096));
+            }
+            return Ok(crate::agent::run::engine::Tick::Finished(Outcome::incomplete(steps, reason)));
+        }
         if reply.finish_reason == "length" {
             if env.config.reasoning_guard.enabled
                 && reply.text.trim().is_empty()
@@ -2584,6 +2611,7 @@ fn run_inner(
                         && reply.finish_reason == "stop"
                         && !reply.text.trim().is_empty()
                         && !env.plan_mode
+                        && !summary_step
                         && job.spec.mutates
                         && names.iter().any(|name| name == "learn")
                         && !phase.exploration.busy()
@@ -3201,13 +3229,7 @@ fn run_inner(
         Err(error) => Outcome::failed(steps, format!("{error:#}")),
         Ok(None) => {
             // Exhaustion still salvages the worker's last written findings.
-            let last_findings = messages
-                .iter()
-                .rev()
-                .filter(|message| message["role"] == "assistant")
-                .filter_map(|message| message["content"].as_str())
-                .find(|text| !text.trim().is_empty());
-            let reason = match last_findings {
+            let reason = match last_written_findings(&messages) {
                 Some(text) => format!(
                     "used all {} steps without a final answer; last findings:\n{}",
                     job.max_steps,
@@ -3220,6 +3242,16 @@ fn run_inner(
     };
     outcome.inspections = inspections;
     outcome
+}
+
+/// Shared salvage path for exhausted workers and refused final-step tool attempts.
+fn last_written_findings(messages: &[Value]) -> Option<&str> {
+    messages
+        .iter()
+        .rev()
+        .filter(|message| message["role"] == "assistant")
+        .filter_map(|message| message["content"].as_str())
+        .find(|text| !text.trim().is_empty())
 }
 
 /// Coordination may be from the parent or a peer, so it does not grant new

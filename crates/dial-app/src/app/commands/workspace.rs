@@ -174,7 +174,7 @@ fn create(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, branch: &str) -> 
     let path = available_path(&git::worktree_path_for(&root, &branch).map_err(|e| anyhow!(e))?);
     let carried = git::worktree_add_keep_changes(&root, &path, &branch).map_err(|e| anyhow!(e))?;
     let path = canonical(&path);
-    relocate(agent, &path).map_err(|e| {
+    let config = relocate(app, agent, &path).map_err(|e| {
         anyhow!(
             "Created {} but the session did not move: {e:#}",
             path.display()
@@ -204,14 +204,15 @@ fn create(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, branch: &str) -> 
         "Worktree",
         format!("Created {} on {branch} ({how}).", path.display()),
     );
-    Ok(Step::Done)
+    Ok(Step::Rebuild(Box::new(config)))
 }
 
 /// Move this session into `dir` through `/move`, so its journal and the live tools follow it.
 /// Fails unless the session actually moved, so `/wt` never reports a move that did not happen.
-fn relocate(agent: &mut Agent<'_>, dir: &Path) -> Result<()> {
-    match super::session::move_session(agent, &dir.to_string_lossy())? {
-        super::session::MoveOutcome::Moved(_) => Ok(()),
+fn relocate(app: &App, agent: &mut Agent<'_>, dir: &Path) -> Result<crate::config::types::Config> {
+    let (outcome, config) = super::session::move_project(app, agent, &dir.to_string_lossy())?;
+    match outcome {
+        super::session::MoveOutcome::Moved(_) => Ok(config.expect("moved project validated")),
         super::session::MoveOutcome::Refused(reason) => bail!("{reason}"),
     }
 }
@@ -278,7 +279,7 @@ fn list(shell: &mut Shell, agent: &Agent<'_>) -> Result<Step> {
 }
 
 /// Move this session into an existing worktree (matched by branch or path).
-fn switch(shell: &mut Shell, _app: &App, agent: &mut Agent<'_>, target: &str) -> Result<Step> {
+fn switch(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, target: &str) -> Result<Step> {
     if target.is_empty() {
         shell.note("Worktree", "Usage: /wt switch <path|branch>");
         return Ok(Step::Done);
@@ -296,13 +297,13 @@ fn switch(shell: &mut Shell, _app: &App, agent: &mut Agent<'_>, target: &str) ->
         );
         return Ok(Step::Done);
     }
-    relocate(agent, &path)?;
+    let config = relocate(app, agent, &path)?;
     shell.stop_loop_for_session_change();
     shell.note(
         "Worktree",
         format!("Moved to {}. Tools now operate there.", path.display()),
     );
-    Ok(Step::Done)
+    Ok(Step::Rebuild(Box::new(config)))
 }
 
 /// Remove a linked worktree (never the primary one) and detach it from the workspace.

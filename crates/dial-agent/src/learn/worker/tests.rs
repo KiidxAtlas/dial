@@ -401,3 +401,96 @@ fn real_sensitivity_scores_every_layer() {
     println!("chosen suffix: {chosen}");
     assert!((2..=24).contains(&chosen));
 }
+
+#[cfg(unix)]
+#[test]
+fn budget_expiry_stops_and_reaps_controlled_workers() {
+    for mode in ["request", "cooperative", "unresponsive"] {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            state_dir: root.path().join("state"),
+            user_dir: root.path().join("user"),
+            python: PathBuf::from("/usr/bin/python3"),
+            worker: root.path().join("worker.py"),
+            model: "fixture".into(),
+            use_case: "budget lifecycle regression".into(),
+            worker_timeout_secs: 30,
+            ..Config::default()
+        };
+        config.improve.daily_compute_minutes = 1;
+        config.training.enabled = true;
+        let marker = root.path().join("started");
+        std::fs::write(
+            &config.worker,
+            format!(
+                r#"
+import json,sys,time,os
+from pathlib import Path
+r=json.load(sys.stdin)
+Path({marker:?}).write_text(str(os.getpid()))
+if r['op']=='train':
+    out=Path(r['output_dir'])
+    out.mkdir()
+    (out/'resume.json').write_text('{{"completed":1}}')
+    while not Path(r['pause_file']).exists():
+        time.sleep(0.005)
+    if {cooperative}:
+        print(json.dumps({{'paused':True}}))
+        sys.exit(0)
+time.sleep(30)
+"#,
+                marker = marker.to_str().unwrap(),
+                cooperative = if mode == "cooperative" {
+                    "True"
+                } else {
+                    "False"
+                }
+            ),
+        )
+        .unwrap();
+        let store = crate::storage::store::Store::open(
+            &config.state_dir,
+            &config.model,
+            &config.use_case,
+            &config.harness,
+        )
+        .unwrap();
+        let active = store.active().unwrap();
+        let lease = super::super::compute::Background::acquire(&config).unwrap();
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !marker.exists() {
+                    assert!(started.elapsed() < Duration::from_secs(5));
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                super::super::resources::record_usage(&config.user_dir, 60).unwrap();
+            });
+            let result = if mode == "request" {
+                call(&config, &json!({"op":"generate"})).map(|_| ())
+            } else {
+                train(&config, &active, &root.path().join("adapter")).map(|_| ())
+            };
+            let error = result.unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<super::super::auto::BudgetReached>()
+                    .is_some(),
+                "{error:#}"
+            );
+        });
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let pid: u32 = std::fs::read_to_string(marker).unwrap().parse().unwrap();
+        assert!(
+            !crate::platform::process::alive(pid),
+            "worker was not reaped"
+        );
+        if mode != "request" {
+            assert!(root.path().join("adapter/resume.json").is_file());
+        }
+        drop(lease);
+        assert!(!super::super::compute::background_active());
+        let file = super::super::auto::lock_file(&config.user_dir.join("compute.lock")).unwrap();
+        fs2::FileExt::try_lock_exclusive(&file).unwrap();
+    }
+}

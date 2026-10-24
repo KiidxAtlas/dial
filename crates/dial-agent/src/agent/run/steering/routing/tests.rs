@@ -483,3 +483,86 @@ fn committed_steering_reports_applied_only_after_journaling() {
         );
     });
 }
+
+#[test]
+fn settled_startup_failure_preserves_input_using_each_routes_failure_policy() {
+    for explicit in [false, true] {
+        let scripts = if explicit {
+            vec![]
+        } else {
+            vec![reply(
+                r#"{"route":"split","reason":"Independent question"}"#,
+            )]
+        };
+        let server = llm::fake::serve(scripts);
+        with_agent("[task]\npersist=true", |agent| {
+            active(agent);
+            // Make transcript creation fail after admission, returning Ok([{status: failed}])
+            // rather than an Err from the admission gate. No worker thread is launched.
+            let dir = crate::agent::workers::child_transcript::transcript_dir(
+                agent.layout.as_ref().unwrap(),
+                agent.session.id(),
+            );
+            std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+            std::fs::write(&dir, "not a directory").unwrap();
+            let text = "Write the changelog";
+            let mut ui = Input::default();
+            if explicit {
+                ui.independent.push(text.into());
+            } else {
+                ui.pending.push(text.into());
+            }
+            assert_eq!(
+                agent
+                    .route_pending_messages(&mut backend(&server.url), &mut ui)
+                    .unwrap(),
+                !explicit
+            );
+            assert!(agent.live_tasks.running_ids().is_empty());
+            assert!(
+                ui.notices
+                    .iter()
+                    .any(|notice| notice.contains("startup did not succeed")),
+                "{:?}",
+                ui.notices
+            );
+            assert!(
+                ui.notices
+                    .iter()
+                    .any(|notice| notice.contains("Could not start an independent worker"))
+            );
+            assert!(
+                !ui.notices
+                    .iter()
+                    .any(|notice| notice.starts_with("Started an independent worker"))
+            );
+            if explicit {
+                assert_eq!(ui.deferred, [text]);
+                assert!(ui.accepted.is_empty() && ui.applied.is_empty());
+                assert_eq!(
+                    agent.session.control_state()["current_instruction"],
+                    "Fix the parser"
+                );
+            } else {
+                assert!(ui.deferred.is_empty());
+                assert_eq!(ui.accepted, [text]);
+                assert_eq!(ui.applied, [text]);
+                assert_eq!(agent.session.control_state()["current_instruction"], text);
+            }
+        });
+        assert_eq!(server.requests().len(), usize::from(!explicit));
+    }
+}
+
+#[test]
+fn startup_validation_accepts_only_confirmed_running_jobs() {
+    assert!(started_worker(json!([{"id":"task-1","status":"running"}])).is_ok());
+    for result in [
+        json!([]),
+        json!({"status":"running"}),
+        json!([{"id":"task-1","status":"failed","result":"transcript failed"}]),
+        json!([{"id":"task-1","status":"running"},{"id":"task-2","status":"failed"}]),
+    ] {
+        assert!(started_worker(result).is_err());
+    }
+}

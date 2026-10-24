@@ -1,4 +1,8 @@
 //! Safe next actions from observed failures. No retries, installation or permission grants.
+use crate::agent::prompts::recovery as policy;
+pub(in crate::agent) use crate::agent::prompts::recovery::{
+    DIAGNOSE_FIRST, FIRST_FAILURE, PROVIDER_RECOVERY,
+};
 use crate::{
     llm::ToolCall,
     runtime::{
@@ -6,14 +10,6 @@ use crate::{
         tool_output::ToolOutput,
     },
 };
-
-/// Full diagnose-first contract, attached once a failure repeats (and to uncertain effects). The
-/// diagnostic remains evidence, not authority to change scope, install dependencies or bypass a
-/// boundary.
-pub(in crate::agent) const DIAGNOSE_FIRST: &str = "Before the next action, briefly tell the user what failed, the cause supported by this result (or explicitly say it is not yet known), and what you will change to address it. Use a diagnostic that names the failing code or prerequisite directly; do not rerun merely to confirm it. If the cause is unknown, obtain the smallest missing evidence instead of guessing. Retry only after correcting the cause or identifying evidence that makes a retry appropriate; changing wording or repeating an equivalent failed call is not recovery. Preserve the requested outcome and report a concrete blocker when correction needs permission or unavailable resources.";
-/// Compact line for the first failure of a kind, so a simple slip costs one sentence.
-pub(in crate::agent) const FIRST_FAILURE: &str =
-    "Fix the cause this result names before retrying; do not repeat the same call unchanged.";
 
 /// Recovery feedback appended to a failed result. `consecutive` counts failures of this tool and
 /// kind in a row, including this one. The text depends only on its inputs, so stored history
@@ -75,10 +71,6 @@ pub(in crate::agent) fn report(
     )
 }
 
-/// Inference failed before the response could enter tool dispatch. This describes only that
-/// response, never earlier operations in the turn or billing at the provider.
-pub(in crate::agent) const PROVIDER_RECOVERY: &str = "Recovery state: inference failed; no tools were dispatched from this failed response. Earlier completed operations are retained, not rolled back. Next action: resolve the provider diagnostic, then continue this session when ready. Do not replay earlier tool operations merely because inference failed.";
-
 pub(in crate::agent) fn provider_failure(error: &anyhow::Error) -> String {
     format!("{error:#}\n{PROVIDER_RECOVERY}")
 }
@@ -88,35 +80,20 @@ pub(in crate::agent) fn classify(
     output: &ToolOutput,
 ) -> Option<(&'static str, &'static str)> {
     if output.execution.effects == Effects::Unknown {
-        return Some((
-            "effects_unknown",
-            "Inspect affected state before any retry. Partial work may exist; do not infer rollback or replay the operation.",
-        ));
+        return Some(("effects_unknown", policy::EFFECTS_UNKNOWN));
     }
     match ToolStatus::from_output(output) {
         ToolStatus::Blocked => {
-            return Some((
-                "permission_or_policy",
-                "Respect the reported boundary. Do not switch tools to bypass it; finish reachable work and report the exact missing permission or prerequisite.",
-            ));
+            return Some(("permission_or_policy", policy::PERMISSION_OR_POLICY));
         }
         ToolStatus::Aborted => {
-            return Some((
-                "interrupted",
-                "Preserve completed effects. Do not automatically replay the interrupted operation; follow the user's direction and inspect state if continuation is requested.",
-            ));
+            return Some(("interrupted", policy::INTERRUPTED));
         }
         ToolStatus::Timeout => {
-            return Some((
-                "timeout",
-                "Inspect the recorded process/task state and completed output. Continue with a narrower bounded operation only when its effects are understood; a timeout is not a code diagnosis.",
-            ));
+            return Some(("timeout", policy::TIMEOUT));
         }
         ToolStatus::Skipped => {
-            return Some((
-                "not_executed",
-                "Resolve the reported ordering, cancellation or prerequisite before making a new call. Do not report this operation as executed.",
-            ));
+            return Some(("not_executed", policy::NOT_EXECUTED));
         }
         ToolStatus::Ok => return None,
         ToolStatus::Error => {}
@@ -137,34 +114,23 @@ pub(in crate::agent) fn classify(
                 timeout_secs: 0,
             });
         return match classify_output(check.as_ref(), output, false) {
-            CheckStatus::EnvironmentUnavailable => Some((
-                "verification_environment",
-                "Diagnose the named runner or environment prerequisite; do not edit application code to hide this failure or install dependencies without approval. Use an already available equivalent check or report the coverage gap.",
-            )),
-            CheckStatus::CodeFailed if check.is_some() => Some((
-                "verification_code",
-                "Use the observed failing assertion/compiler diagnostic to repair the affected behavior, then rerun that check after the final edit. Do not change the acceptance criterion to obtain a pass.",
-            )),
+            CheckStatus::EnvironmentUnavailable => {
+                Some(("verification_environment", policy::VERIFICATION_ENVIRONMENT))
+            }
+            CheckStatus::CodeFailed if check.is_some() => {
+                Some(("verification_code", policy::VERIFICATION_CODE))
+            }
             CheckStatus::CodeFailed => Some((
                 "verification_failed_unclassified",
-                "The process failed, but its runner has no controller-selected setup classification. Inspect the diagnostic to distinguish an environment prerequisite from a code defect before editing application code; preserve the failing acceptance criterion.",
+                policy::VERIFICATION_FAILED_UNCLASSIFIED,
             )),
-            _ => Some((
-                "verification_unavailable",
-                "This result does not establish a code defect or a passing check. Inspect termination and runner evidence, then report or resolve the specific verification gap.",
-            )),
+            _ => Some(("verification_unavailable", policy::VERIFICATION_UNAVAILABLE)),
         };
     }
     if matches!(call.name.as_str(), "edit" | "ast_edit" | "write") {
-        return Some((
-            "source_or_call_contract",
-            "Use the returned diagnostic to correct the call. For stale or unseen source, use complete current lines and fresh anchors already returned; read only the affected ranges still missing. Do not repeat guessed replacements or split a patch without addressing the reported cause.",
-        ));
+        return Some(("source_or_call_contract", policy::SOURCE_OR_CALL_CONTRACT));
     }
-    Some((
-        "tool_failure",
-        "Inspect the original diagnostic and execution status. Correct the named arguments, prerequisite or affected code before retrying. If this result does not establish a cause, use a targeted observation to distinguish causes; do not invent a diagnosis, substitute a different acceptance criterion, or treat failure as permission to bypass safeguards.",
-    ))
+    Some(("tool_failure", policy::TOOL_FAILURE))
 }
 
 #[cfg(test)]

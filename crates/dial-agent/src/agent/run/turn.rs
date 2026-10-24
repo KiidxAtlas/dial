@@ -123,7 +123,6 @@ impl Agent<'_> {
             },
         );
         let mut iteration = 0u32;
-        let turn_cost_start = self.session_cost().unwrap_or(0.0);
         let driven = engine.drive(|engine| {
             if !budget.begin() { return Ok(crate::agent::run::engine::Tick::Exhausted); }
 
@@ -148,14 +147,15 @@ impl Agent<'_> {
             iteration = iteration.saturating_add(1);
             if !self.hermetic {
                 let spent = self.session_cost().unwrap_or(0.0);
+                // The external-turn ledger includes earlier repair/hook rounds and auxiliary work.
+                let turn_spent = self.usage_scope.observed_turn_cost().unwrap_or(0.0);
                 let caps = &self.config.budget;
                 let hit = match (caps.max_session_cost_usd, caps.max_turn_cost_usd) {
                     (Some(cap), _) if cap > 0.0 && spent >= cap => Some(format!(
                         "observed session API cost ${spent:.4} reached the ${cap:.4} stop boundary"
                     )),
-                    (_, Some(cap)) if cap > 0.0 && spent - turn_cost_start >= cap => Some(format!(
-                        "observed API cost this turn is ${:.4}, reaching its ${cap:.4} stop boundary",
-                        spent - turn_cost_start
+                    (_, Some(cap)) if cap > 0.0 && turn_spent >= cap => Some(format!(
+                        "observed API cost this turn is ${turn_spent:.4}, reaching its ${cap:.4} stop boundary"
                     )),
                     _ => None,
                 };

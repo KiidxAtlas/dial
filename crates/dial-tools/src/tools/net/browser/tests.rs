@@ -3,6 +3,18 @@ use crate::config::tools::browser::BrowserConfig;
 use super::*;
 use std::time::Instant;
 #[test]
+fn default_browser_operations_have_a_deadline() {
+    let config = BrowserConfig::default();
+    let timeout = deadline(&json!({"action":"click"}), config.timeout_secs).unwrap();
+    assert!(!timeout.is_zero(), "omitted timeout must not wait forever");
+    assert!(execution_deadline(timeout).is_some());
+    assert_eq!(
+        deadline(&json!({"timeout": 1}), config.timeout_secs).unwrap(),
+        Duration::from_secs(1)
+    );
+    assert_eq!(deadline(&json!({}), 0).unwrap(), Duration::ZERO);
+}
+#[test]
 fn sandbox_dependency_paths_are_not_profile_injection() {
     assert!(profile_path(Path::new("/tmp/a\"(allow network*)")).is_err());
     assert!(profile_path(Path::new("relative")).is_err());
@@ -453,6 +465,19 @@ impl LocalApp {
                         if !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
                             return;
                         }
+                        if String::from_utf8_lossy(&request).starts_with("GET /stall ") {
+                            // Deliberately never return headers. Stop when the operation cancels
+                            // its HTTP job (or the fixture shuts down).
+                            while !stopping.load(Ordering::Acquire) {
+                                match stream.read(&mut chunk) {
+                                    Ok(0) => break,
+                                    Ok(_) => {}
+                                    Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                                    Err(_) => break,
+                                }
+                            }
+                            return;
+                        }
                         let response = if String::from_utf8_lossy(&request)
                             .starts_with("GET /redirect ")
                         {
@@ -865,6 +890,49 @@ fn builtin_runtime_end_to_end_sandboxed() {
         .decode(screenshot["artifact"]["data"].as_str().unwrap())
         .unwrap();
     assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
-    call(json!({"action":"close","tab":tab}));
+    // A completed click must not be held hostage by its background HTTP request.
+    call(
+        json!({"action":"evaluate","tab":tab,"expression":"document.body.innerHTML = '<button id=stall>Start</button>'; document.querySelector('#stall').onclick = () => { document.title = 'clicked-once'; fetch('/stall').catch(() => {}); }; 'ready'"}),
+    );
+    let started = Instant::now();
+    let clicked = call(json!({"action":"click","tab":tab,"selector":"#stall"}));
+    assert_eq!(clicked["network_settlement"]["settled"], false, "{clicked}");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(
+        call(json!({"action":"evaluate","tab":tab,"expression":"document.title"}))["value"],
+        "clicked-once"
+    );
+    let shaped = call(
+        json!({"action":"run","tab":tab,"code":"fetch('/stall').catch(() => {}); return 'completed';"}),
+    );
+    assert_eq!(shaped["network_settlement"]["settled"], false, "{shaped}");
+    // A concrete error returns without waiting for unrelated background HTTP.
+    let started = Instant::now();
+    let failed = tool.call(&ctx, &json!({"action":"evaluate","tab":tab,"expression":"fetch('/stall').catch(() => {}); throw new Error('known-page-failure')"}));
+    assert!(
+        failed.is_error && failed.text.contains("known-page-failure"),
+        "{}",
+        failed.text
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+    // Actionability errors must preserve the tab and include the actual selector diagnostic.
+    let started = Instant::now();
+    let missing = tool.call(
+        &ctx,
+        &json!({"action":"click","selector":"#never-present","timeout":1}),
+    );
+    assert!(missing.is_error, "{}", missing.text);
+    assert!(
+        missing.text.contains("#never-present") && missing.text.contains("Timeout"),
+        "{}",
+        missing.text
+    );
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(
+        call(json!({"action":"evaluate","tab":tab,"expression":"document.title"}))["value"],
+        "clicked-once"
+    );
+    let recovered = call(json!({"action":"open","url":"about:blank"}));
+    call(json!({"action":"close","tab":recovered["tab"]}));
     call(json!({"action":"shutdown"}));
 }
