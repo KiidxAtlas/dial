@@ -40,6 +40,11 @@ const MAX_CATALOG_JSON: u64 = 8 * 1024 * 1024;
 const FILE: &str = "chatgpt-accounts.json";
 const CATALOG_FILE: &str = "chatgpt-model-catalog.json";
 
+/// Credential file protected independently from other subscription-store data.
+pub fn credential_path(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join(FILE)
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct ModelCatalog {
     models: Vec<super::catalog::ModelEntry>,

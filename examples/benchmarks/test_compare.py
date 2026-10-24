@@ -140,5 +140,62 @@ class ComparisonTests(unittest.TestCase):
         measured["cases"][0]["metrics"]["token_usage_incomplete"] = True
         self.assertIsNone(compare(measured, measured)["candidate"]["tokens"])
 
+    def test_run_identity_requires_matching_source_and_suite(self):
+        baseline = report()
+        baseline["contract"] = {
+            "schema_version": 1, "suite_sha256": "a" * 64,
+            "source_sha256": "b" * 64, "executable_sha256": "c" * 64,
+            "configuration_sha256": "d" * 64,
+        }
+        self.assertEqual(compare(baseline, baseline)["run_identity"], "matched")
+        for field, changed in (("source_sha256", "e" * 64),
+                               ("suite_sha256", "e" * 64), ("schema_version", 2)):
+            candidate = copy.deepcopy(baseline)
+            candidate["contract"][field] = changed
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                compare(baseline, candidate)
+        candidate = copy.deepcopy(baseline)
+        candidate["contract"].update(executable_sha256="e" * 64, configuration_sha256="f" * 64)
+        self.assertEqual(compare(baseline, candidate)["run_identity"], "matched")
+        self.assertEqual(compare(report(), baseline)["run_identity"], "legacy_unknown")
+        self.assertEqual(compare(report(), report())["run_identity"], "legacy_unknown")
+
+    def test_zero_token_transport_failure_is_observed_activity(self):
+        failed = report(False)
+        failed["cases"][0]["metrics"].update(
+            prompt_tokens=0, output_tokens=0, tool_calls=0, agent_error=True,
+            runtime_usage={"all": {"transport_attempts": 1}})
+        self.assertFalse(compare(report(), failed)["correctness_nonregressing"])
+        failed["cases"][0]["metrics"]["runtime_usage"]["all"]["transport_attempts"] = 0
+        with self.assertRaisesRegex(ValueError, "invalid run"):
+            compare(report(), failed)
+
+    def test_malformed_transport_usage_is_rejected_as_invalid_report(self):
+        for usage in [False, True, 4, "", "usage", [], [1], {"all": None}, {"all": True}, {"all": [1]},
+                      {"all": {"transport_attempts": True}},
+                      {"all": {"transport_attempts": -1}},
+                      {"all": {"transport_attempts": 2**64}},
+                      {"all": {"transport_attempts": "1"}}]:
+            with self.subTest(usage=usage):
+                malformed = report()
+                malformed["cases"][0]["metrics"]["runtime_usage"] = usage
+                with self.assertRaises(ValueError):
+                    compare(malformed, report())
+                # An active first case must not short-circuit validation of later records.
+                multiple = report()
+                malformed["cases"][0]["id"] = "second"
+                multiple["cases"].extend(malformed["cases"])
+                with self.assertRaises(ValueError):
+                    compare(multiple, multiple)
+
+    def test_optional_transport_usage_preserves_legacy_reports(self):
+        for usage in [None, {}, {"all": {}}, {"all": {"transport_attempts": 0}},
+                      {"all": {"transport_attempts": 2**64 - 1}}]:
+            with self.subTest(usage=usage):
+                valid = report()
+                valid["cases"][0]["metrics"]["runtime_usage"] = usage
+                self.assertTrue(compare(valid, valid)["correctness_nonregressing"])
+
+
 if __name__ == "__main__":
     unittest.main()

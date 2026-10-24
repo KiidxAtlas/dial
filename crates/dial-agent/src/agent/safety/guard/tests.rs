@@ -342,6 +342,21 @@ fn unusable_replies_are_refunded_a_bounded_number_of_times() {
 }
 
 #[test]
+fn consumed_steps_exclude_refunds_and_server_retries() {
+    let mut budget = StepBudget::new(3, 1);
+    assert!(budget.begin());
+    assert_eq!(budget.spent(), 1);
+    assert!(budget.refund());
+    assert_eq!(budget.spent(), 0);
+    assert!(budget.begin());
+    budget.give_back();
+    assert_eq!(budget.spent(), 0);
+    assert!(budget.begin());
+    assert!(!budget.refund());
+    assert_eq!(budget.spent(), 1);
+}
+
+#[test]
 fn zero_step_budget_is_unlimited_but_refunds_remain_bounded() {
     let mut budget = StepBudget::new(0, 2);
     for _ in 0..100 {

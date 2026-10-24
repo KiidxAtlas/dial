@@ -21,6 +21,7 @@ use std::{
 };
 
 mod length_recovery;
+mod turn_admission;
 
 fn system_text(request: &Value) -> String {
     request["messages"]
@@ -352,6 +353,51 @@ fn consistent_ux_promised_actions_stop_incomplete_after_bounded_recovery() {
 }
 
 #[test]
+fn stats_session_announcements_continue_into_real_work() {
+    let server = serve(vec![
+        Reply::Text("Now the full Stats page:"),
+        Reply::Text("Writing the complete page now."),
+        Reply::Call(
+            "write",
+            json!({"path":"stats.txt", "content":"implemented\n"}),
+        ),
+        Reply::Text("Created stats.txt."),
+    ]);
+    let mut e = env(&server.url, "auto");
+    e.config.harness.max_steps = 0;
+    let mut agent = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let report = agent
+        .turn("Create stats.txt", &mut Recorder::default())
+        .unwrap();
+    assert_eq!(report.outcome, TurnOutcome::Completed);
+    assert_eq!(server.requests.lock().len(), 4);
+    assert_eq!(
+        std::fs::read_to_string(e.project.path().join("stats.txt")).unwrap(),
+        "implemented\n"
+    );
+}
+
+#[test]
+fn stats_session_announcements_exhaust_recovery_without_false_completion() {
+    let server = serve(vec![
+        Reply::Text("Now the Stats page itself. It gets the new tabs and charts:"),
+        Reply::Text("Now the full Stats page:"),
+        Reply::Text("Writing the complete page now."),
+        Reply::Text("I'm updating the page now."),
+    ]);
+    let mut e = env(&server.url, "auto");
+    e.config.harness.max_steps = 0;
+    let mut agent = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let report = agent
+        .turn("Create stats.txt", &mut Recorder::default())
+        .unwrap();
+    assert_eq!(report.outcome, TurnOutcome::Incomplete);
+    assert_eq!(server.requests.lock().len(), 4);
+    assert_eq!(agent.metrics().turns_completed, 0);
+    assert!(!e.project.path().join("stats.txt").exists());
+}
+
+#[test]
 fn consistent_ux_quoted_and_optional_actions_finish_without_an_extra_request() {
     for answer in [
         "Example string: \"I'll check that\".",
@@ -372,11 +418,13 @@ fn consistent_ux_quoted_and_optional_actions_finish_without_an_extra_request() {
 
 #[test]
 fn consistent_ux_unlimited_children_bound_empty_promised_and_malformed_replies() {
-    for kind in ["empty", "promise", "malformed"] {
+    for kind in ["empty", "promise", "transition", "present", "malformed"] {
         let side = serve_fn(
             Arc::new(move |_| match kind {
                 "empty" => Reply::Text(""),
                 "promise" => Reply::Text("I will inspect the parser next."),
+                "transition" => Reply::Text("Now the full Stats page:"),
+                "present" => Reply::Text("Writing the complete page now."),
                 _ => Reply::DroppedCall,
             }),
             None,
@@ -10890,4 +10938,108 @@ fn completion_evidence_surfaces_session_recovery_once_without_injecting_damaged_
             .to_string()
             .contains("DO_NOT_TRUST_JOURNAL")
     );
+}
+
+#[test]
+fn completed_edit_preview_rejections_are_bounded_without_a_step_limit() {
+    let mut replies: Vec<_> = (0..12)
+        .map(|_| {
+            Reply::Calls(vec![
+                (
+                    "write",
+                    json!({"path":"must-not-exist.txt","content":"not executed"}),
+                ),
+                (
+                    "edit",
+                    json!({"path":"target.txt","old_string":"missing","new_string":"changed"}),
+                ),
+            ])
+        })
+        .collect();
+    replies.push(Reply::Text("Unexpected completion."));
+    let server = serve(replies);
+    let mut e = env(&server.url, "auto");
+    e.config.harness.max_steps = 0;
+    e.config.edit.streaming_abort = true;
+    e.config.edit_mode_override = Some(dial::config::types::EditMode::Replace);
+    std::fs::write(e.project.path().join("target.txt"), "original\n").unwrap();
+    let mut agent = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let mut ui = Recorder::default();
+    let report = agent.turn("Update target.txt", &mut ui).unwrap();
+    assert_eq!(report.outcome, TurnOutcome::Incomplete);
+    assert!(report.text.contains("8 completed edit previews"));
+    assert_eq!(report.steps, 8);
+    assert_eq!(server.requests.lock().len(), 8);
+    assert!(ui.calls.is_empty(), "the entire rejected batch is withheld");
+    assert!(!e.project.path().join("must-not-exist.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(e.project.path().join("target.txt")).unwrap(),
+        "original\n"
+    );
+    assert_eq!(agent.metrics().turns_completed, 0);
+}
+
+#[test]
+fn completed_edit_preview_recovery_keeps_valid_edits_available() {
+    let server = serve(vec![
+        Reply::Call(
+            "edit",
+            json!({"path":"target.txt","old_string":"missing","new_string":"changed"}),
+        ),
+        Reply::Call("read", json!({"path":"target.txt"})),
+        Reply::Call(
+            "edit",
+            json!({"path":"target.txt","old_string":"original","new_string":"changed"}),
+        ),
+        Reply::Text("Updated target.txt."),
+    ]);
+    let mut e = env(&server.url, "auto");
+    e.config.harness.max_steps = 0;
+    e.config.edit.streaming_abort = true;
+    e.config.edit_mode_override = Some(dial::config::types::EditMode::Replace);
+    std::fs::write(e.project.path().join("target.txt"), "original\n").unwrap();
+    let mut agent = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let mut ui = Recorder::default();
+    let report = agent.turn("Update target.txt", &mut ui).unwrap();
+    assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+    assert_eq!(server.requests.lock().len(), 4);
+    assert_eq!(report.steps, 4, "public steps retain raw attempts");
+    assert_eq!(ui.calls, ["read", "edit"]);
+    assert_eq!(
+        std::fs::read_to_string(e.project.path().join("target.txt")).unwrap(),
+        "changed\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn refunded_replies_preserve_stop_hook_continuation_allowance() {
+    let server = serve(vec![
+        Reply::DroppedCall,
+        Reply::DroppedCall,
+        Reply::Text("Initial report."),
+        Reply::Call("read", json!({"path":"target.txt"})),
+        Reply::Text("Final report with the requested evidence."),
+    ]);
+    let mut e = env(&server.url, "auto");
+    e.config.harness.max_steps = 3;
+    e.config.hooks.push(dial::config::types::HookConfig {
+        event: "stop".into(),
+        matcher: None,
+        command: vec!["sh".into(), "-c".into(), r#"payload=$(cat); case "$payload" in *'"stop_hook_active":false'*) printf '{"decision":"block","reason":"Read target.txt before finishing."}';; *) printf '{}';; esac"#.into()],
+        timeout_secs: 5,
+        fail_closed: None,
+    });
+    std::fs::write(e.project.path().join("target.txt"), "requested evidence").unwrap();
+    let mut agent = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let report = agent
+        .turn("Produce a report", &mut Recorder::default())
+        .unwrap();
+    assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+    assert_eq!(
+        report.steps, 5,
+        "raw attempts include both refunded replies"
+    );
+    assert_eq!(server.requests.lock().len(), 5);
+    assert!(report.text.contains("Final report"));
 }

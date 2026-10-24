@@ -48,7 +48,7 @@ pub(crate) fn announces_unexpected_stop(text: &str) -> bool {
     {
         return false;
     }
-    let lower = last.to_lowercase();
+    let lower = last.to_lowercase().replace('’', "'");
     let sentence = lower.rsplit(". ").next().unwrap_or(&lower).trim();
     // Closing offers ("Let me know what you'd like to change.") hand the turn back to the user;
     // they are not announced actions.
@@ -64,6 +64,10 @@ pub(crate) fn announces_unexpected_stop(text: &str) -> bool {
         "would you like",
         "want me to",
         "happy to",
+        "blocked",
+        "cannot",
+        "can't",
+        "unable",
     ]
     .iter()
     .any(|phrase| sentence.contains(phrase))
@@ -71,6 +75,49 @@ pub(crate) fn announces_unexpected_stop(text: &str) -> bool {
         return false;
     }
     let sentence = sentence.strip_prefix("plan: ").unwrap_or(sentence);
+    // A dangling transition introduces work or output that never followed. Match the
+    // whole last line: it may contain several sentences describing the upcoming edit.
+    if lower.ends_with(':')
+        && ["now the ", "next, the ", "next the "]
+            .iter()
+            .any(|p| lower.starts_with(p))
+        && ![" is ", " are ", " has ", " have "]
+            .iter()
+            .any(|p| lower.contains(p))
+    {
+        return true;
+    }
+    let action = sentence
+        .rsplit_once(", so ")
+        .map_or(sentence, |(_, action)| action);
+    let present = action
+        .strip_prefix("i'm ")
+        .or_else(|| action.strip_prefix("i am "));
+    let announced = present.unwrap_or(action);
+    if (present.is_some()
+        || action.ends_with(':')
+        || action.trim_end_matches(['.', '!']).ends_with(" now"))
+        && [
+            "writing ",
+            "rewriting ",
+            "replacing ",
+            "updating ",
+            "editing ",
+            "implementing ",
+            "checking ",
+            "running ",
+            "inspecting ",
+            "reading ",
+            "fixing ",
+            "testing ",
+            "building ",
+            "verifying ",
+        ]
+        .iter()
+        .any(|verb| announced.starts_with(verb))
+    {
+        return true;
+    }
     INTENT.iter().any(|prefix| sentence.starts_with(prefix))
         && [
             "check",
@@ -89,6 +136,9 @@ pub(crate) fn announces_unexpected_stop(text: &str) -> bool {
             "verify",
             "build",
             "change",
+            "write",
+            "replace",
+            "create",
         ]
         .iter()
         .any(|verb| {

@@ -347,3 +347,93 @@ fn isolated_conflict_publishes_incomplete_and_preserves_candidate_and_parent_byt
         }
     }
 }
+
+#[test]
+fn later_lease_failure_preserves_the_earlier_launched_job_in_batch_reply() {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(project.path(), home.path().to_owned()).unwrap();
+    let workspace = Workspace::new(project.path()).unwrap();
+    let server = crate::llm::fake::serve(vec![crate::llm::fake::Script::Sse(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"finished\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into(),
+    )]);
+    let mut config = Config::default();
+    config.task.persist = true;
+    config.model = "test".into();
+    config.endpoint =
+        Some(serde_json::from_value(json!({"base_url":format!("{}/v1", server.url)})).unwrap());
+    config.compaction.enabled = false;
+    config.codebase.enabled = false;
+    let ext = Registry::new();
+    let harness = Harness::default();
+    let _second_lease = super::super::worker_resume::lease(&layout, "parent", "task-2").unwrap();
+    let mut tasks = LiveTasks::default();
+    let reply = tasks
+        .start(
+            StartContext {
+                config: &config,
+                workspace: &workspace,
+                ext: &ext,
+                layout: Some(&layout),
+                session_id: "parent",
+                harness: &harness,
+                usage: None,
+                context_cap: None,
+                memory: None,
+                plan_mode: false,
+                agents_messages: &[],
+                handoff: subagents::Handoff::capture(&json!({}), &[]),
+            },
+            &json!({"tasks":[
+                {"agent":"worker","task":"inspect one","solution_space":"fixture"},
+                {"agent":"worker","task":"inspect two","solution_space":"fixture"}
+            ]}),
+        )
+        .expect("a per-job lease failure cannot discard the batch reply");
+    assert_eq!(reply[0]["id"], "task-1");
+    assert_eq!(reply[0]["status"], "running");
+    assert!(tasks.jobs.contains_key("task-1"));
+    assert_eq!(reply[1]["id"], "task-2");
+    assert_eq!(reply[1]["status"], "failed");
+    assert_eq!(reply[1]["data"]["dial_effects"], "none");
+    assert!(
+        reply[1]["result"]
+            .as_str()
+            .unwrap()
+            .contains("worker is still owned")
+    );
+    assert!(!tasks.jobs.contains_key("task-2"));
+    let projected = output(Ok(reply));
+    assert!(!projected.is_error, "the batch operation itself succeeded");
+    assert!(projected.text.contains("task-1"));
+    assert!(projected.text.contains("task-2"));
+    assert!(projected.text.contains("worker is still owned"));
+    assert_eq!(projected.data.as_ref().unwrap()[1]["status"], "failed");
+}
+
+#[test]
+fn persistence_errors_are_explicit_bounded_and_separate_from_long_candidate_report() {
+    let value = json!({"id":"task-1","status":"failed","steps":2,
+        "result":format!("Candidate report: {}", "candidate detail ".repeat(2000)),
+        "artifact_error":format!("artifact disk full {}", "x".repeat(4000)),
+        "transcript_error":"transcript flush permission denied"});
+    let result = output(Ok(value.clone()));
+    assert_eq!(result.data, Some(value));
+    assert!(
+        result
+            .text
+            .contains("Worker report retention failed: artifact disk full")
+    );
+    assert!(
+        result
+            .text
+            .contains("Worker transcript persistence failed: transcript flush permission denied")
+    );
+    assert!(
+        result.text.find("artifact disk full").unwrap()
+            < result.text.find("Candidate report:").unwrap()
+    );
+    assert!(result.text.contains("candidate detail"));
+    assert!(!result.text.contains(&"x".repeat(1001)));
+    assert!(!result.text.contains("Complete worker report:"));
+}

@@ -49,7 +49,7 @@ fn continuation_rounds_stop_at_the_external_turn_cost_including_auxiliary_usage(
         let mut backend = agent.backend.take().unwrap();
         // Verification repairs and stop hooks reenter this same loop, not a new external turn.
         for _ in 0..2 {
-            let report = agent
+            let (report, _) = agent
                 .run_loop(&mut backend, &[], &mut vec![], 10, "continue", &mut NullUi)
                 .unwrap();
             assert_eq!(report.outcome, TurnOutcome::Incomplete);

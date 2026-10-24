@@ -484,6 +484,11 @@ impl StepBudget {
         }
     }
 
+    /// Consumed work steps, excluding refunded retries (not the raw generation count).
+    pub fn spent(&self) -> u32 {
+        self.spent
+    }
+
     /// Start a step; false once a finite budget is used up. Zero means unlimited.
     pub fn begin(&mut self) -> bool {
         if self.max != 0 && self.spent >= self.max {

@@ -141,7 +141,7 @@ fn caches_outside_the_workspace_follow_the_sandbox_read_policy() {
     // Strict (also the default): the shell could not read the cache, so neither may this tool.
     let strict = Workspace::new(project.path()).unwrap();
     let error = run(&strict, &json!({"name": "demo-crate"}), &caches).unwrap_err();
-    assert!(error.contains("/add-dir"), "{error}");
+    assert!(error.contains("request_directory"), "{error}");
     // Dev, but the cache is under a denied path.
     let denied = dev(
         Workspace::new(project.path()).unwrap(),

@@ -81,6 +81,18 @@ def indexed(report):
 ACTIVITY_METRICS = ("prompt_tokens", "output_tokens", "cached_tokens", "reasoning_tokens", "tool_calls", "compactions", "turns_completed")
 
 
+def run_contract(report):
+    """Validate recorded execution identity; configuration/build may vary between runs."""
+    contract = report.get("contract")
+    if not isinstance(contract, dict) or type(contract.get("schema_version")) is not int or contract["schema_version"] != 1:
+        raise ValueError("analysis requires a version-1 run contract")
+    for name in ("suite_sha256", "source_sha256", "executable_sha256", "configuration_sha256"):
+        value = contract.get(name)
+        if not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+            raise ValueError(f"invalid run contract: {name}")
+    return contract
+
+
 def invalid_reason(report):
     # Mirrors BenchmarkReport::invalid_reason: a run whose every case failed before any observed
     # model activity never measured the model, so its zero score is not a result.
@@ -90,8 +102,23 @@ def invalid_reason(report):
     if not isinstance(cases, list) or not cases:
         return None
     def inert(metrics):
-        return metrics.get("agent_error") is True and not metrics.get("token_usage_observed") and not metrics.get("token_usage_incomplete") and all(not metrics.get(name) for name in ACTIVITY_METRICS)
-    if all(inert(case.get("metrics") or {}) for case in cases):
+        if not isinstance(metrics, dict):
+            raise ValueError("case metrics must be an object")
+        usage = metrics.get("runtime_usage")
+        if usage is None:
+            usage = {}
+        if not isinstance(usage, dict):
+            raise ValueError("runtime_usage must be an object or null")
+        all_usage = usage.get("all", {})
+        if not isinstance(all_usage, dict):
+            raise ValueError("runtime_usage.all must be an object")
+        attempts = all_usage.get("transport_attempts", 0)
+        if type(attempts) is not int or not 0 <= attempts <= 2**64 - 1:
+            raise ValueError("runtime_usage.all.transport_attempts must be an unsigned 64-bit integer")
+        return metrics.get("agent_error") is True and attempts == 0 and not metrics.get("token_usage_observed") and not metrics.get("token_usage_incomplete") and all(not metrics.get(name) for name in ACTIVITY_METRICS)
+    # Validate every case, even if an earlier active case makes the run non-inert.
+    activity = [inert(case.get("metrics", {})) for case in cases]
+    if all(activity):
         return f"all {len(cases)} cases failed before any observed model activity"
     return None
 
@@ -124,6 +151,15 @@ def compare(baseline, candidate, baseline_configuration=None, candidate_configur
         reason = invalid_reason(report)
         if reason:
             raise ValueError(f"{name} report is an invalid run and cannot be compared: {reason}")
+    contracts = [run_contract(report) if report.get("contract") is not None else None
+                 for report in (baseline, candidate)]
+    if all(contract is not None for contract in contracts):
+        if any(contracts[0][field] != contracts[1][field]
+               for field in ("schema_version", "suite_sha256", "source_sha256")):
+            raise ValueError("run contracts must have identical schema, suite and source identities")
+        run_identity = "matched"
+    else:
+        run_identity = "legacy_unknown"
     before, after = indexed(baseline), indexed(candidate)
     if baseline["suite"] != candidate["suite"] or before.keys() != after.keys():
         raise ValueError("reports must contain the same suite and case IDs")
@@ -136,6 +172,9 @@ def compare(baseline, candidate, baseline_configuration=None, candidate_configur
     return {
         "kind": "benchmark-report-comparison",
         "suite": baseline["suite"],
+        "run_identity": run_identity,
+        "baseline_run_contract": contracts[0],
+        "candidate_run_contract": contracts[1],
         "baseline_build": baseline.get("execution_build"),
         "candidate_build": candidate.get("execution_build"),
         "baseline": totals(before),

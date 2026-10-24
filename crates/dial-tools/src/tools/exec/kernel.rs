@@ -681,14 +681,7 @@ fn serial_operation<'a>(
     interrupt: &AtomicBool,
     cancel: &AtomicBool,
 ) -> Result<std::sync::MutexGuard<'a, ()>, String> {
-    loop {
-        check_operation(end, interrupt, cancel)?;
-        if let Some(guard) = workspace.try_serial_operation() {
-            check_operation(end, interrupt, cancel)?;
-            return Ok(guard);
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    workspace.serial_operation_checked(|| check_operation(end, interrupt, cancel))
 }
 
 /// Runs one controller callback with the workspace serial guard released; the guard is reacquired

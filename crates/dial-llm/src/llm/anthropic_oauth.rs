@@ -29,6 +29,11 @@ const FILE: &str = "anthropic-subscription.json";
 const CALLBACK_PORT: u16 = 54545;
 const CALLBACK_PATH: &str = "/callback";
 const SCOPES: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
+
+/// Credential file protected independently from other subscription-store data.
+pub fn credential_path(dir: &Path) -> std::path::PathBuf {
+    dir.join(FILE)
+}
 const MAX_JSON: u64 = 64 * 1024;
 
 #[derive(Default, Serialize, Deserialize)]

@@ -46,6 +46,34 @@ fn announced_action_without_a_call_is_an_unexpected_stop() {
 }
 
 #[test]
+fn action_transitions_and_present_tense_announcements_require_progress() {
+    for text in [
+        "Now the full Stats page:",
+        "Now the Stats page itself. It gets the new tabs and charts:",
+        "Writing the complete page now.",
+        "I've read the whole page, so I'm replacing it in one write:",
+        "I'm updating the parser now.",
+        "I'll write the page now.",
+    ] {
+        assert!(announces_unexpected_stop(text), "{text}");
+    }
+    for text in [
+        "Now the full Stats page is ready.",
+        "Writing the complete page now would overwrite your edits.",
+        "Writing files is supported by the API.",
+        "I'm updating the docs later if you want.",
+        "I'm writing the page, but blocked on credentials.",
+        "I’m updating the parser later.",
+        "Example: Writing the complete page now.",
+        "Now the results:\nAll five tests passed.",
+        "```text\nWriting the complete page now.",
+        "> Now the full Stats page:",
+    ] {
+        assert!(!announces_unexpected_stop(text), "{text}");
+    }
+}
+
+#[test]
 fn finished_reports_quotes_and_optional_work_do_not_restart_the_turn() {
     for text in [
         "Example string: \"I'll check that\".",

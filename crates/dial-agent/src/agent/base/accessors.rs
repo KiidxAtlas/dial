@@ -380,7 +380,7 @@ impl<'a> Agent<'a> {
         ensure!(
             !config::tools::BUILTIN.contains(&name)
                 && !config::tools::EXTRA_TOOLS.contains(&name)
-                && !matches!(name, "exit_plan" | "message"),
+                && !matches!(name, "exit_plan" | "message" | "request_directory"),
             "extension cannot replace a core/control tool"
         );
         ensure!(
@@ -479,6 +479,9 @@ impl<'a> Agent<'a> {
             .chain(self.ext.names().map(str::to_owned))
             .chain(self.config.tools.keys().cloned())
             .collect();
+        if !self.hermetic {
+            names.push("request_directory".into());
+        }
         if let Some(memory) = &self.memory_runtime {
             names.extend(memory.offered_names().into_iter().map(str::to_owned));
         }
@@ -488,6 +491,7 @@ impl<'a> Agent<'a> {
                     n.as_str(),
                     "todo"
                         | "finish"
+                        | "request_directory"
                         | "ask"
                         | "tool_search"
                         | "tool_load"

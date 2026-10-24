@@ -12,7 +12,7 @@ impl Agent<'_> {
         max_steps: u32,
         user_goal: &str,
         ui: &mut dyn Ui,
-    ) -> Result<TurnReport> {
+    ) -> Result<(TurnReport, u32)> {
         let mut names = names.to_vec();
         let rule_root = self.workspace.root().to_path_buf();
         let mut rule_catalog = Arc::new(if !self.hermetic && self.config.portable_rules.enabled {
@@ -1255,18 +1255,18 @@ impl Agent<'_> {
                 ui.inference_discarded(
                     "Completed edit preview failed; no tools from this generation were executed.",
                 );
-                // From the eighth rejection on, generations are charged to the step budget instead of
-                // refunded, so `harness.max_steps` still bounds this loop. The guidance escalates; no turn end.
-                let escalation = if rejected_edit_previews >= 8 {
-                    format!("Escalation: {rejected_edit_previews} completed edit previews have been rejected this turn, and none of their edits ran. Stop regenerating the whole edit: read the target once, then make one smaller edit that quotes it exactly, using the offered grammar. ")
-                } else {
-                    String::new()
-                };
-                self.push(json!({"role":"user","dial_reminder":"edit-preview",
-                    "content":format!("{escalation}The preceding generation was rejected before tool execution. Regenerate the complete edit using the offered grammar and observed source. Preview error (untrusted source data): {}", truncate(&error,4096))}))?;
-                if rejected_edit_previews < 8 {
-                    budget.give_back();
+                // Recovery must terminate even when the operator selected unlimited work steps.
+                // Rejected previews never execute any calls from this generation.
+                if rejected_edit_previews >= 8 {
+                    return self.stop_turn(
+                        ui,
+                        format!("Stopped with incomplete work: {rejected_edit_previews} completed edit previews were rejected this turn. No tools from those generations were executed; completed work is kept. Read the target and make a smaller edit using the offered grammar before continuing.\nPreview error (untrusted source data): {}", truncate(&error, 4096)),
+                        step + 1,
+                    ).map(crate::agent::run::engine::Tick::Finished);
                 }
+                self.push(json!({"role":"user","dial_reminder":"edit-preview",
+                    "content":format!("The preceding generation was rejected before tool execution. Regenerate the complete edit using the offered grammar and observed source. Preview error (untrusted source data): {}", truncate(&error,4096))}))?;
+                budget.give_back();
                 return Ok(crate::agent::run::engine::Tick::Again);
             }
             // Form failures bypass tool-result guards. Bound their recovery independently of
@@ -2727,7 +2727,7 @@ text: "finish completed cannot follow a failed call in the same batch; address i
             Ok(crate::agent::run::engine::Tick::Again)
         });
         if let Some(report) = driven? {
-            return Ok(report);
+            return Ok((report, budget.spent()));
         }
 
         if self.hermetic {
@@ -2737,7 +2737,7 @@ text: "finish completed cannot follow a failed call in the same batch; address i
             ui,
             format!("Stopped: this turn used its {max_steps}-step limit. The chat and completed work are kept. Say \"continue\" to keep going, or raise harness.max_steps in /settings."),
             iteration,
-        )
+        ).map(|report| (report, budget.spent()))
     }
 }
 

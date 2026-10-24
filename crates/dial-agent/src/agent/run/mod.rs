@@ -2,6 +2,7 @@
 
 pub(in crate::agent) mod call_summary;
 pub mod calls;
+pub(in crate::agent) mod directory_access;
 pub(in crate::agent) mod dispatch;
 pub(in crate::agent) mod edit_runtime;
 pub(in crate::agent) mod engine;

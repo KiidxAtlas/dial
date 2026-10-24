@@ -139,6 +139,10 @@ pub struct Workspace {
     additional_roots: Vec<PathBuf>,
     /// Private application trees excluded independently of shell sandbox mode.
     protected_paths: Vec<PathBuf>,
+    /// Explicit process-local native-file exceptions; never remove shell denies.
+    sensitive_roots: Vec<PathBuf>,
+    /// Credentials cannot be included in a sensitive storage grant.
+    credential_paths: Vec<PathBuf>,
     sandbox: Option<Sandbox>,
     allow_network: bool,
     policy: Option<exec::sandbox::Policy>,
@@ -189,6 +193,8 @@ impl Workspace {
             root,
             additional_roots: Vec::new(),
             protected_paths: Vec::new(),
+            sensitive_roots: Vec::new(),
+            credential_paths: Vec::new(),
             sandbox: None,
             allow_network: false,
             policy: None,
@@ -238,6 +244,22 @@ impl Workspace {
         }
     }
 
+    /// Wait for workspace ownership without losing cancellation or deadline checks. The caller
+    /// retains the guard while effects run; cancellation never detaches an active operation.
+    pub fn serial_operation_checked<E>(
+        &self,
+        mut check: impl FnMut() -> std::result::Result<(), E>,
+    ) -> std::result::Result<MutexGuard<'_, ()>, E> {
+        loop {
+            check()?;
+            if let Some(guard) = self.try_serial_operation() {
+                check()?;
+                return Ok(guard);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     /// Override sandbox detection (tests, or an operator who pre-probed).
     pub fn with_sandbox(mut self, sandbox: Sandbox) -> Self {
         self.sandbox = Some(sandbox);
@@ -256,11 +278,19 @@ impl Workspace {
         self
     }
 
-    /// The sandbox policy in force at exec time: the configured policy, with every attached root
-    /// granted the same write access as the primary root. Attached roots are folded in here, not
-    /// stored in the policy, so `add_root` takes effect on the next command.
+    /// The sandbox policy in force at exec time. Attached roots get normal write access,
+    /// except roots inside protected storage: those can only receive native-file grants.
+    /// Fold roots in here so attachment/removal takes effect on the next command.
     pub fn sandbox_policy(&self) -> exec::sandbox::Policy {
-        let roots = self.additional_roots.iter().cloned();
+        let roots = self
+            .additional_roots
+            .iter()
+            .filter(|root| {
+                !self.protected_paths.iter().any(|protected| {
+                    Self::canonical_prefix(root).starts_with(Self::canonical_prefix(protected))
+                })
+            })
+            .cloned();
         match &self.policy {
             Some(exec::sandbox::Policy::Dev {
                 deny_read,
@@ -423,6 +453,8 @@ impl Workspace {
         copy.sandbox = self.sandbox.clone();
         copy.allow_network = self.allow_network;
         copy.policy = self.policy.clone();
+        copy.protected_paths = self.protected_paths.clone();
+        copy.credential_paths = self.credential_paths.clone();
         copy.unsandboxed = self.unsandboxed;
         copy.bash_interceptor = self.bash_interceptor.clone();
         copy.edit_mode = self.edit_mode;
@@ -444,6 +476,7 @@ impl Workspace {
         let mut next = self.clone();
         next.root = fresh.root;
         next.additional_roots.clear();
+        next.sensitive_roots.clear();
         Ok(next)
     }
 
@@ -551,12 +584,71 @@ impl Workspace {
             .collect();
         self
     }
+    /// Validate a requested existing directory without granting it. Sensitive requests must
+    /// name a directory inside protected storage, never an ancestor (for example home).
+    pub fn directory_request(&self, dir: &Path, sensitive: bool) -> Result<PathBuf> {
+        let absolute = if dir.is_absolute() {
+            dir.to_owned()
+        } else {
+            self.root.join(dir)
+        };
+        let canonical = Self::canonical_dir(&absolute)?;
+        ensure!(
+            canonical.parent().is_some(),
+            "the filesystem root cannot be added"
+        );
+        if sensitive {
+            ensure!(
+                self.protected_paths
+                    .iter()
+                    .any(|p| canonical.starts_with(Self::canonical_prefix(p))),
+                "sensitive access must name a directory inside protected Dial storage, not its ancestor"
+            );
+            ensure!(
+                !self.credential_paths.iter().any(|p| {
+                    let p = Self::canonical_prefix(p);
+                    canonical.starts_with(&p) || p.starts_with(&canonical)
+                }),
+                "sensitive directory includes credentials; request a narrower non-credential directory"
+            );
+        }
+        Ok(canonical)
+    }
+
+    /// Apply an explicit human-approved native-file exception. Callers must display the
+    /// canonical path and obtain a separate decision; ordinary root attachment never calls this.
+    pub fn grant_sensitive_directory(&mut self, canonical: &Path) -> Result<()> {
+        let checked = self.directory_request(canonical, true)?;
+        ensure!(checked == canonical, "directory changed since approval");
+        if checked != self.root && !self.additional_roots.contains(&checked) {
+            self.additional_roots.push(checked.clone());
+        }
+        if !self.sensitive_roots.contains(&checked) {
+            self.sensitive_roots.push(checked);
+        }
+        Ok(())
+    }
+
+    fn sensitive_access(&self, path: &Path) -> bool {
+        let canonical = Self::canonical_prefix(path);
+        !self
+            .credential_paths
+            .iter()
+            .any(|p| canonical.starts_with(Self::canonical_prefix(p)))
+            && self
+                .sensitive_roots
+                .iter()
+                .any(|root| canonical.starts_with(root))
+    }
 
     pub(crate) fn is_protected(&self, path: &Path) -> bool {
         if self.protected_paths.is_empty() {
             return false;
         }
         let canonical = Self::canonical_prefix(path);
+        if self.sensitive_access(&canonical) {
+            return false;
+        }
         self.protected_paths.iter().any(|protected| {
             path.starts_with(protected)
                 || canonical.starts_with(protected)
@@ -566,6 +658,9 @@ impl Workspace {
 
     fn check_protected_mutation(&self, path: &Path) -> Result<(), String> {
         if self.protected_paths.is_empty() {
+            return Ok(());
+        }
+        if self.sensitive_access(path) {
             return Ok(());
         }
         let canonical = Self::canonical_prefix(path);
@@ -589,14 +684,24 @@ impl Workspace {
             return Err("path contains a NUL byte".to_string());
         }
         let path = Path::new(input);
+        // An explicit sensitive root may be nested beneath the primary workspace.
+        // Resolve it from that most-specific root, not through a protected ancestor.
+        if !path.is_absolute() {
+            let absolute = Self::canonical_prefix(&self.root.join(path));
+            if self.sensitive_access(&absolute) {
+                return self.resolve(&absolute.to_string_lossy());
+            }
+        }
         let (root, relative): (&Path, PathBuf) = if path.is_absolute() {
             let within = |candidate: &Path| {
-                self.roots().find_map(|root| {
-                    candidate
-                        .strip_prefix(root)
-                        .ok()
-                        .map(|rest| (root, rest.to_path_buf()))
-                })
+                self.roots()
+                    .filter_map(|root| {
+                        candidate
+                            .strip_prefix(root)
+                            .ok()
+                            .map(|rest| (root, rest.to_path_buf()))
+                    })
+                    .max_by_key(|(root, _)| root.components().count())
             };
             // Roots are canonical (`/private/var` on macOS); input may name the same place through a symlink.
             within(path)
@@ -610,7 +715,7 @@ impl Workspace {
                         .or_else(|| path.parent())
                         .unwrap_or(path);
                     format!(
-                        "path {input:?} is outside the workspace; use a path relative to the workspace root or an added directory. To work there, ask the user to run `/add-dir {}`",
+                        "path {input:?} is outside the workspace; call request_directory with path {:?} to ask for a yes/no access approval, then retry the tool. Normal directory access does not unlock protected Dial storage; that requires a separate sensitive request.",
                         project.display()
                     )
                 })?
@@ -710,6 +815,7 @@ impl Workspace {
         );
         let before = self.additional_roots.len();
         self.additional_roots.retain(|root| *root != target);
+        self.sensitive_roots.retain(|root| *root != target);
         Ok(self.additional_roots.len() != before)
     }
 
@@ -1342,6 +1448,15 @@ pub fn apply_sandbox_config(
         ]),
         None => ws,
     };
+    let mut ws = ws;
+    if let Some((_, user)) = protected {
+        let auth = crate::config::paths::subscription_auth_dir(user)?;
+        ws.credential_paths = vec![
+            Workspace::canonical_prefix(&user.join("credentials.json")),
+            Workspace::canonical_prefix(&crate::llm::chatgpt::credential_path(&auth)),
+            Workspace::canonical_prefix(&crate::llm::anthropic_oauth::credential_path(&auth)),
+        ];
+    }
     Ok(match config.mode {
         SandboxMode::Off => ws.without_sandbox(),
         SandboxMode::Strict => ws.with_policy(Policy::Strict {
@@ -1391,6 +1506,8 @@ pub fn apply_sandbox_config(
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod directory_access_tests;
 #[cfg(test)]
 mod image_tests;
 #[cfg(test)]
