@@ -106,3 +106,13 @@ fn additive_metrics_keep_legacy_reports_readable() {
     assert_eq!(parsed.cases[0].metrics.runtime_usage, None);
     assert_eq!(parsed.cases[0].metrics.efficiency, None);
 }
+
+#[test]
+fn manual_review_is_not_verified_useful_work() {
+    let mut manual = case(true, 1, 20);
+    manual.evidence.as_mut().unwrap().categories = vec!["answer_requires_manual_review".into()];
+    let work = UsefulWork::measured(&[case(true, 1, 10), manual, case(true, 0, 30)]);
+    assert_eq!(work.verified_completed_cases, 1);
+    assert_eq!(work.outcome_checked_cases, 1);
+    assert_eq!(work.tokens_per_verified_completion, Some(60.0));
+}

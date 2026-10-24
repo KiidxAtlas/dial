@@ -6,6 +6,13 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 ## [Unreleased]
 
 ### Fixed
+- Added agent-initiated `request_directory` Yes/No approvals, with a separate native-file-only sensitive storage grant. Normal directory access supports file tools and sandboxed commands; sensitive grants exclude credentials and are not restored on resume.
+- Recover from dangling action transitions and present-tense promises in foreground and worker replies instead of accepting them as finished work; repeated non-progress still ends incomplete after the existing bounded retries.
+- Machine ranking recalculates throughput from verified outcomes and wall time instead of trusting cached report rates; offline comparison and reliability analysis reject malformed transport-usage records with validation errors.
+- Bound completed edit-preview recovery even with unlimited productive work; continuation budgets now charge consumed steps rather than refunded request attempts.
+- Reset current-turn change and verification evidence before fallible admission, preventing rejected prompts from republishing the preceding turn's provenance.
+- Worker workspace-lock waits observe cancellation; partial batch launch failures preserve started-worker results, and worker persistence errors are visible separately from candidate answers.
+- Benchmark recommendations require outcome-verified successes, report comparisons enforce recorded fixture-source identity, and zero-token transport failures remain visible in offline reliability analysis.
 - Delegation avoids duplicate automatic parent-goal text while preserving explicit assignments and constraints; resumed workers retain developer-role operator instructions. Built-in guidance emphasizes evidence reuse, compact handoffs and shared-check ownership without changing permissions.
 - Reliability audit: reject checkpoint restores whose recorded path now resolves elsewhere; bound MCP progress retention; preserve cancellation in automatic-thinking judgments and foreground compute admission; deliver subprocess stdin EOF before waiting for exit on Windows.
 - Model transports reject incomplete Devin streams, cap expanded Connect gzip responses, refresh endpoint credentials between retries, and keep Codex WebSocket streaming cancellation and idle limits active inside frame reads.

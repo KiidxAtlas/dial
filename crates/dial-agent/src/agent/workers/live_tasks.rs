@@ -747,7 +747,7 @@ impl LiveTasks {
                 .remove(&oldest);
         }
         let mut result = Vec::new();
-        // Validate every job before launching any. Each thread reparses its owned arguments.
+        // All job contracts were validated above; runtime setup failures settle only that job.
         for (job, (role, harness)) in request.jobs.iter().zip(roles) {
             let mut harness = harness;
             let resume_messages = resume
@@ -766,13 +766,19 @@ impl LiveTasks {
             let resume_tools = resume.as_ref().map(|saved| saved.tools.clone());
             let lease = match resume.take() {
                 Some(saved) => Some(saved.lease),
-                None => layout
+                None => match layout
                     .filter(|_| config.task.persist)
                     .map(|layout| {
                         crate::agent::workers::worker_resume::lease(layout, &session_id, &id)
                     })
                     .transpose()
-                    .map_err(|error| format!("{error:#}"))?,
+                {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        result.push(json!({"id":id,"status":"failed","result":format!("worker lease acquisition failed: {error:#}"),"data":{"dial_effects":"none"}}));
+                        continue;
+                    }
+                },
             };
             let body = self.tree.start("worker", &job.label, None);
             let mut assignment = json!({"task":job.prompt,"solution_space":job.solution_space,"agent":job.kind,"max_steps":job.max_steps,"name":job.label,"isolated":job.isolated});
@@ -1390,6 +1396,15 @@ pub(in crate::agent) fn model_summary(value: &Value) -> String {
         let status = job["status"].as_str().unwrap_or("unknown");
         let steps = job["steps"].as_u64().unwrap_or(0);
         let mut text = format!("Worker {id}: {status} ({steps} requests)");
+        for (key, label) in [
+            ("artifact_error", "Worker report retention failed"),
+            ("transcript_error", "Worker transcript persistence failed"),
+        ] {
+            if let Some(error) = job[key].as_str() {
+                let error = crate::agent::window::prompt::truncate_chars(error, 1000);
+                text.push_str(&format!("\n[{label}: {error}]"));
+            }
+        }
         let derived;
         let projection = if let Some(projection) = job.get("projection") {
             projection

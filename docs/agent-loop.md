@@ -54,6 +54,16 @@ Overflow recovery uses a fit-only compaction target: the request only needs to f
 Portable summaries update the previous committed summary with newly summarized history instead of summarizing the summary as transcript. A cut within a user turn gets a distinct turn-prefix summary, while the recent suffix remains verbatim. Every subsequent turn-prefix or branch window explicitly integrates the prior output using the original format. Update instructions prioritize active goals, constraints, unresolved work, material decisions and evidence provenance while allowing duplicate or obsolete details to be consolidated. File-operation lists carry forward as attempted targets from call arguments, explicitly not proof of successful reads or modifications; legacy list tags remain readable. Summarizer input is divided at message boundaries, conservatively discounted against the selected summarizer window, and a rejected window is halved and replanned. Single messages too large for a window are clamped with an explicit omission marker.
 
 Parent and child conversations share reply recovery in `agent/turn_recovery.rs`. Empty answers and action-only stops get at most three continuation attempts, and malformed or mixed stalled replies share an eight-attempt bound. Productive work remains unlimited when `max_steps = 0`. Exhausted recovery leaves work incomplete, preserves completed effects, and never records completion. Quotes, code examples and optional future work do not restart a finished report; no classifier request is required. A completed `finish` must contain a report rather than a promise to act.
+Action-only replies include dangling transitions such as “Now the full Stats page:” and
+present-tense announcements such as “Writing the complete page now.” Without a tool call or
+the promised output, these enter the same bounded recovery rather than count as completion.
+This is conservative text detection, not a guarantee against every form of unfinished answer.
+
+Completed edit-preview rejections also consume bounded no-progress recovery, even with an unlimited
+task budget. Exhaustion returns an incomplete result with the preview diagnosis and executes no
+tools from the rejected generation. Request attempts remain visible in reports, while finite
+continuation budgets use charged steps: refunded replies and controller-induced retries do not
+consume the allowance reserved for verification repairs or stop-hook continuations.
 
 After successful worker inference, delivered request-only harness notes are retired even when
 buried in history; failed requests retain them for retry. Operator instructions, coordination,
@@ -63,6 +73,12 @@ calls, text-form calls or recoverable inline edits. Such attempts end incomplete
 unexecuted-call diagnostic and any available findings; they do not gain extra execution budget.
 
 Background worker findings arrive once in the parent's next request with status, a bounded report and a reference to the complete artifact. Typed assignments, rule state and result data remain in the execution journal rather than being repeated in the model-facing summary. Use the delivered findings before repeating a worker's investigation. Todos are optional progress bookkeeping. `done` needs no finding/evidence payload and does not run a verification round. Accepted completion reconciles pending progress; explicit blockers and running work remain completion prerequisites. Plain final replies and explicit `finish` share these prerequisites and the final configured verification/repair pipeline. A failed check cannot become a completed turn, and unfinished replies share bounded reply recovery rather than a separate todo-reminder budget. Routine inspection does not force a separate todo-only request; the configured reasoning-recovery plan gate still applies when it is needed.
+
+Worker waits for the shared workspace-operation lock observe cancellation before dispatch. A
+batch launch reports individual persistence-lease failures without hiding workers already started.
+Artifact-retention and transcript-finalization errors are explicitly labelled in the model-facing
+summary, separately from the worker's candidate answer; a failed persistence operation is not
+silently presented as successful work.
 
 Workers publish their terminal runtime result before releasing their lease or exposing completion,
 so status does not wait for the parent's event pump. An early acknowledgement suppresses later
@@ -124,6 +140,10 @@ environment-unavailable, never passing checks; compiler errors, assertions and m
 application imports remain code failures. A command that executes zero tests supplies
 no passing behavioral evidence, including in the persisted behavior-check cache.
 Round settlement retains verification statuses and bounded receipt history.
+New-turn admission clears checkpoint association and current checks before validation or prompt
+hooks can fail. A rejected prompt therefore cannot inherit the preceding turn's changes, checks or
+code-history label. Opt-in historical verification receipts remain separate and still require
+freshness validation before reuse.
 
 Optional [requirement evidence contracts](requirement-verification.md) map operator-declared
 requirements to configured checks and current rendered pixels. Their coverage is separate from

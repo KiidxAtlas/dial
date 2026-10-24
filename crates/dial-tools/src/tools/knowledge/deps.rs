@@ -806,7 +806,7 @@ fn authorize(ws: &Workspace, package: &Package) -> Result<PathBuf, String> {
             }
         }
         Policy::Strict { .. } => Err(format!(
-            "{} is outside the workspace and the strict sandbox grants no reads there; ask the user to run `/add-dir {}`",
+            "{} is outside the workspace and the strict sandbox grants no reads there; call request_directory with path {:?} for a yes/no approval, then retry",
             root.display(),
             base.display()
         )),

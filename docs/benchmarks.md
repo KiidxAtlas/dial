@@ -88,6 +88,11 @@ hash of the task/verification contract without retaining prompt text. `file_equa
 content, including trailing whitespace. Metric-only and manual-review cases are not counted as
 checked coding successes by the comparison tool; legacy reports lacking this metadata cannot
 establish checked success. Missing or incomplete provider usage stays unknown, not zero cost.
+Comparisons validate recorded run contracts and reject different schema, suite or fixture-source
+identities. Executable and configuration identities may differ intentionally. Missing legacy run
+contracts are labelled `run_identity: legacy_unknown`, not a confirmed matched-source comparison.
+Observed transport attempts count as activity even when the request fails before reporting tokens;
+those failed outcomes remain in reliability analysis rather than being discarded as inert runs.
 The benchmark isolates user tools, configured verification commands and escalation; test those
 policies with focused harness regressions, not a purported live escalation score. Interrupted
 session recovery and concurrent edits are covered separately by terminal/transaction regressions.
@@ -348,6 +353,12 @@ No live-model speed improvement is implied by scripted or report-analysis tests.
 ## Machine-configuration comparisons
 
 Use the existing benchmark CLI to compare explicit configurations on identical checked tasks:
+
+Machine throughput counts only passing cases with outcome checks and no manual-review category.
+The `minimum_correctness` floor uses those outcome-checkable cases as its denominator; metric-only,
+invocation-only, manually reviewed and legacy cases without evidence cannot establish verified
+success. A configuration with no outcome-checkable cases cannot be recommended. Baseline regression
+checks still apply, including to the other recorded cases.
 
 ```sh
 dial benchmark suite.toml --profiles machine.toml --report machine-report.json

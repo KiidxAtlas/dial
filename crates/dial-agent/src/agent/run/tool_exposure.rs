@@ -482,6 +482,7 @@ impl<'a> Agent<'a> {
         let mut schemas = Vec::new();
         for name in names {
             schemas.push(match name.as_str() {
+                "request_directory" => crate::agent::run::directory_access::schema(),
                 "context_notes" | "new_context" => crate::agent::window::context_notes::schema(name).expect("known context tool"),
                 "checkpoint" | "rewind" => crate::agent::workflow::exploration::schema(name).expect("known exploration tool"),
                 "session_search" if self.experimental_context_owner() || self.exploration_owner() => session::session_search_tool::schema_owned(),

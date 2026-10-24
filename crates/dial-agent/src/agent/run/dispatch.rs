@@ -541,6 +541,9 @@ impl<'a> Agent<'a> {
                 return denied(&format!("invalid tool call: {why}"));
             }
         }
+        if call.name == "request_directory" {
+            return self.request_directory(call, ui);
+        }
         if call.name == "exit_plan" && self.plan_mode {
             let Some(plan) = call.arguments["plan"]
                 .as_str()

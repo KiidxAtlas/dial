@@ -500,6 +500,21 @@ impl Ui for Bridge<'_> {
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Decision {
         self.shell.status.phase = Phase::Working;
+        // Capability expansion never offers session/project-wide approval shortcuts.
+        if matches!(tool, "request_directory" | "request_sensitive_directory") {
+            let choice = self.shell.ask_with_cancel(
+                &format!("Allow {tool}?"),
+                summary,
+                &[("Yes — allow this directory", 'y'), ("No — deny", 'n')],
+                Some(cancel),
+            );
+            self.repaint(true);
+            return if choice == Some(0) {
+                Decision::Allow
+            } else {
+                Decision::Deny
+            };
+        }
         let choice = self.shell.ask_with_cancel(
             &format!("Allow {tool}?"),
             summary,

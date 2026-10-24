@@ -36,6 +36,34 @@ impl<'a> Agent<'a> {
         reset_interrupt: bool,
         prepared: Option<Value>,
     ) -> Result<TurnReport> {
+        // Reset current-turn evidence before any admission step can fail. Historical receipts
+        // remain separately labelled and must still pass freshness checks before reuse.
+        self.step_checks = StepChecks::default();
+        self.verifications.clear();
+        self.behavioral_checks.clear();
+        let mut control = self.session.control_state();
+        let previous_receipts = control["reliability"]["verification_receipts"]
+            .as_array()
+            .cloned();
+        control["completion_evidence"] = Value::Null;
+        control["turn_summary"] = Value::Null;
+        control["reliability"] = json!({
+            "stats":crate::reliability::Stats::default(),
+            "verification":"no checks recorded this turn",
+            "interface":"standard",
+            "automatic_passing_checks":0,
+            "automatic_failing_checks":0,
+            "edit_loop":self.step_checks.status()
+        });
+        if let Some(receipts) =
+            previous_receipts.filter(|_| self.config.experimental.verification_receipts)
+        {
+            control["reliability"]["verification_receipts"] = json!(receipts);
+        }
+        self.session.set_control_state(control.clone())?;
+        if !self.hermetic {
+            ui.request_policy(&control);
+        }
         if let Some(error) = &self.parts.system_template_error {
             anyhow::bail!("{error}");
         }
@@ -55,11 +83,6 @@ impl<'a> Agent<'a> {
         );
         self.live_tasks.bind(self.session.runtime());
         let turn_clock = Instant::now();
-        // A failure before finalization must not expose the previous turn's evidence as current.
-        let mut control = self.session.control_state();
-        control["completion_evidence"] = Value::Null;
-        control["turn_summary"] = Value::Null;
-        self.session.set_control_state(control)?;
         let result = self.turn_inner(user_text, &mut observed, reset_interrupt, prepared);
         if let Err(error) = self.flush_local_evidence() {
             observed.diagnostic(&format!("Local model evidence not saved: {error:#}"));
@@ -306,27 +329,6 @@ impl<'a> Agent<'a> {
                 checkpoints.begin_turn(&crate::agent::window::prompt::truncate_chars(user_text, 60))
             })
             .transpose()?;
-        if !self.hermetic {
-            let mut control = self.session.control_state();
-            let previous_receipts = control["reliability"]["verification_receipts"]
-                .as_array()
-                .cloned();
-            control["reliability"] = json!({
-                "stats":crate::reliability::Stats::default(),
-                "verification":"no checks recorded this turn",
-                "interface":"standard",
-                "automatic_passing_checks":0,
-                "automatic_failing_checks":0,
-                "edit_loop":{"phase":"no_edits","mutations":0,"checked_mutations":0,"diff_surfaced_mutations":0,"uncheckpointed_shell_commands":0,"disclosed_shell_commands":0,"uncheckpointed_extension_calls":0,"disclosed_extension_calls":0}
-            });
-            if let Some(receipts) =
-                previous_receipts.filter(|_| self.config.experimental.verification_receipts)
-            {
-                control["reliability"]["verification_receipts"] = json!(receipts);
-            }
-            self.session.set_control_state(control.clone())?;
-            ui.request_policy(&control);
-        }
         self.step_checks = StepChecks {
             turn: checkpoint_turn,
             visual: if self.hermetic {
@@ -383,8 +385,6 @@ impl<'a> Agent<'a> {
         };
         self.assistance.begin(user_text);
         self.training_capture.clear();
-        self.verifications.clear();
-        self.behavioral_checks.clear();
         self.reasoning_recovery = crate::agent::workflow::reasoning::Recovery::default();
         self.logging = self.store.is_some();
         let mut message = message;
@@ -668,11 +668,12 @@ impl<'a> Agent<'a> {
         let mut backend = self.backend.take().context("backend is already in use")?;
         // One finite budget: the initial run, verification repairs and stop-hook continuations all draw from it.
         let mut turn_steps = TurnSteps::new(max_steps);
-        let mut result =
-            self.run_loop(&mut backend, &names, &mut schemas, max_steps, user_text, ui);
-        if let Ok(report) = &mut result {
-            report.steps = turn_steps.charge(report.steps);
-        }
+        let mut result = self
+            .run_loop(&mut backend, &names, &mut schemas, max_steps, user_text, ui)
+            .map(|(mut report, consumed)| {
+                report.steps = turn_steps.charge(report.steps, consumed);
+                report
+            });
         // A turn that ended before the next request still must not lose accepted steering.
         if let Err(error) = self.flush_accepted_live_steering(ui) {
             result = Err(error);
@@ -753,8 +754,8 @@ impl<'a> Agent<'a> {
                             ui,
                         );
                         self.flush_accepted_live_steering(ui)?;
-                        let mut repaired = repaired?;
-                        repaired.steps = turn_steps.charge(repaired.steps);
+                        let (mut repaired, consumed) = repaired?;
+                        repaired.steps = turn_steps.charge(repaired.steps, consumed);
                         if repaired.outcome != TurnOutcome::Completed {
                             repaired.text = unsettled_report(&candidate_summary, &repaired.text);
                             result = Ok(repaired);
@@ -920,13 +921,15 @@ impl<'a> Agent<'a> {
                     ui,
                 );
                 self.flush_accepted_live_steering(ui)?;
-                report
+                report.map(|(mut report, consumed)| {
+                    report.steps = turn_steps.charge(report.steps, consumed);
+                    report
+                })
             })();
-            if let Ok(report) = &mut resumed {
-                report.steps = turn_steps.charge(report.steps);
-                if report.outcome != TurnOutcome::Completed {
-                    report.text = unsettled_report(&candidate_summary, &report.text);
-                }
+            if let Ok(report) = &mut resumed
+                && report.outcome != TurnOutcome::Completed
+            {
+                report.text = unsettled_report(&candidate_summary, &report.text);
             }
             result = resumed;
         }
@@ -1167,11 +1170,16 @@ fn unsettled_report(summary: &str, diagnostic: &str) -> String {
 struct TurnSteps {
     max: u32,
     spent: u32,
+    attempts: u32,
 }
 
 impl TurnSteps {
     fn new(max: u32) -> Self {
-        Self { max, spent: 0 }
+        Self {
+            max,
+            spent: 0,
+            attempts: 0,
+        }
     }
 
     /// Steps the next round may spend (0 = unlimited); `None` once the shared budget is spent.
@@ -1182,10 +1190,11 @@ impl TurnSteps {
         }
     }
 
-    /// Charge one run's own step count and return the turn's cumulative count for its report.
-    fn charge(&mut self, run_steps: u32) -> u32 {
-        self.spent = self.spent.saturating_add(run_steps);
-        self.spent
+    /// Budget consumed work separately while preserving raw attempts in public reports.
+    fn charge(&mut self, run_attempts: u32, consumed: u32) -> u32 {
+        self.spent = self.spent.saturating_add(consumed);
+        self.attempts = self.attempts.saturating_add(run_attempts);
+        self.attempts
     }
 }
 

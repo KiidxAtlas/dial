@@ -3871,7 +3871,16 @@ fn call_tool_inner(
     {
         None
     } else {
-        Some(env.workspace.serial_operation())
+        match env.workspace.serial_operation_checked(|| {
+            if env.interrupt.load(Ordering::SeqCst) {
+                Err(())
+            } else {
+                Ok(())
+            }
+        }) {
+            Ok(guard) => Some(guard),
+            Err(()) => return crate::agent::interrupted_tool(),
+        }
     };
     if env.interrupt.load(Ordering::SeqCst) {
         return crate::agent::interrupted_tool();

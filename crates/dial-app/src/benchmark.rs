@@ -433,10 +433,20 @@ pub struct UsefulWork {
     pub cost_usd_per_verified_completion: Option<f64>,
 }
 
+/// Only independent outcome checks can establish correctness; manual review stays unverified.
+fn outcome_verified_case(case: &CaseResult) -> bool {
+    case.evidence.as_ref().is_some_and(|evidence| {
+        evidence.outcome_checks > 0
+            && !evidence
+                .categories
+                .iter()
+                .any(|category| category == "answer_requires_manual_review")
+    })
+}
+
 impl UsefulWork {
     fn measured(cases: &[CaseResult]) -> Self {
-        let checked =
-            |case: &&CaseResult| case.evidence.as_ref().is_some_and(|e| e.outcome_checks > 0);
+        let checked = |case: &&CaseResult| outcome_verified_case(case);
         let completed = cases.iter().filter(checked).filter(|c| c.passed).count();
         let elapsed = cases
             .iter()
@@ -898,7 +908,11 @@ impl MachineConfigurationReport {
         let repairs = report.cases.iter().try_fold(0u64, |sum, case| {
             case.metrics.repair_attempts.map(|n| sum.saturating_add(n))
         });
-        let successes = report.cases.iter().filter(|case| case.passed).count();
+        let successes = report
+            .cases
+            .iter()
+            .filter(|case| case.passed && outcome_verified_case(case))
+            .count();
         Self {
             configuration,
             settings,
@@ -973,10 +987,27 @@ pub fn rank_machine_configurations(
             &baseline,
             policy.regression_thresholds,
         );
+        let checked = report
+            .report
+            .cases
+            .iter()
+            .filter(|case| outcome_verified_case(case))
+            .count();
+        let successes = report
+            .report
+            .cases
+            .iter()
+            .filter(|case| case.passed && outcome_verified_case(case))
+            .count();
+        // Reports may be deserialized from an older scoring version or modified after measurement.
+        // Never let a cached derived rate override the outcomes and elapsed time being ranked.
+        report.correct_cases_per_second = (report.wall_time_ms > 0)
+            .then(|| successes as f64 * 1000.0 / report.wall_time_ms as f64);
         // An invalid run never measured its model; it cannot be recommended, and comparisons
         // against an invalid baseline are flagged as regressed.
         report.eligible = report.report.invalid_reason().is_none()
-            && report.report.pass_rate >= policy.minimum_correctness
+            && checked > 0
+            && successes as f64 / checked as f64 >= policy.minimum_correctness
             && !report.baseline_comparison.regressed
             && report
                 .correct_cases_per_second

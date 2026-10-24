@@ -737,3 +737,89 @@ fn child_delivers_recovery_once_then_keeps_evidence_not_stale_advice() {
         assert!(text.contains("observed source evidence"));
     }
 }
+
+#[test]
+fn cancelled_child_exits_while_workspace_serial_lock_is_still_held() {
+    struct Approved(std::sync::mpsc::Sender<()>);
+    impl Approver for Approved {
+        fn authorize(&mut self, _: &llm::ToolCall, _: &str, _: bool) -> Result<(), Denial> {
+            self.0.send(()).unwrap();
+            Ok(())
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(dir.path()).unwrap();
+    let config = Config::default();
+    let harness = Harness::default();
+    let mut ext = Registry::new();
+    ext.register(Arc::new(Fake {
+        name: "serial_fixture",
+        asks: true,
+    }));
+    let interrupt = Arc::new(AtomicBool::new(false));
+    let request = subagents::parse(
+        &json!({"agent":"worker","task":"inspect","solution_space":"fixture"}),
+        &config,
+    )
+    .unwrap();
+    let schema = ext.get("serial_fixture").unwrap().schema();
+    let call = llm::ToolCall {
+        id: "waiting".into(),
+        name: "serial_fixture".into(),
+        arguments: json!({}),
+        malformed_arguments: false,
+    };
+    let (approved_tx, approved_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let serial = workspace.serial_operation();
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            let env = Env {
+                config: &config,
+                workspace: &workspace,
+                ext: &ext,
+                layout: None,
+                harness: &harness,
+                interrupt: &interrupt,
+                usage: None,
+                context_cap: None,
+                memory: None,
+                plan_mode: false,
+                agents_messages: &[],
+            };
+            let result = call_tool(
+                env,
+                &request.jobs[0],
+                &[schema],
+                &["serial_fixture".into()],
+                &call,
+                &mut Approved(approved_tx),
+                None,
+                None,
+            );
+            done_tx.send(result).unwrap();
+        });
+        let approved = approved_rx.recv_timeout(std::time::Duration::from_secs(2));
+        let blocked = done_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err();
+        interrupt.store(true, Ordering::SeqCst);
+        let cancelled = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+        // Always release and join, even if the regression reintroduces a blocking acquisition.
+        drop(serial);
+        worker.join().unwrap();
+        approved.expect("tool must reach authorization");
+        assert!(
+            blocked,
+            "tool cannot run while another operation owns the workspace"
+        );
+        let result = cancelled.expect("child must cancel before the serial lock is released");
+        assert!(result.is_error);
+        assert_eq!(result.text, crate::agent::interrupted_tool().text);
+        assert_eq!(
+            result.execution.effects,
+            crate::tools::surface::outcome::Effects::None
+        );
+        assert!(!result.text.contains("serial_fixture ran"));
+    });
+}

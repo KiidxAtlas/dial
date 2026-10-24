@@ -56,7 +56,14 @@ fn measured(name: &str, outcomes: &[bool], wall_time_ms: u64) -> MachineConfigur
         .iter()
         .enumerate()
         .map(|(index, passed)| CaseResult {
-            evidence: None,
+            evidence: Some(CaseEvidence {
+                categories: vec![],
+                outcome_checks: 1,
+                failed_check_indices: if *passed { vec![] } else { vec![0] },
+                unavailable_check_indices: vec![],
+                contract_sha256: "a".repeat(64),
+                agent_error_detail: None,
+            }),
             id: format!("0:{index}"),
             passed: *passed,
             checks_passed: usize::from(*passed),
@@ -333,4 +340,98 @@ fn mismatched_tasks_and_unbounded_work_are_rejected() {
     policy.case_timeout_secs = 1;
     policy.minimum_correctness = f64::NAN;
     assert!(policy.validate(&suite, &[configuration]).is_err());
+}
+
+#[test]
+fn throughput_and_eligibility_require_verified_outcomes() {
+    let mut mixed = measured("mixed", &[true, true, true, true, false], 1000);
+    mixed.report.cases[1]
+        .evidence
+        .as_mut()
+        .unwrap()
+        .outcome_checks = 0;
+    mixed.report.cases[2].evidence.as_mut().unwrap().categories =
+        vec!["answer_requires_manual_review".into()];
+    mixed.report.cases[3].evidence = None;
+    let mixed = MachineConfigurationReport::measured(
+        mixed.configuration,
+        mixed.settings,
+        mixed.report,
+        1000,
+    );
+    assert_eq!(mixed.correct_cases_per_second, Some(1.0));
+    let mut reports = vec![mixed];
+    // Four raw passes cannot hide a failed outcome check (verified rate is 1/2).
+    assert_eq!(
+        rank_machine_configurations(&mut reports, &MachineBenchmarkPolicy::default()).unwrap(),
+        None
+    );
+    let policy = MachineBenchmarkPolicy {
+        minimum_correctness: 0.5,
+        ..Default::default()
+    };
+    assert_eq!(
+        rank_machine_configurations(&mut reports, &policy)
+            .unwrap()
+            .as_deref(),
+        Some("mixed")
+    );
+
+    for excluded in 0..3 {
+        let mut report = measured("unchecked", &[true], 1000);
+        match excluded {
+            0 => report.report.cases[0].evidence = None,
+            1 => {
+                report.report.cases[0]
+                    .evidence
+                    .as_mut()
+                    .unwrap()
+                    .outcome_checks = 0
+            }
+            _ => {
+                report.report.cases[0].evidence.as_mut().unwrap().categories =
+                    vec!["answer_requires_manual_review".into()]
+            }
+        }
+        let report = MachineConfigurationReport::measured(
+            report.configuration,
+            report.settings,
+            report.report,
+            1000,
+        );
+        assert_eq!(report.correct_cases_per_second, Some(0.0));
+        assert_eq!(
+            rank_machine_configurations(&mut [report], &policy).unwrap(),
+            None
+        );
+    }
+}
+
+#[test]
+fn ranking_recomputes_cached_throughput_from_verified_work_and_wall_time() {
+    for cached in [None, Some(10000.0), Some(f64::INFINITY), Some(f64::NAN)] {
+        let mut baseline = measured("baseline", &[true], 2000);
+        baseline.correct_cases_per_second = cached;
+        let mut reports = vec![baseline, measured("faster", &[true], 1000)];
+        assert_eq!(
+            rank_machine_configurations(&mut reports, &MachineBenchmarkPolicy::default())
+                .unwrap()
+                .as_deref(),
+            Some("faster")
+        );
+        let baseline = reports
+            .iter()
+            .find(|r| r.configuration.name == "baseline")
+            .unwrap();
+        assert_eq!(baseline.correct_cases_per_second, Some(0.5));
+        assert!(baseline.eligible);
+    }
+    let mut unmeasured = measured("unmeasured", &[true], 0);
+    unmeasured.correct_cases_per_second = Some(10000.0);
+    let mut reports = vec![unmeasured];
+    assert_eq!(
+        rank_machine_configurations(&mut reports, &MachineBenchmarkPolicy::default()).unwrap(),
+        None
+    );
+    assert_eq!(reports[0].correct_cases_per_second, None);
 }

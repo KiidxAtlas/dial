@@ -6,7 +6,7 @@ import math
 import statistics
 from pathlib import Path
 
-from compare import checked_success, evidence, indexed, invalid_reason
+from compare import checked_success, evidence, indexed, invalid_reason, run_contract
 
 
 def wilson_interval(successes, trials):
@@ -55,17 +55,6 @@ def task_contract(case):
         raise ValueError("reliability analysis requires outcome-check evidence")
     return (case["checks_total"], recorded["outcome_checks"],
             recorded["contract_sha256"], recorded.get("categories", []))
-
-
-def run_contract(report):
-    contract = report.get("contract")
-    if not isinstance(contract, dict) or contract.get("schema_version") != 1:
-        raise ValueError("reliability analysis requires a version-1 run contract")
-    for name in ("suite_sha256", "source_sha256", "executable_sha256", "configuration_sha256"):
-        value = contract.get(name)
-        if not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
-            raise ValueError(f"invalid run contract: {name}")
-    return contract
 
 
 def group_trials(report, repetitions):
