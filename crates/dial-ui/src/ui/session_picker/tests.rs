@@ -77,13 +77,15 @@ fn conversations_hide_empty_but_pins_and_all_view_keep_them_accessible() {
         "",
         false,
     );
-    assert_eq!(p.found, [1, 2]);
+    // The pin leads (index 0); the hidden empty session follows it in catalogue order.
+    assert_eq!(p.sessions[0].id, "pin");
+    assert_eq!(p.found, [0, 2]);
     p.handle(&key(KeyCode::Tab, KeyModifiers::NONE), 24);
     assert_eq!(p.found, [0, 1, 2]);
-    p.handle(&key(KeyCode::Home, KeyModifiers::NONE), 24);
+    p.handle(&key(KeyCode::Down, KeyModifiers::NONE), 24);
     assert!(matches!(
         p.handle(&key(KeyCode::Enter, KeyModifiers::NONE), 24),
-        Action::Resume(0)
+        Action::Resume(1)
     ));
 }
 #[test]
@@ -108,6 +110,27 @@ fn pinning_keeps_selection_and_unpinning_restores_activity_order() {
     p.set_pinned(0, false);
     assert_eq!(p.sessions[0].id, "newer");
     assert_eq!(p.sessions[p.found[p.selected]].id, "older");
+}
+
+#[test]
+fn pinned_sessions_open_first_under_one_header() {
+    let now = crate::platform::time::parse_utc("2026-03-10T12:00:00").unwrap();
+    let mut today = session("today", "Today", 1);
+    today.updated = "2026-03-10T11:00:00".into();
+    let mut saved = session("saved", "Saved", 1);
+    saved.updated = "2025-01-01T00:00:00".into();
+    // The catalogue arrives in activity order; the pin must still lead the list.
+    let p = Picker::new(vec![today, saved], vec!["saved".into()], "", "", false);
+    assert_eq!(p.sessions[p.found[0]].id, "saved");
+    assert_eq!(
+        p.units(now),
+        [
+            Unit::Header("Pinned"),
+            Unit::Item(0),
+            Unit::Header("Today"),
+            Unit::Item(1),
+        ]
+    );
 }
 
 #[test]

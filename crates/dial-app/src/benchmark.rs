@@ -619,6 +619,9 @@ pub struct MachineConfiguration {
     /// Real service/delegation lane. Core isolation remains the default.
     #[serde(default)]
     pub integration: IntegrationOverrides,
+    /// `experimental.*` workflow switches for A/B rows; unset keeps the configured value.
+    #[serde(default)]
+    pub experimental: ExperimentalOverrides,
 }
 
 /// Per-configuration assistance feature switches for ablation. `None` keeps the configured value.
@@ -687,6 +690,36 @@ impl EfficiencyOverrides {
                 "configuration efficiency.history_token_cap must be 0 or 8192..=2000000"
             );
         }
+        Ok(())
+    }
+}
+
+/// Per-configuration `experimental.*` switches. `None` keeps the configured value; the bounds
+/// match the settings schema, and overrides apply only to the run's isolated config.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExperimentalOverrides {
+    pub fault_witness: Option<bool>,
+    pub repro_first: Option<crate::config::types::ReproFirst>,
+    /// 0..=16 isolated check runs.
+    pub edit_bisection_runs: Option<u8>,
+    /// 0..=10 non-improving edit rounds.
+    pub outcome_gradient_rounds: Option<u8>,
+    pub streaming_dispatch: Option<bool>,
+    pub check_predictions: Option<bool>,
+}
+
+impl ExperimentalOverrides {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.edit_bisection_runs.is_none_or(|runs| runs <= 16),
+            "configuration experimental.edit_bisection_runs must be 0..=16"
+        );
+        ensure!(
+            self.outcome_gradient_rounds
+                .is_none_or(|rounds| rounds <= 10),
+            "configuration experimental.outcome_gradient_rounds must be 0..=10"
+        );
         Ok(())
     }
 }
@@ -859,6 +892,7 @@ impl MachineBenchmarkPolicy {
             );
             configuration.assistance.validate()?;
             configuration.efficiency.validate()?;
+            configuration.experimental.validate()?;
             configuration.policy.validate()?;
             configuration.integration.validate()?;
         }

@@ -176,6 +176,18 @@ struct StepChecks {
     failed_checks: Vec<verify::verification::FocusedCheck>,
     failed: bool,
     evidence: verify::evidence::Ledger,
+    /// Empty `grep`/`glob` results this turn, forgotten whenever the workspace revision moves.
+    empty_searches: run::search_frontier::EmptySearches,
+    /// Workspace-relative files successfully read this turn; they clear caller obligations.
+    visited_paths: std::collections::BTreeSet<String>,
+    /// A bash test command failed or a `check` result was `code_failed` this turn.
+    reproduced: bool,
+    /// `experimental.repro_first` already advised or refused once this turn.
+    repro_first_fired: bool,
+    /// `experimental.outcome_gradient_rounds` error-count history for this turn.
+    outcome_gradient: run::outcome_gradient::Gradient,
+    /// `experimental.fault_witness` and `experimental.edit_bisection_runs` results this turn.
+    counterfactual: verify::counterfactual::State,
 }
 impl StepChecks {
     fn revision(&self) -> verify::evidence::Revision {

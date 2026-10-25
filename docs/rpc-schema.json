@@ -746,6 +746,25 @@
       "oneOf": [
         {
           "type": "object",
+          "description": "Observational policy provenance; never a permission grant or approval response.",
+          "properties": {
+            "event": {"const": "policy_explanation"},
+            "call_id": {"type": "string"},
+            "tool": {"type": "string"},
+            "message": {"type": "string"},
+            "explanation": {
+              "type": "object",
+              "properties": {
+                "reason": {"enum": ["deny_rule", "read_only", "plan_mode", "cancelled", "automatic_mode", "allow_rule", "workspace_write", "safe_call", "generated_check", "prompt_required", "operator_allow", "operator_deny", "hook_veto"]},
+                "rule_scope": {"type": "string"}
+              },
+              "required": ["reason"]
+            }
+          },
+          "required": ["event", "call_id", "tool", "message", "explanation"]
+        },
+        {
+          "type": "object",
           "properties": {
             "event": {
               "const": "ready"

@@ -1834,6 +1834,118 @@ fn local_time_formats_like_strftime() {
 }
 
 #[test]
+fn policy_reason_renders_in_normal_and_narrow_approval_panels() {
+    use crate::agent::safety::approval::{PolicyExplanation, PolicyReason};
+    let explanation = PolicyExplanation {
+        reason: PolicyReason::PromptRequired,
+        rule_scope: None,
+    };
+    let summary = format!("cargo test\n{explanation}");
+    let options = [
+        ("Allow once", 'y'),
+        ("Always allow this session", 'a'),
+        ("Always allow this project", 'p'),
+        ("Deny", 'n'),
+    ];
+    for width in [40, 100] {
+        let rows = panel_rows_window(
+            &Theme::dark(),
+            width,
+            "Allow bash?",
+            &summary,
+            &options,
+            0,
+            0,
+            64,
+        );
+        assert!(
+            rows.iter()
+                .all(|row| text::line_width(row) <= width as usize)
+        );
+        let text = rows
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Policy:"));
+        assert!(text.contains("operator approval required"));
+        assert!(text.contains("Always allow this project"));
+        assert!(text.contains("Deny"));
+    }
+}
+
+/// Opt-in review artifact of the real panel rows; no provider, TTY or authority.
+#[test]
+#[ignore = "writes an HTML fixture for explicit browser screenshot review"]
+fn policy_approval_visual_fixture() {
+    use crate::agent::safety::approval::{PolicyExplanation, PolicyReason};
+    use ratatui::style::{Color, Modifier};
+    use std::fmt::Write as _;
+    let escape = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    };
+    let color = |c: Option<Color>| match c {
+        Some(Color::Rgb(r, g, b)) => format!("#{r:02x}{g:02x}{b:02x}"),
+        _ => "inherit".into(),
+    };
+    let summary = format!(
+        "cargo test\n{}",
+        PolicyExplanation {
+            reason: PolicyReason::PromptRequired,
+            rule_scope: None,
+        }
+    );
+    let options = [
+        ("Allow once", 'y'),
+        ("Always allow this session", 'a'),
+        ("Always allow this project", 'p'),
+        ("Deny", 'n'),
+    ];
+    let mut html = String::from(
+        "<!doctype html><meta charset=utf-8><title>Dial policy approval review</title><style>body{background:#111318;color:#e0e3ea;padding:20px}pre{font:14px/1.4 monospace}</style><h1>Actual approval panel rows</h1>",
+    );
+    for width in [40, 100] {
+        writeln!(html, "<h2>{width} columns</h2><pre>").unwrap();
+        for line in panel_rows_window(
+            &Theme::dark(),
+            width,
+            "Allow bash?",
+            &summary,
+            &options,
+            0,
+            0,
+            64,
+        ) {
+            for span in line.spans {
+                let style = line.style.patch(span.style);
+                write!(
+                    html,
+                    "<span style=\"color:{};font-weight:{}\">{}</span>",
+                    color(style.fg),
+                    if style.add_modifier.contains(Modifier::BOLD) {
+                        "bold"
+                    } else {
+                        "normal"
+                    },
+                    escape(&span.content)
+                )
+                .unwrap();
+            }
+            html.push('\n');
+        }
+        html.push_str("</pre>");
+    }
+    let directory = std::env::temp_dir().join("dial-policy-review");
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("approval.html");
+    std::fs::write(&path, html).unwrap();
+    println!("Policy review fixture: {}", path.display());
+}
+
+#[test]
 fn the_approval_panel_fits_any_width_and_shows_the_choice() {
     let theme = Theme::dark();
     let options = [

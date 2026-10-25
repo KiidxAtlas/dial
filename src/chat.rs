@@ -54,14 +54,21 @@ pub(crate) fn chat(
                 .filter(|s| s.id.starts_with(&wanted))
                 .collect();
             if matches.len() > 1 {
-                bail!("session prefix {wanted:?} is ambiguous; use a longer id");
+                let ids: Vec<&str> = matches.iter().take(5).map(|s| s.id.as_str()).collect();
+                bail!(
+                    "session prefix {wanted:?} matches {} sessions ({}); use a longer id",
+                    matches.len(),
+                    ids.join(", ")
+                );
             }
             matches.first().map(|s| s.path.clone())
         };
         match found {
             Some(path) => Some(Session::open(&path)?),
             None if wanted.is_empty() => None,
-            None => bail!("no session to resume in this project"),
+            None => bail!(
+                "no session in this project starts with {wanted:?}; run `dial sessions` to list ids, or `dial -c` to continue the latest"
+            ),
         }
     } else {
         None

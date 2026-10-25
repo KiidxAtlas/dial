@@ -37,6 +37,57 @@ pub fn report(path: &Path, content: &str) -> Value {
     }
 }
 
+/// Declaration kinds whose header (everything before the body) is a call or construction contract.
+const SIGNATURE_KINDS: &[&str] = &[
+    "function_item",
+    "function_signature_item",
+    "function_definition",
+    "function_declaration",
+    "method_declaration",
+    "method_definition",
+    "struct_item",
+    "enum_item",
+    "trait_item",
+    "class_definition",
+    "class_declaration",
+    "interface_declaration",
+];
+
+/// Named declarations in `content` with their whitespace-normalized header text (the source
+/// before the body), used to detect signature changes between two versions of a file. `None`
+/// when no parser applies or the source exceeds the parser budget.
+pub fn signatures(path: &Path, content: &str) -> Option<Vec<(String, String)>> {
+    if content.len() > 4 * 1024 * 1024 {
+        return None;
+    }
+    let lang = language(path)?;
+    let tree = AstGrep::try_new(content, lang).ok()?;
+    let mut out = Vec::new();
+    for node in tree.root().dfs() {
+        if !SIGNATURE_KINDS.contains(&node.kind().as_ref()) {
+            continue;
+        }
+        let Some(name) = node.field("name") else {
+            continue;
+        };
+        let start = node.range().start;
+        let end = node
+            .field("body")
+            .map_or(node.range().end, |body| body.range().start);
+        let header = content
+            .get(start..end)
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        out.push((name.text().into_owned(), header));
+        if out.len() == 4000 {
+            break;
+        }
+    }
+    Some(out)
+}
+
 pub fn advisory(path: &Path, before: &str, proposed: &str) -> Option<String> {
     let after = report(path, proposed);
     let new = after["errors"].as_array().map_or(0, Vec::len);

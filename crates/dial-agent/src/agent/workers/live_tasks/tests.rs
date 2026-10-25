@@ -437,3 +437,71 @@ fn persistence_errors_are_explicit_bounded_and_separate_from_long_candidate_repo
     assert!(!result.text.contains(&"x".repeat(1001)));
     assert!(!result.text.contains("Complete worker report:"));
 }
+
+#[test]
+fn worker_policy_provenance_keeps_deny_before_readonly_and_cancel_before_deny() {
+    #[derive(Default)]
+    struct View(Vec<approval::PolicyExplanation>);
+    impl Ui for View {
+        fn policy_explanation(
+            &mut self,
+            _: &str,
+            _: &str,
+            explanation: &approval::PolicyExplanation,
+        ) {
+            self.0.push(explanation.clone());
+        }
+    }
+    for cancelled in [false, true] {
+        let mut tasks = LiveTasks::default();
+        let (answer, reply) = mpsc::channel();
+        tasks
+            .tx
+            .send(Event::Approve {
+                call: ToolCall {
+                    id: "worker-call".into(),
+                    name: "write".into(),
+                    arguments: json!({"path":"file", "content":"data"}),
+                    malformed_arguments: false,
+                },
+                summary: "write".into(),
+                needs: true,
+                cancel: Arc::new(AtomicBool::new(cancelled)),
+                interrupt: Arc::new(AtomicBool::new(false)),
+                answer,
+            })
+            .unwrap();
+        let mut rules = vec![approval::PermissionRule {
+            effect: approval::Effect::Deny,
+            tool: "write".into(),
+            command_prefix: vec![],
+            paths: vec![],
+        }];
+        let mut view = View::default();
+        tasks.pump(
+            Approval::Auto,
+            true,
+            &mut rules,
+            std::path::Path::new("."),
+            &[],
+            None,
+            &mut None,
+            &mut view,
+        );
+        let result = reply.recv().unwrap();
+        if cancelled {
+            assert!(matches!(result, Err(Denial::User)));
+            assert!(
+                view.0
+                    .iter()
+                    .all(|e| e.reason == approval::PolicyReason::Cancelled)
+            );
+        } else {
+            assert!(matches!(result, Err(Denial::Rule)));
+            assert_eq!(view.0.len(), 1);
+            assert_eq!(view.0[0].reason, approval::PolicyReason::DenyRule);
+            assert!(view.0[0].rule_scope.is_some());
+        }
+        assert_eq!(rules.len(), 1);
+    }
+}

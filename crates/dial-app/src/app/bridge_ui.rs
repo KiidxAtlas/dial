@@ -519,6 +519,26 @@ impl Ui for Bridge<'_> {
         }
     }
 
+    fn policy_explanation(
+        &mut self,
+        _call_id: &str,
+        tool: &str,
+        explanation: &crate::agent::safety::approval::PolicyExplanation,
+    ) {
+        use crate::agent::safety::approval::PolicyReason;
+        if matches!(
+            explanation.reason,
+            PolicyReason::DenyRule
+                | PolicyReason::ReadOnly
+                | PolicyReason::PlanMode
+                | PolicyReason::Cancelled
+                | PolicyReason::HookVeto
+        ) {
+            self.notice(&format!("{tool}: {explanation}"));
+        } else {
+            self.diagnostic(&format!("{tool}: {explanation}"));
+        }
+    }
     fn approve(&mut self, tool: &str, summary: &str) -> Decision {
         self.approve_with_cancel(tool, summary, &std::sync::atomic::AtomicBool::new(false))
     }

@@ -247,3 +247,40 @@ fn approvals_attach_by_call_id_and_expire_when_decided() {
             .contains_key(&key(&json!("dial-permission-p2")))
     );
 }
+
+#[test]
+fn reconnect_does_not_replay_pending_replies_permissions_or_partial_tools() {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let layout = || Layout::with_user_dir(project.path(), home.path().to_path_buf()).unwrap();
+    let mut old = Adapter::new(layout());
+    old.initialized = true;
+    old.sessions.insert("s1".into());
+    old.active = Some("s1".into());
+    old.receive(json!({"jsonrpc":"2.0","id":1,"method":"session/prompt",
+        "params":{"sessionId":"s1","prompt":[{"type":"text","text":"review"}]}}));
+    old.emit(json!({"event":"tool_call","call_id":"a","name":"read"}));
+    old.emit(json!({"event":"tool_output","call_id":"a","name":"read","delta":"partial"}));
+    old.emit(json!({"event":"approval","approval_id":"p1","tool":"read","call_id":"a"}));
+    assert!(!old.pending.is_empty() && !old.permissions.is_empty() && !old.tools.is_empty());
+    drop(old);
+
+    let mut fresh = Adapter::new(layout());
+    assert!(!fresh.initialized);
+    assert!(fresh.sessions.is_empty() && fresh.pending.is_empty());
+    assert!(fresh.permissions.is_empty() && fresh.tools.is_empty());
+    assert!(
+        fresh
+            .emit(json!({"id":1,"result":{"interrupted":true}}))
+            .is_empty()
+    );
+    assert!(
+        fresh
+            .emit(json!({"event":"tool_result","call_id":"a","name":"read","text":"late"}))
+            .is_empty()
+    );
+    let (request, replies) = fresh.receive(json!({"jsonrpc":"2.0","id":2,
+        "method":"session/prompt","params":{"sessionId":"s1","prompt":[]}}));
+    assert!(request.is_none());
+    assert!(replies[0].get("error").is_some());
+}

@@ -118,6 +118,9 @@ impl Picker {
             found: Vec::new(),
             searchable,
         };
+        if !tree {
+            picker.order_pins_first();
+        }
         picker.refilter(None);
         picker
     }
@@ -288,18 +291,26 @@ impl Picker {
             self.pinned.remove(&id);
         }
         if !self.tree {
-            // Stable partition keeps recency within the two groups. The storage catalogue already
-            // carries activity order, but removing a pin must restore it too.
+            // Unpinning must restore activity order too, so this re-sorts both groups.
+            let pinned = &self.pinned;
             self.sessions.sort_by(|a, b| {
-                self.pinned
+                pinned
                     .contains(&b.id)
-                    .cmp(&self.pinned.contains(&a.id))
+                    .cmp(&pinned.contains(&a.id))
                     .then_with(|| b.updated.cmp(&a.updated))
                     .then_with(|| b.id.cmp(&a.id))
             });
             self.searchable = self.sessions.iter().map(search_text).collect();
         }
         self.refilter(Some(&id));
+    }
+
+    /// Pinned sessions lead the list under one header. A stable partition, so the catalogue's
+    /// activity order is kept within both groups.
+    fn order_pins_first(&mut self) {
+        let pinned = &self.pinned;
+        self.sessions.sort_by_key(|s| !pinned.contains(&s.id));
+        self.searchable = self.sessions.iter().map(search_text).collect();
     }
 
     pub fn handle(&mut self, event: &Event, height: usize) -> Action {

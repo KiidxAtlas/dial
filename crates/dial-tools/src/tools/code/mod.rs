@@ -4,3 +4,4 @@ pub mod dap;
 pub mod diagnostics;
 pub mod lsp;
 pub mod navigation;
+pub mod references;

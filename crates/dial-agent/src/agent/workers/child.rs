@@ -3983,7 +3983,16 @@ fn call_tool_inner(
         env.interrupt,
         &mut |notice| approver.borrow_mut().notice(notice),
     ) {
-        Err(reason) => return refuse(reason),
+        Err(reason) => {
+            approver.borrow_mut().policy_explanation(
+                call,
+                &approval::PolicyExplanation {
+                    reason: approval::PolicyReason::HookVeto,
+                    rule_scope: None,
+                },
+            );
+            return refuse(reason);
+        }
         Ok(None) => call,
         Ok(Some(arguments)) => {
             // Only schema-valid read-only rewrites are supported here. The original

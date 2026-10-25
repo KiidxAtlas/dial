@@ -20,6 +20,7 @@ pub fn canonicalize(message: &mut Value) {
         object.remove("dial_prompt_band");
         object.remove("dial_tool_contracts");
         object.remove("dial_execution_status");
+        object.remove("dial_execution");
         object.remove("dial_effects");
         // The typed text behind a turn-optimizer draft; the model sees only the draft.
         object.remove("dial_turn_draft");

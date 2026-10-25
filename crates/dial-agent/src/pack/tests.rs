@@ -312,3 +312,65 @@ fn imported_adapter_is_a_candidate_and_never_activates() {
         "re-import must be refused"
     );
 }
+
+#[test]
+fn workflow_adapter_export_import_export_roundtrip_keeps_weights_and_local_gate() {
+    let root = tempfile::tempdir().unwrap();
+    let checkpoint = root.path().join("checkpoint");
+    fs::create_dir_all(&checkpoint).unwrap();
+    fs::write(checkpoint.join("config.json"), b"{}").unwrap();
+    fs::write(checkpoint.join("model.safetensors"), b"fixture base").unwrap();
+    let config = Config {
+        model: checkpoint.display().to_string(),
+        state_dir: root.path().join("state"),
+        ..Config::default()
+    };
+    let adapter = root.path().join("adapter");
+    fs::create_dir_all(&adapter).unwrap();
+    write_sources(&adapter, &sample_adapter());
+    let source = Store::open(
+        &root.path().join("source"),
+        "model",
+        "coding",
+        &Harness::default(),
+    )
+    .unwrap();
+    let active = source.active().unwrap();
+    let candidate = source
+        .candidate(active.id, "lora", &active.harness, Some(&adapter))
+        .unwrap();
+    let first = root.path().join("first.dialpack");
+    export_adapter(&config, &source, candidate.id, &first).unwrap();
+    let destination = Store::open(
+        &root.path().join("destination"),
+        "model",
+        "coding",
+        &Harness::default(),
+    )
+    .unwrap();
+    let original = destination.active().unwrap().id;
+    let imported = import_adapter(&config, &destination, &first).unwrap();
+    assert_eq!(imported.status, "candidate");
+    assert_eq!(destination.active().unwrap().id, original);
+    let second = root.path().join("second.dialpack");
+    export_adapter(&config, &destination, imported.id, &second).unwrap();
+    let (manifest, unpacked) = open_pack(
+        &second,
+        &root.path().join("verify"),
+        "lora",
+        &pinned_base(&config).unwrap(),
+        MAX_PACK_BYTES,
+    )
+    .unwrap();
+    assert_eq!(manifest.source["status"], "candidate");
+    assert_eq!(
+        fs::read(unpacked.path().join("adapters.safetensors")).unwrap(),
+        b"weights"
+    );
+    let localized: Value =
+        serde_json::from_slice(&fs::read(unpacked.path().join("adapter_config.json")).unwrap())
+            .unwrap();
+    assert_eq!(localized["base_model_name_or_path"], config.model);
+    assert_eq!(localized["r"], 8);
+    assert_eq!(destination.active().unwrap().id, original);
+}

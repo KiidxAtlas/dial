@@ -166,6 +166,7 @@ dial-app.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
+crossterm.workspace = true
 fs2.workspace = true
 serde.workspace = true
 ureq.workspace = true

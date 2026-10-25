@@ -1,0 +1,17 @@
+{
+  "description": "Small static Rust fixture; gold files are hand-labelled navigation targets, not model task-success claims.",
+  "files": {
+    "api.rs": "// request timeout retry entry point\npub fn request() { crate::retry::retry_request(); }\n",
+    "retry.rs": "// timeout retry backoff policy\npub fn retry_request() { crate::clock::backoff_delay(); crate::transport::send_request(); }\n",
+    "clock.rs": "// timeout retry delay calculation\npub fn backoff_delay() -> u64 { 2 }\n",
+    "transport.rs": "// request timeout socket transport\npub fn send_request() { crate::errors::classify_timeout(); }\n",
+    "errors.rs": "// timeout error classification\npub fn classify_timeout() -> bool { true }\n",
+    "guide.rs": "// timeout retry request backoff tutorial example\npub fn tutorial_example() {}\n"
+  },
+  "queries": [
+    {"query": "backoff_delay", "gold": ["clock.rs"]},
+    {"query": "timeout retry backoff", "gold": ["retry.rs", "clock.rs"]},
+    {"query": "request socket transport", "gold": ["api.rs", "transport.rs"]},
+    {"query": "timeout error classification", "gold": ["errors.rs"]}
+  ]
+}

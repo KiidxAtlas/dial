@@ -1016,6 +1016,9 @@ fn env(url: &str, approval: &str) -> Env {
     raise_fd_limit();
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
+    // TMPDIR may live inside the checkout. Bound instruction discovery at the fixture,
+    // rather than inheriting the developer's enclosing repository guidance.
+    std::fs::create_dir(project.path().join(".git")).unwrap();
     let layout = Layout::with_user_dir(project.path(), home.path().join("dial")).unwrap();
     let overlay: toml::Table = toml::from_str(&format!(
         "model = \"scripted\"\napproval = \"{approval}\"\nintegrations = []\n[edit]\nmode = \"hashline\"\n[endpoint]\nbase_url = \"{url}\"\n[sandbox]\nmode = \"strict\"\n")).unwrap();
@@ -5363,7 +5366,11 @@ fn a_worker_edits_through_the_parents_approval_and_checkpoints() {
     let mut ui = Recorder::default();
     a.turn("delegate", &mut ui).unwrap();
     assert_eq!(ui.approvals, ["task", "write"]);
-    assert_eq!(ui.summaries[1], "[worker] f.txt");
+    let policy = dial::agent::safety::approval::PolicyExplanation {
+        reason: dial::agent::safety::approval::PolicyReason::PromptRequired,
+        rule_scope: None,
+    };
+    assert_eq!(ui.summaries[1], format!("[worker] f.txt\n{policy}"));
     assert_eq!(task_result(&main), "changed f.txt");
     assert_eq!(
         std::fs::read_to_string(e.project.path().join("f.txt")).unwrap(),
@@ -7130,7 +7137,6 @@ fn git_with_configured_executables_requires_approval() {
         Reply::Text("denied"),
     ]);
     let e = env(&server.url, "ask");
-    std::fs::create_dir(e.project.path().join(".git")).unwrap();
     std::fs::write(
         e.project.path().join(".git/config"),
         "[diff]\nexternal = touch escaped\n[core]\nfsmonitor = touch escaped\n",
@@ -9052,9 +9058,22 @@ fn repair_hints_ride_with_the_user_turn_so_the_system_prompt_never_changes() {
 #[test]
 fn zero_step_limit_runs_past_64_and_overrides_a_finite_admitted_harness() {
     for unlimited in [false, true] {
-        let mut replies: Vec<_> = (0..65)
-            .map(|n| Reply::Call("read", json!({"path":format!("f{n}.txt")})))
-            .collect();
+        let mut replies = Vec::new();
+        for n in 0..65 {
+            replies.push(Reply::IdentifiedCall(
+                "read",
+                json!({"path":format!("f{n}.txt")}),
+                format!("read-{n}"),
+            ));
+            // Unlimited steps still honor the independent research-synthesis boundary.
+            if (n + 1) % 24 == 0 {
+                replies.push(Reply::Say(json!({
+                    "finding": format!("Read files through f{n}.txt; each contains its numbered value"),
+                    "evidence": [format!("read-{n}")],
+                    "next_action": "Read the remaining numbered files"
+                }).to_string()));
+            }
+        }
         replies.push(Reply::Text("done"));
         let server = serve(replies);
         let mut e = env(&server.url, "auto");
@@ -9085,7 +9104,16 @@ fn zero_step_limit_runs_past_64_and_overrides_a_finite_admitted_harness() {
                 (report.text.as_str(), report.outcome),
                 ("done", TurnOutcome::Completed)
             );
-            assert_eq!(server.requests.lock().len(), 66);
+            assert_eq!(server.requests.lock().len(), 68);
+            assert_eq!(
+                a.session()
+                    .messages()
+                    .iter()
+                    .filter(|m| m["role"] == "tool")
+                    .count(),
+                65,
+                "synthesis must not replace any of the 65 requested reads"
+            );
         } else {
             assert_eq!(report.outcome, TurnOutcome::Incomplete);
             assert!(report.text.contains("2-step limit"), "{}", report.text);

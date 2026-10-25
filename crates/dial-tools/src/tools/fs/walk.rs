@@ -1,7 +1,9 @@
 //! The one workspace file walker behind `glob`, `grep` and `ast_search`/`ast_edit`.
 //!
 //! * `.gitignore` rules apply (also without a `.git` directory), so build output and virtualenvs
-//!   are not searched and do not eat the entry budget. Dotfiles are still visited.
+//!   are not searched and do not eat the visited-entry budget. Dotfiles are still visited.
+//! * Directory enumeration is bounded before sorting, including ignored names; oversized
+//!   directories are omitted and reported as incomplete by both walkers.
 //! * `.git`, `node_modules`, `target`, `.venv`, `__pycache__` and the top-level scratch directory are
 //!   skipped even when no ignore file lists them. An explicit start path inside one still works.
 //! * Nested linked git worktrees (a `.git` file pointing into another repository's `worktrees/`)
@@ -41,7 +43,9 @@ pub(crate) fn is_linked_worktree(directory: &Path) -> bool {
 pub(crate) struct Walk<'a> {
     ws: &'a Workspace,
     entries: usize,
-    /// The walk stopped early (entry budget) or did not descend (depth limit): results may be incomplete.
+    directory_entries: usize,
+    directory_limit: usize,
+    /// Entry/depth/admission limits or I/O errors left results incomplete.
     pub truncated: bool,
 }
 
@@ -50,6 +54,8 @@ impl<'a> Walk<'a> {
         Walk {
             ws,
             entries: 0,
+            directory_entries: 0,
+            directory_limit: MAX_WALK_ENTRIES,
             truncated: false,
         }
     }
@@ -68,51 +74,96 @@ impl<'a> Walk<'a> {
         prefix: &Path,
         visit: &mut dyn FnMut(&Path) -> bool,
     ) {
-        let prefix = prefix.to_path_buf();
-        let root = self.ws.root.clone();
-        let ws = self.ws.clone();
-        let walker = WalkBuilder::new(start)
+        // Keep the legacy ignore crate configuration (including parent rules and
+        // .git/info/exclude), but own enumeration so admission precedes sorting.
+        let mut matcher = WalkBuilder::new(start)
             .hidden(false)
             .follow_links(false)
             .require_git(false)
             .git_global(false)
             .ignore(false)
-            .max_depth(Some(MAX_WALK_DEPTH))
-            .sort_by_file_name(|a, b| a.cmp(b))
-            .filter_entry(move |entry| {
-                if ws.is_protected(entry.path()) {
-                    return false;
-                }
-                if entry.depth() == 0 || !entry.file_type().is_some_and(|t| t.is_dir()) {
+            .build_matchers()
+            .remove(0);
+        self.walk_path(start, start, prefix, 0, &mut matcher, visit);
+    }
+
+    fn walk_path(
+        &mut self,
+        start: &Path,
+        path: &Path,
+        prefix: &Path,
+        depth: usize,
+        matcher: &mut ignore::IncrementalIgnore,
+        visit: &mut dyn FnMut(&Path) -> bool,
+    ) -> bool {
+        if self.ws.is_protected(path) {
+            return true;
+        }
+        let kind = match std::fs::symlink_metadata(path) {
+            Ok(meta) => meta.file_type(),
+            Err(_) => {
+                self.truncated = true;
+                return true;
+            }
+        };
+        if depth > 0 {
+            let (matched, error) = matcher.matched_with_errors(
+                path.strip_prefix(start).expect("walk descendant"),
+                kind.is_dir(),
+            );
+            self.truncated |= error.is_some();
+            if matched.is_ignore() {
+                return true;
+            }
+            if kind.is_dir() {
+                let name = path.file_name().unwrap_or_default();
+                let scratch = name == SCRATCH_DIR && path.parent() == Some(self.ws.root.as_path());
+                if scratch
+                    || SKIPPED_DIRS.iter().any(|skip| name == *skip)
+                    || !(path.starts_with(prefix) || prefix.starts_with(path))
+                    || is_linked_worktree(path)
+                {
                     return true;
                 }
-                let name = entry.file_name();
-                let scratch = name == SCRATCH_DIR && entry.path().parent() == Some(root.as_path());
-                !(scratch || SKIPPED_DIRS.iter().any(|skip| name == *skip))
-                    && (entry.path().starts_with(&prefix) || prefix.starts_with(entry.path()))
-                    && !is_linked_worktree(entry.path())
-            })
-            .build();
-        for entry in walker {
-            let Ok(entry) = entry else {
-                // Unreadable entries leave the result incomplete; say so instead of hiding them.
-                self.truncated = true;
-                continue;
-            };
-            self.entries += 1;
-            if self.entries > MAX_WALK_ENTRIES {
-                self.truncated = true;
-                return;
-            }
-            let Some(kind) = entry.file_type() else {
-                continue;
-            };
-            if kind.is_dir() && entry.depth() >= MAX_WALK_DEPTH {
-                self.truncated = true;
-            } else if kind.is_file() && !visit(entry.path()) {
-                return;
             }
         }
+        self.entries += 1;
+        if self.entries > MAX_WALK_ENTRIES {
+            self.truncated = true;
+            return false;
+        }
+        if kind.is_file() {
+            return visit(path);
+        }
+        if !kind.is_dir() {
+            return true; // Includes symlinks: never follow or report them.
+        }
+        if depth >= MAX_WALK_DEPTH {
+            self.truncated = true;
+            return true;
+        }
+        if !self
+            .ws
+            .resolve(&self.ws.rel(path))
+            .is_ok_and(|resolved| resolved == path)
+        {
+            self.truncated = true;
+            return true;
+        }
+        let children =
+            match bounded_directory(path, self.directory_limit, &mut self.directory_entries) {
+                Ok(children) => children,
+                Err(error) => {
+                    self.truncated = true;
+                    return !matches!(error, DirectoryError::Budget);
+                }
+            };
+        for (name, _) in children {
+            if !self.walk_path(start, &path.join(name), prefix, depth + 1, matcher, visit) {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -289,26 +340,14 @@ impl<'a> SearchWalk<'a> {
             self.omit(path, "unconfined or changed directory");
             return true;
         }
-        let mut iterator = match std::fs::read_dir(path) {
-            Ok(iterator) => iterator,
-            Err(_) => {
-                self.unreadable += 1;
-                self.unreadable_directories += 1;
-                self.omit(path, "unreadable directory");
-                return true;
-            }
-        };
-        // Collect only a bounded admitted directory, never an unbounded
-        // underlying walker sort. Store each name/type once, not full paths.
-        let mut children = Vec::new();
-        loop {
-            if self.directory_entries >= MAX_WALK_ENTRIES * (MAX_WALK_DEPTH + 1) {
+        let children = match bounded_directory(path, MAX_WALK_ENTRIES, &mut self.directory_entries)
+        {
+            Ok(children) => children,
+            Err(DirectoryError::Budget) => {
                 self.next = Some(path.to_path_buf());
                 return false;
             }
-            let Some(entry) = iterator.next() else { break };
-            self.directory_entries += 1;
-            if children.len() >= MAX_WALK_ENTRIES {
+            Err(DirectoryError::Oversized) => {
                 self.oversized_directories += 1;
                 self.omit(
                     path,
@@ -316,27 +355,13 @@ impl<'a> SearchWalk<'a> {
                 );
                 return true;
             }
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(_) => {
-                    self.unreadable += 1;
-                    self.unreadable_directories += 1;
-                    self.omit(path, "unreadable directory entry; directory omitted");
-                    return true;
-                }
-            };
-            let kind = match entry.file_type() {
-                Ok(kind) => kind,
-                Err(_) => {
-                    self.unreadable += 1;
-                    self.unreadable_directories += 1;
-                    self.omit(path, "unreadable directory entry type; directory omitted");
-                    return true;
-                }
-            };
-            children.push((entry.file_name(), kind));
-        }
-        children.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            Err(DirectoryError::Unreadable(reason)) => {
+                self.unreadable += 1;
+                self.unreadable_directories += 1;
+                self.omit(path, reason);
+                return true;
+            }
+        };
         let inherited = rules.len();
         if self.gitignore {
             match bounded_ignore(path, &path.join(".gitignore"), &mut self.ignore_bytes) {
@@ -454,3 +479,45 @@ pub(in crate::tools) fn open_search_file(path: &Path) -> std::io::Result<std::fs
     }
     options.open(path)
 }
+
+/// Mechanism only: callers retain their distinct ignore and policy semantics.
+/// Reject the entire directory at limit + 1 rather than returning a filesystem-
+/// order-dependent subset. No sort or unbounded allocation occurs before admission.
+#[derive(Debug)]
+enum DirectoryError {
+    Budget,
+    Oversized,
+    Unreadable(&'static str),
+}
+
+fn bounded_directory(
+    path: &Path,
+    limit: usize,
+    consumed: &mut usize,
+) -> Result<Vec<(std::ffi::OsString, std::fs::FileType)>, DirectoryError> {
+    let mut iterator =
+        std::fs::read_dir(path).map_err(|_| DirectoryError::Unreadable("unreadable directory"))?;
+    let mut children = Vec::new();
+    loop {
+        if *consumed >= MAX_WALK_ENTRIES * (MAX_WALK_DEPTH + 1) {
+            return Err(DirectoryError::Budget);
+        }
+        let Some(entry) = iterator.next() else { break };
+        *consumed += 1;
+        if children.len() >= limit {
+            return Err(DirectoryError::Oversized);
+        }
+        let entry = entry.map_err(|_| {
+            DirectoryError::Unreadable("unreadable directory entry; directory omitted")
+        })?;
+        let kind = entry.file_type().map_err(|_| {
+            DirectoryError::Unreadable("unreadable directory entry type; directory omitted")
+        })?;
+        children.push((entry.file_name(), kind));
+    }
+    children.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    Ok(children)
+}
+
+#[cfg(test)]
+mod tests;

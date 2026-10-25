@@ -304,6 +304,66 @@ fn batched_read_only_bash_runs_through_parallel_tools_in_call_order() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn parallel_hook_refusals_report_policy_for_each_call_without_execution() {
+    use crate::agent::safety::approval::{PolicyExplanation, PolicyReason};
+    #[derive(Default)]
+    struct View(Vec<(String, PolicyReason)>);
+    impl Ui for View {
+        fn policy_explanation(&mut self, id: &str, _: &str, explanation: &PolicyExplanation) {
+            self.0.push((id.into(), explanation.reason));
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(dir.path()).unwrap();
+    for response in [
+        json!({"decision":"block", "reason":"veto"}),
+        json!({"input":{"path":"rewritten"}}),
+    ] {
+        let mut config = Config::default();
+        config.hooks.push(crate::config::types::HookConfig {
+            event: "pre_tool_use".into(),
+            matcher: Some("read".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                format!("cat >/dev/null; printf '%s' '{response}'"),
+            ],
+            timeout_secs: 5,
+            fail_closed: None,
+        });
+        let calls: Vec<_> = ["first", "second"]
+            .into_iter()
+            .map(|id| ToolCall {
+                id: id.into(),
+                name: "read".into(),
+                arguments: json!({"path":"absent"}),
+                malformed_arguments: false,
+            })
+            .collect();
+        let mut ui = View::default();
+        let outputs = parallel_tools(
+            &workspace,
+            &config,
+            &Registry::new(),
+            &calls,
+            &AtomicBool::new(false),
+            &mut ui,
+            &mut Vec::new(),
+        );
+        assert!(outputs.iter().all(|(output, _)| output.is_error
+            && (output.text.contains("veto") || output.text.contains("changed a scheduled call"))));
+        assert_eq!(
+            ui.0,
+            [
+                ("first".into(), PolicyReason::HookVeto),
+                ("second".into(), PolicyReason::HookVeto)
+            ]
+        );
+    }
+}
+
 #[test]
 fn repair_hints_are_project_scoped_relevant_and_omit_old_values() {
     let dir = tempfile::tempdir().unwrap();

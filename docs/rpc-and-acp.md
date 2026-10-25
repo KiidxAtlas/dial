@@ -15,7 +15,10 @@ Use `--allow read,edit` for named tool approval instead of blanket `-y`; read-on
 still win. With both a prompt argument and piped stdin, stdin is appended as fenced context.
 Exit status: `0` completed, `1` error, `2` incomplete, blocked, needs input, no answer or interrupted, `3` a required tool approval was denied (takes precedence over 2).
 
-`dial sessions --all` lists sessions across projects. `dial sessions rename <id> <title>` and
+`dial sessions` lists this project's sessions by latest activity (`--all` lists every project). On a
+terminal it prints a table (id, relative age, message count, title, and project with `--all`) with
+the resume and export commands; piped output keeps the stable
+`id  started  N msgs  title[  project]` lines for scripts. `dial sessions rename <id> <title>` and
 `dial sessions export <id> [path] [--html]` expose session management without the TUI.
 
 ## Execution tree and result revisions
@@ -99,3 +102,10 @@ In-flight ACP request IDs are rejected before prompt preparation or cancellation
 Cancellation requests with IDs receive their own replies; cancellation notifications never produce
 responses and cannot consume the pending prompt's final response. Cancelling a parked session does
 not interrupt the active session.
+
+## Building a client
+
+See [client compatibility and conformance](client-contracts.md) for the version policy, schema-checked
+request fixtures, cancellation/reconnect handling, revision rules and an executable contract matrix.
+The [workflow examples](../examples/workflows/README.md) compose existing skills, session exports and
+verified learned-artifact packs without adding a transport or workflow interpreter.

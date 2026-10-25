@@ -22,6 +22,7 @@ use crate::agent::Agent;
 
 /// Launch-mode flags as they appear on the Dial command line.
 #[derive(Debug, Clone, Default, clap::Args)]
+#[command(next_help_heading = crate::cli::help_heading::MODES)]
 pub struct ModeArgs {
     /// Start a goal-directed session. Requires a non-empty objective.
     #[arg(long, value_name = "OBJECTIVE")]
@@ -64,23 +65,23 @@ pub struct ModeArgs {
     pub hide_thinking: bool,
 
     /// Disable all extensions.
-    #[arg(long)]
+    #[arg(long, help_heading = crate::cli::help_heading::EXTENSIONS)]
     pub no_extensions: bool,
 
     /// Load an extension module (`--extension` / `-e`, repeatable).
-    #[arg(short = 'e', long = "extension", value_name = "PATH")]
+    #[arg(short = 'e', long = "extension", value_name = "PATH", help_heading = crate::cli::help_heading::EXTENSIONS)]
     pub extensions: Vec<String>,
 
     /// Load a hook module (repeatable).
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", help_heading = crate::cli::help_heading::EXTENSIONS)]
     pub hook: Vec<String>,
 
     /// Load an absolute-path extension that is trusted (repeatable).
-    #[arg(long, value_name = "ABS_PATH")]
+    #[arg(long, value_name = "ABS_PATH", help_heading = crate::cli::help_heading::EXTENSIONS)]
     pub trusted_extension: Vec<String>,
 
     /// Add a plugin root directory (repeatable).
-    #[arg(long, value_name = "DIR")]
+    #[arg(long, value_name = "DIR", help_heading = crate::cli::help_heading::EXTENSIONS)]
     pub plugin_dir: Vec<PathBuf>,
 }
 

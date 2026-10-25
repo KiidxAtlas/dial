@@ -407,8 +407,9 @@ pub(in crate::agent) fn result_projection(
     report: &str,
     payload: Option<&Value>,
     acceptance: &[String],
+    workspace: Option<&Workspace>,
 ) -> Value {
-    handoff::project(report, payload, acceptance)
+    handoff::project(report, payload, acceptance, workspace)
 }
 
 /// A complete report must never be advertised through a silently elided artifact.
@@ -1242,6 +1243,8 @@ pub(in crate::agent) trait Approver {
             MutationScope::ManagedMemory,
         )
     }
+    fn policy_explanation(&mut self, _call: &ToolCall, _explanation: &approval::PolicyExplanation) {
+    }
     fn notice(&mut self, _message: &str) {}
     fn add_cost(&mut self, _cost: f64) {}
     fn take_messages(&mut self) -> Vec<String> {
@@ -1276,6 +1279,10 @@ struct Direct<'a> {
 }
 
 impl Approver for Direct<'_> {
+    fn policy_explanation(&mut self, call: &ToolCall, explanation: &approval::PolicyExplanation) {
+        self.ui
+            .policy_explanation(&call.id, &call.name, explanation);
+    }
     fn notice(&mut self, message: &str) {
         self.ui.notice(message);
     }
@@ -1302,9 +1309,17 @@ impl Approver for Direct<'_> {
         needs_approval: bool,
     ) -> Result<(), Denial> {
         if approval::denied_by_rule(self.always, call, self.root) {
+            approval::explain_rule(
+                self.ui,
+                call,
+                self.root,
+                self.always,
+                approval::Effect::Deny,
+            );
             return Err(Denial::Rule);
         }
         if !needs_approval {
+            approval::explain(self.ui, call, approval::PolicyReason::SafeCall);
             return Ok(());
         }
         approval::authorize(
@@ -1326,15 +1341,25 @@ impl Approver for Direct<'_> {
         cancel: &Arc<AtomicBool>,
     ) -> Result<(), Denial> {
         if cancel.load(Ordering::SeqCst) {
+            approval::explain(self.ui, call, approval::PolicyReason::Cancelled);
             return Err(Denial::User);
         }
         if approval::denied_by_rule(self.always, call, self.root) {
+            approval::explain_rule(
+                self.ui,
+                call,
+                self.root,
+                self.always,
+                approval::Effect::Deny,
+            );
             return Err(Denial::Rule);
         }
         if !needs_approval {
             return if cancel.load(Ordering::SeqCst) {
+                approval::explain(self.ui, call, approval::PolicyReason::Cancelled);
                 Err(Denial::User)
             } else {
+                approval::explain(self.ui, call, approval::PolicyReason::SafeCall);
                 Ok(())
             };
         }
@@ -1351,6 +1376,7 @@ impl Approver for Direct<'_> {
         if cancel.load(Ordering::SeqCst) {
             // Do not retain an AllowAlways grant if cancellation won the UI response race.
             self.always.truncate(prior_rules);
+            approval::explain(self.ui, call, approval::PolicyReason::Cancelled);
             Err(Denial::User)
         } else {
             result.map(|_persist| ())
@@ -1413,6 +1439,7 @@ impl Approver for Direct<'_> {
 }
 
 enum Message {
+    Policy(ToolCall, approval::PolicyExplanation),
     CapturePolicy {
         cancel: Arc<AtomicBool>,
         reply: mpsc::Sender<Result<bool, String>>,
@@ -1548,6 +1575,11 @@ impl Approver for Remote {
                 body.append(text);
             }
         }
+    }
+    fn policy_explanation(&mut self, call: &ToolCall, explanation: &approval::PolicyExplanation) {
+        let _ = self
+            .0
+            .send(Message::Policy(call.clone(), explanation.clone()));
     }
     fn notice(&mut self, message: &str) {
         let _ = self.0.send(Message::Notice(message.to_owned()));
@@ -1832,7 +1864,7 @@ pub(in crate::agent) fn run(parent: Parent<'_>, args: &Value, ui: &mut dyn Ui) -
             )
         })
         .collect();
-    render(&request, outcomes, &models, env.workspace.artifacts())
+    render(&request, outcomes, &models, Some(env.workspace))
 }
 
 pub(in crate::agent) fn nested_schema(config: &Config) -> Value {
@@ -1937,7 +1969,7 @@ pub(in crate::agent) fn nested(
             &mut descendant,
         )));
     }
-    render(&request, outcomes, &models, env.workspace.artifacts())
+    render(&request, outcomes, &models, Some(env.workspace))
 }
 
 /// Loads each job's autoloaded skills through the same `skill` body loader the model uses, so a
@@ -2313,6 +2345,9 @@ impl Approver for Rebase<'_> {
         self.inner
             .authorize_mutation(&original, tool, &paths, unbounded, cancel, scope)
     }
+    fn policy_explanation(&mut self, call: &ToolCall, explanation: &approval::PolicyExplanation) {
+        self.inner.policy_explanation(call, explanation);
+    }
     fn notice(&mut self, message: &str) {
         self.inner.notice(message)
     }
@@ -2621,6 +2656,9 @@ fn pump_messages(
             }
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Ok(Message::Policy(call, explanation)) => {
+                direct.policy_explanation(&call, &explanation)
+            }
             Ok(Message::Notice(message)) => direct.notice(&message),
             Ok(Message::Cost(cost)) => direct.add_cost(cost),
             Ok(Message::ToolStarted(index, tool)) => {
@@ -2665,6 +2703,7 @@ fn pump_messages(
                 if env.interrupt.load(Ordering::SeqCst) || cancel.load(Ordering::SeqCst) {
                     cancel.store(true, Ordering::SeqCst);
                     direct.always.truncate(prior_rules);
+                    approval::explain(direct.ui, &call, approval::PolicyReason::Cancelled);
                     decision = Err(Denial::User);
                 }
                 let _ = reply.send(decision);
@@ -2823,8 +2862,9 @@ fn render(
     request: &Request,
     outcomes: Vec<Option<Outcome>>,
     models: &std::collections::BTreeMap<usize, String>,
-    artifacts: Option<&crate::storage::artifact::ArtifactStore>,
+    workspace: Option<&Workspace>,
 ) -> ToolOutput {
+    let artifacts = workspace.and_then(Workspace::artifacts);
     let outcomes: Vec<Outcome> = outcomes
         .into_iter()
         .map(|o| o.unwrap_or_else(|| Outcome::failed(0, "subagent produced no result")))
@@ -2834,7 +2874,7 @@ fn render(
         let text = outcome.status.text.as_str();
         let mut result = json!({"name":job.label,"agent":job.kind,"status":status,"steps":outcome.steps,"result":outcome.data.clone().unwrap_or_else(|| json!(text))});
         result["inspections"] = json!(outcome.inspections);
-        result["projection"] = result_projection(text, outcome.data.as_ref(), job.work_packet.as_ref().map(|p| p.acceptance.as_slice()).unwrap_or_default());
+        result["projection"] = result_projection(text, outcome.data.as_ref(), job.work_packet.as_ref().map(|p| p.acceptance.as_slice()).unwrap_or_default(), workspace);
         result["role"] = json!(job.role);
         result["model"] = json!(models.get(&job.index));
         if let Some(route) = &outcome.model_route {

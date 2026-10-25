@@ -15,6 +15,7 @@ use crate::config::paths::Layout;
 use crate::storage::session::Session;
 
 #[derive(Debug, Clone, Default, Args)]
+#[command(next_help_heading = crate::cli::help_heading::SESSIONS)]
 pub struct SessionFlagArgs {
     /// Fork a session (by id prefix or by .jsonl path) into a new session.
     #[arg(long, value_name = "ID|PATH")]

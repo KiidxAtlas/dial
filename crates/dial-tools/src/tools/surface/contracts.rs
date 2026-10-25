@@ -28,6 +28,46 @@ const ADDITIVE_PROPERTIES: &[(&str, &[&str])] = &[
     ("find", &["related"]),
 ];
 
+/// `check.expect`, offered only under `experimental.check_predictions`. The controller owns the
+/// `check` schema; this shape lives here so history recorded with or without it stays valid when
+/// the flag changes between runs.
+pub fn check_prediction_property() -> Value {
+    json!({"type":"string","enum":["pass","fail"],"description":"Optional prediction of the overall outcome before running: pass (every selected check passes) or fail. A mismatch is reported."})
+}
+
+/// Every additive variant of the current `check` schema: with or without `repro` (added after
+/// release) and with or without `expect` (experimental). `None` unless the current schema has `repro`.
+fn check_variants(schema: &Value) -> Option<Vec<Value>> {
+    let properties = schema.pointer("/function/parameters/properties")?;
+    // Only the canonical `expect` shape is the additive property; any other shape is a change.
+    if properties.get("repro").is_none()
+        || properties
+            .get("expect")
+            .is_some_and(|expect| *expect != check_prediction_property())
+    {
+        return None;
+    }
+    let mut variants = Vec::new();
+    for keep_repro in [true, false] {
+        for with_expect in [true, false] {
+            let mut variant = schema.clone();
+            let properties = variant
+                .pointer_mut("/function/parameters/properties")
+                .and_then(Value::as_object_mut)?;
+            if !keep_repro {
+                properties.remove("repro");
+            }
+            if with_expect {
+                properties.insert("expect".into(), check_prediction_property());
+            } else {
+                properties.remove("expect");
+            }
+            variants.push(variant);
+        }
+    }
+    Some(variants)
+}
+
 fn native_compatible(old: &Identity, new: &Identity, registry: &Registry) -> bool {
     if old.revision != 1
         || new.revision != 1
@@ -91,6 +131,13 @@ fn controller_compatible(
     else {
         return false;
     };
+    if old.name == "check" {
+        return check_variants(schema).is_some_and(|variants| {
+            variants
+                .into_iter()
+                .any(|variant| identities(&[variant], &Registry::new()).get(&old.name) == Some(old))
+        });
+    }
     let mut before = schema.clone();
     let Some(properties) = before
         .pointer_mut("/function/parameters/properties")
@@ -107,11 +154,6 @@ fn controller_compatible(
                 return false;
             }
             properties["action"]["enum"] = json!(["view", "update"]);
-        }
-        "check" => {
-            if properties.remove("repro").is_none() {
-                return false;
-            }
         }
         _ => return false,
     }

@@ -728,3 +728,191 @@ fn parallel_grep_cursors_resume_exactly_like_serial_ones() {
         "paging loses or repeats rows"
     );
 }
+
+fn search_state(mode: OutputMode, max_matches: usize) -> GrepState {
+    GrepState {
+        matcher: build_matcher("needle", false, false).unwrap(),
+        multiline: false,
+        context: 0,
+        max_matches,
+        out: String::new(),
+        matches: 0,
+        skip: 0,
+        resume: None,
+        next: None,
+        scanned: 0,
+        unreadable: 0,
+        oversized: 0,
+        binary: 0,
+        bytes: 0,
+        read_bytes: 0,
+        context_capped: 0,
+        line_starts: Vec::new(),
+        files: Vec::new(),
+        file_matches: HashMap::new(),
+        matched_files: HashSet::new(),
+        page_matches: Vec::new(),
+        row_ends: Vec::new(),
+        blocked_row: false,
+        cap: None,
+        per_file: usize::MAX,
+        capped_files: Vec::new(),
+        mode,
+        summary_files: 0,
+        summary_rows: Vec::new(),
+    }
+}
+
+#[test]
+fn parallel_search_reserves_actual_reads_before_dispatch() {
+    let (dir, ws) = workspace();
+    // Reusing one large source avoids a 256 MiB on-disk fixture. Each batch
+    // entry still performs a real file read, just as distinct paths would.
+    let path = dir.path().join("large.txt");
+    fs::write(&path, vec![b'x'; MAX_GREP_FILE as usize]).unwrap();
+    for mode in [OutputMode::Lines, OutputMode::Files, OutputMode::Count] {
+        let mut state = search_state(mode, 1000);
+        let mut paths = vec![path.clone(); PARALLEL_BATCH];
+        state.search_batch(&ws, &mut paths, &mut Vec::new(), 8);
+        assert_eq!(state.read_bytes, MAX_GREP_BYTES);
+        assert_eq!(state.bytes, MAX_GREP_BYTES);
+        assert_eq!(state.scanned as u64, MAX_GREP_BYTES / MAX_GREP_FILE);
+        assert_eq!(state.next, Some((path.clone(), 0)));
+    }
+}
+
+#[test]
+fn early_page_stop_reads_only_one_bounded_microbatch() {
+    let (dir, ws) = workspace();
+    let mut paths = Vec::new();
+    for index in 0..PARALLEL_BATCH {
+        let path = dir.path().join(format!("{index:02}.txt"));
+        fs::write(&path, "needle\n").unwrap();
+        paths.push(path);
+    }
+    for mode in [OutputMode::Lines, OutputMode::Files] {
+        let mut state = search_state(mode, 1);
+        state.search_batch(&ws, &mut paths.clone(), &mut Vec::new(), 8);
+        assert_eq!(state.read_bytes, PREFETCH_FILES as u64 * 7);
+        assert_eq!(state.bytes, 14);
+        assert_eq!(state.next, Some((paths[1].clone(), 0)));
+    }
+}
+
+#[test]
+fn prefetched_rows_use_observed_bytes_but_stale_witnesses_are_refused() {
+    let (dir, ws) = workspace();
+    let path = dir.path().join("source.txt");
+    fs::write(&path, "needle original\n").unwrap();
+    let mut state = search_state(OutputMode::Lines, 10);
+    let probed = probe(&ws, &path, &state.matcher, false, OutputMode::Lines);
+    fs::write(&path, "replacement\n").unwrap();
+    state.search_file(&ws, &path, &mut Vec::new(), Some(probed));
+    assert_eq!(state.read_bytes, 0, "rendering must not reopen a probe");
+    let output = state.finish(&ws, None, "", true).unwrap();
+    assert!(output.contains("needle original"), "{output}");
+    assert!(output.contains(GREP_WITNESS_WARNING), "{output}");
+}
+
+#[test]
+fn residual_batch_stops_preserve_serial_walk_coverage() {
+    for files in [1, 7, PARALLEL_BATCH] {
+        let (dir, ws) = workspace();
+        for index in 0..files {
+            fs::write(
+                dir.path().join(format!("{index:02}.txt")),
+                "needle\nneedle\n",
+            )
+            .unwrap();
+        }
+        // These entries are past the stopping file, but discovery can visit them
+        // before the residual batch is searched. They must not affect coverage.
+        fs::create_dir(dir.path().join("zzz")).unwrap();
+        fs::write(dir.path().join("zzz/.gitignore"), "*\n").unwrap();
+        fs::write(dir.path().join("zzz/ignored.txt"), "needle\n").unwrap();
+        let args = json!({"pattern":"needle", "max_results":files * 2 - 1});
+        assert_eq!(
+            grep_with_workers(&ws, &args, 4),
+            grep_with_workers(&ws, &args, 1)
+        );
+        let args = json!({"pattern":"needle", "path":"00.txt", "max_results":1});
+        assert_eq!(
+            grep_with_workers(&ws, &args, 4),
+            grep_with_workers(&ws, &args, 1)
+        );
+    }
+}
+
+/// Opt-in offline measurement; correctness is checked before any timing is reported.
+#[test]
+#[ignore = "offline retrieval measurement; run with --ignored --nocapture --test-threads=1"]
+fn retrieval_measurement_matrix() {
+    use std::time::Instant;
+    const SAMPLES: usize = 20;
+    for (case, size, max_matches, resumed) in [
+        ("small", 256, 1000, false),
+        ("large", 1024 * 1024, 1000, false),
+        ("match-heavy", 4096, 1000, false),
+        ("early-stop", 256, 1, false),
+        ("resumed", 256, 7, true),
+    ] {
+        let source = if case == "match-heavy" {
+            "needle\n".repeat(size / 7)
+        } else {
+            format!("needle\n{}\n", "x".repeat(size - 8))
+        };
+        let make_fixture = || {
+            let (dir, ws) = workspace();
+            let paths: Vec<_> = (0..32)
+                .map(|n| {
+                    let path = dir.path().join(format!("{n:03}.txt"));
+                    fs::write(&path, &source).unwrap();
+                    path
+                })
+                .collect();
+            (dir, ws, paths)
+        };
+        let (_dir, ws, paths) = make_fixture();
+        let mut args = json!({"pattern":"needle", "max_results":max_matches});
+        if resumed {
+            let first = grep_with_workers(&ws, &args, 1).unwrap();
+            let footer = page(&first);
+            args["cursor"] = footer["next_cursor"].clone();
+            args["skip"] = footer["remaining_skip"].clone();
+        }
+        let expected = grep_with_workers(&ws, &args, 1).unwrap();
+        assert_eq!(expected, grep_with_workers(&ws, &args, 4).unwrap());
+        for workers in [1, 4] {
+            // Isolate the content kernel's real counters from directory/witness I/O.
+            let mut state = search_state(OutputMode::Lines, max_matches);
+            let start = if resumed { 7 } else { 0 };
+            state.search_batch(&ws, &mut paths[start..].to_vec(), &mut Vec::new(), workers);
+            assert_eq!(state.read_bytes % source.len() as u64, 0);
+            let reads = state.read_bytes / source.len() as u64;
+            assert!(state.read_bytes <= MAX_GREP_BYTES);
+            for cache in ["fresh-workspace", "warm"] {
+                let mut samples = Vec::new();
+                for _ in 0..SAMPLES {
+                    // Fresh path/invocation, NOT an OS cache purge: writes can warm page cache.
+                    let fresh = (cache == "fresh-workspace").then(&make_fixture);
+                    let target = fresh.as_ref().map_or(&ws, |(_, ws, _)| ws);
+                    let started = Instant::now();
+                    let observed = grep_with_workers(target, &args, workers).unwrap();
+                    samples.push(started.elapsed().as_secs_f64() * 1000.0);
+                    assert_eq!(expected, observed);
+                }
+                samples.sort_by(f64::total_cmp);
+                println!(
+                    "RETRIEVAL_MEASUREMENT {}",
+                    json!({
+                        "case":case, "workers":workers, "cache":cache, "samples":SAMPLES,
+                        "p50_ms":samples[SAMPLES / 2 - 1], "p95_ms":samples[SAMPLES * 95 / 100 - 1],
+                        "content_reads":reads, "content_bytes":state.read_bytes,
+                        "peak_content_buffer_bound_bytes":source.len() * if workers == 1 { 1 } else { PREFETCH_FILES },
+                        "identical_results":true
+                    })
+                );
+            }
+        }
+    }
+}

@@ -1,7 +1,149 @@
 use crate::cmd;
+use clap::builder::Styles;
+use clap::builder::styling::{AnsiColor, Effects};
 use clap::{Parser, Subcommand};
+use dial::cli::help_heading as section;
 use dial::repl::OutputFormat;
 use std::path::PathBuf;
+
+/// Help colours follow the TUI's default accent (green headings, cyan literals). Clap drops them
+/// for pipes and `NO_COLOR`.
+const HELP_STYLES: Styles = Styles::styled()
+    .header(AnsiColor::Green.on_default().effects(Effects::BOLD))
+    .usage(AnsiColor::Green.on_default().effects(Effects::BOLD))
+    .literal(AnsiColor::Cyan.on_default().effects(Effects::BOLD))
+    .placeholder(AnsiColor::Cyan.on_default())
+    .valid(AnsiColor::Green.on_default())
+    .invalid(AnsiColor::Yellow.on_default().effects(Effects::BOLD))
+    .error(AnsiColor::Red.on_default().effects(Effects::BOLD));
+
+/// Task-first examples shown under `dial --help`, so the common entry points are visible before
+/// the full flag reference.
+fn root_after_help() -> String {
+    let h = HELP_STYLES.get_header();
+    let l = HELP_STYLES.get_literal();
+    let examples = [
+        ("dial", "Open the interactive terminal UI"),
+        (
+            "dial \"fix the failing test\"",
+            "Start a session with this request",
+        ),
+        ("dial -c", "Continue the latest session in this project"),
+        (
+            "dial -p \"summarize README.md\"",
+            "Answer once, print the result and exit",
+        ),
+        (
+            "dial sessions",
+            "List recent sessions (resume one with dial -r <id>)",
+        ),
+        (
+            "dial setup -m <model>",
+            "Prepare a local model and save it as the default",
+        ),
+        (
+            "dial doctor",
+            "Check optional capabilities and how to install them",
+        ),
+    ];
+    let width = examples.iter().map(|(cmd, _)| cmd.len()).max().unwrap_or(0);
+    let mut out = format!("{h}Examples:{h:#}\n");
+    for (cmd, what) in examples {
+        out.push_str(&format!("  {l}{cmd:<width$}{l:#}  {what}\n"));
+    }
+    out.push_str(&format!(
+        "\n{h}Print mode exit codes:{h:#} 0 completed · 1 error (execution, provider or configuration)\n  \
+         · 2 incomplete, blocked, needs input, no answer or interrupted · 3 tool approval denied.\n  \
+         Approve named tools with {l}--allow write,bash{l:#}; {l}--yes{l:#} approves every tool.\n\
+         \nInside the TUI, press {l}/{l:#} for commands or {l}/help{l:#} for the action palette."
+    ));
+    out
+}
+
+/// The subcommand a lone prompt word was probably meant to be. Sending `dial sesions` to the
+/// model would start a whole agent turn for a typo, so a single bare word within one edit (two
+/// for longer words) of a subcommand or alias is refused. `dial -- <word>` still sends it.
+pub(crate) fn mistyped_subcommand<S: AsRef<std::ffi::OsStr>>(
+    cli: &Cli,
+    raw_args: impl IntoIterator<Item = S>,
+) -> Option<String> {
+    use clap::CommandFactory;
+    let [word] = cli.prompt.as_slice() else {
+        return None;
+    };
+    let len = word.chars().count();
+    if cli.command.is_some()
+        || cli.print
+        || len < 4
+        || !word.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+        || raw_args.into_iter().any(|arg| arg.as_ref() == "--")
+    {
+        return None;
+    }
+    let limit = if len <= 5 { 1 } else { 2 };
+    let command = Cli::command();
+    command
+        .get_subcommands()
+        .flat_map(|sub| {
+            std::iter::once(sub.get_name())
+                .chain(sub.get_all_aliases())
+                .map(move |candidate| (edit_distance(word, candidate), sub.get_name()))
+        })
+        .filter(|&(distance, _)| distance <= limit)
+        .min_by_key(|&(distance, _)| distance)
+        .map(|(_, name)| name.to_owned())
+}
+
+/// Clap's own "unrecognized subcommand" error, with the suggestion and the way to send the word
+/// as a request instead.
+pub(crate) fn mistyped_subcommand_error(word: &str, suggestion: &str) -> clap::Error {
+    use clap::CommandFactory;
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+    let mut command = Cli::command();
+    let usage = command.render_usage();
+    let mut error = clap::Error::new(ErrorKind::InvalidSubcommand).with_cmd(&command);
+    error.insert(
+        ContextKind::InvalidSubcommand,
+        ContextValue::String(word.to_owned()),
+    );
+    error.insert(
+        ContextKind::SuggestedSubcommand,
+        ContextValue::String(suggestion.to_owned()),
+    );
+    error.insert(
+        ContextKind::Suggested,
+        ContextValue::StyledStrs(vec![
+            format!("to send '{word}' to the model as a request, use 'dial -- {word}'").into(),
+        ]),
+    );
+    error.insert(ContextKind::Usage, ContextValue::StyledStr(usage));
+    error
+}
+
+/// Optimal-string-alignment distance: Levenshtein plus adjacent transpositions (`modles`).
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut rows = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for (i, row) in rows.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for (j, cell) in rows[0].iter_mut().enumerate() {
+        *cell = j;
+    }
+    for i in 1..=a.len() {
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            let mut best = (rows[i - 1][j] + 1)
+                .min(rows[i][j - 1] + 1)
+                .min(rows[i - 1][j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                best = best.min(rows[i - 2][j - 2] + 1);
+            }
+            rows[i][j] = best;
+        }
+    }
+    rows[a.len()][b.len()]
+}
 
 #[derive(Subcommand)]
 pub(crate) enum LayaCommand {
@@ -20,81 +162,75 @@ pub(crate) enum LayaCommand {
 #[command(
     version = dial::build_info::VERSION,
     about = "A local-first coding agent with optional gated learning",
-    after_help = "Print exit codes: 0 completed; 1 execution/provider/configuration error; 2 incomplete, blocked, needs input, no answer or interrupted; 3 needed tool approval denied.\nUse --allow write,bash to approve named tools in print mode; --yes approves all tools."
+    styles = HELP_STYLES,
+    after_help = root_after_help(),
 )]
 pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) command: Option<Command>,
-    /// Show build revision, build-time dirty state, target and actual executable path, then exit.
-    #[arg(long, global = true)]
-    pub(crate) build_info: bool,
     /// Message to send (starts a one-shot run with --print, otherwise an interactive session that opens with it).
     pub(crate) prompt: Vec<String>,
     /// Run non-interactively: answer once, print the result, exit.
-    #[arg(short, long)]
+    #[arg(short, long, help_heading = section::RUN)]
     pub(crate) print: bool,
     /// Stdout format for a non-interactive turn: text, one JSON result, or JSON events.
-    #[arg(long, value_enum, default_value = "text")]
+    #[arg(long, value_enum, default_value = "text", help_heading = section::RUN)]
     pub(crate) output_format: OutputFormat,
     /// Pre-approve these named tools in print mode (comma-separated); does not override readonly.
-    #[arg(long, value_delimiter = ',')]
+    #[arg(long, value_delimiter = ',', help_heading = section::RUN)]
     pub(crate) allow: Vec<String>,
     /// Continue the most recent session in this project.
-    #[arg(short = 'c', long = "continue", conflicts_with_all = ["resume", "no_session"])]
+    #[arg(short = 'c', long = "continue", conflicts_with_all = ["resume", "no_session"], help_heading = section::SESSIONS)]
     pub(crate) continue_session: bool,
-    /// Resume a session by id prefix (latest when no id is given).
-    #[arg(short, long, alias = "session", num_args = 0..=1, default_missing_value = "", conflicts_with = "no_session")]
+    /// Resume a session by id prefix (latest when no id is given). `dial sessions` lists ids.
+    #[arg(short, long, alias = "session", num_args = 0..=1, default_missing_value = "", conflicts_with = "no_session", help_heading = section::SESSIONS)]
     pub(crate) resume: Option<String>,
     /// Do not write the session to disk.
-    #[arg(long)]
+    #[arg(long, help_heading = section::SESSIONS)]
     pub(crate) no_session: bool,
     /// Work in this directory instead of the current one.
     #[arg(short = 'C', long = "dir", alias = "cwd", global = true)]
     pub(crate) dir: Option<PathBuf>,
     /// Model: an MLX model id or local path (or the model name on an --endpoint).
-    #[arg(short, long, global = true)]
+    #[arg(short, long, global = true, help_heading = section::MODEL)]
     pub(crate) model: Option<String>,
     /// Select an explicitly configured model capability/reasoning profile.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = section::MODEL)]
     pub(crate) profile: Option<String>,
     /// Use an OpenAI-compatible server (LM Studio, Ollama, llama.cpp, hosted API) at this base URL.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = section::MODEL)]
     pub(crate) endpoint: Option<String>,
     /// Environment variable holding the endpoint's API key.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = section::MODEL)]
     pub(crate) api_key_env: Option<String>,
-    /// Tool approval policy (default: write).
-    #[arg(long, global = true, value_parser = clap::builder::PossibleValuesParser::new(dial::config::types::Approval::NAMES.iter().copied()))]
+    /// Tool approval: ask (before every edit and command), write (default: destructive or
+    /// outside-the-project actions ask), auto (never asks) or readonly.
+    #[arg(long, global = true, help_heading = section::SAFETY, value_parser = clap::builder::PossibleValuesParser::new(dial::config::types::Approval::NAMES.iter().copied()))]
     pub(crate) approval: Option<String>,
     /// Approve every tool call (same as --approval auto; also accepted as --yolo / --auto-approve).
-    #[arg(short = 'y', long, global = true, aliases = ["auto-approve", "yolo"])]
+    #[arg(short = 'y', long, global = true, aliases = ["auto-approve", "yolo"], help_heading = section::SAFETY)]
     pub(crate) yes: bool,
     /// Compatibility alias for --approval.
-    #[arg(long = "approval-mode", global = true, value_name = "MODE", value_parser = clap::builder::PossibleValuesParser::new(dial::cli::cli_modes::APPROVAL_ALIASES.iter().map(|&(alias, _)| alias)))]
+    #[arg(long = "approval-mode", global = true, value_name = "MODE", help_heading = section::SAFETY, value_parser = clap::builder::PossibleValuesParser::new(dial::cli::cli_modes::APPROVAL_ALIASES.iter().map(|&(alias, _)| alias)))]
     pub(crate) approval_mode: Option<String>,
-    /// Protocol mode: text | json | rpc | rpc-ui | acp (overrides --output-format and the default path).
-    #[arg(long, global = true, value_name = "MODE")]
-    pub(crate) mode: Option<String>,
-    /// RPC modes only: run without a UI surface (requires --mode rpc or rpc-ui).
-    #[arg(long, global = true)]
-    pub(crate) no_ui: bool,
     /// Print mode (text): also write the model's reasoning to stdout before the answer.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = section::RUN)]
     pub(crate) print_thoughts: bool,
-    /// off | dev | strict
-    #[arg(long, global = true)]
+    /// Shell isolation: dev (default: writes only the project, hides secrets), strict (workspace
+    /// only, no network) or off.
+    #[arg(long, global = true, help_heading = section::SAFETY, value_parser = ["off", "dev", "strict"])]
     pub(crate) sandbox: Option<String>,
-    /// apply_patch | hashline | patch | replace | sloppy
-    #[arg(long, global = true, value_parser = ["apply_patch", "hashline", "patch", "replace", "sloppy"])]
+    /// How the model writes edits.
+    #[arg(long, global = true, help_heading = section::CONTEXT, value_parser = ["apply_patch", "hashline", "patch", "replace", "sloppy"])]
     pub(crate) edit_mode: Option<String>,
-    /// Automatic context policy: context-full | handoff | shake | snapcompact | off.
-    #[arg(long, global = true, value_parser = ["context-full", "handoff", "shake", "snapcompact", "off"])]
+    /// Automatic context policy when the window fills.
+    #[arg(long, global = true, help_heading = section::CONTEXT, value_parser = ["context-full", "handoff", "shake", "snapcompact", "off"])]
     pub(crate) compaction_strategy: Option<String>,
     /// Fixed automatic compaction trigger; use auto to clear the saved token trigger.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = section::CONTEXT)]
     pub(crate) compaction_threshold_tokens: Option<String>,
     /// Positive context/output reserve; use auto to clear the saved reserve.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = section::CONTEXT)]
     pub(crate) compaction_reserve_tokens: Option<String>,
     #[command(flatten)]
     pub(crate) model_flags: dial::cli::model_flags::ModelFlags,
@@ -104,6 +240,15 @@ pub(crate) struct Cli {
     pub(crate) mode_args: dial::cli::mode_flags::ModeArgs,
     #[command(flatten)]
     pub(crate) session_flags: dial::cli::session_flags::SessionFlagArgs,
+    /// Show build revision, build-time dirty state, target and actual executable path, then exit.
+    #[arg(long, global = true, help_heading = section::PROTOCOL)]
+    pub(crate) build_info: bool,
+    /// Protocol mode: text | json | rpc | rpc-ui | acp (overrides --output-format and the default path).
+    #[arg(long, global = true, value_name = "MODE", help_heading = section::PROTOCOL)]
+    pub(crate) mode: Option<String>,
+    /// RPC modes only: run without a UI surface (requires --mode rpc or rpc-ui).
+    #[arg(long, global = true, help_heading = section::PROTOCOL)]
+    pub(crate) no_ui: bool,
 }
 
 #[derive(Subcommand)]
@@ -166,15 +311,33 @@ pub(crate) enum ReliabilityCommand {
 
 #[derive(Subcommand)]
 pub(crate) enum Command {
-    /// Generate shell completions from the live command and argument definitions.
-    Completions {
-        #[arg(value_enum)]
-        shell: clap_complete::Shell,
+    // Declaration order is `dial --help` order: everyday work first, then integrations,
+    // inspection and maintenance, and the learning/experimental tooling last.
+    /// List recent sessions in this project; export or rename one.
+    Sessions {
+        /// Include sessions from every project.
+        #[arg(long, global = true)]
+        all: bool,
+        #[command(subcommand)]
+        action: Option<SessionCommand>,
     },
+    /// Create the Python/MLX environment, save the model chosen with -m as your default, verify it loads.
+    Setup,
+    /// List and inspect models; `recommend` checks which local models fit in memory.
+    Models(dial::cli::config_models::ModelsArgs),
     /// Show, read, or change Dial configuration.
     Config(dial::cli::config_models::ConfigArgs),
-    /// Record or list human feedback tied to immutable artifact content.
-    Annotate(dial::cli::annotate::AnnotateArgs),
+    /// Check optional capabilities (language servers, voice, memory, MCP helpers) and fix them.
+    ///
+    /// `--fix <id>` previews the install; add `--yes` to run it.
+    Doctor {
+        /// Capability to set up, e.g. `bun`.
+        #[arg(long)]
+        fix: Option<String>,
+        /// Run the install after previewing it.
+        #[arg(long, requires = "fix")]
+        yes: bool,
+    },
     /// Generate a commit message for the working tree and commit it.
     #[command(trailing_var_arg = true, allow_hyphen_values = true)]
     Commit {
@@ -182,29 +345,93 @@ pub(crate) enum Command {
         #[arg(num_args = 0.., allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// List and inspect models.
-    Models(dial::cli::config_models::ModelsArgs),
-    /// Image commands: status, doctor, probe, purge.
-    #[command(visible_alias = "img")]
-    Images(dial::cli::images::ImagesArgs),
+    /// Share the latest session (or a selected session) through an encrypted upload endpoint.
+    Share {
+        id: Option<String>,
+        #[arg(long)]
+        endpoint: Option<String>,
+        #[arg(long, conflicts_with = "endpoint")]
+        gist: bool,
+        /// Diagnostic: share the whole journal, including abandoned branches and internal records,
+        /// instead of the active branch.
+        #[arg(long)]
+        whole_journal: bool,
+    },
+    /// Search the web from the command line.
+    #[command(alias = "q", alias = "web-search")]
+    Search(dial::cli::search::SearchArgs),
     /// Follow live edits, diagnostics and screenshots in another pane.
     Watch(dial::cli::watch::WatchArgs),
-    /// Sweep stale blobs, archives, and WAL state (dry run unless --apply).
-    Gc(dial::cli::gc::GcArgs),
-    /// Run the deterministic, model-free edit-grammar benchmark (exits 1 on any wrong result).
-    EditBench(dial::cli::edit_bench::EditBenchArgs),
-    /// Install the Chrome extension, run the browser relay, or check its connection.
-    BrowserRelay(dial::cli::browser_relay::BrowserRelayArgs),
-    /// Write an anonymized copy of a session (redacted content, metadata kept).
-    Anonymize(dial::cli::anonymize::AnonymizeArgs),
-    /// List and manage background processes.
-    Ps(dial::cli::ps::PsArgs),
+    /// Recurring or file-triggered prompt runs for this project.
+    Schedule {
+        #[command(subcommand)]
+        action: ScheduleCommand,
+    },
+    /// Install skill packages from Git or registries, or import SKILL.md folders from other tools.
+    Skills {
+        #[command(subcommand)]
+        action: SkillCommand,
+    },
     /// Manage plugins and marketplaces.
     #[command(alias = "plugins")]
     Plugin(dial::cli::plugin::PluginArgs),
-    /// Web search.
-    #[command(alias = "q", alias = "web-search")]
-    Search(dial::cli::search::SearchArgs),
+    /// Verify and install the latest signed release, or a specified release version.
+    Update {
+        /// Version number or v-prefixed release tag (defaults to latest).
+        #[arg(long)]
+        version: Option<String>,
+    },
+    /// Generate shell completions from the live command and argument definitions.
+    Completions {
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
+    /// Persistent JSON-lines agent control protocol on stdin/stdout.
+    Rpc,
+    /// ACP v1 editor integration over stdio JSON-RPC 2.0 (one launched project).
+    Acp,
+    /// Install the Chrome extension, run the browser relay, or check its connection.
+    BrowserRelay(dial::cli::browser_relay::BrowserRelayArgs),
+    /// Run a local WebSocket collaboration relay.
+    Relay {
+        #[arg(long, default_value = "127.0.0.1:7331")]
+        bind: std::net::SocketAddr,
+    },
+    /// Inspect aggregate model/tool usage, or serve a loopback dashboard.
+    Stats {
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        serve: bool,
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long, default_value = "all")]
+        range: String,
+    },
+    /// List and manage background processes.
+    Ps(dial::cli::ps::PsArgs),
+    /// Image commands: status, doctor, probe, purge.
+    #[command(visible_alias = "img")]
+    Images(dial::cli::images::ImagesArgs),
+    /// Inspect saved project understanding without loading a model or refreshing the index.
+    Understanding {
+        /// Use architecture for the architecture view, or filter findings, paths and outlines.
+        query: Option<String>,
+        /// Export every matching entry as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect project experience, reusable recipes and observed utility without loading a model.
+    Experience {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Record or list human feedback tied to immutable artifact content.
+    Annotate(dial::cli::annotate::AnnotateArgs),
+    /// Write an anonymized copy of a session (redacted content, metadata kept).
+    Anonymize(dial::cli::anonymize::AnonymizeArgs),
+    /// Sweep stale blobs, archives, and WAL state (dry run unless --apply).
+    Gc(dial::cli::gc::GcArgs),
     /// Inspect tool reliability or run a bounded backend capability check.
     Reliability {
         #[command(subcommand)]
@@ -215,69 +442,6 @@ pub(crate) enum Command {
         prompt: Option<String>,
         #[arg(long)]
         json: bool,
-    },
-    /// Extract, evaluate or inspect experimental local MLX activation steering.
-    Steering {
-        #[command(subcommand)]
-        action: SteeringCommand,
-    },
-    /// Install, start or inspect Dial's independent Laya decision service.
-    Laya {
-        #[command(subcommand)]
-        action: LayaCommand,
-    },
-    /// Inspect project experience, reusable recipes and observed utility without loading a model.
-    Experience {
-        #[arg(long)]
-        json: bool,
-    },
-    /// Inspect saved project understanding without loading a model or refreshing the index.
-    Understanding {
-        /// Use architecture for the architecture view, or filter findings, paths and outlines.
-        query: Option<String>,
-        /// Export every matching entry as JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Install skill packages from Git or registries, or import SKILL.md folders from other tools.
-    Skills {
-        #[command(subcommand)]
-        action: SkillCommand,
-    },
-    /// Create the Python/MLX environment, save the model chosen with -m as your default, verify it loads.
-    Setup,
-    /// List optional capabilities (MCP helpers, memory backends, voice, LSP) and their status.
-    /// `--fix <id>` previews the install; add `--yes` to run it.
-    Doctor {
-        /// Capability to set up, e.g. `bun`.
-        #[arg(long)]
-        fix: Option<String>,
-        /// Run the install after previewing it.
-        #[arg(long, requires = "fix")]
-        yes: bool,
-    },
-    /// Verify and install the latest signed release, or a specified release version.
-    Update {
-        /// Version number or v-prefixed release tag (defaults to latest).
-        #[arg(long)]
-        version: Option<String>,
-    },
-    /// Persistent JSON-lines agent control protocol on stdin/stdout.
-    Rpc,
-    /// ACP v1 editor integration over stdio JSON-RPC 2.0 (one launched project).
-    Acp,
-    /// Recurring or file-triggered prompt runs for this project.
-    Schedule {
-        #[command(subcommand)]
-        action: ScheduleCommand,
-    },
-    /// List recent sessions for this project.
-    Sessions {
-        /// Include sessions from every project.
-        #[arg(long, global = true)]
-        all: bool,
-        #[command(subcommand)]
-        action: Option<SessionCommand>,
     },
     /// The gated self-improvement loop (evaluation suites, harvesting, LoRA training, rollback).
     #[command(subcommand)]
@@ -310,33 +474,17 @@ pub(crate) enum Command {
         #[arg(long)]
         allow_remote: bool,
     },
-    /// Inspect aggregate model/tool usage, or serve a loopback dashboard.
-    Stats {
-        #[arg(long)]
-        json: bool,
-        #[arg(long)]
-        serve: bool,
-        #[arg(long)]
-        port: Option<u16>,
-        #[arg(long, default_value = "all")]
-        range: String,
+    /// Run the deterministic, model-free edit-grammar benchmark (exits 1 on any wrong result).
+    EditBench(dial::cli::edit_bench::EditBenchArgs),
+    /// Extract, evaluate or inspect experimental local MLX activation steering.
+    Steering {
+        #[command(subcommand)]
+        action: SteeringCommand,
     },
-    /// Run a local WebSocket collaboration relay.
-    Relay {
-        #[arg(long, default_value = "127.0.0.1:7331")]
-        bind: std::net::SocketAddr,
-    },
-    /// Share the latest session (or a selected session) through an encrypted upload endpoint.
-    Share {
-        id: Option<String>,
-        #[arg(long)]
-        endpoint: Option<String>,
-        #[arg(long, conflicts_with = "endpoint")]
-        gist: bool,
-        /// Diagnostic: share the whole journal, including abandoned branches and internal records,
-        /// instead of the active branch.
-        #[arg(long)]
-        whole_journal: bool,
+    /// Install, start or inspect Dial's independent Laya decision service.
+    Laya {
+        #[command(subcommand)]
+        action: LayaCommand,
     },
 }
 #[derive(Subcommand)]

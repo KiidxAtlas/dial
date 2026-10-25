@@ -8,7 +8,10 @@ pub(crate) fn run(cli: &Cli, layout: &Layout, fix: &Option<String>, yes: bool) -
     let env = dial::setup::deps::Env::current(&layout.user_dir);
     match fix {
         None => {
-            println!("{}", dial::setup::deps::run::list_text(&env));
+            println!(
+                "{}",
+                dial::setup::deps::run::list_text(&env, "dial doctor --fix")
+            );
             println!();
             match Config::load(layout, Some(overlay(cli)?)) {
                 Ok(config) => println!("{}", dial::setup::memory::doctor_text(&config)),
@@ -29,15 +32,21 @@ pub(crate) fn run(cli: &Cli, layout: &Layout, fix: &Option<String>, yes: bool) -
                 println!("{summary}");
             } else {
                 println!(
-                    "{}\n\nRe-run with --yes to set it up.",
+                    "{}\n\nSet it up with: dial doctor --fix {id} --yes",
                     dial::setup::embeddings::preview_text(model, &layout.user_dir)
                 );
             }
         }
-        Some(id) if !yes => println!(
-            "{}\n\nRe-run with --yes to set it up.",
-            dial::setup::deps::run::preview_text(id, &env)
-        ),
+        Some(id) if !yes => {
+            let preview = dial::setup::deps::run::preview_text(id, &env);
+            match dial::setup::deps::recipe(id) {
+                None => println!(
+                    "Unknown capability `{id}`. Run `dial doctor` to list them with their ids."
+                ),
+                Some(recipe) if dial::setup::deps::is_ready(recipe, &env) => println!("{preview}"),
+                Some(_) => println!("{preview}\n\nSet it up with: dial doctor --fix {id} --yes"),
+            }
+        }
         Some(id) => {
             let cancel = std::sync::atomic::AtomicBool::new(false);
             let done =

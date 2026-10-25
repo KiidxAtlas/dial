@@ -191,14 +191,21 @@ pub(in crate::agent) fn parallel_tools(
             scope.spawn(move || {
                 let started = Instant::now();
                 let mut notices = Vec::new();
+                let mut policy_reason = None;
                 let output = crate::tools::exec::execution::run(interrupt, || crate::tools::exec::signals::scope(&signals, || {
                     if interrupt.load(Ordering::SeqCst) {
                         return interrupted_tool();
                     }
                     let plugins = ext.plugins();
                     match crate::agent::safety::hooks::pre_tool_with(&config.hooks, plugins.as_deref(), workspace.root(), &call.name, &call.arguments, interrupt, &mut |notice| notices.push(notice.to_owned())) {
-                        Err(error) => return ToolOutput::err(error).with_status(tools::ToolStatus::Blocked),
-                        Ok(Some(args)) if args != call.arguments => return ToolOutput::err("pre_tool_use changed a scheduled call; retry the revised arguments through the execution controller").with_status(tools::ToolStatus::Blocked),
+                        Err(error) => {
+                            policy_reason = Some(crate::agent::safety::approval::PolicyReason::HookVeto);
+                            return ToolOutput::err(error).with_status(tools::ToolStatus::Blocked);
+                        }
+                        Ok(Some(args)) if args != call.arguments => {
+                            policy_reason = Some(crate::agent::safety::approval::PolicyReason::HookVeto);
+                            return ToolOutput::err("pre_tool_use changed a scheduled call; retry the revised arguments through the execution controller").with_status(tools::ToolStatus::Blocked);
+                        }
                         _ => {}
                     }
                     let mut output = crate::tools::exec::execution::native(
@@ -208,12 +215,13 @@ pub(in crate::agent) fn parallel_tools(
                     crate::agent::safety::hooks::post_tool_with(&config.hooks, plugins.as_deref(), workspace.root(), &call.name, &call.arguments, &mut output, interrupt, &mut |notice| notices.push(notice.to_owned()));
                     output
                 }));
-                let _ = tx.send(((output, started.elapsed().as_secs_f64()), notices));
+                let _ = tx.send(((output, started.elapsed().as_secs_f64()), notices, policy_reason));
             });
         }
         let mut results: Vec<_> = receivers
             .into_iter()
-            .map(|rx| {
+            .enumerate()
+            .map(|(source, rx)| {
                 Some(loop {
                     let steering = ui.take_steering();
                     if !steering.is_empty() {
@@ -238,7 +246,14 @@ pub(in crate::agent) fn parallel_tools(
                         }
                     }
                     match rx.recv_timeout(Duration::from_millis(80)) {
-                        Ok((result, notices)) => {
+                        Ok((result, notices, policy_reason)) => {
+                            if let Some(reason) = policy_reason {
+                                crate::agent::safety::approval::explain(
+                                    ui,
+                                    &calls[first_calls[source]],
+                                    reason,
+                                );
+                            }
                             for notice in notices {
                                 ui.notice(&notice);
                             }
@@ -293,6 +308,13 @@ impl<'a> Agent<'a> {
             call,
             self.workspace.root(),
         ) {
+            crate::agent::safety::approval::explain_rule(
+                ui,
+                call,
+                self.workspace.root(),
+                &self.always,
+                crate::agent::safety::approval::Effect::Deny,
+            );
             Err(crate::agent::safety::approval::Denial::Rule)
         } else if self.plan_mode
             && (local_memory_write
@@ -302,6 +324,11 @@ impl<'a> Agent<'a> {
                     &call.arguments,
                 ))
         {
+            crate::agent::safety::approval::explain(
+                ui,
+                call,
+                crate::agent::safety::approval::PolicyReason::PlanMode,
+            );
             Err(crate::agent::safety::approval::Denial::ReadOnly)
         } else if local_memory_write
             || crate::agent::safety::approval::needs_approval(&self.ext, call)
@@ -323,6 +350,11 @@ impl<'a> Agent<'a> {
                 }
             })
         } else {
+            crate::agent::safety::approval::explain(
+                ui,
+                call,
+                crate::agent::safety::approval::PolicyReason::SafeCall,
+            );
             Ok(())
         };
         if let Err(denial) = &result {
@@ -441,6 +473,11 @@ impl<'a> Agent<'a> {
             self.queue_hook_context(context);
             match result {
                 Err(reason) => {
+                    crate::agent::safety::approval::explain(
+                        ui,
+                        call,
+                        crate::agent::safety::approval::PolicyReason::HookVeto,
+                    );
                     if let Err(error) = self.record(
                         self.cur_step,
                         "tool_denied",
@@ -542,6 +579,9 @@ impl<'a> Agent<'a> {
             if let Some((_, why)) = call_form_error(call, &schemas, names) {
                 return denied(&format!("invalid tool call: {why}"));
             }
+        }
+        if self.repro_first_fires(call, crate::config::types::ReproFirst::Gate) {
+            return denied(crate::agent::verify::repro_first::GATE);
         }
         if call.name == "request_directory" {
             return self.request_directory(call, ui);

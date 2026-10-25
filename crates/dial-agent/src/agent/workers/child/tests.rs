@@ -243,8 +243,15 @@ fn isolated_children_are_not_offered_tools_bound_to_another_root() {
 #[cfg(unix)]
 #[test]
 fn rewritten_child_reads_recheck_schema_and_path_authority() {
-    struct PathReviewer(Vec<String>);
+    struct PathReviewer(Vec<String>, Vec<approval::PolicyReason>);
     impl Approver for PathReviewer {
+        fn policy_explanation(
+            &mut self,
+            _: &llm::ToolCall,
+            explanation: &approval::PolicyExplanation,
+        ) {
+            self.1.push(explanation.reason);
+        }
         fn authorize(
             &mut self,
             call: &llm::ToolCall,
@@ -261,6 +268,7 @@ fn rewritten_child_reads_recheck_schema_and_path_authority() {
         }
     }
     for (replacement, expected, authorized) in [
+        (Value::Null, "hook veto fixture", 1),
         (json!({"path":"allowed.txt"}), "allowed evidence", 2),
         (json!({"path":"denied.txt"}), "denied", 2),
         (
@@ -282,7 +290,11 @@ fn rewritten_child_reads_recheck_schema_and_path_authority() {
                 "-c".into(),
                 format!(
                     "cat >/dev/null; printf '%s' '{}'",
-                    json!({"input":replacement})
+                    if replacement.is_null() {
+                        json!({"decision":"block", "reason":"hook veto fixture"})
+                    } else {
+                        json!({"input":replacement})
+                    }
                 ),
             ],
             timeout_secs: 5,
@@ -318,12 +330,17 @@ fn rewritten_child_reads_recheck_schema_and_path_authority() {
             arguments: json!({"path":"original.txt"}),
             malformed_arguments: false,
         };
-        let mut reviewer = PathReviewer(Vec::new());
+        let mut reviewer = PathReviewer(Vec::new(), Vec::new());
         let output = call_tool(env, job, &schemas, &names, &call, &mut reviewer, None, None);
         assert!(output.text.contains(expected), "{}", output.text);
         assert_eq!(output.is_error, expected != "allowed evidence");
         assert!(!output.text.contains("secret evidence"));
         assert_eq!(reviewer.0.len(), authorized);
+        if replacement.is_null() {
+            assert_eq!(reviewer.1, [approval::PolicyReason::HookVeto]);
+        } else {
+            assert!(reviewer.1.is_empty());
+        }
     }
 }
 

@@ -918,8 +918,10 @@ impl Codebase {
                                     |r| r.get(0),
                                 )
                                 .ok()?;
-                            let (_, digest) = source(&self.root, &s.path)?;
-                            (indexed == digest).then_some(digest)
+                            // Reuse this retrieval's bounded source observation, not a second
+                            // read. Missing/unchecked paths never fall back to cached digests.
+                            let digest = snapshot.digest(&s.path)?;
+                            (indexed == digest).then(|| digest.to_owned())
                         })
                         .as_deref()
                         == Some(s.digest.as_str())

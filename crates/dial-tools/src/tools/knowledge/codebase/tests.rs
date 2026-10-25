@@ -16,6 +16,110 @@ fn fixture() -> (tempfile::TempDir, tempfile::TempDir, Layout, Workspace) {
 }
 
 #[test]
+fn context_rechecks_external_edits_on_each_invocation() {
+    let (_home, project, layout, ws) = fixture();
+    let cache = Codebase::open(&layout).unwrap();
+    cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+    cache
+        .remember(
+            "routing",
+            "Saved routing claim.",
+            &["src/router.rs".into()],
+            "s",
+            0,
+        )
+        .unwrap();
+    for scoped in [false, true] {
+        let fresh = cache.context_inner("router routing", 8000, scoped).unwrap();
+        assert!(fresh.contains("Saved routing claim.") && fresh.contains("route_request"));
+    }
+    fs::write(
+        project.path().join("src/router.rs"),
+        "pub fn replacement() {}\n",
+    )
+    .unwrap();
+    for scoped in [false, true] {
+        let stale = cache.context_inner("router routing", 8000, scoped).unwrap();
+        assert!(!stale.contains("Saved routing claim.") && !stale.contains("route_request"));
+        assert!(stale.contains("needs refresh"));
+    }
+}
+
+#[test]
+fn partial_snapshot_withholds_findings_and_unobserved_sources() {
+    let (_home, project, layout, ws) = fixture();
+    fs::write(project.path().join("other.rs"), "pub fn other() {}\n").unwrap();
+    let cache = Codebase::open(&layout).unwrap();
+    cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+    cache
+        .remember(
+            "routing",
+            "Saved routing claim.",
+            &["src/router.rs".into()],
+            "s",
+            0,
+        )
+        .unwrap();
+    // An unreadable-by-policy source makes the scan partial, while router is still observed.
+    fs::write(
+        project.path().join("other.rs"),
+        "x".repeat(MAX_FILE as usize + 1),
+    )
+    .unwrap();
+    let snapshot = cache.freshness_snapshot().unwrap();
+    assert!(snapshot.digest("src/router.rs").is_some());
+    assert!(snapshot.digest("other.rs").is_none());
+    let context = cache.context("", 8000).unwrap();
+    assert!(
+        context.contains("route_request"),
+        "observed outlines remain reusable"
+    );
+    assert!(!context.contains("pub fn other"));
+    assert!(!context.contains("Saved routing claim."));
+    assert!(
+        context.contains("needs refresh"),
+        "partial dependency scopes stay unchecked"
+    );
+}
+
+#[test]
+fn snapshot_digest_is_an_observation_not_a_persistent_freshness_cache() {
+    let (_home, project, layout, ws) = fixture();
+    let cache = Codebase::open(&layout).unwrap();
+    cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+    let snapshot = cache.freshness_snapshot().unwrap();
+    let (_, digest) = source(project.path(), "src/router.rs").unwrap();
+    assert_eq!(snapshot.digest("src/router.rs"), Some(digest.as_str()));
+    assert_eq!(snapshot.digest("missing.rs"), None);
+    fs::write(
+        project.path().join("src/router.rs"),
+        "pub fn changed() {}\n",
+    )
+    .unwrap();
+    assert_eq!(snapshot.digest("src/router.rs"), Some(digest.as_str()));
+    assert_ne!(
+        cache.freshness_snapshot().unwrap().digest("src/router.rs"),
+        Some(digest.as_str())
+    );
+    // Even a current snapshot must agree with the saved index before its outline is reused.
+    cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+    cache
+        .conn
+        .lock()
+        .execute(
+            "UPDATE codebase_files SET digest='wrong' WHERE path='src/router.rs'",
+            [],
+        )
+        .unwrap();
+    assert!(
+        !cache
+            .context("router", 8000)
+            .unwrap()
+            .contains("pub fn changed")
+    );
+}
+
+#[test]
 fn ambient_retrieval_excludes_unrelated_documents_and_inventory() {
     let (_home, project, layout, ws) = fixture();
     fs::write(

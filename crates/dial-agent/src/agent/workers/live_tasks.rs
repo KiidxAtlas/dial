@@ -24,6 +24,7 @@ use std::{
     time::{Duration, Instant},
 };
 enum Event {
+    Policy(ToolCall, approval::PolicyExplanation),
     CapturePolicy {
         cancel: Arc<AtomicBool>,
         interrupt: Arc<AtomicBool>,
@@ -213,6 +214,14 @@ struct CancelUi<'a> {
     interrupt: &'a AtomicBool,
 }
 impl Ui for CancelUi<'_> {
+    fn policy_explanation(
+        &mut self,
+        call_id: &str,
+        tool: &str,
+        explanation: &approval::PolicyExplanation,
+    ) {
+        self.inner.policy_explanation(call_id, tool, explanation);
+    }
     fn approve(&mut self, tool: &str, summary: &str) -> crate::agent::Decision {
         self.gate(|inner, cancel| inner.approve_with_cancel(tool, summary, cancel))
     }
@@ -516,6 +525,11 @@ impl Approver for Bridge {
                 }
             }
         }
+    }
+    fn policy_explanation(&mut self, call: &ToolCall, explanation: &approval::PolicyExplanation) {
+        let _ = self
+            .tx
+            .send(Event::Policy(call.clone(), explanation.clone()));
     }
     fn notice(&mut self, message: &str) {
         let _ = self.tx.send(Event::Notice(message.to_owned()));
@@ -1020,7 +1034,7 @@ impl LiveTasks {
                     }
                     let acceptance = value["assignment"]["work_packet"]["acceptance"].as_array()
                         .map(|items| items.iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>()).unwrap_or_default();
-                    value["projection"] = subagents::result_projection(value["result"].as_str().unwrap_or(""), value.get("data"), &acceptance);
+                    value["projection"] = subagents::result_projection(value["result"].as_str().unwrap_or(""), value.get("data"), &acceptance, Some(&workspace));
                     if let Some(store) = workspace.artifacts() {
                         match subagents::retain_report(store, &value) {
                             Ok(uri) => value["artifact"] = json!(uri),
@@ -1135,11 +1149,14 @@ impl LiveTasks {
                     let prior_rules = rules.len();
                     let mut result =
                         if cancel.load(Ordering::SeqCst) || interrupt.load(Ordering::SeqCst) {
+                            approval::explain(ui, &call, approval::PolicyReason::Cancelled);
                             Err(Denial::User)
-                        } else if read_only && needs {
-                            Err(Denial::ReadOnly)
                         } else if approval::denied_by_rule(rules, &call, root) {
+                            approval::explain_rule(ui, &call, root, rules, approval::Effect::Deny);
                             Err(Denial::Rule)
+                        } else if read_only && needs {
+                            approval::explain(ui, &call, approval::PolicyReason::ReadOnly);
+                            Err(Denial::ReadOnly)
                         } else if needs {
                             approval::authorize_with_cancel(
                                 approval,
@@ -1157,11 +1174,13 @@ impl LiveTasks {
                             // Workers cannot save project rules; the grant lasts the session.
                             .map(|_persist| ())
                         } else {
+                            approval::explain(ui, &call, approval::PolicyReason::SafeCall);
                             Ok(())
                         };
                     if cancel.load(Ordering::SeqCst) || interrupt.load(Ordering::SeqCst) {
                         cancel.store(true, Ordering::SeqCst);
                         rules.truncate(prior_rules);
+                        approval::explain(ui, &call, approval::PolicyReason::Cancelled);
                         result = Err(Denial::User);
                     }
                     let _ = answer.send(result);
@@ -1231,6 +1250,9 @@ impl LiveTasks {
                         result = Err("native mutation cancelled".into());
                     }
                     let _ = answer.send(result);
+                }
+                Event::Policy(call, explanation) => {
+                    ui.policy_explanation(&call.id, &call.name, &explanation)
                 }
                 Event::Notice(text) => ui.background_notice(&text),
                 Event::Cost(value) => *cost = Some(cost.unwrap_or(0.0) + value),
@@ -1428,6 +1450,7 @@ pub(in crate::agent) fn model_summary(value: &Value) -> String {
                 job["result"].as_str().unwrap_or(""),
                 job.get("data"),
                 &acceptance,
+                None,
             );
             &derived
         };

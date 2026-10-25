@@ -354,6 +354,14 @@ impl Ui for StateUi<'_> {
         self.close_prose();
         self.inner.role(r, m)
     }
+    fn policy_explanation(
+        &mut self,
+        call_id: &str,
+        tool: &str,
+        explanation: &crate::agent::safety::approval::PolicyExplanation,
+    ) {
+        self.inner.policy_explanation(call_id, tool, explanation);
+    }
     fn approve(&mut self, t: &str, s: &str) -> Decision {
         self.inner.approve(t, s)
     }

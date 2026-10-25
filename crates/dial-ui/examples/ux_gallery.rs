@@ -40,7 +40,10 @@ use ratatui::{
     style::{Color, Modifier},
     widgets::Paragraph,
 };
-use std::{fmt::Write as _, fs};
+use std::{fmt::Write as _, fs, sync::Mutex};
+
+/// Plain-text copy of every screen, written next to the HTML so reviews can diff before/after.
+static TEXT: Mutex<String> = Mutex::new(String::new());
 use unicode_width::UnicodeWidthStr;
 
 fn escape(s: &str) -> String {
@@ -101,6 +104,14 @@ fn screen(out: &mut String, title: &str, buffer: &Buffer, light: bool) {
         if light { "#202531" } else { "#e0e3ea" }
     )
     .unwrap();
+    let mut text = format!("=== {title}\n");
+    for y in 0..buffer.area.height {
+        let row: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect();
+        let _ = writeln!(text, "{}", row.trim_end());
+    }
+    TEXT.lock().unwrap().push_str(&text);
     for y in 0..buffer.area.height {
         out.push_str("<div class=row>");
         let mut x = 0;
@@ -838,6 +849,10 @@ fn main() -> anyhow::Result<()> {
     fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{label}.html"));
     fs::write(&path, out)?;
+    fs::write(
+        dir.join(format!("{label}.txt")),
+        TEXT.lock().unwrap().as_str(),
+    )?;
     println!("{}", path.display());
     Ok(())
 }

@@ -147,7 +147,24 @@ pub(in crate::agent) fn chat_with_ui_inner(
     interrupt: Arc<AtomicBool>,
     ui: &mut dyn Ui,
     on_idle: &mut dyn FnMut(&mut dyn Ui),
+    rules: Option<&mut crate::agent::safety::rules::Monitor<'_>>,
+) -> Result<llm::Reply> {
+    chat_with_ui_streaming(
+        backend, adapter, request, options, interrupt, ui, on_idle, rules, None,
+    )
+}
+
+/// `chat_with_ui_inner` that also reports streamed tool-argument fragments to `stream`.
+pub(in crate::agent) fn chat_with_ui_streaming(
+    backend: &mut Backend,
+    adapter: Option<&Path>,
+    request: &Chat,
+    options: ChatOptions<'_>,
+    interrupt: Arc<AtomicBool>,
+    ui: &mut dyn Ui,
+    on_idle: &mut dyn FnMut(&mut dyn Ui),
     mut rules: Option<&mut crate::agent::safety::rules::Monitor<'_>>,
+    mut stream: Option<&mut dyn crate::agent::run::streaming_dispatch::ToolStream>,
 ) -> Result<llm::Reply> {
     let mut automatically_retried = false;
     let mut loop_attempts = 1;
@@ -163,6 +180,9 @@ pub(in crate::agent) fn chat_with_ui_inner(
             ui,
             on_idle,
             rules.as_deref_mut(),
+            stream.as_mut().map(|stream| {
+                &mut **stream as &mut dyn crate::agent::run::streaming_dispatch::ToolStream
+            }),
         );
         if result
             .as_ref()
@@ -257,9 +277,13 @@ pub(in crate::agent) fn chat_attempt_with_ui(
     ui: &mut dyn Ui,
     on_idle: &mut dyn FnMut(&mut dyn Ui),
     mut rules: Option<&mut crate::agent::safety::rules::Monitor<'_>>,
+    mut stream: Option<&mut dyn crate::agent::run::streaming_dispatch::ToolStream>,
 ) -> Result<llm::Reply> {
     if let Some(monitor) = rules.as_deref_mut() {
         monitor.restart();
+    }
+    if let Some(stream) = stream.as_deref_mut() {
+        stream.restart();
     }
     let ChatOptions {
         timeout,
@@ -421,6 +445,9 @@ pub(in crate::agent) fn chat_attempt_with_ui(
                     backing_off = waiting;
                     if waiting {
                         partial_text.clear();
+                        if let Some(stream) = stream.as_deref_mut() {
+                            stream.restart();
+                        }
                         // A discarded attempt's output must not count toward the next one. A loop
                         // already detected keeps its verdict; that attempt is being cancelled.
                         if thinking_loop_reason.is_none() {
@@ -564,6 +591,9 @@ pub(in crate::agent) fn chat_attempt_with_ui(
                     }
                     // A tool call starts the tool phase: the text detector stops watching.
                     text_loop = None;
+                    if let Some(stream) = stream.as_deref_mut() {
+                        stream.arguments(index, &id, &name, &delta);
+                    }
                     if !name.is_empty()
                         && let Some(header) = &mut header_loop
                     {

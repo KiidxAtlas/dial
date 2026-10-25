@@ -224,6 +224,44 @@ fn queued_route(follow_up: bool) -> &'static str {
     }
 }
 
+/// One row of the steer/queue strip above the composer, indented like the status row:
+/// ` ○ Steer  pending · acts at the next safe point  “message”`. The glyph and bold label carry
+/// the state; the message is muted and dropped first when the row is narrow.
+fn strip_row(
+    theme: &Theme,
+    width: usize,
+    (sym, label, tok): (Sym, &str, Tok),
+    detail: &str,
+    message: &str,
+) -> Line<'static> {
+    let head = format!(" {} {label}  ", theme.sym(sym));
+    let room = width.saturating_sub(text::width(&head));
+    let detail = text::ellipsize(detail, room, theme.ascii());
+    let room = room.saturating_sub(text::width(&detail));
+    let quoted = if room > 6 {
+        let (open, close) = if theme.ascii() {
+            ('"', '"')
+        } else {
+            ('“', '”')
+        };
+        text::ellipsize(
+            &format!("  {open}{}{close}", text::one_line(message)),
+            room,
+            theme.ascii(),
+        )
+    } else {
+        String::new()
+    };
+    Line::from(vec![
+        Span::styled(
+            text::ellipsize(&head, width, theme.ascii()),
+            theme.fg(tok).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(detail, theme.fg(tok)),
+        Span::styled(quoted, theme.fg(Tok::Muted)),
+    ])
+}
+
 /// The launch/compose placeholder, longest first; the first that fits is shown whole.
 const PLACEHOLDERS: [&str; 3] = [
     "Ask anything, or describe what to build",
@@ -1869,46 +1907,44 @@ impl Composer {
         if !self.explicit.is_empty() {
             let mut strip = Vec::new();
             for item in &self.explicit {
-                let (what, stage, tok) = match (item.kind, item.stage) {
+                // Indented like the status row, with a stage glyph and a bold label so the stage
+                // reads at a glance; the message itself stays muted and quoted.
+                let (what, stage, tok, sym) = match (item.kind, item.stage) {
                     (SteerKind::Steer, SteerStage::Pending) => (
-                        "steer",
-                        "pending: acts at the next safe point",
+                        "Steer",
+                        "pending · acts at the next safe point",
                         Tok::Warning,
+                        Sym::RadioOff,
                     ),
                     (SteerKind::Steer, SteerStage::Received) => (
-                        "steer",
-                        "received: stale reply cancelled, running tools finish",
+                        "Steer",
+                        "received · stale reply cancelled, running tools finish",
                         Tok::Accent,
+                        Sym::Working,
                     ),
                     (SteerKind::Steer, SteerStage::Applied) => (
-                        "steer",
-                        "applied: now the current instruction",
+                        "Steer",
+                        "applied · now the current instruction",
                         Tok::Success,
+                        Sym::Check,
                     ),
                     (SteerKind::Independent, SteerStage::Pending) => (
-                        "worker",
-                        "pending: starts at the next safe point",
+                        "Worker",
+                        "pending · starts at the next safe point",
                         Tok::Warning,
+                        Sym::RadioOff,
                     ),
                     (SteerKind::Independent, SteerStage::Received) => {
-                        ("worker", "received: starting", Tok::Accent)
+                        ("Worker", "received · starting", Tok::Accent, Sym::Working)
                     }
-                    (SteerKind::Independent, SteerStage::Applied) => {
-                        ("worker", "started: this task continues", Tok::Success)
-                    }
-                };
-                strip.push(Line::from(Span::styled(
-                    text::ellipsize(
-                        &format!(
-                            "{what} {stage} {} {}",
-                            theme.sym(Sym::Dot),
-                            text::one_line(&item.text)
-                        ),
-                        w,
-                        theme.ascii(),
+                    (SteerKind::Independent, SteerStage::Applied) => (
+                        "Worker",
+                        "started · this task continues",
+                        Tok::Success,
+                        Sym::Check,
                     ),
-                    theme.fg(tok),
-                )));
+                };
+                strip.push(strip_row(theme, w, (sym, what, tok), stage, &item.text));
             }
             cursor.0 += strip.len() as u16;
             strip.extend(rows);
@@ -1917,23 +1953,18 @@ impl Composer {
         if !self.queued.is_empty() {
             let mut queued = Vec::new();
             for (message, follow_up) in self.queued.iter().take(3) {
-                queued.push(Line::from(Span::styled(
-                    text::ellipsize(
-                        &format!(
-                            "queued to {}: {}",
-                            queued_route(*follow_up),
-                            text::one_line(message)
-                        ),
-                        w,
-                        theme.ascii(),
-                    ),
-                    theme.fg(Tok::Accent),
-                )));
+                queued.push(strip_row(
+                    theme,
+                    w,
+                    (Sym::ArrowUp, "Queued", Tok::Accent),
+                    queued_route(*follow_up),
+                    message,
+                ));
             }
             let hidden = self.queued.len().saturating_sub(3);
             if hidden > 0 {
                 queued.push(Line::from(Span::styled(
-                    text::ellipsize(&format!("+{hidden} more queued"), w, theme.ascii()),
+                    text::ellipsize(&format!("   +{hidden} more queued"), w, theme.ascii()),
                     theme.fg(Tok::Dim),
                 )));
             }

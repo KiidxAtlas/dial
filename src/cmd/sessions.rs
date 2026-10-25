@@ -4,6 +4,7 @@ use crate::overlay::overlay;
 use anyhow::{Result, bail};
 use dial::config::{paths::Layout, types::Config};
 use dial::storage::session::{Session, SessionInfo};
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 /// The single session `id` names: an id-prefix lookup that parses only matching journals, or the
@@ -18,11 +19,16 @@ fn resolve_prefix(layout: &Layout, all: bool, id: &str) -> Result<SessionInfo> {
         Session::find_prefix(layout, id)?
     }
     .into_iter();
-    let info = matching
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("no session matching {id:?}"))?;
-    if matching.next().is_some() {
-        bail!("session prefix {id:?} is ambiguous; use a longer id");
+    let info = matching.next().ok_or_else(|| {
+        let scope = if all { "" } else { " in this project" };
+        anyhow::anyhow!("no session{scope} starts with {id:?}; run `dial sessions` to list ids")
+    })?;
+    if let Some(other) = matching.next() {
+        bail!(
+            "session prefix {id:?} matches {} and {}; use a longer id",
+            info.id,
+            other.id
+        );
     }
     Ok(info)
 }
@@ -72,25 +78,146 @@ pub(crate) fn run(layout: &Layout, all: bool, action: &Option<SessionCommand>) -
         } else {
             sessions.len().min(30)
         };
-        for s in sessions.iter().take(shown) {
-            println!(
-                "{}  {}  {:>4} msgs  {}{}",
-                &s.id[..s.id.len().min(8)],
-                s.started,
-                s.messages,
-                s.title,
-                if all {
-                    format!("  {}", s.project)
-                } else {
-                    String::new()
-                }
+        if std::io::stdout().is_terminal() {
+            let color = std::env::var_os("NO_COLOR").is_none();
+            let home = std::env::var("HOME").ok();
+            print!(
+                "{}",
+                table(
+                    &sessions[..shown],
+                    all,
+                    terminal_width(),
+                    color,
+                    home.as_deref()
+                )
             );
+        } else {
+            // Piped output keeps its stable, script-friendly shape.
+            for s in sessions.iter().take(shown) {
+                println!(
+                    "{}  {}  {:>4} msgs  {}{}",
+                    &s.id[..s.id.len().min(8)],
+                    s.started,
+                    s.messages,
+                    s.title,
+                    if all {
+                        format!("  {}", s.project)
+                    } else {
+                        String::new()
+                    }
+                );
+            }
         }
         if let Some(notice) = Session::listing_notice(shown, sessions.len()) {
             eprintln!("{notice}");
         }
     }
     Ok(())
+}
+
+fn terminal_width() -> usize {
+    // Some pseudo-terminals report zero columns; fall back to a common width.
+    match crossterm::terminal::size() {
+        Ok((cols, _)) if cols >= 40 => usize::from(cols),
+        _ => 100,
+    }
+}
+
+/// The terminal view of `dial sessions`: a header, relative activity, readable titles fitted to
+/// `width`, and the commands that act on a listed id.
+fn table(
+    sessions: &[SessionInfo],
+    all: bool,
+    width: usize,
+    color: bool,
+    home: Option<&str>,
+) -> String {
+    use dial::ui::session_picker::age;
+    use dial::ui::statusline::tilde;
+    use dial::ui::text::{ellipsize, ellipsize_start, one_line};
+    use std::fmt::Write as _;
+    let paint = |code: &str, text: &str| {
+        if color {
+            format!("\x1b[{code}m{text}\x1b[0m")
+        } else {
+            text.to_owned()
+        }
+    };
+    let mut out = String::new();
+    if sessions.is_empty() {
+        let scope = if all { "" } else { " in this project" };
+        let _ = writeln!(
+            out,
+            "No sessions{scope} yet. Run {} to start one.",
+            paint("1", "dial")
+        );
+        if !all {
+            let _ = writeln!(
+                out,
+                "{}",
+                paint(
+                    "2",
+                    "List every project's sessions with: dial sessions --all"
+                )
+            );
+        }
+        return out;
+    }
+    let project_width = if all { 28 } else { 0 };
+    // Id, age, count and their gaps lead each row; the title gets the rest minus one spare
+    // column (at least 16), so rows never touch the terminal's last cell.
+    const LEAD: usize = 8 + 2 + 10 + 2 + 5 + 2;
+    let title_width = width
+        .saturating_sub(LEAD + 1 + project_width + usize::from(all) * 2)
+        .max(16);
+    let mut header = format!("{:<8}  {:<10}  {:>5}  {}", "ID", "UPDATED", "MSGS", "TITLE");
+    if all {
+        header = format!("{header:<w$}  PROJECT", w = LEAD + title_width);
+    }
+    let _ = writeln!(out, "{}", paint("1", &header));
+    for s in sessions {
+        let empty = s.messages == 0;
+        let title = one_line(s.title.trim());
+        let title = match (title.is_empty(), empty) {
+            (true, true) => "(empty session)".to_owned(),
+            (true, false) => "(untitled)".to_owned(),
+            (false, _) => title,
+        };
+        let title = ellipsize(&title, title_width, false);
+        let mut row = format!(
+            "{}  {:<10}  {:>5}  {}",
+            paint("36", &s.id[..s.id.len().min(8)]),
+            age(&s.updated),
+            s.messages,
+            if empty {
+                paint("2", &title)
+            } else {
+                title.clone()
+            },
+        );
+        if all {
+            let pad = title_width.saturating_sub(dial::ui::text::width(&title));
+            let _ = write!(
+                row,
+                "{}  {}",
+                " ".repeat(pad),
+                paint(
+                    "2",
+                    &ellipsize_start(&tilde(&s.project, home), project_width, false)
+                )
+            );
+        }
+        let _ = writeln!(out, "{row}");
+    }
+    let _ = writeln!(
+        out,
+        "\n{}",
+        paint(
+            "2",
+            "Resume one with dial -r <id> · continue the latest with dial -c · export with dial sessions export <id>"
+        )
+    );
+    out
 }
 
 pub(crate) fn share(
@@ -138,3 +265,6 @@ pub(crate) fn share(
     println!("{link}");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

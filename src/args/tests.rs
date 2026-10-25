@@ -64,3 +64,54 @@ fn watch_cli_requires_a_session_and_accepts_once_and_project_directory() {
     );
     assert!(Cli::try_parse_from(["dial", "watch"]).is_err());
 }
+
+#[test]
+fn a_lone_near_miss_word_is_a_mistyped_subcommand_not_a_request() {
+    let suggest = |args: &[&str]| {
+        let cli = Cli::try_parse_from(args).unwrap();
+        mistyped_subcommand(&cli, args)
+    };
+    assert_eq!(suggest(&["dial", "sesions"]).as_deref(), Some("sessions"));
+    assert_eq!(suggest(&["dial", "modles"]).as_deref(), Some("models"));
+    assert_eq!(
+        suggest(&["dial", "plugins"]),
+        None,
+        "aliases parse directly"
+    );
+    assert_eq!(suggest(&["dial", "img"]), None, "aliases parse directly");
+    assert_eq!(suggest(&["dial", "bnech"]).as_deref(), Some("benchmark"));
+    // Real requests, short words, explicit `--` and unrelated words still reach the model.
+    assert_eq!(suggest(&["dial", "fix", "the", "sessions"]), None);
+    assert_eq!(suggest(&["dial", "hi"]), None);
+    assert_eq!(suggest(&["dial", "--", "sesions"]), None);
+    // Explicit print mode selects a model request even if its text resembles a command.
+    assert_eq!(suggest(&["dial", "-p", "status"]), None);
+    assert_eq!(suggest(&["dial", "--print", "sesions"]), None);
+    assert_eq!(suggest(&["dial", "refactor"]), None);
+    assert_eq!(suggest(&["dial", "Sesions"]), None);
+    let message = mistyped_subcommand_error("sesions", "sessions").to_string();
+    assert!(message.contains("'sessions'") && message.contains("dial -- sesions"));
+}
+
+#[test]
+fn subcommand_help_lists_its_own_options_before_grouped_global_flags() {
+    use clap::CommandFactory;
+    // Global flags reach subcommands when the command is built, as it is when parsing.
+    let mut command = Cli::command();
+    command.build();
+    let help = command
+        .find_subcommand_mut("config")
+        .unwrap()
+        .render_help()
+        .to_string();
+    let own = help.find("--json").unwrap();
+    let model = help.find("Model and provider:").unwrap();
+    let safety = help.find("Permissions and isolation:").unwrap();
+    assert!(own < model && model < safety, "{help}");
+    let root = Cli::command().render_help().to_string();
+    assert!(root.contains("Examples:") && root.contains("Print mode exit codes:"));
+    assert!(
+        root.find("Running a prompt:").unwrap() < root.find("Protocols and diagnostics:").unwrap()
+    );
+    assert!(Cli::try_parse_from(["dial", "--sandbox", "nope"]).is_err());
+}

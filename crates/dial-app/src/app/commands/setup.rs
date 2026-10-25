@@ -102,7 +102,7 @@ pub(super) fn run_live(
                 TITLE,
                 format!(
                     "{}\n\n{}",
-                    run::list_text(&env),
+                    run::list_text(&env, "/setup"),
                     crate::setup::memory::doctor_text(&config)
                 ),
             )

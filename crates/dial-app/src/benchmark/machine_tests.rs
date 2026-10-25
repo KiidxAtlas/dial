@@ -51,6 +51,7 @@ fn measured(name: &str, outcomes: &[bool], wall_time_ms: u64) -> MachineConfigur
         efficiency: Default::default(),
         policy: Default::default(),
         integration: Default::default(),
+        experimental: Default::default(),
     };
     let cases = outcomes
         .iter()

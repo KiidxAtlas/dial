@@ -48,6 +48,9 @@ fn main() {
         }
     }
     let cli = Cli::parse();
+    if let Some(suggestion) = args::mistyped_subcommand(&cli, std::env::args_os()) {
+        args::mistyped_subcommand_error(&cli.prompt[0], &suggestion).exit();
+    }
     if cli.build_info {
         println!(
             "{}",

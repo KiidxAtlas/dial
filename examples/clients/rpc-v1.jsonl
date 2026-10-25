@@ -1,0 +1,5 @@
+{"id":"state-1","method":"state","params":{}}
+{"id":"history-1","method":"messages_page","params":{"offset":0,"limit":50}}
+{"id":"turn-1","method":"send","params":{"text":"Summarize the requested review scope without changing files."}}
+{"id":"cancel-1","method":"abort","params":{}}
+{"id":"state-2","method":"state","params":{}}

@@ -197,6 +197,7 @@ This README is an overview. Detailed documentation lives in [`docs/`](docs/), an
 - [Optional learning and harness improvement](docs/improvement.md): `dial improve` cycles, LoRA and fast weight candidates, verified local-model workflows, repository exercises, activation steering, portable packs
 - [Benchmarks and measurement](docs/benchmarks.md): `dial bench`/`dial benchmark` suites, efficiency measurement, regression checks, configuration comparisons, assistance ablation
 - [Autoresearch and archive](docs/autoresearch-and-archive.md)
+- [Competitor analysis and improvement plan](docs/audits/competitor-analysis.md): eleven harnesses, architecture map, prioritized gaps, bounded retrieval changes and verification limits
 
 ## Known limits
 

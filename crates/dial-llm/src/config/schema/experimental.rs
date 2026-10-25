@@ -55,4 +55,66 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Rewrite user and steering messages with turn_drafter. Interactive Dial shows each draft for acceptance before sending; /drafter toggles this feature. A failed or cancelled draft sends nothing.",
         Kind::Bool
     ),
+    field!(
+        "experimental.fault_witness",
+        experimental.fault_witness,
+        EX,
+        "Verification",
+        "Fault witness",
+        "After a focused check passes on a turn with edits, rerun it once in an isolated copy with the changed files restored to their turn-start content. A failure there witnesses the change; a pass there marks the check vacuous. Costs one extra check run, often with a cold build.",
+        Kind::Bool,
+    ),
+    field!(
+        "experimental.repro_first",
+        experimental.repro_first,
+        EX,
+        "Verification",
+        "Reproduce first",
+        "Debugging tasks only: the first edit to a non-test source file before any reproduction has failed gets a note (Advise) or is refused once (Gate). A repeated attempt always proceeds.",
+        Kind::Enum(REPRO_FIRST),
+    ),
+    field!(
+        "experimental.edit_bisection_runs",
+        experimental.edit_bisection_runs,
+        EX,
+        "Verification",
+        "Edit bisection runs",
+        "When a focused check that passed earlier in the turn fails after edits to two or more files, use up to this many isolated check runs to find which changed files cause the failure. 0 disables.",
+        Kind::Int {
+            min: 0,
+            max: 16,
+            step: 1
+        },
+    ),
+    field!(
+        "experimental.outcome_gradient_rounds",
+        experimental.outcome_gradient_rounds,
+        EX,
+        "Agent loop",
+        "No-progress edit rounds",
+        "Consecutive edit rounds whose focused-check failure score does not improve before a no-progress note with the score trend. 0 disables.",
+        Kind::Int {
+            min: 0,
+            max: 10,
+            step: 1
+        },
+    ),
+    field!(
+        "experimental.streaming_dispatch",
+        experimental.streaming_dispatch,
+        EX,
+        "Execution",
+        "Streaming dispatch",
+        "Start admitted read-only calls as soon as their arguments finish streaming, before the reply ends; results are delivered in call order afterwards and discarded if the reply fails. Providers that mark each call's end only.",
+        Kind::Bool,
+    ),
+    field!(
+        "experimental.check_predictions",
+        experimental.check_predictions,
+        EX,
+        "Verification",
+        "Check predictions",
+        "Offer an optional `expect` (pass or fail) on `check`. A mismatch is reported as a fact and the next request asks the model to explain it before editing again. Predictions never skip a check.",
+        Kind::Bool,
+    ),
 ];

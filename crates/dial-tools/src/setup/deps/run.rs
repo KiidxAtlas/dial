@@ -460,8 +460,9 @@ fn silence_wav(seconds: u32) -> Vec<u8> {
 mod tests;
 
 /// Capabilities grouped by status: what is installed (with its path) and what is missing (with the
-/// `/setup` command that installs it). Names are padded so the second column lines up.
-pub fn list_text(env: &Env) -> String {
+/// command that installs it on this surface: `/setup` in the TUI, `dial doctor --fix` on the
+/// command line). Names are padded so the second column lines up.
+pub fn list_text(env: &Env, install_command: &str) -> String {
     let rows = report(env);
     let width = rows
         .iter()
@@ -472,12 +473,12 @@ pub fn list_text(env: &Env) -> String {
     let ready: Vec<String> = rows
         .iter()
         .filter(|row| matches!(row.status, Status::Ready))
-        .map(|row| format!("  {}  {}", pad(row.title), row.detail))
+        .map(|row| format!("  ✓ {}  {}", pad(row.title), row.detail))
         .collect();
     let missing: Vec<String> = rows
         .iter()
         .filter(|row| matches!(row.status, Status::Missing))
-        .map(|row| format!("  {}  /setup {}", pad(row.title), row.id))
+        .map(|row| format!("  · {}  {install_command} {}", pad(row.title), row.id))
         .collect();
     let mut lines = Vec::new();
     if !ready.is_empty() {
@@ -485,7 +486,13 @@ pub fn list_text(env: &Env) -> String {
         lines.extend(ready);
     }
     if !missing.is_empty() {
-        lines.push(format!("Not installed ({}):", missing.len()));
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines.push(format!(
+            "Not installed ({}) — each line ends with the command that previews its setup:",
+            missing.len()
+        ));
         lines.extend(missing);
     }
     if lines.is_empty() {

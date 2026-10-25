@@ -369,19 +369,46 @@ fn experimental_options_are_registered_in_their_tab_and_default_off() {
         "experimental.profile_matching",
         "experimental.tool_speculation",
         "experimental.turn_optimizer",
+        "experimental.fault_witness",
+        "experimental.streaming_dispatch",
+        "experimental.check_predictions",
     ];
-    for path in paths {
-        let setting = registry()
+    let setting = |path: &str| {
+        registry()
             .iter()
             .find(|setting| setting.path == path)
-            .unwrap();
+            .unwrap()
+    };
+    for path in paths {
+        let setting = setting(path);
         assert_eq!(setting.tab, "Experimental");
         assert_eq!(setting.kind, Kind::Bool);
         assert_eq!(setting.default_value(), Some(Value::Boolean(false)));
     }
-    let config: Config = toml::from_str("[experimental]\ncontext_overlap_dedup = true").unwrap();
+    for path in [
+        "experimental.edit_bisection_runs",
+        "experimental.outcome_gradient_rounds",
+    ] {
+        assert_eq!(setting(path).tab, "Experimental");
+        assert_eq!(setting(path).default_value(), Some(Value::Integer(0)));
+    }
+    let repro = setting("experimental.repro_first");
+    assert_eq!(repro.tab, "Experimental");
+    assert_eq!(repro.default_value(), Some(Value::String("off".into())));
+    let config: Config = toml::from_str(
+        "[experimental]\ncontext_overlap_dedup = true\nrepro_first = \"gate\"\nedit_bisection_runs = 4",
+    )
+    .unwrap();
     assert!(config.experimental.context_overlap_dedup);
     assert!(!config.experimental.verification_receipts);
+    assert_eq!(
+        config.experimental.repro_first,
+        crate::config::types::ReproFirst::Gate
+    );
+    assert_eq!(config.experimental.edit_bisection_runs, 4);
+    let mut out_of_range = Config::default();
+    out_of_range.experimental.outcome_gradient_rounds = 11;
+    assert!(out_of_range.validate().is_err());
 }
 
 #[test]

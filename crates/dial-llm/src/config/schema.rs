@@ -240,6 +240,7 @@ const LOCAL_EDIT_MODE: EnumValues = &[
     ("sloppy", "Sloppy"),
 ];
 const LOCAL_THINKING: EnumValues = &[("phase", "Phase"), ("model", "Model decides")];
+const REPRO_FIRST: EnumValues = &[("off", "Off"), ("advise", "Advise"), ("gate", "Gate")];
 const LOCAL_SIDE_MODELS: EnumValues = &[
     ("warn", "Warn once"),
     ("reuse_main", "Reuse main model"),
@@ -962,6 +963,12 @@ static REGISTRY: &[SettingDef] = &[
     experimental::DECLARATIONS[3],
     experimental::DECLARATIONS[4],
     experimental::DECLARATIONS[5],
+    experimental::DECLARATIONS[6],
+    experimental::DECLARATIONS[7],
+    experimental::DECLARATIONS[8],
+    experimental::DECLARATIONS[9],
+    experimental::DECLARATIONS[10],
+    experimental::DECLARATIONS[11],
     coordination::DECLARATIONS[0],
     voice::DECLARATIONS[0],
     voice::DECLARATIONS[1],

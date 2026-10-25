@@ -778,6 +778,25 @@ impl Agent<'_> {
                     self.usage_scope.for_purpose(crate::llm::usage::Purpose::Repair),
                 ))
             });
+            // Experimental: admitted reads start while the reply still streams (`run/streaming_dispatch.rs`).
+            let mut streamed = (!self.hermetic
+                && !single_call
+                && self.effective_config().experimental.streaming_dispatch)
+                .then(|| {
+                    crate::agent::run::streaming_dispatch::StreamingDispatch::new(
+                        self.workspace.clone(),
+                        self.effective_config().clone(),
+                        self.ext.clone(),
+                        self.interrupt.clone(),
+                        crate::agent::run::streaming_dispatch::Admission {
+                            hooks: self.tool_hooks().to_vec(),
+                            plugins: self.hook_plugins(),
+                            always: self.always.clone(),
+                            schemas: provider_request.tools.clone(),
+                            names: names.clone(),
+                        },
+                    )
+                });
             let result = if self.hermetic {
                 crate::learn::compute::background_call(self.config, backend, |backend, cancel| {
                     chat_with_ui(
@@ -801,7 +820,7 @@ impl Agent<'_> {
                     )
                 })
             } else {
-                chat_with_ui_inner(
+                chat_with_ui_streaming(
                     backend,
                     adapter.as_deref(),
                     provider_request,
@@ -835,6 +854,9 @@ impl Agent<'_> {
                         }
                     },
                     Some(&mut rule_monitor),
+                    streamed
+                        .as_mut()
+                        .map(|stream| stream as &mut dyn crate::agent::run::streaming_dispatch::ToolStream),
                 )
             };
             if let Some(previous) = previous_usage {
@@ -1691,6 +1713,10 @@ impl Agent<'_> {
             let (mut form_kinds, mut rejected_calls, mut execution_failed) =
                 (Vec::new(), Vec::new(), false);
             let mut observed_check_failure = false;
+            // `experimental.outcome_gradient_rounds`: checks observed this round and their failures.
+            let mut round_checked = false;
+            let mut round_failing_tests = std::collections::BTreeSet::new();
+            let mut round_unnamed_failures = 0usize;
             let mut parallel = std::collections::VecDeque::new();
             let mut stop: Option<String> = None;
             let mut round_succeeded = false;
@@ -1974,19 +2000,42 @@ impl Agent<'_> {
                                     && engine.rejection_at(&self.workspace, c).is_none()
                             })
                             .count();
-                        if count > 1 {
+                        let group = &reply.tool_calls[index..index + count];
+                        let mut early: Vec<Option<(ToolOutput, f64)>> = match streamed.as_mut() {
+                            Some(streamed) => group.iter().map(|c| streamed.take(c, ui)).collect(),
+                            None => vec![None; count],
+                        };
+                        let reused = early.iter().flatten().count();
+                        if count > 1 || reused > 0 {
+                            let rest: Vec<ToolCall> = group
+                                .iter()
+                                .zip(&early)
+                                .filter(|(_, result)| result.is_none())
+                                .map(|(c, _)| c.clone())
+                                .collect();
                             let mut steering = Vec::new();
-                            parallel = parallel_tools(
-                                &self.workspace,
-                                self.effective_config(),
-                                &self.ext,
-                                &reply.tool_calls[index..index + count],
-                                &self.interrupt,
-                                ui,
-                                &mut steering,
-                            )
-                            .into();
+                            let mut ran = if rest.is_empty() {
+                                Vec::new()
+                            } else {
+                                parallel_tools(
+                                    &self.workspace,
+                                    self.effective_config(),
+                                    &self.ext,
+                                    &rest,
+                                    &self.interrupt,
+                                    ui,
+                                    &mut steering,
+                                )
+                            }
+                            .into_iter();
                             self.pending_tool_steering.extend(steering);
+                            parallel = early
+                                .iter_mut()
+                                .map(|result| result.take().or_else(|| ran.next()).expect("one result per grouped call"))
+                                .collect();
+                            if reused > 0 {
+                                ui.diagnostic(&format!("Streaming dispatch: {reused} of {count} grouped read(s) reused results started while the reply streamed."));
+                            }
                         }
                     }
                     let (mut out, seconds, executed) = match parallel.pop_front() {
@@ -2001,7 +2050,13 @@ impl Agent<'_> {
                             (ToolOutput { execution: Default::default(),  data: None,
 text: "finish completed cannot follow a failed call in the same batch; address its error first".into(), is_error: true }, 0.0, false)
                         }
-                        None => { let started = Instant::now(); let out = self.dispatch(backend, call, ui); (out, started.elapsed().as_secs_f64(), true) }
+                        None => {
+                            // Anything executed serially may change what an early read observed.
+                            if let Some(streamed) = streamed.as_mut() {
+                                streamed.invalidate();
+                            }
+                            let started = Instant::now(); let out = self.dispatch(backend, call, ui); (out, started.elapsed().as_secs_f64(), true)
+                        }
                     };
                     // Only admitted calls that reached execution count; rejected, skipped and blocked forms do not.
                     if executed {
@@ -2097,6 +2152,17 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                     && (output.process_outcome().is_some_and(|process| process.exit_code.is_some_and(|code| code != 0))
                         || crate::agent::verify::verification::zero_tests(&output.text));
                 observed_check_failure |= check_failed;
+                self.step_checks.reproduced |= check_failed;
+                if self.config.experimental.outcome_gradient_rounds > 0
+                    && (is_check || call.name == crate::agent::verify::check_tool::NAME)
+                {
+                    round_checked = true;
+                    let names = crate::agent::run::outcome_gradient::failing_tests(&output.text);
+                    if names.is_empty() && check_failed {
+                        round_unnamed_failures += 1;
+                    }
+                    round_failing_tests.extend(names);
+                }
                 if self.advisor_enabled() || self.config.escalation.enabled {
                     let label = if call.name == "bash" {
                         format!(
@@ -2138,12 +2204,16 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                 // Committed facts decide: any tool whose transaction committed paths (LSP rename, code
                 // actions, checkpointed edits) advances the mutation epoch, even when it failed after
                 // a partial commit. The name list covers writers that commit without reporting paths.
+                let mut repro_advice = None;
                 let committed = !output.execution.changed_paths.is_empty();
                 if committed
                     || (!output.is_error
                         && matches!(call.name.as_str(), "write" | "edit" | "ast_edit" | "solve"))
                 {
                     self.step_checks.mutations += 1;
+                    if self.repro_first_fires(call, crate::config::types::ReproFirst::Advise) {
+                        repro_advice = Some(crate::agent::verify::repro_first::ADVICE);
+                    }
                     self.behavioral_checks.clear();
                     if !self.hermetic
                         && let Some(path) = call.arguments["path"].as_str()
@@ -2165,6 +2235,25 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                         .uncheckpointed_extension_tools
                         .insert(call.name.clone());
                 }
+                let search_note = if self.hermetic {
+                    None
+                } else {
+                    if call.name == "read" && !output.is_error {
+                        let targets = crate::agent::verify::caller_obligations::read_targets(
+                            &self.workspace,
+                            &call.arguments,
+                        );
+                        self.step_checks.visited_paths.extend(targets);
+                    }
+                    let revision = self.step_checks.revision();
+                    self.step_checks.empty_searches.observe(
+                        &call.name,
+                        &call.arguments,
+                        &output.text,
+                        output.is_error,
+                        revision,
+                    )
+                };
                 self.step_checks.evidence.settle_call(&call.id, self.step_checks.revision());
                 let review_stamp = crate::agent::run::enrichment::Stamp {
                     revision: self.step_checks.revision(),
@@ -2329,6 +2418,12 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                 }
                 if let Some(notice) = &retain_notice {
                     body.push_str(notice);
+                }
+                if let Some(note) = &search_note {
+                    body.push_str(note);
+                }
+                if let Some(note) = repro_advice {
+                    body.push_str(note);
                 }
                 self.efficiency_metrics.result(&output.text, &body);
                 let mut message = llm::tool_message(&call.id, &body);
@@ -2524,6 +2619,15 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                 && let Some(advice) = pace.round(&reply.tool_calls)
             {
                 pending_nudges.push(crate::agent::run::guidance::note(crate::agent::run::guidance::Priority::Loop, advice));
+            }
+            let gradient_rounds = self.config.experimental.outcome_gradient_rounds;
+            if round_checked && self.step_checks.mutations > 0 {
+                let score = self.step_checks.failed_checks.len()
+                    + round_failing_tests.len()
+                    + round_unnamed_failures;
+                if let Some(advice) = self.step_checks.outcome_gradient.observe(score, gradient_rounds) {
+                    pending_nudges.push(crate::agent::run::guidance::note(crate::agent::run::guidance::Priority::Loop, advice));
+                }
             }
             if let Some(plan) = self.pending_plan.take() {
                 self.push(json!({"role":"user","content":format!("Approved plan:\n{plan}\nProceed with implementation.")}))?;

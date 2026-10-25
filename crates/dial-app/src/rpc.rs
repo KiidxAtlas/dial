@@ -459,6 +459,14 @@ impl Ui for RpcUi {
             .map(|mut q| std::mem::take(&mut *q))
             .unwrap_or_default()
     }
+    fn policy_explanation(
+        &mut self,
+        call_id: &str,
+        tool: &str,
+        explanation: &crate::agent::safety::approval::PolicyExplanation,
+    ) {
+        self.out.emit(json!({"event":"policy_explanation", "call_id":call_id, "tool":tool, "explanation":explanation, "message":explanation.to_string()}));
+    }
     fn approve(&mut self, tool: &str, summary: &str) -> Decision {
         self.request_approval(tool, summary, None, None)
     }

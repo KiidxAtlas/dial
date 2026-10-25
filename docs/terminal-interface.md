@@ -84,13 +84,15 @@ turn finishes. See [Session coordination](session-coordination.md) for delivery,
   **Independent worker** starts a separate worker for exactly that message while the current task
   continues; it never steers the running task and no model classifies it. If a worker cannot
   start (spawning disabled, capacity, interruption) the message is queued as a follow-up instead.
-  Explicit messages are shown above the composer with the stage Dial actually reported:
+  Explicit messages are shown above the composer, one row each (`○ Steer  pending · acts at the
+  next safe point  “message”`, with ● received and ✓ applied), with the stage Dial actually reported:
   *pending* (typed, not yet read by the agent; it acts at the next safe point), *received*
   (the agent took it and is cancelling the stale reply) and *applied* (recorded as the current
   instruction, or the worker started). If the turn ends before a message was applied it is queued
   to send next rather than lost. They are not part of `/queue`.
   `Option+Enter` on macOS (`Alt+Enter` elsewhere) still queues a follow-up directly.
-  The queue above the composer previews up to three messages and counts the rest.
+  The queue above the composer previews up to three messages (`Queued  send after turn  “message”`)
+  and counts the rest.
   Empty Enter with queued work opens a separate choice, defaulting to **Keep working**;
   stopping to send the oldest message requires explicitly selecting that option and confirming.
   `Up` edits the last queued message (`/queue` edits any item). Saving an edit preserves its queue

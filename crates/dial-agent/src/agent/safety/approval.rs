@@ -956,6 +956,90 @@ pub fn save(path: &Path, rules: &[PermissionRule]) -> Result<()> {
     Ok(())
 }
 
+/// Observational provenance, never an authorization token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyReason {
+    DenyRule,
+    ReadOnly,
+    PlanMode,
+    Cancelled,
+    AutomaticMode,
+    AllowRule,
+    WorkspaceWrite,
+    SafeCall,
+    GeneratedCheck,
+    PromptRequired,
+    OperatorAllow,
+    OperatorDeny,
+    HookVeto,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyExplanation {
+    pub reason: PolicyReason,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule_scope: Option<String>,
+}
+
+impl std::fmt::Display for PolicyExplanation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = match self.reason {
+            PolicyReason::DenyRule => "denied by an explicit permission rule",
+            PolicyReason::ReadOnly => "denied by read-only mode",
+            PolicyReason::PlanMode => "denied by plan mode",
+            PolicyReason::Cancelled => "denied because the request was cancelled",
+            PolicyReason::AutomaticMode => "allowed by automatic approval mode",
+            PolicyReason::AllowRule => "allowed by a saved permission rule",
+            PolicyReason::WorkspaceWrite => "allowed by workspace-write policy",
+            PolicyReason::SafeCall => "allowed without approval by safe-call policy",
+            PolicyReason::GeneratedCheck => "allowed as a harness-generated verification check",
+            PolicyReason::PromptRequired => "operator approval required",
+            PolicyReason::OperatorAllow => "allowed by the operator response",
+            PolicyReason::OperatorDeny => "denied by the operator response",
+            PolicyReason::HookVeto => "denied by a pre-tool hook",
+        };
+        write!(f, "Policy: {text}")?;
+        if let Some(scope) = &self.rule_scope {
+            write!(f, " ({scope})")?;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn explain(ui: &mut dyn Ui, call: &ToolCall, reason: PolicyReason) {
+    ui.policy_explanation(
+        &call.id,
+        &call.name,
+        &PolicyExplanation {
+            reason,
+            rule_scope: None,
+        },
+    );
+}
+
+pub(crate) fn explain_rule(
+    ui: &mut dyn Ui,
+    call: &ToolCall,
+    root: &Path,
+    rules: &[PermissionRule],
+    effect: Effect,
+) {
+    let rule_scope = rules
+        .iter()
+        .find(|r| r.effect == effect && r.matches(call, root))
+        .map(PermissionRule::scope);
+    let reason = if effect == Effect::Deny {
+        PolicyReason::DenyRule
+    } else {
+        PolicyReason::AllowRule
+    };
+    ui.policy_explanation(
+        &call.id,
+        &call.name,
+        &PolicyExplanation { reason, rule_scope },
+    );
+}
 pub enum Denial {
     ReadOnly,
     User,
@@ -1187,11 +1271,14 @@ pub(in crate::agent) fn authorize_automatic_check(
     };
     if !check.configured {
         if denied_by_rule(rules, &call, root) {
+            explain_rule(ui, &call, root, rules, Effect::Deny);
             return Err(Denial::Rule);
         }
         return if approval == Approval::Readonly {
+            explain(ui, &call, PolicyReason::ReadOnly);
             Err(Denial::ReadOnly)
         } else {
+            explain(ui, &call, PolicyReason::GeneratedCheck);
             Ok(false)
         };
     }
@@ -1222,22 +1309,34 @@ fn authorize_inner(
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<bool, Denial> {
     if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+        explain(ui, call, PolicyReason::Cancelled);
         return Err(Denial::User);
     }
     if denied_by_rule(rules, call, root) {
+        explain_rule(ui, call, root, rules, Effect::Deny);
         return Err(Denial::Rule);
     }
     match approval {
-        Approval::Readonly => Err(Denial::ReadOnly),
-        Approval::Auto => Ok(false),
+        Approval::Readonly => {
+            explain(ui, call, PolicyReason::ReadOnly);
+            Err(Denial::ReadOnly)
+        }
+        Approval::Auto => {
+            explain(ui, call, PolicyReason::AutomaticMode);
+            Ok(false)
+        }
         Approval::Ask | Approval::Write
             if rules
                 .iter()
                 .any(|r| r.effect == Effect::Allow && r.matches(call, root)) =>
         {
+            explain_rule(ui, call, root, rules, Effect::Allow);
             Ok(false)
         }
-        Approval::Write if workspace_write(call) => Ok(false),
+        Approval::Write if workspace_write(call) => {
+            explain(ui, call, PolicyReason::WorkspaceWrite);
+            Ok(false)
+        }
         Approval::Ask | Approval::Write => {
             let summary = if call.name == "bash" && approval == Approval::Write {
                 format!("{summary}\nDestructive or privileged shell command; approval required.")
@@ -1246,10 +1345,28 @@ fn authorize_inner(
             } else {
                 summary.to_owned()
             };
+            explain(ui, call, PolicyReason::PromptRequired);
+            let summary = format!(
+                "{summary}\n{}",
+                PolicyExplanation {
+                    reason: PolicyReason::PromptRequired,
+                    rule_scope: None
+                }
+            );
             let decision = ui.approve_call(&call.id, &call.name, &summary, cancel);
             if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+                explain(ui, call, PolicyReason::Cancelled);
                 return Err(Denial::User);
             }
+            explain(
+                ui,
+                call,
+                if decision == Decision::Deny {
+                    PolicyReason::OperatorDeny
+                } else {
+                    PolicyReason::OperatorAllow
+                },
+            );
             match decision {
                 Decision::Allow => Ok(false),
                 Decision::AllowAlways | Decision::AllowProject => {

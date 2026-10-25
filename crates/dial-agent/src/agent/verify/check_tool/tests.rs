@@ -160,6 +160,56 @@ fn before_any_change_it_lists_checks_and_runs_only_a_named_baseline() {
 }
 
 #[test]
+fn predictions_are_offered_only_under_the_flag_and_mismatches_are_reported() {
+    assert!(
+        schema(false)
+            .pointer("/function/parameters/properties/expect")
+            .is_none()
+    );
+    assert!(
+        schema(true)
+            .pointer("/function/parameters/properties/expect")
+            .is_some()
+    );
+    let root = tempfile::tempdir().unwrap();
+    let mut config = config();
+    config
+        .verification
+        .commands
+        .retain(|check| check.name == "unit");
+    // Off: the argument is inert.
+    let mut agent = hermetic_agent(&config, root.path());
+    agent.step_checks.mutations = 1;
+    let off = agent.check_tool(&json!({"expect":"fail"}), &mut NullUi);
+    assert!(off.data.as_ref().unwrap().get("prediction").is_none());
+    assert!(!off.text.contains("Prediction mismatch"), "{}", off.text);
+
+    let mut config = config.clone();
+    config.experimental.check_predictions = true;
+    let mut agent = hermetic_agent(&config, root.path());
+    agent.step_checks.mutations = 1;
+    let invalid = agent.check_tool(&json!({"expect":"maybe"}), &mut NullUi);
+    assert!(invalid.is_error);
+    let missed = agent.check_tool(&json!({"names":["unit"],"expect":"fail"}), &mut NullUi);
+    assert!(!missed.is_error, "the check itself passed");
+    assert_eq!(
+        missed.data.as_ref().unwrap()["prediction"],
+        json!({"expected":"fail","observed":"pass","matched":false})
+    );
+    assert!(
+        missed
+            .text
+            .contains("Prediction mismatch: expected fail, observed pass")
+    );
+    let matched = agent.check_tool(&json!({"names":["unit"],"expect":"pass"}), &mut NullUi);
+    assert_eq!(
+        matched.data.as_ref().unwrap()["prediction"]["matched"],
+        true
+    );
+    assert!(!matched.text.contains("Prediction mismatch"));
+}
+
+#[test]
 fn check_is_offered_by_default_and_on_the_small_tier_and_revert_edit_stays_loadable() {
     use crate::agent::run::tool_exposure::default_offer_tests::with_agent;
     for overlay in ["", "context_window=16384"] {

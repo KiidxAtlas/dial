@@ -80,6 +80,7 @@ impl fmt::Debug for ApiKey {
 
 /// Model/provider flags, flattened into the top-level CLI by `main.rs`.
 #[derive(Debug, Clone, Default, clap::Args)]
+#[command(next_help_heading = crate::cli::help_heading::MODEL)]
 pub struct ModelFlags {
     /// Comma-separated model patterns: scope the `/model next` cycle and pick the starting model
     /// for this run only (not saved). Resolved by `model_scope::apply`.
@@ -104,7 +105,7 @@ pub struct ModelFlags {
     #[arg(long, global = true, value_parser = parse_service_tier)]
     pub service_tier: Option<ServiceTier>,
     /// Whole-run deadline: seconds, or a duration like 5s, 10m, 1h.
-    #[arg(long, global = true, value_parser = parse_max_time)]
+    #[arg(long, global = true, value_parser = parse_max_time, help_heading = crate::cli::help_heading::RUN)]
     pub max_time: Option<f64>,
 }
 

@@ -405,14 +405,6 @@ fn compact_discovery_pins_and_unloads_do_not_leave_hidden_activation_state() {
 #[test]
 fn default_stale_reduction_precedes_automatic_summary_pressure() {
     with_agent("context_window=128000", |agent| {
-        let mut messages = vec![
-            json!({"role":"user","content":"task"}),
-            json!({"role":"assistant","content":"","tool_calls":[{"id":"old","function":{"name":"read","arguments":"{}"}}]}),
-            json!({"role":"tool","tool_call_id":"old","content":"x".repeat(200_000),"dial_evidence":{"artifact":"artifact://old","observation":"same-range"}}),
-            json!({"role":"assistant","content":"","tool_calls":[{"id":"new","function":{"name":"read","arguments":"{}"}}]}),
-            json!({"role":"tool","tool_call_id":"new","content":"y".repeat(160_000),"dial_evidence":{"artifact":"artifact://new","observation":"same-range"}}),
-        ];
-        let raw = crate::llm::wire::estimate_parts(&messages, &[]);
         let selection = agent.auth_config.selection();
         let threshold = agent
             .config
@@ -426,8 +418,19 @@ fn default_stale_reduction_precedes_automatic_summary_pressure() {
                 agent.budget_window(),
             )
             .unwrap();
+        // Cross the current default trigger without filling the physical context window.
+        // The default is reserve-relative, not the historical 75%-of-window trigger.
+        let old_bytes = usize::try_from((threshold + 1024) * 4).unwrap() - 160_000;
+        let mut messages = vec![
+            json!({"role":"user","content":"task"}),
+            json!({"role":"assistant","content":"","tool_calls":[{"id":"old","function":{"name":"read","arguments":"{}"}}]}),
+            json!({"role":"tool","tool_call_id":"old","content":"x".repeat(old_bytes),"dial_evidence":{"artifact":"artifact://old","observation":"same-range"}}),
+            json!({"role":"assistant","content":"","tool_calls":[{"id":"new","function":{"name":"read","arguments":"{}"}}]}),
+            json!({"role":"tool","tool_call_id":"new","content":"y".repeat(160_000),"dial_evidence":{"artifact":"artifact://new","observation":"same-range"}}),
+        ];
+        let raw = crate::llm::wire::estimate_parts(&messages, &[]);
         assert!(raw > threshold);
-        assert!(raw < u64::from(agent.budget_window()) * 75 / 100);
+        assert!(raw < u64::from(agent.budget_window()));
         let mut packet = crate::agent::workers::task_packet::PacketCache::default();
         let mut memo = crate::agent::workflow::evidence::Supersession::default();
         agent

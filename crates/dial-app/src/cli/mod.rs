@@ -27,3 +27,16 @@ pub mod session_import;
 mod table;
 pub mod tool_flags;
 pub mod watch;
+
+/// `--help` sections shared by the root command and the flattened flag groups. Global flags keep
+/// their section in every subcommand's help, so a subcommand's own options stay listed first.
+pub mod help_heading {
+    pub const RUN: &str = "Running a prompt";
+    pub const SESSIONS: &str = "Sessions";
+    pub const MODEL: &str = "Model and provider";
+    pub const SAFETY: &str = "Permissions and isolation";
+    pub const MODES: &str = "Work modes";
+    pub const CONTEXT: &str = "Context, prompts and tools";
+    pub const EXTENSIONS: &str = "Extensions and hooks";
+    pub const PROTOCOL: &str = "Protocols and diagnostics";
+}

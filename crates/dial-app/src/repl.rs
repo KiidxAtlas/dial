@@ -458,6 +458,17 @@ impl Ui for PrintUi {
             "print mode has no human input channel; state the assumption and continue, or ask in an interactive session".into(),
         )
     }
+    fn policy_explanation(
+        &mut self,
+        call_id: &str,
+        tool: &str,
+        explanation: &crate::agent::safety::approval::PolicyExplanation,
+    ) {
+        if self.format == OutputFormat::Text {
+            self.notice(&format!("{tool}: {explanation}"));
+        }
+        self.event(|| serde_json::json!({"type":"policy_explanation", "call_id":call_id, "tool":tool, "explanation":explanation, "message":explanation.to_string()}));
+    }
     fn approve(&mut self, tool: &str, _summary: &str) -> crate::agent::Decision {
         if self.check_output().is_err() {
             self.denied = true;
@@ -476,3 +487,6 @@ impl Ui for PrintUi {
         Some("Non-interactive approval was denied; the operator must pre-approve the tool with --allow.".into())
     }
 }
+
+#[cfg(test)]
+mod tests;

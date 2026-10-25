@@ -12,6 +12,12 @@ consumer invalidates the old scope; genuinely unrelated edits do not. Dependency
 discovery remains lexical and bounded. Legacy scopes without a dependency-edge witness
 are conservatively unchecked until refreshed/re-recorded, not silently treated as fresh.
 Reusable findings remain advisory, never proof that current behavior was verified.
+Each codebase context retrieval uses one bounded, invocation-local source snapshot for freshness
+decisions, including selected outlines and findings. It does not reopen and hash those sources
+again while holding the index lock. Sources absent from that snapshot are unchecked and withheld;
+partial dependency scopes cannot certify findings. A later retrieval scans again, so external
+edits invalidate reuse without relying on modification-time caches. This is an observation during
+the scan, not an atomic snapshot of the entire filesystem and not edit authority.
 
 ### Semantic facts backend
 

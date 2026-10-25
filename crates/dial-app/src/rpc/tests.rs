@@ -353,3 +353,52 @@ fn announced_request_limit_is_the_one_the_reader_enforces() {
         );
     }
 }
+
+#[test]
+fn client_request_examples_validate_against_the_published_schema() {
+    let schema = schema();
+    crate::runtime::schema::check_schema(&schema).unwrap();
+    for line in include_str!("../../../../examples/clients/rpc-v1.jsonl").lines() {
+        let frame: Value = serde_json::from_str(line).unwrap();
+        crate::runtime::schema::validate(&schema, &frame).unwrap();
+        assert!(METHODS.iter().any(|(method, _)| frame["method"] == *method));
+        let mut input = std::io::Cursor::new(format!("{line}\n").into_bytes());
+        let read = read_request(&mut input).unwrap().unwrap().unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&read).unwrap(), frame);
+    }
+    // The examples are constrained contracts, not merely parseable JSON.
+    assert!(
+        crate::runtime::schema::validate(
+            &schema,
+            &json!({"id":"bad","method":"send","params":{"text":42}})
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn revisioned_snapshot_retains_partial_output_and_interrupted_outcome() {
+    use crate::runtime::{Phase, Tree};
+    let tree = Tree::default();
+    let body = tree.start("tool", "read", None);
+    body.correlate("call-1");
+    let before = body.snapshot();
+    body.append("partial λ");
+    let partial = body.snapshot();
+    assert!(partial.result.revision > before.result.revision);
+    assert_eq!(node_metadata(&partial), node_metadata(&before));
+    body.settle("partial λ".into(), None, Phase::Interrupted);
+    let stopped = body.snapshot();
+    assert!(stopped.result.revision > partial.result.revision);
+    assert_ne!(node_metadata(&stopped), node_metadata(&partial));
+    body.append("late text must not resume a stopped stream");
+    assert_eq!(body.snapshot(), stopped);
+    let projection = QueryProjection {
+        state: json!({"session_id":"s1","tree":[stopped]}),
+        ..Default::default()
+    };
+    let restored = state_reply(&projection, false).unwrap();
+    assert_eq!(restored["tree"][0]["result"]["text"], "partial λ");
+    assert_eq!(restored["tree"][0]["result"]["phase"], "interrupted");
+    assert_eq!(restored["tree"][0]["call_id"], "call-1");
+}

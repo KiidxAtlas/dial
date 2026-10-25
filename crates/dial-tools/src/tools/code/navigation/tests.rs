@@ -236,3 +236,120 @@ fn related_bundle_never_surfaces_environment_or_credential_files() {
     }
     assert!(related.contains("config-reference app.toml"), "{related}");
 }
+
+/// Static dependency-ranking ablation, deliberately not production policy.
+#[test]
+#[ignore = "offline retrieval measurement; run with --ignored --nocapture --test-threads=1"]
+fn retrieval_measurement_graph() {
+    use std::time::Instant;
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../../../../examples/benchmarks/retrieval-fixture.json"
+    ))
+    .unwrap();
+    let (dir, ws) = crate::tools::testkit::workspace();
+    for (name, source) in fixture["files"].as_object().unwrap() {
+        fs::write(dir.path().join(name), source.as_str().unwrap()).unwrap();
+    }
+    for case in fixture["queries"].as_array().unwrap() {
+        let args = json!({"query":case["query"], "limit":100, "related":false});
+        let gold = case["gold"].as_array().unwrap();
+        for graph in [false, true] {
+            let mut elapsed = Vec::new();
+            let mut last = Value::Null;
+            for _ in 0..20 {
+                let started = Instant::now();
+                let retrieved = retrieve(&ws, &args, false).unwrap();
+                // One best lexical span per file, identical candidates in both arms.
+                let mut candidates = BTreeMap::new();
+                for hit in &retrieved.results {
+                    candidates.entry(hit.path.clone()).or_insert(hit);
+                }
+                let sum = candidates.values().map(|h| h.score).sum::<usize>() as f64;
+                assert!(sum > 0.0);
+                let seeds: BTreeMap<_, _> = candidates
+                    .iter()
+                    .map(|(path, hit)| (path.clone(), hit.score as f64 / sum))
+                    .collect();
+                let mut scores = seeds.clone();
+                if graph {
+                    // Aider-inspired propagation, NOT Aider or resolved Rust symbols.
+                    // Rebuild explicit crate::<file>:: heuristic edges from current source.
+                    let edges: BTreeMap<_, Vec<_>> = candidates
+                        .keys()
+                        .map(|path| {
+                            let source = fs::read_to_string(dir.path().join(path)).unwrap();
+                            let targets = candidates
+                                .keys()
+                                .filter(|target| {
+                                    source.contains(&format!(
+                                        "crate::{}::",
+                                        target.trim_end_matches(".rs")
+                                    ))
+                                })
+                                .cloned()
+                                .collect();
+                            (path.clone(), targets)
+                        })
+                        .collect();
+                    for _ in 0..8 {
+                        let mut next: BTreeMap<_, _> = seeds
+                            .iter()
+                            .map(|(path, score)| (path.clone(), score * 0.15))
+                            .collect();
+                        for (path, targets) in &edges {
+                            if targets.is_empty() {
+                                *next.get_mut(path).unwrap() += 0.85 * scores[path];
+                            } else {
+                                for target in targets {
+                                    *next.get_mut(target).unwrap() +=
+                                        0.85 * scores[path] / targets.len() as f64;
+                                }
+                            }
+                        }
+                        scores = next;
+                    }
+                }
+                let mut ranked: Vec<_> = candidates.values().copied().collect();
+                ranked.sort_by(|a, b| {
+                    scores[&b.path]
+                        .total_cmp(&scores[&a.path])
+                        .then(a.path.cmp(&b.path))
+                });
+                let rows: Vec<_> = ranked
+                    .into_iter()
+                    .take(2)
+                    .map(|hit| {
+                        assert!(hit.verify_current(), "stale evidence must be withheld");
+                        json!({"path":hit.path,"start":hit.start,"end":hit.end,
+                        "source_sha256":hit.source_sha256,"snippet":hit.snippet,
+                        "via":if graph { "experimental-static-dependency" } else { "lexical" }})
+                    })
+                    .collect();
+                elapsed.push(started.elapsed().as_secs_f64() * 1000.0);
+                let found = gold
+                    .iter()
+                    .filter(|path| rows.iter().any(|r| &r["path"] == *path))
+                    .count();
+                let bytes = serde_json::to_vec(&rows).unwrap().len();
+                last = json!({"query":case["query"],"ranking":if graph {"graph"} else {"lexical"},
+                    "recall_at_2":found as f64 / gold.len() as f64,
+                    "all_gold_at_2":found == gold.len(),"bytes":bytes,
+                    "estimated_tokens":bytes.div_ceil(4),"rows":rows});
+            }
+            elapsed.sort_by(f64::total_cmp);
+            last["p50_ms"] = json!(elapsed[9]);
+            last["p95_ms"] = json!(elapsed[18]);
+            println!("RETRIEVAL_GRAPH {last}");
+        }
+    }
+    let stale = retrieve(&ws, &json!({"query":"backoff_delay"}), false).unwrap();
+    assert!(stale.results.iter().any(|h| h.path == "clock.rs"));
+    fs::write(dir.path().join("clock.rs"), "pub fn changed() {}\n").unwrap();
+    assert!(
+        stale
+            .results
+            .iter()
+            .filter(|h| h.path == "clock.rs")
+            .all(|h| !h.verify_current())
+    );
+}

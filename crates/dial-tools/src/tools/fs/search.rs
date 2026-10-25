@@ -36,6 +36,8 @@ const GREP_PER_FILE: usize = 20;
 const PARALLEL_BATCH: usize = 64;
 const PARALLEL_MIN_FILES: usize = 16;
 const MAX_GREP_WORKERS: usize = 8;
+/// At most 16 MiB of speculative file buffers, independent of host CPU count.
+const PREFETCH_FILES: usize = 4;
 const GREP_WITNESS_WARNING: &str = "[edit witnesses: some observed files changed or could not be verified; no new edit authority was recorded for those files]\n";
 /// Appended to a capped `lines` page: a summary page names every matching file far more cheaply.
 const GREP_FILES_HINT: &str = "; output=\"files\" lists matching files with match counts";
@@ -157,12 +159,13 @@ fn read_file(path: &Path, bytes: &mut Vec<u8>) -> Read {
     Read::Text(bytes.len() as u64)
 }
 
-/// A file examined by a worker thread. `found` is the match test (`lines` pages: 0 or 1) or the
-/// match count (summary pages); row rendering re-reads only the files that matched.
+/// A file examined by a worker thread. Matching line-mode bytes remain the exact
+/// observation used for rendering; final witness publication still checks freshness.
 struct Probed {
     stat: Stat,
     read: Option<Read>,
     found: Option<usize>,
+    source: Vec<u8>,
 }
 
 fn probe(
@@ -178,6 +181,7 @@ fn probe(
             stat,
             read: None,
             found: None,
+            source: Vec::new(),
         };
     }
     let mut data = Vec::new();
@@ -193,6 +197,11 @@ fn probe(
         stat,
         read: Some(read),
         found,
+        source: if mode == OutputMode::Lines && found == Some(1) {
+            data
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -711,6 +720,9 @@ struct GrepState {
     oversized: usize,
     binary: usize,
     bytes: u64,
+    /// Search reads, including speculative files not emitted. Excludes witness validation.
+    #[cfg(test)]
+    read_bytes: u64,
     context_capped: usize,
     line_starts: Vec<usize>,
     files: Vec<GrepFile>,
@@ -848,58 +860,83 @@ impl GrepState {
             return;
         }
         let (stat, read, found) = match probed {
-            Some(probed) => (probed.stat, probed.read, probed.found),
+            Some(probed) => {
+                *bytes = probed.source;
+                (probed.stat, probed.read, probed.found)
+            }
             None => (stat_file(ws, path), None, None),
         };
         let Some(partial) = self.admit(path, &stat) else {
             return;
         };
-        // A worker's read stands when it failed, was binary, or needs no rows rendered from it.
-        let read = match read {
-            Some(read @ (Read::Failed(_) | Read::Binary(_))) => read,
-            Some(read @ Read::Text(_)) if self.mode != OutputMode::Lines || found == Some(0) => {
-                read
+        // Probes own the observation: never reopen matching files to render a different revision.
+        let read = read.unwrap_or_else(|| {
+            let read = read_file(path, bytes);
+            #[cfg(test)]
+            {
+                self.read_bytes += match &read {
+                    Read::Failed(n) | Read::Binary(n) | Read::Text(n) => *n,
+                };
             }
-            _ => read_file(path, bytes),
-        };
+            read
+        });
         self.absorb(ws, path, partial, read, found, bytes);
     }
 
     /// Search a batch in walk order, probing it on worker threads when it is large enough to pay
     /// for them. Only reading and matching run concurrently; everything that decides the page
-    /// (budgets, skips, caps, cursors, output order) stays sequential. Returns `Some(overran)`
-    /// when a file ended the page, `overran` saying files after it had already been handed over.
+    /// (budgets, skips, caps, cursors, output order) stays sequential.
     fn search_batch(
         &mut self,
         ws: &Workspace,
         batch: &mut Vec<PathBuf>,
         bytes: &mut Vec<u8>,
         workers: usize,
-    ) -> Option<bool> {
+    ) {
         let paths = std::mem::take(batch);
-        let mut probes = if workers > 1 && paths.len() >= PARALLEL_MIN_FILES {
-            probe_all(
-                ws,
-                &paths,
-                workers,
-                &self.matcher,
-                self.multiline,
-                self.mode,
-            )
-            .into_iter()
-            .map(Some)
-            .collect()
-        } else {
-            Vec::new()
-        };
-        probes.resize_with(paths.len(), || None);
-        for (index, (path, probed)) in paths.iter().zip(probes).enumerate() {
-            self.search_file(ws, path, bytes, probed);
-            if self.next.is_some() {
-                return Some(index + 1 < paths.len());
+        let parallel = workers > 1 && paths.len() >= PARALLEL_MIN_FILES;
+        let mut index = 0;
+        while index < paths.len() {
+            // Reserve a full read per admitted file, even if it grows after stat.
+            // Settle this microbatch before reserving more. Discarded probes at an
+            // output stop are thus bounded by the same remaining search budget.
+            let slots = ((MAX_GREP_BYTES - self.bytes) / MAX_GREP_FILE) as usize;
+            let count = if parallel {
+                slots.min(PREFETCH_FILES)
+            } else {
+                0
+            }
+            .min(paths.len() - index);
+            let probes = if count > 1 {
+                probe_all(
+                    ws,
+                    &paths[index..index + count],
+                    workers,
+                    &self.matcher,
+                    self.multiline,
+                    self.mode,
+                )
+                .into_iter()
+                .map(Some)
+                .collect::<Vec<_>>()
+            } else {
+                vec![None]
+            };
+            #[cfg(test)]
+            for probe in probes.iter().flatten() {
+                self.read_bytes += match &probe.read {
+                    Some(Read::Failed(n) | Read::Binary(n) | Read::Text(n)) => *n,
+                    None => 0,
+                };
+            }
+            for probed in probes {
+                self.search_file(ws, &paths[index], bytes, probed);
+                index += 1;
+                if self.next.is_some() {
+                    return;
+                }
             }
         }
-        None
     }
 
     /// Account for a file's content (`bytes`) and, when it can contribute, search it.
@@ -1609,94 +1646,98 @@ fn grep_with_workers(ws: &Workspace, args: &Value, workers: usize) -> Result<Str
     let skip = opt_u64(args, "skip")?.unwrap_or(0);
     let hidden = bool_default(args, "hidden", true)?;
     let gitignore = bool_default(args, "gitignore", true)?;
-    // The parallel attempt batches files ahead of the walk. A page that ends inside a batch has
-    // already advanced the walk's counters past where a serial scan stops, so it is redone
-    // serially; every other page is identical by construction.
-    let attempt = |batched: bool| -> Result<Option<String>, String> {
-        let mut walk = SearchWalk::new(
+    // Batched discovery can walk beyond the page. Reconstruct only its coverage
+    // counters when needed, never repeat content reads or matching.
+    let batched = workers > 1;
+    let mut walk = SearchWalk::new(
+        ws,
+        hidden,
+        gitignore,
+        resume.as_ref().map(|(p, _)| p.clone()),
+    );
+    let mut state = GrepState {
+        matcher: matcher.clone(),
+        multiline,
+        context,
+        max_matches: max_matches as usize,
+        out: String::new(),
+        matches: 0,
+        skip,
+        resume: resume.clone(),
+        next: None,
+        scanned: 0,
+        unreadable: 0,
+        oversized: 0,
+        binary: 0,
+        bytes: 0,
+        #[cfg(test)]
+        read_bytes: 0,
+        context_capped: 0,
+        line_starts: Vec::new(),
+        files: Vec::new(),
+        file_matches: HashMap::new(),
+        matched_files: HashSet::new(),
+        page_matches: Vec::new(),
+        row_ends: Vec::new(),
+        blocked_row: false,
+        cap: None,
+        per_file,
+        capped_files: Vec::new(),
+        mode,
+        summary_files: 0,
+        summary_rows: Vec::new(),
+    };
+    let mut bytes = Vec::new();
+    let mut batch: Vec<PathBuf> = Vec::new();
+    let batch_size = if batched { PARALLEL_BATCH } else { 1 };
+    let workers = if batched { workers } else { 1 };
+    for root in &roots {
+        walk.run(root, &mut |path| {
+            if glob.as_ref().is_none_or(|g| g.matches(&ws.rel(path))) && !state.before_resume(path)
+            {
+                batch.push(path.to_path_buf());
+                if batch.len() >= batch_size {
+                    state.search_batch(ws, &mut batch, &mut bytes, workers);
+                }
+            }
+            state.next.is_none()
+        });
+        if state.next.is_none() {
+            state.search_batch(ws, &mut batch, &mut bytes, workers);
+        }
+        if state.next.is_some() || walk.next.is_some() {
+            break;
+        }
+    }
+    if batched && state.next.is_some() {
+        let stop = &state.next.as_ref().expect("overrun has a continuation").0;
+        walk = SearchWalk::new(
             ws,
             hidden,
             gitignore,
             resume.as_ref().map(|(p, _)| p.clone()),
         );
-        let mut state = GrepState {
-            matcher: matcher.clone(),
-            multiline,
-            context,
-            max_matches: max_matches as usize,
-            out: String::new(),
-            matches: 0,
-            skip,
-            resume: resume.clone(),
-            next: None,
-            scanned: 0,
-            unreadable: 0,
-            oversized: 0,
-            binary: 0,
-            bytes: 0,
-            context_capped: 0,
-            line_starts: Vec::new(),
-            files: Vec::new(),
-            file_matches: HashMap::new(),
-            matched_files: HashSet::new(),
-            page_matches: Vec::new(),
-            row_ends: Vec::new(),
-            blocked_row: false,
-            cap: None,
-            per_file,
-            capped_files: Vec::new(),
-            mode,
-            summary_files: 0,
-            summary_rows: Vec::new(),
-        };
-        let mut bytes = Vec::new();
-        let mut batch: Vec<PathBuf> = Vec::new();
-        let mut overran = false;
-        let batch_size = if batched { PARALLEL_BATCH } else { 1 };
-        let workers = if batched { workers } else { 1 };
+        let mut reached = false;
         for root in &roots {
             walk.run(root, &mut |path| {
-                if glob.as_ref().is_none_or(|g| g.matches(&ws.rel(path)))
-                    && !state.before_resume(path)
-                {
-                    batch.push(path.to_path_buf());
-                    if batch.len() >= batch_size
-                        && let Some(past) = state.search_batch(ws, &mut batch, &mut bytes, workers)
-                    {
-                        overran |= past;
-                    }
-                }
-                state.next.is_none()
+                reached = path == stop;
+                !reached
             });
-            if state.next.is_none()
-                && let Some(past) = state.search_batch(ws, &mut batch, &mut bytes, workers)
-            {
-                overran |= past;
-            }
-            if state.next.is_some() || walk.next.is_some() {
+            if reached || walk.next.is_some() {
                 break;
             }
         }
-        if overran {
-            return Ok(None);
-        }
-        let next = state
-            .next
-            .take()
-            .or_else(|| walk.next.clone().map(|p| (p, 0)));
-        let (coverage, complete) = (walk.coverage(), walk.is_complete());
-        Ok(Some(if mode == OutputMode::Lines {
-            state.finish(ws, next, &coverage, complete)?
-        } else {
-            state.finish_summary(ws, next, &coverage, complete)?
-        }))
-    };
-    if workers > 1
-        && let Some(page) = attempt(true)?
-    {
-        return Ok(page);
     }
-    attempt(false)?.ok_or_else(|| "serial grep scan overran its page".to_owned())
+    let next = state
+        .next
+        .take()
+        .or_else(|| walk.next.clone().map(|p| (p, 0)));
+    let (coverage, complete) = (walk.coverage(), walk.is_complete());
+    if mode == OutputMode::Lines {
+        state.finish(ws, next, &coverage, complete)
+    } else {
+        state.finish_summary(ws, next, &coverage, complete)
+    }
 }
 
 #[cfg(test)]

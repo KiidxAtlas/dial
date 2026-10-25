@@ -421,34 +421,54 @@ fn verify(
             !interrupt.load(Ordering::SeqCst),
             "candidate verification interrupted"
         );
-        let result = std::thread::scope(|scope| {
-            let (send, receive) = std::sync::mpsc::channel();
-            scope.spawn(move || {
-                let result = crate::tools::exec::shell::bash_tool_streaming(
-                    &workspace,
-                    &json!({"command":check.command}),
-                    check.timeout_secs,
-                    &|_| {},
-                    interrupt,
-                );
-                let _ = send.send(result);
-            });
-            loop {
-                match receive.recv_timeout(std::time::Duration::from_millis(100)) {
-                    Ok(result) => break result.map_err(anyhow::Error::msg),
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => ui.heartbeat(),
-                    Err(error) => {
-                        break Err(anyhow::anyhow!("candidate verifier disconnected: {error}"));
-                    }
-                }
-            }
-        })?;
+        let result = run_isolated(
+            &workspace,
+            &check.command,
+            check.timeout_secs,
+            interrupt,
+            ui,
+        )?;
         let ok = !result.is_error && verification::exit_code(&result.text) == Some(0);
         passed &= ok;
         evidence.push(json!({"command":check.command,"passed":ok,"output":subagents::clip(&result.text, 2000)}));
     }
     ensure!(passed, "explicit checks failed: {}", json!(evidence));
     Ok(evidence)
+}
+
+/// Run `command` through the sandboxed shell in an isolated `workspace` copy, keeping the UI
+/// alive with heartbeats. Shared by candidate verification and counterfactual focused checks.
+pub(in crate::agent) fn run_isolated(
+    workspace: &Workspace,
+    command: &str,
+    timeout_secs: u64,
+    interrupt: &std::sync::atomic::AtomicBool,
+    ui: &mut dyn Ui,
+) -> Result<ToolOutput> {
+    std::thread::scope(|scope| {
+        let (send, receive) = std::sync::mpsc::channel();
+        scope.spawn(move || {
+            let result = crate::tools::exec::shell::bash_tool_streaming(
+                workspace,
+                &json!({"command":command}),
+                timeout_secs,
+                &|_| {},
+                interrupt,
+            );
+            let _ = send.send(result);
+        });
+        loop {
+            match receive.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(result) => break result.map_err(anyhow::Error::msg),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => ui.heartbeat(),
+                Err(error) => {
+                    break Err(anyhow::anyhow!(
+                        "isolated check runner disconnected: {error}"
+                    ));
+                }
+            }
+        }
+    })
 }
 
 pub(in crate::agent) fn confined_destination(root: &Path, relative: &Path) -> Result<PathBuf> {

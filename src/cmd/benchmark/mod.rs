@@ -6,12 +6,15 @@ use anyhow::{Context, Result, bail, ensure};
 use dial::{
     benchmark::{
         AssistanceOverrides, BenchmarkProfile, BenchmarkReport, BenchmarkSuite, CommandCheck,
-        EfficiencyOverrides, MachineBenchmarkPolicy, MachineBenchmarkReport, MachineConfiguration,
-        MachineConfigurationReport, MachineIdentity, PolicyOverrides, RunMetrics, clone_project,
-        compare_baseline, named_invalid_runs, rank_machine_configurations, score_report,
+        EfficiencyOverrides, ExperimentalOverrides, MachineBenchmarkPolicy, MachineBenchmarkReport,
+        MachineConfiguration, MachineConfigurationReport, MachineIdentity, PolicyOverrides,
+        RunMetrics, clone_project, compare_baseline, named_invalid_runs,
+        rank_machine_configurations, score_report,
     },
     config::paths::Layout,
-    config::types::{Approval, Config, EditMode, LEAN_AUTO_MAX_WINDOW, LeanLocal, SandboxMode},
+    config::types::{
+        Approval, Config, EditMode, LEAN_AUTO_MAX_WINDOW, LeanLocal, ReproFirst, SandboxMode,
+    },
     runtime::tool_output::ToolOutput,
     tools::{self, Workspace},
 };
@@ -417,6 +420,7 @@ fn assist_configurations(
         efficiency: efficiency.clone(),
         policy: shipped_policy(&shipped),
         integration: Default::default(),
+        experimental: Default::default(),
         draft_model: None,
         num_draft_tokens: None,
         kv_bits: None,
@@ -442,6 +446,31 @@ fn assist_configurations(
         } else {
             variant.policy.review_enabled = Some(true);
         }
+        configurations.push(variant);
+    }
+    // One row per experimental workflow switch, each a single change from `dial`.
+    let experiments: [(&str, fn(&mut ExperimentalOverrides)); 7] = [
+        ("enable-fault_witness", |e| e.fault_witness = Some(true)),
+        ("enable-repro_first_advise", |e| {
+            e.repro_first = Some(ReproFirst::Advise)
+        }),
+        ("enable-repro_first_gate", |e| {
+            e.repro_first = Some(ReproFirst::Gate)
+        }),
+        ("enable-edit_bisection", |e| e.edit_bisection_runs = Some(6)),
+        ("enable-outcome_gradient", |e| {
+            e.outcome_gradient_rounds = Some(3)
+        }),
+        ("enable-streaming_dispatch", |e| {
+            e.streaming_dispatch = Some(true)
+        }),
+        ("enable-check_predictions", |e| {
+            e.check_predictions = Some(true)
+        }),
+    ];
+    for (name, enable) in experiments {
+        let mut variant = machine(name.into(), dial.clone());
+        enable(&mut variant.experimental);
         configurations.push(variant);
     }
     configurations
@@ -839,6 +868,29 @@ fn apply_efficiency(config: &mut Config, overrides: &EfficiencyOverrides) {
     }
 }
 
+/// Applies per-configuration experimental switches on top of the user's config; unset fields keep it.
+fn apply_experimental(config: &mut Config, overrides: &ExperimentalOverrides) {
+    let experimental = &mut config.experimental;
+    if let Some(value) = overrides.fault_witness {
+        experimental.fault_witness = value;
+    }
+    if let Some(value) = overrides.repro_first {
+        experimental.repro_first = value;
+    }
+    if let Some(value) = overrides.edit_bisection_runs {
+        experimental.edit_bisection_runs = value;
+    }
+    if let Some(value) = overrides.outcome_gradient_rounds {
+        experimental.outcome_gradient_rounds = value;
+    }
+    if let Some(value) = overrides.streaming_dispatch {
+        experimental.streaming_dispatch = value;
+    }
+    if let Some(value) = overrides.check_predictions {
+        experimental.check_predictions = value;
+    }
+}
+
 /// Use the shared config serializer/validator as the authority for policy semantics. This overlay
 /// also keeps the benchmark independent of the concrete review type's module location.
 fn apply_policy(config: &mut Config, overrides: &PolicyOverrides) -> Result<()> {
@@ -973,6 +1025,7 @@ fn select_configuration(
     selected.harness.max_steps = selected.harness.capped_steps(24);
     apply_assistance(&mut selected, &requested.assistance);
     apply_efficiency(&mut selected, &requested.efficiency);
+    apply_experimental(&mut selected, &requested.experimental);
     apply_policy(&mut selected, &requested.policy)?;
     apply_local_runtime(&mut selected, requested)?;
     let mut quantization = serde_json::Value::Null;
@@ -1079,6 +1132,7 @@ fn select_configuration(
         "model_roles": if selected.verification.review.enabled { "coach:selected_model_only" } else { "disabled" },
         "assistance": assistance_settings(&selected),
         "efficiency": efficiency_settings(&selected),
+        "experimental": selected.experimental,
         "policy_contract_version": 1,
         "policy": shipped_policy(&selected),
         "policy_sha256": format!("{:x}", Sha256::digest(serde_json::to_vec(&shipped_policy(&selected))?)),

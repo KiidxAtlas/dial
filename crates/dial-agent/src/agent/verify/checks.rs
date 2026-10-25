@@ -415,6 +415,14 @@ impl<'a> Agent<'a> {
         {
             self.step_checks.evidence.bind_inputs(check, before);
         }
+        let status = self.step_checks.evidence.latest_status(&check.command);
+        if !unverified
+            && let Some(status) = status
+            && let Some(line) = self.counterfactual_after_check(check, status, ui)
+        {
+            output.text.push('\n');
+            output.text.push_str(&line);
+        }
         output
     }
 
@@ -858,6 +866,11 @@ impl<'a> Agent<'a> {
         ) {
             return Err(reason);
         }
+        if !self.hermetic
+            && let Some(reason) = self.caller_obligation_blocker()
+        {
+            return Err(reason);
+        }
         Ok(())
     }
 
@@ -954,6 +967,8 @@ impl<'a> Agent<'a> {
             "checks": checks,
             "requirements": requirements,
             "uncheckpointed_effects": self.step_checks.has_uncheckpointed_operations(),
+            "caller_obligations": self.caller_obligations(),
+            "counterfactual_checks": self.step_checks.counterfactual.evidence(),
             "note": "Observed checks and delivered pixels are evidence, not independent proof of every requested behavior. Undeclared requirements remain unassessed, not complete."
         })
     }

@@ -110,6 +110,13 @@ pub(super) struct Snapshot {
     outlines: BTreeMap<String, String>,
 }
 
+impl Snapshot {
+    /// Digest observed during this bounded scan; absence is not evidence of freshness.
+    pub(super) fn digest(&self, path: &str) -> Option<&str> {
+        self.files.get(path).map(String::as_str)
+    }
+}
+
 impl Codebase {
     pub(super) fn finding_scope_status(
         conn: &Connection,

@@ -14,6 +14,7 @@ use crate::config::tools::{BUILTIN, EXTRA_TOOLS, default_tools};
 
 /// Flags accepted by `dial` for tools, system prompt, skills, rules, LSP, PTY and title.
 #[derive(Debug, Clone, Default, Args)]
+#[command(next_help_heading = crate::cli::help_heading::CONTEXT)]
 pub struct ToolFlagArgs {
     /// Restrict tools to a comma-separated list (names are normalized and deduplicated).
     #[arg(long, value_name = "CSV")]
@@ -22,7 +23,7 @@ pub struct ToolFlagArgs {
     #[arg(long)]
     pub no_tools: bool,
     /// Additional directory the agent may access. Repeatable.
-    #[arg(long = "add-dir", value_name = "DIR")]
+    #[arg(long = "add-dir", value_name = "DIR", help_heading = crate::cli::help_heading::SAFETY)]
     pub add_dir: Vec<PathBuf>,
     /// Replace the system prompt. A value containing a newline is literal text; otherwise it is a file path.
     #[arg(

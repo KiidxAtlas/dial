@@ -398,3 +398,113 @@ fn mutation_paths_accept_attached_roots_and_refuse_others() {
         .is_err()
     );
 }
+
+#[test]
+fn policy_explanations_follow_winning_precedence_without_grants() {
+    #[derive(Default)]
+    struct Observe(Vec<PolicyExplanation>);
+    impl Ui for Observe {
+        fn policy_explanation(&mut self, _: &str, _: &str, explanation: &PolicyExplanation) {
+            self.0.push(explanation.clone());
+        }
+    }
+    let call = bash("cargo test");
+    let root = Path::new("/p");
+    let rule = |effect| PermissionRule {
+        effect,
+        tool: "bash".into(),
+        command_prefix: vec!["cargo".into()],
+        paths: vec![],
+    };
+    for mode in [
+        Approval::Ask,
+        Approval::Write,
+        Approval::Auto,
+        Approval::Readonly,
+    ] {
+        for reverse in [false, true] {
+            let mut rules = vec![rule(Effect::Allow), rule(Effect::Deny)];
+            if reverse {
+                rules.reverse();
+            }
+            let mut ui = Observe::default();
+            assert!(matches!(
+                authorize(mode, &mut rules, root, &call, "", &mut ui),
+                Err(Denial::Rule)
+            ));
+            assert_eq!(ui.0.len(), 1);
+            assert_eq!(ui.0[0].reason, PolicyReason::DenyRule);
+            assert_eq!(ui.0[0].rule_scope, Some(rule(Effect::Deny).scope()));
+            assert_eq!(rules.len(), 2);
+        }
+    }
+    for (mode, reason, allowed) in [
+        (Approval::Auto, PolicyReason::AutomaticMode, true),
+        (Approval::Readonly, PolicyReason::ReadOnly, false),
+        (Approval::Write, PolicyReason::WorkspaceWrite, true),
+        (Approval::Ask, PolicyReason::OperatorDeny, false),
+    ] {
+        let mut ui = Observe::default();
+        let mut rules = vec![];
+        assert_eq!(
+            authorize(mode, &mut rules, root, &call, "", &mut ui).is_ok(),
+            allowed
+        );
+        assert_eq!(ui.0.last().unwrap().reason, reason);
+        assert!(rules.is_empty());
+    }
+    let mut ui = Observe::default();
+    let mut rules = vec![rule(Effect::Deny)];
+    let cancel = std::sync::atomic::AtomicBool::new(true);
+    assert!(matches!(
+        authorize_with_cancel(
+            Approval::Auto,
+            &mut rules,
+            root,
+            &call,
+            "",
+            &mut ui,
+            &cancel
+        ),
+        Err(Denial::User)
+    ));
+    assert_eq!(ui.0[0].reason, PolicyReason::Cancelled);
+    let encoded = serde_json::to_value(&ui.0[0]).unwrap();
+    assert_eq!(encoded["reason"], "cancelled");
+    assert!(encoded.get("rule_scope").is_none());
+}
+
+#[test]
+fn policy_prompt_and_cancelled_reusable_response_do_not_create_grants() {
+    struct Cancel<'a>(&'a std::sync::atomic::AtomicBool, Vec<PolicyReason>);
+    impl Ui for Cancel<'_> {
+        fn policy_explanation(&mut self, _: &str, _: &str, explanation: &PolicyExplanation) {
+            self.1.push(explanation.reason);
+        }
+        fn approve(&mut self, _: &str, summary: &str) -> Decision {
+            assert!(summary.contains("Policy: operator approval required"));
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+            Decision::AllowAlways
+        }
+    }
+    let flag = std::sync::atomic::AtomicBool::new(false);
+    let mut ui = Cancel(&flag, vec![]);
+    let mut rules = vec![];
+    assert!(
+        authorize_with_cancel(
+            Approval::Ask,
+            &mut rules,
+            Path::new("/p"),
+            &bash("cargo test"),
+            "",
+            &mut ui,
+            &flag
+        )
+        .is_err()
+    );
+    assert!(rules.is_empty());
+    assert_eq!(
+        ui.1,
+        [PolicyReason::PromptRequired, PolicyReason::Cancelled]
+    );
+}

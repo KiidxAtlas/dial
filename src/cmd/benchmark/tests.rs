@@ -80,6 +80,7 @@ fn requested(model: &Path) -> MachineConfiguration {
         quantized_kv_start: None,
         efficiency: Default::default(),
         policy: Default::default(),
+        experimental: Default::default(),
         integration: Default::default(),
     }
 }
@@ -177,6 +178,7 @@ fn remote_inference_needs_explicit_opt_in() {
         quantized_kv_start: None,
         efficiency: Default::default(),
         policy: Default::default(),
+        experimental: Default::default(),
         integration: Default::default(),
     };
     let policy = MachineBenchmarkPolicy::default();
@@ -200,13 +202,13 @@ fn assist_variants_change_exactly_one_feature_from_dial() {
     let configurations = assist_configurations(&Config::default(), "openai", "model");
     let names: Vec<_> = configurations.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names[..2], ["raw", "dial"]);
-    assert_eq!(names.len(), 4 + ASSIST_VARIANTS.len());
+    assert_eq!(names.len(), 4 + ASSIST_VARIANTS.len() + 7);
     assert_eq!(configurations[1].assistance.lean_local, Some(LeanLocal::On));
-    let dial =
-        json!({"assistance": configurations[1].assistance, "policy": configurations[1].policy});
+    let sections = |c: &MachineConfiguration| json!({"assistance": c.assistance, "policy": c.policy, "experimental": c.experimental});
+    let dial = sections(&configurations[1]);
     for variant in &configurations[2..] {
-        let value = json!({"assistance": variant.assistance, "policy": variant.policy});
-        let changed = ["assistance", "policy"]
+        let value = sections(variant);
+        let changed = ["assistance", "policy", "experimental"]
             .iter()
             .map(|section| {
                 dial[section]
@@ -297,6 +299,7 @@ fn efficiency_overrides_stay_in_the_isolated_config_and_are_bounded() {
         kv_group_size: None,
         quantized_kv_start: None,
         policy: Default::default(),
+        experimental: Default::default(),
         integration: Default::default(),
     };
     let policy = MachineBenchmarkPolicy::default();

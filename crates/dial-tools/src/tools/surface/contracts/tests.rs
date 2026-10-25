@@ -262,6 +262,36 @@ fn check_history_before_repro_preserves_saved_calls_and_callback_catalogs() {
     }
 }
 
+/// `check.expect` comes and goes with `experimental.check_predictions`; history recorded on
+/// either side of the flag stays valid, while other changes are still refused.
+#[test]
+fn check_prediction_property_is_compatible_in_both_directions() {
+    let registry = Registry::new();
+    let mut with_expect = check_schema_with_repro();
+    with_expect["function"]["parameters"]["properties"]["expect"] = check_prediction_property();
+    let schemas = [
+        check_schema_before_repro(),
+        check_schema_with_repro(),
+        with_expect.clone(),
+    ];
+    for recorded in &schemas {
+        let old = identities(std::slice::from_ref(recorded), &registry)["check"].clone();
+        let history =
+            vec![json!({"role":"assistant","dial_tool_contracts":{"callback:check":old}})];
+        for current in [check_schema_with_repro(), with_expect.clone()] {
+            assert!(validate_history(&history, &[current], &registry).is_ok());
+        }
+    }
+    let old = identities(&[with_expect.clone()], &registry)["check"].clone();
+    let history = vec![json!({"role":"assistant","dial_tool_contracts":{"callback:check":old}})];
+    let mut changed = with_expect;
+    changed["function"]["parameters"]["properties"]["expect"]["enum"] = json!(["pass"]);
+    assert!(
+        validate_history(&history, &[changed], &registry).is_err(),
+        "a different expect shape is not the additive property"
+    );
+}
+
 #[test]
 fn check_repro_compatibility_rejects_nonadditive_contract_changes() {
     let registry = Registry::new();

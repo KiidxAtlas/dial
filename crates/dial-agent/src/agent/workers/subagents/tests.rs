@@ -110,7 +110,11 @@ fn synchronous_previews_retain_complete_single_and_batch_reports() {
     use base64::Engine;
     let config = config(&[]);
     let root = tempfile::tempdir().unwrap();
-    let store = crate::storage::artifact::ArtifactStore::new(root.path()).unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let workspace = crate::tools::Workspace::new(project.path())
+        .unwrap()
+        .with_artifacts(crate::storage::artifact::ArtifactStore::new(root.path()).unwrap());
+    let store = workspace.artifacts().unwrap();
     let report = format!("{}FINAL-EVIDENCE", "évidence ".repeat(4000));
     for batch in [false, true] {
         let args = if batch {
@@ -128,7 +132,7 @@ fn synchronous_previews_retain_complete_single_and_batch_reports() {
                 Some(outcome)
             })
             .collect();
-        let output = render(&request, outcomes, &BTreeMap::new(), Some(&store));
+        let output = render(&request, outcomes, &BTreeMap::new(), Some(&workspace));
         assert!(!output.is_error);
         assert!(
             output
@@ -169,19 +173,23 @@ fn synchronous_retention_failure_and_absence_preserve_full_typed_report() {
     let config = config(&[]);
     let request = parse(&json!({"task":"audit", "solution_space":"s"}), &config).unwrap();
     let root = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
     let store = crate::storage::artifact::ArtifactStore::new(root.path())
         .unwrap()
         .with_limits(&crate::storage::artifact::ArtifactConfig {
             max_bytes: 128,
             head_bytes: 64,
         });
+    let workspace = crate::tools::Workspace::new(project.path())
+        .unwrap()
+        .with_artifacts(store);
     let report = "é".repeat(20_000);
-    for artifacts in [None, Some(&store)] {
+    for workspace in [None, Some(&workspace)] {
         let output = render(
             &request,
             vec![Some(Outcome::failed(2, report.clone()))],
             &BTreeMap::new(),
-            artifacts,
+            workspace,
         );
         assert!(output.is_error);
         assert!(output.text.contains(&report));
@@ -189,7 +197,7 @@ fn synchronous_retention_failure_and_absence_preserve_full_typed_report() {
         assert_eq!(data["jobs"][0]["result"], report);
         assert!(data.get("artifact").is_none());
         assert!(data["jobs"][0].get("preview").is_none());
-        if artifacts.is_some() {
+        if workspace.is_some() {
             assert!(
                 data["artifact_error"]
                     .as_str()
@@ -812,14 +820,14 @@ fn handoff_state_valid_priority_json_and_explicit_overflow() {
 fn acceptance_projection_missing_ids_and_custom_payload() {
     let payload = json!({"custom":"legacy", "acceptance":{"acceptance_1":{"status":"met"}}});
     let before = payload.clone();
-    let projection = result_projection("done", Some(&payload), &["one".into(), "two".into()]);
+    let projection = result_projection("done", Some(&payload), &["one".into(), "two".into()], None);
     assert_eq!(projection["acceptance"]["acceptance_1"]["status"], "met");
     assert_eq!(
         projection["acceptance"]["acceptance_2"]["status"],
         "not_verified"
     );
     assert_eq!(payload, before);
-    let projection = result_projection("All done, success", None, &["one".into()]);
+    let projection = result_projection("All done, success", None, &["one".into()], None);
     assert_eq!(
         projection["acceptance"]["acceptance_1"]["status"],
         "not_verified"
@@ -827,9 +835,80 @@ fn acceptance_projection_missing_ids_and_custom_payload() {
 }
 
 #[test]
+fn evidence_audit_labels_references_and_downgrades_only_invalid_met_claims() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::create_dir(project.path().join("src")).unwrap();
+    std::fs::write(project.path().join("src/lib.rs"), "a\nb\nc\n").unwrap();
+    let artifacts = tempfile::tempdir().unwrap();
+    let store = crate::storage::artifact::ArtifactStore::new(artifacts.path()).unwrap();
+    let uri = store.retain("retained evidence").unwrap();
+    let workspace = crate::tools::Workspace::new(project.path())
+        .unwrap()
+        .with_artifacts(store);
+    let payload = json!({
+        "evidence_refs": ["src/lib.rs:2", "src/lib.rs:9-12", "src/gone.rs", uri, "artifact://missing", "ran the tests", "/etc/passwd"],
+        "acceptance": {
+            "acceptance_1": {"status":"met", "evidence":["src/gone.rs:3"]},
+            "acceptance_2": {"status":"met", "evidence":["src/lib.rs:1-3"]},
+            "acceptance_3": {"status":"met", "evidence":"src/gone.rs and friends"},
+            "acceptance_4": {"status":"unmet", "evidence":["src/gone.rs"]}
+        }
+    });
+    let before = payload.clone();
+    let acceptance: Vec<String> = (1..=4).map(|n| format!("item {n}")).collect();
+    let projection = result_projection("", Some(&payload), &acceptance, Some(&workspace));
+    assert_eq!(payload, before, "the worker payload is never modified");
+    let status = |reference: &str| {
+        projection["evidence_audit"]["refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["ref"] == reference)
+            .map(|entry| entry["status"].as_str().unwrap().to_owned())
+            .unwrap()
+    };
+    assert_eq!(status("src/lib.rs:2"), "valid");
+    assert_eq!(status("src/lib.rs:9-12"), "stale");
+    assert_eq!(status("src/gone.rs"), "invalid");
+    assert_eq!(status(&uri), "valid");
+    assert_eq!(status("artifact://missing"), "invalid");
+    assert_eq!(status("ran the tests"), "unparsed");
+    assert_eq!(status("/etc/passwd"), "invalid");
+    assert_eq!(status("src/lib.rs:1-3"), "valid");
+    let acceptance = &projection["acceptance"];
+    assert_eq!(acceptance["acceptance_1"]["status"], "not_verified");
+    assert_eq!(
+        acceptance["acceptance_1"]["basis"],
+        "cited_evidence_invalid"
+    );
+    assert_eq!(acceptance["acceptance_2"]["status"], "met");
+    // Prose cannot be checked, so the claim stays a worker claim.
+    assert_eq!(acceptance["acceptance_3"]["status"], "met");
+    // Never upgraded or changed when not claimed as met.
+    assert_eq!(acceptance["acceptance_4"]["status"], "unmet");
+    assert_eq!(
+        projection["evidence_audit"]["downgraded"],
+        json!(["acceptance_1"])
+    );
+    // Evidence lists stay as the worker reported them.
+    assert_eq!(projection["evidence_refs"][2], "src/gone.rs");
+    // Without a workspace (legacy derived projections) there is no audit.
+    assert!(
+        result_projection("", Some(&payload), &acceptance_ids(4), None)
+            .get("evidence_audit")
+            .is_none()
+    );
+}
+
+fn acceptance_ids(count: usize) -> Vec<String> {
+    (1..=count).map(|n| format!("item {n}")).collect()
+}
+
+#[test]
 fn sync_results_receive_separate_model_visible_acceptance_metadata() {
     for exact in [r#"{"value":7}"#, "independent findings"] {
-        let projection = result_projection("blocked: missing service", None, &["boundary".into()]);
+        let projection =
+            result_projection("blocked: missing service", None, &["boundary".into()], None);
         let output = ToolOutput {
             text: exact.into(),
             data: Some(
@@ -864,4 +943,90 @@ fn handoff_dedup_preserves_distinct_parent_constraints_and_explicit_inputs() {
     // The independent constraint field remains even if explicit context repeats it.
     assert!(brief.contains("\"constraints\":[\"Never edit auth\"]"));
     assert_eq!(brief.matches("Retain compatibility").count(), 1);
+}
+
+#[test]
+fn batch_controller_cancellation_reports_final_reason_and_rolls_back_grant() {
+    struct View {
+        interrupt: Arc<AtomicBool>,
+        reasons: Vec<approval::PolicyReason>,
+    }
+    impl Ui for View {
+        fn approve(&mut self, _: &str, _: &str) -> crate::agent::Decision {
+            self.interrupt.store(true, Ordering::SeqCst);
+            crate::agent::Decision::AllowAlways
+        }
+        fn policy_explanation(
+            &mut self,
+            _: &str,
+            _: &str,
+            explanation: &approval::PolicyExplanation,
+        ) {
+            self.reasons.push(explanation.reason);
+        }
+    }
+    for initially_cancelled in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(root.path()).unwrap();
+        let config = Config::default();
+        let ext = Registry::new();
+        let harness = Harness::default();
+        let interrupt = Arc::new(AtomicBool::new(initially_cancelled));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let env = Env {
+            config: &config,
+            workspace: &workspace,
+            ext: &ext,
+            layout: None,
+            harness: &harness,
+            interrupt: &interrupt,
+            usage: None,
+            context_cap: None,
+            memory: None,
+            plan_mode: false,
+            agents_messages: &[],
+        };
+        let mut ui = View {
+            interrupt: interrupt.clone(),
+            reasons: vec![],
+        };
+        let mut rules = vec![];
+        let mut cost = None;
+        let mut direct = Direct {
+            approval: Approval::Ask,
+            always: &mut rules,
+            root: workspace.root(),
+            extra_roots: &[],
+            layout: None,
+            plan_mode: false,
+            cost: &mut cost,
+            ui: &mut ui,
+        };
+        let (tx, rx) = mpsc::channel();
+        let (reply, answer) = mpsc::channel();
+        tx.send(Message::Approve {
+            call: ToolCall {
+                id: "batch-call".into(),
+                name: "write".into(),
+                arguments: json!({"path":"file", "content":"data"}),
+                malformed_arguments: false,
+            },
+            summary: "write".into(),
+            needs_approval: true,
+            cancel: cancel.clone(),
+            reply,
+        })
+        .unwrap();
+        drop(tx);
+        pump_messages(&rx, env, &[], &mut direct, &mut []);
+        assert!(matches!(answer.recv().unwrap(), Err(Denial::User)));
+        assert!(rules.is_empty());
+        assert!(cancel.load(Ordering::SeqCst));
+        assert_eq!(ui.reasons.last(), Some(&approval::PolicyReason::Cancelled));
+        if initially_cancelled {
+            assert_eq!(ui.reasons, [approval::PolicyReason::Cancelled]);
+        } else {
+            assert!(ui.reasons.contains(&approval::PolicyReason::OperatorAllow));
+        }
+    }
 }

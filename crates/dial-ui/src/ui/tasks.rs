@@ -65,20 +65,22 @@ pub fn step_detail(task: &Task) -> String {
     lines.join("\n\n")
 }
 
-/// Phase, reason, finding and evidence: what a step records beyond its text and status.
+/// Reason, finding, phase and evidence: what a step records beyond its text and status. The
+/// step-specific facts lead, so a plan row shows why a step is blocked before its (often
+/// shared) phase.
 fn recorded(task: &Task) -> Vec<String> {
     let mut lines = Vec::new();
-    if let Some(phase) = &task.phase {
-        lines.push(format!("Phase: {phase}"));
-    }
-    if task.investigation {
-        lines.push("Investigation: a question to resolve before implementation".into());
-    }
     if let Some(reason) = &task.note {
         lines.push(format!("Reason: {reason}"));
     }
     if let Some(finding) = &task.finding {
         lines.push(format!("Recorded finding: {finding}"));
+    }
+    if let Some(phase) = &task.phase {
+        lines.push(format!("Phase: {phase}"));
+    }
+    if task.investigation {
+        lines.push("Investigation: a question to resolve before implementation".into());
     }
     if !task.evidence.is_empty() {
         lines.push(format!("Recorded evidence:\n{}", task.evidence.join("\n")));

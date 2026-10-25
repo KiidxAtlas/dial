@@ -502,7 +502,7 @@ impl<'a> Agent<'a> {
                 "tts" => crate::voice::tool::schema(),
                 "todo" => crate::agent::workflow::todo::schema(),
                 "finish" => crate::agent::verify::completion::schema(),
-                "check" => crate::agent::verify::check_tool::schema(),
+                "check" => crate::agent::verify::check_tool::schema(self.config.experimental.check_predictions),
                 "revert_edit" => crate::agent::verify::revert_edit::schema(),
                 "goal" => modes::goal::schema(),
                 "ask" => crate::agent::workflow::questions::schema(),

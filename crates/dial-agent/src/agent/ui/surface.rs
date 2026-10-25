@@ -124,6 +124,14 @@ pub trait Ui {
         !self.interactive_input() && !cancel.load(Ordering::Acquire)
     }
     fn role(&mut self, _role: &str, _model: &str) {}
+    /// Observes a winning policy branch. This callback cannot grant permission.
+    fn policy_explanation(
+        &mut self,
+        _call_id: &str,
+        _tool: &str,
+        _explanation: &crate::agent::safety::approval::PolicyExplanation,
+    ) {
+    }
     fn approve(&mut self, _tool: &str, _summary: &str) -> Decision {
         Decision::Deny
     }

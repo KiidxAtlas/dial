@@ -3360,7 +3360,7 @@ fn the_queue_footer_keeps_its_keys_before_the_management_command_when_narrow() {
     let submit = env.keys.label(Action::Submit);
     let rows = screen(&c, &env, 40).join("\n");
     assert!(rows.contains(&format!("{submit} stop or keep")), "{rows}");
-    assert!(rows.contains("queued to send after turn: later"), "{rows}");
+    assert!(rows.contains("Queued  send after turn  “later”"), "{rows}");
 }
 
 #[test]
@@ -3386,14 +3386,18 @@ fn explicit_steer_is_separate_from_the_queue_and_reports_stages() {
         c.take_steering().is_empty(),
         "automatic routing does not see it"
     );
-    assert!(screen(&c, &env, 100).join("\n").contains("steer pending"));
+    let pending = screen(&c, &env, 100).join("\n");
+    assert!(
+        pending.contains("Steer  pending · acts at the next safe point  “use the v2 API”"),
+        "{pending}"
+    );
     assert_eq!(c.take_explicit_steering(), ["use the v2 API"]);
     assert!(c.take_explicit_steering().is_empty());
     assert!(c.mark_explicit("use the v2 API", SteerStage::Received));
     assert!(
         screen(&c, &env, 100)
             .join("\n")
-            .contains("received: stale reply cancelled")
+            .contains("received · stale reply cancelled")
     );
     assert!(c.mark_explicit("use the v2 API", SteerStage::Applied));
     assert!(

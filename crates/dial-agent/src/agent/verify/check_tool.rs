@@ -22,8 +22,27 @@ const REPRO_PREFIX: &str = "repro: ";
 const REPRO_NAME_BYTES: usize = 64;
 const REPRO_COMMAND_BYTES: usize = 4000;
 
-pub(in crate::agent) fn schema() -> Value {
-    json!({"type":"function","function":{"name":NAME,"description":"Run focused checks selected for this turn and report statuses, commands and diagnostics. Passes count toward final verification. Default calls may reuse passing evidence only when complete operator-declared inputs are revalidated unchanged; reuse is labeled, not reported as a new execution. `names` forces execution of a subset; `failed_only` reruns code failures. `repro` registers and runs a bug reproduction (nonzero before the fix, zero after), approved like bash and rerun by the final gate; max 4 per turn, same name replaces. Behavioral credit requires observed failure before the fix and passing after it.","parameters":{"type":"object","properties":{"names":{"type":"array","maxItems":16,"items":{"type":"string"},"description":"Exact check names to execute; omit for all, allowing valid evidence reuse."},"failed_only":{"type":"boolean"},"repro":{"type":"object","properties":{"name":{"type":"string"},"command":{"type":"string","description":"Exits non-zero while the bug is present, zero once fixed."}},"required":["name","command"],"additionalProperties":false}},"additionalProperties":false}}})
+/// `predictions` adds the optional `expect` argument (`experimental.check_predictions`).
+pub(in crate::agent) fn schema(predictions: bool) -> Value {
+    let mut schema = json!({"type":"function","function":{"name":NAME,"description":"Run focused checks selected for this turn and report statuses, commands and diagnostics. Passes count toward final verification. Default calls may reuse passing evidence only when complete operator-declared inputs are revalidated unchanged; reuse is labeled, not reported as a new execution. `names` forces execution of a subset; `failed_only` reruns code failures. `repro` registers and runs a bug reproduction (nonzero before the fix, zero after), approved like bash and rerun by the final gate; max 4 per turn, same name replaces. Behavioral credit requires observed failure before the fix and passing after it.","parameters":{"type":"object","properties":{"names":{"type":"array","maxItems":16,"items":{"type":"string"},"description":"Exact check names to execute; omit for all, allowing valid evidence reuse."},"failed_only":{"type":"boolean"},"repro":{"type":"object","properties":{"name":{"type":"string"},"command":{"type":"string","description":"Exits non-zero while the bug is present, zero once fixed."}},"required":["name","command"],"additionalProperties":false}},"additionalProperties":false}}});
+    if predictions {
+        schema["function"]["parameters"]["properties"]["expect"] =
+            crate::tools::surface::contracts::check_prediction_property();
+    }
+    schema
+}
+
+/// Compare a declared `expect` with the observed outcome. `None` without a prediction (or when
+/// predictions are off) or when nothing ran to completion (cancelled).
+fn prediction(enabled: bool, args: &Value, all_passed: bool, cancelled: bool) -> Option<Value> {
+    let expected = args["expect"].as_str().filter(|_| enabled && !cancelled)?;
+    let expected_pass = match expected {
+        "pass" => true,
+        "fail" => false,
+        _ => return None,
+    };
+    let observed = if all_passed { "pass" } else { "fail" };
+    Some(json!({"expected":expected,"observed":observed,"matched":expected_pass == all_passed}))
 }
 
 /// The reproduction `args` asks to register, if any. Command text is untrusted model input; it
@@ -82,6 +101,13 @@ fn diagnostics(text: &str) -> String {
 
 impl Agent<'_> {
     pub(in crate::agent) fn check_tool(&mut self, args: &Value, ui: &mut dyn Ui) -> ToolOutput {
+        let predictions = self.config.experimental.check_predictions;
+        if predictions
+            && let Some(expect) = args.get("expect").filter(|value| !value.is_null())
+            && !matches!(expect.as_str(), Some("pass" | "fail"))
+        {
+            return ToolOutput::err("expect must be \"pass\" or \"fail\"");
+        }
         self.refresh_check_inputs();
         let mut names: Option<Vec<String>> = args["names"].as_array().map(|names| {
             names
@@ -168,6 +194,7 @@ impl Agent<'_> {
         let mut results = Vec::new();
         let mut text = Vec::new();
         let mut all_passed = true;
+        let mut cancelled = false;
         for check in &selected {
             let reused = names.is_none() && !failed_only && self.reuse_check(check);
             let (status, output) = if self.interrupt.load(Ordering::SeqCst) {
@@ -181,6 +208,7 @@ impl Agent<'_> {
                         .behavioral_checks
                         .contains(&check.name),
                 );
+                cancelled = true;
                 (CheckStatus::Cancelled, None)
             } else if reused {
                 (CheckStatus::Passed, None)
@@ -204,6 +232,7 @@ impl Agent<'_> {
                 text.push("  reused: declared inputs unchanged; not rerun".into());
             }
             if status != CheckStatus::Passed {
+                self.step_checks.reproduced |= status == CheckStatus::CodeFailed;
                 all_passed = false;
                 self.step_checks.failed_checks.push(check.clone());
                 if let Some(output) = &output {
@@ -254,11 +283,23 @@ impl Agent<'_> {
         if !limits.is_empty() {
             text.push(format!("Coverage gaps: {}", limits.join("; ")));
         }
+        let prediction = prediction(predictions, args, all_passed, cancelled);
+        if let Some(prediction) = &prediction
+            && prediction["matched"] == false
+        {
+            text.push(format!(
+                "Prediction mismatch: expected {}, observed {}. The model of the code that produced this prediction is wrong somewhere; find where before the next edit.",
+                prediction["expected"].as_str().unwrap_or_default(),
+                prediction["observed"].as_str().unwrap_or_default()
+            ));
+        }
+        let mut data = json!({"revision":self.step_checks.revision(),"results":results,"coverage_limits":limits});
+        if let Some(prediction) = prediction {
+            data["prediction"] = prediction;
+        }
         ToolOutput {
             execution: Default::default(),
-            data: Some(
-                json!({"revision":self.step_checks.revision(),"results":results,"coverage_limits":limits}),
-            ),
+            data: Some(data),
             text: text.join("\n"),
             is_error: !all_passed,
         }

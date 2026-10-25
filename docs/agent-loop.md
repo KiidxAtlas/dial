@@ -203,6 +203,24 @@ Semantic evidence retrieval limits contributions from any single file before glo
 candidate truncation. This keeps smaller candidate files eligible for semantic ranking;
 it remains bounded retrieval, not an exhaustive or resolved call-graph guarantee.
 
+Three verification aids are always on (not experimental):
+
+- **Caller obligations.** When a turn changes the header of a named declaration (function,
+  method, type), up to 20 files that mention that name as a whole word and were neither read nor
+  edited this turn are listed under `caller_obligations` in completion evidence. Mentions are
+  lexical, not resolved symbols, so the list is a review prompt, not proof that a caller is broken.
+  Short or very common names are skipped. Under `verification.strict_requirements`, open
+  obligations block completion; hermetic runs skip the scan.
+- **Empty-search memory.** When a local `grep` or `glob` returns no matches, the result names up
+  to three earlier empty searches from this turn in an overlapping scope, so the model widens or
+  changes approach instead of re-probing. Paged, remote and failed searches do not count, and the
+  memory clears whenever the workspace may have changed.
+- **Worker evidence audit.** A delegated job's handoff envelope gains `evidence_audit`: each cited
+  `path[:line[-end]]` reference is checked in the parent workspace as `valid`, `stale` (the file
+  exists but the lines do not), `invalid` or `unparsed`. An acceptance item reported `met` whose
+  every cited reference is invalid is downgraded to `not_verified` (`cited_evidence_invalid`).
+  This checks existence only, not content.
+
 ## Shared execution ownership
 
 `agent/engine.rs` owns the lifecycle driver used by parent and worker adapters, result settlement, output-length recovery, repetition checkpoints, unchanged-read reuse, narration progress, reply recovery, committed-content edit-loop steering, and the uncertain-effect stop boundary. `tools/execution.rs` owns native dispatch, pre-start cancellation, panic containment, and callback effect propagation. A callback tool cannot hide an uncertain nested result by catching its error or returning success; subsequent callbacks are refused.
@@ -639,6 +657,38 @@ each independently:
 - `experimental.profile_matching` exposes `model_profile` on a `task` call. The delegated call
   uses that named profile for all jobs in the call; only profiles already configured by the
   operator are accepted. This is explicit routing, not automatic benchmarking or model selection.
+- `experimental.fault_witness`: after a behavioral focused check (a related test or configured
+  command) passes on a turn with edits, it is rerun once per evidence revision in an isolated copy
+  with this turn's checkpointed changes reverted. The verdict (`fails_without_turn_changes`,
+  `passes_without_turn_changes` or `inconclusive`) is appended to the check output and recorded
+  under `counterfactual_checks` in completion evidence. A check that passes without the change
+  does not exercise it.
+- `experimental.edit_bisection_runs` (0–16, 0 = off): when a check that passed earlier this turn
+  fails after edits to two or more files, halves of those files are reverted to their content at
+  the last pass in isolated copies to name the file whose change broke it, within this many runs
+  (the first run confirms that reverting everything restores the pass).
+  Both counterfactual settings are evidence only: they never change check status or the real
+  workspace. Copies exclude dependency and build directories, so compiled checks rebuild from
+  cold, and shell effects outside checkpoints are not reverted.
+- `experimental.repro_first` (`off`, `advise`, `gate`): on a debugging task, the first edit to a
+  non-test, non-documentation source file before any reproduction failed this turn (a failing
+  `bash` test command or a `code_failed` `check`) gets a note (`advise`) or is refused once
+  (`gate`). It fires at most once per turn; the next attempt proceeds.
+- `experimental.outcome_gradient_rounds` (0–10, 0 = off): after this many consecutive checked
+  rounds with edits in which the error count (failing checks plus failing libtest, pytest, Go or
+  Jest tests) does not drop below its best, a loop note suggests changing hypothesis.
+- `experimental.check_predictions` adds an optional `expect` (`pass` or `fail`) to `check`. A
+  mismatch between prediction and outcome is reported in the result text and in
+  `data.prediction`; it does not change the check status. Sessions recorded with or without the
+  property resume under either setting.
+- `experimental.streaming_dispatch` starts parallel-safe reads while the reply is still streaming.
+  A call counts as complete once the stream moves to a later tool call, so the last call of a
+  reply gains nothing. Reads start only under the parallel-read admission (no hooks for the tool,
+  no deny rule, valid offered form, at most `task.max_concurrency` per request). A result is used
+  only for the identical call in a multi-call reply, after the ordinary admission runs again, and
+  only while every earlier call in the reply was itself a grouped read; otherwise it is discarded
+  and the call runs as usual. Off in single-call mode and hermetic runs. Background work that
+  changes files during streaming can make an early read older than a serial read would be.
 
 ## Human questions and investigation checkpoints
 

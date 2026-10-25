@@ -76,3 +76,55 @@ fn lock_root_waits_out_a_briefly_held_lock_but_not_a_held_one() {
     assert!(error.contains("another skill import is running"), "{error}");
     drop(second);
 }
+
+#[test]
+fn curated_workflows_roundtrip_as_portable_skills_and_protect_local_edits() {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/workflows");
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(project.path(), home.path().into()).unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let destination_home = tempfile::tempdir().unwrap();
+    let second = Layout::with_user_dir(destination.path(), destination_home.path().into()).unwrap();
+    for name in ["review", "pack-review"] {
+        let source = fixtures.join(name);
+        let original = fs::read(source.join(SKILL_FILE)).unwrap();
+        let preview = run(&layout, &source, Scope::Project, true, false)
+            .unwrap()
+            .join("\n");
+        assert!(preview.contains("Would import"), "{preview}");
+        let installed = layout.skills_dirs()[0].join(name);
+        assert!(!installed.exists());
+        let imported = run(&layout, &source, Scope::Project, false, false)
+            .unwrap()
+            .join("\n");
+        assert!(imported.contains("Imported"), "{imported}");
+        assert_eq!(fs::read(installed.join(SKILL_FILE)).unwrap(), original);
+        // Sharing a skill is copying its authored directory, not a learned-artifact pack.
+        let reimported = run(&second, &installed, Scope::Project, false, false)
+            .unwrap()
+            .join("\n");
+        assert!(reimported.contains("Imported"), "{reimported}");
+        assert_eq!(
+            fs::read(second.skills_dirs()[0].join(name).join(SKILL_FILE)).unwrap(),
+            original
+        );
+        let edited = format!(
+            "{}\nLocal review note.\n",
+            String::from_utf8(original).unwrap()
+        );
+        fs::write(installed.join(SKILL_FILE), &edited).unwrap();
+        let update = run(&layout, &source, Scope::Project, false, true)
+            .unwrap()
+            .join("\n");
+        assert!(update.contains("local changes"), "{update}");
+        assert_eq!(
+            fs::read_to_string(installed.join(SKILL_FILE)).unwrap(),
+            edited
+        );
+    }
+    let catalog = discover(&second);
+    for name in ["review", "pack-review"] {
+        assert!(catalog.iter().any(|skill| skill.name == name));
+    }
+}
