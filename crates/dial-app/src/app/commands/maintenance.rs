@@ -18,7 +18,15 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
+mod watch_launch;
+
 pub(super) const COMMANDS: &[CommandSpec] = &[
+    CommandSpec {
+        name: "watch",
+        description: "open live edits, errors and screenshots in a separate terminal pane",
+        args_hint: "",
+        subcommands: &[],
+    },
     CommandSpec {
         name: "advisor",
         description: "coach reviews each tool round and the final reply (on, completion, off, status)",
@@ -116,6 +124,7 @@ pub(super) fn run_live(
     args: &str,
 ) -> Option<Result<Step>> {
     let result = match name {
+        "watch" => watch(shell, app, args),
         "schedule" => schedule(shell, app, args),
         "gc" => gc(shell, app, args),
         "images" => images(shell, app, args),
@@ -125,6 +134,49 @@ pub(super) fn run_live(
         _ => return None,
     };
     Some(result.map(|()| Step::Done))
+}
+
+fn watch(shell: &mut Shell, app: &App, args: &str) -> Result<()> {
+    if !args.trim().is_empty() {
+        shell.note("Watch", "usage: /watch");
+        return Ok(());
+    }
+    crate::cli::watch::append(
+        &app.layout,
+        &shell.session_id,
+        crate::cli::watch::Event::Text {
+            title: "Dial live feed".into(),
+            body:
+                "Edits and language-server advisories appear here. Advisories are not verification."
+                    .into(),
+        },
+    )?;
+    let command = shlex::try_join([
+        std::env::current_exe()?.to_string_lossy().as_ref(),
+        "-C",
+        app.layout.project_root.to_string_lossy().as_ref(),
+        "watch",
+        &shell.session_id,
+    ])?;
+    // Keep the manual command available even if Automation is denied or the job slot is busy.
+    shell.note("Watch", format!("Run in another pane: {command}"));
+    match watch_launch::target() {
+        Ok(Some(session)) => {
+            spawn_job_streaming(
+                shell,
+                "Watch",
+                move |cancel, _progress| match watch_launch::launch(&session, &command, &cancel) {
+                    Ok(()) => Ok("Opened the live feed in an iTerm2 split.".into()),
+                    Err(error) => Ok(format!(
+                        "Could not open the iTerm2 split: {error:#}. Check macOS Automation permission for your terminal, or run in another pane: {command}"
+                    )),
+                },
+            )
+        }
+        Ok(None) => {}
+        Err(error) => shell.note("Watch", format!("Automatic split unavailable: {error:#}")),
+    }
+    Ok(())
 }
 
 /// `on`, `off` or a status request; an empty argument is a status request.

@@ -3,43 +3,10 @@ use std::fs::{DirBuilder, File, Metadata, OpenOptions};
 use std::io;
 use std::path::Path;
 
+mod reflink;
 mod rename;
+pub use reflink::{CopyCounts, copy_counts, copy_on_write};
 pub use rename::rename_noreplace;
-
-/// Native clone where supported; ordinary copying is the portable fallback.
-pub fn copy_on_write(source: &Path, dest: &Path) -> std::io::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        use std::{ffi::CString, os::unix::ffi::OsStrExt};
-        let source = CString::new(source.as_os_str().as_bytes())?;
-        let target = CString::new(dest.as_os_str().as_bytes())?;
-        if unsafe { libc::clonefile(source.as_ptr(), target.as_ptr(), 0) } == 0 {
-            return Ok(());
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::fd::AsRawFd;
-        let input = std::fs::File::open(source)?;
-        // An existing destination is replaced, as on macOS: `std::fs::copy` below overwrites.
-        if let Ok(output) = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(dest)
-            && unsafe {
-                libc::ioctl(
-                    output.as_raw_fd(),
-                    0x40049409 as libc::c_ulong,
-                    input.as_raw_fd(),
-                )
-            } == 0
-        {
-            std::fs::set_permissions(dest, input.metadata()?.permissions())?;
-            return Ok(());
-        }
-    }
-    std::fs::copy(source, dest).map(|_| ())
-}
 
 /// Open `path` with `options`, refusing a symbolic link (or, on Windows, a junction or other
 /// name-surrogate reparse point) as the final component. Unix: `O_NOFOLLOW | O_CLOEXEC`.

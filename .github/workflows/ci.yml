@@ -2,7 +2,11 @@ name: CI
 on:
   push:
     branches: [main]
+    # Documentation-only changes skip CI. Only root-level and docs/ Markdown is ignored: Markdown
+    # under crates/ is compiled in with include_str! and must still trigger builds.
+    paths-ignore: ['docs/**/*.md', '*.md', '.github/pull_request_template.md']
   pull_request:
+    paths-ignore: ['docs/**/*.md', '*.md', '.github/pull_request_template.md']
 
 permissions:
   contents: read
@@ -21,7 +25,7 @@ jobs:
         os: [macos-15, macos-15-intel, ubuntu-22.04]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install Linux sandbox
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y bubblewrap tmux
@@ -30,10 +34,10 @@ jobs:
         run: |
           command -v tmux || brew install tmux
           brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '22'
       - name: Test embedded driver contracts
@@ -41,7 +45,7 @@ jobs:
       - name: Install Rust
         # Honor rust-toolchain.toml instead of downloading an unrelated moving stable toolchain.
         run: rustup show active-toolchain
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: test-${{ matrix.os }}
       - name: Test terminal installer
@@ -86,13 +90,13 @@ jobs:
         run: cargo run --locked --profile ci --example runtime_baseline -- target/runtime-baseline.json
       - name: Preserve runtime baseline
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: runtime-baseline-${{ matrix.os }}
           path: target/runtime-baseline.json
       - name: Preserve terminal failure evidence
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: terminal-${{ matrix.os }}
           path: target/pty-captures
@@ -100,17 +104,17 @@ jobs:
     name: Clippy and dependency policy
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install pinned Rust and Clippy
         run: |
           rustup show active-toolchain
           rustup component add clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: lint
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D clippy::correctness -D clippy::suspicious
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check
           command-arguments: advisories licenses bans sources
@@ -119,8 +123,8 @@ jobs:
     name: Python tests
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
       - run: python -m pip install pytest fastapi==0.141.1 pydantic uvicorn
@@ -138,8 +142,8 @@ jobs:
       run:
         shell: ${{ matrix.shell }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
       - name: Test install.ps1
@@ -148,15 +152,15 @@ jobs:
     name: Windows Rust contract
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
       - name: Test contract runner selection and empty-filter rejection
         run: python scripts/test-windows-contract.py
       - name: Install pinned Rust
         run: rustup show active-toolchain
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: windows-contract
       # Focused native suite with a tracked exclusion list: scripts/windows-contract.txt.

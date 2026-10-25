@@ -358,6 +358,42 @@ fn goal_stops_with_budget_limit_message_when_the_budget_is_spent() {
 }
 
 #[test]
+fn a_blocked_turn_stops_goal_continuation_but_an_incomplete_one_continues() {
+    use crate::agent::TurnOutcome;
+    // Script exactly the expected requests: the fake server waits for every scripted one, and an
+    // unexpected extra request is refused once the scripts run out.
+    for (reply, expected) in [
+        ("Blocked: the API key is missing.", 1),
+        ("Incomplete: still need the key", 2),
+    ] {
+        let mut scripts = vec![sse_reply(reply)];
+        if expected == 2 {
+            scripts.push(sse_reply("continuing"));
+        }
+        let server = fake::serve(scripts);
+        let config = Config::default();
+        let dir = workspace();
+        let mut agent = new_agent(&config, &server.url, dir.path());
+        agent
+            .goal_mutate(|goal| goal.start("ship the parser", None))
+            .unwrap();
+        let report = agent.turn("begin", &mut NullUi).unwrap();
+        assert_eq!(
+            server.requests().len(),
+            expected,
+            "{reply}: a blocker waits for the human; an incomplete turn may continue"
+        );
+        if expected == 1 {
+            assert_eq!(report.outcome, TurnOutcome::Blocked);
+            assert_eq!(
+                agent.modes().goal.goal.clone().unwrap().status,
+                Status::Active
+            );
+        }
+    }
+}
+
+#[test]
 fn guided_goal_asks_questions_before_any_goal_exists() {
     let server = fake::serve(vec![
         sse_reply("What command proves success?"),

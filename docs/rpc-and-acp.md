@@ -4,7 +4,7 @@
 
 RPC query methods remain available during active turns; commands that mutate or interrupt the active conversation retain their turn semantics. ACP requests are served by one core worker that runs one turn at a time: a prompt for a session other than the active one is refused until the running turn ends, and the running turn is never cancelled on another session's behalf. ACP permission requests are sent to the client as `session/request_permission`. Client filesystem, terminal, auth, and MCP bridge methods are not implemented; ACP refuses them with `-32601` rather than executing them with ambient authority.
 
-The Rust RPC request/response types define the wire protocol; no generated JSON schema file is shipped. Print mode (`dial --print`) answers exactly one prompt per invocation: the positional words are joined with spaces and piped stdin is appended as context. It does not accept image attachments. Stdout is drained before exit. `stream-json` omits repeated full-history snapshots.
+[rpc-schema.json](rpc-schema.json) is a hand-maintained JSON Schema (draft 2020-12) of the plain `dial rpc` request, response and event frames; ACP uses JSON-RPC 2.0 and is not covered. Tests in `crates/dial-app/src/rpc/tests.rs` fail when its request methods, event names or limits drift from the implementation (method names are checked against the dispatch arms, event names against every emitted `"event"`). Print mode (`dial --print`) answers exactly one prompt per invocation: the positional words are joined with spaces and piped stdin is appended as context. It does not accept image attachments. Stdout is drained before exit. `stream-json` omits repeated full-history snapshots.
 
 ## Print mode and session automation
 
@@ -53,6 +53,16 @@ Approval responses must name the currently pending `approval_id`; future/stale/r
 The `approval` event carries `approval_id`, `tool`, `summary` and, when the request belongs to a call card, the call's `call_id`. `approval_resolved` (`approval_id`) follows once the request is decided, so clients can retire it.
 Abort and task messaging/cancellation remain usable while inference or an approval wait is active.
 Consumers must handle out-of-order response IDs and asynchronous events.
+
+### Ready frame
+
+The first event on every connection is `ready`. Besides `protocol_version` (the version this build speaks), `session_id`, `model`, `tools`, `image_input` and `question_input`, it carries what a client needs to negotiate and size its requests:
+
+- `supported_protocol_versions`: array of versions the server serves (currently `[1]`). Refuse to continue when none is one you implement.
+- `methods`: request methods this transport accepts. `capabilities`: the capability groups those methods belong to (`prompt`, `query`, `plan_mode`, `sessions`, `maintenance`, `context_seed`, `tasks`, `steering`, `abort`, `approvals`, `questions`, `live_voice`, `shutdown`). Over ACP the `questions` and `live_voice` groups are absent.
+- `limits`: `max_request_bytes` (1 MiB for RPC, 8 MiB for ACP; a longer line is drained and answered with an error), `max_pending_steering` (8), `max_seed_messages` (200), `max_seed_message_bytes` (1 MiB), `max_memory_command_bytes` (8192), `messages_page_default` (50), `messages_page_max` (500) and `tool_result_event_bytes` (24 KiB; `tool_result` event text is clipped, the model-visible result is not).
+
+All three are derived from the same constants the reader and handlers enforce.
 
 `dial acp` exposes the ACP initialize/session/prompt/cancel/permission/mode flow over bounded JSON-RPC
 stdio with streamed assistant/tool updates. Loaded sessions retain exclusive writer ownership; parked

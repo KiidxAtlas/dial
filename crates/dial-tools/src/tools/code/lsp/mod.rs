@@ -226,13 +226,16 @@ fn diagnostic_line(ws: &Workspace, path: &Path, item: &Value) -> String {
     )
 }
 
+/// First words of the advisory block [`new_errors_note`] appends to an edit result.
+const NEW_ERRORS_PREFIX: &str = "[LSP advisory, not verification] ";
+
 /// The advisory block appended to an edit result; empty when the edit added no errors.
 fn new_errors_note(errors: &[String], unknown_baseline: bool) -> String {
     if errors.is_empty() {
         return String::new();
     }
     let mut note = format!(
-        "[LSP advisory, not verification] {} new error(s) after this edit{}:\n",
+        "{NEW_ERRORS_PREFIX}{} new error(s) after this edit{}:\n",
         errors.len(),
         if unknown_baseline {
             " (file had no earlier diagnostics; some may predate the edit)"
@@ -252,6 +255,25 @@ fn new_errors_note(errors: &[String], unknown_baseline: bool) -> String {
         );
     }
     note
+}
+
+/// The new-error advisory [`writethrough`] appended to an edit result, read back from `text`: the
+/// count it announced and the `path:line:col: message` lines it listed (at most
+/// [`WRITE_DIAGNOSTICS_LINES`]). `None` when the result carries no such block.
+pub fn new_errors_in(text: &str) -> Option<(usize, Vec<&str>)> {
+    let mut lines = text.lines();
+    let count = lines.find_map(|line| {
+        line.strip_prefix(NEW_ERRORS_PREFIX)?
+            .split_once(" new error(s) after this edit")?
+            .0
+            .parse::<usize>()
+            .ok()
+    })?;
+    let listed = lines
+        .take_while(|line| !line.is_empty() && !line.starts_with("... "))
+        .take(WRITE_DIAGNOSTICS_LINES)
+        .collect();
+    Some((count, listed))
 }
 
 /// The tool bound to this workspace instance, if it is still alive.

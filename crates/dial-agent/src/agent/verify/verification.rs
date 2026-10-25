@@ -50,6 +50,7 @@ impl CheckStatus {
     }
 }
 
+#[cfg(test)]
 pub fn classify(
     check: &FocusedCheck,
     output: &crate::runtime::tool_output::ToolOutput,

@@ -10,25 +10,14 @@ pub(in crate::agent) struct CheckRun {
 }
 
 impl<'a> Agent<'a> {
-    /// Explicit contracts and known isolated built-in checks share the same conservative ledger.
-    /// Reproductions and arbitrary model shell calls never acquire a witness from command spelling.
-    fn check_inputs(
+    /// Capture a complete contract separately from whether a usable witness is available.
+    /// `Err` means a contract exists but could not be captured; `Ok(None)` is undeclared.
+    fn capture_check_inputs(
         &self,
         check: &verify::verification::FocusedCheck,
-    ) -> Option<verify::inputs::Snapshot> {
-        if self.plan_mode
-            || self.step_checks.evidence.is_repro(&check.command)
-            || !self.awaited_background_jobs().is_empty()
-        {
-            return None;
-        }
-        let jobs = self.live_tasks.status(None).ok()?;
-        if jobs
-            .as_array()?
-            .iter()
-            .any(|job| job["status"] == "running")
-        {
-            return None;
+    ) -> Result<Option<verify::inputs::Snapshot>, ()> {
+        if self.step_checks.evidence.is_repro(&check.command) {
+            return Ok(None);
         }
         let mut configured = self
             .config
@@ -37,30 +26,62 @@ impl<'a> Agent<'a> {
             .iter()
             .filter(|custom| custom.command == check.command || custom.name == check.name);
         if let Some(custom) = configured.next() {
+            let Some(contract) = self.config.verification.inputs.get(&check.name) else {
+                return Ok(None);
+            };
             if configured.next().is_some()
                 || custom.name != check.name
                 || custom.command != check.command
                 || custom.timeout_secs != check.timeout_secs
             {
-                return None;
+                return Err(());
             }
-            return verify::inputs::capture(
-                &self.workspace,
-                self.config.verification.inputs.get(&check.name)?,
-            );
+            return self.capture_check_inputs_when_idle(|| {
+                verify::inputs::capture(&self.workspace, contract)
+            });
         }
         let python = if self.config.python.is_file() {
             self.config.python.clone()
         } else {
             PathBuf::from("python3")
         };
-        let source = verify::verification::automatic_python_source(
+        let Some(source) = verify::verification::automatic_python_source(
             self.workspace.root(),
             &python,
             &self.config.verification.python_command,
             check,
-        )?;
-        verify::inputs::python_snapshot(&self.workspace, &source, &python)
+        ) else {
+            return Ok(None);
+        };
+        self.capture_check_inputs_when_idle(|| {
+            verify::inputs::python_snapshot(&self.workspace, &source, &python)
+        })
+    }
+
+    fn capture_check_inputs_when_idle(
+        &self,
+        capture: impl FnOnce() -> Option<verify::inputs::Snapshot>,
+    ) -> Result<Option<verify::inputs::Snapshot>, ()> {
+        if self.plan_mode || !self.awaited_background_jobs().is_empty() {
+            return Err(());
+        }
+        let jobs = self.live_tasks.status(None).map_err(|_| ())?;
+        if jobs
+            .as_array()
+            .ok_or(())?
+            .iter()
+            .any(|job| job["status"] == "running")
+        {
+            return Err(());
+        }
+        capture().map(Some).ok_or(())
+    }
+
+    fn check_inputs(
+        &self,
+        check: &verify::verification::FocusedCheck,
+    ) -> Option<verify::inputs::Snapshot> {
+        self.capture_check_inputs(check).ok().flatten()
     }
 
     pub(in crate::agent) fn reuse_check(
@@ -73,6 +94,11 @@ impl<'a> Agent<'a> {
             return false;
         }
         let Some(inputs) = self.check_inputs(check) else {
+            self.step_checks.evidence.validate_inputs(
+                &check.command,
+                None,
+                self.step_checks.revision(),
+            );
             return false;
         };
         self.step_checks
@@ -101,6 +127,16 @@ impl<'a> Agent<'a> {
         call: &ToolCall,
         output: &ToolOutput,
         ui: &mut dyn Ui,
+    ) {
+        self.note_verification_verdict(call, output, ui, None);
+    }
+
+    fn note_verification_verdict(
+        &mut self,
+        call: &ToolCall,
+        output: &ToolOutput,
+        ui: &mut dyn Ui,
+        override_verdict: Option<verify::verification::CheckStatus>,
     ) {
         let Some(command) = call.arguments["command"].as_str() else {
             return;
@@ -143,14 +179,16 @@ impl<'a> Agent<'a> {
                 })
             });
         // Share the verdict and runner context used by focused-check diagnostics.
-        let verdict = crate::agent::verify::verification::classify_with_runner(
-            check.as_ref(),
-            configured
-                .and_then(|check| self.config.verification.runners.get(&check.name))
-                .map(|runner| (runner.program.as_str(), runner.module.as_deref())),
-            output,
-            self.interrupt.load(Ordering::SeqCst),
-        );
+        let verdict = override_verdict.unwrap_or_else(|| {
+            crate::agent::verify::verification::classify_with_runner(
+                check.as_ref(),
+                configured
+                    .and_then(|check| self.config.verification.runners.get(&check.name))
+                    .map(|runner| (runner.program.as_str(), runner.module.as_deref())),
+                output,
+                self.interrupt.load(Ordering::SeqCst),
+            )
+        });
         let exit = verdict.repair_exit_code(output);
         let passed = verdict == crate::agent::verify::verification::CheckStatus::Passed;
         self.step_checks.evidence.observe_with_fix_revision(
@@ -262,7 +300,7 @@ impl<'a> Agent<'a> {
         ui: &mut dyn Ui,
     ) -> ToolOutput {
         let args = json!({"command":check.command,"timeout":check.timeout_secs});
-        let inputs_before = self.check_inputs(check);
+        let inputs_before = self.capture_check_inputs(check);
         let revision_before = self.step_checks.revision();
         // Long generated commands (an interpreter path plus inline code) say nothing the check name does not.
         let title = if check.command.len() <= 80 {
@@ -305,7 +343,7 @@ impl<'a> Agent<'a> {
             Some(self.interrupt.as_ref()),
         );
         let started = Instant::now();
-        let output = match gate {
+        let mut output = match gate {
             Ok(persist) => {
                 if persist && let Err(error) = self.persist_permissions() {
                     ui.notice(&format!(
@@ -337,13 +375,28 @@ impl<'a> Agent<'a> {
                 crate::agent::safety::approval::denied_check_output(&check.name, &denial)
             }
         };
-        if inputs_before.is_none() && output.process_outcome().is_some_and(|p| p.started) {
+        let inputs_after = self.capture_check_inputs(check);
+        let inputs_stale = inputs_before.is_err()
+            || inputs_after.is_err()
+            || inputs_before != inputs_after
+            || (inputs_before.as_ref().is_ok_and(|inputs| inputs.is_some())
+                && self.step_checks.revision() != revision_before);
+        let unverified = inputs_stale && output.process_outcome().is_some_and(|p| p.started);
+        if unverified {
+            // Preserve process and effect facts: freshness is a verification verdict, not a
+            // claim that the subprocess failed, was cancelled, or had unknown effects.
+            output = output.with_status(crate::tools::ToolStatus::Error);
+            output.text.push_str("\n[Verification unverified: declared inputs changed during the check or could not be captured completely. Rerun against stable inputs; this result earns neither pass nor code-failure repair credit.]");
+        }
+        if !matches!(&inputs_before, Ok(Some(_)))
+            && output.process_outcome().is_some_and(|p| p.started)
+        {
             // Even harness-launched commands without a complete contract may change hidden inputs.
             self.step_checks.evidence.invalidate_inputs();
         }
         ui.tool_timing("bash", started.elapsed().as_secs_f64());
         ui.tool_result_with_id(&call_id, "bash", &output);
-        self.note_verification(
+        self.note_verification_verdict(
             &ToolCall {
                 id: format!("focused-check:{}", check.name),
                 name: "bash".into(),
@@ -352,10 +405,12 @@ impl<'a> Agent<'a> {
             },
             &output,
             ui,
+            unverified.then_some(verify::verification::CheckStatus::Unverified),
         );
         if self.step_checks.revision() == revision_before
-            && let Some(before) = inputs_before
-            && self.check_inputs(check).as_ref() == Some(&before)
+            && !unverified
+            && let Ok(Some(before)) = inputs_before
+            && inputs_after == Ok(Some(before.clone()))
         {
             self.step_checks.evidence.bind_inputs(check, before);
         }
@@ -602,12 +657,12 @@ impl<'a> Agent<'a> {
                         })
                     })
                     .map(|runner| (runner.program.as_str(), runner.module.as_deref()));
-            let status = crate::agent::verify::verification::classify_with_runner(
-                Some(check),
-                runner,
-                &output,
-                self.interrupt.load(Ordering::SeqCst),
-            );
+            // The focused runner applies freshness in addition to raw process classification.
+            let status = self
+                .step_checks
+                .evidence
+                .latest_status(&check.command)
+                .unwrap_or(crate::agent::verify::verification::CheckStatus::Unverified);
             results.push(json!({"name":check.name,"command":check.command,"status":status,"reused":false,"ran":true}));
             outcomes.push(crate::agent::verify::verification_receipts::Outcome {
                 name: check.name.clone(),

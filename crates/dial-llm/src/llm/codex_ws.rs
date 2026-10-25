@@ -98,8 +98,8 @@ impl Session {
 }
 static SESSIONS: LazyLock<Mutex<HashMap<String, Session>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-/// Socket keys whose server refused the WebSocket upgrade (404, 405, 426) or ended a response
-/// before completion. Like a session's `disableWebsocket`, they use SSE on later attempts.
+/// Socket keys whose server refused the WebSocket upgrade (404, 405, 426), ended a response
+/// before completion, or stalled. Like a session's `disableWebsocket`, they use SSE later.
 /// Other failures (including interruption, fatal events and steering errors) do not disable WS.
 static SSE_ONLY: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
@@ -490,6 +490,9 @@ pub(super) fn exchange(
             if error
                 .downcast_ref::<super::stream::IncompleteStream>()
                 .is_some()
+                || error
+                    .downcast_ref::<super::stream::StalledStream>()
+                    .is_some()
             {
                 // Never retry inline after callbacks: partial text/tool data belongs to the
                 // failed attempt. Only a subsequent exchange may select HTTP streaming.

@@ -2,7 +2,7 @@
 //! of a project.
 //!
 //! File layout (`<sessions_dir>/<ts>_<id>.jsonl`): the first line is a header
-//! `{type:"session", id, started, cwd, model, version}`; every further line is an entry
+//! `{type:"session", id, started, cwd, model, version, schema_version}`; every further line is an entry
 //! `{type:"message"|"compaction"|"meta", id, parent, ts, ...}`. The active branch is the parent
 //! chain of the *last* entry in the file, so branching (rewind) is just another appended line and
 //! no history is ever deleted.
@@ -250,6 +250,7 @@ const KNOWN_ENTRY_TYPES: &[&str] = &[
     "custom",
     "reset_boundary",
     "meta",
+    "label",
 ];
 
 #[derive(Debug, Clone)]
@@ -275,6 +276,11 @@ enum Kind {
         removed: usize,
     },
     Title(String),
+    /// A short user label on entry `target`; the latest label in file order wins, empty clears.
+    Label {
+        target: String,
+        label: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -512,7 +518,21 @@ fn session_files(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(names.into_iter().map(|n| dir.join(n)).collect())
 }
 
+/// Message key of the experimental turn optimizer. A drafted user message keeps
+/// `{"original": <typed text>}` here, while `content` holds the prompt the main model received.
+/// Like every `dial_*` key it never reaches a provider.
+pub const TURN_DRAFT_KEY: &str = "dial_turn_draft";
+
+/// The text the user typed for a message the turn drafter rewrote; `None` for any other message.
+pub fn typed_text(message: &Value) -> Option<&str> {
+    message.get(TURN_DRAFT_KEY)?.get("original")?.as_str()
+}
+
+/// Display and search text: what the user typed, not the drafted prompt sent in its place.
 fn content_text(message: &Value) -> String {
+    if let Some(typed) = typed_text(message) {
+        return typed.to_owned();
+    }
     match message.get("content") {
         Some(Value::String(s)) => s.clone(),
         Some(Value::Array(parts)) => parts
@@ -585,6 +605,9 @@ fn entry_json(e: &Entry, copied: bool) -> Value {
         }
         Kind::Title(title) => {
             json!({"type": "meta", "id": e.id, "parent": e.parent, "ts": e.ts, "kind": "title", "title": title})
+        }
+        Kind::Label { target, label } => {
+            json!({"type": "label", "id": e.id, "parent": e.parent, "ts": e.ts, "target": target, "label": label})
         }
         Kind::Compaction {
             summary,
@@ -673,6 +696,10 @@ fn parse_entry(v: &Value) -> Option<Entry> {
                     .to_owned(),
             }
         }
+        "label" => Kind::Label {
+            target: v.get("target")?.as_str()?.to_owned(),
+            label: v.get("label")?.as_str()?.to_owned(),
+        },
         "meta" if v["kind"] == "title" => Kind::Title(v["title"].as_str().unwrap_or("").to_owned()),
         "meta" => Kind::Meta {
             kind: v
@@ -777,6 +804,7 @@ impl Session {
             "type": "session", "id": id, "started": started,
             "cwd": origin.cwd.clone().unwrap_or_else(|| layout.project_root.clone()),
             "model": model, "version": env!("CARGO_PKG_VERSION"),
+            "schema_version": migrate::CURRENT_SCHEMA_VERSION,
         });
         if let Some(parent) = forked_from {
             header["forked_from"] = json!(parent);
@@ -927,6 +955,8 @@ impl Session {
             recovery: Vec::new(),
         };
         let mut header_id: Option<String> = None;
+        // A journal without a header marker is legacy (0); its records upgrade in memory.
+        let mut schema = 0u32;
         let mut saw_header = false;
         let mut buf = Vec::new();
         let mut ends_with_newline = true;
@@ -958,7 +988,7 @@ impl Session {
             if buf.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
-            let v = match serde_json::from_slice::<Value>(&buf) {
+            let mut v = match serde_json::from_slice::<Value>(&buf) {
                 Ok(v) => v,
                 Err(error) => {
                     s.recovery.push(issue(
@@ -971,6 +1001,8 @@ impl Session {
             if v.get("type").and_then(Value::as_str) == Some("session") {
                 if !saw_header && s.entries.is_empty() {
                     saw_header = true;
+                    schema = migrate::header_version(&v)
+                        .with_context(|| format!("session {}", path.display()))?;
                     header_id = v
                         .get("id")
                         .and_then(Value::as_str)
@@ -1004,6 +1036,7 @@ impl Session {
                 }
                 continue;
             }
+            migrate::upgrade_record(schema, &mut v);
             let Some(entry) = parse_entry(&v) else {
                 if let Some(kind) = v.get("type").and_then(Value::as_str)
                     && KNOWN_ENTRY_TYPES.contains(&kind)
@@ -1612,6 +1645,7 @@ impl Session {
             "started": self.started,
             "model": self.model,
             "version": env!("CARGO_PKG_VERSION"),
+            "schema_version": migrate::CURRENT_SCHEMA_VERSION,
         })];
         for &i in self.branch() {
             let entry = &self.entries[i];
@@ -1735,6 +1769,15 @@ impl Session {
                         .get("dial_child_original_response")
                         .filter(|original| matches!(role_of(original), "user" | "assistant"))
                         .unwrap_or(message);
+                    // Memory observes what the user typed, not the drafted prompt.
+                    if let Some(typed) = typed_text(original) {
+                        let mut typed_message = original.clone();
+                        typed_message["content"] = json!(typed);
+                        if let Some(object) = typed_message.as_object_mut() {
+                            object.remove(TURN_DRAFT_KEY);
+                        }
+                        return Some(typed_message);
+                    }
                     Some(original.clone())
                 }
                 _ => None,
@@ -2284,6 +2327,22 @@ impl Session {
     /// rewind removed from context) and the rewind marker, then rebuilds runtime. Callers guarantee
     /// `removed > 0`; a no-op rewind never reaches here.
     fn push_rewind_marker(&mut self, new_leaf: Option<String>, removed: usize) -> Result<()> {
+        ensure!(
+            new_leaf
+                .as_ref()
+                .is_none_or(|leaf| self.contains_branch_leaf(leaf)),
+            "rewind parent is outside the active branch"
+        );
+        self.commit_leaf_move(new_leaf, "rewind", removed)
+    }
+    /// Moves the leaf to `new_leaf` (any entry, or the root for `None`) by appending a control
+    /// snapshot of that point and a `kind` marker beneath it. `removed` must be positive.
+    fn commit_leaf_move(
+        &mut self,
+        new_leaf: Option<String>,
+        kind: &str,
+        removed: usize,
+    ) -> Result<()> {
         if removed == 0 {
             return Ok(());
         }
@@ -2293,19 +2352,14 @@ impl Session {
             .checked_add(1)
             .context("provider history generation exhausted; no rewind committed")?;
         // Restore the target branch's state, not obligations from the discarded turn.
-        let end = match new_leaf.as_ref() {
-            Some(leaf) => {
-                self.active
-                    .branch
-                    .iter()
-                    .position(|&i| self.entries[i].id == *leaf)
-                    .context("rewind parent is outside the active branch")?
-                    + 1
-            }
-            None => 0,
-        };
+        let target_path = self.ancestry(new_leaf.as_deref());
+        ensure!(
+            new_leaf.is_none() || !target_path.is_empty(),
+            "branch point {} is not in this session",
+            new_leaf.as_deref().unwrap_or("")
+        );
         let mut control = json!({});
-        for &i in self.active.branch.iter().take(end) {
+        for &i in &target_path {
             if let Kind::Message(message) = &self.entries[i].kind
                 && message["role"] == "dial_state"
             {
@@ -2324,7 +2378,7 @@ impl Session {
         }
         control["provider_identity"]["history_generation"] = json!(generation);
         let meta = Kind::Meta {
-            kind: "rewind".to_owned(),
+            kind: kind.to_owned(),
             removed,
         };
         if self.owns_journal() {
@@ -3870,6 +3924,9 @@ pub mod session_search_tool {
 }
 
 mod index;
+mod migrate;
+mod tree;
+pub use tree::{MAX_LABEL_CHARS, Navigation, TreeNode, TreeNodeKind};
 #[cfg(test)]
 mod tests;
 

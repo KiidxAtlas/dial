@@ -16,7 +16,7 @@ use regex::bytes::{Regex, RegexBuilder};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::Read;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 const DEFAULT_GREP_MATCHES: usize = 400;
@@ -32,6 +32,10 @@ const MAX_GREP_BYTES: u64 = 64 * 1024 * 1024;
 /// Matching lines one file may add to a page when `max_results` is defaulted. An explicit
 /// `max_results` lifts it; otherwise the rest of that file is named in the footer.
 const GREP_PER_FILE: usize = 20;
+/// Files handed to worker threads at a time, the smallest batch worth the threads, and their cap.
+const PARALLEL_BATCH: usize = 64;
+const PARALLEL_MIN_FILES: usize = 16;
+const MAX_GREP_WORKERS: usize = 8;
 const GREP_WITNESS_WARNING: &str = "[edit witnesses: some observed files changed or could not be verified; no new edit authority was recorded for those files]\n";
 /// Appended to a capped `lines` page: a summary page names every matching file far more cheaply.
 const GREP_FILES_HINT: &str = "; output=\"files\" lists matching files with match counts";
@@ -71,6 +75,159 @@ fn count_multiline(matcher: &Regex, bytes: &[u8]) -> usize {
         }
     }
     count
+}
+
+/// Matching lines of a file (or non-overlapping multiline matches), as a summary page counts them.
+fn match_count(matcher: &Regex, multiline: bool, bytes: &[u8]) -> usize {
+    if multiline {
+        count_multiline(matcher, bytes)
+    } else {
+        bytes
+            .split_inclusive(|&b| b == b'\n')
+            .filter(|raw| matcher.is_match(trim_eol(raw)))
+            .count()
+    }
+}
+
+/// Whether a `lines` page could show anything from the file: the same test the row search applies.
+fn any_match(matcher: &Regex, multiline: bool, bytes: &[u8]) -> bool {
+    if multiline {
+        matcher.is_match(bytes)
+    } else {
+        bytes
+            .split_inclusive(|&b| b == b'\n')
+            .any(|raw| matcher.is_match(trim_eol(raw)))
+    }
+}
+
+/// What looking at a path found, before any content is read.
+enum Stat {
+    /// Outside the workspace, a symlink or unreadable.
+    Unreadable,
+    /// Not a regular file (a directory entry changed since the walk).
+    NotFile,
+    /// A regular file; `partial` when it exceeds the per-file read limit.
+    File { partial: bool },
+}
+
+/// Confinement and type checks repeated immediately before opening a file.
+fn stat_file(ws: &Workspace, path: &Path) -> Stat {
+    if path.to_str().is_none()
+        || ws.resolve(&ws.rel(path)).is_err()
+        || fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+    {
+        return Stat::Unreadable;
+    }
+    match fs::metadata(path) {
+        Err(_) => Stat::Unreadable,
+        Ok(meta) if !meta.is_file() => Stat::NotFile,
+        Ok(meta) => Stat::File {
+            partial: meta.len() > MAX_GREP_FILE,
+        },
+    }
+}
+
+/// What reading a file's content produced; each carries the bytes read toward the byte budget.
+enum Read {
+    Failed(u64),
+    /// A NUL byte within the first 8 KiB.
+    Binary(u64),
+    Text(u64),
+}
+
+/// Read up to the per-file limit into `bytes`, probing the first 8 KiB for NUL bytes.
+fn read_file(path: &Path, bytes: &mut Vec<u8>) -> Read {
+    bytes.clear();
+    let Ok(mut file) = super::walk::open_search_file(path) else {
+        return Read::Failed(0);
+    };
+    let prefix = file.by_ref().take(8192).read_to_end(bytes);
+    if prefix.is_err() {
+        return Read::Failed(bytes.len() as u64);
+    }
+    if bytes.contains(&0) {
+        return Read::Binary(bytes.len() as u64);
+    }
+    let result = file
+        .take(MAX_GREP_FILE - bytes.len() as u64)
+        .read_to_end(bytes);
+    if result.is_err() {
+        return Read::Failed(bytes.len() as u64);
+    }
+    Read::Text(bytes.len() as u64)
+}
+
+/// A file examined by a worker thread. `found` is the match test (`lines` pages: 0 or 1) or the
+/// match count (summary pages); row rendering re-reads only the files that matched.
+struct Probed {
+    stat: Stat,
+    read: Option<Read>,
+    found: Option<usize>,
+}
+
+fn probe(
+    ws: &Workspace,
+    path: &Path,
+    matcher: &Regex,
+    multiline: bool,
+    mode: OutputMode,
+) -> Probed {
+    let stat = stat_file(ws, path);
+    if !matches!(stat, Stat::File { .. }) {
+        return Probed {
+            stat,
+            read: None,
+            found: None,
+        };
+    }
+    let mut data = Vec::new();
+    let read = read_file(path, &mut data);
+    let found = matches!(read, Read::Text(_)).then(|| {
+        if mode == OutputMode::Lines {
+            usize::from(any_match(matcher, multiline, &data))
+        } else {
+            match_count(matcher, multiline, &data)
+        }
+    });
+    Probed {
+        stat,
+        read: Some(read),
+        found,
+    }
+}
+
+/// Probe `paths` on up to `workers` threads; results come back in input order.
+fn probe_all(
+    ws: &Workspace,
+    paths: &[PathBuf],
+    workers: usize,
+    matcher: &Regex,
+    multiline: bool,
+    mode: OutputMode,
+) -> Vec<Probed> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let slots: Vec<std::sync::Mutex<Option<Probed>>> =
+        paths.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    std::thread::scope(|scope| {
+        for _ in 0..workers.min(paths.len()) {
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(path) = paths.get(index) else { break };
+                    let probed = probe(ws, path, matcher, multiline, mode);
+                    *slots[index].lock().unwrap_or_else(|e| e.into_inner()) = Some(probed);
+                }
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .unwrap_or_else(|e| e.into_inner())
+                .expect("every slot is filled before the workers join")
+        })
+        .collect()
 }
 
 fn bool_default(args: &Value, key: &str, default: bool) -> Result<bool, String> {
@@ -644,77 +801,144 @@ impl GrepState {
         Emitted::Shown
     }
 
-    fn search_file(&mut self, ws: &Workspace, path: &Path, bytes: &mut Vec<u8>) {
-        if self
-            .resume
+    /// True for a file the resumed page already covered: it does nothing, not even count.
+    fn before_resume(&self, path: &Path) -> bool {
+        self.resume
             .as_ref()
             .is_some_and(|(p, _)| path < p.as_path())
-        {
-            return;
-        }
-        let consumed = self
-            .resume
+    }
+
+    /// Matches of `path` already consumed by the previous page.
+    fn consumed_for(&self, path: &Path) -> usize {
+        self.resume
             .as_ref()
             .filter(|(p, _)| p == path)
-            .map_or(0, |(_, n)| *n);
-        // Repeat confinement validation immediately before opening, and reject symlinks.
-        if path.to_str().is_none()
-            || ws.resolve(&ws.rel(path)).is_err()
-            || fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
-        {
-            self.unreadable += 1;
+            .map_or(0, |(_, n)| *n)
+    }
+
+    /// Apply the outcome of looking at `path` and say whether its content is to be read. Unreadable
+    /// and non-regular files are settled here; a file that would pass the byte budget ends the page.
+    fn admit(&mut self, path: &Path, stat: &Stat) -> Option<bool> {
+        match stat {
+            Stat::Unreadable => {
+                self.unreadable += 1;
+                None
+            }
+            Stat::NotFile => None,
+            Stat::File { partial } => {
+                if self.bytes + MAX_GREP_FILE > MAX_GREP_BYTES {
+                    self.next = Some((path.to_path_buf(), self.consumed_for(path)));
+                    return None;
+                }
+                Some(*partial)
+            }
+        }
+    }
+
+    /// Search one file in walk order. `probed` is the worker-thread result for the same file when
+    /// the batch ran in parallel; the page accounting is identical either way.
+    fn search_file(
+        &mut self,
+        ws: &Workspace,
+        path: &Path,
+        bytes: &mut Vec<u8>,
+        probed: Option<Probed>,
+    ) {
+        if self.before_resume(path) {
             return;
         }
-        let meta = match fs::metadata(path) {
-            Ok(meta) => meta,
-            Err(_) => {
+        let (stat, read, found) = match probed {
+            Some(probed) => (probed.stat, probed.read, probed.found),
+            None => (stat_file(ws, path), None, None),
+        };
+        let Some(partial) = self.admit(path, &stat) else {
+            return;
+        };
+        // A worker's read stands when it failed, was binary, or needs no rows rendered from it.
+        let read = match read {
+            Some(read @ (Read::Failed(_) | Read::Binary(_))) => read,
+            Some(read @ Read::Text(_)) if self.mode != OutputMode::Lines || found == Some(0) => {
+                read
+            }
+            _ => read_file(path, bytes),
+        };
+        self.absorb(ws, path, partial, read, found, bytes);
+    }
+
+    /// Search a batch in walk order, probing it on worker threads when it is large enough to pay
+    /// for them. Only reading and matching run concurrently; everything that decides the page
+    /// (budgets, skips, caps, cursors, output order) stays sequential. Returns `Some(overran)`
+    /// when a file ended the page, `overran` saying files after it had already been handed over.
+    fn search_batch(
+        &mut self,
+        ws: &Workspace,
+        batch: &mut Vec<PathBuf>,
+        bytes: &mut Vec<u8>,
+        workers: usize,
+    ) -> Option<bool> {
+        let paths = std::mem::take(batch);
+        let mut probes = if workers > 1 && paths.len() >= PARALLEL_MIN_FILES {
+            probe_all(
+                ws,
+                &paths,
+                workers,
+                &self.matcher,
+                self.multiline,
+                self.mode,
+            )
+            .into_iter()
+            .map(Some)
+            .collect()
+        } else {
+            Vec::new()
+        };
+        probes.resize_with(paths.len(), || None);
+        for (index, (path, probed)) in paths.iter().zip(probes).enumerate() {
+            self.search_file(ws, path, bytes, probed);
+            if self.next.is_some() {
+                return Some(index + 1 < paths.len());
+            }
+        }
+        None
+    }
+
+    /// Account for a file's content (`bytes`) and, when it can contribute, search it.
+    /// `found` is the match count a worker already computed: any matches (`lines`) or the total.
+    fn absorb(
+        &mut self,
+        ws: &Workspace,
+        path: &Path,
+        partial: bool,
+        read: Read,
+        found: Option<usize>,
+        bytes: &mut Vec<u8>,
+    ) {
+        match read {
+            Read::Failed(read) => {
+                self.bytes += read;
                 self.unreadable += 1;
                 return;
             }
-        };
-        if !meta.is_file() {
-            return;
-        }
-        let partial = meta.len() > MAX_GREP_FILE;
-        if self.bytes + MAX_GREP_FILE > MAX_GREP_BYTES {
-            self.next = Some((path.to_path_buf(), consumed));
-            return;
-        }
-        let mut file = match super::walk::open_search_file(path) {
-            Ok(file) => file,
-            Err(_) => {
-                self.unreadable += 1;
+            Read::Binary(read) => {
+                self.bytes += read;
+                self.binary += 1;
                 return;
             }
-        };
-        bytes.clear();
-        let prefix_result = file.by_ref().take(8192).read_to_end(bytes);
-        self.bytes += bytes.len() as u64;
-        if prefix_result.is_err() {
-            self.unreadable += 1;
-            return;
-        }
-        if bytes.contains(&0) {
-            self.binary += 1;
-            return;
-        }
-        let before_read = bytes.len();
-        let result = file
-            .take(MAX_GREP_FILE - bytes.len() as u64)
-            .read_to_end(bytes);
-        self.bytes += (bytes.len() - before_read) as u64;
-        if result.is_err() {
-            self.unreadable += 1;
-            return;
+            Read::Text(read) => self.bytes += read,
         }
         if partial {
             self.oversized += 1;
         }
         self.scanned += 1;
         if self.mode != OutputMode::Lines {
-            self.summarize(ws, path, bytes);
+            let count = found.unwrap_or_else(|| match_count(&self.matcher, self.multiline, bytes));
+            self.summarize(ws, path, count);
             return;
         }
+        if found == Some(0) {
+            return;
+        }
+        let consumed = self.consumed_for(path);
         let rel = ws.rel(path);
         let start = self.out.len();
         let match_start = self.page_matches.len();
@@ -763,15 +987,7 @@ impl GrepState {
     }
 
     /// Count one file's matches for a summary page. `skip` and the page limits count files.
-    fn summarize(&mut self, ws: &Workspace, path: &Path, bytes: &[u8]) {
-        let count = if self.multiline {
-            count_multiline(&self.matcher, bytes)
-        } else {
-            bytes
-                .split_inclusive(|&b| b == b'\n')
-                .filter(|raw| self.matcher.is_match(trim_eol(raw)))
-                .count()
-        };
+    fn summarize(&mut self, ws: &Workspace, path: &Path, count: usize) {
         if count == 0 {
             return;
         }
@@ -1277,6 +1493,14 @@ impl GrepState {
 }
 
 pub(in crate::tools) fn grep_tool(ws: &Workspace, args: &Value) -> Result<String, String> {
+    let workers = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(MAX_GREP_WORKERS);
+    grep_with_workers(ws, args, workers)
+}
+
+/// `grep` with an explicit worker count; one worker is the serial scan.
+fn grep_with_workers(ws: &Workspace, args: &Value, workers: usize) -> Result<String, String> {
     let pattern = req_str(args, "pattern")?;
     if pattern.is_empty() || pattern.len() > MAX_PATTERN {
         return Err(format!("pattern must be 1..={MAX_PATTERN} bytes"));
@@ -1374,12 +1598,6 @@ pub(in crate::tools) fn grep_tool(ws: &Workspace, args: &Value) -> Result<String
         return Err(format!("max_results must be 1..={MAX_GREP_MATCHES}"));
     }
     let glob = opt_str(args, "glob")?.map(Glob::new).transpose()?;
-    let mut walk = SearchWalk::new(
-        ws,
-        bool_default(args, "hidden", true)?,
-        bool_default(args, "gitignore", true)?,
-        resume.as_ref().map(|(p, _)| p.clone()),
-    );
     let per_file = if args
         .get("max_results")
         .is_some_and(|value| !value.is_null())
@@ -1388,57 +1606,97 @@ pub(in crate::tools) fn grep_tool(ws: &Workspace, args: &Value) -> Result<String
     } else {
         GREP_PER_FILE
     };
-    let mut state = GrepState {
-        matcher,
-        multiline,
-        context,
-        max_matches: max_matches as usize,
-        out: String::new(),
-        matches: 0,
-        skip: opt_u64(args, "skip")?.unwrap_or(0),
-        resume,
-        next: None,
-        scanned: 0,
-        unreadable: 0,
-        oversized: 0,
-        binary: 0,
-        bytes: 0,
-        context_capped: 0,
-        line_starts: Vec::new(),
-        files: Vec::new(),
-        file_matches: HashMap::new(),
-        matched_files: HashSet::new(),
-        page_matches: Vec::new(),
-        row_ends: Vec::new(),
-        blocked_row: false,
-        cap: None,
-        per_file,
-        capped_files: Vec::new(),
-        mode,
-        summary_files: 0,
-        summary_rows: Vec::new(),
-    };
-    let mut bytes = Vec::new();
-    for root in roots {
-        walk.run(&root, &mut |path| {
-            if glob.as_ref().is_none_or(|g| g.matches(&ws.rel(path))) {
-                state.search_file(ws, path, &mut bytes);
+    let skip = opt_u64(args, "skip")?.unwrap_or(0);
+    let hidden = bool_default(args, "hidden", true)?;
+    let gitignore = bool_default(args, "gitignore", true)?;
+    // The parallel attempt batches files ahead of the walk. A page that ends inside a batch has
+    // already advanced the walk's counters past where a serial scan stops, so it is redone
+    // serially; every other page is identical by construction.
+    let attempt = |batched: bool| -> Result<Option<String>, String> {
+        let mut walk = SearchWalk::new(
+            ws,
+            hidden,
+            gitignore,
+            resume.as_ref().map(|(p, _)| p.clone()),
+        );
+        let mut state = GrepState {
+            matcher: matcher.clone(),
+            multiline,
+            context,
+            max_matches: max_matches as usize,
+            out: String::new(),
+            matches: 0,
+            skip,
+            resume: resume.clone(),
+            next: None,
+            scanned: 0,
+            unreadable: 0,
+            oversized: 0,
+            binary: 0,
+            bytes: 0,
+            context_capped: 0,
+            line_starts: Vec::new(),
+            files: Vec::new(),
+            file_matches: HashMap::new(),
+            matched_files: HashSet::new(),
+            page_matches: Vec::new(),
+            row_ends: Vec::new(),
+            blocked_row: false,
+            cap: None,
+            per_file,
+            capped_files: Vec::new(),
+            mode,
+            summary_files: 0,
+            summary_rows: Vec::new(),
+        };
+        let mut bytes = Vec::new();
+        let mut batch: Vec<PathBuf> = Vec::new();
+        let mut overran = false;
+        let batch_size = if batched { PARALLEL_BATCH } else { 1 };
+        let workers = if batched { workers } else { 1 };
+        for root in &roots {
+            walk.run(root, &mut |path| {
+                if glob.as_ref().is_none_or(|g| g.matches(&ws.rel(path)))
+                    && !state.before_resume(path)
+                {
+                    batch.push(path.to_path_buf());
+                    if batch.len() >= batch_size
+                        && let Some(past) = state.search_batch(ws, &mut batch, &mut bytes, workers)
+                    {
+                        overran |= past;
+                    }
+                }
+                state.next.is_none()
+            });
+            if state.next.is_none()
+                && let Some(past) = state.search_batch(ws, &mut batch, &mut bytes, workers)
+            {
+                overran |= past;
             }
-            state.next.is_none()
-        });
-        if state.next.is_some() || walk.next.is_some() {
-            break;
+            if state.next.is_some() || walk.next.is_some() {
+                break;
+            }
         }
+        if overran {
+            return Ok(None);
+        }
+        let next = state
+            .next
+            .take()
+            .or_else(|| walk.next.clone().map(|p| (p, 0)));
+        let (coverage, complete) = (walk.coverage(), walk.is_complete());
+        Ok(Some(if mode == OutputMode::Lines {
+            state.finish(ws, next, &coverage, complete)?
+        } else {
+            state.finish_summary(ws, next, &coverage, complete)?
+        }))
+    };
+    if workers > 1
+        && let Some(page) = attempt(true)?
+    {
+        return Ok(page);
     }
-    let next = state
-        .next
-        .take()
-        .or_else(|| walk.next.clone().map(|p| (p, 0)));
-    if mode == OutputMode::Lines {
-        state.finish(ws, next, &walk.coverage(), walk.is_complete())
-    } else {
-        state.finish_summary(ws, next, &walk.coverage(), walk.is_complete())
-    }
+    attempt(false)?.ok_or_else(|| "serial grep scan overran its page".to_owned())
 }
 
 #[cfg(test)]

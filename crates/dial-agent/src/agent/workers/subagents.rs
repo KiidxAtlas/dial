@@ -208,7 +208,7 @@ pub fn schema(config: &Config) -> Value {
         format!("{presets}\nCustom agents:{custom}")
     };
     let description = format!(
-        "Delegate self-contained slices to subagents. Batch independent slices in one call: `context` is shared; each item gives `task`, `solution_space`, and optionally `skills` and `agent`. Default model-role preference chains (first configured role, otherwise the conversation model): worker task → coach → small; scout small → task; reviewer and test-runner tester → coach → task → small; planner planner → coach → task → small. Custom agents inherit their base role unless explicitly overridden. Agent types:{types}{presets}"
+        "Delegate self-contained slices to subagents. For test authoring, execution and failure diagnosis, prefer test-runner with action=start while the parent continues independent work; coordinate owned files and wait for relevant inputs to settle before checks. Batch independent slices in one call: `context` is shared; each item gives `task`, `solution_space`, and optionally `skills` and `agent`. Default model-role preference chains (first configured role, otherwise the conversation model): worker task → coach → small; scout small → task; reviewer and test-runner tester → coach → task → small; planner planner → coach → task → small. Custom agents inherit their base role unless explicitly overridden. Agent types:{types}{presets}"
     );
     let mut entry_properties = json!({
         "agent":{"type":"string","description":"Agent type or preset (default scout)."},
@@ -487,7 +487,7 @@ fn model_routes(
     } else {
         selectors.iter().map(|s| Some(s.as_str())).collect()
     };
-    selectors
+    let mut routes = selectors
         .into_iter()
         .map(|selector| {
             let mut role = default_task_role(config, job.role);
@@ -566,7 +566,26 @@ fn model_routes(
                 source,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, String>>()?;
+    // Configured `[retry.fallback_chains]` for the worker's role extend the route list. `run_child`
+    // tries them only while the child has done no work, so a half-finished job is never restarted.
+    // An operator-named profile is exact and is not substituted.
+    if profile.is_none()
+        && let Some(primary) = routes.first()
+    {
+        let role = primary.role;
+        let selected = primary.config.selection();
+        let chained = crate::llm::fallback::fallback_models(config, role, &selected)
+            .into_iter()
+            .map(|next| ModelRoute {
+                role,
+                config: primary.config.with_selection(&next),
+                source: "fallback",
+            })
+            .collect::<Vec<_>>();
+        routes.extend(chained);
+    }
+    Ok(routes)
 }
 
 impl Job<'_> {
@@ -1127,12 +1146,16 @@ impl Outcome {
             inspections: Default::default(),
         }
     }
-    pub fn provider_failed(steps: u32, error: &anyhow::Error) -> Self {
+    pub fn provider_failed(
+        steps: u32,
+        error: &anyhow::Error,
+        fallback_on: crate::config::types::FallbackOn,
+    ) -> Self {
         let mut outcome = Self::failed(
             steps,
             crate::agent::run::failure_guidance::provider_failure(error),
         );
-        outcome.retryable_provider = crate::llm::fallback::should_fallback(error);
+        outcome.retryable_provider = crate::llm::fallback::should_fallback(error, fallback_on);
         outcome
     }
 }

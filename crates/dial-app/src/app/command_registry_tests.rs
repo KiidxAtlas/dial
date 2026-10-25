@@ -1,7 +1,7 @@
 use super::*;
 use crate::app::command_registry::{
-    BUILTIN_COMMANDS, COMMAND_ALIASES, RUNS_NOW, RUNS_NOW_ARGS, STOPS_TURN, canonical_command,
-    command_entries, during_turn_note,
+    BUILTIN_COMMANDS, COMMAND_ALIASES, DuringTurn, RUNS_NOW, RUNS_NOW_ARGS, STOPS_TURN,
+    canonical_command, command_entries, command_panel, during_turn, during_turn_note,
 };
 use crate::app::core::App;
 use crate::app::overlay::auth::{AuthJob, PreparedModel};
@@ -104,7 +104,9 @@ fn turn_lists_drive_stops_turn_and_the_palette_notes_alike() {
         assert!(!Shell::stops_turn(&format!("/{name}")), "/{name} runs now");
         let note = during_turn_note(name);
         assert!(
-            note.starts_with("Runs now") || note.starts_with("Opens now"),
+            note.starts_with("Runs now")
+                || note.starts_with("Opens now")
+                || note.starts_with("Refreshes"),
             "/{name}: {note}"
         );
     }
@@ -114,6 +116,45 @@ fn turn_lists_drive_stops_turn_and_the_palette_notes_alike() {
     // Aliases follow their target, so /quit stops a turn exactly like /exit.
     assert!(Shell::stops_turn("/quit") && Shell::stops_turn("/q") && Shell::stops_turn("/clear"));
     assert!(!Shell::stops_turn("/review"));
+}
+
+#[test]
+fn model_aliases_and_subcommands_share_live_policy_and_panel_destinations() {
+    use crate::app::overlay::Which;
+    for name in ["model", "models"] {
+        for args in [
+            "", "settings", "setting", "defaults", "local", "memory", "next", "cancel",
+        ] {
+            assert_eq!(during_turn(name, args), DuringTurn::Now, "/{name} {args}");
+            assert!(!Shell::stops_turn(&format!("/{name} {args}")));
+        }
+        assert!(matches!(command_panel(name, ""), Some(Which::Models)));
+        assert!(matches!(
+            command_panel(name, "settings"),
+            Some(Which::ModelSettings)
+        ));
+        assert!(matches!(
+            command_panel(name, "setting"),
+            Some(Which::ModelSettings)
+        ));
+        assert!(matches!(
+            command_panel(name, "defaults"),
+            Some(Which::ContextDefaults)
+        ));
+        assert!(matches!(
+            command_panel(name, "local"),
+            Some(Which::ModelDownloads)
+        ));
+        assert!(matches!(
+            command_panel(name, "memory"),
+            Some(Which::ModelMemory)
+        ));
+        assert!(command_panel(name, "restart").is_none());
+        assert_eq!(during_turn(name, "restart"), DuringTurn::Unavailable);
+        assert_eq!(during_turn_note(name), during_turn_note("model"));
+    }
+    assert_eq!(during_turn("review", ""), DuringTurn::AfterTurn);
+    assert_eq!(during_turn("quit", ""), DuringTurn::Stop);
 }
 
 #[test]

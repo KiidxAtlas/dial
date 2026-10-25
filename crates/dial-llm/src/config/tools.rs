@@ -112,6 +112,7 @@ pub const EXTRA_TOOLS: &[&str] = &[
     "working_state",
     "message",
     "recall",
+    "peers",
     "retain",
     "memory_update",
     "forget",

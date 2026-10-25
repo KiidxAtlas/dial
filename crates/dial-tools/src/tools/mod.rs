@@ -149,6 +149,13 @@ pub struct Workspace {
     unsandboxed: bool,
     /// Shell that runs `bash` commands (`shell.backend`).
     shell_backend: crate::config::types::ShellBackend,
+    /// Shrink the output of recognised noisy commands (`shell.minimize_output`).
+    minimize_output: bool,
+    /// Which commands the git guard refuses (`shell.git_guard`).
+    git_guard: crate::config::types::GitGuard,
+    /// This workspace is a delegated worker's view of the parent's live checkout, not an isolated
+    /// copy. Set by the worker spawner; never inherited by [`Workspace::rebased`].
+    shared_checkout: bool,
     edit_mode: EditMode,
     edit_settings: EditSettings,
     /// Bash intent interceptor and the tool names offered this session (a redirect applies only
@@ -167,6 +174,8 @@ pub struct Workspace {
     observer: ObserverSlot,
     /// Session snapshots / seen lines / registers for hashline; shared by clones.
     edits: Arc<Mutex<edit::hashline::EditStore>>,
+    /// `ast_edit` dry-run previews awaiting an `apply_token`; shared by clones.
+    staged_rewrites: Arc<edit::ast::StagedPreviews>,
     artifacts: Option<artifact::ArtifactStore>,
     operations: Arc<Mutex<()>>,
     shell_sessions: Arc<Mutex<BTreeMap<String, crate::embedded_shell::state::State>>>,
@@ -200,6 +209,9 @@ impl Workspace {
             policy: None,
             unsandboxed: false,
             shell_backend: crate::config::types::ShellBackend::Auto,
+            minimize_output: false,
+            git_guard: crate::config::types::GitGuard::Workers,
+            shared_checkout: false,
             edit_mode: EditMode::default(),
             edit_settings: EditSettings::default(),
             bash_interceptor: None,
@@ -210,6 +222,7 @@ impl Workspace {
             native_edits: Arc::default(),
             observer: ObserverSlot::default(),
             edits: Arc::default(),
+            staged_rewrites: Arc::default(),
             artifacts: None,
             operations: Arc::default(),
             shell_sessions: Arc::default(),
@@ -222,6 +235,7 @@ impl Workspace {
         isolated.speculation = Arc::default();
         isolated.native_edits = Arc::default();
         isolated.edits = Arc::default();
+        isolated.staged_rewrites = Arc::default();
         isolated.observer = ObserverSlot::default();
         isolated.artifacts = None;
         isolated
@@ -336,6 +350,39 @@ impl Workspace {
     pub fn with_shell_backend(mut self, backend: crate::config::types::ShellBackend) -> Self {
         self.shell_backend = backend;
         self
+    }
+
+    /// Apply the whole `[shell]` section: backend, output minimizer and git guard.
+    pub fn with_shell_config(mut self, shell: &crate::config::types::ShellConfig) -> Self {
+        self.shell_backend = shell.backend;
+        self.minimize_output = shell.minimize_output;
+        self.git_guard = shell.git_guard;
+        self
+    }
+
+    /// Mark this workspace as a delegated worker running in the parent's live checkout, which is
+    /// what `shell.git_guard = "workers"` protects.
+    pub fn with_shared_checkout(mut self, shared: bool) -> Self {
+        self.shared_checkout = shared;
+        self
+    }
+
+    pub(crate) fn minimizing_output(&self) -> bool {
+        self.minimize_output
+    }
+
+    /// Whether `bash` and `bg` refuse git commands that discard uncommitted work here.
+    pub(crate) fn git_guard_active(&self) -> bool {
+        use crate::config::types::GitGuard;
+        match self.git_guard {
+            GitGuard::Always => true,
+            GitGuard::Workers => self.shared_checkout,
+            GitGuard::Off => false,
+        }
+    }
+
+    pub(crate) fn git_guard_policy(&self) -> crate::config::types::GitGuard {
+        self.git_guard
     }
 
     /// Choose the `edit`/`read` contract (default: hashline).
@@ -457,6 +504,9 @@ impl Workspace {
         copy.credential_paths = self.credential_paths.clone();
         copy.unsandboxed = self.unsandboxed;
         copy.bash_interceptor = self.bash_interceptor.clone();
+        copy.shell_backend = self.shell_backend;
+        copy.minimize_output = self.minimize_output;
+        copy.git_guard = self.git_guard;
         copy.edit_mode = self.edit_mode;
         copy.edit_settings = self.edit_settings.clone();
         copy.edit_repair = self.edit_repair.clone();
@@ -480,6 +530,9 @@ impl Workspace {
         Ok(next)
     }
 
+    pub(crate) fn staged_rewrites(&self) -> &edit::ast::StagedPreviews {
+        &self.staged_rewrites
+    }
     pub(crate) fn store(&self) -> MutexGuard<'_, edit::hashline::EditStore> {
         self.edits
             .lock()
@@ -559,6 +612,16 @@ impl Workspace {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Advisory changes to previously observed native text in the primary workspace.
+    /// Does not refresh snapshots, grant edit witnesses or provide overwrite protection.
+    /// Round-robin polling considers at most 64 files, reads at most 4 MiB, and returns
+    /// at most 16 paths. Files over 256 KiB and notebooks are skipped. The 50 ms budget
+    /// is cooperative between filesystem calls (slow filesystems can exceed it).
+    /// Missing/unreadable versions are deduplicated by error kind until recovery or reread.
+    pub fn changed_observations(&self) -> Vec<String> {
+        edit::hashline::changed_observations(self)
     }
 
     /// Every root this workspace may touch: the primary root first, then the
@@ -910,7 +973,7 @@ file's total line count. \
 Without a range, output is capped at 48 KiB and the footer names the range to read next, so read large files in \
 ranges. `edit` may only touch lines you have been shown.";
 
-const HASHLINE_WRITE_DESC: &str = "Create a new file or replace a whole file (max 1 MiB). BEFORE replacing an existing file, read its complete current contents; prefer edit for changes. Missing parent directories are created. Notebook content is literal JSON, not the editable # %% source projection. In hashline mode, complete copied read headers/numbered prefixes are stripped; incomplete/truncated projections reject. Existing files require complete source witnesses unless the operator disables the seen-line guard. Returns the fresh `[PATH#TAG]` header.";
+const HASHLINE_WRITE_DESC: &str = "Create a new file or replace a whole file (max 1 MiB). BEFORE replacing an existing file, read its complete current contents; prefer edit for changes, especially to large files. The whole call must fit your output budget: keep each call coherent and complete, never a placeholder, and do not also paste the file into chat. Missing parent directories are created. Notebook content is literal JSON, not the editable # %% source projection. In hashline mode, complete copied read headers/numbered prefixes are stripped; incomplete/truncated projections reject. Existing files require complete source witnesses unless the operator disables the seen-line guard. Returns the fresh `[PATH#TAG]` header.";
 
 const HASHLINE_EDIT_DESC: &str = notebook_edit_description!(
     r#"Edit existing files with a line-anchored patch (use `write` to create or overwrite whole files).
@@ -970,7 +1033,9 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
                 HASHLINE_WRITE_DESC
             } else {
                 "Create or overwrite a file in the workspace with the given content (max 1 MiB). \
-                 Missing parent directories are created."
+                 Prefer edit for changes to existing files, especially large ones; the whole call \
+                 must fit your output budget, so keep it complete, never a placeholder, and do not \
+                 also paste the file into chat. Missing parent directories are created."
             },
             json!({
                 "path": {"type": "string", "description": "Workspace-relative file path or an `ssh://host/path` remote file (requires approval)."},

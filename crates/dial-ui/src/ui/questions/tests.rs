@@ -133,6 +133,39 @@ fn request(count: usize, header: Option<&str>) -> QuestionRequest {
 }
 
 #[test]
+fn a_full_answer_stays_editable_and_oversized_pastes_are_refused() {
+    let single = request(1, None);
+    let mut dialog = Dialog::new(&single, Path::new("/tmp"));
+    let keys = Keymap::defaults();
+    dialog.start_text(Field::Custom);
+    dialog.paste(&"a".repeat(questions::MAX_TEXT));
+    let Mode::Text(_, editor) = &dialog.mode else {
+        panic!("text mode")
+    };
+    assert_eq!(editor.text.len(), questions::MAX_TEXT);
+    // Growth is refused at the limit; deletion still works.
+    dialog.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE), &keys);
+    dialog.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), &keys);
+    let Mode::Text(_, editor) = &dialog.mode else {
+        panic!("text mode")
+    };
+    assert_eq!(editor.text.len(), questions::MAX_TEXT - 1);
+    dialog.paste("too long");
+    assert!(dialog.feedback.contains("too long"));
+
+    // The attachment path field uses its own, smaller limit for paste too.
+    dialog.key(
+        KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+        &keys,
+    );
+    dialog.paste(&"p".repeat(MAX_PATH + 1));
+    let Mode::Attach(_, _, path) = &dialog.mode else {
+        panic!("attach mode")
+    };
+    assert!(path.text.is_empty());
+}
+
+#[test]
 fn a_single_question_has_no_counter_and_hints_only_working_keys() {
     let single = request(1, None);
     let rows = Dialog::new(&single, Path::new("/tmp")).rows(80, 30);

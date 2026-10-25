@@ -616,8 +616,8 @@ impl LoopMode {
         }
     }
 
-    /// Called when a turn settles. An interrupted or failed turn suspends the loop. Otherwise the
-    /// next iteration is armed after [`AUTO_SUBMIT_DELAY`].
+    /// Called when a turn settles. A turn that halted (interrupted, waiting for input, blocked or
+    /// failed) suspends the loop. Otherwise the next iteration is armed after [`AUTO_SUBMIT_DELAY`].
     pub fn turn_settled(&mut self, now: Instant, halted: bool) {
         if !self.enabled {
             return;

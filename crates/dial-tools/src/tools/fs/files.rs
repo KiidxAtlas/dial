@@ -336,9 +336,17 @@ fn read_target(
             meta.len()
         ));
     }
+    // Only an unqualified whole-file read may be summarized; any selector, offset or limit is a
+    // request for those exact lines.
+    let whole = offset.is_none() && !present(args, "limit") && !sel.selects_lines() && !sel.raw;
     let offset = offset.map_or(1, |o| o.min(usize::MAX as u64) as usize);
     match ws.edit_mode {
-        EditMode::Hashline => hashline::read(ws, path_text, &sel, offset, limit, budget),
+        EditMode::Hashline => {
+            if whole && let Some(summary) = super::summary::try_read(ws, path_text, limit, budget) {
+                return Ok(summary);
+            }
+            hashline::read(ws, path_text, &sel, offset, limit, budget)
+        }
         _ => read_plain(ws, path_text, &sel, offset, limit, budget),
     }
 }

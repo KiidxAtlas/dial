@@ -198,3 +198,79 @@ fn turn_notices_follow_the_authoritative_outcome() {
         );
     }
 }
+
+#[test]
+fn iterm2_gets_every_integration_and_progress_only_from_3_6() {
+    let caps = detect_integration(
+        &env(&[
+            ("TERM_PROGRAM", "iTerm.app"),
+            ("TERM_PROGRAM_VERSION", "3.6.2"),
+        ]),
+        TerminalId::Iterm2,
+    );
+    assert_eq!(
+        caps,
+        Integration {
+            hyperlinks: true,
+            line_fragments: true,
+            cwd: true,
+            tab_color: true,
+            attention: true,
+            user_vars: true,
+            progress: true,
+            tmux: false,
+        }
+    );
+    let old = detect_integration(
+        &env(&[
+            ("TERM_PROGRAM", "iTerm.app"),
+            ("TERM_PROGRAM_VERSION", "3.5.14"),
+        ]),
+        TerminalId::Iterm2,
+    );
+    assert!(!old.progress && old.tab_color);
+    let unknown = detect_integration(&env(&[("TERM_PROGRAM", "iTerm.app")]), TerminalId::Iterm2);
+    assert!(!unknown.progress);
+}
+
+#[test]
+fn inside_tmux_iterm2_reports_its_version_through_lc_terminal() {
+    let caps = detect_integration(
+        &env(&[
+            ("TMUX", "/tmp/tmux-501/default,1,0"),
+            ("TERM_PROGRAM", "tmux"),
+            ("TERM_PROGRAM_VERSION", "3.4"),
+            ("LC_TERMINAL", "iTerm2"),
+            ("LC_TERMINAL_VERSION", "3.6.0beta2"),
+        ]),
+        TerminalId::Iterm2,
+    );
+    assert!(caps.tmux && caps.progress && caps.tab_color && caps.cwd);
+    assert!(!caps.hyperlinks);
+    assert_eq!(
+        caps.wrap("\x1b]9;4;0\x07"),
+        "\x1bPtmux;\x1b\x1b]9;4;0\x07\x1b\\"
+    );
+}
+
+#[test]
+fn other_terminals_get_only_what_they_implement() {
+    let ghostty = detect_integration(
+        &env(&[
+            ("TERM_PROGRAM", "ghostty"),
+            ("TERM_PROGRAM_VERSION", "1.2.0"),
+        ]),
+        TerminalId::Ghostty,
+    );
+    assert!(
+        ghostty.progress && ghostty.hyperlinks && !ghostty.tab_color && !ghostty.line_fragments
+    );
+    let wezterm = detect_integration(&env(&[]), TerminalId::WezTerm);
+    assert!(wezterm.user_vars && !wezterm.attention && !wezterm.progress);
+    assert_eq!(
+        detect_integration(&env(&[]), TerminalId::Base),
+        Integration::default()
+    );
+    let zellij = detect_integration(&env(&[("ZELLIJ", "0")]), TerminalId::Iterm2);
+    assert_eq!(zellij, Integration::default());
+}

@@ -198,7 +198,9 @@ fn build(
 ) -> ureq::Agent {
     let connector = ()
         .chain(ConnectProxyConnector::default())
-        .chain(tcp::KeepaliveConnector)
+        .chain(tcp::KeepaliveConnector {
+            interrupt: Arc::clone(&interrupt),
+        })
         .chain(CancelConnector {
             interrupt: Arc::clone(&interrupt),
             patience,
@@ -279,7 +281,8 @@ impl<T: Transport> Transport for CancelTransport<T> {
     }
     fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
         self.check()?;
-        // A partial write must never be replayed; retain the configured write deadline.
+        // A partial write must never be replayed; the TCP transport resumes at the sent offset and
+        // checks the interrupt between short write slices.
         self.inner.transmit_output(amount, timeout)
     }
     fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {

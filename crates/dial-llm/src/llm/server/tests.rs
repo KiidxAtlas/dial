@@ -350,6 +350,42 @@ fn early_exit_reports_stderr() {
         .to_string();
     assert!(error.contains("exited during startup"), "{error}");
     assert!(error.contains("fatal: cannot load model"), "{error}");
+    assert!(error.contains(python.to_str().unwrap()), "{error}");
+}
+
+#[test]
+fn unknown_architecture_reports_the_selected_runtime_and_recovery_options() {
+    let error = anyhow!("model server exited during startup");
+    let stderr = "llama_model_load: error loading model: unknown model architecture: 'flint'\nfailed to load model";
+    let program = std::ffi::OsStr::new("/custom/runtime/bin/llama-server");
+    let diagnostic = startup_diagnostic(&error, stderr, program);
+    for detail in [
+        "model server exited during startup",
+        "unknown model architecture: 'flint'",
+        "failed to load model",
+        "/custom/runtime/bin/llama-server",
+        "DIAL_LLAMA_SERVER",
+        "LM Studio",
+    ] {
+        assert!(diagnostic.contains(detail), "missing {detail:?}: {diagnostic}");
+    }
+    assert!(diagnostic.to_lowercase().contains("upgrad"), "{diagnostic}");
+}
+
+#[test]
+fn unrelated_startup_failures_preserve_details_without_architecture_advice() {
+    let program = std::ffi::OsStr::new("/custom/python");
+    for stderr in ["fatal: cannot load model", "out of memory", ""] {
+        let error = anyhow!("model server exited during startup");
+        let diagnostic = startup_diagnostic(&error, stderr, program);
+        assert!(diagnostic.contains("model server exited during startup"));
+        assert!(diagnostic.contains("/custom/python"), "{diagnostic}");
+        if !stderr.is_empty() {
+            assert!(diagnostic.contains(stderr), "{diagnostic}");
+        }
+        assert!(!diagnostic.contains("DIAL_LLAMA_SERVER"), "{diagnostic}");
+        assert!(!diagnostic.contains("LM Studio"), "{diagnostic}");
+    }
 }
 
 #[test]

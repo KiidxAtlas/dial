@@ -1172,7 +1172,8 @@ fn a_stalled_stream_after_partial_text_continues_the_turn() {
     );
     assert_eq!(requests.len(), 2);
     assert!(sent_messages(&requests[1]).contains("partial answer"));
-    assert!(sent_messages(&requests[1]).contains("Continue exactly where it stopped"));
+    assert!(sent_messages(&requests[1]).contains("Continue from where it stopped"));
+    assert!(!sent_messages(&requests[1]).contains("connection dropped"));
 }
 
 #[test]
@@ -1703,5 +1704,88 @@ fn native_edits_work_inside_an_added_root_but_not_an_undeclared_sibling() {
     assert_eq!(
         std::fs::read_to_string(sibling.join("lib.txt")).unwrap(),
         "old\n"
+    );
+}
+
+fn anthropic_sse(events: &[Value]) -> crate::llm::fake::Script {
+    crate::llm::fake::Script::Sse(
+        events
+            .iter()
+            .map(|event| {
+                format!(
+                    "event: {}\ndata: {event}\n\n",
+                    event["type"].as_str().unwrap()
+                )
+            })
+            .collect(),
+    )
+}
+
+fn anthropic_text(text: &str) -> crate::llm::fake::Script {
+    anthropic_sse(&[
+        json!({"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}),
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":text}}),
+        json!({"type":"content_block_stop","index":0}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}),
+        json!({"type":"message_stop"}),
+    ])
+}
+
+#[test]
+fn a_recovered_inline_edit_replays_to_anthropic_with_a_matching_tool_use() {
+    let mut config = Config::default();
+    config.edit.mode = crate::config::types::EditMode::Sloppy;
+    config.edit.recover_inline_edits = true;
+    let inline = "*** Edit File: notes.txt\n*** Find\nalpha\n*** Replace\nbeta";
+    assert!(crate::tools::inline_edit_payload(inline).is_some());
+    let server = crate::llm::fake::serve(vec![anthropic_text(inline), anthropic_text("done")]);
+    let backend = Backend::new(
+        ProviderKind::AnthropicEndpoint {
+            base_url: server.url.clone(),
+            model: "claude-test".into(),
+            api_key: Some("test-key".into()),
+        },
+        PathBuf::new(),
+        5,
+    );
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("notes.txt"), "alpha\n").unwrap();
+    let version = Version {
+        id: 0,
+        parent: None,
+        kind: "config".into(),
+        harness: config.harness.clone(),
+        adapter: None,
+        status: "active".into(),
+    };
+    let mut agent = Agent::hermetic(&config, backend, &version, root.path(), None, None).unwrap();
+    let report = agent.turn("change alpha to beta", &mut NullUi).unwrap();
+    drop(agent);
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2, "{}", report.text);
+    let messages = crate::llm::fake::body(&requests[1])["messages"].clone();
+    let messages = messages.as_array().unwrap();
+    let mut results = 0;
+    for (index, message) in messages.iter().enumerate() {
+        for block in message["content"].as_array().into_iter().flatten() {
+            if block["type"] != "tool_result" {
+                continue;
+            }
+            results += 1;
+            let id = &block["tool_use_id"];
+            let previous = &messages[index - 1];
+            assert_eq!(previous["role"], "assistant", "{messages:?}");
+            assert!(
+                previous["content"].as_array().is_some_and(|blocks| blocks
+                    .iter()
+                    .any(|b| b["type"] == "tool_use" && &b["id"] == id)),
+                "tool_result {id} has no preceding tool_use: {messages:?}"
+            );
+        }
+    }
+    assert_eq!(
+        results, 1,
+        "the recovered edit's result was replayed: {messages:?}"
     );
 }

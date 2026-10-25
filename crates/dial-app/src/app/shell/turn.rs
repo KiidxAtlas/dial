@@ -163,6 +163,21 @@ impl Shell {
             Ok(report) => report.outcome,
             Err(_) => crate::agent::TurnOutcome::Failed,
         };
+        if crate::cli::watch::enabled(&app.layout, &self.session_id)
+            && let Err(error) = crate::cli::watch::append(
+                &app.layout,
+                &self.session_id,
+                crate::cli::watch::Event::Text {
+                    title: "Turn finished".into(),
+                    body: format!("{outcome:?}"),
+                },
+            )
+        {
+            self.note(
+                "Live feed",
+                format!("Could not record turn outcome: {error:#}"),
+            );
+        }
         let summary = agent.session().control_state()["turn_summary"].clone();
         if let Some(report) = turn_report::render(&summary) {
             self.note("Turn report", report);
@@ -172,6 +187,7 @@ impl Shell {
         {
             crate::ui::termcaps::notify(notice.kind, "Dial", notice.body, &self.session_id);
         }
+        self.term_activity = crate::ui::term_state::Activity::after_turn(outcome);
         self.transcript.finish_turn();
         if matches!(&result, Ok(report) if !report.interrupted) {
             self.auto_speak(app, agent);
@@ -186,7 +202,10 @@ impl Shell {
                 outcome: None,
             });
         }
-        let halted = result.as_ref().map_or(true, |report| report.interrupted);
+        // Questions, blockers and failures wait for the human instead of re-arming the loop.
+        let halted = result
+            .as_ref()
+            .map_or(true, |report| report.halts_automation());
         self.loop_mode.turn_settled(Instant::now(), halted);
         if failed {
             anyhow::bail!("terminal draw failed; the screen was restored");

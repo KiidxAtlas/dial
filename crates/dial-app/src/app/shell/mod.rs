@@ -47,6 +47,7 @@ pub(in crate::app) mod sessions;
 pub(in crate::app) mod submit;
 pub(in crate::app) mod teach;
 pub(in crate::app) mod theme;
+mod tree;
 pub(in crate::app) mod turn;
 pub(in crate::app) mod turn_report;
 pub(in crate::app) mod voice;
@@ -118,6 +119,10 @@ pub(super) struct Shell {
     pub(super) dark: Option<bool>,
     pub(super) session_id: String,
     pub(super) title: String,
+    /// What the terminal tab shows between turns (done, failed, waiting); cleared by a key press.
+    pub(super) term_activity: crate::ui::term_state::Activity,
+    /// A modal question or approval is on screen and waits for the user.
+    pub(in crate::app) awaiting_user: bool,
     pub(super) turn_output_tokens: u64,
     /// The agent's task list as last reported; drawn above the composer while any task is open.
     pub(super) todo: TodoList,

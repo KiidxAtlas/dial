@@ -120,17 +120,37 @@ impl Drop for Seat {
     }
 }
 
-/// Result of a send: recipients that accepted the letter, and `"recipient: reason"` for those
-/// that refused it because their mailbox was full.
+/// A recipient that did not accept a letter, and why.
+#[derive(Debug, PartialEq)]
+pub struct Refusal {
+    pub to: String,
+    pub reason: String,
+}
+
+/// Per-recipient outcome of a send. A letter a mailbox accepted is `queued`: it is delivered when
+/// the recipient drains its mailbox at its next model step, which the sender cannot know
+/// synchronously, so `delivered` is never claimed. A recipient that could not take the letter
+/// (full mailbox) is listed with its reason. Finished or unknown recipients fail the whole send.
 #[derive(Debug)]
 pub struct Receipt {
-    pub delivered: Vec<String>,
-    pub refused: Vec<String>,
+    pub queued: Vec<String>,
+    pub refused: Vec<Refusal>,
 }
 
 impl Receipt {
+    /// One `{to, status}` row per recipient, `status` being `queued` or `refused` (with `reason`).
     pub fn json(&self) -> Value {
-        json!({"delivered": self.delivered, "refused": self.refused})
+        let rows: Vec<Value> = self
+            .queued
+            .iter()
+            .map(|to| json!({"to": to, "status": "queued"}))
+            .chain(
+                self.refused
+                    .iter()
+                    .map(|r| json!({"to": r.to, "status": "refused", "reason": r.reason})),
+            )
+            .collect();
+        json!({"receipts": rows})
     }
 }
 
@@ -249,7 +269,7 @@ impl Team {
         };
         let broadcast = to == ALL;
         let mut receipt = Receipt {
-            delivered: Vec::new(),
+            queued: Vec::new(),
             refused: Vec::new(),
         };
         for (id, inbox) in targets {
@@ -258,13 +278,13 @@ impl Team {
                 text: text.to_owned(),
             };
             match inbox.push(letter, limit) {
-                Ok(()) => receipt.delivered.push(id),
-                Err(why) if broadcast => receipt.refused.push(format!("{id}: {why}")),
+                Ok(()) => receipt.queued.push(id),
+                Err(reason) if broadcast => receipt.refused.push(Refusal { to: id, reason }),
                 Err(why) => return Err(why),
             }
         }
-        if !receipt.delivered.is_empty() {
-            self.record(from, &receipt.delivered, text);
+        if !receipt.queued.is_empty() {
+            self.record(from, &receipt.queued, text);
         }
         Ok(receipt)
     }

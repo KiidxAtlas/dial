@@ -1,3 +1,4 @@
+pub mod credentials;
 pub mod output;
 pub mod platform;
 pub mod prose;

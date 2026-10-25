@@ -216,14 +216,21 @@ prompt resolves its weights; a missing default MLX runtime gets an installation 
 ### Publishing a release (maintainers)
 
 The release workflow runs on pushed `v*` tags and requires the tag to match
-`Cargo.toml`'s version. After updating the version and lockfile as needed, commit
-the release changes and push that commit and its tag, for example:
+`Cargo.toml`'s version. `scripts/release.sh <version>` prepares the release from a clean `main`:
+it sets `[workspace.package] version`, refreshes `Cargo.lock` for workspace members only, moves the
+`## [Unreleased]` changelog entries under a dated version heading (refusing an empty section), runs
+`cargo fmt --check`, `make lint` and `make test-rust` (skip with `--no-check`), then commits
+`release: v<version>` and creates an annotated tag. It pushes only with `--push`:
 
 ```sh
-git tag v0.1.1
+scripts/release.sh 0.1.23          # commit + tag locally
 git push origin main
-git push origin v0.1.1
+git push origin v0.1.23
 ```
+
+CI skips commits that only touch Markdown under `docs/`, root-level Markdown or the PR template.
+Changes to protocol files such as `docs/rpc-schema.json` still trigger CI. A release commit always
+changes `Cargo.toml`, so CI runs for it; do not tag a documentation-only commit.
 
 `.github/workflows/release.yml` does not re-run the test suite. Each macOS and Linux build job
 first requires a successful `CI` run (formatting, clippy, the full Rust suite including the Linux

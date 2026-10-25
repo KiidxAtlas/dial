@@ -34,3 +34,6 @@ dial-llm = { workspace = true, features = ["test-support"] }
 [features]
 # Test helpers used by other crates' tests (`#[cfg(test)]` items compiled only for this crate otherwise).
 test-support = []
+
+[lints]
+workspace = true

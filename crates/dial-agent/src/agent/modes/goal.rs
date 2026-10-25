@@ -6,6 +6,7 @@
 use crate::agent::prompts::modes::goal::{
     BUDGET_LIMIT, CONTINUATION, GOAL_MODE_ACTIVE, GUIDED_RULES,
 };
+use crate::agent::run::turn_draft::TurnOrigin;
 use crate::agent::workflow::todo::{Status as TodoStatus, TodoList};
 use crate::agent::{Agent, TurnReport, Ui};
 use crate::llm::usage::Counts;
@@ -388,11 +389,12 @@ impl State {
         Some(hasher.finish())
     }
 
-    /// Decides what runs after a finished turn. `continued` says whether that turn was a continuation;
+    /// Decides what runs after a finished turn. `halted` says the turn needs the human (see
+    /// `TurnReport::halts_automation`); `continued` says whether that turn was a continuation;
     /// `previous` carries the last continuation's activity digest for the stall rule.
     pub fn follow_up(
         &mut self,
-        interrupted: bool,
+        halted: bool,
         continued: bool,
         previous: &mut Option<u64>,
         todo: &TodoList,
@@ -402,7 +404,7 @@ impl State {
         // completed. Tool calls made while interviewing (grounding reads, a failed create) keep `goal` offered.
         let stalled = continued && (activity.is_none() || *previous == activity);
         *previous = if continued { activity } else { None };
-        if interrupted || stalled {
+        if halted || stalled {
             return None;
         }
         let goal = self.goal.clone()?;
@@ -426,21 +428,24 @@ impl State {
 
 impl Agent<'_> {
     /// Runs one user turn and keeps the goal going. Continuation and budget-limit turns follow while the
-    /// goal is running, and stop on interrupt, on a stalled continuation, or when the goal leaves the loop.
+    /// goal is running, and stop on interrupt, a question, a blocker or failure, on a stalled
+    /// continuation, or when the goal leaves the loop.
     pub(crate) fn turn_with_goal(
         &mut self,
         user_text: &str,
         ui: &mut dyn Ui,
     ) -> Result<TurnReport> {
-        let mut report = self.goal_turn(user_text, ui)?;
+        let mut report = self.goal_turn(user_text, ui, TurnOrigin::User)?;
         let mut previous = None;
         let mut continued = false;
         loop {
             let interview = self.modes.goal.interview;
-            let next =
-                self.modes
-                    .goal
-                    .follow_up(report.interrupted, continued, &mut previous, &self.todo);
+            let next = self.modes.goal.follow_up(
+                report.halts_automation(),
+                continued,
+                &mut previous,
+                &self.todo,
+            );
             if self.modes.goal.goal.is_some() || self.modes.goal.interview != interview {
                 self.save_modes()?;
             }
@@ -448,14 +453,15 @@ impl Agent<'_> {
                 break;
             };
             continued = kind == Kind::Continuation;
-            report = self.goal_turn(&prompt, ui)?;
+            // Continuation and budget prompts are written by the harness, not the user.
+            report = self.goal_turn(&prompt, ui, TurnOrigin::Harness)?;
         }
         Ok(report)
     }
 
-    fn goal_turn(&mut self, text: &str, ui: &mut dyn Ui) -> Result<TurnReport> {
+    fn goal_turn(&mut self, text: &str, ui: &mut dyn Ui, origin: TurnOrigin) -> Result<TurnReport> {
         let started = Instant::now();
-        let report = self.turn_with_state(text, ui, true, None)?;
+        let report = self.turn_with_state(text, ui, true, None, origin)?;
         if self.modes.goal.goal.is_some() {
             let (_, turn) = self.usage_scope.snapshot();
             self.modes

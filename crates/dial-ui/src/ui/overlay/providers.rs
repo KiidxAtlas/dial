@@ -1063,6 +1063,7 @@ impl ProviderOverlay {
                         label: if label.is_empty() { id.clone() } else { label },
                         base_url,
                         api_key_env: Some(env).filter(|e| !e.is_empty()),
+                        api_key_envs: Vec::new(),
                         enabled: true,
                         allow_insecure: false,
                         protocol: None,

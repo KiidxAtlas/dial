@@ -36,7 +36,9 @@ impl ImageProtocol {
         Self::from_terminal(
             &env("TERM"),
             &env("TERM_PROGRAM"),
-            !env("TMUX").is_empty() || !env("STY").is_empty(),
+            ["TMUX", "STY", "ZELLIJ", "ZELLIJ_SESSION_NAME"]
+                .iter()
+                .any(|key| !env(key).is_empty()),
         )
     }
 
@@ -78,7 +80,7 @@ impl NativeImage {
         self.columns + self.indent <= u32::from(columns) && self.rows < u32::from(rows)
     }
 
-    pub(crate) fn write_ansi(&self, out: &mut String, protocol: ImageProtocol) {
+    pub fn write_ansi(&self, out: &mut String, protocol: ImageProtocol) {
         // The driver has reserved all image rows plus the separator. Draw upward into that space,
         // leaving room for terminals that advance the cursor below the image, then restore it.
         // Ordinary tool output can never enter this trusted protocol path.
@@ -216,6 +218,29 @@ impl Thumbnail {
             columns,
             rows: height.div_ceil(2),
             indent,
+        })
+    }
+
+    /// A larger native preview for a dedicated viewer, fitted to its available cell rectangle.
+    /// Transcript thumbnails deliberately keep their separate compact sizing policy.
+    pub fn native_fitted(&self, columns: u16, rows: u16) -> Option<NativeImage> {
+        if columns == 0 || rows == 0 {
+            return None;
+        }
+        let png = self.native_png.clone()?;
+        let (width, height) = self.original;
+        let columns = u64::from(columns).min(u64::from(width));
+        let fitted_columns =
+            columns.min((u64::from(rows) * 2 * u64::from(width) / u64::from(height)).max(1));
+        let fitted_rows = (u64::from(height) * fitted_columns)
+            .div_ceil(u64::from(width) * 2)
+            .max(1)
+            .min(u64::from(rows));
+        Some(NativeImage {
+            png,
+            columns: fitted_columns as u32,
+            rows: fitted_rows as u32,
+            indent: 0,
         })
     }
 

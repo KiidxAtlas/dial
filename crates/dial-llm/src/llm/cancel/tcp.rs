@@ -8,8 +8,18 @@
 //!
 //! Connect behaviour matches ureq's `TcpConnector`: resolved addresses share the connect budget, and an
 //! address-specific failure (an unrouted IPv6 address, a refusal) moves on to the next address.
+//!
+//! Cancellation reaches both blocking phases a request starts with: the connect runs on a helper thread
+//! the request stops waiting for, and the request body is written in short slices that resume at the
+//! byte offset already sent, so an interrupt never waits out the whole phase budget and a partially sent
+//! request is never replayed.
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::sync::{
+    Arc,
+    atomic::AtomicBool,
+    mpsc::{self, RecvTimeoutError},
+};
 use std::time::{Duration, Instant};
 
 use socket2::{SockRef, TcpKeepalive};
@@ -25,10 +35,14 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const KEEPALIVE_PROBES: u32 = 3;
 /// Smallest connect budget any one resolved address gets.
 const MIN_PER_ADDRESS: Duration = Duration::from_millis(10);
+/// How often a blocked connect or write looks at the interrupt flag.
+const CANCEL_POLL: Duration = Duration::from_millis(100);
 
 /// Opens the TCP connection unless an earlier connector (a CONNECT proxy) already did.
 #[derive(Debug)]
-pub(super) struct KeepaliveConnector;
+pub(super) struct KeepaliveConnector {
+    pub(super) interrupt: Arc<AtomicBool>,
+}
 
 impl<In: Transport> Connector<In> for KeepaliveConnector {
     type Out = Either<In, KeepaliveTransport>;
@@ -41,7 +55,7 @@ impl<In: Transport> Connector<In> for KeepaliveConnector {
         if chained.is_some() {
             return Ok(chained.map(Either::A));
         }
-        let stream = connect_any(&details.addrs, details.timeout)?;
+        let stream = connect_cancellable(&details.addrs, details.timeout, &self.interrupt)?;
         keepalive(&stream)?;
         if details.config.no_delay() {
             stream.set_nodelay(true)?;
@@ -53,9 +67,36 @@ impl<In: Transport> Connector<In> for KeepaliveConnector {
         Ok(Some(Either::B(KeepaliveTransport {
             stream,
             buffers,
+            interrupt: Arc::clone(&self.interrupt),
             read_timeout: None,
             write_timeout: None,
         })))
+    }
+}
+
+/// [`connect_any`] on a helper thread, abandoned as soon as the request is interrupted. The abandoned
+/// attempt ends on its own within its connect budget and drops whatever socket it opened.
+fn connect_cancellable(
+    addrs: &[SocketAddr],
+    timeout: NextTimeout,
+    interrupt: &AtomicBool,
+) -> Result<TcpStream, ureq::Error> {
+    super::check(interrupt)?;
+    let addrs = addrs.to_vec();
+    let (tx, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("dial-connect".into())
+        .spawn(move || {
+            let _ = tx.send(connect_any(&addrs, timeout));
+        })?;
+    loop {
+        match rx.recv_timeout(CANCEL_POLL) {
+            Ok(result) => return result,
+            Err(RecvTimeoutError::Timeout) => super::check(interrupt)?,
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(io::Error::other("the connect attempt ended without a result").into());
+            }
+        }
     }
 }
 
@@ -126,6 +167,7 @@ fn address_specific(error: &io::Error) -> bool {
 pub(super) struct KeepaliveTransport {
     stream: TcpStream,
     buffers: LazyBuffers,
+    interrupt: Arc<AtomicBool>,
     read_timeout: Option<Duration>,
     write_timeout: Option<Duration>,
 }
@@ -158,15 +200,19 @@ fn arm(
 /// Unix reports the first as `WouldBlock` (EAGAIN) and the second as `TimedOut` (ETIMEDOUT); Windows
 /// reports an expired socket timeout as `TimedOut`, so there both stay timeouts.
 fn io_failure(error: io::Error, timeout: NextTimeout) -> ureq::Error {
-    let expired = match error.kind() {
-        io::ErrorKind::WouldBlock => true,
-        io::ErrorKind::TimedOut => cfg!(windows),
-        _ => false,
-    };
-    if expired {
+    if expired(&error) {
         ureq::Error::Timeout(timeout.reason)
     } else {
         error.into()
+    }
+}
+
+/// Whether this error is an expired socket timeout (see [`io_failure`]).
+fn expired(error: &io::Error) -> bool {
+    match error.kind() {
+        io::ErrorKind::WouldBlock => true,
+        io::ErrorKind::TimedOut => cfg!(windows),
+        _ => false,
     }
 }
 
@@ -175,17 +221,37 @@ impl Transport for KeepaliveTransport {
         &mut self.buffers
     }
 
+    /// Writes in slices of at most [`CANCEL_POLL`], resuming at the offset already sent, so an
+    /// interrupt is noticed while a slow peer holds the write and no byte is ever sent twice.
     fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
-        arm(
-            &self.stream,
-            &mut self.write_timeout,
-            timeout,
-            TcpStream::set_write_timeout,
-        )?;
-        let output = &self.buffers.output()[..amount];
-        self.stream
-            .write_all(output)
-            .map_err(|error| io_failure(error, timeout))
+        let budget = timeout.not_zero().map(|after| *after);
+        let started = Instant::now();
+        let mut sent = 0;
+        while sent < amount {
+            super::check(&self.interrupt)?;
+            let mut slice = CANCEL_POLL;
+            if let Some(budget) = budget {
+                let remaining = budget.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return Err(ureq::Error::Timeout(timeout.reason));
+                }
+                slice = slice.min(remaining);
+            }
+            if self.write_timeout != Some(slice) {
+                self.stream.set_write_timeout(Some(slice))?;
+                self.write_timeout = Some(slice);
+            }
+            let output = &self.buffers.output()[sent..amount];
+            match self.stream.write(output) {
+                Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero).into()),
+                Ok(count) => sent += count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                // An expired slice: look at the interrupt and the phase budget, then resume.
+                Err(error) if expired(&error) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
     }
 
     fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {

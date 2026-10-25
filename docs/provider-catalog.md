@@ -51,7 +51,9 @@ are served by dial's own MLX server (so LoRA training applies), and running LM S
 servers on their usual loopback ports. It also discovers OpenAI-compatible endpoints and Anthropic's
 Messages API. OpenAI, Anthropic, Google Gemini, OpenRouter, Groq, Mistral and DeepSeek have setup presets.
 
-**Local model formats.** Dial detects the format from the files in the model directory.
+**Local model formats.** Dial detects the format from the files in the model directory. Both formats share the local route
+(`provider = "mlx"` in configuration), but `/models` names GGUF entries `gguf/…` and its detail line names the serving
+runtime; a GGUF entry's source notes when `llama-server` is not installed yet.
 - **MLX** (`config.json` + safetensors): served by `mlx_lm`/`mlx_vlm`; supports LoRA, steering and runtime tuning.
 - **GGUF** (a `.gguf` file, or a directory holding one; sharded files load from the first shard): served by llama.cpp's `llama-server` (found via `DIAL_LLAMA_SERVER`, `PATH`, `/opt/homebrew/bin` or `/usr/local/bin`) with `--jinja` and one slot. Tool and reasoning support come from the chat template in the GGUF header; a sibling `mmproj*.gguf` is passed as `--mmproj` and marks the model as vision-capable. `--ctx-size` is the configured context window, or else the largest window the memory estimate below allows (never the full native window by default). Constrained repair uses llama.cpp's JSON-schema grammar, and sampling names are translated (`repeat_penalty`, `repeat_last_n`). `[local_runtime]` maps `draft_model` (a local GGUF) and `num_draft_tokens` to `--model-draft`/`--spec-draft-n-max`, and `kv_bits` 8 or 4 to a `q8_0`/`q4_0` KV cache; the MLX-only `kv_group_size` and `quantized_kv_start` are rejected. An adapter must be a GGUF LoRA (`--lora`); steering and LoRA training need MLX weights.
 - **Splash** (`manifest.json` with `target/` and `tokenizer/`): only LM Studio can run these. Load the model in LM Studio and select it under the LM Studio provider; Dial's own launcher reports this instead of failing obscurely.

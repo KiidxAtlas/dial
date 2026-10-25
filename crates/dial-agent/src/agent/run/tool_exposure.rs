@@ -339,6 +339,9 @@ impl<'a> Agent<'a> {
         if !self.hermetic && !pinned && catalog.iter().any(|name| name == "check") {
             names.push("check".into());
         }
+        if !self.hermetic && !pinned && catalog.iter().any(|name| name == "peers") {
+            names.push("peers".into());
+        }
         if catalog.iter().any(|name| name == "codebase_memory") {
             names.push("codebase_memory".into());
         }
@@ -431,6 +434,10 @@ impl<'a> Agent<'a> {
             names.sort();
         }
         // Late additions must obey the same restrictions as discovery and explicit loads.
+        // Independent-session coordination belongs to the foreground controller, not its children.
+        if selection_only {
+            names.retain(|name| name != "peers");
+        }
         names.retain(|name| self.tool_eligible(name));
         // Peer messaging follows the `task` offer after mode and profile filters have settled.
         if !names.iter().any(|name| name == "task") {
@@ -501,6 +508,7 @@ impl<'a> Agent<'a> {
                 "ask" => crate::agent::workflow::questions::schema(),
                 "task" => crate::agent::workers::subagents::schema(self.config),
                 "message" => crate::agent::workers::live_tasks::message_schema(),
+                "peers" => crate::agent::run::coordination::schema(),
                 "solve" => crate::agent::workflow::solve::schema(),
                 "escalate" => crate::agent::workflow::solve::escalation_schema(),
                 "skill" => skills::skill_tool::schema(),

@@ -9,6 +9,7 @@ pub(in crate::agent) mod progress;
 pub mod questions;
 pub(in crate::agent) mod reasoning;
 pub(in crate::agent) mod recovery_checkpoint;
+pub(in crate::agent) mod research;
 pub mod solve;
 pub mod todo;
 pub(in crate::agent) mod todo_recovery;

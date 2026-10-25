@@ -210,6 +210,11 @@ pub fn render_result(name: &str, args: &Value, output: &ToolOutput) -> Presentat
             }
             _ => {}
         }
+        // Errors a live language server reported after an edit: a count on the card, the lines in
+        // the result (and in `dial watch`).
+        if let Some((count, _)) = crate::tools::code::lsp::new_errors_in(&output.text) {
+            view.facts.push(plural(count, "new error"));
+        }
     }
     if let Some(code) = output
         .text

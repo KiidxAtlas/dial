@@ -280,6 +280,14 @@ impl Backend {
             scope.begin(billing)?;
         }
         let transport = llm::usage::Transport::enter(scope.clone());
+        let (masked, restorer) = match self.secrets.clone() {
+            Some(masker) => {
+                let (masked, restorer) = masker.mask_chat(request);
+                (Some(masked), Some(restorer))
+            }
+            None => (None, None),
+        };
+        let request = masked.as_ref().unwrap_or(request);
         let result = self
             .compact_native_inner(
                 request,
@@ -298,6 +306,16 @@ impl Backend {
                     cause
                 }
             });
+        let result = result.map(|mut done| {
+            if let Some(restorer) = &restorer {
+                restorer.restore_reply(&mut done.reply);
+                restorer.restore_text(&mut done.summary);
+                for item in &mut done.prefix {
+                    restorer.restore_value(item);
+                }
+            }
+            done
+        });
         transport.settle(result.is_ok())?;
         if let Some(scope) = scope {
             scope.finish(
@@ -473,6 +491,14 @@ impl Backend {
         let uri = url::Url::parse(endpoint).context("invalid remote compaction endpoint")?;
         endpoint_url(endpoint, self.allow_insecure)?;
         let token = llm::catalog::resolve_credential(user_dir, endpoint, None)?;
+        let (masked, restorer) = match self.secrets.clone() {
+            Some(masker) => {
+                let (masked, restorer) = masker.mask_chat(request);
+                (Some(masked), Some(restorer))
+            }
+            None => (None, None),
+        };
+        let request = masked.as_ref().unwrap_or(request);
         let system = request
             .messages
             .iter()
@@ -550,6 +576,10 @@ impl Backend {
                         .is_none_or(Vec::is_empty),
                 "remote compaction returned tool calls instead of a complete summary"
             );
+            let mut summary = summary;
+            if let Some(restorer) = &restorer {
+                restorer.restore_text(&mut summary);
+            }
             Ok(Reply {
                 text: summary,
                 finish_reason: "stop".into(),

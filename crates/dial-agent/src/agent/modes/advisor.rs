@@ -230,6 +230,12 @@ impl CoachTurn {
 
     /// Track the blocker and build the next-request guidance note for a non-`none` review.
     fn apply_round(&mut self, round: &RoundNote) -> Option<Value> {
+        // "Stop." or "looks good" carries no advice: it neither blocks completion nor reaches the
+        // model, whatever severity the coach attached to it.
+        if guidance::is_content_free(&round.note) {
+            self.blocker = None;
+            return None;
+        }
         self.blocker = (round.severity == Severity::Blocker).then(|| round.note.clone());
         let priority = round.severity.priority()?;
         let text = if round.severity == Severity::Blocker {

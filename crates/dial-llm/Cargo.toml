@@ -45,3 +45,6 @@ default = ["aws"]
 aws = ["dep:aws-config", "dep:aws-credential-types", "dep:aws-sigv4", "dep:aws-smithy-http-client"]
 # Test helpers used by other crates' tests (`#[cfg(test)]` items compiled only for this crate otherwise).
 test-support = []
+
+[lints]
+workspace = true

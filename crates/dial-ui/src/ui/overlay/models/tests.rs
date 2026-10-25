@@ -182,6 +182,35 @@ fn judge_role_can_select_laya_once_a_decision_checkpoint_exists() {
 }
 
 #[test]
+fn decision_role_picks_checkpoint_instead_of_the_judge_alias() {
+    let rig = Rig::new();
+    let mut roles = roles_with_main();
+    roles.push(RoleStatus {
+        role: "decision",
+        assigned: Some(ModelSelection::new("laya", "/tmp/laya-checkpoint")),
+        effective: Some("laya//tmp/laya-checkpoint".into()),
+        source: RoleSource::Assigned,
+    });
+    let mut o = ModelOverlay::new(Some(discovery()), roles, Scope::Global).with_learning(false);
+    o.show_roles();
+    o.cursor = o
+        .visible_roles()
+        .iter()
+        .position(|(role, _)| *role == "decision")
+        .unwrap();
+    send(&mut o, &rig, key(KeyCode::Enter));
+    assert!(o.prompt.is_none());
+    assert_eq!(o.target_role.as_deref(), Some("decision"));
+    assert_eq!(o.rows().len(), 1);
+    assert_eq!(o.rows()[0].0.selection.model, "/tmp/laya-checkpoint");
+    assert!(matches!(send(&mut o, &rig, key(KeyCode::Enter)),
+        OverlayEvent::AssignModel { role, selection, .. }
+            if role == "decision" && selection.model == "/tmp/laya-checkpoint"));
+    send(&mut o, &rig, key(KeyCode::F(2)));
+    assert!(o.prompt.is_some());
+}
+
+#[test]
 fn discovery_refresh_preserves_role_cursor_and_assignment_target() {
     let rig = Rig::new();
     let mut o = overlay();
@@ -429,6 +458,7 @@ fn cleared_role_refresh_removes_assignment_and_preserves_selected_row() {
             ..Default::default()
         };
         config.codebase.architecture_model.clear();
+        config.experimental.turn_optimizer = true;
         let provider = if role == "decision" { "laya" } else { "mlx" };
         config
             .model_roles
@@ -453,6 +483,26 @@ fn cleared_role_refresh_removes_assignment_and_preserves_selected_row() {
         assert!(!shown.contains("assigned-model"), "{role}: {shown}");
         assert!(o.role_selection("main").is_some());
     }
+}
+
+#[test]
+fn turn_drafter_row_follows_the_turn_optimizer_setting() {
+    let rig = Rig::new();
+    let mut config = crate::config::types::Config {
+        model: "main-model".into(),
+        ..Default::default()
+    };
+    let mut o = ModelOverlay::new(None, config.role_statuses(), Scope::Global);
+    o.show_roles();
+    assert_eq!(o.list_len(), ROLES.len() - 1);
+    assert!(!draw(&mut o, &rig, 130, 40).contains(TURN_DRAFTER));
+    config.experimental.turn_optimizer = true;
+    o.set_roles(config.role_statuses());
+    assert_eq!(o.list_len(), ROLES.len());
+    o.cursor = ROLES.len() - 1;
+    let shown = draw(&mut o, &rig, 130, 40);
+    assert!(shown.contains(TURN_DRAFTER), "{shown}");
+    assert!(shown.contains("follows main"), "{shown}");
 }
 
 #[test]
@@ -823,6 +873,49 @@ fn rows_and_details_show_lora_compatibility_and_the_main_adapter() {
     send(&mut o, &rig, key(KeyCode::Down));
     let shown = draw(&mut o, &rig, 130, 30);
     assert!(shown.contains("no LoRA: served by lm-studio"), "{shown}");
+}
+
+#[test]
+fn local_gguf_models_are_named_and_described_by_their_format() {
+    use crate::llm::local_format::LocalFormat;
+    let rig = Rig::new();
+    let local = |label: &str, format| ModelEntry {
+        selection: ModelSelection {
+            model: format!("/models/{label}"),
+            ..ModelSelection::default()
+        },
+        label: label.into(),
+        source: "LM Studio download".into(),
+        available: true,
+        metadata: crate::llm::catalog::ModelMetadata {
+            format: Some(format),
+            ..Default::default()
+        },
+    };
+    let mut o = ModelOverlay::new(
+        Some(Discovery {
+            models: vec![
+                local("qwen-gguf", LocalFormat::Gguf),
+                local("qwen-mlx", LocalFormat::Mlx),
+            ],
+            providers: vec![],
+        }),
+        roles_with_main(),
+        Scope::Global,
+    );
+    let shown = draw(&mut o, &rig, 130, 30);
+    assert!(
+        shown.contains("gguf/qwen-gguf") && !shown.contains("mlx/qwen-gguf"),
+        "{shown}"
+    );
+    assert!(shown.contains("mlx/qwen-mlx"), "{shown}");
+    assert!(shown.contains("GGUF, served by llama.cpp"), "{shown}");
+    send(&mut o, &rig, key(KeyCode::Down));
+    let shown = draw(&mut o, &rig, 130, 30);
+    assert!(
+        shown.contains("MLX, served by Dial's MLX server"),
+        "{shown}"
+    );
 }
 
 #[test]

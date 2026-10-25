@@ -34,6 +34,7 @@ fn icon(kind: EventKind, ascii: bool) -> &'static str {
         (Subagent, false) => "◎",
         (Continue, false) => "↻",
         (Compaction | ContextReset, false) => "⟲",
+        (Draft, false) => "✎",
         (Recovery, true) => "!",
         (Steering, true) => ">",
         (Compaction | ContextReset, true) => "~",
@@ -46,7 +47,7 @@ fn icon_tok(kind: EventKind) -> Tok {
     match kind {
         Recovery => Tok::Warning,
         Skill | Tools | Learning => Tok::SectionLearn,
-        Steering | Continue | Plan => Tok::Accent,
+        Steering | Continue | Plan | Draft => Tok::Accent,
         Verification => Tok::Success,
         Hook | Model | Subagent => Tok::SectionConnect,
         _ => Tok::Muted,

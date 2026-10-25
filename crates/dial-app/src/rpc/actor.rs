@@ -138,8 +138,13 @@ impl Actor {
                 projection_dirty: false,
                 tree: None,
             };
-            worker_out.emit(json!({"event":"ready","protocol_version":PROTOCOL_VERSION,"session_id":agent.session().id(),"model":config.model,"tools":agent.tool_names(),"image_input":image_input,
-                "question_input":if acp { json!({"supported":false,"reason":"ACP custom input capability was not negotiated"}) } else { json!({"supported":true,"protocol":1,"presentation_ack_required":true,"answer_method":"question_answer","presentation_method":"question_presented","images":"explicit_user_paths","preview":"text"}) }}));
+            worker_out.emit(ready_frame(
+                agent.session().id(),
+                &config.model,
+                json!(agent.tool_names()),
+                image_input,
+                acp,
+            ));
             let _ = control_tx.send((
                 agent.live_task_control(),
                 agent.background_compaction_control(),
@@ -348,6 +353,12 @@ impl Actor {
                             Ok(json!({"enabled":agent.plan_mode()}))
                         }
                         "new_session" => {
+                            agent
+                                .gate_session_change(
+                                    "session_before_switch",
+                                    json!({"reason":"new"}),
+                                )
+                                .map_err(anyhow::Error::msg)?;
                             let session = Session::create(
                                 &layout,
                                 SessionMeta {
@@ -394,8 +405,8 @@ impl Actor {
                                 .as_str()
                                 .context("memory requires params.command")?;
                             anyhow::ensure!(
-                                command.len() <= 8192,
-                                "memory command exceeds 8192 bytes"
+                                command.len() <= MAX_MEMORY_COMMAND_BYTES,
+                                "memory command exceeds {MAX_MEMORY_COMMAND_BYTES} bytes"
                             );
                             agent.selected_memory_command(command, &mut ui)
                         }
@@ -403,12 +414,15 @@ impl Actor {
                             let messages = params["messages"]
                                 .as_array()
                                 .context("seed_context requires params.messages")?;
-                            anyhow::ensure!(messages.len() <= 200, "at most 200 seed messages");
+                            anyhow::ensure!(
+                                messages.len() <= MAX_SEED_MESSAGES,
+                                "at most {MAX_SEED_MESSAGES} seed messages"
+                            );
                             for text in messages {
                                 let text =
                                     text.as_str().context("context entries must be strings")?;
                                 anyhow::ensure!(
-                                    text.len() <= 1024 * 1024,
+                                    text.len() <= MAX_SEED_ENTRY_BYTES,
                                     "context entry exceeds 1 MiB"
                                 );
                                 agent
@@ -421,6 +435,14 @@ impl Actor {
                             let wanted = params["session_id"]
                                 .as_str()
                                 .context("resume requires params.session_id")?;
+                            if !agent.session().id().starts_with(wanted) {
+                                agent
+                                    .gate_session_change(
+                                        "session_before_switch",
+                                        json!({"reason":"resume","target_session_id":wanted}),
+                                    )
+                                    .map_err(anyhow::Error::msg)?;
+                            }
                             if acp {
                                 if !current || agent.session().id() != wanted {
                                     let session = if let Some(session) = parked.remove(wanted) {
@@ -469,6 +491,12 @@ impl Actor {
                             let wanted = params["session_id"]
                                 .as_str()
                                 .context("session_id required")?;
+                            agent
+                                .gate_session_change(
+                                    "session_before_branch",
+                                    json!({"reason":"fork","source_session_id":wanted}),
+                                )
+                                .map_err(anyhow::Error::msg)?;
                             let session = if current && agent.session().id() == wanted {
                                 stop_owned_tasks(&mut agent, &mut ui);
                                 agent.session().fork(&layout)?

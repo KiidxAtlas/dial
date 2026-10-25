@@ -19,6 +19,7 @@ pub(in crate::agent) struct Engine {
     repeats: guard::RepeatGuard,
     investigation: investigation::InvestigationGuard,
     returned_reads: investigation::ReturnedReads,
+    research: crate::agent::workflow::research::Research,
     pub narration: guard::NarrationGuard,
     pub recovery: turn_recovery::Recovery,
     uncertain: bool,
@@ -64,6 +65,25 @@ pub(in crate::agent) trait Terminal {
 }
 
 impl Engine {
+    pub fn research_prompt(&self) -> Option<serde_json::Value> {
+        self.research.prompt()
+    }
+
+    pub fn research_required(&self) -> bool {
+        self.research.required()
+    }
+
+    pub fn synthesize(
+        &mut self,
+        reply: &crate::llm::Reply,
+    ) -> crate::agent::workflow::research::Synthesis {
+        self.research.synthesize(reply)
+    }
+
+    pub fn research_round(&mut self) {
+        self.research.round();
+    }
+
     pub fn length(
         &mut self,
         requested: u32,
@@ -248,12 +268,12 @@ impl Engine {
         }
         // Returning a file to content it already had is not progress and cannot clear recovery.
         let mutated = observation.novel;
-        if mutated
-            || (!output.is_error
-                && task_changed
-                && call.name == "todo"
-                && matches!(call.arguments["op"].as_str(), Some("done" | "block")))
-        {
+        let resolved = !output.is_error
+            && task_changed
+            && call.name == "todo"
+            && matches!(call.arguments["op"].as_str(), Some("done" | "block"));
+        self.research.observe(call, output, mutated || resolved);
+        if mutated || resolved {
             self.narration.progress();
         }
         self.checkpoint.progress(
@@ -303,3 +323,6 @@ mod evidence_tests;
 
 #[cfg(test)]
 mod length_tests;
+
+#[cfg(test)]
+mod research_tests;

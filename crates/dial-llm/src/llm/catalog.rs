@@ -1,6 +1,7 @@
 //! Metadata-only discovery: no subnet scan, inference, or model downloads.
 //! Saved credentials are plaintext JSON, protected by owner-only directories/files,
 //! not an OS keychain. They are URL-scoped and written only on explicit user action.
+use super::local_format::LocalFormat;
 use super::model_config::{ApiProtocol, ModelSelection, ProviderSpec};
 use crate::config::paths::Layout;
 use crate::config::settings_store::{locked, write_private};
@@ -114,6 +115,15 @@ impl ModelEntry {
     pub fn supports_chat(&self) -> bool {
         self.metadata.kind.supports_chat()
     }
+    /// The provider shown before the label. Dial's own local route keeps the id `mlx` (configs
+    /// select it as `provider = "mlx"`) but serves GGUF files on llama.cpp, so those read `gguf`.
+    pub fn display_provider(&self) -> &str {
+        if self.metadata.format == Some(LocalFormat::Gguf) {
+            "gguf"
+        } else {
+            &self.selection.provider
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct ModelMetadata {
@@ -138,6 +148,9 @@ pub struct ModelMetadata {
     /// What the model is for. Set from structured provider or checkpoint metadata only.
     #[serde(default)]
     pub kind: ModelKind,
+    /// On-disk format of a downloaded local model; `None` for served and hosted models.
+    #[serde(default)]
+    pub format: Option<LocalFormat>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LoraCheck {
@@ -1809,14 +1822,18 @@ fn local_models(cache: &Path, trainable: Option<&Path>) -> Vec<ModelEntry> {
                 },
                 label,
                 source: if gguf {
-                    "Hugging Face cache (GGUF)"
+                    gguf_source("Hugging Face cache")
                 } else {
-                    "Hugging Face cache (MLX)"
-                }
-                .into(),
+                    "Hugging Face cache (MLX)".into()
+                },
                 available: true,
                 metadata: ModelMetadata {
                     lora: lora_support(trainable, &path),
+                    format: Some(if gguf {
+                        LocalFormat::Gguf
+                    } else {
+                        LocalFormat::Mlx
+                    }),
                     ..local_model_metadata(&path)
                 },
             });
@@ -1824,6 +1841,15 @@ fn local_models(cache: &Path, trainable: Option<&Path>) -> Vec<ModelEntry> {
         }
     }
     models
+}
+/// Source text for a GGUF listing. A missing `llama-server` is named here; Dial offers to install it
+/// before the first turn on the model.
+fn gguf_source(origin: &str) -> String {
+    if super::local_format::llama_server().is_some() {
+        format!("{origin} (GGUF)")
+    } else {
+        format!("{origin} (GGUF) · llama.cpp not installed; Dial offers to install it on first use")
+    }
 }
 /// Resolve local inference without asking Hugging Face to look up a revision.
 pub fn resolve_local_model(model: &str) -> Result<String> {
@@ -1951,6 +1977,7 @@ fn lmstudio_mlx_models(folder: &Path, trainable: Option<&Path>) -> Vec<ModelEntr
                 available: true,
                 metadata: ModelMetadata {
                     lora: lora_support(trainable, &path),
+                    format: Some(LocalFormat::Mlx),
                     ..local_model_metadata(&path)
                 },
             });
@@ -1987,10 +2014,11 @@ fn lmstudio_gguf_models(folder: &Path) -> Vec<ModelEntry> {
                     publisher.file_name().to_string_lossy(),
                     repo.file_name().to_string_lossy()
                 ),
-                source: "LM Studio download (GGUF)".into(),
+                source: gguf_source("LM Studio download"),
                 available: true,
                 metadata: ModelMetadata {
                     vision: Some(false),
+                    format: Some(LocalFormat::Gguf),
                     ..ModelMetadata::default()
                 },
             });

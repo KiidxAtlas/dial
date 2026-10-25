@@ -709,7 +709,7 @@ fn run_command_check(
         layout.user_dir.clone(),
         config.user_dir.clone(),
     ])
-    .with_shell_backend(config.shell.backend);
+    .with_shell_config(&config.shell);
     let output: ToolOutput = tools::execute(
         &ws,
         "bash",

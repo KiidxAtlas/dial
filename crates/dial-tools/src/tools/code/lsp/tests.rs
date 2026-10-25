@@ -1206,6 +1206,18 @@ fn edit_results_list_only_errors_the_edit_introduced() {
     assert!(notes.contains("10 new error(s)"), "{notes}");
     assert_eq!(notes.matches(": found ERROR").count(), 8, "{notes}");
     assert!(notes.contains("... 2 more"), "{notes}");
+    // The card and `dial watch` read the same block back.
+    let (count, listed) = super::new_errors_in(&notes).unwrap();
+    assert_eq!((count, listed.len()), (10, 8), "{notes}");
+    assert!(listed.iter().all(|line| line.ends_with(": found ERROR")));
+}
+
+#[test]
+fn new_errors_in_reads_back_the_advisory_block() {
+    let note = super::new_errors_note(&["a.rs:1:2: bad".to_owned()], true);
+    let text = format!("Edited a.rs\n{note}\nmore output");
+    assert_eq!(super::new_errors_in(&text), Some((1, vec!["a.rs:1:2: bad"])));
+    assert_eq!(super::new_errors_in("Edited a.rs\n"), None);
 }
 
 #[test]

@@ -480,6 +480,9 @@ impl<'a> Agent<'a> {
             .chain(self.config.tools.keys().cloned())
             .collect();
         if !self.hermetic {
+            if self.config.coordination.enabled && self.layout.is_some() {
+                names.push("peers".into());
+            }
             names.push("request_directory".into());
         }
         if let Some(memory) = &self.memory_runtime {
@@ -492,6 +495,7 @@ impl<'a> Agent<'a> {
                     "todo"
                         | "finish"
                         | "request_directory"
+                        | "peers"
                         | "ask"
                         | "tool_search"
                         | "tool_load"
@@ -517,6 +521,7 @@ impl<'a> Agent<'a> {
         // `check` runs the verification gate's selection; `revert_edit` needs the checkpoint journal.
         names.retain(|name| match name.as_str() {
             "check" => self.config.verification.enabled,
+            "peers" => !self.hermetic && self.config.coordination.enabled && self.layout.is_some(),
             "revert_edit" => self.checkpoints.is_some(),
             _ => true,
         });

@@ -18,7 +18,7 @@ use crate::{
     config::paths::Layout,
     config::settings_store::Scope,
     llm::catalog::{Discovery, ModelEntry, ModelKind, ProviderStatus},
-    llm::model_config::{ModelSelection, ROLES, RoleSource, RoleStatus},
+    llm::model_config::{ModelSelection, ROLES, RoleSource, RoleStatus, TURN_DRAFTER},
     setup::embeddings,
     stats::{ModelUsage, local_models::Settings},
     ui::{
@@ -233,6 +233,8 @@ pub struct ModelOverlay {
     learning: bool,
     /// The judge role's Laya entry, offered only while choosing the judge model (see `laya_judge_entry`).
     laya_judge: ModelEntry,
+    /// Installed or explicitly assigned checkpoint, never the judge's `decision` alias.
+    laya_decision: ModelEntry,
     /// The Get models group: installed local models, downloads and the embedding models.
     downloads: ModelDownloads,
     /// Recorded requests, cost and decode speed per stats model name (see `usage_of`).
@@ -247,12 +249,10 @@ fn is_embedding(entry: &ModelEntry) -> bool {
     entry.is_embedding()
 }
 
-/// Whether a role can take this entry. Embedding models are offered only to the `embedding` role (they
-/// cannot chat); `decision` takes a typed Laya checkpoint, never a catalog entry; the Laya engine entry
-/// answers only the `judge` role's typed choices.
+/// Laya checkpoints are only for typed decisions; chat and embedding models stay separate.
 fn role_accepts(role: &str, entry: &ModelEntry) -> bool {
     if entry.selection.provider == crate::config::laya::PROVIDER {
-        return role == "judge";
+        return matches!(role, "judge" | "decision");
     }
     match role {
         "decision" => false,
@@ -314,6 +314,27 @@ fn laya_judge_entry(roles: &[RoleStatus]) -> ModelEntry {
     }
 }
 
+fn laya_decision_entry(roles: &[RoleStatus]) -> ModelEntry {
+    let checkpoint = roles
+        .iter()
+        .find(|status| status.role == "decision")
+        .and_then(|status| status.assigned.as_ref())
+        .map(|selection| selection.model.clone())
+        .or_else(|| crate::config::laya::expected_checkpoint(&Default::default()));
+    ModelEntry {
+        selection: ModelSelection::new(
+            crate::config::laya::PROVIDER,
+            checkpoint.as_deref().unwrap_or(""),
+        ),
+        label: "Laya checkpoint".into(),
+        source: checkpoint
+            .clone()
+            .unwrap_or_else(|| "No installed Laya checkpoint".into()),
+        available: checkpoint.is_some(),
+        metadata: Default::default(),
+    }
+}
+
 fn source_label(source: RoleSource) -> &'static str {
     match source {
         RoleSource::Assigned => "assigned",
@@ -353,12 +374,10 @@ fn same_model(a: &ModelSelection, b: &ModelSelection) -> bool {
 }
 
 fn display_name(entry: &ModelEntry) -> String {
+    let provider = entry.display_provider();
     text::one_line(&match &entry.selection.account_id {
-        Some(id) => format!(
-            "{}/{} [account {id}]",
-            entry.selection.provider, entry.label
-        ),
-        None => format!("{}/{}", entry.selection.provider, entry.label),
+        Some(id) => format!("{provider}/{} [account {id}]", entry.label),
+        None => format!("{provider}/{}", entry.label),
     })
 }
 
@@ -718,6 +737,7 @@ impl ModelOverlay {
             memory_required: false,
             memory_optional: false,
             laya_judge: laya_judge_entry(&roles),
+            laya_decision: laya_decision_entry(&roles),
             discovery,
             roles,
             favorites: Vec::new(),
@@ -881,6 +901,10 @@ impl ModelOverlay {
         std::iter::once(&self.laya_judge)
             .filter(move |_| judging)
             .chain(
+                std::iter::once(&self.laya_decision)
+                    .filter(move |_| self.target_role.as_deref() == Some("decision")),
+            )
+            .chain(
                 self.discovery
                     .iter()
                     .flat_map(|discovery| discovery.models.iter())
@@ -920,9 +944,6 @@ impl ModelOverlay {
 
     pub fn with_learning(mut self, enabled: bool) -> Self {
         self.learning = enabled;
-        if !enabled {
-            self.roles.retain(|role| role.role != "decision");
-        }
         self
     }
 
@@ -1099,6 +1120,7 @@ impl ModelOverlay {
     pub fn set_roles(&mut self, roles: Vec<RoleStatus>) {
         let anchor = self.highlighted().map(|e| e.selection.clone());
         self.laya_judge = laya_judge_entry(&roles);
+        self.laya_decision = laya_decision_entry(&roles);
         self.roles = roles;
         if self.group != Group::Roles {
             let rows = self.rows();
@@ -1118,8 +1140,18 @@ impl ModelOverlay {
             .and_then(|status| status.assigned.as_ref())
     }
 
+    /// `ROLES` rows the Roles view lists. `turn_drafter` (always last) is shown only when the role
+    /// statuses include it, which `Config::role_statuses` does while the turn optimizer is on.
+    fn visible_roles(&self) -> &'static [(&'static str, &'static str)] {
+        let drafter = self.roles.iter().any(|status| status.role == TURN_DRAFTER);
+        match ROLES.split_last() {
+            Some((&(last, _), rest)) if last == TURN_DRAFTER && !drafter => rest,
+            _ => ROLES,
+        }
+    }
+
     fn roles_using(&self, selection: &ModelSelection) -> Vec<&str> {
-        ROLES
+        self.visible_roles()
             .iter()
             .map(|(name, _)| *name)
             .filter(|name| {
@@ -1130,7 +1162,7 @@ impl ModelOverlay {
     }
 
     fn assigned_roles(&self) -> usize {
-        ROLES
+        self.visible_roles()
             .iter()
             .filter(|(name, _)| self.role_selection(name).is_some())
             .count()
@@ -1141,7 +1173,7 @@ impl ModelOverlay {
             return 0;
         }
         match group {
-            Group::Roles => ROLES.len(),
+            Group::Roles => self.visible_roles().len(),
             Group::All => self.all_entries().count(),
             Group::Favorites => self.favorite_entries.len(),
             Group::Memory => self
@@ -1291,7 +1323,7 @@ impl ModelOverlay {
 
     fn list_len(&self) -> usize {
         if self.group == Group::Roles {
-            ROLES.len()
+            self.visible_roles().len()
         } else {
             self.rows().len()
         }
@@ -1426,6 +1458,18 @@ impl ModelOverlay {
                 }
             }
         }
+        if key.code == KeyCode::F(2)
+            && self.focus == Focus::List
+            && (self.target_role.as_deref() == Some("decision")
+                || (self.group == Group::Roles
+                    && self
+                        .visible_roles()
+                        .get(self.cursor)
+                        .is_some_and(|(role, _)| *role == "decision")))
+        {
+            self.open_prompt("decision");
+            return OverlayEvent::None;
+        }
         if key.code == KeyCode::F(8) {
             // Headers belong to a role's assignment; outside Roles only a role being picked for has one.
             if self.group != Group::Roles && self.target_role.is_none() {
@@ -1436,7 +1480,9 @@ impl ModelOverlay {
                 return OverlayEvent::None;
             }
             let role = if self.group == Group::Roles {
-                ROLES.get(self.cursor).map(|(role, _)| (*role).to_owned())
+                self.visible_roles()
+                    .get(self.cursor)
+                    .map(|(role, _)| (*role).to_owned())
             } else {
                 self.target_role.clone()
             };
@@ -1520,7 +1566,7 @@ impl ModelOverlay {
                 return OverlayEvent::None;
             }
             let selected = if self.group == Group::Roles {
-                ROLES
+                self.visible_roles()
                     .get(self.cursor)
                     .and_then(|(role, _)| self.role_selection(role))
                     .cloned()
@@ -1604,7 +1650,8 @@ impl ModelOverlay {
     fn cancel(&mut self) -> OverlayEvent {
         if let Some(role) = self.target_role.take() {
             self.show_roles();
-            self.cursor = ROLES
+            self.cursor = self
+                .visible_roles()
                 .iter()
                 .position(|(name, _)| *name == role)
                 .unwrap_or(0);
@@ -1691,12 +1738,8 @@ impl ModelOverlay {
             return OverlayEvent::None;
         }
         if self.group == Group::Roles {
-            let at = self.cursor.min(ROLES.len() - 1);
-            let role = ROLES[at].0;
-            if role == "decision" {
-                self.open_prompt(role);
-                return OverlayEvent::None;
-            }
+            let roles = self.visible_roles();
+            let role = roles[self.cursor.min(roles.len() - 1)].0;
             self.target_role = Some(role.to_owned());
             // The memory role is picked in its own group, which shows the memory backend's status.
             self.group = if role == "memory" {
@@ -1748,7 +1791,11 @@ impl ModelOverlay {
         let role = self.target_role.take();
         if let Some(role) = &role {
             self.show_roles();
-            self.cursor = ROLES.iter().position(|(name, _)| name == role).unwrap_or(0);
+            self.cursor = self
+                .visible_roles()
+                .iter()
+                .position(|(name, _)| name == role)
+                .unwrap_or(0);
         }
         OverlayEvent::AssignModel {
             role: target,
@@ -1768,7 +1815,8 @@ impl ModelOverlay {
             ));
             return OverlayEvent::None;
         }
-        let roles: Vec<_> = ROLES
+        let roles: Vec<_> = self
+            .visible_roles()
             .iter()
             .map(|(role, _)| *role)
             .filter(|role| role_accepts(role, entry))
@@ -1861,7 +1909,8 @@ impl ModelOverlay {
         if self.group != Group::Roles || self.focus != Focus::List {
             return OverlayEvent::None;
         }
-        let (role, _) = ROLES[self.cursor.min(ROLES.len() - 1)];
+        let roles = self.visible_roles();
+        let (role, _) = roles[self.cursor.min(roles.len() - 1)];
         if role == "main" {
             self.message = Some((
                 "The main model cannot be cleared: pick another model for it instead".to_owned(),
@@ -1945,7 +1994,7 @@ impl ModelOverlay {
         let right_w = w - if left_w > 0 { left_w + 1 } else { 0 };
 
         let len = if roles_view {
-            ROLES.len()
+            self.visible_roles().len()
         } else {
             self.rows().len()
         };
@@ -2030,7 +2079,7 @@ impl ModelOverlay {
                 let line = if let Some(chooser) = &self.chooser {
                     self.chooser_line(theme, chooser, i, list_w)
                 } else if roles_view {
-                    if index < ROLES.len() {
+                    if index < self.visible_roles().len() {
                         self.role_line(theme, index, list_w)
                     } else {
                         filled(vec![], list_w, Style::default())
@@ -2287,7 +2336,7 @@ impl ModelOverlay {
             line(
                 &Group::Roles,
                 "Roles".to_owned(),
-                format!("{}/{}", self.assigned_roles(), ROLES.len()),
+                format!("{}/{}", self.assigned_roles(), self.visible_roles().len()),
                 None,
                 self,
             ),
@@ -2503,7 +2552,7 @@ impl ModelOverlay {
     }
 
     fn role_line(&self, theme: &Theme, index: usize, w: usize) -> Line<'static> {
-        let (role, description) = ROLES[index];
+        let (role, description) = self.visible_roles()[index];
         let selected = index == self.cursor;
         let fill = if selected {
             theme.bg(Tok::SelectedBg)
@@ -2667,7 +2716,8 @@ impl ModelOverlay {
             return self.downloads.detail(theme);
         }
         if self.group == Group::Roles {
-            let (role, description) = ROLES[self.cursor.min(ROLES.len() - 1)];
+            let roles = self.visible_roles();
+            let (role, description) = roles[self.cursor.min(roles.len() - 1)];
             return (
                 vec![Span::styled(
                     format!(" {role}: {description}"),
@@ -2709,6 +2759,12 @@ impl ModelOverlay {
         let facts = context
             .into_iter()
             .chain(max_output)
+            .chain(
+                entry
+                    .metadata
+                    .format
+                    .map(|format| format.serving().to_owned()),
+            )
             .chain([
                 state_of(entry).to_owned(),
                 if is_local(entry) { "local" } else { "cloud" }.to_owned(),
@@ -2868,6 +2924,7 @@ impl ModelOverlay {
                     pair_label(keys, Action::SelectUp, Action::SelectDown)
                 ),
                 "x clear".to_owned(),
+                "F2 custom decision checkpoint".to_owned(),
                 if self.learning {
                     "F6 verify LoRA".to_owned()
                 } else {
@@ -2886,6 +2943,13 @@ impl ModelOverlay {
             }
             hints.push("F5 rescan".to_owned());
             return hints;
+        }
+        if self.target_role.as_deref() == Some("decision") {
+            return vec![
+                hint(keys, Action::SelectConfirm, "assign checkpoint"),
+                "F2 custom checkpoint".into(),
+                hint(keys, Action::SelectCancel, "back"),
+            ];
         }
         if self.nothing_discovered() {
             return vec![

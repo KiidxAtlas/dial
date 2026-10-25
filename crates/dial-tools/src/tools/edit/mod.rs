@@ -7,6 +7,7 @@ pub(in crate::tools) mod edit_native;
 pub(crate) mod edit_source;
 pub(in crate::tools) mod edit_transaction;
 pub mod editing;
+pub mod grammar_bench;
 pub mod hashline;
 pub mod preview;
 #[cfg(test)]

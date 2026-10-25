@@ -5,13 +5,14 @@ use serde_json::json;
 fn removes_only_bookkeeping_and_preserves_evidence_text() {
     let original = json!({"role":"tool","content":"answer [artifact://proof]","tool_call_id":"1",
         "dial_evidence":{"artifact":"artifact://proof"},"dial_recall":"notes",
-        "dial_transient":true,"unknown":"reject me",
+        "dial_transient":true,"unknown":"reject me","dial_turn_draft":{"original":"typed"},
         "dial_images":[{"url":"artifact://image"}],
         "dial_provider_content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]});
     let projected = canonical(&original);
     assert!(projected.get("dial_evidence").is_none());
     assert!(projected.get("dial_transient").is_none());
     assert!(projected.get("dial_recall").is_none());
+    assert!(projected.get("dial_turn_draft").is_none());
     assert_eq!(projected["content"], original["content"]);
     assert_eq!(projected["unknown"], "reject me");
     assert_eq!(projected["dial_images"], original["dial_images"]);

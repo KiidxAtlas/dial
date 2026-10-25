@@ -1,4 +1,5 @@
 use super::*;
+use dial_core::credentials::env_secrets;
 
 fn redact(text: &str) -> (String, usize) {
     let (replaced, count) = redact_with(text, &[]);

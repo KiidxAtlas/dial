@@ -299,4 +299,22 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Additional guidance for soft, remote and handoff summaries. Shake and image archives ignore summary-only guidance. Use inherit to clear a lower-layer override.",
         Kind::Text,
     ),
+    field!(
+        "compaction.promotion.enabled",
+        compaction.promotion.enabled,
+        MO,
+        "Compaction",
+        "Context promotion",
+        "Before compacting or retrying a context overflow, switch to a configured larger-window model (see the targets map). Compacts only when no target qualifies. The switch lasts until you change models.",
+        Kind::Bool,
+    ),
+    field!(
+        "compaction.promotion.targets",
+        compaction.promotion.targets,
+        MO,
+        "Compaction",
+        "Promotion target map",
+        "TOML map from default, an exact provider/model or provider/* to an ordered list of larger-window models (provider/model, bare model on the same provider, or @role). A target qualifies only with a strictly larger window and credentials.",
+        Kind::Table,
+    ),
 ];

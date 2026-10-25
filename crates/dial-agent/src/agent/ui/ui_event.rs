@@ -39,6 +39,8 @@ pub enum EventKind {
     Compaction,
     /// A new notes-backed context window replaced the old one.
     ContextReset,
+    /// The experimental turn optimizer rewrote a user message before the main model saw it.
+    Draft,
 }
 
 /// Where a surface should place an event.
@@ -81,6 +83,7 @@ impl EventKind {
             Self::Continue => "resume",
             Self::Compaction => "compacted",
             Self::ContextReset => "new context",
+            Self::Draft => "draft",
         }
     }
 }

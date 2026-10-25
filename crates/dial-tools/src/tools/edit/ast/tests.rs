@@ -548,3 +548,155 @@ fn schemas_follow_the_tool_contract() {
         );
     }
 }
+
+fn token_of(preview: &str) -> String {
+    preview
+        .lines()
+        .find_map(|line| line.strip_prefix("apply_token: "))
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or_else(|| panic!("no apply_token in:\n{preview}"))
+        .to_owned()
+}
+
+#[test]
+fn apply_token_applies_exactly_the_previewed_rewrite() {
+    let (dir, ws) = workspace();
+    let a = put(&dir, "a.rs", "fn main() {\n    old(1);\n}\n");
+    let b = put(&dir, "b.rs", "fn other() { old(2); }\n");
+    let preview = edit(&ws, json!({"pattern": "old($A)", "rewrite": "new($A)"}));
+    assert!(!preview.is_error, "{}", preview.text);
+    let token = token_of(&preview.text);
+    assert!(fs::read_to_string(&a).unwrap().contains("old(1)"));
+    assert!(AstEdit.needs_approval(&json!({"apply_token": token})));
+
+    let done = edit(&ws, json!({"apply_token": token}));
+    assert!(!done.is_error, "{}", done.text);
+    assert!(
+        done.text.contains("applied 2 replacements in 2 files"),
+        "{}",
+        done.text
+    );
+    assert_eq!(
+        fs::read_to_string(&a).unwrap(),
+        "fn main() {\n    new(1);\n}\n"
+    );
+    assert_eq!(fs::read_to_string(&b).unwrap(), "fn other() { new(2); }\n");
+
+    // A token is single-use.
+    let again = edit(&ws, json!({"apply_token": token}));
+    assert!(
+        again.is_error && again.text.contains("unknown or expired"),
+        "{}",
+        again.text
+    );
+}
+
+#[test]
+fn apply_token_is_refused_when_an_affected_file_changed_since_the_preview() {
+    let (dir, ws) = workspace();
+    let a = put(&dir, "a.rs", "fn f() { old(1); }\n");
+    let b = put(&dir, "b.rs", "fn g() { old(2); }\n");
+    let token = token_of(&edit(&ws, json!({"pattern": "old($A)", "rewrite": "new($A)"})).text);
+    fs::write(&b, "fn g() { old(2); extra(); }\n").unwrap();
+
+    let refused = edit(&ws, json!({"apply_token": token}));
+    assert!(refused.is_error, "{}", refused.text);
+    assert!(
+        refused.text.contains("changed after AST planning"),
+        "{}",
+        refused.text
+    );
+    assert_eq!(
+        fs::read_to_string(&a).unwrap(),
+        "fn f() { old(1); }\n",
+        "all-or-nothing"
+    );
+    assert_eq!(
+        fs::read_to_string(&b).unwrap(),
+        "fn g() { old(2); extra(); }\n"
+    );
+}
+
+#[test]
+fn apply_token_rejects_unknown_tokens_and_mixed_arguments() {
+    let (dir, ws) = workspace();
+    let a = put(&dir, "a.rs", "fn f() { old(1); }\n");
+    let unknown = edit(&ws, json!({"apply_token": "deadbeef"}));
+    assert!(unknown.is_error && unknown.text.contains("unknown or expired"));
+
+    let token = token_of(&edit(&ws, json!({"pattern": "old($A)", "rewrite": "new($A)"})).text);
+    for extra in [
+        json!({"pattern": "x"}),
+        json!({"path": "a.rs"}),
+        json!({"dry_run": true}),
+    ] {
+        let mut args = json!({"apply_token": token});
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let out = edit(&ws, args);
+        assert!(out.is_error, "{}", out.text);
+    }
+    assert!(
+        fs::read_to_string(&a).unwrap().contains("old(1)"),
+        "mixed calls write nothing"
+    );
+    // The rejected calls did not spend the token.
+    assert!(!edit(&ws, json!({"apply_token": token})).is_error);
+}
+
+#[test]
+fn staged_previews_are_bounded_shared_by_clones_and_skipped_for_refusals() {
+    let (dir, ws) = workspace();
+    put(&dir, "a.rs", "fn f() { old(1); }\n");
+    let clone = ws.clone();
+    let tokens: Vec<String> = (0..6)
+        .map(|n| {
+            token_of(
+                &edit(
+                    &ws,
+                    json!({"pattern": "old($A)", "rewrite": format!("new{n}($A)")}),
+                )
+                .text,
+            )
+        })
+        .collect();
+    // The oldest previews were evicted; the newest applies through a clone of the workspace.
+    let evicted = edit(&clone, json!({"apply_token": tokens[0]}));
+    assert!(
+        evicted.is_error && evicted.text.contains("unknown or expired"),
+        "{}",
+        evicted.text
+    );
+    let applied = edit(&clone, json!({"apply_token": tokens[5]}));
+    assert!(!applied.is_error, "{}", applied.text);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("a.rs")).unwrap(),
+        "fn f() { new5(1); }\n"
+    );
+
+    let none = edit(&ws, json!({"pattern": "absent($A)", "rewrite": "x($A)"}));
+    assert!(!none.text.contains("apply_token"), "{}", none.text);
+}
+
+#[test]
+fn full_dry_run_false_call_still_applies_and_old_schema_history_stays_valid() {
+    let (dir, ws) = workspace();
+    let a = put(&dir, "a.rs", "fn f() { old(1); }\n");
+    let done = edit(
+        &ws,
+        json!({"pattern": "old($A)", "rewrite": "new($A)", "dry_run": false}),
+    );
+    assert!(!done.is_error, "{}", done.text);
+    assert_eq!(fs::read_to_string(&a).unwrap(), "fn f() { new(1); }\n");
+
+    let registry = crate::tools::integrations::ext::Registry::new();
+    let old =
+        crate::tools::surface::contracts::identities(&[edit_schema(false)], &registry)["ast_edit"]
+            .clone();
+    assert!(AstEdit.accepts_historical_contract(&old));
+    let current =
+        crate::tools::surface::contracts::identities(&[AstEdit.schema()], &registry)["ast_edit"]
+            .clone();
+    assert_ne!(old, current, "the token property is a real schema change");
+}

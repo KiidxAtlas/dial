@@ -56,9 +56,13 @@ pub(super) fn drive(app: &mut App, shell: &mut Shell, session: Option<Session>) 
     // A local model server survives a same-session rebuild; the new backend reuses it when the
     // changed settings still match what it loaded.
     let mut resident = None;
+    let mut coordination = None;
     loop {
         let (step, layout) = {
             let mut agent = app.make_agent(session)?;
+            if let Some(carry) = coordination.take() {
+                agent.restore_coordination(carry);
+            }
             if let Some(server) = resident.take() {
                 agent.adopt_resident_server(server);
             }
@@ -103,6 +107,7 @@ pub(super) fn drive(app: &mut App, shell: &mut Shell, session: Option<Session>) 
                 agent.hand_off_session_lifecycle();
                 lifecycle_open = true;
                 resident = agent.take_resident_server();
+                coordination = agent.take_coordination();
             } else {
                 agent.end_session_lifecycle();
             }

@@ -59,6 +59,22 @@ present-tense announcements such as “Writing the complete page now.” Without
 the promised output, these enter the same bounded recovery rather than count as completion.
 This is conservative text detection, not a guarantee against every form of unfinished answer.
 
+Different successful lookups also have a shared foreground/worker synthesis boundary. After 12
+observation-bearing model rounds without a novel committed change or accepted task resolution,
+Dial requests synthesis; after 24 it reserves a tool-free checkpoint request. Batches count as one
+round. The checkpoint must return JSON with a new nonempty `finding`, `evidence` containing actual
+returned observation tool-call IDs, and a nonempty `next_action`. It does not complete the task or
+verify the claims. Referenced IDs establish provenance only; Dial cannot prove that a paraphrased
+finding is substantively new or that it follows from the cited result.
+
+A valid synthesis renews the research window, including for read-only agents with no working-state
+tool. There is no total research cap and no requirement to edit files or manufacture todos. Tool
+schemas remain for provider-history compatibility, but structured calls, inline edits and completion
+handling cannot execute on a checkpoint response. Three invalid checkpoint responses leave the work
+incomplete with earlier effects preserved. No-op edits, todo polling, state bookkeeping, failures,
+automatic continuation and compaction do not reset the window; new user steering/worker coordination
+does. A worker's final reserved summary request still takes precedence over research synthesis.
+
 Completed edit-preview rejections also consume bounded no-progress recovery, even with an unlimited
 task budget. Exhaustion returns an incomplete result with the preview diagnosis and executes no
 tools from the rejected generation. Request attempts remain visible in reports, while finite
@@ -699,6 +715,11 @@ summary_instructions = "inherit"
 [compaction.agent_threshold_overrides]
 # "reviewer" = 90000        # exact named agent; bare numbers are fixed here
 
+[compaction.promotion]
+enabled = false # switch to a larger-window model before compacting or retrying an overflow
+[compaction.promotion.targets]
+# default = ["@long"]  # keys: default | provider/model | provider/*; see docs/model-routing.md
+
 [compaction.native_models]
 # "provider/model" = "responses-v2" # explicitly declared compatible endpoint/model
 # Other values: responses-v1, responses-v1-v2, anthropic, none
@@ -826,3 +847,30 @@ hash of the bytes actually observed. Edits, processes, directory scans, callback
 replacements are excluded. Batch teardown cancels unconsumed preparation. RPC and benchmark records
 report preparation, reuse and discarded work separately from model calls. No live-model efficiency
 improvement is implied by these counters.
+
+## Turn optimizer (experimental)
+
+`experimental.turn_optimizer` (Settings → Experimental → Agent routing) defaults to false. When it is
+on, the `turn_drafter` role appears in the model picker's Roles section, and every user message,
+both a new turn and steering sent while a turn runs, is rewritten by that role before the main model
+sees it. The drafter treats the message as data, never as instructions to follow. It produces a
+structured Markdown prompt (objective, context, requirements, constraints, acceptance criteria,
+assumptions, open questions) and, where they help, Mermaid diagrams that restate the request. File
+paths, `@references`, code and quoted text are kept verbatim. An unassigned `turn_drafter` uses the
+main model in a separate request.
+
+- It is a hard layer: the main model receives only the drafted prompt. Files attached through
+  `@references` are expanded from the typed text and stay attached. The drafted prompt is shown in
+  a panel, and the session keeps the typed text under `dial_turn_draft`. The transcript, resume,
+  session previews, search and memory show what the user typed. Provider requests never carry the key.
+- It fails closed: if the drafter errors, is cancelled, hits its output limit or returns an empty
+  prompt, the turn fails and nothing is sent to the main model. For a steering message, any
+  steering still queued behind it is dropped too.
+- Steering is drafted at the next step boundary, because the main stream holds the model connection
+  while it generates. Codex live mid-stream steering is therefore not used while the optimizer is
+  on, and steering takes the local replan path. Steering left over from an interrupted turn is
+  drafted before the next turn's message.
+- Messages the harness writes itself (goal-mode continuation and budget prompts) and sealed
+  evaluation agents are not drafted.
+
+Each draft is an extra model request per user message, so it adds latency and cost.

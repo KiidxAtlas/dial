@@ -153,6 +153,7 @@ pub(in crate::agent) fn chat_with_ui_inner(
     let mut loop_attempts = 1;
     let mut redirected: Option<Chat> = None;
     loop {
+        let controls = backend.request_controls();
         let result = chat_attempt_with_ui(
             backend,
             adapter,
@@ -163,6 +164,15 @@ pub(in crate::agent) fn chat_with_ui_inner(
             on_idle,
             rules.as_deref_mut(),
         );
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.downcast_ref::<SilentRequest>().is_some())
+            && !interrupt.load(Ordering::SeqCst)
+            && backend.recover_stalled_stream()
+        {
+            ui.diagnostic("Codex WebSocket made no progress; recovery will use HTTP streaming. Completed tools are not replayed.");
+        }
         let mut error = match result {
             Ok(reply) => return Ok(reply),
             Err(error)
@@ -173,6 +183,7 @@ pub(in crate::agent) fn chat_with_ui_inner(
                 // Discard the looping attempt and re-sample the same model with a hidden,
                 // request-local redirect. It is never journaled.
                 loop_attempts += 1;
+                backend.restore_request_controls(&controls);
                 // Local routes with `assistance.local.loop_penalty` re-sample with a presence and
                 // repetition penalty (and thinking off where switchable) for this retry only.
                 let penalty = if backend.retry_with_loop_penalty() {
@@ -212,6 +223,7 @@ pub(in crate::agent) fn chat_with_ui_inner(
         };
         if !automatically_retried && options.recovery.is_some_and(|policy| policy.retry_once) {
             automatically_retried = true;
+            backend.restore_request_controls(&controls);
             ui.diagnostic("Retrying only the silent inference request once, with the same context. Completed tools are not replayed.");
             continue;
         }
@@ -224,6 +236,7 @@ pub(in crate::agent) fn chat_with_ui_inner(
                 ui.ask_user("Model request needs recovery", &error.to_string(), &choices)
             {
                 if answer == choices[0] {
+                    backend.restore_request_controls(&controls);
                     continue;
                 }
                 if !answer.trim().is_empty() && answer != choices[1] {

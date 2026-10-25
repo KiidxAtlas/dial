@@ -196,13 +196,21 @@ validation/approval boundaries. It is a Rust embedding API, not a loader for arb
 ## Lifecycle hooks, path permissions, isolated workers and schedules
 
 **Hooks.** `[[hooks]]` in your user or project-state config (never the repository) run programs at
-`user_prompt_submit`, `pre_tool_use`, `post_tool_use`, `stop`, `session_start`, `session_end`, `before_compact`, `before_subagent_spawn` and `before_provider_request`. The event arrives as JSON on stdin.
+`user_prompt_submit`, `pre_tool_use`, `post_tool_use`, `stop`, `session_start`, `session_end`, `before_compact`, `before_subagent_spawn`, `before_provider_request`, `context`, `assistant_message`, `after_provider_response`, `session_before_branch` and `session_before_switch`. The event arrives as JSON on stdin.
 Exit 0 continues (stdout is shown; for `post_tool_use` it is appended to the tool result), exit 2 blocks
 (`pre_tool_use` refuses the call, `user_prompt_submit` rejects the message, `stop` makes the agent continue with the reason for up to 3 rounds; stderr is the reason).
 Other exits only produce a notice. On `pre_tool_use`, a timeout or missing program blocks by default (`fail_closed` defaults to true; set `fail_closed = false` for notice-only); on other events it only produces a notice. `matcher` is an anchored regex on
 the tool name. Hooks are trusted and unsandboxed like `[mcp.*]`, apply to subagents too, are off in
 sealed evaluations, and disable parallel read batching so every call passes `pre_tool_use`.
 `before_provider_request` rewrites the model request before each call. `{"payload":..}` replaces the body; handlers chain in order, each seeing the previous replacement. A block (`{"block":..}` or exit 2) refuses that request with an error instead of sending it.
+
+**More lifecycle events.** Aliases are accepted for the names that differ in other harnesses (`before_branch`, `before_switch`, `message_end`, `provider_response`).
+
+- `context` fires before each provider request (before `before_provider_request`) with `{"messages":[..]}`, the request's message list. `{"messages":[..]}` in the answer replaces the list for that one request only (every entry needs a `role`; replacements over 256 KiB or malformed are skipped with a notice). Persisted history is never changed. A block refuses the request.
+- `assistant_message` fires when a final assistant reply (one with no tool calls) is complete, with `{"text":..,"step":..}`. It is observe-only: the reply is already saved and cannot be replaced or withheld. A hook may return `additional_context`, which reaches the next request.
+- `after_provider_response` is observe-only and fires after each main-session model response with `{"model","stop_reason","latency_ms","tool_calls","usage":{prompt_tokens,completion_tokens,reasoning_tokens,cache_read_tokens,cache_write_tokens}}`. Exit 2 or a block changes nothing.
+- `session_before_branch` (`/branch`, `/undo`, `/retry` rewinds, `/fork`, ACP `fork_session`) and `session_before_switch` (`/new`, `/resume`, `/sessions`, RPC `new_session` and `resume`) are cancelable. The payload has `reason` and the target ids; exit 2 or `{"block":reason}` refuses the change and leaves the session as it is, showing the reason. Use `fail_closed = true` to make a crashing hook refuse too.
+- `additional_context` (also `additionalContext`) is a result field on `pre_tool_use`, `post_tool_use`, `user_prompt_submit`, `assistant_message` and `context`. The text (clipped to 4 KiB per answer, repeats dropped, discarded when the same event blocks) becomes a transient harness note on the next model request. It is delivered once, is never written to session history, and never changes a tool result.
 
 ```toml
 [[hooks]]

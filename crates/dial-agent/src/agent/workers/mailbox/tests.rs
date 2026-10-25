@@ -24,7 +24,7 @@ fn send_never_waits_for_the_recipient_and_wakes_it_per_letter() {
     // The recipient never drains; every send still returns at once.
     for n in 0..3 {
         let receipt = team.send(PARENT, "task-1", &format!("note {n}")).unwrap();
-        assert_eq!(receipt.delivered, ["task-1"]);
+        assert_eq!(receipt.queued, ["task-1"]);
     }
     assert_eq!(woken.load(Ordering::SeqCst), 3);
 }
@@ -109,7 +109,7 @@ fn a_worker_reaches_the_parent_and_the_parent_reaches_a_worker() {
     let team = Team::open(8);
     team.enlist("task-1", "scout", quiet()).unwrap();
     let receipt = team.send("task-1", PARENT, "found it").unwrap();
-    assert_eq!(receipt.delivered, [PARENT]);
+    assert_eq!(receipt.queued, [PARENT]);
     let letters = team.drain(PARENT);
     assert_eq!(letters[0].from, "task-1 (scout)");
     assert_eq!(letters[0].text, "found it");
@@ -122,7 +122,7 @@ fn a_worker_broadcast_reaches_siblings_but_not_itself_or_the_parent() {
     team.enlist("task-2", "b", quiet()).unwrap();
     team.enlist("task-3", "c", quiet()).unwrap();
     let receipt = team.send("task-1", ALL, "status").unwrap();
-    assert_eq!(receipt.delivered, ["task-2", "task-3"]);
+    assert_eq!(receipt.queued, ["task-2", "task-3"]);
     assert!(team.drain("task-1").is_empty());
     assert!(team.drain(PARENT).is_empty());
     assert_eq!(team.drain("task-2").len(), 1);
@@ -134,7 +134,7 @@ fn a_parent_broadcast_reaches_every_worker() {
     team.enlist("task-1", "a", quiet()).unwrap();
     team.enlist("task-2", "b", quiet()).unwrap();
     let receipt = team.send(PARENT, ALL, "regroup").unwrap();
-    assert_eq!(receipt.delivered, ["task-1", "task-2"]);
+    assert_eq!(receipt.queued, ["task-1", "task-2"]);
 }
 
 #[test]
@@ -198,9 +198,18 @@ fn a_broadcast_reports_full_mailboxes_without_failing_the_rest() {
     team.enlist("task-3", "c", quiet()).unwrap();
     team.send(PARENT, "task-2", "already queued").unwrap();
     let receipt = team.send(PARENT, ALL, "news").unwrap();
-    assert_eq!(receipt.delivered, ["task-1", "task-3"]);
+    assert_eq!(receipt.queued, ["task-1", "task-3"]);
     assert_eq!(receipt.refused.len(), 1);
-    assert!(receipt.refused[0].starts_with("task-2: mailbox is full"));
+    assert_eq!(receipt.refused[0].to, "task-2");
+    assert!(receipt.refused[0].reason.starts_with("mailbox is full"));
+    assert_eq!(
+        receipt.json(),
+        json!({"receipts":[
+            {"to":"task-1","status":"queued"},
+            {"to":"task-3","status":"queued"},
+            {"to":"task-2","status":"refused","reason":receipt.refused[0].reason},
+        ]})
+    );
 }
 
 #[test]
@@ -212,7 +221,7 @@ fn labels_resolve_only_when_unambiguous() {
     let ambiguous = team.send(PARENT, "scout", "hi").unwrap_err();
     assert!(ambiguous.contains("several live workers"), "{ambiguous}");
     assert_eq!(
-        team.send(PARENT, "reviewer", "hi").unwrap().delivered,
+        team.send(PARENT, "reviewer", "hi").unwrap().queued,
         ["task-3"]
     );
 }
@@ -233,4 +242,29 @@ fn teams_are_isolated_from_each_other() {
     first.enlist("task-1", "scout", quiet()).unwrap();
     assert!(second.send(PARENT, "task-1", "wrong team").is_err());
     assert!(second.drain("task-1").is_empty());
+}
+
+#[test]
+fn a_queued_receipt_is_reported_per_recipient_and_never_claims_delivery() {
+    let team = Team::open(8);
+    team.enlist("task-1", "a", quiet()).unwrap();
+    let receipt = team.send(PARENT, "task-1", "hi").unwrap();
+    assert_eq!(
+        receipt.json(),
+        json!({"receipts":[{"to":"task-1","status":"queued"}]})
+    );
+    assert_eq!(
+        team.drain("task-1").len(),
+        1,
+        "delivery happens at the drain"
+    );
+}
+
+#[test]
+fn a_finished_recipient_is_refused_with_its_reason() {
+    let team = Team::open(8);
+    team.enlist("task-1", "a", quiet()).unwrap();
+    team.retire("task-1");
+    let why = team.send(PARENT, "task-1", "late").unwrap_err();
+    assert!(why.contains("unknown or finished"), "{why}");
 }

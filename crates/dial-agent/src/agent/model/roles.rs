@@ -246,6 +246,44 @@ impl<'a> Agent<'a> {
         ui: &mut dyn Ui,
         timeout_secs: u64,
     ) -> Result<String> {
+        self.role_chat_with_control(
+            main,
+            role,
+            purpose,
+            request,
+            ui,
+            timeout_secs,
+            self.interrupt.clone(),
+        )
+    }
+
+    /// A best-effort control-plane request has one wall-clock budget, including provider retries.
+    /// Its cancellation is request-local: timing out must not interrupt the user's active turn.
+    pub(in crate::agent) fn bounded_role_chat(
+        &mut self,
+        main: &mut Backend,
+        role: &str,
+        purpose: llm::usage::Purpose,
+        request: &Chat,
+        ui: &mut dyn Ui,
+        timeout_secs: u64,
+    ) -> Result<String> {
+        let parent = self.interrupt.clone();
+        with_request_deadline(parent, Duration::from_secs(timeout_secs), |cancel| {
+            self.role_chat_with_control(main, role, purpose, request, ui, timeout_secs, cancel)
+        })
+    }
+
+    fn role_chat_with_control(
+        &mut self,
+        main: &mut Backend,
+        role: &str,
+        purpose: llm::usage::Purpose,
+        request: &Chat,
+        ui: &mut dyn Ui,
+        timeout_secs: u64,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<String> {
         ensure!(
             !self.interrupt.load(Ordering::SeqCst),
             "{role} request cancelled"
@@ -270,6 +308,7 @@ impl<'a> Agent<'a> {
             &namespace,
             previous_profile.as_ref(),
             timeout_secs,
+            cancel,
         );
         main.restore_cache_namespace(previous_cache);
         main.set_usage_scope(previous_scope);
@@ -286,6 +325,7 @@ impl<'a> Agent<'a> {
         namespace: &str,
         main_profile: Option<&llm::profiles::ModelProfile>,
         timeout_secs: u64,
+        cancel: Arc<AtomicBool>,
     ) -> Result<String> {
         let selection = self.role_selection(role).cloned();
         let Some(selection) = selection else {
@@ -305,20 +345,25 @@ impl<'a> Agent<'a> {
             let request = rewritten.as_ref().unwrap_or(request);
             let started = Instant::now();
             let result = if self.hermetic {
-                crate::learn::compute::background_call(self.config, main, |main, cancel| {
-                    main.chat_with_control(
-                        self.version.adapter.as_deref(),
-                        request,
-                        timeout_secs,
-                        None,
-                        &mut |_| {},
-                        cancel,
-                    )
-                })
+                crate::learn::compute::background_call_controlled(
+                    self.config,
+                    main,
+                    Some(&cancel),
+                    |main, cancel| {
+                        main.chat_with_control(
+                            self.version.adapter.as_deref(),
+                            request,
+                            timeout_secs,
+                            None,
+                            &mut |_| {},
+                            cancel,
+                        )
+                    },
+                )
             } else {
                 let adapter = self.version.adapter.clone();
                 let timeout = timeout_secs;
-                let interrupt = self.interrupt.clone();
+                let interrupt = cancel.clone();
                 chat_with_ui(
                     main,
                     adapter.as_deref(),
@@ -374,12 +419,24 @@ impl<'a> Agent<'a> {
         let request = rewritten.as_ref().unwrap_or(request);
         let started = Instant::now();
         let result = if self.hermetic {
-            crate::learn::compute::background_call(self.config, &mut backend, |backend, cancel| {
-                backend.chat_with_control(None, request, timeout_secs, None, &mut |_| {}, cancel)
-            })
+            crate::learn::compute::background_call_controlled(
+                self.config,
+                &mut backend,
+                Some(&cancel),
+                |backend, cancel| {
+                    backend.chat_with_control(
+                        None,
+                        request,
+                        timeout_secs,
+                        None,
+                        &mut |_| {},
+                        cancel,
+                    )
+                },
+            )
         } else {
             let timeout = timeout_secs;
-            let interrupt = self.interrupt.clone();
+            let interrupt = cancel.clone();
             chat_with_ui(
                 &mut backend,
                 None,
@@ -410,6 +467,40 @@ impl<'a> Agent<'a> {
         ui.role("main", &self.config.selection().display_name());
         result
     }
+}
+
+/// Keep the watcher scoped to the request and wake it immediately on completion. Provider transports
+/// already honor cancellation; this additionally bounds retries/backoff without abandoning a worker.
+pub(in crate::agent) fn with_request_deadline<T>(
+    parent: Arc<AtomicBool>,
+    budget: Duration,
+    call: impl FnOnce(Arc<AtomicBool>) -> Result<T>,
+) -> Result<T> {
+    let cancel = Arc::new(AtomicBool::new(parent.load(Ordering::SeqCst)));
+    thread::scope(|scope| {
+        let (done, finished) = std::sync::mpsc::channel();
+        let deadline = Instant::now() + budget;
+        let request_cancel = cancel.clone();
+        scope.spawn(move || {
+            loop {
+                if parent.load(Ordering::SeqCst) || Instant::now() >= deadline {
+                    request_cancel.store(true, Ordering::SeqCst);
+                    break;
+                }
+                match finished.recv_timeout(Duration::from_millis(20)) {
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                }
+            }
+        });
+        let result = call(cancel.clone());
+        let _ = done.send(());
+        ensure!(
+            !cancel.load(Ordering::SeqCst),
+            "auxiliary request cancelled or deadline exceeded"
+        );
+        result
+    })
 }
 
 /// Auxiliary replies must be complete, tool-free text. A received reply that is rejected remains

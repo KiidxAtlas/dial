@@ -686,6 +686,38 @@ fn task_defaults_use_configured_helper_chains_before_main() {
 }
 
 #[test]
+fn worker_routes_append_the_configured_fallback_chain_for_their_role() {
+    use crate::llm::model_config::ModelSelection;
+    let mut config = config(&[]);
+    config.model = "main-model".into();
+    config
+        .model_roles
+        .insert("task".into(), ModelSelection::new("openai", "task-model"));
+    config.retry.fallback_chains.insert(
+        "task".into(),
+        vec!["backup-model".into(), "openai/task-model".into()],
+    );
+    let args = json!({"agent":"worker","task":"slice","solution_space":"s"});
+    let routes = &parse(&args, &config).unwrap().jobs[0].model_routes;
+    let models: Vec<_> = routes.iter().map(|r| r.config.model.as_str()).collect();
+    assert_eq!(models, ["task-model", "backup-model"]);
+    assert_eq!(routes[1].source, "fallback");
+    assert_eq!(routes[1].role, "task");
+    // An exact provider/model chain and a provider wildcard apply when no role chain does.
+    config.retry.fallback_chains.clear();
+    config
+        .retry
+        .fallback_chains
+        .insert("openai/*".into(), vec!["wild-model".into()]);
+    let routes = &parse(&args, &config).unwrap().jobs[0].model_routes;
+    assert_eq!(routes.len(), 2);
+    assert_eq!(routes[1].config.model, "wild-model");
+    // No chain, no extra routes.
+    config.retry.fallback_chains.clear();
+    assert_eq!(parse(&args, &config).unwrap().jobs[0].model_routes.len(), 1);
+}
+
+#[test]
 fn file_defined_agents_spawn_with_their_base_prompt_and_autoloads() {
     let root = tempfile::tempdir().unwrap();
     let project = root.path().canonicalize().unwrap();

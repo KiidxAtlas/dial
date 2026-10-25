@@ -2,6 +2,19 @@ use super::*;
 use crate::ui::theme::Glyphs;
 
 #[test]
+fn dedicated_viewer_images_use_available_width_but_fit_the_viewport() {
+    let (_root, reference) = fixture(1600, 900, image::ImageFormat::Png);
+    let thumbnail = Thumbnail::load_with_native(&reference, true).unwrap();
+    let large = thumbnail.native_fitted(160, 60).unwrap();
+    assert_eq!(large.columns, 160);
+    assert_eq!(large.rows, 45);
+    assert!(thumbnail.native(160).unwrap().rows <= MAX_ROWS);
+    let short = thumbnail.native_fitted(160, 10).unwrap();
+    assert!(short.columns <= 160 && short.rows <= 10);
+    assert!(thumbnail.native_fitted(0, 10).is_none());
+    assert!(thumbnail.native_fitted(160, 0).is_none());
+}
+#[test]
 fn native_protocols_are_selected_only_for_supported_direct_terminals() {
     for (term, program, protocol) in [
         ("xterm-kitty", "", Some(ImageProtocol::Kitty)),
@@ -63,6 +76,7 @@ fn native_preview_preserves_detail_and_commits_once_without_displacing_composer(
             rows: &view,
             cursor: Some((0, 8)),
             title: None,
+            signals: None,
         };
         terminal.paint(&viewport).unwrap();
         terminal.paint(&viewport).unwrap();
@@ -225,6 +239,7 @@ fn image_blocks_settle_once_and_are_written_as_colored_terminal_cells() {
             rows: &[Line::raw("composer")],
             cursor: None,
             title: None,
+            signals: None,
         })
         .unwrap();
     let mut screen = vt100::Parser::new(24, 80, 100);

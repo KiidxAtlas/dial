@@ -129,6 +129,7 @@ fn scoped_guidance(offer: &Offer<'_>, concise: bool) -> String {
         }
     }
     if has("task") {
+        out.push_str(TESTER_DELEGATION_RULES);
         out.push_str(if lean || concise {
             LEAN_DELEGATION_RULES
         } else {

@@ -20,7 +20,110 @@ use std::{
 
 mod actor;
 pub const PROTOCOL_VERSION: u32 = 1;
+/// Protocol versions this build serves, announced in `ready` so clients can negotiate.
+const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[PROTOCOL_VERSION];
 const MAX_REQUEST: usize = 1024 * 1024;
+/// ACP clients may send larger frames (embedded resources and images).
+const MAX_ACP_REQUEST: usize = 8 * MAX_REQUEST;
+/// Queued `steer` messages per active turn.
+const MAX_STEERING: usize = 8;
+const MAX_SEED_MESSAGES: usize = 200;
+const MAX_SEED_ENTRY_BYTES: usize = 1024 * 1024;
+const MAX_MEMORY_COMMAND_BYTES: usize = 8192;
+const MESSAGES_PAGE_DEFAULT: u64 = 50;
+const MESSAGES_PAGE_MAX: u64 = 500;
+/// `tool_result` events clip their text to this many bytes (the model-visible result is unchanged).
+const TOOL_RESULT_EVENT_BYTES: usize = 24 * 1024;
+
+/// Every request method of the plain RPC endpoint with the capability it belongs to. The `ready`
+/// frame derives its method and capability lists from this table, `docs/rpc-schema.json` is
+/// tested against it, and a source scan test keeps it equal to the methods the dispatchers match.
+const METHODS: &[(&str, &str)] = &[
+    ("send", "prompt"),
+    ("state", "query"),
+    ("messages", "query"),
+    ("messages_page", "query"),
+    ("plan", "plan_mode"),
+    ("new_session", "sessions"),
+    ("resume", "sessions"),
+    ("rename", "sessions"),
+    ("compact", "maintenance"),
+    ("memory", "maintenance"),
+    ("seed_context", "context_seed"),
+    ("task_start", "tasks"),
+    ("task_status", "tasks"),
+    ("task_cancel", "tasks"),
+    ("task_message", "tasks"),
+    ("steer", "steering"),
+    ("abort", "abort"),
+    ("approve", "approvals"),
+    ("question_presented", "questions"),
+    ("question_answer", "questions"),
+    ("live_start", "live_voice"),
+    ("live_mute", "live_voice"),
+    ("live_stop", "live_voice"),
+    ("live_listen", "live_voice"),
+    ("shutdown", "shutdown"),
+];
+
+/// Largest request line the reader accepts on this transport.
+fn request_limit(acp: bool) -> usize {
+    if acp { MAX_ACP_REQUEST } else { MAX_REQUEST }
+}
+
+/// Capabilities a transport lacks: ACP has no custom question input and no live voice.
+fn capability_available(capability: &str, acp: bool) -> bool {
+    !(acp && matches!(capability, "questions" | "live_voice"))
+}
+
+/// The first event of every connection: identity, negotiation data and the limits the reader and
+/// handlers actually enforce.
+pub(crate) fn ready_frame(
+    session_id: &str,
+    model: &str,
+    tools: Value,
+    image_input: bool,
+    acp: bool,
+) -> Value {
+    let methods: Vec<&str> = METHODS
+        .iter()
+        .filter(|(_, capability)| capability_available(capability, acp))
+        .map(|(method, _)| *method)
+        .collect();
+    let mut capabilities: Vec<&str> = Vec::new();
+    for (_, capability) in METHODS {
+        if capability_available(capability, acp) && !capabilities.contains(capability) {
+            capabilities.push(capability);
+        }
+    }
+    let question_input = if acp {
+        json!({"supported":false,"reason":"ACP custom input capability was not negotiated"})
+    } else {
+        json!({"supported":true,"protocol":1,"presentation_ack_required":true,"answer_method":"question_answer","presentation_method":"question_presented","images":"explicit_user_paths","preview":"text"})
+    };
+    json!({
+        "event":"ready",
+        "protocol_version":PROTOCOL_VERSION,
+        "supported_protocol_versions":SUPPORTED_PROTOCOL_VERSIONS,
+        "session_id":session_id,
+        "model":model,
+        "tools":tools,
+        "image_input":image_input,
+        "methods":methods,
+        "capabilities":capabilities,
+        "limits":{
+            "max_request_bytes":request_limit(acp),
+            "max_pending_steering":MAX_STEERING,
+            "max_seed_messages":MAX_SEED_MESSAGES,
+            "max_seed_message_bytes":MAX_SEED_ENTRY_BYTES,
+            "max_memory_command_bytes":MAX_MEMORY_COMMAND_BYTES,
+            "messages_page_default":MESSAGES_PAGE_DEFAULT,
+            "messages_page_max":MESSAGES_PAGE_MAX,
+            "tool_result_event_bytes":TOOL_RESULT_EVENT_BYTES,
+        },
+        "question_input":question_input,
+    })
+}
 struct Output {
     acp: Option<crate::acp::Adapter>,
 }
@@ -291,7 +394,7 @@ impl Ui for RpcUi {
             .emit(json!({"event":"tool_call","call_id":call_id,"name":name,"summary":summary}));
     }
     fn tool_result_with_id(&mut self, call_id: &str, name: &str, output: &ToolOutput) {
-        self.out.emit(json!({"event":"tool_result","call_id":call_id,"name":name,"text":crate::agent::safety::guard::clip_middle(&output.text,24*1024),"is_error":output.is_error,"data":output.data}));
+        self.out.emit(json!({"event":"tool_result","call_id":call_id,"name":name,"text":crate::agent::safety::guard::clip_middle(&output.text,TOOL_RESULT_EVENT_BYTES),"is_error":output.is_error,"data":output.data}));
     }
     fn notice(&mut self, message: &str) {
         self.out.emit(json!({"event":"notice","message":message}));
@@ -661,9 +764,9 @@ fn messages_page(messages: &[Value], params: &Value) -> Result<Value> {
         Some(value) => value
             .as_u64()
             .context("limit must be an unsigned integer")?,
-        None => 50,
+        None => MESSAGES_PAGE_DEFAULT,
     }
-    .clamp(1, 500) as usize;
+    .clamp(1, MESSAGES_PAGE_MAX) as usize;
     anyhow::ensure!(offset <= messages.len(), "message offset is past the end");
     let end = offset + limit.min(messages.len() - offset);
     Ok(
@@ -831,21 +934,17 @@ fn run_control(
         loop {
             #[cfg(unix)]
             let line = if acp {
-                read_request_limit(&mut input, 8 * MAX_REQUEST)
+                read_request_limit(&mut input, MAX_ACP_REQUEST)
             } else {
                 read_request(&mut input)
             };
             #[cfg(windows)]
-            let line = read_request_limit_with(
-                &mut input,
-                if acp { 8 * MAX_REQUEST } else { MAX_REQUEST },
-                |input| {
-                    input
-                        .get_mut()
-                        .wait_readable(Duration::from_millis(25))
-                        .map(|_| ())
-                },
-            );
+            let line = read_request_limit_with(&mut input, request_limit(acp), |input| {
+                input
+                    .get_mut()
+                    .wait_readable(Duration::from_millis(25))
+                    .map(|_| ())
+            });
             let finished = !matches!(&line, Ok(Some(_)));
             // EOF is a FIFO marker, not a broken output transport. The controller must
             // consume every preceding line before beginning cancellation and cleanup.
@@ -953,7 +1052,7 @@ fn run_control(
                         let mut q = steering
                             .lock()
                             .map_err(|_| anyhow::anyhow!("steering unavailable"))?;
-                        anyhow::ensure!(q.len() < 8, "steering queue full");
+                        anyhow::ensure!(q.len() < MAX_STEERING, "steering queue full");
                         q.push(text.to_owned());
                         maintenance_control.note_input();
                         Ok(json!({"queued":true}))

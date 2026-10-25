@@ -50,3 +50,99 @@ fn an_expired_read_is_a_phase_timeout_but_a_dropped_connection_is_not() {
         );
     }
 }
+
+fn transport(stream: TcpStream, interrupt: &Arc<AtomicBool>, size: usize) -> KeepaliveTransport {
+    let mut transport = KeepaliveTransport {
+        stream,
+        buffers: LazyBuffers::new(1024, size),
+        interrupt: Arc::clone(interrupt),
+        read_timeout: None,
+        write_timeout: None,
+    };
+    for (index, byte) in transport.buffers.output().iter_mut().enumerate() {
+        *byte = (index % 251) as u8;
+    }
+    transport
+}
+
+fn pattern_prefix(received: &[u8]) -> bool {
+    received
+        .iter()
+        .enumerate()
+        .all(|(index, byte)| *byte == (index % 251) as u8)
+}
+
+#[test]
+fn a_write_to_a_reading_peer_sends_every_byte_exactly_once() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let reader = std::thread::spawn(move || {
+        let (mut peer, _) = listener.accept().unwrap();
+        let mut received = Vec::new();
+        peer.read_to_end(&mut received).unwrap();
+        received
+    });
+    let interrupt = Arc::new(AtomicBool::new(false));
+    let size = 4 << 20;
+    let mut sender = transport(TcpStream::connect(addr).unwrap(), &interrupt, size);
+    sender
+        .transmit_output(size, next(Duration::from_secs(30)))
+        .unwrap();
+    drop(sender);
+    let received = reader.join().unwrap();
+    assert_eq!(received.len(), size);
+    assert!(pattern_prefix(&received));
+}
+
+#[test]
+fn an_interrupt_stops_a_blocked_write_without_replaying_sent_bytes() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let stream = TcpStream::connect(addr).unwrap();
+    // The peer never reads during the write, so a large request blocks on full socket buffers.
+    let (mut peer, _) = listener.accept().unwrap();
+    let interrupt = Arc::new(AtomicBool::new(false));
+    let size = 64 << 20;
+    let mut sender = transport(stream, &interrupt, size);
+    let flag = Arc::clone(&interrupt);
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    let started = Instant::now();
+    let error = sender
+        .transmit_output(size, next(Duration::from_secs(60)))
+        .unwrap_err();
+    assert!(matches!(error, ureq::Error::Other(_)), "{error:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the interrupt was noticed, not the 60 s write budget"
+    );
+    drop(sender);
+    let mut received = Vec::new();
+    peer.read_to_end(&mut received).unwrap();
+    assert!(received.len() < size);
+    assert!(pattern_prefix(&received), "sent bytes are an exact prefix");
+}
+
+#[test]
+fn an_interrupted_request_does_not_start_a_connect() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let interrupt = AtomicBool::new(true);
+    let error = connect_cancellable(
+        &[listener.local_addr().unwrap()],
+        next(Duration::from_secs(5)),
+        &interrupt,
+    )
+    .unwrap_err();
+    assert!(matches!(error, ureq::Error::Other(_)), "{error:?}");
+    let interrupt = AtomicBool::new(false);
+    assert!(
+        connect_cancellable(
+            &[listener.local_addr().unwrap()],
+            next(Duration::from_secs(5)),
+            &interrupt,
+        )
+        .is_ok()
+    );
+}

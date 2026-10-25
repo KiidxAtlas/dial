@@ -6,6 +6,7 @@ pub mod anonymize;
 pub mod archive;
 pub mod artifact;
 pub mod checkpoint;
+pub mod coordination;
 pub mod dump;
 pub mod experience;
 pub mod export;

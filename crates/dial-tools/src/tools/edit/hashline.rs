@@ -13,7 +13,10 @@
 //!   preview) displayed for that snapshot;
 //! * a stale tag is recovered only when a line diff between the snapshot and
 //!   the current file proves that every anchor sits on unchanged, contiguous
-//!   lines; otherwise the edit is refused with the current context;
+//!   lines; otherwise the edit is refused with the current context. Even then
+//!   the remap is refused (see [`recovery`]) when a shifted anchor landed in a
+//!   different enclosing construct, or when the replacement reads as written
+//!   for the lines at the authored numbers rather than the remap target;
 //! * a multi-section patch is parsed and validated completely before the first
 //!   write, and the write observer sees every target before any file changes;
 //! * all paths go through `Workspace::resolve` (no `..` / symlink escapes).
@@ -35,6 +38,8 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+mod recovery;
 
 pub const MAX_INPUT: usize = 256 * 1024;
 pub const MAX_FILE: u64 = 4 * 1024 * 1024;
@@ -86,7 +91,7 @@ fn join_lines(lines: &[String], trailing_newline: bool) -> String {
     out
 }
 
-fn truncate_chars(text: &str, cap: usize) -> (&str, bool) {
+pub(crate) fn truncate_chars(text: &str, cap: usize) -> (&str, bool) {
     if text.len() <= cap {
         return (text, false);
     }
@@ -206,6 +211,9 @@ struct Snapshot {
     text: Arc<str>,
     seen: Seen,
     raw_revision: Option<[u8; 32]>,
+    /// Cached once at publication, never rehash retained source while polling.
+    digest: [u8; 32],
+    observation_id: u64,
 }
 
 /// Session state shared by `read`, `write` and `edit` of one workspace.
@@ -217,6 +225,9 @@ pub struct EditStore {
     named: HashMap<String, Vec<String>>,
     /// (hash of the patch, consecutive occurrences) of the last no-op edit.
     noop: Option<(u64, u32)>,
+    observation_id: u64,
+    observation_cursor: usize,
+    observations: HashMap<PathBuf, DiskObservation>,
 }
 
 impl std::fmt::Debug for EditStore {
@@ -241,13 +252,17 @@ impl EditStore {
         raw_revision: Option<[u8; 32]>,
         seen: &[(usize, usize)],
     ) -> String {
-        let tag = tag_of(lf);
+        let digest: [u8; 32] = Sha256::digest(lf.as_bytes()).into();
+        let tag = format!("{:02X}{:02X}", digest[0], digest[1]);
+        self.observation_id = self.observation_id.wrapping_add(1);
+        self.observations.remove(path);
         let snaps = self.files.entry(path.to_path_buf()).or_default();
         if let Some(pos) = snaps
             .iter()
             .position(|s| s.tag == tag && *s.text == *lf && s.raw_revision == raw_revision)
         {
             let mut snap = snaps.remove(pos);
+            snap.observation_id = self.observation_id;
             for &(a, b) in seen {
                 snap.seen.0.push((a, b));
             }
@@ -259,6 +274,8 @@ impl EditStore {
                 text: Arc::from(lf),
                 seen: Seen::from_ranges(seen),
                 raw_revision,
+                digest,
+                observation_id: self.observation_id,
             });
             if snaps.len() > SNAPSHOTS_PER_FILE {
                 snaps.remove(0);
@@ -289,6 +306,7 @@ impl EditStore {
         while self.lru.len() > MAX_FILES || (self.bytes() > MAX_STORE_BYTES && self.lru.len() > 1) {
             let oldest = self.lru.remove(0);
             self.files.remove(&oldest);
+            self.observations.remove(&oldest);
         }
         // A single huge file keeps only its newest snapshot.
         while self.bytes() > MAX_STORE_BYTES {
@@ -367,6 +385,7 @@ impl EditStore {
 
     pub fn forget(&mut self, path: &Path) {
         self.files.remove(path);
+        self.observations.remove(path);
         self.lru.retain(|p| p != path);
     }
 }
@@ -1509,6 +1528,8 @@ fn load_job(
         text: Arc::from(cur_lf.as_str()),
         seen: Seen::default(),
         raw_revision,
+        digest: Sha256::digest(cur_lf.as_bytes()).into(),
+        observation_id: 0,
     };
     let snap = match store.snapshot(&abs, &sec.tag) {
         Some(snapshot) => snapshot,
@@ -1882,8 +1903,17 @@ fn finalize(job: &mut Job, store: &mut EditStore) -> Result<Prepared, String> {
                 job.rel, job.tag, reread_hint(job)
             )
         })?;
+        let authored = edits.clone();
         if let Err(blocked) = translate(&mut edits, &map, job.cur.len()) {
             return Err(mismatch_error(job, store, &blocked, &map));
+        }
+        if let Err(reason) = recovery::check(&job.abs, &job.base, &job.cur, &authored, &edits) {
+            return Err(format!(
+                "{}#{}: the file changed since that snapshot and re-anchoring the edit would likely misplace it ({reason}), so nothing was written. {}",
+                job.rel,
+                job.tag,
+                reread_hint(job)
+            ));
         }
         let base_flags = job.seen.flags(job.base.len());
         let mut flags = vec![false; job.cur.len()];
@@ -2751,6 +2781,123 @@ pub(crate) fn input_arg(args: &Value) -> Result<&str, String> {
         Some(_) => Err("argument \"input\" must be a string".to_owned()),
     }
 }
+
+// Advisory polling shares snapshots, but never publishes source or seen-line witnesses.
+const OBSERVATION_FILES: usize = 64;
+const OBSERVATION_BYTES: usize = 4 * 1024 * 1024;
+const OBSERVATION_FILE_BYTES: usize = 256 * 1024;
+const OBSERVATION_NOTICES: usize = 16;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DiskObservation {
+    Content([u8; 32]),
+    Unavailable(std::io::ErrorKind),
+}
+
+pub(crate) fn changed_observations(ws: &Workspace) -> Vec<String> {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+
+    let started = Instant::now();
+    let candidates = {
+        let mut store = ws.store();
+        let len = store.lru.len();
+        let start = store.observation_cursor;
+        if len != 0 {
+            store.observation_cursor = (start + 1) % len;
+        }
+        let mut candidates = Vec::new();
+        for offset in 0..len.min(OBSERVATION_FILES) {
+            let index = (start + offset) % len;
+            let path = &store.lru[index];
+            let Some(snapshot) = store.files.get(path).and_then(|s| s.last()) else {
+                continue;
+            };
+            // Notebook snapshots are source projections, not native text on disk.
+            if snapshot.raw_revision.is_some()
+                || ext_of(path) == "ipynb"
+                || snapshot.text.len() > OBSERVATION_FILE_BYTES
+            {
+                continue;
+            }
+            candidates.push((path.clone(), snapshot.digest, snapshot.observation_id));
+        }
+        candidates
+    };
+    let mut remaining = OBSERVATION_BYTES;
+    let mut notices = Vec::new();
+    for (path, expected, id) in candidates {
+        if notices.len() >= OBSERVATION_NOTICES
+            || remaining == 0
+            || started.elapsed() >= Duration::from_millis(50)
+        {
+            break;
+        }
+        {
+            let mut store = ws.store();
+            if let Some(index) = store.lru.iter().position(|p| p == &path) {
+                store.observation_cursor = (index + 1) % store.lru.len();
+            }
+        }
+        let Ok(relative) = path.strip_prefix(ws.root()) else {
+            continue;
+        };
+        // Revalidate policy before opening; no returned name or source for private paths.
+        if ws.is_protected(&path) || ws.resolve(&path.to_string_lossy()).is_err() {
+            continue;
+        }
+        let observed = (|| -> std::io::Result<Option<DiskObservation>> {
+            let file = crate::platform::fs::open_beneath(ws.root(), relative, false)?;
+            let metadata = file.metadata()?;
+            if !metadata.is_file() || metadata.len() > OBSERVATION_FILE_BYTES as u64 {
+                return Ok(None);
+            }
+            // The extra byte detects growth after metadata without unbounded allocation/I/O.
+            let limit = (OBSERVATION_FILE_BYTES + 1).min(remaining);
+            let mut bytes = Vec::new();
+            let read = file.take(limit as u64).read_to_end(&mut bytes);
+            remaining -= bytes.len();
+            read?;
+            if bytes.len() > OBSERVATION_FILE_BYTES
+                || bytes.len() < metadata.len() as usize
+                || (bytes.len() == limit && limit <= OBSERVATION_FILE_BYTES)
+            {
+                return Ok(None);
+            }
+            let text = std::str::from_utf8(&bytes)
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+            Ok(Some(DiskObservation::Content(
+                Sha256::digest(normalize(text).as_bytes()).into(),
+            )))
+        })();
+        let observed = match observed {
+            Ok(Some(observed)) => observed,
+            Ok(None) => continue,
+            Err(error) => DiskObservation::Unavailable(error.kind()),
+        };
+        let mut store = ws.store();
+        // A concurrent native read/edit supersedes this poll, even for identical text.
+        if store
+            .files
+            .get(&path)
+            .and_then(|s| s.last())
+            .map(|s| s.observation_id)
+            != Some(id)
+        {
+            continue;
+        }
+        if observed == DiskObservation::Content(expected) {
+            store.observations.remove(&path);
+        } else if store.observations.get(&path) != Some(&observed) {
+            store.observations.insert(path.clone(), observed);
+            notices.push(relative.to_string_lossy().into_owned());
+        }
+    }
+    notices
+}
+
+#[cfg(test)]
+mod observation_tests;
 
 #[cfg(test)]
 mod tests;

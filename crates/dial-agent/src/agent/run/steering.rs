@@ -41,8 +41,9 @@ impl<'a> Agent<'a> {
             let Some(message) = self.prepare_steering(&text, ui) else {
                 continue;
             };
-            self.commit_steering(message, &text)?;
-            ui.steering_applied(&text);
+            if self.commit_steering(message, &text)? {
+                ui.steering_applied(&text);
+            }
             received = true;
         }
         if received {
@@ -80,7 +81,19 @@ impl<'a> Agent<'a> {
     }
 
     /// Journal a prepared steering message exactly once and make it the current instruction.
-    pub(in crate::agent) fn commit_steering(&mut self, message: Value, text: &str) -> Result<()> {
+    /// Returns `false` when the turn optimizer deferred it instead: the drafter needs the main
+    /// backend, so the message is drafted and journaled at the next step boundary.
+    pub(in crate::agent) fn commit_steering(&mut self, message: Value, text: &str) -> Result<bool> {
+        if self.turn_optimizer_enabled() {
+            self.undrafted_steering.push((message, text.to_owned()));
+            return Ok(false);
+        }
+        self.journal_steering(message, text)?;
+        Ok(true)
+    }
+
+    /// Append a steering message to the journal and make `text` the current instruction.
+    pub(in crate::agent) fn journal_steering(&mut self, message: Value, text: &str) -> Result<()> {
         self.push(message)?;
         self.task_policy = crate::learn::task_policy::Policy::for_prompt(
             text,
@@ -125,6 +138,9 @@ impl<'a> Agent<'a> {
             // Already discarding this generation; keep journaling new input for the replay.
             return self.take_steering(ui);
         }
+        // The drafter needs the backend this stream holds, so with the turn optimizer on every
+        // message replans locally and is drafted before the next request.
+        let live_key = live_key.filter(|_| !self.turn_optimizer_enabled());
         for text in self.drain_steering(ui) {
             let Some(message) = self.prepare_steering(&text, ui) else {
                 continue;
@@ -201,12 +217,14 @@ impl<'a> Agent<'a> {
         live.replanning = true;
         let mut received = !self.accepted_live_steering.is_empty();
         for (message, text) in std::mem::take(&mut self.accepted_live_steering) {
-            self.commit_steering(message, &text)?;
-            ui.steering_applied(&text);
+            if self.commit_steering(message, &text)? {
+                ui.steering_applied(&text);
+            }
         }
         while let Some(steer) = live.pending.pop_front() {
-            self.commit_steering(steer.message, &steer.text)?;
-            ui.steering_applied(&steer.text);
+            if self.commit_steering(steer.message, &steer.text)? {
+                ui.steering_applied(&steer.text);
+            }
             received = true;
         }
         if received {
@@ -228,8 +246,9 @@ impl<'a> Agent<'a> {
             return Ok(false);
         }
         for (message, text) in std::mem::take(&mut self.accepted_live_steering) {
-            self.commit_steering(message, &text)?;
-            ui.steering_applied(&text);
+            if self.commit_steering(message, &text)? {
+                ui.steering_applied(&text);
+            }
         }
         self.finish_steering(
             ui,

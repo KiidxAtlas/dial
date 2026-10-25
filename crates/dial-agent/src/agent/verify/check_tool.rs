@@ -186,11 +186,12 @@ impl Agent<'_> {
                 (CheckStatus::Passed, None)
             } else {
                 let output = self.run_focused_check(check, ui);
-                let status = crate::agent::verify::verification::classify(
-                    check,
-                    &output,
-                    self.interrupt.load(Ordering::SeqCst),
-                );
+                // Include the focused runner's declared-input freshness verdict, not only exit facts.
+                let status = self
+                    .step_checks
+                    .evidence
+                    .latest_status(&check.command)
+                    .unwrap_or(CheckStatus::Unverified);
                 (status, Some(output))
             };
             // Same bookkeeping as a gate pass: a check's most recent non-pass is retained.

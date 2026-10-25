@@ -60,6 +60,7 @@ const SCHEMA_KEYS: &[&str] = &[
     "started",
     "version",
     "model",
+    "schema_version",
     "forked_from",
     "cwd",
     "message",
@@ -67,6 +68,8 @@ const SCHEMA_KEYS: &[&str] = &[
     "summary",
     "first_kept",
     "custom_type",
+    "target",
+    "label",
     "role",
     "content",
     "tool_calls",
@@ -212,11 +215,13 @@ impl Anonymizer {
                 ("id", Rule::Id),
                 ("started", Rule::Time),
                 ("version", Rule::Label),
+                ("schema_version", Rule::Label),
                 ("model", Rule::Label),
                 ("forked_from", Rule::Id),
                 ("cwd", Rule::Path),
             ],
-            "runtime" | "message" | "meta" | "compaction" | "custom" | "reset_boundary" => &[
+            "runtime" | "message" | "meta" | "compaction" | "custom" | "reset_boundary"
+            | "label" => &[
                 ("type", Rule::Label),
                 ("id", Rule::Id),
                 ("parent", Rule::Id),
@@ -240,6 +245,8 @@ impl Anonymizer {
             let mapped = match (ty, key.as_str()) {
                 ("message", "message") => self.message(value),
                 ("meta", "title") | ("compaction", "summary") => self.text_value(value),
+                ("label", "label") => self.text_value(value),
+                ("label", "target") => self.apply(Rule::Id, value),
                 ("compaction", "first_kept") => self.apply(Rule::Id, value),
                 ("custom", "custom_type") => self.apply(Rule::Label, value),
                 _ => self.apply(rule, value),

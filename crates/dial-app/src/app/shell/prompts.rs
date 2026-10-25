@@ -31,6 +31,20 @@ impl Shell {
         if options.is_empty() {
             return None;
         }
+        // The terminal tab shows that Dial waits for an answer while the panel is up.
+        let was_waiting = std::mem::replace(&mut self.awaiting_user, true);
+        let answer = self.ask_loop(title, body, options, cancel);
+        self.awaiting_user = was_waiting;
+        answer
+    }
+
+    fn ask_loop(
+        &mut self,
+        title: &str,
+        body: &str,
+        options: &[(&str, char)],
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Option<usize> {
         let mut body_offset = 0usize;
         let mut selected = 0usize;
         let mut show_raw = false;

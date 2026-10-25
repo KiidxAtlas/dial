@@ -1703,7 +1703,7 @@ fn embedding_spans(
 fn discovered_spans(entry: &ModelEntry, theme: &Theme, width: usize) -> Vec<Span<'static>> {
     const STATE_W: usize = 11;
     let name_w = (width.saturating_sub(1 + STATE_W + 1) * 3 / 5).max(8);
-    let name = text::one_line(&format!("{}/{}", entry.selection.provider, entry.label));
+    let name = text::one_line(&format!("{}/{}", entry.display_provider(), entry.label));
     let name = text::pad(&text::ellipsize(&name, name_w, theme.ascii()), name_w);
     let (state, tok) = if entry.available {
         ("ready", Tok::Success)

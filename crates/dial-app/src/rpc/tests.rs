@@ -190,3 +190,166 @@ fn cached_history_refresh_is_incremental_and_preserves_old_busy_snapshot() {
     refresh_messages(&Session::ephemeral(), &mut projection);
     assert_eq!(projection.messages, json!([]));
 }
+
+fn schema() -> Value {
+    serde_json::from_str(include_str!("../../../../docs/rpc-schema.json")).unwrap()
+}
+fn names(values: impl IntoIterator<Item = String>) -> std::collections::BTreeSet<String> {
+    values.into_iter().collect()
+}
+fn schema_consts(branches: &Value, key: &str) -> std::collections::BTreeSet<String> {
+    names(branches.as_array().unwrap().iter().map(|branch| {
+        branch["properties"][key]["const"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }))
+}
+/// Method names matched by the dispatchers: arms made only of quoted identifiers (`"a" | "b" =>`),
+/// excluding ACP-only arms.
+fn dispatched_methods() -> std::collections::BTreeSet<String> {
+    let mut found = std::collections::BTreeSet::new();
+    for source in [include_str!("../rpc.rs"), include_str!("actor.rs")] {
+        for line in source.lines() {
+            let Some((pattern, _)) = line.trim().split_once(" => ") else {
+                continue;
+            };
+            if pattern.ends_with(" if acp") {
+                continue;
+            }
+            let quoted: Option<Vec<&str>> = pattern
+                .split(" | ")
+                .map(|part| {
+                    let name = part.strip_prefix('"')?.strip_suffix('"')?;
+                    (!name.is_empty() && name.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'))
+                        .then_some(name)
+                })
+                .collect();
+            found.extend(quoted.into_iter().flatten().map(str::to_owned));
+        }
+    }
+    found
+}
+fn emitted_events() -> std::collections::BTreeSet<String> {
+    let mut found = std::collections::BTreeSet::new();
+    for source in [include_str!("../rpc.rs"), include_str!("actor.rs")] {
+        for piece in source.split("\"event\":\"").skip(1) {
+            found.insert(piece.split('"').next().unwrap().to_owned());
+        }
+    }
+    found
+}
+
+#[test]
+fn schema_requests_match_the_method_table_and_the_dispatchers() {
+    let schema = schema();
+    let in_schema = schema_consts(&schema["$defs"]["request"]["oneOf"], "method");
+    let table = names(METHODS.iter().map(|(method, _)| (*method).to_owned()));
+    assert_eq!(in_schema, table, "docs/rpc-schema.json and METHODS differ");
+    let dispatched = dispatched_methods()
+        .into_iter()
+        .filter(|name| !name.starts_with('_'))
+        .collect();
+    assert_eq!(table, dispatched, "METHODS and the dispatch arms differ");
+}
+
+#[test]
+fn schema_events_match_the_events_the_server_emits() {
+    let schema = schema();
+    let in_schema = schema_consts(&schema["$defs"]["event"]["oneOf"], "event");
+    assert_eq!(in_schema, emitted_events());
+}
+
+#[test]
+fn schema_limits_equal_the_enforced_constants() {
+    let schema = schema();
+    let ready = ready_frame("s", "m", json!([]), false, false);
+    let keys = |value: &Value| names(value.as_object().unwrap().keys().cloned());
+    assert_eq!(
+        keys(&ready["limits"]),
+        keys(&schema["$defs"]["limits"]["properties"])
+    );
+    assert_eq!(
+        names(
+            schema["$defs"]["limits"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|key| key.as_str().unwrap().to_owned())
+        ),
+        keys(&ready["limits"])
+    );
+    let params = |method: &str| -> Value {
+        schema["$defs"]["request"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|branch| branch["properties"]["method"]["const"] == method)
+            .unwrap()["properties"]["params"]["properties"]
+            .clone()
+    };
+    assert_eq!(
+        params("memory")["command"]["maxLength"],
+        MAX_MEMORY_COMMAND_BYTES
+    );
+    assert_eq!(
+        params("seed_context")["messages"]["maxItems"],
+        MAX_SEED_MESSAGES
+    );
+    assert_eq!(
+        params("messages_page")["limit"]["maximum"],
+        MESSAGES_PAGE_MAX
+    );
+    assert_eq!(
+        params("messages_page")["limit"]["default"],
+        MESSAGES_PAGE_DEFAULT
+    );
+}
+
+#[test]
+fn ready_frame_announces_versions_limits_and_transport_capabilities() {
+    let rpc = ready_frame("s1", "m", json!(["read"]), true, false);
+    assert_eq!(rpc["protocol_version"], PROTOCOL_VERSION);
+    assert_eq!(
+        rpc["supported_protocol_versions"],
+        json!([PROTOCOL_VERSION])
+    );
+    assert_eq!(rpc["limits"]["max_request_bytes"], MAX_REQUEST);
+    let capability = |frame: &Value, name: &str| {
+        frame["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(name))
+    };
+    assert!(capability(&rpc, "questions") && capability(&rpc, "live_voice"));
+    assert_eq!(rpc["methods"].as_array().unwrap().len(), METHODS.len());
+
+    let acp = ready_frame("s1", "m", json!([]), false, true);
+    assert_eq!(acp["limits"]["max_request_bytes"], MAX_ACP_REQUEST);
+    assert!(!capability(&acp, "questions") && !capability(&acp, "live_voice"));
+    assert!(capability(&acp, "prompt"));
+    let methods = acp["methods"].as_array().unwrap();
+    assert!(!methods.contains(&json!("live_start")) && methods.contains(&json!("send")));
+    assert_eq!(acp["question_input"]["supported"], false);
+}
+
+#[test]
+fn announced_request_limit_is_the_one_the_reader_enforces() {
+    for acp in [false, true] {
+        let limit = request_limit(acp);
+        let mut exact = std::io::Cursor::new(vec![b'x'; limit]);
+        assert!(
+            read_request_limit(&mut exact, limit)
+                .unwrap()
+                .unwrap()
+                .is_ok()
+        );
+        let mut over = std::io::Cursor::new(vec![b'x'; limit + 1]);
+        assert!(
+            read_request_limit(&mut over, limit)
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+    }
+}

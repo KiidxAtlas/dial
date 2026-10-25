@@ -117,6 +117,20 @@ fn settle_stderr(tail: &Mutex<Tail>) {
     }
 }
 
+/// Preserve the provider diagnostic and identify the executable the operator must repair.
+fn startup_diagnostic(error: &anyhow::Error, stderr: &str, program: &std::ffi::OsStr) -> String {
+    let program = Path::new(program).display();
+    let mut message = if stderr.is_empty() {
+        format!("{error:#}; server executable: {program} (server wrote nothing to stderr)")
+    } else {
+        format!("{error:#}; server executable: {program}; server stderr (last {ERROR_TAIL_BYTES} bytes):\n{stderr}")
+    };
+    if stderr.contains("unknown model architecture") {
+        message.push_str("\nThe selected llama.cpp runtime does not support this GGUF architecture. Use a llama-server build with support for this architecture (the latest package-manager release may still be too old). Set DIAL_LLAMA_SERVER to that executable, or load the model in a compatible LM Studio runtime and select the LM Studio provider. Changing sampling or context settings cannot add architecture support.");
+    }
+    message
+}
+
 /// The child and every process it started share one process group (or Windows Job Object).
 pub(super) struct Supervised {
     pub(super) child: Child,
@@ -897,11 +911,7 @@ fn launch(
             process.stop();
             settle_stderr(&tail);
             let text = tail_text(&tail, ERROR_TAIL_BYTES);
-            let message = if text.is_empty() {
-                format!("{error:#} (server wrote nothing to stderr)")
-            } else {
-                format!("{error:#}; server stderr (last {ERROR_TAIL_BYTES} bytes):\n{text}")
-            };
+            let message = startup_diagnostic(&error, &text, command.get_program());
             if text.contains("Address already in use") {
                 Err(Failure::PortTaken(anyhow!(message)))
             } else {

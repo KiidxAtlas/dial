@@ -26,6 +26,7 @@ mod extensions;
 pub(crate) mod extensions_browser;
 pub(crate) mod maintenance;
 mod modes;
+mod peers;
 mod security;
 mod session;
 mod setup;
@@ -51,6 +52,7 @@ pub(super) fn specs() -> impl Iterator<Item = &'static CommandSpec> {
         .chain(setup::COMMANDS)
         .chain(commit::COMMANDS)
         .chain(workspace::COMMANDS)
+        .chain(peers::COMMANDS)
         .chain(session::COMMANDS)
         .chain(modes::COMMANDS)
         .chain(maintenance::COMMANDS)
@@ -88,6 +90,9 @@ pub(super) fn run(
     if let Some(result) = commit::run(shell, app, agent, name, args) {
         return Some(result);
     }
+    if let Some(result) = peers::run(shell, agent, name, args) {
+        return Some(result);
+    }
     if let Some(result) = workspace::run(shell, app, agent, name, args) {
         return Some(result);
     }
@@ -100,9 +105,9 @@ pub(super) fn run(
     modes::run(shell, app, agent, name, args)
 }
 
-/// Group commands that need only the shell and app. `Shell::live_command` runs these at once while
-/// a turn runs; the idle dispatcher reaches them through [`run`]. Every result is `Step::Done`.
-/// Keep `RUNS_NOW` and `RUNS_NOW_ARGS` in `command_registry` in step with this set.
+/// Group commands that need only the shell and app. The central `command_registry::during_turn`
+/// policy permits live dispatch; the idle dispatcher reaches the same handlers through [`run`].
+/// Add scheduling rules in that registry when adding handlers here (default: after the turn).
 pub(super) fn run_live(
     shell: &mut Shell,
     app: &App,

@@ -19,6 +19,19 @@ pub fn protocol(
         .unwrap_or_else(|| crate::llm::model_config::ApiProtocol::builtin(&selection.provider))
 }
 
+/// Whether selection must acquire chat/embedding weights before publishing settings.
+/// Laya loads its own typed checkpoint; its judge id `decision` is not a repository.
+pub fn requires_local_preparation(config: &Config, selection: &ModelSelection) -> bool {
+    config.selection_endpoint(selection).is_none()
+        && !matches!(
+            selection.provider.as_str(),
+            crate::llm::apple::PROVIDER | super::laya::PROVIDER
+        )
+}
+
+#[cfg(test)]
+mod tests;
+
 /// The settings writes that make `selection` the model for `role` (`main` or a helper role).
 pub fn changes(config: &Config, selection: &ModelSelection, role: &str) -> Result<Vec<Change>> {
     ensure!(!selection.model.trim().is_empty(), "a model id is required");

@@ -11,6 +11,26 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Longest attachment path the path field accepts.
+const MAX_PATH: usize = 4096;
+
+/// Apply an editing key unless it would grow the text past `limit`. Deletion, cursor movement and
+/// undo always work, so a field filled to its limit stays editable.
+fn edit_within(editor: &mut Editor, key: KeyEvent, limit: usize) {
+    let before = editor.text.len();
+    // A typed character adds at most four bytes; chords (yank, for example) can add more.
+    let may_overflow = before + 4 > limit || !(key.modifiers - KeyModifiers::SHIFT).is_empty();
+    if !may_overflow {
+        editor.key(key);
+        return;
+    }
+    let mut trial = editor.clone();
+    trial.key(key);
+    if trial.text.len() <= limit || trial.text.len() <= before {
+        *editor = trial;
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Field {
     Custom,
@@ -123,10 +143,15 @@ impl<'a> Dialog<'a> {
     pub fn paste(&mut self, value: &str) {
         let clean = questions::sanitize(value);
         match &mut self.mode {
-            Mode::Text(_, editor) | Mode::Attach(_, _, editor)
-                if editor.text.len() + clean.len() <= questions::MAX_TEXT =>
-            {
+            Mode::Text(_, editor) if editor.text.len() + clean.len() <= questions::MAX_TEXT => {
                 editor.insert(&clean)
+            }
+            Mode::Attach(_, _, editor) if editor.text.len() + clean.len() <= MAX_PATH => {
+                editor.insert(&clean)
+            }
+            Mode::Text(..) | Mode::Attach(..) => {
+                self.feedback =
+                    "That paste is too long for this field; nothing was inserted.".into();
             }
             _ => {}
         }
@@ -185,9 +210,7 @@ impl<'a> Dialog<'a> {
                     self.mode = Mode::Attach(field, editor, Editor::default())
                 }
                 _ => {
-                    if editor.text.len() < questions::MAX_TEXT {
-                        editor.key(key);
-                    }
+                    edit_within(&mut editor, key, questions::MAX_TEXT);
                     self.mode = Mode::Text(field, editor);
                 }
             },
@@ -230,9 +253,7 @@ impl<'a> Dialog<'a> {
                     }
                 }
                 _ => {
-                    if path_editor.text.len() < 4096 {
-                        path_editor.key(key);
-                    }
+                    edit_within(&mut path_editor, key, MAX_PATH);
                     self.mode = Mode::Attach(field, answer_editor, path_editor);
                 }
             },

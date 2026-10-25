@@ -131,14 +131,9 @@ pub(crate) fn refusal(path: &Path, rel: &str, before: &str, after: &str) -> Opti
         },
     ))
 }
-/// Block resolution, adapted to Dial's already-linked tree-sitter grammars.
-/// Parse once for all requested anchors; never swallow a statement-sequence container or
-/// an error-recovery subtree. Unsupported grammars return None to the explicit fallback.
-pub(crate) fn block_ends(
-    path: &Path,
-    source: &str,
-    requested: &[usize],
-) -> Option<std::collections::BTreeMap<usize, Result<usize, String>>> {
+/// Grammar for block and context resolution: the extension's language, or bash for shell rc files
+/// whose names carry none. zsh has no linked grammar and is never guessed.
+fn source_language(path: &Path) -> Option<SupportLang> {
     if is_zsh(path) {
         return None;
     }
@@ -146,7 +141,7 @@ pub(crate) fn block_ends(
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("");
-    let lang = SupportLang::from_path(path).or_else(|| {
+    SupportLang::from_path(path).or_else(|| {
         matches!(
             name,
             ".bashrc"
@@ -161,7 +156,92 @@ pub(crate) fn block_ends(
         )
         .then(|| SupportLang::from_path(Path::new("source.sh")))
         .flatten()
-    })?;
+    })
+}
+
+/// Statement-sequence containers: they begin at their first child rather than at a header row, so
+/// they never identify a construct.
+fn is_container_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "statement_list"
+            | "block"
+            | "body_statement"
+            | "statements"
+            | "body"
+            | "indented_block"
+            | "block_mapping"
+            | "block_sequence"
+            | "import_list"
+            | "hash_literal_body"
+    )
+}
+
+/// One enclosing construct: its grammar node kind and the trimmed text of the row it opens on.
+pub(crate) type Enclosing = (String, String);
+
+/// For each requested 1-based line, the constructs enclosing it, innermost first. Identity is the
+/// node kind plus its opening row's text rather than any position, so an identical block elsewhere
+/// in the file is told apart while unrelated edits above or below do not matter. Only multi-line
+/// constructs that begin above the line itself count; containers and parser-recovery nodes are
+/// skipped. `None` when no grammar is linked for `path` or the source is too large.
+pub(crate) fn enclosing_constructs(
+    path: &Path,
+    source: &str,
+    requested: &[usize],
+) -> Option<std::collections::BTreeMap<usize, Vec<Enclosing>>> {
+    if source.len() > 4 * 1024 * 1024 {
+        return None;
+    }
+    let lang = source_language(path)?;
+    let tree = AstGrep::try_new(source, lang).ok()?;
+    let root = tree.root().get_inner_node();
+    let rows: Vec<&str> = source.split('\n').collect();
+    let mut starts = Vec::with_capacity(rows.len());
+    let mut offset = 0;
+    for row in &rows {
+        starts.push(offset);
+        offset += row.len() + 1;
+    }
+    let mut output = std::collections::BTreeMap::new();
+    for &line in requested {
+        let Some(row) = line.checked_sub(1).filter(|row| *row < rows.len()) else {
+            continue;
+        };
+        let column = rows[row]
+            .bytes()
+            .position(|byte| byte != b' ' && byte != b'\t' && byte != b'\r')
+            .unwrap_or(0);
+        let at = starts[row] + column;
+        let mut chain = Vec::new();
+        let mut node = root.named_descendant_for_byte_range(at, at + 1);
+        while let Some(current) = node {
+            let (start, end) = (current.start_position(), current.end_position());
+            if current.id() != root.id()
+                && !current.is_error()
+                && !is_container_kind(current.kind())
+                && start.row != row
+                && end.row > start.row
+                && let Some(opener) = rows.get(start.row)
+            {
+                chain.push((current.kind().to_owned(), opener.trim().to_owned()));
+            }
+            node = current.parent();
+        }
+        output.insert(line, chain);
+    }
+    Some(output)
+}
+
+/// Block resolution, adapted to Dial's already-linked tree-sitter grammars.
+/// Parse once for all requested anchors; never swallow a statement-sequence container or
+/// an error-recovery subtree. Unsupported grammars return None to the explicit fallback.
+pub(crate) fn block_ends(
+    path: &Path,
+    source: &str,
+    requested: &[usize],
+) -> Option<std::collections::BTreeMap<usize, Result<usize, String>>> {
+    let lang = source_language(path)?;
     let tree = AstGrep::try_new(source, lang).ok()?;
     let root = tree.root().get_inner_node();
     let wanted: std::collections::BTreeSet<_> = requested.iter().copied().collect();
@@ -194,19 +274,7 @@ pub(crate) fn block_ends(
                     if parent.id() == root.id() || parent.start_position().row != row {
                         break;
                     }
-                    if matches!(
-                        parent.kind(),
-                        "statement_list"
-                            | "block"
-                            | "body_statement"
-                            | "statements"
-                            | "body"
-                            | "indented_block"
-                            | "block_mapping"
-                            | "block_sequence"
-                            | "import_list"
-                            | "hash_literal_body"
-                    ) && parent.start_byte() == node.start_byte()
+                    if is_container_kind(parent.kind()) && parent.start_byte() == node.start_byte()
                     {
                         let mut next = node.next_named_sibling();
                         let mut skipped = false;

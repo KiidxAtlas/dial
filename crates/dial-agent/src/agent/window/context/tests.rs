@@ -352,6 +352,8 @@ fn symlinked_instruction_files_must_stay_inside_the_tree() {
 fn binary_context_files_are_skipped() {
     let tmp = tempfile::tempdir().unwrap();
     let base = canon(&tmp);
+    // Pin the walk to this directory even when the temp dir sits inside another repository.
+    fs::create_dir_all(base.join(".git")).unwrap();
     fs::write(base.join("AGENTS.md"), b"abc\0def").unwrap();
     let layout = layout_at(&base, &base.join("u"));
     assert!(discover_with_home(&layout, None, false).is_empty());

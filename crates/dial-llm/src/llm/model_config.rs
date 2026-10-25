@@ -461,6 +461,10 @@ pub struct ProviderSpec {
         skip_serializing_if = "Option::is_none"
     )]
     pub headers: Option<RequestHeaders>,
+    /// Further key variables for the same provider. With `api_key_env` they form a key pool: a
+    /// throttled or quota-exhausted key is skipped until its cooldown ends.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub api_key_envs: Vec<String>,
 }
 impl Default for ProviderSpec {
     fn default() -> Self {
@@ -468,6 +472,7 @@ impl Default for ProviderSpec {
             label: String::new(),
             base_url: String::new(),
             api_key_env: None,
+            api_key_envs: Vec::new(),
             enabled: true,
             allow_insecure: false,
             protocol: None,
@@ -592,8 +597,12 @@ pub struct UiConfig {
     pub notify_errors: bool,
     /// Mouse wheel and clicks inside full-screen panels (the inline view never captures the mouse).
     pub mouse: bool,
-    /// Retired (OSC 8 links were removed). Still accepted so existing config files load; never read
-    /// or written.
+    /// Terminal integration where the terminal supports it: tab color and dock attention by state,
+    /// OSC 9;4 progress, `SetUserVar` values, the working directory (OSC 7) and links on URLs and
+    /// existing file paths in scrollback.
+    pub terminal_integration: bool,
+    /// Retired (links are part of `terminal_integration` now). Still accepted so existing config
+    /// files load; never read or written.
     #[serde(default, skip_serializing, rename = "hyperlinks")]
     #[allow(dead_code)]
     pub retired_hyperlinks: Option<serde::de::IgnoredAny>,
@@ -637,6 +646,7 @@ impl Default for UiConfig {
             notify: true,
             notify_errors: false,
             mouse: true,
+            terminal_integration: true,
             retired_hyperlinks: None,
         }
     }
@@ -644,7 +654,9 @@ impl Default for UiConfig {
 
 /// Model roles a user can assign, each with the consumers it drives. `main` is the session model and is
 /// always assigned. Unassigned `judge` follows `small`, which follows `main`; `task`, `coach`, `tester`,
-/// `planner` and `memory` follow `main`. `decision` is the Laya checkpoint (never a chat model) and has no chat fallback.
+/// `planner`, `memory` and `turn_drafter` follow `main`. `decision` is the Laya checkpoint (never a chat
+/// model) and has no chat fallback. `turn_drafter` stays last: it is listed only while
+/// `experimental.turn_optimizer` is on, so hiding it never shifts another row.
 pub const ROLES: &[(&str, &str)] = &[
     ("main", "Conversation and coding agent"),
     (
@@ -680,7 +692,14 @@ pub const ROLES: &[(&str, &str)] = &[
         "embedding",
         "Embedding model for semantic memory recall; use an OpenAI-compatible, Ollama or Gemini embedding endpoint; unassigned uses lexical recall",
     ),
+    (
+        TURN_DRAFTER,
+        "Turn optimizer (experimental): rewrites each user message into a structured prompt with diagrams; the main model sees only the draft; unassigned follows main",
+    ),
 ];
+
+/// Role key of the experimental turn optimizer's drafting model.
+pub const TURN_DRAFTER: &str = "turn_drafter";
 
 /// Where a role's effective model comes from. Shown next to each role in the Alt+M Roles view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

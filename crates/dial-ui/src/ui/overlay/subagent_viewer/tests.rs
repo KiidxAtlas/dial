@@ -358,6 +358,53 @@ fn cancel_needs_a_second_x_and_only_when_cancellable() {
 }
 
 #[test]
+fn a_held_x_does_not_confirm_its_own_cancellation() {
+    use crossterm::event::{KeyEventKind, KeyEventState};
+    let keys = Keymap::defaults();
+    let now = Instant::now();
+    let mut view = viewer(None, false);
+    view.agent = Some(AgentEntry {
+        cancellable: true,
+        ..agent(AgentStatus::Running)
+    });
+    let x = |kind| {
+        Event::Key(KeyEvent {
+            code: KeyCode::Char('x'),
+            modifiers: KeyModifiers::NONE,
+            kind,
+            state: KeyEventState::NONE,
+        })
+    };
+    assert_eq!(
+        tag(view.handle(&x(KeyEventKind::Press), &keys, now)),
+        "none"
+    );
+    for _ in 0..5 {
+        assert_eq!(
+            tag(view.handle(&x(KeyEventKind::Repeat), &keys, now)),
+            "none"
+        );
+    }
+    assert!(view.armed_cancel, "repeats leave the confirmation armed");
+    assert_eq!(
+        tag(view.handle(&x(KeyEventKind::Press), &keys, now)),
+        "action:subagent-cancel:w1"
+    );
+}
+
+#[test]
+fn paste_goes_into_the_draft_without_sending() {
+    let keys = Keymap::defaults();
+    let now = Instant::now();
+    let mut view = viewer(None, false);
+    assert_eq!(
+        tag(view.handle(&Event::Paste("steer: use the cache".into()), &keys, now)),
+        "none"
+    );
+    assert_eq!(view.draft.text, "steer: use the cache");
+}
+
+#[test]
 fn ctrl_o_toggles_tool_expansion_and_keys_scroll_without_a_draft() {
     let keys = Keymap::defaults();
     let now = Instant::now();

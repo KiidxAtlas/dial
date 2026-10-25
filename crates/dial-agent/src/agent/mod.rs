@@ -35,6 +35,7 @@ pub use memory::selfplay::{check_case, check_case_measured, selfplay_run};
 pub use model::backend::{Runtime, make_backend, make_session_backend};
 pub use model::laya;
 pub use run::call_summary::{legacy_tool_presentation, legacy_tool_result, summarize_call};
+pub use run::coordination::CoordinationCarry;
 pub use safety::approval;
 pub use ui::surface::{Decision, NullUi, RequestPhase, Ui};
 pub use workflow::todo;
@@ -92,6 +93,21 @@ impl run::engine::Terminal for TurnReport {
             self.outcome = TurnOutcome::Incomplete;
             self.text.push_str(&format!("\n{reason}"));
         }
+    }
+}
+impl TurnReport {
+    /// Whether automatic follow-up turns (goal continuations, `/loop` iterations) must stop and
+    /// wait for the human: the turn was interrupted, asked a question, declared a blocker or
+    /// failed. An incomplete turn keeps going; the callers' own stall and budget rules bound it.
+    pub fn halts_automation(&self) -> bool {
+        self.interrupted
+            || matches!(
+                self.outcome,
+                TurnOutcome::NeedsInput
+                    | TurnOutcome::Blocked
+                    | TurnOutcome::Failed
+                    | TurnOutcome::Interrupted
+            )
     }
 }
 
@@ -270,6 +286,10 @@ pub struct Agent<'a> {
     /// `bash` job completions not yet delivered to the model; sent once as a transient message
     /// in the next request (see `pump_subagents`, `run_loop`).
     background_notices: Vec<String>,
+    /// Bounded `additional_context` notes from lifecycle hooks, delivered once as transient
+    /// notes in the next request (see `queue_hook_context`).
+    hook_context: Vec<String>,
+    peer_state: run::coordination::State,
     todo: TodoList,
     memory: Option<Arc<ProvenanceMemory>>,
     memory_runtime: Option<Arc<crate::storage::memory_backend::MemoryRuntime>>,
@@ -360,6 +380,9 @@ pub struct Agent<'a> {
     /// Live steering the server accepted for the reply in flight; journaled after that reply.
     accepted_live_steering: Vec<(Value, String)>,
     pending_tool_steering: Vec<String>,
+    /// Steering prepared while the turn optimizer is on, waiting for the drafter: the main stream
+    /// holds the backend, so it is drafted and journaled at the next step boundary.
+    undrafted_steering: Vec<(Value, String)>,
     request_prefix: window::request_prefix::Tracker,
     /// True while this agent owns the session lifecycle: `session_start` has been fired for the
     /// session and `session_end` is due when the agent goes away.

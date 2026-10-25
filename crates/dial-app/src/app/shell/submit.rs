@@ -141,7 +141,7 @@ impl Shell {
                     &app.config.sandbox,
                     Some((layout.state_dir.as_path(), layout.user_dir.as_path())),
                 )
-                .map(|ws| ws.with_shell_backend(app.config.shell.backend))
+                .map(|ws| ws.with_shell_config(&app.config.shell))
             })
             .and_then(|ws| {
                 Ok(

@@ -122,6 +122,7 @@ pub(super) fn run(
     )?;
 
     let mut text = captured_text(capture);
+    let body_len = text.len();
     let code = shell.code();
     let success = code == Some(0) && !timed_out && !cancelled;
     if cancelled {
@@ -137,6 +138,7 @@ pub(super) fn run(
         text.push_str("[in-process shell did not stop (a builtin that never yields cannot be interrupted); it was abandoned and may keep using CPU until Dial exits]\n");
     }
     append_output_notes(&mut text, spool, &capture_error, &mut artifact_error);
+    minimize_body(ws, command, body_len, &mut text);
     let output = ToolOutput {
         execution: Default::default(),
         data: None,

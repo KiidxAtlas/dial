@@ -350,6 +350,32 @@ fn append_output_notes(
     }
 }
 
+/// Replaces the first `body_len` bytes of `text` (the captured output) with their minimized form
+/// when `shell.minimize_output` is on and the complete output is saved as an artifact, which the
+/// `[complete output: ...]` line that follows the note names. Without that line the raw output
+/// would be unrecoverable, so the text is left alone.
+fn minimize_body(ws: &Workspace, command: &str, body_len: usize, text: &mut String) {
+    if !ws.minimizing_output()
+        || !text[body_len..].contains("[complete output: artifact://")
+        || text.contains("[output capture error:")
+        || text.contains("[output artifact error:")
+    {
+        return;
+    }
+    let Some(minimized) = super::minimizer::minimize(command, &text[..body_len]) else {
+        return;
+    };
+    let mut body = minimized.text;
+    if !body.ends_with('\n') {
+        body.push('\n');
+    }
+    body.push_str(&format!(
+        "[output filtered ({}): {} -> {} bytes; the complete output is at the artifact below]\n",
+        minimized.filter, minimized.before, minimized.after
+    ));
+    text.replace_range(..body_len, &body);
+}
+
 /// Deletes the one-shot script an embedded-shell command line refers to. The host removes it when
 /// it runs; a command that is never spawned would otherwise leak it into the scratch directory.
 pub(in crate::tools) fn discard_unspawned_script(spawn: &std::process::Command) {
@@ -583,6 +609,9 @@ fn run_bash(
     } else {
         None
     };
+    if let Some(refusal) = super::git_guard::guard(ws, &command, &cwd) {
+        return Ok(refusal);
+    }
     if preview_server(&command) {
         let start = serde_json::json!({"action":"start","name":"preview","command":command});
         return Ok(ToolOutput::err(format!(
@@ -748,6 +777,7 @@ fn run_bash(
     )?;
 
     let mut text = captured_text(capture);
+    let body_len = text.len();
     let success = status.success() && !timed_out && !cancelled;
     if cancelled {
         text.push_str("[cancelled; process group killed]\n");
@@ -765,6 +795,7 @@ fn run_bash(
         text.push_str("[sandbox: /tmp is outside the project and not writable; use $TMPDIR, a scratch directory inside the project]\n");
     }
     append_output_notes(&mut text, spool, &capture_error, &mut artifact_error);
+    minimize_body(ws, &command, body_len, &mut text);
     let mut state_error = None;
     if let (Some(name), Some(sessions), Some(exchange)) =
         (session, sessions.as_mut(), exchange.as_ref())

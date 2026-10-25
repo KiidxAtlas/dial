@@ -1,6 +1,14 @@
 //! Shared recovery and verification instruction text.
 //! Runtime classifiers, priorities, retry limits and admission remain with their owners.
 
+pub(crate) const RESEARCH_WARNING: &str = "[Research progress checkpoint] Many observation rounds have run without a novel committed change or resolved task. Different successful lookups alone do not establish delivery progress. Synthesize the findings and remaining question now; implement if supported, or deliver the requested read-only findings. Further research is allowed when needed. Do not make a dummy edit or close unfinished work to reset this checkpoint.";
+
+pub(crate) const RESEARCH_SYNTHESIS: &str = r#"[Research synthesis required by Dial]
+This request is a tool-free checkpoint, not task completion. Tool schemas may remain for provider-history compatibility; no tools requested in this response will execute.
+Return only a JSON object (no fences) with these fields:
+{"finding":"a concrete new finding established by the returned evidence, with limits or contradictions stated","evidence":["an actual returned observation tool_call_id"],"next_action":"the supported implementation action, requested final report, or one specific remaining question and the check that distinguishes it"}
+Use only evidence already returned. Findings remain model claims, not verification proof. Do not repeat a previous finding, invent evidence, create a new plan, or make an edit merely to restore access. A valid checkpoint resumes the existing task with its tools and permissions unchanged; legitimate read-only investigation may continue. Scope, approvals, blockers and verification obligations remain unchanged."#;
+
 /// Injected after a gemini run of reasoning-summary headers with no tool call.
 pub(crate) const GEMINI_TOOL_CALL_REMINDER: &str = r#"<system-interrupt reason="reasoning_without_tool_calls">
 The response was interrupted after {{count}} consecutive planning headers without a tool call. No tool was dispatched from this interrupted response; earlier completed work is retained.
@@ -57,10 +65,10 @@ This is not a fresh observation. Use retained evidence, choose a justified next 
     )
 }
 
-/// Continues a turn whose stream dropped after partial text.
+/// Continues a turn whose request made no progress after partial text (Dial's silent-request timeout).
 pub(crate) const STREAM_STALL_CONTINUE: &str = r#"<system-injection>
-The provider connection dropped mid-response: your last turn was cut off after the text above, possibly mid-sentence. The user already saw that text.
-Continue exactly where it stopped. Do not repeat, restate, or summarize what you already wrote.
+Dial interrupted your last response after it stopped making progress. The text above was kept and the user already saw it; no tool calls from the interrupted response ran, and effects of earlier tool calls remain.
+Continue from where it stopped without repeating or summarizing that text. If the next step needs a tool, issue one complete call; never continue partial tool arguments as prose. Scope, approvals and budgets are unchanged; if you cannot proceed, report the blocker.
 Attempt #{{retryCount}}/{{maxRetries}}
 </system-injection>"#;
 

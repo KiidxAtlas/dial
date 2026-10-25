@@ -11,8 +11,9 @@ silently change permissions, budgets, tool contracts, or completion criteria.
 | --- | --- | --- |
 | [system.rs](system.rs) | Engineering, tool policy, workflow, trust, focused work, delivery and delegation; full and lean variants | [window/prompt.rs](../window/prompt.rs) selects offered-tool/profile sections and assembles cacheable message bands; workers reuse focused-work policy |
 | [compaction.rs](compaction.rs) | Initial/update, handoff, turn-prefix and branch summary policy, plus file-target provenance wording | [compact/compaction.rs](../compact/compaction.rs) and [summary.rs](../compact/compaction/summary.rs) select, escape and fold inputs within budgets |
-| [recovery.rs](recovery.rs) | First/repeated failure advice, failure categories, stalled/empty/action-only replies, duplicate-call and thinking-loop notices, initial visual guidance | [run/failure_guidance.rs](../run/failure_guidance.rs), [safety/stream_guards.rs](../safety/stream_guards.rs), [ui/chat.rs](../ui/chat.rs), [verify/visual.rs](../verify/visual.rs) |
+| [recovery.rs](recovery.rs) | First/repeated failure advice, failure categories, stalled/empty/action-only replies, duplicate-call, research-synthesis and thinking-loop notices, initial visual guidance | [run/failure_guidance.rs](../run/failure_guidance.rs), [workflow/research.rs](../workflow/research.rs), [safety/stream_guards.rs](../safety/stream_guards.rs), [ui/chat.rs](../ui/chat.rs), [verify/visual.rs](../verify/visual.rs) |
 | [modes/](modes/) | Advisor, external-thinking, goal, prewalk and TAN instructions | Corresponding modules under [modes/](../modes/) retain state, activation, rendering and enforcement |
+| [turn_drafter.rs](turn_drafter.rs) | Experimental turn optimizer: rewrites each user message into a structured prompt with optional Mermaid diagrams | [run/turn_draft.rs](../run/turn_draft.rs) decides when drafting runs, frames the message as data, fails closed and keeps the typed text in `dial_turn_draft` |
 
 The Rust constants are compiled into the binary: no working-directory-dependent file
 loading, runtime reload, or installation asset copying is required. Existing public

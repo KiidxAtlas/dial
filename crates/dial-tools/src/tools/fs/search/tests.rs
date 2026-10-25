@@ -656,3 +656,75 @@ fn many_double_star_segments_match_in_bounded_time() {
     let glob = Glob::new("a/*/b").unwrap();
     assert!(glob.matches("a/x/b") && !glob.matches("a/b") && !glob.matches("a/x/y/b"));
 }
+
+/// A tree of many small files, a few of them binary or unreadable-by-policy, with repeated hits.
+fn many_files(dir: &tempfile::TempDir) {
+    for d in 0..6 {
+        let sub = dir.path().join(format!("d{d:02}"));
+        fs::create_dir_all(sub.join("nested")).unwrap();
+        for f in 0..20 {
+            let body: String = (0..30)
+                .map(|l| {
+                    if (l + f + d) % 7 == 0 {
+                        format!("needle {d}-{f}-{l}\n")
+                    } else {
+                        format!("filler {l}\n")
+                    }
+                })
+                .collect();
+            fs::write(sub.join(format!("f{f:02}.txt")), &body).unwrap();
+            fs::write(sub.join("nested").join(format!("g{f:02}.txt")), &body).unwrap();
+        }
+        fs::write(sub.join("blob.bin"), b"needle\0\x01").unwrap();
+    }
+}
+
+#[test]
+fn parallel_and_serial_grep_pages_are_byte_identical() {
+    let (dir, ws) = workspace();
+    many_files(&dir);
+    let cases = [
+        json!({"pattern": "needle"}),
+        json!({"pattern": "needle", "context": 2}),
+        json!({"pattern": "needle [0-3]-1", "max_results": 7}),
+        json!({"pattern": "needle", "output": "files"}),
+        json!({"pattern": "needle", "output": "count"}),
+        json!({"pattern": "needle", "output": "files", "max_results": 5, "skip": 3}),
+        json!({"pattern": "needle\\n", "multiline": true, "max_results": 40}),
+        json!({"pattern": "absent-token"}),
+        json!({"pattern": "needle", "glob": "**/g*.txt", "skip": 11}),
+        json!({"pattern": "needle", "max_results": 1}),
+    ];
+    for args in cases {
+        let serial = grep_with_workers(&ws, &args, 1);
+        let parallel = grep_with_workers(&ws, &args, 4);
+        assert_eq!(parallel, serial, "{args}");
+    }
+}
+
+#[test]
+fn parallel_grep_cursors_resume_exactly_like_serial_ones() {
+    let (dir, ws) = workspace();
+    many_files(&dir);
+    let mut args = json!({"pattern": "needle", "max_results": 25});
+    let mut collected = Vec::new();
+    for _ in 0..40 {
+        let serial = grep_with_workers(&ws, &args, 1).unwrap();
+        assert_eq!(grep_with_workers(&ws, &args, 4).unwrap(), serial);
+        collected.push(body(&serial).to_owned());
+        let footer = page(&serial);
+        if footer["next_cursor"].is_null() {
+            break;
+        }
+        args["cursor"] = footer["next_cursor"].clone();
+        args["skip"] = footer["remaining_skip"].clone();
+    }
+    let total =
+        grep_with_workers(&ws, &json!({"pattern": "needle", "max_results": 1000}), 4).unwrap();
+    let paged: usize = collected.iter().map(|page| page.lines().count()).sum();
+    assert_eq!(
+        paged,
+        body(&total).lines().count(),
+        "paging loses or repeats rows"
+    );
+}

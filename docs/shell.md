@@ -54,6 +54,36 @@ configured deadline; cancellation, timeout or an incomplete state exchange inval
 state. Functions, unexported variables and process-restart persistence are not retained. Protected
 host variables and credentials are excluded, and each command keeps the ordinary sandbox policy.
 
+## Output minimizer
+
+With `shell.minimize_output = true` (default), foreground `bash` output of a recognised noisy command is shrunk before the model reads it. A filter applies only when the command is one simple command (optionally with leading `NAME=value` assignments or `2>&1`); compound commands (`a && b`, `a; b`), pipelines, redirections and substitutions are never filtered.
+
+| Command | Dropped | Collapsed |
+|---|---|---|
+| `cargo build/check/clippy/test/run/doc/bench/nextest/install/fetch` | `Compiling`, `Checking`, `Fresh`, `Documenting`, `Downloaded`, index updates | runs of `test ... ok` / nextest `PASS` |
+| `git status` | `(use "git ..." ...)` hints, `hint:` lines | |
+| `git push/pull/fetch/clone` | object-transfer progress, `hint:` lines | |
+| `git commit/checkout/switch/merge/rebase/...` | `hint:` lines | |
+| `npm`/`pnpm` install-like, `yarn` install | notices, funding and audit lines, progress | |
+| `pytest`, `python -m pytest` | session header, progress dots | `PASSED` lines |
+| `go test` | `=== RUN` / `PAUSE` / `CONT` | `--- PASS`, `ok pkg` |
+
+For every command, ANSI escape sequences are stripped and carriage-return progress redraws are reduced to their last frame.
+
+Guarantees: a line mentioning error, warning, panic, fail, traceback, exception or fatal is never dropped or collapsed (a frame overwritten by a carriage return that carries one is kept on its own line); the exit status and the `[exit code: N]` line are untouched; the result is used only if it saves at least 256 bytes and a tenth of the output. The text gains a line `[output filtered (cargo): 41230 -> 3810 bytes; ...]` and the `[complete output: artifact://...]` link still holds the raw output, readable with `artifact_read`. Without an artifact store (so the raw output could not be recovered), or after a capture or artifact error, nothing is filtered. Background (`bg`) output is not minimized.
+
+## Git guard
+
+`shell.git_guard` refuses git commands that discard uncommitted work, so agents sharing one checkout cannot destroy each other's edits:
+
+- `workers` (default): the guard applies to delegated workers that edit the parent's live checkout (tasks that are not `isolation: "copy"`). The main agent and isolated copies are not restricted.
+- `always`: every `bash` and `bg` command is guarded.
+- `off`: never.
+
+Refused forms: `git stash` (push, save, drop, clear, pop, apply; `list`, `show`, `create`, `store` run), `git reset --hard`, `git checkout -f`, `git checkout .`/`:/`/`*`, `git checkout -- <path>` (and `git checkout <path>` when a file of that name exists), `git restore` of the working tree (`--staged` alone is fine), `git clean -f` (not with `-n`), and `git switch -f`/`--discard-changes`. Forms that keep work run normally: `git reset`, `--soft`, `--mixed`, `git reset <path>`, `git checkout -b`, `git checkout --ours|--theirs -- <path>`, `git restore --staged`, `git clean -n`.
+
+The command is read before it runs, following `-C <dir>`, `-c k=v` and other global options, a preceding `cd`, `env`/`command`/`exec` wrappers, `sh -c '...'` scripts, subshells and `if`/`while` bodies. A git command whose directory resolves outside every workspace root is allowed (it is another repository). Only clear matches are refused: a script that cannot be lexed (unterminated quote), `git` reached through a variable, alias or script file, and arguments that need expansion are never refused on a guess. The refusal is a blocked tool error naming the form and the safe alternatives; to proceed, ask the user to run it or to set `shell.git_guard = "off"`, or run the worker isolated.
+
 ## Approval of shell commands
 
 Shell commands are classified from executable arguments, with conservative fallback for unsupported

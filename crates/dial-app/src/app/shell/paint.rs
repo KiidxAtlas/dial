@@ -11,6 +11,7 @@ use crate::ui::composer::ComposerCtx;
 use crate::ui::keys::Action;
 use crate::ui::status::{Lora, Phase};
 use crate::ui::term::Viewport;
+use crate::ui::term_state::{Activity, Progress, Signals};
 use crate::ui::transcript::TranscriptCtx;
 use crate::ui::{Rows, tasks};
 use anyhow::Result;
@@ -47,6 +48,44 @@ pub(super) fn update_model_status(
         home.info.provider.clone_from(&status.provider);
         home.info.model.clone_from(&status.model);
     }
+}
+
+/// What the terminal should show outside the cells for this paint (see `ui::term_state`); `None`
+/// when terminal integration is off.
+pub(super) fn terminal_signals(
+    ui: &crate::llm::model_config::UiConfig,
+    status: &crate::ui::status::StatusData,
+    after_turn: Activity,
+    awaiting_user: bool,
+) -> Option<Signals> {
+    if !ui.terminal_integration {
+        return None;
+    }
+    let (activity, progress) = if awaiting_user {
+        (Activity::Waiting, Progress::Paused)
+    } else if status.busy() {
+        let progress = status
+            .prompt_fraction()
+            .map_or(Progress::Indeterminate, |fraction| {
+                Progress::Percent((fraction * 100.0).round() as u8)
+            });
+        (Activity::Working, progress)
+    } else {
+        (after_turn, Progress::None)
+    };
+    let mut vars = vec![
+        ("dialState", activity.name().to_owned()),
+        ("dialModel", status.model.clone()),
+    ];
+    if let Some(fraction) = status.context_fraction() {
+        vars.push(("dialContext", format!("{:.0}%", fraction * 100.0)));
+    }
+    Some(Signals {
+        activity,
+        progress,
+        cwd: (!status.project_path.is_empty()).then(|| status.project_path.clone().into()),
+        vars,
+    })
 }
 
 impl Shell {
@@ -192,10 +231,12 @@ impl Shell {
         }
         let above = live.len() as u16;
         live.extend(bottom);
+        let signals = terminal_signals(ui, status, self.term_activity, self.awaiting_user);
         term.paint(&Viewport {
             rows: &live,
             cursor: cursor.map(|(row, col)| (above + row, col)),
             title: Some(title.as_str()),
+            signals: signals.as_ref(),
         })
     }
 

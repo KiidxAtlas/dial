@@ -75,6 +75,16 @@ pub(in crate::agent) fn acquire(config: &Config, interrupt: &AtomicBool) -> Opti
     acquire_key(key, limit, interrupt)
 }
 
+/// Best-effort control-plane work must never queue behind busy inference.
+pub(in crate::agent) fn try_acquire(config: &Config) -> Option<Slot> {
+    let (key, limit) = route(config);
+    if limit == 0 {
+        Some(Slot { key: None })
+    } else {
+        try_acquire_key(key, limit)
+    }
+}
+
 /// Wait for a request slot while preserving the caller's admission failure cause.
 pub(in crate::agent) fn acquire_checked<E>(
     config: &Config,

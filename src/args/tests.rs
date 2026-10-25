@@ -47,3 +47,20 @@ fn schedule_cli_accepts_comma_and_repeated_allow_lists() {
     assert_eq!(entry.approval, "readonly");
     assert_eq!(entry.prompt, "inspect the project");
 }
+
+#[test]
+fn watch_cli_requires_a_session_and_accepts_once_and_project_directory() {
+    let cli = Cli::try_parse_from([
+        "dial",
+        "-C",
+        "/tmp/project",
+        "watch",
+        "session_123",
+        "--once",
+    ])
+    .unwrap();
+    assert!(
+        matches!(cli.command, Some(Command::Watch(args)) if args.session == "session_123" && args.once)
+    );
+    assert!(Cli::try_parse_from(["dial", "watch"]).is_err());
+}

@@ -103,6 +103,8 @@ impl Shell {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default()
             ),
+            term_activity: Default::default(),
+            awaiting_user: false,
             turn_output_tokens: 0,
             todo: TodoList::new(),
             skills: Vec::new(),
@@ -377,9 +379,16 @@ impl Shell {
                         "\u{2193}"
                     }
                 ),
+                // `/setup` only picks optional capabilities; `dial setup -m` installs the MLX
+                // runtime, which exists only on Apple Silicon Macs.
                 setup_hint: format!(
-                    "{} or /providers to sign in to a hosted model; /setup installs the local model runtime",
-                    self.keys.label(Action::ModelSelect)
+                    "{} to choose a model or /providers to sign in to a hosted one{}",
+                    self.keys.label(Action::ModelSelect),
+                    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                        "; `dial setup -m <mlx-model>` downloads a local one"
+                    } else {
+                        ""
+                    }
                 ),
                 branch,
                 approval: format!("{:?}", app.config.approval).to_lowercase(),

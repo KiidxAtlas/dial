@@ -187,8 +187,12 @@ pub(crate) enum Command {
     /// Image commands: status, doctor, probe, purge.
     #[command(visible_alias = "img")]
     Images(dial::cli::images::ImagesArgs),
+    /// Follow live edits, diagnostics and screenshots in another pane.
+    Watch(dial::cli::watch::WatchArgs),
     /// Sweep stale blobs, archives, and WAL state (dry run unless --apply).
     Gc(dial::cli::gc::GcArgs),
+    /// Run the deterministic, model-free edit-grammar benchmark (exits 1 on any wrong result).
+    EditBench(dial::cli::edit_bench::EditBenchArgs),
     /// Install the Chrome extension, run the browser relay, or check its connection.
     BrowserRelay(dial::cli::browser_relay::BrowserRelayArgs),
     /// Write an anonymized copy of a session (redacted content, metadata kept).

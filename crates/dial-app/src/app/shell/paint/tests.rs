@@ -58,3 +58,60 @@ fn model_change_updates_status_and_home_without_resetting_navigation() {
         "A conversation must not reopen the welcome screen"
     );
 }
+
+#[test]
+fn terminal_signals_follow_the_session_state() {
+    use crate::ui::status::Phase;
+    use crate::ui::term_state::{Activity, Progress};
+    let mut ui = crate::llm::model_config::UiConfig::default();
+    let mut status = StatusData {
+        model: "qwen3".into(),
+        project_path: "/work/dial".into(),
+        prompt_tokens: Some(2_500),
+        context_window: 10_000,
+        ..Default::default()
+    };
+    let idle = terminal_signals(&ui, &status, Activity::Done, false).unwrap();
+    assert_eq!(
+        (idle.activity, idle.progress),
+        (Activity::Done, Progress::None)
+    );
+    assert_eq!(
+        idle.cwd.as_deref(),
+        Some(std::path::Path::new("/work/dial"))
+    );
+    assert_eq!(
+        idle.vars,
+        vec![
+            ("dialState", "done".to_owned()),
+            ("dialModel", "qwen3".to_owned()),
+            ("dialContext", "25%".to_owned()),
+        ]
+    );
+
+    status.phase = Phase::Working;
+    let busy = terminal_signals(&ui, &status, Activity::Done, false).unwrap();
+    assert_eq!(
+        (busy.activity, busy.progress),
+        (Activity::Working, Progress::Indeterminate)
+    );
+    status.model_progress = Some(
+        serde_json::from_value(serde_json::json!({
+            "phase": "processing",
+            "processed_tokens": 400,
+            "prompt_tokens": 1000,
+        }))
+        .unwrap(),
+    );
+    let prefill = terminal_signals(&ui, &status, Activity::Idle, false).unwrap();
+    assert_eq!(prefill.progress, Progress::Percent(40));
+
+    let asking = terminal_signals(&ui, &status, Activity::Idle, true).unwrap();
+    assert_eq!(
+        (asking.activity, asking.progress),
+        (Activity::Waiting, Progress::Paused)
+    );
+
+    ui.terminal_integration = false;
+    assert!(terminal_signals(&ui, &status, Activity::Idle, true).is_none());
+}

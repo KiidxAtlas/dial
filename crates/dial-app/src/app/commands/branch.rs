@@ -25,6 +25,12 @@ pub(in crate::app) fn rewind(
     agent: &mut Agent<'_>,
     user_turns: usize,
 ) -> Result<Rewound> {
+    agent
+        .gate_session_change(
+            "session_before_branch",
+            serde_json::json!({"reason":"branch","user_turns":user_turns}),
+        )
+        .map_err(anyhow::Error::msg)?;
     let rewound = rewind_branch(app, agent, user_turns);
     crate::collab::room::sync_host(agent.session());
     rewound

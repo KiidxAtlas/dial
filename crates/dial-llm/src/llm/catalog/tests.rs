@@ -742,6 +742,52 @@ fn lm_studio_mlx_downloads_are_listed_and_other_formats_skipped() {
     );
 }
 #[test]
+fn gguf_downloads_keep_the_local_route_but_are_named_by_their_format() {
+    let studio = tempfile::tempdir().unwrap();
+    let mlx = studio.path().join("lmstudio-community/Qwen-MLX");
+    fs::create_dir_all(&mlx).unwrap();
+    fs::write(mlx.join("config.json"), r#"{"model_type":"qwen3"}"#).unwrap();
+    fs::write(mlx.join("model.safetensors"), "weights").unwrap();
+    let studio_gguf = studio.path().join("lmstudio-community/Qwen-GGUF");
+    fs::create_dir_all(&studio_gguf).unwrap();
+    fs::write(studio_gguf.join("model-Q4_K_M.gguf"), b"GGUF weights").unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let repo = cache.path().join("models--org--Qwen-GGUF");
+    let snapshot = repo.join("snapshots/abc123");
+    fs::create_dir_all(&snapshot).unwrap();
+    fs::create_dir_all(repo.join("refs")).unwrap();
+    fs::write(repo.join("refs/main"), "abc123").unwrap();
+    fs::write(snapshot.join("model-Q4_K_M.gguf"), b"GGUF weights").unwrap();
+
+    let entries = [
+        lmstudio_mlx_models(studio.path(), None).remove(0),
+        lmstudio_gguf_models(studio.path()).remove(0),
+        local_models(cache.path(), None).remove(0),
+    ];
+    let shown: Vec<_> = entries
+        .iter()
+        .map(|e| {
+            (
+                e.selection.provider.as_str(),
+                e.display_provider(),
+                e.metadata.format,
+            )
+        })
+        .collect();
+    let local = |shown, format| ("mlx", shown, Some(format));
+    assert_eq!(
+        shown,
+        [
+            local("mlx", LocalFormat::Mlx),
+            local("gguf", LocalFormat::Gguf),
+            local("gguf", LocalFormat::Gguf),
+        ],
+        "the route id stays `mlx` (configs and resume select it); only the shown name changes"
+    );
+    assert!(entries[1].source.starts_with("LM Studio download (GGUF)"));
+    assert!(entries[2].source.starts_with("Hugging Face cache (GGUF)"));
+}
+#[test]
 fn disabled_endpoint_is_never_contacted() {
     let dir = tempfile::tempdir().unwrap();
     let probe = prepare(

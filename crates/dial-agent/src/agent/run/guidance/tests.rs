@@ -178,3 +178,97 @@ fn delivered_notes_retire_across_requests_even_when_buried_behind_tool_history()
     retire_delivered(&mut messages, true);
     assert!(!contents(&messages).contains(&"fresh review"));
 }
+
+fn advice(messages: &[Value]) -> Vec<&str> {
+    messages
+        .iter()
+        .filter(|message| Priority::of(message).is_some())
+        .map(|message| message["content"].as_str().unwrap_or_default())
+        .collect()
+}
+
+#[test]
+fn normalization_folds_case_whitespace_and_punctuation() {
+    assert_eq!(normalize("  Looks   GOOD!! "), "looks good");
+    assert_eq!(normalize("No issue; continue."), "no issue continue");
+    assert_eq!(normalize("?!..."), "");
+    assert!(is_content_free(""));
+    assert!(is_content_free(" - . "));
+    assert!(is_content_free("LGTM."));
+    assert!(is_content_free("Looks good"));
+    assert!(!is_content_free(
+        "Looks good, but the migration drops a column"
+    ));
+    assert!(!is_content_free(
+        "Stop: await is missing on writeStream.end()"
+    ));
+}
+
+#[test]
+fn content_free_advice_is_dropped_before_it_can_crowd_out_real_advice() {
+    let mut emissions = Emissions::default();
+    let mut messages = history();
+    messages.push(note(Priority::Review, "Looks good."));
+    messages.push(note(Priority::Todo, "run the failing test first"));
+    let dropped = curate(&mut messages, &mut emissions);
+    assert_eq!(contents(&dropped), ["Looks good."]);
+    assert_eq!(advice(&messages), ["run the failing test first"]);
+}
+
+#[test]
+fn identical_advice_is_suppressed_for_the_window_then_allowed_again() {
+    let mut emissions = Emissions::default();
+    let mut delivered = Vec::new();
+    for _ in 0..6 {
+        let mut messages = history();
+        // Case and spacing differ, but the normalized text is the same advice.
+        messages.push(note(Priority::Review, "Verify the  build passes."));
+        curate(&mut messages, &mut emissions);
+        delivered.push(!advice(&messages).is_empty());
+    }
+    assert_eq!(delivered, [true, false, false, true, false, false]);
+}
+
+#[test]
+fn suppressed_repeat_lets_a_lower_priority_note_through_and_new_advice_is_unaffected() {
+    let mut emissions = Emissions::default();
+    let mut first = history();
+    first.push(note(Priority::Review, "check the diff"));
+    curate(&mut first, &mut emissions);
+    assert_eq!(advice(&first), ["check the diff"]);
+    let mut second = history();
+    second.push(note(Priority::Review, "check the diff"));
+    second.push(note(Priority::Todo, "finish step 2"));
+    curate(&mut second, &mut emissions);
+    assert_eq!(advice(&second), ["finish step 2"]);
+    let mut third = history();
+    third.push(note(Priority::Review, "check the diff again, line 40"));
+    curate(&mut third, &mut emissions);
+    assert_eq!(advice(&third), ["check the diff again, line 40"]);
+}
+
+#[test]
+fn safety_and_failure_notes_are_never_suppressed_or_filtered() {
+    let mut emissions = Emissions::default();
+    for priority in [Priority::Safety, Priority::Failure] {
+        for _ in 0..5 {
+            let mut messages = history();
+            messages.push(note(priority, "Stop."));
+            let dropped = curate(&mut messages, &mut emissions);
+            assert!(dropped.is_empty(), "{priority:?}");
+            assert_eq!(advice(&messages), ["Stop."]);
+        }
+    }
+}
+
+#[test]
+fn duplicates_within_one_request_collapse_and_protocol_notes_stay() {
+    let mut emissions = Emissions::default();
+    let mut messages = history();
+    messages.push(json!({"role":"user","content":"looks good","dial_transient":true}));
+    messages.push(note(Priority::Loop, "narration"));
+    messages.push(note(Priority::Loop, "Narration"));
+    curate(&mut messages, &mut emissions);
+    assert_eq!(advice(&messages), ["narration"]);
+    assert!(contents(&messages).contains(&"looks good"));
+}

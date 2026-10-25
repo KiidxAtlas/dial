@@ -214,6 +214,9 @@ impl Background {
         if !cwd.is_dir() {
             return Err(format!("cwd {} is not a directory", ws.rel(&cwd)));
         }
+        if let Some(refusal) = crate::tools::exec::git_guard::guard(ws, command, &cwd) {
+            return Ok(refusal);
+        }
         let (name, pid) = self.table().start(
             ws,
             opt_str(args, "name")?,

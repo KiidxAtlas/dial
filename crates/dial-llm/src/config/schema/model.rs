@@ -398,4 +398,14 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Coordinate background training and maintenance with sessions. Sessions with local models share compute and never wait on each other; background work waits for them and yields to coding. Turn off to run background work concurrently; it may exhaust RAM/GPU memory. Pause and stop controls still apply. Laya never requires this lock.",
         Kind::Bool,
     ),
+    field!(
+        "retry.fallback_on",
+        retry.fallback_on,
+        MO,
+        "Roles & Sampling",
+        "Fallback trigger",
+        "Which failures move a request to its fallback chain: any recoverable failure, only usage limits (throttling and quota), or everything except usage limits.",
+        Kind::Enum(FALLBACK_ON),
+        true
+    ),
 ];

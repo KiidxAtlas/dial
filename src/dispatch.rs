@@ -139,8 +139,14 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
         Some(Command::Images(args)) => {
             return exit_with(dial::cli::images::run(&layout, args.clone())?);
         }
+        Some(Command::Watch(args)) => {
+            return exit_with(dial::cli::watch::run(&layout, args.clone())?);
+        }
         Some(Command::Gc(args)) => {
             return exit_with(dial::cli::gc::run(&layout, args.clone())?);
+        }
+        Some(Command::EditBench(args)) => {
+            return exit_with(dial::cli::edit_bench::run(args)?);
         }
         Some(Command::BrowserRelay(args)) => {
             return exit_with(dial::cli::browser_relay::run(&layout, args.clone())?);

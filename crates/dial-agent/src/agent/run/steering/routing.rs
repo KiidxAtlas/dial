@@ -73,6 +73,8 @@ fn started_worker(result: Value) -> Result<Value> {
     Ok(result)
 }
 
+const ROUTING_BUDGET_SECS: u64 = 3;
+
 impl Agent<'_> {
     /// Whether a separate worker may be started right now.
     fn can_split_now(&self) -> bool {
@@ -85,6 +87,103 @@ impl Agent<'_> {
             && self.layout.is_some()
             && self.catalog().iter().any(|name| name == "task")
             && self.tool_eligible("task")
+    }
+
+    fn classify_pending_message(
+        &mut self,
+        main: &mut Backend,
+        chat: &Chat,
+        ui: &mut dyn Ui,
+    ) -> Result<Decision> {
+        let budget = self
+            .config
+            .worker_timeout_secs
+            .clamp(1, ROUTING_BUDGET_SECS);
+        if crate::judgment::judge_uses_laya(self.config) {
+            let mut config = self.config.laya_service();
+            config.timeout_secs = config.timeout_secs.min(budget);
+            let state = chat.messages[1]["content"]
+                .as_str()
+                .unwrap_or("")
+                .to_owned();
+            let instructions = chat.messages[0]["content"]
+                .as_str()
+                .unwrap_or("")
+                .to_owned();
+            let parent = self.interrupt.clone();
+            // Laya is a typed engine, not a chat model. Keep the UI and existing worker approvals
+            // responsive while its cancellable request runs, without borrowing the main backend.
+            let route = thread::scope(|scope| -> Result<String> {
+                let (tx, rx) = std::sync::mpsc::channel();
+                scope.spawn(move || {
+                    let result = crate::agent::model::roles::with_request_deadline(
+                        parent,
+                        Duration::from_secs(budget),
+                        |cancel| {
+                            crate::agent::model::laya::choose(
+                                &config,
+                                &instructions,
+                                &[
+                                    (
+                                        "steer",
+                                        "Changes or depends on the active task, or is ambiguous",
+                                    ),
+                                    ("split", "Clearly independent, self-contained work"),
+                                ],
+                                &state,
+                                cancel,
+                            )
+                        },
+                    );
+                    let _ = tx.send(result);
+                });
+                loop {
+                    match rx.recv_timeout(Duration::from_millis(80)) {
+                        Ok(result) => break result,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            anyhow::bail!("message-routing worker ended without a result")
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            ui.heartbeat();
+                            self.pump_subagents(ui);
+                        }
+                    }
+                }
+            })?;
+            return match route.as_str() {
+                "steer" => Ok(Decision {
+                    route: Route::Steer,
+                    reason: "Decision engine selected steering".into(),
+                }),
+                "split" => Ok(Decision {
+                    route: Route::Split,
+                    reason: "Decision engine selected independent work".into(),
+                }),
+                _ => anyhow::bail!("invalid message-routing choice"),
+            };
+        }
+        let role = if self.config.role_selection("judge").is_some() {
+            "judge"
+        } else {
+            "small"
+        };
+        let config = self.auth_config.for_role(role);
+        // A classifier is optional control-plane work. Never queue it behind a worker holding
+        // the single local-provider slot; steering is the safe immediate fallback instead.
+        let _slot = if config.endpoint.is_some()
+            || main.supports_adapters()
+            || config.provider.as_deref() == Some(crate::llm::apple::PROVIDER)
+            || self.role_selection(role).is_some()
+        {
+            Some(
+                crate::agent::model::provider_slots::try_acquire(&config)
+                    .context("routing provider is busy")?,
+            )
+        } else {
+            None
+        };
+        self.bounded_role_chat(main, role, llm::usage::Purpose::Judgment, chat, ui, budget)
+            .and_then(|text| decision(&text))
     }
 
     /// Messages the user explicitly sent as independent work. The user already decided, so no model
@@ -186,15 +285,7 @@ impl Agent<'_> {
                     "Deciding whether your message steers this task or starts independent work…",
                 );
                 let chat = request(instruction, &self.session.messages(), &text, can_split);
-                self.role_chat_with_timeout(
-                    main,
-                    "small",
-                    llm::usage::Purpose::Judgment,
-                    &chat,
-                    ui,
-                    self.config.worker_timeout_secs.clamp(1, 30),
-                )
-                .and_then(|text| decision(&text))
+                self.classify_pending_message(main, &chat, ui)
             };
             if self.interrupt.load(Ordering::SeqCst) {
                 ui.restore_pending_messages(std::iter::once(text).chain(messages).collect());

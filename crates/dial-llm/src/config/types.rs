@@ -206,6 +206,11 @@ pub struct ShellConfig {
     pub no_pty: bool,
     /// Shell that runs `bash` commands: `auto`, `system`, `embedded` (built-in POSIX shell), or `inprocess` (built-in shell inside Dial; sandbox off only).
     pub backend: ShellBackend,
+    /// Shrink the output of recognised noisy commands (cargo, git, npm, pytest, go test) before the model sees it.
+    /// The complete raw output stays in the command's output artifact.
+    pub minimize_output: bool,
+    /// When `bash` and `bg` refuse git commands that discard uncommitted work: `workers`, `always` or `off`.
+    pub git_guard: GitGuard,
 }
 impl Default for ShellConfig {
     fn default() -> Self {
@@ -214,8 +219,22 @@ impl Default for ShellConfig {
             auto_background_secs: 15,
             no_pty: false,
             backend: ShellBackend::Auto,
+            minimize_output: true,
+            git_guard: GitGuard::Workers,
         }
     }
+}
+
+/// Where `bash` and `bg` refuse git commands that discard uncommitted work (`git reset --hard`,
+/// `git stash`, `git checkout -- <path>`, `git clean -f`, ...). `workers` guards delegated workers that
+/// share the parent's checkout; `always` guards every command; `off` never refuses.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GitGuard {
+    #[default]
+    Workers,
+    Always,
+    Off,
 }
 
 /// One host added with `/ssh add`. `~/.ssh/config` hosts are merged with these; an entry here wins on a name clash.
@@ -441,7 +460,9 @@ pub struct Config {
     pub telemetry: config::telemetry::TelemetryConfig,
     pub voice: config::voice::VoiceConfig,
     pub collab: config::collab::Config,
+    pub coordination: config::coordination::CoordinationConfig,
     pub share: crate::config::share::Config,
+    pub secrets: crate::config::secrets::Config,
     /// Effective model budget, resolved after loading. Never persisted as an operator override.
     #[serde(skip)]
     pub context_window: u32,
@@ -581,6 +602,8 @@ pub struct ExperimentalConfig {
     pub context_overlap_dedup: bool,
     pub profile_matching: bool,
     pub tool_speculation: bool,
+    /// Rewrite each user message with the `turn_drafter` role before the main model sees it.
+    pub turn_optimizer: bool,
 }
 
 /// A user-defined subagent built on a built-in type. Writers (`base = "worker"`) are allowed:
@@ -977,8 +1000,24 @@ pub struct RetryConfig {
     /// the request once with another signed-in, policy-allowed account of the same provider.
     pub rotate_accounts: bool,
     /// Ordered selectors attempted after a terminal provider failure. Keys are role names or
-    /// exact `provider/model` identities; values may be bare models, qualified models, or `@role`.
+    /// exact `provider/model` identities, or `provider/*` wildcards (matched last); values may be
+    /// bare models, qualified models, or `@role`.
     pub fallback_chains: std::collections::BTreeMap<String, Vec<String>>,
+    /// Which terminal failures move a request on to its fallback chain.
+    pub fallback_on: FallbackOn,
+}
+
+/// Failure classes that trigger `[retry.fallback_chains]` (`retry.fallback_on`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FallbackOn {
+    /// Throttling, quota exhaustion, transient failures and rejected credentials.
+    #[default]
+    Any,
+    /// Only throttling and quota exhaustion.
+    UsageLimit,
+    /// Transient failures and rejected credentials, never usage limits.
+    ExceptUsageLimit,
 }
 impl Default for RetryConfig {
     fn default() -> Self {
@@ -988,6 +1027,7 @@ impl Default for RetryConfig {
             wait_for_quota_reset: false,
             rotate_accounts: true,
             fallback_chains: std::collections::BTreeMap::new(),
+            fallback_on: FallbackOn::default(),
         }
     }
 }
@@ -1485,7 +1525,9 @@ impl Default for Config {
             telemetry: config::telemetry::TelemetryConfig::default(),
             voice: config::voice::VoiceConfig::default(),
             collab: config::collab::Config::default(),
+            coordination: Default::default(),
             share: crate::config::share::Config::default(),
+            secrets: crate::config::secrets::Config::default(),
             harness: Harness::default(),
             skills: SkillsConfig::default(),
             codex_websocket: true,

@@ -175,6 +175,13 @@ impl SubagentsOverlay {
     }
 
     pub fn handle(&mut self, event: &Event, keys: &Keymap) -> OverlayEvent {
+        if let Event::Paste(text) = event {
+            // Paste only fills an open message draft; it never opens one or triggers shortcuts.
+            if let Some(draft) = self.compose.as_mut() {
+                draft.push_str(&crate::ui::text::sanitize(text));
+            }
+            return OverlayEvent::None;
+        }
         let Event::Key(key) = event else {
             return OverlayEvent::None;
         };

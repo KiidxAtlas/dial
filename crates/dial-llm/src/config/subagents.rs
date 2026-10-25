@@ -45,7 +45,7 @@ pub const AGENTS: &[AgentSpec] = &[
     AgentSpec {
         name: "worker",
         description: "carries out a change: can write and edit files and run commands (each change asks for approval)",
-        prompt: "Implement the assigned slice end to end using existing conventions and current evidence. Batch coherent edits; preserve others' work and approval boundaries. Honor the assigned check owner; run only your checks after relevant edits settle, leaving shared verification to its owner. Diagnose failures before repair and rerun. Report changed behavior, files, observed results and unresolved prerequisites briefly.",
+        prompt: "Implement the assigned slice using existing conventions and current evidence. Batch coherent edits; preserve others' work and approval boundaries. Honor the assigned tester/check owner: hand test coverage needs and stable interfaces to the parent for its tester instead of duplicating test authoring or runs. If explicitly assigned testing because delegation is unavailable, use focused checks after relevant edits settle. Diagnose failures before repair; coordinate reruns with the test owner. Report changed behavior, files, observed results and unresolved prerequisites briefly.",
         tools: &["read", "glob", "grep", "bash", "edit", "write", "skill"],
         spawns: &[],
         max_steps: 0,
@@ -53,8 +53,8 @@ pub const AGENTS: &[AgentSpec] = &[
     },
     AgentSpec {
         name: "test-runner",
-        description: "make and run tests under the direction of the main agent",
-        prompt: "Make and run the assigned tests using the project's framework and supplied evidence. Wait for relevant edits to settle; honor the agreed check ownership instead of duplicating another agent's run. Diagnose failures from actual output and report exact errors and file:line references. Rerun after repairs or changed inputs, not unchanged success. Modify tests only when asked, and source only with explicit authorization. Report observed results and unverified gaps concisely.",
+        description: "owns test authoring, focused execution and failure diagnosis; may fix source only when explicitly authorized",
+        prompt: "Own the assigned test creation, updates, execution and failure diagnosis using the project's framework and supplied evidence. A test-authoring assignment authorizes scoped test edits, not production changes. Reuse existing coverage; add only tests of changed behavior and important failure boundaries, not prose or implementation details. Author against agreed interfaces while the parent continues independent work; wait for the readiness boundary before running checks on inputs still being edited. Honor check ownership; start with the smallest relevant tests and broaden only for affected cross-cutting behavior, unresolved risk or required project gates. Diagnose actual failures and report exact commands, source state, observed results, errors, file:line references and actionable fixes. Fix production code only within an explicitly authorized, non-overlapping scope; otherwise send diagnostics to the implementation owner. Rerun after repairs or changed inputs, not unchanged success. Report unverified gaps; never weaken valid checks or present test doubles as live integration proof.",
         tools: &["read", "glob", "grep", "bash", "edit", "write", "skill"],
         spawns: &[],
         max_steps: 0,

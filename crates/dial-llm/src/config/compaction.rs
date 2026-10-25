@@ -278,6 +278,54 @@ pub struct CompactionConfig {
         serialize_with = "inherit_string_serialize"
     )]
     pub summary_instructions: Option<String>,
+    /// Opt-in switch to a larger-window model before compacting.
+    pub promotion: PromotionConfig,
+}
+
+/// Context promotion: when a conversation is about to be compacted, or the provider rejects it for
+/// context overflow, switch to a configured larger-window model first and compact only when no
+/// target qualifies. Off by default. The switch lasts until the user changes models.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PromotionConfig {
+    pub enabled: bool,
+    /// Ordered target selectors (`@role`, `provider/model` or a bare model on the current provider)
+    /// keyed like `retry.fallback_chains`: `default`, an exact `provider/model`, or `provider/*`.
+    pub targets: BTreeMap<String, Vec<String>>,
+}
+
+/// Most keys and most targets per key a promotion table may hold.
+const MAX_PROMOTION_KEYS: usize = 128;
+const MAX_PROMOTION_TARGETS: usize = 32;
+
+impl PromotionConfig {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.targets.len() <= MAX_PROMOTION_KEYS,
+            "compaction.promotion.targets exceeds {MAX_PROMOTION_KEYS} keys"
+        );
+        for (key, chain) in &self.targets {
+            ensure!(
+                !key.trim().is_empty() && key.len() <= 512,
+                "invalid compaction.promotion.targets key"
+            );
+            ensure!(
+                !chain.is_empty(),
+                "compaction.promotion.targets {key:?} must list at least one model"
+            );
+            ensure!(
+                chain.len() <= MAX_PROMOTION_TARGETS,
+                "compaction.promotion.targets {key:?} exceeds {MAX_PROMOTION_TARGETS} entries"
+            );
+            for selector in chain {
+                ensure!(
+                    !selector.trim().is_empty() && selector.trim().len() <= 512,
+                    "invalid model selector in compaction.promotion.targets {key:?}"
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for CompactionConfig {
@@ -322,6 +370,7 @@ impl Default for CompactionConfig {
             drop_useless: false,
             experimental_context_management: false,
             summary_instructions: None,
+            promotion: PromotionConfig::default(),
         }
     }
 }
@@ -377,6 +426,7 @@ impl CompactionConfig {
             validate_selector(key)?;
         }
         self.snapcompact.validate()?;
+        self.promotion.validate()?;
         for (key, billing) in &self.snapcompact_models {
             validate_selector(key)?;
             billing.validate()?;
@@ -683,3 +733,6 @@ pub(crate) const SPECULATION_LEAD_MAX_TOKENS: u64 = 32_000;
 pub fn speculation_lead(threshold: u64) -> u64 {
     (threshold / 8).clamp(SPECULATION_LEAD_MIN_TOKENS, SPECULATION_LEAD_MAX_TOKENS)
 }
+
+#[cfg(test)]
+mod tests;

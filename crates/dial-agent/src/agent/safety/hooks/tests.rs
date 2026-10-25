@@ -456,3 +456,340 @@ fn scheduling_ignores_hooks_that_match_other_tools() {
     let unmatched = [hook("tool_call", None, "true")];
     assert!(wanted_for_tool(&unmatched, None, "pre_tool_use", "read"));
 }
+
+fn chat(messages: Vec<Value>) -> crate::llm::Chat {
+    crate::llm::Chat {
+        messages,
+        tools: Vec::new(),
+        temperature: 0.0,
+        max_tokens: 64,
+        seed: None,
+    }
+}
+
+#[test]
+fn new_events_and_aliases_validate_and_canonicalize() {
+    for (name, canonical) in [
+        ("context", "context"),
+        ("assistant_message", "assistant_message"),
+        ("message_end", "assistant_message"),
+        ("after_provider_response", "after_provider_response"),
+        ("provider_response", "after_provider_response"),
+        ("session_before_branch", "session_before_branch"),
+        ("before_branch", "session_before_branch"),
+        ("session_before_switch", "session_before_switch"),
+        ("before_switch", "session_before_switch"),
+    ] {
+        assert!(validate(&hook(name, None, "true")).is_ok(), "{name}");
+        assert_eq!(crate::config::hooks::canonical(name), canonical);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn context_hook_replaces_one_request_without_touching_the_original() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = chat(vec![json!({"role":"user","content":"hello"})]);
+    let hooks = [
+        hook(
+            "context",
+            None,
+            r#"printf '{"messages":[{"role":"user","content":"rewritten"}],"additional_context":"mind the style guide"}'"#,
+        ),
+        // Later hooks see the earlier replacement.
+        hook(
+            "context",
+            None,
+            r#"grep -q rewritten || { echo 'replacement not visible' >&2; exit 2; }"#,
+        ),
+    ];
+    let sent = provider_request(
+        &hooks,
+        None,
+        dir.path(),
+        &original,
+        &AtomicBool::new(false),
+        &mut |_| {},
+    )
+    .unwrap()
+    .expect("the hook changed the request");
+    assert_eq!(sent.messages[0]["content"], "rewritten");
+    let note = sent.messages.last().unwrap();
+    assert_eq!(note["content"], "mind the style guide");
+    assert_eq!(note["dial_transient"], true);
+    assert_eq!(original.messages.len(), 1);
+    assert_eq!(original.messages[0]["content"], "hello");
+}
+
+#[cfg(unix)]
+#[test]
+fn context_hook_invalid_or_oversized_replacements_are_skipped_and_blocks_refuse() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = chat(vec![json!({"role":"user","content":"hello"})]);
+    let big = "x".repeat(MAX_CONTEXT_MESSAGES + 1);
+    for script in [
+        r#"printf '{"messages":"nope"}'"#.to_owned(),
+        r#"printf '{"messages":[{"content":"no role"}]}'"#.to_owned(),
+        format!(r#"printf '{{"messages":[{{"role":"user","content":"{big}"}}]}}'"#),
+    ] {
+        let mut notices = Vec::new();
+        let sent = provider_request(
+            &[hook("context", None, &script)],
+            None,
+            dir.path(),
+            &original,
+            &AtomicBool::new(false),
+            &mut |n| notices.push(n.to_owned()),
+        );
+        // The oversized stdout is rejected by the output cap before it can replace anything.
+        assert!(sent.unwrap().is_none(), "{script:.60}");
+    }
+    let mut notices = Vec::new();
+    provider_request(
+        &[hook(
+            "context",
+            None,
+            r#"printf '{"messages":[{"nope":1}]}'"#,
+        )],
+        None,
+        dir.path(),
+        &original,
+        &AtomicBool::new(false),
+        &mut |n| notices.push(n.to_owned()),
+    )
+    .unwrap();
+    assert!(
+        notices.iter().any(|n| n.contains("replacement ignored")),
+        "{notices:?}"
+    );
+    let refused = provider_request(
+        &[hook("context", None, "echo stale >&2; exit 2")],
+        None,
+        dir.path(),
+        &original,
+        &AtomicBool::new(false),
+        &mut |_| {},
+    )
+    .expect_err("a context block refuses the request");
+    assert!(refused.to_string().contains("stale"), "{refused}");
+}
+
+#[cfg(unix)]
+#[test]
+fn additional_context_is_bounded_deduplicated_and_dropped_by_a_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let long = "y".repeat(MAX_CONTEXT * 2);
+    let hooks = [
+        hook(
+            "pre_tool_use",
+            None,
+            r#"printf '{"additional_context":"  use the cache  "}'"#,
+        ),
+        hook(
+            "pre_tool_use",
+            None,
+            r#"printf '{"additionalContext":"use the cache"}'"#,
+        ),
+        hook(
+            "pre_tool_use",
+            None,
+            &format!(r#"printf '{{"additional_context":"{long}"}}'"#),
+        ),
+    ];
+    let (result, context) = pre_tool_noted(
+        &hooks,
+        None,
+        dir.path(),
+        "bash",
+        &json!({}),
+        &AtomicBool::new(false),
+        &mut |_| {},
+    );
+    assert_eq!(result, Ok(None));
+    let context = context.expect("a note was queued");
+    assert!(context.starts_with("use the cache\n"), "{context}");
+    assert_eq!(context.matches("use the cache").count(), 1);
+    assert!(context.len() <= MAX_OUTPUT + " [cut]".len());
+
+    let hooks = [
+        hook(
+            "pre_tool_use",
+            None,
+            r#"printf '{"additional_context":"discard me"}'"#,
+        ),
+        hook("pre_tool_use", None, "echo no >&2; exit 2"),
+    ];
+    let (result, context) = pre_tool_noted(
+        &hooks,
+        None,
+        dir.path(),
+        "bash",
+        &json!({}),
+        &AtomicBool::new(false),
+        &mut |_| {},
+    );
+    assert!(result.is_err());
+    assert_eq!(context, None, "a refusal discards earlier context");
+}
+
+#[cfg(unix)]
+#[test]
+fn post_tool_context_stays_outside_the_tool_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut out = crate::runtime::tool_output::ToolOutput {
+        execution: Default::default(),
+        data: None,
+        text: "ok".into(),
+        is_error: true,
+    };
+    let context = post_tool_with(
+        &[hook(
+            "post_tool_use",
+            None,
+            r#"printf '{"additional_context":"retry with --force-with-lease"}'"#,
+        )],
+        None,
+        dir.path(),
+        "bash",
+        &json!({}),
+        &mut out,
+        &AtomicBool::new(false),
+        &mut |_| {},
+    );
+    assert_eq!(context.as_deref(), Some("retry with --force-with-lease"));
+    assert_eq!(out.text, "ok", "the note never edits the tool result");
+    assert!(out.is_error);
+}
+
+#[cfg(unix)]
+#[test]
+fn additional_context_is_ignored_on_events_that_do_not_deliver_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let hooks = [hook(
+        "stop",
+        None,
+        r#"printf '{"additional_context":"ignored"}'"#,
+    )];
+    let outcome = fire_with(
+        &hooks,
+        None,
+        dir.path(),
+        "stop",
+        None,
+        json!({}),
+        &AtomicBool::new(false),
+    );
+    assert!(outcome.context_note().is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn assistant_message_hooks_get_the_reply_and_may_queue_context_but_never_block_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let seen = dir.path().join("seen.json");
+    let hooks = [hook(
+        "message_end",
+        None,
+        &format!(
+            r#"cat > '{}'; printf '{{"additional_context":"cite sources next time"}}'"#,
+            seen.display()
+        ),
+    )];
+    let outcome = fire_with(
+        &hooks,
+        None,
+        dir.path(),
+        "assistant_message",
+        None,
+        json!({"text":"final answer"}),
+        &AtomicBool::new(false),
+    );
+    assert_eq!(
+        outcome.context_note().as_deref(),
+        Some("cite sources next time")
+    );
+    let payload: Value = serde_json::from_str(&std::fs::read_to_string(&seen).unwrap()).unwrap();
+    assert_eq!(payload["event"], "assistant_message");
+    assert_eq!(payload["text"], "final answer");
+}
+
+#[cfg(unix)]
+#[test]
+fn after_provider_response_reports_usage_and_cannot_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let seen = dir.path().join("response.json");
+    let reply = crate::llm::Reply {
+        finish_reason: "stop".into(),
+        prompt_tokens: Some(120),
+        completion_tokens: Some(8),
+        ..Default::default()
+    };
+    // `exit 2` is a block everywhere else; an observer's refusal changes nothing here.
+    let hooks = [hook(
+        "after_provider_response",
+        None,
+        &format!("cat > '{}'; echo refused >&2; exit 2", seen.display()),
+    )];
+    let mut notices = Vec::new();
+    provider_response(
+        &hooks,
+        None,
+        dir.path(),
+        "gpt-test",
+        &reply,
+        Duration::from_millis(42),
+        &mut |n| notices.push(n.to_owned()),
+    );
+    let payload: Value = serde_json::from_str(&std::fs::read_to_string(&seen).unwrap()).unwrap();
+    assert_eq!(payload["model"], "gpt-test");
+    assert_eq!(payload["stop_reason"], "stop");
+    assert_eq!(payload["latency_ms"], 42);
+    assert_eq!(payload["usage"]["prompt_tokens"], 120);
+    assert_eq!(payload["usage"]["completion_tokens"], 8);
+    assert!(notices.is_empty(), "{notices:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn session_change_gates_refuse_with_the_hook_reason_and_honor_aliases() {
+    let dir = tempfile::tempdir().unwrap();
+    let interrupt = AtomicBool::new(false);
+    for (configured, event) in [
+        ("before_branch", "session_before_branch"),
+        ("session_before_branch", "session_before_branch"),
+        ("before_switch", "session_before_switch"),
+    ] {
+        let hooks = [hook(
+            configured,
+            None,
+            "echo 'uncommitted work' >&2; exit 2",
+        )];
+        let refused = gate(
+            &hooks,
+            None,
+            dir.path(),
+            event,
+            json!({"reason":"branch"}),
+            &interrupt,
+            &mut |_| {},
+        );
+        assert_eq!(refused, Err("uncommitted work".into()), "{configured}");
+    }
+    // A hook for the other event does not fire, and an allowing hook lets the change proceed.
+    let hooks = [
+        hook("session_before_switch", None, "exit 2"),
+        hook("session_before_branch", None, "true"),
+    ];
+    assert_eq!(
+        gate(
+            &hooks,
+            None,
+            dir.path(),
+            "session_before_branch",
+            json!({}),
+            &interrupt,
+            &mut |_| {},
+        ),
+        Ok(())
+    );
+}

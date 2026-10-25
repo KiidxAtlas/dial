@@ -117,6 +117,17 @@ enigo = { version = "=0.6.1", default-features = false }
 uiautomation = "=0.25.1"
 winreg = "0.56"
 
+# Lints every member inherits with `[lints] workspace = true`. Only lints the tree is already clean
+# for are listed (a ratchet): add one after fixing its hits, never with blanket allows.
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+rc_mutex = "deny"
+
+[lints]
+workspace = true
+
 [features]
 default = ["aws", "voice", "embedded-shell", "desktop"]
 # AWS credential chain (env, profiles, SSO, process, web identity, ECS/IMDS) and SigV4 for Bedrock.

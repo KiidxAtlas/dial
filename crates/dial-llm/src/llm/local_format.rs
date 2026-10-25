@@ -7,12 +7,14 @@
 //! - **Splash**: LM Studio's bundle (`manifest.json` plus `target/` and `tokenizer/`); only LM Studio
 //!   can run it, so Dial recognises it to give an actionable error instead of a failed load.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum LocalFormat {
     Mlx,
     Gguf,
@@ -25,6 +27,15 @@ impl LocalFormat {
             Self::Mlx => "MLX",
             Self::Gguf => "GGUF",
             Self::Splash => "Splash",
+        }
+    }
+
+    /// The format and the runtime that serves it, as `/models` describes a local model.
+    pub fn serving(self) -> &'static str {
+        match self {
+            Self::Mlx => "MLX, served by Dial's MLX server",
+            Self::Gguf => "GGUF, served by llama.cpp",
+            Self::Splash => "Splash, LM Studio only",
         }
     }
 }

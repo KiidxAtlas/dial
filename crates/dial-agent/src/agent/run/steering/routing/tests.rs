@@ -566,3 +566,110 @@ fn startup_validation_accepts_only_confirmed_running_jobs() {
         assert!(started_worker(result).is_err());
     }
 }
+
+#[test]
+fn routing_deadline_is_request_local_and_does_not_interrupt_the_turn() {
+    let parent = Arc::new(AtomicBool::new(false));
+    let started = Instant::now();
+    crate::agent::model::roles::with_request_deadline(
+        parent.clone(),
+        Duration::from_millis(40),
+        |cancel| {
+            while !cancel.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Ok(())
+        },
+    )
+    .unwrap_err();
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(!parent.load(Ordering::SeqCst));
+}
+
+#[test]
+fn silent_routing_provider_falls_back_within_one_budget_and_preserves_input() {
+    let server = llm::fake::serve(vec![llm::fake::Script::Stall {
+        silence: Duration::from_secs(3),
+    }]);
+    with_agent("worker_timeout_secs=1", |agent| {
+        active(agent);
+        let text = "Use a state machine instead";
+        let mut ui = Input {
+            pending: vec![text.into()],
+            ..Default::default()
+        };
+        let started = Instant::now();
+        assert!(
+            agent
+                .route_pending_messages(&mut backend(&server.url), &mut ui)
+                .unwrap()
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(!agent.interrupt.load(Ordering::SeqCst));
+        assert_eq!(ui.accepted, [text]);
+        assert_eq!(agent.session.control_state()["current_instruction"], text);
+        assert!(
+            ui.notices
+                .iter()
+                .any(|notice| notice.contains("keeping it as steering"))
+        );
+    });
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[test]
+fn occupied_routing_provider_falls_back_without_waiting_or_making_a_request() {
+    let server = llm::fake::serve(vec![]);
+    with_agent(
+        &format!("[endpoint]\nbase_url='{}/v1'", server.url),
+        |agent| {
+            active(agent);
+            let config = agent.auth_config.for_role("small");
+            let _occupied =
+                crate::agent::model::provider_slots::acquire(&config, &agent.interrupt).unwrap();
+            let mut ui = Input {
+                pending: vec!["Use v2".into()],
+                ..Default::default()
+            };
+            let started = Instant::now();
+            assert!(
+                agent
+                    .route_pending_messages(&mut backend(&server.url), &mut ui)
+                    .unwrap()
+            );
+            assert!(started.elapsed() < Duration::from_secs(1));
+            assert_eq!(ui.accepted, ["Use v2"]);
+            assert!(!agent.interrupt.load(Ordering::SeqCst));
+        },
+    );
+    assert!(server.requests().is_empty());
+}
+
+#[test]
+fn configured_judge_answers_routing_instead_of_the_main_provider() {
+    let main = llm::fake::serve(vec![]);
+    let judge = llm::fake::serve(vec![reply(
+        r#"{"route":"steer","reason":"Changes approach"}"#,
+    )]);
+    with_agent(
+        &format!(
+            "[model_roles.judge]\nprovider='endpoint'\nmodel='judge-test'\nbase_url='{}/v1'",
+            judge.url
+        ),
+        |agent| {
+            active(agent);
+            let mut ui = Input {
+                pending: vec!["Use v2".into()],
+                ..Default::default()
+            };
+            assert!(
+                agent
+                    .route_pending_messages(&mut backend(&main.url), &mut ui)
+                    .unwrap()
+            );
+            assert_eq!(ui.accepted, ["Use v2"]);
+        },
+    );
+    assert!(main.requests().is_empty());
+    assert_eq!(judge.requests().len(), 1);
+}

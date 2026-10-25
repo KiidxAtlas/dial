@@ -107,6 +107,21 @@ fn message_composes_and_sends_to_the_selected_worker() {
 }
 
 #[test]
+fn paste_fills_an_open_message_draft_and_is_ignored_otherwise() {
+    let keys = keymap();
+    let mut hub = SubagentsOverlay::new();
+    hub.set_snapshot(snapshot(vec![agent("task-1", AgentStatus::Done)]));
+    hub.handle(&Event::Paste("ignored".into()), &keys);
+    assert!(hub.compose.is_none(), "paste never opens the editor");
+    hub.handle(&key(KeyCode::Char('m')), &keys);
+    hub.handle(&Event::Paste("fix the\nparser \u{1b}[31m".into()), &keys);
+    match hub.handle(&key(KeyCode::Enter), &keys) {
+        OverlayEvent::Action(a) => assert_eq!(a, "subagent-message:task-1\nfix the\nparser"),
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[test]
 fn message_refuses_a_running_inline_worker_that_cannot_be_steered() {
     let keys = keymap();
     let mut hub = SubagentsOverlay::new();

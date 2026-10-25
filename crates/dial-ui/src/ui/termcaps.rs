@@ -1,5 +1,7 @@
 //! What the hosting terminal understands beyond plain text, read from its environment: which
-//! notification escape it turns into a desktop toast (OSC 9, OSC 99, OSC 777 or only a bell).
+//! notification escape it turns into a desktop toast (OSC 9, OSC 99, OSC 777 or only a bell), and
+//! which optional integrations it offers (hyperlinks, working directory, tab color, attention,
+//! user variables, progress; see [`Integration`]).
 //! Detection checks the terminal's capabilities; multiplexers (tmux, Zellij, GNU
 //! screen) are accounted for.
 use std::{io::Write, sync::OnceLock};
@@ -64,6 +66,111 @@ pub fn detect(env: &dyn Fn(&str) -> Option<String>) -> TerminalInfo {
         id,
         notify: notify_protocol(id),
     }
+}
+
+/// Optional terminal integrations Dial drives while the inline UI runs. Each flag is set only for
+/// terminals known to implement the sequence, so an unknown terminal never sees one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Integration {
+    /// OSC 8 hyperlinks on URLs and existing file paths in scrollback.
+    pub hyperlinks: bool,
+    /// `file://…#line` opens the file through the terminal's own rules for that line (iTerm2
+    /// Semantic History); other terminals get no fragment.
+    pub line_fragments: bool,
+    /// OSC 7 working directory, so new tabs and splits start in the project.
+    pub cwd: bool,
+    /// iTerm2 OSC 6 tab color by state.
+    pub tab_color: bool,
+    /// iTerm2 `OSC 1337 ; RequestAttention` (dock bounce) while Dial waits for the user.
+    pub attention: bool,
+    /// `OSC 1337 ; SetUserVar` (iTerm2, WezTerm) for status bars, badges and tab titles.
+    pub user_vars: bool,
+    /// OSC 9;4 progress (iTerm2 3.6+, Ghostty 1.2+). Older versions show OSC 9 as a notification,
+    /// so an unknown version gets no progress.
+    pub progress: bool,
+    /// Inside tmux: terminal-only sequences go through DCS passthrough (`allow-passthrough on`).
+    pub tmux: bool,
+}
+
+impl Integration {
+    /// Wrap a terminal-only sequence for the multiplexer in between, if any.
+    pub fn wrap(&self, sequence: &str) -> String {
+        if self.tmux {
+            tmux_passthrough(sequence)
+        } else {
+            sequence.to_owned()
+        }
+    }
+}
+
+/// This process's terminal integrations, detected on first use.
+pub fn integration() -> Integration {
+    static INTEGRATION: OnceLock<Integration> = OnceLock::new();
+    *INTEGRATION.get_or_init(|| {
+        let env = |name: &str| std::env::var(name).ok();
+        detect_integration(&env, current().id)
+    })
+}
+
+pub fn detect_integration(env: &dyn Fn(&str) -> Option<String>, id: TerminalId) -> Integration {
+    // Zellij and GNU screen own the screen and have no reliable passthrough for these.
+    if set(env, "ZELLIJ") || set(env, "STY") {
+        return Integration::default();
+    }
+    let tmux = set(env, "TMUX");
+    let version = terminal_version(env, id);
+    let at_least = |want: (u32, u32)| version.is_some_and(|have| have >= want);
+    use TerminalId as T;
+    Integration {
+        // tmux rewrites cells and drops OSC 8 unless configured for it; links stay plain there.
+        hyperlinks: !tmux
+            && matches!(
+                id,
+                T::Iterm2 | T::Kitty | T::Ghostty | T::WezTerm | T::Vscode | T::Foot | T::Rio
+            ),
+        line_fragments: id == T::Iterm2,
+        // tmux reads OSC 7 itself (the pane's path), so it is sent unwrapped there.
+        cwd: tmux || matches!(id, T::Iterm2 | T::Kitty | T::Ghostty | T::WezTerm | T::Foot),
+        tab_color: id == T::Iterm2,
+        attention: id == T::Iterm2,
+        user_vars: matches!(id, T::Iterm2 | T::WezTerm),
+        progress: match id {
+            T::Iterm2 => at_least((3, 6)),
+            T::Ghostty => at_least((1, 2)),
+            _ => false,
+        },
+        tmux,
+    }
+}
+
+/// `(major, minor)` of the hosting terminal. Inside tmux `TERM_PROGRAM_VERSION` is tmux's own, and
+/// iTerm2 reports itself in `LC_TERMINAL_VERSION` instead.
+fn terminal_version(env: &dyn Fn(&str) -> Option<String>, id: TerminalId) -> Option<(u32, u32)> {
+    let own_program = env("TERM_PROGRAM").is_some_and(|program| {
+        let program = program.to_ascii_lowercase();
+        match id {
+            TerminalId::Iterm2 => program == "iterm.app" || program == "iterm2",
+            TerminalId::Ghostty => program == "ghostty",
+            _ => false,
+        }
+    });
+    let raw = if own_program {
+        env("TERM_PROGRAM_VERSION")
+    } else if id == TerminalId::Iterm2 {
+        env("LC_TERMINAL_VERSION")
+    } else {
+        None
+    }?;
+    let mut parts = raw.trim().split(['.', '-', '+']);
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts
+        .next()
+        .and_then(|part| {
+            let digits: String = part.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse().ok()
+        })
+        .unwrap_or(0);
+    Some((major, minor))
 }
 
 fn set(env: &dyn Fn(&str) -> Option<String>, name: &str) -> bool {

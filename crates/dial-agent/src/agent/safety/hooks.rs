@@ -8,13 +8,18 @@
 //!   result). A JSON object on stdout is structured: `{"decision":"block","reason":..}` or
 //!   `{"block":reason}` blocks, `{"input":{..}}` rewrites a `pre_tool_use` call's arguments,
 //!   `{"content":..,"is_error":..}` replaces a `post_tool_use` result, `{"notice":..}` is shown;
-//!   `{"payload":..}` rewrites a `before_provider_request` body (handlers run in
-//!   extension order and each sees the earlier replacement). A
-//!   `before_provider_request` block (`{"block":..}` or exit 2) refuses that model request with an
-//!   error instead of sending it;
+//!   `{"additional_context":..}` (also `additionalContext`) queues a bounded harness note for the
+//!   next model request on `pre_tool_use`, `post_tool_use`, `user_prompt_submit`,
+//!   `assistant_message` and `context` (a block discards it);
+//!   `{"payload":..}` rewrites a `before_provider_request` body and `{"messages":[..]}` replaces
+//!   one request's message list on `context` (handlers run in extension order and each sees the
+//!   earlier replacement). A `before_provider_request` or `context` block (`{"block":..}` or
+//!   exit 2) refuses that model request with an error instead of sending it;
 //! * exit 2: block (`pre_tool_use` refuses the call, `user_prompt_submit` rejects the message,
 //!   `stop` makes the agent continue with the reason, `before_compact` skips compaction,
-//!   `before_subagent_spawn` refuses the task); stderr is the reason handed to the model or user;
+//!   `before_subagent_spawn` refuses the task, `session_before_branch` and
+//!   `session_before_switch` refuse the rewind, fork or session change); stderr is the reason
+//!   handed to the model or user. `assistant_message` and `after_provider_response` only observe;
 //! * exit anything else, time out or fail to start: a notice and the action proceeds, unless the
 //!   hook is fail-closed (`fail_closed`, default true for `pre_tool_use`), which blocks instead.
 //!
@@ -37,6 +42,18 @@ use std::{
 /// Longest hook output kept (bytes).
 const MAX_OUTPUT: usize = 8 * 1024;
 
+/// Longest `additional_context` note kept per answer (bytes).
+const MAX_CONTEXT: usize = 4 * 1024;
+
+/// Events whose `additional_context` reaches the next request.
+const CONTEXT_EVENTS: &[&str] = &[
+    "pre_tool_use",
+    "post_tool_use",
+    "user_prompt_submit",
+    "assistant_message",
+    "context",
+];
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Verdict {
     Continue { output: String },
@@ -53,6 +70,11 @@ pub struct Reply {
     pub is_error: Option<bool>,
     /// Replacement request body for `before_provider_request` (`{"payload":..}`).
     pub payload: Option<Value>,
+    /// Bounded harness note for the next request (`{"additional_context":..}`).
+    pub additional_context: Option<String>,
+    /// Replacement message list for a `context` hook (`{"messages":[..]}`), validated by the
+    /// caller before use.
+    pub messages: Option<Value>,
 }
 
 impl Reply {
@@ -92,6 +114,18 @@ impl Reply {
         reply.content = text("content");
         reply.is_error = object.get("is_error").and_then(Value::as_bool);
         reply.payload = object.get("payload").cloned();
+        reply.messages = object.get("messages").cloned();
+        reply.additional_context = ["additional_context", "additionalContext"]
+            .into_iter()
+            .find_map(text)
+            .or_else(|| {
+                object
+                    .get("hookSpecificOutput")
+                    .and_then(Value::as_object)
+                    .and_then(|specific| specific.get("additionalContext"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
         reply.output = ["notice", "message", "output", "systemMessage"]
             .into_iter()
             .find_map(text)
@@ -119,6 +153,17 @@ pub struct Outcome {
     pub is_error: Option<bool>,
     /// Rewritten `before_provider_request` body.
     pub request: Option<Value>,
+    /// Distinct `additional_context` notes, in handler order, each already bounded.
+    pub context: Vec<String>,
+    /// Replacement `context` message list, not yet validated.
+    pub messages: Option<Value>,
+}
+
+impl Outcome {
+    /// The notes joined into one bounded harness note; `None` when no hook supplied any.
+    pub fn context_note(&self) -> Option<String> {
+        (!self.context.is_empty()).then(|| clip(self.context.join("\n")))
+    }
 }
 
 /// Whether a failure of this hook (crash, timeout, start failure) blocks the action.
@@ -147,9 +192,13 @@ fn matches(hook: &HookConfig, tool: Option<&str>) -> bool {
     }
 }
 
-fn clip(mut text: String) -> String {
-    if text.len() > MAX_OUTPUT {
-        let end = (0..=MAX_OUTPUT)
+fn clip(text: String) -> String {
+    clip_to(text, MAX_OUTPUT)
+}
+
+fn clip_to(mut text: String, max: usize) -> String {
+    if text.len() > max {
+        let end = (0..=max)
             .rev()
             .find(|&i| text.is_char_boundary(i))
             .unwrap_or(0);
@@ -157,6 +206,25 @@ fn clip(mut text: String) -> String {
         text.push_str(" [cut]");
     }
     text.trim().to_owned()
+}
+
+/// A `context` hook's replacement message list: an array of role-bearing objects no larger than
+/// `limit` serialized bytes.
+fn valid_messages(messages: &Value, limit: usize) -> Result<(), String> {
+    let list = messages.as_array().ok_or("messages must be an array")?;
+    if !list.iter().all(|message| {
+        message
+            .get("role")
+            .and_then(Value::as_str)
+            .is_some_and(|role| !role.is_empty())
+    }) {
+        return Err("every message must be an object with a role".into());
+    }
+    let bytes = messages.to_string().len();
+    if bytes > limit {
+        return Err(format!("messages are {bytes} bytes; the limit is {limit}"));
+    }
+    Ok(())
 }
 
 fn run_one(
@@ -385,9 +453,60 @@ pub fn gate(
     }
 }
 
-/// Run `before_provider_request` over a built request. `Ok(None)` means the request is sent
-/// unchanged; `Ok(Some(body))` is the rewritten request. Hooks and plugins run in order and each
-/// sees earlier rewrites; a block refuses the request with its reason.
+/// Largest replacement message list a `context` hook may return (serialized bytes).
+const MAX_CONTEXT_MESSAGES: usize = 256 * 1024;
+
+/// Run the `context` event over the request's message list. The result is a copy for this one
+/// request: a hook's `{"messages":[..]}` replaces the list, and its `additional_context` is
+/// appended as a transient user note. Persisted history is never touched. An invalid replacement
+/// is reported and skipped; a block refuses the request.
+fn context_request(
+    hooks: &[HookConfig],
+    plugins: Option<&crate::tools::integrations::plugin::Host>,
+    root: &Path,
+    request: &crate::llm::Chat,
+    interrupt: &AtomicBool,
+    notice: &mut dyn FnMut(&str),
+) -> anyhow::Result<Option<crate::llm::Chat>> {
+    const EVENT: &str = "context";
+    if !wanted(hooks, plugins, EVENT) {
+        return Ok(None);
+    }
+    let payload = json!({"messages": request.messages});
+    let outcome = fire_with(hooks, plugins, root, EVENT, None, payload, interrupt);
+    outcome.notices.iter().for_each(|n| notice(n));
+    match &outcome.verdict {
+        Verdict::Block { reason } => {
+            anyhow::bail!("request refused by context hook: {reason}")
+        }
+        Verdict::Continue { output } => {
+            if !output.is_empty() {
+                notice(&format!("hook: {output}"));
+            }
+        }
+    }
+    let mut chat = request.clone();
+    let mut changed = false;
+    if let Some(messages) = &outcome.messages {
+        match valid_messages(messages, MAX_CONTEXT_MESSAGES) {
+            Ok(()) => {
+                chat.messages = messages.as_array().cloned().unwrap_or_default();
+                changed = true;
+            }
+            Err(why) => notice(&format!("context hook replacement ignored: {why}")),
+        }
+    }
+    if let Some(note) = outcome.context_note() {
+        chat.messages
+            .push(json!({"role":"user","content":note,"dial_transient":true}));
+        changed = true;
+    }
+    Ok(changed.then_some(chat))
+}
+
+/// Run `context` and then `before_provider_request` over a built request. `Ok(None)` means the
+/// request is sent unchanged; `Ok(Some(body))` is the rewritten request. Hooks and plugins run in
+/// order and each sees earlier rewrites; a block refuses the request with its reason.
 pub fn provider_request(
     hooks: &[HookConfig],
     plugins: Option<&crate::tools::integrations::plugin::Host>,
@@ -397,8 +516,10 @@ pub fn provider_request(
     notice: &mut dyn FnMut(&str),
 ) -> anyhow::Result<Option<crate::llm::Chat>> {
     const EVENT: &str = "before_provider_request";
+    let contextual = context_request(hooks, plugins, root, request, interrupt, notice)?;
+    let request = contextual.as_ref().unwrap_or(request);
     if !wanted(hooks, plugins, EVENT) {
-        return Ok(None);
+        return Ok(contextual);
     }
     let payload = json!({"request": request.to_payload()});
     let outcome = fire_with(hooks, plugins, root, EVENT, None, payload, interrupt);
@@ -411,12 +532,47 @@ pub fn provider_request(
             if !output.is_empty() {
                 notice(&format!("hook: {output}"));
             }
-            outcome
-                .request
-                .map(crate::llm::Chat::from_payload)
-                .transpose()
+            match outcome.request {
+                Some(body) => crate::llm::Chat::from_payload(body).map(Some),
+                None => Ok(contextual),
+            }
         }
     }
+}
+
+/// `after_provider_response`: observe one completed model response (model, stop reason, usage,
+/// latency). Hooks cannot change or block the response; failures and output become notices.
+pub fn provider_response(
+    hooks: &[HookConfig],
+    plugins: Option<&crate::tools::integrations::plugin::Host>,
+    root: &Path,
+    model: &str,
+    reply: &crate::llm::Reply,
+    latency: Duration,
+    notice: &mut dyn FnMut(&str),
+) {
+    const EVENT: &str = "after_provider_response";
+    if !wanted(hooks, plugins, EVENT) {
+        return;
+    }
+    let payload = json!({
+        "model": model,
+        "stop_reason": reply.finish_reason,
+        "latency_ms": latency.as_millis() as u64,
+        "tool_calls": reply.tool_calls.len(),
+        "usage": {
+            "prompt_tokens": reply.prompt_tokens,
+            "completion_tokens": reply.completion_tokens,
+            "reasoning_tokens": reply.reasoning_tokens,
+            "cache_read_tokens": reply.cached_prompt_tokens,
+            "cache_write_tokens": reply.cache_creation_tokens,
+        },
+    });
+    // A response was already received; an unrelated cancel flag must not skip observers.
+    let interrupt = AtomicBool::new(false);
+    observe(hooks, plugins, root, EVENT, payload, &interrupt)
+        .iter()
+        .for_each(|n| notice(n));
 }
 
 /// Fold one answer into the event state. Returns the block reason when the answer blocks.
@@ -432,6 +588,15 @@ fn apply(
     }
     if !reply.output.is_empty() {
         output.push(reply.output);
+    }
+    if CONTEXT_EVENTS.contains(&event)
+        && let Some(note) = reply.additional_context
+    {
+        let note = clip_to(note, MAX_CONTEXT);
+        // Repeats are compared ignoring surrounding whitespace, like the note itself.
+        if !note.is_empty() && !outcome.context.contains(&note) {
+            outcome.context.push(note);
+        }
     }
     match event {
         "pre_tool_use" => {
@@ -456,6 +621,13 @@ fn apply(
                 // Later hooks and plugins see the rewritten body.
                 payload["request"] = request.clone();
                 outcome.request = Some(request);
+            }
+        }
+        "context" => {
+            if let Some(messages) = reply.messages {
+                // Later hooks and plugins see the replacement list.
+                payload["messages"] = messages.clone();
+                outcome.messages = Some(messages);
             }
         }
         _ => {}
@@ -487,6 +659,8 @@ pub fn fire_with(
         content: None,
         is_error: None,
         request: None,
+        context: Vec::new(),
+        messages: None,
     };
     let mut output = Vec::new();
     let block = |outcome: &mut Outcome, reason: String, source: &str| {
@@ -496,6 +670,8 @@ pub fn fire_with(
             reason
         };
         outcome.verdict = Verdict::Block { reason };
+        // A refusal discards everything the answers before it asked for.
+        outcome.context.clear();
     };
     for hook in hooks
         .iter()
@@ -581,8 +757,22 @@ pub fn pre_tool_with(
     interrupt: &AtomicBool,
     notice: &mut dyn FnMut(&str),
 ) -> Result<Option<Value>, String> {
+    pre_tool_noted(hooks, plugins, root, name, args, interrupt, notice).0
+}
+
+/// `pre_tool_with` that also returns the bounded `additional_context` note the hooks queued for
+/// the next request (`None` when refused or when no hook supplied one).
+pub fn pre_tool_noted(
+    hooks: &[HookConfig],
+    plugins: Option<&crate::tools::integrations::plugin::Host>,
+    root: &Path,
+    name: &str,
+    args: &Value,
+    interrupt: &AtomicBool,
+    notice: &mut dyn FnMut(&str),
+) -> (Result<Option<Value>, String>, Option<String>) {
     if !wanted(hooks, plugins, "pre_tool_use") {
-        return Ok(None);
+        return (Ok(None), None);
     }
     let outcome = fire_with(
         hooks,
@@ -594,20 +784,25 @@ pub fn pre_tool_with(
         interrupt,
     );
     outcome.notices.iter().for_each(|n| notice(n));
+    let context = outcome.context_note();
     match outcome.verdict {
-        Verdict::Block { reason } => Err(format!("blocked by a pre_tool_use hook: {reason}")),
+        Verdict::Block { reason } => (
+            Err(format!("blocked by a pre_tool_use hook: {reason}")),
+            None,
+        ),
         Verdict::Continue { output } => {
             if !output.is_empty() {
                 notice(&format!("hook: {output}"));
             }
-            Ok(outcome.input.filter(|input| input != args))
+            (Ok(outcome.input.filter(|input| input != args)), context)
         }
     }
 }
 
 /// `post_tool_use`: hook output is appended to the tool result so the model sees it (a formatter's
 /// diagnostics, say). A structured `content` replaces the result text; a block (exit 2) marks the
-/// result as an error with the reason.
+/// result as an error with the reason. The return value is the bounded `additional_context` note
+/// for the next request, delivered outside the tool result.
 #[cfg(test)]
 pub fn post_tool(
     hooks: &[HookConfig],
@@ -618,7 +813,7 @@ pub fn post_tool(
     interrupt: &AtomicBool,
     notice: &mut dyn FnMut(&str),
 ) {
-    post_tool_with(hooks, None, root, name, args, out, interrupt, notice)
+    let _ = post_tool_with(hooks, None, root, name, args, out, interrupt, notice);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -631,9 +826,9 @@ pub fn post_tool_with(
     out: &mut crate::runtime::tool_output::ToolOutput,
     interrupt: &AtomicBool,
     notice: &mut dyn FnMut(&str),
-) {
+) -> Option<String> {
     if !wanted(hooks, plugins, "post_tool_use") {
-        return;
+        return None;
     }
     let outcome = fire_with(
         hooks,
@@ -645,6 +840,7 @@ pub fn post_tool_with(
         interrupt,
     );
     outcome.notices.iter().for_each(|n| notice(n));
+    let context = outcome.context_note();
     if let Some(content) = outcome.content {
         out.text = content;
         // Structured data described the replaced text; keep the model and clients consistent.
@@ -658,11 +854,11 @@ pub fn post_tool_with(
         Verdict::Continue { output } => (output, false),
         Verdict::Block { reason } => (reason, true),
     };
-    if text.is_empty() {
-        return;
+    if !text.is_empty() {
+        out.text.push_str(&format!("\n[post_tool_use hook] {text}"));
+        out.is_error |= is_error;
     }
-    out.text.push_str(&format!("\n[post_tool_use hook] {text}"));
-    out.is_error |= is_error;
+    context
 }
 
 #[cfg(test)]

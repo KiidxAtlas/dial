@@ -1673,7 +1673,10 @@ pub(in crate::agent) fn run(
                 .with_edit_settings(pinned.edit.clone())
                 .with_ssh_config(pinned.ssh.clone())
                 .with_ssh_hosts(&pinned.ssh_hosts)
-                .with_edit_mode(pinned.resolved_edit_mode(env.harness));
+                .with_edit_mode(pinned.resolved_edit_mode(env.harness))
+                .with_shell_config(&pinned.shell)
+                // A worker that is not isolated edits the parent's live checkout.
+                .with_shared_checkout(!job.isolated);
             // Direct workers write the real project, so their edits stay checkpointed. An
             // isolated copy has no observer of its own and gets none here.
             // Writes are attributed to this worker so /review can group them.
@@ -1929,6 +1932,7 @@ fn run_inner(
     let mut paired_tools = 0usize;
     let mut max_tokens = backend.output_budget(env.harness.max_tokens);
     let mut engine = crate::agent::run::engine::Engine::default();
+    let mut emissions = crate::agent::run::guidance::Emissions::default();
     let turn_cancel = children.cancellation.turn(env.interrupt.clone());
     let mut reasoning_recovery = reasoning::Recovery::default();
     let mut request_prefix = crate::agent::window::request_prefix::Tracker::default();
@@ -2034,8 +2038,12 @@ fn run_inner(
         if summary_step {
             messages.push(json!({"role":"user","dial_transient":true,"content":"Step budget reached: this is your final request. Reply now with your findings: what you verified and its evidence, what remains unverified, and the exact next step. Call no tools."}));
         }
+        let research_step = !summary_step && engine.research_required();
+        if !summary_step && let Some(note) = engine.research_prompt() {
+            messages.push(note);
+        }
         // Same advisory cap as the parent request tail.
-        crate::agent::run::guidance::cap(&mut messages);
+        crate::agent::run::guidance::curate(&mut messages, &mut emissions);
         let mut request = Chat {
             messages: std::mem::take(&mut messages),
             tools: if text_only {
@@ -2446,7 +2454,7 @@ fn run_inner(
                     Err(error) => return Ok(crate::agent::run::engine::Tick::Finished(Outcome::failed(steps, format!("{error:#}")))),
                 }
             }
-            Err(error) => return Ok(crate::agent::run::engine::Tick::Finished(Outcome::provider_failed(steps, &error))),
+            Err(error) => return Ok(crate::agent::run::engine::Tick::Finished(Outcome::provider_failed(steps, &error, env.config.retry.fallback_on))),
         };
         if let Some(prepared) = prepared_recall.take() {
             // `false` means a newer branch or recall superseded this one: nothing to publish.
@@ -2477,6 +2485,25 @@ fn run_inner(
                 reason.push_str(&clip_evidence(text, 4096));
             }
             return Ok(crate::agent::run::engine::Tick::Finished(Outcome::incomplete(steps, reason)));
+        }
+        if research_step {
+            use crate::agent::workflow::research::Synthesis;
+            let message = match engine.synthesize(&reply) {
+                Synthesis::Accepted => {
+                    let assistant = llm::assistant_message(&reply);
+                    if let Err(error) = children.archive_assistant(&messages, &assistant, None) {
+                        return Ok(crate::agent::run::engine::Tick::Finished(Outcome::failed(steps, format!("archiving research synthesis: {error:#}"))));
+                    }
+                    messages.push(assistant);
+                    "Research checkpoint recorded as unverified model findings. Resume the existing assignment with its tools and permissions unchanged; implement if supported, report findings, or investigate the stated remaining question.".to_owned()
+                }
+                Synthesis::Retry(message) => message,
+                Synthesis::Incomplete(message) => {
+                    return Ok(crate::agent::run::engine::Tick::Finished(Outcome::incomplete(steps, message)));
+                }
+            };
+            messages.push(json!({"role":"user","dial_transient":true,"content":message}));
+            return Ok(crate::agent::run::engine::Tick::Again);
         }
         if reply.finish_reason == "length" {
             if env.config.reasoning_guard.enabled
@@ -3103,6 +3130,7 @@ fn run_inner(
             }
             messages.push(message);
         }
+        engine.research_round();
         if portable_batch_intercepted && rule_state.callback_retry() && budget != 0 {
             budget = budget.saturating_add(1);
         }

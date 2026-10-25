@@ -429,6 +429,8 @@ pub fn is_read_only(ext: &Registry, name: &str, args: &Value) -> bool {
         | "working_state" => true,
         // Each selected command passes the automatic-check gate itself (`run_focused_check`).
         "check" => true,
+        // Project coordination changes only bounded advisory metadata, never workspace authority.
+        "peers" => true,
         "recall" | "reflect" => true,
         "retain" => !args["items"]
             .as_array()

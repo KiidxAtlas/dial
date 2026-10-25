@@ -65,6 +65,7 @@ impl Rig {
                 rows,
                 cursor,
                 title: None,
+                signals: None,
             })
             .unwrap();
         self.sync();
@@ -799,6 +800,7 @@ fn title_is_set_once_per_change_and_sanitized() {
                 rows: &rows,
                 cursor: None,
                 title: Some(title),
+                signals: None,
             })
             .unwrap();
     }
@@ -883,4 +885,95 @@ fn explicit_default_style_after_a_styled_span_resets() {
         Span::raw("y"),
     ]);
     assert_eq!(rows_to_ansi(&[row], 5)[0], "\x1b[0;31mx\x1b[0my\x1b[0m");
+}
+
+fn every_integration() -> crate::ui::termcaps::Integration {
+    crate::ui::termcaps::Integration {
+        hyperlinks: true,
+        line_fragments: true,
+        cwd: false,
+        tab_color: true,
+        attention: true,
+        user_vars: true,
+        progress: true,
+        tmux: false,
+    }
+}
+
+#[test]
+fn scrollback_links_existing_paths_and_urls_but_not_the_live_region() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
+    let mut rig = Rig::new(80, 6);
+    rig.term.set_integration_for_test(every_integration());
+    let signals = crate::ui::term_state::Signals {
+        cwd: Some(root.path().to_path_buf()),
+        ..Default::default()
+    };
+    rig.commit(&["see main.rs:12, https://example.com/a and missing.rs"]);
+    rig.term
+        .paint(&Viewport {
+            rows: &lines(&["live main.rs"]),
+            cursor: None,
+            title: None,
+            signals: Some(&signals),
+        })
+        .unwrap();
+    rig.sync();
+    let text = String::from_utf8(rig.raw.clone()).unwrap();
+    let file = url::Url::from_file_path(root.path().join("main.rs")).unwrap();
+    assert!(
+        text.contains(&format!("\x1b]8;;{file}#12\x1b\\main.rs:12\x1b]8;;\x1b\\")),
+        "{text:?}"
+    );
+    assert!(
+        text.contains("\x1b]8;;https://example.com/a\x1b\\https://example.com/a\x1b]8;;\x1b\\")
+    );
+    assert_eq!(text.matches("\x1b]8;;\x1b\\").count(), 2, "{text:?}");
+    // The text a user sees is unchanged.
+    assert!(
+        rig.transcript()
+            .iter()
+            .any(|row| row == "see main.rs:12, https://example.com/a and missing.rs"),
+        "{:?}",
+        rig.transcript()
+    );
+}
+
+#[test]
+fn signals_are_written_on_change_and_restored_on_leave() {
+    use crate::ui::term_state::{Activity, Progress, Signals};
+    let mut rig = Rig::new(40, 4);
+    rig.term.set_integration_for_test(every_integration());
+    let rows = lines(&["x"]);
+    let working = Signals {
+        activity: Activity::Working,
+        progress: Progress::Percent(40),
+        vars: vec![("dialState", "working".into())],
+        ..Default::default()
+    };
+    for _ in 0..2 {
+        rig.term
+            .paint(&Viewport {
+                rows: &rows,
+                cursor: None,
+                title: None,
+                signals: Some(&working),
+            })
+            .unwrap();
+    }
+    rig.sync();
+    let first = String::from_utf8(std::mem::take(&mut rig.raw)).unwrap();
+    assert_eq!(first.matches("\x1b]9;4;1;40\x07").count(), 1, "{first:?}");
+    assert_eq!(first.matches("\x1b]6;1;bg;red;brightness;").count(), 1);
+    assert_eq!(
+        first.matches("SetUserVar=dialState=d29ya2luZw==").count(),
+        1
+    );
+    rig.term.leave();
+    rig.sync();
+    let last = String::from_utf8(rig.raw.clone()).unwrap();
+    assert!(last.contains("\x1b]9;4;0\x07"), "{last:?}");
+    assert!(last.contains("\x1b]6;1;bg;*;default\x07"));
+    assert!(last.contains("SetUserVar=dialState=\x07"));
 }

@@ -1,6 +1,7 @@
 //! The built-in command table, aliases, turn-stopping rules and palette entries.
 
 use crate::agent::window::context;
+use crate::app::overlay::{Which, work_panel};
 use crate::storage::skills;
 use crate::ui::composer::{CommandEntry, CommandKind};
 use crate::ui::overlay::palette::PaletteEntry;
@@ -47,8 +48,8 @@ pub(super) const BUILTIN_COMMANDS: &[(&str, &str, &str)] = &[
     ),
     (
         "review-file",
-        "<turn> [path]",
-        "review checkpoint changes; keep or revert them",
+        "[turn] [path]",
+        "keep or revert a checkpoint's changes; AI review is /review",
     ),
     (
         "model",
@@ -88,7 +89,11 @@ pub(super) const BUILTIN_COMMANDS: &[(&str, &str, &str)] = &[
         "[status|init|run|log|notes|resume]",
         "manage branch-scoped benchmark experiments",
     ),
-    ("tree", "", "browse session forks"),
+    (
+        "tree",
+        "[forks]",
+        "browse this session's branches; forks browses session forks",
+    ),
     ("copy", "", "copy the last assistant answer"),
     ("plan", "[on|off]", "toggle read-only planning mode"),
     ("profile", "[name|off]", "choose a capability profile"),
@@ -236,6 +241,17 @@ pub(super) const STOPS_TURN: &[&str] = &[
 /// `commands::run_live` and `commands::run_settings`). Settings they save land at once; the agent
 /// adopts them when the turn finishes. `/help` and the palette read this list too.
 pub(super) const RUNS_NOW: &[&str] = &[
+    "model",
+    "roles",
+    "model-settings",
+    "providers",
+    "settings",
+    "compute",
+    "processes",
+    "agents",
+    "palette",
+    "extensions",
+    "reload",
     "help",
     "hotkeys",
     "todo",
@@ -252,7 +268,6 @@ pub(super) const RUNS_NOW: &[&str] = &[
     "archive",
     "changes",
     "status",
-    "join",
     "leave",
     "usage",
     "marketplace",
@@ -262,6 +277,7 @@ pub(super) const RUNS_NOW: &[&str] = &[
     "update",
     "relay",
     "hooks",
+    "watch",
     "login",
     "logout",
     "stats",
@@ -324,7 +340,74 @@ pub(super) const RUNS_NOW_ARGS: &[&str] = &[
     "code-history search",
     "code-history show",
     "understanding clear",
+    "improve settings",
+    "improve models",
 ];
+
+/// One scheduling decision for dispatch, help and palette annotations. Aliases are resolved before
+/// considering arguments; model restart is deliberately refused, not queued or used to interrupt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DuringTurn {
+    Now,
+    Stop,
+    AfterTurn,
+    Unavailable,
+}
+
+pub(super) fn during_turn(name: &str, args: &str) -> DuringTurn {
+    let name = canonical_command(name);
+    let args = args.trim();
+    if name == "model" && args == "restart" {
+        return DuringTurn::Unavailable;
+    }
+    if STOPS_TURN.contains(&name) {
+        return DuringTurn::Stop;
+    }
+    if RUNS_NOW.contains(&name) {
+        return DuringTurn::Now;
+    }
+    let sub = args.split_whitespace().next().unwrap_or("");
+    let live = match name {
+        "security" => !matches!(
+            crate::security::command::parse(args),
+            Ok(Some(invocation)) if matches!(invocation.op, "scan" | "validate")
+        ),
+        "setup" => !matches!(sub, "" | "providers" | "choose" | "memory" | "presets"),
+        "mcp" => !sub.starts_with("smithery-") || sub == "smithery-logout",
+        "code-history" => sub != "clear",
+        "computer" => matches!(sub, "" | "status" | "on" | "off"),
+        _ => RUNS_NOW_ARGS.iter().any(|form| {
+            let (command, argument) = form.split_once(' ').unwrap_or((form, ""));
+            command == name && argument == sub
+        }),
+    };
+    if live {
+        DuringTurn::Now
+    } else {
+        DuringTurn::AfterTurn
+    }
+}
+
+/// Agent-free panels have one destination table for both idle and busy dispatch.
+pub(super) fn command_panel(name: &str, args: &str) -> Option<Which> {
+    let name = canonical_command(name);
+    let args = args.trim();
+    match (name, args) {
+        ("model", "") => Some(Which::Models),
+        ("model", "settings" | "setting") | ("model-settings", "") => Some(Which::ModelSettings),
+        ("model", "defaults") => Some(Which::ContextDefaults),
+        ("model", "local") => Some(Which::ModelDownloads),
+        ("model", "memory") => Some(Which::ModelMemory),
+        ("roles", "") => Some(Which::ModelRoles),
+        ("providers", "") => Some(Which::Providers),
+        ("settings", "") => Some(Which::Settings),
+        ("palette", "") => Some(Which::Palette),
+        ("extensions", "") => Some(Which::Extensions),
+        ("improve", "settings") => Some(Which::LearningSettings),
+        ("improve", "models") => Some(Which::LearningModels),
+        _ => work_panel(name, args),
+    }
+}
 
 /// Built-ins always win at dispatch, so a custom command with a built-in's name is never offered.
 pub(super) fn command_entries(
@@ -395,12 +478,17 @@ pub(super) fn command_entries(
 /// What typing `name` during a running turn does. Derived from the same lists dispatch uses.
 pub(super) fn during_turn_note(name: &str) -> &'static str {
     let name = canonical_command(name);
-    if STOPS_TURN.contains(&name) {
+    if during_turn(name, "") == DuringTurn::Stop {
         "Stops the current turn before running."
     } else if name == "reload" {
         "Refreshes disk resources now; validated settings apply after this turn."
-    } else if matches!(name, "model" | "providers" | "settings" | "compute") {
-        "Opens now; changes to model/config apply after this turn."
+    } else if name == "model" {
+        "Opens now; changes apply after this turn. Restart is unavailable while busy."
+    } else if matches!(
+        name,
+        "roles" | "model-settings" | "providers" | "settings" | "compute"
+    ) {
+        "Opens now; changes apply after this turn."
     } else if matches!(name, "workers" | "agents") {
         "Opens now; m messages or resumes a worker, x x cancels a running one."
     } else if name == "processes" {

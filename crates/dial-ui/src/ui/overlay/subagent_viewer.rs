@@ -10,7 +10,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use ratatui::{
     Frame,
     style::{Modifier, Style},
@@ -417,7 +419,22 @@ impl SubagentViewer {
 
     pub fn handle(&mut self, event: &Event, keys: &Keymap, now: Instant) -> OverlayEvent {
         match event {
+            // A held `x` must not confirm its own armed cancellation (the hub has the same rule).
+            Event::Key(key)
+                if key.kind == KeyEventKind::Repeat
+                    && key.code == KeyCode::Char('x')
+                    && self.draft.text.is_empty() =>
+            {
+                OverlayEvent::None
+            }
             Event::Key(key) if pressed(key) => self.key(key, keys, now),
+            // Pasted steering goes into the draft (the editor sanitizes it); it never submits.
+            Event::Paste(text) => {
+                self.armed_cancel = false;
+                self.notice = None;
+                self.draft.insert(text);
+                OverlayEvent::None
+            }
             Event::Mouse(mouse) => self.wheel(mouse),
             _ => OverlayEvent::None,
         }

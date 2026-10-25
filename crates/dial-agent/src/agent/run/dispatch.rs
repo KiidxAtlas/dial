@@ -421,8 +421,8 @@ impl<'a> Agent<'a> {
             let configured_hooks = self.tool_hooks();
             let interrupt = self.interrupt.as_ref();
             let mut notices = Vec::new();
-            let result = crate::agent::safety::hooks::with_heartbeat(ui, || {
-                crate::agent::safety::hooks::pre_tool_with(
+            let (result, context) = crate::agent::safety::hooks::with_heartbeat(ui, || {
+                crate::agent::safety::hooks::pre_tool_noted(
                     configured_hooks,
                     plugins.as_deref(),
                     &root,
@@ -438,6 +438,7 @@ impl<'a> Agent<'a> {
                     notice,
                 ))
             });
+            self.queue_hook_context(context);
             match result {
                 Err(reason) => {
                     if let Err(error) = self.record(
@@ -484,7 +485,7 @@ impl<'a> Agent<'a> {
             let configured_hooks = self.tool_hooks();
             let interrupt = self.interrupt.as_ref();
             let mut notices = Vec::new();
-            crate::agent::safety::hooks::with_heartbeat(ui, || {
+            let context = crate::agent::safety::hooks::with_heartbeat(ui, || {
                 crate::agent::safety::hooks::post_tool_with(
                     configured_hooks,
                     plugins.as_deref(),
@@ -502,6 +503,7 @@ impl<'a> Agent<'a> {
                     notice,
                 ))
             });
+            self.queue_hook_context(context);
         }
         out
     }
@@ -1021,6 +1023,7 @@ impl<'a> Agent<'a> {
             "message" => {
                 crate::agent::workers::live_tasks::output(self.live_tasks.message_call(args))
             }
+            "peers" => self.peer_coordination(args),
             "solve" => self.run_solve(backend, args, ui),
             "escalate" => {
                 backend.release();

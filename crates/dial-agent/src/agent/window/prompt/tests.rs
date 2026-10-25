@@ -436,12 +436,28 @@ fn task_evidence_changes_leave_policy_bytes_and_tool_gating_stable() {
             assert_ne!(before.last(), after.last());
             let policy = before[0]["content"].as_str().unwrap();
             assert_eq!(policy.matches(FOCUSED_WORK).count(), 1);
+            assert_eq!(
+                policy
+                    .matches(crate::agent::prompts::system::TESTER_DELEGATION_RULES)
+                    .count(),
+                usize::from(delegated),
+                "tester delegation must follow task capability exactly once: lean={lean}, concise={concise}, one_call={one_call}"
+            );
             let delegation = if lean || concise || one_call {
                 LEAN_DELEGATION_RULES
             } else {
                 DELEGATION_RULES
             };
             assert_eq!(policy.ends_with(delegation), delegated);
+            if delegated {
+                assert!(
+                    policy
+                        .find(crate::agent::prompts::system::TESTER_DELEGATION_RULES)
+                        .unwrap()
+                        < policy.find(delegation).unwrap(),
+                    "tester ownership precedes the variant's general delegation policy"
+                );
+            }
         }
     }
 }

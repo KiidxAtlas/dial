@@ -134,6 +134,18 @@ pub fn pipeline_heads(command: &str) -> Vec<(String, bool)> {
     heads
 }
 
+/// The only command of `command` when it is a single flat pipeline stage, without leading
+/// `NAME=value` assignments or `2>&1`. `None` for compound commands (`a && b`, `a; b`), pipelines
+/// (the stage's output is not the command's), and syntax the flat scanner declines.
+pub fn sole_command(command: &str) -> Option<String> {
+    let mut heads = pipeline_heads(command);
+    let (head, filtered) = heads.pop().filter(|_| heads.is_empty())?;
+    if filtered {
+        return None;
+    }
+    Some(without_leading_environment_assignments(&head).unwrap_or(head))
+}
+
 /// `gh` commands that read a workflow run's or a PR's check status.
 static CI_STATUS_COMMAND: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\bgh\s+(?:run\s+(?:view|list)|pr\s+checks)\b").expect("valid CI status regex")

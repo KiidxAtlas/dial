@@ -140,5 +140,134 @@ pub(in crate::agent) fn cap(messages: &mut Vec<Value>) -> Vec<Value> {
     dropped
 }
 
+/// Requests a delivered advisory note stays suppressed for when it repeats.
+const REPEAT_WINDOW: u64 = 3;
+/// Delivered notes remembered; older ones can no longer fall inside the window anyway.
+const REMEMBERED: usize = 16;
+
+/// Case- and punctuation-folded form of a note: every run of non-alphanumeric characters becomes
+/// one space, so `"Looks good!"` and `"  looks   GOOD "` compare equal.
+pub(in crate::agent) fn normalize(text: &str) -> String {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Normalized phrases a coach emits that carry no actionable content: self-stops, completion
+/// self-talk, "nothing to flag" and endorsements. Anything longer or more specific is real advice.
+const FILLER: &[&str] = &[
+    "stop",
+    "stop here",
+    "stop now",
+    "halt",
+    "abort",
+    "done",
+    "task done",
+    "task complete",
+    "complete",
+    "finished",
+    "ok",
+    "okay",
+    "no issue",
+    "no issues",
+    "no issue continue",
+    "no issues continue",
+    "no concern",
+    "no concerns",
+    "no problems",
+    "no notes",
+    "nothing to add",
+    "nothing to flag",
+    "nothing to report",
+    "no further advice",
+    "no further input",
+    "lgtm",
+    "looks good",
+    "all good",
+    "on track",
+    "agent is on track",
+    "continue",
+    "carry on",
+];
+
+/// Whether `text` says nothing: empty, only punctuation, or generic filler.
+pub(in crate::agent) fn is_content_free(text: &str) -> bool {
+    let normalized = normalize(text);
+    normalized.is_empty() || FILLER.contains(&normalized.as_str())
+}
+
+/// Advisory notes already delivered, so the same advice is not repeated every round. Safety and
+/// failure-recovery notes are never counted or suppressed: they state enforced boundaries and
+/// recovery the model must always see.
+#[derive(Debug, Default)]
+pub(in crate::agent) struct Emissions {
+    requests: u64,
+    delivered: std::collections::VecDeque<(u64, String)>,
+}
+
+impl Emissions {
+    fn exempt(priority: Priority) -> bool {
+        matches!(priority, Priority::Safety | Priority::Failure)
+    }
+
+    fn repeated(&self, key: &str) -> bool {
+        self.delivered
+            .iter()
+            .any(|(at, seen)| seen == key && self.requests - at < REPEAT_WINDOW)
+    }
+}
+
+/// `cap` for one request with emission hygiene: content-free and recently delivered advisory
+/// notes are removed first (so they cannot crowd out a real lower-priority note), the highest
+/// priority survivor is kept, and that survivor is remembered for the next requests. Returns every
+/// removed note.
+pub(in crate::agent) fn curate(messages: &mut Vec<Value>, emissions: &mut Emissions) -> Vec<Value> {
+    emissions.requests += 1;
+    let tail = messages
+        .iter()
+        .rposition(|message| message["dial_transient"] != true)
+        .map_or(0, |index| index + 1);
+    let mut seen_now: Vec<String> = Vec::new();
+    let mut remove = Vec::new();
+    // Forward, so the first assembled note of a duplicate pair is the one kept.
+    for index in tail..messages.len() {
+        let Some(priority) = Priority::of(&messages[index]) else {
+            continue;
+        };
+        if Emissions::exempt(priority) {
+            continue;
+        }
+        let text = messages[index]["content"].as_str().unwrap_or_default();
+        let key = normalize(text);
+        if is_content_free(text) || emissions.repeated(&key) || seen_now.contains(&key) {
+            remove.push(index);
+        } else {
+            seen_now.push(key);
+        }
+    }
+    // Removing from the end keeps every lower index valid.
+    let mut dropped: Vec<Value> = remove
+        .into_iter()
+        .rev()
+        .map(|i| messages.remove(i))
+        .collect();
+    dropped.reverse();
+    dropped.extend(cap(messages));
+    if let Some(kept) = messages[tail.min(messages.len())..]
+        .iter()
+        .find(|message| Priority::of(message).is_some_and(|priority| !Emissions::exempt(priority)))
+    {
+        let key = normalize(kept["content"].as_str().unwrap_or_default());
+        let requests = emissions.requests;
+        emissions.delivered.push_back((requests, key));
+        while emissions.delivered.len() > REMEMBERED {
+            emissions.delivered.pop_front();
+        }
+    }
+    dropped
+}
+
 #[cfg(test)]
 mod tests;

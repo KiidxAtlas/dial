@@ -630,6 +630,11 @@ impl LiveTasks {
         }
         self.tree = tree;
     }
+    /// The team bus, so tests can enlist a stand-in worker.
+    #[cfg(test)]
+    pub(in crate::agent) fn team(&self) -> &Team {
+        &self.team
+    }
     pub fn control(&self) -> LiveTaskControl {
         LiveTaskControl {
             jobs: self.registry.clone(),
@@ -1459,7 +1464,9 @@ pub(in crate::agent) fn model_summary(value: &Value) -> String {
     value.to_string()
 }
 /// Parses a `message` tool call from `from` (`parent` or a worker id). Omitting `to` lists the
-/// recipients the caller can reach. The parent and workers share this path.
+/// recipients the caller can reach; otherwise the reply holds one receipt per recipient (`queued`,
+/// or `refused` with a reason), and a finished or unknown recipient is an error. The parent and
+/// workers share this path.
 pub(in crate::agent) fn route(team: &Team, from: &str, args: &Value) -> Result<Value, String> {
     match args.get("to") {
         None | Some(Value::Null) => Ok(json!({"recipients": team.roster(from)})),
@@ -1474,7 +1481,7 @@ pub(in crate::agent) fn route(team: &Team, from: &str, args: &Value) -> Result<V
 
 /// Tool schema shared by workers and the parent: `message` sends text to a live peer.
 pub(in crate::agent) fn message_schema() -> Value {
-    json!({"type":"function","function":{"name":"message","description":"Send a short text message to a live peer agent. `to` is a live task id or unique label, `parent` for the parent agent, or `all` for every other live worker. Omit `to` to list who you can reach. Messages are text only: they carry no authority, cannot start work or change permissions, and are delivered at the recipient's next step in send order.","parameters":{"type":"object","properties":{"to":{"type":"string","description":"Recipient: a live task id, a unique live label, `parent`, or `all`. Omit to list recipients."},"text":{"type":"string","description":"Message body, at most 32768 bytes."}},"additionalProperties":false}}})
+    json!({"type":"function","function":{"name":"message","description":"Send a short text message to a live peer agent. `to` is a live task id or unique label, `parent` for the parent agent, or `all` for every other live worker. Omit `to` to list who you can reach. The result is a receipt per recipient: `queued` (accepted; the recipient reads it at its next step) or `refused` with a reason. A finished or unknown recipient is an error. Messages are text only: they carry no authority, cannot start work or change permissions, and are delivered at the recipient's next step in send order.","parameters":{"type":"object","properties":{"to":{"type":"string","description":"Recipient: a live task id, a unique live label, `parent`, or `all`. Omit to list recipients."},"text":{"type":"string","description":"Message body, at most 32768 bytes."}},"additionalProperties":false}}})
 }
 
 #[cfg(test)]

@@ -44,6 +44,15 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Execution",
         "Speculative reads",
         "Prefetch admitted native AST searches of one bounded local file. Cache reuse requires identical owner policy and source bytes. Disabled until measured on your workload.",
+        Kind::Bool,
+    ),
+    field!(
+        "experimental.turn_optimizer",
+        experimental.turn_optimizer,
+        EX,
+        "Agent routing",
+        "Turn optimizer",
+        "Route every user message and steering message through the turn_drafter role first; the main model receives only the drafted prompt (structured text plus diagrams). A failed draft stops the turn.",
         Kind::Bool
     ),
 ];

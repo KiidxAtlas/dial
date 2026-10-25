@@ -41,6 +41,8 @@ use ratatui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
+use super::term_links::Linker;
+use super::term_state::{SignalWriter, Signals};
 use super::text;
 
 /// Only one real terminal may own the screen at a time.
@@ -51,6 +53,8 @@ static KEYBOARD_FLAGS: AtomicBool = AtomicBool::new(false);
 static IN_ALT_SCREEN: AtomicBool = AtomicBool::new(false);
 static HOOK: Once = Once::new();
 static UI_THREAD: std::sync::Mutex<Option<std::thread::ThreadId>> = std::sync::Mutex::new(None);
+/// What restores the tab color, progress, attention and user variables Dial set (panic hook).
+static SIGNALS_RESET: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
 const SYNC_BEGIN: &str = "\x1b[?2026h";
 const SYNC_END: &str = "\x1b[?2026l";
@@ -64,6 +68,10 @@ const ALT_LEAVE: &str = "\x1b[?1049l";
 const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1006h";
 const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1000l";
 const RESET: &str = "\x1b[0m";
+const LINK_END: &str = "\x1b]8;;\x1b\\";
+/// A row within this many cells of the width may have been hard-wrapped, so its last token is
+/// never linked (it could be the first half of a longer URL or path).
+const LINK_EDGE: usize = 4;
 
 /// The live region: rows to repaint, where the hardware cursor goes, and an optional window title.
 pub struct Viewport<'a> {
@@ -71,6 +79,9 @@ pub struct Viewport<'a> {
     /// `(row in rows, column in cells)`. `None` leaves the cursor hidden.
     pub cursor: Option<(u16, u16)>,
     pub title: Option<&'a str>,
+    /// Terminal integration for this paint (tab state, progress, user variables, working
+    /// directory and scrollback links). `None` turns it off and restores anything already set.
+    pub signals: Option<&'a Signals>,
 }
 
 /// A painted frame: its rows and the cursor position, if any.
@@ -108,6 +119,12 @@ pub struct InlineTerminal {
     /// Report mouse buttons and the wheel while a panel is open (never on the inline screen,
     /// where it would take selection and scrollback away from the terminal).
     overlay_mouse: bool,
+    /// Terminal state outside the cells (see [`super::term_state`]).
+    signals: SignalWriter,
+    /// Scrollback hyperlinks, when the terminal supports them.
+    linker: Option<Linker>,
+    /// The last paint asked for integration, so rows flushed on `leave` are linked too.
+    linking: bool,
 }
 
 /// Borrowed drawing surface for a terminal overlay session.
@@ -173,6 +190,11 @@ impl InlineTerminal {
     }
 
     fn build(out: Box<dyn Write>, size: (u16, u16), real: bool, keyboard_flags: bool) -> Self {
+        let caps = if real {
+            super::termcaps::integration()
+        } else {
+            super::termcaps::Integration::default()
+        };
         Self {
             out,
             real,
@@ -192,7 +214,31 @@ impl InlineTerminal {
             last_rendered: Vec::new(),
             overlay: None,
             overlay_mouse: false,
+            signals: SignalWriter::new(caps),
+            linker: caps.hyperlinks.then(|| Linker::new(caps.line_fragments)),
+            linking: false,
         }
+    }
+
+    /// Test seam: act as a terminal with these integrations.
+    #[cfg(test)]
+    pub fn set_integration_for_test(&mut self, caps: super::termcaps::Integration) {
+        self.signals = SignalWriter::new(caps);
+        self.linker = caps.hyperlinks.then(|| Linker::new(caps.line_fragments));
+    }
+
+    /// Bytes that bring the terminal's tab state, progress and variables to `want`.
+    fn signal_update(&mut self, want: Option<&Signals>) -> String {
+        let bytes = match want {
+            Some(want) => self.signals.update(want),
+            None if self.signals.is_clear() => String::new(),
+            None => self.signals.reset(),
+        };
+        if self.real && !bytes.is_empty() {
+            *SIGNALS_RESET.lock().unwrap_or_else(|e| e.into_inner()) =
+                self.signals.reset_sequence();
+        }
+        bytes
     }
 
     /// `(columns, rows)`, re-queried from the terminal on every call.
@@ -267,6 +313,9 @@ impl InlineTerminal {
             && vp
                 .title
                 .is_none_or(|title| self.title.as_deref() == Some(title))
+            && vp.signals.map_or(self.signals.is_clear(), |want| {
+                self.signals.is_current(want)
+            })
             && self
                 .last_frame
                 .as_ref()
@@ -299,8 +348,20 @@ impl InlineTerminal {
                 }
             })
             .collect();
-        let history: Vec<(String, usize)> =
-            self.pending.iter().map(|l| render_row(l, width)).collect();
+        // Scrollback rows are written once, so only they carry links; the live region does not.
+        self.linking = vp.signals.is_some() && self.linker.is_some();
+        let mut linker = match (vp.signals, self.linker.as_mut()) {
+            (Some(signals), Some(linker)) => {
+                linker.set_root(signals.cwd.as_deref());
+                Some(linker)
+            }
+            _ => None,
+        };
+        let history: Vec<(String, usize)> = self
+            .pending
+            .iter()
+            .map(|l| render_row_linked(l, width, linker.as_deref_mut()))
+            .collect();
 
         let width_changed = cols != self.last_size.0;
         let erase_first = self.force_erase || (cols, rows) != self.last_size;
@@ -333,6 +394,8 @@ impl InlineTerminal {
                 self.title = Some(clean);
             }
         }
+        let signals = self.signal_update(vp.signals);
+        buf.push_str(&signals);
         if up > 0 {
             buf.push_str(&format!("\x1b[{up}A"));
         }
@@ -617,8 +680,9 @@ impl InlineTerminal {
             s.push_str(&format!("\x1b[{}A", self.cursor_row));
         }
         s.push_str("\r\x1b[J");
+        let mut linker = self.linker.as_mut().filter(|_| self.linking);
         for (index, line) in self.pending.iter().enumerate() {
-            s.push_str(&render_row(line, cols as usize).0);
+            s.push_str(&render_row_linked(line, cols as usize, linker.as_deref_mut()).0);
             for (_, image, protocol) in self
                 .pending_images
                 .iter()
@@ -639,6 +703,7 @@ impl InlineTerminal {
             }
             push_command(&mut s, &DisableBracketedPaste);
         }
+        s.push_str(&self.signal_update(None));
         let _ = self.out.write_all(s.as_bytes());
         let _ = self.out.flush();
         self.painted_rows = 0;
@@ -668,6 +733,8 @@ impl InlineTerminal {
             push_command(&mut s, &PopKeyboardEnhancementFlags);
         }
         push_command(&mut s, &DisableBracketedPaste);
+        // The shell (or the program) owns the tab while Dial is away; the next paint restores it.
+        s.push_str(&self.signal_update(None));
         self.out.write_all(s.as_bytes())?;
         self.out.flush()?;
         // The viewport no longer exists; the cursor now rests where it began.
@@ -791,6 +858,9 @@ fn emergency_restore() {
         push_command(&mut s, &PopKeyboardEnhancementFlags);
     }
     push_command(&mut s, &DisableBracketedPaste);
+    if let Ok(reset) = SIGNALS_RESET.try_lock() {
+        s.push_str(&reset);
+    }
     let mut stdout = io::stdout();
     let _ = stdout.write_all(s.as_bytes());
     let _ = stdout.flush();
@@ -918,10 +988,30 @@ pub fn rows_to_ansi(rows: &[Line<'static>], width: u16) -> Vec<String> {
 
 /// The encoded row and the number of cells it occupies.
 fn render_row(line: &Line<'_>, width: usize) -> (String, usize) {
-    let mut out = String::new();
+    encode_row(line, width, &[])
+}
+
+/// [`render_row`] with OSC 8 links on the URLs and existing paths `linker` finds in the row's
+/// visible text.
+fn render_row_linked(
+    line: &Line<'_>,
+    width: usize,
+    linker: Option<&mut Linker>,
+) -> (String, usize) {
+    let Some(linker) = linker else {
+        return render_row(line, width);
+    };
+    let mut plain = String::new();
+    let used = visible_graphemes(line, width, |_, grapheme| plain.push_str(grapheme));
+    let links = linker.links(&plain, used + LINK_EDGE >= width);
+    encode_row(line, width, &links)
+}
+
+/// Call `each` with the style and text of every grapheme that fits in `width` cells (control
+/// characters dropped); returns the cells used.
+fn visible_graphemes(line: &Line<'_>, width: usize, mut each: impl FnMut(Style, &str)) -> usize {
     let mut used = 0;
-    let mut current = Style::default();
-    'spans: for span in &line.spans {
+    for span in &line.spans {
         let style = line.style.patch(span.style);
         for grapheme in span.content.graphemes(true) {
             if grapheme.chars().any(char::is_control) {
@@ -929,19 +1019,55 @@ fn render_row(line: &Line<'_>, width: usize) -> (String, usize) {
             }
             let w = text::width(grapheme);
             if used + w > width {
-                break 'spans;
+                return used;
             }
-            if style != current {
-                if style == Style::default() {
-                    out.push_str(RESET);
-                } else {
-                    push_sgr(&mut out, style);
-                }
-                current = style;
-            }
-            out.push_str(grapheme);
+            each(style, grapheme);
             used += w;
         }
+    }
+    used
+}
+
+/// SGR-encode the row; `links` are byte ranges of its visible text and their URLs.
+fn encode_row(
+    line: &Line<'_>,
+    width: usize,
+    links: &[(std::ops::Range<usize>, String)],
+) -> (String, usize) {
+    let mut out = String::new();
+    let mut current = Style::default();
+    let mut at = 0;
+    let mut links = links.iter().peekable();
+    let mut open: Option<usize> = None;
+    let used = visible_graphemes(line, width, |style, grapheme| {
+        if open.is_some_and(|end| at >= end) {
+            out.push_str(LINK_END);
+            open = None;
+        }
+        while links.peek().is_some_and(|(range, _)| range.end <= at) {
+            links.next();
+        }
+        if open.is_none()
+            && let Some((range, url)) = links.next_if(|(range, _)| range.start <= at)
+        {
+            out.push_str("\x1b]8;;");
+            out.push_str(url);
+            out.push_str("\x1b\\");
+            open = Some(range.end);
+        }
+        if style != current {
+            if style == Style::default() {
+                out.push_str(RESET);
+            } else {
+                push_sgr(&mut out, style);
+            }
+            current = style;
+        }
+        out.push_str(grapheme);
+        at += grapheme.len();
+    });
+    if open.is_some() {
+        out.push_str(LINK_END);
     }
     out.push_str(RESET);
     (out, used)

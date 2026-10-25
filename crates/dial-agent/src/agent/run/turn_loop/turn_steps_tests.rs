@@ -105,7 +105,13 @@ fn completion_persistence_failure_keeps_the_original_error_and_backend() {
 
     // Stop locally at the observed cost boundary: no provider request is needed to settle a turn.
     let error = agent
-        .turn_inner("Report the current status", &mut NullUi, true, None)
+        .turn_inner(
+            "Report the current status",
+            &mut NullUi,
+            true,
+            None,
+            crate::agent::run::turn_draft::TurnOrigin::User,
+        )
         .err()
         .expect("completion persistence must fail");
     assert!(format!("{error:#}").contains("completion persistence regression"));
@@ -116,7 +122,13 @@ fn completion_persistence_failure_keeps_the_original_error_and_backend() {
 
     db.execute_batch("DROP TRIGGER reject_completion").unwrap();
     let report = agent
-        .turn_inner("Report again", &mut NullUi, true, None)
+        .turn_inner(
+            "Report again",
+            &mut NullUi,
+            true,
+            None,
+            crate::agent::run::turn_draft::TurnOrigin::User,
+        )
         .unwrap();
     assert_eq!(report.outcome, TurnOutcome::Incomplete);
     assert!(report.text.contains("this turn is $1.0000"));

@@ -469,3 +469,142 @@ fn requirement_mapped_baseline_failure_stays_actionable_without_behavioral_credi
         0
     );
 }
+
+fn input_contract_config(command: &str) -> (Config, verify::verification::FocusedCheck) {
+    let mut config = Config::default();
+    config
+        .verification
+        .commands
+        .push(crate::config::types::VerificationCommand {
+            name: "contract".into(),
+            command: command.into(),
+            file_extensions: vec![],
+            timeout_secs: 15,
+        });
+    config.verification.inputs.insert(
+        "contract".into(),
+        crate::config::types::VerificationInputs {
+            paths: vec!["input".into()],
+            environment: vec![],
+        },
+    );
+    config
+        .verification
+        .behavioral_checks
+        .push("contract".into());
+    let check = verify::verification::FocusedCheck {
+        name: "contract".into(),
+        command: command.into(),
+        timeout_secs: 15,
+    };
+    (config, check)
+}
+
+#[test]
+fn concurrent_input_changes_withhold_pass_and_failure_credit_but_preserve_process_facts() {
+    for (remove, exit) in [(false, 0), (false, 1), (true, 0), (true, 1)] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("input"), "before").unwrap();
+        // A handshake, not a timing guess: the peer writes only while the real shell is running.
+        let command = format!(
+            "touch started; while test ! -f changed; do sleep 0.01; done; echo 'assertion diagnostic'; exit {exit}"
+        );
+        let (config, check) = input_contract_config(&command);
+        let mut agent = hermetic_agent(&config, root.path());
+        let peer_root = root.path().to_owned();
+        let peer = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !peer_root.join("started").exists() {
+                assert!(Instant::now() < deadline, "focused process never started");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if remove {
+                std::fs::remove_file(peer_root.join("input")).unwrap();
+            } else {
+                std::fs::write(peer_root.join("input"), "after").unwrap();
+            }
+            std::fs::write(peer_root.join("changed"), "ready").unwrap();
+        });
+        let output = agent.run_focused_check(&check, &mut NullUi);
+        peer.join().unwrap();
+        assert_eq!(output.process_outcome().unwrap().exit_code, Some(exit));
+        assert!(output.process_outcome().unwrap().output_complete);
+        assert!(output.is_error);
+        assert!(output.text.contains("Verification unverified"));
+        assert_eq!(
+            agent.step_checks.evidence.latest_status(&command),
+            Some(verify::verification::CheckStatus::Unverified)
+        );
+        assert_eq!(agent.verifications, vec![false]);
+        assert_eq!(agent.behavioral_checks, vec![false]);
+        assert!(!agent.reuse_check(&check));
+    }
+}
+
+#[test]
+fn failed_contract_capture_is_unverified_in_gate_and_check_tool() {
+    for exit in [0, 1] {
+        let root = tempfile::tempdir().unwrap();
+        let command = format!("echo 'assertion diagnostic'; exit {exit}");
+        let (config, check) = input_contract_config(&command);
+        let mut agent = hermetic_agent(&config, root.path());
+        let run = agent.run_checks(std::slice::from_ref(&check), &mut NullUi);
+        assert_eq!(run.failures.len(), 1);
+        assert!(run.actionable.is_empty());
+        assert!(run.failures[0].contains("Verification unverified"));
+        let output = agent.check_tool(&json!({"names":["contract"]}), &mut NullUi);
+        assert!(output.is_error);
+        assert!(
+            output.text.contains("unverified: contract"),
+            "{}",
+            output.text
+        );
+        assert!(!agent.reuse_check(&check));
+    }
+}
+
+#[test]
+fn external_changes_and_disappearance_invalidate_passes_without_local_counter_changes() {
+    for remove in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("input"), "before").unwrap();
+        let (config, check) = input_contract_config("echo checked");
+        let mut agent = hermetic_agent(&config, root.path());
+        agent.run_focused_check(&check, &mut NullUi);
+        assert!(agent.reuse_check(&check));
+        let revision = agent.step_checks.revision();
+        if remove {
+            std::fs::remove_file(root.path().join("input")).unwrap();
+        } else {
+            std::fs::write(root.path().join("input"), "after").unwrap();
+        }
+        agent.refresh_check_inputs();
+        assert_eq!(agent.step_checks.revision(), revision);
+        assert_eq!(
+            agent
+                .step_checks
+                .evidence
+                .current_status(&check.command, revision),
+            "stale"
+        );
+        assert_eq!(agent.step_checks.evidence.passing_behavioral(revision), 0);
+        // Restoring bytes must not revive invalidated evidence without execution.
+        std::fs::write(root.path().join("input"), "before").unwrap();
+        assert!(!agent.reuse_check(&check));
+    }
+}
+
+#[test]
+fn failed_reuse_capture_is_sticky_even_if_input_is_restored() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("input"), "before").unwrap();
+    let (config, check) = input_contract_config("echo checked");
+    let mut agent = hermetic_agent(&config, root.path());
+    agent.run_focused_check(&check, &mut NullUi);
+    std::fs::remove_file(root.path().join("input")).unwrap();
+    assert!(!agent.reuse_check(&check));
+    std::fs::write(root.path().join("input"), "before").unwrap();
+    assert!(!agent.reuse_check(&check));
+    agent.run_focused_check(&check, &mut NullUi);
+    assert!(agent.reuse_check(&check));
+}

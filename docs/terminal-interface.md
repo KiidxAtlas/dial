@@ -2,6 +2,11 @@
 
 Everyday use of the interactive terminal UI: composer, slash commands, shortcuts, settings panels, model settings, themes and previews. Rendering internals are described in [tui-rendering.md](tui-rendering.md).
 
+For independent Dial sessions in the same checkout, `/peers` lists live peers and your own ID;
+`/peers send <id> <text>`, `/peers claim <paths...>` and `/peers clear` exchange messages and
+manage advisory path claims through ordinary transcript notices. Commands wait until an active
+turn finishes. See [Session coordination](session-coordination.md) for delivery, safety and opt-out details.
+
 ## Interface overview and shortcuts
 
 - Inline, scrollback-native transcript with a live composer; finished turns remain in normal terminal
@@ -93,15 +98,18 @@ Everyday use of the interactive terminal UI: composer, slash commands, shortcuts
   The status line reports stopping immediately; interrupted turns do not send a finished notification.
   Slash commands never become model steering: `/hotkeys`, `/todo`, `/skills`, `/commands`, `/context`, `/search`, `/workers`, `/message`,
   `/cancel`, `/policy`, `/reliability`, and `/improve status|jobs|stop` run at once without stopping the turn.
-  `/help` lists the exact "Stops the turn" and "Runs at once" sets, generated from the lists the dispatcher
-  uses; `/clear` is in the stop set, and other commands wait for the turn to finish. `/model`, `/models`, and the model shortcut (`Ctrl+K` on macOS,
-  `Alt+M` elsewhere) open the picker immediately; a selection
-  applies after the current turn, without canceling it. Closing the picker without selecting changes
-  nothing. A selection changes only this session and the saved default for new sessions; other
-  running Dial sessions keep their models. Other commands wait for the turn to finish, with a notice, except commands
+  `/help` lists the "Stops the turn" and "Runs at once" sets from the central command policy,
+  also used by dispatch and palette notes. `/model` and `/models` share the same policy, including
+  `settings` (`setting`), `defaults`, `local` and `memory`: these panels open immediately, even during
+  a turn. The model shortcut (`Ctrl+K` on macOS, `Alt+M` elsewhere) opens the same picker.
+  Saved choices apply after the current turn without canceling it; display settings apply immediately.
+  Closing the picker without selecting changes nothing. A selection changes only this session and the
+  saved default for new sessions; other running Dial sessions keep their models.
+  Other commands wait for the turn to finish, with a notice, except commands
   that replace or alter the active session/work: `/exit` (`/quit`, `/q`), `/new`, `/clear`, `/resume`, `/sessions`,
   `/tree`, `/fork`, `/undo`, `/rollback`, `/compact` and `/plan` stop it first.
-  `/queue` inspection and queue edits also leave the current turn running. `/model restart` is refused
+  `/queue` inspection and queue edits also leave the current turn running. `/model restart` (also
+  `/models restart`) is refused
   while busy without cancelling inference. Live informational notices do not settle or replay the
   streaming answer.
 - In `/models`, highlight a model and press `Ctrl+F` to favorite or unfavorite it.
@@ -110,7 +118,7 @@ Everyday use of the interactive terminal UI: composer, slash commands, shortcuts
   In All models, favorites are pinned below the current main model and above other models.
   Press `Option+]` on macOS or `Alt+]` elsewhere (remappable as `app.model.favoriteNext`), or use `/model next` to cycle through
   available chat favorites without opening the picker. Unavailable/embedding models are skipped;
-  a switch requested during a turn queues until it finishes rather than interrupting it.
+  a switch requested during a turn saves immediately and is adopted when the turn finishes rather than interrupting it.
   On the first press, if discovery is needed, the switch is retained and applies when ready.
   Escape or `/model cancel` cancels that pending switch. Changes to the selected model, saved
   favorites, scope, or discovery request also cancel it rather than applying a stale choice.
@@ -156,10 +164,20 @@ Everyday use of the interactive terminal UI: composer, slash commands, shortcuts
   `/resume <id-prefix>` opens a unique ID directly, including empty sessions; an ambiguous prefix
   opens the picker with that prefix as its search. Choosing the current session notes
   `Already in session`. After a resume, the note shows the title, model, last activity and the
-  recorded state. `/tree` shows fork depth: each fork is indented under its parent, and siblings are
-  ordered most recent first; it includes empty sessions initially. The picker keeps up to 200
-  conversations and 200 empty sessions; listing occurs once per open, and each action reloads the
-  list rather than running per keystroke.
+  recorded state. `/tree forks` shows fork depth across sessions: each fork is indented under its
+  parent, and siblings are ordered most recent first; it includes empty sessions initially. The picker
+  keeps up to 200 conversations and 200 empty sessions; listing occurs once per open, and each action
+  reloads the list rather than running per keystroke.
+- `/tree` opens the session's own entry tree: every user message and labeled entry, including
+  branches abandoned by a rewind, indented where the conversation forked (filled markers are on the
+  branch the model sees, hollow ones are abandoned; `<- here` marks where you are). Type to filter
+  by text or label, **Enter** moves there. Choosing a user message rewinds to just before it and
+  puts its text in the composer to edit and resend; choosing a labeled answer continues from it.
+  The move appends a branch marker, so nothing is deleted and the previous path stays in the tree.
+  `/label <text>` bookmarks the latest message (up to 60 characters; `/label` alone clears it;
+  the newest label on an entry wins). Labels are journal records the model never sees. Session
+  journals carry an integer `schema_version` in their header; older journals load unchanged and a
+  journal from a newer Dial is refused with a message to update.
 - `/branch` with no argument opens a list of the nine most recent user messages (keys 1-9);
   `/branch <n>` names one directly. Either way the rewind asks first and says how many messages
   leave the view. `/delete` and `/session delete` ask before removing the current session file;
@@ -340,6 +358,57 @@ shrink for narrow terminals and remain in scrollback. iTerm2, Kitty and Ghostty 
 native image preview; other terminals and multiplexers use portable colored cells. Image decoding
 runs on a worker while input and interruption remain responsive. The model receives the original
 image bytes independently of preview size; supported cloud image requests use high detail.
+
+## Terminal integration
+
+With `ui.terminal_integration` on (the default; `/settings` → Interaction → Notifications), Dial
+tells terminals that support it more than the cells it draws. Each item is sent only to terminals
+known to implement it, detected from `TERM_PROGRAM`, `LC_TERMINAL` and similar variables:
+
+| Signal | Terminals | What you see |
+| --- | --- | --- |
+| Links (OSC 8) | iTerm2, Ghostty, kitty, WezTerm, VS Code, foot, Rio | URLs and file paths that exist, resolved against the project, are clickable in scrollback. In iTerm2, `path:line[:col]` opens at that line through Semantic History (⌘-click, using the editor set in Profiles → Advanced). The live region and text that is not a real URL or path are never linked. |
+| Working directory (OSC 7) | iTerm2, Ghostty, kitty, WezTerm, foot, tmux | New tabs and splits start in the project. |
+| Tab color (OSC 6) | iTerm2 | Amber while working, red when an approval or question waits or a turn failed, green when a turn finished. A key press clears it. |
+| Attention | iTerm2 | The dock icon bounces while an approval or question waits. |
+| Progress (OSC 9;4) | iTerm2 3.6+, Ghostty 1.2+ | Prompt processing percentage, an indeterminate bar while generating, paused while waiting for you. |
+| User variables | iTerm2, WezTerm | `user.dialState` (`idle`, `working`, `waiting`, `done`, `failed`), `user.dialModel` and `user.dialContext` (context used, such as `42%`) for status bar components, badges (`\(user.dialState)`) and tab titles. |
+
+Under tmux, terminal-only sequences go through passthrough, which needs `set -g allow-passthrough on`.
+Links are off there because tmux does not keep them by default. Zellij and GNU screen get none of
+these. Dial restores tab color, progress and variables when it exits, suspends or crashes. The older
+`ui.hyperlinks` key is still accepted but ignored.
+
+### Live side pane
+
+`/watch` enables a private live feed for the current session and runs immediately, even during a
+turn. In a direct macOS iTerm2 session it opens a vertical split targeted to that exact session.
+macOS may ask for Automation permission. If unavailable, or under a multiplexer, Dial prints a
+shell-quoted command to run in another pane:
+
+```sh
+dial -C /path/to/project watch SESSION_ID
+```
+
+The pane follows new edit-result previews, changed paths, language-server advisories, turn outcomes
+and `/review` results in its own scrollback. Preview diff lines are coloured; this is a display of
+tool output, not a new verification result. LSP advisories require a running server under the usual
+LSP settings and remain explicitly **not verification**. `/review` keeps its existing execution and
+queuing behaviour; opening a watcher does not start a review or model request.
+
+When the pane is attached, screenshots are copied only from verified attachments and shown there,
+with a one-line marker in the conversation instead of an inline thumbnail. Native images fit the
+viewer's available width and height; unsupported terminals use coloured cells. If publishing fails
+or no viewer is attached, Dial keeps the inline preview. Closing the watcher restores inline images
+on the next capture. `Ctrl-C` stops the viewer; `dial watch SESSION_ID --once` prints the recorded
+feed and exits. Redirected output contains no colour or graphics escape sequences.
+
+Feeds are opt-in per session and stored outside the checkout under the project's private state
+directory, `live/SESSION_ID/`. Switching or forking sessions does not redirect an existing viewer;
+run `/watch` in the new session. Text previews are bounded and the append-only text feed stops at
+16 MiB rather than silently deleting earlier entries; screenshot copies stop at 64 MiB per session.
+These files may contain source and screenshots; they are local private state, not published or sent
+to an additional service.
 
 ## Workspace rail and live worker cards
 

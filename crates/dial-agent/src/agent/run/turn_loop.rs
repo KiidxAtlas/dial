@@ -1,5 +1,6 @@
 //! The turn entry points and main step loop.
 
+use crate::agent::run::turn_draft::TurnOrigin;
 use crate::agent::*;
 
 impl<'a> Agent<'a> {
@@ -13,7 +14,7 @@ impl<'a> Agent<'a> {
         user_text: &str,
         ui: &mut dyn Ui,
     ) -> Result<TurnReport> {
-        self.turn_with_state(user_text, ui, false, None)
+        self.turn_with_state(user_text, ui, false, None, TurnOrigin::User)
     }
     /// ACP has already resolved explicit content blocks. Do not interpret resource bodies as
     /// terminal @file syntax: a referenced document must not attach other local files implicitly.
@@ -27,7 +28,7 @@ impl<'a> Agent<'a> {
             message["role"] == "user" && message["content"].as_str() == Some(user_text),
             "invalid prepared user message"
         );
-        self.turn_with_state(user_text, ui, false, Some(message))
+        self.turn_with_state(user_text, ui, false, Some(message), TurnOrigin::User)
     }
     pub(in crate::agent) fn turn_with_state(
         &mut self,
@@ -35,6 +36,7 @@ impl<'a> Agent<'a> {
         ui: &mut dyn Ui,
         reset_interrupt: bool,
         prepared: Option<Value>,
+        origin: TurnOrigin,
     ) -> Result<TurnReport> {
         // Reset current-turn evidence before any admission step can fail. Historical receipts
         // remain separately labelled and must still pass freshness checks before reuse.
@@ -83,7 +85,9 @@ impl<'a> Agent<'a> {
         );
         self.live_tasks.bind(self.session.runtime());
         let turn_clock = Instant::now();
-        let result = self.turn_inner(user_text, &mut observed, reset_interrupt, prepared);
+        self.coordination_phase("working", Some(user_text));
+        let result = self.turn_inner(user_text, &mut observed, reset_interrupt, prepared, origin);
+        self.coordination_phase("idle", None);
         if let Err(error) = self.flush_local_evidence() {
             observed.diagnostic(&format!("Local model evidence not saved: {error:#}"));
         }
@@ -205,6 +209,7 @@ impl<'a> Agent<'a> {
         ui: &mut dyn Ui,
         reset_interrupt: bool,
         prepared: Option<Value>,
+        origin: TurnOrigin,
     ) -> Result<TurnReport> {
         let capture_start = (self.config.memory.autolearn
             && self.config.memory.autolearn_auto_continue)
@@ -227,18 +232,21 @@ impl<'a> Agent<'a> {
             let root = self.workspace.root();
             let interrupt = self.interrupt.as_ref();
             let payload = json!({"prompt":user_text,"session_id":self.session.id()});
-            let (verdict, notices) = crate::agent::safety::hooks::with_heartbeat(ui, || {
-                let outcome = crate::agent::safety::hooks::fire_with(
-                    configured_hooks,
-                    plugins.as_deref(),
-                    root,
-                    "user_prompt_submit",
-                    None,
-                    payload,
-                    interrupt,
-                );
-                (outcome.verdict, outcome.notices)
-            });
+            let (verdict, notices, context) =
+                crate::agent::safety::hooks::with_heartbeat(ui, || {
+                    let outcome = crate::agent::safety::hooks::fire_with(
+                        configured_hooks,
+                        plugins.as_deref(),
+                        root,
+                        "user_prompt_submit",
+                        None,
+                        payload,
+                        interrupt,
+                    );
+                    let context = outcome.context_note();
+                    (outcome.verdict, outcome.notices, context)
+                });
+            self.queue_hook_context(context);
             notices.iter().for_each(|n| {
                 ui.event(&crate::agent::ui::ui_event::UiEvent::new(
                     crate::agent::ui::ui_event::EventKind::Hook,
@@ -259,6 +267,20 @@ impl<'a> Agent<'a> {
                 }
             }
         }
+        // Turn optimizer: steering left from an earlier turn, then this message, pass through the
+        // drafter before anything else reads them. From here on the turn runs on the drafted text;
+        // the typed text is kept only as message metadata for display and memory.
+        let typed_text = user_text;
+        let drafted = if self.turn_optimizer_enabled() {
+            self.draft_leftover_steering(ui)?;
+            match origin {
+                TurnOrigin::User => Some(self.draft_turn_text(typed_text, ui)?),
+                TurnOrigin::Harness => None,
+            }
+        } else {
+            None
+        };
+        let user_text = drafted.as_deref().unwrap_or(typed_text);
         if std::mem::take(&mut self.legacy_memory_migrated) {
             ui.diagnostic("Migrated legacy memory tool selection to provenance memory tools for this runtime; admitted history is unchanged.");
         }
@@ -307,12 +329,13 @@ impl<'a> Agent<'a> {
             .flatten()
             .filter(crate::learn::probe::informative);
         self.session.repair_incomplete_tools()?;
-        let message = if let Some(message) = prepared {
+        let mut message = if let Some(message) = prepared {
             message
         } else if let Some(layout) = &self.layout {
+            // References expand from what the user typed, never from model-written text.
             let (message, warnings) = crate::agent::window::context::expand_message(
                 &layout.project_root,
-                user_text,
+                typed_text,
                 &self.interrupt,
             );
             for warning in warnings {
@@ -320,13 +343,18 @@ impl<'a> Agent<'a> {
             }
             message
         } else {
-            json!({"role":"user","content":user_text})
+            json!({"role":"user","content":typed_text})
         };
+        if let Some(drafted) = &drafted {
+            crate::agent::run::turn_draft::apply_draft(&mut message, typed_text, drafted);
+        }
         let checkpoint_turn = self
             .checkpoints
             .as_ref()
             .map(|checkpoints| {
-                checkpoints.begin_turn(&crate::agent::window::prompt::truncate_chars(user_text, 60))
+                checkpoints.begin_turn(&crate::agent::window::prompt::truncate_chars(
+                    typed_text, 60,
+                ))
             })
             .transpose()?;
         self.step_checks = StepChecks {
@@ -387,7 +415,6 @@ impl<'a> Agent<'a> {
         self.training_capture.clear();
         self.reasoning_recovery = crate::agent::workflow::reasoning::Recovery::default();
         self.logging = self.store.is_some();
-        let mut message = message;
         if let (Some(hint), Some(content)) = (
             self.skill_hint(user_text),
             message["content"].as_str().map(str::to_owned),
@@ -676,6 +703,14 @@ impl<'a> Agent<'a> {
             });
         // A turn that ended before the next request still must not lose accepted steering.
         if let Err(error) = self.flush_accepted_live_steering(ui) {
+            result = Err(error);
+        }
+        // Steering deferred for the drafter after the last request is journaled now. A failed
+        // or interrupted turn keeps it queued; the next turn drafts it before its own message.
+        if result.is_ok()
+            && !self.interrupt.load(Ordering::SeqCst)
+            && let Err(error) = self.draft_deferred_steering(&mut backend, ui)
+        {
             result = Err(error);
         }
         // Finalization is reentered after every stop-hook continuation. Repairs and hooks retain

@@ -145,6 +145,7 @@ fn configured() -> BTreeMap<String, ProviderSpec> {
             label: "Work".into(),
             base_url: "https://llm.example.com/v1".into(),
             api_key_env: Some("WORK_KEY".into()),
+            api_key_envs: Vec::new(),
             enabled: false,
             allow_insecure: false,
             protocol: None,

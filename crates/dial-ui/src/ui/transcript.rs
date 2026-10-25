@@ -1587,7 +1587,10 @@ impl Replay {
         let first = transcript.blocks.len();
         match message["role"].as_str() {
             Some("user") => {
-                if let Some(text) = message["content"].as_str().filter(|t| !t.trim().is_empty()) {
+                // A drafted message shows what the user typed, not the prompt sent in its place.
+                let text = crate::storage::session::typed_text(message)
+                    .or_else(|| message["content"].as_str());
+                if let Some(text) = text.filter(|t| !t.trim().is_empty()) {
                     transcript.push_user(text);
                 }
             }

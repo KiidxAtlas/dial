@@ -299,12 +299,27 @@ struct CredentialSource {
 impl CredentialSource {
     /// The key `resolve_credential` gives for this endpoint right now.
     fn resolve(&self) -> Result<Option<String>> {
-        llm::catalog::resolve_credential(
-            &self.user_dir,
-            &self.base_url,
-            self.api_key_env.as_deref(),
-        )
+        self.resolve_with(self.api_key_env.as_deref())
     }
+
+    /// Whether `variable` currently yields a key for this endpoint.
+    fn has_key(&self, variable: &str) -> bool {
+        llm::key_pool::env_present(variable)
+            && matches!(self.resolve_with(Some(variable)), Ok(Some(_)))
+    }
+
+    /// The key `resolve_credential` gives for this endpoint when read through `variable`.
+    fn resolve_with(&self, variable: Option<&str>) -> Result<Option<String>> {
+        llm::catalog::resolve_credential(&self.user_dir, &self.base_url, variable)
+    }
+}
+
+/// One-shot controls retained by a logical request's caller across rejected inference attempts.
+/// Does not capture credentials, cancellation, usage or provider response/transport state.
+pub struct RequestControls {
+    profile: Option<llm::profiles::ModelProfile>,
+    local_hints: Option<llm::local_hints::LocalHints>,
+    reasoning_guard: Option<crate::config::types::ReasoningGuardConfig>,
 }
 
 pub struct Backend {
@@ -334,6 +349,8 @@ pub struct Backend {
     oauth: Option<llm::oauth::Binding>,
     /// Where a key-authenticated endpoint reads its key at each dispatch; `None` for other routes.
     credential: Option<CredentialSource>,
+    /// Several API keys for the same endpoint; the active one replaces `credential`'s variable.
+    key_pool: Option<llm::key_pool::KeyPool>,
     /// Stable conversation identity for provider proxy attribution and live steering.
     session_id: Option<String>,
     /// A generated transport correlation ID is not a persistent conversation binding.
@@ -344,6 +361,8 @@ pub struct Backend {
     /// The llama.cpp tool-template notice was shown in this conversation.
     tool_template_noticed: bool,
     wire: llm::wire::Shared,
+    /// Provider-bound secret masking (`[secrets]`); `None` when off.
+    secrets: Option<Arc<llm::secrets::Masker>>,
     /// Test-only idle limit for this backend's model calls, carried to the worker thread that runs them.
     #[cfg(any(test, feature = "test-support"))]
     idle_limit: Option<Duration>,
@@ -412,10 +431,12 @@ impl Backend {
             session_identity_error,
             oauth: None,
             credential: None,
+            key_pool: None,
             codex_websocket: false,
             image_notices: Default::default(),
             tool_template_noticed: false,
             wire: Default::default(),
+            secrets: None,
             #[cfg(any(test, feature = "test-support"))]
             idle_limit: None,
         }
@@ -681,11 +702,36 @@ impl Backend {
         self
     }
 
+    /// Let this endpoint use several API keys: `envs` name the variables, in preference order. A
+    /// key that is throttled or out of quota is skipped until its cooldown ends. Needs a
+    /// credential source (the pool replaces which variable it reads); without one it does nothing.
+    pub fn with_key_pool(mut self, envs: impl IntoIterator<Item = String>) -> Self {
+        if self.credential.is_some() {
+            self.key_pool = llm::key_pool::KeyPool::new(envs);
+        }
+        self
+    }
+
+    /// Leave an active pool key that another request in this process already blocked.
+    fn settle_key_pool(&mut self) {
+        if let (Some(pool), Some(source)) = (self.key_pool.as_mut(), self.credential.as_ref()) {
+            pool.settle(
+                llm::key_pool::process_blocks(),
+                &source.base_url,
+                Instant::now(),
+                |variable| source.has_key(variable),
+            );
+        }
+    }
+
     /// The API key an endpoint request sends at this dispatch: re-read through the credential source
     /// when the backend has one, otherwise the key it was built with.
     pub(super) fn endpoint_api_key(&self) -> Result<Option<String>> {
         if let Some(source) = &self.credential {
-            return source.resolve();
+            return match &self.key_pool {
+                Some(pool) => source.resolve_with(Some(pool.active())),
+                None => source.resolve(),
+            };
         }
         Ok(match &self.kind {
             ProviderKind::Endpoint { api_key, .. }
@@ -712,6 +758,22 @@ impl Backend {
     pub fn with_allow_insecure(mut self, allow: bool) -> Self {
         self.allow_insecure = allow;
         self
+    }
+
+    /// Mask secrets in every request sent to a hosted model and restore them in its reply
+    /// (`[secrets]`). Dial-launched local models and the on-device model never leave the machine
+    /// and receive the real text. Fails if the install key cannot be read or created.
+    pub fn with_secrets(
+        mut self,
+        config: &crate::config::secrets::Config,
+        user_dir: &Path,
+    ) -> Result<Self> {
+        self.secrets = if matches!(self.kind, ProviderKind::Local { .. } | ProviderKind::Apple) {
+            None
+        } else {
+            llm::secrets::Masker::from_config(config, user_dir)?.map(Arc::new)
+        };
+        Ok(self)
     }
 
     pub fn with_remote_idle_timeout(mut self, seconds: u64) -> Self {
@@ -818,6 +880,21 @@ impl Backend {
     pub fn model_profile(&self) -> Option<&llm::profiles::ModelProfile> {
         self.profile.as_ref()
     }
+    /// Capture pending controls before dispatch when the caller owns request-level recovery.
+    pub fn request_controls(&self) -> RequestControls {
+        RequestControls {
+            profile: self.next_profile.clone(),
+            local_hints: self.next_local_hints.clone(),
+            reasoning_guard: self.next_reasoning_guard.clone(),
+        }
+    }
+    /// Re-arm only the controls consumed by a rejected attempt of the same logical request.
+    pub fn restore_request_controls(&mut self, controls: &RequestControls) {
+        self.next_profile = controls.profile.clone();
+        self.next_local_hints = controls.local_hints.clone();
+        self.next_reasoning_guard = controls.reasoning_guard.clone();
+    }
+
     /// Consumed once at the request boundary; transport retries keep the same profile.
     pub fn next_request_profile(&mut self, profile: Option<llm::profiles::ModelProfile>) {
         self.next_profile = profile;
@@ -940,6 +1017,18 @@ impl Backend {
     pub fn reset_provider_stream(&mut self) {
         llm::codex_ws::forget(self.session_id.as_deref().unwrap_or("codex-default"));
     }
+    /// After the caller's silence watchdog has settled an attempt, avoid retrying a stuck Codex
+    /// WebSocket route. This backend uses HTTP streaming until rebuilt; configuration is unchanged.
+    /// Never call this for ordinary user cancellation.
+    pub fn recover_stalled_stream(&mut self) -> bool {
+        if !self.codex_websocket || !matches!(self.kind, ProviderKind::ChatGpt { .. }) {
+            return false;
+        }
+        self.reset_provider_stream();
+        self.codex_websocket = false;
+        true
+    }
+
     pub fn with_profile(mut self, profile: llm::profiles::ModelProfile) -> Self {
         self.profile = Some(profile);
         self
@@ -1206,8 +1295,18 @@ impl Backend {
             scope.begin(billing)?;
         }
         let transport = llm::usage::Transport::enter(scope.clone());
-        let mut result =
-            self.chat_with_control_events_inner(adapter, req, limits, on_text, on_notice, on_event);
+        let mut result = match self.secrets.clone() {
+            Some(masker) => {
+                let (masked, restorer) = masker.mask_chat(req);
+                restorer.run(on_text, |on_text| {
+                    self.chat_with_control_events_inner(
+                        adapter, &masked, limits, on_text, on_notice, on_event,
+                    )
+                })
+            }
+            None => self
+                .chat_with_control_events_inner(adapter, req, limits, on_text, on_notice, on_event),
+        };
         if let Ok(reply) = &mut result {
             reply.wire = self.wire.lock().latest();
         }
@@ -1304,6 +1403,7 @@ impl Backend {
         // Key-authenticated endpoints read their key at dispatch, so a key saved, replaced or removed
         // since the backend was built applies to this request. Precedence and origin checks stay in
         // `resolve_credential`.
+        self.settle_key_pool();
         let endpoint_key = self.endpoint_api_key()?;
         if matches!(self.kind, ProviderKind::Apple) {
             ensure!(
@@ -1596,6 +1696,15 @@ impl Backend {
                 .unwrap_or_default(),
             self.retry_backoff,
         );
+        // An endpoint that already refused the reasoning parameter is not asked again.
+        let reasoning_scope = (url.clone(), model.to_owned());
+        let mut reasoning_stripped = false;
+        if llm::reasoning_memory::process_memory()
+            .remembered(&reasoning_scope.0, &reasoning_scope.1)
+            && let Some(current) = profile.take()
+        {
+            profile = Some(llm::reasoning_memory::without_reasoning(current));
+        }
         let mut active_account = self.account_id.clone();
         let mut tried_accounts = active_account
             .iter()
@@ -1859,6 +1968,10 @@ impl Backend {
             }
             let error = match result {
                 Ok(mut reply) => {
+                    if reasoning_stripped {
+                        llm::reasoning_memory::process_memory()
+                            .remember(&reasoning_scope.0, &reasoning_scope.1);
+                    }
                     if profile
                         .as_ref()
                         .is_some_and(|p| p.capabilities.strict_tools)
@@ -1869,6 +1982,21 @@ impl Backend {
                 }
                 Err(error) => error,
             };
+            if !reasoning_stripped
+                && attempt < retry_policy.max_attempts
+                && llm::reasoning_memory::rejects_reasoning(&error)
+                && profile
+                    .as_ref()
+                    .is_some_and(|p| p.reasoning_effort.is_some() || p.thinking == Some(false))
+                && let Some(current) = profile.take()
+            {
+                profile = Some(llm::reasoning_memory::without_reasoning(current));
+                reasoning_stripped = true;
+                on_notice(
+                    "Provider rejected the reasoning parameter; retrying without it and remembering this for the session",
+                );
+                continue;
+            }
             if self.oauth.is_some()
                 && oauth_retry == 0
                 && attempt < retry_policy.max_attempts
@@ -1883,6 +2011,31 @@ impl Backend {
                 continue;
             }
             let class = llm::errors::classify(&error);
+            if attempt < retry_policy.max_attempts
+                && let Some(cooldown) = llm::key_pool::cooldown(
+                    &class,
+                    error
+                        .downcast_ref::<llm::HttpError>()
+                        .and_then(|http| http.retry_after),
+                    std::time::SystemTime::now(),
+                )
+                && let (Some(pool), Some(source)) =
+                    (self.key_pool.as_mut(), self.credential.as_ref())
+                && pool
+                    .rotate(
+                        llm::key_pool::process_blocks(),
+                        &source.base_url,
+                        Instant::now(),
+                        cooldown,
+                        |variable| source.has_key(variable),
+                    )
+                    .is_some()
+            {
+                on_notice(
+                    "API key was rate limited or out of quota; retrying with the next configured key",
+                );
+                continue;
+            }
             if attempt < retry_policy.max_attempts
                 && retry_policy.rotate_accounts
                 && matches!(

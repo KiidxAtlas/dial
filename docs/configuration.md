@@ -96,6 +96,11 @@ symbols = "auto"                   # auto | unicode | nerd | ascii
 show_tools = true
 history_limit = 0
 
+[secrets]                  # mask secrets in provider-bound messages; see llm-transport.md
+enabled = false
+env = true                  # also mask values of KEY/TOKEN/SECRET/PASSWORD-named environment variables
+values = []                 # extra literal secrets (at least 8 bytes each)
+
 [model_roles.small]
 provider = "mlx"
 model = "mlx-community/Qwen2.5-0.5B-Instruct-4bit"

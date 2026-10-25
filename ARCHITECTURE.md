@@ -198,6 +198,7 @@ Fast loops (the lib and the integration suite are separate test binaries):
 ```sh
 make test-module MOD=llm::provider   # cargo test --locked --workspace --lib llm::provider
 make test-integration                # cargo test --locked -p dial --test integration
+make test-nextest                    # cargo-nextest, no retries, hung-test timeouts (.config/nextest.toml)
 ```
 
 Discoverable check tiers (portable checks never download models):

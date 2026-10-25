@@ -188,13 +188,29 @@ pub fn make_backend(config: &Config) -> Result<Backend> {
     .with_headers(metadata_selection.headers.take().unwrap_or_default())?
     .with_allow_insecure(config.endpoint.as_ref().is_some_and(|e| e.allow_insecure))
     .with_metadata(metadata)
-    .with_steering(config);
+    .with_steering(config)
+    .with_secrets(&config.secrets, &config.user_dir)?;
     if let Some(endpoint) = &config.endpoint {
         backend = backend.with_credential_source(
             &config.user_dir,
             &endpoint.base_url,
             endpoint.api_key_env.as_deref(),
         );
+        // A provider may declare further keys; they pool with the endpoint's own variable.
+        if let Some(spec) = config
+            .provider
+            .as_ref()
+            .and_then(|id| config.providers.get(id))
+            .filter(|spec| !spec.api_key_envs.is_empty())
+        {
+            backend = backend.with_key_pool(
+                endpoint
+                    .api_key_env
+                    .iter()
+                    .chain(spec.api_key_envs.iter())
+                    .cloned(),
+            );
+        }
     }
     if let Some(id) = account_id {
         backend = backend.with_account(id);

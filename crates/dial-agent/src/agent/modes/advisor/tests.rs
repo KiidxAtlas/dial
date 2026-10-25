@@ -170,3 +170,19 @@ fn round_evidence_is_bounded_and_consumed_per_review() {
 fn completion_only_launch_is_off_by_default() {
     assert!(!crate::agent::modes::cli::Launch::default().advisor_completion_only);
 }
+
+#[test]
+fn content_free_coach_notes_neither_block_nor_reach_the_model() {
+    let mut state = CoachTurn::default();
+    for filler in ["Stop.", "  LOOKS good! ", "No issues; continue.", "..."] {
+        let round = RoundNote {
+            severity: Severity::Blocker,
+            note: filler.into(),
+        };
+        assert!(state.apply_round(&round).is_none(), "{filler:?}");
+        assert!(state.completion_note().is_empty(), "{filler:?}");
+    }
+    let real = parse_round(r#"{"severity":"blocker","note":"Stop: the migration drops a column"}"#)
+        .unwrap();
+    assert!(state.apply_round(&real).is_some());
+}

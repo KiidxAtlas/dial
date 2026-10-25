@@ -6,6 +6,14 @@ The shared LLM layer provides bounded streaming, provider-aware error classifica
 
 Streaming reads have bounded raw and line sizes. Reasoning markup leaked into visible text is routed to reasoning events where recognized, and tool-call markup is kept out of user-visible output. Remote model context is taken from configuration or the bundled catalog, falling back to a conservative 32768 tokens. Image inputs are resized to model limits before transmission. Provider-specific OAuth credentials are refreshed per request/retry, without exposing secrets in errors.
 
+Logical-request recovery preserves one-shot model profiles, local hints and reasoning controls
+across rejected attempts, without making them defaults for later requests. Codex WebSocket streams
+that stall, like incomplete streams, select HTTP Responses streaming on the next exchange for that
+session/account/model. If the agent's earlier silence watchdog cancels a Codex attempt first, the
+backend switches to HTTP streaming until rebuilt. Neither path retries inline after partial
+callbacks or replays completed tools. User cancellation remains interruption, not a transport-fallback
+signal; history/account validation and retry bounds still apply.
+
 ## Local server request fields
 
 Local-profile requests (`[assistance.local]`) add server-specific fields only when the route is a
@@ -153,9 +161,43 @@ first request. Owner-rejected auxiliary replies and full-generation guidance/edi
 record discarded responses under the purpose that requested them; discarding does not erase their
 physical tokens or cost. Partial batch interception is not a discarded full generation.
 
+## Secret masking
+
+`[secrets] enabled = true` (default `false`) keeps secrets out of what a hosted model sees. Each
+request's messages (user text, tool results, replayed assistant text and tool-call arguments,
+including strings inside nested JSON) are rewritten before wire serialization; the static system
+prompt and tool definitions are not. Local (Dial-launched MLX/llama) and on-device routes never leave
+the machine and are not masked.
+
+- **Sources.** Credential-shaped tokens (the same patterns as transcript redaction, in
+  `dial_core::credentials`: vendor API keys, JWTs, bearer tokens, PEM private keys, URL passwords);
+  values of environment variables whose names contain `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`,
+  `CREDENTIAL` or `AUTH` (`secrets.env`, default `true`, read at startup); and literals in
+  `secrets.values` (settings.toml only). Values shorter than 8 bytes are never masked, and
+  `secrets.values` rejects them.
+- **Placeholder.** `$$SECRET_<12 hex>$$`, the first 6 bytes of HMAC-SHA256 of the secret under a random
+  per-install key stored owner-only at `<dial home>/secret-mask.key`. The same secret always maps to
+  the same placeholder, so prompt-cache prefixes stay byte-stable across turns and restarts, and the
+  placeholder cannot be dictionary-tested without the key. Overlapping or duplicate secrets collapse
+  to the longest span.
+- **Restoration.** Placeholders the request carried are restored in the reply before anything else
+  sees it: streamed text (chunk boundaries are handled), reasoning, tool-call arguments (nested JSON
+  strings are restored structurally, so quotes in a secret stay valid) and native replay content. Tools
+  therefore run with the real value, and the session journal stores real values. A placeholder the
+  request did not contain is left untouched.
+- **Failure.** If the key cannot be read or created, backend construction fails; Dial never falls back
+  to sending raw text. Provider-owned opaque fields (signatures, encrypted reasoning) are not rewritten.
+- Masking is best-effort pattern matching: a secret with no recognizable shape that is not in the
+  environment or `secrets.values` is sent as written. Files the model reads are masked only on the way
+  out; the model cannot tell you the real value, but it can still act on a placeholder you give a tool.
+
 ## Retries and image input
 
 Devin also requires its successful completion trailer and complete framing before releasing text or tool calls. Connect responses from Devin and Cursor enforce expanded-byte limits as well as wire-byte limits. Endpoint API-key credentials are resolved again for each retry attempt, so replacement or removal during backoff takes effect before the next dispatch.
+
+**Rejected reasoning parameter.** If a request fails with HTTP 400 and the body names `reasoning_effort`, `reasoning.effort`, or an unsupported parameter involving `reasoning`, Dial retries once without the reasoning parameter (including an explicit thinking-off). A retry that succeeds is remembered for that endpoint URL and model for the life of the process, so later requests omit the parameter up front. Nothing is written to configuration. An unrelated 400, or a request that sent no reasoning parameter, is not retried.
+
+**API-key pools.** A provider can name several keys: `api_key_env` plus `api_key_envs = ["KEY_B", "KEY_C"]` on `[providers.<id>]`. When the active key is rate limited or out of quota, that key is blocked until the Retry-After or quota reset time (60 seconds when the provider gives none, at most one hour) and the same request is retried at once with the next key whose variable is set. This consumes one attempt. The key that works keeps serving later requests, and blocks are shared by every session in the process. If no other key is available the ordinary backoff applies. Pool state is process-local and never persisted; only variable names are tracked, so key values are never logged. Each variable must belong to the provider's origin, as for `api_key_env`. A pool needs a key-authenticated endpoint; OAuth and subscription routes do not use one.
 
 Transient provider errors use bounded backoff with server retry hints and visible notices (up to `[retry].max_attempts`
 attempts, default 10; backoff without a server hint is capped at 60 seconds, and server-requested waits are honoured up to `[retry].max_delay_secs`, default 300). This includes macOS socket `Invalid argument (os error 22)` and

@@ -322,6 +322,8 @@ impl Shell {
             }
             match event {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    // The user is back: the tab stops showing how the last turn ended.
+                    self.term_activity = crate::ui::term_state::Activity::Idle;
                     if self.pending_favorite.is_some()
                         && (key.code == KeyCode::Esc
                             || (key.code == KeyCode::Char('c')

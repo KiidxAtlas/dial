@@ -31,21 +31,21 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install Linux sandbox
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y bubblewrap
       - name: Install OpenSSL 3 on macOS
         if: runner.os == 'macOS'
         run: brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
       - name: Install Rust
         run: |
           rustup show active-toolchain
           rustup target add "${{ matrix.target }}"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: release-${{ matrix.target }}
       - name: Validate release tag
@@ -87,7 +87,7 @@ jobs:
           cd "$smoke/$package"
           ./dial --version | awk 'NR==1 {print $1, $2}' | grep -Fx "dial ${GITHUB_REF_NAME#v}"
           ./dial --help
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-assets-${{ matrix.target }}
           path: |
@@ -99,12 +99,12 @@ jobs:
     name: Build and package Windows release
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install pinned Rust
         run: |
           rustup show active-toolchain
           rustup target add x86_64-pc-windows-msvc
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: release-x86_64-pc-windows-msvc
       - name: Validate release tag
@@ -137,7 +137,7 @@ jobs:
           if ($code -ne 0 -or $version -notmatch ("^dial " + [regex]::Escape($expected) + "( |$)")) { throw "Packaged version check failed (exit $code): $version" }
           & "dist/$package/dial.exe" --help
           if ($LASTEXITCODE -ne 0) { throw "Packaged help check failed" }
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
       - name: Test installer under Windows PowerShell 5.1
@@ -146,7 +146,7 @@ jobs:
       - name: Test installer under PowerShell 7
         shell: pwsh
         run: ./scripts/test-install.ps1 -ArchivePath "${{ github.workspace }}/dist/dial-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-assets-x86_64-pc-windows-msvc
           path: dist/*.zip
@@ -156,10 +156,10 @@ jobs:
     name: Windows Rust contract (gates publication)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install pinned Rust
         run: rustup show active-toolchain
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: windows-contract
       - name: Run focused Windows contract suite
@@ -175,8 +175,8 @@ jobs:
       # Reads CI's result for the tagged commit.
       actions: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: release-assets-*
           merge-multiple: true
@@ -295,26 +295,26 @@ jobs:
           git add Formula/dial.rb
           git commit -m "release: update package metadata for $version"
           git push origin HEAD:main
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.ref }}
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
       - name: Resolve container tags
         id: docker-meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
             type=ref,event=tag
             type=raw,value=latest
       - name: Publish container
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           build-args: |

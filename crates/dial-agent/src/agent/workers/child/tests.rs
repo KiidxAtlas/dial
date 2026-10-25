@@ -577,6 +577,13 @@ fn scripted_worker(
     }
     let server = llm::fake::serve(scripts);
     let dir = tempfile::tempdir().unwrap();
+    for index in 0..24 {
+        std::fs::write(
+            dir.path().join(format!("source-{index}.txt")),
+            format!("source evidence {index}\n"),
+        )
+        .unwrap();
+    }
     let mut config = Config::default();
     config.compaction.enabled = false;
     config.codebase.enabled = false;
@@ -587,7 +594,7 @@ fn scripted_worker(
         .with_edit_settings(config.edit.clone())
         .with_edit_mode(crate::config::types::EditMode::Sloppy);
     let harness = Harness {
-        tools: vec!["fixture_lookup".into(), "edit".into()],
+        tools: vec!["fixture_lookup".into(), "edit".into(), "read".into()],
         ..Harness::default()
     };
     let count = Arc::new(AtomicUsize::new(0));
@@ -822,4 +829,77 @@ fn cancelled_child_exits_while_workspace_serial_lock_is_still_held() {
         );
         assert!(!result.text.contains("serial_fixture ran"));
     });
+}
+
+#[test]
+fn research_checkpoint_refuses_tools_without_working_state() {
+    let mut scripts: Vec<_> = (0..24)
+        .map(|index| {
+            scripted_reply(
+                "",
+                Some(("read", json!({"path":format!("source-{index}.txt")}))),
+            )
+        })
+        .collect();
+    for _ in 0..3 {
+        scripts.push(scripted_reply("", Some(("fixture_lookup", json!({})))));
+    }
+    let (outcome, requests, calls, started) = scripted_worker(scripts, 0, vec![]);
+    assert_eq!(outcome.status.phase, crate::runtime::Phase::Incomplete);
+    assert_eq!(requests.len(), 27);
+    assert_eq!(calls, 0, "no requested checkpoint tool may dispatch");
+    assert_eq!(started.len(), 24);
+    assert!(
+        requests[24]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tool| tool["function"]["name"] != "working_state")
+    );
+    assert!(
+        requests[24]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["function"]["name"] == "fixture_lookup"),
+        "protocol schemas remain but are not execution permission"
+    );
+}
+
+#[test]
+fn research_checkpoint_renews_worker_without_working_state() {
+    let mut scripts: Vec<_> = (0..24)
+        .map(|index| {
+            scripted_reply(
+                "",
+                Some(("read", json!({"path":format!("source-{index}.txt")}))),
+            )
+        })
+        .collect();
+    let llm::fake::Script::Sse(last) = scripts.last().unwrap() else {
+        panic!("expected SSE fixture")
+    };
+    let event: Value =
+        serde_json::from_str(last.lines().next().unwrap().strip_prefix("data: ").unwrap()).unwrap();
+    let evidence = &event["choices"][0]["delta"]["tool_calls"][0]["id"];
+    scripts.push(scripted_reply(&json!({"finding":"Distinct numbered source evidence was returned","evidence":[evidence],"next_action":"Resolve the remaining lookup and report findings"}).to_string(), None));
+    scripts.push(scripted_reply("", Some(("fixture_lookup", json!({})))));
+    scripts.push(scripted_reply(
+        "The numbered source evidence was read; runtime behavior was not verified.",
+        None,
+    ));
+    let (outcome, requests, calls, started) = scripted_worker(scripts, 0, vec![]);
+    assert_eq!(
+        outcome.status.phase,
+        crate::runtime::Phase::Completed,
+        "{}",
+        outcome.status.text
+    );
+    assert_eq!(requests.len(), 27);
+    assert_eq!(calls, 1);
+    assert_eq!(started.len(), 25);
+    assert!(
+        !outcome.status.text.trim_start().starts_with('{'),
+        "checkpoint claims cannot become the final report"
+    );
 }

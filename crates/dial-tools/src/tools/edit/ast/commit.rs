@@ -10,6 +10,7 @@ use std::fs;
 use std::path::PathBuf;
 
 /// One file's new content.
+#[derive(Clone)]
 pub(super) struct Change {
     pub abs: PathBuf,
     pub rel: String,

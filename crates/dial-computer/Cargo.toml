@@ -64,3 +64,6 @@ desktop = [
 ]
 # Linux Wayland screencast (PipeWire); off by default.
 wayland-pipewire = ["desktop", "dep:pipewire"]
+
+[lints]
+workspace = true

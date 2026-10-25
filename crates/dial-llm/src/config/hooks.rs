@@ -3,8 +3,9 @@ use crate::config::types::HookConfig;
 
 use anyhow::Result;
 
-/// Canonical event names. Alias names (`tool_call`, `tool_result`, `input`,
-/// `session_shutdown`, `session_before_compact`, `session_stop`) are accepted as well.
+/// Canonical event names. Alias names (`tool_call`, `tool_result`, `input`, `session_shutdown`,
+/// `session_before_compact`, `session_stop`, `before_branch`, `before_switch`, `message_end`,
+/// `provider_response`) are accepted as well.
 pub const EVENTS: &[&str] = &[
     "session_start",
     "session_end",
@@ -15,6 +16,11 @@ pub const EVENTS: &[&str] = &[
     "before_compact",
     "before_subagent_spawn",
     "before_provider_request",
+    "context",
+    "assistant_message",
+    "after_provider_response",
+    "session_before_branch",
+    "session_before_switch",
 ];
 
 /// The Dial name for an event or one of its aliases.
@@ -55,6 +61,10 @@ pub fn canonical_event(event: &str) -> &str {
         "session_shutdown" | "session_end" => "session_end",
         "session_before_compact" | "before_compact" => "before_compact",
         "session_stop" | "stop" => "stop",
+        "before_branch" | "session_before_branch" => "session_before_branch",
+        "before_switch" | "session_before_switch" => "session_before_switch",
+        "message_end" | "assistant_message" => "assistant_message",
+        "provider_response" | "after_provider_response" => "after_provider_response",
         other => other,
     }
 }

@@ -102,6 +102,7 @@ impl Agent<'_> {
     /// arms `session_end` for teardown. A rebuild of the same session uses
     /// `continue_session_lifecycle` instead.
     pub fn begin_session_lifecycle(&mut self) {
+        self.initialize_coordination();
         self.session_lifecycle = true;
         let plugins = self.hook_plugins();
         let root = self.workspace.root().to_path_buf();
@@ -121,6 +122,131 @@ impl Agent<'_> {
                 json!({"event":"session_start","notice":notice}),
             );
         }
+    }
+
+    /// Queue a bounded `additional_context` note from a lifecycle hook for the next model
+    /// request. Notes are transient: delivered once, never written to session history.
+    pub(in crate::agent) fn queue_hook_context(&mut self, note: Option<String>) {
+        /// Notes held between requests; the oldest are dropped past this.
+        const HELD: usize = 8;
+        let Some(note) = note.filter(|note| !note.trim().is_empty()) else {
+            return;
+        };
+        if !self.hook_context.contains(&note) {
+            self.hook_context.push(note);
+        }
+        let excess = self.hook_context.len().saturating_sub(HELD);
+        self.hook_context.drain(..excess);
+    }
+
+    /// The queued hook notes as transient request messages, emptying the queue.
+    pub(in crate::agent) fn take_hook_context(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.hook_context)
+            .into_iter()
+            .map(|note| json!({"role":"user","content":note,"dial_transient":true}))
+            .collect()
+    }
+
+    /// `after_provider_response`: tell observers about a completed model response. Hooks cannot
+    /// change it; their notices are recorded on the session.
+    pub(in crate::agent) fn observe_provider_response(
+        &self,
+        model: &str,
+        reply: &crate::llm::Reply,
+        latency: std::time::Duration,
+    ) {
+        let plugins = self.hook_plugins();
+        let mut notices = Vec::new();
+        crate::agent::safety::hooks::provider_response(
+            self.tool_hooks(),
+            plugins.as_deref(),
+            self.workspace.root(),
+            model,
+            reply,
+            latency,
+            &mut |notice| notices.push(notice.to_owned()),
+        );
+        for notice in notices {
+            let _ = self.record(
+                self.cur_step,
+                "hook_notice",
+                json!({"event":"after_provider_response","notice":notice}),
+            );
+        }
+    }
+
+    /// `assistant_message`: a final assistant reply is complete. The text is already persisted
+    /// and is never replaced or blocked here; a hook's `additional_context` is delivered with the
+    /// next request (the next turn, since this reply ends the step).
+    pub(in crate::agent) fn observe_assistant_message(
+        &mut self,
+        text: &str,
+        step: u32,
+        ui: &mut dyn Ui,
+    ) {
+        let plugins = self.hook_plugins();
+        if !crate::agent::safety::hooks::wanted(
+            self.tool_hooks(),
+            plugins.as_deref(),
+            "assistant_message",
+        ) {
+            return;
+        }
+        let payload = json!({
+            "session_id": self.session.id(),
+            "step": step,
+            "text": crate::agent::window::prompt::truncate_chars(text, 8000),
+        });
+        let configured_hooks = self.tool_hooks();
+        let root = self.workspace.root();
+        let interrupt = self.interrupt.as_ref();
+        let outcome = crate::agent::safety::hooks::with_heartbeat(ui, || {
+            crate::agent::safety::hooks::fire_with(
+                configured_hooks,
+                plugins.as_deref(),
+                root,
+                "assistant_message",
+                None,
+                payload,
+                interrupt,
+            )
+        });
+        for notice in &outcome.notices {
+            ui.event(&crate::agent::ui::ui_event::UiEvent::new(
+                crate::agent::ui::ui_event::EventKind::Hook,
+                notice,
+            ));
+        }
+        // Observe-only: a block or failure never rewrites or withholds the reply.
+        let context = outcome.context_note();
+        self.queue_hook_context(context);
+    }
+
+    /// Run a cancelable `session_before_branch` / `session_before_switch` hook. `Err(reason)`
+    /// means a hook refused the change and the caller must leave the session as it is.
+    pub fn gate_session_change(&self, event: &str, detail: Value) -> Result<(), String> {
+        let plugins = self.hook_plugins();
+        let root = self.workspace.root().to_path_buf();
+        let mut payload = detail;
+        payload["session_id"] = json!(self.session.id());
+        let mut notices = Vec::new();
+        let result = crate::agent::safety::hooks::gate(
+            self.tool_hooks(),
+            plugins.as_deref(),
+            &root,
+            event,
+            payload,
+            self.interrupt.as_ref(),
+            &mut |notice| notices.push(notice.to_owned()),
+        );
+        for notice in notices {
+            let _ = self.record(
+                self.cur_step,
+                "hook_notice",
+                json!({"event":event,"notice":notice}),
+            );
+        }
+        result.map_err(|reason| format!("{event} hook refused: {reason}"))
     }
 
     /// Take over the session lifecycle of the agent this one replaces, without firing
@@ -286,6 +412,8 @@ impl<'a> Agent<'a> {
             workspace,
             ext: Registry::standard(config, crate::computer::tools(config)),
             background_notices: Vec::new(),
+            hook_context: Vec::new(),
+            peer_state: Default::default(),
             todo: TodoList::default(),
             memory,
             memory_runtime,
@@ -351,6 +479,7 @@ impl<'a> Agent<'a> {
             legacy_memory_migrated,
             accepted_live_steering: Vec::new(),
             pending_tool_steering: Vec::new(),
+            undrafted_steering: Vec::new(),
             request_prefix: Default::default(),
             workflow_metrics: Default::default(),
             efficiency_metrics: Default::default(),
@@ -387,6 +516,7 @@ impl<'a> Agent<'a> {
                 .register(crate::tools::knowledge::history::tool(history.clone()));
         }
         agent.restore_control()?;
+        agent.initialize_coordination();
         agent.rebuild_system();
         Ok(agent)
     }
@@ -426,6 +556,8 @@ impl<'a> Agent<'a> {
             workspace,
             ext: Registry::new(),
             background_notices: Vec::new(),
+            hook_context: Vec::new(),
+            peer_state: Default::default(),
             todo: TodoList::default(),
             memory: None,
             codebase: None,
@@ -514,6 +646,7 @@ impl<'a> Agent<'a> {
             legacy_memory_migrated,
             accepted_live_steering: Vec::new(),
             pending_tool_steering: Vec::new(),
+            undrafted_steering: Vec::new(),
             request_prefix: Default::default(),
         };
         agent.rebuild_system();

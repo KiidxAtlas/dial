@@ -307,6 +307,40 @@ network disabled; state, `.dial`, build caches and common credential files are e
 The report omits prompts and model output. The Rust `BenchmarkSuite` API accepts custom agent and
 verifier callbacks for normalized reports from other harnesses.
 
+## Edit-grammar benchmark (offline, no model)
+
+`dial edit-bench` measures whether each edit grammar applies a correct edit correctly, without any
+model call. A seeded generator derives mutation cases from the committed corpus in
+`examples/benchmarks/edit-grammar-corpus/` (Rust, TypeScript and Python files): rename an identifier,
+replace a statement, insert after an anchor, delete a block, change a function body, edit one of several
+duplicate lines, and `stale_read` (the same kinds after one to three lines were inserted above the edit
+since the file was read). Every case is rendered as the correct call in each grammar (`hashline`,
+`replace`, `apply_patch`, `patch`, `sloppy`, and `ast_edit` for whole-word renames, which is `n/a`
+for other kinds) and applied through the real `read`/`edit`/`ast_edit` entry points in a temporary workspace.
+
+```sh
+dial edit-bench                                   # 20 seeds, all grammars, tables
+dial edit-bench --seeds 200 --report edit-bench.json
+dial edit-bench --grammar hashline --grammar patch --first-seed 100 --json
+dial edit-bench --corpus path/to/your/files       # your own corpus (regular files, <= 256 KiB each)
+```
+
+Reading the result: each case is `exact` (the file equals the intended result), `refused` (the tool errored
+and the file is unchanged: a safe failure) or `WRONG` (any other file state, including success reported
+without the change: an unsafe failure). `n/a` means the grammar cannot express the case. `bytes/call` and
+`tokens/call` are the serialized call arguments and that size divided by four, rounded up, averaged over
+cases that ran. The command exits 1 when any result is `WRONG`; refusals never fail it. Expect hashline to
+stay exact after the file shifted (it re-anchors by unchanged lines) while context-matching grammars
+refuse those `stale_read` cases, trading a retry for safety.
+
+A fast seed set (`cargo test --locked -p dial-tools --lib grammar_bench`) asserts zero wrong results for every
+grammar; the 200-seed sweep is `#[ignore]`d (`cargo test --locked -p dial-tools --lib grammar_bench -- --ignored`).
+To tune a grammar, treat any `WRONG` as a bug, compare `refused` and `tokens/call` between grammar
+changes with the same seeds and corpus, and use the opt-in `[edit.blackbox]` log (see
+[tools.md](tools.md#editing-grammars-and-safety)) to find the real-world edits that fail; add their shape
+to the corpus or generator so the offline run reproduces them. The cases are synthetic, so the figures
+describe grammar mechanics rather than model skill.
+
 ## Suite features and scripted smoke checks
 
 Benchmark suites now support seeded `context_messages`, sequential `turns` with `compact_before`,

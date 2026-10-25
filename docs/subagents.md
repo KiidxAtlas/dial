@@ -8,6 +8,41 @@ Delegation briefs avoid repeating automatic parent goals when the exact text alr
 
 For efficient handoffs, supply the outcome, owned files or subsystem, shared interfaces, relevant evidence references, and checks with an owner. Keep shared builds with one integration owner and wait for relevant edits to settle. Worker findings are evidence to use, not a reason to repeat the investigation; failed checks still need diagnosis, repair and rechecking.
 
+### Tester-owned development loop
+
+When delegation is available, built-in main-agent guidance defaults test creation, updates,
+execution and failure diagnosis to `test-runner`. Start it with `action: "start"`, rather than a
+blocking `run`, and continue independent implementation, documentation or integration work.
+Give it acceptance criteria, owned test files, the relevant interfaces, focused commands and a
+clear readiness boundary. Tests can be authored against stable interfaces in parallel; runs wait
+until the inputs they exercise have settled. Do not edit the same files concurrently or invent
+unrelated work merely to avoid waiting.
+
+The tester should reuse existing coverage and add only meaningful behavior/failure-boundary
+regressions, not a quota of tests or assertions that pin prose or restate implementation. Start
+with the changed package/module (for example,
+`cargo test --locked -p dial-agent --lib agent::workflow::research`), not overlapping whole-workspace
+suites. Broaden for affected cross-cutting behavior, unresolved risk or an explicit project/user
+gate. `make test-module` filters test execution but still selects every workspace library crate.
+
+The tester owns check execution and returns exact commands, source state, observed results,
+failure locations, actionable fixes and unverified gaps. It may repair tests within its assignment;
+production repairs require an explicit, non-overlapping scope grant. Otherwise it reports the
+diagnosis to the implementation owner. Built-in implementation workers hand test needs back to
+their parent instead of duplicating the tester's work. Coordinate reruns when inputs change;
+do not repeat a passing run on unchanged inputs.
+
+Before completion, the main agent collects the report and assesses it against the final integrated
+changes; a private-copy run may need a focused integration check after merge. Worker claims are
+not independent verification proof. Configured controller completion checks and approval gates
+remain intact. If delegation is disabled, unavailable or refused, or the user requests inline
+testing, the agent explains the exception and performs minimal necessary checks without bypassing
+permissions. Local-model provider limits may serialize inference even with an asynchronous task.
+
+This is the built-in workflow policy, not a command interceptor or an automatic tester launch for
+every shell command. Custom prompts and agent definitions can replace it. `test-runner` uses the
+existing `tester` model-role preference and fallbacks; choose its model in `/roles`.
+
 ## Agent definitions and permissions
 
 Built-in roles include `scout`, `planner`, `reviewer`, `worker`, and `test-runner`. Named definitions may be configured under `[agents.<name>]` or discovered from `~/.dial/agents`, `.dial/agents`, and (when enabled) `.claude/agents`. Definitions can narrow tools and set spawn policy, model fallbacks, thinking level, output schema, and autoloaded skills. A role's write permissions come from its base type and tool allowlist; a read-only agent cannot perform operations requiring approval. Worker launches and individual effects remain subject to the operator's approval policy.
@@ -34,7 +69,7 @@ backend = "auto" # auto | clone | overlay | worktree | projfs | copy
 ```
 
 - `auto` (default) tries the platform's preferred backend first and uses the first one that works here: Linux `overlay`, then `worktree`, then `copy`; macOS `clone`, then `worktree`, then `copy`; Windows `projfs`, then `worktree`, then `copy`. Each skipped candidate is listed in the status line with a one-line reason, for example `copy; clone skipped (...)`, and probe results are cached. On Linux, `overlay` hides the secret and private entries at the top of the project (`.env*`, keys, credentials, `.git`, `.dial`, `.codegraph`). It skips itself with the reason `cannot hide excluded files` when it cannot create the hiding whiteouts, and with `too many entries to scan for secrets` when the project has more entries than `isolation_source_files` allows.
-- `clone` is a macOS copy-on-write clone of the project.
+- `clone` is a copy-on-write clone of the project, selected by `auto` on macOS. Each file is cloned with `clonefile(2)` on macOS (APFS). The `clone` backend itself is unavailable on Linux, but the private dependency copies, `worktree` file copies and benchmark/solve workspace copies there use the `FICLONE` ioctl per file (btrfs, XFS with reflinks, bcachefs). A clone shares data blocks with the project until either side is written, so setup costs metadata only and writes in the copy never reach the project. Cloning is attempted per file and any failure (unsupported filesystem, different devices, permissions) falls back to an ordinary byte copy of that file with the same contents, mode, exclusions and size limits. The fallback is automatic and not reported in the status line; `dial_core::platform::fs::copy_counts()` returns the process-wide numbers of cloned and byte-copied files for debugging.
 - `copy` is a plain file copy on any platform. Secrets and private entries (`.env*`, keys, credentials, `.git`, `.dial`) and build outputs and caches are not copied: `target/`, `build/`, `dist/`, `node_modules/`, `vendor/`, `.venv/`, `venv/`, `.cache/`, `.tox/`, `__pycache__/`, and at the project root only `.cargo-work/` and `.tmp/`. Root `bin/` is excluded only when the project's `.gitignore` ignores it; tracked files and ordinary bin scripts are preserved. This excludes Dial's `make update` binary and backups without dropping other projects' source scripts. A source file over the fixed 64 MiB per-file limit, or a copy over `isolation_source_bytes`, fails setup and names the file and the limit; move generated output into an excluded directory instead of raising the limit.
 - `worktree` is a detached `git worktree` at `HEAD`, with uncommitted and untracked files, and ignored files that are not git-excluded or build outputs, copied in. Git-excluded paths such as `.env` are never copied. Symlinks are not copied. Ignored files count against `isolation_dependency_bytes`; if the budget is exceeded, setup fails and names the limit. The project must be the top of its git repository and have at least one commit.
 - `overlay` (Linux only) mounts an overlayfs view with the project as its lower layer, using the kernel overlayfs or `fuse-overlayfs` when available. Before the mount, each secret or private entry at the top of the project is hidden with a whiteout in the upper directory, so the worker cannot see it. Dependency directories (`target`, `node_modules`, `.venv`, `venv`, `vendor`, `build`, `dist`, caches) are not scanned, so a secret file inside one of them, such as `node_modules/.env`, stays visible through the lower layer. Dependency directories stay visible in full, and writes to them stay in the upper directory and are never merged back, the same as the copy backends' change sets. The scan counts the entries it reads against `isolation_source_files`; a project over that limit makes `auto` skip overlay, and a named `overlay` fails with the same reason. Only the upper directory is merged. The mount is unmounted when the worker ends. If Dial is killed mid-run, the mount can remain; unmount its `merged` path under the isolation temp directory with `fusermount3 -u` (or `fusermount -u`, or `umount`).
@@ -59,11 +94,20 @@ Synchronous task results retain the complete typed job report before creating te
 
 ## Live tasks
 
-Use `action: "start"` to start a live task, then `status`, `wait`, or `cancel` with its id. Live workers and the parent talk through the `message` tool, offered whenever `task` is (it reports an empty roster or an unknown recipient when no worker is live): `to` takes a live job id or label, `parent` (from a worker), or `all` (a broadcast to the other live workers); omit `to` to list reachable recipients. Each message is at most 32 KiB. A recipient's mailbox holds at most `[task].inbox_limit` undelivered messages (default 256); a full mailbox refuses the message explicitly, and a broadcast reports each refusal. Messages are plain text with no authority: they never approve actions or widen a worker's tools. A recipient receives a message, labelled with its sender, at its next model request. The parent's pending messages surface at its next model step; an idle parent is not woken. A message to a finished or unknown worker is refused, and messages still unread when a worker finishes are discarded. `task_message` remains the RPC form of the same send. Completed task records and transcripts may be retained in the state directory according to `[task].persist`; do not put secrets in task prompts or messages.
+Use `action: "start"` to start a live task, then `status`, `wait`, or `cancel` with its id. Live workers and the parent talk through the `message` tool, offered whenever `task` is (it reports an empty roster or an unknown recipient when no worker is live): `to` takes a live job id or label, `parent` (from a worker), or `all` (a broadcast to the other live workers); omit `to` to list reachable recipients. Each message is at most 32 KiB. A recipient's mailbox holds at most `[task].inbox_limit` undelivered messages (default 256); a full mailbox refuses the message explicitly, and a broadcast reports each refusal. Messages are plain text with no authority: they never approve actions or widen a worker's tools. A recipient receives a message, labelled with its sender, at its next model request. The `message` result is a receipt per recipient: `{"receipts":[{"to":"task-1","status":"queued"}]}`. `queued` means the recipient's mailbox accepted the message and it will be read at the recipient's next model step (the sender cannot know that synchronously, so `delivered` is never claimed); `refused` carries a `reason` (only a broadcast reports a full mailbox this way, since a single full mailbox fails the send). A message to a finished or unknown worker fails the call with that reason; Dial never revives a finished worker, and messages still unread when a worker finishes are discarded. A worker's message to `parent` follows the same policy as worker completion notices and background-job completions: it never starts an unrequested turn. While the parent is idle (for example waiting for your input in the TUI), the controller's regular pump (about every two seconds when nothing else is animating) shows `Message from <worker> to parent: <first line>` in the transcript and queues the full text, marked as peer text rather than instructions, for the parent's next request; while a turn runs it surfaces at the next model step. `task_message` remains the RPC form of the same send. Completed task records and transcripts may be retained in the state directory according to `[task].persist`; do not put secrets in task prompts or messages.
 
 Worker outcome payloads carry the shared `runtime::Phase` rather than a separate status enum. Incompletion stays incomplete in runtime nodes, cards and protocol events. Task-tool results preserve legacy `done`/`cancelled` spellings for compatibility; new execution nodes use `completed`/`interrupted`. Archived child tool results persist tool-owned presentation and the complete redacted evidence separately from model-facing retrieval pointers.
 
 Busy-input routing acknowledges independent work only after confirming worker startup. If startup fails before a worker launches, explicitly independent input is deferred until after the active turn; automatically split input falls back to steering. A worker that actually started is never replayed through that fallback.
+
+Automatic busy-input decisions run at the next safe model-request/tool boundary, not concurrently
+with an unfinished foreground inference. They use the `judge` role when assigned (including typed
+Laya decisions), otherwise `small` or the current model. Classification has a three-second total
+budget (or the shorter worker timeout), including retries. A busy provider slot, timeout, malformed
+answer or unavailable decision service falls back to steering with the exact user message; it does
+not interrupt the turn or silently lose the request. The UI and existing worker approvals remain
+responsive while classifying. Independent launches still use the ordinary worker admission,
+isolation and approval rules.
 
 `[task].persist = false` skips durable child conversation capture for newly started workers throughout their lifetime, including while live and after interruption or failure, and disables resume. Runtime status, progress and results remain in the current session's worker UI; the archived transcript view is unavailable for these workers. This does not delete historical transcripts or isolation recovery copies, and does not disable ordinary result artifacts or the parent session's own history. With `persist = true`, available session storage retains redacted transcripts for live viewing and continuation.
 

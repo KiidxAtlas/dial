@@ -20,7 +20,7 @@ DIAL ?= $(BUILD_DIR)/dial
 
 
 .DEFAULT_GOAL := help
-.PHONY: help update install build check test test-lib test-integration test-module lint test-rust test-drivers test-python test-bench-offline test-smoke test-mlx
+.PHONY: help update install build check test test-lib test-integration test-module test-nextest lint test-rust test-drivers test-python test-bench-offline test-smoke test-mlx
 
 help:
 	@printf '%s\n' \
@@ -34,6 +34,7 @@ help:
 		'make test-module MOD=llm::provider  Run lib tests under one module path' \
 		'make lint     Run clippy with the CI lint gate' \
 		'make test-rust TEST_PROFILE=dev  Run portable Rust tests (CI uses ci)' \
+		'make test-nextest  Run the Rust tests under cargo-nextest (no retries, hung-test timeouts; .config/nextest.toml)' \
 		'make test-drivers  Run browser, JavaScript eval and Python kernel transport contracts (Node 22+, Python 3)' \
 		'make test-python  Run Python contracts; report unavailable optional MLX checks' \
 		'make test-bench-offline  Run benchmark grader/reporting tests, no model or binary needed' \
@@ -78,6 +79,11 @@ test-integration:
 test-module:
 	@test -n "$(MOD)" || { printf '%s\n' 'Usage: make test-module MOD=llm::provider' >&2; exit 2; }
 	$(CARGO) test --locked --workspace --lib $(CARGO_FEATURE_FLAGS) $(MOD)
+
+test-nextest:
+	@command -v cargo-nextest >/dev/null 2>&1 || { printf '%s\n' 'cargo-nextest is not installed: https://nexte.st (or use make test-rust)' >&2; exit 2; }
+	$(CARGO) nextest run --locked --workspace --cargo-profile $(TEST_PROFILE) $(CARGO_FEATURE_FLAGS)
+	$(CARGO) test --locked --workspace --doc --profile $(TEST_PROFILE) $(CARGO_FEATURE_FLAGS)
 
 lint:
 	$(CARGO) clippy --locked --workspace --all-targets $(CARGO_FEATURE_FLAGS) -- -D clippy::correctness -D clippy::suspicious

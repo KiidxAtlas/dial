@@ -82,7 +82,7 @@ pub(in crate::agent) fn configure_sandbox(
         &config.sandbox,
         layout.map(|l| (l.state_dir.as_path(), l.user_dir.as_path())),
     )?;
-    Ok(ws.with_shell_backend(config.shell.backend))
+    Ok(ws.with_shell_config(&config.shell))
 }
 
 /// A superseded read is replaced only if no more than this many estimated tokens follow it (or the context is

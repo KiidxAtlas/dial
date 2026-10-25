@@ -8,15 +8,17 @@ mod commit;
 mod diff;
 mod engine;
 mod scan;
+mod staged;
 #[cfg(test)]
 mod tests;
 
 use crate::config::types::Config;
 use crate::tools::integrations::ext::{Concurrency, Tool, ToolContext};
-use crate::tools::{ToolOutput, Workspace, opt_str, opt_u64, req_str, tool_schema};
+use crate::tools::{ToolOutput, Workspace, opt_str, opt_u64, present, req_str, tool_schema};
 use commit::{Change, commit};
 use scan::{Coverage, Queries, Target, scan};
 use serde_json::{Value, json};
+pub(crate) use staged::StagedPreviews;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
@@ -102,31 +104,29 @@ impl Tool for AstEdit {
     }
 
     fn schema(&self) -> Value {
-        tool_schema(
-            "ast_edit",
-            &format!(
-                "Structural code rewrite: every match of the ast-grep `pattern` is replaced by `rewrite`, a template that may use the \
-                 pattern's variables (`$A`, `$$$ARGS`). Use it for renames and API migrations across files. Defaults to a dry run that \
-                 shows a diff; set `dry_run` to false to apply. Applying is all-or-nothing if any file cannot be rewritten. \
-                 Syntax diagnostics are advisory and never veto changes. After applying, `read` files again before using `edit`. {}",
-                lang_help()
-            ),
-            json!({
-                "pattern": {"type": "string", "description": "ast-grep pattern: valid code in the target language with metavariables"},
-                "rewrite": {"type": "string", "description": "Replacement template; may use the pattern's variables. Empty deletes the match"},
-                "lang": {"type": "string", "description": "Language name; omit to infer from file extensions"},
-                "path": {"type": "string", "description": "File or directory to rewrite (default: the workspace)"},
-                "dry_run": {"type": "boolean", "description": "Preview only (default true); false writes the files"},
-            }),
-            &["pattern", "rewrite"],
+        edit_schema(true)
+    }
+
+    /// `apply_token` only adds an optional way to apply a preview, so history recorded against the
+    /// schema without it stays valid. Any other schema difference is still refused.
+    fn accepts_historical_contract(
+        &self,
+        recorded: &crate::tools::surface::contracts::Identity,
+    ) -> bool {
+        crate::tools::surface::contracts::identities(
+            &[edit_schema(false)],
+            &crate::tools::integrations::ext::Registry::new(),
         )
+        .get("ast_edit")
+            == Some(recorded)
     }
 
     fn needs_approval(&self, args: &Value) -> bool {
-        !matches!(
-            args.get("dry_run"),
-            None | Some(Value::Null) | Some(Value::Bool(true))
-        )
+        present(args, "apply_token")
+            || !matches!(
+                args.get("dry_run"),
+                None | Some(Value::Null) | Some(Value::Bool(true))
+            )
     }
 
     fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
@@ -135,6 +135,35 @@ impl Tool for AstEdit {
             Err(message) => ToolOutput::err(message),
         }
     }
+}
+
+fn edit_schema(with_token: bool) -> Value {
+    let mut properties = json!({
+        "pattern": {"type": "string", "description": "ast-grep pattern: valid code in the target language with metavariables"},
+        "rewrite": {"type": "string", "description": "Replacement template; may use the pattern's variables. Empty deletes the match"},
+        "lang": {"type": "string", "description": "Language name; omit to infer from file extensions"},
+        "path": {"type": "string", "description": "File or directory to rewrite (default: the workspace)"},
+        "dry_run": {"type": "boolean", "description": "Preview only (default true); false writes the files"},
+    });
+    let mut description = format!(
+        "Structural code rewrite: every match of the ast-grep `pattern` is replaced by `rewrite`, a template that may use the \
+         pattern's variables (`$A`, `$$$ARGS`). Use it for renames and API migrations across files. Defaults to a dry run that \
+         shows a diff; set `dry_run` to false to apply. Applying is all-or-nothing if any file cannot be rewritten. \
+         Syntax diagnostics are advisory and never veto changes. After applying, `read` files again before using `edit`. {}",
+        lang_help()
+    );
+    let mut required: &[&str] = &["pattern", "rewrite"];
+    if with_token {
+        description.push_str(
+            " A dry run that found changes ends with an `apply_token`; call `ast_edit` with only that `apply_token` \
+             (no pattern, rewrite or path) to apply exactly the previewed rewrite without repeating it. It is refused if \
+             any affected file changed since the preview or the token is unknown or evicted; run the dry run again then. \
+             `pattern` and `rewrite` are required unless `apply_token` is given.",
+        );
+        properties["apply_token"] = json!({"type": "string", "description": "Token from a dry run; applies that exact preview. Use alone"});
+        required = &[];
+    }
+    tool_schema("ast_edit", &description, properties, required)
 }
 
 fn search(
@@ -193,6 +222,7 @@ fn search(
 }
 
 /// A file whose rewrite succeeded, with its preview.
+#[derive(Clone)]
 struct Planned {
     change: Change,
     replacements: usize,
@@ -253,6 +283,9 @@ fn plan(
 
 fn edit(ctx: &ToolContext, args: &Value) -> Result<String, String> {
     let ws = ctx.workspace;
+    if let Some(token) = opt_str(args, "apply_token")? {
+        return apply_staged(ctx, args, token);
+    }
     let pattern = pattern_arg(args)?;
     let rewrite = req_str(args, "rewrite")?;
     let dry_run = match args.get("dry_run") {
@@ -275,6 +308,21 @@ fn edit(ctx: &ToolContext, args: &Value) -> Result<String, String> {
         out.push_str(&refused);
         append_previews(&mut out, &plan.files);
         out.push_str(&coverage.footer());
+        // A preview with refusals could never be applied, so it is not staged.
+        if plan.refused.is_empty() && !plan.files.is_empty() {
+            match ws.staged_rewrites()
+                .stage(plan.files, coverage.footer(), plan.bytes) {
+                Some(token) => {
+                    let _ = writeln!(
+                        out,
+                        "apply_token: {token} (call ast_edit with only this apply_token to apply exactly this preview)"
+                    );
+                }
+                None => out.push_str(
+                    "[preview too large to hold for an apply_token; repeat the call with dry_run false to apply]\n",
+                ),
+            }
+        }
         return Ok(out);
     }
     if !plan.refused.is_empty() {
@@ -283,21 +331,59 @@ fn edit(ctx: &ToolContext, args: &Value) -> Result<String, String> {
             plan.refused.len()
         ));
     }
-    let targets: Vec<std::path::PathBuf> = plan
-        .files
+    apply(ctx, &plan.files, &coverage.footer())
+}
+
+/// Apply the preview an earlier dry run staged under `token`, exactly as previewed.
+fn apply_staged(ctx: &ToolContext, args: &Value, token: &str) -> Result<String, String> {
+    for key in ["pattern", "rewrite", "lang", "path"] {
+        if present(args, key) {
+            return Err(format!(
+                "apply_token applies a previous preview as it was; do not pass `{key}` with it"
+            ));
+        }
+    }
+    if args.get("dry_run") == Some(&Value::Bool(true)) {
+        return Err(
+            "apply_token applies a preview; it cannot be combined with dry_run true".into(),
+        );
+    }
+    let staged = ctx.workspace.staged_rewrites();
+    let (files, footer) = staged.get(token).ok_or_else(|| {
+        "unknown or expired apply_token; run the ast_edit dry run again for a new one".to_owned()
+    })?;
+    let result = apply(ctx, &files, &footer);
+    // A token is single-use: after an attempt that reached the files it is spent or stale.
+    // A refused authorization leaves it available.
+    if !matches!(&result, Err(message) if message.starts_with(AUTHORIZATION_PREFIX)) {
+        staged.forget(token);
+    }
+    result.map_err(|message| {
+        if message.contains("changed after AST planning") {
+            format!("{message} (the files changed since the preview; run the dry run again)")
+        } else {
+            message
+        }
+    })
+}
+
+const AUTHORIZATION_PREFIX: &str = "native mutation";
+
+/// Write every planned file atomically after authorization, then describe the result.
+fn apply(ctx: &ToolContext, files: &[Planned], footer: &str) -> Result<String, String> {
+    let ws = ctx.workspace;
+    let total: usize = files.iter().map(|p| p.replacements).sum();
+    let targets: Vec<std::path::PathBuf> = files
         .iter()
         .map(|planned| planned.change.abs.clone())
         .collect();
     ctx.authorize_mutation("ast_edit", &targets, false)?;
-    let mut out = format!(
-        "applied {total} replacements in {} files:\n",
-        plan.files.len()
-    );
-    for planned in &plan.files {
+    let mut out = format!("applied {total} replacements in {} files:\n", files.len());
+    for planned in files {
         let _ = writeln!(out, "  {} ({})", planned.change.rel, planned.replacements);
     }
-    append_previews(&mut out, &plan.files);
-    let changes: Vec<Change> = plan.files.into_iter().map(|p| p.change).collect();
+    append_previews(&mut out, files);
+    let changes: Vec<Change> = files.iter().map(|p| p.change.clone()).collect();
     for note in commit(ws, &changes)? {
         let _ = writeln!(out, "{note}");
     }
@@ -309,7 +395,7 @@ fn edit(ctx: &ToolContext, args: &Value) -> Result<String, String> {
     out.push_str(
         "Earlier [path#TAG] headers for these files are stale; read them again before editing.\n",
     );
-    out.push_str(&coverage.footer());
+    out.push_str(footer);
     Ok(out)
 }
 

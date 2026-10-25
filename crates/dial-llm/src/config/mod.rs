@@ -6,6 +6,7 @@ pub mod ask;
 pub mod checkpoint;
 pub mod collab;
 pub mod compaction;
+pub mod coordination;
 pub mod embeddings;
 pub mod hooks;
 pub mod isolation;
@@ -14,6 +15,7 @@ pub mod memory_backend;
 pub mod paths;
 pub mod reliability;
 pub mod schema;
+pub mod secrets;
 pub mod selection;
 pub mod session_models;
 pub mod settings;
@@ -1225,11 +1227,13 @@ impl Config {
     }
 
     /// Alt+M Roles rows in `ROLES` order: the model each role uses now and where that model comes from.
+    /// `turn_drafter` is listed only while `experimental.turn_optimizer` is on.
     pub fn role_statuses(&self) -> Vec<crate::llm::model_config::RoleStatus> {
-        use crate::llm::model_config::{RoleSource, RoleStatus};
+        use crate::llm::model_config::{RoleSource, RoleStatus, TURN_DRAFTER};
         let main = self.selection().display_name();
         crate::llm::model_config::ROLES
             .iter()
+            .filter(|&&(role, _)| role != TURN_DRAFTER || self.experimental.turn_optimizer)
             .map(|&(role, _)| {
                 let assigned = if role == "main" {
                     Some(self.selection())
@@ -1610,6 +1614,7 @@ impl Config {
             }
         }
         self.edit.validate().map_err(anyhow::Error::msg)?;
+        self.secrets.validate().map_err(anyhow::Error::msg)?;
         ensure!(
             SERVICE_TIERS.contains(&self.service_tier.as_str()),
             "service_tier must be one of: {}",
@@ -1968,6 +1973,15 @@ impl Config {
                 "{id} is reserved for a built-in local provider"
             );
             crate::llm::provider::endpoint_url(&provider.base_url, provider.allow_insecure)?;
+            ensure!(
+                provider.api_key_envs.len() <= 16
+                    && provider.api_key_envs.iter().all(|name| {
+                        !name.trim().is_empty()
+                            && name.len() <= 256
+                            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                    }),
+                "provider {id} api_key_envs must list at most 16 environment variable names"
+            );
         }
         let i = &self.improve;
         ensure!(

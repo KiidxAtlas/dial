@@ -318,6 +318,12 @@ impl Ui for Bridge<'_> {
             self.shell.transcript.tool_data(id, data);
         }
         self.attach_write_preview(id, output);
+        if let Err(error) =
+            crate::cli::watch::tool_result(&self.app.layout, &self.shell.session_id, _name, output)
+        {
+            self.shell
+                .note("Live feed", format!("Could not record edit: {error:#}"));
+        }
         let activity = self.pending.last().map_or_else(
             || "thinking".to_owned(),
             |(_, name, _)| format!("running {name}"),
@@ -374,12 +380,14 @@ impl Ui for Bridge<'_> {
         }
         let reference = reference.clone();
         let native = self.shell.term.image_protocol().is_some();
+        let layout = self.app.layout.clone();
+        let session = self.shell.session_id.clone();
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let worker = std::thread::Builder::new()
             .name("dial-image-preview".into())
             .spawn(move || {
-                let _ = tx.send(crate::ui::images::Thumbnail::load_with_native(
-                    &reference, native,
+                let _ = tx.send(crate::cli::watch::preview_image(
+                    &layout, &session, &reference, native,
                 ));
             });
         if worker.is_err() {
@@ -387,8 +395,16 @@ impl Ui for Bridge<'_> {
         }
         loop {
             match rx.recv_timeout(TICK) {
-                Ok(Ok(thumbnail)) => {
-                    self.shell.transcript.image(thumbnail);
+                Ok(Ok((thumbnail, warning))) => {
+                    if let Some(warning) = warning {
+                        self.shell.note("Live feed", warning);
+                    }
+                    if let Some(thumbnail) = thumbnail {
+                        self.shell.transcript.image(thumbnail);
+                    } else {
+                        self.shell
+                            .note("Image", "Screenshot sent to the watch pane.");
+                    }
                     self.repaint(true);
                     break;
                 }
@@ -555,6 +571,7 @@ impl Ui for Bridge<'_> {
                 &self.shell.session_id,
             );
         }
+        let was_waiting = std::mem::replace(&mut self.shell.awaiting_user, true);
         let outcome = loop {
             if cancel.load(Ordering::SeqCst) || self.interrupt.load(Ordering::SeqCst) {
                 break QuestionOutcome::Cancelled;
@@ -597,6 +614,7 @@ impl Ui for Bridge<'_> {
                 Err(_) => break QuestionOutcome::Disconnected,
             }
         };
+        self.shell.awaiting_user = was_waiting;
         self.repaint(true);
         outcome
     }
@@ -613,6 +631,7 @@ impl Ui for Bridge<'_> {
             .map(|(label, key)| (label.as_str(), *key))
             .collect();
 
+        let was_waiting = std::mem::replace(&mut self.shell.awaiting_user, true);
         let answer = match self.shell.ask(title, question, &choice_refs) {
             Some(index) if index < options.len() => Some(options[index].clone()),
             Some(_) => {
@@ -662,13 +681,15 @@ impl Ui for Bridge<'_> {
             }
             None => None,
         };
+        self.shell.awaiting_user = was_waiting;
         self.repaint(true);
         answer
     }
 
     fn approval_reason(&mut self) -> Option<String> {
         let mut editor = crate::ui::editor::Editor::default();
-        loop {
+        let was_waiting = std::mem::replace(&mut self.shell.awaiting_user, true);
+        let reason = loop {
             let (width, _) = self.shell.term.size();
             let theme = self.shell.themes.current();
             let rows = vec![
@@ -682,16 +703,19 @@ impl Ui for Bridge<'_> {
                 Line::from(text::clip(&text::one_line(&editor.text), width as usize)),
             ];
             if self.shell.paint(Some(rows)).is_err() {
-                return None;
+                break None;
             }
-            match read().ok()? {
+            let Ok(event) = read() else {
+                break None;
+            };
+            match event {
                 Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
                     KeyCode::Enter => {
-                        return (!editor.text.trim().is_empty()).then_some(editor.text);
+                        break (!editor.text.trim().is_empty()).then_some(editor.text);
                     }
-                    KeyCode::Esc => return None,
+                    KeyCode::Esc => break None,
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        return None;
+                        break None;
                     }
                     _ => {
                         editor.key(key);
@@ -701,7 +725,9 @@ impl Ui for Bridge<'_> {
                 Event::Resize(..) => self.shell.term.on_resize(),
                 _ => {}
             }
-        }
+        };
+        self.shell.awaiting_user = was_waiting;
+        reason
     }
 }
 

@@ -1,12 +1,12 @@
 //! Routing commands typed while a turn is running, and the hotkey reference.
 
-use crate::app::command_registry::{RUNS_NOW, canonical_command};
+use crate::app::command_registry::{DuringTurn, canonical_command, command_panel, during_turn};
 use crate::app::core::App;
 use crate::app::display::{app_home_hint, short};
 use crate::app::drive::Step;
 use crate::app::improve_view::{improve_jobs_text, improve_stop_text};
+use crate::app::overlay::Which;
 use crate::app::overlay::auth::AuthJob;
-use crate::app::overlay::{Which, work_panel};
 use crate::app::shell::Shell;
 use crate::storage::session::Session;
 use std::path::Path;
@@ -22,62 +22,48 @@ impl Shell {
             self.startup = Some(text);
             return true;
         }
-        if text.split_whitespace().next() == Some("/reload") {
-            if text.trim() == "/reload" {
+        let rest = text.trim().trim_start_matches('/');
+        let (name, args) = rest
+            .split_once(char::is_whitespace)
+            .map_or((rest, ""), |(name, args)| (name, args.trim()));
+        let name = canonical_command(name);
+        let policy = during_turn(name, args);
+        if name == "reload" {
+            if args.is_empty() {
                 self.refresh_resources(app, true, true);
             } else {
                 self.note("Reload", "Usage: /reload");
             }
             return false;
         }
-        if let Some(rest) = text.trim().strip_prefix("/todo")
-            && (rest.is_empty() || rest.starts_with(char::is_whitespace))
-        {
-            if let Some(spec) = self.work_plan(rest.trim())
+        if name == "todo" {
+            if let Some(spec) = self.work_plan(args)
                 && let Err(error) = self.start_busy_overlay(app, Which::Choice(Box::new(spec)))
             {
                 self.note("Work plan", format!("{error:#}"));
             }
             return false;
         }
-        if text.split_whitespace().next().is_some_and(|word| {
-            RUNS_NOW.contains(&word.trim_start_matches('/')) && word == "/queue"
-        }) {
+        if name == "queue" {
             self.queue_command(&text);
             return false;
         }
-        if text.trim() == "/model restart" {
+        if policy == DuringTurn::Unavailable {
             self.note("Model", "Finish or cancel the current turn before restarting its managed model. No server was stopped.");
             return false;
         }
-        let overlay = match text.trim() {
-            "/palette" => Some(Which::Palette),
-            "/model" | "/models" => Some(Which::Models),
-            "/roles" => Some(Which::ModelRoles),
-            "/model settings" => Some(Which::ModelSettings),
-            "/model defaults" => Some(Which::ContextDefaults),
-            "/providers" | "/provider" => Some(Which::Providers),
-            "/settings" => Some(Which::Settings),
-            "/model-settings" => Some(Which::ModelSettings),
-            "/extensions" => Some(Which::Extensions),
-            _ => text.trim().strip_prefix('/').and_then(|rest| {
-                let (name, args) = rest
-                    .split_once(char::is_whitespace)
-                    .map_or((rest, ""), |(name, args)| (name, args.trim()));
-                work_panel(name, args)
-            }),
-        };
+        let overlay = command_panel(name, args);
         if let Some(which) = overlay {
             if let Err(error) = self.start_busy_overlay(app, which) {
                 self.note("Panel", format!("{error:#}"));
             }
             return false;
         }
-        if self.live_command(app, &text) {
+        if policy == DuringTurn::Now && self.live_command(app, &text) {
             return false;
         }
         let name = text.split_whitespace().next().unwrap_or("");
-        if Self::stops_turn(&text) {
+        if policy == DuringTurn::Stop {
             self.note(
                 "Command",
                 format!("stopping the current turn to run {name}"),
@@ -104,7 +90,12 @@ impl Shell {
         let (name, args) = rest
             .split_once(char::is_whitespace)
             .map_or((rest, ""), |(name, args)| (name, args.trim()));
+        let name = canonical_command(name);
         match (name, args) {
+            ("model", args) => {
+                let result = self.model_command(app, None, args);
+                self.adopt_live(app, "Model", result);
+            }
             ("reliability", "" | "status") => {
                 self.note(
                     "Tool reliability",
@@ -123,7 +114,7 @@ impl Shell {
                     )),
                 );
             }
-            ("help" | "?", "" | "all") => {
+            ("help" | "?", _) => {
                 let text = self.help_text(args.trim() == "all");
                 self.note("Help", text);
             }

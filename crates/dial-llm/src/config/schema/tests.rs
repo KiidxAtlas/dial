@@ -296,6 +296,8 @@ fn experimental_options_are_registered_in_their_tab_and_default_off() {
         "experimental.verification_receipts",
         "experimental.context_overlap_dedup",
         "experimental.profile_matching",
+        "experimental.tool_speculation",
+        "experimental.turn_optimizer",
     ];
     for path in paths {
         let setting = registry()

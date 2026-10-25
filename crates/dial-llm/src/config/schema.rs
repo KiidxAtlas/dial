@@ -194,6 +194,11 @@ const SHELL_BACKEND: EnumValues = &[
     ("inprocess", "In-process (sandbox off only)"),
     ("powershell", "PowerShell"),
 ];
+const GIT_GUARD: EnumValues = &[
+    ("workers", "Workers sharing the checkout"),
+    ("always", "Always"),
+    ("off", "Off"),
+];
 const EDIT_MODE: EnumValues = &[
     ("hashline", "Hashline"),
     ("replace", "Replace"),
@@ -214,6 +219,11 @@ const LOCAL_SIDE_MODELS: EnumValues = &[
     ("warn", "Warn once"),
     ("reuse_main", "Reuse main model"),
     ("allow", "Allow silently"),
+];
+const FALLBACK_ON: EnumValues = &[
+    ("any", "Any recoverable failure"),
+    ("usage-limit", "Usage limits only"),
+    ("except-usage-limit", "Everything but usage limits"),
 ];
 const COMPACTION_STRATEGY: EnumValues = &[
     ("context-full", "Context full"),
@@ -322,6 +332,7 @@ macro_rules! field {
     }};
 }
 mod compaction;
+mod coordination;
 mod experimental;
 mod improvement;
 mod memory;
@@ -595,6 +606,15 @@ static UI: &[SettingDef] = &[
         Kind::Bool,
     ),
     field!(
+        "ui.terminal_integration",
+        ui.terminal_integration,
+        IN,
+        "Notifications",
+        "Terminal integration",
+        "Tab color, attention, progress, status variables, working directory and file links in terminals that support them (iTerm2, Ghostty, WezTerm, kitty).",
+        Kind::Bool,
+    ),
+    field!(
         "ui.autocomplete_items",
         ui.autocomplete_items,
         IN,
@@ -651,6 +671,7 @@ static REGISTRY: &[SettingDef] = &[
     UI[26],
     UI[27],
     UI[28],
+    UI[29],
     model::DECLARATIONS[33],
     model::DECLARATIONS[0],
     model::DECLARATIONS[1],
@@ -674,6 +695,7 @@ static REGISTRY: &[SettingDef] = &[
     model::DECLARATIONS[18],
     model::DECLARATIONS[19],
     model::DECLARATIONS[20],
+    model::DECLARATIONS[35],
     model::DECLARATIONS[21],
     model::DECLARATIONS[22],
     model::DECLARATIONS[23],
@@ -752,8 +774,8 @@ static REGISTRY: &[SettingDef] = &[
     memory::DECLARATIONS[63],
     memory::DECLARATIONS[64],
     memory::DECLARATIONS[65],
-    UI[29],
     UI[30],
+    UI[31],
     tools::DECLARATIONS[0],
     improvement::DECLARATIONS[0],
     improvement::DECLARATIONS[1],
@@ -874,6 +896,8 @@ static REGISTRY: &[SettingDef] = &[
     compaction::DECLARATIONS[27],
     compaction::DECLARATIONS[28],
     compaction::DECLARATIONS[29],
+    compaction::DECLARATIONS[30],
+    compaction::DECLARATIONS[31],
     tools::DECLARATIONS[23],
     tools::DECLARATIONS[24],
     tools::DECLARATIONS[25],
@@ -910,6 +934,8 @@ static REGISTRY: &[SettingDef] = &[
     experimental::DECLARATIONS[2],
     experimental::DECLARATIONS[3],
     experimental::DECLARATIONS[4],
+    experimental::DECLARATIONS[5],
+    coordination::DECLARATIONS[0],
     voice::DECLARATIONS[0],
     voice::DECLARATIONS[1],
     voice::DECLARATIONS[2],
@@ -926,6 +952,10 @@ static REGISTRY: &[SettingDef] = &[
     tools::DECLARATIONS[44],
     tools::DECLARATIONS[45],
     tools::DECLARATIONS[46],
+    tools::DECLARATIONS[47],
+    tools::DECLARATIONS[48],
+    tools::DECLARATIONS[49],
+    tools::DECLARATIONS[50],
 ];
 const _: () = assert!(
     REGISTRY.len()
@@ -936,6 +966,7 @@ const _: () = assert!(
             + tools::DECLARATIONS.len()
             + compaction::DECLARATIONS.len()
             + experimental::DECLARATIONS.len()
+            + coordination::DECLARATIONS.len()
             + voice::DECLARATIONS.len()
 );
 
@@ -1030,6 +1061,7 @@ const ADVANCED: &[&str] = &[
     "compaction.agent_threshold_overrides",
     "compaction.native_models",
     "compaction.snapcompact_models",
+    "compaction.promotion.targets",
     "compaction.snapcompact.shape",
     "compaction.snapcompact.system_prompt",
     "compaction.snapcompact.tool_results",

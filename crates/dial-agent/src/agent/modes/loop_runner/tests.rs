@@ -138,6 +138,37 @@ fn interrupt_pauses_and_a_manual_prompt_resumes() {
 }
 
 #[test]
+fn only_turns_that_need_the_human_halt_automation() {
+    use crate::agent::{TurnOutcome, TurnReport};
+    let report = |outcome, interrupted| TurnReport {
+        text: String::new(),
+        outcome,
+        steps: 1,
+        interrupted,
+        trajectory: None,
+    };
+    for outcome in [
+        TurnOutcome::NeedsInput,
+        TurnOutcome::Blocked,
+        TurnOutcome::Failed,
+        TurnOutcome::Interrupted,
+    ] {
+        assert!(report(outcome, false).halts_automation(), "{outcome:?}");
+    }
+    assert!(report(TurnOutcome::Completed, true).halts_automation());
+    assert!(!report(TurnOutcome::Completed, false).halts_automation());
+    assert!(!report(TurnOutcome::Incomplete, false).halts_automation());
+
+    // A failed turn that returned Ok (not a transport error) still pauses the loop.
+    let t0 = Instant::now();
+    let mut mode = LoopMode::default();
+    mode.enable(&parsed("go"), t0);
+    mode.turn_started("go");
+    mode.turn_settled(t0, report(TurnOutcome::Failed, false).halts_automation());
+    assert_eq!(mode.next_due(), None);
+}
+
+#[test]
 fn evaluate_maps_exit_status_onto_verdicts() {
     let cwd = std::env::temp_dir();
     let wait = Duration::from_secs(10);
@@ -246,7 +277,7 @@ fn run_loop<F: Fn(&Condition) -> Gate>(
     loop {
         mode.turn_started(&prompt);
         let report = agent.turn(&prompt, &mut crate::agent::NullUi).unwrap();
-        mode.turn_settled(now, report.interrupted);
+        mode.turn_settled(now, report.halts_automation());
         now += Duration::from_secs(1);
         prompt = loop {
             match mode.take_due(now + Duration::from_secs(1), &gate) {

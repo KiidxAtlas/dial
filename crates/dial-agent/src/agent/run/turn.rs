@@ -61,8 +61,12 @@ impl Agent<'_> {
         let mut rejected_edit_previews = 0u32;
         let mut reasoning_budget = None;
         // `thinking = "auto"`: judge this user turn's effort once from its prompt, not per step.
+        // External thinking promises provider reasoning off, so no judge runs for it.
         let mut turn_effort: Option<crate::llm::profiles::ReasoningEffort> = None;
-        if self.config.thinking_auto && !self.hermetic {
+        if self.config.thinking_auto
+            && !self.hermetic
+            && self.external_thinking_instruction().is_none()
+        {
             match crate::judgment::judge_turn_thinking(
                 &self.auth_config,
                 &self.config.user_dir,
@@ -82,6 +86,7 @@ impl Agent<'_> {
         let mut todo_recovery = crate::agent::workflow::todo_recovery::TodoRecovery::default();
         let mut solo_todo_noted = false;
         let mut pending_nudges: Vec<Value> = Vec::new();
+        let mut emissions = crate::agent::run::guidance::Emissions::default();
         let mut coach_turn = modes::advisor::CoachTurn::default();
         let mut automatic_coach_pending = false;
         let mut auto_continues = 0u32;
@@ -172,7 +177,10 @@ impl Agent<'_> {
             }
             let accepted_live = self.flush_accepted_live_steering(ui)?;
             let routed_steering = self.route_pending_messages(backend, ui)?;
-            if self.take_steering(ui)? || accepted_live || routed_steering {
+            let taken = self.take_steering(ui)?;
+            // Steering deferred for the turn optimizer is drafted and journaled before this request.
+            let drafted = self.draft_deferred_steering(backend, ui)?;
+            if taken || accepted_live || routed_steering || drafted {
                 steering_pending = true;
             }
             if std::mem::take(&mut steering_pending) {
@@ -333,6 +341,9 @@ impl Agent<'_> {
                     .into_iter()
                     .map(|text| json!({"role":"user","content":text,"dial_transient":true})),
             );
+            // Lifecycle hooks' `additional_context` is delivered once, like background notices.
+            pending_nudges.extend(self.take_hook_context());
+            pending_nudges.extend(self.poll_coordination(ui));
             messages.extend(pending_nudges.iter().cloned());
             // The redirect is stated once; if the identical repeat continues, the stronger
             // guidance replaces it. Neither stage ends the turn.
@@ -353,8 +364,12 @@ impl Agent<'_> {
                 };
                 messages.push(crate::agent::run::guidance::note(crate::agent::run::guidance::Priority::Repetition, guidance));
             }
+            let research_step = engine.research_required();
+            if let Some(note) = engine.research_prompt() {
+                messages.push(note);
+            }
             // One advisory note per request, by priority; protocol notes and gates are unaffected.
-            crate::agent::run::guidance::cap(&mut messages);
+            crate::agent::run::guidance::curate(&mut messages, &mut emissions);
             coalesce_harness_notes(&mut messages, notes_start);
             if !self.experimental_context_owner()
                 && let Some(guidance) = rule_catalog.guidance(&mut rule_state, "main")
@@ -455,6 +470,27 @@ impl Agent<'_> {
             );
             let retry_ready = compaction_retry_floor
                 .is_none_or(|floor| request_context >= floor || request_context > safe_prompt_budget);
+            // Switch to a configured larger-window model before any compaction (background claim
+            // included) once the request is over the compaction threshold.
+            if !self.config.compaction.experimental_context_management
+                && self.config.compaction.promotion.enabled
+                && self.config.compaction.should_compact(
+                    compaction_identity,
+                    budget_window,
+                    request_context,
+                    step != 0,
+                )?
+                && {
+                    let output = backend.output_budget(request.max_tokens);
+                    self.try_promote_context(backend, request_context, output, false, ui)
+                }
+            {
+                max_tokens = backend.output_budget(h.max_tokens);
+                compaction_failed = false;
+                compaction_retry_floor = None;
+                budget.give_back();
+                return Ok(crate::agent::run::engine::Tick::Again);
+            }
             let mut deferred_compaction = false;
             if !compaction_failed && retry_ready {
                 let action = self.compaction_runtime.speculation_action(
@@ -600,16 +636,17 @@ impl Agent<'_> {
                 {
                     profile.capabilities.parallel_tool_calls = Some(false);
                 }
-                if self.external_thinking_instruction().is_some()
-                    && let Some(profile) = profile.as_mut()
-                {
-                    profile.reasoning_effort = Some(crate::llm::profiles::ReasoningEffort::None);
-                }
                 if let (Some(effort), Some(profile)) = (turn_effort, profile.as_mut())
                     && let Some(clamped) =
                         crate::judgment::clamp_effort(effort, &profile.capabilities.reasoning_efforts)
                 {
                     profile.reasoning_effort = Some(clamped);
+                }
+                // Applied last: external thinking keeps provider reasoning off whatever else chose an effort.
+                if self.external_thinking_instruction().is_some()
+                    && let Some(profile) = profile.as_mut()
+                {
+                    profile.reasoning_effort = Some(crate::llm::profiles::ReasoningEffort::None);
                 }
                 if repairing {
                     let model = self.auth_config.selection();
@@ -883,7 +920,11 @@ impl Agent<'_> {
                 {
                     let stalled = error.downcast_ref::<SilentRequest>().unwrap();
                     if let Some(direction) = stalled.direction.clone() {
-                        self.accept_steering(vec![direction], ui)?;
+                        // Same local resets as ordinary steering: the new direction must not
+                        // inherit the old task's restrictions, guidance or recovery counters.
+                        if self.accept_steering(vec![direction], ui)? {
+                            steering_pending = true;
+                        }
                         budget.give_back();
                         return Ok(crate::agent::run::engine::Tick::Again);
                     }
@@ -971,7 +1012,10 @@ impl Agent<'_> {
                 Err(error)
                     if !self.hermetic
                         && error.downcast_ref::<llm::errors::ThinkingLoop>().is_none()
-                        && crate::llm::fallback::should_fallback(&error)
+                        && crate::llm::fallback::should_fallback(
+                            &error,
+                            self.effective_config().retry.fallback_on,
+                        )
                         && self.fail_over(backend, &error, ui) =>
                 {
                     max_tokens = backend.output_budget(h.max_tokens);
@@ -989,6 +1033,14 @@ impl Agent<'_> {
                     self.request_phase
                         .recover("context overflow; bounded compaction retry");
                     overflow_retries += 1;
+                    let promote_output = backend.output_budget(requested_tokens);
+                    if self.try_promote_context(backend, request_context, promote_output, true, ui) {
+                        max_tokens = backend.output_budget(h.max_tokens);
+                        compaction_failed = false;
+                        compaction_retry_floor = None;
+                        budget.give_back();
+                        return Ok(crate::agent::run::engine::Tick::Again);
+                    }
                     // The provider measured the prompt it rejected. Calibrate on that real count so
                     // the compaction budget checks below stop trusting the estimate that let it through.
                     if let Some(actual) = crate::llm::errors::overflow_prompt_tokens(&error) {
@@ -1116,6 +1168,7 @@ impl Agent<'_> {
                 backend.reply_cost(&reply),
                 started.elapsed(),
             );
+            self.observe_provider_response(backend.model_label(), &reply, started.elapsed());
             if let Some(tokens) = reply.prompt_tokens {
                 self.last_prompt_tokens = tokens;
                 self.reported_messages = sent_messages;
@@ -1132,6 +1185,31 @@ impl Agent<'_> {
                 steering_pending = true;
                 ui.event(&crate::agent::ui::ui_event::UiEvent::new(crate::agent::ui::ui_event::EventKind::Steering, "Discarded the old response before executing its tools; replanning with your new instruction."));
                 budget.give_back();
+                return Ok(crate::agent::run::engine::Tick::Again);
+            }
+            // A research checkpoint is a tool-free protocol step. Handle it before length/inline
+            // recovery and completion so retained schemas cannot authorize any effects.
+            if research_step {
+                use crate::agent::workflow::research::Synthesis;
+                let result = engine.synthesize(&reply);
+                let message = match result {
+                    Synthesis::Accepted => {
+                        self.push(llm::assistant_message(&reply))?;
+                        self.record(step, "research_synthesis", json!({"accepted":true}))?;
+                        "Research checkpoint recorded as unverified model findings. Resume the existing task: act on the supported path, deliver the requested report, or investigate the stated remaining question. Tools, scope, permissions and completion checks are unchanged.".to_owned()
+                    }
+                    Synthesis::Retry(message) => {
+                        record_rejected_reply(&self.usage_scope, backend, repairing)?;
+                        self.record(step, "research_synthesis", json!({"accepted":false}))?;
+                        ui.inference_discarded("Research checkpoint not satisfied; no tools from this reply were executed.");
+                        message
+                    }
+                    Synthesis::Incomplete(message) => {
+                        record_rejected_reply(&self.usage_scope, backend, repairing)?;
+                        return self.stop_turn(ui, message, step + 1).map(crate::agent::run::engine::Tick::Finished);
+                    }
+                };
+                pending_nudges.push(json!({"role":"user","dial_transient":true,"content":message}));
                 return Ok(crate::agent::run::engine::Tick::Again);
             }
             if reply.finish_reason == "length" {
@@ -1218,6 +1296,10 @@ impl Agent<'_> {
                 && names.iter().any(|name| name == "edit")
                 && let Some((_, arguments)) = tools::inline_edit_payload(&reply.text)
             {
+                // The transport emitted ordinary text, not this controller-recovered tool use.
+                // Native replay (Anthropic content blocks) would otherwise win over the
+                // normalized calls and leave the synthetic edit's result without a `tool_use`.
+                reply.provider_content.clear();
                 reply.tool_calls.push(ToolCall {
                     id: format!(
                         "dial-inline-{}-{step}-{}",
@@ -1353,6 +1435,7 @@ impl Agent<'_> {
             stall_continues = 0;
             if reply.tool_calls.is_empty() {
                 self.push(json!({"role":"assistant","content":reply.text}))?;
+                self.observe_assistant_message(&reply.text, step, ui);
                 let accepted_live = self.flush_accepted_live_steering(ui)?;
                 if self.take_steering(ui)? || accepted_live {
                     steering_pending = true;
@@ -2327,6 +2410,7 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                 let (tokens, estimated) = self.context_usage();
                 ui.context_usage(tokens, estimated);
             }
+            engine.research_round();
             if let Some(reason) = engine.pending_refusal() {
                 self.accept_steering(round_steering, ui)?;
                 return self.stop_turn(ui, stop.unwrap_or_else(|| reason.to_owned()), step + 1).map(crate::agent::run::engine::Tick::Finished);

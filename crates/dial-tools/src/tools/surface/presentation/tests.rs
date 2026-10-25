@@ -42,3 +42,17 @@ fn coherent_runtime_check_presentation_does_not_guess_from_command_text() {
     );
     assert_eq!(check.body, BodyStyle::Quiet);
 }
+#[test]
+fn edit_results_with_new_language_server_errors_show_the_count_as_a_fact() {
+    let output = ToolOutput::ok(
+        "Edited src/a.rs\n[LSP advisory, not verification] 2 new error(s) after this edit:\nsrc/a.rs:3:1: expected `;`\nsrc/a.rs:9:5: unknown name\n".into(),
+    );
+    let view = render_result("edit", &serde_json::json!({"path":"src/a.rs"}), &output);
+    assert!(view.facts.contains(&"2 new errors".to_owned()), "{:?}", view.facts);
+    let clean = render_result(
+        "edit",
+        &serde_json::json!({"path":"src/a.rs"}),
+        &ToolOutput::ok("Edited src/a.rs\n".into()),
+    );
+    assert!(clean.facts.iter().all(|fact| !fact.contains("error")));
+}

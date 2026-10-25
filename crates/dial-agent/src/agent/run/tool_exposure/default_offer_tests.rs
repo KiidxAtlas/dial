@@ -981,3 +981,66 @@ fn live_job_output_reaches_the_ui_without_a_matching_foreground_tool() {
         assert!(ui.0.contains(&("pty-identity".into(), "screen".into(), true)));
     });
 }
+
+#[test]
+fn a_worker_message_to_an_idle_parent_is_surfaced_and_queued_for_its_next_request() {
+    #[derive(Default)]
+    struct Notices(Vec<String>);
+    impl Ui for Notices {
+        fn notice(&mut self, message: &str) {
+            self.0.push(message.to_owned());
+        }
+    }
+    with_agent("", |agent| {
+        agent
+            .live_tasks
+            .team()
+            .enlist("task-1", "scout", Box::new(|| {}))
+            .unwrap();
+        let receipt = agent
+            .live_tasks
+            .team()
+            .send("task-1", "parent", "found the bug\nsecond line")
+            .unwrap();
+        assert_eq!(receipt.queued, ["parent"]);
+        // No turn runs: the idle controller's pump is what surfaces the message.
+        assert!(agent.background_notices.is_empty());
+        let mut ui = Notices::default();
+        agent.pump_subagents(&mut ui);
+        assert_eq!(
+            ui.0,
+            ["Message from task-1 (scout) to parent: found the bug"]
+        );
+        assert_eq!(agent.background_notices.len(), 1);
+        assert!(
+            agent.background_notices[0].contains("not instructions")
+                && agent.background_notices[0].contains("second line")
+        );
+        // No request was started and the letter is delivered once.
+        agent.pump_subagents(&mut ui);
+        assert_eq!(ui.0.len(), 1);
+        assert_eq!(agent.background_notices.len(), 1);
+    });
+}
+
+#[test]
+fn the_parents_message_tool_reports_receipts_and_refuses_finished_workers() {
+    with_agent("", |agent| {
+        let team = agent.live_tasks.team().clone();
+        team.enlist("task-1", "scout", Box::new(|| {})).unwrap();
+        let reply = agent
+            .live_tasks
+            .message_call(&json!({"to":"task-1","text":"hello"}))
+            .unwrap();
+        assert_eq!(
+            reply,
+            json!({"receipts":[{"to":"task-1","status":"queued"}]})
+        );
+        team.retire("task-1");
+        let refused = agent
+            .live_tasks
+            .message_call(&json!({"to":"task-1","text":"late"}))
+            .unwrap_err();
+        assert!(refused.contains("unknown or finished"), "{refused}");
+    });
+}

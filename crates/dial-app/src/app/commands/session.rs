@@ -20,6 +20,12 @@ pub(super) const COMMANDS: &[super::CommandSpec] = &[
         subcommands: &[],
     },
     super::CommandSpec {
+        name: "label",
+        description: "Label the latest message so it is easy to find in /tree (no text clears the label)",
+        args_hint: "[text]",
+        subcommands: &[],
+    },
+    super::CommandSpec {
         name: "delete",
         description: "Delete the current session after confirming, and start a new one",
         args_hint: "",
@@ -91,6 +97,9 @@ pub(super) fn run(
     let args = args.trim();
     let result = match name {
         "branch" | "rewind" => branch(shell, app, agent, args),
+        "label" => label(shell, agent, args),
+        // `/tree forks` stays the cross-session fork browser, handled by the dispatcher.
+        "tree" if args.is_empty() => tree(shell, agent),
         "retry" => retry(shell, app, agent),
         "session" => session(shell, app, agent, args),
         "delete" => delete_current(shell, app, agent),
@@ -548,6 +557,49 @@ fn branch(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) -> Re
     Ok(Step::Done)
 }
 
+fn label(shell: &mut Shell, agent: &mut Agent<'_>, args: &str) -> Result<Step> {
+    match agent.session_mut().label_leaf(args) {
+        Ok(_) if args.is_empty() => shell.note("Label", "Label cleared."),
+        Ok(_) => shell.note(
+            "Label",
+            format!(
+                "Labeled the latest message \"{}\". /tree shows it.",
+                one_line(args)
+            ),
+        ),
+        Err(error) => shell.note("Label", format!("{error:#}")),
+    }
+    Ok(Step::Done)
+}
+
+/// `/tree`: pick any user message or labeled entry of this session, including abandoned branches,
+/// and continue from there. Nothing is deleted: the move appends a branch marker.
+fn tree(shell: &mut Shell, agent: &mut Agent<'_>) -> Result<Step> {
+    let Some(id) = shell.pick_tree_node(agent.session())? else {
+        return Ok(Step::Done);
+    };
+    agent.cancel_background_compaction();
+    match agent.session_mut().navigate_to(&id) {
+        Ok(nav) if !nav.moved => {
+            shell.note("Tree", "Already there; the conversation is unchanged.")
+        }
+        Ok(nav) => {
+            crate::collab::room::sync_host(agent.session());
+            shell.show_session(agent.session());
+            let mut body =
+                "Moved the conversation here; the previous path is kept as a branch in /tree."
+                    .to_owned();
+            if let Some(text) = nav.prefill {
+                shell.composer.set_draft(&text);
+                body.push_str("\nThe message is in the composer to edit and resend.");
+            }
+            shell.note("Tree", body);
+        }
+        Err(error) => shell.note("Tree", format!("{error:#}")),
+    }
+    Ok(Step::Done)
+}
+
 /// Messages that leave the view when `n` user turns are rewound: from the n-th latest user message
 /// to the end of the view.
 fn dropped_on_rewind(agent: &Agent<'_>, n: usize) -> usize {
@@ -619,7 +671,7 @@ fn session(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) -> R
             shell.note(
                 "Session",
                 format!(
-                    "id: {} · title: {title}\nfile: {path}\n/rename names it · /tree browses branches · /session delete removes it",
+                    "id: {} · title: {title}\nfile: {path}\n/rename names it · /tree browses branches · /label bookmarks a message · /session delete removes it",
                     session.id(),
                 ),
             );

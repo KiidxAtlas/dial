@@ -346,6 +346,34 @@ fn task_status_shows_assigned_model_or_main_without_changing_small_fallback() {
 }
 
 #[test]
+fn turn_drafter_row_is_listed_only_while_the_turn_optimizer_is_on() {
+    use crate::llm::model_config::{ROLES, RoleSource, TURN_DRAFTER};
+    assert_eq!(ROLES.last().map(|(role, _)| *role), Some(TURN_DRAFTER));
+    let mut config = Config {
+        model: "main-model".into(),
+        ..Default::default()
+    };
+    assert!(
+        !config
+            .role_statuses()
+            .iter()
+            .any(|row| row.role == TURN_DRAFTER)
+    );
+    config.experimental.turn_optimizer = true;
+    let drafter = config
+        .role_statuses()
+        .into_iter()
+        .find(|row| row.role == TURN_DRAFTER)
+        .unwrap();
+    assert_eq!(drafter.source, RoleSource::FollowsMain);
+    assert_eq!(drafter.effective, Some(config.selection().display_name()));
+    assert_eq!(
+        config.for_role(TURN_DRAFTER).selection(),
+        config.selection()
+    );
+}
+
+#[test]
 fn unassigned_roles_resolve_to_the_main_selection() {
     let config = resolve(
         "provider='chatgpt'\nmodel='account-model'\n[model_roles.small]\nprovider='chatgpt'\nmodel='account-small'\n",

@@ -1,0 +1,1470 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dial/dial/docs/rpc-schema.json",
+  "title": "Dial RPC protocol, version 1",
+  "description": "Newline-delimited JSON frames of `dial rpc`. Client -> server: `request`. Server -> client: `response` (correlated by id) and `event` (unsolicited). Hand-maintained; tests in crates/dial-app/src/rpc/tests.rs keep its method and event names equal to the implementation. ACP (`dial acp`) uses JSON-RPC 2.0 and is not described here.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/request"
+    },
+    {
+      "$ref": "#/$defs/response"
+    },
+    {
+      "$ref": "#/$defs/event"
+    }
+  ],
+  "$defs": {
+    "id": {
+      "description": "Opaque correlation id echoed in the response; null when absent.",
+      "type": [
+        "string",
+        "integer",
+        "null"
+      ]
+    },
+    "request": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "send"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "text": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "text"
+              ]
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "state"
+            },
+            "params": {
+              "type": "object",
+              "properties": {},
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "messages"
+            },
+            "params": {
+              "type": "object",
+              "properties": {},
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "messages_page"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "offset": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "cursor": {
+                  "type": "string",
+                  "pattern": "^[0-9]+$"
+                },
+                "limit": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 500,
+                  "default": 50
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "plan"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "enabled"
+              ]
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "new_session"
+            },
+            "params": {
+              "type": "object",
+              "properties": {},
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "resume"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "session_id": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "session_id"
+              ]
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "rename"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "title"
+              ]
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "compact"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "instructions": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "method": {
+                  "enum": [
+                    "remote",
+                    "snapcompact",
+                    "handoff",
+                    "shake",
+                    "soft",
+                    null
+                  ]
+                },
+                "strategy": {
+                  "enum": [
+                    "context-full",
+                    "handoff",
+                    "shake",
+                    "snapcompact",
+                    "off",
+                    null
+                  ]
+                },
+                "keep_recent_tokens": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 0
+                },
+                "suppress_continuation": {
+                  "type": "boolean"
+                },
+                "require_method": {
+                  "type": "boolean"
+                },
+                "reason": {
+                  "const": "manual"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "memory"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "command": {
+                  "type": "string",
+                  "maxLength": 8192
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "command"
+              ]
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "seed_context"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "messages": {
+                  "type": "array",
+                  "maxItems": 200,
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "messages"
+              ]
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "task_start"
+            },
+            "params": {
+              "type": "object",
+              "properties": {},
+              "additionalProperties": true
+            }
+          },
+          "required": [
+            "method"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "task_status"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "task_cancel"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "id"
+              ]
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "task_message"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "text": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "id",
+                "text"
+              ]
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "steer"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "text": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "text"
+              ]
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "abort"
+            },
+            "params": {
+              "type": "object",
+              "properties": {},
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "approve"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "approval_id": {
+                  "type": "string"
+                },
+                "decision": {
+                  "enum": [
+                    "allow",
+                    "always",
+                    "project",
+                    "deny"
+                  ]
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "approval_id",
+                "decision"
+              ]
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "question_presented"
+            },
+            "params": {
+              "$ref": "#/$defs/question_correlation"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "question_answer"
+            },
+            "params": {
+              "$ref": "#/$defs/question_submission"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "live_start"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "voice": {
+                  "type": "string"
+                },
+                "instructions": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "live_mute"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "muted": {
+                  "type": "boolean"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "muted"
+              ]
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "live_stop"
+            },
+            "params": {
+              "type": "object",
+              "properties": {},
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "live_listen"
+            },
+            "params": {
+              "type": "object",
+              "properties": {},
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "shutdown"
+            },
+            "params": {
+              "type": "object",
+              "properties": {},
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "response": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "result": {}
+          },
+          "required": [
+            "id",
+            "result"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "error": {
+              "type": "object",
+              "properties": {
+                "message": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "message"
+              ]
+            }
+          },
+          "required": [
+            "id",
+            "error"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "event": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "const": "ready"
+            },
+            "protocol_version": {
+              "type": "integer"
+            },
+            "supported_protocol_versions": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "tools": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "image_input": {
+              "type": "boolean"
+            },
+            "methods": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "capabilities": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "limits": {
+              "$ref": "#/$defs/limits"
+            },
+            "question_input": {
+              "type": "object"
+            }
+          },
+          "required": [
+            "event",
+            "protocol_version",
+            "supported_protocol_versions",
+            "session_id",
+            "model",
+            "tools",
+            "image_input",
+            "methods",
+            "capabilities",
+            "limits",
+            "question_input"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "const": "fatal"
+            },
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "event",
+            "message"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "const": "active_session"
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "event",
+            "session_id"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "const": "replay_message"
+            },
+            "message": {}
+          },
+          "required": [
+            "event",
+            "message"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "const": "text"
+            },
+            "delta": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "event",
+            "delta"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "const": "reasoning"
+            },
+            "delta": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "event",
+            "delta"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "const": "tool_arguments"
+            },
+            "index": {
+              "type": "integer"
+            },
+            "id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "delta": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "event"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "const": "tool_call"
+            },
+            "call_id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "summary": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "event"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "const": "tool_output"
+            },
+            "name": {
+              "type": "string"
+            },
+            "delta": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "event"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "const": "tool_result"
+            },
+            "call_id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "is_error": {
+              "type": "boolean"
+            },
+            "data": {}
+          },
+          "required": [
+            "event"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "const": "tool_timing"
+            },
+            "name": {
+              "type": "string"
+            },
+            "seconds": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "event"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "const": "notice"
+            },
+            "message": {
+              "type": "string"
+            },
+            "kind": {},
+            "lane": {
+              "enum": [
+                "context",
+                "divider",
+                "alert"
+              ]
+            },
+            "tokens": {}
+          },
+          "required": [
+            "event",
+            "message"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "const": "background"
+            },
+            "message": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "replace": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "event",
+            "message"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "const": "panel"
+            },
+            "title": {
+              "type": "string"
+            },
+            "markdown": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "event"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "const": "todo"
+            },
+            "tasks": {
+              "type": "array"
+            }
+          },
+          "required": [
+            "event"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "const": "model_progress"
+            },
+            "progress": {}
+          },
+          "required": [
+            "event"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "const": "context_usage"
+            },
+            "tokens": {
+              "type": "integer"
+            },
+            "estimated": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "event"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "const": "cached_usage"
+            },
+            "read_tokens": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "write_tokens": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "event"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "const": "usage"
+            },
+            "prompt_tokens": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "output_tokens": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "seconds": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "event"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "const": "efficiency"
+            },
+            "report": {}
+          },
+          "required": [
+            "event"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "const": "approval"
+            },
+            "approval_id": {
+              "type": "string"
+            },
+            "tool": {
+              "type": "string"
+            },
+            "summary": {
+              "type": "string"
+            },
+            "call_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "event",
+            "approval_id",
+            "tool",
+            "summary"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "const": "approval_resolved"
+            },
+            "approval_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "event",
+            "approval_id"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "const": "question"
+            },
+            "request": {
+              "type": "object"
+            },
+            "presentation_ack_required": {
+              "type": "boolean"
+            },
+            "capabilities": {
+              "type": "object"
+            }
+          },
+          "required": [
+            "event",
+            "request"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "const": "question_closed"
+            },
+            "question_id": {
+              "type": "string"
+            },
+            "generation": {
+              "type": "integer"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "outcome": {
+              "enum": [
+                "answered",
+                "chat",
+                "cancelled",
+                "disconnected",
+                "unsupported"
+              ]
+            }
+          },
+          "required": [
+            "event",
+            "question_id",
+            "outcome"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "const": "state_reset"
+            }
+          },
+          "required": [
+            "event"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "const": "state_node"
+            },
+            "node": {
+              "type": "object"
+            }
+          },
+          "required": [
+            "event",
+            "node"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "const": "state_delta"
+            },
+            "id": {
+              "type": "string"
+            },
+            "revision": {
+              "type": "integer"
+            },
+            "append": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "event",
+            "id",
+            "revision",
+            "append"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "const": "live_error"
+            },
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "event",
+            "message"
+          ],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "limits": {
+      "type": "object",
+      "properties": {
+        "max_request_bytes": {
+          "type": "integer"
+        },
+        "max_pending_steering": {
+          "type": "integer"
+        },
+        "max_seed_messages": {
+          "type": "integer"
+        },
+        "max_seed_message_bytes": {
+          "type": "integer"
+        },
+        "max_memory_command_bytes": {
+          "type": "integer"
+        },
+        "messages_page_default": {
+          "type": "integer"
+        },
+        "messages_page_max": {
+          "type": "integer"
+        },
+        "tool_result_event_bytes": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "max_request_bytes",
+        "max_pending_steering",
+        "max_seed_messages",
+        "max_seed_message_bytes",
+        "max_memory_command_bytes",
+        "messages_page_default",
+        "messages_page_max",
+        "tool_result_event_bytes"
+      ],
+      "additionalProperties": false
+    },
+    "question_correlation": {
+      "type": "object",
+      "properties": {
+        "question_id": {
+          "type": "string"
+        },
+        "generation": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "question_id",
+        "generation",
+        "session_id"
+      ]
+    },
+    "question_submission": {
+      "type": "object",
+      "properties": {
+        "question_id": {
+          "type": "string"
+        },
+        "generation": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "results": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "selectedOptions": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "customInput": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "note": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "customInputImages": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "noteImages": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "selectedOptions"
+            ]
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "question_id",
+        "generation",
+        "session_id",
+        "kind"
+      ]
+    }
+  }
+}

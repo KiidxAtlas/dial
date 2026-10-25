@@ -100,6 +100,7 @@ pub(super) fn command_argument_completions(
         ),
         ("theme", &["auto"]),
         ("export", &["--html"]),
+        ("tree", &["forks"]),
         ("profile", &["off"]),
     ] {
         candidates.extend(args.iter().map(|arg| format!("/{name} {arg}")));

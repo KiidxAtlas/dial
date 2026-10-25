@@ -380,6 +380,94 @@ fn ping_only_stream_expires_without_reply_progress() {
 }
 
 #[test]
+fn stalled_exchange_preserves_partial_callbacks_and_selects_sse_only_for_its_key() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let url = format!("http://{address}/responses");
+    let key = format!("stream-stall-{address}");
+    let socket_key = format!("{key}\0account\0m");
+    let server = std::thread::spawn(move || {
+        let mut socket = tungstenite::accept(listener.accept().unwrap().0).unwrap();
+        assert!(socket.read().unwrap().is_text());
+        socket
+            .send(Message::Text(
+                json!({"type":"response.output_text.delta", "delta":"started"})
+                    .to_string()
+                    .into(),
+            ))
+            .unwrap();
+        trickle_frame(socket, Arc::new(AtomicBool::new(false)), false);
+    });
+    let endpoint = super::super::responses::Endpoint {
+        url: &url,
+        token: "test",
+        account_id: Some("account"),
+        model: "m",
+        headers: &[],
+    };
+    let chat = Chat {
+        messages: vec![json!({"role":"user","content":"hello"})],
+        tools: vec![],
+        temperature: 0.0,
+        max_tokens: 64,
+        seed: None,
+    };
+    let _limit = super::super::cancel::TestIdleLimitScope::enter(Some(Duration::from_millis(250)));
+    let mut partial = String::new();
+    let error = exchange(
+        endpoint,
+        &chat,
+        1,
+        &mut Some(&mut |text| {
+            partial.push_str(text);
+            true
+        }),
+        Arc::new(AtomicBool::new(false)),
+        None,
+        None,
+        &mut |_| true,
+        &key,
+    )
+    .unwrap_err();
+    server.join().unwrap();
+    assert!(
+        error
+            .downcast_ref::<super::super::stream::StalledStream>()
+            .is_some(),
+        "{error:#}"
+    );
+    assert_eq!(
+        partial, "started",
+        "failed attempt must not replay callbacks"
+    );
+    assert!(!SESSIONS.lock().contains_key(&socket_key));
+    assert!(SSE_ONLY.lock().contains(&socket_key));
+    for other in [
+        format!("{key}-other\0account\0m"),
+        format!("{key}\0other-account\0m"),
+        format!("{key}\0account\0other-model"),
+    ] {
+        assert!(!SSE_ONLY.lock().contains(&other));
+    }
+    assert!(
+        exchange(
+            endpoint,
+            &chat,
+            1,
+            &mut Some(&mut |_| panic!("SSE selection must not emit text")),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            None,
+            &mut |_| panic!("SSE selection must not emit events"),
+            &key,
+        )
+        .unwrap()
+        .is_none()
+    );
+    SSE_ONLY.lock().remove(&socket_key);
+}
+
+#[test]
 fn cached_stream_detaches_old_flag_and_rebinds_active_cancellation() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();

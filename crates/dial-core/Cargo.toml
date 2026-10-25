@@ -26,3 +26,6 @@ windows-sys.workspace = true
 [features]
 # Test helpers used by other crates' tests (`#[cfg(test)]` items compiled only for this crate otherwise).
 test-support = []
+
+[lints]
+workspace = true

@@ -3,12 +3,12 @@
 use crate::agent::window::context;
 use crate::agent::{Agent, Ui};
 use crate::app::bridge::Bridge;
-use crate::app::command_registry::canonical_command;
+use crate::app::command_registry::{canonical_command, command_panel};
 use crate::app::core::App;
 use crate::app::display::{group_digits, short};
 use crate::app::drive::Step;
 use crate::app::notices::memory_status_text;
-use crate::app::overlay::{Which, work_panel};
+use crate::app::overlay::Which;
 use crate::app::selection::{PendingFavorite, cycle_set, next_favorite};
 use crate::app::shell::{PAINT_EVERY, Shell};
 use crate::config::selection::changes as selection_changes;
@@ -26,6 +26,74 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 impl Shell {
+    /// Favorites only need the saved settings and discovery snapshot. The active agent is optional:
+    /// a live switch saves now and is adopted through the existing end-of-turn settings boundary.
+    pub(super) fn model_command(
+        &mut self,
+        app: &App,
+        agent: Option<&mut Agent<'_>>,
+        args: &str,
+    ) -> Result<Step> {
+        match args {
+            "cancel" => {
+                self.pending_favorite = None;
+                self.note("Favorites", "Pending switch cancelled.");
+            }
+            "next" => {
+                self.pending_favorite = None;
+                let effective = self.settings_config(app).clone();
+                let favorites = cycle_set(&effective);
+                if favorites.is_empty() {
+                    self.note("Favorites", "No favorites saved. Use Ctrl-F in /models to save one.");
+                    return Ok(Step::Done);
+                }
+                let Some(discovery) = self.catalog.get() else {
+                    self.catalog.start(app);
+                    self.pending_favorite = Some(PendingFavorite {
+                        main: effective.selection(),
+                        favorites,
+                        scope: self.scope,
+                        catalog_request: self.catalog.request,
+                    });
+                    self.note("Favorites", "Discovering available models; the favorite switch will apply when ready. Esc or /model cancel cancels it.");
+                    return Ok(Step::Done);
+                };
+                let available = discovery.models.iter()
+                    .filter(|entry| entry.available && entry.supports_chat())
+                    .map(|entry| entry.selection.clone()).collect::<Vec<_>>();
+                match next_favorite(&effective, &favorites, &available) {
+                    Some(selection) => {
+                        let changes = selection_changes(&effective, &selection, "main")?;
+                        // Keep the explicit main-role persistence used by the idle command.
+                        let result = app.save_settings(self.scope, &changes, Some("main"))
+                            .and_then(|_| app.reload());
+                        match result {
+                            Ok(fresh) => {
+                                let step = if let Some(agent) = agent {
+                                    self.config_changed(app, agent, fresh)
+                                } else {
+                                    self.apply_display(app, &fresh);
+                                    self.adopt_after_turn(app, Step::Rebuild(Box::new(fresh)));
+                                    Step::Done
+                                };
+                                self.note("Favorites", format!("Switched to {}", selection.display_name()));
+                                return Ok(step);
+                            }
+                            Err(error) => self.note("Favorites", format!("not changed: {error:#}")),
+                        }
+                    }
+                    None => self.note("Favorites", if crate::cli::model_scope::is_active() {
+                        "No available models in the --models scope."
+                    } else {
+                        "No available chat favorites. Use Ctrl-F in /models to save one."
+                    }),
+                }
+            }
+            _ => self.note("Model", "Unknown option. Use /model, /model settings, /model defaults, /model local or /model memory."),
+        }
+        Ok(Step::Done)
+    }
+
     pub(in crate::app) fn command(
         &mut self,
         app: &App,
@@ -59,7 +127,7 @@ impl Shell {
         {
             return self.open(app, agent, Which::Choice(Box::new(spec)));
         }
-        if let Some(panel) = work_panel(name, args) {
+        if let Some(panel) = command_panel(name, args) {
             return self.open(app, agent, panel);
         }
         if let Some(result) = crate::app::commands::run(self, app, agent, name, args) {
@@ -121,6 +189,12 @@ impl Shell {
                 self.composer.set_busy(false);
                 self.status.activity.clear();
                 self.refresh_status(app, agent);
+                if crate::cli::watch::enabled(&app.layout, &self.session_id) {
+                    let body = match &result { Ok(report) => report.clone(), Err(error) => format!("{error:#}") };
+                    if let Err(error) = crate::cli::watch::append(&app.layout, &self.session_id, crate::cli::watch::Event::Text { title: "Review".into(), body }) {
+                        self.note("Live feed", format!("Could not record review: {error:#}"));
+                    }
+                }
                 match result { Ok(report) => self.note("Review", report), Err(error) => self.note("Review", format!("{error:#}")) }
             }
             "review-file" => self.review_checkpoints(agent, args),
@@ -132,102 +206,20 @@ impl Shell {
                     }
                 }
             }
-            "model" if args == "cancel" => {
-                self.pending_favorite = None;
-                self.note("Favorites", "Pending switch cancelled.");
-            }
-            "model" if args == "next" => {
-                self.pending_favorite = None;
-                let effective = &app.config;
-                let favorites = cycle_set(effective);
-                if favorites.is_empty() {
-                    self.note(
-                        "Favorites",
-                        "No favorites saved. Use Ctrl-F in /models to save one.",
-                    );
-                    return Ok(Step::Done);
-                }
-                let Some(discovery) = self.catalog.get() else {
-                    self.catalog.start(app);
-                    self.pending_favorite = Some(PendingFavorite {
-                        main: effective.selection(),
-                        favorites,
-                        scope: self.scope,
-                        catalog_request: self.catalog.request,
-                    });
-                    self.note(
-                        "Favorites",
-                        "Discovering available models; the favorite switch will apply when ready. Esc or /model cancel cancels it.",
-                    );
-                    return Ok(Step::Done);
-                };
-                let available = discovery
-                    .models
-                    .iter()
-                    .filter(|entry| {
-                        entry.available && entry.supports_chat()
-                    })
-                    .map(|entry| entry.selection.clone())
-                    .collect::<Vec<_>>();
-                match next_favorite(effective, &favorites, &available) {
-                    Some(selection) => {
-                        let changes = selection_changes(effective, &selection, "main")?;
-                        match app.save_settings(self.scope, &changes, Some("main"))
-                            .and_then(|_| app.reload())
-                            .map(|fresh| self.config_changed(app, agent, fresh)) {
-                            Ok(step) => {
-                                self.note(
-                                    "Favorites",
-                                    format!("Switched to {}", selection.display_name()),
-                                );
-                                return Ok(step);
-                            }
-                            Err(error) => self.note("Favorites", format!("not changed: {error:#}")),
-                        }
-                    }
-                    None => self.note(
-                        "Favorites",
-                        if crate::cli::model_scope::is_active() {
-                            "No available models in the --models scope."
-                        } else {
-                            "No available chat favorites. Use Ctrl-F in /models to save one."
-                        },
-                    ),
-                }
-            }
-            "model" if matches!(args, "settings" | "setting") => {
-                return self.open(app, agent, Which::ModelSettings);
-            }
-            "model" if args == "defaults" => {
-                return self.open(app, agent, Which::ContextDefaults);
-            }
-            "model" | "models" if args == "local" => {
-                return self.open(app, agent, Which::ModelDownloads);
-            }
-            "model" | "models" if args == "memory" => {
-                return self.open(app, agent, Which::ModelMemory);
-            }
+            "model" if matches!(args, "next" | "cancel") => return self.model_command(app, Some(agent), args),
             "model" if !args.is_empty() => {
                 self.note(
                     "Model",
                     "Unknown option. Use /model to choose a model, /model settings to tune it, /model defaults for shared context defaults, /model local for the Get models downloads in /models, or /model memory for the memory role's models.",
                 );
             }
-            "model" | "models" => return self.open(app, agent, Which::Models),
-            "roles" => return self.open(app, agent, Which::ModelRoles),
             "profile" => return self.profile_command(app, Some(agent), args),
-            "providers" | "provider" => return self.open(app, agent, Which::Providers),
-            "palette" => return self.open(app, agent, Which::Palette),
-            "settings" => return self.open(app, agent, Which::Settings),
-            "improve" if args == "settings" => return self.open(app, agent, Which::LearningSettings),
-            "improve" if args == "models" => return self.open(app, agent, Which::LearningModels),
-            "model-settings" => return self.open(app, agent, Which::ModelSettings),
             "hotkeys" => return self.open(app, agent, Which::Shortcuts),
             "accounts" => self.accounts_note(),
             "improve" => return self.improve_command(app, agent, args),
             "changes" => self.changes_note(&agent.layout().unwrap_or(&app.layout).project_root),
             "theme" => return self.theme_command(app, Some(agent), args),
-            "new" | "clear" => match agent.layout().context("agent has no project layout").and_then(|layout| {
+            "new" | "clear" => match agent.gate_session_change("session_before_switch", serde_json::json!({"reason":"new"})).map_err(anyhow::Error::msg).and_then(|()| agent.layout().context("agent has no project layout")).and_then(|layout| {
                 Session::create(
                     layout,
                     SessionMeta {
@@ -270,8 +262,21 @@ impl Shell {
             }
             "archive" => self.archive_note(app, args),
             "sessions" | "resume" | "tree" => {
-                match self.pick_session(agent, args, name == "tree", name == "resume") {
+                // `/tree forks` is the fork browser; its argument is a keyword, not a search.
+                if name == "tree" && args != "forks" {
+                    self.note("Tree", "Usage: /tree (this session's branches) or /tree forks (session forks).");
+                    return Ok(Step::Done);
+                }
+                let query = if name == "tree" { "" } else { args };
+                match self.pick_session(agent, query, name == "tree", name == "resume") {
                     Ok(Some(session)) => {
+                        if let Err(reason) = agent.gate_session_change(
+                            "session_before_switch",
+                            serde_json::json!({"reason":"resume","target_session_id":session.id()}),
+                        ) {
+                            self.note("Resume", reason);
+                            return Ok(Step::Done);
+                        }
                         self.show_session(&session);
                         agent.swap_session(session);
                         agent.set_plan_mode(false);
@@ -498,7 +503,7 @@ impl Shell {
                 Ok(value) => self.note("Jobs", value.to_string()),
                 Err(error) => self.note("Jobs", format!("{error:#}")),
             },
-            "fork" => match agent.layout().context("agent has no project layout").and_then(|layout| agent.session().fork(layout)) {
+            "fork" => match agent.gate_session_change("session_before_branch", serde_json::json!({"reason":"fork"})).map_err(anyhow::Error::msg).and_then(|()| agent.layout().context("agent has no project layout")).and_then(|layout| agent.session().fork(layout)) {
                 Ok(session) => {
                     let id = session.id().to_owned();
                     agent.swap_session(session);

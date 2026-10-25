@@ -588,7 +588,9 @@ impl Adapter {
             } else {
                 "agent_message_chunk"
             };
-            if let Some(text) = message["content"].as_str()
+            // A drafted user message replays as typed; `content` is the prompt the model saw.
+            if let Some(text) =
+                crate::storage::session::typed_text(message).or_else(|| message["content"].as_str())
                 && let Some(update) =
                     self.update(json!({"sessionUpdate":kind,"content":{"type":"text","text":text}}))
             {

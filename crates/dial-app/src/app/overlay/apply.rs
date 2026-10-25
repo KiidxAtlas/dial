@@ -105,10 +105,8 @@ impl OverlayEnv<'_> {
                     } else {
                         format!("{role} set to {}", selection.display_name())
                     };
-                    // Apple's on-device model lives in the OS; there is nothing to download or prepare.
-                    if config.selection_endpoint(&selection).is_none()
-                        && selection.provider != crate::llm::apple::PROVIDER
-                    {
+                    // OS models and Laya's typed service do not use chat-weight acquisition.
+                    if crate::config::selection::requires_local_preparation(&config, &selection) {
                         let model = selection.model.clone();
                         let python = config.python.clone();
                         let started =

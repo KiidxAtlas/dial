@@ -136,9 +136,12 @@ fn a_check_that_changes_its_own_inputs_cannot_supply_a_reuse_witness() {
     let config = incremental_config("echo x >> inputs/output");
     let mut agent = hermetic_agent(&config, root.path());
     agent.step_checks.mutations = 1;
-    assert!(!agent.check_tool(&json!({}), &mut NullUi).is_error);
-    assert!(!agent.check_tool(&json!({}), &mut NullUi).is_error);
-    assert_eq!(agent.verifications.len(), 2);
+    for _ in 0..2 {
+        let output = agent.check_tool(&json!({}), &mut NullUi);
+        assert!(output.is_error);
+        assert_eq!(output.data.unwrap()["results"][0]["status"], "unverified");
+    }
+    assert_eq!(agent.verifications, vec![false, false]);
     assert_eq!(
         std::fs::read_to_string(root.path().join("inputs/output")).unwrap(),
         "x\nx\n"

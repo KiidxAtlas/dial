@@ -44,11 +44,9 @@ pub(super) fn run(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &st
 /// Every operation except `scan` and `validate`, which run reviewer tasks on the agent. Bad input
 /// and usage requests also answer at once.
 pub(super) fn run_live(shell: &mut Shell, app: &App, args: &str) -> Option<Result<Step>> {
-    let reviewer = matches!(
-        command::parse(args),
-        Ok(Some(invocation)) if matches!(invocation.op, "scan" | "validate")
-    );
-    (!reviewer).then(|| report(shell, command::execute(&app.config, args, None)))
+    let live = crate::app::command_registry::during_turn("security", args)
+        == crate::app::command_registry::DuringTurn::Now;
+    live.then(|| report(shell, command::execute(&app.config, args, None)))
 }
 
 fn report(shell: &mut Shell, result: Result<String>) -> Result<Step> {

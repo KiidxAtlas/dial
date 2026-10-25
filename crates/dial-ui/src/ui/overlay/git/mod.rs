@@ -21,7 +21,7 @@ use crate::{
     },
 };
 use crossterm::event::{
-    Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use model::*;
 use ratatui::{Frame, widgets::Paragraph};
@@ -237,6 +237,16 @@ impl GitOverlay {
             Event::Paste(value) if self.editing => {
                 self.message
                     .push_str(&value.replace("\r\n", "\n").replace('\r', "\n"));
+                OverlayEvent::None
+            }
+            // Auto-repeat from a held key must never act on a destructive shortcut: the first
+            // press arms the discard confirmation and only a second deliberate press confirms it.
+            Event::Key(key)
+                if key.kind == KeyEventKind::Repeat
+                    && !self.editing
+                    && self.ai_prompt.is_none()
+                    && (key.code == KeyCode::Delete || plain_char(key) == Some('x')) =>
+            {
                 OverlayEvent::None
             }
             Event::Key(key) if pressed(key) => self.key(key, keys),
@@ -703,3 +713,6 @@ impl GitOverlay {
             })
     }
 }
+
+#[cfg(test)]
+mod tests;

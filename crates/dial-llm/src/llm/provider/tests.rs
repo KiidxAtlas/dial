@@ -2597,6 +2597,40 @@ fn request_profile_is_one_shot_and_error_restores_baseline() {
     assert!(remote.model_profile().unwrap().temperature.is_none());
 }
 
+#[test]
+fn request_controls_rearm_only_one_shot_settings() {
+    let mut remote = backend(endpoint("http://127.0.0.1:9"));
+    let profile = llm::profiles::ModelProfile {
+        temperature: Some(0.17),
+        ..Default::default()
+    };
+    let hints = llm::local_hints::LocalHints {
+        thinking: Some(false),
+        cache_slot: Some(3),
+        ..Default::default()
+    };
+    remote.next_request_profile(Some(profile));
+    remote.next_local_hints(hints.clone());
+    remote.next_reasoning_guard = Some(crate::config::types::ReasoningGuardConfig::default());
+    let controls = remote.request_controls();
+    // Dispatch consumes these; failed attempts must be explicitly re-armed by their caller.
+    assert_eq!(remote.next_profile.take().unwrap().temperature, Some(0.17));
+    assert_eq!(remote.next_local_hints.take(), Some(hints.clone()));
+    assert!(remote.next_reasoning_guard.take().is_some());
+    remote.restore_request_controls(&controls);
+    assert_eq!(remote.next_profile.take().unwrap().temperature, Some(0.17));
+    assert_eq!(remote.next_local_hints.take(), Some(hints));
+    assert!(remote.next_reasoning_guard.take().is_some());
+    assert!(remote.model_profile().is_none());
+    let empty = remote.request_controls();
+    remote.next_local_hints(llm::local_hints::LocalHints {
+        thinking: Some(true),
+        ..Default::default()
+    });
+    remote.restore_request_controls(&empty);
+    assert!(remote.next_local_hints.is_none());
+}
+
 #[cfg(unix)]
 #[test]
 fn thinking_controls_reach_only_the_owned_mlx_request_and_expire_after_use() {
@@ -2937,4 +2971,206 @@ fn disconnected_anthropic_start_retains_only_reported_usage() {
     assert_eq!(counts.failed_requests, 1);
     assert_eq!(counts.observed_cost_usd, None);
     assert_eq!(server.requests().len(), 1);
+}
+
+fn notices_of(remote: &mut Backend) -> (Result<Reply>, Vec<String>) {
+    let mut notices = Vec::new();
+    let result = remote.chat_with_control(
+        None,
+        &request(),
+        5,
+        None,
+        &mut |notice| notices.push(notice.to_owned()),
+        Arc::new(AtomicBool::new(false)),
+    );
+    (result, notices)
+}
+
+fn effort_profile() -> llm::profiles::ModelProfile {
+    llm::profiles::ModelProfile {
+        provider: "endpoint".into(),
+        model: "gpt-x".into(),
+        reasoning_effort: Some(llm::profiles::ReasoningEffort::High),
+        capabilities: llm::profiles::ModelCapabilities {
+            reasoning: llm::profiles::ReasoningApi::OpenaiEffort,
+            reasoning_efforts: vec![llm::profiles::ReasoningEffort::High],
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+#[test]
+fn a_400_rejecting_reasoning_effort_retries_once_without_it_and_is_remembered() {
+    let rejection = fake::json(
+        400,
+        &json!({"error": {"message": "Unsupported parameter: 'reasoning_effort' is not supported with this model."}}),
+    );
+    let server = fake::serve(vec![rejection, ok("one"), ok("two")]);
+    let mut remote =
+        backend(endpoint(&format!("{}/v1", server.url))).with_profile(effort_profile());
+    let (reply, notices) = notices_of(&mut remote);
+    assert_eq!(reply.unwrap().text, "one");
+    assert!(
+        notices.iter().any(|n| n.contains("reasoning parameter")),
+        "{notices:?}"
+    );
+    // A fresh backend for the same endpoint and model omits the parameter up front.
+    let mut again = backend(endpoint(&format!("{}/v1", server.url))).with_profile(effort_profile());
+    assert_eq!(again.chat(None, &request(), 5, None).unwrap().text, "two");
+    let bodies: Vec<_> = server
+        .requests()
+        .iter()
+        .map(|raw| fake::body(raw))
+        .collect();
+    assert_eq!(bodies[0]["reasoning_effort"], "high");
+    assert!(bodies[1].get("reasoning_effort").is_none(), "{}", bodies[1]);
+    assert!(bodies[2].get("reasoning_effort").is_none(), "{}", bodies[2]);
+}
+
+#[test]
+fn unrelated_400s_and_requests_without_reasoning_are_not_retried() {
+    let other = fake::json(
+        400,
+        &json!({"error": {"message": "Unsupported parameter: 'seed'"}}),
+    );
+    let server = fake::serve(vec![other]);
+    let mut remote =
+        backend(endpoint(&format!("{}/v1", server.url))).with_profile(effort_profile());
+    assert!(remote.chat(None, &request(), 5, None).is_err());
+    assert_eq!(server.requests().len(), 1);
+    let rejection = fake::json(
+        400,
+        &json!({"error": {"message": "unsupported parameter reasoning_effort"}}),
+    );
+    let server = fake::serve(vec![rejection]);
+    let mut remote = backend(endpoint(&format!("{}/v1", server.url)));
+    assert!(remote.chat(None, &request(), 5, None).is_err());
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[test]
+fn a_throttled_api_key_is_blocked_and_the_next_key_serves_with_affinity() {
+    // Unique variable names: the process environment is shared by every test.
+    let (first, second) = ("DIAL_TEST_POOL_KEY_A", "DIAL_TEST_POOL_KEY_B");
+    // SAFETY-free: the variables are unique to this test.
+    unsafe {
+        std::env::set_var(first, "pool-key-a");
+        std::env::set_var(second, "pool-key-b");
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let throttle = Script::HttpHeaders {
+        status: 429,
+        headers: vec![("Retry-After", "30".into())],
+        body: b"{\"error\":\"slow down\"}".to_vec(),
+    };
+    let server = fake::serve(vec![throttle, ok("via b"), ok("still b")]);
+    let base = format!("{}/v1", server.url);
+    let mut remote = backend(endpoint(&base))
+        .with_credential_source(dir.path(), &base, Some(first))
+        .with_key_pool([first.to_owned(), second.to_owned()]);
+    let (reply, notices) = notices_of(&mut remote);
+    assert_eq!(reply.unwrap().text, "via b");
+    assert!(
+        notices.iter().any(|n| n.contains("next configured key")),
+        "{notices:?}"
+    );
+    assert_eq!(
+        remote.chat(None, &request(), 5, None).unwrap().text,
+        "still b"
+    );
+    let seen = server.requests();
+    let auth = |i: usize| header(&seen[i], "authorization");
+    assert_eq!(auth(0).as_deref(), Some("Bearer pool-key-a"));
+    assert_eq!(auth(1).as_deref(), Some("Bearer pool-key-b"));
+    assert_eq!(auth(2).as_deref(), Some("Bearer pool-key-b"));
+    // A second backend in this process starts on the blocked key's successor.
+    let other = backend(endpoint(&base))
+        .with_credential_source(dir.path(), &base, Some(first))
+        .with_key_pool([first.to_owned(), second.to_owned()]);
+    let mut other = other;
+    other.settle_key_pool();
+    assert_eq!(
+        other.endpoint_api_key().unwrap().as_deref(),
+        Some("pool-key-b")
+    );
+}
+
+#[test]
+fn a_pool_with_every_other_key_unavailable_surfaces_the_ordinary_retry() {
+    let (only, missing) = ("DIAL_TEST_POOL_ONLY", "DIAL_TEST_POOL_UNSET");
+    // SAFETY-free: the variables are unique to this test.
+    unsafe {
+        std::env::set_var(only, "only-key");
+        std::env::remove_var(missing);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let throttle = Script::HttpHeaders {
+        status: 429,
+        headers: vec![("Retry-After", "0".into())],
+        body: b"{}".to_vec(),
+    };
+    let server = fake::serve(vec![throttle, ok("same key")]);
+    let base = format!("{}/v1", server.url);
+    let mut remote = backend(endpoint(&base))
+        .with_credential_source(dir.path(), &base, Some(only))
+        .with_key_pool([only.to_owned(), missing.to_owned()]);
+    let (reply, notices) = notices_of(&mut remote);
+    assert_eq!(reply.unwrap().text, "same key");
+    assert!(
+        notices.iter().all(|n| !n.contains("next configured key")),
+        "{notices:?}"
+    );
+    let seen = server.requests();
+    assert_eq!(
+        header(&seen[1], "authorization").as_deref(),
+        Some("Bearer only-key")
+    );
+}
+
+/// A masking backend sends placeholders, never the secret, and the tool call that comes back
+/// carries the real value again. A local route is never masked.
+#[test]
+fn secrets_are_masked_on_the_wire_and_restored_in_tool_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = crate::config::secrets::Config {
+        enabled: true,
+        env: false,
+        values: vec!["hunter2-hunter2".into()],
+    };
+    let placeholder = llm::secrets::Masker::from_config(&config, dir.path())
+        .unwrap()
+        .unwrap()
+        .placeholder("hunter2-hunter2");
+    let reply = json!({"choices": [{"finish_reason": "tool_calls", "message": {
+        "content": format!("using {placeholder}"),
+        "tool_calls": [{"id": "c1", "type": "function", "function": {
+            "name": "bash", "arguments": json!({"cmd": format!("login {placeholder}")}).to_string()}}]}}]});
+    let server = fake::serve(vec![fake::json(200, &reply)]);
+    let mut backend = backend(endpoint(&format!("{}/v1", server.url)))
+        .with_secrets(&config, dir.path())
+        .unwrap();
+    let mut chat = request();
+    chat.messages = vec![json!({"role":"user","content":"password is hunter2-hunter2"})];
+    let reply = backend.chat(None, &chat, 5, None).unwrap();
+    assert_eq!(reply.text, "using hunter2-hunter2");
+    assert_eq!(
+        reply.tool_calls[0].arguments["cmd"],
+        "login hunter2-hunter2"
+    );
+    let sent = String::from_utf8(server.requests().remove(0)).unwrap();
+    assert!(!sent.contains("hunter2-hunter2"), "{sent}");
+    assert!(sent.contains(&placeholder), "{sent}");
+    assert_eq!(chat.messages[0]["content"], "password is hunter2-hunter2");
+
+    let local = backend_for_local_route(&config, dir.path());
+    assert!(local.secrets.is_none());
+}
+
+fn backend_for_local_route(config: &crate::config::secrets::Config, dir: &Path) -> Backend {
+    backend(ProviderKind::Local {
+        model_dir: "/nonexistent/model".into(),
+    })
+    .with_secrets(config, dir)
+    .unwrap()
 }

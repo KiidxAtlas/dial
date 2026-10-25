@@ -877,3 +877,122 @@ fn sigint_cancellation_kills_shell_and_process_group_promptly() {
         );
     }
 }
+
+fn with_artifacts(minimize: bool) -> (tempfile::TempDir, Workspace, tempfile::TempDir) {
+    let (dir, ws) = workspace();
+    let artifacts = tempfile::tempdir().unwrap();
+    let store = crate::storage::artifact::ArtifactStore::new(artifacts.path()).unwrap();
+    let shell = crate::config::types::ShellConfig {
+        minimize_output: minimize,
+        ..Default::default()
+    };
+    let ws = ws
+        .without_sandbox()
+        .with_artifacts(store)
+        .with_shell_config(&shell);
+    (dir, ws, artifacts)
+}
+
+/// A fake `cargo` that prints build progress, so the filter is chosen by the command name alone.
+fn fake_cargo(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let script = "#!/bin/sh\nfor i in $(seq 1 80); do echo \"   Compiling crate$i v1.0.$i\"; done\necho 'warning: unused variable'\necho 'error: boom' >&2\nexit 101\n";
+    let path = dir.join("cargo");
+    fs::write(&path, script).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn minimized_output_keeps_status_diagnostics_and_a_raw_artifact() {
+    let (dir, ws, artifacts) = with_artifacts(true);
+    fake_cargo(dir.path());
+    let command = "PATH=.:$PATH cargo build";
+    let output = bash(&ws, command);
+    assert!(output.is_error, "{}", output.text);
+    assert!(
+        !output.text.contains("Compiling crate7 "),
+        "{}",
+        output.text
+    );
+    for kept in [
+        "warning: unused variable",
+        "error: boom",
+        "[exit code: 101]",
+        "[output filtered (cargo): ",
+    ] {
+        assert!(output.text.contains(kept), "{kept}: {}", output.text);
+    }
+    let uri = output
+        .text
+        .lines()
+        .find_map(|line| line.strip_prefix("[complete output: "))
+        .expect("raw output artifact")
+        .trim_end_matches(']');
+    let raw = fs::read_to_string(
+        artifacts
+            .path()
+            .join(uri.strip_prefix("artifact://").unwrap()),
+    )
+    .unwrap();
+    assert!(raw.contains("Compiling crate7 v1.0.7") && raw.contains("error: boom"));
+}
+
+#[cfg(unix)]
+#[test]
+fn minimizing_can_be_turned_off_and_needs_an_artifact() {
+    let (dir, ws, _artifacts) = with_artifacts(false);
+    fake_cargo(dir.path());
+    let output = bash(&ws, "PATH=.:$PATH cargo build");
+    assert!(
+        output.text.contains("Compiling crate7 v1.0.7"),
+        "{}",
+        output.text
+    );
+    assert!(!output.text.contains("[output filtered"));
+
+    // Without an artifact store the raw output would be lost, so nothing is filtered.
+    let (dir, ws) = workspace();
+    fake_cargo(dir.path());
+    let shell = crate::config::types::ShellConfig::default();
+    let ws = ws.without_sandbox().with_shell_config(&shell);
+    let output = bash(&ws, "PATH=.:$PATH cargo build");
+    assert!(
+        output.text.contains("Compiling crate7 v1.0.7"),
+        "{}",
+        output.text
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn compound_commands_are_not_minimized() {
+    let (dir, ws, _artifacts) = with_artifacts(true);
+    fake_cargo(dir.path());
+    let output = bash(&ws, "PATH=.:$PATH cargo build; true");
+    assert!(
+        output.text.contains("Compiling crate7 v1.0.7"),
+        "{}",
+        output.text
+    );
+}
+
+#[test]
+fn the_git_guard_refuses_before_anything_runs() {
+    let (dir, ws) = workspace();
+    let ws = ws.without_sandbox().with_shared_checkout(true);
+    fs::write(dir.path().join("keep.txt"), "x").unwrap();
+    let output = bash(&ws, "touch ran.txt && git clean -fd");
+    assert!(output.is_error);
+    assert!(output.text.contains("was not run"), "{}", output.text);
+    assert!(!dir.path().join("ran.txt").exists());
+    assert!(dir.path().join("keep.txt").exists());
+    assert_eq!(
+        crate::tools::ToolStatus::from_output(&output),
+        crate::tools::ToolStatus::Blocked
+    );
+    // Not a shared checkout: the default policy leaves the command alone.
+    let (_dir, plain) = workspace();
+    let output = bash(&plain.without_sandbox(), "git clean -fd");
+    assert!(!output.text.contains("was not run"), "{}", output.text);
+}

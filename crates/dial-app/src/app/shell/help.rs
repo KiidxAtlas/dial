@@ -1,8 +1,8 @@
 //! Help text and the queue of commands typed while a turn is busy.
 
-use crate::app::command_registry::{
-    RUNS_NOW, RUNS_NOW_ARGS, STOPS_TURN, canonical_command, command_entries,
-};
+#[cfg(test)]
+use crate::app::command_registry::{DuringTurn, during_turn};
+use crate::app::command_registry::{RUNS_NOW, RUNS_NOW_ARGS, STOPS_TURN, command_entries};
 use crate::app::shell::Shell;
 use crate::ui::composer::{CommandEntry, CommandKind};
 use crate::ui::keys::Action;
@@ -85,7 +85,11 @@ impl Shell {
         ));
         lines.push(row(
             &format!("/model or {}", self.keys.label(Action::ModelSelect)),
-            "opens now; the choice applies after the turn",
+            "all model panels open now; saved choices apply after the turn",
+        ));
+        lines.push(row(
+            "/model restart",
+            "unavailable while busy; never stops inference",
         ));
         lines.push(row("Anything else", "runs when the turn finishes"));
         // Commands, grouped the same way as the action palette. Advanced sections stay folded
@@ -150,6 +154,7 @@ impl Shell {
 
     /// Commands whose purpose is to end or replace what the running turn is doing, so typing one during a turn
     /// stops it. Every other command leaves the turn alone: it runs at once or right after the turn.
+    #[cfg(test)]
     pub(in crate::app) fn stops_turn(line: &str) -> bool {
         let name = line
             .trim()
@@ -157,7 +162,7 @@ impl Shell {
             .split_whitespace()
             .next()
             .unwrap_or("");
-        STOPS_TURN.contains(&canonical_command(name))
+        during_turn(name, "") == DuringTurn::Stop
     }
 
     pub(super) fn queue_command(&mut self, line: &str) {
