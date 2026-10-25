@@ -1653,6 +1653,17 @@ pub(in crate::agent) fn run(
     adapter: Option<&Path>,
     approver: &mut dyn Approver,
 ) -> Outcome {
+    // A background worker may outlive its parent's foreground turn. Its own guard
+    // keeps the machine awake until this worker returns, including on cancellation.
+    let _idle_sleep = match crate::platform::power::IdleSleepGuard::acquire() {
+        Ok(guard) => Some(guard),
+        Err(error) => {
+            approver.notice(&format!(
+                "Could not prevent automatic sleep during this worker: {error:#}"
+            ));
+            None
+        }
+    };
     // Role helpers inherit the actual worker account, not a mutable parent/default account.
     if let Err(error) = backend.require_session_identity() {
         return Outcome::failed(0, format!("{error:#}"));

@@ -96,6 +96,9 @@ pub struct McpLoad {
     pub instructions: Vec<(String, String)>,
     /// Sessions of connected servers, for `/mcp resources|prompts|notifications`.
     pub sessions: Vec<Arc<Session>>,
+    /// Servers that failed only because they answered HTTP 401 with an OAuth (Bearer) challenge:
+    /// `/mcp login <name>` can sign them in. Each also has a line in `notices`.
+    pub sign_in: Vec<String>,
 }
 
 impl McpLoad {
@@ -601,7 +604,15 @@ fn load_with(config: &Config, connect_timeout: Duration) -> McpLoad {
         };
         match outcome {
             Ok(connected) => add_tools(&mut loaded, &mut namer, server, connected),
-            Err(error) => loaded.notices.push(format!("mcp `{server}`: {error:#}")),
+            Err(error) => {
+                if error
+                    .downcast_ref::<http::AuthRequired>()
+                    .is_some_and(http::AuthRequired::oauth_sign_in)
+                {
+                    loaded.sign_in.push(server.clone());
+                }
+                loaded.notices.push(format!("mcp `{server}`: {error:#}"));
+            }
         }
     }
     loaded
@@ -821,6 +832,15 @@ fn open(
     match client.initialize(remaining(deadline), cancel) {
         Ok(()) => Ok((client, rx)),
         Err(error) => {
+            // The request thread reports refusals as text, so the typed error is rebuilt from the
+            // transport: installers and `/mcp` need to tell "sign in" apart from "broken".
+            if client.sign_in_offered() {
+                return Err(anyhow::Error::new(http::AuthRequired(
+                    name.to_owned(),
+                    401,
+                    true,
+                )));
+            }
             if error.downcast_ref::<http::AuthRequired>().is_some()
                 && client.auth_challenge().is_none()
             {

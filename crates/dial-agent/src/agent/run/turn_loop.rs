@@ -38,6 +38,21 @@ impl<'a> Agent<'a> {
         prepared: Option<Value>,
         origin: TurnOrigin,
     ) -> Result<TurnReport> {
+        // The turn owns the assertion, not the session: idle prompts must allow sleep.
+        // Hermetic evaluation must not change host power state.
+        let _idle_sleep = if self.hermetic {
+            None
+        } else {
+            match crate::platform::power::IdleSleepGuard::acquire() {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    ui.notice(&format!(
+                        "Could not prevent automatic sleep during this turn: {error:#}"
+                    ));
+                    None
+                }
+            }
+        };
         // Reset current-turn evidence before any admission step can fail. Historical receipts
         // remain separately labelled and must still pass freshness checks before reuse.
         self.step_checks = StepChecks::default();

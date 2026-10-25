@@ -92,6 +92,22 @@ fn filesystem_curated_candidate_appends_the_project_root() {
 }
 
 #[test]
+fn graphify_runs_its_local_server_in_the_project_root_without_root_arguments() {
+    let item = CURATED.iter().find(|c| c.id == "graphify").unwrap();
+    let candidate = curated_candidate(item, Path::new("/u"), Path::new("/work"));
+    let server = candidate.server(&BTreeMap::new()).unwrap();
+    assert_eq!(server.program, PathBuf::from("uvx"));
+    assert_eq!(server.args, ["--from", "graphifyy[mcp]", "graphify-mcp"]);
+    assert_eq!(server.cwd, Some(PathBuf::from("/work")));
+    assert!(server.url.is_none() && candidate.inputs.is_empty());
+
+    let filesystem = CURATED.iter().find(|c| c.id == "filesystem").unwrap();
+    let candidate = curated_candidate(filesystem, Path::new("/u"), Path::new("/work"));
+    let server = candidate.server(&BTreeMap::new()).unwrap();
+    assert_eq!(server.cwd, None);
+}
+
+#[test]
 fn config_names_never_contain_dots_or_slashes() {
     assert_eq!(config_name("memory"), "memory");
     assert_eq!(
@@ -190,6 +206,29 @@ fn listings_running_the_same_package_fold_but_bridges_do_not() {
         merged[0].sources,
         vec![Source::Official, Source::Npm, Source::Curated]
     );
+}
+
+#[test]
+fn pypi_extras_name_the_same_package() {
+    let curated = running(
+        candidate("graphify", Source::Curated, vec![]),
+        "uvx",
+        &["--from", "graphifyy[mcp]", "graphify-mcp"],
+    );
+    let github = running(
+        candidate("github:Graphify-Labs/graphify", Source::Github, vec![]),
+        "uvx",
+        &["--from", "graphifyy==0.9.95", "graphify-mcp"],
+    );
+    let other = running(
+        candidate("other", Source::Npm, vec![]),
+        "uvx",
+        &["--from", "graphifyy-tools[mcp]", "graphify-mcp"],
+    );
+    let merged = merge(vec![curated, github, other]);
+    let names: Vec<&str> = merged.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["graphify", "other"]);
+    assert_eq!(merged[0].sources, vec![Source::Curated, Source::Github]);
 }
 
 #[test]

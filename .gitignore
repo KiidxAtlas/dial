@@ -10,6 +10,7 @@
 /.cargo-work/
 /.tmp/
 /.codegraph
+/graphify-out/
 /bin/
 .venv/
 *.pyc

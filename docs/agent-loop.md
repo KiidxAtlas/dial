@@ -1,5 +1,24 @@
 # Agent loop and context maintenance
 
+## Automatic sleep prevention
+
+Dial automatically requests idle-system-sleep prevention while a foreground agent turn or
+delegated worker is running. Each turn/worker owns its own request, so a background worker
+can keep the machine awake after the foreground turn ends. Requests are released on completion,
+error, cancellation, or process exit; leaving Dial open at an idle prompt does not keep it awake.
+An active turn includes tool execution and waits for approvals or answers within that turn.
+
+This does not change saved power settings, inhibit display dimming or screen locking, or request
+that manual sleep be blocked. OS policy, lid closure and critical-battery behavior still apply.
+macOS uses an IOKit idle-system-sleep assertion, Windows uses a system-required power request,
+and Linux uses systemd-logind's idle inhibitor. Linux requires a reachable system bus and logind
+permission; environments whose desktop power manager does not honor logind idle inhibitors may
+still sleep. If acquisition fails, Dial reports a notice and continues the work without claiming
+sleep protection. Hermetic evaluations do not request host power changes. Standalone commands
+outside agent turns and background servers left running after a turn are not covered.
+
+## Context maintenance
+
 The agent re-evaluates context pressure at request boundaries using the larger of the serialized-request estimate and the calibrated provider-token estimate. Successful compaction returns to the loop and the replacement request is measured again; it is not limited to one proactive compaction per user turn. Failed attempts are associated with the unchanged request snapshot so the same dead end is not retried until history changes.
 
 Failed blocking compaction applies the same growth-based retry floor to speculative launches, so

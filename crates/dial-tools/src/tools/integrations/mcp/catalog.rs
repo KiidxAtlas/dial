@@ -13,6 +13,18 @@ use anyhow::{Result, anyhow, bail};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
+/// How a curated server is pointed at the project.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectRoot {
+    /// The server does not use the project.
+    Unused,
+    /// The project root is appended as the last argument (filesystem and git servers).
+    LastArg,
+    /// The server runs with the project root as its working directory and finds its own files
+    /// there (Graphify reads `graphify-out/graph.json`).
+    WorkingDir,
+}
+
 /// A built-in MCP server. It runs through `runtime`, which must be on PATH.
 pub struct Curated {
     pub id: &'static str,
@@ -21,8 +33,7 @@ pub struct Curated {
     /// Runtime that must be on PATH; also the program that runs the server.
     pub runtime: &'static str,
     pub args: &'static [&'static str],
-    /// Whether the project root is appended as the last argument (filesystem and git servers).
-    pub takes_root: bool,
+    pub project: ProjectRoot,
     /// Tools the server exposes, for the details pane.
     pub tools: &'static str,
     /// Environment variables the server reads: `(name, description, required)`.
@@ -39,7 +50,7 @@ pub const CURATED: &[Curated] = &[
         summary: "official Nuxt documentation, modules, blog posts and deployment guides",
         runtime: "npx",
         args: &["-y", "mcp-remote", "https://nuxt.com/mcp"],
-        takes_root: false,
+        project: ProjectRoot::Unused,
         tools: "list-documentation-pages, get-documentation-page, list-modules, get-module and more",
         env: &[],
     },
@@ -49,7 +60,7 @@ pub const CURATED: &[Curated] = &[
         summary: "persistent knowledge graph across sessions",
         runtime: "npx",
         args: &["-y", "@modelcontextprotocol/server-memory"],
-        takes_root: false,
+        project: ProjectRoot::Unused,
         tools: "create_entities, create_relations, search_nodes, read_graph",
         env: &[],
     },
@@ -59,7 +70,7 @@ pub const CURATED: &[Curated] = &[
         summary: "read and write files under the project root",
         runtime: "npx",
         args: &["-y", "@modelcontextprotocol/server-filesystem"],
-        takes_root: true,
+        project: ProjectRoot::LastArg,
         tools: "read_file, write_file, list_directory, search_files",
         env: &[],
     },
@@ -69,7 +80,7 @@ pub const CURATED: &[Curated] = &[
         summary: "structured step-by-step reasoning tool",
         runtime: "npx",
         args: &["-y", "@modelcontextprotocol/server-sequential-thinking"],
-        takes_root: false,
+        project: ProjectRoot::Unused,
         tools: "sequentialthinking",
         env: &[],
     },
@@ -79,7 +90,7 @@ pub const CURATED: &[Curated] = &[
         summary: "download web pages as markdown",
         runtime: "uvx",
         args: &["mcp-server-fetch"],
-        takes_root: false,
+        project: ProjectRoot::Unused,
         tools: "fetch",
         env: &[],
     },
@@ -89,7 +100,7 @@ pub const CURATED: &[Curated] = &[
         summary: "current time and timezone conversion",
         runtime: "uvx",
         args: &["mcp-server-time"],
-        takes_root: false,
+        project: ProjectRoot::Unused,
         tools: "get_current_time, convert_time",
         env: &[],
     },
@@ -99,7 +110,7 @@ pub const CURATED: &[Curated] = &[
         summary: "reference server that exercises every MCP feature (for testing Dial)",
         runtime: "npx",
         args: &["-y", "@modelcontextprotocol/server-everything"],
-        takes_root: false,
+        project: ProjectRoot::Unused,
         tools: "echo, add, longRunningOperation, getTinyImage and more",
         env: &[],
     },
@@ -109,8 +120,21 @@ pub const CURATED: &[Curated] = &[
         summary: "read history, diffs and status of the project's git repository",
         runtime: "uvx",
         args: &["mcp-server-git", "--repository"],
-        takes_root: true,
+        project: ProjectRoot::LastArg,
         tools: "git_status, git_diff, git_log, git_add, git_commit and more",
+        env: &[],
+    },
+    // Local stdio server from the graphifyy PyPI package (`mcp` extra):
+    // https://github.com/Graphify-Labs/graphify. It starts without a graph and loads
+    // graphify-out/graph.json (or $GRAPHIFY_OUT) from its working directory on each call.
+    Curated {
+        id: "graphify",
+        title: "Graphify",
+        summary: "query a local code knowledge graph (build it first: graphify extract . --code-only)",
+        runtime: "uvx",
+        args: &["--from", "graphifyy[mcp]", "graphify-mcp"],
+        project: ProjectRoot::WorkingDir,
+        tools: "query_graph, get_node, get_neighbors, shortest_path, god_nodes and more",
         env: &[],
     },
     Curated {
@@ -119,7 +143,7 @@ pub const CURATED: &[Curated] = &[
         summary: "drive a real browser: navigate, click, type and screenshot",
         runtime: "npx",
         args: &["-y", "@playwright/mcp@latest"],
-        takes_root: false,
+        project: ProjectRoot::Unused,
         tools: "browser_navigate, browser_click, browser_snapshot, browser_take_screenshot",
         env: &[],
     },
@@ -129,7 +153,7 @@ pub const CURATED: &[Curated] = &[
         summary: "current library documentation and code examples",
         runtime: "npx",
         args: &["-y", "@upstash/context7-mcp"],
-        takes_root: false,
+        project: ProjectRoot::Unused,
         tools: "resolve-library-id, get-library-docs",
         env: &[],
     },
@@ -139,7 +163,7 @@ pub const CURATED: &[Curated] = &[
         summary: "headless Chrome: navigate, screenshot and run scripts (archived upstream)",
         runtime: "npx",
         args: &["-y", "@modelcontextprotocol/server-puppeteer"],
-        takes_root: false,
+        project: ProjectRoot::Unused,
         tools: "puppeteer_navigate, puppeteer_screenshot, puppeteer_click, puppeteer_evaluate",
         env: &[],
     },
@@ -156,7 +180,7 @@ pub const CURATED: &[Curated] = &[
             "GITHUB_PERSONAL_ACCESS_TOKEN",
             "ghcr.io/github/github-mcp-server",
         ],
-        takes_root: false,
+        project: ProjectRoot::Unused,
         tools: "search_code, issue_read, create_pull_request, get_file_contents and more",
         env: &[(
             "GITHUB_PERSONAL_ACCESS_TOKEN",
@@ -170,7 +194,7 @@ pub const CURATED: &[Curated] = &[
         summary: "search and edit Notion pages and databases (needs an integration token)",
         runtime: "npx",
         args: &["-y", "@notionhq/notion-mcp-server"],
-        takes_root: false,
+        project: ProjectRoot::Unused,
         tools: "API-post-search, API-retrieve-a-page, API-patch-block-children and more",
         env: &[(
             "OPENAPI_MCP_HEADERS",
@@ -184,7 +208,7 @@ pub const CURATED: &[Curated] = &[
         summary: "web and local search through the Brave Search API (needs a key; archived upstream)",
         runtime: "npx",
         args: &["-y", "@modelcontextprotocol/server-brave-search"],
-        takes_root: false,
+        project: ProjectRoot::Unused,
         tools: "brave_web_search, brave_local_search",
         env: &[("BRAVE_API_KEY", "Brave Search API key", true)],
     },
@@ -194,7 +218,7 @@ pub const CURATED: &[Curated] = &[
         summary: "read channels and post messages (needs a bot token; archived upstream)",
         runtime: "npx",
         args: &["-y", "@modelcontextprotocol/server-slack"],
-        takes_root: false,
+        project: ProjectRoot::Unused,
         tools: "slack_list_channels, slack_post_message, slack_get_channel_history",
         env: &[
             ("SLACK_BOT_TOKEN", "Slack bot token (xoxb-...)", true),
@@ -207,7 +231,7 @@ pub const CURATED: &[Curated] = &[
         summary: "projects, merge requests and issues (needs a token; archived upstream)",
         runtime: "npx",
         args: &["-y", "@modelcontextprotocol/server-gitlab"],
-        takes_root: false,
+        project: ProjectRoot::Unused,
         tools: "create_merge_request, list_issues, get_file_contents and more",
         env: &[
             (
@@ -450,12 +474,31 @@ pub fn on_path(program: &str) -> bool {
         .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
 }
 
-/// Starts `server` once and counts its tools. `Err(why)` when it lists none or fails to start.
+/// Why a health check found no tools.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckFailure {
+    /// The server answered HTTP 401 with an OAuth (Bearer) challenge. It is reachable and only
+    /// needs `/mcp login <name>`, which requires a config entry, so installers save it anyway.
+    SignIn(String),
+    /// Anything else: the server did not start, did not answer, or listed no tools.
+    Failed(String),
+}
+
+impl std::fmt::Display for CheckFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SignIn(why) | Self::Failed(why) => f.write_str(why),
+        }
+    }
+}
+
+/// Starts `server` once and counts its tools. `Err` when it lists none or fails to start;
+/// [`CheckFailure::SignIn`] when it only lacks an OAuth sign-in.
 pub fn check(
     config: &Config,
     name: &str,
     server: &McpServerConfig,
-) -> std::result::Result<usize, String> {
+) -> std::result::Result<usize, CheckFailure> {
     // An explicit health check tests disabled entries without enabling them in saved config.
     let mut server = server.clone();
     server.enabled = true;
@@ -463,11 +506,16 @@ pub fn check(
     let load = super::connect_extra(&specs, config);
     let count = load.tools.len();
     if count == 0 {
-        return Err(load
+        let why = load
             .notices
             .first()
             .cloned()
-            .unwrap_or_else(|| "the server listed no tools".into()));
+            .unwrap_or_else(|| "the server listed no tools".into());
+        return Err(if load.sign_in.iter().any(|signed| signed == name) {
+            CheckFailure::SignIn(why)
+        } else {
+            CheckFailure::Failed(why)
+        });
     }
     Ok(count)
 }
@@ -477,13 +525,14 @@ pub fn check(
 /// The candidate for a curated entry. Its install is ready; required env entries are inputs.
 pub fn curated_candidate(item: &Curated, user_dir: &Path, project_root: &Path) -> Candidate {
     let mut args: Vec<String> = item.args.iter().map(|s| s.to_string()).collect();
-    if item.takes_root {
+    if item.project == ProjectRoot::LastArg {
         args.push(project_root.display().to_string());
     }
     let server = McpServerConfig {
         program: PathBuf::from(item.runtime),
         args,
         env: cache_env(user_dir),
+        cwd: (item.project == ProjectRoot::WorkingDir).then(|| project_root.to_path_buf()),
         enabled: true,
         ..Default::default()
     };
@@ -543,15 +592,16 @@ pub fn dedupe_key(name: &str) -> String {
 }
 
 /// The package a stdio install runs as a whole (`npx -y <pkg>[@v]`, `npx -y --package=<pkg> <cmd>`,
-/// `uvx [--from <pkg>==v] <cmd>`), so listings that run the same package fold together. Installs
-/// with further arguments (a bridge to a URL, a project root) are not a package identity.
+/// `uvx [--from <pkg>[extras]==v] <cmd>`), so listings that run the same package fold together.
+/// Installs with further arguments (a bridge to a URL, a project root) are not a package identity.
 fn package_key(server: &McpServerConfig) -> Option<String> {
     let args: Vec<&str> = server.args.iter().map(String::as_str).collect();
     let program = server.program.to_str()?;
     let (kind, package) = match (program, args.as_slice()) {
         ("npx", ["-y", spec]) => ("npm", unversioned(spec)),
         ("npx", ["-y", spec, _]) => ("npm", unversioned(spec.strip_prefix("--package=")?)),
-        ("uvx", ["--from", spec, _]) => ("pypi", spec.split("==").next()?),
+        // Extras (`graphifyy[mcp]`) select optional dependencies of the same package.
+        ("uvx", ["--from", spec, _]) => ("pypi", spec.split(['=', '[']).next()?),
         ("uvx", [package]) if !package.starts_with('-') => ("pypi", *package),
         _ => return None,
     };

@@ -1,7 +1,8 @@
 //! Data and install work behind `/extensions`. The overlay in `ui::overlay::extensions` only shows
 //! rows and emits intents; this module builds the rows, plans installs and runs them on a worker
 //! thread. Config changes come back as [`Change`]s and are saved on the main thread by [`poll`],
-//! and only after the install and its health check succeed.
+//! and only after the install and its health check succeed, or when the check shows the server
+//! only lacks an OAuth sign-in (the entry is saved so `/mcp login <name>` can complete it).
 use crate::agent::Agent;
 use crate::app::{App, Shell};
 use crate::config::Config;
@@ -11,7 +12,7 @@ use crate::config::types::McpServerConfig;
 use crate::storage::skills::packages;
 use crate::storage::skills::packages::registry::Entry as SkillEntry;
 use crate::tools::integrations::mcp::catalog::{
-    self, CURATED, Candidate, Endpoints, Install, Source,
+    self, CURATED, Candidate, CheckFailure, Endpoints, Install, Source,
 };
 use crate::tools::integrations::mcp::{foreign, smithery};
 use crate::tools::integrations::plugin::installer::PluginStore;
@@ -211,6 +212,9 @@ fn mcp_rows(config: &Config, home: Option<&Path>) -> Vec<Row> {
             format!("runs: {} {}", item.runtime, item.args.join(" ")),
             format!("needs: {} on PATH", item.runtime),
         ];
+        if item.project == catalog::ProjectRoot::WorkingDir {
+            details.push(format!("runs in: {}", config.project_root.display()));
+        }
         details.extend(credential_details);
         details.push(format!(
             "installs to: {}",
@@ -856,7 +860,9 @@ fn say(progress: &SharedProgress, line: impl Into<String>) {
 }
 
 /// Installs a curated, official-registry, npm or GitHub server. Missing required values reopen the
-/// form first; a server that starts and lists tools is saved, anything else saves nothing.
+/// form first; a server that starts and lists tools is saved, and so is a remote server that only
+/// asks for an OAuth sign-in (the result directs the user to `/mcp login`). Anything else saves
+/// nothing.
 fn install_mcp(
     endpoints: &Endpoints,
     config: &Config,
@@ -910,8 +916,30 @@ fn install_mcp(
                 changes: vec![smithery::config_change(&local, &server)?],
             })
         }
+        Err(CheckFailure::SignIn(_)) => sign_in_saved(&local, &server, progress),
         Err(why) => Ok(failed(format!("health check failed, nothing saved: {why}"))),
     }
+}
+
+/// The server is reachable and answered with an OAuth challenge. `/mcp login` needs a config
+/// entry, so the entry is saved and the user is directed to sign in; Dial never signs in for them.
+fn sign_in_saved(
+    local: &str,
+    server: &McpServerConfig,
+    progress: &SharedProgress,
+) -> Result<Outcome> {
+    say(progress, "the server asks for an OAuth sign-in");
+    Ok(Outcome {
+        ok: true,
+        message: sign_in_message(local),
+        changes: vec![smithery::config_change(local, server)?],
+    })
+}
+
+fn sign_in_message(local: &str) -> String {
+    format!(
+        "Saved `{local}`; it needs a sign-in before it lists tools. Run `/mcp login {local}` and finish in your browser, then `/mcp reconnect` to connect it."
+    )
 }
 
 /// The form that asks for a candidate's values. Secret values are masked as they are typed.
@@ -950,6 +978,11 @@ fn test_mcp(config: &Config, id: &str, progress: &SharedProgress) -> Result<Outc
             message: format!("`{id}` connected with {count} tool(s)"),
             changes: Vec::new(),
         },
+        Err(CheckFailure::SignIn(why)) => Outcome {
+            ok: false,
+            message: format!("`{id}` needs a sign-in ({why})"),
+            changes: Vec::new(),
+        },
         Err(why) => Outcome {
             ok: false,
             message: format!("`{id}` failed: {why}"),
@@ -963,7 +996,7 @@ fn health_check(
     config: &Config,
     name: &str,
     server: &McpServerConfig,
-) -> Result<std::result::Result<usize, String>> {
+) -> Result<std::result::Result<usize, CheckFailure>> {
     Ok(catalog::check(config, name, server))
 }
 
@@ -1045,6 +1078,7 @@ fn smithery_deploy(
             message: format!("Connected, {count} tools. Saved as `{local}`."),
             changes: vec![smithery::config_change(&local, &server)?],
         }),
+        Err(CheckFailure::SignIn(_)) => sign_in_saved(&local, &server, progress),
         Err(why) => Ok(failed(format!(
             "Nothing was saved: could not connect ({why}). Check the settings, then run /extensions and install again."
         ))),
@@ -1292,6 +1326,18 @@ fn import_mcp(
                 progress,
                 format!("health check passed with {count} tool(s)"),
             ),
+            Err(CheckFailure::SignIn(_)) => {
+                say(progress, "the server asks for an OAuth sign-in");
+                return Ok(Outcome {
+                    ok: true,
+                    message: format!(
+                        "Imported `{id}` from {}. {}",
+                        found.provider,
+                        sign_in_message(id)
+                    ),
+                    changes: vec![smithery::config_change(id, &server)?],
+                });
+            }
             Err(why) => {
                 return Ok(failed(format!("health check failed, nothing saved: {why}")));
             }

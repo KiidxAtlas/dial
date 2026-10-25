@@ -82,8 +82,24 @@ fn is_timeout(error: &std::io::Error) -> bool {
 }
 
 /// The server wants authorization dial does not have (HTTP 401/403 without static credentials).
+/// The flag is set for an HTTP 401 whose `WWW-Authenticate` challenge offers the Bearer scheme:
+/// the OAuth sign-in (`/mcp login`) can obtain a grant for it.
 #[derive(Debug)]
-pub struct AuthRequired(pub String, pub u16);
+pub struct AuthRequired(pub String, pub u16, pub bool);
+
+impl AuthRequired {
+    /// Whether `/mcp login` can sign this server in.
+    pub fn oauth_sign_in(&self) -> bool {
+        self.2
+    }
+}
+
+/// Whether a `WWW-Authenticate` value offers the Bearer scheme (case-insensitive, any position).
+fn offers_bearer(challenge: &str) -> bool {
+    challenge
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .any(|token| token.eq_ignore_ascii_case("bearer"))
+}
 
 impl std::fmt::Display for AuthRequired {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -118,6 +134,8 @@ pub(super) struct Auth {
     fixed: bool,
     oauth: Option<Arc<TokenSource>>,
     challenge: Mutex<Option<String>>,
+    /// The last refusal was an HTTP 401 offering the Bearer scheme ([`AuthRequired::oauth_sign_in`]).
+    sign_in: AtomicBool,
 }
 
 impl Auth {
@@ -145,6 +163,7 @@ impl Auth {
             fixed,
             oauth: if fixed { None } else { oauth },
             challenge: Mutex::default(),
+            sign_in: AtomicBool::new(false),
         })
     }
 
@@ -177,7 +196,9 @@ impl Auth {
         }
         *self.challenge.lock().unwrap_or_else(|e| e.into_inner()) =
             Some(challenge.unwrap_or("").to_owned());
-        anyhow::Error::new(AuthRequired(self.server.clone(), status))
+        let oauth = status == 401 && challenge.is_some_and(offers_bearer);
+        self.sign_in.store(oauth, Ordering::Release);
+        anyhow::Error::new(AuthRequired(self.server.clone(), status, oauth))
     }
 
     /// After a 401 that carried `stale`: refresh the grant unless another request already did.
@@ -192,6 +213,10 @@ impl Auth {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    pub(super) fn sign_in_offered(&self) -> bool {
+        self.sign_in.load(Ordering::Acquire)
     }
 }
 
@@ -679,6 +704,10 @@ impl Remote for Http {
 
     fn auth_challenge(&self) -> Option<String> {
         self.auth.challenge()
+    }
+
+    fn sign_in_offered(&self) -> bool {
+        self.auth.sign_in_offered()
     }
 
     fn shutdown(&self) {

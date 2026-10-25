@@ -2,6 +2,7 @@ use crate::config::tools::mcp::validate_url;
 
 use super::*;
 use serde_json::json;
+use std::collections::BTreeMap;
 
 #[test]
 fn sse_events_join_data_lines_and_skip_noise() {
@@ -185,6 +186,34 @@ fn authorization_errors_preserve_the_http_status() {
         assert_eq!(error.downcast_ref::<AuthRequired>().unwrap().1, status);
         assert!(error.to_string().contains(&format!("HTTP {status}")));
     }
+}
+
+#[test]
+fn only_a_401_bearer_challenge_offers_an_oauth_sign_in() {
+    let auth = Auth::new("test", &McpServerConfig::default(), None).unwrap();
+    for (status, challenge, oauth) in [
+        (
+            401,
+            Some("Bearer resource_metadata=\"https://x/.well-known\""),
+            true,
+        ),
+        (401, Some("Basic realm=\"x\", bearer"), true),
+        (401, Some("Basic realm=\"x\""), false),
+        (401, None, false),
+        (403, Some("Bearer error=\"insufficient_scope\""), false),
+    ] {
+        let error = auth.refused(status, challenge);
+        let required = error.downcast_ref::<AuthRequired>().unwrap();
+        assert_eq!(required.oauth_sign_in(), oauth, "{status} {challenge:?}");
+    }
+    // Static credentials that are refused are wrong, not missing: no sign-in is offered.
+    let fixed = McpServerConfig {
+        headers: BTreeMap::from([("Authorization".into(), "Bearer static".into())]),
+        ..Default::default()
+    };
+    let auth = Auth::new("test", &fixed, None).unwrap();
+    let error = auth.refused(401, Some("Bearer"));
+    assert!(error.downcast_ref::<AuthRequired>().is_none());
 }
 
 #[test]

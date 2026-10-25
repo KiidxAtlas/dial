@@ -1,8 +1,9 @@
 //! MCP inventory and discovery for the agent. `list` reports what is configured and connected
 //! (configuration presence is not evidence of a live connection). `search` reads the official MCP
 //! registry, Smithery and the curated list. `install` adds one server to the global config after a
-//! health check, and needs the user's approval (see [`Tool::needs_approval`]).
-use super::catalog::{self, Endpoints, Input};
+//! health check, and needs the user's approval (see [`Tool::needs_approval`]). A server that only
+//! lacks an OAuth sign-in is saved too, and the result asks the user to run `/mcp login`.
+use super::catalog::{self, CheckFailure, Endpoints, Input};
 use super::smithery;
 use super::{McpLoad, Session};
 use crate::config::paths::Layout;
@@ -134,12 +135,18 @@ fn search(config: &Config, query: &str) -> ToolOutput {
 }
 
 /// Approval-gated install: resolve, refuse anything that needs values, start once to check, save.
+/// A server that answers with an OAuth challenge is saved so `/mcp login` can sign it in.
 fn install(config: &Config, id: &str) -> ToolOutput {
+    install_at(&Endpoints::live(), config, id)
+}
+
+/// [`install`] against explicit listing endpoints (tests serve them from a loopback fixture).
+fn install_at(endpoints: &Endpoints, config: &Config, id: &str) -> ToolOutput {
     let id = id.trim();
     if id.is_empty() {
         return ToolOutput::err("install needs `id`: use the id of a search result");
     }
-    let candidate = match catalog::resolve(&Endpoints::live(), config, id) {
+    let candidate = match catalog::resolve(endpoints, config, id) {
         Ok(candidate) => candidate,
         Err(error) => return ToolOutput::err(format!("{error:#}")),
     };
@@ -175,12 +182,20 @@ fn install(config: &Config, id: &str) -> ToolOutput {
             server.program.display()
         ));
     }
-    let tools = match catalog::check(config, &local, &server) {
-        Ok(count) => count,
-        Err(why) => return ToolOutput::err(format!("health check failed, nothing saved: {why}")),
-    };
-    match save(config, &local, &server) {
-        Ok(()) => ToolOutput::structured(json!({
+    let checked = catalog::check(config, &local, &server);
+    if let Err(CheckFailure::Failed(why)) = &checked {
+        return ToolOutput::err(format!("health check failed, nothing saved: {why}"));
+    }
+    if let Err(error) = save(config, &local, &server) {
+        let passed = if checked.is_ok() {
+            "health check passed"
+        } else {
+            "the server asked for an OAuth sign-in"
+        };
+        return ToolOutput::err(format!("{passed}, but saving the config failed: {error:#}"));
+    }
+    match checked {
+        Ok(tools) => ToolOutput::structured(json!({
             "status": "installed",
             "name": local,
             "tools": tools,
@@ -188,9 +203,13 @@ fn install(config: &Config, id: &str) -> ToolOutput {
                 "Installed `{local}` with {tools} tool(s) in the global config. It takes effect when Dial starts its next session; /mcp shows its status."
             ),
         })),
-        Err(error) => ToolOutput::err(format!(
-            "health check passed, but saving the config failed: {error:#}"
-        )),
+        Err(_) => ToolOutput::structured(json!({
+            "status": "needs_sign_in",
+            "name": local,
+            "message": format!(
+                "Saved `{local}` in the global config. It requires an OAuth sign-in before it lists tools, which only the user can complete. Ask the user to run `/mcp login {local}` and finish the sign-in in their browser, then `/mcp reconnect` to connect it; /mcp shows its status."
+            ),
+        })),
     }
 }
 
@@ -210,7 +229,7 @@ impl Tool for Inventory {
     fn schema(&self) -> Value {
         json!({"type":"function","function":{
             "name":self.name(),
-            "description":"Inspect and find MCP servers. action `list` (default): configured servers with runtime connection status (connected, disconnected, failed or disabled), negotiated capabilities and registered tool names; starts nothing. action `search` with optional `query`: find servers in the official MCP registry, Smithery, npm, GitHub and the curated list (read-only). action `install` with `id` from a search result: needs the user's approval, starts the server once to check it, then saves it to the global config; it takes effect in the next session. Servers that need environment values are not installed; the result names them for the user to enter in /extensions. Discover exact listed tools with tool_search or tool_load to use them next round.",
+            "description":"Inspect and find MCP servers. action `list` (default): configured servers with runtime connection status (connected, disconnected, failed or disabled), negotiated capabilities and registered tool names; starts nothing. action `search` with optional `query`: find servers in the official MCP registry, Smithery, npm, GitHub and the curated list (read-only). action `install` with `id` from a search result: needs the user's approval, starts the server once to check it, then saves it to the global config; it takes effect in the next session. A remote server that asks for an OAuth sign-in is saved with status needs_sign_in: the user completes it with `/mcp login <name>`. Servers that need environment values are not installed; the result names them for the user to enter in /extensions. Discover exact listed tools with tool_search or tool_load to use them next round.",
             "parameters":{"type":"object","properties":{
                 "action":{"type":"string","enum":["list","search","install"]},
                 "query":{"type":"string","description":"Search text for action search; empty lists the catalog"},

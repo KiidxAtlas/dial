@@ -321,17 +321,34 @@ of them to appear in remote search. `i` installs; installation always asks for c
 The curated list includes the [official Nuxt MCP server](https://nuxt.com/docs/4.x/guide/ai/mcp),
 available as `nuxt` even without registry access. It uses Nuxt's documented stdio bridge,
 `npx -y mcp-remote https://nuxt.com/mcp` (Node.js/npm required).
+It also includes `graphify`, the local MCP server of [Graphify](https://github.com/Graphify-Labs/graphify),
+which answers questions about a code knowledge graph: `query_graph`, `get_node`, `get_neighbors`,
+`shortest_path`, `god_nodes` and more. It runs `uvx --from graphifyy[mcp] graphify-mcp` (uv required)
+with the project root as its working directory, needs no account or key, and reads
+`graphify-out/graph.json` there (or under `$GRAPHIFY_OUT`). Build or refresh the graph in the project
+first, for example `uvx --from graphifyy graphify extract . --code-only` (a local tree-sitter pass;
+nothing leaves the machine), and consider adding `graphify-out/` to `.gitignore`. The server starts
+without a graph and loads the file on each call, so a rebuilt graph is picked up without a
+reconnect. The hosted `https://api.graphify.com/mcp` endpoint is a different server that needs a
+Graphify Cloud account and `/mcp login`.
 Required environment values are requested in a masked
 form and saved in that server's `[mcp.<name>]` entry (`env`); Dial never guesses them. Servers that
 need a header or a templated URL are not installed from here: the details pane names what to add by
-hand. Each install starts the server once and saves nothing unless it starts and lists tools. npm
+hand. Each install starts the server once and saves nothing unless it starts and lists tools, with
+one exception: a remote server that answers HTTP 401 with an OAuth (`WWW-Authenticate: Bearer`)
+challenge is reachable but needs your account, so its `[mcp.<name>]` entry is saved and Dial tells
+you to run `/mcp login <name>`; after the browser sign-in, `/mcp reconnect` connects it (`/mcp test
+<name>` checks it). Dial never starts that sign-in by itself. A 401 without an OAuth challenge, a 403, or a
+server configured with its own `Authorization` header or `bearer_env` still saves nothing. Imports
+from other tools and Smithery installs follow the same rule. npm
 and PyPI packages are pinned to the version the registry lists; `npx`, `uvx` or `docker` must be on
 PATH. Config names are the last segment of the listing name (`io.github.acme/notes` → `notes`).
 
 The agent has the same reach through `mcp_servers`: `list` (default), `search` with optional
 `query` (reads listings only, downloads and starts nothing) and `install` with `id` from a search
 result (`npm:<package>` and `github:<owner>/<repo>` ids resolve as above). Only `install` needs approval. It returns `needs_input` with the variable names when values
-are required, and the user enters them in `/extensions`. An installed server takes effect in the
+are required, and the user enters them in `/extensions`. It returns `needs_sign_in` after saving a
+server that asks for an OAuth sign-in; the user then runs `/mcp login <name>`. An installed server takes effect in the
 next session; `/mcp` shows its status. Smithery servers still install through their settings form
 (`/extensions` → `i`, or `/mcp smithery-install`). Archived upstream packages (Brave, Slack,
 GitLab, Puppeteer) are listed with that note because they still install.

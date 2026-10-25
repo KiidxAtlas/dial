@@ -20,6 +20,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(target_os = "macos")]
+mod idle_sleep;
 mod length_recovery;
 mod turn_admission;
 

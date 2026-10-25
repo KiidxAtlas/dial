@@ -42,6 +42,7 @@ pub mod process;
 
 pub mod atomic;
 pub mod interrupt;
+pub mod power;
 pub mod process_record;
 pub mod procinfo;
 /// Event-driven waits: pipe readiness, child exit, and cancellation wakeups.

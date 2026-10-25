@@ -5,6 +5,16 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 
 ## [Unreleased]
 
+### Added
+
+- Automatically prevent idle system sleep during active agent turns and delegated workers, releasing each request when its work ends. Uses native macOS/Windows power requests and a Linux logind idle inhibitor without changing saved settings or inhibiting screen locking; unavailable protection is reported rather than failing the turn (`docs/agent-loop.md`).
+
+- Graphify is a curated MCP server in `/extensions` and `mcp_servers`: `graphify` runs the local `graphify-mcp` stdio server from the `graphifyy[mcp]` PyPI package through `uvx`, in the project root, so it serves that project's `graphify-out/graph.json` with no account or key (`docs/extensibility.md`). Curated servers can now run in the project root instead of receiving it as an argument, and PyPI installs that differ only in extras (`graphifyy[mcp]` and `graphifyy==<version>`) fold into one catalog row.
+
+### Fixed
+
+- Installing a remote MCP server that requires an OAuth sign-in (HTTP 401 with a `WWW-Authenticate: Bearer` challenge, for example Graphify) no longer fails with "health check failed, nothing saved" and a `/mcp login` hint that could not work without a config entry. `/extensions` (install, import and Smithery) and the agent's `mcp_servers install` now save the `[mcp.<name>]` entry and direct the user to `/mcp login <name>`; the agent tool reports `needs_sign_in`. Other failures, including a 401 without an OAuth challenge, a 403 or refused static credentials, still save nothing.
+
 ## [0.2.0] - 2026-10-25
 
 ### Added

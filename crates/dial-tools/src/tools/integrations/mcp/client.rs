@@ -314,6 +314,10 @@ pub(super) trait Remote: Send + Sync {
     fn auth_challenge(&self) -> Option<String> {
         None
     }
+    /// Whether the last refusal was an HTTP 401 with an OAuth (Bearer) challenge.
+    fn sign_in_offered(&self) -> bool {
+        false
+    }
     fn shutdown(&self) {}
 }
 
@@ -518,6 +522,15 @@ impl Client {
         match &self.transport {
             Transport::Remote(remote) => remote.auth_challenge(),
             Transport::Stdio { .. } => None,
+        }
+    }
+
+    /// Whether the server refused with an HTTP 401 that `/mcp login` can answer. The request
+    /// thread reports failures as text, so this is read from the transport, not the error.
+    pub fn sign_in_offered(&self) -> bool {
+        match &self.transport {
+            Transport::Remote(remote) => remote.sign_in_offered(),
+            Transport::Stdio { .. } => false,
         }
     }
 

@@ -376,3 +376,121 @@ fn curated_servers_that_need_values_open_a_form_before_anything_starts() {
     .expect("runs");
     assert!(!missing.ok && missing.changes.is_empty());
 }
+
+/// An MCP endpoint that refuses every request with HTTP 401 and `challenge` (none when empty).
+fn refusing_endpoint(challenge: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let Ok(clone) = stream.try_clone() else {
+                continue;
+            };
+            let mut reader = BufReader::new(clone);
+            let mut length = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let _ = reader.read_exact(&mut vec![0; length]);
+            let extra = if challenge.is_empty() {
+                String::new()
+            } else {
+                format!("WWW-Authenticate: {challenge}\r\n")
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 401 Unauthorized\r\n{extra}Content-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+        }
+    });
+    format!("http://{addr}/mcp")
+}
+
+/// An official registry listing one remote server, `io.github.acme/notes`, at `remote`.
+fn official_listing(remote: String) -> String {
+    serve(Arc::new(move |_: &str, target: &str| {
+        if target.starts_with("/servers?") {
+            let listing = json!({
+                "servers": [{
+                    "server": {
+                        "name": "io.github.acme/notes",
+                        "title": "Notes",
+                        "description": "Notes over MCP",
+                        "version": "1.0.0",
+                        "remotes": [{"type": "streamable-http", "url": remote}],
+                    },
+                    "_meta": {"io.modelcontextprotocol.registry/official": {"status": "active", "isLatest": true}},
+                }],
+                "metadata": {},
+            });
+            (200, listing.to_string())
+        } else {
+            (404, "{}".to_owned())
+        }
+    }))
+}
+
+#[test]
+fn servers_that_ask_for_an_oauth_sign_in_are_saved_and_point_to_mcp_login() {
+    use crate::config::settings_store::{load_config, save_config};
+    let project = tempfile::tempdir().expect("tempdir");
+    let user = tempfile::tempdir().expect("tempdir");
+    let layout = Layout::with_user_dir(project.path(), user.path().to_path_buf()).expect("layout");
+    let config = load_config(&layout, &toml::Table::new()).expect("config");
+    let remote = refusing_endpoint("Bearer resource_metadata=\"http://127.0.0.1/.well-known/x\"");
+    let endpoints = Endpoints::at(&official_listing(remote.clone()));
+    let intent = Intent::InstallCuratedMcp {
+        id: "io.github.acme/notes".into(),
+    };
+    let progress = SharedProgress::default();
+    let outcome = run_at(&endpoints, &layout, &config, &intent, &progress).expect("runs");
+    assert!(outcome.ok, "{}", outcome.message);
+    assert!(
+        outcome.message.contains("/mcp login notes"),
+        "{}",
+        outcome.message
+    );
+    assert_eq!(outcome.changes.len(), 1);
+    let scope = intent_scope(&layout, &intent, Scope::Global).expect("scope");
+    finish(
+        Finished {
+            ok: outcome.ok,
+            message: outcome.message,
+            changes: outcome.changes,
+            scope,
+            progress,
+        },
+        |changes, scope| save_config(&layout, scope, changes).map(|_| ()),
+    );
+    let saved = load_config(&layout, &toml::Table::new()).expect("saved config");
+    assert_eq!(saved.mcp["notes"].url.as_deref(), Some(remote.as_str()));
+    assert!(saved.mcp["notes"].enabled);
+}
+
+#[test]
+fn servers_refusing_without_an_oauth_challenge_still_save_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = Config {
+        user_dir: dir.path().into(),
+        project_root: dir.path().into(),
+        ..Default::default()
+    };
+    let endpoints = Endpoints::at(&official_listing(refusing_endpoint("")));
+    let progress = SharedProgress::default();
+    let out = install_mcp(
+        &endpoints,
+        &config,
+        "io.github.acme/notes",
+        &BTreeMap::new(),
+        &progress,
+    )
+    .expect("runs");
+    assert!(!out.ok && out.changes.is_empty());
+    assert!(out.message.contains("nothing saved"), "{}", out.message);
+}

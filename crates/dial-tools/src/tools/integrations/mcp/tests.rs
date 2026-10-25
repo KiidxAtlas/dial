@@ -579,6 +579,14 @@ fn server_environment_drops_inherited_credentials_but_keeps_explicit_entries() {
 
 /// A minimal streamable-HTTP MCP server: JSON for `initialize`, SSE for `tools/list`, 202 for notifications.
 fn http_server(token: &'static str) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    http_server_with(token, "")
+}
+
+/// [`http_server`] whose 401 replies carry `challenge` as `WWW-Authenticate` (none when empty).
+pub(super) fn http_server_with(
+    token: &'static str,
+    challenge: &'static str,
+) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
     use std::io::{BufRead, BufReader, Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!(
@@ -632,7 +640,12 @@ fn http_server(token: &'static str) -> (String, Arc<std::sync::Mutex<Vec<String>
                 let _ = stream.write_all(body.as_bytes());
             };
             if auth != format!("Bearer {token}") {
-                respond("401 Unauthorized", "text/plain", "", "no".into());
+                let extra = if challenge.is_empty() {
+                    String::new()
+                } else {
+                    format!("WWW-Authenticate: {challenge}\r\n")
+                };
+                respond("401 Unauthorized", "text/plain", &extra, "no".into());
                 continue;
             }
             let id = message["id"].clone();
@@ -687,6 +700,54 @@ fn temporary_http_connection_uses_oauth_grant_from_custom_user_directory() {
         log.iter()
             .all(|line| line.contains("|Bearer custom-user-grant|"))
     );
+}
+
+#[test]
+fn health_check_tells_an_oauth_challenge_apart_from_a_broken_server() {
+    let user = tempfile::tempdir().unwrap();
+    let config = Config {
+        user_dir: user.path().to_path_buf(),
+        ..Default::default()
+    };
+    let remote = |url: String| McpServerConfig {
+        url: Some(url),
+        program: Default::default(),
+        ..Default::default()
+    };
+    let (url, _) = http_server_with(
+        "granted",
+        "Bearer resource_metadata=\"http://127.0.0.1/.well-known/oauth-protected-resource/mcp\"",
+    );
+    let server = remote(url);
+    let failure = catalog::check(&config, "remote", &server).unwrap_err();
+    assert!(
+        matches!(&failure, catalog::CheckFailure::SignIn(why) if why.contains("/mcp login remote")),
+        "{failure:?}"
+    );
+    // A completed `/mcp login` stores a grant; the same entry then connects and lists its tools.
+    crate::config::settings_store::write_private(
+        &user.path().join("mcp-oauth-remote.json"),
+        serde_json::to_vec(&json!({"access": "granted", "expires_at_ms": u64::MAX}))
+            .unwrap()
+            .as_slice(),
+    )
+    .unwrap();
+    assert_eq!(catalog::check(&config, "remote", &server).unwrap(), 1);
+
+    // A 401 without an OAuth challenge, or a server that cannot start, is a plain failure.
+    let (plain, _) = http_server("granted");
+    assert!(matches!(
+        catalog::check(&config, "plain", &remote(plain)),
+        Err(catalog::CheckFailure::Failed(_))
+    ));
+    let missing = McpServerConfig {
+        program: "/nonexistent/dial-mcp-server".into(),
+        ..Default::default()
+    };
+    assert!(matches!(
+        catalog::check(&config, "missing", &missing),
+        Err(catalog::CheckFailure::Failed(_))
+    ));
 }
 
 #[test]
