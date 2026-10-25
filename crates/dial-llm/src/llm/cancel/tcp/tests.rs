@@ -97,15 +97,19 @@ fn a_write_to_a_reading_peer_sends_every_byte_exactly_once() {
 #[test]
 fn an_interrupt_stops_a_blocked_write_without_replaying_sent_bytes() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    // Bound both buffers rather than relying on platform defaults (Windows can buffer the
+    // entire request). Set the receive window before the handshake so it starts out small.
+    SockRef::from(&listener).set_recv_buffer_size(4096).unwrap();
     let addr = listener.local_addr().unwrap();
     let stream = TcpStream::connect(addr).unwrap();
-    // The peer never reads during the write, so a large request blocks on full socket buffers.
+    SockRef::from(&stream).set_send_buffer_size(4096).unwrap();
+    // The peer never reads during the write, so the request blocks on the bounded buffers.
     let (mut peer, _) = listener.accept().unwrap();
     let interrupt = Arc::new(AtomicBool::new(false));
     let size = 64 << 20;
     let mut sender = transport(stream, &interrupt, size);
     let flag = Arc::clone(&interrupt);
-    std::thread::spawn(move || {
+    let interrupter = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(200));
         flag.store(true, std::sync::atomic::Ordering::SeqCst);
     });
@@ -113,6 +117,7 @@ fn an_interrupt_stops_a_blocked_write_without_replaying_sent_bytes() {
     let error = sender
         .transmit_output(size, next(Duration::from_secs(60)))
         .unwrap_err();
+    interrupter.join().unwrap();
     assert!(matches!(error, ureq::Error::Other(_)), "{error:?}");
     assert!(
         started.elapsed() < Duration::from_secs(5),
@@ -121,6 +126,10 @@ fn an_interrupt_stops_a_blocked_write_without_replaying_sent_bytes() {
     drop(sender);
     let mut received = Vec::new();
     peer.read_to_end(&mut received).unwrap();
+    assert!(
+        !received.is_empty(),
+        "the write made progress before cancellation"
+    );
     assert!(received.len() < size);
     assert!(pattern_prefix(&received), "sent bytes are an exact prefix");
 }

@@ -304,3 +304,23 @@ fn built_in_python_reuses_without_input_declarations_and_tracks_external_edits()
     assert!(!agent.run_checks(&checks, &mut NullUi).failures.is_empty());
     assert_eq!(agent.verifications.len(), before_break + 1);
 }
+
+#[cfg(unix)]
+#[test]
+fn built_in_python_without_a_runtime_snapshot_executes_without_reuse() {
+    // A loader variable deliberately makes the automatic runtime contract unknown. Keep it in a
+    // child process so parallel tests never observe a modified process environment. This is also
+    // the setup-python CI case (LD_LIBRARY_PATH), without depending on a particular installation.
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "agent::verify::check_tool::tests::incremental::built_in_python_reuses_without_input_declarations_and_tracks_external_edits", "--nocapture"])
+        .env("LD_DIAL_TEST_UNKNOWN_RUNTIME", "1")
+        .env_remove("DYLD_FALLBACK_LIBRARY_PATH")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

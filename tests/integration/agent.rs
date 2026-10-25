@@ -7972,10 +7972,13 @@ fn working_state_and_read_evidence_survive_compaction_without_mutation_loss() {
             json!({"path":"evidence.txt","content":"new evidence\n"}),
         ),
         Reply::Call("read", json!({"path":"evidence.txt"})),
-        // Enough compressible history to offset the irreducible exact state/constraint carry.
+        // Distinct details survive repetition detection and provide enough removable history
+        // to offset exact state/evidence carry even with long runner-dependent paths.
         Reply::Say(format!(
             "first done {}",
-            "historical read details ".repeat(100)
+            (0..400)
+                .map(|i| format!("Historical observation {i}: value {}. ", i * 17))
+                .collect::<String>()
         )),
         Reply::Text("second done"),
         Reply::Text("third done"),
@@ -7997,6 +8000,14 @@ fn working_state_and_read_evidence_survive_compaction_without_mutation_loss() {
             .as_str()
             .is_some_and(|s| s.contains("old evidence"))
     }));
+    assert!(
+        a.session().messages().iter().any(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|s| s.contains("Historical observation 399:"))
+        }),
+        "the compressible history must survive response repetition detection"
+    );
     a.turn("second goal", &mut ui).unwrap();
     a.turn("third goal", &mut ui).unwrap();
     a.compact(&mut ui).unwrap();

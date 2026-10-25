@@ -38,6 +38,8 @@ impl<'a> Agent<'a> {
             }
             return self.capture_check_inputs_when_idle(|| {
                 verify::inputs::capture(&self.workspace, contract)
+                    .map(Some)
+                    .ok_or(())
             });
         }
         let python = if self.config.python.is_file() {
@@ -54,13 +56,20 @@ impl<'a> Agent<'a> {
             return Ok(None);
         };
         self.capture_check_inputs_when_idle(|| {
-            verify::inputs::python_snapshot(&self.workspace, &source, &python)
+            // Automatic inputs are an optional reuse optimization, not an operator contract.
+            // Unknown runtimes still execute normally; a snapshot appearing/disappearing across
+            // the run remains stale because the caller compares both captures.
+            Ok(verify::inputs::python_snapshot(
+                &self.workspace,
+                &source,
+                &python,
+            ))
         })
     }
 
     fn capture_check_inputs_when_idle(
         &self,
-        capture: impl FnOnce() -> Option<verify::inputs::Snapshot>,
+        capture: impl FnOnce() -> Result<Option<verify::inputs::Snapshot>, ()>,
     ) -> Result<Option<verify::inputs::Snapshot>, ()> {
         if self.plan_mode || !self.awaited_background_jobs().is_empty() {
             return Err(());
@@ -74,7 +83,7 @@ impl<'a> Agent<'a> {
         {
             return Err(());
         }
-        capture().map(Some).ok_or(())
+        capture()
     }
 
     fn check_inputs(
