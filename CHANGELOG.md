@@ -5,6 +5,8 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-25
+
 ### Added
 
 - Bounded retrieval work: parallel grep reserves read budgets before dispatch, reuses matched source snapshots, and rebuilds capped-page coverage without rerunning content search. Codebase context reuses its current bounded freshness snapshot instead of hashing selected sources twice; missing observations remain unchecked. Added resource-budget, paging, stale-witness and freshness regressions, plus an eleven-harness comparison and staged improvement plan in `docs/audits/competitor-analysis.md`.
