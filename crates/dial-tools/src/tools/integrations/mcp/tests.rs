@@ -95,6 +95,51 @@ fn temporary_connections_preserve_project_and_oauth_identity() {
     assert!(!config.mcp.contains_key("temporary"));
 }
 
+/// A relative `cwd` runs a stdio server in the project root, not in Dial's working directory
+/// (they differ under `-C`). The wrapper only starts the real server when it sees the marker that
+/// exists in the project root alone.
+#[cfg(unix)]
+#[test]
+fn relative_stdio_cwd_resolves_against_the_project_root() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("project-marker"), "").unwrap();
+    assert!(
+        !std::env::current_dir()
+            .unwrap()
+            .join("project-marker")
+            .exists()
+    );
+    let fake = fake_config("", 30);
+    let mut args = vec![
+        "-c".to_owned(),
+        r#"test -f project-marker || exit 3; exec "$0" "$@""#.to_owned(),
+        fake.program.display().to_string(),
+    ];
+    args.extend(fake.args.iter().cloned());
+    let wrapped = |cwd: Option<&str>| McpServerConfig {
+        program: PathBuf::from("/bin/sh"),
+        args: args.clone(),
+        cwd: cwd.map(PathBuf::from),
+        ..fake.clone()
+    };
+    let config = Config {
+        project_root: root.path().to_path_buf(),
+        ..Default::default()
+    };
+
+    let specs = BTreeMap::from([("relative".into(), wrapped(Some(".")))]);
+    let loaded = connect_extra(&specs, &config);
+    assert!(loaded.notices.is_empty(), "{:?}", loaded.notices);
+    assert!(!loaded.tools.is_empty());
+
+    let specs = BTreeMap::from([("unset".into(), wrapped(None))]);
+    let loaded = connect_extra(&specs, &config);
+    assert!(
+        loaded.tools.is_empty(),
+        "without cwd the server runs in Dial's directory"
+    );
+}
+
 #[test]
 fn explicit_health_check_connects_disabled_server_without_enabling_it() {
     let mut server = fake_config("", 30);

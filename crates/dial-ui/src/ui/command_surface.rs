@@ -169,7 +169,7 @@ pub fn category(name: &str) -> Category {
         | "dirs" | "trace" => Category::Context,
         "extensions" | "mcp" | "plugins" | "marketplace" | "reload-plugins" | "tools"
         | "computer" | "ssh" | "git" | "wt" | "security" | "collab" | "join" | "leave" | "hub"
-        | "relay" | "hooks" | "login" | "logout" => Category::Integrations,
+        | "relay" | "hooks" | "login" | "logout" | "graphify" => Category::Integrations,
         "gc" | "anonymize" | "images" | "update" | "benchmark" | "schedule" | "stats" => {
             Category::Maintenance
         }

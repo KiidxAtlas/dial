@@ -784,7 +784,8 @@ pub struct McpServerConfig {
     pub headers: BTreeMap<String, String>,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
-    /// Working directory for stdio servers; defaults to dial's own.
+    /// Working directory for stdio servers; defaults to dial's own. A relative path resolves
+    /// against the project root, so `"."` runs the server in whichever project Dial opened.
     pub cwd: Option<PathBuf>,
     /// Per request timeout; 0 waits until the server answers or the call is cancelled (Esc).
     pub timeout_secs: u64,

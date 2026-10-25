@@ -24,6 +24,7 @@ mod config_cmds;
 pub(crate) use config_cmds::UsageStatus;
 mod extensions;
 pub(crate) mod extensions_browser;
+mod graphify;
 pub(crate) mod maintenance;
 mod modes;
 mod peers;
@@ -48,6 +49,7 @@ pub(super) fn specs() -> impl Iterator<Item = &'static CommandSpec> {
         .iter()
         .chain(advanced::COMMANDS)
         .chain(extensions::COMMANDS)
+        .chain(graphify::COMMANDS)
         .chain(config_cmds::COMMANDS)
         .chain(setup::COMMANDS)
         .chain(commit::COMMANDS)
@@ -120,6 +122,7 @@ pub(super) fn run_live(
         .or_else(|| collab::run_live(shell, app, name, args))
         .or_else(|| smithery::run_live(shell, app, name, args))
         .or_else(|| extensions::run_live(shell, app, name, args))
+        .or_else(|| graphify::run_live(shell, app, name, args))
         .or_else(|| config_cmds::run_live(shell, app, name, args))
         .or_else(|| session::run_live(shell, app, name, args))
         .or_else(|| setup::run_live(shell, app, name, args))

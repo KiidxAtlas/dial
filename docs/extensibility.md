@@ -324,7 +324,8 @@ available as `nuxt` even without registry access. It uses Nuxt's documented stdi
 It also includes `graphify`, the local MCP server of [Graphify](https://github.com/Graphify-Labs/graphify),
 which answers questions about a code knowledge graph: `query_graph`, `get_node`, `get_neighbors`,
 `shortest_path`, `god_nodes` and more. It runs `uvx --from graphifyy[mcp] graphify-mcp` (uv required)
-with the project root as its working directory, needs no account or key, and reads
+with `cwd = "."`, which resolves against the project root of each session (also under `-C`), so
+one installed entry serves every project's own graph. It needs no account or key and reads
 `graphify-out/graph.json` there (or under `$GRAPHIFY_OUT`). Build or refresh the graph in the project
 first, for example `uvx --from graphifyy graphify extract . --code-only` (a local tree-sitter pass;
 nothing leaves the machine), and consider adding `graphify-out/` to `.gitignore`. The server starts

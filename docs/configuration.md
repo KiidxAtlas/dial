@@ -192,6 +192,7 @@ extensions = ["rs"]
 program = "npx"
 args = ["-y", "@modelcontextprotocol/server-everything"]
 timeout_secs = 0
+cwd = "."                                            # optional; relative paths resolve against the project root
 
 [dap.python]                 # approved local DAP adapter process
 program = "/workspace/bin/python-debug-adapter"

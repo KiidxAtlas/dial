@@ -213,7 +213,7 @@ fn mcp_rows(config: &Config, home: Option<&Path>) -> Vec<Row> {
             format!("needs: {} on PATH", item.runtime),
         ];
         if item.project == catalog::ProjectRoot::WorkingDir {
-            details.push(format!("runs in: {}", config.project_root.display()));
+            details.push("runs in: the project root of each session (cwd = \".\")".to_owned());
         }
         details.extend(credential_details);
         details.push(format!(

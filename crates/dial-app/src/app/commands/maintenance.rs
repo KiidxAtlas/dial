@@ -13,7 +13,9 @@ use super::extensions::spawn_job_streaming;
 use crate::agent::Agent;
 use crate::app::{App, Shell, Step};
 use anyhow::{Context, Result, bail};
+use std::ffi::OsString;
 use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -456,8 +458,7 @@ fn benchmark(shell: &mut Shell, app: &App, args: &str) -> Result<()> {
     spawn_dial(shell, app, "Benchmark", argv, None)
 }
 
-/// Run `dial ARGS` from the project directory as a background job. Output lines stream into the
-/// transcript under `label`; the job's cancellation kills the child process.
+/// Run `dial ARGS` from the project directory as a background job (see [`spawn_process`]).
 fn spawn_dial(
     shell: &mut Shell,
     app: &App,
@@ -466,19 +467,52 @@ fn spawn_dial(
     after_success: Option<&'static str>,
 ) -> Result<()> {
     let exe = std::env::current_exe().context("locating the dial executable")?;
-    let project = app.layout.project_root.clone();
     let shown = format!("dial {}", argv.join(" "));
+    let message = after_success.map_or_else(|| "Finished.".to_owned(), str::to_owned);
+    spawn_process(
+        shell,
+        label,
+        exe.into_os_string(),
+        argv.into_iter().map(OsString::from).collect(),
+        app.layout.project_root.clone(),
+        shown,
+        move || Ok(message),
+    );
+    Ok(())
+}
+
+/// Run `program ARGV` in `cwd` as a background job. Output lines stream into the transcript under
+/// `label`, after the `$ shown` command line; the job's cancellation kills the child process.
+/// After a successful exit, `finish` produces the job's result message.
+pub(super) fn spawn_process(
+    shell: &mut Shell,
+    label: &'static str,
+    program: OsString,
+    argv: Vec<OsString>,
+    cwd: PathBuf,
+    shown: String,
+    finish: impl FnOnce() -> Result<String> + Send + 'static,
+) {
     spawn_job_streaming(shell, label, move |cancel: Arc<AtomicBool>, progress| {
         progress(&format!("$ {shown}"));
-        let mut child = Command::new(&exe)
+        let mut child = Command::new(&program)
             .args(&argv)
-            .current_dir(&project)
+            .current_dir(&cwd)
             .env("NO_COLOR", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .with_context(|| format!("starting {shown}"))?;
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    anyhow::anyhow!(
+                        "starting {shown}: {} was not found on PATH",
+                        program.to_string_lossy()
+                    )
+                } else {
+                    anyhow::Error::new(error).context(format!("starting {shown}"))
+                }
+            })?;
         let (tx, rx) = mpsc::channel::<String>();
         let readers: Vec<_> = [
             child
@@ -529,12 +563,11 @@ fn spawn_dial(
             progress(&line);
         }
         if status.success() {
-            Ok(after_success.map_or_else(|| "Finished.".to_owned(), str::to_owned))
+            finish()
         } else {
             bail!("{shown} exited with {status}")
         }
     });
-    Ok(())
 }
 
 /// The relay child started by `/relay start`, kept until `/relay stop` or exit.

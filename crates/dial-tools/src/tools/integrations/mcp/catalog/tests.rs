@@ -98,7 +98,8 @@ fn graphify_runs_its_local_server_in_the_project_root_without_root_arguments() {
     let server = candidate.server(&BTreeMap::new()).unwrap();
     assert_eq!(server.program, PathBuf::from("uvx"));
     assert_eq!(server.args, ["--from", "graphifyy[mcp]", "graphify-mcp"]);
-    assert_eq!(server.cwd, Some(PathBuf::from("/work")));
+    // Project-relative, so the saved entry never pins the project it was installed from.
+    assert_eq!(server.cwd, Some(PathBuf::from(".")));
     assert!(server.url.is_none() && candidate.inputs.is_empty());
 
     let filesystem = CURATED.iter().find(|c| c.id == "filesystem").unwrap();

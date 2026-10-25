@@ -278,6 +278,7 @@ pub(super) const RUNS_NOW: &[&str] = &[
     "relay",
     "hooks",
     "watch",
+    "graphify",
     "login",
     "logout",
     "stats",

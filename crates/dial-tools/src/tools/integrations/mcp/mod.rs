@@ -47,6 +47,7 @@ use client::{Client, Shared};
 use names::Namer;
 use parking_lot::{Mutex, MutexGuard};
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak, mpsc};
@@ -805,6 +806,20 @@ fn remaining(deadline: Option<Instant>) -> Duration {
     })
 }
 
+/// The stdio config with a relative `cwd` resolved against the project root, not against Dial's
+/// own working directory (which differs under `-C`). A portable entry such as `cwd = "."` then
+/// runs every project's server in that project, whichever config layer holds it.
+fn in_project<'a>(server: &'a McpServerConfig, root: &Path) -> Cow<'a, McpServerConfig> {
+    match &server.cwd {
+        Some(cwd) if cwd.is_relative() => {
+            let mut resolved = server.clone();
+            resolved.cwd = Some(root.join(cwd));
+            Cow::Owned(resolved)
+        }
+        _ => Cow::Borrowed(server),
+    }
+}
+
 /// Spawns or dials the server and performs `initialize`, returning the client and its signals.
 fn open(
     name: &str,
@@ -827,7 +842,7 @@ fn open(
         }
         Client::remote(name, remote, shared)
     } else {
-        Client::spawn(name, server, shared)?
+        Client::spawn(name, &in_project(server, root), shared)?
     };
     match client.initialize(remaining(deadline), cancel) {
         Ok(()) => Ok((client, rx)),

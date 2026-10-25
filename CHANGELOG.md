@@ -10,6 +10,9 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 - Automatically prevent idle system sleep during active agent turns and delegated workers, releasing each request when its work ends. Uses native macOS/Windows power requests and a Linux logind idle inhibitor without changing saved settings or inhibiting screen locking; unavailable protection is reported rather than failing the turn (`docs/agent-loop.md`).
 
 - Graphify is a curated MCP server in `/extensions` and `mcp_servers`: `graphify` runs the local `graphify-mcp` stdio server from the `graphifyy[mcp]` PyPI package through `uvx`, in the project root, so it serves that project's `graphify-out/graph.json` with no account or key (`docs/extensibility.md`). Curated servers can now run in the project root instead of receiving it as an argument, and PyPI installs that differ only in extras (`graphifyy[mcp]` and `graphifyy==<version>`) fold into one catalog row.
+- A relative `[mcp.<name>] cwd` now resolves against the project root instead of Dial's process directory, so a user-level entry with `cwd = "."` runs in whichever project Dial opened, including under `-C`.
+
+- `/graphify [tree|html|callflow]` opens the project's Graphify knowledge graph in the browser. It runs Graphify's own tree, interactive-graph or call-flow exporter on `graphify-out/graph.json` (or `$GRAPHIFY_OUT`) through `uvx` as a background job, and names the build command when no graph exists (`docs/tools.md`).
 
 ### Fixed
 

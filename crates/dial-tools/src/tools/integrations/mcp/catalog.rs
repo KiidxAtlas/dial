@@ -21,7 +21,8 @@ pub enum ProjectRoot {
     /// The project root is appended as the last argument (filesystem and git servers).
     LastArg,
     /// The server runs with the project root as its working directory and finds its own files
-    /// there (Graphify reads `graphify-out/graph.json`).
+    /// there (Graphify reads `graphify-out/graph.json`). The entry saves `cwd = "."`, which the
+    /// client resolves against the project Dial opened, so one entry serves every project.
     WorkingDir,
 }
 
@@ -532,7 +533,7 @@ pub fn curated_candidate(item: &Curated, user_dir: &Path, project_root: &Path) -
         program: PathBuf::from(item.runtime),
         args,
         env: cache_env(user_dir),
-        cwd: (item.project == ProjectRoot::WorkingDir).then(|| project_root.to_path_buf()),
+        cwd: (item.project == ProjectRoot::WorkingDir).then(|| PathBuf::from(".")),
         enabled: true,
         ..Default::default()
     };
