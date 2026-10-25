@@ -37,8 +37,8 @@ const KEEPALIVE_PROBES: u32 = 3;
 const MIN_PER_ADDRESS: Duration = Duration::from_millis(10);
 /// How often a blocked connect or write looks at the interrupt flag.
 const CANCEL_POLL: Duration = Duration::from_millis(100);
-/// Most bytes handed to one `write`. Windows accepts a send of any size whenever its socket
-/// buffer has room, so an unbounded write could absorb a whole request before the interrupt is
+/// Most bytes handed to one `send`. Windows accepts a send of any size whenever its socket
+/// buffer has room, so an unbounded send could absorb a whole request before the interrupt is
 /// checked; bounded chunks keep cancellation responsive on every platform.
 const MAX_WRITE: usize = 64 << 10;
 
@@ -73,7 +73,6 @@ impl<In: Transport> Connector<In> for KeepaliveConnector {
             buffers,
             interrupt: Arc::clone(&self.interrupt),
             read_timeout: None,
-            write_timeout: None,
         })))
     }
 }
@@ -173,7 +172,6 @@ pub(super) struct KeepaliveTransport {
     buffers: LazyBuffers,
     interrupt: Arc<AtomicBool>,
     read_timeout: Option<Duration>,
-    write_timeout: Option<Duration>,
 }
 
 impl std::fmt::Debug for KeepaliveTransport {
@@ -181,6 +179,38 @@ impl std::fmt::Debug for KeepaliveTransport {
         f.debug_struct("KeepaliveTransport")
             .field("addr", &self.stream.peer_addr().ok())
             .finish()
+    }
+}
+
+impl KeepaliveTransport {
+    /// The send loop of [`Transport::transmit_output`]; the stream must be non-blocking.
+    fn send_nonblocking(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
+        let budget = timeout.not_zero().map(|after| *after);
+        let started = Instant::now();
+        let mut sent = 0;
+        while sent < amount {
+            super::check(&self.interrupt)?;
+            let mut slice = CANCEL_POLL;
+            if let Some(budget) = budget {
+                let remaining = budget.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return Err(ureq::Error::Timeout(timeout.reason));
+                }
+                slice = slice.min(remaining);
+            }
+            let output = &self.buffers.output()[sent..amount.min(sent + MAX_WRITE)];
+            match self.stream.write(output) {
+                Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero).into()),
+                Ok(count) => sent += count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                // No room yet: wait one slice, then look at the interrupt and the phase budget.
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    crate::platform::io::wait_socket_writable(&self.stream, slice)?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -225,38 +255,17 @@ impl Transport for KeepaliveTransport {
         &mut self.buffers
     }
 
-    /// Writes in slices of at most [`CANCEL_POLL`] and chunks of at most [`MAX_WRITE`] bytes,
-    /// resuming at the offset already sent, so an interrupt is noticed while a slow peer holds
-    /// the write and no byte is ever sent twice.
+    /// Sends non-blocking chunks of at most [`MAX_WRITE`] bytes, waiting at most [`CANCEL_POLL`]
+    /// at a time for room, so an interrupt is noticed while a slow peer holds the write. A
+    /// non-blocking send accepts a definite count or nothing (`WouldBlock`), so resuming at the
+    /// offset already sent never sends a byte twice. A socket send timeout is not used: on
+    /// Windows an expired one leaves the socket state indeterminate.
     fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
-        let budget = timeout.not_zero().map(|after| *after);
-        let started = Instant::now();
-        let mut sent = 0;
-        while sent < amount {
-            super::check(&self.interrupt)?;
-            let mut slice = CANCEL_POLL;
-            if let Some(budget) = budget {
-                let remaining = budget.saturating_sub(started.elapsed());
-                if remaining.is_zero() {
-                    return Err(ureq::Error::Timeout(timeout.reason));
-                }
-                slice = slice.min(remaining);
-            }
-            if self.write_timeout != Some(slice) {
-                self.stream.set_write_timeout(Some(slice))?;
-                self.write_timeout = Some(slice);
-            }
-            let output = &self.buffers.output()[sent..amount.min(sent + MAX_WRITE)];
-            match self.stream.write(output) {
-                Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero).into()),
-                Ok(count) => sent += count,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                // An expired slice: look at the interrupt and the phase budget, then resume.
-                Err(error) if expired(&error) => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Ok(())
+        self.stream.set_nonblocking(true)?;
+        let sent = self.send_nonblocking(amount, timeout);
+        let restored = self.stream.set_nonblocking(false);
+        sent?;
+        Ok(restored?)
     }
 
     fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {

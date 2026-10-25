@@ -42,6 +42,13 @@ pub fn wait_writable(pipe: &impl Pipe, timeout: Duration) -> io::Result<bool> {
     super::imp::io::wait_writable(pipe, timeout)
 }
 
+/// Wait up to `timeout` until `socket` can accept a send (Unix: `poll(POLLOUT)`; Windows:
+/// `WSAPoll(POLLWRNORM)`). Returns whether it became writable; an interrupted wait returns
+/// `false`. A socket error or hang-up also wakes the wait, so the next send reports it.
+pub fn wait_socket_writable(socket: &std::net::TcpStream, timeout: Duration) -> io::Result<bool> {
+    super::imp::io::wait_socket_writable(socket, timeout)
+}
+
 /// A bounded asynchronous writer for synchronous Windows pipe handles. The worker owns the
 /// writer and performs blocking writes; callers only enqueue owned bytes.
 #[cfg(windows)]

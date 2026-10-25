@@ -56,3 +56,10 @@ pub(in crate::platform) fn wait_readable(pipe: &impl Pipe, timeout: Duration) ->
 pub(in crate::platform) fn wait_writable(pipe: &impl Pipe, timeout: Duration) -> io::Result<bool> {
     wait(pipe, libc::POLLOUT, timeout)
 }
+
+pub(in crate::platform) fn wait_socket_writable(
+    socket: &std::net::TcpStream,
+    timeout: Duration,
+) -> io::Result<bool> {
+    wait(socket, libc::POLLOUT, timeout)
+}

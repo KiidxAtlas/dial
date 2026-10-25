@@ -75,12 +75,16 @@ impl MacCapture {
             let height = monitor.height().map_err(metadata_error)?;
             let scale = f64::from(monitor.scale_factor().map_err(metadata_error)?);
             // xcap's macOS friendly_name path matches CGDirectDisplayID to
-            // NSScreenNumber, then returns NSScreen.localizedName(). Keep the
-            // model-number name as fallback.
-            let name = monitor
-                .friendly_name()
-                .or_else(|_| monitor.name())
-                .unwrap_or_else(|_| format!("Display {id}"));
+            // NSScreenNumber, then returns NSScreen.localizedName(). That binding
+            // panics when AppKit returns no name (headless and virtual displays), so a
+            // panic there means "no friendly name": keep the model-number fallback.
+            let friendly =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| monitor.friendly_name()));
+            let name = friendly
+                .ok()
+                .and_then(Result::ok)
+                .or_else(|| monitor.name().ok())
+                .unwrap_or_else(|| format!("Display {id}"));
             displays.push(DesktopDisplay {
                 id,
                 name,

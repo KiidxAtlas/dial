@@ -310,6 +310,9 @@ openai=3
 '''
     (home / "config.toml").write_text(config)
     (home / "config.toml").chmod(0o600)
+    # A fresh home would start the daily runtime update check (Homebrew queries) beside the
+    # session under test; that background load is not under test and can starve timing windows.
+    (home / "runtime-update-check").write_text(str(int(time.time())))
     return project, home
 
 
@@ -474,6 +477,8 @@ def main():
             server.discovery.clear()
             terminal = Terminal(binary, project, home, args.captures)
             terminal.wait("mock-main")
+            # Esc is only meaningful once the switch is pending, and local discovery gives up
+            # after 1 s, so send it as soon as the pending note renders.
             terminal.command("/model next")
             terminal.wait("Discovering available models")
             terminal.key("Escape")

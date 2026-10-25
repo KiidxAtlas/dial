@@ -136,3 +136,31 @@ pub(in crate::platform) fn wait_writable(
         "Windows anonymous pipes do not expose writable readiness; use QueuedWriter",
     ))
 }
+
+pub(in crate::platform) fn wait_socket_writable(
+    socket: &std::net::TcpStream,
+    timeout: Duration,
+) -> io::Result<bool> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        POLLWRNORM, SOCKET_ERROR, WSAGetLastError, WSAPOLLFD, WSAPoll,
+    };
+    let mut poll = WSAPOLLFD {
+        fd: socket.as_raw_socket() as _,
+        events: POLLWRNORM,
+        revents: 0,
+    };
+    let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+    // SAFETY: one initialized WSAPOLLFD naming a socket borrowed for the call; finite timeout.
+    let ready = unsafe { WSAPoll(&mut poll, 1, millis) };
+    if ready == SOCKET_ERROR {
+        // SAFETY: reads this thread's last Winsock error; no arguments.
+        let error = io::Error::from_raw_os_error(unsafe { WSAGetLastError() });
+        return if error.kind() == io::ErrorKind::Interrupted {
+            Ok(false)
+        } else {
+            Err(error)
+        };
+    }
+    Ok(ready > 0)
+}
