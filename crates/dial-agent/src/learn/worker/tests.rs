@@ -458,13 +458,19 @@ time.sleep(30)
         let active = store.active().unwrap();
         let lease = super::super::compute::Background::acquire(&config).unwrap();
         let started = Instant::now();
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
+        // Starting Python can take several seconds on a cold CI runner; that start-up is not
+        // what this test measures. The bound below is from the budget being spent to the stop.
+        let spent = std::thread::scope(|scope| {
+            let recorder = scope.spawn(|| {
                 while !marker.exists() {
-                    assert!(started.elapsed() < Duration::from_secs(5));
+                    assert!(
+                        started.elapsed() < Duration::from_secs(25),
+                        "worker did not start"
+                    );
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 super::super::resources::record_usage(&config.user_dir, 60).unwrap();
+                Instant::now()
             });
             let result = if mode == "request" {
                 call(&config, &json!({"op":"generate"})).map(|_| ())
@@ -478,8 +484,12 @@ time.sleep(30)
                     .is_some(),
                 "{error:#}"
             );
+            recorder.join().unwrap()
         });
-        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            spent.elapsed() < Duration::from_secs(5),
+            "the spent budget was noticed, not the worker timeout"
+        );
         let pid: u32 = std::fs::read_to_string(marker).unwrap().parse().unwrap();
         assert!(
             !crate::platform::process::alive(pid),

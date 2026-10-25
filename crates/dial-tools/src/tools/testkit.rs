@@ -2,8 +2,11 @@
 use super::{EditMode, ToolOutput, Workspace, execute};
 use serde_json::Value;
 
+/// The directory is created under the canonical temp root so `dir.path()` equals `ws.root`
+/// (on macOS the default `/var/folders/...` is a symlink into `/private/var`).
 pub(crate) fn workspace() -> (tempfile::TempDir, Workspace) {
-    let dir = tempfile::tempdir().unwrap();
+    let base = std::env::temp_dir().canonicalize().unwrap();
+    let dir = tempfile::tempdir_in(base).unwrap();
     let ws = Workspace::new(dir.path())
         .unwrap()
         .with_edit_mode(EditMode::Replace);

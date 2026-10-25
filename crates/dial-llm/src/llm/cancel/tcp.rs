@@ -37,6 +37,10 @@ const KEEPALIVE_PROBES: u32 = 3;
 const MIN_PER_ADDRESS: Duration = Duration::from_millis(10);
 /// How often a blocked connect or write looks at the interrupt flag.
 const CANCEL_POLL: Duration = Duration::from_millis(100);
+/// Most bytes handed to one `write`. Windows accepts a send of any size whenever its socket
+/// buffer has room, so an unbounded write could absorb a whole request before the interrupt is
+/// checked; bounded chunks keep cancellation responsive on every platform.
+const MAX_WRITE: usize = 64 << 10;
 
 /// Opens the TCP connection unless an earlier connector (a CONNECT proxy) already did.
 #[derive(Debug)]
@@ -221,8 +225,9 @@ impl Transport for KeepaliveTransport {
         &mut self.buffers
     }
 
-    /// Writes in slices of at most [`CANCEL_POLL`], resuming at the offset already sent, so an
-    /// interrupt is noticed while a slow peer holds the write and no byte is ever sent twice.
+    /// Writes in slices of at most [`CANCEL_POLL`] and chunks of at most [`MAX_WRITE`] bytes,
+    /// resuming at the offset already sent, so an interrupt is noticed while a slow peer holds
+    /// the write and no byte is ever sent twice.
     fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
         let budget = timeout.not_zero().map(|after| *after);
         let started = Instant::now();
@@ -241,7 +246,7 @@ impl Transport for KeepaliveTransport {
                 self.stream.set_write_timeout(Some(slice))?;
                 self.write_timeout = Some(slice);
             }
-            let output = &self.buffers.output()[sent..amount];
+            let output = &self.buffers.output()[sent..amount.min(sent + MAX_WRITE)];
             match self.stream.write(output) {
                 Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero).into()),
                 Ok(count) => sent += count,

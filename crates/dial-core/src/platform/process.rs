@@ -61,3 +61,6 @@ pub fn exit_signal(status: &ExitStatus) -> Option<i32> {
 pub fn forget_group(leader: u32) {
     super::imp::process::forget_group(leader)
 }
+
+#[cfg(all(test, unix))]
+mod tests;

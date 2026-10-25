@@ -17,7 +17,17 @@ fn check(result: libc::c_int) -> io::Result<()> {
     }
 }
 
+/// Serializes group spawns. Where std has no `pipe2` (macOS among them) it creates a child's
+/// stdio pipes with `pipe()` and only then sets `FD_CLOEXEC`, so a concurrent spawn on another
+/// thread can fork in between and its child inherits those pipes. A long-lived child holding
+/// another child's stderr write end keeps that reader from ever seeing EOF. Spawning is brief,
+/// and the guard covers pipe creation and fork together.
+static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub(in crate::platform) fn spawn_group(command: &mut Command) -> io::Result<Child> {
+    let _spawning = SPAWN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     command.process_group(0).spawn()
 }
 

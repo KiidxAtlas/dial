@@ -501,6 +501,9 @@ fn brew(
             None,
         );
     }
+    // Ownership was checked on canonical paths; match kegs the same way so a Cellar reached
+    // through a symlink (for example a relocated Homebrew prefix) is still recognised.
+    let keg_root = keg_root.canonicalize()?;
     let installed = info["installed"]
         .as_array()
         .context("Homebrew installed version metadata missing")?;
