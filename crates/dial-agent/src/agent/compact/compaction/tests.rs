@@ -71,26 +71,26 @@ fn cut_works_inside_one_user_turn_and_never_splits_a_tool_pair() {
 }
 
 #[test]
-fn auto_threshold_leaves_headroom_below_the_reserve() {
+fn auto_threshold_uses_the_reserve_subtracted_large_window() {
     let policy = CompactionConfig::default();
     let identity = CompactionIdentity {
         provider: "p",
         model: "m",
         agent: None,
     };
-    // 200k window: reserve is 15% (30k), auto trigger is 80% of the remaining 170k.
+    // 200k window: reserve is 15% (30k), auto trigger uses all of the remaining 170k.
     assert_eq!(
         policy.effective_threshold(identity, 200_000).unwrap(),
-        136_000
+        170_000
     );
     assert!(
         !policy
-            .should_compact(identity, 200_000, 136_000, false)
+            .should_compact(identity, 200_000, 170_000, false)
             .unwrap()
     );
     assert!(
         policy
-            .should_compact(identity, 200_000, 136_001, false)
+            .should_compact(identity, 200_000, 170_001, false)
             .unwrap()
     );
     let mut percent = policy.clone();

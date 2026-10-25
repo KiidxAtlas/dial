@@ -118,6 +118,11 @@ impl Agent<'_> {
         let mut stall = crate::agent::safety::guard::StallGuard::default();
         let mut pace = crate::agent::safety::guard::PaceGuard::default();
         let mut completion = crate::agent::verify::completion::CompletionGuard;
+        let mut completion_recovery =
+            crate::agent::verify::completion::CompletionRecovery::default();
+        let mut completion_candidate: Option<String> = None;
+        let mut enrichment = crate::agent::run::enrichment::Enrichment::default();
+        let mut enrichment_epoch = 0u64;
         let mut steering_pending = false;
         let mut budget = crate::agent::safety::guard::StepBudget::new(
             max_steps,
@@ -184,6 +189,7 @@ impl Agent<'_> {
                 steering_pending = true;
             }
             if std::mem::take(&mut steering_pending) {
+                enrichment_epoch = enrichment_epoch.wrapping_add(1);
                 let instruction = self.session.control_state()["current_instruction"]
                     .as_str()
                     .unwrap_or("")
@@ -193,6 +199,8 @@ impl Agent<'_> {
                 rule_state.save(&mut control);
                 self.session.set_control_state(control)?;
                 completion.reset_for_steering();
+                completion_recovery = Default::default();
+                completion_candidate = None;
                 engine.transition(crate::agent::run::engine::RecoveryTransition::Steering);
 
                 todo_recovery = Default::default();
@@ -242,6 +250,14 @@ impl Agent<'_> {
                 max_tokens = backend.output_budget(h.max_tokens);
             }
             let prep_started = Instant::now();
+            if let Some(hints) = enrichment.poll(crate::agent::run::enrichment::Stamp {
+                revision: self.step_checks.revision(),
+                instruction: enrichment_epoch,
+            }) {
+                pending_nudges.push(crate::agent::run::guidance::note(
+                    crate::agent::run::guidance::Priority::Review, hints,
+                ));
+            }
             let budget_window = self.budget_window();
             self.before_request(backend, &names, &mut pending_nudges, ui)?;
             let mut messages = self.system_messages();
@@ -1507,7 +1523,21 @@ impl Agent<'_> {
                     }
                 }
                 if let Err(reason) = self.validate_completion(ui) {
-                    return self.stop_turn(ui, reason, step + 1).map(crate::agent::run::engine::Tick::Finished);
+                    if !self.interrupt.load(Ordering::SeqCst)
+                        && engine.pending_refusal().is_none()
+                        && completion_recovery.retry()
+                    {
+                        completion_candidate = Some(format!(
+                            "Candidate summary (completion not accepted):\n{}\n\n{reason}", reply.text
+                        ));
+                        self.push(json!({"role":"user","content":format!(
+                            "Completion was not accepted: {reason}\nThe preceding answer is a candidate summary, not an accepted completion. Address the stated prerequisite using the current evidence, then report again; if it cannot be resolved, report the concrete blocker. This feedback grants no execution permission."
+                        )}))?;
+                        return Ok(crate::agent::run::engine::Tick::Again);
+                    }
+                    return self.stop_turn(ui, format!(
+                        "Candidate summary (completion not accepted):\n{}\n\n{reason}", reply.text
+                    ), step + 1).map(crate::agent::run::engine::Tick::Finished);
                 }
                 if let Some(message) = self.coach_completion(
                     &mut coach_turn,
@@ -2007,15 +2037,6 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                 } else {
                     tools::ToolStatus::from_output(&output)
                 };
-                crate::telemetry::tool_with_effects(
-                    self.config,
-                    self.hermetic,
-                    self.session.id(),
-                    &call.name,
-                    tool_seconds,
-                    status,
-                    crate::tools::surface::outcome::effects(&output),
-                );
                 self.record(step, "tool_outcome", json!({"name":call.name,"id":call.id,"status":status,"effects":tools::surface::outcome::effects(&output),"duration_ms":tool_seconds*1000.0}))?;
                 let callback_intercepted = std::mem::take(&mut self.portable_callback_intercepted);
                 if callback_intercepted || self.ext.contains(&call.name) {
@@ -2145,28 +2166,11 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                         .insert(call.name.clone());
                 }
                 self.step_checks.evidence.settle_call(&call.id, self.step_checks.revision());
-                if !self.hermetic
-                    && !output.is_error
-                    && matches!(call.name.as_str(), "write" | "edit" | "ast_edit")
-                    && let (Some(cache), Some(path)) =
-                        (self.codebase.clone(), call.arguments["path"].as_str())
-                    && reviewed_paths.len() < 4
-                    && reviewed_paths.insert(path.to_owned())
-                {
-                    let paths = vec![path.to_owned()];
-                    let context = thread::scope(|scope| -> Result<_> {
-                        let (tx, rx) = mpsc::sync_channel(1);
-                        scope.spawn(move || {
-                            let _ = tx.send(cache.impact_context(&paths, 3000));
-                        });
-                        receive_with_heartbeat(&rx, ui)?
-                    });
-                    if let Ok(context) = context {
-                        output.text.push_str("\n\n");
-                        output.text.push_str(&context);
-                        self.record(step, "change_review", json!({"path":path}))?;
-                    }
-                }
+                let review_stamp = crate::agent::run::enrichment::Stamp {
+                    revision: self.step_checks.revision(),
+                    instruction: enrichment_epoch,
+                };
+                enrichment.invalidate(review_stamp);
                 if call.name == "finish" && !output.is_error && self.step_checks.finish_accepted {
                     finished = Some(
                         crate::agent::verify::completion::Finish::parse(&call.arguments).map_err(anyhow::Error::msg)?,
@@ -2180,6 +2184,18 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                     todo_before != self.todo.snapshot(),
                     |id| self.holds_full_result(id),
                 );
+                // Only admit optional work after committed facts have settled. The cache owns a
+                // single best-effort worker; admission, polling and turn drop never await it.
+                if !self.hermetic
+                    && !output.is_error
+                    && matches!(call.name.as_str(), "write" | "edit" | "ast_edit")
+                    && let (Some(cache), Some(path)) =
+                        (self.codebase.as_ref(), call.arguments["path"].as_str())
+                    && reviewed_paths.len() < 4
+                    && reviewed_paths.insert(path.to_owned())
+                {
+                    enrichment.submit(cache, vec![path.to_owned()], review_stamp);
+                }
                 let is_duplicate = duplicate.is_some();
                 // A read pointer re-presents evidence the model already holds: it is neither a
                 // withheld call nor a new observation.
@@ -2283,6 +2299,7 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                 );
                 let (mut body, dropped) =
                     crate::agent::workflow::efficiency::visible_result(&output.text, limit, duplicate);
+                let mut presentation_changed = body != output.text;
                 if call.name == "bash"
                     && !output.is_error
                     && call.arguments["command"]
@@ -2292,7 +2309,21 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                     && let Some(compact) = crate::agent::verify::verification::compact_success(&output.text, uri)
                 {
                     body = compact;
+                    presentation_changed = true;
                 }
+                if presentation_changed {
+                    let integrity = output.execution.output.get_or_insert_with(Default::default);
+                    integrity.mark_presentation_partial();
+                }
+                crate::telemetry::tool_output(
+                    self.config,
+                    self.hermetic,
+                    self.session.id(),
+                    &call.name,
+                    tool_seconds,
+                    status,
+                    &output.execution,
+                );
                 if let Some(uri) = &artifact {
                     crate::agent::workflow::efficiency::evidence_link(&mut body, uri, dropped);
                 }
@@ -2817,11 +2848,15 @@ text: "finish completed cannot follow a failed call in the same batch; address i
         if self.hermetic {
             bail!("agent exhausted the admitted step budget without a final answer")
         }
-        self.stop_turn(
-            ui,
-            format!("Stopped: this turn used its {max_steps}-step limit. The chat and completed work are kept. Say \"continue\" to keep going, or raise harness.max_steps in /settings."),
-            iteration,
-        ).map(|report| (report, budget.spent()))
+        let reason = format!(
+            "Stopped: this turn used its {max_steps}-step limit. The chat and completed work are kept. Say \"continue\" to keep going, or raise harness.max_steps in /settings."
+        );
+        let reason = match completion_candidate {
+            Some(candidate) => format!("{candidate}\n\n{reason}"),
+            None => reason,
+        };
+        self.stop_turn(ui, reason, iteration)
+            .map(|report| (report, budget.spent()))
     }
 }
 
@@ -2883,3 +2918,6 @@ fn record_rejected_reply(
 
 #[cfg(test)]
 mod usage_join_tests;
+
+#[cfg(test)]
+mod completion_tests;

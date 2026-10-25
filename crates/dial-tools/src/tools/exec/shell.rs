@@ -79,6 +79,7 @@ pub struct ForegroundJob {
     pub(crate) reader: io::PipeReader,
     /// Output already read before adoption, so the adopted job keeps it.
     pub(crate) captured: Vec<u8>,
+    pub(crate) captured_total: u64,
     /// Complete-output artifact already being written before adoption.
     pub(crate) spool: Option<crate::storage::artifact::ArtifactSpool>,
 }
@@ -138,6 +139,7 @@ impl ForegroundJob {
         Child,
         io::PipeReader,
         Vec<u8>,
+        u64,
         Option<crate::storage::artifact::ArtifactSpool>,
     ) {
         let job = std::mem::ManuallyDrop::new(self);
@@ -149,6 +151,7 @@ impl ForegroundJob {
                 std::ptr::read(&job.child),
                 std::ptr::read(&job.reader),
                 std::ptr::read(&job.captured),
+                job.captured_total,
                 std::ptr::read(&job.spool),
             )
         }
@@ -317,6 +320,44 @@ fn captured_text(capture: Capture) -> String {
     text
 }
 
+fn output_integrity(
+    original: u64,
+    inline: u64,
+    elided: Option<u64>,
+    artifact: Option<String>,
+    complete: bool,
+    minimized: bool,
+) -> crate::runtime::execution::OutputIntegrity {
+    use crate::runtime::execution::{Completeness, OutputIntegrity};
+    let retained = if artifact.is_some() {
+        original.saturating_sub(elided.unwrap_or(0))
+    } else {
+        inline
+    };
+    OutputIntegrity {
+        capture: if complete {
+            Completeness::Complete
+        } else {
+            Completeness::Partial
+        },
+        retention: if retained == original {
+            Completeness::Complete
+        } else {
+            Completeness::Partial
+        },
+        presentation: if original <= inline && !minimized {
+            Completeness::Complete
+        } else {
+            Completeness::Partial
+        },
+        original_bytes: Some(original),
+        retained_bytes: Some(retained),
+        omitted_bytes: Some(original.saturating_sub(retained)),
+        presented_bytes: (!minimized).then_some(inline),
+        artifact,
+    }
+}
+
 /// Finishes the artifact spool and appends the `[complete|partial output: uri]` block plus any
 /// capture/artifact error lines. A failed spool finish becomes the artifact error.
 fn append_output_notes(
@@ -324,16 +365,19 @@ fn append_output_notes(
     spool: Option<crate::storage::artifact::ArtifactSpool>,
     capture_error: &Option<String>,
     artifact_error: &mut Option<String>,
-) {
+) -> Option<String> {
+    let mut artifact = None;
     if let Some(spool) = spool {
+        let elided = spool.elided_bytes();
         match spool.finish() {
             Ok(uri) => {
-                let completeness = if capture_error.is_some() {
+                let completeness = if capture_error.is_some() || elided > 0 {
                     "partial"
                 } else {
                     "complete"
                 };
                 text.push_str(&format!("[{completeness} output: {uri}]\n"));
+                artifact = Some(uri);
             }
             Err(error) => {
                 *artifact_error = Some(format!("saving complete command output artifact: {error}"));
@@ -348,22 +392,23 @@ fn append_output_notes(
             "[output artifact error: {error}; inline output retained]\n"
         ));
     }
+    artifact
 }
 
 /// Replaces the first `body_len` bytes of `text` (the captured output) with their minimized form
 /// when `shell.minimize_output` is on and the complete output is saved as an artifact, which the
 /// `[complete output: ...]` line that follows the note names. Without that line the raw output
 /// would be unrecoverable, so the text is left alone.
-fn minimize_body(ws: &Workspace, command: &str, body_len: usize, text: &mut String) {
+fn minimize_body(ws: &Workspace, command: &str, body_len: usize, text: &mut String) -> bool {
     if !ws.minimizing_output()
         || !text[body_len..].contains("[complete output: artifact://")
         || text.contains("[output capture error:")
         || text.contains("[output artifact error:")
     {
-        return;
+        return false;
     }
     let Some(minimized) = super::minimizer::minimize(command, &text[..body_len]) else {
-        return;
+        return false;
     };
     let mut body = minimized.text;
     if !body.ends_with('\n') {
@@ -374,6 +419,7 @@ fn minimize_body(ws: &Workspace, command: &str, body_len: usize, text: &mut Stri
         minimized.filter, minimized.before, minimized.after
     ));
     text.replace_range(..body_len, &body);
+    true
 }
 
 /// Deletes the one-shot script an embedded-shell command line refers to. The host removes it when
@@ -693,7 +739,11 @@ fn run_bash(
         if may_adopt(cancel_now, adoption_wanted) {
             crate::platform::io::set_blocking(&reader)
                 .map_err(|e| format!("restoring adopted output pipe mode: {e}"))?;
-            let captured = capture.retained();
+            let mut captured = capture.retained();
+            if captured.len() < capture.total {
+                // Only a contiguous suffix can be placed in bg's offset-addressed ring.
+                captured = capture.tail.clone();
+            }
             let so_far = output_tail(&captured);
             let job = ForegroundJob {
                 workspace: ws.clone(),
@@ -702,6 +752,7 @@ fn run_bash(
                 child: release_process(group),
                 reader,
                 captured,
+                captured_total: capture.total as u64,
                 spool: spool.take(),
             };
             return on_adopt(job).map(|id| {
@@ -776,6 +827,10 @@ fn run_bash(
         on_output,
     )?;
 
+    use crate::runtime::execution::Completeness;
+    let original = capture.total as u64;
+    let inline_retained = (capture.head.len() + capture.tail.len().min(BASH_TAIL)) as u64;
+    let elided = spool.as_ref().map(|spool| spool.elided_bytes());
     let mut text = captured_text(capture);
     let body_len = text.len();
     let success = status.success() && !timed_out && !cancelled;
@@ -794,8 +849,16 @@ fn run_bash(
     if !success && text.contains("Operation not permitted") && text.contains("/tmp/") {
         text.push_str("[sandbox: /tmp is outside the project and not writable; use $TMPDIR, a scratch directory inside the project]\n");
     }
-    append_output_notes(&mut text, spool, &capture_error, &mut artifact_error);
-    minimize_body(ws, &command, body_len, &mut text);
+    let artifact = append_output_notes(&mut text, spool, &capture_error, &mut artifact_error);
+    let minimized = minimize_body(ws, &command, body_len, &mut text);
+    let integrity = output_integrity(
+        original,
+        inline_retained,
+        elided,
+        artifact,
+        eof && capture_error.is_none(),
+        minimized,
+    );
     let mut state_error = None;
     if let (Some(name), Some(sessions), Some(exchange)) =
         (session, sessions.as_mut(), exchange.as_ref())
@@ -842,8 +905,12 @@ fn run_bash(
         signal: crate::platform::process::exit_signal(&status),
         timed_out,
         cancelled,
-        output_complete: capture_error.is_none() && artifact_error.is_none() && eof,
+        output_complete: capture_error.is_none()
+            && artifact_error.is_none()
+            && eof
+            && integrity.retention == Completeness::Complete,
     });
+    let output = output.with_output_integrity(integrity);
     // The group was killed and its leader reaped above, so a timeout is a known (failed)
     // outcome the model can inspect and retry; only a user cancel stays uncertain.
     Ok(if cancelled {

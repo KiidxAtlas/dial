@@ -21,6 +21,62 @@ pub struct Execution {
     pub effects: Effects,
     #[serde(default)]
     pub changed_paths: Vec<std::path::PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation: Option<Observation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<ProcessOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<OutputIntegrity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration: Option<crate::runtime::integration::IntegrationExecution>,
+}
+
+/// A successful wait/read is not evidence that the observed child succeeded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationKind {
+    Snapshot,
+    Wait,
+    Readiness,
+    Input,
+    Termination,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Observation {
+    pub kind: ObservationKind,
+    pub satisfied: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Completeness {
+    Complete,
+    Partial,
+    #[default]
+    Unknown,
+}
+
+/// Independent byte-stream facts. Counts exclude generated labels and truncation markers.
+/// `original_bytes` counts observed bytes, not an estimate of bytes never read.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OutputIntegrity {
+    pub capture: Completeness,
+    pub retention: Completeness,
+    pub presentation: Completeness,
+    pub original_bytes: Option<u64>,
+    pub retained_bytes: Option<u64>,
+    pub omitted_bytes: Option<u64>,
+    pub presented_bytes: Option<u64>,
+    pub artifact: Option<String>,
+}
+
+impl OutputIntegrity {
+    /// A downstream projection cannot keep a producer's full-presentation claim after clipping.
+    pub fn mark_presentation_partial(&mut self) {
+        self.presentation = Completeness::Partial;
+        self.presented_bytes = None;
+    }
 }
 
 /// Observed subprocess termination, independent of printed shell output or model claims.
@@ -154,3 +210,6 @@ impl Drop for Capture {
         });
     }
 }
+
+#[cfg(test)]
+mod tests;

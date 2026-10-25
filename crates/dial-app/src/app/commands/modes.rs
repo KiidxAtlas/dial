@@ -10,6 +10,7 @@ mod btw;
 mod cleanse;
 mod compaction;
 mod debug;
+mod drafter;
 mod fresh;
 mod goal;
 mod handoff;
@@ -23,6 +24,12 @@ mod switch;
 mod tan;
 
 pub(super) const COMMANDS: &[super::CommandSpec] = &[
+    super::CommandSpec {
+        name: "drafter",
+        description: "Toggle turn drafting and review before sending to the agent",
+        args_hint: "[on|off|status]",
+        subcommands: &["on", "off", "status"],
+    },
     super::CommandSpec {
         name: "effort",
         description: "Show or set the thinking effort for the current model",
@@ -186,6 +193,7 @@ pub(super) fn run_settings(
 ) -> Option<Result<Step>> {
     match name {
         "effort" => Some(effort(shell, app, agent, args)),
+        "drafter" => Some(drafter::run(shell, app, agent, args)),
         _ => None,
     }
 }

@@ -208,6 +208,14 @@ impl Ui for Bridge<'_> {
         self.shell.transcript.finish_turn();
         self.repaint(true);
     }
+    fn review_turn_draft(&mut self, drafted: &str, cancel: &AtomicBool) -> bool {
+        self.shell.ask_with_cancel(
+            "Turn drafter · review before sending",
+            &format!("{drafted}\n\nAccept sends this instruction to the agent. Cancel sends nothing. Use Page Up/Page Down to review the full draft."),
+            &[("Accept and send", 'a'), ("Cancel", 'c')],
+            Some(cancel),
+        ) == Some(0)
+    }
 
     fn role(&mut self, role: &str, model: &str) {
         let status = &mut self.shell.status;

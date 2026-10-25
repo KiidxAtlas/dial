@@ -5,7 +5,7 @@ use crate::config::types::Harness;
 fn template_data_exposes_every_omp_system_prompt_variable() {
     let harness: Harness = serde_json::from_str("{}").unwrap();
     let tools = vec!["read".to_owned(), "browser".to_owned()];
-    let inputs = Inputs {
+    let mut inputs = Inputs {
         cwd: Path::new("/work"),
         harness: &harness,
         soul: None,
@@ -21,6 +21,7 @@ fn template_data_exposes_every_omp_system_prompt_variable() {
         concise_guidance: false,
         one_call: false,
         worked_example: false,
+        prefer_subagents: false,
     };
     let data = template_data(&inputs, &[], Some("APPEND"));
     for key in [
@@ -78,6 +79,19 @@ fn template_data_exposes_every_omp_system_prompt_variable() {
         prompt_template::render_system_prompt(&template, &data).unwrap(),
         "Rread|B|APPEND|SKILLS"
     );
+    for prefer_subagents in [false, true] {
+        inputs.prefer_subagents = prefer_subagents;
+        let data = template_data(&inputs, &[], None);
+        assert_eq!(data["inlineFirstDelegation"], !prefer_subagents);
+        assert_eq!(
+            data["delegationBias"],
+            if prefer_subagents {
+                "prefer-subagents"
+            } else {
+                "selective"
+            }
+        );
+    }
 }
 
 #[test]
@@ -101,6 +115,7 @@ fn computer_use_block_follows_computer_tool() {
             concise_guidance: false,
             one_call: false,
             worked_example: false,
+            prefer_subagents: false,
         };
         system_prompt(&inputs, &[], None).unwrap()
     };
@@ -120,6 +135,7 @@ fn guidance_for(tools: &[String], lean: bool, one_call: bool) -> String {
             lean,
             one_call,
         },
+        false,
         false,
     )
 }
@@ -222,6 +238,7 @@ fn preview_rules_require_their_own_capabilities() {
                                 one_call,
                             },
                             concise,
+                            false,
                         );
                         assert_eq!(policy.contains(PREVIEW_RULES), browser);
                         assert_eq!(policy.contains(PREVIEW_SERVER_RULES), browser && background);
@@ -327,6 +344,7 @@ fn worked_example_is_appended_to_built_in_guidance_only() {
             concise_guidance: false,
             one_call: true,
             worked_example,
+            prefer_subagents: false,
         };
         system_prompt(&inputs, &[], None).unwrap()
     };
@@ -361,6 +379,7 @@ fn concise_guidance_preserves_visual_rules_and_operator_owned_content() {
             concise_guidance,
             one_call: false,
             worked_example: false,
+            prefer_subagents: false,
         })
         .unwrap()
     };
@@ -394,69 +413,76 @@ fn concise_guidance_preserves_visual_rules_and_operator_owned_content() {
 #[test]
 fn task_evidence_changes_leave_policy_bytes_and_tool_gating_stable() {
     let harness: Harness = serde_json::from_str("{}").unwrap();
-    for (lean, concise, one_call) in [
-        (false, false, false),
-        (false, true, false),
-        (true, false, false),
-        (true, false, true),
-    ] {
-        for delegated in [false, true] {
-            let tools = if delegated {
-                names(&["read", "edit", "task"])
-            } else {
-                names(&["read", "edit"])
-            };
-            let build = |evidence: &str| {
-                system_messages(Inputs {
-                    cwd: Path::new("/work"),
-                    harness: &harness,
-                    soul: None,
-                    overrides: (None, None),
-                    context: &[],
-                    skills: String::new(),
-                    memory: evidence.into(),
-                    tools: &tools,
-                    discoverable: &[],
-                    edit_mode: EditMode::default(),
-                    template: None,
-                    lean,
-                    concise_guidance: concise,
-                    one_call,
-                    worked_example: false,
-                })
-                .unwrap()
-            };
-            let before = build("Fixture evidence: failing check in owned module");
-            let after = build("Fixture evidence: repaired module; check passed");
-            assert_eq!(
-                serde_json::to_vec(&before[..2]).unwrap(),
-                serde_json::to_vec(&after[..2]).unwrap(),
-                "task evidence belongs outside frozen/stable policy bands"
-            );
-            assert_ne!(before.last(), after.last());
-            let policy = before[0]["content"].as_str().unwrap();
-            assert_eq!(policy.matches(FOCUSED_WORK).count(), 1);
-            assert_eq!(
-                policy
-                    .matches(crate::agent::prompts::system::TESTER_DELEGATION_RULES)
-                    .count(),
-                usize::from(delegated),
-                "tester delegation must follow task capability exactly once: lean={lean}, concise={concise}, one_call={one_call}"
-            );
-            let delegation = if lean || concise || one_call {
-                LEAN_DELEGATION_RULES
-            } else {
-                DELEGATION_RULES
-            };
-            assert_eq!(policy.ends_with(delegation), delegated);
-            if delegated {
-                assert!(
-                    policy
-                        .find(crate::agent::prompts::system::TESTER_DELEGATION_RULES)
-                        .unwrap()
-                        < policy.find(delegation).unwrap(),
-                    "tester ownership precedes the variant's general delegation policy"
-                );
+    for lean in [false, true] {
+        for concise in [false, true] {
+            for one_call in [false, true] {
+                for prefer_subagents in [false, true] {
+                    for delegated in [false, true] {
+                        let tools = if delegated {
+                            names(&["read", "edit", "task"])
+                        } else {
+                            names(&["read", "edit"])
+                        };
+                        let build = |evidence: &str| {
+                            system_messages(Inputs {
+                                cwd: Path::new("/work"),
+                                harness: &harness,
+                                soul: None,
+                                overrides: (None, None),
+                                context: &[],
+                                skills: String::new(),
+                                memory: evidence.into(),
+                                tools: &tools,
+                                discoverable: &[],
+                                edit_mode: EditMode::default(),
+                                template: None,
+                                lean,
+                                concise_guidance: concise,
+                                one_call,
+                                worked_example: false,
+                                prefer_subagents,
+                            })
+                            .unwrap()
+                        };
+                        let before = build("Fixture evidence: failing check in owned module");
+                        let after = build("Fixture evidence: repaired module; check passed");
+                        assert_eq!(
+                            serde_json::to_vec(&before[..2]).unwrap(),
+                            serde_json::to_vec(&after[..2]).unwrap(),
+                            "task evidence belongs outside frozen/stable policy bands"
+                        );
+                        assert_ne!(before.last(), after.last());
+                        let policy = before[0]["content"].as_str().unwrap();
+                        assert_eq!(policy.matches(FOCUSED_WORK).count(), 1);
+                        for (rule, selected) in [
+                            (TESTER_DELEGATION_RULES, prefer_subagents),
+                            (SELECTIVE_DELEGATION_RULES, !prefer_subagents),
+                        ] {
+                            assert_eq!(
+                                policy.matches(rule).count(),
+                                usize::from(delegated && selected),
+                                "delegation routing: lean={lean}, concise={concise}, one_call={one_call}, prefer_subagents={prefer_subagents}, task={delegated}"
+                            );
+                        }
+                        let delegation = if lean || concise || one_call {
+                            LEAN_DELEGATION_RULES
+                        } else {
+                            DELEGATION_RULES
+                        };
+                        assert_eq!(policy.ends_with(delegation), delegated);
+                        if delegated {
+                            let selected = if prefer_subagents {
+                                TESTER_DELEGATION_RULES
+                            } else {
+                                SELECTIVE_DELEGATION_RULES
+                            };
+                            assert!(
+                                policy.find(selected).unwrap() < policy.find(delegation).unwrap(),
+                                "selected delegation guidance precedes the general delegation policy"
+                            );
+                        }
+                    }
+                }
             }
         }
     }

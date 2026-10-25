@@ -180,13 +180,14 @@ impl<'a> Agent<'a> {
             });
         // Share the verdict and runner context used by focused-check diagnostics.
         let verdict = override_verdict.unwrap_or_else(|| {
-            crate::agent::verify::verification::classify_with_runner(
+            crate::agent::verify::verification::classify_with_artifacts(
                 check.as_ref(),
                 configured
                     .and_then(|check| self.config.verification.runners.get(&check.name))
                     .map(|runner| (runner.program.as_str(), runner.module.as_deref())),
                 output,
                 self.interrupt.load(Ordering::SeqCst),
+                self.workspace.artifacts(),
             )
         });
         let exit = verdict.repair_exit_code(output);
@@ -581,9 +582,6 @@ impl<'a> Agent<'a> {
         checks: &[crate::agent::verify::verification::FocusedCheck],
         ui: &mut dyn Ui,
     ) -> CheckRun {
-        if !checks.is_empty() {
-            self.step_checks.failed_checks.clear();
-        }
         let mut failures = Vec::new();
         let mut actionable = Vec::new();
         let mut results = Vec::new();
@@ -609,6 +607,9 @@ impl<'a> Agent<'a> {
         for (index, check) in checks.iter().enumerate() {
             if self.interrupt.load(Ordering::SeqCst) {
                 for skipped in &checks[index..] {
+                    self.step_checks
+                        .failed_checks
+                        .retain(|failed| failed.command != skipped.command);
                     self.step_checks.failed_checks.push(skipped.clone());
                     results.push(json!({"name":skipped.name,"command":skipped.command,"status":crate::agent::verify::verification::CheckStatus::Cancelled}));
                     self.step_checks.evidence.observe(
@@ -632,6 +633,9 @@ impl<'a> Agent<'a> {
                 break;
             }
             if self.reuse_check(check) {
+                self.step_checks
+                    .failed_checks
+                    .retain(|failed| failed.command != check.command);
                 results.push(json!({"name":check.name,"command":check.command,"status":"passed","reused":true,"ran":false}));
                 outcomes.push(crate::agent::verify::verification_receipts::Outcome {
                     name: check.name.clone(),
@@ -670,6 +674,9 @@ impl<'a> Agent<'a> {
                 status,
                 ran: true,
             });
+            self.step_checks
+                .failed_checks
+                .retain(|failed| failed.command != check.command);
             // A passing check is already its own `✓ Verify …` tool row; only a problem earns a notice.
             if status != crate::agent::verify::verification::CheckStatus::Passed {
                 ui.event(&crate::agent::ui::ui_event::UiEvent::new(
@@ -734,7 +741,7 @@ impl<'a> Agent<'a> {
             }
             failures.insert(0, header);
         }
-        self.step_checks.failed = !failures.is_empty();
+        self.step_checks.failed = !self.step_checks.failed_checks.is_empty();
 
         if !self.hermetic {
             let mut control = self.session.control_state();
@@ -750,9 +757,11 @@ impl<'a> Agent<'a> {
                     .map(PathBuf::from)
                     .collect::<Vec<_>>();
                 let limits = self.related_test_plan(&changed).limits;
-                state["verification"] = json!(if checks.is_empty() {
+                state["verification"] = json!(if self.step_checks.failed {
+                    "focused checks failed; retained obligations remain"
+                } else if checks.is_empty() {
                     "no automatic focused check available; behavior unverified"
-                } else if failures.is_empty() && !limits.is_empty() {
+                } else if !limits.is_empty() {
                     "focused checks passed with partial coverage; see coverage_limits"
                 } else if failures.is_empty() {
                     "focused checks passed; assess coverage against requirements"

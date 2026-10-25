@@ -34,7 +34,15 @@ use std::time::Instant;
 
 impl Shell {
     pub(in crate::app) fn new(app: &App, startup: String) -> Result<Shell> {
-        let mut term = InlineTerminal::enter()?;
+        Self::with_terminal(app, startup, InlineTerminal::enter()?)
+    }
+
+    /// Keep initialization identical for the real terminal and the in-memory input-routing tests.
+    pub(super) fn with_terminal(
+        app: &App,
+        startup: String,
+        mut term: InlineTerminal,
+    ) -> Result<Shell> {
         term.clear_screen()?;
         let dark = terminal_dark(std::env::var("COLORFGBG").ok().as_deref());
         let (keys, warnings) = Keymap::load(&app.layout.user_dir);
@@ -44,6 +52,7 @@ impl Shell {
         let commands = context::discover_commands(&app.layout);
         let mut shell = Shell {
             files: super::file_discovery::Files::new(),
+            runtime_updates: Default::default(),
             loop_mode: Default::default(),
             runtime: Default::default(),
             pending_result: None,
@@ -111,7 +120,6 @@ impl Shell {
             deferred: Default::default(),
             deferred_editor: false,
             deferred_approval_cycle: false,
-            deferred_display_reset: false,
             held: Default::default(),
             live_tasks: None,
             workers: Default::default(),
@@ -155,6 +163,15 @@ impl Shell {
     /// Observe disk on a bounded timer. A running agent only receives a pending snapshot.
     pub(in crate::app) fn refresh_resources(&mut self, app: &App, force: bool, busy: bool) -> bool {
         let mut files_changed = false;
+        // Optional update checks never block startup or input, and never run in network-off mode.
+        if app.config.sandbox.mode != crate::config::types::SandboxMode::Strict
+            && app.config.sandbox.allow_network
+        {
+            if let Some(message) = self.runtime_updates.poll(&app.layout.user_dir) {
+                self.note("Runtime updates", message);
+                files_changed = true;
+            }
+        }
         self.files.request(&app.layout.project_root);
         if let Some(listing) = self.files.poll() {
             self.composer.set_files(listing.paths);

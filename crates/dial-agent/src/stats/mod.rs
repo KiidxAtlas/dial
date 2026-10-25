@@ -72,6 +72,7 @@ pub struct WireRecord {
 
 #[derive(Debug, Clone, Default)]
 pub struct ToolRecord {
+    pub facts: crate::telemetry::ExecutionFacts,
     pub status: Option<crate::tools::ToolStatus>,
     pub ts_ms: i64,
     pub session: String,
@@ -315,6 +316,7 @@ CREATE INDEX IF NOT EXISTS requests_ts ON requests(ts);
 CREATE TABLE IF NOT EXISTS tool_calls(id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, session TEXT NOT NULL,
   project TEXT NOT NULL, tool TEXT NOT NULL, duration_ms INTEGER NOT NULL, error INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS tool_outcomes(call_id INTEGER PRIMARY KEY, status TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS tool_facts(call_id INTEGER PRIMARY KEY, facts TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS tool_calls_ts ON tool_calls(ts);
 CREATE TABLE IF NOT EXISTS request_hourly(hour INTEGER NOT NULL, project TEXT NOT NULL, model TEXT NOT NULL,
   requests INTEGER NOT NULL, errors INTEGER NOT NULL, reported INTEGER NOT NULL, input INTEGER NOT NULL,
@@ -486,6 +488,11 @@ impl Db {
             "INSERT INTO tool_calls(ts, session, project, tool, duration_ms, error) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
             params![r.ts_ms, r.session, r.project, r.tool, sql_u64(r.duration_ms), r.error],
         )?;
+        let call_id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO tool_facts(call_id, facts) VALUES(?1, ?2)",
+            params![call_id, serde_json::to_string(&r.facts)?],
+        )?;
         let status = r.status.unwrap_or(if r.error {
             crate::tools::ToolStatus::Error
         } else {
@@ -493,7 +500,7 @@ impl Db {
         });
         tx.execute(
             "INSERT INTO tool_outcomes(call_id, status) VALUES(?1, ?2)",
-            params![tx.last_insert_rowid(), status.as_str()],
+            params![call_id, status.as_str()],
         )?;
         tx.execute(
             "INSERT INTO tool_hourly VALUES(?1, ?2, ?3, 1, ?4, ?5)

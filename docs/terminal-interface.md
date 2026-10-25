@@ -98,7 +98,7 @@ turn finishes. See [Session coordination](session-coordination.md) for delivery,
   The status line reports stopping immediately; interrupted turns do not send a finished notification.
   Slash commands never become model steering: `/hotkeys`, `/todo`, `/skills`, `/commands`, `/context`, `/search`, `/workers`, `/message`,
   `/cancel`, `/policy`, `/reliability`, and `/improve status|jobs|stop` run at once without stopping the turn.
-  `/help` lists the "Stops the turn" and "Runs at once" sets from the central command policy,
+  `/help` opens the action palette while idle or busy; `/help text` and `/help all` list commands and their scheduling policies,
   also used by dispatch and palette notes. `/model` and `/models` share the same policy, including
   `settings` (`setting`), `defaults`, `local` and `memory`: these panels open immediately, even during
   a turn. The model shortcut (`Ctrl+K` on macOS, `Alt+M` elsewhere) opens the same picker.
@@ -112,6 +112,12 @@ turn finishes. See [Session coordination](session-coordination.md) for delivery,
   `/models restart`) is refused
   while busy without cancelling inference. Live informational notices do not settle or replay the
   streaming answer.
+  The shortcut editor (`/hotkeys`) also stays fully editable during a turn. Provider connection tests
+  return to the provider list while discovery runs, rather than silently closing the panel.
+  During compute waits and local-model preparation, provider/model/settings navigation, tool and
+  reasoning visibility, tool expansion, screen reset and dictation remain available. Escape first
+  dismisses a local completion/search/send chooser; a subsequent Escape cancels the wait. Screen
+  reset works immediately during inference instead of waiting for the turn to finish.
 - In `/models`, highlight a model and press `Ctrl+F` to favorite or unfavorite it.
   The **Favorites** view lists saved favorites; `*` marks favorites that are not the current main model.
   Favorites use the picker's global/project scope (`Ctrl-S`) and persist across restarts.
@@ -262,7 +268,7 @@ Shortcut labels use **Option** on macOS and **Alt** elsewhere. **Ctrl** always m
 not Command. Both `Alt` and `Option` are accepted in keybinding configuration on every platform;
 saved bindings retain the portable `Alt` spelling. `/hotkeys` shows the effective native labels.
 
-`/hotkeys` opens a searchable shortcut editor when idle (during a turn it prints the active reference).
+`/hotkeys` opens the same searchable shortcut editor while idle, during a turn or while waiting for compute.
 Type to filter by action, group or key; `Enter` edits, `Delete` restores defaults, and `Esc` goes back.
 Enter chord names separated by spaces, such as `Alt+M Ctrl+K`; an empty field disables the action.
 Changes save globally and apply immediately, only after validation and a successful write. Conflicting
@@ -274,9 +280,12 @@ bindings are rejected, and the editor keeps a way to confirm and close panels. Y
 "app.history.search" = []
 ```
 
+### Settings
+
 `/settings` is the configuration hub. Type to search labels, descriptions and configuration paths
-across every category; search words can appear in any order. `Left`/`Right` change categories and
-`Tab`/`Shift-Tab` jump sections. `Enter` toggles a two-state switch or opens an editor/choice list.
+across every category; search words can appear in any order. Exact configuration paths rank before
+fuzzy matches. `Left`/`Right` change categories and `Tab`/`Shift-Tab` jump sections.
+`Enter` toggles a two-state switch or opens an editor/choice list.
 Settings with an automatic mode open an explicit **Auto / On / Off** picker at the current value
 instead of cycling and saving immediately. Choices save only when confirmed; `Esc` cancels without
 saving. `Ctrl-S` switches **All projects** / **This
@@ -289,6 +298,24 @@ While you search, the category tabs are not offered and `Tab` does nothing; `Esc
 Choice lists also accept typing to filter their labels and stored values. `Esc` clears that filter
 before returning to settings; `Enter` confirms only a visible match. Clearing an override restores
 its inherited value, rather than resetting unrelated settings.
+
+The hub includes controls for all persisted configuration fields. `/settings` manages interactive/coding
+settings; `/improve settings` holds the learning and evaluation categories. Less common scalar fields
+and complex collections have explicit configuration rows: provider definitions, model profiles and
+presets, agents/custom tools, MCP/LSP/debug adapters, hooks, verification, budgets, training and voice.
+Search by a descendant path such as `providers.custom.headers` or `browser.allowed_hosts` to find
+the complete structured editor. These advanced rows accept TOML inline tables or arrays (including
+arrays of tables), not JSON. For example, browser host restrictions use `{ allowed_hosts = ["example.com"] }`.
+Structured editors start with only the selected storage layer, not inherited global values. Saving
+replaces that layer's value; untouched inherited fields continue to merge normally. Hooks retain their
+append-across-layers semantics. `Delete` removes the selected layer's override. The controller validates
+the full configuration before writing; failures keep the editor and its draft open.
+
+Credential-bearing collections and literal secret lists are masked while browsing and editing.
+`Ctrl-R` deliberately reveals/hides a sensitive editor; opening another editor always restores masking.
+Prefer environment-variable references to literal tokens. Runtime-only paths, derived context and
+private account policy are not editable settings. The retired `ui.hyperlinks` compatibility key is not
+offered, and reserved MCP switches are explicitly labeled as having no current runtime effect.
 
 ### Local and hosted setup presets
 

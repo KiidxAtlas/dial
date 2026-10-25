@@ -118,6 +118,11 @@ pub trait Ui {
     fn extension_panel(&mut self, title: &str, markdown: &str) {
         self.notice(&format!("{title}\n{markdown}"));
     }
+    /// Review a generated instruction before it reaches the main model. Non-interactive
+    /// clients retain automatic delivery; interactive adapters must explicitly collect consent.
+    fn review_turn_draft(&mut self, _drafted: &str, cancel: &AtomicBool) -> bool {
+        !self.interactive_input() && !cancel.load(Ordering::Acquire)
+    }
     fn role(&mut self, _role: &str, _model: &str) {}
     fn approve(&mut self, _tool: &str, _summary: &str) -> Decision {
         Decision::Deny

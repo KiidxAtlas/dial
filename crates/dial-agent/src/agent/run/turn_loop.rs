@@ -761,7 +761,6 @@ impl<'a> Agent<'a> {
                     .include_failed_checks(self.workspace.root(), &mut checks);
                 self.step_checks.record_checked();
                 let mut run = self.run_checks(&checks, ui);
-                self.step_checks.failed = !run.failures.is_empty();
                 // Zero selects a bounded default; hooks cannot reset the repair allowance.
                 let repair_outcome = (|| -> Result<()> {
                     while repair_attempts < repair_limit {
@@ -809,7 +808,6 @@ impl<'a> Agent<'a> {
                                 .include_failed_checks(self.workspace.root(), &mut checks);
                             self.step_checks.record_checked();
                             run = self.run_checks(&checks, ui);
-                            self.step_checks.failed = !run.failures.is_empty();
                         }
                     }
                     Ok(())

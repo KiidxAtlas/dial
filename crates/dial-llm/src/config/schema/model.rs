@@ -254,7 +254,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         MO,
         "Roles & Sampling",
         "History token ceiling",
-        "Window that compaction and pruning plan against when the model's context window is larger; 0 uses the full window. Every step resends the history, so a 1M-token model would otherwise carry requests of several hundred thousand tokens. The default compacts near 178k. Applies when the efficiency policy is on.",
+        "Window that compaction and pruning plan against when the model's context window is larger; 0 uses the full window. Every step resends the history, so a 1M-token model would otherwise carry requests of several hundred thousand tokens. The default compacts near 223k. Applies when the efficiency policy is on.",
         Kind::Int {
             min: 0,
             max: 2000000,

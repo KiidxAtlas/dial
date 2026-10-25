@@ -97,12 +97,12 @@ impl TokenSource {
 
     /// The access token to send now. An expired grant with a refresh token is refreshed first,
     /// so the request is not sent unauthenticated. None when no usable token exists.
-    pub fn bearer(&self) -> Option<String> {
+    pub(super) fn bearer_with(&self, cancel: &Arc<AtomicBool>) -> Option<String> {
         let grant = lock(&self.grant).clone()?;
         if util::now_ms() < grant.expires_at_ms {
             return Some(grant.access);
         }
-        self.refresh(&grant.access)
+        self.refresh_with(&grant.access, cancel)
             .then(|| lock(&self.grant).as_ref().map(|fresh| fresh.access.clone()))
             .flatten()
     }
@@ -117,8 +117,15 @@ impl TokenSource {
     /// Refresh tokens rotate, so refreshes are serialized: when the stored token is no longer
     /// `stale`, another request already refreshed it and that result is reused. False when there
     /// is no refresh token or the token endpoint refuses it; the stored grant is then unchanged.
-    pub fn refresh(&self, stale: &str) -> bool {
-        let _turn = self.refreshing.lock();
+    pub(super) fn refresh_with(&self, stale: &str, cancel: &Arc<AtomicBool>) -> bool {
+        let _turn = loop {
+            if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                return false;
+            }
+            if let Some(turn) = self.refreshing.try_lock_for(Duration::from_millis(50)) {
+                break turn;
+            }
+        };
         let Some(grant) = lock(&self.grant).clone() else {
             return false;
         };
@@ -141,13 +148,12 @@ impl TokenSource {
         if let Some(secret) = secret.as_deref() {
             form.push(("client_secret", secret));
         }
-        let cancel = Arc::new(AtomicBool::new(false));
         let Ok(response) = util::request(
             "POST",
             &grant.token_endpoint,
             &[],
             Body::Form(&form[..]),
-            &cancel,
+            cancel,
         ) else {
             return false;
         };
@@ -156,7 +162,9 @@ impl TokenSource {
         };
         // The fresh grant is usable now even if writing it to disk failed; that failure only
         // means the next start asks for a fresh sign-in, so it does not fail this request.
-        let _ = persist(&self.path, &fresh);
+        if let Ok(_guard) = crate::config::settings_store::try_locked(&self.path) {
+            let _ = serde_json::to_vec(&fresh).map(|bytes| write_private(&self.path, &bytes));
+        }
         *lock(&self.grant) = Some(fresh);
         true
     }
@@ -488,3 +496,6 @@ fn persist(path: &Path, grant: &Grant) -> Result<()> {
     drop(guard);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

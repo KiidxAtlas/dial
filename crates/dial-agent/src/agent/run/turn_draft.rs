@@ -6,6 +6,8 @@
 //! Drafting fails closed: a failed, cancelled, truncated or empty draft fails the turn and nothing
 //! reaches the main model. Harness-generated turns (goal continuations) and hermetic agents are
 //! not drafted.
+//! Interactive surfaces require review before delivery; unattended surfaces retain automatic
+//! delivery of valid drafts. Rejection never falls back to the original message.
 
 use crate::agent::*;
 use crate::llm::model_config::TURN_DRAFTER;
@@ -115,12 +117,17 @@ impl Agent<'_> {
             !drafted.is_empty(),
             "turn drafter returned an empty prompt; your message was not sent to the main model"
         );
+        ui.extension_panel("Turn drafter · proposed instruction", drafted);
+        ensure!(
+            ui.review_turn_draft(drafted, &self.interrupt)
+                && !self.interrupt.load(Ordering::Acquire),
+            "turn draft cancelled; your message was not sent to the main model"
+        );
         self.record(
             step,
             "turn_drafted",
             json!({"typed_chars":typed.chars().count(),"drafted_chars":drafted.chars().count()}),
         )?;
-        ui.extension_panel("Turn optimizer · drafted prompt", drafted);
         Ok(drafted.to_owned())
     }
 

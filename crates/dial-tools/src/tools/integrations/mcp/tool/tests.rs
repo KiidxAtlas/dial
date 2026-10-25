@@ -94,3 +94,33 @@ fn prompt_messages_render_with_role_and_description() {
         "(the prompt returned no messages)"
     );
 }
+
+#[test]
+fn protocol_capture_retention_and_text_presentation_are_independent() {
+    let result = json!({"content":[{"type":"text","text":"caption"},{"type":"image","data":"AAAA"}],"structuredContent":{"n":1}});
+    let output = render_result(&result);
+    assert!(output.text.contains("caption"));
+    assert!(output.text.contains(r#"{"n":1}"#));
+    assert_eq!(output.data.as_ref(), Some(&result));
+    let facts = output.execution.output.unwrap();
+    assert_eq!(facts.capture, Completeness::Complete);
+    assert_eq!(facts.retention, Completeness::Complete);
+    assert_eq!(facts.presentation, Completeness::Partial);
+    assert_eq!(facts.original_bytes, Some(result.to_string().len() as u64));
+    assert_eq!(facts.omitted_bytes, Some(0));
+    let bounded =
+        render_result(&json!({"content":[{"type":"text","text":"x".repeat(MAX_RESULT * 2)}]}));
+    assert_eq!(
+        bounded.execution.output.as_ref().unwrap().presentation,
+        Completeness::Partial
+    );
+    assert_eq!(
+        bounded.execution.output.as_ref().unwrap().capture,
+        Completeness::Complete
+    );
+    let plain = render_result(&json!({"content":[{"type":"text","text":"hello"}]}));
+    assert_eq!(
+        plain.execution.output.unwrap().presentation,
+        Completeness::Complete
+    );
+}

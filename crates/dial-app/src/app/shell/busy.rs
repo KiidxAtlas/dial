@@ -176,8 +176,11 @@ impl Shell {
                     Err(error) => self.note("Jobs", error),
                 }
             }
-            ("message", rest) if rest.split_once(char::is_whitespace).is_some() => {
-                let (id, text) = rest.split_once(char::is_whitespace).unwrap_or_default();
+            ("message", rest) => {
+                let Some((id, text)) = rest.split_once(char::is_whitespace) else {
+                    self.note("Jobs", "Usage: /message <id> <text>");
+                    return true;
+                };
                 let result = match &self.live_tasks {
                     Some(control) => control.send(id, text.trim()),
                     None => Err(anyhow::anyhow!("no live jobs")),
@@ -187,7 +190,11 @@ impl Shell {
                     Err(error) => self.note("Jobs", format!("{error:#}")),
                 }
             }
-            ("cancel", id) if !id.is_empty() => {
+            ("cancel", id) => {
+                if id.is_empty() {
+                    self.note("Jobs", "Usage: /cancel <id>");
+                    return true;
+                }
                 let result = match &self.live_tasks {
                     Some(control) => control.cancel(id),
                     None => Err(anyhow::anyhow!("no live jobs")),

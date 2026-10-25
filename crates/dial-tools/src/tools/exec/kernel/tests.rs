@@ -326,3 +326,26 @@ fn workspace_python_launcher_is_rejected_before_execution() {
     assert!(error.contains("outside the editable workspace"));
     assert!(!marker.exists());
 }
+
+#[test]
+fn persistent_reply_observation_and_retention_do_not_invent_child_success() {
+    use crate::runtime::execution::Completeness;
+    let out = code_output(Ok(json!({"stdout":"abc", "error":null,
+        "output_integrity":{"original_bytes":9,"retained_bytes":3}})));
+    assert!(!out.is_error);
+    assert!(out.execution.observation.unwrap().satisfied);
+    assert!(
+        out.execution.process.is_none(),
+        "a persistent interpreter has not exited"
+    );
+    let integrity = out.execution.output.unwrap();
+    assert_eq!(integrity.capture, Completeness::Unknown);
+    assert_eq!(integrity.retention, Completeness::Partial);
+    assert_eq!(integrity.omitted_bytes, Some(6));
+    let failed = code_output(Err("transport disconnected".into()));
+    assert!(!failed.execution.observation.unwrap().satisfied);
+    assert_eq!(
+        failed.execution.output.unwrap().capture,
+        Completeness::Unknown
+    );
+}

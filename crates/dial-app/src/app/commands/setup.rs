@@ -24,13 +24,21 @@ mod presets;
 
 const TITLE: &str = "Setup";
 
-const USAGE: &str = "/setup                 guided setup: search, review, then confirm\n/setup presets [local-only|local-assisted|hosted] [project|global]   review and save a model-routing setup\n/setup list            list capabilities and their status as text\n/setup <id>            preview what would run and where it installs\n/setup <id> yes        set it up (prerequisites first), then save its settings\n/setup providers       connect a model provider\n/setup memory          choose a memory backend: what each needs and whether it is ready\n/setup memory <backend>   switch memory to off, provenance, local, hindsight, sharpshooter or semantic (all projects)\n/setup embeddings      list local embedding models (Ollama)\n/setup embeddings:<model> [yes]   preview, then pull the model and assign it to the embedding role (used by the semantic memory backend)";
+const USAGE: &str = "/setup                 guided setup: search, review, then confirm\n/setup presets [local-only|local-assisted|hosted] [project|global]   review and save a model-routing setup\n/setup list            list capabilities and their status as text\n/setup updates         check installed external runtimes/tools for updates (no installs)\n/setup update <id>     review update commands and destination\n/setup update <id> yes explicitly approve and run that update\n/setup <id>            preview what would run and where it installs\n/setup <id> yes        set it up (prerequisites first), then save its settings\n/setup providers       connect a model provider\n/setup memory          choose a memory backend: what each needs and whether it is ready\n/setup memory <backend>   switch memory to off, provenance, local, hindsight, sharpshooter or semantic (all projects)\n/setup embeddings      list local embedding models (Ollama)\n/setup embeddings:<model> [yes]   preview, then pull the model and assign it to the embedding role (used by the semantic memory backend)";
 
 pub(super) const COMMANDS: &[super::CommandSpec] = &[super::CommandSpec {
     name: "setup",
     description: "check optional capabilities, set one up, choose memory, or sign in to providers",
     args_hint: "[<id> [yes]]",
-    subcommands: &["presets", "providers", "memory", "embeddings", "list"],
+    subcommands: &[
+        "presets",
+        "providers",
+        "memory",
+        "embeddings",
+        "list",
+        "updates",
+        "update",
+    ],
 }];
 
 pub(super) fn run_command(
@@ -77,6 +85,10 @@ pub(super) fn run_live(
         return None;
     }
     let parts: Vec<&str> = args.split_whitespace().collect();
+    if let Some(action) = update_action(&parts) {
+        runtime_update_command(shell, app, action);
+        return Some(Ok(Step::Done));
+    }
     if parts.first().is_some_and(|id| id.starts_with("embeddings")) {
         embedding_command(shell, app, &parts);
         return Some(Ok(Step::Done));
@@ -101,6 +113,55 @@ pub(super) fn run_live(
         _ => shell.note(TITLE, USAGE),
     }
     Some(Ok(Step::Done))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum UpdateAction<'a> {
+    Check,
+    Preview(&'a str),
+    Apply(&'a str),
+}
+
+fn update_action<'a>(parts: &[&'a str]) -> Option<UpdateAction<'a>> {
+    match parts {
+        ["updates"] => Some(UpdateAction::Check),
+        ["update", id] => Some(UpdateAction::Preview(id)),
+        ["update", id, "yes"] => Some(UpdateAction::Apply(id)),
+        _ => None,
+    }
+}
+
+fn runtime_update_command(shell: &mut Shell, app: &App, action: UpdateAction<'_>) {
+    let env = Env::current(&app.layout.user_dir);
+    // Queries as well as installs may use the network. Keep network-off sessions offline.
+    if app.config.sandbox.mode == crate::config::types::SandboxMode::Strict
+        || !app.config.sandbox.allow_network
+    {
+        shell.note(
+            "Runtime updates",
+            "Runtime update checks and installs are disabled while network access is off.",
+        );
+        return;
+    }
+    match action {
+        UpdateAction::Check => {
+            spawn_job_streaming(shell, "Runtime updates", move |cancel, _| {
+                deps::updates::check(&env, &cancel).map(|report| report.text())
+            });
+        }
+        UpdateAction::Preview(id) => {
+            let id = id.to_owned();
+            spawn_job_streaming(shell, "Runtime updates", move |_, _| {
+                deps::updates::preview(&id, &env)
+            });
+        }
+        UpdateAction::Apply(id) => {
+            let id = id.to_owned();
+            spawn_job_streaming(shell, "Runtime updates", move |cancel, progress| {
+                deps::updates::update(&id, &env, &cancel, progress)
+            });
+        }
+    }
 }
 
 /// The picker emits only review/navigation commands, never the explicit `yes` form.

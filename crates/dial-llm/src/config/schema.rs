@@ -40,6 +40,9 @@ pub enum Kind {
     StringList,
     /// A TOML inline table, validated against the complete configuration before saving.
     Table,
+    /// A complete TOML value, including arrays of tables and optional structured settings.
+    /// The controller still deserializes and validates the complete configuration before saving.
+    Toml,
     /// Names come from the theme manager (passed to `SettingsOverlay::new`).
     Theme,
 }
@@ -59,6 +62,26 @@ pub struct SettingDef {
 }
 
 impl SettingDef {
+    /// Collections that may contain credentials never render their contents in the panel.
+    pub fn sensitive(&self) -> bool {
+        matches!(
+            self.path,
+            "secrets.values"
+                | "mcp"
+                | "telemetry"
+                | "telemetry.headers"
+                | "endpoint"
+                | "providers"
+                | "model_roles"
+                | "model_favorites"
+                | "model_presets"
+                | "tools"
+                | "hooks"
+                | "extensions"
+                | "dap"
+                | "lsp"
+        )
+    }
     /// Machine-readable UI constraints; open choices remain suggestions, never closed enums.
     pub fn constraints(&self) -> serde_json::Value {
         use serde_json::json;
@@ -84,6 +107,7 @@ impl SettingDef {
             Kind::Text | Kind::Theme => json!({"type":"string"}),
             Kind::StringList => json!({"type":"array","items":{"type":"string"}}),
             Kind::Table => json!({"type":"object"}),
+            Kind::Toml => json!({"format":"toml"}),
         }
     }
     pub fn kind_for(&self, values: &Table) -> Kind {
@@ -121,6 +145,7 @@ impl SettingDef {
                     Some(Value::String("auto".into()))
                 }
                 Kind::Text => Some(Value::String(String::new())),
+                Kind::Toml => Some(Value::Table(Table::new())),
                 _ => None,
             })
     }
@@ -335,6 +360,7 @@ mod compaction;
 mod coordination;
 mod experimental;
 mod improvement;
+mod management;
 mod memory;
 mod model;
 mod tools;
@@ -910,6 +936,7 @@ static REGISTRY: &[SettingDef] = &[
     tools::DECLARATIONS[32],
     tools::DECLARATIONS[33],
     tools::DECLARATIONS[34],
+    tools::DECLARATIONS[51],
     improvement::DECLARATIONS[59],
     improvement::DECLARATIONS[60],
     improvement::DECLARATIONS[61],
@@ -971,7 +998,14 @@ const _: () = assert!(
 );
 
 pub fn registry() -> &'static [SettingDef] {
-    REGISTRY
+    static ALL: std::sync::LazyLock<Vec<SettingDef>> = std::sync::LazyLock::new(|| {
+        REGISTRY
+            .iter()
+            .chain(management::DECLARATIONS)
+            .copied()
+            .collect()
+    });
+    &ALL
 }
 
 /// Checks a value written outside `/settings` (the CLI) against its schema entry, so a value the
@@ -982,7 +1016,7 @@ pub fn check_value(path: &str, value: &Value) -> Result<(), String> {
 }
 
 pub fn check_value_for(values: &Table, path: &str, value: &Value) -> Result<(), String> {
-    let Some(def) = REGISTRY.iter().find(|def| def.path == path) else {
+    let Some(def) = registry().iter().find(|def| def.path == path) else {
         return Ok(());
     };
     let number = value
@@ -1008,6 +1042,7 @@ pub fn check_value_for(values: &Table, path: &str, value: &Value) -> Result<(), 
             .as_array()
             .is_some_and(|items| items.iter().all(Value::is_str)),
         Kind::Table => value.is_table(),
+        Kind::Toml => true,
     };
     if fits {
         Ok(())

@@ -278,7 +278,7 @@ fn server_summary(server: &McpServerConfig) -> String {
     }
 }
 
-fn server_command(server: &McpServerConfig) -> String {
+pub(super) fn server_command(server: &McpServerConfig) -> String {
     let summary = server_summary(server);
     if server.url.is_none() && !server.args.is_empty() {
         format!("{summary} ({} arguments hidden)", server.args.len())
@@ -483,6 +483,16 @@ fn start(job: &mut Option<InstallJob>, pending: Pending, app: &App) {
             );
         }
     };
+    let scope = match intent_scope(&app.layout, &intent, scope) {
+        Ok(scope) => scope,
+        Err(error) => {
+            return fail(
+                &progress,
+                &intent,
+                format!("could not read settings: {error:#}"),
+            );
+        }
+    };
     if let Ok(mut shown) = progress.lock() {
         *shown = JobProgress {
             label: Some(intent.describe()),
@@ -513,6 +523,16 @@ fn start(job: &mut Option<InstallJob>, pending: Pending, app: &App) {
         scope,
         intent: job_intent,
     });
+}
+
+/// Existing MCP entries are changed in their owning layer, not the install destination.
+fn intent_scope(layout: &Layout, intent: &Intent, selected: Scope) -> Result<Scope> {
+    match intent {
+        Intent::ToggleMcp { id, .. } | Intent::RemoveMcp { id } => {
+            super::extensions::mcp_scope(layout, id)
+        }
+        _ => Ok(selected),
+    }
 }
 
 /// A finished intent, ready to save its config changes and publish its result.
@@ -878,7 +898,7 @@ fn install_mcp(
         progress,
         "starting the server to check it (first run downloads packages)",
     );
-    match catalog::check(&config.project_root, &local, &server) {
+    match catalog::check(config, &local, &server) {
         Ok(count) => {
             say(
                 progress,
@@ -944,7 +964,7 @@ fn health_check(
     name: &str,
     server: &McpServerConfig,
 ) -> Result<std::result::Result<usize, String>> {
-    Ok(catalog::check(&config.project_root, name, server))
+    Ok(catalog::check(config, name, server))
 }
 
 fn smithery_install(
@@ -1267,7 +1287,7 @@ fn import_mcp(
             ),
         );
         say(progress, "starting the server to check it");
-        match catalog::check(&config.project_root, id, &server) {
+        match catalog::check(config, id, &server) {
             Ok(count) => say(
                 progress,
                 format!("health check passed with {count} tool(s)"),

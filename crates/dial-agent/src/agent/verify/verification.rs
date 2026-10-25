@@ -77,6 +77,16 @@ pub(in crate::agent) fn classify_with_runner(
     output: &crate::runtime::tool_output::ToolOutput,
     cancelled: bool,
 ) -> CheckStatus {
+    classify_with_artifacts(check, runner, output, cancelled, None)
+}
+
+pub(in crate::agent) fn classify_with_artifacts(
+    check: Option<&FocusedCheck>,
+    runner: Option<(&str, Option<&str>)>,
+    output: &crate::runtime::tool_output::ToolOutput,
+    cancelled: bool,
+    artifacts: Option<&crate::storage::artifact::ArtifactStore>,
+) -> CheckStatus {
     let process = output.process_outcome();
     let status = crate::tools::ToolStatus::from_output(output);
     if cancelled
@@ -93,6 +103,10 @@ pub(in crate::agent) fn classify_with_runner(
     if status == crate::tools::ToolStatus::Blocked {
         return CheckStatus::PermissionDenied;
     }
+    let Some(text) = classification_text(output, artifacts) else {
+        return CheckStatus::Unverified;
+    };
+    let empty = zero_tests(&text);
     let complete = process
         .as_ref()
         .is_some_and(|process| process.started && process.output_complete)
@@ -102,7 +116,7 @@ pub(in crate::agent) fn classify_with_runner(
         && process
             .as_ref()
             .is_some_and(|process| process.exit_code == Some(0))
-        && !zero_tests(&output.text)
+        && !empty
     {
         return CheckStatus::Passed;
     }
@@ -113,17 +127,73 @@ pub(in crate::agent) fn classify_with_runner(
                 .is_some_and(|p| matches!(p.exit_code, Some(1 | 126 | 127))));
     if output.is_error
         && runner_launch_observed
-        && check.is_some_and(|check| runner_problem(check, runner, &output.text).is_some())
+        && check.is_some_and(|check| runner_problem(check, runner, &text).is_some())
     {
         return CheckStatus::EnvironmentUnavailable;
     }
     let Some(process) = process.filter(|_| complete) else {
         return CheckStatus::Unverified;
     };
-    if zero_tests(&output.text) || process.exit_code.is_none() || process.exit_code == Some(0) {
+    if empty || process.exit_code.is_none() || process.exit_code == Some(0) {
         return CheckStatus::Unverified;
     }
     CheckStatus::CodeFailed
+}
+
+/// Presentation is not exhaustive evidence. Recover complete retained bytes through the bounded
+/// artifact API, never a display link or payload-supplied fact. Oversized/unavailable evidence
+/// remains unverified rather than earning a pass or triggering speculative code repair.
+fn classification_text<'a>(
+    output: &'a crate::runtime::tool_output::ToolOutput,
+    artifacts: Option<&crate::storage::artifact::ArtifactStore>,
+) -> Option<std::borrow::Cow<'a, str>> {
+    use crate::runtime::execution::Completeness;
+    use std::borrow::Cow;
+    let Some(integrity) = &output.execution.output else {
+        // Legacy controller-created results have no presentation transform metadata.
+        return Some(Cow::Borrowed(&output.text));
+    };
+    if integrity.capture != Completeness::Complete {
+        return None;
+    }
+    if integrity.presentation == Completeness::Complete {
+        return Some(Cow::Borrowed(&output.text));
+    }
+    if integrity.retention != Completeness::Complete {
+        return None;
+    }
+    const MAX_CLASSIFICATION_BYTES: u64 = 1024 * 1024;
+    let size = integrity.original_bytes?;
+    if size > MAX_CLASSIFICATION_BYTES || integrity.retained_bytes != Some(size) {
+        return None;
+    }
+    let store = artifacts?;
+    let uri = integrity.artifact.as_deref()?;
+    let mut bytes = Vec::with_capacity(size as usize);
+    // Even empty artifacts must be opened: metadata alone is not evidence of availability.
+    loop {
+        let page: serde_json::Value =
+            serde_json::from_str(&store.retrieve_bytes(uri, bytes.len() as u64, 16384).ok()?)
+                .ok()?;
+        if page["total_bytes"].as_u64()? != size {
+            return None;
+        }
+        use base64::Engine;
+        let chunk = base64::engine::general_purpose::STANDARD
+            .decode(page["data"].as_str()?)
+            .ok()?;
+        if chunk.len() as u64 > size.saturating_sub(bytes.len() as u64) {
+            return None;
+        }
+        let done = bytes.len() + chunk.len() == size as usize;
+        if chunk.is_empty() && !done {
+            return None;
+        }
+        bytes.extend(chunk);
+        if done {
+            return String::from_utf8(bytes).ok().map(Cow::Owned);
+        }
+    }
 }
 
 #[cfg(test)]

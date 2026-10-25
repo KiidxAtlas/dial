@@ -190,7 +190,7 @@ impl ActiveOverlay {
         let arrow = match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 return match self {
-                    Self::Palette(o) => o.click(mouse.row),
+                    Self::Palette(o) => o.click(mouse.column, mouse.row),
                     Self::Jobs(o) => o.click(mouse.row),
                     Self::Subagents(o) => {
                         o.click(mouse.column, mouse.row, std::time::Instant::now())

@@ -452,12 +452,15 @@ pub fn on_path(program: &str) -> bool {
 
 /// Starts `server` once and counts its tools. `Err(why)` when it lists none or fails to start.
 pub fn check(
-    project_root: &Path,
+    config: &Config,
     name: &str,
     server: &McpServerConfig,
 ) -> std::result::Result<usize, String> {
-    let specs = BTreeMap::from([(name.to_string(), server.clone())]);
-    let load = super::connect_extra(&specs, project_root);
+    // An explicit health check tests disabled entries without enabling them in saved config.
+    let mut server = server.clone();
+    server.enabled = true;
+    let specs = BTreeMap::from([(name.to_string(), server)]);
+    let load = super::connect_extra(&specs, config);
     let count = load.tools.len();
     if count == 0 {
         return Err(load

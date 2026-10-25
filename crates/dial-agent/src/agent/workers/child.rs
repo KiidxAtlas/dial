@@ -1936,6 +1936,9 @@ fn run_inner(
     let turn_cancel = children.cancellation.turn(env.interrupt.clone());
     let mut reasoning_recovery = reasoning::Recovery::default();
     let mut request_prefix = crate::agent::window::request_prefix::Tracker::default();
+    // Messages taken while waiting or generating remain owned until the next request
+    // accepts them. In particular, cancellation must not consume coordination.
+    let pending_coordination = std::cell::RefCell::new(Vec::new());
     let mut overflow_retried = false;
     let mut compaction_failed = false;
     // After a failed compaction, retry only once the request grew by a real amount or must make
@@ -1946,7 +1949,8 @@ fn run_inner(
             if budget != 0 && steps >= budget { return Ok(crate::agent::run::engine::Tick::Exhausted); }
 
         rule_state.clear_callback();
-        if append_coordination(&mut messages, approver.take_messages()) {
+        pending_coordination.borrow_mut().extend(approver.take_messages());
+        if append_coordination(&mut messages, std::mem::take(&mut *pending_coordination.borrow_mut())) {
             paired_tools = 0;
             rule_state.begin(
                 rule_root,
@@ -2207,22 +2211,50 @@ fn run_inner(
         if budget != 0 && steps >= budget {
             return Ok(crate::agent::run::engine::Tick::Finished(Outcome::failed(steps, "used all child model requests while compacting")));
         }
-        let Some(_provider_slot) = crate::agent::model::provider_slots::acquire(env.config, env.interrupt) else {
-            return Ok(crate::agent::run::engine::Tick::Finished(Outcome::interrupted(steps)));
-        };
-        // Hold the provider slot only for this in-flight request, never while
-        // the child runs tools or waits for nested work.
-        // The inference-only flag must never cancel the child task or its hook/tool interrupt.
-        steps += 1;
-        approver.progress(steps, "processing", "");
         let observer = std::cell::RefCell::new(&mut *approver);
-        let generation_scope = turn_cancel.inference();
-        let generation_cancel = generation_scope.flag();
-        let mut rule_monitor = rule_catalog.monitor(rule_root, rule_state, &rule_agent);
+        let check_admission = || {
+            pending_coordination.borrow_mut().extend(observer.borrow_mut().take_messages());
+            if env.interrupt.load(Ordering::SeqCst) || !pending_coordination.borrow().is_empty() {
+                Err(Interrupted)
+            } else {
+                Ok(())
+            }
+        };
+        let _provider_slot = match crate::agent::model::provider_slots::acquire_checked(env.config, check_admission) {
+            Ok(slot) => slot,
+            Err(_) if env.interrupt.load(Ordering::SeqCst) => return Ok(crate::agent::run::engine::Tick::Finished(Outcome::interrupted(steps))),
+            Err(_) => {
+                messages = request.messages;
+                if !text_only {
+                    schemas = request.tools;
+                }
+                return Ok(crate::agent::run::engine::Tick::Again);
+            }
+        };
+        // Request hooks are synchronous and can themselves wait. Revalidate after
+        // that boundary, before spending a request or dispatching stale context.
         let provider_rewrite = match child_provider_request(&env, &request, &observer) {
             Ok(rewrite) => rewrite,
             Err(error) => return Ok(crate::agent::run::engine::Tick::Finished(Outcome::failed(steps, format!("{error:#}")))),
         };
+        if check_admission().is_err() {
+            messages = request.messages;
+            if !text_only {
+                schemas = request.tools;
+            }
+            return Ok(if env.interrupt.load(Ordering::SeqCst) {
+                crate::agent::run::engine::Tick::Finished(Outcome::interrupted(steps))
+            } else {
+                crate::agent::run::engine::Tick::Again
+            });
+        }
+        // Hold the provider slot only for inference, never tools or nested work.
+        // Coordination cancels this scope only, not the task or hook/tool interrupt.
+        steps += 1;
+        observer.borrow_mut().progress(steps, "processing", "");
+        let generation_scope = turn_cancel.inference();
+        let generation_cancel = generation_scope.flag();
+        let mut rule_monitor = rule_catalog.monitor(rule_root, rule_state, &rule_agent);
         let provider_request = provider_rewrite.as_ref().unwrap_or(&request);
         let prefix =
             request_prefix.observe(&env.config.selection().display_name(), provider_request);
@@ -2259,6 +2291,10 @@ fn run_inner(
             &mut stream_ui,
             &mut |_| {
                 generation_scope.sync();
+                pending_coordination.borrow_mut().extend(observer.borrow_mut().take_messages());
+                if !pending_coordination.borrow().is_empty() {
+                    generation_cancel.store(true, Ordering::SeqCst);
+                }
             },
             Some(&mut rule_monitor),
         );
@@ -2283,7 +2319,8 @@ fn run_inner(
         if !text_only {
             schemas = request.tools;
         }
-        if append_coordination(&mut messages, approver.take_messages())
+        pending_coordination.borrow_mut().extend(approver.take_messages());
+        if append_coordination(&mut messages, std::mem::take(&mut *pending_coordination.borrow_mut()))
             && !env.interrupt.load(Ordering::SeqCst)
         {
             paired_tools = 0;
@@ -2974,19 +3011,7 @@ fn run_inner(
             if !blocked && !output.is_error {
                 inspections.record(call);
             }
-            crate::telemetry::tool_with_effects(
-                env.config,
-                false,
-                &children.namespace,
-                &call.name,
-                seconds.unwrap_or_else(|| started.elapsed().as_secs_f64()),
-                if blocked {
-                    tools::ToolStatus::Blocked
-                } else {
-                    tools::ToolStatus::from_output(&output)
-                },
-                crate::tools::surface::outcome::effects(&output),
-            );
+            let tool_seconds = seconds.unwrap_or_else(|| started.elapsed().as_secs_f64());
             portable_batch_intercepted |= rule_state.callback_pending();
             let (duplicate, repeat_advice, stop) =
                 engine.settle(env.workspace, call, &mut output, false, false, |id| {
@@ -3042,6 +3067,23 @@ fn run_inner(
             );
             let (mut body, dropped) =
                 crate::agent::workflow::efficiency::visible_result(&output.text, limit, duplicate);
+            if body != output.text {
+                let integrity = output.execution.output.get_or_insert_with(Default::default);
+                integrity.mark_presentation_partial();
+            }
+            crate::telemetry::tool_output(
+                env.config,
+                false,
+                &children.namespace,
+                &call.name,
+                tool_seconds,
+                if blocked {
+                    tools::ToolStatus::Blocked
+                } else {
+                    tools::ToolStatus::from_output(&output)
+                },
+                &output.execution,
+            );
             if let Some(uri) = &artifact {
                 crate::agent::workflow::efficiency::evidence_link(&mut body, uri, dropped);
             }

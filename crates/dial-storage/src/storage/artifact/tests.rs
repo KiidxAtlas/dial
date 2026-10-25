@@ -104,3 +104,28 @@ fn abandoned_spool_is_removed() {
     drop(spool);
     assert!(!path.exists());
 }
+
+#[test]
+fn finalized_integrity_counts_payload_not_truncation_marker() {
+    use crate::runtime::execution::Completeness;
+    let dir = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::new(dir.path())
+        .unwrap()
+        .with_limits(&ArtifactConfig {
+            max_bytes: 8,
+            head_bytes: 3,
+        });
+    let (uri, facts) = store.retain_with_integrity("0123456789abcdef").unwrap();
+    assert_eq!(facts.retention, Completeness::Partial);
+    assert_eq!(facts.capture, Completeness::Unknown);
+    assert_eq!(facts.original_bytes, Some(16));
+    assert_eq!(facts.retained_bytes, Some(8));
+    assert_eq!(facts.omitted_bytes, Some(8));
+    assert_eq!(facts.artifact.as_deref(), Some(uri.as_str()));
+    assert!(
+        store
+            .retrieve(&uri, 1, 100)
+            .unwrap()
+            .contains("ARTIFACT TRUNCATED")
+    );
+}

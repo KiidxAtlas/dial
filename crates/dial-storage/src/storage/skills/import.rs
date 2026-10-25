@@ -69,8 +69,18 @@ fn collect(base: &Path, rel: &Path, files: &mut Files, total: &mut usize) -> Res
         } else {
             ensure!(kind.is_file(), "not a regular file: {}", path.display());
             ensure!(files.len() < MAX_LISTED_FILES, "too many bundled files");
-            let (bytes, truncated) = read_head(&entry.path(), MAX_READ_BYTES)?;
-            ensure!(!truncated, "file exceeds 64 KiB: {}", path.display());
+            let limit = if path == Path::new(SKILL_FILE) {
+                MAX_SKILL_BYTES
+            } else {
+                MAX_READ_BYTES
+            };
+            let (bytes, truncated) = read_head(&entry.path(), limit)?;
+            ensure!(
+                !truncated,
+                "file exceeds {} KiB: {}",
+                limit / 1024,
+                path.display()
+            );
             *total += bytes.len();
             ensure!(*total <= MAX_TOTAL, "bundle exceeds 8 MiB");
             files.insert(path, bytes);

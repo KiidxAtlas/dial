@@ -175,3 +175,31 @@ fn fetches_from_a_local_bare_repository_and_detects_new_commits() {
     assert_ne!(first.commit, second.commit);
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn local_resolution_preserves_remote_identities() {
+    let root = scratch("resolve");
+    fs::create_dir_all(root.join("repo")).unwrap();
+    assert_eq!(
+        resolve_local("./repo", &root),
+        fs::canonicalize(root.join("repo"))
+            .unwrap()
+            .to_str()
+            .unwrap()
+    );
+    for url in [
+        "https://host/repo",
+        "file:///tmp/repo",
+        "git@host:repo",
+        "host:repo",
+    ] {
+        assert_eq!(resolve_local(url, &root), url);
+    }
+    // Even an existing path that resembles an scp URL must not change its remote identity.
+    #[cfg(unix)]
+    {
+        fs::create_dir_all(root.join("host:repo")).unwrap();
+        assert_eq!(resolve_local("host:repo", &root), "host:repo");
+    }
+    let _ = fs::remove_dir_all(root);
+}

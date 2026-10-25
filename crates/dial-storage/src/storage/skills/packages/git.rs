@@ -39,6 +39,7 @@ pub(super) fn fetch(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(&str),
 ) -> Result<Checkout> {
+    source.validate()?;
     let url = resolve_local(&source.url, base);
     progress(&format!("Fetching {}", source.spec()));
     let dir = tempfile::Builder::new()
@@ -50,7 +51,16 @@ pub(super) fn fetch(
     run_git(&["init", "--quiet", "--template="], root, cancel)?;
     let rev = source.reference.as_deref().unwrap_or("HEAD");
     run_git(
-        &["fetch", "--quiet", "--depth", "1", "--no-tags", &url, rev],
+        &[
+            "fetch",
+            "--quiet",
+            "--depth",
+            "1",
+            "--no-tags",
+            "--",
+            &url,
+            rev,
+        ],
         root,
         cancel,
     )?;
@@ -70,7 +80,11 @@ pub(super) fn fetch(
 }
 
 /// Makes a local repository path absolute so git, which runs inside a temp directory, finds it.
-fn resolve_local(url: &str, base: &Path) -> String {
+pub(super) fn resolve_local(url: &str, base: &Path) -> String {
+    // Schemes and scp-style remotes keep their identity even if a same-named local path exists.
+    if url.contains(':') && !Path::new(url).is_absolute() {
+        return url.to_owned();
+    }
     let candidate = Path::new(url);
     let joined = if candidate.is_absolute() {
         candidate.to_path_buf()
@@ -259,7 +273,7 @@ fn declared_name(dir: &Path) -> Result<String> {
         .unwrap_or(fallback);
     ensure!(
         valid_name(&name),
-        "skill name {name:?} in {} is not a valid name (use letters, digits, '-' and '_', up to 64 characters)",
+        "skill name {name:?} in {} is not a valid name (use lowercase letters, digits and '-', up to 64 characters)",
         dir.display()
     );
     Ok(name)

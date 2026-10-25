@@ -660,7 +660,12 @@ pub fn read_skill(
             if parts.peek().is_some() {
                 parent = parent.existing_child(part)?;
             } else {
-                let (bytes, truncated) = parent.read_head(part, 65536)?;
+                let limit = if file.is_none() {
+                    crate::storage::skills::MAX_SKILL_BYTES
+                } else {
+                    crate::storage::skills::MAX_READ_BYTES
+                };
+                let (bytes, truncated) = parent.read_head(part, limit)?;
                 let text = if truncated {
                     String::from_utf8_lossy(&bytes).into_owned()
                 } else {
@@ -676,3 +681,6 @@ pub fn read_skill(
         anyhow::bail!("managed file missing")
     })())
 }
+
+#[cfg(test)]
+mod tests;

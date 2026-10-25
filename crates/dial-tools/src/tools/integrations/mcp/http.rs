@@ -12,6 +12,8 @@
 //! `endpoint` event names the POST target, and replies arrive on that stream.
 use crate::config::tools::mcp::validate_url;
 
+use super::Signal;
+use super::client::lifecycle::Operation;
 use super::client::{Remote, Shared};
 use super::oauth::TokenSource;
 use crate::config::types::{McpServerConfig, McpTransport};
@@ -95,6 +97,19 @@ impl std::fmt::Display for AuthRequired {
 
 impl std::error::Error for AuthRequired {}
 
+#[derive(Debug)]
+pub(super) struct CredentialsRefused(String, u16);
+impl std::fmt::Display for CredentialsRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "MCP server `{}` refused the credentials (HTTP {}); set bearer_env to a valid token",
+            self.0, self.1
+        )
+    }
+}
+impl std::error::Error for CredentialsRefused {}
+
 /// Request credentials for one remote server.
 pub(super) struct Auth {
     server: String,
@@ -134,16 +149,19 @@ impl Auth {
     }
 
     /// Every header to send, plus the OAuth access token they carry (None without a usable grant).
-    pub(super) fn headers(&self) -> (Vec<(String, String)>, Option<String>) {
+    fn headers_with(&self, cancel: &Arc<AtomicBool>) -> (Vec<(String, String)>, Option<String>) {
         let mut headers = self.headers.clone();
-        let bearer = self.oauth.as_ref().and_then(|oauth| oauth.bearer());
+        let bearer = self
+            .oauth
+            .as_ref()
+            .and_then(|oauth| oauth.bearer_with(cancel));
         if let Some(token) = &bearer {
             headers.push(("Authorization".into(), format!("Bearer {token}")));
         }
         (headers, bearer)
     }
 
-    /// Like [`Auth::headers`] but never refreshes the grant; used when dropping a connection.
+    /// Stored headers without refreshing the grant; used when dropping a connection.
     pub(super) fn headers_stored(&self) -> Vec<(String, String)> {
         let mut headers = self.headers.clone();
         if let Some(token) = self.oauth.as_ref().and_then(|oauth| oauth.stored_access()) {
@@ -155,10 +173,7 @@ impl Auth {
     /// The error for a 401/403, remembering the challenge so the manager can offer a sign-in.
     pub(super) fn refused(&self, status: u16, challenge: Option<&str>) -> anyhow::Error {
         if self.fixed {
-            return anyhow!(
-                "MCP server `{}` refused the credentials (HTTP {status}); set bearer_env to a valid token",
-                self.server
-            );
+            return anyhow::Error::new(CredentialsRefused(self.server.clone(), status));
         }
         *self.challenge.lock().unwrap_or_else(|e| e.into_inner()) =
             Some(challenge.unwrap_or("").to_owned());
@@ -166,10 +181,10 @@ impl Auth {
     }
 
     /// After a 401 that carried `stale`: refresh the grant unless another request already did.
-    pub(super) fn refresh(&self, stale: &str) -> bool {
+    fn refresh_with(&self, stale: &str, cancel: &Arc<AtomicBool>) -> bool {
         self.oauth
             .as_ref()
-            .is_some_and(|oauth| oauth.refresh(stale))
+            .is_some_and(|oauth| oauth.refresh_with(stale, cancel))
     }
 
     pub(super) fn challenge(&self) -> Option<String> {
@@ -196,7 +211,8 @@ pub struct Http {
     agent: ureq::Agent,
     session: Mutex<Option<String>>,
     protocol: Mutex<Option<String>>,
-    stop: AtomicBool,
+    stop: Arc<AtomicBool>,
+    listener: Mutex<Option<std::thread::JoinHandle<()>>>,
     sse: bool,
     endpoint: Mutex<Option<String>>,
     /// How long one GET event stream may run before Dial closes it (see `read_stream`).
@@ -218,7 +234,8 @@ impl Http {
             agent: agent(),
             session: Mutex::default(),
             protocol: Mutex::default(),
-            stop: AtomicBool::new(false),
+            stop: Arc::new(AtomicBool::new(false)),
+            listener: Mutex::new(None),
             sse: config.transport == Some(McpTransport::Sse),
             endpoint: Mutex::default(),
             stream_lifetime: if config.transport == Some(McpTransport::Sse) {
@@ -263,13 +280,17 @@ impl Http {
     fn post_once(
         &self,
         message: &Value,
-        timeout: Duration,
+        _timeout: Duration,
         sink: &mut dyn FnMut(Value),
         auth: &[(String, String)],
+        operation: &Arc<Operation>,
     ) -> Result<()> {
         let target = self.target()?;
-        let mut request = self
-            .agent
+        if !operation.dispatch() {
+            bail!("MCP request cancelled before dispatch");
+        }
+        let agent = cancellable_agent(operation.cancel.clone());
+        let mut request = agent
             .post(&target)
             .header("Accept", "application/json, text/event-stream")
             .header("Content-Type", "application/json");
@@ -284,10 +305,13 @@ impl Http {
         }
         let mut response = request
             .config()
-            .timeout_global((!timeout.is_zero()).then_some(timeout))
+            .timeout_global(Some(
+                operation.deadline.saturating_duration_since(Instant::now()),
+            ))
             .build()
             .send(message.to_string())
             .map_err(|e| anyhow!("MCP server `{}` request failed: {e}", self.server))?;
+        operation.delivered();
         let status = response.status().as_u16();
         if let Some(id) = response
             .headers()
@@ -325,9 +349,9 @@ impl Http {
         if is_sse {
             read_events(
                 BufReader::new(reader),
-                &|| !self.stop.load(Ordering::Relaxed),
+                &|| !self.stop.load(Ordering::Relaxed) && !operation.stopped(),
                 &mut |_, data| {
-                    if self.stop.load(Ordering::Relaxed) {
+                    if self.stop.load(Ordering::Relaxed) || operation.stopped() {
                         return false;
                     }
                     if let Ok(value) = serde_json::from_str::<Value>(data) {
@@ -372,35 +396,52 @@ impl Http {
     /// POST endpoint and carries every reply, so its end is a lost connection.
     fn listen(self: Arc<Self>, shared: Arc<Shared>, ready: Option<mpsc::Sender<Result<()>>>) {
         let mut ready = ready;
-        let result = loop {
+        let mut attempt = 0u32;
+        loop {
+            if self.stop.load(Ordering::SeqCst) {
+                return;
+            }
             let result = self.read_stream(&shared, &mut ready);
-            // A streamable GET stream that reaches its lifetime is reopened on the same session.
-            let expired = result
+            if self.stop.load(Ordering::SeqCst) {
+                return;
+            }
+            let session_ended = result
                 .as_ref()
                 .err()
-                .is_some_and(|error| error.downcast_ref::<StreamExpired>().is_some());
-            if self.sse || !expired || self.stop.load(Ordering::Relaxed) {
-                break result;
+                .is_some_and(|e| e.downcast_ref::<SessionEnded>().is_some());
+            let unsupported = result
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.downcast_ref::<NotificationUnsupported>().is_some());
+            if unsupported {
+                shared.signal(Signal::NotificationUnsupported);
+                return;
             }
-        };
-        // The optional GET stream may be unsupported or end normally, but an explicit
-        // session termination invalidates POST requests too and must reach the supervisor.
-        let session_ended = result
-            .as_ref()
-            .err()
-            .is_some_and(|error| error.downcast_ref::<SessionEnded>().is_some());
-        if !self.sse && !session_ended {
-            return;
-        }
-        let error = result
-            .err()
-            .unwrap_or_else(|| anyhow!("MCP server `{}` closed its event stream", self.server));
-        let reason = format!("{error:#}");
-        if let Some(tx) = ready.take() {
-            let _ = tx.send(Err(error));
-        }
-        if !self.stop.load(Ordering::Relaxed) {
-            shared.close(reason);
+            if self.sse || session_ended {
+                let error = result.err().unwrap_or_else(|| {
+                    anyhow!("MCP server `{}` closed its event stream", self.server)
+                });
+                let reason = format!("{error:#}");
+                if let Some(tx) = ready.take() {
+                    let _ = tx.send(Err(error));
+                }
+                shared.close(reason);
+                return;
+            }
+            // Optional notification transport health is independent of POST connection health.
+            shared.signal(Signal::NotificationDegraded);
+            attempt = attempt.saturating_add(1);
+            let delay =
+                Duration::from_millis((100u64 << attempt.min(5)) + u64::from(rand::random::<u8>()));
+            let until = Instant::now() + delay;
+            while Instant::now() < until {
+                if self.stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(
+                    CANCEL_POLL.min(until.saturating_duration_since(Instant::now())),
+                );
+            }
         }
     }
 
@@ -412,11 +453,12 @@ impl Http {
     ) -> Result<()> {
         let mut refreshed = false;
         let mut response = loop {
-            let (headers, sent) = self.auth.headers();
-            let mut request = self
-                .agent
-                .get(&self.url)
-                .header("Accept", "text/event-stream");
+            let (headers, sent) = self.auth.headers_with(&self.stop);
+            if self.stop.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            let agent = cancellable_agent(self.stop.clone());
+            let mut request = agent.get(&self.url).header("Accept", "text/event-stream");
             for (name, value) in &headers {
                 request = request.header(name.as_str(), value.as_str());
             }
@@ -438,7 +480,7 @@ impl Http {
                     && !refreshed
                     && sent
                         .as_deref()
-                        .is_some_and(|stale| self.auth.refresh(stale))
+                        .is_some_and(|stale| self.auth.refresh_with(stale, &self.stop))
                 {
                     refreshed = true;
                     continue;
@@ -465,14 +507,17 @@ impl Http {
                         self.server
                     );
                 }
-                return Ok(());
+                if status == 405 {
+                    return Err(anyhow::Error::new(NotificationUnsupported));
+                }
+                bail!("MCP notification stream failed (HTTP {status})");
             }
+            shared.signal(Signal::NotificationHealthy);
             break response;
         };
         // The stream lives at most `stream_lifetime`: the transport read fails with a timeout when
         // that elapses, so a server that stalls cannot hold this thread and its socket forever.
-        // `shutdown` and `Drop` only set `stop`, which is checked before every line; nothing joins
-        // this thread, so no caller waits on it.
+        // Cancellation is polled below TLS even while the stream is silent; shutdown joins it.
         let reader = BufReader::new(response.body_mut().with_config().limit(u64::MAX).reader());
         read_events(
             reader,
@@ -492,7 +537,9 @@ impl Http {
                 if let Ok(value) = serde_json::from_str::<Value>(data) {
                     for message in flatten(value) {
                         if let Some(answer) = shared.handle(&message) {
-                            let _ = self.post(&answer, ANSWER_TIMEOUT, &mut |_| {});
+                            let operation =
+                                Operation::with_cancel(ANSWER_TIMEOUT, self.stop.clone());
+                            let _ = self.post(&answer, ANSWER_TIMEOUT, &operation, &mut |_| {});
                         }
                     }
                 }
@@ -543,10 +590,12 @@ impl Http {
     ) -> Result<()> {
         let (tx, rx) = mpsc::channel();
         let worker = self.clone();
-        std::thread::Builder::new()
-            .name(format!("mcp-{}-sse", self.server))
-            .spawn(move || worker.listen(shared, Some(tx)))
-            .context("starting the event stream thread")?;
+        *self.listener.lock().unwrap_or_else(|e| e.into_inner()) = Some(
+            std::thread::Builder::new()
+                .name(format!("mcp-{}-sse", self.server))
+                .spawn(move || worker.listen(shared, Some(tx)))
+                .context("starting the event stream thread")?,
+        );
         let deadline = (!wait.is_zero()).then(|| Instant::now() + wait);
         let outcome = loop {
             match rx.recv_timeout(CANCEL_POLL) {
@@ -555,7 +604,7 @@ impl Http {
                 Err(RecvTimeoutError::Timeout) => {}
             }
             if cancel() {
-                self.stop.store(true, Ordering::Relaxed);
+                self.shutdown();
                 bail!("connecting to MCP server `{}` was cancelled", self.server);
             }
             if deadline.is_some_and(|end| Instant::now() >= end) {
@@ -565,7 +614,7 @@ impl Http {
         match outcome {
             Some(result) => result,
             None => {
-                self.stop.store(true, Ordering::Relaxed);
+                self.shutdown();
                 bail!(
                     "MCP server `{}` did not announce its SSE endpoint in time",
                     self.server
@@ -576,19 +625,28 @@ impl Http {
 }
 
 impl Remote for Http {
-    fn post(&self, message: &Value, timeout: Duration, sink: &mut dyn FnMut(Value)) -> Result<()> {
-        let (headers, sent) = self.auth.headers();
-        match self.post_once(message, timeout, sink, &headers) {
+    fn post(
+        &self,
+        message: &Value,
+        timeout: Duration,
+        operation: &Arc<Operation>,
+        sink: &mut dyn FnMut(Value),
+    ) -> Result<()> {
+        if operation.stopped() {
+            bail!("MCP request cancelled before authentication");
+        }
+        let (headers, sent) = self.auth.headers_with(&operation.cancel);
+        match self.post_once(message, timeout, sink, &headers, operation) {
             Err(error)
                 if error
                     .downcast_ref::<AuthRequired>()
                     .is_some_and(|error| error.1 == 401)
                     && sent
                         .as_deref()
-                        .is_some_and(|stale| self.auth.refresh(stale)) =>
+                        .is_some_and(|stale| self.auth.refresh_with(stale, &operation.cancel)) =>
             {
-                let (headers, _) = self.auth.headers();
-                self.post_once(message, timeout, sink, &headers)
+                let (headers, _) = self.auth.headers_with(&operation.cancel);
+                self.post_once(message, timeout, sink, &headers, operation)
             }
             other => other,
         }
@@ -604,9 +662,15 @@ impl Remote for Http {
             return;
         }
         let name = format!("mcp-{}-listen", self.server);
-        let _ = std::thread::Builder::new()
+        let worker = self.clone();
+        let signals = shared.clone();
+        match std::thread::Builder::new()
             .name(name)
-            .spawn(move || self.listen(shared, None));
+            .spawn(move || worker.listen(shared, None))
+        {
+            Ok(handle) => *self.listener.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle),
+            Err(_) => signals.signal(Signal::NotificationDegraded),
+        }
     }
 
     fn set_protocol(&self, version: &str) {
@@ -619,31 +683,56 @@ impl Remote for Http {
 
     fn shutdown(&self) {
         self.stop.store(true, Ordering::Relaxed);
-        // Spec: a client that is done with a session SHOULD end it. Best effort, off the caller.
-        let Some(session) = self.session() else {
-            return;
-        };
-        let (agent, url, headers) = (
-            self.agent.clone(),
-            self.url.clone(),
-            self.auth.headers_stored(),
-        );
-        let _ = std::thread::Builder::new()
-            .name(format!("mcp-{}-close", self.server))
-            .spawn(move || {
-                let mut request = agent
-                    .delete(&url)
-                    .header("Mcp-Session-Id", session.as_str());
-                for (name, value) in &headers {
-                    request = request.header(name.as_str(), value.as_str());
-                }
-                let _ = request
-                    .config()
-                    .timeout_global(Some(Duration::from_secs(5)))
-                    .build()
-                    .call();
-            });
+        if let Some(listener) = self
+            .listener
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let _ = listener.join();
+        }
+        // Best effort session deletion is bounded and owned, not a detached drop worker.
+        if let Some(session) = self.session() {
+            let mut request = self
+                .agent
+                .delete(&self.url)
+                .header("Mcp-Session-Id", session.as_str());
+            for (name, value) in self.auth.headers_stored() {
+                request = request.header(name, value);
+            }
+            let _ = request
+                .config()
+                .timeout_global(Some(Duration::from_secs(2)))
+                .build()
+                .call();
+        }
     }
+}
+
+#[derive(Debug)]
+struct NotificationUnsupported;
+impl std::fmt::Display for NotificationUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("notification stream unsupported")
+    }
+}
+impl std::error::Error for NotificationUnsupported {}
+
+fn cancellable_agent(cancel: Arc<AtomicBool>) -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .timeout_resolve(Some(Duration::from_secs(2)))
+        .timeout_connect(Some(Duration::from_secs(2)))
+        .timeout_send_request(Some(Duration::from_secs(30)))
+        .timeout_send_body(Some(Duration::from_secs(30)))
+        .timeout_recv_response(Some(Duration::from_secs(30)))
+        .build();
+    crate::llm::cancellable_agent_with_resolver(
+        config,
+        cancel,
+        ureq::unversioned::resolver::DefaultResolver::default(),
+    )
 }
 
 /// A JSON-RPC batch is an array; anything else is one message.

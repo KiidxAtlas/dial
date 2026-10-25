@@ -100,6 +100,7 @@ fn otlp_json_payloads_have_the_protocol_shape() {
     let mut exporter = Exporter::new(settings("http://127.0.0.1:4318"));
     exporter.observe(&request_event("s1", false));
     exporter.observe(&Event::Tool(Tool {
+        facts: ExecutionFacts::default(),
         status: crate::tools::ToolStatus::Error,
         effects: crate::tools::surface::outcome::Effects::Known,
         session: "s1".into(),
@@ -286,4 +287,179 @@ fn flush_posts_json_to_the_signal_path() {
         2
     );
     assert!(exporter.last_error.is_none());
+}
+
+fn execution_event(execution: &crate::runtime::execution::Execution) -> Event {
+    Event::Tool(Tool {
+        facts: ExecutionFacts::from(execution),
+        status: crate::tools::ToolStatus::Ok,
+        effects: execution.effects,
+        session: "facts-test".into(),
+        project: "project".into(),
+        tool: "bg".into(),
+        duration: Duration::ZERO,
+        error: false,
+        end: SystemTime::now(),
+    })
+}
+
+#[test]
+fn successful_observation_keeps_failed_child_and_incomplete_output_distinct() {
+    use crate::runtime::execution::*;
+    let execution = Execution {
+        observation: Some(Observation {
+            kind: ObservationKind::Wait,
+            satisfied: true,
+        }),
+        process: Some(ProcessOutcome {
+            started: true,
+            exit_code: Some(7),
+            signal: None,
+            timed_out: false,
+            cancelled: false,
+            output_complete: false,
+        }),
+        output: Some(OutputIntegrity {
+            capture: Completeness::Partial,
+            retention: Completeness::Complete,
+            presentation: Completeness::Partial,
+            original_bytes: Some(100),
+            retained_bytes: Some(100),
+            omitted_bytes: Some(80),
+            presented_bytes: Some(20),
+            artifact: Some("artifact://private-secret".into()),
+        }),
+        changed_paths: vec!["/private/secret".into()],
+        ..Default::default()
+    };
+    let mut exporter = Exporter::new(settings("http://127.0.0.1:4318"));
+    exporter.observe(&execution_event(&execution));
+    let serialized =
+        serde_json::to_string(&exporter.take_payloads(unix_ns(SystemTime::now()))).unwrap();
+    for expected in [
+        "dial.observation.satisfied",
+        "true",
+        "dial.process.outcome",
+        "failed",
+        "dial.output.capture",
+        "partial",
+        "dial.output.retention",
+        "complete",
+        "dial.agent.output.bytes",
+        "80",
+    ] {
+        assert!(serialized.contains(expected), "missing {expected}");
+    }
+    assert!(!serialized.contains("private"));
+    assert!(!serialized.contains("artifact://"));
+    assert!(!serialized.contains("dial.agent.errors"));
+}
+
+#[test]
+fn integration_health_dimensions_and_failure_are_independent() {
+    use crate::runtime::{execution::Execution, integration::*};
+    let execution = Execution {
+        integration: Some(IntegrationExecution {
+            health: IntegrationHealth {
+                connection: ConnectionHealth::Connected,
+                notifications: NotificationHealth::Degraded,
+                catalog: CatalogFreshness::Stale,
+                generation: 3,
+                transitions: 4,
+            },
+            state_changes: 2,
+            dispatch: DispatchState::Dispatched,
+            settlement: Settlement::Reply,
+            failure: Some(IntegrationFailure::Remote),
+        }),
+        ..Default::default()
+    };
+    let facts = ExecutionFacts::from(&execution);
+    assert_eq!(facts.connection.as_deref(), Some("connected"));
+    assert_eq!(facts.notifications.as_deref(), Some("degraded"));
+    assert_eq!(facts.catalog.as_deref(), Some("stale"));
+    let mut exporter = Exporter::new(settings("http://127.0.0.1:4318"));
+    exporter.observe(&execution_event(&execution));
+    let serialized =
+        serde_json::to_string(&exporter.take_payloads(unix_ns(SystemTime::now()))).unwrap();
+    for expected in [
+        "dial.integration.failure",
+        "remote",
+        "dial.integration.dispatch",
+        "dispatched",
+        "dial.integration.settlement",
+        "reply",
+        "dial.agent.integration.state_changes",
+    ] {
+        assert!(serialized.contains(expected), "missing {expected}");
+    }
+}
+
+#[test]
+fn full_or_disconnected_ingress_drops_without_blocking_and_counts_loss() {
+    let before = loss_counters().ingress;
+    let (tx, rx) = mpsc::sync_channel(1);
+    let route = Route {
+        stats: None,
+        otlp: None,
+    };
+    enqueue(
+        &tx,
+        Msg::Event(Box::new(route.clone()), request_event("first", false)),
+    );
+    enqueue(
+        &tx,
+        Msg::Event(Box::new(route.clone()), request_event("overflow", false)),
+    );
+    assert!(loss_counters().ingress >= before + 1);
+    drop(rx);
+    enqueue(
+        &tx,
+        Msg::Event(Box::new(route), request_event("disconnected", false)),
+    );
+    assert!(loss_counters().ingress >= before + 2);
+}
+
+#[test]
+fn unavailable_stats_are_counted_without_stopping_the_hub() {
+    let dir = tempfile::tempdir().unwrap();
+    let before = loss_counters().stats;
+    let (tx, rx) = mpsc::sync_channel(4);
+    let hub = thread::spawn(move || run(rx));
+    tx.send(Msg::Event(
+        Box::new(Route {
+            stats: Some(dir.path().to_path_buf()),
+            otlp: None,
+        }),
+        request_event("stats-loss", false),
+    ))
+    .unwrap();
+    let (done, wait) = mpsc::channel();
+    tx.send(Msg::Stop(done)).unwrap();
+    wait.recv_timeout(Duration::from_secs(5)).unwrap();
+    hub.join().unwrap();
+    assert!(loss_counters().stats > before);
+}
+
+#[test]
+fn failed_export_is_observable_and_batch_does_not_accumulate() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let mut config = settings(&format!("http://{address}"));
+    config.metrics_url = None;
+    config.logs_url = None;
+    config.timeout = Duration::from_secs(1);
+    let mut exporter = Exporter::new(config);
+    let before = loss_counters().export;
+    exporter.observe(&request_event("export-loss", false));
+    exporter.flush();
+    assert!(loss_counters().export > before);
+    assert!(exporter.last_error.is_some());
+    assert!(exporter.spans.is_empty());
+    assert!(
+        exporter
+            .take_payloads(unix_ns(SystemTime::now()))
+            .is_empty()
+    );
 }

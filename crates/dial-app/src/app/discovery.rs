@@ -64,19 +64,28 @@ impl Catalog {
     }
 
     pub(super) fn refresh(&mut self, app: &App) {
+        self.refresh_config(app, &app.config);
+    }
+
+    /// Probe saved settings without changing the configuration used by an in-flight agent.
+    pub(super) fn refresh_config(&mut self, app: &App, config: &crate::config::types::Config) {
         self.collect();
         // Config changes must not opt an idle chat into provider discovery. Once the
         // user has opened a model/provider panel, keep that requested catalog fresh.
         if self.request != 0 {
-            self.scan(app);
+            self.scan_config(app, config);
         }
     }
 
     fn scan(&mut self, app: &App) {
+        self.scan_config(app, &app.config);
+    }
+
+    fn scan_config(&mut self, app: &App, config: &crate::config::types::Config) {
         let layout = app.layout.clone();
-        let configured = app.config.providers.clone();
-        let mut selections = vec![app.config.selection()];
-        selections.extend(app.config.model_roles.values().cloned());
+        let configured = config.providers.clone();
+        let mut selections = vec![config.selection()];
+        selections.extend(config.model_roles.values().cloned());
         self.launch(move || catalog::discover(&layout, &configured, &selections));
     }
 

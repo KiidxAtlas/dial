@@ -29,6 +29,8 @@ pub struct Inputs<'a> {
     pub lean: bool,
     /// Use concise delivery/delegation prose without narrowing tools, discovery or workflow rules.
     pub concise_guidance: bool,
+    /// Prefer specialist delegation; false keeps coupled work and focused testing inline.
+    pub prefer_subagents: bool,
     /// One tool call per response (the small local tier without a passing batch record): the
     /// guidance asks for single calls instead of batches. Implies the lean sections.
     pub one_call: bool,
@@ -116,7 +118,7 @@ fn full_guidance(
 
 /// Scope optional workflow prose to the configured catalog, not per-request tool
 /// loading, so the system prefix remains stable throughout a turn.
-fn scoped_guidance(offer: &Offer<'_>, concise: bool) -> String {
+fn scoped_guidance(offer: &Offer<'_>, concise: bool, prefer_subagents: bool) -> String {
     let has = |name: &str| offer.has(name);
     let lean = offer.lean || offer.one_call;
     // Concise reporting prose alone must not change tool policy, workflow or visual rules.
@@ -129,7 +131,11 @@ fn scoped_guidance(offer: &Offer<'_>, concise: bool) -> String {
         }
     }
     if has("task") {
-        out.push_str(TESTER_DELEGATION_RULES);
+        out.push_str(if prefer_subagents {
+            TESTER_DELEGATION_RULES
+        } else {
+            SELECTIVE_DELEGATION_RULES
+        });
         out.push_str(if lean || concise {
             LEAN_DELEGATION_RULES
         } else {
@@ -214,7 +220,11 @@ fn policy_prompt(
                     lean: i.lean,
                     one_call: i.one_call,
                 };
-                out.push_str(&scoped_guidance(&offer, i.concise_guidance));
+                out.push_str(&scoped_guidance(
+                    &offer,
+                    i.concise_guidance,
+                    i.prefer_subagents,
+                ));
                 if i.worked_example
                     && let Some(example) = worked_example(&offer, i.edit_mode)
                 {
@@ -373,8 +383,8 @@ fn template_data(
         "subagent": false,
         "eagerTasks": false,
         "eagerTasksAlways": false,
-        "inlineFirstDelegation": false,
-        "delegationBias": "",
+        "inlineFirstDelegation": !i.prefer_subagents,
+        "delegationBias": if i.prefer_subagents { "prefer-subagents" } else { "selective" },
         "taskBatch": false,
         "scoutAvailable": false,
         "taskIrcEnabled": false,

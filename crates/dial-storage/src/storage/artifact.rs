@@ -111,6 +111,14 @@ impl ArtifactStore {
         spool.write_all(text.as_bytes())?;
         spool.finish()
     }
+    pub fn retain_with_integrity(
+        &self,
+        text: &str,
+    ) -> Result<(String, crate::runtime::execution::OutputIntegrity)> {
+        let mut spool = self.spool()?;
+        spool.write_all(text.as_bytes())?;
+        spool.finish_with_integrity()
+    }
     pub fn image_reference(&self, uri: &str) -> Result<Value> {
         let path = self.path(uri)?;
         let id = path
@@ -453,6 +461,29 @@ impl ArtifactSpool {
     /// Bytes the cap has dropped from the middle so far (0 while the output is verbatim).
     pub fn elided_bytes(&self) -> u64 {
         self.tail.as_ref().map_or(0, |tail| tail.len - tail.kept())
+    }
+    /// Finalize retention facts from the spool's counters, never its generated marker text.
+    /// Capture and presentation belong to the producer and remain unknown here.
+    pub fn finish_with_integrity(
+        self,
+    ) -> Result<(String, crate::runtime::execution::OutputIntegrity)> {
+        use crate::runtime::execution::{Completeness, OutputIntegrity};
+        let original = self.head_written + self.tail.as_ref().map_or(0, |tail| tail.len);
+        let omitted = self.elided_bytes();
+        let uri = self.finish()?;
+        let integrity = OutputIntegrity {
+            retention: if omitted == 0 {
+                Completeness::Complete
+            } else {
+                Completeness::Partial
+            },
+            original_bytes: Some(original),
+            retained_bytes: Some(original.saturating_sub(omitted)),
+            omitted_bytes: Some(omitted),
+            artifact: Some(uri.clone()),
+            ..Default::default()
+        };
+        Ok((uri, integrity))
     }
     /// Write the head, the truncation marker (only when bytes were dropped) and the tail.
     fn close_tail(&mut self) -> Result<()> {

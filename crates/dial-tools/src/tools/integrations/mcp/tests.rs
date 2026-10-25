@@ -74,6 +74,38 @@ fn call(loaded: &McpLoad, name: &str, args: Value) -> crate::runtime::tool_outpu
 }
 
 #[test]
+fn temporary_connections_preserve_project_and_oauth_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let user = tempfile::tempdir().unwrap();
+    let config = Config {
+        project_root: root.path().to_path_buf(),
+        user_dir: user.path().to_path_buf(),
+        mcp: BTreeMap::from([("unrelated".into(), fake_config("", 30))]),
+        ..Default::default()
+    };
+    let specs = BTreeMap::from([("temporary".into(), fake_config("", 30))]);
+    let loaded = connect_extra(&specs, &config);
+    assert!(loaded.notices.is_empty(), "{:?}", loaded.notices);
+    assert_eq!(loaded.sessions.len(), 1);
+    let session = &loaded.sessions[0];
+    assert_eq!(session.name(), "temporary");
+    assert_eq!(session.root, config.project_root);
+    assert_eq!(session.user_dir, config.user_dir);
+    assert!(config.mcp.contains_key("unrelated"));
+    assert!(!config.mcp.contains_key("temporary"));
+}
+
+#[test]
+fn explicit_health_check_connects_disabled_server_without_enabling_it() {
+    let mut server = fake_config("", 30);
+    server.enabled = false;
+    let config = config_with(vec![("disabled", server.clone())]);
+    assert!(catalog::check(&config, "disabled", &server).unwrap() > 0);
+    assert!(!server.enabled);
+    assert!(!config.mcp["disabled"].enabled);
+}
+
+#[test]
 fn handshake_follows_every_page_and_exposes_prefixed_tools() {
     let loaded = load_fake();
     let names: BTreeSet<_> = loaded.tools.iter().map(|t| t.name().to_owned()).collect();
@@ -619,6 +651,45 @@ fn http_server(token: &'static str) -> (String, Arc<std::sync::Mutex<Vec<String>
 }
 
 #[test]
+fn temporary_http_connection_uses_oauth_grant_from_custom_user_directory() {
+    let user = tempfile::tempdir().unwrap();
+    let (url, seen) = http_server("custom-user-grant");
+    // Seed a synthetic stored grant, not a bearer-env override: the HTTP transport must
+    // find it through the caller's custom user_dir and server identity.
+    crate::config::settings_store::write_private(
+        &user.path().join("mcp-oauth-temporary.json"),
+        serde_json::to_vec(&json!({
+            "access": "custom-user-grant",
+            "expires_at_ms": u64::MAX,
+        }))
+        .unwrap()
+        .as_slice(),
+    )
+    .unwrap();
+    let config = Config {
+        user_dir: user.path().to_path_buf(),
+        ..Default::default()
+    };
+    let server = McpServerConfig {
+        url: Some(url),
+        program: Default::default(),
+        ..Default::default()
+    };
+    let specs = BTreeMap::from([("temporary".into(), server)]);
+    let loaded = connect_extra(&specs, &config);
+    assert!(loaded.notices.is_empty(), "{:?}", loaded.notices);
+    assert_eq!(loaded.sessions.len(), 1);
+    let output = call(&loaded, "mcp__temporary__hello", json!({}));
+    assert!(!output.is_error, "{}", output.text);
+    let log = seen.lock().unwrap();
+    assert!(log.iter().any(|line| line.starts_with("tools/call|")));
+    assert!(
+        log.iter()
+            .all(|line| line.contains("|Bearer custom-user-grant|"))
+    );
+}
+
+#[test]
 fn http_servers_handshake_with_a_bearer_token_session_and_sse_replies() {
     let (url, seen) = http_server("s3cret");
     // SAFETY-free: the variable is unique to this test.
@@ -832,3 +903,5 @@ fn listing_fetched_before_an_invalidation_is_not_cached() {
         .store(after, |cache| cache.prompts = Some(json!({"fresh": true})));
     assert!(session.listing.lock().prompts.is_some());
 }
+
+mod health_tests;

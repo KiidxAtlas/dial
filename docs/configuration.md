@@ -29,6 +29,22 @@ incompatible adapter. Sessions, skills, memory and prompt history remain project
 
 Service options are settings too. `fast_mode`, `slow_mode` and `extended_context` are the flags behind `/fast`, `/slow` and `/extended-context`; `/settings` → Model → Requests shows and toggles the same three rows, and `service_tier` sets an explicit tier that takes precedence over them. The session-only modes (`/vibe`, `/skillful`, `/advisor`, `/external-thinking`) are not stored in config and stay command-only.
 
+## Interactive management and coverage
+
+`/settings` exposes coding/interactive configuration; `/improve settings` exposes learning and
+evaluation configuration. The shared registry in `crates/dial-llm/src/config/schema.rs` is the
+definitive inventory for editable controls. Coverage tests compare it to serialized defaults and
+Serde's field inventory, including optional fields and empty collections. Runtime-only fields and
+the retired `ui.hyperlinks` compatibility input are excluded.
+
+Simple settings use switches, choices and typed fields. Complex maps, nested options and arrays of
+tables use a validated TOML editor, discoverable by parent or descendant path. Structured editors
+manage only the selected global/project layer, so saving does not copy inherited values or credentials.
+Sensitive editors are masked until explicitly revealed. See [Settings in the terminal interface](terminal-interface.md#settings)
+for editing controls and surrounding setup navigation.
+During a turn, shell display changes apply immediately on panel close; agent-bound settings are saved
+and adopted at the next safe turn boundary.
+
 ## Unlimited execution defaults
 
 Most configurable execution limits and result/context size caps default to `0`, meaning **unlimited**:
@@ -54,10 +70,17 @@ interactive work. Configure positive limits where that is not acceptable.
 
 `efficiency.history_token_cap` is the window that compaction and history pruning plan against when
 the model's window is larger (0 = the model's full window). Every step resends the history, so on a
-1M-token model the `auto` compaction trigger would otherwise fire near 680k tokens; at the default
-it fires near 178k, while models with windows of 262144 tokens or less are unaffected. Change it under
-`/settings` → **Model** → **Roles & Sampling** → **History token ceiling** (under *Show advanced*) or in
+1M-token model the `auto` compaction trigger would otherwise fire near 850k tokens; at the default
+it fires near 223k, while models with windows of 262144 tokens or less are unaffected by the cap.
+Change it under `/settings` → **Model** → **Roles & Sampling** → **History token ceiling** (under *Show advanced*) or in
 `[efficiency]`; validation accepts 0 or 8192..2000000.
+
+Automatic compaction now applies at the planning window minus its response reserve (normally 85%
+of the window), rather than 80% of that usable space. For example, a 200k window triggers near 170k
+instead of 136k. Windows up to 65536 tokens retain the conservative 80%-of-usable policy. Background
+summaries prepare before the trigger but do not replace history early. Explicit
+`compaction.threshold_percent`, token thresholds and model/agent overrides remain in effect; the
+independent response-headroom check is unchanged.
 
 Set `efficiency.enabled=false` to disable these shared economy policies. Each completed/failed task
 stores an `efficiency` completion snapshot in session control state. Structured print output and RPC
@@ -152,6 +175,8 @@ mode = "hint"             # hint (default): run it and add a one-line pointer | 
 [tools.lint]              # operator tools: trusted programs, not sandboxed
 program = "/usr/local/bin/mylint"
 timeout_secs = 0
+[task]
+prefer_subagents = false  # default: coupled work and focused testing inline; true prefers specialists
 [subagents]               # custom scouts: extra instructions, selected with task agent = "security"
 security = "Focus on injection, authentication and secret-handling bugs."
 [web]

@@ -5,6 +5,62 @@ use std::collections::HashSet;
 fn default_table() -> Table {
     Table::try_from(Config::default()).expect("default config serializes")
 }
+
+#[test]
+fn prefer_subagents_defaults_off_for_new_and_existing_configs() {
+    assert!(!Config::default().task.prefer_subagents);
+    for source in [
+        "",
+        "[task]\n",
+        "[task]\nmax_concurrency = 4\npersist = false\n",
+    ] {
+        let config: Config = toml::from_str(source).unwrap();
+        assert!(!config.task.prefer_subagents, "{source}");
+    }
+    let existing: Config =
+        toml::from_str("[task]\nmax_concurrency = 4\npersist = false\n").unwrap();
+    assert_eq!(existing.task.max_concurrency, 4);
+    assert!(!existing.task.persist);
+}
+
+#[test]
+fn prefer_subagents_is_a_boolean_setting_and_roundtrips_both_values() {
+    let path = "task.prefer_subagents";
+    let setting = registry()
+        .iter()
+        .find(|setting| setting.path == path)
+        .expect("subagent preference is exposed in settings");
+    assert_eq!(setting.kind, Kind::Bool);
+    assert_eq!(setting.default_value(), Some(Value::Boolean(false)));
+    assert_eq!(
+        setting.constraints(),
+        serde_json::json!({"type": "boolean"})
+    );
+    for enabled in [false, true] {
+        let value = Value::Boolean(enabled);
+        check_value(path, &value).unwrap();
+        let mut settings = default_table();
+        set(&mut settings, path, value.clone());
+        let config: Config = Value::Table(settings).try_into().unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.task.prefer_subagents, enabled);
+        let saved = toml::to_string(&config).unwrap();
+        let loaded: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(loaded.task.prefer_subagents, enabled);
+        assert_eq!(get(&Table::try_from(loaded).unwrap(), path), Some(&value));
+    }
+    for value in [
+        Value::String("true".into()),
+        Value::String("auto".into()),
+        Value::Integer(1),
+    ] {
+        assert!(check_value(path, &value).is_err(), "accepted {value}");
+        let mut settings = default_table();
+        set(&mut settings, path, value);
+        assert!(Value::Table(settings).try_into::<Config>().is_err());
+    }
+}
+
 #[test]
 fn suggested_models_remain_open_and_output_bounds_follow_the_selected_profile() {
     check_value(
@@ -64,11 +120,26 @@ fn every_path_is_a_real_key_with_the_real_default() {
             .default_value()
             .unwrap_or_else(|| panic!("{} has no declared default", def.path));
         let Some(actual) = get(&table, def.path) else {
-            // `None` fields are left out of the serialized default. A blank or "auto" literal is exactly that unset state.
-            let unset =
-                default == Value::String(String::new()) || default == Value::String("auto".into());
+            // Optional values have no serialized default. Text uses an empty editor seed;
+            // structured optional values use an empty table seed, not a persisted override.
+            let optional = matches!(
+                def.path,
+                "provider"
+                    | "endpoint"
+                    | "model_profile"
+                    | "gate"
+                    | "snowflake_account"
+                    | "cloudflare_account_id"
+                    | "cloudflare_gateway_id"
+            );
+            let unset = default == Value::String(String::new())
+                || default == Value::String("auto".into())
+                || (matches!(def.kind, Kind::Toml) && default == Value::Table(Table::new()));
             assert!(
-                (def.path.starts_with("local_runtime.") || def.path.starts_with("lsp.")) && unset,
+                (optional
+                    || def.path.starts_with("local_runtime.")
+                    || def.path.starts_with("lsp."))
+                    && unset,
                 "{} is not a key of the default config",
                 def.path
             );
@@ -325,4 +396,92 @@ fn dotted_get_set_unset() {
     assert!(unset(&mut t, "a.b"));
     assert!(t.is_empty(), "empty parents are pruned");
     assert!(!unset(&mut t, "a.b"));
+}
+
+#[test]
+fn every_serialized_setting_has_a_management_route() {
+    fn visit(value: &serde_json::Value, path: &str, missing: &mut Vec<String>) {
+        if registry().iter().any(|def| def.path == path) {
+            return;
+        }
+        if let serde_json::Value::Object(table) = value {
+            if !table.is_empty() {
+                for (key, value) in table {
+                    let child = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    visit(value, &child, missing);
+                }
+                return;
+            }
+        }
+        missing.push(path.to_owned());
+    }
+    let mut missing = Vec::new();
+    // JSON retains optional null fields that TOML necessarily omits.
+    visit(
+        &serde_json::to_value(Config::default()).unwrap(),
+        "",
+        &mut missing,
+    );
+    assert!(
+        missing.is_empty(),
+        "Missing settings UI routes:\n{}",
+        missing.join("\n")
+    );
+}
+
+// Serde's field list includes optional fields omitted by default serialization. Skipped runtime
+// fields are absent. This guards new top-level Config and UiConfig settings without a hand-kept
+// duplicate list. Parent TOML routes manage every optional/dynamic descendant of their table.
+#[test]
+fn optional_and_ui_fields_have_routes_too() {
+    use serde::Deserialize;
+    struct Fields<'a>(&'a mut Vec<&'static str>);
+    impl<'de> serde::Deserializer<'de> for Fields<'_> {
+        type Error = serde::de::value::Error;
+        fn deserialize_any<V: serde::de::Visitor<'de>>(
+            self,
+            _: V,
+        ) -> Result<V::Value, Self::Error> {
+            Err(serde::de::Error::custom("field inventory only"))
+        }
+        fn deserialize_struct<V: serde::de::Visitor<'de>>(
+            self,
+            _: &'static str,
+            fields: &'static [&'static str],
+            _: V,
+        ) -> Result<V::Value, Self::Error> {
+            self.0.extend(fields);
+            Err(serde::de::Error::custom("field inventory only"))
+        }
+        serde::forward_to_deserialize_any! { bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string bytes byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct map enum identifier ignored_any }
+    }
+    let mut fields = Vec::new();
+    let _ = Config::deserialize(Fields(&mut fields));
+    assert!(!fields.is_empty());
+    for field in fields {
+        assert!(
+            registry()
+                .iter()
+                .any(|def| def.path == field || def.path.starts_with(&format!("{field}."))),
+            "Config.{field} lacks a management route"
+        );
+    }
+    let mut fields = Vec::new();
+    let _ = UiConfig::deserialize(Fields(&mut fields));
+    for field in fields {
+        // Retired compatibility input; never read or serialized (model_config::UiConfig).
+        if field == "hyperlinks" {
+            continue;
+        }
+        assert!(
+            registry()
+                .iter()
+                .any(|def| def.path == format!("ui.{field}")),
+            "UiConfig.{field} lacks a management route"
+        );
+    }
 }

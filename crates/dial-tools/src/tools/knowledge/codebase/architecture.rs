@@ -1147,12 +1147,7 @@ impl Codebase {
             paths.len() <= 64 && (1024..=12000).contains(&max_bytes),
             "invalid impact context bounds"
         );
-        let stems = paths
-            .iter()
-            .filter_map(|p| Path::new(p).file_stem().and_then(|s| s.to_str()))
-            .filter(|s| s.len() > 2 && !matches!(*s, "mod" | "main" | "lib" | "index"))
-            .map(str::to_owned)
-            .collect::<BTreeSet<_>>();
+        let stems = impact_stems(paths);
         if stems.is_empty() {
             return Ok(String::new());
         }
@@ -1160,6 +1155,27 @@ impl Codebase {
         // Change context needs relevant, current findings rather than another stale-map reminder.
         let query = stems.iter().cloned().collect::<Vec<_>>().join(" ");
         let mut out = self.architecture_context_inner(&query, max_bytes / 2, true, true)?;
+        out.push_str(
+            &self
+                .related_source_hints(paths, max_bytes.saturating_sub(out.len()), &|| false)?
+                .text,
+        );
+        Ok(out)
+    }
+
+    /// Shared lexical impact query. Background callers can cancel between bounded source reads;
+    /// every emitted candidate still passes the normal visibility and exact digest checks.
+    pub(super) fn related_source_hints(
+        &self,
+        paths: &[String],
+        max_bytes: usize,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<enrichment::Hints> {
+        ensure!(!cancelled(), "impact hints cancelled");
+        let stems = impact_stems(paths);
+        if stems.is_empty() {
+            return Ok(enrichment::Hints::default());
+        }
         let rows = self
             .conn
             .lock()
@@ -1172,6 +1188,7 @@ impl Codebase {
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        ensure!(!cancelled(), "impact hints cancelled");
         let mut ranked = rows
             .into_iter()
             .filter(|(path, _, _)| !paths.contains(path))
@@ -1198,9 +1215,11 @@ impl Codebase {
         });
         const REVIEW: &str = "\nRelated-source hints (not a resolved dependency graph; inspect current sources before relying on them):\n";
         let mut hints = String::new();
+        let mut sources = Vec::new();
         // Bound filesystem validation as well as output. Reuse the index's normal visibility and
         // digest rules, including ignores, linked worktrees, symlinks and missing/changed files.
         for (rank, _, path, digest) in ranked.into_iter().take(MAX_SCOPE_NEIGHBOURS) {
+            ensure!(!cancelled(), "impact hints cancelled");
             let Ok((_, current)) = self.current_source(&path) else {
                 continue;
             };
@@ -1213,16 +1232,28 @@ impl Codebase {
                 "Lexical identifier match"
             };
             let row = format!("{reason}: {path}\n");
-            if out.len() + REVIEW.len() + hints.len() + row.len() <= max_bytes {
+            if REVIEW.len() + hints.len() + row.len() <= max_bytes {
                 hints.push_str(&row);
+                sources.push((path, digest));
             }
         }
-        if !hints.is_empty() {
-            out.push_str(REVIEW);
-            out.push_str(&hints);
-        }
-        Ok(out)
+        let text = if hints.is_empty() {
+            String::new()
+        } else {
+            format!("{REVIEW}{hints}")
+        };
+        ensure!(!cancelled(), "impact hints cancelled");
+        Ok(enrichment::Hints { text, sources })
     }
+}
+
+fn impact_stems(paths: &[String]) -> BTreeSet<String> {
+    paths
+        .iter()
+        .filter_map(|p| Path::new(p).file_stem().and_then(|s| s.to_str()))
+        .filter(|s| s.len() > 2 && !matches!(*s, "mod" | "main" | "lib" | "index"))
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Exact identifiers keep `tool_exposure` distinct from generic `tool`/`exposure` prose. Imports

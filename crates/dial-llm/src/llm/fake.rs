@@ -77,6 +77,40 @@ pub fn json(status: u16, body: &serde_json::Value) -> Script {
     }
 }
 
+/// Drive the real Codex WebSocket transport against a caller-owned loopback server.
+/// Keeps transport internals private while higher-layer tests exercise live steering receipts.
+pub fn codex_exchange(
+    url: &str,
+    session_key: &str,
+    interrupt: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    on_text: &mut dyn FnMut(&str) -> bool,
+) -> anyhow::Result<Option<super::Reply>> {
+    let chat = super::Chat {
+        messages: vec![serde_json::json!({"role":"user","content":"original"})],
+        tools: vec![],
+        temperature: 0.0,
+        max_tokens: 64,
+        seed: None,
+    };
+    super::codex_ws::exchange(
+        super::responses::Endpoint {
+            url,
+            token: "test",
+            account_id: None,
+            model: "test",
+            headers: &[],
+        },
+        &chat,
+        5,
+        &mut Some(on_text),
+        interrupt,
+        None,
+        None,
+        &mut |_| true,
+        session_key,
+    )
+}
+
 pub fn serve(scripts: Vec<Script>) -> Fake {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let url = format!("http://{}", listener.local_addr().expect("addr"));

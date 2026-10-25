@@ -197,9 +197,10 @@ impl Shell {
     }
 
     fn wait_key(&mut self, app: &App, key: crossterm::event::KeyEvent) -> Result<WaitFlow> {
-        // Dismiss the local send decision before interpreting the same key as wait cancellation.
+        // Compute admission can also run for idle maintenance, when the composer is not busy.
+        // Let local menus/search/choices consume dismissal, but still cancel an otherwise idle wait.
         if self.keys.matches(Action::Interrupt, &key)
-            && !(self.composer.choice_open() && self.keys.matches(Action::Dismiss, &key))
+            && !self.composer.dismisses_interrupt(&key, &self.keys)
         {
             return Ok(WaitFlow::Cancel);
         }
@@ -215,11 +216,38 @@ impl Shell {
             ComposerEvent::Action(Action::CommandPalette) => self.wait_command(app, "/palette"),
             ComposerEvent::Action(Action::ModelSelect) => self.wait_command(app, "/model"),
             ComposerEvent::Action(Action::ModelRoles) => self.wait_command(app, "/roles"),
+            ComposerEvent::Action(Action::ProviderSetup) => self.wait_command(app, "/providers"),
             ComposerEvent::Action(Action::ModelFavoriteNext) => {
                 self.wait_command(app, "/model next")
             }
             ComposerEvent::Action(Action::Settings) => self.wait_command(app, "/settings"),
             ComposerEvent::Action(Action::SubagentsHub) => self.wait_command(app, "/agents"),
+            ComposerEvent::Action(Action::ToolsExpand) => {
+                self.tools_expanded = !self.tools_expanded;
+                self.display_reset();
+                WaitFlow::Continue
+            }
+            ComposerEvent::Action(Action::ToolsToggle) => {
+                self.ui.show_tools = !self.ui.show_tools;
+                WaitFlow::Continue
+            }
+            ComposerEvent::Action(Action::ThinkingToggle) => {
+                self.ui.show_thinking = !self.ui.show_thinking;
+                WaitFlow::Continue
+            }
+            ComposerEvent::Action(Action::DisplayReset) => {
+                self.display_reset();
+                WaitFlow::Continue
+            }
+            ComposerEvent::Action(Action::ApprovalCycle) => {
+                self.deferred_approval_cycle = true;
+                self.note("Approval", "approval mode changes after the current turn.");
+                WaitFlow::Continue
+            }
+            ComposerEvent::Action(Action::VoiceInput) => {
+                self.voice_press(app);
+                WaitFlow::Continue
+            }
             ComposerEvent::Action(Action::EditExternal) => {
                 self.edit_externally();
                 WaitFlow::Continue
@@ -467,3 +495,6 @@ impl Shell {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;

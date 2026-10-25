@@ -29,12 +29,15 @@ impl ToolOutput {
     }
     /// Annotate a controller-created outcome without interpreting arbitrary prose.
     pub fn process_outcome(&self) -> Option<crate::runtime::execution::ProcessOutcome> {
-        self.data
-            .as_ref()?
-            .get("process")
-            .and_then(|value| serde_json::from_value(value.clone()).ok())
+        self.execution.process.clone().or_else(|| {
+            self.data
+                .as_ref()?
+                .get("process")
+                .and_then(|value| serde_json::from_value(value.clone()).ok())
+        })
     }
     pub fn with_process(mut self, process: crate::runtime::execution::ProcessOutcome) -> Self {
+        self.execution.process = Some(process.clone());
         let data = self.data.get_or_insert_with(|| serde_json::json!({}));
         if let Some(data) = data.as_object_mut() {
             data.insert("process".into(), serde_json::json!(process));
@@ -44,6 +47,20 @@ impl ToolOutput {
     pub fn with_status(mut self, status: ToolStatus) -> Self {
         self.execution.status = Some(status);
         self.is_error |= status != ToolStatus::Ok;
+        self
+    }
+
+    pub fn with_observation(
+        mut self,
+        kind: super::execution::ObservationKind,
+        satisfied: bool,
+    ) -> Self {
+        self.execution.observation = Some(super::execution::Observation { kind, satisfied });
+        self
+    }
+
+    pub fn with_output_integrity(mut self, output: super::execution::OutputIntegrity) -> Self {
+        self.execution.output = Some(output);
         self
     }
 
@@ -88,3 +105,6 @@ impl ToolStatus {
         })
     }
 }
+
+#[cfg(test)]
+mod tests;

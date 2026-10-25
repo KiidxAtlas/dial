@@ -1,5 +1,27 @@
 # Execution and web tools
 
+## Background job controls
+
+`/processes` (also `/bg`) lists the current session's background jobs. Enter or click a job
+to inspect it. Pipe-based jobs show their retained output without consuming the `bg output` or
+`bg wait` cursor. The view follows the newest output by default; arrows and Page Up/Page Down
+scroll, Home shows the oldest retained rows, and End resumes following. Esc returns to the list.
+Output older than the bounded capture ring may remain in the job's output artifact when
+artifact capture is configured, subject to the artifact's own retention cap.
+
+Only running PTY jobs accept keyboard input and paste. While attached to one, Esc and Ctrl+C
+belong to the process; Ctrl+] detaches. Exited jobs and pipe-output views are read-only.
+`bg wait` reports output-capture failures as errors even when the observed process has exited;
+the exit status and capture diagnostic remain visible together.
+
+Execution metadata separates the observation (`snapshot`, `wait`, `readiness`, `input`, or
+`termination`, plus whether it was satisfied) from the child's exit code/signal. In particular,
+successful `bg wait` observation of exit 3 does not mean the command succeeded. Output metadata
+reports capture, retention, and presentation completeness independently. Byte totals count
+observed bytes, not unread estimates; generated labels and omission markers are not original
+output. Clipping or summarizing a model-facing result downgrades presentation only. Artifact
+retention caps can remove the middle of a stream even when capture reached EOF.
+
 ## Persistent kernels and evaluation
 
 Python kernels retain their namespace between successful cells. Interrupting a running cell first sends SIGINT; an interrupt that does not unwind within five seconds escalates to terminating the kernel. Failed transport, cancellation and timeout paths discard the namespace. Effects already performed remain; loss of the final cell result is recorded as uncertain. Kernel interpreters may be selected from the project virtual environment (`.venv`/`VIRTUAL_ENV`) or conda environment when configured/approved, but execution remains subject to the mandatory process-creation fence.
@@ -92,6 +114,27 @@ and cwd paths must resolve inside the workspace. `[mcp.<id>].lifecycle_hooks` op
 `turn_started`, `turn_finished`, `tool_started`, and `tool_finished` notifications through
 `notifications/dial/event`; payloads contain identifiers/status only, never prompts, arguments,
 outputs, or source content. Hook delivery is observational and cannot bypass tool approvals.
+
+MCP requests have bounded admission and locally owned dispatch/settlement. Cancelling queued
+work prevents its dispatch; cancellation/deadline propagates into transport and credential
+refresh work. HTTP initialization does not become ready before `notifications/initialized`
+is delivered. Progress can renew inactivity allowance, but not the absolute request lifetime.
+Cancellation is not rollback: after dispatch, remote cancellation is advisory and remote effects
+may remain unknown. Such results stop automatic continuation rather than triggering a blind retry.
+Native DNS/connect helpers have bounded phases but cannot be forcibly aborted inside the OS;
+cancellation prevents subsequent dispatch. Escaped descendants, filesystem stalls and arbitrary
+consumer callbacks likewise cannot be forcibly preempted by the local controller.
+
+Connection health, notification health and catalog freshness are independent inventory facts.
+A working POST channel does not prove a healthy notification stream. Degraded/unsupported
+notification channels do not justify reusing indefinitely cached resource/prompt listings.
+Reconnection checks the tool catalog against registered definitions, and stale definitions fail
+closed instead of retaining an obsolete read-only approval exemption. After a notification gap,
+the next call revalidates an unknown catalog without requiring a connection restart; matching
+definitions restore freshness, while changed definitions remain stale. Reload the integration
+to register a changed catalog. MCP results retain typed output-integrity metadata; structured
+content is included alongside text, while binary placeholders and text bounds mark presentation
+partial. A protocol-result artifact is labelled complete only if its retention was complete.
 
 ## Browser provisioning and local hosts
 

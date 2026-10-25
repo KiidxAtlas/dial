@@ -2,7 +2,10 @@
 //! their results.
 
 use super::Session;
-use crate::runtime::execution::Effects;
+use crate::runtime::execution::{Completeness, Effects, OutputIntegrity};
+use crate::runtime::integration::{
+    CatalogFreshness, DispatchState, IntegrationExecution, IntegrationFailure, Settlement,
+};
 use crate::runtime::tool_output::ToolOutput;
 use crate::tools::integrations::ext::{EXTENSION_API_VERSION, LifecycleEvent, Tool, ToolContext};
 use serde_json::{Value, json};
@@ -15,6 +18,7 @@ const MAX_RESULT: usize = 64 * 1024;
 const MAX_DESCRIPTION: usize = 2048;
 
 /// What `tools/list` says about one tool.
+#[derive(Clone, Debug, PartialEq)]
 pub struct RemoteTool {
     pub name: String,
     pub description: String,
@@ -99,37 +103,158 @@ impl McpTool {
         cancel: &dyn Fn() -> bool,
         progress: &dyn Fn(&str),
     ) -> ToolOutput {
-        if !args.is_object() {
-            return ToolOutput::err("MCP tool arguments must be a JSON object")
+        let output = if !args.is_object() {
+            let mut output = ToolOutput::err("MCP tool arguments must be a JSON object")
                 .with_effects(Effects::None);
-        }
-        let params = json!({"name": self.remote.name, "arguments": args});
-        let client = match self.session.client_until(cancel) {
-            Ok(client) => client,
-            Err(error) => return ToolOutput::err(format!("{error:#}")).with_effects(Effects::None),
-        };
-        match client.request_with("tools/call", params, self.timeout, cancel, Some(progress)) {
-            Ok(result) => retain_result(ctx, render_result(&result), &result),
-            Err(error) => {
-                let effects = error
-                    .downcast_ref::<super::client::RequestEffects>()
-                    .map_or(Effects::None, |failure| failure.0);
-                ToolOutput::err(format!("{error:#}")).with_effects(effects)
+            output.execution.integration = Some(IntegrationExecution {
+                dispatch: DispatchState::NotDispatched,
+                failure: Some(IntegrationFailure::Admission),
+                ..Default::default()
+            });
+            output
+        } else {
+            let params = json!({"name": self.remote.name, "arguments": args});
+            match self.session.client_until(cancel) {
+                Err(error) => integration_error(error, IntegrationFailure::Connection),
+                Ok(client) => {
+                    if self.session.health().catalog == CatalogFreshness::Stale
+                        || (self.remote.read_only_hint && !self.session.catalog_current())
+                    {
+                        let mut output = ToolOutput::err("MCP tool catalog is stale or unverified; reload the integration before using this registered definition").with_effects(Effects::None);
+                        output.execution.integration = Some(IntegrationExecution {
+                            dispatch: DispatchState::NotDispatched,
+                            failure: Some(IntegrationFailure::Admission),
+                            ..Default::default()
+                        });
+                        return attach_health(output, &self.session);
+                    }
+                    match client.request_with(
+                        "tools/call",
+                        params,
+                        self.timeout,
+                        cancel,
+                        Some(progress),
+                    ) {
+                        Ok(result) => {
+                            let mut output = retain_result(ctx, render_result(&result), &result);
+                            output.execution.integration = Some(IntegrationExecution {
+                                dispatch: DispatchState::Dispatched,
+                                settlement: Settlement::Reply,
+                                failure: output.is_error.then_some(IntegrationFailure::Remote),
+                                ..Default::default()
+                            });
+                            output
+                        }
+                        Err(error) => integration_error(error, IntegrationFailure::Connection),
+                    }
+                }
             }
-        }
+        };
+        attach_health(output, &self.session)
     }
 }
 
-/// Appends a pointer to the complete protocol result when the workspace can store artifacts.
-/// The remote call already ran, so a storage failure keeps the rendered result and says so.
+fn attach_health(mut output: ToolOutput, session: &Session) -> ToolOutput {
+    let health = session.health();
+    let facts = output
+        .execution
+        .integration
+        .get_or_insert_with(Default::default);
+    facts.state_changes = session.observe_health(health.transitions);
+    facts.health = health;
+    output
+}
+
+fn integration_error(error: anyhow::Error, fallback: IntegrationFailure) -> ToolOutput {
+    let effects = error
+        .downcast_ref::<super::client::RequestEffects>()
+        .map_or(Effects::None, |failure| failure.0);
+    let mut output = ToolOutput::err(format!("{error:#}")).with_effects(effects);
+    let facts = if let Some(failure) = error.downcast_ref::<super::client::RequestFailure>() {
+        IntegrationExecution {
+            dispatch: if failure.dispatched {
+                DispatchState::Dispatched
+            } else {
+                DispatchState::NotDispatched
+            },
+            settlement: failure.settlement,
+            failure: Some(failure.failure),
+            ..Default::default()
+        }
+    } else {
+        IntegrationExecution {
+            dispatch: if effects == Effects::None {
+                DispatchState::NotDispatched
+            } else {
+                DispatchState::Unknown
+            },
+            failure: Some(fallback),
+            ..Default::default()
+        }
+    };
+    output.execution.integration = Some(facts);
+    output
+}
+
+/// Retain the protocol representation with explicit bounded-storage integrity.
 fn retain_result(ctx: &ToolContext, mut output: ToolOutput, result: &Value) -> ToolOutput {
     if let Some(store) = ctx.workspace.artifacts() {
-        let note = match store.retain(&result.to_string()) {
-            Ok(uri) => format!("\n[Complete MCP protocol result: {uri}]"),
-            Err(e) => format!("\n[complete MCP protocol result could not be retained: {e:#}]"),
+        let presentation = output
+            .execution
+            .output
+            .as_ref()
+            .map_or(Completeness::Unknown, |facts| facts.presentation);
+        let note = match store.retain_with_integrity(&result.to_string()) {
+            Ok((uri, mut facts)) => {
+                facts.capture = Completeness::Complete;
+                facts.presentation = presentation;
+                let label = if facts.retention == Completeness::Complete {
+                    "Complete"
+                } else {
+                    "Partial"
+                };
+                output.execution.output = Some(facts);
+                format!("\n[{label} MCP protocol result: {uri}]")
+            }
+            Err(error) => {
+                if let Some(facts) = output.execution.output.as_mut() {
+                    facts.retention = Completeness::Unknown;
+                    facts.retained_bytes = None;
+                    facts.omitted_bytes = None;
+                }
+                format!("\n[MCP protocol result could not be retained: {error:#}]")
+            }
         };
         output.text.push_str(&note);
     }
+    output
+}
+
+/// Protocol bytes remain in `data`; the text is a projection, not the original payload.
+fn rendered(result: &Value, text: String, is_error: bool, omitted: bool) -> ToolOutput {
+    let clean = strip_controls(&text);
+    let visible = bound(&clean);
+    let partial = omitted || clean != text || visible != clean;
+    let bytes = result.to_string().len() as u64;
+    let mut output = ToolOutput {
+        execution: Default::default(),
+        text: visible,
+        is_error,
+        data: Some(result.clone()),
+    };
+    output.execution.output = Some(OutputIntegrity {
+        capture: Completeness::Complete,
+        retention: Completeness::Complete,
+        presentation: if partial {
+            Completeness::Partial
+        } else {
+            Completeness::Complete
+        },
+        original_bytes: Some(bytes),
+        retained_bytes: Some(bytes),
+        omitted_bytes: Some(0),
+        ..Default::default()
+    });
     output
 }
 
@@ -150,11 +275,11 @@ impl Tool for McpTool {
     }
 
     fn needs_approval(&self, _args: &Value) -> bool {
-        !self.remote.read_only_hint
+        !self.remote.read_only_hint || !self.session.catalog_current()
     }
 
     fn read_only_hint(&self) -> bool {
-        self.remote.read_only_hint
+        self.remote.read_only_hint && self.session.catalog_current()
     }
 
     fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
@@ -247,10 +372,20 @@ impl McpSurface {
             SurfaceKind::Resource => self.read_resource(args, cancel),
             SurfaceKind::Prompt => self.get_prompt(args, cancel),
         };
-        match output {
-            Ok((output, result)) => retain_result(ctx, output, &result),
-            Err(error) => ToolOutput::err(format!("{error:#}")),
-        }
+        let output = match output {
+            Ok((output, result)) => {
+                let mut output = retain_result(ctx, output, &result);
+                output.execution.integration = Some(IntegrationExecution {
+                    // Listings may have been served from a validated cache.
+                    dispatch: DispatchState::Unknown,
+                    settlement: Settlement::Reply,
+                    ..Default::default()
+                });
+                output
+            }
+            Err(error) => integration_error(error, IntegrationFailure::Protocol),
+        };
+        attach_health(output, &self.session)
     }
 
     fn read_resource(
@@ -260,7 +395,7 @@ impl McpSurface {
     ) -> anyhow::Result<(ToolOutput, Value)> {
         match args.get("uri").and_then(Value::as_str) {
             None => {
-                let listing = self.session.resources()?;
+                let listing = self.session.resources_until(cancel)?;
                 Ok((listing_output(&listing), listing))
             }
             Some(uri) => {
@@ -282,7 +417,7 @@ impl McpSurface {
     ) -> anyhow::Result<(ToolOutput, Value)> {
         match args.get("name").and_then(Value::as_str) {
             None => {
-                let listing = self.session.prompts()?;
+                let listing = self.session.prompts_until(cancel)?;
                 Ok((listing_output(&listing), listing))
             }
             Some(name) => {
@@ -409,9 +544,7 @@ pub fn render_result(result: &Value) -> ToolOutput {
         .and_then(Value::as_array)
         .map(|blocks| blocks.iter().map(render_block).collect())
         .unwrap_or_default();
-    if parts.is_empty()
-        && let Some(structured) = result.get("structuredContent")
-    {
+    if let Some(structured) = result.get("structuredContent") {
         parts.push(structured.to_string());
     }
     let text = if parts.is_empty() {
@@ -420,13 +553,11 @@ pub fn render_result(result: &Value) -> ToolOutput {
         parts.join("\n")
     };
     let is_error = result.get("isError").and_then(Value::as_bool) == Some(true);
-    let text = bound(&strip_controls(&text));
-    ToolOutput {
-        execution: Default::default(),
-        text,
-        is_error,
-        data: Some(result.clone()),
-    }
+    let omitted = result
+        .get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|blocks| blocks.iter().any(block_omitted));
+    rendered(result, text, is_error, omitted)
 }
 
 /// Renders a `resources/read` result: each content item's text verbatim, blobs noted.
@@ -456,12 +587,15 @@ fn render_resource(result: &Value) -> ToolOutput {
     } else {
         parts.join("\n")
     };
-    ToolOutput {
-        execution: Default::default(),
-        text: bound(&strip_controls(&text)),
-        is_error: false,
-        data: Some(result.clone()),
-    }
+    let omitted = result
+        .get("contents")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item.get("text").and_then(Value::as_str).is_none())
+        });
+    rendered(result, text, false, omitted)
 }
 
 /// Renders a `prompts/get` result: the description, then each message as `role: content`.
@@ -489,22 +623,33 @@ fn render_prompt(result: &Value) -> ToolOutput {
     } else {
         parts.join("\n")
     };
-    ToolOutput {
-        execution: Default::default(),
-        text: bound(&strip_controls(&text)),
-        is_error: false,
-        data: Some(result.clone()),
-    }
+    let omitted = result
+        .get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|messages| {
+            messages
+                .iter()
+                .filter_map(|message| message.get("content"))
+                .any(block_omitted)
+        });
+    rendered(result, text, false, omitted)
 }
 
 /// Renders a resource or prompt listing as pretty JSON, bounded like any server output.
 fn listing_output(listing: &Value) -> ToolOutput {
     let text = serde_json::to_string_pretty(listing).unwrap_or_else(|_| listing.to_string());
-    ToolOutput {
-        execution: Default::default(),
-        text: bound(&strip_controls(&text)),
-        is_error: false,
-        data: Some(listing.clone()),
+    rendered(listing, text, false, false)
+}
+
+fn block_omitted(block: &Value) -> bool {
+    match block.get("type").and_then(Value::as_str) {
+        Some("text") => false,
+        Some("resource") => block
+            .pointer("/resource/text")
+            .and_then(Value::as_str)
+            .is_none(),
+        Some("resource_link") => false,
+        _ => true,
     }
 }
 

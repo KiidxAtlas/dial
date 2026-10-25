@@ -513,6 +513,7 @@ pub struct SettingsOverlay {
     page: usize,
     search: String,
     mode: Mode,
+    reveal_sensitive: bool,
     pending: BTreeMap<String, Pending>,
     /// Save feedback is shown only after the controller acknowledges persistence.
     feedback: Option<String>,
@@ -720,6 +721,16 @@ fn fmt_float(f: f64) -> String {
 }
 
 fn value_text(def: &SettingDef, value: &Value) -> String {
+    if def.sensitive() {
+        return "(hidden)".into();
+    }
+    if matches!(def.kind, Kind::Toml) {
+        return match value {
+            Value::Table(items) => format!("{} entries · TOML", items.len()),
+            Value::Array(items) => format!("{} items · TOML", items.len()),
+            _ => "TOML value".into(),
+        };
+    }
     if def.path == "harness.max_steps" && value.as_integer() == Some(0) {
         return "0 (unlimited)".into();
     }
@@ -751,6 +762,14 @@ fn value_text(def: &SettingDef, value: &Value) -> String {
     text::one_line(&raw)
 }
 
+fn setting_edit_text(def: &SettingDef, value: &Value) -> String {
+    if matches!(def.kind, Kind::Toml) {
+        value.to_string()
+    } else {
+        edit_text(value)
+    }
+}
+
 fn edit_text(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
@@ -778,6 +797,7 @@ fn input_hint(kind: Kind) -> String {
             format!("Number from {} to {}.", fmt_float(min), fmt_float(max))
         }
         Kind::StringList => "Comma-separated list.".to_owned(),
+        Kind::Toml => "One TOML value: { name = { program = \"tool\" } } or [{ name = \"check\" }]. Enter saves; Esc cancels; Delete in browse resets.".to_owned(),
         Kind::Table => {
             "TOML inline table, for example { \"provider/model\" = \"80%\" }.".to_owned()
         }
@@ -832,6 +852,18 @@ fn parse_input(kind: Kind, input: &str) -> Result<Value, String> {
                 .map(|s| Value::String(s.to_owned()))
                 .collect(),
         )),
+        Kind::Toml => {
+            if input.len() > 256 * 1024 {
+                return Err("Settings value exceeds 256 KiB".into());
+            }
+            let mut table: Table = toml::from_str(&format!("value = {input}"))
+                .map_err(|_| "Enter one valid TOML value (inline table or array)".to_owned())?;
+            let value = table.remove("value").ok_or("Enter a TOML value")?;
+            if !table.is_empty() {
+                return Err("Enter only one TOML value".into());
+            }
+            Ok(value)
+        }
         Kind::Table => {
             if input.len() > 16 * 1024 {
                 return Err("Settings table exceeds 16 KiB".into());
@@ -924,6 +956,7 @@ impl SettingsOverlay {
             page: 8,
             search: String::new(),
             mode: Mode::Browse,
+            reveal_sensitive: false,
             pending: BTreeMap::new(),
             notes: BTreeMap::new(),
             hints: BTreeMap::new(),
@@ -1293,7 +1326,8 @@ impl SettingsOverlay {
         match choice {
             "override" => {
                 let mut editor = Editor::default();
-                editor.set(&edit_text(&self.current(def)));
+                editor.set(&setting_edit_text(def, &self.edit_seed(def)));
+                self.reveal_sensitive = false;
                 self.mode = Mode::Edit { def, editor };
                 OverlayEvent::None
             }
@@ -1395,6 +1429,26 @@ impl SettingsOverlay {
         }
     }
 
+    /// Structured editors manage one raw settings layer, not the merged effective table.
+    /// Copying effective collections into a project would leak inherited credentials and pin
+    /// unrelated global fields. Scalar overrides deliberately retain their effective seed.
+    fn edit_seed(&self, def: &SettingDef) -> Value {
+        if !matches!(def.kind, Kind::Toml) {
+            return self.current(def);
+        }
+        let empty = || match def.default_value() {
+            Some(Value::Array(_)) => Value::Array(Vec::new()),
+            _ => Value::Table(Table::new()),
+        };
+        match self.pending.get(def.path) {
+            Some(Pending::Set(value, scope)) if *scope == self.scope => value.clone(),
+            Some(Pending::Unset(scope)) if *scope == self.scope => empty(),
+            _ => crate::config::schema::get(self.layer_ref(self.scope), def.path)
+                .cloned()
+                .unwrap_or_else(empty),
+        }
+    }
+
     fn current(&self, def: &SettingDef) -> Value {
         match self.pending.get(def.path) {
             Some(Pending::Set(v, _)) => v.clone(),
@@ -1446,8 +1500,22 @@ impl SettingsOverlay {
                 .filter(|(_, def)| self.scope_shown(def))
             {
                 if let Some((score, _)) =
-                    search_match(&self.search, &haystack(def), def.description)
+                    search_match(&self.search, &haystack(def), def.description).or_else(|| {
+                        // Exact descendant paths find their complete structured editor, including
+                        // optional fields and operator-defined map entries absent from defaults.
+                        (matches!(def.kind, Kind::Toml)
+                            && self
+                                .search
+                                .to_lowercase()
+                                .starts_with(&format!("{}.", def.path)))
+                        .then_some((0, Vec::new()))
+                    })
                 {
+                    let score = if self.search.trim().eq_ignore_ascii_case(def.path) {
+                        i32::MAX
+                    } else {
+                        score
+                    };
                     hits.push((score, Row::Setting(i)));
                 }
             }
@@ -1812,9 +1880,11 @@ impl SettingsOverlay {
             | Kind::AutoFloat { .. }
             | Kind::Text
             | Kind::StringList
-            | Kind::Table => {
+            | Kind::Table
+            | Kind::Toml => {
                 let mut editor = Editor::default();
-                editor.set(&edit_text(&current));
+                editor.set(&setting_edit_text(def, &self.edit_seed(def)));
+                self.reveal_sensitive = false;
                 self.notes.remove(def.path);
                 self.mode = Mode::Edit { def, editor };
                 OverlayEvent::None
@@ -1856,7 +1926,9 @@ impl SettingsOverlay {
             return OverlayEvent::None;
         };
         let def: &'static SettingDef = def;
-        if keys.matches(Action::SelectCancel, key) {
+        if def.sensitive() && is_ctrl(key, 'r') {
+            self.reveal_sensitive = !self.reveal_sensitive;
+        } else if keys.matches(Action::SelectCancel, key) {
             self.notes.remove(def.path);
             self.mode = Mode::Browse;
         } else if keys.matches(Action::SelectConfirm, key) {
@@ -2456,7 +2528,12 @@ impl SettingsOverlay {
                         let models = ctx.keys.label(Action::ModelSelect);
                         head.push((memory_summary(&backend, &models), Tok::Text));
                     } else if matches!(self.mode, Mode::Edit { .. }) {
-                        head.push((input_hint(def.kind_for(&self.effective)), Tok::Muted));
+                        let hint = if matches!(def.kind, Kind::Toml) {
+                            format!("Editing only the {} layer; inherited values are not copied. {}", scope_name(self.scope), input_hint(def.kind))
+                        } else {
+                            input_hint(def.kind_for(&self.effective))
+                        };
+                        head.push((hint, Tok::Muted));
                     } else {
                         if let Some(feedback) = &self.feedback {
                             head.push((feedback.clone(), Tok::Success));
@@ -2659,7 +2736,12 @@ impl SettingsOverlay {
                 let value_spans = if let Some(editor) = editing {
                     let room = w.saturating_sub(2 + label_w + 2);
                     let mut s = vec![Span::styled("[", base(Tok::Muted))];
-                    s.extend(editor_spans(theme, editor, room, false));
+                    s.extend(editor_spans(
+                        theme,
+                        editor,
+                        room,
+                        def.sensitive() && !self.reveal_sensitive,
+                    ));
                     s.push(Span::styled("]", base(Tok::Muted)));
                     s
                 } else {
@@ -2786,6 +2868,11 @@ impl SettingsOverlay {
                 );
                 vec![
                     hint(keys, Action::SelectConfirm, "save"),
+                    if def.sensitive() {
+                        "Ctrl+R reveal/hide".into()
+                    } else {
+                        String::new()
+                    },
                     if numeric {
                         pair(Action::SelectUp, Action::SelectDown, "adjust")
                     } else {

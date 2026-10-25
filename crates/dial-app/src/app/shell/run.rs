@@ -31,9 +31,6 @@ impl Shell {
             if std::mem::take(&mut self.deferred_approval_cycle) {
                 self.cycle_approval(agent);
             }
-            if std::mem::take(&mut self.deferred_display_reset) {
-                self.display_reset();
-            }
             dirty |= self.refresh_resources(app, false, false);
             // Large @file rankings finish on a worker; land them without waiting for a keystroke.
             dirty |= self.composer.poll_autocomplete();

@@ -47,6 +47,7 @@ dial-core = { workspace = true, features = ["test-support"] }
 dial-llm = { workspace = true, features = ["test-support"] }
 dial-storage = { workspace = true, features = ["test-support"] }
 dial-tools = { workspace = true, features = ["test-support"] }
+tungstenite.workspace = true
 
 [features]
 # Test helpers used by other crates' tests (`#[cfg(test)]` items compiled only for this crate otherwise).

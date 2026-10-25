@@ -52,7 +52,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         EX,
         "Agent routing",
         "Turn optimizer",
-        "Route every user message and steering message through the turn_drafter role first; the main model receives only the drafted prompt (structured text plus diagrams). A failed draft stops the turn.",
+        "Rewrite user and steering messages with turn_drafter. Interactive Dial shows each draft for acceptance before sending; /drafter toggles this feature. A failed or cancelled draft sends nothing.",
         Kind::Bool
     ),
 ];

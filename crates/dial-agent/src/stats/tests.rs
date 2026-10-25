@@ -147,6 +147,7 @@ fn rollups_sum_exactly_and_derive_rates() {
     .unwrap();
     db.record_tool(&ToolRecord {
         status: None,
+        facts: Default::default(),
         ts_ms: base,
         session: "s1".into(),
         project: "proj-0000aaaa".into(),
@@ -157,6 +158,7 @@ fn rollups_sum_exactly_and_derive_rates() {
     .unwrap();
     db.record_tool(&ToolRecord {
         status: None,
+        facts: Default::default(),
         ts_ms: base,
         session: "s1".into(),
         project: "proj-0000aaaa".into(),
@@ -306,6 +308,7 @@ fn trace_returns_only_the_requested_session() {
     db.record_request(&other).unwrap();
     db.record_tool(&ToolRecord {
         status: None,
+        facts: Default::default(),
         ts_ms: 1_700_000_000_000,
         session: "abcd1234".into(),
         project: "demo-1234abcd".into(),
@@ -420,4 +423,58 @@ fn iso_and_range_parsing() {
     assert_eq!(parse_range("7d").unwrap(), Some(7 * DAY_MS));
     assert_eq!(parse_range("2w").unwrap(), Some(14 * DAY_MS));
     assert!(parse_range("0d").is_err() && parse_range("3y").is_err());
+}
+
+#[test]
+fn legacy_tools_gain_typed_facts_without_rewriting_old_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = db_path(dir.path());
+    Connection::open(&path).unwrap().execute_batch(
+        "CREATE TABLE tool_calls(id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, session TEXT NOT NULL,
+         project TEXT NOT NULL, tool TEXT NOT NULL, duration_ms INTEGER NOT NULL, error INTEGER NOT NULL);
+         INSERT INTO tool_calls VALUES(1,1,'old','p','bg',1,0);"
+    ).unwrap();
+    let mut db = Db::open(&path).unwrap();
+    drop(Db::open(&path).unwrap());
+    let facts = crate::telemetry::ExecutionFacts {
+        observation_kind: Some("wait".into()),
+        observation_satisfied: Some(true),
+        child_outcome: Some("failed".into()),
+        capture: Some("partial".into()),
+        retention: Some("complete".into()),
+        presentation: Some("partial".into()),
+        omitted_bytes: Some(80),
+        connection: Some("connected".into()),
+        notifications: Some("degraded".into()),
+        catalog: Some("stale".into()),
+        state_changes: 2,
+        failure: Some("remote".into()),
+        ..Default::default()
+    };
+    db.record_tool(&ToolRecord {
+        tool: "bg".into(),
+        facts: facts.clone(),
+        ..Default::default()
+    })
+    .unwrap();
+    let (status, stored): (String, String) = db
+        .conn
+        .query_row(
+            "SELECT status,facts FROM tool_outcomes JOIN tool_facts USING(call_id) WHERE call_id=2",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "ok", "observation success is not child success");
+    assert_eq!(
+        serde_json::from_str::<crate::telemetry::ExecutionFacts>(&stored).unwrap(),
+        facts
+    );
+    let historical: i64 = db
+        .conn
+        .query_row("SELECT COUNT(*) FROM tool_facts WHERE call_id=1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(historical, 0, "historical facts remain unknown");
 }

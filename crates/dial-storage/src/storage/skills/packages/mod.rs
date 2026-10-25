@@ -306,7 +306,17 @@ fn store_checkout(layout: &Layout, checkout: &Path, path: Option<&str>) -> Resul
     let manifest = git::manifest(&staging_path)?;
     let integrity = git::integrity(&manifest);
     let target = store.join(&integrity);
-    if !target.exists() {
+    let intact = stored_dir(layout, &integrity)
+        .and_then(|dir| git::manifest(&dir).ok())
+        .is_some_and(|existing| git::integrity(&existing) == integrity);
+    if !intact {
+        // Never follow a tampered store entry's symlink when replacing it.
+        match fs::symlink_metadata(&target) {
+            Ok(meta) if meta.is_dir() => fs::remove_dir_all(&target)?,
+            Ok(_) => fs::remove_file(&target)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         fs::rename(&staging_path, &target)
             .with_context(|| format!("storing package in {}", target.display()))?;
         staging.0 = None;
@@ -422,7 +432,8 @@ pub fn install(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(&str),
 ) -> Result<String> {
-    let plan = plan(spec, registries, &layout.project_root)?;
+    let mut plan = plan(spec, registries, &layout.project_root)?;
+    plan.source.url = git::resolve_local(&plan.source.url, &layout.project_root);
     ensure_not_installed(layout, &plan.name)?;
     let checkout = git::fetch(&plan.source, &layout.project_root, cancel, progress)?;
     check_cancel(cancel)?;
@@ -528,26 +539,24 @@ fn update_one(
         package.name,
         package.name
     );
-    // Same commit with its content still stored is already current; otherwise store the checkout,
-    // which also restores content that went missing.
-    let old_dir = stored_dir(layout, &package.integrity);
-    if checkout.commit == package.commit && old_dir.is_some() {
+    // Commit identity alone does not establish that the stored files remain intact.
+    let old_manifest = stored_dir(layout, &package.integrity)
+        .and_then(|dir| git::manifest(&dir).ok())
+        .unwrap_or_default();
+    if checkout.commit == package.commit && git::integrity(&old_manifest) == package.integrity {
         return Ok(format!(
             "{}: already up to date at {}",
             package.name,
             short(&package.commit)
         ));
     }
-    let old_manifest = match old_dir {
-        Some(dir) => git::manifest(&dir)?,
-        None => BTreeMap::new(),
-    };
     let stored = store_checkout(layout, checkout.dir.path(), package.source.path.as_deref())?;
     ensure_no_skill_clash(layout, &package.name, &stored.skills)?;
     let entry = lock
         .packages
         .get_mut(&package.name)
         .ok_or_else(|| anyhow!("{} was removed while updating", package.name))?;
+    entry.url = git::resolve_local(&package.source.url, &layout.project_root);
     entry.commit = checkout.commit.clone();
     entry.integrity = stored.integrity.clone();
     entry.skills = stored.skills.clone();
@@ -555,7 +564,7 @@ fn update_one(
     prune_store(layout)?;
     if checkout.commit == package.commit {
         return Ok(format!(
-            "{}: restored missing content at {}",
+            "{}: restored missing or modified content at {}",
             package.name,
             short(&package.commit)
         ));

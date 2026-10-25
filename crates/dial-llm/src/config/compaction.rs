@@ -17,8 +17,11 @@ const SMALL_WINDOW_RESERVE_FLOOR: u32 = 2_048;
 /// Default verbatim tail; a configured value equal to this on a small window is scaled to fit the band.
 pub const DEFAULT_KEEP_RECENT_TOKENS: u32 = 20_000;
 
-/// Auto trigger as a percentage of the window left after the reserve.
-pub const DEFAULT_THRESHOLD_PERCENT: u64 = 80;
+/// Large-window auto trigger uses the whole reserve-subtracted window; speculation starts earlier.
+pub const DEFAULT_THRESHOLD_PERCENT: u64 = 100;
+
+/// Small windows retain extra headroom for estimation drift and less capable local models.
+const SMALL_WINDOW_THRESHOLD_PERCENT: u64 = 80;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -571,14 +574,19 @@ impl CompactionConfig {
                 .max(1)
                 .min(base.saturating_sub(1)));
         }
-        // Trigger with headroom below the usable window: waiting until the reserve itself is reached
-        // runs every late request at near-full context and leaves no room for background speculation.
+        // Prepare summaries ahead of this boundary, but keep large-window history until the reserve
+        // is reached. Small windows retain their conservative extra margin.
         let usable = base
             .saturating_sub(u64::from(
                 self.reserve(base.min(u64::from(u32::MAX)) as u32),
             ))
             .min(base.saturating_sub(1));
-        Ok((usable.saturating_mul(DEFAULT_THRESHOLD_PERCENT) / 100).max(1))
+        let percent = if base <= u64::from(SMALL_WINDOW_TOKENS) {
+            SMALL_WINDOW_THRESHOLD_PERCENT
+        } else {
+            DEFAULT_THRESHOLD_PERCENT
+        };
+        Ok((usable.saturating_mul(percent) / 100).max(1))
     }
     pub fn should_compact(
         &self,

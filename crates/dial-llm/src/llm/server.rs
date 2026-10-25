@@ -123,10 +123,12 @@ fn startup_diagnostic(error: &anyhow::Error, stderr: &str, program: &std::ffi::O
     let mut message = if stderr.is_empty() {
         format!("{error:#}; server executable: {program} (server wrote nothing to stderr)")
     } else {
-        format!("{error:#}; server executable: {program}; server stderr (last {ERROR_TAIL_BYTES} bytes):\n{stderr}")
+        format!(
+            "{error:#}; server executable: {program}; server stderr (last {ERROR_TAIL_BYTES} bytes):\n{stderr}"
+        )
     };
     if stderr.contains("unknown model architecture") {
-        message.push_str("\nThe selected llama.cpp runtime does not support this GGUF architecture. Use a llama-server build with support for this architecture (the latest package-manager release may still be too old). Set DIAL_LLAMA_SERVER to that executable, or load the model in a compatible LM Studio runtime and select the LM Studio provider. Changing sampling or context settings cannot add architecture support.");
+        message.push_str("\nThe selected llama.cpp runtime does not support this GGUF architecture. Upgrade to a llama-server build with support for this architecture (the latest package-manager release may still be too old). Set DIAL_LLAMA_SERVER to that executable, or load the model in a compatible LM Studio runtime and select the LM Studio provider. Changing sampling or context settings cannot add architecture support.");
     }
     message
 }

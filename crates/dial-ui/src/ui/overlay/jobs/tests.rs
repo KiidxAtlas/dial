@@ -171,3 +171,55 @@ fn empty_list_explains_what_appears_here() {
     assert!(shown.contains("No background"), "{shown}");
     assert!(!shown.contains("attach"), "nothing to attach to: {shown}");
 }
+
+#[test]
+fn pipe_and_exited_viewers_are_read_only_and_show_recent_output() {
+    let keys = Keymap::defaults();
+    let theme = crate::ui::theme::Theme::dark();
+    for (terminal, running) in [(false, true), (false, false), (true, false)] {
+        let mut overlay = JobsOverlay::new();
+        let mut job = row("build", running);
+        job.terminal = terminal;
+        overlay.set_jobs(vec![job]);
+        overlay.handle(&Event::Key(key(KeyCode::Enter, KeyModifiers::NONE)), &keys);
+        assert_eq!(overlay.attached(), Some("build"));
+        for event in [
+            Event::Key(key(KeyCode::Char('x'), KeyModifiers::NONE)),
+            Event::Paste("do not send".into()),
+        ] {
+            assert!(matches!(overlay.handle(&event, &keys), OverlayEvent::None));
+        }
+        overlay.set_screen((0..100).map(|i| format!("output-{i}")).collect(), None);
+        let shown = draw_rows(&mut overlay, &theme, 80, 12).join("\n");
+        if !terminal {
+            assert!(shown.contains("output-99"), "{shown}");
+            assert!(!shown.contains("output-0 "), "{shown}");
+        }
+        assert!(!shown.contains("keys go to"), "{shown}");
+        overlay.handle(&Event::Key(key(KeyCode::Esc, KeyModifiers::NONE)), &keys);
+        assert_eq!(overlay.attached(), None);
+    }
+}
+
+#[test]
+fn pipe_output_scrolls_and_end_resumes_following() {
+    let keys = Keymap::defaults();
+    let theme = crate::ui::theme::Theme::dark();
+    let mut overlay = JobsOverlay::new();
+    let mut job = row("build", true);
+    job.terminal = false;
+    overlay.set_jobs(vec![job]);
+    overlay.handle(&Event::Key(key(KeyCode::Enter, KeyModifiers::NONE)), &keys);
+    overlay.set_screen((0..100).map(|i| format!("output-{i}")).collect(), None);
+    draw_rows(&mut overlay, &theme, 80, 12);
+    overlay.handle(&Event::Key(key(KeyCode::Home, KeyModifiers::NONE)), &keys);
+    let first = draw_rows(&mut overlay, &theme, 80, 12).join("\n");
+    assert!(first.contains("output-0 "), "{first}");
+    assert!(!first.contains("output-99"), "{first}");
+    overlay.handle(&Event::Key(key(KeyCode::End, KeyModifiers::NONE)), &keys);
+    let last = draw_rows(&mut overlay, &theme, 80, 12).join("\n");
+    assert!(last.contains("output-99"), "{last}");
+    overlay.set_screen(vec!["new output".into()], None);
+    let short = draw_rows(&mut overlay, &theme, 38, 12).join("\n");
+    assert!(short.contains("new output"), "{short}");
+}

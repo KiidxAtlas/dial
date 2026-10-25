@@ -226,10 +226,7 @@ impl Bridge<'_> {
                             shell.deferred_approval_cycle = true;
                             shell.note("Approval", "approval mode changes after the current turn.");
                         }
-                        ComposerEvent::Action(Action::DisplayReset) => {
-                            shell.deferred_display_reset = true;
-                            shell.note("Display", "display reset after the current turn.");
-                        }
+                        ComposerEvent::Action(Action::DisplayReset) => shell.display_reset(),
                         ComposerEvent::Action(Action::PasteImage) => {
                             if let Err(error) = shell.composer.paste_clipboard_image() {
                                 shell.note(

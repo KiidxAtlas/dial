@@ -1216,7 +1216,10 @@ fn edit_results_list_only_errors_the_edit_introduced() {
 fn new_errors_in_reads_back_the_advisory_block() {
     let note = super::new_errors_note(&["a.rs:1:2: bad".to_owned()], true);
     let text = format!("Edited a.rs\n{note}\nmore output");
-    assert_eq!(super::new_errors_in(&text), Some((1, vec!["a.rs:1:2: bad"])));
+    assert_eq!(
+        super::new_errors_in(&text),
+        Some((1, vec!["a.rs:1:2: bad"]))
+    );
     assert_eq!(super::new_errors_in("Edited a.rs\n"), None);
 }
 

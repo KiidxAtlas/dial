@@ -50,3 +50,116 @@ fn promotion_validation_bounds_keys_chains_and_selectors() {
     }
     assert!(config.validate().is_err());
 }
+
+#[test]
+fn auto_threshold_uses_the_usable_large_window_and_preserves_small_windows() {
+    let identity = CompactionIdentity {
+        provider: "p",
+        model: "m",
+        agent: None,
+    };
+    for policy in [
+        CompactionConfig::default(),
+        parse("threshold_percent = 'auto'\nthreshold_tokens = 'auto'\n").unwrap(),
+    ] {
+        for (window, expected) in [
+            (8_192, 5_571),
+            (32_768, 20_972),
+            (65_536, 41_943),
+            (65_537, 49_153),
+            (200_000, 170_000),
+            (1_000_000, 850_000),
+        ] {
+            assert_eq!(
+                policy.effective_threshold(identity, window).unwrap(),
+                expected,
+                "window {window}"
+            );
+            for mid_turn in [false, true] {
+                assert!(
+                    !policy
+                        .should_compact(identity, window, expected, mid_turn)
+                        .unwrap()
+                );
+                assert!(
+                    policy
+                        .should_compact(identity, window, expected + 1, mid_turn)
+                        .unwrap()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn explicit_thresholds_do_not_change_with_the_large_window_auto_default() {
+    let identity = CompactionIdentity {
+        provider: "p",
+        model: "m",
+        agent: None,
+    };
+    for (text, expected) in [
+        ("threshold_percent = 80", 160_000),
+        ("threshold_tokens = 120000", 120_000),
+        ("[model_thresholds]\n'p/m' = '80%'", 160_000),
+        ("[model_thresholds]\n'p/m' = 'f120000'", 120_000),
+    ] {
+        let policy = parse(text).unwrap();
+        assert_eq!(
+            policy.effective_threshold(identity, 200_000).unwrap(),
+            expected,
+            "{text}"
+        );
+    }
+    let policy = parse("reserve_tokens = 50000").unwrap();
+    assert_eq!(
+        policy.effective_threshold(identity, 200_000).unwrap(),
+        150_000
+    );
+}
+
+#[test]
+fn model_numeric_thresholds_remain_bases_and_agent_overrides_remain_triggers() {
+    let identity = CompactionIdentity {
+        provider: "p",
+        model: "m",
+        agent: None,
+    };
+    for (base, expected) in [
+        (65_536, 41_943),
+        (100_000, 83_616),
+        (200_000, 170_000),
+        (1_000_000, 170_000),
+    ] {
+        let policy = parse(&format!("[model_thresholds]\n'p/m' = {base}")).unwrap();
+        assert_eq!(
+            policy.effective_threshold(identity, 200_000).unwrap(),
+            expected,
+            "base {base}"
+        );
+    }
+    for (value, expected) in [("100000", 100_000), ("'80%'", 160_000)] {
+        let policy = parse(&format!(
+            "[model_thresholds]\n'p/m' = 'f120000'\n[agent_threshold_overrides]\nworker = {value}"
+        ))
+        .unwrap();
+        let worker = CompactionIdentity {
+            agent: Some("worker"),
+            ..identity
+        };
+        assert_eq!(
+            policy.effective_threshold(worker, 200_000).unwrap(),
+            expected
+        );
+        assert_eq!(
+            policy.effective_threshold(identity, 200_000).unwrap(),
+            120_000
+        );
+    }
+    let policy =
+        parse("model_thresholds_enabled = false\n[model_thresholds]\n'p/m' = 100000").unwrap();
+    assert_eq!(
+        policy.effective_threshold(identity, 200_000).unwrap(),
+        170_000
+    );
+}

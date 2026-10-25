@@ -608,3 +608,104 @@ fn failed_reuse_capture_is_sticky_even_if_input_is_restored() {
     agent.run_focused_check(&check, &mut NullUi);
     assert!(agent.reuse_check(&check));
 }
+
+#[test]
+fn subset_checks_preserve_unrelated_obligations_across_pass_reuse_and_cancellation() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("input"), "stable").unwrap();
+    let (config, passed) = input_contract_config("echo checked");
+    let mut agent = hermetic_agent(&config, root.path());
+    let unrelated = verify::verification::FocusedCheck {
+        name: "unrelated".into(),
+        command: "echo failed; exit 1".into(),
+        timeout_secs: 5,
+    };
+    agent.run_checks(std::slice::from_ref(&unrelated), &mut NullUi);
+    for _ in 0..2 {
+        let run = agent.run_checks(std::slice::from_ref(&passed), &mut NullUi);
+        assert!(run.failures.is_empty());
+        assert_eq!(agent.step_checks.failed_checks, vec![unrelated.clone()]);
+        assert!(agent.step_checks.failed);
+    }
+    assert!(agent.reuse_check(&passed));
+    agent.interrupt.store(true, Ordering::SeqCst);
+    for _ in 0..2 {
+        agent.run_checks(std::slice::from_ref(&passed), &mut NullUi);
+        assert_eq!(
+            agent.step_checks.failed_checks,
+            vec![unrelated.clone(), passed.clone()]
+        );
+    }
+    agent.interrupt.store(false, Ordering::SeqCst);
+    agent.run_checks(std::slice::from_ref(&passed), &mut NullUi);
+    assert_eq!(agent.step_checks.failed_checks, vec![unrelated]);
+    agent.run_checks(&[], &mut NullUi);
+    assert!(agent.step_checks.failed);
+}
+
+#[test]
+fn real_shell_empty_suite_hidden_in_clipped_output_is_unverified() {
+    let root = tempfile::tempdir().unwrap();
+    let artifact_root = tempfile::tempdir().unwrap();
+    let config = Config::default();
+    let mut agent = hermetic_agent(&config, root.path());
+    agent.workspace = agent.workspace.clone().with_artifacts(
+        crate::storage::artifact::ArtifactStore::new(artifact_root.path()).unwrap(),
+    );
+    let padding = "padding diagnostic\n".repeat(10000);
+    std::fs::write(
+        root.path().join("output"),
+        format!("{padding}Ran 0 tests\n{padding}"),
+    )
+    .unwrap();
+    let check = verify::verification::FocusedCheck {
+        name: "empty suite".into(),
+        command: "cat output".into(),
+        timeout_secs: 5,
+    };
+    let output = agent.run_focused_check(&check, &mut NullUi);
+    assert_eq!(output.process_outcome().unwrap().exit_code, Some(0));
+    assert!(!output.text.contains("Ran 0 tests"));
+    assert_eq!(
+        agent.step_checks.evidence.latest_status(&check.command),
+        Some(verify::verification::CheckStatus::Unverified)
+    );
+}
+
+#[test]
+fn strict_required_subset_cannot_discharge_an_unrelated_failed_check() {
+    use crate::config::types::{VerificationCommand, VerificationRequirement};
+    let root = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config.verification.strict_requirements = true;
+    config.verification.automatic_checks = true;
+    config.verification.commands.push(VerificationCommand {
+        name: "required".into(),
+        command: "printf checked".into(),
+        file_extensions: vec![],
+        timeout_secs: 5,
+    });
+    config.verification.requirements.insert(
+        "boundary".into(),
+        VerificationRequirement {
+            checks: vec!["required".into()],
+            visual: false,
+        },
+    );
+    let mut agent = hermetic_agent(&config, root.path());
+    let unrelated = verify::verification::FocusedCheck {
+        name: "unrelated".into(),
+        command: "echo assertion failed; exit 1".into(),
+        timeout_secs: 5,
+    };
+    agent.run_checks(std::slice::from_ref(&unrelated), &mut NullUi);
+    agent.hermetic = false;
+    let refusal = agent.validate_completion(&mut NullUi).unwrap_err();
+    assert!(refusal.contains("focused checks failed"), "{refusal}");
+    assert_eq!(
+        agent.step_checks.evidence.latest_status("printf checked"),
+        Some(verify::verification::CheckStatus::Passed)
+    );
+    assert_eq!(agent.step_checks.failed_checks, vec![unrelated]);
+    assert!(agent.step_checks.failed);
+}

@@ -147,6 +147,9 @@ impl Finished {
                 super::execution::Effects::Known
             },
             changed_paths: Vec::new(),
+            process: Some(self.outcome()),
+            output: Some(self.output_integrity()),
+            ..Default::default()
         }
     }
     pub fn stdout_text(&self) -> String {
@@ -180,6 +183,29 @@ impl Finished {
             start += 1;
         }
         format!("…{}", &text[start..])
+    }
+    pub fn output_integrity(&self) -> super::execution::OutputIntegrity {
+        use super::execution::{Completeness, OutputIntegrity};
+        let original = (self.stdout_total + self.stderr_total) as u64;
+        let retained = (self.stdout.len() + self.stderr.len()) as u64;
+        OutputIntegrity {
+            capture: if !self.started {
+                Completeness::Unknown
+            } else if self.output_incomplete || self.io_error.is_some() {
+                Completeness::Partial
+            } else {
+                Completeness::Complete
+            },
+            retention: if original == retained {
+                Completeness::Complete
+            } else {
+                Completeness::Partial
+            },
+            original_bytes: Some(original),
+            retained_bytes: Some(retained),
+            omitted_bytes: Some(original.saturating_sub(retained)),
+            ..Default::default()
+        }
     }
     pub fn outcome(&self) -> super::execution::ProcessOutcome {
         super::execution::ProcessOutcome {
@@ -376,6 +402,7 @@ pub fn run_with_control(
         Ok(writer) => writer,
         Err(error) => {
             result.io_error = Some(format!("preparing pipes: {error}"));
+            result.output_incomplete = true;
             owner.kill();
             result.status = owner.reap();
             if policy.may_mutate {
@@ -389,6 +416,7 @@ pub fn run_with_control(
     let started = Instant::now();
     let mut exited_at = None;
     let mut buffer = [0u8; 16 * 1024];
+    let mut failed_at: Option<Instant> = None;
     loop {
         let mut progress = false;
         for stream in [Stream::Stdout, Stream::Stderr] {
@@ -512,11 +540,22 @@ pub fn run_with_control(
             || result.output_limited
             || result.io_error.is_some()
         {
-            if !owner.reaped {
-                owner.kill();
-                result.status = owner.reap();
+            if failed_at.is_none() {
+                if !owner.reaped {
+                    owner.kill();
+                    result.status = owner.reap();
+                    exited_at = Some(Instant::now());
+                }
+                writer = None;
+                failed_at = Some(Instant::now());
             }
-            break;
+            if out.is_none() && err.is_none() {
+                break;
+            }
+            if failed_at.is_some_and(|at| at.elapsed() >= Duration::from_millis(300)) {
+                result.output_incomplete = true;
+                break;
+            }
         }
         if let Some(at) = exited_at {
             if out.is_none() && err.is_none() {
@@ -531,6 +570,7 @@ pub fn run_with_control(
             std::thread::sleep(Duration::from_millis(5));
         }
     }
+    result.output_incomplete = out.is_some() || err.is_some();
     if result.cancelled || result.timed_out {
         super::execution::process_status(result.tool_status());
     }

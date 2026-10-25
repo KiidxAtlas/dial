@@ -38,6 +38,9 @@ pub mod smithery;
 pub use oauth::{login, logout};
 mod tool;
 use crate::config::types::{Config, McpServerConfig};
+use crate::runtime::integration::{
+    CatalogFreshness, ConnectionHealth, IntegrationHealth, NotificationHealth,
+};
 use crate::tools::integrations::ext::Tool;
 use anyhow::{Context, Result, bail, ensure};
 use client::{Client, Shared};
@@ -45,6 +48,7 @@ use names::Namer;
 use parking_lot::{Mutex, MutexGuard};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -57,17 +61,18 @@ pub enum Signal {
     PromptsChanged,
     ResourcesChanged,
     ResourceUpdated,
+    NotificationHealthy,
+    NotificationUnsupported,
+    NotificationDegraded,
 }
 
+/// Connect temporary server specifications using the caller's project and OAuth identity.
 pub fn connect_extra(
     specs: &std::collections::BTreeMap<String, McpServerConfig>,
-    root: &std::path::Path,
+    config: &Config,
 ) -> McpLoad {
-    let config = Config {
-        project_root: root.to_path_buf(),
-        mcp: specs.clone(),
-        ..Config::default()
-    };
+    let mut config = config.clone();
+    config.mcp = specs.clone();
     load(&config)
 }
 
@@ -113,6 +118,10 @@ pub struct Session {
     /// Start times of automatic reconnect attempts inside the burst window.
     attempts: Mutex<Vec<Instant>>,
     listing: Mutex<Listing>,
+    health: Mutex<IntegrationHealth>,
+    /// Definitions registered at startup; reconnects must not silently change approval semantics.
+    tool_catalog: Mutex<Vec<RemoteTool>>,
+    reported_transitions: AtomicU64,
 }
 
 /// Cached `resources/list` + templates and `prompts/list` results; `None` until fetched or
@@ -147,6 +156,38 @@ impl Session {
         &self.name
     }
 
+    /// Independent runtime states. Reading this snapshot never connects to a server.
+    pub fn health(&self) -> IntegrationHealth {
+        if self.current().is_closed() {
+            self.update_health(|health| {
+                health.connection = ConnectionHealth::Disconnected;
+                health.catalog = CatalogFreshness::Stale;
+            });
+        }
+        self.health.lock().clone()
+    }
+
+    fn update_health(&self, update: impl FnOnce(&mut IntegrationHealth)) {
+        let mut health = self.health.lock();
+        let before = health.clone();
+        update(&mut health);
+        if *health != before {
+            health.transitions = before.transitions.saturating_add(1);
+        }
+    }
+
+    pub(super) fn catalog_current(&self) -> bool {
+        self.health().catalog == CatalogFreshness::Fresh
+    }
+
+    /// Claim each transition once even when several calls settle concurrently.
+    pub(super) fn observe_health(&self, through: u64) -> u64 {
+        let before = self
+            .reported_transitions
+            .fetch_max(through, Ordering::AcqRel);
+        through.saturating_sub(before)
+    }
+
     /// The server's `initialize` capabilities as last negotiated, without reconnecting.
     /// `Null` when the current connection never completed initialization.
     pub fn capabilities(&self) -> Value {
@@ -162,19 +203,27 @@ impl Session {
         self.client.lock().clone()
     }
 
-    /// The live client. Waits for an in-flight connect, and reconnects on demand when the
-    /// transport dropped and the burst breaker allows it.
-    pub(super) fn client(self: &Arc<Self>) -> Result<Arc<Client>> {
-        self.client_until(&|| false)
-    }
-
-    /// [`Session::client`] that gives up when `cancel` turns true, both while waiting for another
-    /// connect and while reconnecting: a server that never answers `initialize` must not hold a
-    /// tool call forever when no connect timeout is configured.
+    /// Wait for a live client or reconnect, with cancellation during both lock acquisition and
+    /// connection setup. A server that never answers must not hold a cancelled tool call.
     pub(super) fn client_until(self: &Arc<Self>, cancel: &dyn Fn() -> bool) -> Result<Arc<Client>> {
         let _turn = lock_turn(&self.turn, cancel)?;
         let current = self.current();
         if !current.is_closed() {
+            let snapshot = self.health();
+            if snapshot.catalog == CatalogFreshness::Unknown {
+                let deadline = crate::tools::exec::kernel::execution_deadline(self.timeout());
+                let matches = self.catalog_matches(&current, deadline, cancel)?;
+                self.update_health(|health| {
+                    // Never erase a concurrent invalidation while the listing was in flight.
+                    if health.transitions == snapshot.transitions {
+                        health.catalog = if matches {
+                            CatalogFreshness::Fresh
+                        } else {
+                            CatalogFreshness::Stale
+                        };
+                    }
+                });
+            }
             return Ok(current);
         }
         self.open_locked(cancel)
@@ -203,36 +252,90 @@ impl Session {
         );
         attempts.push(now);
         let deadline = crate::tools::exec::kernel::execution_deadline(self.connect_timeout);
-        let (client, signals) = open(
+        self.update_health(|health| health.connection = ConnectionHealth::Connecting);
+        let opened = open(
             &self.name,
             &self.server,
             &self.root,
             &self.user_dir,
             deadline,
             cancel,
-        )?;
+        );
+        let (client, signals) = match opened {
+            Ok(opened) => opened,
+            Err(error) => {
+                self.update_health(|health| health.connection = ConnectionHealth::Disconnected);
+                return Err(error);
+            }
+        };
+        let fresh = self
+            .catalog_matches(&client, deadline, cancel)
+            .unwrap_or(false);
         let client = Arc::new(client);
-        listen(self, signals)?;
         let old = std::mem::replace(&mut *self.client.lock(), client.clone());
-        drop(old);
         self.listing.lock().reset();
+        self.update_health(|health| {
+            health.connection = ConnectionHealth::Connected;
+            health.notifications = if self.server.url.is_none() {
+                NotificationHealth::Healthy
+            } else {
+                NotificationHealth::Unknown
+            };
+            health.catalog = if fresh {
+                CatalogFreshness::Fresh
+            } else {
+                CatalogFreshness::Stale
+            };
+            health.generation = health.generation.saturating_add(1);
+        });
+        drop(old);
+        listen(self, signals)?;
         Ok(client)
+    }
+
+    fn catalog_matches(
+        &self,
+        client: &Client,
+        deadline: Option<Instant>,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<bool> {
+        let entries = if client.has_capability("tools")
+            || !(client.has_capability("resources") || client.has_capability("prompts"))
+        {
+            list_all(client, "tools/list", "tools", deadline, cancel)?
+        } else {
+            Vec::new()
+        };
+        let mut tools: Vec<_> = entries.iter().filter_map(RemoteTool::parse).collect();
+        tools.truncate(MAX_TOOLS_PER_SERVER);
+        for tool in &mut tools {
+            tool.read_only_hint &= self.server.trust_read_only_hint;
+        }
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(tools == *self.tool_catalog.lock())
     }
 
     /// Resources and resource templates, from cache when the server has not announced a change.
     pub fn resources(self: &Arc<Self>) -> Result<Value> {
+        self.resources_until(&|| false)
+    }
+
+    pub(super) fn resources_until(self: &Arc<Self>, cancel: &dyn Fn() -> bool) -> Result<Value> {
+        ensure!(!cancel(), "MCP resource listing cancelled before sending");
         let (cached, generation) = {
             let listing = self.listing.lock();
             (listing.resources.clone(), listing.generation)
         };
-        if let Some(cached) = cached {
+        if let Some(cached) =
+            cached.filter(|_| self.health().notifications == NotificationHealth::Healthy)
+        {
             return Ok(cached);
         }
-        let client = self.client()?;
-        let timeout = self.timeout();
+        let deadline = crate::tools::exec::kernel::execution_deadline(self.timeout());
+        let client = self.client_until(cancel)?;
         let listing = json!({
-            "resources": list_all(&client, "resources/list", "resources", timeout)?,
-            "templates": list_all(&client, "resources/templates/list", "resourceTemplates", timeout)?,
+            "resources": list_all(&client, "resources/list", "resources", deadline, cancel)?,
+            "templates": list_all(&client, "resources/templates/list", "resourceTemplates", deadline, cancel)?,
         });
         self.listing
             .lock()
@@ -242,16 +345,24 @@ impl Session {
 
     /// Prompts, from cache when the server has not announced a change.
     pub fn prompts(self: &Arc<Self>) -> Result<Value> {
+        self.prompts_until(&|| false)
+    }
+
+    pub(super) fn prompts_until(self: &Arc<Self>, cancel: &dyn Fn() -> bool) -> Result<Value> {
+        ensure!(!cancel(), "MCP prompt listing cancelled before sending");
         let (cached, generation) = {
             let listing = self.listing.lock();
             (listing.prompts.clone(), listing.generation)
         };
-        if let Some(cached) = cached {
+        if let Some(cached) =
+            cached.filter(|_| self.health().notifications == NotificationHealth::Healthy)
+        {
             return Ok(cached);
         }
-        let client = self.client()?;
+        let deadline = crate::tools::exec::kernel::execution_deadline(self.timeout());
+        let client = self.client_until(cancel)?;
         let listing =
-            json!({"prompts": list_all(&client, "prompts/list", "prompts", self.timeout())?});
+            json!({"prompts": list_all(&client, "prompts/list", "prompts", deadline, cancel)?});
         self.listing
             .lock()
             .store(generation, |cache| cache.prompts = Some(listing.clone()));
@@ -314,20 +425,52 @@ impl Session {
                 listing.prompts = None;
                 listing.generation += 1;
             }
-            Signal::ToolsChanged | Signal::Closed => {}
+            Signal::ToolsChanged => {
+                self.update_health(|health| health.catalog = CatalogFreshness::Stale)
+            }
+            Signal::Closed => self.update_health(|health| {
+                health.connection = ConnectionHealth::Disconnected;
+                health.catalog = CatalogFreshness::Stale;
+            }),
+            Signal::NotificationHealthy => {
+                self.update_health(|health| health.notifications = NotificationHealth::Healthy)
+            }
+            Signal::NotificationUnsupported => {
+                self.update_health(|health| health.notifications = NotificationHealth::Unsupported)
+            }
+            Signal::NotificationDegraded => {
+                listing.reset();
+                self.update_health(|health| {
+                    health.notifications = NotificationHealth::Degraded;
+                    if health.catalog == CatalogFreshness::Fresh {
+                        health.catalog = CatalogFreshness::Unknown;
+                    }
+                });
+            }
         }
     }
 }
 
 /// Follows `nextCursor` pages of a list method and collects the `key` arrays.
-fn list_all(client: &Client, method: &str, key: &str, timeout: Duration) -> Result<Vec<Value>> {
+fn list_all(
+    client: &Client,
+    method: &str,
+    key: &str,
+    deadline: Option<Instant>,
+    cancel: &dyn Fn() -> bool,
+) -> Result<Vec<Value>> {
     let mut items = Vec::new();
     let mut cursor: Option<String> = None;
     for _ in 0..MAX_PAGES {
+        ensure!(!cancel(), "MCP listing `{method}` cancelled");
+        ensure!(
+            deadline.is_none_or(|end| Instant::now() < end),
+            "MCP listing `{method}` exceeded its operation deadline"
+        );
         let params = cursor
             .as_ref()
             .map_or_else(|| json!({}), |cursor| json!({"cursor": cursor}));
-        let page = client.request(method, params, timeout)?;
+        let page = client.request_with(method, params, remaining(deadline), cancel, None)?;
         let Some(entries) = page.get(key).and_then(Value::as_array) else {
             bail!("`{method}` returned no `{key}` array");
         };
@@ -341,6 +484,10 @@ fn list_all(client: &Client, method: &str, key: &str, timeout: Duration) -> Resu
             break;
         }
     }
+    ensure!(
+        cursor.is_none(),
+        "MCP listing `{method}` incomplete: pagination limit reached"
+    );
     Ok(items)
 }
 
@@ -349,6 +496,7 @@ fn list_all(client: &Client, method: &str, key: &str, timeout: Duration) -> Resu
 /// the session (its tools) stops the server.
 fn listen(session: &Arc<Session>, signals: mpsc::Receiver<Signal>) -> Result<()> {
     let weak: Weak<Session> = Arc::downgrade(session);
+    let generation = session.health.lock().generation;
     thread::Builder::new()
         .name(format!("mcp-{}-signals", session.name))
         .spawn(move || {
@@ -356,11 +504,14 @@ fn listen(session: &Arc<Session>, signals: mpsc::Receiver<Signal>) -> Result<()>
                 let Some(session) = weak.upgrade() else {
                     return;
                 };
+                if session.health.lock().generation != generation {
+                    return;
+                }
+                session.on_signal(signal.clone());
                 if matches!(signal, Signal::Closed) {
                     session.recover();
                     return;
                 }
-                session.on_signal(signal);
             }
         })
         .context("starting MCP signal listener")?;
@@ -547,8 +698,20 @@ fn connect(
         turn: Mutex::new(()),
         attempts: Mutex::new(Vec::new()),
         listing: Mutex::new(Listing::default()),
+        reported_transitions: AtomicU64::new(0),
+        health: Mutex::new(IntegrationHealth {
+            connection: ConnectionHealth::Connected,
+            notifications: if server.url.is_none() {
+                NotificationHealth::Healthy
+            } else {
+                NotificationHealth::Unknown
+            },
+            catalog: CatalogFreshness::Fresh,
+            generation: 1,
+            transitions: 1,
+        }),
+        tool_catalog: Mutex::new(Vec::new()),
     });
-    listen(&session, signals)?;
 
     let mut tools = Vec::new();
     let mut notice = None;
@@ -592,6 +755,10 @@ fn connect(
             tools.len()
         ));
     }
+    let mut catalog = tools.clone();
+    catalog.sort_by(|a, b| a.name.cmp(&b.name));
+    *session.tool_catalog.lock() = catalog;
+    listen(&session, signals)?;
     Ok(Connected {
         session,
         tools,

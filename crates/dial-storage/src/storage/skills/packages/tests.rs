@@ -264,7 +264,7 @@ fn install_update_and_remove_a_local_repository_end_to_end() {
     {
         return;
     }
-    let root = scratch("e2e");
+    let root = scratch("e2e with spaces");
     let project = root.join("project");
     fs::create_dir_all(&project).unwrap();
     let layout = layout(&project);
@@ -300,12 +300,12 @@ fn install_update_and_remove_a_local_repository_end_to_end() {
     git(&["commit", "--quiet", "-m", "one"], &remote);
     let registries = BTreeMap::new();
     let cancel = AtomicBool::new(false);
-    let spec = format!("{}#pdf", remote.display());
+    let spec = "../remote#pdf".to_owned();
 
     let installed = install(
         &layout,
         &registries,
-        Scope::Project,
+        Scope::User,
         &spec,
         &cancel,
         &mut |_| {},
@@ -326,6 +326,15 @@ fn install_update_and_remove_a_local_repository_end_to_end() {
             .to_string()
             .contains("already installed")
     );
+    let locked = list_packages(&layout).unwrap();
+    assert_eq!(
+        locked[0].source.url,
+        fs::canonicalize(&remote).unwrap().to_str().unwrap()
+    );
+    // A user package must keep its original local repository when used in another project.
+    let project_b = root.join("other/project-b");
+    fs::create_dir_all(&project_b).unwrap();
+    let layout = Layout::with_user_dir(&project_b, layout.user_dir.clone()).unwrap();
     let packages = list_packages(&layout).unwrap();
     assert_eq!(packages.len(), 1);
     assert_eq!(packages[0].skills, vec!["pdf".to_owned()]);
@@ -337,6 +346,71 @@ fn install_update_and_remove_a_local_repository_end_to_end() {
 
     let up_to_date = update(&layout, Some("pdf"), &cancel, &mut |_| {}).unwrap();
     assert!(up_to_date.contains("already up to date"), "{up_to_date}");
+
+    let stored_root = roots(&layout)[0].1.clone();
+    let original = fs::read(stored_root.join("pdf/SKILL.md")).unwrap();
+    for damage in 0..3 {
+        match damage {
+            0 => fs::write(stored_root.join("pdf/SKILL.md"), "tampered").unwrap(),
+            1 => fs::remove_file(stored_root.join("pdf/SKILL.md")).unwrap(),
+            _ => fs::remove_dir_all(&stored_root).unwrap(),
+        }
+        let repaired = update(&layout, Some("pdf"), &cancel, &mut |_| {}).unwrap();
+        assert!(
+            repaired.contains("restored missing or modified content"),
+            "{repaired}"
+        );
+        assert_eq!(
+            fs::read(stored_root.join("pdf/SKILL.md")).unwrap(),
+            original
+        );
+    }
+    #[cfg(unix)]
+    {
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("sentinel"), "untouched").unwrap();
+        fs::remove_dir_all(&stored_root).unwrap();
+        std::os::unix::fs::symlink(&outside, &stored_root).unwrap();
+        let repaired = update(&layout, Some("pdf"), &cancel, &mut |_| {}).unwrap();
+        assert!(
+            repaired.contains("restored missing or modified content"),
+            "{repaired}"
+        );
+        assert!(
+            !fs::symlink_metadata(&stored_root)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read(stored_root.join("pdf/SKILL.md")).unwrap(),
+            original
+        );
+        assert_eq!(
+            fs::read_to_string(outside.join("sentinel")).unwrap(),
+            "untouched"
+        );
+    }
+
+    // Structured lock fields must be validated before fetch, not only install input strings.
+    let path = lock_path(&layout, Scope::User);
+    let clean = read_lock(&path).unwrap();
+    for (url, reference) in [
+        ("--upload-pack=evil", None),
+        ("https://example.invalid/repo", Some("--upload-pack=evil")),
+    ] {
+        let mut modified = read_lock(&path).unwrap();
+        let entry = modified.packages.get_mut("pdf").unwrap();
+        entry.url = url.to_owned();
+        entry.reference = reference.map(str::to_owned);
+        write_lock(&path, &modified).unwrap();
+        let mut progressed = false;
+        let error = update(&layout, Some("pdf"), &cancel, &mut |_| progressed = true).unwrap_err();
+        assert!(error.to_string().contains("invalid"), "{error:#}");
+        assert!(!progressed, "fetch must not start for invalid lock sources");
+        write_lock(&path, &clean).unwrap();
+    }
 
     write_skill("v2");
     git(&["commit", "--quiet", "-am", "two"], &remote);

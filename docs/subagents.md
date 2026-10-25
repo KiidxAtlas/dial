@@ -8,15 +8,35 @@ Delegation briefs avoid repeating automatic parent goals when the exact text alr
 
 For efficient handoffs, supply the outcome, owned files or subsystem, shared interfaces, relevant evidence references, and checks with an owner. Keep shared builds with one integration owner and wait for relevant edits to settle. Worker findings are evidence to use, not a reason to repeat the investigation; failed checks still need diagnosis, repair and rechecking.
 
-### Tester-owned development loop
+### Delegation preference
 
-When delegation is available, built-in main-agent guidance defaults test creation, updates,
-execution and failure diagnosis to `test-runner`. Start it with `action: "start"`, rather than a
-blocking `run`, and continue independent implementation, documentation or integration work.
-Give it acceptance criteria, owned test files, the relevant interfaces, focused commands and a
-clear readiness boundary. Tests can be authored against stable interfaces in parallel; runs wait
-until the inputs they exercise have settled. Do not edit the same files concurrently or invent
-unrelated work merely to avoid waiting.
+Dial defaults to **selective delegation**: the main agent keeps coupled planning, implementation,
+regression tests and focused diagnosis in one loop, loading skills for specialized procedures.
+It delegates substantial independent parallel work, useful fresh-context reviews and work that
+benefits from context isolation. A long-running command alone can use a background process
+without starting another model conversation.
+
+In **Settings → Tools → Subagents**, enable **Prefer subagents** for specialist-first guidance,
+including tester-owned verification when useful. The equivalent project or user configuration is:
+
+```toml
+[task]
+prefer_subagents = true # default false
+```
+
+This is an advisory preference, not an automatic launcher or a permission grant. It does not
+enable a withheld `task` tool, override explicit user instructions, change worker limits, or
+disable completion checks. Small coupled checks may still run inline when enabled; independent
+verification and parallel workers remain available when disabled. Custom prompts can replace
+the built-in guidance. Existing configurations without this key use selective delegation.
+
+### Coordinating delegated testing
+
+When delegating testing, start `test-runner` with `action: "start"` and continue independent work
+when available; do not invent unrelated work just to keep a worker busy. Give it acceptance
+criteria, owned test files, interfaces, focused commands and a readiness boundary. Tests can be
+authored against stable interfaces in parallel; runs wait until the inputs have settled. Do not
+edit the same files concurrently.
 
 The tester should reuse existing coverage and add only meaningful behavior/failure-boundary
 regressions, not a quota of tests or assertions that pin prose or restate implementation. Start
@@ -28,9 +48,10 @@ gate. `make test-module` filters test execution but still selects every workspac
 The tester owns check execution and returns exact commands, source state, observed results,
 failure locations, actionable fixes and unverified gaps. It may repair tests within its assignment;
 production repairs require an explicit, non-overlapping scope grant. Otherwise it reports the
-diagnosis to the implementation owner. Built-in implementation workers hand test needs back to
-their parent instead of duplicating the tester's work. Coordinate reruns when inputs change;
-do not repeat a passing run on unchanged inputs.
+diagnosis to the implementation owner. Implementation workers own scoped tests and focused
+verification unless the parent assigns a separate tester/check owner; then they coordinate
+coverage and stable interfaces instead of duplicating test edits or runs.
+Coordinate reruns when inputs change; do not repeat a passing run on unchanged inputs.
 
 Before completion, the main agent collects the report and assesses it against the final integrated
 changes; a private-copy run may need a focused integration check after merge. Worker claims are
@@ -39,9 +60,9 @@ remain intact. If delegation is disabled, unavailable or refused, or the user re
 testing, the agent explains the exception and performs minimal necessary checks without bypassing
 permissions. Local-model provider limits may serialize inference even with an asynchronous task.
 
-This is the built-in workflow policy, not a command interceptor or an automatic tester launch for
-every shell command. Custom prompts and agent definitions can replace it. `test-runner` uses the
-existing `tester` model-role preference and fallbacks; choose its model in `/roles`.
+The preference is built-in workflow guidance, not a command interceptor or an automatic tester
+launch for every shell command. `test-runner` uses the existing `tester` model-role preference
+and fallbacks; choose its model in `/roles`.
 
 ## Agent definitions and permissions
 

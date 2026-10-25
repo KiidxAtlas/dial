@@ -121,3 +121,13 @@ test('throwing falsy values is still a failed cell and leaves the REPL usable', 
   assert.deepEqual(output.slice(0, 7).map(frame => frame.result.error), ['null', 'undefined', '0', '', 'null', 'undefined', '0']);
   assert.equal(output[7].result.value, '42');
 });
+
+for (const python of [false, true]) {
+  test(`${python ? 'Python' : 'JS'} stream retention counters disclose bounded loss`, () => {
+    const code = python ? 'print("x" * 12500); print("x" * 12500)' : 'console.log("x".repeat(12500)); console.log("x".repeat(12500))';
+    const result = run([cell(1, code)], python)[0].result;
+    assert.equal(result.output_integrity.original_bytes, 25002);
+    assert.equal(result.output_integrity.retained_bytes, 20000);
+    assert.match(result.stdout, /truncated/);
+  });
+}

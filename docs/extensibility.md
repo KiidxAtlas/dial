@@ -181,10 +181,15 @@ are reported as skipped. `.dial-import.json` records source paths and hashes.
 `--update` only replaces imports from the same source with no local content
 changes. Updates are explicit; back up local edits before resolving conflicts.
 
-Symlinks and special files are refused. Limits: 64 KiB per file, 200 files,
+Symlinks and special files are refused. Limits: 64 KiB per bundled file (80 KiB for the root
+`SKILL.md`, including its metadata), 200 files,
 8 MiB per skill, five nested directories. Executable permissions are not copied;
 invoke reviewed scripts with their interpreter. Harness-specific tool names and
 dependencies may need adaptation. Importing does not grant extra permissions.
+
+For the recommended authoring pattern, versioned examples, loader budgets and utility evaluation,
+see [Writing and evaluating skills](skills.md). Skills are procedures, not executable tools;
+`/skill:<name>` requests guidance rather than running a script.
 
 ## Rust embedding SDK
 

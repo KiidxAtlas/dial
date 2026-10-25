@@ -43,6 +43,7 @@ pub(in crate::app) mod paint;
 pub(in crate::app) mod pickers;
 pub(in crate::app) mod prompts;
 pub(in crate::app) mod run;
+mod runtime_updates;
 pub(in crate::app) mod sessions;
 pub(in crate::app) mod submit;
 pub(in crate::app) mod teach;
@@ -52,6 +53,9 @@ pub(in crate::app) mod turn;
 pub(in crate::app) mod turn_report;
 pub(in crate::app) mod voice;
 pub(in crate::app) mod wait;
+
+#[cfg(test)]
+mod testkit;
 
 /// How long a keystroke may go unnoticed while the UI is idle; also the animation frame time.
 pub(super) const TICK: Duration = Duration::from_millis(80);
@@ -64,6 +68,7 @@ pub(super) const PAINT_EVERY: Duration = Duration::from_millis(40);
 
 pub(super) struct Shell {
     files: file_discovery::Files,
+    runtime_updates: runtime_updates::RuntimeUpdates,
     pub(super) loop_mode: crate::agent::modes::loop_runner::LoopMode,
     pub(super) runtime: crate::runtime::Tree,
     pub(super) pending_result: Option<crate::runtime::Body>,
@@ -133,9 +138,8 @@ pub(super) struct Shell {
     /// as soon as the turn finishes.
     pub(super) deferred: std::collections::VecDeque<String>,
     pub(super) deferred_editor: bool,
-    /// Shift+Tab / display reset pressed during a turn; applied at the next idle boundary.
+    /// Shift+Tab pressed during a turn; applied at the next idle boundary.
     pub(super) deferred_approval_cycle: bool,
-    pub(super) deferred_display_reset: bool,
     /// Input read before the main loop could take it (typing while the first agent is built);
     /// the loop handles these before reading the terminal again.
     pub(super) held: std::collections::VecDeque<crossterm::event::Event>,

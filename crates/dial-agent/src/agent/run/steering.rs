@@ -162,7 +162,7 @@ impl<'a> Agent<'a> {
                 return self.replan_live_steering(ui, live);
             }
         }
-        self.poll_live_steering(ui, live, false)
+        self.poll_live_steering(ui, live)
     }
 
     /// Move the acknowledged prefix to `accepted_live_steering`; any failed or expired receipt
@@ -172,20 +172,14 @@ impl<'a> Agent<'a> {
         &mut self,
         ui: &mut dyn Ui,
         live: &mut LiveSteering,
-        wait: bool,
     ) -> Result<bool> {
         while let Some(front) = live.pending.front() {
             let Some(ticket) = front.ticket.as_ref() else {
-                break;
+                return self.replan_live_steering(ui, live);
             };
-            let outcome = if wait {
-                Some(ticket.wait_until(front.deadline))
-            } else {
-                ticket.try_outcome().or_else(|| {
-                    (Instant::now() >= front.deadline)
-                        .then_some(llm::codex_ws::SteerOutcome::Uncertain)
-                })
-            };
+            let outcome = ticket.try_outcome().or_else(|| {
+                (Instant::now() >= front.deadline).then_some(llm::codex_ws::SteerOutcome::Uncertain)
+            });
             match outcome {
                 None => break,
                 Some(llm::codex_ws::SteerOutcome::Accepted { id }) => {
@@ -263,12 +257,37 @@ impl<'a> Agent<'a> {
         ui: &mut dyn Ui,
         live: &mut LiveSteering,
     ) -> Result<bool> {
-        if live.pending.is_empty() {
-            return Ok(false);
+        while !live.pending.is_empty() {
+            // Keep the original receipt deadlines, but never wait on the transport while the
+            // controller cannot service abort, approvals, or newer user input.
+            ui.heartbeat();
+            self.pump_subagents(ui);
+            if self.interrupt.load(Ordering::SeqCst) {
+                return self.replan_live_steering(ui, live);
+            }
+            let steering = self.drain_steering(ui);
+            if !steering.is_empty() {
+                // The stream has ended: later input must replan locally, not attach to it.
+                // Commit the accepted prefix and uncertain suffix before the newer input.
+                self.replan_live_steering(ui, live)?;
+                self.accept_steering(steering, ui)?;
+                return Ok(true);
+            }
+            if self.poll_live_steering(ui, live)? {
+                return Ok(true);
+            }
+            if let Some(front) = live.pending.front() {
+                thread::sleep(
+                    front
+                        .deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(20)),
+                );
+            }
         }
-        if self.interrupt.load(Ordering::SeqCst) {
-            return self.replan_live_steering(ui, live);
-        }
-        self.poll_live_steering(ui, live, true)
+        Ok(false)
     }
 }
+
+#[cfg(test)]
+mod tests;

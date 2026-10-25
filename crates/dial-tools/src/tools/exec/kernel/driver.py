@@ -71,12 +71,16 @@ class Capture(io.TextIOBase):
         self.parts = []
         self.size = 0
         self.dropped = 0
+        self.original_bytes = 0
+        self.retained_bytes = 0
 
     def writable(self):
         return True
 
     def write(self, text):
         take = min(len(text), max(0, LIMIT - self.size))
+        self.original_bytes += len(text.encode("utf-8", errors="replace"))
+        self.retained_bytes += len(text[:take].encode("utf-8", errors="replace"))
         if take:
             self.parts.append(text[:take])
         self.size += take
@@ -242,6 +246,11 @@ while True:
         operation["active"] = False
         current_operation.reset(token)
     result["stdout"], result["stderr"] = stdout.value(), stderr.value()
+    # Counts redirected text streams, not native writes or bounded repr/traceback formatting.
+    result["output_integrity"] = {
+        "original_bytes": stdout.original_bytes + stderr.original_bytes,
+        "retained_bytes": stdout.retained_bytes + stderr.retained_bytes,
+    }
     try:
         send_frame({"id": request_id, "result": result})
     except (ToolError, ValueError):

@@ -7,6 +7,7 @@
 pub mod plan;
 pub mod prebuilt;
 pub mod run;
+pub mod updates;
 
 use std::path::{Path, PathBuf};
 

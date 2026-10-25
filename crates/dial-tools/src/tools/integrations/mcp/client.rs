@@ -10,15 +10,19 @@
 //! For stdio, helper threads keep the caller from ever blocking on the server: the **reader** parses
 //! stdout lines, the **writer** owns stdin (a server that stops reading cannot stall a caller) and
 //! the **stderr drain** keeps the last few KiB for error messages. Remote requests are POSTed from a
-//! short-lived thread. A waiting request polls its cancellation check, so Esc and timeouts both
-//! send `notifications/cancelled` and return at once. When the connection ends every waiting request
+//! bounded, owned worker. A waiting request polls cancellation; cancellation stops queued
+//! dispatch, interrupts active HTTP I/O and joins the worker before returning. Dispatched remote
+//! effects remain unknown even after a cancellation notification. When the connection ends every waiting request
 //! fails with the reason, so a crash surfaces as a clear error, never a hang.
 
 use super::Signal;
+use crate::runtime::integration::{IntegrationFailure, Settlement};
+pub(super) mod lifecycle;
 use crate::config::types::McpServerConfig;
 use crate::runtime::execution::Effects;
 use crate::tools::exec::sandbox::is_secret_env;
 use anyhow::{Context, Result, anyhow, bail};
+use lifecycle::{MAX_IN_FLIGHT, MAX_REQUEST_LIFETIME, Operation, Outgoing, OwnedSend, Phase};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -45,6 +49,19 @@ impl std::fmt::Display for RequestEffects {
 }
 impl std::error::Error for RequestEffects {}
 
+#[derive(Debug)]
+pub(super) struct RequestFailure {
+    pub dispatched: bool,
+    pub settlement: Settlement,
+    pub failure: IntegrationFailure,
+}
+impl std::fmt::Display for RequestFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MCP lifecycle: {:?}/{:?}", self.settlement, self.failure)
+    }
+}
+impl std::error::Error for RequestFailure {}
+
 /// Newest first; the first entry is what `initialize` offers.
 const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 /// Longest single message accepted from a server; longer lines are dropped.
@@ -66,7 +83,7 @@ enum Failure {
     /// The connection ended before an answer.
     Closed(String),
     /// A remote request failed below JSON-RPC (HTTP status, network); the text names the server.
-    Transport(String),
+    Transport(String, IntegrationFailure),
 }
 
 enum Event {
@@ -136,18 +153,18 @@ impl Shared {
         lock(&self.state).closed.is_some()
     }
 
-    fn signal(&self, signal: Signal) {
+    pub(super) fn signal(&self, signal: Signal) {
         if let Some(sender) = &self.signals {
             let _ = sender.send(signal);
         }
     }
 
     /// Fails one waiting request (a remote POST that broke below JSON-RPC).
-    fn fail(&self, id: u64, text: String) {
+    fn fail(&self, id: u64, text: String, failure: IntegrationFailure) {
         if let Some(waiter) = lock(&self.state).pending.remove(&id) {
             let _ = waiter
                 .reply
-                .send(Event::Reply(Err(Failure::Transport(text))));
+                .send(Event::Reply(Err(Failure::Transport(text, failure))));
         }
     }
 
@@ -277,7 +294,13 @@ pub(super) fn progress_text(params: &Value) -> String {
 
 /// A remote transport: sends one JSON-RPC message and feeds every message of the reply to `sink`.
 pub(super) trait Remote: Send + Sync {
-    fn post(&self, message: &Value, timeout: Duration, sink: &mut dyn FnMut(Value)) -> Result<()>;
+    fn post(
+        &self,
+        message: &Value,
+        timeout: Duration,
+        operation: &Arc<Operation>,
+        sink: &mut dyn FnMut(Value),
+    ) -> Result<()>;
     /// Called once the handshake completed (streamable HTTP opens its server-message stream).
     fn after_initialize(self: Arc<Self>, _version: &str, _shared: Arc<Shared>) {}
     /// True when replies come on a stream rather than the POST response (legacy SSE): a 202 for a
@@ -297,7 +320,8 @@ pub(super) trait Remote: Send + Sync {
 enum Transport {
     Stdio {
         child: Mutex<Child>,
-        outgoing: Sender<String>,
+        outgoing: mpsc::SyncSender<Outgoing>,
+        workers: Mutex<Vec<thread::JoinHandle<()>>>,
     },
     Remote(Arc<dyn Remote>),
 }
@@ -309,6 +333,7 @@ pub struct Client {
     next_id: AtomicU64,
     capabilities: Mutex<Value>,
     instructions: Mutex<Option<String>>,
+    admitted: Mutex<usize>,
 }
 
 impl Client {
@@ -342,34 +367,45 @@ impl Client {
         };
 
         let shared = Arc::new(shared);
-        let (outgoing, queue) = mpsc::channel::<String>();
+        let (outgoing, queue) = mpsc::sync_channel::<Outgoing>(MAX_IN_FLIGHT * 2);
         // Any thread failure tears the server down: the child is otherwise dropped unreaped
         // and keeps running with its pipes closed.
+        let mut workers = Vec::new();
         let spawned = (|| -> std::io::Result<()> {
-            thread::Builder::new()
-                .name(format!("mcp-{server}-out"))
-                .spawn({
-                    let shared = shared.clone();
-                    move || write_loop(stdin, queue, &shared)
-                })?;
-            thread::Builder::new()
-                .name(format!("mcp-{server}-in"))
-                .spawn({
-                    let (shared, replies) = (shared.clone(), outgoing.clone());
-                    move || read_loop(stdout, &shared, &replies)
-                })?;
-            thread::Builder::new()
-                .name(format!("mcp-{server}-err"))
-                .spawn({
-                    let shared = shared.clone();
-                    move || drain_stderr(stderr, &shared)
-                })?;
+            workers.push(
+                thread::Builder::new()
+                    .name(format!("mcp-{server}-out"))
+                    .spawn({
+                        let shared = shared.clone();
+                        move || write_loop(stdin, queue, &shared)
+                    })?,
+            );
+            workers.push(
+                thread::Builder::new()
+                    .name(format!("mcp-{server}-in"))
+                    .spawn({
+                        let (shared, replies) = (shared.clone(), outgoing.clone());
+                        move || read_loop(stdout, &shared, &replies)
+                    })?,
+            );
+            workers.push(
+                thread::Builder::new()
+                    .name(format!("mcp-{server}-err"))
+                    .spawn({
+                        let shared = shared.clone();
+                        move || drain_stderr(stderr, &shared)
+                    })?,
+            );
             Ok(())
         })();
         if let Err(error) = spawned {
+            shared.close("starting MCP server threads failed".into());
             let _ = crate::platform::process::kill_group(child.id());
             let _ = child.kill();
             let _ = child.wait();
+            for worker in workers {
+                let _ = worker.join();
+            }
             return Err(error).context("starting MCP server threads");
         }
 
@@ -378,6 +414,7 @@ impl Client {
             Transport::Stdio {
                 child: Mutex::new(child),
                 outgoing,
+                workers: Mutex::new(workers),
             },
             shared,
         ))
@@ -396,12 +433,14 @@ impl Client {
             next_id: AtomicU64::new(1),
             capabilities: Mutex::new(Value::Null),
             instructions: Mutex::default(),
+            admitted: Mutex::new(0),
         }
     }
 
     /// The `initialize` handshake: offers the newest protocol version, accepts any version this
     /// client knows, then sends `notifications/initialized`.
     pub fn initialize(&self, timeout: Duration, cancel: &dyn Fn() -> bool) -> Result<()> {
+        let deadline = (!timeout.is_zero()).then(|| Instant::now() + timeout);
         let result = self.request_with(
             "initialize",
             json!({
@@ -423,15 +462,22 @@ impl Client {
                 PROTOCOL_VERSIONS.join(", ")
             );
         }
+        if let Transport::Remote(remote) = &self.transport {
+            remote.set_protocol(version);
+        }
+        let remaining = deadline.map_or(NOTIFY_TIMEOUT, |deadline| {
+            deadline.saturating_duration_since(Instant::now())
+        });
+        if remaining.is_zero() {
+            bail!("MCP initialize timed out before initialized notification delivery");
+        }
+        self.notify_with("notifications/initialized", json!({}), remaining, cancel)?;
         *lock(&self.capabilities) = result.get("capabilities").cloned().unwrap_or(Value::Null);
         *lock(&self.instructions) = result
             .get("instructions")
             .and_then(Value::as_str)
             .map(str::to_owned);
-        if let Transport::Remote(remote) = &self.transport {
-            remote.set_protocol(version);
-        }
-        self.notify("notifications/initialized", json!({}))?;
+
         if let Transport::Remote(remote) = &self.transport {
             remote
                 .clone()
@@ -475,7 +521,8 @@ impl Client {
         }
     }
 
-    /// Sends a request and waits for its response, at most `timeout` (zero waits indefinitely).
+    /// Sends a request with a progress-inactivity `timeout` (zero disables inactivity expiry).
+    /// Every request has a separate one-hour absolute lifetime, including authentication/dispatch.
     pub fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
         self.request_with(method, params, timeout, &|| false, None)
     }
@@ -485,17 +532,43 @@ impl Client {
     pub fn request_with(
         &self,
         method: &str,
-        mut params: Value,
+        params: Value,
         timeout: Duration,
         cancel: &dyn Fn() -> bool,
         progress: Option<&dyn Fn(&str)>,
     ) -> Result<Value> {
+        self.request_with_limit(
+            method,
+            params,
+            timeout,
+            cancel,
+            progress,
+            MAX_REQUEST_LIFETIME,
+        )
+    }
+
+    fn request_with_limit(
+        &self,
+        method: &str,
+        mut params: Value,
+        timeout: Duration,
+        cancel: &dyn Fn() -> bool,
+        progress: Option<&dyn Fn(&str)>,
+        absolute_limit: Duration,
+    ) -> Result<Value> {
+        let operation = Operation::new(absolute_limit);
         if cancel() {
-            bail!(
+            return Err(anyhow!(
                 "MCP request `{method}` to `{}` was cancelled before sending",
                 self.server
-            );
+            )
+            .context(RequestFailure {
+                dispatched: false,
+                settlement: Settlement::NotStarted,
+                failure: IntegrationFailure::Cancelled,
+            }));
         }
+        let _admission = self.admit()?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         if progress.is_some()
             && let Some(object) = params.as_object_mut()
@@ -510,7 +583,11 @@ impl Client {
         {
             let mut state = lock(&self.shared.state);
             if let Some(reason) = &state.closed {
-                return Err(self.closed_error(reason));
+                return Err(self.closed_error(reason).context(RequestFailure {
+                    dispatched: false,
+                    settlement: Settlement::NotStarted,
+                    failure: IntegrationFailure::Connection,
+                }));
             }
             state.pending.insert(
                 id,
@@ -520,11 +597,28 @@ impl Client {
                 },
             );
         }
-        let message = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        if let Err(error) = self.send(message, timeout) {
-            self.forget(id);
-            return Err(error);
+        struct Pending<'a>(&'a Client, u64, Arc<Operation>);
+        impl Drop for Pending<'_> {
+            fn drop(&mut self) {
+                self.0.forget(self.1);
+                // Every return and unwind settles stdio work too, not only explicit abandon.
+                self.0.stop_operation(&self.2);
+            }
         }
+        let _pending = Pending(self, id, operation.clone());
+        let message = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        let owned = match self.send(message, timeout, operation.clone(), None) {
+            Ok(owned) => owned,
+            Err(error) => {
+                self.forget(id);
+                return Err(error.context(RequestFailure {
+                    dispatched: false,
+                    settlement: Settlement::NotStarted,
+                    failure: IntegrationFailure::Admission,
+                }));
+            }
+        };
+        let _owned = owned;
         let mut deadline = (!timeout.is_zero()).then(|| Instant::now() + timeout);
         loop {
             let wait = deadline.map_or(POLL, |end| {
@@ -537,21 +631,76 @@ impl Client {
                         "MCP server `{}` returned an error: {message}",
                         self.server
                     )
-                    .context(RequestEffects(Effects::Known)));
+                    .context(RequestEffects(Effects::Known))
+                    .context(RequestFailure {
+                        dispatched: true,
+                        settlement: Settlement::Reply,
+                        failure: IntegrationFailure::Remote,
+                    }));
                 }
                 Ok(Event::Reply(Err(Failure::Closed(reason)))) => {
                     return Err(self
                         .closed_error(&reason)
-                        .context(RequestEffects(Effects::Unknown)));
+                        .context(RequestEffects(
+                            if matches!(operation.phase(), Phase::Queued | Phase::Cancelled) {
+                                Effects::None
+                            } else {
+                                Effects::Unknown
+                            },
+                        ))
+                        .context(RequestFailure {
+                            dispatched: matches!(
+                                operation.phase(),
+                                Phase::Dispatching | Phase::Delivered
+                            ),
+                            settlement: Settlement::TransportLost,
+                            failure: IntegrationFailure::Connection,
+                        }));
                 }
-                Ok(Event::Reply(Err(Failure::Transport(text)))) => {
-                    return Err(anyhow!(text).context(RequestEffects(Effects::Unknown)));
+                Ok(Event::Reply(Err(Failure::Transport(text, failure)))) => {
+                    return Err(anyhow!(text)
+                        .context(RequestEffects(
+                            if matches!(operation.phase(), Phase::Queued | Phase::Cancelled) {
+                                Effects::None
+                            } else {
+                                Effects::Unknown
+                            },
+                        ))
+                        .context(RequestFailure {
+                            dispatched: matches!(
+                                operation.phase(),
+                                Phase::Dispatching | Phase::Delivered
+                            ),
+                            settlement: if matches!(
+                                operation.phase(),
+                                Phase::Queued | Phase::Cancelled
+                            ) {
+                                Settlement::NotStarted
+                            } else {
+                                Settlement::TransportLost
+                            },
+                            failure,
+                        }));
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
                     return Err(self
                         .closed_error("the connection is closed")
-                        .context(RequestEffects(Effects::Unknown)));
+                        .context(RequestEffects(
+                            if matches!(operation.phase(), Phase::Queued | Phase::Cancelled) {
+                                Effects::None
+                            } else {
+                                Effects::Unknown
+                            },
+                        ))
+                        .context(RequestFailure {
+                            dispatched: matches!(
+                                operation.phase(),
+                                Phase::Dispatching | Phase::Delivered
+                            ),
+                            settlement: Settlement::TransportLost,
+                            failure: IntegrationFailure::Connection,
+                        }));
                 }
             }
             // The reply channel contains terminal replies only; progress cannot queue ahead of
@@ -566,85 +715,217 @@ impl Client {
             }
             // Checked on every wake-up: steady progress must not starve cancel or the deadline.
             if cancel() {
-                self.abandon(id, "cancelled by the user");
+                let dispatched = self.abandon(id, "cancelled by the user", &operation);
                 return Err(
                     anyhow!("MCP request `{method}` to `{}` was cancelled", self.server)
-                        .context(RequestEffects(Effects::Unknown)),
+                        .context(RequestEffects(if dispatched {
+                            Effects::Unknown
+                        } else {
+                            Effects::None
+                        }))
+                        .context(RequestFailure {
+                            dispatched,
+                            settlement: Settlement::Cancelled,
+                            failure: IntegrationFailure::Cancelled,
+                        }),
                 );
             }
-            if deadline.is_some_and(|end| Instant::now() >= end) {
-                self.abandon(id, "timed out");
+            if deadline.is_some_and(|end| Instant::now() >= end)
+                || Instant::now() >= operation.deadline
+            {
+                let dispatched = self.abandon(id, "timed out", &operation);
                 return Err(anyhow!(
                     "MCP server `{}` did not answer `{method}` within {}s",
                     self.server,
                     timeout.as_secs().max(1)
                 )
-                .context(RequestEffects(Effects::Unknown)));
+                .context(RequestEffects(if dispatched {
+                    Effects::Unknown
+                } else {
+                    Effects::None
+                }))
+                .context(RequestFailure {
+                    dispatched,
+                    settlement: Settlement::TimedOut,
+                    failure: IntegrationFailure::Timeout,
+                }));
             }
         }
     }
 
     pub fn notify(&self, method: &str, params: Value) -> Result<()> {
-        self.send(
-            json!({"jsonrpc": "2.0", "method": method, "params": params}),
-            NOTIFY_TIMEOUT,
-        )
+        self.notify_with(method, params, NOTIFY_TIMEOUT, &|| false)
     }
 
-    fn send(&self, message: Value, timeout: Duration) -> Result<()> {
-        match &self.transport {
-            Transport::Stdio { outgoing, .. } => outgoing
-                .send(message.to_string())
-                .map_err(|_| self.closed_error("the connection is closed")),
-            Transport::Remote(remote) => {
-                let (remote, shared) = (remote.clone(), self.shared.clone());
-                let id = message.get("id").and_then(Value::as_u64);
-                thread::Builder::new()
-                    .name(format!("mcp-{}-post", self.server))
-                    .spawn(move || {
-                        // Answer server requests while the POST stream is still open: a server
-                        // may hold its final reply until it has this answer.
-                        let result = remote.post(&message, timeout, &mut |reply| {
-                            if let Some(answer) = shared.handle(&reply) {
-                                let _ = remote.post(&answer, NOTIFY_TIMEOUT, &mut |_| {});
-                            }
-                        });
-                        match result {
-                            Err(error)
-                                if error.downcast_ref::<super::http::SessionEnded>().is_some() =>
-                            {
-                                shared.close(format!("{error:#}"))
-                            }
-                            Err(error) => {
-                                if let Some(id) = id {
-                                    shared.fail(id, format!("{error:#}"));
-                                }
-                            }
-                            Ok(()) if remote.replies_on_stream() => {}
-                            Ok(()) => {
-                                if let Some(id) = id {
-                                    shared.fail(
-                                        id,
-                                        "MCP server closed the response without answering"
-                                            .to_owned(),
-                                    );
-                                }
-                            }
-                        }
-                    })
-                    .context("starting request thread")?;
-                Ok(())
+    fn notify_with(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<()> {
+        if cancel() {
+            bail!("MCP notification `{method}` cancelled before admission");
+        }
+        let _admission = self.admit()?;
+        let lifetime = if timeout.is_zero() {
+            NOTIFY_TIMEOUT
+        } else {
+            timeout.min(NOTIFY_TIMEOUT)
+        };
+        let operation = Operation::new(lifetime);
+        let (tx, rx) = mpsc::channel();
+        let _owned = self.send(
+            json!({"jsonrpc": "2.0", "method": method, "params": params}),
+            lifetime,
+            operation.clone(),
+            Some(tx),
+        )?;
+        loop {
+            if cancel() || operation.stopped() {
+                self.stop_operation(&operation);
+                bail!("MCP notification `{method}` cancelled or timed out before delivery");
+            }
+            match rx.recv_timeout(POLL) {
+                Ok(result) => return result,
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    bail!("MCP notification delivery worker ended")
+                }
             }
         }
     }
 
-    /// Stops waiting for `id` and tells the server, so it can stop working on it.
-    fn abandon(&self, id: u64, reason: &str) {
+    fn send(
+        &self,
+        message: Value,
+        timeout: Duration,
+        operation: Arc<Operation>,
+        delivered: Option<Sender<Result<()>>>,
+    ) -> Result<OwnedSend> {
+        let worker = match &self.transport {
+            Transport::Stdio { outgoing, .. } => {
+                outgoing
+                    .try_send(Outgoing {
+                        message,
+                        operation: operation.clone(),
+                        delivered,
+                    })
+                    .map_err(|_| self.closed_error("the outgoing queue is full or closed"))?;
+                None
+            }
+            Transport::Remote(remote) => {
+                let (remote, shared, operation) =
+                    (remote.clone(), self.shared.clone(), operation.clone());
+                let id = message.get("id").and_then(Value::as_u64);
+                Some(
+                    thread::Builder::new()
+                        .name(format!("mcp-{}-post", self.server))
+                        .spawn(move || {
+                            // Transport performs its dispatch transition after cancellable authentication.
+                            let result = if operation.stopped() {
+                                Err(anyhow!("request cancelled before dispatch"))
+                            } else {
+                                remote.post(&message, timeout, &operation, &mut |reply| {
+                                    if let Some(answer) = shared.handle(&reply) {
+                                        let _ = remote.post(
+                                            &answer,
+                                            NOTIFY_TIMEOUT,
+                                            &operation,
+                                            &mut |_| {},
+                                        );
+                                    }
+                                })
+                            };
+                            if let Some(delivered) = delivered {
+                                let _ = delivered.send(result);
+                                return;
+                            }
+                            match result {
+                                Err(error)
+                                    if error
+                                        .downcast_ref::<super::http::SessionEnded>()
+                                        .is_some() =>
+                                {
+                                    shared.close(format!("{error:#}"))
+                                }
+                                Err(error) => {
+                                    if let Some(id) = id {
+                                        let failure = if error
+                                            .downcast_ref::<super::http::AuthRequired>()
+                                            .is_some()
+                                        {
+                                            IntegrationFailure::Authentication
+                                        } else {
+                                            IntegrationFailure::Connection
+                                        };
+                                        shared.fail(id, format!("{error:#}"), failure);
+                                    }
+                                }
+                                Ok(()) if remote.replies_on_stream() => {}
+                                Ok(()) => {
+                                    if let Some(id) = id {
+                                        shared.fail(
+                                            id,
+                                            "MCP server closed the response without answering"
+                                                .to_owned(),
+                                            IntegrationFailure::Protocol,
+                                        );
+                                    }
+                                }
+                            }
+                        })
+                        .context("starting request thread")?,
+                )
+            }
+        };
+        Ok(OwnedSend { operation, worker })
+    }
+
+    fn stop_operation(&self, operation: &Operation) -> Phase {
+        let previous = operation.cancel();
+        // A blocked stdio write cannot be independently interrupted. Tear down this connection
+        // rather than leave a writer capable of dispatching after cancellation returns.
+        if previous == Phase::Dispatching {
+            if let Transport::Stdio { child, .. } = &self.transport {
+                let mut child = lock(child);
+                self.shared
+                    .close("cancelled during a blocked stdio write".into());
+                let _ = crate::platform::process::kill_group(child.id());
+                let _ = child.kill();
+                let _ = child.wait();
+                while operation.phase() == Phase::Dispatching {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+        previous
+    }
+
+    fn abandon(&self, id: u64, reason: &str, operation: &Operation) -> bool {
         self.forget(id);
-        let _ = self.notify(
-            "notifications/cancelled",
-            json!({"requestId": id, "reason": reason}),
-        );
+        let phase = self.stop_operation(operation);
+        let dispatched = matches!(phase, Phase::Dispatching | Phase::Delivered);
+        if dispatched && !self.is_closed() {
+            // Best effort, bounded and settled; this does not assert remote rollback.
+            let _ = self.notify_with(
+                "notifications/cancelled",
+                json!({"requestId": id, "reason": reason}),
+                Duration::from_secs(2),
+                &|| false,
+            );
+        }
+        dispatched
+    }
+
+    fn admit(&self) -> Result<lifecycle::Admission<'_>> {
+        lifecycle::Admission::acquire(&self.admitted).ok_or_else(|| {
+            anyhow!("MCP request admission limit reached").context(RequestFailure {
+                dispatched: false,
+                settlement: Settlement::NotStarted,
+                failure: IntegrationFailure::Admission,
+            })
+        })
     }
 
     fn forget(&self, id: u64) {
@@ -667,11 +948,15 @@ impl Client {
 impl Drop for Client {
     fn drop(&mut self) {
         match &self.transport {
-            Transport::Stdio { child, .. } => {
+            Transport::Stdio { child, workers, .. } => {
+                self.shared.close("the client was dropped".into());
                 let mut child = lock(child);
                 let _ = crate::platform::process::kill_group(child.id());
                 let _ = child.kill();
                 let _ = child.wait();
+                for worker in lock(workers).drain(..) {
+                    let _ = worker.join();
+                }
             }
             Transport::Remote(remote) => remote.shutdown(),
         }
@@ -695,13 +980,30 @@ pub(super) fn server_env(
     env.into_iter().collect()
 }
 
-fn write_loop(mut stdin: ChildStdin, queue: mpsc::Receiver<String>, shared: &Shared) {
-    for mut line in queue {
-        line.push('\n');
-        if let Err(error) = stdin
+fn write_loop(mut stdin: ChildStdin, queue: mpsc::Receiver<Outgoing>, shared: &Shared) {
+    while !shared.is_closed() {
+        let outgoing = match queue.recv_timeout(POLL) {
+            Ok(outgoing) => outgoing,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+        if !outgoing.operation.dispatch() {
+            continue;
+        }
+        let line = format!("{}\n", outgoing.message);
+        let result = stdin
             .write_all(line.as_bytes())
-            .and_then(|()| stdin.flush())
-        {
+            .and_then(|()| stdin.flush());
+        outgoing.operation.delivered();
+        if let Some(delivered) = outgoing.delivered {
+            let _ = delivered.send(
+                result
+                    .as_ref()
+                    .map(|_| ())
+                    .map_err(|error| anyhow!("writing to server failed: {error}")),
+            );
+        }
+        if let Err(error) = result {
             shared.close(format!("writing to the server failed ({error})"));
             return;
         }
@@ -722,7 +1024,7 @@ fn drain_stderr(mut stderr: impl Read, shared: &Shared) {
     shared.stderr_done.store(true, Ordering::Release);
 }
 
-fn read_loop(stdout: impl Read, shared: &Shared, replies: &Sender<String>) {
+fn read_loop(stdout: impl Read, shared: &Shared, replies: &mpsc::SyncSender<Outgoing>) {
     let mut reader = BufReader::new(stdout);
     let mut line = Vec::new();
     let mut skipping = false;
@@ -739,7 +1041,17 @@ fn read_loop(stdout: impl Read, shared: &Shared, replies: &Sender<String>) {
                     && let Ok(message) = serde_json::from_slice::<Value>(&line)
                     && let Some(answer) = shared.handle(&message)
                 {
-                    let _ = replies.send(answer.to_string());
+                    if replies
+                        .try_send(Outgoing {
+                            message: answer,
+                            operation: Operation::new(NOTIFY_TIMEOUT),
+                            delivered: None,
+                        })
+                        .is_err()
+                    {
+                        shared.close("outgoing server-answer queue is full".into());
+                        return;
+                    }
                 }
                 skipping = false;
                 line.clear();

@@ -452,20 +452,20 @@ fn short_panels_keep_cancel_visible_and_clicks_match_drawn_rows() {
             assert!(first_row.contains("dark"));
             // The first click on the cursor row runs it, like Enter.
             assert!(matches!(
-                palette.click(list_top as u16),
+                palette.click(1, list_top as u16),
                 OverlayEvent::Action(action) if action == "command:/theme dark"
             ));
         } else {
             assert!(first_row.contains("Start or continue work"), "{first_row}");
             // Clicking an unselected goal only selects it; the next click opens it.
             assert!(matches!(
-                palette.click(list_top as u16 + 1),
+                palette.click(1, list_top as u16 + 1),
                 OverlayEvent::None
             ));
             assert_eq!(palette.view, View::Goals);
             assert_eq!(palette.cursor, 1);
             assert!(matches!(
-                palette.click(list_top as u16 + 1),
+                palette.click(1, list_top as u16 + 1),
                 OverlayEvent::None
             ));
             assert_eq!(palette.view, View::Goal(1));
@@ -499,9 +499,208 @@ fn picker_opens_on_the_current_value_and_click_targets_it() {
         palette.handle(&plain(KeyCode::Enter), &keys),
         OverlayEvent::Action(action) if action == "command:/approval write"
     ));
+    let rig = Rig::new();
+    let ctx = DrawCtx {
+        theme: &rig.theme,
+        keys: &rig.keys,
+        status: &rig.status,
+        preview_status: &status_preview,
+    };
+    render(80, 24, |frame| palette.draw(frame, &ctx));
     let list_top = palette.list_top() as u16;
     assert!(matches!(
-        palette.click(list_top + 1),
+        palette.click(1, list_top + 1),
         OverlayEvent::Action(action) if action == "command:/approval write"
     ));
+}
+
+fn draw_in(palette: &mut PaletteOverlay, area: Rect) -> ratatui::buffer::Buffer {
+    use ratatui::{Terminal, TerminalOptions, Viewport, backend::TestBackend};
+    let rig = Rig::new();
+    let ctx = DrawCtx {
+        theme: &rig.theme,
+        keys: &rig.keys,
+        status: &rig.status,
+        preview_status: &status_preview,
+    };
+    let backend = TestBackend::new(area.right() + 2, area.bottom() + 2);
+    let mut terminal = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Fixed(area),
+        },
+    )
+    .unwrap();
+    terminal.draw(|frame| palette.draw(frame, &ctx)).unwrap();
+    terminal.backend().buffer().clone()
+}
+
+#[test]
+fn palette_clicks_require_a_drawn_list_and_exclude_borders_and_blank_rows() {
+    let keys = Keymap::defaults();
+    for area in [Rect::new(0, 0, 80, 24), Rect::new(7, 5, 12, 12)] {
+        let mut palette = PaletteOverlay::new(entries(), false);
+        palette.handle(&Event::Paste("model".into()), &keys);
+        assert!(matches!(palette.click(1, 3), OverlayEvent::None));
+        let buffer = draw_in(&mut palette, area);
+        let y = area.y + 3;
+        let x = area.x + 1;
+        assert!(!buffer[(x, y)].symbol().is_empty());
+        assert_eq!(
+            palette.list_bounds,
+            Some(Rect::new(x, y, area.width - 2, 1))
+        );
+        for (column, row) in [
+            (area.x, y),
+            (area.right() - 1, y),
+            (area.right(), y),
+            (x, area.y),
+            (x, y - 1),
+            (x, y + 1),
+            (x, area.bottom() - 1),
+            (x, area.bottom()),
+        ] {
+            assert!(matches!(palette.click(column, row), OverlayEvent::None));
+            assert_eq!(palette.cursor, 0);
+        }
+        assert!(
+            matches!(palette.click(x, y), OverlayEvent::Action(action) if action == "command:/model")
+        );
+    }
+}
+
+#[test]
+fn tiny_and_empty_panels_clear_previous_click_targets() {
+    let keys = Keymap::defaults();
+    let mut palette = PaletteOverlay::new(entries(), false);
+    palette.handle(&Event::Paste("model".into()), &keys);
+    for area in [
+        Rect::new(0, 0, 4, 20),
+        Rect::new(0, 0, 80, 4),
+        Rect::new(0, 0, 5, 5),
+        Rect::new(7, 5, 2, 2),
+    ] {
+        draw_in(&mut palette, Rect::new(0, 0, 80, 24));
+        assert!(palette.list_bounds.is_some());
+        draw_in(&mut palette, area);
+        assert!(palette.list_bounds.is_none());
+        for y in 0..24 {
+            for x in 0..80 {
+                assert!(matches!(palette.click(x, y), OverlayEvent::None));
+            }
+        }
+    }
+    palette.handle(&plain(KeyCode::Esc), &keys);
+    palette.handle(&Event::Paste("no-matching-command".into()), &keys);
+    draw_in(&mut palette, Rect::new(0, 0, 80, 24));
+    assert!(palette.list_bounds.is_none());
+    assert!(matches!(palette.click(1, 3), OverlayEvent::None));
+}
+
+#[test]
+fn offset_category_clicks_select_then_activate_the_rendered_row() {
+    let keys = Keymap::defaults();
+    let mut palette = PaletteOverlay::new(entries(), false);
+    palette.handle(&plain(KeyCode::Tab), &keys);
+    let area = Rect::new(9, 6, 50, 20);
+    draw_in(&mut palette, area);
+    let bounds = palette.list_bounds.unwrap();
+    assert_eq!(bounds.y, area.y + 4);
+    assert!(matches!(
+        palette.click(bounds.x, bounds.y + 1),
+        OverlayEvent::None
+    ));
+    assert_eq!(palette.cursor, 1);
+    let Row::Entry(index) = palette.rows()[1] else {
+        panic!("category row must be a command");
+    };
+    let expected = format!("command:/{}", palette.entries[index].command.name);
+    assert!(
+        matches!(palette.click(bounds.x, bounds.y + 1), OverlayEvent::Action(action) if action == expected)
+    );
+}
+
+#[test]
+fn changed_input_cannot_activate_unpainted_rows_before_redraw() {
+    let keys = Keymap::defaults();
+    let area = Rect::new(7, 5, 50, 20);
+    for event in [
+        Event::Paste("model".into()),
+        plain(KeyCode::Char('m')),
+        plain(KeyCode::Tab),
+        plain(KeyCode::Enter),
+    ] {
+        let mut palette = PaletteOverlay::new(entries(), false);
+        draw_in(&mut palette, area);
+        let bounds = palette.list_bounds.unwrap();
+        palette.handle(&event, &keys);
+        assert!(palette.list_bounds.is_none(), "{event:?}");
+        let cursor = palette.cursor;
+        assert!(matches!(
+            palette.click(bounds.x, bounds.y),
+            OverlayEvent::None
+        ));
+        assert_eq!(palette.cursor, cursor);
+        draw_in(&mut palette, area);
+        assert!(palette.list_bounds.is_some());
+    }
+
+    // Filtering, switching categories and backing out can replace rows without moving the panel.
+    for event in [
+        plain(KeyCode::Esc),
+        plain(KeyCode::Backspace),
+        plain(KeyCode::Tab),
+    ] {
+        let mut palette = PaletteOverlay::new(entries(), false);
+        palette.handle(&plain(KeyCode::Tab), &keys);
+        palette.handle(&Event::Paste("model".into()), &keys);
+        draw_in(&mut palette, area);
+        let bounds = palette.list_bounds.unwrap();
+        palette.handle(&event, &keys);
+        assert!(palette.list_bounds.is_none(), "{event:?}");
+        assert!(matches!(
+            palette.click(bounds.x, bounds.y),
+            OverlayEvent::None
+        ));
+        if matches!(event, Event::Key(key) if key.code == KeyCode::Esc) {
+            draw_in(&mut palette, area);
+            palette.handle(&plain(KeyCode::Esc), &keys);
+            assert_eq!(palette.view, View::Goals);
+            assert!(palette.list_bounds.is_none());
+            assert!(matches!(
+                palette.click(bounds.x, bounds.y),
+                OverlayEvent::None
+            ));
+        }
+    }
+}
+
+#[test]
+fn clicking_a_goal_invalidates_its_old_hitbox_but_selection_alone_does_not() {
+    let mut palette = PaletteOverlay::new(entries(), false);
+    let area = Rect::new(7, 5, 50, 20);
+    draw_in(&mut palette, area);
+    let bounds = palette.list_bounds.unwrap();
+    assert!(matches!(
+        palette.click(bounds.x, bounds.y + 1),
+        OverlayEvent::None
+    ));
+    assert_eq!(palette.cursor, 1);
+    assert_eq!(palette.list_bounds, Some(bounds));
+    assert!(matches!(
+        palette.click(bounds.x, bounds.y + 1),
+        OverlayEvent::None
+    ));
+    assert_eq!(palette.view, View::Goal(1));
+    assert!(palette.list_bounds.is_none());
+    // The newly selected command must be drawn before another click can execute it.
+    assert!(matches!(
+        palette.click(bounds.x, bounds.y),
+        OverlayEvent::None
+    ));
+    draw_in(&mut palette, area);
+    let bounds = palette.list_bounds.unwrap();
+    assert!(
+        matches!(palette.click(bounds.x, bounds.y), OverlayEvent::Action(action) if action == "command:/undo")
+    );
 }

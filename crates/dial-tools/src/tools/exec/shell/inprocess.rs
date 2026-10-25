@@ -121,6 +121,9 @@ pub(super) fn run(
         on_output,
     )?;
 
+    let original = capture.total as u64;
+    let inline_retained = (capture.head.len() + capture.tail.len().min(BASH_TAIL)) as u64;
+    let elided = spool.as_ref().map(|spool| spool.elided_bytes());
     let mut text = captured_text(capture);
     let body_len = text.len();
     let code = shell.code();
@@ -137,8 +140,16 @@ pub(super) fn run(
     if abandoned {
         text.push_str("[in-process shell did not stop (a builtin that never yields cannot be interrupted); it was abandoned and may keep using CPU until Dial exits]\n");
     }
-    append_output_notes(&mut text, spool, &capture_error, &mut artifact_error);
-    minimize_body(ws, command, body_len, &mut text);
+    let artifact = append_output_notes(&mut text, spool, &capture_error, &mut artifact_error);
+    let minimized = minimize_body(ws, command, body_len, &mut text);
+    let integrity = output_integrity(
+        original,
+        inline_retained,
+        elided,
+        artifact,
+        eof && capture_error.is_none(),
+        minimized,
+    );
     let output = ToolOutput {
         execution: Default::default(),
         data: None,
@@ -151,8 +162,12 @@ pub(super) fn run(
         signal: None,
         timed_out,
         cancelled,
-        output_complete: capture_error.is_none() && artifact_error.is_none() && eof,
-    });
+        output_complete: capture_error.is_none()
+            && artifact_error.is_none()
+            && eof
+            && integrity.retention == crate::runtime::execution::Completeness::Complete,
+    })
+    .with_output_integrity(integrity);
     Ok(if cancelled {
         output
             .with_status(crate::tools::ToolStatus::Aborted)

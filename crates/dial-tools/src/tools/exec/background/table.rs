@@ -61,6 +61,8 @@ pub(super) struct Ring {
     pub(super) closed: bool,
     pub(super) artifact: Option<String>,
     pub(super) error: Option<String>,
+    pub(super) reached_eof: bool,
+    pub(super) elided_bytes: u64,
     /// A pipe read failure requires stopping the process; an artifact failure does not.
     read_failed: bool,
     /// Terminal emulator for PTY output; `None` for pipes and adopted processes.
@@ -77,6 +79,8 @@ impl Ring {
             closed: false,
             artifact: None,
             error: None,
+            reached_eof: false,
+            elided_bytes: 0,
             read_failed: false,
             screen: None,
         }
@@ -154,6 +158,10 @@ impl Ring {
         let lost = start.saturating_sub(from);
         let skip = from.max(start) - retained;
         (self.data.range(skip as usize..).copied().collect(), lost)
+    }
+
+    pub(super) fn retained_bytes(&self) -> u64 {
+        self.data.len() as u64
     }
 
     /// Everything retained, as text.
@@ -241,9 +249,12 @@ fn spawn_reader<R: Read + Send + 'static>(
                 ring.read_failed = true;
                 ring.error = error.clone();
             }
+            let elided_bytes = spool.as_ref().map_or(0, ArtifactSpool::elided_bytes);
             let artifact = spool.map(ArtifactSpool::finish).transpose();
             {
                 let mut ring = lock(&ring);
+                ring.reached_eof = reached_eof;
+                ring.elided_bytes = elided_bytes;
                 match artifact {
                     Ok(uri) => ring.artifact = uri,
                     Err(e) => error = Some(format!("saving complete output artifact: {e}")),
@@ -274,7 +285,11 @@ fn finish_reader(ring: &Mutex<Ring>, reader: JoinHandle<()>) {
 #[derive(Clone)]
 pub(super) enum State {
     Running,
-    Exited { at: Instant, detail: String },
+    Exited {
+        at: Instant,
+        detail: String,
+        status: Option<ExitStatus>,
+    },
 }
 
 impl State {
@@ -331,11 +346,11 @@ impl ManagedProcess {
             Self::Pty { child, .. } => child.try_wait().map(|status| status.is_some()),
         }
     }
-    fn wait(&mut self) -> io::Result<String> {
+    fn wait(&mut self) -> io::Result<ExitStatus> {
         match self {
-            Self::Group(group) => group.child.wait().map(describe),
+            Self::Group(group) => group.child.wait(),
             #[cfg(windows)]
-            Self::Pty { child, .. } => child.wait().map(describe),
+            Self::Pty { child, .. } => child.wait(),
         }
     }
     fn close_output(&mut self) {
@@ -580,16 +595,16 @@ impl Proc {
         self.group.close_output();
         self.stop.store(true, Ordering::Release);
         self.input.take();
-        let detail = match failure {
-            Some(detail) => detail,
-            None => self
-                .group
-                .wait()
-                .unwrap_or_else(|e| format!("status unavailable: {e}")),
-        };
+        let status = self.group.wait().ok();
+        let detail = failure.unwrap_or_else(|| {
+            status
+                .map(describe)
+                .unwrap_or_else(|| "status unavailable".into())
+        });
         self.state = State::Exited {
             at: Instant::now(),
             detail,
+            status,
         };
     }
 
@@ -724,6 +739,7 @@ impl Killed {
             self.proc.state = State::Exited {
                 at: Instant::now(),
                 detail: "killed; process group stopped".into(),
+                status: None,
             };
         }
         let events = self.proc.drain_notifications();
@@ -893,7 +909,8 @@ impl Table {
         &mut self,
         job: crate::tools::exec::shell::ForegroundJob,
     ) -> Result<String, String> {
-        let (workspace, command, _, child, reader, captured, spool) = job.into_parts();
+        let (workspace, command, _, child, reader, captured, captured_total, spool) =
+            job.into_parts();
         let group = ManagedProcess::Group(ProcessGroup::new(child));
         self.refresh();
         if self.running() >= MAX_PROCESSES {
@@ -905,6 +922,7 @@ impl Table {
         let mut ring = Ring::new(MAX_BUFFER);
         // Output read before adoption is part of this process's output and artifact.
         ring.push(&captured);
+        ring.total = captured_total;
         let ring = Arc::new(Mutex::new(ring));
         crate::platform::io::set_nonblocking(&reader)
             .map_err(|error| format!("configuring adopted output reader: {error}"))?;

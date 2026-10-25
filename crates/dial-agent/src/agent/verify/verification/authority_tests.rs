@@ -206,3 +206,79 @@ fn rust_single_test_targets_are_not_hidden_by_empty_targets() {
         CheckStatus::Unverified
     );
 }
+
+#[test]
+fn clipped_checks_use_complete_artifacts_and_never_infer_from_missing_evidence() {
+    use crate::runtime::{
+        execution::{Completeness, ProcessOutcome},
+        tool_output::ToolOutput,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let store = crate::storage::artifact::ArtifactStore::new(root.path()).unwrap();
+    for (raw, expected) in [
+        (
+            format!(
+                "{}\nRan 0 tests\n{}",
+                "prefix\n".repeat(4000),
+                "suffix\n".repeat(4000)
+            ),
+            CheckStatus::Unverified,
+        ),
+        (
+            "running 1 test\nrunning 0 tests\n".into(),
+            CheckStatus::Passed,
+        ),
+        (
+            "? pkg [no test files]\nok other 0.01s\n".into(),
+            CheckStatus::Passed,
+        ),
+        ("build complete\n".into(), CheckStatus::Passed),
+        ("x".repeat(1024 * 1024 + 1), CheckStatus::Unverified),
+    ] {
+        let (uri, mut integrity) = store.retain_with_integrity(&raw).unwrap();
+        integrity.capture = Completeness::Complete;
+        integrity.presentation = Completeness::Partial;
+        integrity.artifact = Some(uri);
+        let display = if expected == CheckStatus::Unverified {
+            "prefix\n[... clipped ...]\nsuffix\n[exit code: 0]"
+        } else {
+            "running 0 tests\n[exit code: 0]"
+        };
+        let mut output = ToolOutput::ok(display.into())
+            .with_process(ProcessOutcome {
+                started: true,
+                exit_code: Some(0),
+                signal: None,
+                timed_out: false,
+                cancelled: false,
+                output_complete: true,
+            })
+            .with_output_integrity(integrity);
+        assert_eq!(
+            classify_with_artifacts(None, None, &output, false, Some(&store)),
+            expected
+        );
+        assert_eq!(
+            classify_output(None, &output, false),
+            CheckStatus::Unverified
+        );
+        output.execution.output.as_mut().unwrap().capture = Completeness::Partial;
+        assert_eq!(
+            classify_with_artifacts(None, None, &output, false, Some(&store)),
+            CheckStatus::Unverified
+        );
+        output.execution.output.as_mut().unwrap().capture = Completeness::Complete;
+        output.execution.output.as_mut().unwrap().retention = Completeness::Partial;
+        assert_eq!(
+            classify_with_artifacts(None, None, &output, false, Some(&store)),
+            CheckStatus::Unverified
+        );
+        output.execution.output.as_mut().unwrap().retention = Completeness::Complete;
+        output.execution.output.as_mut().unwrap().artifact =
+            Some(format!("artifact://{}", "0".repeat(64)));
+        assert_eq!(
+            classify_with_artifacts(None, None, &output, false, Some(&store)),
+            CheckStatus::Unverified
+        );
+    }
+}

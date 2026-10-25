@@ -788,6 +788,16 @@ impl Composer {
         self.choice.is_some()
     }
 
+    /// Whether a local input layer should get the dismiss key before an enclosing wait cancels.
+    pub fn dismisses_interrupt(&self, key: &KeyEvent, keys: &Keymap) -> bool {
+        keys.matches(Action::Dismiss, key)
+            && (self.search.is_some()
+                || self.choice.is_some()
+                || self.editing_queue.is_some()
+                || self.menu_open()
+                || self.ghost().is_some())
+    }
+
     // -----------------------------------------------------------------------------------------
     // Input
     // -----------------------------------------------------------------------------------------

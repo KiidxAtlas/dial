@@ -1334,9 +1334,9 @@ pub struct EfficiencyConfig {
     pub lightweight_requests: u32,
     pub cache_pressure_percent: u32,
     /// Window (tokens) that compaction and pruning plan against when the model's window is larger;
-    /// 0 plans against the full window. Every step resends the history, so a 1M-token window must
-    /// not mean a 600k-token request: at the default the auto trigger fires near 178k instead of
-    /// 680k. Smaller model windows are unaffected.
+    /// 0 plans against the full window. Every step resends the history; at the default the auto
+    /// trigger fires near 223k instead of 850k on a 1M-token model. Smaller model windows are
+    /// unaffected by the cap.
     pub history_token_cap: u32,
 }
 impl Default for EfficiencyConfig {

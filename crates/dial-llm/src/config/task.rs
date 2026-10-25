@@ -7,6 +7,9 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct TaskConfig {
+    /// Prefer specialist delegation over inline work when a useful handoff is available.
+    /// Advisory only: never enables tools or bypasses worker admission.
+    pub prefer_subagents: bool,
     /// How many levels deep subagents may start their own subagents: -1 unlimited, 0 none.
     /// The main agent's children are depth 1; with 2 they may spawn one more level.
     pub max_recursion_depth: i32,
@@ -36,6 +39,7 @@ pub struct TaskConfig {
 impl Default for TaskConfig {
     fn default() -> Self {
         Self {
+            prefer_subagents: false,
             max_recursion_depth: 2,
             max_concurrency: 32,
             isolation_dependencies: true,

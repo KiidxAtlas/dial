@@ -45,6 +45,22 @@ pub(super) fn exchange(
         on_event,
         None,
     )
+    .map_err(|error| {
+        if error.downcast_ref::<super::HttpError>().is_some_and(|http| {
+            http.status == 400
+                && http
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("the requested model is not supported")
+        }) {
+            error.context(format!(
+                "GitHub Copilot rejected model {:?}. The model may be disabled by your account's model policy or unavailable on your plan. Enable it in GitHub Copilot's model settings (an organization administrator may need to allow it), or choose an enabled model in /models. Dial does not accept model terms or enable billing policies automatically",
+                route.model
+            ))
+        } else {
+            error
+        }
+    })
 }
 
 fn copilot_chat_url(base: &str) -> String {

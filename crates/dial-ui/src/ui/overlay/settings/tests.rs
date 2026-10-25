@@ -1603,3 +1603,222 @@ fn home_and_end_jump_in_the_list_and_in_pickers() {
         OverlayEvent::PreviewTheme(Some(theme)) if theme == "dark"
     ));
 }
+
+#[test]
+fn structured_settings_roundtrip_nested_tables_and_arrays_without_stringifying() {
+    for (path, source) in [
+        (
+            "verification",
+            "{ commands = [{ name = \"check\", command = \"cargo check\", timeout_secs = 30 }] }",
+        ),
+        (
+            "model_profiles",
+            "{ \"custom/profile\" = { provider = \"custom\", model = \"model\", max_tokens = 16384 } }",
+        ),
+        (
+            "hooks",
+            "[{ event = \"turn_end\", command = \"echo done\" }]",
+        ),
+        (
+            "providers",
+            "{ custom = { base_url = \"http://localhost:8000/v1\", headers = [{ name = \"X-Token\", value = { env = \"CUSTOM_TOKEN\" } }] } }",
+        ),
+    ] {
+        let def = crate::config::schema::registry()
+            .iter()
+            .find(|def| def.path == path)
+            .unwrap();
+        let value = parse_input(def.kind, source).unwrap();
+        let text = setting_edit_text(def, &value);
+        assert_eq!(parse_input(def.kind, &text).unwrap(), value, "{path}");
+        let rig = Rig::new();
+        let mut o = overlay();
+        goto(&mut o, &rig.keys, path);
+        send(&mut o, &rig.keys, key(KeyCode::Enter));
+        let Mode::Edit { editor, .. } = &mut o.mode else {
+            panic!("{path} did not open an editor");
+        };
+        editor.set(source);
+        assert!(
+            matches!(send(&mut o, &rig.keys, key(KeyCode::Enter)), OverlayEvent::Set { path: written, value: saved, scope: Scope::Global } if written == path && saved == value)
+        );
+    }
+    assert!(parse_input(Kind::Toml, "{}\nunrelated = true").is_err());
+    assert!(parse_input(Kind::Toml, "{ invalid = }").is_err());
+}
+
+#[test]
+fn exact_configuration_path_is_ranked_before_fuzzy_matches() {
+    let mut o = overlay();
+    for (index, def) in crate::config::schema::registry().iter().enumerate() {
+        o.search = def.path.to_uppercase();
+        assert_eq!(
+            o.visible().first(),
+            Some(&Row::Setting(index)),
+            "{}",
+            def.path
+        );
+    }
+}
+
+#[test]
+fn credential_settings_are_masked_until_deliberately_revealed() {
+    let rig = Rig::new();
+    for (path, source) in [
+        ("secrets.values", "[\"sentinel-private-secret\"]"),
+        (
+            "mcp",
+            "{ custom = { env = { TOKEN = \"sentinel-private-secret\" } } }",
+        ),
+        (
+            "model_roles",
+            "{ small = { provider = \"custom\", model = \"m\", headers = [{ name = \"X-Token\", value = \"sentinel-private-secret\" }] } }",
+        ),
+        (
+            "model_favorites",
+            "[{ provider = \"custom\", model = \"m\", headers = [{ name = \"X-Token\", value = \"sentinel-private-secret\" }] }]",
+        ),
+        (
+            "model_presets",
+            "{ custom = { roles = { small = { headers = [{ name = \"X-Token\", value = \"sentinel-private-secret\" }] } } } }",
+        ),
+    ] {
+        let mut o = overlay();
+        let def = crate::config::schema::registry()
+            .iter()
+            .find(|def| def.path == path)
+            .unwrap();
+        let value: Value = toml::from_str::<Table>(&format!("value = {source}"))
+            .unwrap()
+            .remove("value")
+            .unwrap();
+        crate::config::schema::set(&mut o.effective, path, value.clone());
+        crate::config::schema::set(&mut o.global, path, value.clone());
+        goto(&mut o, &rig.keys, path);
+        assert!(!draw(&mut o, &rig, 180, 40).contains("sentinel-private-secret"));
+        send(&mut o, &rig.keys, key(KeyCode::Enter));
+        assert!(!draw(&mut o, &rig, 180, 40).contains("sentinel-private-secret"));
+        send(&mut o, &rig.keys, ctrl('r'));
+        assert!(o.reveal_sensitive);
+        assert!(draw(&mut o, &rig, 220, 40).contains("sentinel-private-secret"));
+        send(&mut o, &rig.keys, key(KeyCode::Esc));
+        assert!(!draw(&mut o, &rig, 180, 40).contains("sentinel-private-secret"));
+        send(&mut o, &rig.keys, key(KeyCode::Enter));
+        assert!(!o.reveal_sensitive);
+        assert_eq!(o.current(def), value);
+    }
+}
+
+#[test]
+fn every_registry_setting_is_reachable_in_coding_or_learning_view() {
+    let mut coding = overlay().coding_only();
+    let mut learning = overlay().learning_only();
+    for (index, def) in crate::config::schema::registry().iter().enumerate() {
+        coding.search = def.path.into();
+        learning.search = def.path.into();
+        assert!(
+            [&coding, &learning]
+                .iter()
+                .any(|o| o.visible().contains(&Row::Setting(index))),
+            "{} is unreachable",
+            def.path
+        );
+    }
+}
+
+#[test]
+fn descendant_path_search_finds_structured_management_routes() {
+    let mut o = overlay().coding_only();
+    for (query, route) in [
+        ("browser.allowed_hosts", "browser"),
+        ("providers.custom.headers", "providers"),
+        ("verification.commands", "verification"),
+    ] {
+        o.search = query.into();
+        assert!(o.visible().iter().any(|row| matches!(row, Row::Setting(i) if crate::config::schema::registry()[*i].path == route)), "{query}");
+    }
+}
+
+#[test]
+fn project_structured_edits_do_not_copy_global_credentials_or_unrelated_fields() {
+    let rig = Rig::new();
+    for path in ["providers", "mcp", "browser"] {
+        let inherited =
+            table("[inherited]\ncredential = 'private-global-only'\nunrelated = true\n");
+        let local = table("[project_only]\nsetting = 'local-value'\n");
+        for project_value in [None, Some(Value::Table(local.clone()))] {
+            let mut o = overlay();
+            o.scope = Scope::Project;
+            crate::config::schema::set(&mut o.global, path, Value::Table(inherited.clone()));
+            let mut merged = inherited.clone();
+            if let Some(Value::Table(project)) = &project_value {
+                merged.extend(project.clone());
+                crate::config::schema::set(&mut o.project, path, Value::Table(project.clone()));
+            }
+            crate::config::schema::set(&mut o.effective, path, Value::Table(merged));
+            goto(&mut o, &rig.keys, path);
+            send(&mut o, &rig.keys, key(KeyCode::Enter));
+            let Mode::Edit { editor, def } = &o.mode else {
+                panic!("expected structured editor");
+            };
+            assert!(!editor.text.contains("private-global-only"));
+            assert!(!editor.text.contains("unrelated"));
+            let expected = project_value.unwrap_or_else(|| Value::Table(Table::new()));
+            assert_eq!(parse_input(def.kind, &editor.text).unwrap(), expected);
+            assert!(
+                matches!(send(&mut o, &rig.keys, key(KeyCode::Enter)), OverlayEvent::Set { value, scope: Scope::Project, .. } if value == expected)
+            );
+        }
+    }
+}
+
+#[test]
+fn structured_seeds_preserve_selected_scope_pending_values_and_empty_array_shape() {
+    let mut o = overlay();
+    for path in ["providers", "hooks", "model_favorites"] {
+        let def = crate::config::schema::registry()
+            .iter()
+            .find(|def| def.path == path)
+            .unwrap();
+        let inherited = def.default_value().unwrap();
+        crate::config::schema::set(&mut o.global, path, inherited);
+        o.scope = Scope::Project;
+        let empty = if path == "providers" {
+            Value::Table(Table::new())
+        } else {
+            Value::Array(Vec::new())
+        };
+        assert_eq!(o.edit_seed(def), empty, "{path}");
+        let pending = if path == "providers" {
+            Value::Table(table("[pending]\nmodel = 'local'"))
+        } else {
+            Value::Array(vec![Value::String("local".into())])
+        };
+        o.pending
+            .insert(path.into(), Pending::Set(pending.clone(), Scope::Project));
+        assert_eq!(o.edit_seed(def), pending);
+        o.pending
+            .insert(path.into(), Pending::Set(pending, Scope::Global));
+        assert_eq!(
+            o.edit_seed(def),
+            empty,
+            "other-scope pending must not be copied"
+        );
+        o.pending
+            .insert(path.into(), Pending::Unset(Scope::Project));
+        assert_eq!(o.edit_seed(def), empty);
+    }
+}
+
+#[test]
+fn scalar_override_still_starts_from_inherited_effective_value() {
+    let mut o = overlay();
+    o.scope = Scope::Project;
+    let def = crate::config::schema::registry()
+        .iter()
+        .find(|def| def.path == "python")
+        .unwrap();
+    let value = Value::String("/global/python".into());
+    crate::config::schema::set(&mut o.effective, def.path, value.clone());
+    assert_eq!(o.edit_seed(def), value);
+}

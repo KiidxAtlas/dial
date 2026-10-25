@@ -198,5 +198,23 @@ impl CompletionGuard {
     pub fn reset_for_steering(&mut self) {}
 }
 
+/// Plain reports receive actionable rejection feedback, just as explicit finish calls do.
+/// This allowance is independent of max_steps, so unlimited work cannot loop on rejected finals.
+#[derive(Default)]
+pub(in crate::agent) struct CompletionRecovery {
+    attempts: u8,
+}
+
+impl CompletionRecovery {
+    pub fn retry(&mut self) -> bool {
+        const ATTEMPTS: u8 = 3;
+        if self.attempts >= ATTEMPTS {
+            return false;
+        }
+        self.attempts += 1;
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests;

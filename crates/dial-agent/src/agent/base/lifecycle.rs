@@ -706,6 +706,7 @@ impl<'a> Agent<'a> {
                 template: self.parts.system_template.as_ref(),
                 lean,
                 concise_guidance: self.config.efficiency.enabled && !self.hermetic,
+                prefer_subagents: self.config.task.prefer_subagents,
                 one_call: self.local_one_call(),
                 worked_example: self.local_tier()
                     == Some(crate::agent::model::local_profile::Tier::Small),

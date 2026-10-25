@@ -641,3 +641,101 @@ fn schemas_accept_valid_calls() {
         .is_err()
     );
 }
+
+#[test]
+fn managed_body_limit_round_trips_without_truncation() {
+    let e = env();
+    let body = "é".repeat(MAX_BODY_BYTES / 2);
+    let created = manage(
+        &e.layout,
+        json!({"action": "create", "name": "limit", "description": "Boundary check", "body": body}),
+    );
+    assert!(!created.is_error, "{}", created.text);
+    let loaded = skill_tool::call(&e.layout, &json!({"name": "limit"}));
+    assert!(!loaded.is_error, "{}", loaded.text);
+    assert!(loaded.text.contains(&body));
+    assert!(!loaded.text.contains("[truncated"));
+}
+
+#[test]
+fn body_truncation_is_bounded_and_preserves_utf8() {
+    let text = format!(
+        "---\ndescription: Large external skill\n---\n{}end",
+        "界".repeat(MAX_BODY_BYTES)
+    );
+    let (body, truncated) = skill_body(&text);
+    assert!(truncated);
+    assert!(body.len() <= MAX_BODY_BYTES);
+    assert_eq!(body, "界".repeat(MAX_BODY_BYTES / 3));
+    let e = env();
+    put(&e.layout.skills_dirs()[0], "large", SKILL_FILE, &text);
+    let loaded = skill_tool::call(&e.layout, &json!({"name": "large"}));
+    assert!(!loaded.is_error);
+    assert!(loaded.text.contains(body));
+    assert!(loaded.text.contains("[truncated"));
+    assert!(!loaded.text.contains('\u{fffd}'));
+}
+
+#[test]
+fn authored_body_limit_can_be_imported_and_updated() {
+    let e = env();
+    let body = "é".repeat(MAX_BODY_BYTES / 2);
+    let created = manage(
+        &e.layout,
+        json!({"action": "create", "name": "limit", "description": "Limit", "body": body, "scope": "user"}),
+    );
+    assert!(!created.is_error, "{}", created.text);
+    let imported = import::run(
+        &e.layout,
+        &e.layout.skills_dirs()[1].join("limit"),
+        Scope::Project,
+        false,
+        false,
+    )
+    .unwrap();
+    assert_eq!(imported, ["Imported limit"]);
+    let updated = manage(
+        &e.layout,
+        json!({"action": "update", "name": "limit", "description": "Still complete"}),
+    );
+    assert!(!updated.is_error, "{}", updated.text);
+    let loaded = skill_tool::call(&e.layout, &json!({"name": "limit"}));
+    assert!(!loaded.is_error && loaded.text.contains(&body));
+    assert!(!loaded.text.contains("[truncated"));
+}
+
+#[test]
+fn versioned_skill_examples_import_discover_and_load() {
+    let e = env();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/skills");
+    let reports = import::run(&e.layout, &root, Scope::Project, false, false).unwrap();
+    let names = [
+        "code-cleanup",
+        "debugging",
+        "file-structure-cleanup",
+        "implementation-quality",
+        "test-runner",
+    ];
+    assert_eq!(reports.len(), names.len());
+    for name in names {
+        assert!(reports.contains(&format!("Imported {name}")), "{reports:?}");
+        let original = fs::read_to_string(root.join(name).join(SKILL_FILE)).unwrap();
+        let (frontmatter, body) = split_frontmatter(&original).unwrap();
+        let fields = parse_fields(frontmatter);
+        assert_eq!(field(&fields, "name").unwrap().value, name);
+        assert!(
+            field(&fields, "description").unwrap().value.chars().count()
+                <= CATALOG_DESCRIPTION_CHARS
+        );
+        let loaded = skill_tool::call(&e.layout, &json!({"name": name}));
+        assert!(!loaded.is_error, "{}", loaded.text);
+        assert!(loaded.text.contains(body.trim()));
+    }
+    let skills = discover(&e.layout);
+    assert_eq!(skills.len(), names.len());
+    let catalog = catalog_block(&skills);
+    for name in names {
+        assert!(catalog.contains(&format!("- {name}:")));
+    }
+    assert!(!catalog.contains("more skills"));
+}

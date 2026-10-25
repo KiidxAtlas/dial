@@ -8,6 +8,30 @@ fn empty_env(root: &std::path::Path) -> Env {
 }
 
 #[test]
+fn runtime_updates_require_the_exact_explicit_yes_action() {
+    assert_eq!(update_action(&["updates"]), Some(UpdateAction::Check));
+    assert_eq!(
+        update_action(&["update", "llama-cpp"]),
+        Some(UpdateAction::Preview("llama-cpp"))
+    );
+    assert_eq!(
+        update_action(&["update", "llama-cpp", "yes"]),
+        Some(UpdateAction::Apply("llama-cpp"))
+    );
+    for parts in [
+        vec![],
+        vec!["update"],
+        vec!["update", "llama-cpp", "no"],
+        vec!["update", "llama-cpp", "YES"],
+        vec!["update", "llama-cpp", "yes", "extra"],
+        vec!["updates", "yes"],
+        vec!["llama-cpp", "yes"],
+    ] {
+        assert_eq!(update_action(&parts), None, "{parts:?}");
+    }
+}
+
+#[test]
 fn choices_only_dispatch_review_and_cover_every_capability() {
     let temp = tempfile::tempdir().unwrap();
     let spec = setup_choices(&empty_env(temp.path()));

@@ -59,6 +59,31 @@ embedding URL/model overrides still take precedence. Setup jobs retain the exist
 cancellation and error reporting. Cancelling a job after it starts may leave software or model
 data already downloaded; cancelling the review never starts a job.
 
+## Keeping external runtimes and tools current
+
+Interactive Dial checks installed external tools in the background at most once per day.
+Checks are read-only: they do not install packages, change models, accept provider terms,
+or update Dial or project lockfiles. Offline/strict-sandbox sessions skip these checks.
+Failed attempts are also throttled so an offline machine does not retry on every UI tick;
+the transcript shows failures rather than claiming the tool is current.
+
+- `/setup updates` checks now, bypassing the daily throttle.
+- `/setup update <id>` reviews the update commands and destination.
+- `/setup update <id> yes` explicitly approves that tool's update as a background job.
+
+Updates never run merely because a check found a newer version. Review the plan first,
+especially for Homebrew: changing a global formula can affect software outside Dial.
+Unmanaged/custom installations and unsupported update sources show manual guidance instead
+of being replaced. Updates do not silently downgrade a newer runtime to a bundled fallback.
+Private npm packages are checked against their published stable versions; Homebrew tools
+are checked against formula metadata only after ownership of the active binary is verified.
+Private release-archive runtimes report newer upstream releases for manual review rather
+than downloading unreviewed archives. MLX stays on Dial's embedded compatibility pins,
+not arbitrary latest PyPI versions. Browser helpers use their owner's tested manifest;
+independent Playwright/Chromium upgrades are not supported. Other custom/uv/Go/rustup
+installations report manual guidance, not a guarantee that they are current.
+Restart Dial after updating an active runtime so the next process uses the new version.
+
 ## Local providers that are not running
 
 A configured local provider (Ollama, LM Studio, llama.cpp or any loopback endpoint) that refuses

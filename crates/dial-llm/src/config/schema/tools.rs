@@ -486,4 +486,13 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Refuse shell commands that discard uncommitted work (git reset --hard, stash, checkout -- paths, restore, clean -f, switch --discard-changes). Workers: only delegated workers that share the parent's checkout. Always: every command. Off: never.",
         Kind::Enum(GIT_GUARD),
     ),
+    field!(
+        "task.prefer_subagents",
+        task.prefer_subagents,
+        TO,
+        "Subagents",
+        "Prefer subagents",
+        "Prefer specialist workers and tester-owned verification when useful. Off keeps coupled implementation and focused testing in the main loop, delegating for independent parallel work, fresh-context review or context isolation. Guidance only; permissions and worker limits are unchanged.",
+        Kind::Bool,
+    ),
 ];

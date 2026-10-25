@@ -238,7 +238,7 @@ fn mcp(shell: &mut Shell, app: &App, agent: Option<&mut Agent<'_>>, args: &str) 
                 &[Change::Remove {
                     path: format!("mcp.{name}"),
                 }],
-                server_scope(app, name)?,
+                mcp_scope(&app.layout, name)?,
             )?;
             shell.note("MCP", format!("Removed MCP server {name}."));
             Ok(step)
@@ -253,7 +253,7 @@ fn mcp(shell: &mut Shell, app: &App, agent: Option<&mut Agent<'_>>, args: &str) 
                     path: format!("mcp.{name}.enabled"),
                     value: toml::Value::Boolean(enabled),
                 }],
-                server_scope(app, name)?,
+                mcp_scope(&app.layout, name)?,
             )?;
             shell.note(
                 "MCP",
@@ -317,10 +317,10 @@ fn mcp_live(shell: &mut Shell, app: &App, args: &str) -> Option<Result<Step>> {
                 .filter(|(_, server)| server.enabled)
                 .map(|(name, server)| (name.clone(), server.clone()))
                 .collect();
-            let root = app.config.project_root.clone();
+            let config = app.config.clone();
             let kind = sub.to_owned();
             spawn_job(shell, "MCP", move |_| {
-                let load = connect_extra(&specs, &root);
+                let load = connect_extra(&specs, &config);
                 Ok(mcp_listing(&kind, &load))
             });
             Ok(Step::Done)
@@ -331,11 +331,12 @@ fn mcp_live(shell: &mut Shell, app: &App, args: &str) -> Option<Result<Step>> {
 }
 
 /// Connects to `server` on a temporary connection in the background and lists its tools.
-fn test_server(shell: &mut Shell, app: &App, name: String, server: McpServerConfig) {
-    let root = app.config.project_root.clone();
+fn test_server(shell: &mut Shell, app: &App, name: String, mut server: McpServerConfig) {
+    let config = app.config.clone();
+    server.enabled = true;
     spawn_job(shell, "MCP test", move |_| {
         let specs = BTreeMap::from([(name.clone(), server)]);
-        let load = connect_extra(&specs, &root);
+        let load = connect_extra(&specs, &config);
         let mut lines = vec![format!("{name}: {} tool(s)", load.tools.len())];
         lines.extend(load.tools.iter().map(|tool| format!("  {}", tool.name())));
         lines.extend(load.notices);
@@ -440,13 +441,7 @@ fn mcp_list(config: &Config) -> String {
         .mcp
         .iter()
         .map(|(name, server)| {
-            let target = match &server.url {
-                Some(url) => url.clone(),
-                None => std::iter::once(server.program.display().to_string())
-                    .chain(server.args.iter().cloned())
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            };
+            let target = super::extensions_browser::server_command(server);
             format!(
                 "{name}  {}  {target}",
                 if server.enabled {
@@ -530,8 +525,8 @@ fn parse_transport(value: &str) -> Result<McpTransport> {
 }
 
 /// Layer that owns `name`: project when the project config defines it, otherwise user.
-fn server_scope(app: &App, name: &str) -> Result<Scope> {
-    let project = load_layer(&app.layout, Scope::Project)?;
+pub(super) fn mcp_scope(layout: &crate::config::paths::Layout, name: &str) -> Result<Scope> {
+    let project = load_layer(layout, Scope::Project)?;
     let defined = project
         .get("mcp")
         .and_then(toml::Value::as_table)

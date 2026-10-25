@@ -158,6 +158,23 @@ fn model_aliases_and_subcommands_share_live_policy_and_panel_destinations() {
 }
 
 #[test]
+fn navigation_panels_have_the_same_destinations_while_busy() {
+    use crate::app::overlay::Which;
+    for name in ["hotkeys", "help"] {
+        assert_eq!(during_turn(name, ""), DuringTurn::Now);
+        assert!(command_panel(name, "unexpected").is_none());
+    }
+    assert!(matches!(
+        command_panel("hotkeys", ""),
+        Some(Which::Shortcuts)
+    ));
+    assert!(matches!(command_panel("help", ""), Some(Which::Palette)));
+    assert!(matches!(command_panel("?", ""), Some(Which::Palette)));
+    assert!(command_panel("help", "text").is_none());
+    assert!(command_panel("help", "all").is_none());
+}
+
+#[test]
 fn model_preparation_only_publishes_successful_uncancelled_results() {
     let (_home, _project, layout, config) = super::tests::config();
     let app = App::new(

@@ -292,6 +292,7 @@ pub(super) const RUNS_NOW: &[&str] = &[
     "reload-plugins",
     "effort",
     "theme",
+    "drafter",
     "profile",
     "outcome",
 ];
@@ -400,6 +401,8 @@ pub(super) fn command_panel(name: &str, args: &str) -> Option<Which> {
         ("model", "memory") => Some(Which::ModelMemory),
         ("roles", "") => Some(Which::ModelRoles),
         ("providers", "") => Some(Which::Providers),
+        ("hotkeys", "") => Some(Which::Shortcuts),
+        ("help", "") => Some(Which::Palette),
         ("settings", "") => Some(Which::Settings),
         ("palette", "") => Some(Which::Palette),
         ("extensions", "") => Some(Which::Extensions),
@@ -493,6 +496,8 @@ pub(super) fn during_turn_note(name: &str) -> &'static str {
         "Opens now; m messages or resumes a worker, x x cancels a running one."
     } else if name == "processes" {
         "Opens now; keystrokes go to the attached job."
+    } else if name == "drafter" {
+        "Runs now; saves changes for after the current turn. Drafts still require review."
     } else if RUNS_NOW.contains(&name) {
         "Runs now without stopping the current turn."
     } else if RUNS_NOW_ARGS

@@ -28,6 +28,7 @@ pub use wake::notify_cancel;
 mod tests;
 
 use crate::config::types::Config;
+use crate::runtime::execution::{Completeness, ObservationKind, OutputIntegrity, ProcessOutcome};
 use crate::tools::integrations::ext::{JobEntry, JobsView, Tool, ToolContext, ToolEvent};
 use crate::tools::{
     ToolOutput, Workspace, opt_bool, opt_str, opt_u64, present, req_str, tool_schema,
@@ -111,7 +112,7 @@ impl Background {
         input.write(bytes, None, &NO_CANCEL, &NO_CANCEL)
     }
 
-    /// Job table and, for an attached PTY job, its rendered screen. Refreshes the table first.
+    /// Job table and the attached job's output. Pipe views never consume the tool-output cursor.
     pub fn jobs_view(&self, attached: Option<&str>) -> JobsView {
         let mut table = self.table();
         table.refresh();
@@ -127,15 +128,13 @@ impl Background {
             })
             .collect();
         let (screen, cursor) = attached
-            .and_then(|name| {
-                table
-                    .procs
-                    .iter()
-                    .find(|proc| proc.name == name && proc.terminal)
-            })
-            .and_then(|proc| {
+            .and_then(|name| table.procs.iter().find(|proc| proc.name == name))
+            .map(|proc| {
                 let ring = lock(&proc.ring);
-                Some((ring.screen_rows()?, ring.screen_cursor()))
+                let rows = ring
+                    .screen_rows()
+                    .unwrap_or_else(|| ring.text().lines().map(str::to_owned).collect());
+                (rows, ring.screen_cursor())
             })
             .unwrap_or_default();
         JobsView {
@@ -313,12 +312,16 @@ impl Background {
         snap.settle();
         let (body, lost) = take_unread(&snap);
         let is_error = lock(&snap.ring).error.is_some();
+        let integrity = output_integrity(&snap, &body, lost, tail);
         Ok(ToolOutput {
             execution: Default::default(),
             data: None,
             text: render_output(&snap, body, lost, tail),
             is_error,
-        })
+        }
+        .with_observation(ObservationKind::Snapshot, !is_error)
+        .with_process(process_outcome(&snap))
+        .with_output_integrity(integrity))
     }
 
     fn wait(
@@ -442,14 +445,18 @@ impl Background {
                 return Ok(ToolOutput::ok(format!(
                     "ready: {name} {detail}\n[{}]",
                     snap.state.label()
-                )));
+                ))
+                .with_observation(ObservationKind::Readiness, true)
+                .with_process(process_outcome(&snap)));
             }
             if exited {
                 let state = snap.state.label();
                 // The exit result carries the unread output, so a finished build or test needs no
                 // separate `output` round trip. Shares the model-visible cursor with `output`.
                 let (body, lost) = take_unread(&snap);
+                let integrity = output_integrity(&snap, &body, lost, None);
                 let output = render_body(&snap, body, lost, None);
+                let observation_satisfied = !conditions && lock(&snap.ring).error.is_none();
                 return Ok(if conditions {
                     ToolOutput::err(format!(
                         "not ready: {name} {state} before {} was established\n{output}",
@@ -466,13 +473,37 @@ impl Background {
                         )
                     ))
                 } else {
-                    ToolOutput::ok(format!("ready: {name} {state}\n{output}"))
-                });
+                    let text = format!("ready: {name} {state}\n{output}");
+                    if lock(&snap.ring).error.is_some() {
+                        ToolOutput::err(text)
+                    } else {
+                        ToolOutput::ok(text)
+                    }
+                }
+                .with_observation(
+                    if conditions {
+                        ObservationKind::Readiness
+                    } else {
+                        ObservationKind::Wait
+                    },
+                    observation_satisfied,
+                )
+                .with_process(process_outcome(&snap))
+                .with_output_integrity(integrity));
             }
             if deadline.is_some_and(|end| Instant::now() >= end) {
                 return Ok(ToolOutput::ok(format!(
                     "not ready: timed out after {secs}s; {name} is still running"
-                )));
+                ))
+                .with_observation(
+                    if conditions {
+                        ObservationKind::Readiness
+                    } else {
+                        ObservationKind::Wait
+                    },
+                    false,
+                )
+                .with_process(process_outcome(&snap)));
             }
             let mut wake_at = deadline;
             if port.is_some() {
@@ -636,6 +667,71 @@ fn take_unread(snap: &Snapshot) -> (String, u64) {
     fresh
 }
 
+fn process_outcome(snap: &Snapshot) -> ProcessOutcome {
+    let status = match &snap.state {
+        State::Exited { status, .. } => *status,
+        State::Running => None,
+    };
+    let ring = lock(&snap.ring);
+    ProcessOutcome {
+        started: true,
+        exit_code: status.and_then(|status| status.code()),
+        signal: status
+            .as_ref()
+            .and_then(crate::platform::process::exit_signal),
+        timed_out: false,
+        cancelled: false,
+        output_complete: ring.closed
+            && ring.reached_eof
+            && ring.error.is_none()
+            && ring.elided_bytes == 0,
+    }
+}
+
+fn output_integrity(
+    snap: &Snapshot,
+    body: &str,
+    lost: u64,
+    tail: Option<usize>,
+) -> OutputIntegrity {
+    let body = tail.map_or(body, |lines| last_lines(body, lines));
+    let mut cut = body.len().saturating_sub(MAX_OUTPUT);
+    while !body.is_char_boundary(cut) {
+        cut += 1;
+    }
+    let presented = (body.len() - cut) as u64;
+    let ring = lock(&snap.ring);
+    let retained = if ring.artifact.is_some() {
+        ring.total.saturating_sub(ring.elided_bytes)
+    } else {
+        ring.retained_bytes()
+    };
+    OutputIntegrity {
+        capture: if !ring.closed {
+            Completeness::Unknown
+        } else if ring.reached_eof {
+            Completeness::Complete
+        } else {
+            Completeness::Partial
+        },
+        retention: if retained == ring.total {
+            Completeness::Complete
+        } else {
+            Completeness::Partial
+        },
+        presentation: if !snap.terminal && presented == ring.total && lost == 0 {
+            Completeness::Complete
+        } else {
+            Completeness::Partial
+        },
+        original_bytes: Some(ring.total),
+        retained_bytes: Some(retained),
+        omitted_bytes: Some(ring.total.saturating_sub(retained)),
+        presented_bytes: (!snap.terminal).then_some(presented),
+        artifact: ring.artifact.clone(),
+    }
+}
+
 fn render_output(snap: &Snapshot, body: String, lost: u64, tail: Option<usize>) -> String {
     format!(
         "[{}: {}, pid {}]\n{}",
@@ -680,7 +776,7 @@ fn render_body(snap: &Snapshot, mut body: String, lost: u64, tail: Option<usize>
     }
     let ring = lock(&snap.ring);
     if let Some(uri) = &ring.artifact {
-        let completeness = if ring.error.is_some() {
+        let completeness = if ring.error.is_some() || ring.elided_bytes > 0 || !ring.reached_eof {
             "partial"
         } else {
             "complete"

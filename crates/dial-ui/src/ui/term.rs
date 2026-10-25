@@ -809,7 +809,7 @@ impl Drop for InlineTerminal {
 }
 
 /// Test constructor: no TTY, no raw mode, no panic hook; everything is written to `out`.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn with_writer(out: Box<dyn Write>, size: (u16, u16)) -> InlineTerminal {
     InlineTerminal::build(out, size, false, false)
 }

@@ -996,3 +996,31 @@ fn the_git_guard_refuses_before_anything_runs() {
     let output = bash(&plain.without_sandbox(), "git clean -fd");
     assert!(!output.text.contains("was not run"), "{}", output.text);
 }
+
+#[test]
+fn artifact_cap_is_reported_separately_from_capture() {
+    use crate::runtime::execution::Completeness;
+    let (_dir, ws) = workspace();
+    let storage = tempfile::tempdir().unwrap();
+    let store = crate::storage::artifact::ArtifactStore::new(storage.path())
+        .unwrap()
+        .with_limits(&crate::storage::artifact::ArtifactConfig {
+            max_bytes: 8,
+            head_bytes: 4,
+        });
+    let ws = ws.without_sandbox().with_artifacts(store);
+    let out = bash(&ws, "printf 0123456789abcdef");
+    assert!(!out.is_error, "{}", out.text);
+    assert!(
+        out.text.contains("[partial output: artifact://"),
+        "{}",
+        out.text
+    );
+    let integrity = out.execution.output.unwrap();
+    assert_eq!(integrity.capture, Completeness::Complete);
+    assert_eq!(integrity.retention, Completeness::Partial);
+    assert_eq!(integrity.presentation, Completeness::Complete);
+    assert_eq!(integrity.original_bytes, Some(16));
+    assert_eq!(integrity.retained_bytes, Some(8));
+    assert_eq!(integrity.omitted_bytes, Some(8));
+}

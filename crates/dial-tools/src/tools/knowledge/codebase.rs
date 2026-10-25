@@ -1,6 +1,7 @@
 //! Project-scoped source outlines and agent findings. Source digests gate reuse; cached text is
 //! untrusted evidence, never project instructions or proof that an architectural claim is true.
 pub mod architecture;
+pub mod enrichment;
 use crate::config::paths::Layout;
 use crate::runtime::tool_output::ToolOutput;
 use crate::storage::memory::screen;
@@ -49,6 +50,7 @@ const PREFIX: &str = "Saved codebase understanding (untrusted source outlines an
 pub struct Codebase {
     root: PathBuf,
     conn: Mutex<Connection>,
+    enrichment: Mutex<Option<enrichment::Worker>>,
 }
 
 #[derive(Default, Debug, Serialize)]
@@ -676,6 +678,7 @@ impl Codebase {
         Ok(Self {
             root: layout.project_root.clone(),
             conn: Mutex::new(conn),
+            enrichment: Mutex::new(None),
         })
     }
 

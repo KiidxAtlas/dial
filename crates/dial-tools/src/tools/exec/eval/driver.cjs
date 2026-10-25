@@ -35,11 +35,13 @@ let pendingEnd = 0;
 let pendingScan = 0;
 
 class Capture {
-  constructor() { this.parts = []; this.size = 0; this.dropped = 0; }
+  constructor() { this.parts = []; this.size = 0; this.dropped = 0; this.originalBytes = 0; this.retainedBytes = 0; }
   write(text) {
     text = String(text);
+    this.originalBytes += Buffer.byteLength(text.toWellFormed(), 'utf8');
     const take = Math.min(text.length, Math.max(0, LIMIT - this.size));
     if (take) this.parts.push(text.slice(0, take));
+    this.retainedBytes += Buffer.byteLength(text.slice(0, take).toWellFormed(), 'utf8');
     this.size += take;
     this.dropped += text.length - take;
   }
@@ -244,6 +246,11 @@ function evaluate(code) {
     }
     result.stdout = operation.stdout.value();
     result.stderr = operation.stderr.value();
+    // These count captured console streams only; native writes and value formatting are not a lossless capture.
+    result.output_integrity = {
+      original_bytes: operation.stdout.originalBytes + operation.stderr.originalBytes,
+      retained_bytes: operation.stdout.retainedBytes + operation.stderr.retainedBytes,
+    };
     try {
       sendFrame({ id: request.id, result });
     } catch (error) {

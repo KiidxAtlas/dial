@@ -12,6 +12,34 @@ pub struct Source {
 }
 
 impl Source {
+    /// Validates structured sources too, including values read directly from a lock file.
+    pub(super) fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.url.is_empty()
+                && !self.url.starts_with('-')
+                && !self.url.chars().any(char::is_control)
+                && (!self.url.chars().any(char::is_whitespace)
+                    || Path::new(&self.url).is_absolute()
+                    || is_local_path(&self.url)),
+            "invalid repository {:?}",
+            self.url
+        );
+        if let Some(reference) = &self.reference {
+            ensure!(
+                !reference.is_empty()
+                    && !reference.starts_with('-')
+                    && !reference
+                        .chars()
+                        .any(|c| c.is_whitespace() || c.is_control()),
+                "invalid ref {reference:?}"
+            );
+        }
+        if let Some(path) = &self.path {
+            validate_relative_path(path)?;
+        }
+        Ok(())
+    }
+
     /// Canonical `url[@ref][#path]` spelling, as stored in the lock file and shown in lists.
     pub fn spec(&self) -> String {
         let mut out = self.url.clone();
@@ -39,33 +67,13 @@ pub fn parse(spec: &str) -> Result<Source> {
         None => (spec, None),
     };
     let (url, reference) = split_reference(head);
-    ensure!(
-        !url.is_empty(),
-        "missing repository before '@' or '#' in {spec:?}"
-    );
-    ensure!(
-        !url.starts_with('-') && !url.chars().any(char::is_whitespace),
-        "invalid repository {url:?}"
-    );
-    let reference = match reference {
-        Some(reference) => {
-            ensure!(!reference.is_empty(), "empty ref after '@' in {spec:?}");
-            ensure!(
-                !reference.starts_with('-')
-                    && !reference
-                        .chars()
-                        .any(|c| c.is_whitespace() || c.is_control()),
-                "invalid ref {reference:?}"
-            );
-            Some(reference.to_owned())
-        }
-        None => None,
-    };
-    Ok(Source {
+    let source = Source {
         url: url.to_owned(),
-        reference,
+        reference: reference.map(str::to_owned),
         path,
-    })
+    };
+    source.validate()?;
+    Ok(source)
 }
 
 /// Splits the last `@` that follows the repository location, so `user@host:repo` keeps its user part.

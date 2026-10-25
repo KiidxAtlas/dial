@@ -35,6 +35,52 @@ fn home_workspace_loads_and_saves_existing_user_configuration() {
 }
 
 #[test]
+fn prefer_subagents_persists_and_reloads_with_project_precedence() {
+    let (_home, _project, layout) = fixture();
+    let overlay = toml::Table::new();
+    let initial = load_config(&layout, &overlay).unwrap();
+    assert!(!initial.task.prefer_subagents);
+    let mut reload = SettingsReload::new(&layout, &overlay, &initial);
+    for (scope, enabled) in [(Scope::Global, true), (Scope::Project, false)] {
+        let saved = save_config(
+            &layout,
+            scope,
+            &[Change::Set {
+                path: "task.prefer_subagents".into(),
+                value: toml::Value::Boolean(enabled),
+            }],
+        )
+        .unwrap();
+        assert_eq!(saved.task.prefer_subagents, enabled);
+        assert_eq!(
+            load_config(&layout, &overlay)
+                .unwrap()
+                .task
+                .prefer_subagents,
+            enabled
+        );
+        let (current, diagnostics) = reload.reload(&layout, &overlay, None);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(current.task.prefer_subagents, enabled);
+        assert_eq!(reload.config().task.prefer_subagents, enabled);
+    }
+    save_config(
+        &layout,
+        Scope::Project,
+        &[Change::Remove {
+            path: "task.prefer_subagents".into(),
+        }],
+    )
+    .unwrap();
+    let (current, diagnostics) = reload.reload(&layout, &overlay, None);
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    assert!(
+        current.task.prefer_subagents,
+        "removing project override restores global preference"
+    );
+}
+
+#[test]
 fn model_assignment_rejects_invalid_project_without_changing_global() {
     let (_home, _project, layout) = fixture();
     save_config(

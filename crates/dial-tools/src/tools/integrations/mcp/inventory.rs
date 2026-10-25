@@ -88,6 +88,7 @@ impl Inventory {
                     })
                     .unwrap_or_default();
                 json!({"name": server.name, "status": status,
+                    "health": server.session.as_ref().map(|session| session.health()),
                     "capabilities": capabilities, "tools": server.tools})
             })
             .collect();
@@ -174,7 +175,7 @@ fn install(config: &Config, id: &str) -> ToolOutput {
             server.program.display()
         ));
     }
-    let tools = match catalog::check(&config.project_root, &local, &server) {
+    let tools = match catalog::check(config, &local, &server) {
         Ok(count) => count,
         Err(why) => return ToolOutput::err(format!("health check failed, nothing saved: {why}")),
     };

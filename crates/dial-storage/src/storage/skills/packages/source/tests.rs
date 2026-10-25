@@ -105,3 +105,16 @@ fn package_name_rules() {
     assert!(!valid_package_name(&"x".repeat(65)));
     assert!(!valid_package_name(""));
 }
+
+#[test]
+fn structured_sources_use_the_same_validation_as_parsed_sources() {
+    for source in [
+        src("--upload-pack=evil", None, None),
+        src("https://x/r", Some("--upload-pack=evil"), None),
+        src("https://x/r", Some(""), None),
+        src("https://x/r\u{0000}", None, None),
+        src("https://x/r", None, Some("../outside")),
+    ] {
+        assert!(source.validate().is_err(), "{source:?}");
+    }
+}

@@ -32,6 +32,13 @@ scope, shared interfaces, evidence references and checks with an owner. Shared b
 for relevant edits to settle; repairs or changed inputs still need rechecking. These are prompt
 policies, not enforced scheduling or proof of live-model compliance; they do not add model
 requests, enable delegation automatically, or change tool and approval permissions.
+Delegation is selective by default: coupled implementation and focused testing stay in the
+main loop; independent parallel work, fresh-context review and context isolation can use workers.
+`task.prefer_subagents = true` (Settings → Tools → Subagents → Prefer subagents) instead adds
+specialist-first and tester-owned verification guidance. Neither setting enables withheld tools,
+changes worker permissions/concurrency, or bypasses configured completion checks. Both full and
+lean prompt variants use the preference; custom replacement prompts remain operator-owned.
+No live-model quality, latency or cost improvement is implied by this prompt-policy change.
 For an unlimited foreground output setting, the model's advertised output ceiling is bounded by
 the context remaining beside the current prompt; it is not reserved in full before admission.
 Explicit output limits and the compaction policy's response reserve remain authoritative.
@@ -80,6 +87,11 @@ task budget. Exhaustion returns an incomplete result with the preview diagnosis 
 tools from the rejected generation. Request attempts remain visible in reports, while finite
 continuation budgets use charged steps: refunded replies and controller-induced retries do not
 consume the allowance reserved for verification repairs or stop-hook continuations.
+
+Worker coordination is checked while waiting for provider capacity and again immediately before
+dispatch. Messages arriving during generation cancel only that inference scope and are retained
+in order for the replacement request. Superseded replies cannot dispatch tools; physical provider
+usage remains accounted for, while the existing coordination retry allowance is preserved.
 
 After successful worker inference, delivered request-only harness notes are retired even when
 buried in history; failed requests retain them for retry. Operator instructions, coordination,
@@ -143,6 +155,11 @@ ends before application, the direction is preserved as follow-up input. Independ
 classification without changing the foreground instruction; failed admission preserves the message
 as follow-up input rather than silently steering the foreground task. These choices do not grant
 worker permissions or bypass isolation, approval, or concurrency limits.
+
+Live-steering receipt settlement keeps its original acknowledgement deadlines but polls while
+servicing heartbeats, workers, aborts and newer steering. Replanning journals the accepted prefix
+and uncertain suffix once, in submission order, before later input. Cancellation is not rollback
+and does not replay completed tools.
 
 Explicit evaluation/learning runs capture the actual inference request and target. Normal coding launches disable trajectory and recovery-sample recording, learned candidates, automatic Laya/learned-skill capture, project-learning updates and startup evaluations without rewriting saved learning preferences. When exporting a verified example to the training template, valid tool-result error flags are removed as execution metadata while the evidence text is preserved. Malformed flags and unknown fields remain rejectable. An HTTP 200 response to a WebSocket upgrade establishes SSE-only transport for that session, so an unsupported upgrade is not retried at every request.
 
@@ -303,6 +320,12 @@ checks and registered reproductions remain actionable. Configured runner declara
 strict outcome settlement/selective review are described in [requirement-verification.md](requirement-verification.md).
 Recognized manually executed checks are bound after their own call settles. Cancelled, unavailable,
 zero-test, or incomplete-process results never supply passing credit.
+Semantic result classification uses complete presentation only when marked exhaustive; otherwise
+it reads the complete retained artifact through the bounded byte API (at most 1 MiB). Missing,
+partially retained, oversized or unavailable raw evidence stays unverified rather than earning test
+credit from clipped/minimized text. Ordinary exit-code checks still need no positive test count.
+Subset verification reconciles obligations by command: passing B cannot erase a retained failure
+of A; only a current successful execution or valid declared-input reuse of A clears it.
 
 **Dependency-aware verification reuse.** Reuse is enabled by default for the exact built-in
 isolated Python AST check on recognized Unix CPython installations. Dial tracks the source,
@@ -348,9 +371,16 @@ only within one planning invocation; later invocations observe changed manifests
 Behavioral provenance still hashes fresh bounded source state, but no longer loads dependency
 outlines that its record does not use. See [Core harness review](audits/harness-core-review.md) for the
 comparison, rationale, and measurement limits.
+
+Automatic post-edit related-source hints are best effort, not part of edit settlement or verification.
+Each cache owns at most one hint worker, using an independent read-only database connection;
+busy admission skips optional work. Turns poll without waiting and cancel pending hints on effects,
+new steering or turn exit. Ready hints are revision-bound advisory notes for a later request, not
+edit witnesses. Automatic hints use source-validated lexical neighbors; explicit impact retrieval
+retains the richer saved-architecture context. Mandatory pre-edit source checks are unchanged.
 Approval-denied writes are not treated as successful verification. `todo` is optional progress bookkeeping, not a verification checkpoint. `done` closes the current item and starts the next; findings and references are optional notes, including for legacy investigation entries. No separate tool-activity, citation or text-delivery gate applies. Accepted completion reconciles pending progress entries, while explicit blockers and running workers remain completion prerequisites. Failed checks remain failures independently of todo state.
 
-Plain final replies and `finish` use the same completion prerequisites and final configured verification/repair pipeline. Empty replies, action-only promises and explicit admissions of unfinished work share bounded parent/child reply recovery. Invalid todo arguments still receive a simple corrected call and bounded recovery; there is no separate budget of todo-closing reminder turns. Productive work remains unlimited with `max_steps = 0`.
+Plain final replies and `finish` use the same completion prerequisites and final configured verification/repair pipeline. A rejected plain completion receives actionable feedback and up to three corrective requests within the original step budget; repeated rejection stops incomplete with its candidate summary and blocker preserved. Interruption and uncertain effects never grant a continuation. Empty replies, action-only promises and explicit admissions of unfinished work share bounded parent/child reply recovery. Invalid todo arguments still receive a simple corrected call and bounded recovery; there is no separate budget of todo-closing reminder turns. Productive work remains unlimited with `max_steps = 0`.
 
 Default guidance starts with focused source inspection and moves to implementation once the path is known. It does not force a plan after an arbitrary number of reads. The optional reasoning-recovery plan gate still applies when explicitly enabled. Progress lists help substantial multi-step work; concise investigations and informational answers need no checklist. Optional source notes survive resume, and ordinary coding does not automatically harvest them into project learning. Identical successful observations remain subject to the shared read/investigation guards; changed sources and new user steering permit fresh observations.
 
@@ -559,8 +589,10 @@ limits, reasoning budgets, approvals or verification requirements:
   Compaction still uses configured token/percentage/model/agent policy with output/reserve headroom.
 - Very large windows are planned against `efficiency.history_token_cap` (default 262144) rather
   than their full size, because every step resends the whole history. With `threshold_*` on `auto`,
-  the trigger is 80% of the planning window after its reserve (15%, at least 16k): about 178k on a
-  1M-token model instead of about 680k, and unchanged (about 136k) on a 200k model. The prefix
+  the trigger is the planning window minus its reserve (15%, at least 16k): about 223k on a
+  1M-token model instead of about 850k, and about 170k on a 200k model. Windows up to 65536
+  tokens retain an additional 20% margin on usable space. Background summaries prepare before
+  the trigger and are held until due; the response-headroom safety check is unchanged. The prefix
   stays byte-stable between compactions, so caching is unaffected; compaction still keeps
   `keep_recent_tokens` of recent history verbatim, a summary of up to 16k tokens, and the
   carried-forward read/modified file lists. Requests sent while a background summary is still
@@ -860,12 +892,23 @@ paths, `@references`, code and quoted text are kept verbatim. An unassigned `tur
 main model in a separate request.
 
 - It is a hard layer: the main model receives only the drafted prompt. Files attached through
-  `@references` are expanded from the typed text and stay attached. The drafted prompt is shown in
-  a panel, and the session keeps the typed text under `dial_turn_draft`. The transcript, resume,
-  session previews, search and memory show what the user typed. Provider requests never carry the key.
-- It fails closed: if the drafter errors, is cancelled, hits its output limit or returns an empty
-  prompt, the turn fails and nothing is sent to the main model. For a steering message, any
-  steering still queued behind it is dropped too.
+  `@references` are expanded from the typed text and stay attached. Interactive Dial shows the
+  proposed instruction in the transcript and a scrollable review panel: **Accept and send** (`a`,
+  or Enter on that choice) submits it; **Cancel** (`c` or Esc) sends nothing. Page Up/Page Down
+  scroll through long drafts. This also applies to steering. Non-interactive clients retain
+  automatic delivery of valid drafts; interactive adapters without review support fail closed.
+  The session keeps the typed text under `dial_turn_draft`. The transcript, resume, session
+  previews, search and memory show what the user typed. Provider requests never carry the key.
+- `/drafter` toggles the feature; `/drafter on`, `/drafter off` and `/drafter status` set or inspect
+  it. The preference is saved for the project through `experimental.turn_optimizer`. During a
+  running turn it is saved immediately and adopted after that turn. When off, original user
+  messages go directly to the agent, without a drafter request or draft review.
+- The drafter preserves the mode of work: implementation requests become direct instructions to
+  inspect, implement and verify; questions and read-only reviews do not become edit requests.
+  It must not manufacture permission gates or open questions for already actionable tasks.
+- It fails closed: if the drafter errors, is cancelled, hits its output limit, returns an empty
+  prompt, or the user cancels review, nothing is sent to the main model. For a steering message,
+  any steering still queued behind it is dropped too.
 - Steering is drafted at the next step boundary, because the main stream holds the model connection
   while it generates. Codex live mid-stream steering is therefore not used while the optimizer is
   on, and steering takes the local replan path. Steering left over from an interrupted turn is

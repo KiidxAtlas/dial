@@ -347,6 +347,9 @@ impl Ui for StateUi<'_> {
     fn extension_panel(&mut self, t: &str, m: &str) {
         self.inner.extension_panel(t, m)
     }
+    fn review_turn_draft(&mut self, drafted: &str, cancel: &AtomicBool) -> bool {
+        self.inner.review_turn_draft(drafted, cancel)
+    }
     fn role(&mut self, r: &str, m: &str) {
         self.close_prose();
         self.inner.role(r, m)

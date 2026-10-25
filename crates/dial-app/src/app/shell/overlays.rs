@@ -92,7 +92,7 @@ impl Shell {
                 .and_then(|next| next.strip_prefix("test:"))
             {
                 // The catalog scan probes each provider's endpoint; the reopened page shows the result.
-                self.catalog.refresh(app);
+                self.catalog.refresh_config(app, &app.reload()?);
                 self.note(
                     "Connection test",
                     format!("Checking {id}. Its status appears in the provider list when the check finishes."),
@@ -497,8 +497,8 @@ impl Shell {
         self.themes.restore();
         self.term.close_overlay()?;
         if let Some(config) = state.latest {
-            self.pending_config = Some(config);
-            self.note("Settings", "Saved; changes apply after the current turn.");
+            self.apply_display(app, &config);
+            self.adopt_after_turn(app, Step::Rebuild(Box::new(config.for_coding())));
         }
         if let Some(selection) = state.verify_lora {
             self.pending_verification = Some(selection);
@@ -516,6 +516,17 @@ impl Shell {
             .and_then(|next| next.strip_prefix("command:"))
         {
             return Ok(self.route_busy_command(app, command.to_owned()));
+        } else if let Some(id) = state
+            .next
+            .as_deref()
+            .and_then(|next| next.strip_prefix("test:"))
+        {
+            self.catalog.refresh_config(app, &app.reload()?);
+            self.note(
+                "Connection test",
+                format!("Checking {id}. Its status appears in the provider list when the check finishes."),
+            );
+            self.start_busy_overlay(app, Which::Providers)?;
         } else if let Some(payload) = state
             .next
             .as_deref()
@@ -539,3 +550,6 @@ impl Shell {
         Ok(false)
     }
 }
+
+#[cfg(test)]
+mod tests;

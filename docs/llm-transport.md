@@ -14,6 +14,19 @@ backend switches to HTTP streaming until rebuilt. Neither path retries inline af
 callbacks or replays completed tools. User cancellation remains interruption, not a transport-fallback
 signal; history/account validation and retry bounds still apply.
 
+For GGUF startup failures, Dial reports the selected server executable and its stderr. An
+`unknown model architecture` error means that llama.cpp build cannot load the architecture:
+upgrade to a compatible build, point `DIAL_LLAMA_SERVER` at it, or serve the model with a
+compatible LM Studio runtime and select that provider. The latest package-manager release
+can lag architecture support; changing sampling or context size cannot fix it.
+
+Copilot's `The requested model is not supported` rejection includes the selected model and
+account-policy recovery guidance. A bundled model listing is not proof of account access:
+enable the model in GitHub Copilot settings (and, where applicable, the organization policy),
+or select an enabled model in `/models`. Dial never accepts model terms or enables billing
+policies automatically. A nearby background-compaction notice does not by itself identify
+compaction as the source of a foreground provider rejection.
+
 ## Local server request fields
 
 Local-profile requests (`[assistance.local]`) add server-specific fields only when the route is a

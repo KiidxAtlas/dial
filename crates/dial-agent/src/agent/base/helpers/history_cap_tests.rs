@@ -23,14 +23,16 @@ fn default_ceiling_bounds_the_auto_trigger_on_huge_windows_only() {
             .effective_threshold(identity, capped_window(window, cap, true))
             .unwrap()
     };
-    // A 1M window used to trigger near 680k; the default ceiling keeps requests under ~180k.
-    assert_eq!(trigger(1_000_000), 178_258);
-    assert!(
-        policy
-            .effective_threshold(identity, capped_window(1_000_000, cap, false))
-            .unwrap()
-            > 600_000
-    );
+    // The default ceiling applies the large-window trigger to 262144 tokens, not the full 1M.
+    assert_eq!(trigger(1_000_000), 222_823);
+    for (cap, economy) in [(cap, false), (0, true)] {
+        assert_eq!(
+            policy
+                .effective_threshold(identity, capped_window(1_000_000, cap, economy))
+                .unwrap(),
+            850_000
+        );
+    }
     // Windows at or below the ceiling keep their own trigger.
     assert_eq!(
         trigger(200_000),

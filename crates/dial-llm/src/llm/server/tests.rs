@@ -367,7 +367,10 @@ fn unknown_architecture_reports_the_selected_runtime_and_recovery_options() {
         "DIAL_LLAMA_SERVER",
         "LM Studio",
     ] {
-        assert!(diagnostic.contains(detail), "missing {detail:?}: {diagnostic}");
+        assert!(
+            diagnostic.contains(detail),
+            "missing {detail:?}: {diagnostic}"
+        );
     }
     assert!(diagnostic.to_lowercase().contains("upgrad"), "{diagnostic}");
 }

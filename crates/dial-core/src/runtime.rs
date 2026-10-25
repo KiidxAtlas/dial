@@ -4,6 +4,7 @@ pub mod cancellation;
 pub mod clock;
 pub mod execution;
 pub mod fingerprint;
+pub mod integration;
 pub mod json_transport;
 pub mod presentation;
 pub mod process;

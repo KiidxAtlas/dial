@@ -6,7 +6,9 @@
 //! tool output — so neither sink can leak conversation content. Recording never blocks or fails a
 //! turn: events go over a channel to one background thread, which batches OTLP records (flushed
 //! when a batch fills, every `flush_interval_secs`, and on `shutdown`).
+mod facts;
 use crate::config::telemetry::TelemetryConfig;
+pub use facts::ExecutionFacts;
 
 use crate::config::types::Config;
 use anyhow::{Context, Result, bail};
@@ -14,7 +16,11 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap},
     path::PathBuf,
-    sync::{Mutex, mpsc},
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -43,6 +49,7 @@ pub struct Request {
 
 #[derive(Debug, Clone)]
 pub struct Tool {
+    pub facts: ExecutionFacts,
     pub status: crate::tools::ToolStatus,
     pub effects: crate::tools::surface::outcome::Effects,
     pub session: String,
@@ -194,6 +201,7 @@ pub fn tool_with_effects(
     emit(
         config,
         Event::Tool(Tool {
+            facts: ExecutionFacts::default(),
             status,
             effects,
             session: session.into(),
@@ -201,6 +209,37 @@ pub fn tool_with_effects(
             tool: name.into(),
             duration: Duration::try_from_secs_f64(seconds).unwrap_or_default(),
             error: status.failed() || effects == crate::tools::surface::outcome::Effects::Unknown,
+            end: SystemTime::now(),
+        }),
+    );
+}
+
+/// Record only controller-owned execution metadata, never tool payloads.
+#[allow(clippy::too_many_arguments)]
+pub fn tool_output(
+    config: &Config,
+    hermetic: bool,
+    session: &str,
+    name: &str,
+    seconds: f64,
+    status: crate::tools::ToolStatus,
+    execution: &crate::runtime::execution::Execution,
+) {
+    if hermetic {
+        return;
+    }
+    emit(
+        config,
+        Event::Tool(Tool {
+            facts: ExecutionFacts::from(execution),
+            status,
+            effects: execution.effects,
+            session: session.into(),
+            project: project_key(config),
+            tool: name.into(),
+            duration: Duration::try_from_secs_f64(seconds).unwrap_or_default(),
+            error: status.failed()
+                || execution.effects == crate::runtime::execution::Effects::Unknown,
             end: SystemTime::now(),
         }),
     );
@@ -246,7 +285,7 @@ fn project_key(config: &Config) -> String {
 pub fn flush() {
     let Some(tx) = hub_sender(false) else { return };
     let (done, wait) = mpsc::channel();
-    if tx.send(Msg::Flush(done)).is_ok() {
+    if tx.try_send(Msg::Flush(done)).is_ok() {
         let _ = wait.recv_timeout(Duration::from_secs(15));
     }
 }
@@ -256,7 +295,7 @@ pub fn shutdown() {
     let hub = HUB.lock().unwrap_or_else(|e| e.into_inner()).take();
     if let Some(hub) = hub {
         let (done, wait) = mpsc::channel();
-        if hub.tx.send(Msg::Stop(done)).is_ok() {
+        if hub.tx.try_send(Msg::Stop(done)).is_ok() {
             let _ = wait.recv_timeout(Duration::from_secs(15));
         }
     }
@@ -287,15 +326,15 @@ enum Msg {
 }
 
 struct Hub {
-    tx: mpsc::Sender<Msg>,
+    tx: mpsc::SyncSender<Msg>,
 }
 
 static HUB: Mutex<Option<Hub>> = Mutex::new(None);
 
-fn hub_sender(spawn: bool) -> Option<mpsc::Sender<Msg>> {
+fn hub_sender(spawn: bool) -> Option<mpsc::SyncSender<Msg>> {
     let mut slot = HUB.lock().unwrap_or_else(|e| e.into_inner());
     if slot.is_none() && spawn {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(1024);
         thread::Builder::new()
             .name("dial-telemetry".into())
             .spawn(move || run(rx))
@@ -311,7 +350,32 @@ fn emit(config: &Config, event: Event) {
         return;
     }
     if let Some(tx) = hub_sender(true) {
-        let _ = tx.send(Msg::Event(Box::new(route), event));
+        enqueue(&tx, Msg::Event(Box::new(route), event));
+    } else {
+        INGRESS_LOSS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Process-lifetime loss counters, readable even when every sink is unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LossCounters {
+    pub ingress: u64,
+    pub export: u64,
+    pub stats: u64,
+}
+static INGRESS_LOSS: AtomicU64 = AtomicU64::new(0);
+static EXPORT_LOSS: AtomicU64 = AtomicU64::new(0);
+static STATS_LOSS: AtomicU64 = AtomicU64::new(0);
+pub fn loss_counters() -> LossCounters {
+    LossCounters {
+        ingress: INGRESS_LOSS.load(Ordering::Relaxed),
+        export: EXPORT_LOSS.load(Ordering::Relaxed),
+        stats: STATS_LOSS.load(Ordering::Relaxed),
+    }
+}
+fn enqueue(tx: &mpsc::SyncSender<Msg>, msg: Msg) {
+    if tx.try_send(msg).is_err() {
+        INGRESS_LOSS.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -334,6 +398,7 @@ fn run(rx: mpsc::Receiver<Msg>) {
                                 failed_open = None;
                             }
                             Err(error) => {
+                                STATS_LOSS.fetch_add(1, Ordering::Relaxed);
                                 stats = None;
                                 if failed_open.as_ref() != Some(path) {
                                     eprintln!(
@@ -346,7 +411,9 @@ fn run(rx: mpsc::Receiver<Msg>) {
                         }
                     }
                     if let Some((_, db)) = &mut stats {
-                        let _ = record_stats(db, &event);
+                        if record_stats(db, &event).is_err() {
+                            STATS_LOSS.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
                 if exporter.as_ref().map(|e| &e.settings) != route.otlp.as_ref() {
@@ -383,6 +450,7 @@ fn run(rx: mpsc::Receiver<Msg>) {
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 if let Some(e) = &mut exporter {
+                    e.close_open_turns();
                     e.flush();
                 }
                 return;
@@ -432,6 +500,7 @@ fn record_stats(db: &mut crate::stats::Db, event: &Event) -> Result<()> {
             }),
         }),
         Event::Tool(t) => db.record_tool(&crate::stats::ToolRecord {
+            facts: t.facts.clone(),
             status: Some(t.status),
             ts_ms: unix_ms(t.end),
             session: t.session.clone(),
@@ -591,6 +660,34 @@ type MetricSpec = (
 /// Every metric the exporter emits.
 const METRICS: &[MetricSpec] = &[
     (
+        "dial.agent.execution.facts",
+        "{fact}",
+        "Independent execution facts observed.",
+        None,
+        false,
+    ),
+    (
+        "dial.agent.output.bytes",
+        "By",
+        "Output bytes by accounting dimension.",
+        None,
+        false,
+    ),
+    (
+        "dial.agent.integration.state_changes",
+        "{change}",
+        "Integration health transitions during a call.",
+        None,
+        false,
+    ),
+    (
+        "dial.agent.telemetry.loss",
+        "{loss}",
+        "Telemetry dropped or failed by sink.",
+        None,
+        false,
+    ),
+    (
         "gen_ai.client.token.usage",
         "{token}",
         "Token usage reported by GenAI chat calls.",
@@ -706,6 +803,7 @@ struct Exporter {
     sums: BTreeMap<(&'static str, Attrs), f64>,
     hists: BTreeMap<(&'static str, Attrs), Hist>,
     turns: HashMap<String, TurnSpan>,
+    losses: LossCounters,
     #[cfg(test)]
     last_error: Option<String>,
 }
@@ -766,6 +864,11 @@ impl Exporter {
             sums: BTreeMap::new(),
             hists: BTreeMap::new(),
             turns: HashMap::new(),
+            losses: LossCounters {
+                ingress: 0,
+                export: 0,
+                stats: 0,
+            },
             #[cfg(test)]
             last_error: None,
         }
@@ -908,6 +1011,30 @@ impl Exporter {
             Event::Tool(t) => {
                 let (trace, parent) = self.turn_for(&t.session, start_ns);
                 let status = t.status.as_str();
+                for (key, value) in t.facts.labels() {
+                    self.add("dial.agent.execution.facts", vec![(key, value)], 1.0);
+                }
+                for (dimension, bytes) in [
+                    ("original", t.facts.original_bytes),
+                    ("retained", t.facts.retained_bytes),
+                    ("omitted", t.facts.omitted_bytes),
+                    ("presented", t.facts.presented_bytes),
+                ] {
+                    if let Some(bytes) = bytes {
+                        self.add(
+                            "dial.agent.output.bytes",
+                            vec![("dial.output.dimension", dimension.into())],
+                            bytes as f64,
+                        );
+                    }
+                }
+                if t.facts.state_changes > 0 {
+                    self.add(
+                        "dial.agent.integration.state_changes",
+                        vec![],
+                        t.facts.state_changes as f64,
+                    );
+                }
                 self.add(
                     "dial.agent.tool.calls",
                     vec![
@@ -929,13 +1056,25 @@ impl Exporter {
                     );
                 }
                 if self.settings.traces_url.is_some() {
-                    let attrs = attributes(&[
+                    let mut pairs = vec![
                         ("gen_ai.operation.name", json!("execute_tool")),
                         ("gen_ai.tool.name", json!(t.tool)),
                         ("dial.tool.status", json!(status)),
                         ("dial.tool.effects", json!(t.effects)),
                         ("session.id", json!(t.session)),
-                    ]);
+                    ];
+                    pairs.extend(
+                        t.facts
+                            .labels()
+                            .into_iter()
+                            .map(|(key, value)| (key, json!(value))),
+                    );
+                    pairs.push((
+                        "dial.integration.state_changes",
+                        json!(t.facts.state_changes),
+                    ));
+                    pairs.push(("dial.output.omitted_bytes", json!(t.facts.omitted_bytes)));
+                    let attrs = attributes(&pairs);
                     self.spans.push(span_json(
                         trace,
                         nonzero_u64(),
@@ -1138,9 +1277,27 @@ impl Exporter {
 
     fn flush(&mut self) {
         self.next_flush = Instant::now() + self.settings.flush;
+        let losses = loss_counters();
+        for (sink, now, before) in [
+            ("ingress", losses.ingress, self.losses.ingress),
+            ("export", losses.export, self.losses.export),
+            ("stats", losses.stats, self.losses.stats),
+        ] {
+            if now > before {
+                self.add(
+                    "dial.agent.telemetry.loss",
+                    vec![("dial.telemetry.sink", sink.into())],
+                    (now - before) as f64,
+                );
+            }
+        }
+        self.losses = losses;
         for (url, body) in self.take_payloads(unix_ns(SystemTime::now())) {
             // Exports are best effort; a failed batch is dropped rather than growing without bound.
             let _result = self.post(&url, &body);
+            if _result.is_err() {
+                EXPORT_LOSS.fetch_add(1, Ordering::Relaxed);
+            }
             #[cfg(test)]
             if let Err(error) = _result {
                 self.last_error = Some(format!("{error:#}"));

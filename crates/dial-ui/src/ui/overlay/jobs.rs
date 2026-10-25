@@ -39,6 +39,8 @@ pub struct JobsOverlay {
     attached: Option<String>,
     screen: Vec<String>,
     screen_cursor: Option<(u16, u16)>,
+    /// Distance from the newest pipe-output row; zero follows live output.
+    output_scroll: usize,
     message: Option<(String, bool)>,
     /// List rows drawn by the last frame, so clicks map to the same rows.
     list_h: std::cell::Cell<usize>,
@@ -98,13 +100,38 @@ impl JobsOverlay {
 
     pub fn handle(&mut self, event: &Event, keys: &Keymap) -> OverlayEvent {
         if let Some(name) = self.attached.clone() {
+            let interactive = self
+                .jobs
+                .iter()
+                .any(|job| job.name == name && job.running && job.terminal);
             return match event {
                 Event::Key(key) if pressed(key) => {
-                    if is_detach(key) {
+                    if is_detach(key) || (!interactive && keys.matches(Action::SelectCancel, key)) {
                         self.attached = None;
                         self.screen.clear();
                         self.screen_cursor = None;
+                        self.output_scroll = 0;
                         self.message = None;
+                        return OverlayEvent::None;
+                    }
+                    if !interactive {
+                        let page = self.list_h.get().max(1);
+                        if keys.matches(Action::SelectUp, key) {
+                            self.output_scroll = self.output_scroll.saturating_add(1);
+                        } else if keys.matches(Action::SelectDown, key) {
+                            self.output_scroll = self.output_scroll.saturating_sub(1);
+                        } else if keys.matches(Action::SelectPageUp, key) {
+                            self.output_scroll = self.output_scroll.saturating_add(page);
+                        } else if keys.matches(Action::SelectPageDown, key) {
+                            self.output_scroll = self.output_scroll.saturating_sub(page);
+                        } else if key.code == KeyCode::Home {
+                            self.output_scroll = self.screen.len();
+                        } else if key.code == KeyCode::End {
+                            self.output_scroll = 0;
+                        }
+                        self.output_scroll = self
+                            .output_scroll
+                            .min(self.screen.len().saturating_sub(page));
                         return OverlayEvent::None;
                     }
                     match key_bytes(key) {
@@ -112,7 +139,7 @@ impl JobsOverlay {
                         None => OverlayEvent::None,
                     }
                 }
-                Event::Paste(value) => OverlayEvent::JobInput {
+                Event::Paste(value) if interactive => OverlayEvent::JobInput {
                     name,
                     bytes: value.replace("\r\n", "\r").replace('\n', "\r").into_bytes(),
                 },
@@ -148,6 +175,7 @@ impl JobsOverlay {
             self.attached = Some(job.name.clone());
             self.screen.clear();
             self.screen_cursor = None;
+            self.output_scroll = 0;
             self.message = (!job.running).then(|| {
                 (
                     format!("{} has exited; showing its last output", job.name),
@@ -180,6 +208,7 @@ impl JobsOverlay {
             self.attached = Some(job.name.clone());
             self.screen.clear();
             self.screen_cursor = None;
+            self.output_scroll = 0;
             self.message = (!job.running).then(|| {
                 (
                     format!("{} has exited; showing its last output", job.name),
@@ -194,7 +223,7 @@ impl JobsOverlay {
 
     pub fn draw(&mut self, frame: &mut Frame, ctx: &DrawCtx) {
         let extra = match &self.attached {
-            Some(name) => format!("attached to {name}"),
+            Some(name) => format!("viewing {name}"),
             None => {
                 let running = self.jobs.iter().filter(|job| job.running).count();
                 let exited = self.jobs.len() - running;
@@ -236,6 +265,8 @@ impl JobsOverlay {
         if let Some(name) = &self.attached {
             let job = self.jobs.iter().find(|job| &job.name == name);
             let running = job.is_some_and(|job| job.running);
+            let terminal = job.is_some_and(|job| job.terminal);
+            let interactive = running && terminal;
             // A pending message (an input error, "has exited") replaces the header.
             match (&self.message, job) {
                 (Some(_), _) => message(&mut out),
@@ -261,21 +292,42 @@ impl JobsOverlay {
                 }
                 (None, None) => out.push(Line::default()),
             }
-            for row in 0..h.saturating_sub(2) {
-                let content = self.screen.get(row).map(String::as_str).unwrap_or("");
+            let body_h = h.saturating_sub(2);
+            self.list_h.set(body_h);
+            let start = if terminal {
+                0
+            } else {
+                self.screen
+                    .len()
+                    .saturating_sub(body_h)
+                    .saturating_sub(self.output_scroll)
+            };
+            for row in 0..body_h {
+                let content = self
+                    .screen
+                    .get(start + row)
+                    .map(String::as_str)
+                    .unwrap_or("");
                 let content = text::clip(&text::sanitize(content), w);
                 let cursor = self
                     .screen_cursor
-                    .filter(|(r, _)| running && usize::from(*r) == row)
+                    .filter(|(r, _)| interactive && usize::from(*r) == row)
                     .map(|(_, c)| usize::from(c));
                 out.push(screen_row(&content, cursor, w, theme.fg(Tok::Text)));
             }
             let segments = [
-                "Ctrl+] detach".to_owned(),
-                if running {
-                    "keys go to the process".to_owned()
+                if interactive {
+                    "Ctrl+] detach"
                 } else {
-                    "process exited".to_owned()
+                    "Esc back"
+                }
+                .to_owned(),
+                if interactive {
+                    "keys go to the process".to_owned()
+                } else if terminal {
+                    "process exited; read-only".to_owned()
+                } else {
+                    "read-only; ↑↓/PgUp/PgDn scroll; End follow".to_owned()
                 },
             ];
             out.truncate(h.saturating_sub(1));
@@ -361,7 +413,11 @@ impl JobsOverlay {
             segments.push(hint(
                 ctx.keys,
                 Action::SelectConfirm,
-                if job.running { "attach" } else { "view output" },
+                if job.running && job.terminal {
+                    "attach"
+                } else {
+                    "view output"
+                },
             ));
             segments.push(format!(
                 "{} select",

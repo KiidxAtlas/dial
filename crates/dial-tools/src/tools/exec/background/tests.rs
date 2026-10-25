@@ -284,6 +284,13 @@ fn wait_without_pattern_returns_at_exit_with_status() {
         "{}",
         wait.text
     );
+    assert_eq!(
+        wait.execution.observation.as_ref().unwrap().kind,
+        ObservationKind::Wait
+    );
+    assert!(wait.execution.observation.as_ref().unwrap().satisfied);
+    assert_eq!(wait.execution.process.as_ref().unwrap().exit_code, Some(3));
+    assert_eq!(wait.data.as_ref().unwrap()["process"]["exit_code"], 3);
     // `output` shares the model-visible cursor: nothing is repeated, but the status still is.
     let out = bg(&tool, &ws, json!({"action": "output", "name": "quick"}));
     assert!(
@@ -1066,4 +1073,85 @@ fn escaped_writer_is_drained_bounded_and_kill_yields_one_incomplete_artifact() {
         libc::kill(child, libc::SIGKILL);
     }
     assert!(gone_soon(child), "escaped writer {child} survived SIGKILL");
+}
+
+#[test]
+fn jobs_view_shows_pipe_output_without_consuming_it() {
+    let (_dir, ws) = open_workspace();
+    let tool = tool();
+    assert!(!start(&tool, &ws, "pipe-view", "printf 'first\\nlast\\n'").is_error);
+    let snap = tool.table().snapshot("pipe-view").unwrap();
+    let end = Instant::now() + Duration::from_secs(5);
+    loop {
+        let seen = wake::generation();
+        if lock(&snap.ring).closed {
+            break;
+        }
+        assert!(Instant::now() < end, "capture did not close");
+        wake::wait_past(seen, Some(end));
+    }
+    let view = tool.jobs_view(Some("pipe-view"));
+    assert_eq!(view.screen, ["first", "last"]);
+    assert_eq!(view.cursor, None);
+    let output = bg(&tool, &ws, json!({"action":"output", "name":"pipe-view"}));
+    assert!(output.text.contains("first\nlast\n"), "{}", output.text);
+}
+
+#[test]
+fn wait_reports_capture_failure_as_an_error() {
+    let (_dir, ws) = open_workspace();
+    let tool = tool();
+    assert!(!start(&tool, &ws, "capture-failed", "true").is_error);
+    let finished = bg(
+        &tool,
+        &ws,
+        json!({"action":"wait", "name":"capture-failed", "timeout":5}),
+    );
+    assert!(!finished.is_error, "{}", finished.text);
+    let snap = tool.table().snapshot("capture-failed").unwrap();
+    lock(&snap.ring).error = Some("test capture failure".into());
+    let output = bg(
+        &tool,
+        &ws,
+        json!({"action":"wait", "name":"capture-failed", "timeout":5}),
+    );
+    assert!(output.is_error, "{}", output.text);
+    assert!(
+        output.text.contains("test capture failure"),
+        "{}",
+        output.text
+    );
+}
+
+#[test]
+fn capped_artifact_is_not_labeled_complete() {
+    let (_dir, ws) = open_workspace();
+    let storage = tempfile::tempdir().unwrap();
+    let store = crate::storage::artifact::ArtifactStore::new(storage.path())
+        .unwrap()
+        .with_limits(&crate::storage::artifact::ArtifactConfig {
+            max_bytes: 8,
+            head_bytes: 4,
+        });
+    let ws = ws.with_artifacts(store);
+    let tool = tool();
+    start(&tool, &ws, "cap", "printf 0123456789abcdef");
+    let out = bg(
+        &tool,
+        &ws,
+        json!({"action":"wait","name":"cap","timeout":5}),
+    );
+    assert!(!out.is_error, "{}", out.text);
+    assert!(
+        out.text.contains("[partial output: artifact://"),
+        "{}",
+        out.text
+    );
+    assert!(!out.text.contains("[complete output:"));
+    let integrity = out.execution.output.unwrap();
+    assert_eq!(integrity.capture, Completeness::Complete);
+    assert_eq!(integrity.retention, Completeness::Partial);
+    assert_eq!(integrity.original_bytes, Some(16));
+    assert_eq!(integrity.retained_bytes, Some(8));
+    assert_eq!(integrity.omitted_bytes, Some(8));
 }

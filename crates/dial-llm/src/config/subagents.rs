@@ -45,7 +45,7 @@ pub const AGENTS: &[AgentSpec] = &[
     AgentSpec {
         name: "worker",
         description: "carries out a change: can write and edit files and run commands (each change asks for approval)",
-        prompt: "Implement the assigned slice using existing conventions and current evidence. Batch coherent edits; preserve others' work and approval boundaries. Honor the assigned tester/check owner: hand test coverage needs and stable interfaces to the parent for its tester instead of duplicating test authoring or runs. If explicitly assigned testing because delegation is unavailable, use focused checks after relevant edits settle. Diagnose failures before repair; coordinate reruns with the test owner. Report changed behavior, files, observed results and unresolved prerequisites briefly.",
+        prompt: "Implement the assigned slice using existing conventions and current evidence. Batch coherent edits; preserve others' work and approval boundaries. Own scoped regression tests and focused verification unless the parent assigns a separate tester/check owner. When a tester is assigned, hand over coverage needs and stable interfaces instead of duplicating test edits or runs. Run checks after relevant edits settle. Diagnose failures before repair; coordinate reruns with the check owner. Report changed behavior, files, observed results and unresolved prerequisites briefly.",
         tools: &["read", "glob", "grep", "bash", "edit", "write", "skill"],
         spawns: &[],
         max_steps: 0,

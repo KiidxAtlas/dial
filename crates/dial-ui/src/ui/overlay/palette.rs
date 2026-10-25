@@ -9,7 +9,7 @@ use super::{
     settings::{editor_spans, filled, hint_line, panel, pressed, tab_strip, typed_char},
 };
 use crate::ui::{
-    chrome::Section,
+    chrome::{self, Section},
     composer::{CommandEntry, CommandKind},
     editor::Editor,
     keys::{Action, Keymap},
@@ -19,6 +19,7 @@ use crate::ui::{
 use crossterm::event::{Event, KeyCode};
 use ratatui::{
     Frame,
+    layout::{Position, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
 };
@@ -287,6 +288,8 @@ pub struct PaletteOverlay {
     cursor: usize,
     scroll: usize,
     page: usize,
+    /// Interactive rows from the last bordered panel draw; absent before drawing or on tiny panels.
+    list_bounds: Option<Rect>,
     arguments: Option<(usize, Editor)>,
     choice: Option<ChoiceSpec>,
     /// Why the last Enter did nothing, shown until the next key.
@@ -323,6 +326,7 @@ impl PaletteOverlay {
             cursor: 0,
             scroll: 0,
             page: 8,
+            list_bounds: None,
             arguments: None,
             choice: None,
             notice: None,
@@ -451,6 +455,9 @@ impl PaletteOverlay {
     }
 
     fn reset_selection(&mut self) {
+        // Input may be drained in a batch before drawing. Never map an old painted row onto
+        // a newly filtered list or view; selection-only clicks retain their existing hitbox.
+        self.list_bounds = None;
         self.cursor = 0;
         self.scroll = 0;
     }
@@ -467,6 +474,7 @@ impl PaletteOverlay {
             View::Goals => return false,
         };
         self.view = View::Goals;
+        self.list_bounds = None;
         self.cursor = cursor;
         self.scroll = 0;
         true
@@ -589,6 +597,7 @@ impl PaletteOverlay {
             }
         } else if keys.matches(Action::Newline, key) && self.choice.is_none() {
             if let Some(&Row::Entry(index)) = rows.get(self.cursor) {
+                self.list_bounds = None;
                 self.arguments = Some((index, Editor::default()));
             }
         } else if self.search.text.is_empty() && key.code == KeyCode::Home {
@@ -628,6 +637,7 @@ impl PaletteOverlay {
                     .as_deref()
                     .is_some_and(|hint| hint.starts_with('<'))
                 {
+                    self.list_bounds = None;
                     self.arguments = Some((index, Editor::default()));
                     OverlayEvent::None
                 } else {
@@ -643,19 +653,15 @@ impl PaletteOverlay {
         if self.shows_tabs() { 4 } else { 3 }
     }
 
-    /// A left click on screen `row`: selects the action drawn there; clicking the selected action
-    /// runs it, like Enter. Rows follow `compose`: border, search, optional tabs, count, then the list.
-    pub fn click(&mut self, row: u16) -> OverlayEvent {
-        let list_top = self.list_top();
-        if self.arguments.is_some() {
-            return OverlayEvent::None;
-        }
-        let Some(offset) = usize::from(row).checked_sub(list_top) else {
+    /// Select the action drawn at this screen position; clicking the selected action runs it.
+    pub fn click(&mut self, column: u16, row: u16) -> OverlayEvent {
+        let Some(bounds) = self.list_bounds else {
             return OverlayEvent::None;
         };
-        if offset >= self.page {
+        if self.arguments.is_some() || !bounds.contains(Position::new(column, row)) {
             return OverlayEvent::None;
         }
+        let offset = usize::from(row - bounds.y);
         let rows = self.rows();
         let position = self.scroll + offset;
         let Some(&picked) = rows.get(position) else {
@@ -681,9 +687,24 @@ impl PaletteOverlay {
             &[""]
         };
         let extra = title_extra(ctx.theme, &title, frame.area().width, extras);
+        let area = frame.area();
+        self.list_bounds = None;
+        let inner = (area.width >= 5 && area.height >= 5).then(|| {
+            chrome::panel_block_titled(ctx.theme, Section::Dial, &title, &extra).inner(area)
+        });
         panel(frame, ctx.theme, Section::Dial, &title, &extra, |w, h| {
             self.compose(w, h, ctx)
         });
+        if let Some(inner) = inner
+            && self.arguments.is_none()
+        {
+            let headers = self.list_top() as u16 - 1;
+            let visible = self.page.min(self.rows().len().saturating_sub(self.scroll)) as u16;
+            let height = visible.min(inner.height.saturating_sub(headers + 1));
+            if inner.width > 0 && height > 0 {
+                self.list_bounds = Some(Rect::new(inner.x, inner.y + headers, inner.width, height));
+            }
+        }
     }
 
     /// Key hints for the current mode. Arguments and pickers list only what they can do here, and

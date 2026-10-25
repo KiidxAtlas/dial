@@ -556,14 +556,41 @@ pub(crate) fn strip_runtime_injection(command: &mut Command) {
 }
 
 pub(crate) fn code_output(result: Result<Value, String>) -> ToolOutput {
+    use crate::runtime::execution::{Completeness, ObservationKind, OutputIntegrity};
     match result {
-        Ok(data) => ToolOutput {
-            execution: Default::default(),
-            is_error: data.get("error").is_some_and(|error| !error.is_null()),
-            text: data.to_string(),
-            data: Some(data),
-        },
-        Err(error) => ToolOutput::err(error),
+        Ok(data) => {
+            let original = data["output_integrity"]["original_bytes"].as_u64();
+            let retained = data["output_integrity"]["retained_bytes"].as_u64();
+            let omitted = original
+                .zip(retained)
+                .map(|(original, retained)| original.saturating_sub(retained));
+            // A protocol reply completes observation, not the persistent interpreter's lifetime.
+            // Native writes and bounded value/traceback formatting prevent a lossless capture claim.
+            let integrity = OutputIntegrity {
+                capture: Completeness::Unknown,
+                retention: if omitted.is_some_and(|n| n > 0) {
+                    Completeness::Partial
+                } else {
+                    Completeness::Unknown
+                },
+                presentation: Completeness::Unknown,
+                original_bytes: original,
+                retained_bytes: retained,
+                omitted_bytes: omitted,
+                ..Default::default()
+            };
+            ToolOutput {
+                execution: Default::default(),
+                is_error: data.get("error").is_some_and(|error| !error.is_null()),
+                text: data.to_string(),
+                data: Some(data),
+            }
+            .with_output_integrity(integrity)
+            .with_observation(ObservationKind::Wait, true)
+        }
+        Err(error) => ToolOutput::err(error)
+            .with_output_integrity(OutputIntegrity::default())
+            .with_observation(ObservationKind::Wait, false),
     }
 }
 

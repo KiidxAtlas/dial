@@ -155,17 +155,7 @@ fn redirects_never_forward_credentials_or_session_ids() {
     let location = format!("http://{}/redirected", target.local_addr().unwrap());
     let server = std::thread::spawn(move || {
         let (mut socket, _) = listener.accept().unwrap();
-        socket
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let mut reader = BufReader::new(&mut socket);
-        loop {
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
-            if line == "\r\n" || line.is_empty() {
-                break;
-            }
-        }
+        drain_request(&mut socket);
         write!(socket, "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
     });
     let http = Http::new("redirect", &url, &McpServerConfig::default(), None).unwrap();
@@ -176,6 +166,7 @@ fn redirects_never_forward_credentials_or_session_ids() {
             Duration::from_secs(2),
             &mut |_| panic!("redirect is not an MCP response"),
             &[("X-Api-Key".into(), "private-token".into())],
+            &Operation::new(Duration::from_secs(2)),
         )
         .unwrap_err();
     server.join().unwrap();
@@ -227,7 +218,19 @@ fn streamable_get_session_termination_closes_the_shared_connection() {
         }
         let (signals, received) = mpsc::channel();
         let shared = Arc::new(Shared::new(Vec::new(), Some(signals)));
-        http.listen(shared.clone(), None);
+        if known_session {
+            http.listen(shared.clone(), None);
+        } else {
+            let worker = http.clone();
+            let state = shared.clone();
+            let handle = std::thread::spawn(move || worker.listen(state, None));
+            assert!(matches!(
+                received.recv_timeout(Duration::from_secs(2)),
+                Ok(Signal::NotificationDegraded)
+            ));
+            http.stop.store(true, Ordering::SeqCst);
+            handle.join().unwrap();
+        }
         server.join().unwrap();
         assert_eq!(shared.is_closed(), known_session);
         if known_session {
@@ -239,4 +242,151 @@ fn streamable_get_session_termination_closes_the_shared_connection() {
             assert!(received.try_recv().is_err());
         }
     }
+}
+
+/// Consume the whole request, so the next read observes cancellation rather than request bytes.
+fn drain_request(socket: &mut std::net::TcpStream) {
+    socket
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let mut reader = BufReader::new(socket);
+    let mut length = 0;
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        if line == "\r\n" || line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                length = value.trim().parse::<usize>().unwrap();
+            }
+        }
+    }
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body).unwrap();
+}
+
+#[test]
+fn notification_drop_recovers_and_shutdown_interrupts_a_silent_stream() {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        drain_request(&mut first);
+        first.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n: first\n\n").unwrap();
+        drop(first);
+        let (mut recovered, _) = listener.accept().unwrap();
+        drain_request(&mut recovered);
+        recovered.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n: healthy\n\n").unwrap();
+        let mut byte = [0];
+        assert_eq!(
+            recovered.read(&mut byte).unwrap(),
+            0,
+            "shutdown closes a silent stream's socket"
+        );
+    });
+    let http = Arc::new(Http::new("recover", &url, &McpServerConfig::default(), None).unwrap());
+    let (tx, rx) = mpsc::channel();
+    let shared = Arc::new(Shared::new(Vec::new(), Some(tx)));
+    http.clone().after_initialize("2025-06-18", shared.clone());
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_secs(2)),
+        Ok(Signal::NotificationHealthy)
+    ));
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_secs(2)),
+        Ok(Signal::NotificationDegraded)
+    ));
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_secs(2)),
+        Ok(Signal::NotificationHealthy)
+    ));
+    let began = Instant::now();
+    http.shutdown();
+    assert!(began.elapsed() < Duration::from_secs(1));
+    assert!(
+        !shared.is_closed(),
+        "optional listener loss must not close POST health"
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn notification_405_is_unsupported_not_a_connection_failure_or_retry_loop() {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        drain_request(&mut socket);
+        socket.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        listener
+    });
+    let http = Arc::new(Http::new("unsupported", &url, &McpServerConfig::default(), None).unwrap());
+    let (tx, rx) = mpsc::channel();
+    let shared = Arc::new(Shared::new(Vec::new(), Some(tx)));
+    http.clone().after_initialize("2025-06-18", shared.clone());
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_secs(2)),
+        Ok(Signal::NotificationUnsupported)
+    ));
+    http.shutdown();
+    let listener = server.join().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert!(!shared.is_closed());
+}
+
+#[test]
+fn cancelled_http_request_closes_socket_and_settles_owned_worker() {
+    use super::super::client::{Client, RequestFailure};
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let (entered, rx) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut request, _) = listener.accept().unwrap();
+        drain_request(&mut request);
+        entered.send(()).unwrap();
+        let stalled = std::thread::spawn(move || {
+            let mut byte = [0];
+            assert_eq!(
+                request.read(&mut byte).unwrap(),
+                0,
+                "cancel must close active request socket"
+            );
+        });
+        let (mut cancellation, _) = listener.accept().unwrap();
+        drain_request(&mut cancellation);
+        cancellation
+            .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        stalled.join().unwrap();
+    });
+    let http = Arc::new(Http::new("cancel", &url, &McpServerConfig::default(), None).unwrap());
+    let client = Client::remote("cancel", http, Arc::new(Shared::new(Vec::new(), None)));
+    let cancelled = AtomicBool::new(false);
+    let began = Instant::now();
+    let error = client
+        .request_with(
+            "tools/call",
+            json!({}),
+            Duration::from_secs(20),
+            &|| {
+                if rx.try_recv().is_ok() {
+                    cancelled.store(true, Ordering::SeqCst);
+                }
+                cancelled.load(Ordering::SeqCst)
+            },
+            None,
+        )
+        .unwrap_err();
+    assert!(began.elapsed() < Duration::from_secs(2));
+    assert!(error.downcast_ref::<RequestFailure>().unwrap().dispatched);
+    server.join().unwrap();
 }

@@ -82,3 +82,64 @@ fn cancellation_before_start_runs_nothing() {
     .unwrap();
     assert!(done.cancelled && done.status.is_none());
 }
+
+#[test]
+fn capture_and_retention_are_independent() {
+    use crate::runtime::execution::Completeness;
+    let done = run(
+        sh("printf 123456789"),
+        None,
+        Duration::from_secs(2),
+        3,
+        &AtomicBool::new(false),
+        &mut |_, _| {},
+    )
+    .unwrap();
+    let facts = done.execution(false);
+    let output = facts.output.unwrap();
+    assert_eq!(output.capture, Completeness::Complete);
+    assert_eq!(output.retention, Completeness::Partial);
+    assert_eq!(output.original_bytes, Some(9));
+    assert_eq!(output.retained_bytes, Some(3));
+    assert_eq!(output.omitted_bytes, Some(6));
+    assert!(!facts.process.unwrap().output_complete);
+}
+
+#[test]
+fn cancellation_drains_buffered_output_before_claiming_eof() {
+    let cancel = AtomicBool::new(false);
+    let done = run(
+        sh("printf first; sleep 30"),
+        None,
+        Duration::from_secs(2),
+        1024,
+        &cancel,
+        &mut |_, _| {
+            cancel.store(true, Ordering::Release);
+        },
+    )
+    .unwrap();
+    assert!(done.cancelled);
+    assert_eq!(done.stdout, b"first");
+    assert!(!done.output_incomplete);
+}
+
+#[test]
+fn unread_pipe_never_claims_complete_output() {
+    let mut policy = Policy::bounded(Duration::from_secs(2), 1024);
+    policy.retain_descendants = true;
+    let done = run_with_policy(
+        sh("(sleep 0.7) & printf ready"),
+        None,
+        policy,
+        &AtomicBool::new(false),
+        &mut |_, _| {},
+    )
+    .unwrap();
+    assert!(done.output_incomplete);
+    assert!(!done.outcome().output_complete);
+    assert_eq!(
+        done.output_integrity().capture,
+        crate::runtime::execution::Completeness::Partial
+    );
+}

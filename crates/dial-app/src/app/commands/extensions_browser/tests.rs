@@ -405,3 +405,115 @@ fn import_changes_use_insert_preconditions_and_keep_original_execution_values() 
     assert_eq!(path, "mcp.notes");
     assert_eq!(value["args"][0].as_str(), Some("secret-positional"));
 }
+
+#[test]
+fn existing_mcp_changes_follow_owning_scope_not_install_destination() {
+    let project = tempfile::tempdir().unwrap();
+    let user = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(project.path(), user.path().to_path_buf()).unwrap();
+    let files = layout.config_files();
+    std::fs::create_dir_all(files[1].parent().unwrap()).unwrap();
+    std::fs::write(&files[0], "[mcp.global]\nprogram = 'global-server'\n").unwrap();
+    std::fs::write(&files[1], "[mcp.project]\nprogram = 'project-server'\n").unwrap();
+    for intent in [
+        Intent::RemoveMcp {
+            id: "global".into(),
+        },
+        Intent::ToggleMcp {
+            id: "global".into(),
+            enable: false,
+        },
+    ] {
+        assert_eq!(
+            intent_scope(&layout, &intent, Scope::Project).unwrap(),
+            Scope::Global
+        );
+    }
+    for intent in [
+        Intent::RemoveMcp {
+            id: "project".into(),
+        },
+        Intent::ToggleMcp {
+            id: "project".into(),
+            enable: false,
+        },
+    ] {
+        assert_eq!(
+            intent_scope(&layout, &intent, Scope::Global).unwrap(),
+            Scope::Project
+        );
+    }
+    let install = Intent::InstallCuratedMcp { id: "new".into() };
+    assert_eq!(
+        intent_scope(&layout, &install, Scope::Global).unwrap(),
+        Scope::Global
+    );
+    assert_eq!(
+        intent_scope(&layout, &install, Scope::Project).unwrap(),
+        Scope::Project
+    );
+}
+
+#[test]
+fn browser_mcp_changes_persist_to_owner_and_update_effective_configuration() {
+    use crate::config::settings_store::{load_config, save_config};
+
+    for selected in [Scope::Global, Scope::Project] {
+        for (id, owner) in [("global", Scope::Global), ("project", Scope::Project)] {
+            let project = tempfile::tempdir().unwrap();
+            let user = tempfile::tempdir().unwrap();
+            let layout = Layout::with_user_dir(project.path(), user.path().to_path_buf()).unwrap();
+            let files = layout.config_files();
+            std::fs::create_dir_all(files[1].parent().unwrap()).unwrap();
+            std::fs::write(&files[0], "[mcp.global]\nprogram = 'global-server'\n").unwrap();
+            std::fs::write(&files[1], "[mcp.project]\nprogram = 'project-server'\n").unwrap();
+            let untouched = if owner == Scope::Global { 1 } else { 0 };
+            let original = std::fs::read(&files[untouched]).unwrap();
+            for intent in [
+                Intent::ToggleMcp {
+                    id: id.into(),
+                    enable: false,
+                },
+                Intent::ToggleMcp {
+                    id: id.into(),
+                    enable: true,
+                },
+                Intent::RemoveMcp { id: id.into() },
+            ] {
+                let config = load_config(&layout, &toml::Table::new()).unwrap();
+                let scope = intent_scope(&layout, &intent, selected).unwrap();
+                let progress = SharedProgress::default();
+                let outcome = run(&layout, &config, &intent, &progress).unwrap();
+                assert!(outcome.ok);
+                finish(
+                    Finished {
+                        ok: outcome.ok,
+                        message: outcome.message,
+                        changes: outcome.changes,
+                        scope,
+                        progress,
+                    },
+                    |changes, scope| save_config(&layout, scope, changes).map(|_| ()),
+                );
+                let effective = load_config(&layout, &toml::Table::new()).unwrap();
+                match intent {
+                    Intent::ToggleMcp { enable, .. } => {
+                        assert_eq!(effective.mcp[id].enabled, enable);
+                        assert_eq!(effective.mcp[id].program, config.mcp[id].program);
+                    }
+                    Intent::RemoveMcp { .. } => assert!(!effective.mcp.contains_key(id)),
+                    _ => unreachable!(),
+                }
+                assert_eq!(std::fs::read(&files[untouched]).unwrap(), original);
+                assert_eq!(
+                    effective.mcp.len(),
+                    if matches!(intent, Intent::RemoveMcp { .. }) {
+                        1
+                    } else {
+                        2
+                    }
+                );
+            }
+        }
+    }
+}

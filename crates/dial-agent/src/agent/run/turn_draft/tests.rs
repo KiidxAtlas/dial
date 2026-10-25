@@ -224,3 +224,130 @@ fn steering_is_journaled_directly_while_the_optimizer_is_off() {
         assert!(agent.undrafted_steering.is_empty());
     });
 }
+
+#[derive(Default)]
+struct DraftReview {
+    accept: bool,
+    interrupt_on_accept: bool,
+    displayed: Vec<String>,
+    reviewed: Vec<String>,
+}
+impl Ui for DraftReview {
+    fn interactive_input(&self) -> bool {
+        true
+    }
+    fn extension_panel(&mut self, _: &str, drafted: &str) {
+        self.displayed.push(drafted.into());
+    }
+    fn review_turn_draft(&mut self, drafted: &str, cancel: &AtomicBool) -> bool {
+        assert_eq!(self.displayed.last().map(String::as_str), Some(drafted));
+        self.reviewed.push(drafted.into());
+        if self.interrupt_on_accept {
+            cancel.store(true, Ordering::Release);
+        }
+        self.accept
+    }
+}
+
+#[test]
+fn reviewed_instruction_is_the_only_instruction_sent_after_acceptance() {
+    let drafted = "## Objective\nImplement the parser fix and verify it.";
+    let server = llm::fake::serve(vec![reply(drafted), reply("Done.")]);
+    with_agent(ON, |agent| {
+        agent.backend = Some(backend(&server.url));
+        // Keep this wire-content assertion independent of user-installed skill catalogs.
+        agent.modes.skillful = Some(false);
+        let mut ui = DraftReview {
+            accept: true,
+            ..Default::default()
+        };
+        agent.turn("fix parser", &mut ui).unwrap();
+        assert_eq!(ui.reviewed, [drafted]);
+        assert_eq!(user_messages(agent)[0]["content"], drafted);
+        assert_eq!(
+            user_messages(agent)[0][TURN_DRAFT_KEY]["original"],
+            "fix parser"
+        );
+    });
+    assert_eq!(server.requests().len(), 2);
+}
+
+#[test]
+fn rejected_or_interrupted_review_never_sends_or_journals_the_instruction() {
+    for interrupt in [false, true] {
+        let server = llm::fake::serve(vec![reply("Fix the parser.")]);
+        with_agent(ON, |agent| {
+            agent.backend = Some(backend(&server.url));
+            let instruction = agent.session.control_state()["current_instruction"].clone();
+            let mut ui = DraftReview {
+                accept: interrupt,
+                interrupt_on_accept: interrupt,
+                ..Default::default()
+            };
+            let Err(error) = agent.turn("fix parser", &mut ui) else {
+                panic!("rejected draft must not reach the main model");
+            };
+            assert!(format!("{error:#}").contains("not sent to the main model"));
+            assert_eq!(ui.reviewed, ["Fix the parser."]);
+            assert!(user_messages(agent).is_empty());
+            assert_eq!(
+                agent.session.control_state()["current_instruction"],
+                instruction
+            );
+            assert!(agent.backend.is_some());
+        });
+        assert_eq!(server.requests().len(), 1);
+    }
+}
+
+#[test]
+fn rejected_steering_draft_drops_later_steering_without_journaling() {
+    let server = llm::fake::serve(vec![reply("Use version 2.")]);
+    with_agent(ON, |agent| {
+        let mut ui = DraftReview::default();
+        agent
+            .accept_steering(vec!["use v2".into(), "then fix tests".into()], &mut ui)
+            .unwrap();
+        assert!(
+            agent
+                .draft_deferred_steering(&mut backend(&server.url), &mut ui)
+                .is_err()
+        );
+        assert_eq!(ui.reviewed, ["Use version 2."]);
+        assert!(user_messages(agent).is_empty());
+        assert!(agent.undrafted_steering.is_empty());
+    });
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[test]
+fn disabled_drafter_sends_original_without_a_review_or_auxiliary_request() {
+    let server = llm::fake::serve(vec![reply("Answer.")]);
+    with_agent("", |agent| {
+        agent.backend = Some(backend(&server.url));
+        let mut ui = DraftReview::default();
+        agent.turn("what does parser() do?", &mut ui).unwrap();
+        assert!(ui.reviewed.is_empty());
+        assert!(ui.displayed.is_empty());
+        assert_eq!(user_messages(agent)[0]["content"], "what does parser() do?");
+        assert!(user_messages(agent)[0].get(TURN_DRAFT_KEY).is_none());
+    });
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[test]
+fn interactive_adapter_without_review_support_cannot_silently_accept() {
+    struct Unsupported;
+    impl Ui for Unsupported {
+        fn interactive_input(&self) -> bool {
+            true
+        }
+    }
+    let server = llm::fake::serve(vec![reply("Fix parser.")]);
+    with_agent(ON, |agent| {
+        agent.backend = Some(backend(&server.url));
+        assert!(agent.turn("fix parser", &mut Unsupported).is_err());
+        assert!(user_messages(agent).is_empty());
+    });
+    assert_eq!(server.requests().len(), 1);
+}

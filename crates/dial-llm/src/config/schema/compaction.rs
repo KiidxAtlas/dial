@@ -34,7 +34,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         MO,
         "Compaction",
         "Percentage trigger",
-        "Auto uses 80% of context capacity minus reserve. A percentage replaces that trigger; model and exact-agent policies may override it.",
+        "Auto uses the planning window minus reserve (normally 85%); windows up to 65536 tokens use 80% of that usable window. A percentage replaces that trigger; model and exact-agent policies may override it.",
         Kind::AutoFloat {
             min: 0.000001,
             max: 100.0,

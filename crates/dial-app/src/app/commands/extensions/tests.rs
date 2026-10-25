@@ -38,3 +38,46 @@ fn parses_mcp_add_scope() {
         "Invalid --scope value. Use project or user."
     );
 }
+
+#[test]
+fn mcp_list_hides_credentials_and_command_arguments() {
+    let config = Config {
+        mcp: BTreeMap::from([
+            (
+                "remote".into(),
+                McpServerConfig {
+                    url: Some(
+                        "https://user:password@example.com/private-token?key=secret#fragment"
+                            .into(),
+                    ),
+                    ..Default::default()
+                },
+            ),
+            (
+                "local".into(),
+                McpServerConfig {
+                    program: PathBuf::from("/private/location/server"),
+                    args: vec!["--token".into(), "positional-secret".into()],
+                    enabled: false,
+                    ..Default::default()
+                },
+            ),
+        ]),
+        ..Default::default()
+    };
+    let listing = mcp_list(&config);
+    assert!(listing.contains("remote  enabled  remote MCP endpoint (URL hidden)"));
+    assert!(listing.contains("local  disabled  server (2 arguments hidden)"));
+    for secret in [
+        "user",
+        "password",
+        "example.com",
+        "private-token",
+        "secret",
+        "fragment",
+        "/private",
+        "--token",
+    ] {
+        assert!(!listing.contains(secret), "leaked {secret}: {listing}");
+    }
+}

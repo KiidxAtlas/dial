@@ -903,3 +903,238 @@ fn research_checkpoint_renews_worker_without_working_state() {
         "checkpoint claims cannot become the final report"
     );
 }
+
+enum CoordinationBoundary {
+    Queued,
+    Prepared,
+    Streaming,
+}
+
+/// Inject coordination at an observed boundary, without racing wall-clock sleeps.
+fn coordinated_worker(boundary: CoordinationBoundary) {
+    let queued = matches!(boundary, CoordinationBoundary::Queued);
+    let streaming = matches!(boundary, CoordinationBoundary::Streaming);
+    struct Observer {
+        slot: Option<crate::agent::model::provider_slots::Slot>,
+        streaming: bool,
+        polls: usize,
+        generating: bool,
+        delivered: bool,
+        started: Vec<String>,
+    }
+    impl Approver for Observer {
+        fn authorize(
+            &mut self,
+            _: &llm::ToolCall,
+            _: &str,
+            _: bool,
+        ) -> Result<(), approval::Denial> {
+            Ok(())
+        }
+        fn progress(&mut self, _: u32, phase: &str, _: &str) {
+            self.generating |= phase == "generating";
+        }
+        fn take_messages(&mut self) -> Vec<String> {
+            if self.delivered {
+                // The admission callback runs under the slot mutex; release the
+                // holder on the next turn's mailbox poll, outside that callback.
+                self.slot.take();
+            }
+            self.polls += 1;
+            // Top-of-turn and first admission poll see no mail. The third poll
+            // is either a queued admission check or the post-hook revalidation.
+            let ready = if self.streaming {
+                self.generating
+            } else {
+                self.polls >= 3
+            };
+            if !self.delivered && ready {
+                self.delivered = true;
+                vec!["First coordination".into(), "Second coordination".into()]
+            } else {
+                Vec::new()
+            }
+        }
+        fn tool_started(&mut self, name: &str, _: &Registry) {
+            self.started.push(name.into());
+        }
+    }
+    let usage_event = json!({"choices":[{"delta":{"content":"Obsolete answer", "tool_calls":[{
+        "index":0,"id":"obsolete","type":"function","function":{"name":"fixture_lookup","arguments":"{}"}
+    }]},"finish_reason":null}],"usage":{"prompt_tokens":11,"completion_tokens":3,"total_tokens":14}});
+    let scripts = if !streaming {
+        vec![scripted_reply("Updated answer", None)]
+    } else {
+        vec![
+            llm::fake::Script::StallAfter {
+                first: format!("data: {usage_event}\n\n"),
+                silence: std::time::Duration::from_secs(3),
+            },
+            scripted_reply("Updated answer", None),
+        ]
+    };
+    let server = llm::fake::serve(scripts);
+    let dir = tempfile::tempdir().unwrap();
+    // A unique local slot route isolates parallel tests without touching a provider.
+    let mut config = Config {
+        model: format!("coordination-{}", dir.path().display()),
+        ..Config::default()
+    };
+    config.compaction.enabled = false;
+    config.codebase.enabled = false;
+    config.memory.autolearn = false;
+    let workspace = Workspace::new(dir.path()).unwrap();
+    let harness = Harness {
+        tools: vec!["fixture_lookup".into()],
+        ..Harness::default()
+    };
+    let mut ext = Registry::new();
+    ext.register(Arc::new(Fake {
+        name: "fixture_lookup",
+        asks: false,
+    }));
+    let interrupt = Arc::new(AtomicBool::new(false));
+    let usage = llm::usage::Scope::default();
+    let env = Env {
+        config: &config,
+        workspace: &workspace,
+        ext: &ext,
+        layout: None,
+        harness: &harness,
+        interrupt: &interrupt,
+        usage: Some(&usage),
+        context_cap: None,
+        memory: None,
+        agents_messages: &[],
+        plan_mode: false,
+    };
+    let parsed = subagents::parse(&json!({"agent":"worker","task":"Inspect source","solution_space":"fixtures","max_steps":if streaming { 1 } else { 2 }}), &config).unwrap();
+    let children = ChildBackends::new(env, None).unwrap();
+    let mut backend = Backend::new(
+        llm::provider::ProviderKind::Endpoint {
+            base_url: format!("{}/v1", server.url),
+            model: "test".into(),
+            api_key: None,
+        },
+        std::path::PathBuf::new(),
+        5,
+    );
+    backend
+        .bind_session(&config, &mut children.journal.borrow_mut().session)
+        .unwrap();
+    backend.set_usage_scope(Some(usage.worker()));
+    let mut observer = Observer {
+        slot: queued
+            .then(|| crate::agent::model::provider_slots::acquire(&config, &interrupt).unwrap()),
+        streaming,
+        polls: 0,
+        generating: false,
+        delivered: false,
+        started: Vec::new(),
+    };
+    // A regression that stops polling admission must fail rather than hang with
+    // the fixture's deliberately held slot. This timeout does not deliver mail.
+    let (settled_tx, settled_rx) = std::sync::mpsc::channel();
+    let watchdog_interrupt = interrupt.clone();
+    let watchdog = std::thread::spawn(move || {
+        if settled_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .is_err()
+        {
+            watchdog_interrupt.store(true, Ordering::SeqCst);
+        }
+    });
+    let started = std::time::Instant::now();
+    let outcome = run_inner(
+        env,
+        &parsed.jobs[0],
+        &mut backend,
+        None,
+        &mut observer,
+        &mut crate::agent::safety::rules::State::default(),
+        &children,
+    );
+    let _ = settled_tx.send(());
+    watchdog.join().unwrap();
+    // Fake::requests joins the deliberately stalled responder, so measure before it.
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "{}",
+        outcome.status.text
+    );
+    assert_eq!(
+        outcome.status.phase,
+        crate::runtime::Phase::Completed,
+        "{}",
+        outcome.status.text
+    );
+    assert_eq!(outcome.steps, if streaming { 2 } else { 1 });
+    assert!(observer.delivered);
+    assert!(
+        observer.started.is_empty(),
+        "obsolete tools executed: {:?}",
+        observer.started
+    );
+    assert!(!interrupt.load(Ordering::SeqCst));
+    let requests: Vec<_> = server
+        .requests()
+        .iter()
+        .map(|raw| llm::fake::body(raw))
+        .collect();
+    assert_eq!(requests.len(), if streaming { 2 } else { 1 });
+    let final_messages = requests.last().unwrap()["messages"].as_array().unwrap();
+    assert!(final_messages.iter().any(|message| {
+        message["content"]
+            .as_str()
+            .is_some_and(|text| text.contains("Inspect source"))
+    }));
+    if !streaming {
+        assert!(
+            requests.last().unwrap()["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["function"]["name"] == "fixture_lookup")
+        );
+    }
+    let coordination: Vec<_> = final_messages
+        .iter()
+        .filter_map(|message| {
+            message["content"]
+                .as_str()
+                .filter(|text| text == &"First coordination" || text == &"Second coordination")
+        })
+        .collect();
+    assert_eq!(
+        coordination,
+        vec!["First coordination", "Second coordination"]
+    );
+    if streaming {
+        assert!(
+            !requests[0]["messages"]
+                .to_string()
+                .contains("First coordination")
+        );
+        let counts = usage.snapshot().0.workers;
+        assert_eq!(counts.requests, 2);
+        assert_eq!(counts.transport_attempts, 2);
+        assert_eq!(counts.input, 11);
+        assert_eq!(counts.output, 3);
+        assert_eq!(counts.partial_reported_attempts, 1);
+    }
+}
+
+#[test]
+fn coordination_revalidates_a_held_provider_slot_without_spending_a_request() {
+    coordinated_worker(CoordinationBoundary::Queued);
+}
+
+#[test]
+fn coordination_cancels_streaming_inference_preserving_mail_usage_and_tools() {
+    coordinated_worker(CoordinationBoundary::Streaming);
+}
+
+#[test]
+fn coordination_revalidates_prepared_requests_before_dispatch() {
+    coordinated_worker(CoordinationBoundary::Prepared);
+}
