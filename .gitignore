@@ -18,3 +18,12 @@
 .pytest_cache/
 .ruff_cache/
 /crates/dial-tools/browser/
+# Local agent notes, session dumps and runtime state
+/.worktrees/
+/docs/audits/
+/docs/FILE_STRUCTURE_REFACTOR_PLAN.md
+/stalled-session.md
+/compute-owner.json
+/compute.lock
+/package-lock.json
+*.log

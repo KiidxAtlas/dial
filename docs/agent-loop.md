@@ -387,8 +387,7 @@ markers. Unverified runs invalidate a matching failure baseline rather than pair
 with a later pass. Related-test planning reuses JS package/runner metadata and Go directory scans
 only within one planning invocation; later invocations observe changed manifests and tests.
 Behavioral provenance still hashes fresh bounded source state, but no longer loads dependency
-outlines that its record does not use. See [Core harness review](audits/harness-core-review.md) for the
-comparison, rationale, and measurement limits.
+outlines that its record does not use.
 
 Automatic post-edit related-source hints are best effort, not part of edit settlement or verification.
 Each cache owns at most one hint worker, using an independent read-only database connection;

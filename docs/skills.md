@@ -154,5 +154,4 @@ add automatic telemetry for an audit. Unit tests establish loader contracts, not
 
 Keep a skill when it has a distinct useful procedure. Rewrite unsupported or ceremonial guidance;
 merge genuine duplication; add a new skill only for an evidenced recurring gap that is not better
-served by an existing skill or tool. The current decisions and verification limits are recorded in
-[the skills audit](audits/skills-review.md).
+served by an existing skill or tool.

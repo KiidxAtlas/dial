@@ -177,8 +177,7 @@ python3 -m unittest discover -s examples/benchmarks -p 'test_*.py'
 ```
 
 The smoke uses a loopback scripted provider with baseline and compact-tool configurations.
-It verifies orchestration and graders, **not real-model performance**. See
-[Harness quality design](audits/harness-quality.md) for the research rationale and interpretation rules.
+It verifies orchestration and graders, **not real-model performance**.
 
 ### Core-reliability acceptance protocol
 

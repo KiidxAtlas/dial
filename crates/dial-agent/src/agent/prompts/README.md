@@ -86,6 +86,3 @@ remain beside their runtime consumers. A source-organization change should prese
 prompt bytes; substantive wording changes instead need outcome-based evaluation.
 Neither passing unit tests nor centralization establishes better live-model reasoning,
 latency or token cost. See the controlled evaluation guidance in `docs/agent-loop.md`.
-
-The migration mapping and preservation constraints are recorded in
-[FILE_STRUCTURE_REFACTOR_PLAN.md](../../../../../docs/FILE_STRUCTURE_REFACTOR_PLAN.md).
