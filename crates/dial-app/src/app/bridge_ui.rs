@@ -209,12 +209,18 @@ impl Ui for Bridge<'_> {
         self.repaint(true);
     }
     fn review_turn_draft(&mut self, drafted: &str, cancel: &AtomicBool) -> bool {
-        self.shell.ask_with_cancel(
-            "Turn drafter · review before sending",
-            &format!("{drafted}\n\nAccept sends this instruction to the agent. Cancel sends nothing. Use Page Up/Page Down to review the full draft."),
-            &[("Accept and send", 'a'), ("Cancel", 'c')],
-            Some(cancel),
-        ) == Some(0)
+        self.shell.review_turn_draft(cancel, |shell| {
+            shell.ask_with_cancel(
+                "Turn drafter · review before sending",
+                &format!("{drafted}\n\nAccept sends this instruction to the agent. Accept all draft messages also accepts pending and future drafts without review until Dial exits. Cancel sends nothing. Use Page Up/Page Down to review the full draft."),
+                &[
+                    ("Accept and send", 'a'),
+                    ("Accept all draft messages", 's'),
+                    ("Cancel", 'c'),
+                ],
+                Some(cancel),
+            )
+        })
     }
 
     fn role(&mut self, role: &str, model: &str) {

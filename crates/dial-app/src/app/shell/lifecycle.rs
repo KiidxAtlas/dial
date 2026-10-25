@@ -114,6 +114,7 @@ impl Shell {
             ),
             term_activity: Default::default(),
             awaiting_user: false,
+            accept_all_turn_drafts: false,
             turn_output_tokens: 0,
             todo: TodoList::new(),
             skills: Vec::new(),

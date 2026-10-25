@@ -894,9 +894,12 @@ main model in a separate request.
 - It is a hard layer: the main model receives only the drafted prompt. Files attached through
   `@references` are expanded from the typed text and stay attached. Interactive Dial shows the
   proposed instruction in the transcript and a scrollable review panel: **Accept and send** (`a`,
-  or Enter on that choice) submits it; **Cancel** (`c` or Esc) sends nothing. Page Up/Page Down
-  scroll through long drafts. This also applies to steering. Non-interactive clients retain
-  automatic delivery of valid drafts; interactive adapters without review support fail closed.
+  or Enter on that choice) submits it; **Accept all draft messages** (`s`) submits it and
+  automatically accepts pending and future drafts, including steering, until Dial exits. This
+  consent is not saved and does not change tool approvals or other confirmations. Drafts still
+  appear in the transcript. **Cancel** (`c` or Esc) sends nothing. Page Up/Page Down scroll through
+  long drafts. Non-interactive clients retain automatic delivery of valid drafts; interactive
+  adapters without review support fail closed.
   The session keeps the typed text under `dial_turn_draft`. The transcript, resume, session
   previews, search and memory show what the user typed. Provider requests never carry the key.
 - `/drafter` toggles the feature; `/drafter on`, `/drafter off` and `/drafter status` set or inspect

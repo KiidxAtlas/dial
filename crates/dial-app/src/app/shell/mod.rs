@@ -128,6 +128,8 @@ pub(super) struct Shell {
     pub(super) term_activity: crate::ui::term_state::Activity,
     /// A modal question or approval is on screen and waits for the user.
     pub(in crate::app) awaiting_user: bool,
+    /// Draft-review consent for this shell only; never persisted or shared with tool approvals.
+    accept_all_turn_drafts: bool,
     pub(super) turn_output_tokens: u64,
     /// The agent's task list as last reported; drawn above the composer while any task is open.
     pub(super) todo: TodoList,

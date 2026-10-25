@@ -7,6 +7,7 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 
 ### Added
 
+- Turn-drafter review offers **Accept all draft messages** to accept the current, queued and future drafts without further draft-review prompts until Dial exits. Consent is session-only; tool approvals and other confirmations are unchanged.
 - Owned MCP request dispatch and settlement: bounded admission, cancellation-aware transport/authentication, an initialized-delivery barrier and absolute request lifetimes. Integration inventory now separates connection, notification health and catalog freshness; stale tool definitions lose read-only exemptions and fail closed.
 - Shared controller facts distinguish background observation from child success, and captured/retained/presented output completeness with byte accounting. Bounded artifact loss and model-facing clipping remain explicit rather than claiming complete output. Existing local SQLite statistics and optional OTLP record sanitized lifecycle/integrity facts with bounded telemetry ingress and loss counters.
 - Interactive turn-drafter review: proposed prompts are visible before **Accept and send** or **Cancel**, including steering. `/drafter [on|off|status]` controls the project preference; off sends original messages directly. Drafter guidance now preserves action requests as executable instructions without turning questions into edit requests.

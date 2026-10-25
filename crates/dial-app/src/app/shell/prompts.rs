@@ -11,6 +11,34 @@ use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, poll, read};
 impl Shell {
     // ----- asking the user ------------------------------------------------------------------
 
+    /// Keep draft-only consent across bridges and turns, but not across app launches.
+    pub(in crate::app) fn review_turn_draft(
+        &mut self,
+        cancel: &std::sync::atomic::AtomicBool,
+        ask: impl FnOnce(&mut Self) -> Option<usize>,
+    ) -> bool {
+        use std::sync::atomic::Ordering;
+
+        if cancel.load(Ordering::Acquire) {
+            return false;
+        }
+        if self.accept_all_turn_drafts {
+            return true;
+        }
+        let choice = ask(self);
+        if cancel.load(Ordering::Acquire) {
+            return false;
+        }
+        match choice {
+            Some(0) => true,
+            Some(1) => {
+                self.accept_all_turn_drafts = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// A modal choice drawn in place of the composer. `None` means the user cancelled.
     pub(in crate::app) fn ask(
         &mut self,
@@ -148,3 +176,6 @@ impl Shell {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
