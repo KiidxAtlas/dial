@@ -5,6 +5,8 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-26
+
 ### Fixed
 
 - Read-only subagents (`scout`, `planner`, `reviewer` and read-only custom agents) are told their limits before their first call instead of discovering them through a refused call: the system prompt marks them read-only and, when `bash` is offered, lists the inspection commands that run without approval and says to use `cwd` instead of `cd`. A refused call now repeats that rule (`docs/subagents.md`).
