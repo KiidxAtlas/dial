@@ -710,12 +710,28 @@ impl<'a> Agent<'a> {
         let mut backend = self.backend.take().context("backend is already in use")?;
         // One finite budget: the initial run, verification repairs and stop-hook continuations all draw from it.
         let mut turn_steps = TurnSteps::new(max_steps);
-        let mut result = self
-            .run_loop(&mut backend, &names, &mut schemas, max_steps, user_text, ui)
-            .map(|(mut report, consumed)| {
-                report.steps = turn_steps.charge(report.steps, consumed);
-                report
-            });
+        // One turn state and engine for the whole user turn: repair and stop-hook rounds resume
+        // it instead of judging effort, loading portable rules and learning failures again.
+        let mut engine = crate::agent::run::engine::Engine::default();
+        let mut turn_state = None;
+        let mut result = match self.begin_turn(&mut backend, &names, max_steps, user_text, ui) {
+            Ok(state) => {
+                let state = turn_state.insert(state);
+                self.run_round(
+                    state,
+                    &mut engine,
+                    &mut backend,
+                    &mut schemas,
+                    max_steps,
+                    ui,
+                )
+            }
+            Err(error) => Err(error),
+        }
+        .map(|(mut report, consumed)| {
+            report.steps = turn_steps.charge(report.steps, consumed);
+            report
+        });
         // A turn that ended before the next request still must not lose accepted steering.
         if let Err(error) = self.flush_accepted_live_steering(ui) {
             result = Err(error);
@@ -794,12 +810,15 @@ impl<'a> Agent<'a> {
                                 repair_attempts + 1, run.actionable.join("\n")
                             )}))?;
                         repair_attempts = repair_attempts.saturating_add(1);
-                        let repaired = self.run_loop(
+                        let state = turn_state
+                            .as_mut()
+                            .context("a repair round needs the turn it resumes")?;
+                        let repaired = self.resume_round(
+                            state,
+                            &mut engine,
                             &mut backend,
-                            &names,
                             &mut schemas,
                             repair_steps,
-                            user_text,
                             ui,
                         );
                         self.flush_accepted_live_steering(ui)?;
@@ -960,12 +979,15 @@ impl<'a> Agent<'a> {
                     json!({"reason":reason,"round":stop_rounds}),
                 )?;
                 self.push(json!({"role":"user","content":format!("A stop hook blocked completion. Address this before finishing:\n{reason}")}))?;
-                let report = self.run_loop(
+                let state = turn_state
+                    .as_mut()
+                    .context("a stop-hook round needs the turn it resumes")?;
+                let report = self.resume_round(
+                    state,
+                    &mut engine,
                     &mut backend,
-                    &names,
                     &mut schemas,
                     resume_steps,
-                    user_text,
                     ui,
                 );
                 self.flush_accepted_live_steering(ui)?;

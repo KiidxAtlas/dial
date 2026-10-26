@@ -85,6 +85,40 @@ present-tense announcements such as “Writing the complete page now.” Without
 the promised output, these enter the same bounded recovery rather than count as completion.
 This is conservative text detection, not a guarantee against every form of unfinished answer.
 
+### Turn reliability boundaries
+
+One turn state covers a whole user turn: verification-repair and stop-hook rounds resume it and
+count only their own steps. One-shot notes stay queued until a model reply is actually received,
+so a request discarded by overflow, failover or regeneration does not lose them. These boundaries
+end a turn with a stop report and keep completed work, instead of failing it:
+
+- 24 consecutive steps without a model reply (compaction, fallback or context retries making no
+  progress). Context-overflow retries count consecutively, and an overflow that compaction cannot
+  fix stops the turn.
+- Recoveries of any kind without progress (unusable replies, rejected previews or completions,
+  regenerations, length stalls) share one ledger: after 6 the model is told to change approach,
+  after 16 the turn stops. A successful tool round resets it.
+- `--max-time` and `[budget]` cost caps are checked when a step is admitted, between the calls of
+  one tool round, before settlement makes further model calls and while a reply streams; a
+  request's timeout is clamped to the time left. A capped model that reports no price gets a
+  one-time notice that the cap cannot stop it.
+- With a finite step limit, the last step asks for a report and runs no tools. At 80% of the
+  `--max-time` window or a cost cap, the model is asked once to prioritize finishing.
+- The `portable_rules.max_regenerations` limit and a refusal to continue after uncertain effects.
+
+When `[verification].automatic_checks` is off and the turn edited files without any passing focused
+or shell check, the first final answer gets one reminder to run one; a second final answer is
+accepted with a disclosure that the edits are unverified. A long report that ends with a promise to
+act is challenged once. An interrupt during a tool round keeps finished parallel results and records
+calls that never started as not run. A panicking read-only tool is a failure with no effects
+(except `bash`, or a tool that committed before panicking). A timed-out or killed check counts as
+failed; a cancelled one settles nothing. Calls repeating in an exact short cycle (period 2 or 3)
+get an advisory note.
+
+When a configured fallback is ready, failures it accepts (`retry.fallback_on`) get two attempts
+and at most a 10 s wait on the primary before failing over. A primary that cannot be rebuilt when
+the fallback's cooldown ends keeps the fallback and is retried 5 minutes later.
+
 Different successful lookups also have a shared foreground/worker synthesis boundary. After 12
 observation-bearing model rounds without a novel committed change or accepted task resolution,
 Dial requests synthesis; after 24 it reserves a tool-free checkpoint request. Batches count as one

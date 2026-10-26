@@ -143,3 +143,32 @@ fn attempts_and_delay_ceiling_bound_retries() {
         Decision::Stop(None)
     ));
 }
+
+#[test]
+fn a_ready_fallback_shortens_only_the_failures_it_accepts() {
+    use crate::config::types::FallbackOn;
+    let failover = policy().with_failover(Some(FallbackOn::UsageLimit));
+    let throttled = ErrorClass::RateLimited { retry_after: None };
+    assert!(matches!(
+        decide(&throttled, None, 1, &failover),
+        Decision::Retry { .. }
+    ));
+    assert!(
+        matches!(decide(&throttled, None, FAILOVER_ATTEMPTS, &failover), Decision::Stop(Some(why)) if why.contains("fallback"))
+    );
+    let long = Some(FAILOVER_MAX_WAIT + Duration::from_secs(1));
+    assert!(
+        matches!(decide(&throttled, long, 1, &failover), Decision::Stop(Some(why)) if why.contains("fallback")),
+        "a long wait fails over instead"
+    );
+    // A failure the fallback does not take keeps every configured attempt.
+    assert!(matches!(
+        decide(&ErrorClass::Transient, None, FAILOVER_ATTEMPTS, &failover),
+        Decision::Retry { .. }
+    ));
+    assert_eq!(
+        failover.attempts(&ErrorClass::Transient),
+        failover.max_attempts
+    );
+    assert_eq!(failover.attempts(&throttled), FAILOVER_ATTEMPTS);
+}

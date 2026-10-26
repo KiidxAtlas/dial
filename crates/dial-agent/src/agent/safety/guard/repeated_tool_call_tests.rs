@@ -195,3 +195,58 @@ fn a_multi_call_repeat_pairs_each_call_with_its_own_earlier_result() {
     assert!(results[0].contains("`grep hits`"));
     assert!(results[1].contains("tool_call_id `r5`") && results[1].contains("`file text`"));
 }
+
+#[test]
+fn alternating_identical_call_sets_are_a_cycle_once_three_full_cycles_repeat() {
+    let alternate = |rounds: usize| {
+        let mut messages = Vec::new();
+        for n in 0..rounds {
+            let (name, args) = if n % 2 == 0 {
+                ("read", "{\"path\":\"a\"}")
+            } else {
+                ("bash", "{\"command\":\"cargo test\"}")
+            };
+            messages.extend(turn(&format!("c{n}"), name, args));
+        }
+        messages
+    };
+    assert!(CallCycle::detect(&alternate(5), &["wait"]).is_none());
+    let cycle = CallCycle::detect(&alternate(6), &["wait"]).expect("A,B three times");
+    assert_eq!(cycle.period, 2);
+    assert_eq!(cycle.turns, 6);
+    assert_eq!(cycle.tools, ["bash", "read"]);
+    assert!(cycle.guidance().contains("bash → read"));
+    // The identical streak and a break in the pattern are not cycles.
+    let mut same = Vec::new();
+    for n in 0..6 {
+        same.extend(turn(&format!("s{n}"), "read", "{\"path\":\"a\"}"));
+    }
+    assert!(CallCycle::detect(&same, &["wait"]).is_none());
+    let mut broken = alternate(6);
+    broken.extend(turn("x", "read", "{\"path\":\"b\"}"));
+    assert!(CallCycle::detect(&broken, &["wait"]).is_none());
+}
+
+#[test]
+fn a_three_step_cycle_is_found_but_progressing_arguments_are_not() {
+    let mut messages = Vec::new();
+    for n in 0..9 {
+        let path = ["a", "b", "c"][n % 3];
+        messages.extend(turn(
+            &format!("c{n}"),
+            "read",
+            &format!("{{\"path\":\"{path}\"}}"),
+        ));
+    }
+    let cycle = CallCycle::detect(&messages, &["wait"]).expect("A,B,C three times");
+    assert_eq!(cycle.period, 3);
+    let mut paging = Vec::new();
+    for n in 0..9 {
+        paging.extend(turn(
+            &format!("p{n}"),
+            "read",
+            &format!("{{\"path\":\"a\",\"offset\":{}}}", n * 100),
+        ));
+    }
+    assert!(CallCycle::detect(&paging, &["wait"]).is_none());
+}

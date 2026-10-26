@@ -1,5 +1,5 @@
 use super::*;
-use crate::commit::run::Completion;
+use crate::commit::backend::Completion;
 use crate::llm::Chat;
 use std::process::Command;
 

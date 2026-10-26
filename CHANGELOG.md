@@ -5,6 +5,12 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 
 ## [Unreleased]
 
+### Fixed
+
+- Read-only subagents (`scout`, `planner`, `reviewer` and read-only custom agents) are told their limits before their first call instead of discovering them through a refused call: the system prompt marks them read-only and, when `bash` is offered, lists the inspection commands that run without approval and says to use `cwd` instead of `cd`. A refused call now repeats that rule (`docs/subagents.md`).
+- The ambient codebase brief no longer pulls in test, benchmark and fixture sources, files that match a long task prompt by a single outline word, or files that match only by a near-universal path word (`crates`, the project name, `mod.rs`/`tests.rs` file names). Such sources need to be named or, for tests and benchmarks, asked for (`docs/tools.md`).
+- Core-loop reliability: deadlines, cost caps, overflow and compaction failures, guidance-regeneration limits and uncertain-effect refusals now stop a turn with a report instead of failing it; one turn state spans repair and stop-hook rounds; one-shot notes survive discarded requests; a no-reply watchdog and a shared no-progress ledger bound recovery; the last step of a finite budget asks for a report without tools; interrupts keep finished parallel results; timed-out checks count as failed; unverified edits get one reminder then a disclosure when automatic checks are off; ready fallbacks take over after two attempts instead of every retry; a primary that cannot be rebuilt keeps the fallback (`docs/agent-loop.md`).
+
 ## [0.2.0] - 2026-10-25
 
 ### Added

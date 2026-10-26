@@ -142,7 +142,7 @@ impl StreamingDispatch {
                         if interrupt.load(Ordering::SeqCst) {
                             return interrupted_tool();
                         }
-                        crate::tools::exec::execution::native(
+                        crate::tools::exec::execution::native_read(
                             &ToolContext {
                                 workspace: &runner.workspace,
                                 config: &runner.config,

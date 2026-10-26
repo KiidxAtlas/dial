@@ -28,11 +28,12 @@ use tools::{ToolEnv, parse_numstat};
 use topo_sort::compute_dependency_order;
 use trivial::{TrivialChange, detect_trivial_change};
 
+use crate::commit::CommitError;
+use crate::commit::backend::CommitBackend;
 use crate::commit::changelog::detect::detect_targets;
 use crate::commit::changelog::{apply_changelog_proposals, read_unreleased};
 use crate::commit::commit_types::format_conventional_commit;
 use crate::commit::execute::{commit_with_message, git_output_indexed};
-use crate::commit::run::{CommitBackend, CommitError};
 use crate::commit::types::CommitCommandArgs;
 use crate::config::types::Config;
 

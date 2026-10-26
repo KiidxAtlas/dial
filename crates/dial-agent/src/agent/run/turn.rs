@@ -1,9 +1,174 @@
 //! Parent-turn orchestration: live steering, durable session state and learning policy.
 //! Model transport, result recovery and native execution are shared with worker controllers.
+//!
+//! [`Agent::run_round`] drives one [`Agent::turn_step`] per engine tick over a [`TurnState`].
 use crate::agent::modes::lifecycle::Lifecycle;
 use crate::agent::*;
 
+mod begin;
+mod progress;
+mod round;
+mod settle;
+mod step;
+mod transition;
+
+/// A reply admitted for tool execution, with the request facts its round still needs.
+struct Round {
+    step: u32,
+    single_call: bool,
+    planning_required: bool,
+    reply: llm::Reply,
+    /// Exact history and tools sent, kept for tool-recovery and training capture.
+    context_before: Vec<Value>,
+    request_tools: Vec<Value>,
+    /// Sampling of the sent request, reused if the round rolls over to a new context.
+    temperature: f64,
+    max_tokens: u32,
+    seed: Option<u64>,
+    /// Tools loaded for compatibility this round; calls to them are retried next request.
+    compatibility_loaded: HashSet<String>,
+    repeat_streak: Option<crate::agent::safety::guard::RepeatedToolCall>,
+    streamed: Option<crate::agent::run::streaming_dispatch::StreamingDispatch>,
+    outcome: ToolOutcome,
+}
+
+/// What a round's tool calls produced; written by dispatch, consumed by settlement.
+#[derive(Default)]
+struct ToolOutcome {
+    narration_warning: Option<String>,
+    /// An identical repeated call set was answered from earlier results instead of running.
+    short_circuited: bool,
+    form_kinds: Vec<String>,
+    rejected_calls: Vec<Value>,
+    execution_failed: bool,
+    observed_check_failure: bool,
+    /// `experimental.outcome_gradient_rounds`: checks observed this round and their failures.
+    checked: bool,
+    failing_tests: std::collections::BTreeSet<String>,
+    unnamed_failures: usize,
+    stop: Option<String>,
+    succeeded: bool,
+    last_tool_failure: Option<String>,
+    edit_failed: bool,
+    finished: Option<crate::agent::verify::completion::Finish>,
+    steering: Vec<String>,
+    portable_batch_intercepted: bool,
+}
+
+/// Everything one parent turn carries from one engine tick to the next.
+pub(in crate::agent) struct TurnState<'a> {
+    user_goal: &'a str,
+    harness: crate::config::Harness,
+    adapter: Option<PathBuf>,
+    cancel: crate::runtime::cancellation::TurnCancellation,
+    turn_started: Instant,
+    budget: crate::agent::safety::guard::StepBudget,
+    iteration: u32,
+    names: Vec<String>,
+    // Portable rules.
+    rule_root: PathBuf,
+    rule_catalog: Arc<crate::agent::safety::rules::Catalog>,
+    rule_state: crate::agent::safety::rules::State,
+    rule_regenerations: u32,
+    // Pre-edit assumption checks and post-edit reviews.
+    reviewed_paths: std::collections::BTreeSet<String>,
+    prechecked_paths: std::collections::BTreeSet<String>,
+    revalidated_paths: std::collections::BTreeSet<String>,
+    // Request sizing, compaction and output recovery.
+    pending: Option<Pending>,
+    /// Context overflows since the last reply; bounds overflow recovery per request, not per turn.
+    overflow_retries: u32,
+    compaction_failed: bool,
+    /// A compaction ran since the last reply. If the next request is still over the compaction
+    /// threshold, compacting again cannot help, so it is treated as a failed compaction.
+    compacted_without_reply: bool,
+    /// After a failed blocking compaction, retry only once the request has grown by a real
+    /// amount (or would overflow): retrying every tool step re-ran the whole method chain.
+    compaction_retry_floor: Option<u64>,
+    /// The user was told once that a configured cost cap cannot trip on an unpriced model.
+    unpriced_cap_noted: bool,
+    /// The model was told once that most of the time or cost budget is used.
+    wrap_up_noted: bool,
+    /// The current step is the round's last: it must answer, not start tools.
+    final_step: bool,
+    max_tokens: u32,
+    recovering_output: bool,
+    repair: crate::agent::model::constrained_repair::Repair,
+    stall_continues: u32,
+    rejected_edit_previews: u32,
+    reasoning_budget: Option<u32>,
+    turn_effort: Option<crate::llm::profiles::ReasoningEffort>,
+    // Guidance, coaching and planning.
+    todo_recovery: crate::agent::workflow::todo_recovery::TodoRecovery,
+    solo_todo_noted: bool,
+    pending_nudges: Vec<Value>,
+    emissions: crate::agent::run::guidance::Emissions,
+    coach_turn: modes::advisor::CoachTurn,
+    automatic_coach_pending: bool,
+    auto_continues: u32,
+    planning_notice: bool,
+    plan_after_gate: bool,
+    // Tool-contract reliability and stall/pace guards.
+    measured: Option<Value>,
+    reliability: crate::reliability::Stats,
+    policy_signature: String,
+    stall: crate::agent::safety::guard::StallGuard,
+    pace: crate::agent::safety::guard::PaceGuard,
+    // Completion acceptance.
+    completion: crate::agent::verify::completion::CompletionGuard,
+    completion_recovery: crate::agent::verify::completion::CompletionRecovery,
+    completion_candidate: Option<String>,
+    /// Recovery attempts since the last progress, across every recovery mechanism.
+    progress: progress::ProgressLedger,
+    // Background enrichment and steering.
+    enrichment: crate::agent::run::enrichment::Enrichment,
+    enrichment_epoch: u64,
+    steering_pending: bool,
+}
+
+impl TurnState<'_> {
+    /// A reply answered the last request: its one-shot notes reached the model, and per-request
+    /// recovery (overflow retries, the no-reply watchdog, compaction effect) starts over. Until
+    /// then a discarded request (fallback, overflow, steering, guidance regeneration) resends them.
+    fn reply_received(&mut self) {
+        self.pending_nudges.clear();
+        self.emissions.confirm();
+        self.budget.replied();
+        self.overflow_retries = 0;
+        self.compacted_without_reply = false;
+    }
+
+    /// Refund the step of an unusable reply. Once the free retries are spent the retry is
+    /// charged as a real step, which the user is told so a shrinking budget is not a surprise.
+    fn refund_unusable(&mut self, ui: &mut dyn Ui) {
+        if !self.budget.refund() {
+            ui.diagnostic(
+                "Free retries for unusable replies are spent; this retry counts as a step.",
+            );
+        }
+    }
+
+    /// A compaction made room: retry the request and allow compaction again later this turn.
+    fn compaction_succeeded(&mut self) {
+        self.compaction_failed = false;
+        self.compaction_retry_floor = None;
+        self.compacted_without_reply = true;
+    }
+
+    /// Blocking compaction could not make room for a request of `request_context` tokens; it is
+    /// retried only once the request has grown by a real amount.
+    fn compaction_failed_at(&mut self, request_context: u64) {
+        self.compaction_failed = true;
+        self.compaction_retry_floor = Some(
+            request_context.saturating_add(crate::config::compaction::SPECULATION_LEAD_MIN_TOKENS),
+        );
+    }
+}
+
 impl Agent<'_> {
+    /// One user turn's first round with fresh turn state; see [`Agent::run_round`]. Production
+    /// turns hold their state across rounds in `turn_inner`; tests drive a single round here.
+    #[cfg(test)]
     pub(in crate::agent) fn run_loop(
         &mut self,
         backend: &mut Backend,
@@ -13,9 +178,137 @@ impl Agent<'_> {
         user_goal: &str,
         ui: &mut dyn Ui,
     ) -> Result<(TurnReport, u32)> {
-        let mut names = names.to_vec();
+        let mut turn = self.begin_turn(backend, names, max_steps, user_goal, ui)?;
+        let mut engine = crate::agent::run::engine::Engine::default();
+        self.run_round(&mut turn, &mut engine, backend, schemas, max_steps, ui)
+    }
+
+    /// Resume a turn whose final answer verification or a stop hook rejected, with a step
+    /// allowance of its own. The turn keeps its judged effort, portable-rule scope, delivered
+    /// advice, reviews and failure history instead of starting over; the caller has already
+    /// pushed the feedback that resumes it.
+    pub(in crate::agent) fn resume_round(
+        &mut self,
+        turn: &mut TurnState<'_>,
+        engine: &mut crate::agent::run::engine::Engine,
+        backend: &mut Backend,
+        schemas: &mut Vec<Value>,
+        max_steps: u32,
+        ui: &mut dyn Ui,
+    ) -> Result<(TurnReport, u32)> {
+        turn.budget = self.step_budget(max_steps);
+        self.transition_turn(
+            turn,
+            engine,
+            transition::Transition::Resumed,
+            backend,
+            schemas,
+        )?;
+        self.run_round(turn, engine, backend, schemas, max_steps, ui)
+    }
+
+    /// Drive steps until the turn finishes or `max_steps` (the budget already in `turn`) runs
+    /// out. Returns the report, whose `steps` count this round's attempts, and the work steps
+    /// the round consumed.
+    pub(in crate::agent) fn run_round(
+        &mut self,
+        turn: &mut TurnState<'_>,
+        engine: &mut crate::agent::run::engine::Engine,
+        backend: &mut Backend,
+        schemas: &mut Vec<Value>,
+        max_steps: u32,
+        ui: &mut dyn Ui,
+    ) -> Result<(TurnReport, u32)> {
+        // Step indices keep counting across rounds so journal records stay distinct; reports
+        // count this round's attempts, which the caller adds to the turn total.
+        let first = turn.iteration;
+        let report = self.drive_round(turn, engine, backend, schemas, max_steps, ui)?;
+        Ok((
+            TurnReport {
+                steps: report.steps.saturating_sub(first),
+                ..report
+            },
+            turn.budget.spent(),
+        ))
+    }
+
+    fn drive_round(
+        &mut self,
+        turn: &mut TurnState<'_>,
+        engine: &mut crate::agent::run::engine::Engine,
+        backend: &mut Backend,
+        schemas: &mut Vec<Value>,
+        max_steps: u32,
+        ui: &mut dyn Ui,
+    ) -> Result<TurnReport> {
+        let driven = engine.drive(|engine| self.turn_step(turn, engine, backend, schemas, ui));
+        let driven = match driven {
+            Err(error)
+                if error
+                    .downcast_ref::<crate::agent::run::engine::UncertainRefusal>()
+                    .is_some() =>
+            {
+                let reason = engine
+                    .pending_refusal()
+                    .unwrap_or("An earlier tool ended with uncertain effects.");
+                return self.stop_turn(
+                    ui,
+                    format!("Stopped: {reason} Automatic continuation was refused; completed effects were not rolled back or replayed. Say \"continue\" once the affected state is inspected."),
+                    turn.iteration,
+                );
+            }
+            driven => driven?,
+        };
+        if let Some(report) = driven {
+            return Ok(report);
+        }
+
+        if self.hermetic {
+            bail!("agent exhausted the admitted step budget without a final answer")
+        }
+        let reason = step_limit_reason(max_steps);
+        let reason = match turn.completion_candidate.take() {
+            Some(candidate) => format!("{candidate}\n\n{reason}"),
+            None => reason,
+        };
+        self.stop_turn(ui, reason, turn.iteration)
+    }
+}
+
+/// Why a round ended at its finite step limit, and how to go on.
+fn step_limit_reason(max_steps: u32) -> String {
+    format!(
+        "Stopped: this turn used its {max_steps}-step limit. The chat and completed work are kept. Say \"continue\" to keep going, or raise harness.max_steps in /settings."
+    )
+}
+
+impl Agent<'_> {
+    /// A round's step allowance. Evaluation runs get no free retries: their budget is what
+    /// they measure.
+    fn step_budget(&self, max_steps: u32) -> crate::agent::safety::guard::StepBudget {
+        crate::agent::safety::guard::StepBudget::new(
+            max_steps,
+            if self.hermetic {
+                0
+            } else {
+                crate::agent::safety::guard::StepBudget::FREE_RETRIES
+            },
+        )
+    }
+
+    /// Turn-scoped setup, once per user turn: portable rules, thinking effort and reliability
+    /// policy. Repair and stop-hook rounds reuse it through [`Agent::resume_round`].
+    pub(in crate::agent) fn begin_turn<'g>(
+        &mut self,
+        backend: &mut Backend,
+        names: &[String],
+        max_steps: u32,
+        user_goal: &'g str,
+        ui: &mut dyn Ui,
+    ) -> Result<TurnState<'g>> {
+        let names = names.to_vec();
         let rule_root = self.workspace.root().to_path_buf();
-        let mut rule_catalog = Arc::new(if !self.hermetic && self.config.portable_rules.enabled {
+        let rule_catalog = Arc::new(if !self.hermetic && self.config.portable_rules.enabled {
             self.layout
                 .as_ref()
                 .map(|layout| crate::agent::safety::rules::Catalog::discover(layout, &rule_root))
@@ -34,32 +327,20 @@ impl Agent<'_> {
             .unwrap_or("")
             .to_owned();
         rule_state.begin(&rule_root, &instruction);
-        let mut rule_regenerations: u32 = rule_state.regenerations();
+        let rule_regenerations: u32 = rule_state.regenerations();
         rule_state.set_regenerations(0);
         rule_state.clear_callback();
         let mut control = self.session.control_state();
         rule_state.save(&mut control);
         self.session.set_control_state(control)?;
-        let mut reviewed_paths = std::collections::BTreeSet::new();
-        let mut prechecked_paths = std::collections::BTreeSet::new();
-        let mut revalidated_paths = std::collections::BTreeSet::new();
-        let h = self.config.effective_harness(&self.version.harness)?;
+        let reviewed_paths = std::collections::BTreeSet::new();
+        let prechecked_paths = std::collections::BTreeSet::new();
+        let revalidated_paths = std::collections::BTreeSet::new();
+        let harness = self.config.effective_harness(&self.version.harness)?;
         let adapter = self.version.adapter.clone();
-        let mut pending: Option<Pending> = None;
-        let mut overflow_retries = 0u32;
-        let mut compaction_failed = false;
-        // After a failed blocking compaction, retry only once the request has grown by a real
-        // amount (or would overflow): retrying every tool step re-ran the whole method chain.
-        let mut compaction_retry_floor: Option<u64> = None;
-        let mut max_tokens = backend.output_budget(h.max_tokens);
+        let max_tokens = backend.output_budget(harness.max_tokens);
         self.report_retained_fallback(ui);
-        let mut recovering_output = false;
-        let mut engine = crate::agent::run::engine::Engine::default();
-        let turn_cancel = self.cancellation.turn(self.interrupt.clone());
-        let mut repair = crate::agent::model::constrained_repair::Repair::default();
-        let mut stall_continues = 0u32;
-        let mut rejected_edit_previews = 0u32;
-        let mut reasoning_budget = None;
+        let cancel = self.cancellation.turn(self.interrupt.clone());
         // `thinking = "auto"`: judge this user turn's effort once from its prompt, not per step.
         // External thinking promises provider reasoning off, so no judge runs for it.
         let mut turn_effort: Option<crate::llm::profiles::ReasoningEffort> = None;
@@ -83,15 +364,6 @@ impl Agent<'_> {
                 )),
             }
         }
-        let mut todo_recovery = crate::agent::workflow::todo_recovery::TodoRecovery::default();
-        let mut solo_todo_noted = false;
-        let mut pending_nudges: Vec<Value> = Vec::new();
-        let mut emissions = crate::agent::run::guidance::Emissions::default();
-        let mut coach_turn = modes::advisor::CoachTurn::default();
-        let mut automatic_coach_pending = false;
-        let mut auto_continues = 0u32;
-        let mut planning_notice = false;
-        let mut plan_after_gate = false;
         let measured = if self.hermetic
             || adapter.is_some()
             || self.config.steering.enabled
@@ -104,7 +376,7 @@ impl Agent<'_> {
         } else {
             crate::reliability::measured(self.config)
         };
-        let mut reliability: crate::reliability::Stats =
+        let reliability: crate::reliability::Stats =
             serde_json::from_value(self.session.control_state()["reliability"]["stats"].clone())
                 .unwrap_or_default();
         let turn_started = self.workflow_started;
@@ -114,2853 +386,59 @@ impl Agent<'_> {
             self.session.set_control_state(control.clone())?;
             ui.request_policy(&control);
         }
-        let mut policy_signature = String::new();
-        let mut stall = crate::agent::safety::guard::StallGuard::default();
-        let mut pace = crate::agent::safety::guard::PaceGuard::default();
-        let mut completion = crate::agent::verify::completion::CompletionGuard;
-        let mut completion_recovery =
-            crate::agent::verify::completion::CompletionRecovery::default();
-        let mut completion_candidate: Option<String> = None;
-        let mut enrichment = crate::agent::run::enrichment::Enrichment::default();
-        let mut enrichment_epoch = 0u64;
-        let mut steering_pending = false;
-        let mut budget = crate::agent::safety::guard::StepBudget::new(
-            max_steps,
-            if self.hermetic {
-                0
-            } else {
-                crate::agent::safety::guard::StepBudget::FREE_RETRIES
-            },
-        );
-        let mut iteration = 0u32;
-        let driven = engine.drive(|engine| {
-            if !budget.begin() { return Ok(crate::agent::run::engine::Tick::Exhausted); }
-
-            rule_state = crate::agent::safety::rules::State::restore(&self.session.control_state());
-            rule_regenerations = rule_state.regenerations();
-            if rule_state.callback_pending() {
-                rule_catalog = Arc::new(if !self.hermetic && self.config.portable_rules.enabled {
-                    self.layout
-                        .as_ref()
-                        .map(|layout| crate::agent::safety::rules::Catalog::discover(layout, &rule_root))
-                        .unwrap_or_default()
-                } else {
-                    crate::agent::safety::rules::Catalog::default()
-                });
-                self.context_rule_catalog = Some(rule_catalog.clone());
-                for warning in &rule_catalog.warnings {
-                    ui.notice(warning);
-                }
-                rule_state.clear_callback();
-            }
-            let step = iteration;
-            iteration = iteration.saturating_add(1);
-            if !self.hermetic {
-                let spent = self.session_cost().unwrap_or(0.0);
-                // The external-turn ledger includes earlier repair/hook rounds and auxiliary work.
-                let turn_spent = self.usage_scope.observed_turn_cost().unwrap_or(0.0);
-                let caps = &self.config.budget;
-                let hit = match (caps.max_session_cost_usd, caps.max_turn_cost_usd) {
-                    (Some(cap), _) if cap > 0.0 && spent >= cap => Some(format!(
-                        "observed session API cost ${spent:.4} reached the ${cap:.4} stop boundary"
-                    )),
-                    (_, Some(cap)) if cap > 0.0 && turn_spent >= cap => Some(format!(
-                        "observed API cost this turn is ${turn_spent:.4}, reaching its ${cap:.4} stop boundary"
-                    )),
-                    _ => None,
-                };
-                if let Some(why) = hit {
-                    return self.stop_turn(
-                        ui,
-                        format!("Stopped: {why}. This is not an invoice ceiling: missing prices/usage, discarded attempts and in-flight workers may add charges. Raise [budget] in the configuration to continue."),
-                        step,
-                    ).map(crate::agent::run::engine::Tick::Finished);
-                }
-            }
-            if self.modes.launch.expired() {
-                return self.stop_turn(ui, "Stopped: --max-time deadline reached.".into(), step).map(crate::agent::run::engine::Tick::Finished);
-            }
-            let accepted_live = self.flush_accepted_live_steering(ui)?;
-            let routed_steering = self.route_pending_messages(backend, ui)?;
-            let taken = self.take_steering(ui)?;
-            // Steering deferred for the turn optimizer is drafted and journaled before this request.
-            let drafted = self.draft_deferred_steering(backend, ui)?;
-            if taken || accepted_live || routed_steering || drafted {
-                steering_pending = true;
-            }
-            if std::mem::take(&mut steering_pending) {
-                enrichment_epoch = enrichment_epoch.wrapping_add(1);
-                let instruction = self.session.control_state()["current_instruction"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_owned();
-                rule_state.begin(&rule_root, &instruction);
-                let mut control = self.session.control_state();
-                rule_state.save(&mut control);
-                self.session.set_control_state(control)?;
-                completion.reset_for_steering();
-                completion_recovery = Default::default();
-                completion_candidate = None;
-                engine.transition(crate::agent::run::engine::RecoveryTransition::Steering);
-
-                todo_recovery = Default::default();
-                stall = Default::default();
-
-                pending = None;
-                engine.recovery.reset();
-                crate::agent::run::guidance::reset_for_steering(&mut pending_nudges);
-                rejected_edit_previews = 0;
-                recovering_output = false;
-                max_tokens = backend.output_budget(h.max_tokens);
-                reasoning_budget = None;
-                planning_notice = false;
-                plan_after_gate = false;
-                compaction_failed = false;
-                compaction_retry_floor = None;
-                reliability.consecutive_contract_failures = 0;
-                names = self.offered();
-                *schemas = self.schemas(&names)?;
-            }
-            self.pump_subagents(ui);
-            self.cur_step = step;
-            if self.interrupt.load(Ordering::SeqCst) {
-                return Ok(crate::agent::run::engine::Tick::Finished(TurnReport {
-                    text: String::new(),
-                    outcome: TurnOutcome::Interrupted,
-                    steps: step,
-                    interrupted: true,
-                    trajectory: None,
-                }));
-            }
-            // Worker results are persisted before the request is built, so they stay in context and survive
-            // an overflow retry; each one is delivered exactly once.
-            self.deliver_worker_results()?;
-            // A plan approved inside this turn ends planner-model use at this boundary, so implementation
-            // runs on the main model. The loop owns the backend, so it is swapped in place.
-            if !self.plan_mode && self.plan_model_prior.is_some() {
-                self.plan_model_resume()?;
-                if let Some(mut main) = self.backend.take() {
-                    main.set_usage_scope(Some(self.usage_scope.clone()));
-                    let mut planner = std::mem::replace(backend, main);
-                    planner.release();
-                }
-            }
-            // A fallback whose cooldown elapsed returns to the primary before anything is sized for it.
-            if self.restore_primary_if_due(backend, ui)? {
-                max_tokens = backend.output_budget(h.max_tokens);
-            }
-            let prep_started = Instant::now();
-            if let Some(hints) = enrichment.poll(crate::agent::run::enrichment::Stamp {
-                revision: self.step_checks.revision(),
-                instruction: enrichment_epoch,
-            }) {
-                pending_nudges.push(crate::agent::run::guidance::note(
-                    crate::agent::run::guidance::Priority::Review, hints,
-                ));
-            }
-            let budget_window = self.budget_window();
-            self.before_request(backend, &names, &mut pending_nudges, ui)?;
-            let mut messages = self.system_messages();
-            self.session.extend_messages(&mut messages);
-            let pre_action_secs = if step == 0 {
-                self.task_policy.initial_reasoning_secs
-            } else {
-                self.config.reasoning_guard.max_pre_action_secs
-            };
-            let mut selection = crate::adaptive::select(
-                self.config,
-                &self.request_phase,
-                crate::adaptive::Request {
-                    kind: self.task_policy.kind,
-                    temperature: h.temperature,
-                    tokens: reasoning_budget.unwrap_or(max_tokens),
-                    pre_action_secs,
-                    base_profile: backend.model_profile(),
-                    recovering_output: recovering_output || reasoning_budget.is_some(),
-                    hermetic: self.hermetic,
-                },
-            );
-            if let Some(source) = self.apply_local_sampling(&mut selection.profile, h.temperature) {
-                selection.sampling_source = format!("local profile: {source}");
-            }
-            let mut request_control = self.session.control_state();
-            let mut packet_cache = std::mem::take(&mut self.task_packet);
-            let mut superseded = std::mem::take(&mut self.superseded);
-            let sent_messages = self.project_history(
-                &mut messages,
-                schemas,
-                selection.context_bytes,
-                &mut packet_cache,
-                &mut superseded,
-                Some(&mut rule_state),
-            )?;
-            self.task_packet = packet_cache;
-            self.superseded = superseded;
-            // Opt-in (`reasoning_guard.require_plan`): after a reasoning-gate hit with no plan,
-            // only `todo` is offered until one exists.
-            if self.todo.has_open() {
-                plan_after_gate = false;
-            }
-            let planning_required = !self.hermetic
-                && plan_after_gate
-                && !self.todo.has_open()
-                && schemas.iter().any(|s| s["function"]["name"] == "todo");
-            // Harness notes for this request start here; they are coalesced into one message below.
-            let notes_start = messages.len();
-            if planning_required {
-                if !planning_notice {
-                    ui.event(&crate::agent::ui::ui_event::UiEvent::new(crate::agent::ui::ui_event::EventKind::Plan, "Plan required: create a todo plan to resume tools. The next request offers only todo."));
-                }
-                messages.push(json!({"role":"user","dial_transient":true,"content":
-                    "The previous generation stalled without an active plan. If the request is already answered, answer directly. Otherwise your next tool call must create actual todos: use todo set for an empty list, or append to preserve existing tasks. Add 1-3 concrete unresolved questions with investigation=true, then the known implementation and verification steps. Do not invent a large speculative plan. A prose plan is not a todo update."}));
-                schemas
-                    .retain(|s| matches!(s["function"]["name"].as_str(), Some("todo" | "finish")));
-                names.retain(|name| name == "todo" || name == "finish");
-            }
-            planning_notice = planning_required;
-            engine.apply(schemas, &mut names, &mut messages);
-            let measured_single = !self.hermetic
-                && crate::reliability::single_call(self.config, measured.as_ref(), &reliability);
-            // The small local tier defaults to one call per response unless its saved record passed
-            // the batch fixture; the system prompt states the same mode for the whole session. Its
-            // offer is already minimal and listed in that prompt, so it is not simplified further.
-            let single_call = measured_single || (!self.hermetic && self.local_one_call());
-            let mut contract = crate::reliability::Contract::new(schemas.clone())?;
-            if measured_single {
-                let loaded = self.enabled_tools.iter().cloned().chain(self.discovered_tools()).collect();
-                crate::reliability::simplify(&mut contract.schemas, &loaded);
-                // Simplification can drop offered schemas, so the offered contract is validated again.
-                contract = crate::reliability::Contract::new(contract.schemas)?;
-            }
-            names = contract.names.clone();
-            let lightweight = self.config.efficiency.enabled
-                && !self.hermetic
-                && self.task_policy.lightweight
-                && step < self.config.efficiency.lightweight_requests
-                && !self.todo.has_open()
-                && self.efficiency_metrics.failed_tool_results == 0;
-            // The tool contract is restated only when the model is constrained to one call or has
-            // just broken the contract; the offered schemas already carry it otherwise.
-            if !self.hermetic
-                && self.config.reliability.enabled
-                && (single_call || reliability.consecutive_contract_failures > 0)
-            {
-                let guidance = contract.instruction(
-                    single_call,
-                    self.config.reliability.examples && !lightweight,
-                );
-                messages.push(json!({"role":"user","content":guidance,"dial_transient":true}));
-            }
-            todo_recovery.apply(&mut messages);
-            pending_nudges.extend(
-                std::mem::take(&mut self.background_notices)
-                    .into_iter()
-                    .map(|text| json!({"role":"user","content":text,"dial_transient":true})),
-            );
-            // Lifecycle hooks' `additional_context` is delivered once, like background notices.
-            pending_nudges.extend(self.take_hook_context());
-            pending_nudges.extend(self.poll_coordination(ui));
-            messages.extend(pending_nudges.iter().cloned());
-            // The redirect is stated once; if the identical repeat continues, the stronger
-            // guidance replaces it. Neither stage ends the turn.
-            let repeat_streak = crate::agent::safety::guard::RepeatedToolCall::detect(
-                &messages,
-                crate::agent::safety::stream_guards::TOOL_CALL_LOOP_THRESHOLD,
-                crate::agent::safety::stream_guards::TOOL_CALL_LOOP_EXEMPT_TOOLS,
-            );
-            if let Some(repeat) = &repeat_streak {
-                ui.event(&crate::agent::ui::ui_event::UiEvent::new(crate::agent::ui::ui_event::EventKind::Recovery, format!(
-                    "Repeated tool call {}x; redirecting the model",
-                    repeat.count
-                )));
-                let guidance = if repeat.count > crate::agent::safety::stream_guards::TOOL_CALL_LOOP_THRESHOLD {
-                    crate::agent::safety::stream_guards::render_tool_call_loop_escalation(&repeat.tool_name, repeat.count, &repeat.arguments_summary, &repeat.result_summary)
-                } else {
-                    crate::agent::safety::stream_guards::render_tool_call_loop_redirect(&repeat.tool_name, repeat.count, &repeat.arguments_summary, &repeat.result_summary)
-                };
-                messages.push(crate::agent::run::guidance::note(crate::agent::run::guidance::Priority::Repetition, guidance));
-            }
-            let research_step = engine.research_required();
-            if let Some(note) = engine.research_prompt() {
-                messages.push(note);
-            }
-            // One advisory note per request, by priority; protocol notes and gates are unaffected.
-            crate::agent::run::guidance::curate(&mut messages, &mut emissions);
-            coalesce_harness_notes(&mut messages, notes_start);
-            if !self.experimental_context_owner()
-                && let Some(guidance) = rule_catalog.guidance(&mut rule_state, "main")
-            {
-                messages.push(guidance);
-            }
-            rule_state.save(&mut request_control);
-            let mut request = Chat {
-                messages,
-                tools: contract.schemas,
-                temperature: selection.temperature.unwrap_or(h.temperature),
-                max_tokens: selection.max_tokens,
-                seed: if self.hermetic {
-                    Some(42 + u64::from(step))
-                } else {
-                    None
-                },
-            };
-            let local_control = self.prepare_local_request(backend, &mut selection.profile);
-            if let Some(local) = &local_control {
-                self.record(step, "local_request", local.clone())?;
-            }
-            backend.next_request_profile(crate::llm::profiles::request_tiers_for(
-                selection.profile.clone(),
-                &self.auth_config.selection(),
-                self.auth_config.effective_service_tier(),
-                self.auth_config.extended_context,
-            )?);
-            let compaction_selection = self.auth_config.selection();
-            let compaction_identity = crate::config::compaction::CompactionIdentity {
-                provider: &compaction_selection.provider,
-                model: &compaction_selection.model,
-                agent: None,
-            };
-            let mut request_estimate = crate::agent::compact::compaction::request_tokens_with_policy(
-                &request,
-                &self.config.compaction,
-                compaction_identity,
-            );
-            if self.experimental_context_owner()
-                && self.config.compaction.enabled
-                && crate::agent::window::context_notes::TOOL_NAMES.iter().all(|name| {
-                    request
-                        .tools
-                        .iter()
-                        .any(|schema| schema["function"]["name"] == *name)
-                })
-            {
-                let threshold = self
-                    .config
-                    .compaction
-                    .effective_threshold(compaction_identity, budget_window)?;
-                let current = self
-                    .context_meter
-                    .predict(request_estimate)
-                    .max(request_estimate);
-                if let Some(guidance) = crate::agent::window::context_notes::pressure_guidance(
-                    &self.session,
-                    current,
-                    threshold,
-                    crate::config::compaction::speculation_lead(threshold),
-                    &mut self.context_notes_reminder_boundary,
-                ) {
-                    // Price only the appended message; re-serializing the whole history again
-                    // per step is pure overhead at large context sizes.
-                    request_estimate = request_estimate.saturating_add(crate::llm::wire::estimate(&guidance));
-                    request.messages.push(guidance);
-                }
-            }
-            let request_overhead = crate::agent::window::context_meter::overhead(&request);
-            let request_context = self
-                .context_meter
-                .predict(request_estimate)
-                .max(request_estimate);
-            if h.max_tokens == 0
-                && selection.profile.as_ref().is_none_or(|profile| profile.max_tokens.is_none())
-            {
-                // Unlimited output resolves to a model ceiling, not an allocation that must fit
-                // beside every prompt. Bound that automatic ceiling by this request's remaining
-                // context; the policy reserve below still cannot be consumed by the prompt.
-                let remaining = u64::from(self.context_window()).saturating_sub(request_context);
-                if remaining > 0 {
-                    request.max_tokens = request.max_tokens.min(remaining as u32);
-                }
-            }
-            let reason = if step == 0 {
-                crate::config::compaction::CompactionReason::Threshold
-            } else {
-                crate::config::compaction::CompactionReason::MidTurn
-            };
-            self.poll_background_compaction(ui);
-            // Apply the same failed-attempt backoff to speculation and blocking maintenance.
-            // Otherwise each small tool result can relaunch the method chain in the background.
-            let safe_prompt_budget = crate::agent::compact::compaction::prompt_budget(
-                &self.config.compaction,
-                self.context_window(),
-                backend.output_budget(request.max_tokens),
-            );
-            let retry_ready = compaction_retry_floor
-                .is_none_or(|floor| request_context >= floor || request_context > safe_prompt_budget);
-            // Switch to a configured larger-window model before any compaction (background claim
-            // included) once the request is over the compaction threshold.
-            if !self.config.compaction.experimental_context_management
-                && self.config.compaction.promotion.enabled
-                && self.config.compaction.should_compact(
-                    compaction_identity,
-                    budget_window,
-                    request_context,
-                    step != 0,
-                )?
-                && {
-                    let output = backend.output_budget(request.max_tokens);
-                    self.try_promote_context(backend, request_context, output, false, ui)
-                }
-            {
-                max_tokens = backend.output_budget(h.max_tokens);
-                compaction_failed = false;
-                compaction_retry_floor = None;
-                budget.give_back();
-                return Ok(crate::agent::run::engine::Tick::Again);
-            }
-            let mut deferred_compaction = false;
-            if !compaction_failed && retry_ready {
-                let action = self.compaction_runtime.speculation_action(
-                    crate::agent::compact::compaction_runtime::SpeculationContext {
-                        policy: &self.config.compaction,
-                        identity: compaction_identity,
-                        session_id: self.session.id(),
-                        window: budget_window,
-                        fixed_tokens: crate::agent::compact::compaction::request_tokens_with_policy(
-                            &crate::agent::compact::compaction::replacement_request(&request, &[]),
-                            &self.config.compaction,
-                            compaction_identity,
-                        ),
-                        tokens: request_context,
-                        mid_turn: step != 0,
-                        image_input: backend.accepts_image_input(),
-                        parallel_supported: !backend.local_inference(),
-                    },
-                )?;
-                match action {
-                    crate::agent::compact::compaction_runtime::SpeculationAction::Claim => {
-                        match self.claim_background_compaction(ui, reason, Some(&request), Some(backend)) {
-                            Ok(Some(outcome)) => {
-                                if !outcome.continue_allowed { return self.pause_after_compaction(ui, step).map(crate::agent::run::engine::Tick::Finished); }
-                                compaction_failed = false;
-                                compaction_retry_floor = None;
-                                engine.evidence_compacted();
-                                budget.give_back();
-                                return Ok(crate::agent::run::engine::Tick::Again);
-                            }
-                            Ok(None) => {}
-                            Err(error) => ui.diagnostic(&format!("Prepared compaction was not claimed ({error:#}); considering blocking maintenance.")),
-                        }
-                    }
-                    crate::agent::compact::compaction_runtime::SpeculationAction::Defer => deferred_compaction = true,
-                    crate::agent::compact::compaction_runtime::SpeculationAction::Start(method)
-                    | crate::agent::compact::compaction_runtime::SpeculationAction::Refresh(method) => {
-                        if action == crate::agent::compact::compaction_runtime::SpeculationAction::Refresh(method) {
-                            self.compaction_runtime.cancel();
-                        }
-                        let native_profile = backend.compaction_profile().cloned();
-                        match self.start_background_compaction(ui, Some(&request), crate::agent::compact::compaction_runtime::WorkKind::Speculative,
-                            Some(method), request_context, native_profile.as_ref(), Some(backend)) {
-                            Ok(crate::agent::compact::compaction_runtime::Launch::Started) => deferred_compaction = true,
-                            Ok(_) => {}
-                            Err(error) => ui.diagnostic(&format!("Background compaction was not started ({error:#}); considering blocking maintenance.")),
-                        }
-                    }
-                    crate::agent::compact::compaction_runtime::SpeculationAction::Blocking
-                    | crate::agent::compact::compaction_runtime::SpeculationAction::None => {}
-                }
-            }
-            // A deferred background summary may finish later, but never let a request through that
-            // leaves less than the output reserve: past that budget, compact in the foreground now.
-            if !compaction_failed
-                && retry_ready
-                && (!deferred_compaction || request_context > safe_prompt_budget)
-                && !self.config.compaction.experimental_context_management
-                && self.config.compaction.should_compact(
-                    compaction_identity,
-                    budget_window,
-                    request_context,
-                    step != 0,
-                )?
-            {
-                let options = crate::config::compaction::CompactionOptions {
-                    reason,
-                    ..Default::default()
-                };
-                match self.compact_using(backend, ui, Some(&request), &options) {
-                    Ok(outcome) => {
-                        if !outcome.continue_allowed {
-                            return self.pause_after_compaction(ui, step).map(crate::agent::run::engine::Tick::Finished);
-                        }
-                        // The compacted context no longer holds the results duplicate memory cited.
-                        engine.evidence_compacted();
-                        // Re-check at the next request boundary; compaction may be needed again
-                        // after subsequent tool results in this same autonomous turn.
-                        compaction_failed = false;
-                        compaction_retry_floor = None;
-                        budget.give_back();
-                        return Ok(crate::agent::run::engine::Tick::Again);
-                    }
-                    Err(error) => {
-                        compaction_failed = true;
-                        compaction_retry_floor = Some(request_context.saturating_add(
-                            crate::config::compaction::SPECULATION_LEAD_MIN_TOKENS,
-                        ));
-                        ui.event(&crate::agent::ui::ui_event::UiEvent::new(crate::agent::ui::ui_event::EventKind::Recovery, format!(
-                            "context compaction could not make enough room ({error:#})"
-                        )));
-                        if self.interrupt.load(Ordering::SeqCst) {
-                            return Ok(crate::agent::run::engine::Tick::Finished(TurnReport {
-                                text: String::new(),
-                                outcome: TurnOutcome::Interrupted,
-                                steps: step + 1,
-                                interrupted: true,
-                                trajectory: None,
-                            }));
-                        }
-                    }
-                }
-            }
-            if request_context > safe_prompt_budget && !self.lean_tools {
-                self.lean_tools = true;
-                self.rebuild_system();
-                names = self.offered();
-                *schemas = self.schemas(&names)?;
-                ui.event(&crate::agent::ui::ui_event::UiEvent::new(crate::agent::ui::ui_event::EventKind::Model, format!(
-                    "Context window {} needs response headroom; offering lean instructions and tools (others load on demand)",
-                    self.context_window()
-                )));
-                budget.give_back();
-                return Ok(crate::agent::run::engine::Tick::Again);
-            }
-            ensure!(
-                request_context <= safe_prompt_budget && request_context < u64::from(self.context_window()),
-                "the projected request needs about {request_context} tokens, exceeding the usable prompt budget of {safe_prompt_budget} tokens in the {}-token context window{} (the remainder is reserved for a useful response). Estimated wire bytes: system={}, tools={}, results={}, task={}, conversation={}. Compaction cannot safely make room; reduce system/project instructions or tool schemas, retrieve smaller evidence slices, or select a larger-window model. The session and unfinished work are preserved",
-                self.context_window(),
-                if self.lean_tools {
-                    " even with the lean tool set"
-                } else {
-                    ""
-                },
-                request_overhead.system_bytes,
-                request_overhead.tool_schema_bytes,
-                request_overhead.tool_result_bytes,
-                request_overhead.task_context_bytes,
-                request_overhead.conversation_bytes
-            );
-            pending_nudges.clear();
-            self.efficiency_metrics
-                .request(&request_overhead, lightweight);
-            let requested_tokens = request.max_tokens;
-            let repairing = repair.take_request();
-            let mut request_selection = None;
-            if !self.hermetic {
-                let mut profile = selection.profile.clone();
-                if single_call
-                    && let Some(profile) = profile.as_mut()
-                    && crate::llm::model_config::ApiProtocol::builtin(&profile.provider)
-                        .accepts_parallel_tool_calls()
-                {
-                    profile.capabilities.parallel_tool_calls = Some(false);
-                }
-                if let (Some(effort), Some(profile)) = (turn_effort, profile.as_mut())
-                    && let Some(clamped) =
-                        crate::judgment::clamp_effort(effort, &profile.capabilities.reasoning_efforts)
-                {
-                    profile.reasoning_effort = Some(clamped);
-                }
-                // Applied last: external thinking keeps provider reasoning off whatever else chose an effort.
-                if self.external_thinking_instruction().is_some()
-                    && let Some(profile) = profile.as_mut()
-                {
-                    profile.reasoning_effort = Some(crate::llm::profiles::ReasoningEffort::None);
-                }
-                if repairing {
-                    let model = self.auth_config.selection();
-                    let profile = profile.get_or_insert_with(|| {
-                        crate::llm::profiles::ModelProfile::minimal(&model.provider, &model.model)
-                    });
-                    profile.tool_repair = true;
-                }
-                let effective = local_control.as_ref().map(|local| {
-                    crate::adaptive::local_request_settings(&request, profile.as_ref(), local, &selection.sampling_source)
-                });
-                backend.next_request_profile(crate::llm::profiles::request_tiers_for(
-                    profile,
-                    &self.auth_config.selection(),
-                    self.auth_config.effective_service_tier(),
-                    self.auth_config.extended_context,
-                )?);
-                let signature = json!([
-                    selection.enabled,
-                    selection.phase,
-                    selection.temperature,
-                    selection.top_p,
-                    selection.max_tokens,
-                    selection.pre_action_secs,
-                    selection.reasoning_effort
-                ])
-                .to_string();
-                if signature != policy_signature {
-                    policy_signature = signature;
-                    if selection.enabled {
-                        ui.diagnostic(&format!("Policy: {} → {} · temp {} · output {} · pre-action {}s · /policy shows why",selection.task,selection.phase.label(),selection.temperature.map(|t|t.to_string()).unwrap_or("provider-controlled".into()),selection.max_tokens,selection.pre_action_secs));
-                    }
-                }
-                let mut control = request_control;
-                control["reliability"]["interface"] = json!(if single_call {
-                    "compact single call"
-                } else {
-                    "standard"
-                });
-                control["reliability"]["current_tools"] = json!(names);
-                self.session.set_control_state(control)?;
-                let mut selected = serde_json::to_value(&selection)?;
-                if let Some(effective) = effective {
-                    selected["temperature"] = effective["temperature"].clone();
-                    selected["top_p"] = effective["top_p"].clone();
-                    selected["effective"] = effective;
-                }
-                request_selection = Some(selected);
-            }
-            // The headroom gate used this exact projected request, including transient guidance.
-            self.record(
-                step,
-                "request_overhead",
-                serde_json::to_value(&request_overhead)?,
-            )?;
-            let started = Instant::now();
-            let timeout = self.config.worker_timeout_secs;
-            let mut reasoning_policy = self.config.reasoning_guard.clone();
-            reasoning_policy.max_pre_action_secs = selection.pre_action_secs;
-            if reasoning_policy.max_pre_action_secs == 0
-                && let Some(secs) = self.local_time_budget(
-                    request_estimate,
-                    self.local_reasoning_cap()
-                        .map_or(u64::from(selection.max_tokens), |bytes| (bytes / 4) as u64),
-                )
-            {
-                reasoning_policy.max_pre_action_secs = secs;
-            }
-            if let Some(cap) = self.local_reasoning_cap()
-                && (reasoning_policy.max_reasoning_bytes == 0
-                    || reasoning_policy.max_reasoning_bytes > cap)
-            {
-                reasoning_policy.max_reasoning_bytes = cap;
-            }
-            if let Some(mut selected) = request_selection {
-                if selected["effective"].is_object() {
-                    selected["effective"]["max_reasoning_bytes"] = json!(if reasoning_policy.enabled { reasoning_policy.max_reasoning_bytes } else { 0 });
-                    selected["effective"]["max_pre_action_secs"] = json!(if reasoning_policy.enabled { reasoning_policy.max_pre_action_secs } else { 0 });
-                }
-                self.record(step, "request_policy", selected.clone())?;
-                self.save_request_policy(Some(selected), json!({"state":"awaiting response"}), ui)?;
-            }
-            let interrupt = self.interrupt.clone();
-            // Steering cancels only this generation, never the whole user turn or
-            // independent workers that share the ordinary interrupt flag.
-            let generation_scope = turn_cancel.inference();
-            let generation_cancel = generation_scope.flag();
-            let mut steered_during_generation = false;
-            let mut steering_error = None;
-            let live_steering_key = backend.live_steering_key();
-            let mut live_steering = LiveSteering::default();
-            let mut rule_monitor = rule_catalog.monitor(&rule_root, &rule_state, "main");
-            let rewritten = self.provider_request_with(&request, ui)?;
-            let provider_request = rewritten.as_ref().unwrap_or(&request);
-            let prefix = self.request_prefix.observe(
-                &self.auth_config.selection().display_name(),
-                provider_request,
-            );
-            self.record(step, "request_prefix", serde_json::to_value(&prefix)?)?;
-            // Wall time before primary inference, including synchronous maintenance and waits.
-            self.record(
-                step,
-                "request_prep",
-                json!({"elapsed_ms": prep_started.elapsed().as_millis()}),
-            )?;
-            ui.diagnostic(&format!(
-                "Request prefix: {}; {} stable message bytes",
-                prefix.invalidation, prefix.stable_message_bytes
-            ));
-            // A constrained repair request is tagged as repair; the agent scope is restored after it.
-            let previous_usage = repairing.then(|| {
-                backend.set_usage_scope(Some(
-                    self.usage_scope.for_purpose(crate::llm::usage::Purpose::Repair),
-                ))
-            });
-            // Experimental: admitted reads start while the reply still streams (`run/streaming_dispatch.rs`).
-            let mut streamed = (!self.hermetic
-                && !single_call
-                && self.effective_config().experimental.streaming_dispatch)
-                .then(|| {
-                    crate::agent::run::streaming_dispatch::StreamingDispatch::new(
-                        self.workspace.clone(),
-                        self.effective_config().clone(),
-                        self.ext.clone(),
-                        self.interrupt.clone(),
-                        crate::agent::run::streaming_dispatch::Admission {
-                            hooks: self.tool_hooks().to_vec(),
-                            plugins: self.hook_plugins(),
-                            always: self.always.clone(),
-                            schemas: provider_request.tools.clone(),
-                            names: names.clone(),
-                        },
-                    )
-                });
-            let result = if self.hermetic {
-                crate::learn::compute::background_call(self.config, backend, |backend, cancel| {
-                    chat_with_ui(
-                        backend,
-                        adapter.as_deref(),
-                        provider_request,
-                        ChatOptions {
-                            timeout,
-                            render_text: false,
-                            context_tokens: Some(request_context),
-                            policy: Some(&reasoning_policy),
-                            recovery: Some(&self.config.request_recovery),
-                        },
-                        if crate::learn::compute::background_active() {
-                            cancel
-                        } else {
-                            interrupt.clone()
-                        },
-                        &mut NullUi,
-                        &mut |_| {},
-                    )
-                })
-            } else {
-                chat_with_ui_streaming(
-                    backend,
-                    adapter.as_deref(),
-                    provider_request,
-                    ChatOptions {
-                        timeout,
-                        render_text: self.external_thinking_instruction().is_none() && !repairing,
-                        context_tokens: Some(request_context),
-                        policy: Some(&reasoning_policy),
-                        recovery: Some(&self.config.request_recovery),
-                    },
-                    generation_cancel.clone(),
-                    ui,
-                    &mut |ui| {
-                        self.pump_subagents(ui);
-                        generation_scope.sync();
-                        let result = self.steer_during_generation(
-                            ui,
-                            live_steering_key.as_deref(),
-                            &mut live_steering,
-                        );
-                        match result {
-                            Ok(true) => {
-                                steered_during_generation = true;
-                                generation_cancel.store(true, Ordering::SeqCst);
-                            }
-                            Ok(false) => {}
-                            Err(error) => {
-                                steering_error = Some(error);
-                                generation_cancel.store(true, Ordering::SeqCst);
-                            }
-                        }
-                    },
-                    Some(&mut rule_monitor),
-                    streamed
-                        .as_mut()
-                        .map(|stream| stream as &mut dyn crate::agent::run::streaming_dispatch::ToolStream),
-                )
-            };
-            if let Some(previous) = previous_usage {
-                backend.set_usage_scope(previous);
-            }
-            self.session.runtime().check_persistence().map_err(anyhow::Error::msg)?;
-            // Also clear a profile if the model worker failed before entering the provider.
-            if let Some(observation) = backend.wire_observation() {
-                self.record(step, "provider_wire", serde_json::to_value(observation)?)?;
-            }
-            backend.next_request_profile(None);
-            match &result {
-                Ok(reply) => self.observe_local_reply(reply, backend),
-                Err(error) => self.observe_local_failure(error, backend),
-            }
-            // The projected request is not reused after inference: move its history instead of
-            // deep-copying it each iteration. Recovery and training still see the exact bytes sent.
-            let (context_before, request_tools) = match rewritten {
-                Some(rewritten) => (rewritten.messages, rewritten.tools),
-                None => (std::mem::take(&mut request.messages), request.tools.clone()),
-            };
-            *schemas = request.tools;
-            // Receipts still outstanding after the stream ends: wait to their deadline, then commit.
-            match self.settle_live_steering(ui, &mut live_steering) {
-                Ok(true) => steered_during_generation = true,
-                Ok(false) => {}
-                Err(error) => {
-                    steering_error.get_or_insert(error);
-                }
-            }
-            // Undecided input never cancels a live generation or a running tool. Classify only at
-            // this safe boundary, before admitting any calls from the completed response.
-            if !steered_during_generation && !self.interrupt.load(Ordering::SeqCst)
-                && self.route_pending_messages(backend, ui)? {
-                if result.is_ok() {
-                    record_rejected_reply(&self.usage_scope, backend, repairing)?;
-                }
-                steered_during_generation = true;
-            }
-            if let Some(error) = steering_error {
-                return Err(error).map(crate::agent::run::engine::Tick::Finished);
-            }
-            if steered_during_generation && !self.interrupt.load(Ordering::SeqCst) {
-                steering_pending = true;
-                self.record(
-                    step,
-                    "steering_superseded_generation",
-                    json!({"elapsed_ms":started.elapsed().as_millis()}),
-                )?;
-                ui.event(&crate::agent::ui::ui_event::UiEvent::new(crate::agent::ui::ui_event::EventKind::Steering, "Stopped the old generation; replanning with your new instruction."));
-                budget.give_back();
-                return Ok(crate::agent::run::engine::Tick::Again);
-            }
-            let rule_hit = result
-                .as_ref()
-                .err()
-                .and_then(|e| e.downcast_ref::<crate::agent::safety::rules::Hit>())
-                .cloned();
-            let scoped_paths = result.as_ref().ok().and_then(|reply| {
-                rule_catalog.pending_paths(&rule_root, &rule_state, "main", &reply.tool_calls)
-            });
-            if !self.interrupt.load(Ordering::SeqCst)
-                && (rule_hit.is_some() || scoped_paths.is_some())
-            {
-                if result.is_ok() {
-                    record_rejected_reply(&self.usage_scope, backend, repairing)?;
-                }
-                ensure!(
-                    rule_regenerations < self.config.portable_rules.max_regenerations,
-                    "portable guidance regeneration limit reached; stale tools were not executed"
-                );
-                rule_regenerations += 1;
-                rule_state.set_regenerations(rule_regenerations);
-                if let Some(hit) = rule_hit {
-                    rule_state
-                        .remember(&hit, "main")
-                        .map_err(anyhow::Error::msg)?;
-                    ui.notice(&hit.to_string());
-                }
-                if let Some(paths) = scoped_paths {
-                    rule_state.activate(paths).map_err(anyhow::Error::msg)?;
-                    ui.inference_discarded("New file-scoped guidance must be delivered before these tools; discarded the entire tool attempt.");
-                }
-                let mut control = self.session.control_state();
-                rule_state.save(&mut control);
-                self.session.set_control_state(control)?;
-                self.record(
-                    step,
-                    "portable_rule_regeneration",
-                    json!({"count":rule_regenerations}),
-                )?;
-                budget.give_back();
-                return Ok(crate::agent::run::engine::Tick::Again);
-            }
-            let mut reply = match result {
-                Err(error)
-                    if error.downcast_ref::<SilentRequest>().is_some()
-                        && !self.interrupt.load(Ordering::SeqCst) =>
-                {
-                    let stalled = error.downcast_ref::<SilentRequest>().unwrap();
-                    if let Some(direction) = stalled.direction.clone() {
-                        // Same local resets as ordinary steering: the new direction must not
-                        // inherit the old task's restrictions, guidance or recovery counters.
-                        if self.accept_steering(vec![direction], ui)? {
-                            steering_pending = true;
-                        }
-                        budget.give_back();
-                        return Ok(crate::agent::run::engine::Tick::Again);
-                    }
-                    if !stalled.partial.trim().is_empty()
-                        && stall_continues < crate::agent::safety::stream_guards::STREAM_STALL_CONTINUE_MAX_RETRIES
-                    {
-                        stall_continues += 1;
-                        let partial = if self.external_thinking_instruction().is_some() {
-                            crate::agent::modes::external_thinking::strip_scratchpad(
-                                &stalled.partial,
-                            )
-                        } else {
-                            stalled.partial.clone()
-                        };
-                        self.request_phase
-                            .recover("the stream stalled after partial text; continuing");
-                        ui.event(&crate::agent::ui::ui_event::UiEvent::new(crate::agent::ui::ui_event::EventKind::Recovery, format!(
-                            "Stream stalled after partial text; continuing ({stall_continues}/{})",
-                            crate::agent::safety::stream_guards::STREAM_STALL_CONTINUE_MAX_RETRIES
-                        )));
-                        self.push(json!({"role":"assistant","content":partial}))?;
-                        pending_nudges.push(json!({"role":"user","content":crate::agent::safety::stream_guards::render_retry_prompt(crate::agent::safety::stream_guards::STREAM_STALL_CONTINUE, stall_continues, crate::agent::safety::stream_guards::STREAM_STALL_CONTINUE_MAX_RETRIES),"dial_transient":true}));
-                        budget.refund();
-                        return Ok(crate::agent::run::engine::Tick::Again);
-                    }
-                    self.save_request_policy(None, json!({"state":"request needs recovery","elapsed_ms":started.elapsed().as_millis()}), ui)?;
-                    return self.stop_turn(
-                        ui,
-                        format!("{error} Send a direction or retry to resume the unfinished task."),
-                        step + 1,
-                    ).map(crate::agent::run::engine::Tick::Finished);
-                }
-                Ok(reply) => reply,
-                Err(error)
-                    if error.downcast_ref::<crate::agent::workflow::reasoning::GateHit>().is_some()
-                        && !self.interrupt.load(Ordering::SeqCst) =>
-                {
-                    reasoning_budget = Some(requested_tokens);
-                    self.request_phase
-                        .recover("reasoning gate intercepted the previous request");
-                    self.save_request_policy(None,json!({"state":"reasoning gate","elapsed_ms":started.elapsed().as_millis()}),ui)?;
-                    self.metrics.reasoning_interceptions += 1;
-                    self.record(step, "reasoning_gate", json!({"reason":error.to_string(),"elapsed_ms":started.elapsed().as_millis()}))?;
-                    let plan_gate = self.config.reasoning_guard.require_plan
-                        && !self.todo.has_open()
-                        && !error
-                            .downcast_ref::<crate::agent::workflow::reasoning::GateHit>()
-                            .is_some_and(|hit| hit.is_repetition());
-                    let recovered = if plan_gate {
-                        self.reasoning_recovery
-                            .intercept_planned(&error.to_string())
-                    } else {
-                        self.reasoning_recovery.intercept(&error.to_string())
-                    };
-                    plan_after_gate = plan_gate && recovered.is_ok();
-                    match recovered {
-                        Ok(message) => {
-                            ui.notice(&message);
-                            self.push(json!({"role":"user","content":message}))?;
-                        }
-                        Err(message) => return self.stop_turn(ui, message, step + 1).map(crate::agent::run::engine::Tick::Finished),
-                    }
-                    return Ok(crate::agent::run::engine::Tick::Again);
-                }
-                Err(error)
-                    if error.downcast_ref::<llm::Interrupted>().is_some()
-                        || self.interrupt.load(Ordering::SeqCst) =>
-                {
-                    self.save_request_policy(
-                        None,
-                        json!({"state":"interrupted","elapsed_ms":started.elapsed().as_millis()}),
-                        ui,
-                    )?;
-                    return Ok(crate::agent::run::engine::Tick::Finished(TurnReport {
-                        text: String::new(),
-                        outcome: TurnOutcome::Interrupted,
-                        steps: step,
-                        interrupted: true,
-                        trajectory: None,
-                    }));
-                }
-                // Only a fallback that actually took over retries here. Without one, the error
-                // continues to the shared failure arm below, so every provider failure is recorded
-                // and carries the same recovery guidance whichever class it had.
-                Err(error)
-                    if !self.hermetic
-                        && error.downcast_ref::<llm::errors::ThinkingLoop>().is_none()
-                        && crate::llm::fallback::should_fallback(
-                            &error,
-                            self.effective_config().retry.fallback_on,
-                        )
-                        && self.fail_over(backend, &error, ui) =>
-                {
-                    max_tokens = backend.output_budget(h.max_tokens);
-                    budget.give_back();
-                    return Ok(crate::agent::run::engine::Tick::Again);
-                }
-                Err(error)
-                    if !self.hermetic
-                        && looks_like_overflow(&error)
-                        && overflow_retries < 3
-                        && self.config.compaction.enabled
-                        && self.config.compaction.strategy
-                            != crate::config::compaction::CompactionStrategy::Off =>
-                {
-                    self.request_phase
-                        .recover("context overflow; bounded compaction retry");
-                    overflow_retries += 1;
-                    let promote_output = backend.output_budget(requested_tokens);
-                    if self.try_promote_context(backend, request_context, promote_output, true, ui) {
-                        max_tokens = backend.output_budget(h.max_tokens);
-                        compaction_failed = false;
-                        compaction_retry_floor = None;
-                        budget.give_back();
-                        return Ok(crate::agent::run::engine::Tick::Again);
-                    }
-                    // The provider measured the prompt it rejected. Calibrate on that real count so
-                    // the compaction budget checks below stop trusting the estimate that let it through.
-                    if let Some(actual) = crate::llm::errors::overflow_prompt_tokens(&error) {
-                        self.context_meter.complete(
-                            request_estimate,
-                            request_context,
-                            Some(actual),
-                            sent_messages,
-                        );
-                    }
-                    ui.event(&crate::agent::ui::ui_event::UiEvent::new(crate::agent::ui::ui_event::EventKind::Recovery, "context window exceeded; compacting and retrying"));
-                    let overflow_request = Chat {
-                        messages: context_before.clone(),
-                        tools: schemas.clone(),
-                        temperature: h.temperature,
-                        max_tokens: requested_tokens,
-                        seed: None,
-                    };
-                    let options = crate::config::compaction::CompactionOptions {
-                        reason: crate::config::compaction::CompactionReason::Overflow,
-                        ..Default::default()
-                    };
-                    self.poll_background_compaction(ui);
-                    let outcome = match self.claim_background_compaction(
-                        ui,
-                        crate::config::compaction::CompactionReason::Overflow,
-                        Some(&overflow_request),
-                        Some(backend),
-                    ) {
-                        Ok(Some(outcome)) => outcome,
-                        Ok(None) => {
-                            self.compact_using(backend, ui, Some(&overflow_request), &options)?
-                        }
-                        Err(error) => {
-                            ui.diagnostic(&format!("Prepared compaction was not claimed during overflow ({error:#}); using blocking maintenance."));
-                            self.compact_using(backend, ui, Some(&overflow_request), &options)?
-                        }
-                    };
-                    if !outcome.continue_allowed
-                        && outcome.kind != crate::agent::compact::compaction::CompactionOutcomeKind::Compaction
-                    {
-                        return self.pause_after_compaction(ui, step).map(crate::agent::run::engine::Tick::Finished);
-                    }
-                    compaction_failed = false;
-                    compaction_retry_floor = None;
-                    engine.evidence_compacted();
-                    budget.give_back();
-                    return Ok(crate::agent::run::engine::Tick::Again);
-                }
-                Err(error) => {
-                    self.save_request_policy(None,json!({"state":"generation failed","elapsed_ms":started.elapsed().as_millis()}),ui)?;
-                    self.record(step, "generation_error", json!({"error":format!("{error:#}"),"elapsed_ms":started.elapsed().as_millis()}))?;
-                    crate::telemetry::request_failed(
-                        self.config,
-                        self.hermetic,
-                        self.session.id(),
-                        backend.model_label(),
-                        started.elapsed(),
-                        &error,
-                    );
-                    return Err(error.context(crate::agent::run::failure_guidance::PROVIDER_RECOVERY)).map(crate::agent::run::engine::Tick::Finished);
-                }
-            };
-            // Counted when a provider reply is received: its schemas were sent, whether the reply later
-            // ends in text, a tool dispatch, or a guidance discard. Pre-reply regenerations, stream failures
-            // and interceptions return earlier and are not counted.
-            self.metrics.tool_trace.record_offered(&request_tools);
-            if self.external_thinking_instruction().is_some() {
-                reply.text = crate::agent::modes::external_thinking::strip_scratchpad(&reply.text);
-                if !reply.text.is_empty() {
-                    ui.text_delta(&reply.text);
-                }
-            }
-            self.context_meter.complete(
-                request_estimate,
-                request_context,
-                reply.prompt_tokens,
-                sent_messages,
-            );
-            reasoning_budget = None;
-            if repairing {
-                match crate::agent::model::constrained_repair::finish(&mut reply, &names, format!("constrained_{step}"))
-                {
-                    Ok(outcome) => self.record(
-                        step,
-                        "constrained_repair",
-                        json!({"phase":"result","outcome":outcome}),
-                    )?,
-                    Err(reason) => {
-                        reply.finish_reason = "tool_calls".into();
-                        self.record(
-                            step,
-                            "constrained_repair",
-                            json!({"phase":"result","outcome":"rejected","reason":reason}),
-                        )?;
-                    }
-                }
-            }
-            self.step_checks.visual.delivered();
-            self.save_request_policy(None,json!({"state":"response received","prompt_tokens":reply.prompt_tokens,"completion_tokens":reply.completion_tokens,"elapsed_ms":started.elapsed().as_millis(),"tool_calls":reply.tool_calls.len(),"finish_reason":reply.finish_reason}),ui)?;
-            ui.usage(
-                reply.prompt_tokens,
-                reply.completion_tokens,
-                started.elapsed().as_secs_f64(),
-            );
-            self.metrics.responses += 1;
-            if reply.prompt_tokens.is_some() && reply.completion_tokens.is_some() {
-                self.metrics.usage_reported_responses += 1;
-            }
-            self.metrics.prompt_tokens += reply.prompt_tokens.unwrap_or(0);
-            self.metrics.output_tokens += reply.completion_tokens.unwrap_or(0);
-            self.metrics.cache_write_tokens += reply.cache_creation_tokens.unwrap_or(0);
-            self.metrics.cached_tokens += reply.cached_prompt_tokens.unwrap_or(0);
-            self.metrics.reasoning_tokens += reply.reasoning_tokens.unwrap_or(0);
-            ui.cached_usage(reply.cached_prompt_tokens, reply.cache_creation_tokens);
-            if let Some(cost) = backend.reply_cost(&reply) {
-                self.session_cost = Some(self.session_cost.unwrap_or(0.0) + cost);
-            }
-            crate::telemetry::request(
-                self.config,
-                self.hermetic,
-                self.session.id(),
-                backend.model_label(),
-                &reply,
-                backend.reply_cost(&reply),
-                started.elapsed(),
-            );
-            self.observe_provider_response(backend.model_label(), &reply, started.elapsed());
-            if let Some(tokens) = reply.prompt_tokens {
-                self.last_prompt_tokens = tokens;
-                self.reported_messages = sent_messages;
-            }
-            self.probe_context();
-            self.record(step, "generation", json!({"output":reply.text,"tool_calls":reply.tool_calls.len(),
-                "prompt_tokens":reply.prompt_tokens,"completion_tokens":reply.completion_tokens,"cache_read_tokens":reply.cached_prompt_tokens,"cache_write_tokens":reply.cache_creation_tokens,"elapsed_ms":started.elapsed().as_millis()}))?;
-            let steering = self.drain_steering(ui);
-            if !steering.is_empty() {
-                // Earlier accepted steering precedes the new local input in the journal.
-                self.flush_accepted_live_steering(ui)?;
-            }
-            if self.accept_steering(steering, ui)? {
-                steering_pending = true;
-                ui.event(&crate::agent::ui::ui_event::UiEvent::new(crate::agent::ui::ui_event::EventKind::Steering, "Discarded the old response before executing its tools; replanning with your new instruction."));
-                budget.give_back();
-                return Ok(crate::agent::run::engine::Tick::Again);
-            }
-            // A research checkpoint is a tool-free protocol step. Handle it before length/inline
-            // recovery and completion so retained schemas cannot authorize any effects.
-            if research_step {
-                use crate::agent::workflow::research::Synthesis;
-                let result = engine.synthesize(&reply);
-                let message = match result {
-                    Synthesis::Accepted => {
-                        self.push(llm::assistant_message(&reply))?;
-                        self.record(step, "research_synthesis", json!({"accepted":true}))?;
-                        "Research checkpoint recorded as unverified model findings. Resume the existing task: act on the supported path, deliver the requested report, or investigate the stated remaining question. Tools, scope, permissions and completion checks are unchanged.".to_owned()
-                    }
-                    Synthesis::Retry(message) => {
-                        record_rejected_reply(&self.usage_scope, backend, repairing)?;
-                        self.record(step, "research_synthesis", json!({"accepted":false}))?;
-                        ui.inference_discarded("Research checkpoint not satisfied; no tools from this reply were executed.");
-                        message
-                    }
-                    Synthesis::Incomplete(message) => {
-                        record_rejected_reply(&self.usage_scope, backend, repairing)?;
-                        return self.stop_turn(ui, message, step + 1).map(crate::agent::run::engine::Tick::Finished);
-                    }
-                };
-                pending_nudges.push(json!({"role":"user","dial_transient":true,"content":message}));
-                return Ok(crate::agent::run::engine::Tick::Again);
-            }
-            if reply.finish_reason == "length" {
-                if self.config.reasoning_guard.enabled
-                    && reply.text.trim().is_empty()
-                    && reply.tool_calls.is_empty()
-                {
-                    reasoning_budget = Some(requested_tokens);
-                    recovering_output = true;
-                    self.request_phase
-                        .recover("output budget consumed without an action or answer");
-                    self.metrics.reasoning_interceptions += 1;
-                    let reason = "the output token limit was spent without any answer or tool call";
-                    self.record(
-                        step,
-                        "reasoning_gate",
-                        json!({"reason":reason,"elapsed_ms":started.elapsed().as_millis()}),
-                    )?;
-                    let plan_gate =
-                        self.config.reasoning_guard.require_plan && !self.todo.has_open();
-                    let recovered = if plan_gate {
-                        self.reasoning_recovery.intercept_planned(reason)
-                    } else {
-                        self.reasoning_recovery.intercept(reason)
-                    };
-                    plan_after_gate = plan_gate && recovered.is_ok();
-                    match recovered {
-                        Ok(message) => {
-                            ui.notice(&message);
-                            self.push(json!({"role":"user","content":message,"dial_reminder":"reasoning"}))?;
-                        }
-                        Err(message) => return self.stop_turn(ui, message, step + 1).map(crate::agent::run::engine::Tick::Finished),
-                    }
-                    return Ok(crate::agent::run::engine::Tick::Again);
-                }
-                match engine.length(
-                    requested_tokens,
-                    self.context_window(),
-                    self.last_prompt_tokens,
-                    &reply,
-                ) {
-                    crate::agent::safety::guard::LengthAction::Retry { max_tokens: raised } => {
-                        self.request_phase.recover(
-                            "output was truncated; retry retains an expanded token budget",
-                        );
-                        recovering_output = true;
-                        ui.event(&crate::agent::ui::ui_event::UiEvent::new(crate::agent::ui::ui_event::EventKind::Recovery, format!("the model hit its output limit ({requested_tokens} tokens); retrying with {raised}")));
-                        max_tokens = raised;
-                        budget.refund();
-                        return Ok(crate::agent::run::engine::Tick::Again);
-                    }
-                    crate::agent::safety::guard::LengthAction::Nudge { partial, message } => {
-                        self.request_phase.recover(
-                            "continue truncated output without executing a partial tool call",
-                        );
-                        recovering_output = true;
-                        if let Some(text) = partial {
-                            let text = if self.external_thinking_instruction().is_some() {
-                                crate::agent::modes::external_thinking::strip_scratchpad(&text)
-                            } else {
-                                text
-                            };
-                            self.push(json!({"role":"assistant","content":text}))?;
-                        }
-                        pending_nudges
-                            .push(json!({"role":"user","content":message,"dial_transient":true}));
-                        budget.refund();
-                        return Ok(crate::agent::run::engine::Tick::Again);
-                    }
-                    crate::agent::safety::guard::LengthAction::Incomplete(message) => {
-                        return self.stop_turn(ui, message, step + 1).map(crate::agent::run::engine::Tick::Finished);
-                    }
-                }
-            }
-            engine.length_recovered(&reply);
-            if recovering_output {
-                self.metrics.truncated_recoveries += 1;
-                recovering_output = false;
-            }
-            if reply.tool_calls.is_empty()
-                && reply.finish_reason == "stop"
-                && self.config.edit.recover_inline_edits
-                && self.edit_mode() == crate::config::types::EditMode::Sloppy
-                && names.iter().any(|name| name == "edit")
-                && let Some((_, arguments)) = tools::inline_edit_payload(&reply.text)
-            {
-                // The transport emitted ordinary text, not this controller-recovered tool use.
-                // Native replay (Anthropic content blocks) would otherwise win over the
-                // normalized calls and leave the synthetic edit's result without a `tool_use`.
-                reply.provider_content.clear();
-                reply.tool_calls.push(ToolCall {
-                    id: format!(
-                        "dial-inline-{}-{step}-{}",
-                        self.session.id(),
-                        self.session.branch_leaf().unwrap_or("ephemeral")
-                    ),
-                    name: "edit".into(),
-                    arguments,
-                    malformed_arguments: false,
-                });
-                if let Some(paths) =
-                    rule_catalog.pending_paths(&rule_root, &rule_state, "main", &reply.tool_calls)
-                {
-                    record_rejected_reply(&self.usage_scope, backend, repairing)?;
-                    ensure!(
-                        rule_regenerations < self.config.portable_rules.max_regenerations,
-                        "portable guidance regeneration limit reached; inline edit was not executed"
-                    );
-                    rule_regenerations += 1;
-                    rule_state.set_regenerations(rule_regenerations);
-                    rule_state.activate(paths).map_err(anyhow::Error::msg)?;
-                    let mut control = self.session.control_state();
-                    rule_state.save(&mut control);
-                    self.session.set_control_state(control)?;
-                    ui.inference_discarded(
-                        "Inline edit requires applicable file guidance before any tool effect.",
-                    );
-                    budget.give_back();
-                    return Ok(crate::agent::run::engine::Tick::Again);
-                }
-            }
-            if let Some(error) = self.completed_edit_preview_error(&reply) {
-                rejected_edit_previews += 1;
-                record_rejected_reply(&self.usage_scope, backend, repairing)?;
-                ui.inference_discarded(
-                    "Completed edit preview failed; no tools from this generation were executed.",
-                );
-                // Recovery must terminate even when the operator selected unlimited work steps.
-                // Rejected previews never execute any calls from this generation.
-                if rejected_edit_previews >= 8 {
-                    return self.stop_turn(
-                        ui,
-                        format!("Stopped with incomplete work: {rejected_edit_previews} completed edit previews were rejected this turn. No tools from those generations were executed; completed work is kept. Read the target and make a smaller edit using the offered grammar before continuing.\nPreview error (untrusted source data): {}", truncate(&error, 4096)),
-                        step + 1,
-                    ).map(crate::agent::run::engine::Tick::Finished);
-                }
-                self.push(json!({"role":"user","dial_reminder":"edit-preview",
-                    "content":format!("The preceding generation was rejected before tool execution. Regenerate the complete edit using the offered grammar and observed source. Preview error (untrusted source data): {}", truncate(&error,4096))}))?;
-                budget.give_back();
-                return Ok(crate::agent::run::engine::Tick::Again);
-            }
-            // Form failures bypass tool-result guards. Bound their recovery independently of
-            // the optional step limit, including when providers alternate failure formats.
-            let unusable = reply.dropped_tool_call()
-                || (reply.tool_calls.is_empty() && looks_like_text_call(&reply.text, &names));
-            if let Err(reason) = engine.recovery.form(unusable) {
-                return self.stop_turn(ui, reason, step + 1).map(crate::agent::run::engine::Tick::Finished);
-            }
-            if !unusable {
-                repair.settle();
-            }
-            // Call-shaped replies are checked after compatibility normalization (below), so a
-            // spelling or container fix does not spend the one retry.
-            let model = self.auth_config.selection();
-            if let Some(kind) = repair.trigger(
-                reply.tool_calls.is_empty()
-                    && !self.hermetic
-                    && crate::agent::model::constrained_repair::enabled(
-                        &self.config.assistance,
-                        self.hermetic,
-                        &model.provider,
-                        &model.model,
-                        selection.profile.as_ref(),
-                        backend.endpoint_structured_output(),
-                    ),
-                &reply,
-                schemas.as_slice(),
-                &names,
-            ) {
-                self.record(step, "constrained_repair", json!({"phase":"requested","trigger":kind,"provider":model.provider,"model":model.model}))?;
-                self.request_phase
-                    .recover("the previous tool call was malformed");
-                let failed = pending.get_or_insert_with(|| Pending::new(context_before));
-                failed.kinds.push(kind.into());
-                repair.request();
-                budget.refund();
-                return Ok(crate::agent::run::engine::Tick::Again);
-            }
-            if reply.dropped_tool_call() {
-                self.request_phase
-                    .recover("the previous tool call was malformed");
-                self.record(step, "tool_form_failure", json!({"kind":"dropped_call"}))?;
-                let failed = pending.get_or_insert_with(|| Pending::new(context_before));
-                failed.kinds.push("dropped_call".into());
-                pending_nudges.push(json!({"role":"user","content":"Your tool call was unreadable JSON. Issue it again with valid arguments, or answer directly.","dial_transient":true}));
-                budget.refund();
-                return Ok(crate::agent::run::engine::Tick::Again);
-            }
-            if reply.tool_calls.is_empty() && looks_like_text_call(&reply.text, &names) {
-                self.request_phase
-                    .recover("tool syntax appeared as text instead of a valid call");
-                // The model wrote a tool call as plain text instead of using the tool-call channel.
-                // That is a form failure (and a learnable one): do not run it, do not hide it.
-                self.record(step, "tool_form_failure", json!({"kind":"text_call"}))?;
-                let failed = pending.get_or_insert_with(|| Pending::new(context_before));
-                failed.kinds.push("text_call".into());
-                failed.reject(json!({"role":"assistant","content":reply.text.clone()}));
-                self.push(json!({"role":"assistant","content":reply.text}))?;
-                self.push(json!({"role":"user","content":"That looked like a tool call written as plain text, so nothing ran. Call the tool through the tool-calling interface, or answer in words."}))?;
-                budget.refund();
-                return Ok(crate::agent::run::engine::Tick::Again);
-            }
-            match engine
-                .recovery
-                .stopped(&reply.text, !reply.tool_calls.is_empty())
-            {
-                crate::agent::run::turn_recovery::StopAction::Accept => {}
-                crate::agent::run::turn_recovery::StopAction::Continue { reason, message } => {
-                    self.request_phase.recover(reason);
-                    ui.event(&crate::agent::ui::ui_event::UiEvent::new(crate::agent::ui::ui_event::EventKind::Recovery, format!("Recovering: {reason}.")));
-                    if !reply.text.trim().is_empty() {
-                        self.push(json!({"role":"assistant","content":reply.text}))?;
-                    }
-                    pending_nudges
-                        .push(json!({"role":"user","content":message,"dial_transient":true}));
-                    budget.refund();
-                    return Ok(crate::agent::run::engine::Tick::Again);
-                }
-                crate::agent::run::turn_recovery::StopAction::Incomplete(reason) => {
-                    return self.stop_turn(ui, reason, step + 1).map(crate::agent::run::engine::Tick::Finished);
-                }
-            }
-            stall_continues = 0;
-            if reply.tool_calls.is_empty() {
-                self.push(json!({"role":"assistant","content":reply.text}))?;
-                self.observe_assistant_message(&reply.text, step, ui);
-                let accepted_live = self.flush_accepted_live_steering(ui)?;
-                if self.take_steering(ui)? || accepted_live {
-                    steering_pending = true;
-                    return Ok(crate::agent::run::engine::Tick::Again);
-                }
-                if self.interrupt.load(Ordering::SeqCst) {
-                    return Ok(crate::agent::run::engine::Tick::Finished(TurnReport {
-                        text: String::new(),
-                        outcome: TurnOutcome::Interrupted,
-                        steps: step + 1,
-                        interrupted: true,
-                        trajectory: None,
-                    }));
-                }
-                if self.exploration.active.is_some() {
-                    self.push(json!({"role":"user","dial_exploration_reminder":true,
-                        "content":"Investigation checkpoint is active. Call rewind with your findings before finishing; the report replaces intermediate context, not actual effects or current user instructions."}))?;
-                    return Ok(crate::agent::run::engine::Tick::Again);
-                }
-                if self.plan_mode && !crate::agent::verify::completion::open_work(&self.todo).is_empty() {
-                    return Ok(crate::agent::run::engine::Tick::Finished(TurnReport {
-                        text: reply.text,
-                        outcome: TurnOutcome::NeedsInput,
-                        steps: step + 1,
-                        interrupted: false,
-                        trajectory: None,
-                    }));
-                }
-                if let Some(outcome) = crate::agent::verify::completion::declared_outcome(&reply.text)
-                    && (outcome != TurnOutcome::Completed || !self.advisor_enabled())
-                {
-                    self.disclose_turn_changes(ui);
-                    return Ok(crate::agent::run::engine::Tick::Finished(TurnReport {
-                        text: reply.text,
-                        outcome,
-                        steps: step + 1,
-                        interrupted: false,
-                        trajectory: None,
-                    }));
-                }
-                if !self.hermetic && crate::agent::verify::completion::awaiting_input(&reply.text) {
-                    ui.notice("Waiting for your answer; unfinished todos are preserved.");
-                    return Ok(crate::agent::run::engine::Tick::Finished(TurnReport {
-                        text: reply.text,
-                        outcome: TurnOutcome::NeedsInput,
-                        steps: step + 1,
-                        interrupted: false,
-                        trajectory: None,
-                    }));
-                }
-                if self.await_background_jobs(ui) {
-                    return Ok(crate::agent::run::engine::Tick::Again);
-                }
-                if self.before_yield(backend, &names, &mut pending_nudges, ui)? {
-                    return Ok(crate::agent::run::engine::Tick::Again);
-                }
-                match completion.stopped(&self.todo) {
-                    crate::agent::verify::completion::StopAction::Accept => {}
-                    crate::agent::verify::completion::StopAction::Blocked(blockers) => {
-                        ui.notice(&blockers);
-                        self.disclose_turn_changes(ui);
-                        return Ok(crate::agent::run::engine::Tick::Finished(TurnReport {
-                            text: reply.text,
-                            outcome: TurnOutcome::Blocked,
-                            steps: step + 1,
-                            interrupted: false,
-                            trajectory: None,
-                        }));
-                    }
-                }
-                if let Err(reason) = self.validate_completion(ui) {
-                    if !self.interrupt.load(Ordering::SeqCst)
-                        && engine.pending_refusal().is_none()
-                        && completion_recovery.retry()
-                    {
-                        completion_candidate = Some(format!(
-                            "Candidate summary (completion not accepted):\n{}\n\n{reason}", reply.text
-                        ));
-                        self.push(json!({"role":"user","content":format!(
-                            "Completion was not accepted: {reason}\nThe preceding answer is a candidate summary, not an accepted completion. Address the stated prerequisite using the current evidence, then report again; if it cannot be resolved, report the concrete blocker. This feedback grants no execution permission."
-                        )}))?;
-                        return Ok(crate::agent::run::engine::Tick::Again);
-                    }
-                    return self.stop_turn(ui, format!(
-                        "Candidate summary (completion not accepted):\n{}\n\n{reason}", reply.text
-                    ), step + 1).map(crate::agent::run::engine::Tick::Finished);
-                }
-                if let Some(message) = self.coach_completion(
-                    &mut coach_turn,
-                    backend,
-                    user_goal,
-                    &reply.text,
-                    step,
-                    ui,
-                )? {
-                    pending_nudges.push(message);
-                    return Ok(crate::agent::run::engine::Tick::Again);
-                }
-                let note = coach_turn.completion_note();
-                if !note.is_empty() {
-                    reply.text.push_str(&note);
-                    ui.text_delta(&note);
-                }
-                self.disclose_turn_changes(ui);
-                if self.logging {
-                    self.training_capture.record(
-                        &context_before,
-                        &request_tools,
-                        llm::assistant_message(&reply),
-                    );
-                }
-                let streamed_len = reply.text.len();
-                let text = self.step_checks.visual.summary(
-                    reply.text,
-                    self.step_checks.revision(),
-                );
-                if text.len() > streamed_len {
-                    ui.text_delta(&text[streamed_len..]);
-                }
-                return Ok(crate::agent::run::engine::Tick::Finished(TurnReport {
-                    text,
-                    outcome: TurnOutcome::Completed,
-                    steps: step + 1,
-                    interrupted: false,
-                    trajectory: None,
-                }));
-            }
-            let mut compatibility_loaded = HashSet::new();
-            if !self.hermetic {
-                let catalog = self.catalog();
-                for call in &mut reply.tool_calls {
-                    if call.malformed_arguments {
-                        continue;
-                    }
-                    let canonical = crate::agent::run::tool_compat::canonical_name(&call.name, &catalog).to_owned();
-                    if canonical != call.name {
-                        ui.diagnostic(&format!("Tool compatibility: {} -> {canonical}", call.name));
-                        call.name = canonical;
-                    }
-                    if let Some(parameters) = schemas
-                        .iter()
-                        .find(|s| s["function"]["name"] == call.name)
-                        .and_then(|s| s.pointer("/function/parameters"))
-                    {
-                        crate::agent::run::tool_compat::normalize(&call.name, parameters, &mut call.arguments);
-                    } else if !planning_required
-                        && !self.plan_mode
-                        && engine.rejection_at(&self.workspace, call).is_none()
-                        && catalog.contains(&call.name)
-                    {
-                        // Capability discovery is not permission to execute a call whose schema
-                        // was absent. Enable the real tool, then require a fresh call next round.
-                        compatibility_loaded.insert(call.name.clone());
-                    }
-                }
-                if !compatibility_loaded.is_empty() {
-                    let mut loaded: Vec<_> = compatibility_loaded.iter().cloned().collect();
-                    loaded.sort();
-                    self.activate_tools(&loaded)?;
-                    ui.event(&crate::agent::ui::ui_event::UiEvent::new(
-                        crate::agent::ui::ui_event::EventKind::Tools,
-                        format!("Enabled {} for the next round", loaded.join(", ")),
-                    ));
-                }
-            }
-            let model = self.auth_config.selection();
-            if let Some(kind) = repair.trigger(
-                // Hermetic turns disable repair; do not evaluate its live endpoint probe either.
-                !self.hermetic
-                    && crate::agent::model::constrained_repair::enabled(
-                        &self.config.assistance,
-                        self.hermetic,
-                        &model.provider,
-                        &model.model,
-                        selection.profile.as_ref(),
-                        backend.endpoint_structured_output(),
-                    ),
-                &reply,
-                schemas.as_slice(),
-                &names,
-            ) {
-                self.record(step, "constrained_repair", json!({"phase":"requested","trigger":kind,"provider":model.provider,"model":model.model}))?;
-                self.request_phase
-                    .recover("the previous tool call was malformed");
-                let failed = pending.get_or_insert_with(|| Pending::new(context_before));
-                failed.kinds.push(kind.into());
-                repair.request();
-                budget.refund();
-                return Ok(crate::agent::run::engine::Tick::Again);
-            }
-            // Compatibility can decode JSON containers and rename arguments. Recheck that exact
-            // executable form before journaling any assistant/tool pair or prefetching a read.
-            let mut normalized_rules = rule_catalog.monitor(&rule_root, &rule_state, "main");
-            let normalized_hit = normalized_rules.completed(&reply);
-            if let Some(failure) = normalized_rules.failure {
-                bail!("{failure}");
-            }
-            let scoped_paths =
-                rule_catalog.pending_paths(&rule_root, &rule_state, "main", &reply.tool_calls);
-            if normalized_hit.is_some() || scoped_paths.is_some() {
-                record_rejected_reply(&self.usage_scope, backend, repairing)?;
-                ensure!(
-                    rule_regenerations < self.config.portable_rules.max_regenerations,
-                    "portable guidance regeneration limit reached; stale tools were not executed"
-                );
-                rule_regenerations += 1;
-                rule_state.set_regenerations(rule_regenerations);
-                if let Some(hit) = normalized_hit {
-                    rule_state
-                        .remember(&hit, "main")
-                        .map_err(anyhow::Error::msg)?;
-                    ui.notice(&hit.to_string());
-                }
-                if let Some(paths) = scoped_paths {
-                    rule_state.activate(paths).map_err(anyhow::Error::msg)?;
-                }
-                let mut control = self.session.control_state();
-                rule_state.save(&mut control);
-                self.session.set_control_state(control)?;
-                ui.inference_discarded("Applicable portable guidance must be delivered before the normalized tool attempt; no tools executed.");
-                budget.give_back();
-                return Ok(crate::agent::run::engine::Tick::Again);
-            }
-            if rule_catalog
-                .observe_paths(&rule_root, &mut rule_state, &reply.tool_calls)
-                .map_err(anyhow::Error::msg)?
-            {
-                let mut control = self.session.control_state();
-                rule_state.save(&mut control);
-                self.session.set_control_state(control)?;
-            }
-            let narration_warning = engine.narration.observe(&reply);
-            self.edit_preview_intercepted = false;
-            self.push(crate::tools::surface::contracts::assistant_message(
-                &reply, schemas, &self.ext,
-            ))?;
-            let (mut form_kinds, mut rejected_calls, mut execution_failed) =
-                (Vec::new(), Vec::new(), false);
-            let mut observed_check_failure = false;
-            // `experimental.outcome_gradient_rounds`: checks observed this round and their failures.
-            let mut round_checked = false;
-            let mut round_failing_tests = std::collections::BTreeSet::new();
-            let mut round_unnamed_failures = 0usize;
-            let mut parallel = std::collections::VecDeque::new();
-            let mut stop: Option<String> = None;
-            let mut round_succeeded = false;
-            let mut last_tool_failure = None;
-            let mut edit_failed = false;
-            let mut finished = None;
-            let mut round_steering = Vec::new();
-            let mut portable_batch_intercepted = false;
-            let _speculative_batch = self.workspace.speculation.batch();
-            if (!single_call || reply.tool_calls.len() <= 1) && engine.pending_refusal().is_none() {
-                for call in reply.tool_calls.iter().skip(1) {
-                    if call_form_error(call,schemas,&names).is_none() && engine.rejection_at(&self.workspace,call).is_none() {
-                        self.warm_speculative_read(call);
-                    }
-                }
-            }
-            // Past the stronger guidance, an identical repeat is answered with its earlier result
-            // instead of running again. Only the repeated call set qualifies; anything else runs.
-            let duplicates = repeat_streak
-                .as_ref()
-                .filter(|repeat| repeat.count > crate::agent::safety::stream_guards::TOOL_CALL_LOOP_THRESHOLD)
-                .and_then(|repeat| repeat.short_circuit(&reply.tool_calls));
-            if duplicates.is_some() {
-                ui.event(&crate::agent::ui::ui_event::UiEvent::new(crate::agent::ui::ui_event::EventKind::Recovery, "Repeated tool call not executed; the earlier identical result is already in context"));
-            }
-            for (index, call) in reply.tool_calls.iter().enumerate() {
-                if parallel.is_empty()
-                    && let Some(reason) = engine.pending_refusal()
-                {
-                    self.push(crate::tools::surface::outcome::skipped(&call.id, reason))?;
-                    continue;
-                }
-                if self.interrupt.load(Ordering::SeqCst) {
-                    self.session.repair_incomplete_tools()?;
-                    return Ok(crate::agent::run::engine::Tick::Finished(TurnReport {
-                        text: String::new(),
-                        outcome: TurnOutcome::Interrupted,
-                        steps: step + 1,
-                        interrupted: true,
-                        trajectory: None,
-                    }));
-                }
-                if let Some(results) = &duplicates {
-                    let output = ToolOutput::ok(results[index].clone());
-                    ui.tool_call_with_args(&call.id, &call.name, &summarize(call), &call.arguments);
-                    ui.tool_result_with_id(&call.id, &call.name, &output);
-                    self.push(crate::tools::surface::outcome::message(&call.id, &output))?;
-                    continue;
-                }
-                if self.edit_preview_intercepted && parallel.is_empty() {
-                    let output = ToolOutput::err(
-                        "This call was not executed: a completed, authorized edit preview failed earlier in this assistant batch. Regenerate the edit before starting further tools; completed effects and prefetched results remain intact.",
-                    );
-                    ui.tool_call_with_args(&call.id, &call.name, &summarize(call), &call.arguments);
-                    ui.tool_result_with_id(&call.id, &call.name, &output);
-                    self.push(crate::tools::surface::outcome::message(&call.id, &output))?;
-                    crate::telemetry::tool(
-                        self.config,
-                        self.hermetic,
-                        self.session.id(),
-                        &call.name,
-                        0.0,
-                        tools::ToolStatus::Skipped,
-                    );
-                    continue;
-                }
-                if portable_batch_intercepted && parallel.is_empty() {
-                    let output = ToolOutput::err(
-                        "This call was not executed: portable guidance intercepted an earlier native-code callback in this assistant batch. Regenerate with the staged guidance before any further tool action.",
-                    );
-                    ui.tool_call_with_args(&call.id, &call.name, &summarize(call), &call.arguments);
-                    ui.tool_result_with_id(&call.id, &call.name, &output);
-                    self.push(crate::tools::surface::outcome::message(&call.id, &output))?;
-                    crate::telemetry::tool(
-                        self.config,
-                        self.hermetic,
-                        self.session.id(),
-                        &call.name,
-                        0.0,
-                        tools::ToolStatus::Skipped,
-                    );
-                    continue;
-                }
-                round_steering.extend(
-                    self.drain_steering(ui)
-                        .into_iter()
-                        .filter(|text| !text.trim().is_empty()),
-                );
-                if !round_steering.is_empty() && parallel.is_empty() {
-                    // Close the old call/result pair before appending the new user
-                    // message. Already-prefetched reads keep their actual results.
-                    self.push(llm::tool_message(&call.id, "This call was not executed: a newer user instruction superseded this pending action. Replan from the latest user message."))?;
-                    crate::telemetry::tool(
-                        self.config,
-                        self.hermetic,
-                        self.session.id(),
-                        &call.name,
-                        0.0,
-                        tools::ToolStatus::Skipped,
-                    );
-                    continue;
-                }
-                if self.exploration.requested_rewind() && parallel.is_empty() {
-                    let output = ToolOutput::err(
-                        "This call was not executed: rewind was requested earlier in this assistant batch. Completed sibling effects and their actual results are preserved; continue after the owner commits or rejects the anchored report.",
-                    );
-                    ui.tool_call_with_args(&call.id, &call.name, &summarize(call), &call.arguments);
-                    ui.tool_result_with_id(&call.id, &call.name, &output);
-                    self.push(crate::tools::surface::outcome::message(&call.id, &output))?;
-                    crate::telemetry::tool(
-                        self.config,
-                        self.hermetic,
-                        self.session.id(),
-                        &call.name,
-                        0.0,
-                        tools::ToolStatus::Skipped,
-                    );
-                    continue;
-                }
-                if self.pending_context_rollover.is_some() && parallel.is_empty() {
-                    let output = ToolOutput::err(
-                        "This call was not executed: a new context window was requested earlier in this assistant batch. Continue after the owner commits or rejects that request; previously completed effects and results are preserved.",
-                    );
-                    ui.tool_call_with_args(&call.id, &call.name, &summarize(call), &call.arguments);
-                    ui.tool_result_with_id(&call.id, &call.name, &output);
-                    self.push(crate::tools::surface::outcome::message(&call.id, &output))?;
-                    crate::telemetry::tool(
-                        self.config,
-                        self.hermetic,
-                        self.session.id(),
-                        &call.name,
-                        0.0,
-                        tools::ToolStatus::Skipped,
-                    );
-                    continue;
-                }
-                let todo_before = self.todo.snapshot();
-                let observed_sources = self.experience_sources(call, ui);
-                // Read-only batch results may already have finished before a prior
-                // result arms recovery. Consume those results honestly; never label
-                // a prefetched operation as unexecuted or shift its result to another call.
-                let form = (if parallel.is_empty() && let Some(reason) = engine.rejection_at(&self.workspace, call) {
-                    Some(("recovery_checkpoint", reason))
-                } else if single_call && reply.tool_calls.len() > 1 {
-                    Some(("batch_contract", "This request permits one tool call. The entire batch is rejected without executing it; choose one action and await its result.".into()))
-                } else { call_form_error(call, schemas, &names) }).map(|(kind, why)| {
-                    if planning_required && call.name != "todo" && kind == "unknown_tool" {
-                        (kind, format!("{} is temporarily withheld until a plan exists. This request offers only todo and finish. Create a plan with todo before requesting read, grep, bash or other tools; they return in the next round after a valid plan. If the request is already answered, call finish.", call.name))
-                    } else if kind == "unknown_tool" && compatibility_loaded.contains(&call.name) {
-                        (kind, format!("{} is available and has been loaded for the next request. This call was not executed. Retry using its newly supplied schema; normal approvals and sandbox restrictions still apply.", call.name))
-                    } else {
-                        (kind, why)
-                    }
-                }).or_else(|| {
-                    (call.name == "finish" && index + 1 != reply.tool_calls.len()).then(|| {
-                        (
-                            "invalid_arguments",
-                            "finish must be the last call in a batch".to_owned(),
-                        )
-                    })
-                });
-                let contract_failed = form.is_some();
-                let mut image = None;
-                let mut preflight = None;
-                if form.is_none()
-                    && !self.hermetic
-                    && matches!(call.name.as_str(), "write" | "edit" | "ast_edit")
-                    && let (Some(cache), Some(path)) =
-                        (self.codebase.clone(), call.arguments["path"].as_str())
-                {
-                    if prechecked_paths.insert(path.to_owned()) {
-                        let path = path.to_owned();
-                        let check = thread::scope(|scope| -> Result<_> {
-                            let (tx, rx) = mpsc::sync_channel(1);
-                            scope.spawn(move || {
-                                let _ = tx.send(cache.pre_edit_context(&path));
-                            });
-                            receive_with_heartbeat(&rx, ui)?
-                        });
-                        match check {
-                            Ok(Some(text)) => {
-                                preflight = Some(ToolOutput { execution: Default::default(),
-                                    data: None,
-                                    text,
-                                    is_error: true,
-                                });
-                            }
-                            Ok(None) => {
-                                revalidated_paths
-                                    .insert(call.arguments["path"].as_str().unwrap().to_owned());
-                            }
-                            Err(error) => {
-                                preflight = Some(ToolOutput { execution: Default::default(),
-                                    data: None,
-                                    text: format!(
-                                        "Could not check saved assumptions: {error}. Read the current target before retrying."
-                                    ),
-                                    is_error: true,
-                                });
-                            }
-                        }
-                    } else if !revalidated_paths.contains(path) {
-                        preflight = Some(ToolOutput { execution: Default::default(),
-                            data: None,
-                            text: format!(
-                                "Read current {path} before retrying this edit; its saved assumptions required review."
-                            ),
-                            is_error: true,
-                        });
-                    }
-                }
-                let controller_blocked = preflight.is_some() || form.is_some();
-                let mut tool_seconds = 0.0;
-                let mut output = if let Some(output) = preflight {
-                    ui.tool_call_with_args(&call.id, &call.name, &summarize(call), &call.arguments);
-                    ui.tool_result_with_id(&call.id, &call.name, &output);
-                    output
-                } else if let Some((kind, why)) = form {
-                    self.metrics.tool_contract_errors += 1;
-                    self.record(
-                        step,
-                        "tool_form_failure",
-                        json!({"kind":kind,"name":call.name}),
-                    )?;
-                    form_kinds.push(kind.to_owned());
-                    if !call.malformed_arguments {
-                        rejected_calls.push(rejected_tool_call_message(call));
-                    }
-                    let output = ToolOutput { execution: Default::default(),
-                        data: None,
-                        text: format!("invalid tool call: {why}"),
-                        is_error: true,
-                    };
-                    ui.tool_call_with_args(&call.id, &call.name, &summarize(call), &call.arguments);
-                    ui.tool_timing(&call.name, 0.0);
-                    ui.tool_result_with_id(&call.id, &call.name, &output);
-                    output
-                } else {
-                    ui.tool_call_with_args(&call.id, &call.name, &summarize(call), &call.arguments);
-                    self.record(
-                        step,
-                        "tool_call",
-                        json!({"name":call.name,"input":call.arguments}),
-                    )?;
-                    if self.enabled_tools.contains(&call.name)
-                        || self.discovered_tools().contains(&call.name)
-                        || self.tool_routing.selected.contains(&call.name)
-                    {
-                        self.metrics.dynamic_tools_used += 1;
-                    }
-                    if !single_call
-                        && parallel.is_empty()
-                        // Rewrites must pass the serial controller's schema and approval checks.
-                        && !crate::agent::safety::hooks::wanted_for_tool(
-                            self.tool_hooks(),
-                            self.hook_plugins().as_deref(),
-                            "pre_tool_use",
-                            &call.name,
-                        )
-                        && crate::agent::safety::approval::parallel_read(&self.ext, &call.name, &call.arguments)
-                        && !crate::agent::safety::approval::denied_by_rule(&self.always, call, self.workspace.root())
-                    {
-                        let count = reply.tool_calls[index..]
-                            .iter()
-                            .take(self.config.task.max_concurrency)
-                            .take_while(|c| {
-                                !crate::agent::safety::hooks::wanted_for_tool(
-                                    self.tool_hooks(),
-                                    self.hook_plugins().as_deref(),
-                                    "pre_tool_use",
-                                    &c.name,
-                                ) &&
-                                crate::agent::safety::approval::parallel_read(&self.ext, &c.name, &c.arguments)
-                                    && !crate::agent::safety::approval::denied_by_rule(
-                                        &self.always,
-                                        c,
-                                        self.workspace.root(),
-                                    )
-                                    && call_form_error(c, schemas, &names).is_none()
-                                    && !self.speculative_pending(c)
-                                    && engine.rejection_at(&self.workspace, c).is_none()
-                            })
-                            .count();
-                        let group = &reply.tool_calls[index..index + count];
-                        let mut early: Vec<Option<(ToolOutput, f64)>> = match streamed.as_mut() {
-                            Some(streamed) => group.iter().map(|c| streamed.take(c, ui)).collect(),
-                            None => vec![None; count],
-                        };
-                        let reused = early.iter().flatten().count();
-                        if count > 1 || reused > 0 {
-                            let rest: Vec<ToolCall> = group
-                                .iter()
-                                .zip(&early)
-                                .filter(|(_, result)| result.is_none())
-                                .map(|(c, _)| c.clone())
-                                .collect();
-                            let mut steering = Vec::new();
-                            let mut ran = if rest.is_empty() {
-                                Vec::new()
-                            } else {
-                                parallel_tools(
-                                    &self.workspace,
-                                    self.effective_config(),
-                                    &self.ext,
-                                    &rest,
-                                    &self.interrupt,
-                                    ui,
-                                    &mut steering,
-                                )
-                            }
-                            .into_iter();
-                            self.pending_tool_steering.extend(steering);
-                            parallel = early
-                                .iter_mut()
-                                .map(|result| result.take().or_else(|| ran.next()).expect("one result per grouped call"))
-                                .collect();
-                            if reused > 0 {
-                                ui.diagnostic(&format!("Streaming dispatch: {reused} of {count} grouped read(s) reused results started while the reply streamed."));
-                            }
-                        }
-                    }
-                    let (mut out, seconds, executed) = match parallel.pop_front() {
-                        Some(result) => {
-                            // Batched bash skips `dispatch`; record verification evidence as the serial path does.
-                            if call.name == "bash" {
-                                self.note_verification(call, &result.0, ui);
-                            }
-                            (result.0, result.1, true)
-                        }
-                        None if call.name == "finish" && call.arguments["outcome"] == "completed" && (execution_failed || !form_kinds.is_empty()) => {
-                            (ToolOutput { execution: Default::default(),  data: None,
-text: "finish completed cannot follow a failed call in the same batch; address its error first".into(), is_error: true }, 0.0, false)
-                        }
-                        None => {
-                            // Anything executed serially may change what an early read observed.
-                            if let Some(streamed) = streamed.as_mut() {
-                                streamed.invalidate();
-                            }
-                            let started = Instant::now(); let out = self.dispatch(backend, call, ui); (out, started.elapsed().as_secs_f64(), true)
-                        }
-                    };
-                    // Only admitted calls that reached execution count; rejected, skipped and blocked forms do not.
-                    if executed {
-                        self.metrics.tool_trace.record_invoked(&call.name);
-                        self.efficiency_metrics.tool_result(call, !out.execution.changed_paths.is_empty(), self.workflow_started.elapsed());
-                    }
-                    if (call.name == "browser" || call.name == "computer") && !out.is_error {
-                        match crate::storage::artifact::capture_image(self.workspace.artifacts(), &mut out) {
-                            Ok(attachment) => image = attachment,
-                            Err(e) => {
-                                out = ToolOutput { execution: Default::default(),
-                                    data: None,
-                                    text: format!("retaining browser screenshot: {e:#}"),
-                                    is_error: true,
-                                }
-                            }
-                        }
-                    }
-                    ui.tool_timing(&call.name, seconds);
-                    tool_seconds = seconds;
-                    self.settled(call, &out);
-                    if call.name == "task"
-                        && let Some(data) = &out.data
-                    {
-                        self.efficiency_metrics.worker_results(data);
-                    }
-                    self.observe_tool_routing(call, &out);
-                    ui.tool_result_with_id(&call.id, &call.name, &out);
-                    out
-                };
-                let status = if controller_blocked {
-                    tools::ToolStatus::Blocked
-                } else {
-                    tools::ToolStatus::from_output(&output)
-                };
-                self.record(step, "tool_outcome", json!({"name":call.name,"id":call.id,"status":status,"effects":tools::surface::outcome::effects(&output),"duration_ms":tool_seconds*1000.0}))?;
-                let callback_intercepted = std::mem::take(&mut self.portable_callback_intercepted);
-                if callback_intercepted || self.ext.contains(&call.name) {
-                    rule_state = crate::agent::safety::rules::State::restore(&self.session.control_state());
-                    portable_batch_intercepted |=
-                        rule_state.callback_pending() || callback_intercepted;
-                }
-                if call.name == "new_context" && output.is_error {
-                    self.clear_context_rollover();
-                }
-                if crate::agent::workflow::exploration::TOOL_NAMES.contains(&call.name.as_str()) && output.is_error {
-                    self.exploration.reject_result(call);
-                }
-                reliability.observe(
-                    contract_failed,
-                    output.is_error,
-                    !matches!(
-                        call.name.as_str(),
-                        "todo"
-                            | "finish"
-                            | "working_state"
-                            | "tool_search"
-                            | "tool_load"
-                            | "context_notes"
-                            | "new_context"
-                            | "checkpoint"
-                            | "rewind"
-                    ),
-                    turn_started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-                );
-                self.observe_experience(call, &output, observed_sources, ui);
-                if output.is_error {
-                    last_tool_failure = Some(format!(
-                        "Most recent tool error (`{}`):\n{}",
-                        call.name,
-                        crate::agent::safety::guard::clip_middle(&output.text, 1200)
-                    ));
-                }
-                edit_failed |= output.is_error && matches!(call.name.as_str(), "edit" | "write");
-                if matches!(call.name.as_str(), "edit" | "write") {
-                    self.observe_local_edit(!output.is_error);
-                }
-                if call.name == "todo" && !output.is_error {
-                    self.observe_local_plan_change();
-                }
-                let is_check = call.name == "bash"
-                    && call.arguments["command"]
-                        .as_str()
-                        .is_some_and(is_check_command);
-                if is_check {
-                    if output.is_error || output.process_outcome().is_none_or(|process| process.exit_code != Some(0) || !process.output_complete || process.cancelled || process.timed_out) {
-                        reliability.failing_checks += 1;
-                    } else {
-                        reliability.passing_checks += 1;
-                    }
-                }
-                let check_failed = is_check
-                    && (output.process_outcome().is_some_and(|process| process.exit_code.is_some_and(|code| code != 0))
-                        || crate::agent::verify::verification::zero_tests(&output.text));
-                observed_check_failure |= check_failed;
-                self.step_checks.reproduced |= check_failed;
-                if self.config.experimental.outcome_gradient_rounds > 0
-                    && (is_check || call.name == crate::agent::verify::check_tool::NAME)
-                {
-                    round_checked = true;
-                    let names = crate::agent::run::outcome_gradient::failing_tests(&output.text);
-                    if names.is_empty() && check_failed {
-                        round_unnamed_failures += 1;
-                    }
-                    round_failing_tests.extend(names);
-                }
-                if self.advisor_enabled() || self.config.escalation.enabled {
-                    let label = if call.name == "bash" {
-                        format!(
-                            "bash {}",
-                            crate::agent::safety::guard::clip_middle(
-                                call.arguments["command"].as_str().unwrap_or(""),
-                                200
-                            )
-                        )
-                    } else {
-                        call.name.clone()
-                    };
-                    coach_turn.observe(
-                        &label,
-                        &output.text,
-                        output.is_error || check_failed,
-                        is_check,
-                    );
-                }
-                self.request_phase
-                    .observe(&call.name, !output.is_error && !check_failed, is_check);
-                if output.is_error && form_kinds.is_empty() {
-                    execution_failed = true;
-                }
-                if !output.is_error
-                    && call.name == "read"
-                    && let Some(path) = call.arguments["path"].as_str()
-                    && prechecked_paths.contains(path)
-                {
-                    revalidated_paths.insert(path.to_owned());
-                }
-                if !output.is_error {
-                    round_succeeded = true;
-                }
-                // Close this call's per-file revisions so `revert_edit` can detect later outside edits.
-                if let Some(checkpoints) = &self.checkpoints {
-                    checkpoints.settle_changes();
-                }
-                // Committed facts decide: any tool whose transaction committed paths (LSP rename, code
-                // actions, checkpointed edits) advances the mutation epoch, even when it failed after
-                // a partial commit. The name list covers writers that commit without reporting paths.
-                let mut repro_advice = None;
-                let committed = !output.execution.changed_paths.is_empty();
-                if committed
-                    || (!output.is_error
-                        && matches!(call.name.as_str(), "write" | "edit" | "ast_edit" | "solve"))
-                {
-                    self.step_checks.mutations += 1;
-                    if self.repro_first_fires(call, crate::config::types::ReproFirst::Advise) {
-                        repro_advice = Some(crate::agent::verify::repro_first::ADVICE);
-                    }
-                    self.behavioral_checks.clear();
-                    if !self.hermetic
-                        && let Some(path) = call.arguments["path"].as_str()
-                    {
-                        self.step_checks.visual.changed(Path::new(path));
-                    }
-                }
-                if call.name == "bash" {
-                    if call.arguments["command"].as_str().is_some_and(|command| {
-                        !crate::agent::safety::approval::safe_bash(command) && !crate::agent::safety::approval::safe_review_batch(command)
-                    }) {
-                        self.step_checks.uncheckpointed_shell_commands += 1;
-                    }
-                } else if let Some(tool) = self.ext.get(&call.name)
-                    && tool.may_modify_workspace(&call.arguments)
-                {
-                    self.step_checks.uncheckpointed_extension_calls += 1;
-                    self.step_checks
-                        .uncheckpointed_extension_tools
-                        .insert(call.name.clone());
-                }
-                let search_note = if self.hermetic {
-                    None
-                } else {
-                    if call.name == "read" && !output.is_error {
-                        let targets = crate::agent::verify::caller_obligations::read_targets(
-                            &self.workspace,
-                            &call.arguments,
-                        );
-                        self.step_checks.visited_paths.extend(targets);
-                    }
-                    let revision = self.step_checks.revision();
-                    self.step_checks.empty_searches.observe(
-                        &call.name,
-                        &call.arguments,
-                        &output.text,
-                        output.is_error,
-                        revision,
-                    )
-                };
-                self.step_checks.evidence.settle_call(&call.id, self.step_checks.revision());
-                let review_stamp = crate::agent::run::enrichment::Stamp {
-                    revision: self.step_checks.revision(),
-                    instruction: enrichment_epoch,
-                };
-                enrichment.invalidate(review_stamp);
-                if call.name == "finish" && !output.is_error && self.step_checks.finish_accepted {
-                    finished = Some(
-                        crate::agent::verify::completion::Finish::parse(&call.arguments).map_err(anyhow::Error::msg)?,
-                    );
-                }
-                let (duplicate, repeat_advice, recovery_stop) = engine.settle(
-                    &self.workspace,
-                    call,
-                    &mut output,
-                    check_failed,
-                    todo_before != self.todo.snapshot(),
-                    |id| self.holds_full_result(id),
-                );
-                // Only admit optional work after committed facts have settled. The cache owns a
-                // single best-effort worker; admission, polling and turn drop never await it.
-                if !self.hermetic
-                    && !output.is_error
-                    && matches!(call.name.as_str(), "write" | "edit" | "ast_edit")
-                    && let (Some(cache), Some(path)) =
-                        (self.codebase.as_ref(), call.arguments["path"].as_str())
-                    && reviewed_paths.len() < 4
-                    && reviewed_paths.insert(path.to_owned())
-                {
-                    enrichment.submit(cache, vec![path.to_owned()], review_stamp);
-                }
-                let is_duplicate = duplicate.is_some();
-                // A read pointer re-presents evidence the model already holds: it is neither a
-                // withheld call nor a new observation.
-                let is_pointer = duplicate
-                    .as_deref()
-                    .is_some_and(crate::agent::workflow::investigation::is_unchanged_read);
-                if is_duplicate && !is_pointer {
-                    self.record(step, "investigation_gate", json!({"name":call.name}))?;
-                    ui.diagnostic(&format!("Recovery checkpoint: unchanged observation in this `{}` call; it is withheld while corrected arguments and narrower evidence remain available.", call.name));
-                }
-                if stop.is_none() {
-                    stop = recovery_stop;
-                }
-                let todo_advice = todo_recovery.observe(
-                    call,
-                    output.is_error,
-                    todo_before != self.todo.snapshot(),
-                    &output.text,
-                    &self.todo,
-                );
-                if output.is_error {
-                    self.efficiency_metrics.failed_tool_results += 1;
-                    // The first failure speaks for itself; coaching starts when the same tool
-                    // fails again in a row, so the model is not lectured on every error. Patch
-                    // syntax errors are the exception: the fix is to the call, never the file.
-                    let advice = todo_advice.as_deref().or_else(|| {
-                        (stall.streak(&call.name) >= 1
-                            || matches!(call.name.as_str(), "edit" | "ast_edit"))
-                        .then(|| crate::learn::task_policy::recovery_hint(&call.name, &output.text))
-                        .flatten()
-                    });
-                    if let Some(advice) = advice {
-                        output.text.push_str("\n\n");
-                        output.text.push_str(advice);
-                    }
-                }
-                if call.name == "todo"
-                    && !output.is_error
-                    && let Some(note) = crate::agent::workflow::todo_recovery::solo_update_note(
-                        &reply.tool_calls,
-                        planning_required,
-                        solo_todo_noted,
-                    )
-                {
-                    solo_todo_noted = true;
-                    output.text.push_str("\n\n");
-                    output.text.push_str(note);
-                }
-                if let Some(advice) = repeat_advice {
-                    ui.diagnostic(&format!("Recovery checkpoint: `{}` failed; correct its arguments or choose a different concrete action.", call.name));
-                    output.text.push_str("\n\n");
-                    output.text.push_str(&advice);
-                }
-                if let Some(advice) = pace.call(call, &output) {
-                    output.text.push_str("\n\n");
-                    output.text.push_str(&advice);
-                }
-                if output.is_error {
-                    stall.note_error(&call.name, &output.text);
-                }
-                match stall.call(call, output.is_error) {
-                    crate::agent::safety::guard::Stall::Warn(advice) => {
-                        if self.config.reliability.enabled {
-                            engine.arm(call, &advice);
-                            ui.diagnostic(&format!("Recovery checkpoint: `{}` keeps failing; correct its arguments or choose a different concrete action.", call.name));
-                        } else {
-                            ui.event(&crate::agent::ui::ui_event::UiEvent::new(crate::agent::ui::ui_event::EventKind::Recovery, advice.as_str()));
-                        }
-                        output.text.push_str("\n\n");
-                        output.text.push_str(&advice);
-                    }
-                    crate::agent::safety::guard::Stall::None => {}
-                }
-                self.record(
-                    step,
-                    if output.is_error {
-                        "tool_error"
-                    } else {
-                        "tool_result"
-                    },
-                    json!({"name":call.name,"output":truncate(&output.text, 4096)}),
-                )?;
-                let (artifact, retain_notice) = match self.workspace.artifacts() {
-                    Some(store) => match store.retain(&output.text) {
-                        Ok(uri) => (Some(uri), None),
-                        Err(error) => (
-                            None,
-                            Some(format!(
-                                "\n[Complete tool evidence could not be retained: {error:#}]"
-                            )),
-                        ),
-                    },
-                    None => (None, None),
-                };
-                let limit = crate::agent::workflow::efficiency::preview_limit(
-                    &self.config.efficiency,
-                    self.context_window(),
-                    &call.name,
-                    output.is_error,
-                    artifact.is_some(),
-                );
-                let (mut body, dropped) =
-                    crate::agent::workflow::efficiency::visible_result(&output.text, limit, duplicate);
-                let mut presentation_changed = body != output.text;
-                if call.name == "bash"
-                    && !output.is_error
-                    && call.arguments["command"]
-                        .as_str()
-                        .is_some_and(is_check_command)
-                    && let Some(uri) = &artifact
-                    && let Some(compact) = crate::agent::verify::verification::compact_success(&output.text, uri)
-                {
-                    body = compact;
-                    presentation_changed = true;
-                }
-                if presentation_changed {
-                    let integrity = output.execution.output.get_or_insert_with(Default::default);
-                    integrity.mark_presentation_partial();
-                }
-                crate::telemetry::tool_output(
-                    self.config,
-                    self.hermetic,
-                    self.session.id(),
-                    &call.name,
-                    tool_seconds,
-                    status,
-                    &output.execution,
-                );
-                if let Some(uri) = &artifact {
-                    crate::agent::workflow::efficiency::evidence_link(&mut body, uri, dropped);
-                }
-                if let Some(notice) = &retain_notice {
-                    body.push_str(notice);
-                }
-                if let Some(note) = &search_note {
-                    body.push_str(note);
-                }
-                if let Some(note) = repro_advice {
-                    body.push_str(note);
-                }
-                self.efficiency_metrics.result(&output.text, &body);
-                let mut message = llm::tool_message(&call.id, &body);
-                crate::tools::surface::outcome::annotate(&mut message, &output);
-                message["dial_evidence"] = json!({"artifact":artifact,"is_error":output.is_error});
-                message["is_error"] = json!(output.is_error);
-                if call.name == "ask"
-                    && let Some(data) = &output.data
-                {
-                    message["dial_question_result"] = data.clone();
-                }
-                if call.name == "task"
-                    && let Some(note) = crate::agent::workers::subagents::structured_result_note(&output) {
-                    pending_nudges.push(note);
-                }
-                let clipped = output.text.len() > limit
-                    || output.text.contains("output omitted")
-                    || output.text.contains("bytes clipped");
-                if clipped {
-                    let mut state = self.session.control_state();
-                    let mut uris = state["truncated_artifacts"]
-                        .as_array()
-                        .cloned()
-                        .unwrap_or_default();
-                    if let Some(uri) = &artifact
-                        && !uris.contains(&json!(uri))
-                    {
-                        uris.push(json!(uri));
-                    }
-                    for uri in crate::storage::artifact::uris(&output.text) {
-                        if !uris.contains(&json!(uri)) {
-                            uris.push(json!(uri));
-                        }
-                    }
-                    state["truncated_artifacts"] = json!(uris);
-                    self.session.set_control_state(state)?;
-                }
-                if call.name == "read" && !output.is_error && !is_duplicate {
-                    let mut observation = call.arguments.clone();
-                    if let Some(args) = observation.as_object_mut() {
-                        args.remove("i");
-                    }
-                    message["dial_evidence"]["observation"] = json!(observation.to_string());
-                }
-                if let Some(image) = image {
-                    message["dial_images"] = json!([image]);
-                }
-                if call.name == "ask"
-                    && let Some(images) = output
-                        .data
-                        .as_ref()
-                        .and_then(|data| data["dial_images"].as_array())
-                    && !images.is_empty()
-                {
-                    message["dial_images"] = json!(images);
-                }
-                crate::agent::workflow::questions::project_callbacks(
-                    &mut message,
-                    std::mem::take(&mut self.callback_question_results),
-                    limit,
-                );
-                if call.name == "read"
-                    && !output.is_error
-                    && !self.hermetic
-                    && let Some(path) = call.arguments["path"].as_str()
-                {
-                    let path = Path::new(path);
-                    if llm::images::is_image(path) {
-                        let authorized =
-                            llm::images::authorized_user_reference(&self.session.messages(), path);
-                        let attachment = if let Some(image) = authorized {
-                            Ok(image)
-                        } else {
-                            self.workspace
-                                .resolve(path.to_string_lossy().as_ref())
-                                .map_err(anyhow::Error::msg)
-                                .and_then(|absolute| {
-                                    let relative = absolute
-                                        .strip_prefix(self.workspace.root())
-                                        .context("image resolves outside the project")?;
-                                    llm::images::attachment(self.workspace.root(), relative)
-                                })
-                        };
-                        match attachment {
-                            Ok(image) => message["dial_images"] = json!([image]),
-                            Err(error) => {
-                                ui.notice(&format!("Image attachment unavailable: {error:#}"))
-                            }
-                        }
-                    }
-                }
-                if !self.hermetic
-                    && message.get("dial_images").is_some()
-                    && backend.accepts_image_input()
-                {
-                    self.step_checks.visual.captured(
-                        self.step_checks.revision(),
-                        call.name == "browser" || call.name == "computer",
-                    );
-                }
-                for reference in message["dial_images"].as_array().into_iter().flatten() {
-                    ui.image(reference);
-                }
-                if crate::agent::workflow::exploration::TOOL_NAMES.contains(&call.name.as_str()) && !output.is_error {
-                    message["dial_exploration_result"] = json!(true);
-                }
-                self.push(message)?;
-                // A changed history snapshot may make a previously dead-ended compaction fit.
-                compaction_failed = false;
-                let (tokens, estimated) = self.context_usage();
-                ui.context_usage(tokens, estimated);
-            }
-            engine.research_round();
-            if let Some(reason) = engine.pending_refusal() {
-                self.accept_steering(round_steering, ui)?;
-                return self.stop_turn(ui, stop.unwrap_or_else(|| reason.to_owned()), step + 1).map(crate::agent::run::engine::Tick::Finished);
-            }
-            if portable_batch_intercepted && rule_state.callback_retry() {
-                // One inference retry per intercepted cell/batch, charged to the shared
-                // portable-rule budget. Already completed/prefetched reads retain their results.
-                budget.give_back();
-            }
-            if self.accept_steering(round_steering, ui)? || self.take_steering(ui)? {
-                steering_pending = true;
-                ui.event(&crate::agent::ui::ui_event::UiEvent::new(crate::agent::ui::ui_event::EventKind::Steering, "Kept completed tool results and skipped unstarted old actions; replanning with your new instruction."));
-                return Ok(crate::agent::run::engine::Tick::Again);
-            }
-            if portable_batch_intercepted {
-                if !rule_state.callback_retry() {
-                    let reason = if rule_state.callback_pending() {
-                        "Portable guidance regeneration limit reached; the intercepted callback and remaining unstarted batch actions were refused. Completed work is preserved."
-                    } else {
-                        "Portable callback guidance could not be journaled; remaining unstarted actions were refused. Restore writable session storage before continuing."
-                    };
-                    return self.stop_turn(ui, reason.into(), step + 1).map(crate::agent::run::engine::Tick::Finished);
-                }
-                names = self.offered();
-                *schemas = self.schemas(&names)?;
-                return Ok(crate::agent::run::engine::Tick::Again);
-            }
-            match self.settle_exploration(backend, ui) {
-                Ok(true) => {
-                    names = self.offered();
-                    *schemas = self.schemas(&names)?;
-                    compaction_failed = true;
-                    compaction_retry_floor = None;
-                    engine.evidence_compacted();
-                    return Ok(crate::agent::run::engine::Tick::Again);
-                }
-                Ok(false) => {}
-                Err(error) => return self.stop_turn(ui, format!(
-                    "Investigation transition did not receive a successful durable acknowledgement: {error:#}. Automatic continuation stopped; no rollback or retry is implied."),
-                    step + 1).map(crate::agent::run::engine::Tick::Finished),
-            }
-            if let Some(requested) = self.pending_context_rollover.take() {
-                let request = Chat {
-                    messages: context_before,
-                    tools: std::mem::take(schemas),
-                    temperature: request.temperature,
-                    max_tokens: request.max_tokens,
-                    seed: request.seed,
-                };
-                match self.rollover_context_using(backend, ui, requested, Some(&request)) {
-                    Ok(_) => {
-                        compaction_failed = true;
-                        compaction_retry_floor = None;
-                        engine.evidence_compacted();
-                        names = self.offered();
-                        *schemas = self.schemas(&names)?;
-                        return Ok(crate::agent::run::engine::Tick::Again);
-                    }
-                    Err(error) => {
-                        return self.stop_turn(ui, format!(
-                            "New-context processing stopped: {error:#}. Automatic continuation stopped; recorded work and original history are preserved."),
-                            step + 1).map(crate::agent::run::engine::Tick::Finished);
-                    }
-                }
-            }
-            if let Some(advice) = narration_warning {
-                ui.event(&crate::agent::ui::ui_event::UiEvent::new(crate::agent::ui::ui_event::EventKind::Recovery, advice.as_str()));
-                pending_nudges.push(crate::agent::run::guidance::note(crate::agent::run::guidance::Priority::Loop, advice));
-            }
-            // A short-circuited round neither failed nor succeeded, so it must not advance failure streaks.
-            let stall_round = if duplicates.is_some() { crate::agent::safety::guard::Stall::None } else { stall.round(!round_succeeded) };
-            let warning = match stall_round {
-                crate::agent::safety::guard::Stall::Warn(advice) => Some(advice),
-                crate::agent::safety::guard::Stall::None => None,
-            };
-            if let Some(advice) = warning {
-                pending_nudges.push(crate::agent::run::guidance::note(crate::agent::run::guidance::Priority::Failure, advice));
-            }
-            if duplicates.is_none()
-                && let Some(advice) = pace.round(&reply.tool_calls)
-            {
-                pending_nudges.push(crate::agent::run::guidance::note(crate::agent::run::guidance::Priority::Loop, advice));
-            }
-            let gradient_rounds = self.config.experimental.outcome_gradient_rounds;
-            if round_checked && self.step_checks.mutations > 0 {
-                let score = self.step_checks.failed_checks.len()
-                    + round_failing_tests.len()
-                    + round_unnamed_failures;
-                if let Some(advice) = self.step_checks.outcome_gradient.observe(score, gradient_rounds) {
-                    pending_nudges.push(crate::agent::run::guidance::note(crate::agent::run::guidance::Priority::Loop, advice));
-                }
-            }
-            if let Some(plan) = self.pending_plan.take() {
-                self.push(json!({"role":"user","content":format!("Approved plan:\n{plan}\nProceed with implementation.")}))?;
-            }
-            reliability.round(!form_kinds.is_empty(), round_succeeded);
-            // A reached escalation step takes effect at the next turn, so this turn's prompt and
-            // offer stay as they are.
-            self.observe_local_round(!form_kinds.is_empty() || edit_failed, ui);
-            let tool_round_failed = !form_kinds.is_empty()
-                || execution_failed
-                || observed_check_failure
-                || self.request_phase.phase == crate::config::adaptive::Phase::Recovery;
-            if !self.hermetic {
-                let mut control = self.session.control_state();
-                settle_reliability(
-                    &mut control["reliability"],
-                    &reliability,
-                    &measured,
-                    single_call,
-                    &self.step_checks,
-                );
-                self.session.set_control_state(control.clone())?;
-                ui.request_policy(&control);
-                // Repeated contract failures escalate the guidance instead of ending the turn; the step
-                // budget still bounds the retries.
-                let failures = reliability.consecutive_contract_failures;
-                let limit = self.config.reliability.max_contract_failures;
-                if self.config.reliability.enabled && limit > 0 && failures >= limit && failures.is_multiple_of(limit) {
-                    pending_nudges.push(crate::agent::run::guidance::note(crate::agent::run::guidance::Priority::Failure, format!(
-                        "[Escalation from dial] {failures} tool calls in a row broke the tool contract, and none of the rejected calls ran. Call only the offered tools, with arguments that match their schemas exactly. Do not restate the rules or explain the failure at length: make the next call now."
-                    )));
-                }
-                let mut result = control["adaptive_policy"]["result"].clone();
-                result["tool_round_failed"] = json!(tool_round_failed);
-                result["next_observed_phase"] = json!(self.request_phase.phase);
-                self.save_request_policy(None, result, ui)?;
-            }
-            if tool_round_failed {
-                self.step_checks.auto_escalation.remember(
-                    last_tool_failure
-                        .as_deref()
-                        .unwrap_or("A tool round failed without a captured error."),
-                );
-            }
-            if automatic_coach_pending {
-                self.record(
-                    step,
-                    "auto_coach_follow_up",
-                    json!({
-                        "tool_round_failed": tool_round_failed,
-                        "observed_check_failure": observed_check_failure,
-                        "verified": false,
-                        "causal_improvement_claimed": false
-                    }),
-                )?;
-                automatic_coach_pending = false;
-            }
-            let role_configured = self.config.model_roles.contains_key("coach");
-            // A turn already ending is not charged for a coach-model call.
-            if stop.is_none()
-                && self.step_checks.auto_escalation.round(
-                    tool_round_failed,
-                    &self.config.escalation,
-                    role_configured,
-                )
-            {
-                let mut question = self.step_checks.auto_escalation.question(user_goal);
-                let observations = coach_turn.evidence();
-                if !observations.is_empty() {
-                    question["evidence"] = json!(observations);
-                }
-                let call = ToolCall {
-                    id: format!("auto-escalation-{step}"),
-                    name: "escalate".into(),
-                    arguments: question.clone(),
-                    malformed_arguments: false,
-                };
-                let before = self.session_cost;
-                // Same approval decision as the escalate tool: Ask prompts, Readonly, plan mode and
-                // rules refuse. A refusal never reaches the coach model.
-                let outcome = match self.authorize_call(&call, ui) {
-                    Ok(()) => {
-                        backend.release();
-                        let env = crate::agent::workers::subagents::Env {
-                            config: &self.auth_config,
-                            workspace: &self.workspace,
-                            ext: &self.ext,
-                            layout: self.layout.as_ref(),
-                            harness: &self.version.harness,
-                            interrupt: &self.interrupt,
-                            usage: Some(&self.usage_scope),
-                            context_cap: Some(self.context_window()),
-                            agents_messages: &self.agents_messages,
-                            plan_mode: self.plan_mode,
-                            memory: self.memory_runtime.as_ref(),
-                        };
-                        crate::agent::workflow::solve::ask(
-                            env,
-                            &question,
-                            &mut self.session_cost,
-                            ui,
-                            self.session.id(),
-                            self.hermetic,
-                        )
-                    }
-                    Err(denial) => Err(anyhow::anyhow!("approval {}", denial.message())),
-                };
-                match outcome {
-                    Ok(answer) => {
-                        automatic_coach_pending = true;
-                        pending_nudges.push(crate::agent::verify::auto_escalation::advice_message(
-                            answer["advice"].as_str().unwrap_or_default(),
-                        ));
-                        ui.event(&crate::agent::ui::ui_event::UiEvent::new(crate::agent::ui::ui_event::EventKind::Coach, "Automatic escalation: the coach model's unverified advice is added to the next turn.",));
-                        let cost = self.session_cost.unwrap_or(0.0) - before.unwrap_or(0.0);
-                        self.record(
-                            step,
-                            "auto_escalation",
-                            json!({"status":"advised","cost":cost}),
-                        )?;
-                    }
-                    Err(error) => {
-                        let reason = format!("{error:#}");
-                        ui.event(&crate::agent::ui::ui_event::UiEvent::new(crate::agent::ui::ui_event::EventKind::Coach, format!("Automatic escalation skipped: {reason}")));
-                        self.record(
-                            step,
-                            "auto_escalation",
-                            json!({"status":"skipped","reason":reason}),
-                        )?;
-                    }
-                }
-            }
-            // Live advisor: the coach reviews this round; its note reaches the next request. A
-            // turn already ending is not charged for a coach-model call.
-            if stop.is_none()
-                && let Some(note) = self.coach_round(&mut coach_turn, backend, user_goal, step, ui)?
-            {
-                pending_nudges.push(note);
-            }
-            if let Some(mut message) = stop {
-                if self.hermetic {
-                    bail!("{message}");
-                }
-                if let Some(failure) = last_tool_failure {
-                    message.push_str("\n\n");
-                    message.push_str(&failure);
-                }
-                if engine.pending_refusal().is_some() {
-                    return self.stop_turn(ui, message, step + 1).map(crate::agent::run::engine::Tick::Finished);
-                }
-                // First resume the model on its own:
-                // most stalls end with one fresh instruction and nobody has to type "continue".
-                if auto_continues < self.config.reliability.auto_continue_rounds
-                    && !self.interrupt.load(Ordering::SeqCst)
-                {
-                    auto_continues += 1;
-                    let headline = message.lines().next().unwrap_or_default().to_owned();
-                    ui.event(&crate::agent::ui::ui_event::UiEvent::new(crate::agent::ui::ui_event::EventKind::Continue, format!(
-                        "Auto-continue {auto_continues}/{}: {headline}",
-                        self.config.reliability.auto_continue_rounds
-                    )));
-                    self.record(
-                        step,
-                        "auto_continue",
-                        json!({"attempt":auto_continues,"reason":headline}),
-                    )?;
-                    self.push(json!({"role":"user","content":format!(
-                        "<system-notice>\n{message}\n\nContinue. MUST resume the most recent intent with a different concrete action and complete the unfinished work. NEVER repeat the unchanged call, pause to summarize progress, or ask whether to proceed.\n</system-notice>"
-                    )}))?;
-
-                    stall = Default::default();
-
-                    todo_recovery = Default::default();
-                    engine.transition(crate::agent::run::engine::RecoveryTransition::AutomaticContinue);
-
-                    reliability.consecutive_contract_failures = 0;
-                    names = self.offered();
-                    *schemas = self.schemas(&names)?;
-                    return Ok(crate::agent::run::engine::Tick::Again);
-                }
-                // Warnings and call-specific withholding come first. Interactive users can
-                // redirect recovery in this same turn instead of losing their active task.
-                // Noninteractive UIs return None, preserving finite evaluation behavior.
-                let options = vec![
-                    "Continue with a different approach".into(),
-                    "Pause and keep completed work".into(),
-                ];
-                if !self.interrupt.load(Ordering::SeqCst)
-                    && let Some(answer) =
-                        ui.ask_user("Recovery needs direction", &message, &options)
-                    && !answer.trim().is_empty()
-                    && answer != options[1]
-                {
-                    self.push(json!({"role":"user","content":format!(
-                        "Recovery direction from the user: {answer}\nResume the existing task using the evidence already returned. Correct the failed call or choose a genuinely different approach; do not repeat unchanged calls or fabricate success."
-                    )}))?;
-
-                    stall = Default::default();
-
-                    todo_recovery = Default::default();
-                    engine.transition(crate::agent::run::engine::RecoveryTransition::DirectedContinue);
-
-                    reliability.consecutive_contract_failures = 0;
-                    names = self.offered();
-                    *schemas = self.schemas(&names)?;
-                    return Ok(crate::agent::run::engine::Tick::Again);
-                }
-                message.push_str("\n\nThe chat and completed work are kept. Send a corrected instruction or say \"continue\" to resume.");
-                return self.stop_turn(ui, message, step + 1).map(crate::agent::run::engine::Tick::Finished);
-            }
-            if !form_kinds.is_empty() || execution_failed || observed_check_failure {
-                self.request_phase
-                    .recover("tool round failed; correct its observed diagnostics");
-            }
-            names = self.offered();
-            *schemas = self.schemas(&names)?;
-            if let Some(mut finish) = finished {
-                let accepted_live = self.flush_accepted_live_steering(ui)?;
-                if self.take_steering(ui)? || accepted_live {
-                    steering_pending = true;
-                    return Ok(crate::agent::run::engine::Tick::Again);
-                }
-                if self.interrupt.load(Ordering::SeqCst) {
-                    return Ok(crate::agent::run::engine::Tick::Finished(TurnReport {
-                        text: String::new(),
-                        outcome: TurnOutcome::Interrupted,
-                        steps: step + 1,
-                        interrupted: true,
-                        trajectory: None,
-                    }));
-                }
-                if finish.outcome == TurnOutcome::Completed {
-                    if let Some(message) = self.coach_completion(
-                        &mut coach_turn,
-                        backend,
-                        user_goal,
-                        &finish.text,
-                        step,
-                        ui,
-                    )? {
-                        pending_nudges.push(message);
-                        return Ok(crate::agent::run::engine::Tick::Again);
-                    }
-                    finish.text.push_str(&coach_turn.completion_note());
-                    finish.text = self.step_checks.visual.summary(
-                        finish.text,
-                        self.step_checks.revision(),
-                    );
-                    if self.logging {
-                        self.training_capture.record(
-                            &context_before,
-                            &request_tools,
-                            llm::assistant_message(&reply),
-                        );
-                    }
-                }
-                if self.external_thinking_instruction().is_some() {
-                    finish.text =
-                        crate::agent::modes::external_thinking::strip_scratchpad(&finish.text);
-                }
-                self.push(json!({"role":"assistant","content":finish.text}))?;
-                ui.text_delta(&finish.text);
-                return Ok(crate::agent::run::engine::Tick::Finished(TurnReport {
-                    text: finish.text,
-                    outcome: finish.outcome,
-                    steps: step + 1,
-                    interrupted: false,
-                    trajectory: None,
-                }));
-            }
-            if self.interrupt.load(Ordering::SeqCst) {
-                return Ok(crate::agent::run::engine::Tick::Finished(TurnReport {
-                    text: String::new(),
-                    outcome: TurnOutcome::Interrupted,
-                    steps: step + 1,
-                    interrupted: true,
-                    trajectory: None,
-                }));
-            }
-            if self.take_steering(ui)? {
-                steering_pending = true;
-            }
-            if form_kinds.is_empty() && !execution_failed && self.logging {
-                self.training_capture.record(
-                    &context_before,
-                    &request_tools,
-                    llm::assistant_message(&reply),
-                );
-            }
-            if !form_kinds.is_empty() {
-                let failed = pending.get_or_insert_with(|| Pending::new(context_before));
-                failed.kinds.extend(form_kinds);
-                for rejected in rejected_calls {
-                    failed.reject(rejected);
-                }
-            } else if !execution_failed
-                && let (Some(failed), Some(store), Some((id, _, _))) =
-                    (pending.take(), self.store, &self.trajectory)
-            {
-                // Corrected turn: every call validated and ran without error.
-                match store.tool_recovery(*id, self.version.id, &json!({
-                        "context": failed.context, "tools": request_tools, "corrected": llm::assistant_message(&reply),
-                        "failure_kinds": failed.kinds, "rejected": failed.rejected,
-                        "project_root": self.workspace.root().to_string_lossy(),
-                    })) {
-                    Ok(true) => {
-                        if self.record(step, "tool_recovery", json!({"failure_kinds":failed.kinds})).is_err() {
-                            ui.diagnostic("Tool recovery was captured, but its optional learning event could not be recorded; continuing.");
-                        }
-                    }
-                    Ok(false) => {} // Duplicate or oversized learning sample, not a failed tool call.
-                    Err(_) => ui.diagnostic("Optional tool-recovery capture unavailable; continuing the task."),
-                }
-            }
-
-            Ok(crate::agent::run::engine::Tick::Again)
-        });
-        if let Some(report) = driven? {
-            return Ok((report, budget.spent()));
-        }
-
-        if self.hermetic {
-            bail!("agent exhausted the admitted step budget without a final answer")
-        }
-        let reason = format!(
-            "Stopped: this turn used its {max_steps}-step limit. The chat and completed work are kept. Say \"continue\" to keep going, or raise harness.max_steps in /settings."
-        );
-        let reason = match completion_candidate {
-            Some(candidate) => format!("{candidate}\n\n{reason}"),
-            None => reason,
-        };
-        self.stop_turn(ui, reason, iteration)
-            .map(|report| (report, budget.spent()))
+        Ok(TurnState {
+            user_goal,
+            harness,
+            adapter,
+            cancel,
+            turn_started,
+            budget: self.step_budget(max_steps),
+            iteration: 0,
+            names,
+            rule_root,
+            rule_catalog,
+            rule_state,
+            rule_regenerations,
+            reviewed_paths,
+            prechecked_paths,
+            revalidated_paths,
+            pending: None,
+            overflow_retries: 0,
+            compacted_without_reply: false,
+            compaction_failed: false,
+            compaction_retry_floor: None,
+            unpriced_cap_noted: false,
+            wrap_up_noted: false,
+            final_step: false,
+            max_tokens,
+            recovering_output: false,
+            repair: Default::default(),
+            stall_continues: 0,
+            rejected_edit_previews: 0,
+            reasoning_budget: None,
+            turn_effort,
+            todo_recovery: Default::default(),
+            solo_todo_noted: false,
+            pending_nudges: Vec::new(),
+            emissions: Default::default(),
+            coach_turn: Default::default(),
+            automatic_coach_pending: false,
+            auto_continues: 0,
+            planning_notice: false,
+            plan_after_gate: false,
+            measured,
+            reliability,
+            policy_signature: String::new(),
+            stall: Default::default(),
+            pace: Default::default(),
+            completion: Default::default(),
+            completion_recovery: Default::default(),
+            completion_candidate: None,
+            progress: Default::default(),
+            enrichment: Default::default(),
+            enrichment_epoch: 0,
+            steering_pending: false,
+        })
     }
 }
 
@@ -3025,3 +503,6 @@ mod usage_join_tests;
 
 #[cfg(test)]
 mod completion_tests;
+
+#[cfg(test)]
+mod reliability_tests;

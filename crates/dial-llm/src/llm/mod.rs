@@ -76,6 +76,13 @@ pub(crate) use cancel::Patience;
 #[cfg(any(test, feature = "test-support"))]
 pub mod fake;
 
+/// Whether `url` is on `origin` (`scheme://host:port`), so `…:5000` does not match `…:50001`.
+#[cfg(any(test, feature = "test-support"))]
+fn same_origin(url: &str, origin: &str) -> bool {
+    url.strip_prefix(origin)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Map, Value, json};
 use std::collections::HashSet;

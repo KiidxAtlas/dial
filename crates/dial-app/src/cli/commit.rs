@@ -5,8 +5,9 @@ use std::path::Path;
 
 use anyhow::Result;
 
+use crate::commit::backend::ProviderBackend;
 use crate::commit::cli::{commit_help, parse_commit_args};
-use crate::commit::run::{ProviderBackend, run_commit_command};
+use crate::commit::run::run_commit_command;
 use crate::config::types::Config;
 
 /// Run `dial commit` with the raw arguments after the subcommand. `global_model` is the top-level

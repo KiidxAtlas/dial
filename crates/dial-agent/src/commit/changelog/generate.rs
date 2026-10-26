@@ -7,10 +7,11 @@ use serde_json::{Value as Json, json};
 use super::detect::ChangelogTarget;
 use super::parse::{CATEGORY_ORDER, normalize_items};
 use super::read_unreleased;
+use crate::commit::CommitError;
 use crate::commit::agentic::state::ChangelogTargetProposal;
 use crate::commit::agentic::template::{Value, render};
+use crate::commit::backend::CommitBackend;
 use crate::commit::execute::git_output;
-use crate::commit::run::{CommitBackend, CommitError};
 use crate::config::types::Config;
 use crate::llm::{Chat, Reply};
 

@@ -313,6 +313,17 @@ pub(crate) fn exit_code(output: &str) -> Option<i32> {
     })
 }
 
+/// A shell check that failed: a nonzero exit, a timeout, a kill by signal, or an explicitly
+/// empty suite. A user cancellation, or a run adopted into the background, settles nothing.
+pub(in crate::agent) fn check_failed(output: &crate::runtime::tool_output::ToolOutput) -> bool {
+    output.process_outcome().is_some_and(|process| {
+        !process.cancelled
+            && (process.timed_out
+                || process.signal.is_some()
+                || process.exit_code.is_some_and(|code| code != 0))
+    }) || zero_tests(&output.text)
+}
+
 /// Recognize explicit empty-suite outcomes. A successful exit alone does not prove tests executed.
 /// Whole-run aggregation: a runner reports testless packages one row each (`go test` prints
 /// `? pkg [no test files]`), so the run is empty only when no package executed a test.

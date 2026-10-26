@@ -61,6 +61,32 @@ fn shell_inspection_is_conservative() {
 }
 
 #[test]
+fn the_read_only_shell_rule_matches_the_policy() {
+    for program in SAFE_BASH_PROGRAMS {
+        let example = match *program {
+            "uname" => "uname -a".to_owned(),
+            "date" => "date -u".to_owned(),
+            "sed" => "sed -n '1,5p' f".to_owned(),
+            other => format!("{other} x"),
+        };
+        assert!(safe_bash(&example), "{example}");
+    }
+    let rule = safe_bash_rule();
+    assert!(rule.contains("wc") && rule.contains("`cwd`"), "{rule}");
+    // The forms the rule forbids are the ones the policy refuses.
+    for text in [
+        "cd crates && wc -l a.rs",
+        "cd crates",
+        "wc -l a.rs | sort",
+        "wc -l a.rs; ls",
+        "X=1 wc -l a.rs",
+        "rg pattern",
+    ] {
+        assert!(!safe_bash(text), "{text}");
+    }
+}
+
+#[test]
 fn review_batches_do_not_rearm_completion_but_still_require_approval() {
     let status = "git -c core.fsmonitor=false -c core.pager=cat --no-pager status --short --untracked-files=all";
     let diff = "git -c core.fsmonitor=false -c core.pager=cat --no-pager diff --no-color --no-ext-diff --no-textconv";

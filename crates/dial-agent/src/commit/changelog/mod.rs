@@ -9,8 +9,9 @@ pub(crate) mod parse;
 
 use std::path::Path;
 
+use crate::commit::CommitError;
 use crate::commit::agentic::state::ChangelogTargetProposal;
-use crate::commit::run::{CommitBackend, CommitError};
+use crate::commit::backend::CommitBackend;
 use crate::config::types::Config;
 use detect::detect_targets;
 use parse::{apply_to_content, parse_unreleased};

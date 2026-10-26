@@ -109,6 +109,17 @@ impl TurnReport {
                     | TurnOutcome::Interrupted
             )
     }
+
+    /// The report of a turn stopped by the user's interrupt after `steps` steps.
+    pub(crate) fn interrupted(steps: u32) -> Self {
+        Self {
+            text: String::new(),
+            outcome: TurnOutcome::Interrupted,
+            steps,
+            interrupted: true,
+            trajectory: None,
+        }
+    }
 }
 
 struct PromptParts {
@@ -176,6 +187,9 @@ struct StepChecks {
     failed_checks: Vec<verify::verification::FocusedCheck>,
     failed: bool,
     evidence: verify::evidence::Ledger,
+    /// Revision at which a shell test/build command (`is_check_command`) last passed; evidence for
+    /// the completion gate when the model verifies through `bash` rather than `check`.
+    shell_check_passed: Option<verify::evidence::Revision>,
     /// Empty `grep`/`glob` results this turn, forgotten whenever the workspace revision moves.
     empty_searches: run::search_frontier::EmptySearches,
     /// Workspace-relative files successfully read this turn; they clear caller obligations.

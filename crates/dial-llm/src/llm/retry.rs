@@ -11,6 +11,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// Longest exponential backoff step when the server gives no explicit delay.
 const BACKOFF_CAP: Duration = Duration::from_secs(60);
 
+/// Attempts on one model, including the first, before a failure a configured fallback accepts
+/// moves the request on to that fallback instead of waiting out further retries.
+pub(crate) const FAILOVER_ATTEMPTS: usize = 2;
+/// Longest wait before a retry while a fallback is ready; a longer one fails over instead.
+pub(crate) const FAILOVER_MAX_WAIT: Duration = Duration::from_secs(10);
+
 /// Server timing hints from one non-2xx response.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ServerHints {
@@ -163,6 +169,9 @@ pub(crate) struct Policy {
     pub(crate) rotate_accounts: bool,
     /// First exponential backoff step.
     pub(crate) backoff: Duration,
+    /// A fallback model is ready for failures of this class (`retry.fallback_on`): such failures
+    /// are retried briefly here, then handed to the caller to fail over.
+    pub(crate) failover: Option<crate::config::types::FallbackOn>,
 }
 
 impl Policy {
@@ -173,6 +182,30 @@ impl Policy {
             wait_for_quota_reset: config.wait_for_quota_reset,
             rotate_accounts: config.rotate_accounts,
             backoff,
+            failover: None,
+        }
+    }
+
+    pub(crate) fn with_failover(
+        mut self,
+        failover: Option<crate::config::types::FallbackOn>,
+    ) -> Self {
+        self.failover = failover;
+        self
+    }
+
+    /// Whether a ready fallback takes over failures of `class` after a brief retry.
+    fn fails_over(&self, class: &ErrorClass) -> bool {
+        self.failover
+            .is_some_and(|on| crate::llm::fallback::fallback_applies(class, on))
+    }
+
+    /// Attempts allowed for a request failing with `class`, including the first.
+    pub(crate) fn attempts(&self, class: &ErrorClass) -> usize {
+        if self.fails_over(class) {
+            self.max_attempts.min(FAILOVER_ATTEMPTS)
+        } else {
+            self.max_attempts
         }
     }
 }
@@ -222,10 +255,17 @@ pub(crate) fn decide(
         }
         _ => return Decision::Stop(None),
     };
-    if attempt >= policy.max_attempts {
-        return Decision::Stop(Some(format!(
-            "provider request failed after {attempt} attempts; the turn is paused. Say \"continue\" to retry"
-        )));
+    let failing_over = policy.fails_over(class);
+    if attempt >= policy.attempts(class) {
+        return Decision::Stop(Some(if failing_over {
+            format!(
+                "provider request failed after {attempt} attempts; moving to the configured fallback model"
+            )
+        } else {
+            format!(
+                "provider request failed after {attempt} attempts; the turn is paused. Say \"continue\" to retry"
+            )
+        }));
     }
     let exponential = policy
         .backoff
@@ -236,6 +276,12 @@ pub(crate) fn decide(
         .mul_f64(0.75 + rand::random::<f64>() * 0.5)
         .min(policy.max_delay);
     let delay = minimum.map_or(jitter, |minimum| minimum.max(jitter));
+    if failing_over && delay > FAILOVER_MAX_WAIT {
+        return Decision::Stop(Some(format!(
+            "provider asked to wait {:.0}s; moving to the configured fallback model instead",
+            delay.as_secs_f64()
+        )));
+    }
     if delay > policy.max_delay {
         return Decision::Stop(Some(format!(
             "provider asked to wait {:.0}s, beyond retry.max_delay_secs ({}s)",

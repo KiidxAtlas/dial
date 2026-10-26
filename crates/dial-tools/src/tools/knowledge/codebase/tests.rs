@@ -148,26 +148,118 @@ fn ambient_retrieval_excludes_unrelated_documents_and_inventory() {
 
 #[test]
 fn query_naming_a_file_or_directory_outranks_incidental_word_matches() {
+    let none = BTreeSet::new();
     let terms = navigation::tokens("fix the approval flow in src/agent/approval.rs");
     let named = path_relevance(
         "fix the approval flow in src/agent/approval.rs",
         "src/agent/approval.rs",
         &terms,
+        &none,
     );
     let other = path_relevance(
         "fix the approval flow in src/agent/approval.rs",
         "src/ui/theme.rs",
         &terms,
+        &none,
     );
     assert!(named >= 20 && other == 0);
-    assert_eq!(path_relevance("", "src/a.rs", &BTreeSet::new()), 0);
+    assert_eq!(path_relevance("", "src/a.rs", &none, &none), 0);
     // A bare file name mention still ranks above a path that only shares one word.
     let by_name = path_relevance(
         "what does router.rs do",
         "src/router.rs",
         &navigation::tokens("what does router.rs do"),
+        &none,
     );
     assert!(by_name >= 12);
+}
+
+#[test]
+fn generic_file_names_and_shared_path_words_do_not_make_a_path_relevant() {
+    let query = "edit grammar_bench/mod.rs and the crates/app dispatch loop";
+    let terms = navigation::tokens(query);
+    let none = BTreeSet::new();
+    // `mod.rs` names a file only together with its directory.
+    assert_eq!(path_relevance(query, "src/agent/mod.rs", &terms, &none), 0);
+    assert!(path_relevance(query, "src/grammar_bench/mod.rs", &terms, &none) >= 12);
+    // Tokens shared by most indexed paths (`crates`, the project name) locate nothing.
+    let mut paths: Vec<String> = (0..24).map(|i| format!("crates/app/src/f{i}.rs")).collect();
+    paths.push("crates/app/src/dispatch.rs".into());
+    let common = common_path_tokens(paths.iter().map(String::as_str));
+    assert!(common.contains("crates") && common.contains("app"));
+    assert!(!common.contains("dispatch"));
+    assert_eq!(
+        path_relevance(query, "crates/app/src/f3.rs", &terms, &common),
+        0
+    );
+    assert!(path_relevance(query, "crates/app/src/dispatch.rs", &terms, &common) > 0);
+    // Small projects keep every path token distinctive.
+    assert!(common_path_tokens(["src/a.rs", "src/b.rs"].into_iter()).is_empty());
+}
+
+#[test]
+fn ambient_retrieval_skips_incidental_tests_benchmarks_and_single_word_matches() {
+    let (_home, project, layout, ws) = fixture();
+    fs::create_dir_all(project.path().join("src/router")).unwrap();
+    fs::create_dir_all(project.path().join("src/fixtures")).unwrap();
+    fs::create_dir_all(project.path().join("benches")).unwrap();
+    fs::write(
+        project.path().join("src/router/tests.rs"),
+        "fn routes_requests_to_storage() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("benches/router_bench.rs"),
+        "fn route_request_to_storage() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("src/fixtures/sample_router.rs"),
+        "fn sample_requests() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("src/theme.rs"),
+        "//! Colors.\npub fn request_theme() {}\n",
+    )
+    .unwrap();
+    let cache = Codebase::open(&layout).unwrap();
+    cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+    // A long task prompt: one shared outline word ("request" in theme.rs) is incidental.
+    let task = "change how route_request sends incoming requests to storage and keep the behaviour";
+    assert!(navigation::tokens(task).len() > SHORT_QUERY_TERMS);
+    let brief = cache.task_context(task, 8000).unwrap();
+    assert!(brief.contains("\"path\":\"src/router.rs\""), "{brief}");
+    for incidental in [
+        "src/router/tests.rs",
+        "benches/router_bench.rs",
+        "src/fixtures/sample_router.rs",
+        "src/theme.rs",
+    ] {
+        assert!(!brief.contains(incidental), "{incidental}: {brief}");
+    }
+    // A short, deliberate query still locates a file by one shared word.
+    let short = cache
+        .task_context("understand request theming", 8000)
+        .unwrap();
+    assert!(short.contains("src/theme.rs"), "{short}");
+    // A task about tests admits test sources whose path matches it.
+    let tests = cache
+        .task_context("add tests for router storage requests", 8000)
+        .unwrap();
+    assert!(tests.contains("src/router/tests.rs"), "{tests}");
+    // Naming an auxiliary source admits it without admitting its neighbours.
+    let named = cache
+        .task_context("what is sample_router.rs for", 8000)
+        .unwrap();
+    assert!(named.contains("src/fixtures/sample_router.rs"), "{named}");
+    assert!(
+        !named.contains("src/router/tests.rs") && !named.contains("benches/router_bench.rs"),
+        "{named}"
+    );
+    // Explicit recall keeps the complete view.
+    let full = cache.context(task, 8000).unwrap();
+    assert!(full.contains("src/router/tests.rs"), "{full}");
 }
 
 #[test]

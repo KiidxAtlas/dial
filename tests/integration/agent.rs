@@ -782,30 +782,9 @@ fn serve_with(
 /// subagents) get the right answer in any order. Every connection is served on its own thread.
 type Choose = Arc<dyn Fn(&Value) -> Reply + Send + Sync>;
 
-/// Parallel tests each hold sockets, databases and child pipes; macOS defaults to 256 descriptors,
-/// which the suite exceeds. Raise this process's soft limit (never above the hard limit), once.
-fn raise_fd_limit() {
-    #[cfg(unix)]
-    {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            let mut lim = libc::rlimit {
-                rlim_cur: 0,
-                rlim_max: 0,
-            };
-            // SAFETY: plain getrlimit/setrlimit calls on a local, fully initialised struct.
-            unsafe {
-                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0 {
-                    let target = lim.rlim_max.min(10_240);
-                    if lim.rlim_cur < target {
-                        lim.rlim_cur = target;
-                        libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
-                    }
-                }
-            }
-        });
-    }
-}
+// Parallel tests each hold sockets, databases and child pipes, which macOS's default descriptor
+// limit does not cover.
+use dial::llm::fake::raise_fd_limit;
 
 fn serve_fn(choose: Choose, token: Option<&'static str>, lm_context: Option<u32>) -> Scripted {
     raise_fd_limit();

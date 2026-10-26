@@ -118,6 +118,25 @@ fn callback_uncertainty_survives_a_tool_catching_errors() {
     assert!(output.is_error);
 }
 #[test]
+fn a_panicking_read_is_a_known_failure_unless_it_recorded_a_commit() {
+    let cancel = AtomicBool::new(false);
+    let output = contained(&cancel, Effects::None, || panic!("read worker bug"));
+    assert!(output.is_error);
+    assert_eq!(outcome::effects(&output), Effects::None);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("unexpected");
+    let output = contained(&cancel, Effects::None, || {
+        std::fs::write(&path, "x").unwrap();
+        committed([path.clone()]);
+        panic!("a read that wrote");
+    });
+    assert_eq!(
+        outcome::effects(&output),
+        Effects::Unknown,
+        "a recorded commit keeps the panic uncertain"
+    );
+}
+#[test]
 fn skipped_and_uncertain_effects_are_distinct() {
     let cancel = AtomicBool::new(true);
     let output = run(&cancel, || panic!("must not run"));

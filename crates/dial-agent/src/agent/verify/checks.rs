@@ -883,6 +883,34 @@ impl<'a> Agent<'a> {
         Ok(())
     }
 
+    /// The applicable checks when this turn's file edits have no passing check on the current
+    /// revision. `None` when no evidence is owed: nothing was edited, no check applies, automatic
+    /// checks verify after the turn anyway, or a relevant `check` or shell test command passed.
+    pub(in crate::agent) fn unverified_edits(&mut self) -> Option<Vec<String>> {
+        if self.hermetic
+            || self.plan_mode
+            || !self.config.verification.enabled
+            || self.config.verification.automatic_checks
+            || self.step_checks.mutations == 0
+        {
+            return None;
+        }
+        self.refresh_check_inputs();
+        let revision = self.step_checks.revision();
+        if self.step_checks.shell_check_passed == Some(revision) {
+            return None;
+        }
+        let checks = self.current_focused_checks();
+        let observed = checks.iter().any(|check| {
+            self.step_checks
+                .evidence
+                .current_status(&check.command, revision)
+                == "passed"
+        });
+        (!checks.is_empty() && !observed)
+            .then(|| checks.into_iter().map(|check| check.name).collect())
+    }
+
     /// One completion boundary for plain reports and explicit finish calls. Pumps worker results
     /// first, so a worker that already finished is not reported as running.
     pub(in crate::agent) fn validate_completion(&mut self, ui: &mut dyn Ui) -> Result<(), String> {

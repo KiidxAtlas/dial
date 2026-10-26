@@ -1,7 +1,7 @@
 use super::*;
 use crate::agent::run::tool_exposure::default_offer_tests::with_agent;
 
-fn response(text: &str, call: Option<(&str, Value)>) -> llm::fake::Script {
+pub(super) fn response(text: &str, call: Option<(&str, Value)>) -> llm::fake::Script {
     let mut delta = json!({"content":text});
     let reason = if let Some((name, args)) = call {
         delta["tool_calls"] = json!([{"index":0,"id":format!("call-{name}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]);
@@ -13,7 +13,7 @@ fn response(text: &str, call: Option<(&str, Value)>) -> llm::fake::Script {
     llm::fake::Script::Sse(format!("data: {event}\n\ndata: [DONE]\n\n"))
 }
 
-fn connect(agent: &mut Agent<'_>, url: &str) {
+pub(super) fn connect(agent: &mut Agent<'_>, url: &str) {
     agent.backend = Some(Backend::new(
         ProviderKind::Endpoint {
             base_url: format!("{url}/v1"),
@@ -25,7 +25,7 @@ fn connect(agent: &mut Agent<'_>, url: &str) {
     ));
 }
 
-fn completion_requests(server: &llm::fake::Fake) -> Vec<Value> {
+pub(super) fn completion_requests(server: &llm::fake::Fake) -> Vec<Value> {
     server
         .requests()
         .iter()

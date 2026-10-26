@@ -20,23 +20,25 @@ pub(in crate::agent) struct Observation {
     pub request_message_bytes: usize,
 }
 
+/// Digest and serialized length of one value, from a single serialization.
+fn digest(value: &impl Serialize) -> (Vec<u8>, usize) {
+    let bytes = serde_json::to_vec(value).expect("JSON value serialization cannot fail");
+    (Sha256::digest(&bytes).to_vec(), bytes.len())
+}
+
 impl Tracker {
+    /// Runs once per request on the whole history, so each message is serialized once: the
+    /// system identity is derived from the system messages' own digests.
     pub fn observe(&mut self, model: &str, request: &Chat) -> Observation {
-        let hash =
-            |value: &serde_json::Value| Sha256::digest(value.to_string().as_bytes()).to_vec();
-        let system = hash(&serde_json::json!(
-            request
-                .messages
-                .iter()
-                .filter(|m| m["role"] == "system")
-                .collect::<Vec<_>>()
-        ));
-        let tools = hash(&serde_json::json!(request.tools));
-        let messages: Vec<_> = request
-            .messages
-            .iter()
-            .map(|m| (hash(m), m.to_string().len()))
-            .collect();
+        let messages: Vec<_> = request.messages.iter().map(digest).collect();
+        let mut system = Sha256::new();
+        for (message, (hash, _)) in request.messages.iter().zip(&messages) {
+            if message["role"] == "system" {
+                system.update(hash);
+            }
+        }
+        let system = system.finalize().to_vec();
+        let (tools, _) = digest(&request.tools);
         let common = self
             .messages
             .iter()

@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicBool;
 /// An interactive (non-hermetic) agent over default configuration plus `overlay` and an
 /// unreachable endpoint; these tests inspect the offer and prompt only, so no request is made.
 pub(crate) fn with_agent<T>(overlay: &str, f: impl FnOnce(&mut Agent<'_>) -> T) -> T {
+    crate::llm::fake::raise_fd_limit();
     let temp = tempfile::tempdir().unwrap();
     let project = temp.path().join("project");
     std::fs::create_dir(&project).unwrap();

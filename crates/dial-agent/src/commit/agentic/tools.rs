@@ -18,13 +18,14 @@ use super::validation::{
     MAX_DETAIL_ITEMS, SUMMARY_MAX_CHARS, cap_details, is_test_path, normalize_summary,
     parse_category, validate_analysis, validate_summary_rules, validate_type_consistency,
 };
+use crate::commit::CommitError;
 use crate::commit::ai_stage::map_bounded;
+use crate::commit::backend::CommitBackend;
 use crate::commit::changelog::parse::normalize_items;
 use crate::commit::commit_types::{COMMIT_TYPE_ORDER, canonical_commit_type, coerce_commit_type};
 use crate::commit::config::GenerationConfig;
 use crate::commit::diff::{FileStatus, parse_file_diffs, parse_file_hunks, parse_prompt_diff};
 use crate::commit::execute::{git_output, git_output_indexed};
-use crate::commit::run::{CommitBackend, CommitError};
 use crate::commit::scope::extract_scope_candidates;
 use crate::config::types::Config;
 use crate::llm::Chat;

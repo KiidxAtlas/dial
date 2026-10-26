@@ -450,33 +450,132 @@ fn status_note(status: &Value) -> &'static str {
     }
 }
 
-/// Extra relevance for a path the query refers to: path-component tokens count triple, and a
-/// literal mention of the file name or full path wins outright.
-fn path_relevance(query: &str, path: &str, terms: &BTreeSet<String>) -> usize {
+/// Path tokens that mark test, benchmark and fixture sources. They share vocabulary with the code
+/// they exercise, so ambient retrieval admits them only when the task names them or asks for them.
+const AUXILIARY: [&str; 11] = [
+    "test",
+    "tests",
+    "testing",
+    "testkit",
+    "testdata",
+    "fixture",
+    "fixtures",
+    "bench",
+    "benches",
+    "benchmark",
+    "benchmarks",
+];
+/// Generic path tokens ("src", "rs", "mod", "tests") occur in nearly every path and say nothing.
+const GENERIC_PATH_TOKENS: [&str; 12] = [
+    "src", "rs", "py", "js", "ts", "mod", "lib", "main", "index", "md", "test", "tests",
+];
+/// Below this many indexed files every path token stays distinctive.
+const COMMON_PATH_MIN_FILES: usize = 20;
+/// Queries with at most this many terms are short and deliberate: one shared word can locate a
+/// file. Longer task prompts share some word with almost every outline by chance.
+const SHORT_QUERY_TERMS: usize = 6;
+
+fn auxiliary(path: &str) -> bool {
+    navigation::tokens(path)
+        .iter()
+        .any(|token| AUXILIARY.contains(&token.as_str()))
+}
+
+/// Path tokens shared by more than a fifth of the indexed files (`crates`, the project name)
+/// locate nothing, so they never make a path relevant on their own.
+fn common_path_tokens<'a>(paths: impl Iterator<Item = &'a str>) -> BTreeSet<String> {
+    let mut counts = BTreeMap::<String, usize>::new();
+    let mut total = 0;
+    for path in paths {
+        total += 1;
+        for token in navigation::tokens(path) {
+            *counts.entry(token).or_default() += 1;
+        }
+    }
+    if total < COMMON_PATH_MIN_FILES {
+        return BTreeSet::new();
+    }
+    counts
+        .into_iter()
+        .filter(|(_, count)| count * 5 > total)
+        .map(|(token, _)| token)
+        .collect()
+}
+
+/// Whether the query names this file: its full path, a distinctive file name, or a generic file
+/// name ("mod.rs", "tests.rs") together with its directory.
+fn names_file(query_lower: &str, path_lower: &str) -> bool {
+    if query_lower.contains(path_lower) {
+        return true;
+    }
+    let path = Path::new(path_lower);
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    let stem = path
+        .file_stem()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    if GENERIC_PATH_TOKENS.contains(&stem) {
+        path.parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|parent| parent.to_str())
+            .is_some_and(|parent| query_lower.contains(&format!("{parent}/{name}")))
+    } else {
+        name.len() > 3 && query_lower.contains(name)
+    }
+}
+
+/// Extra relevance for a path the query refers to: distinctive path-component tokens count
+/// triple, and a literal mention of the file name or full path wins outright.
+fn path_relevance(
+    query: &str,
+    path: &str,
+    terms: &BTreeSet<String>,
+    common: &BTreeSet<String>,
+) -> usize {
     if terms.is_empty() {
         return 0;
     }
-    // Generic path tokens ("src", "rs", "mod") occur in nearly every path and say nothing.
-    const GENERIC: [&str; 10] = [
-        "src", "rs", "py", "js", "ts", "mod", "lib", "main", "index", "md",
-    ];
     let mut rank = navigation::tokens(path)
         .iter()
-        .filter(|t| terms.contains(*t) && !GENERIC.contains(&t.as_str()))
+        .filter(|t| {
+            terms.contains(*t) && !GENERIC_PATH_TOKENS.contains(&t.as_str()) && !common.contains(*t)
+        })
         .count()
         * 3;
     let lower = query.to_lowercase();
     let path_lower = path.to_lowercase();
-    let name = Path::new(&path_lower)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or_default();
     if lower.contains(&path_lower) {
         rank += 20;
-    } else if name.len() > 3 && lower.contains(name) {
+    } else if names_file(&lower, &path_lower) {
         rank += 12;
     }
     rank
+}
+
+/// Ambient admission for one indexed file. In a long task prompt one shared outline word is
+/// incidental: a file needs a distinctive path match or two shared outline words. Test, benchmark
+/// and fixture sources need to be named, or a task about tests and a distinctive path match.
+fn ambient_file(
+    query: &str,
+    path: &str,
+    terms: &BTreeSet<String>,
+    outline_overlap: usize,
+    path_rank: usize,
+) -> bool {
+    if auxiliary(path) {
+        let wants_auxiliary = terms.iter().any(|term| AUXILIARY.contains(&term.as_str()));
+        return names_file(&query.to_lowercase(), &path.to_lowercase())
+            || (wants_auxiliary && path_rank > 0);
+    }
+    let min_overlap = if terms.len() > SHORT_QUERY_TERMS {
+        2
+    } else {
+        1
+    };
+    path_rank > 0 || outline_overlap >= min_overlap
 }
 
 fn document(path: &Path) -> bool {
@@ -983,18 +1082,20 @@ impl Codebase {
         }
         candidates.extend(findings);
         let mut groups = BTreeMap::<String, usize>::new();
-        let mut files =
-            conn.prepare("SELECT path,digest,outline FROM codebase_files ORDER BY path")?;
+        let rows = conn
+            .prepare("SELECT path,digest,outline FROM codebase_files ORDER BY path")?
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let common = common_path_tokens(rows.iter().map(|(path, _, _)| path.as_str()));
         let mut ranked_files = Vec::new();
         let mut architecture_files = Vec::new();
-        for row in files.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        })? {
-            let (path, digest, outline) = row?;
+        for (path, digest, outline) in rows {
             if screen(&path).is_err() || screen(&outline).is_err() {
                 continue;
             }
@@ -1003,12 +1104,18 @@ impl Codebase {
                 .or_default() += 1;
             // Paths and file names are the strongest locator: weight their tokens above outline
             // text, and prefer files the query names outright ("approval.rs", "src/agent").
-            let rank = score(&format!("{path} {outline}")) + path_relevance(query, &path, &terms);
+            let path_rank = path_relevance(query, &path, &terms, &common);
+            let rank = score(&format!("{path} {outline}")) + path_rank;
             if architecture_document(Path::new(&path)) && (!scoped || rank > 0) {
                 architecture_files.push((rank, path.clone(), digest.clone(), outline.clone()));
             }
             let root_doc = !path.contains('/') && document(Path::new(&path));
-            if terms.is_empty() || rank > 0 || (!scoped && root_doc) {
+            let admitted = if scoped {
+                ambient_file(query, &path, &terms, score(&outline), path_rank)
+            } else {
+                terms.is_empty() || rank > 0 || root_doc
+            };
+            if admitted {
                 ranked_files.push((rank * 10 + usize::from(root_doc) * 5, path, digest, outline));
             }
         }
@@ -1036,7 +1143,7 @@ impl Codebase {
             architecture_bytes += row.len();
             candidates.push((
                 if scoped {
-                    20 + path_relevance(query, &path, &terms) * 10
+                    20 + path_relevance(query, &path, &terms, &common) * 10
                 } else {
                     usize::MAX
                 },

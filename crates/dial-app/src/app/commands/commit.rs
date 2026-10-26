@@ -9,8 +9,9 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 
 use crate::agent::Agent;
 use crate::app::{App, Shell, Step};
+use crate::commit::backend::ProviderBackend;
 use crate::commit::cli::{commit_help, parse_commit_args};
-use crate::commit::run::{ProviderBackend, run_commit_command};
+use crate::commit::run::run_commit_command;
 use anyhow::{Result, anyhow};
 
 pub(super) const COMMANDS: &[super::CommandSpec] = &[super::CommandSpec {

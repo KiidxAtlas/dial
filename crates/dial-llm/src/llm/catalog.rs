@@ -1360,6 +1360,15 @@ fn llama_props_key(base_url: &str) -> String {
     base_url.trim_end_matches('/').to_owned()
 }
 
+/// Forgets the `/props` answers cached for every base URL on `origin` (`scheme://host:port`): a
+/// test server bound to a port an earlier one used is a different server.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn forget_llama_props(origin: &str) {
+    if let Ok(mut known) = LLAMA_PROPS.lock() {
+        known.retain(|key, _| !super::same_origin(key, origin));
+    }
+}
+
 /// Records a `/props` document fetched elsewhere (`local_server::facts`), so later lookups reuse it.
 pub(crate) fn record_llama_props(base_url: &str, props: &Value) {
     if let Some(found) = LlamaProps::parse(props)

@@ -353,10 +353,19 @@ fn mlx_tokenizer_digest(dir: &Path) -> Option<String> {
 
 type FactsKey = (String, String);
 
+static KNOWN: LazyLock<Mutex<BTreeMap<FactsKey, ServerFacts>>> = LazyLock::new(Default::default);
+
+/// Forgets the facts learned for every base URL on `origin` (`scheme://host:port`): a test server
+/// bound to a port an earlier one used is a different server.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn forget(origin: &str) {
+    if let Ok(mut known) = KNOWN.lock() {
+        known.retain(|(base, _), _| !super::same_origin(base, origin));
+    }
+}
+
 /// Answers already learned for `(base_url, model)`. Only successful loads are stored.
 fn cached(base: &str, model: &str, load: impl FnOnce() -> Option<ServerFacts>) -> ServerFacts {
-    static KNOWN: LazyLock<Mutex<BTreeMap<FactsKey, ServerFacts>>> =
-        LazyLock::new(Default::default);
     let key = (base.trim_end_matches('/').to_owned(), model.to_owned());
     if let Some(known) = KNOWN.lock().ok().and_then(|known| known.get(&key).copied()) {
         return known;

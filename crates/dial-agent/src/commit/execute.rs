@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::{sync::atomic::AtomicBool, time::Duration};
 
-use super::run::CommitError;
+use super::commit_types::CommitError;
 
 /// Run `git <args>` in `cwd` and return stdout. A failed command becomes [`CommitError::Git`]
 /// with `context` and the captured stderr (or stdout) so the cause is readable.

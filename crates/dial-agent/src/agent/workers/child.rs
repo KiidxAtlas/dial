@@ -3711,6 +3711,16 @@ fn call_tool(
     })
 }
 
+/// A read-only child cannot ask for approval; say what it can do instead of only refusing.
+fn read_only_refusal(tool: &str) -> String {
+    let next = if tool == "bash" {
+        approval::safe_bash_rule()
+    } else {
+        "It needs approval, which a read-only subagent cannot request; use the offered tools that need none.".to_owned()
+    };
+    format!("denied: read-only subagent cannot execute this operation. {next}")
+}
+
 fn call_tool_inner(
     env: Env,
     job: &Job,
@@ -3829,7 +3839,7 @@ fn call_tool_inner(
             approval::needs_approval(env.ext, call)
         };
     if !job.spec.mutates && needs_approval {
-        return refuse("denied: read-only subagent cannot execute this operation".into());
+        return refuse(read_only_refusal(&call.name));
     }
     let summary = format!("[{}] {}", job.label, describe(call));
     if let Err(denial) =

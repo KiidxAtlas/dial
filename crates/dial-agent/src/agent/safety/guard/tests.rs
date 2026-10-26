@@ -357,6 +357,27 @@ fn consumed_steps_exclude_refunds_and_server_retries() {
 }
 
 #[test]
+fn steps_given_back_without_a_reply_are_bounded_but_replies_reset_the_bound() {
+    let mut budget = StepBudget::new(0, 0);
+    for _ in 0..StepBudget::MAX_STEPS_WITHOUT_REPLY {
+        assert!(budget.begin());
+        budget.give_back();
+        assert!(!budget.stalled_without_reply());
+    }
+    assert!(budget.begin());
+    assert!(budget.stalled_without_reply());
+    assert_eq!(budget.spent(), 1, "give_back still refunds every step");
+    budget.replied();
+    assert!(!budget.stalled_without_reply());
+    // A productive turn receives a reply in every step and is never cut off by the watchdog.
+    for _ in 0..1000 {
+        assert!(budget.begin());
+        budget.replied();
+    }
+    assert!(!budget.stalled_without_reply());
+}
+
+#[test]
 fn zero_step_budget_is_unlimited_but_refunds_remain_bounded() {
     let mut budget = StepBudget::new(0, 2);
     for _ in 0..100 {

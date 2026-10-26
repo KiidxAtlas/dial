@@ -64,6 +64,19 @@ pub(in crate::agent) trait Terminal {
     fn prevent_completion(&mut self, reason: &str);
 }
 
+/// `Engine::drive` refused an automatic continuation after a tool ended with uncertain effects.
+/// Role adapters that can end a turn gracefully downcast it and stop with its message.
+#[derive(Debug)]
+pub(in crate::agent) struct UncertainRefusal;
+
+impl std::fmt::Display for UncertainRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("automatic continuation refused after uncertain effects")
+    }
+}
+
+impl std::error::Error for UncertainRefusal {}
+
 impl Engine {
     pub fn research_prompt(&self) -> Option<serde_json::Value> {
         self.research.prompt()
@@ -151,6 +164,10 @@ impl Engine {
             self.length_cycle = false;
         }
     }
+    /// The last truncated reply did not advance the output.
+    pub fn length_stalling(&self) -> bool {
+        self.length_stalled > 0
+    }
     /// One lifecycle driver for foreground and worker adapters. Adapters supply admission,
     /// role-specific request preparation and persistence; they never own a second retry loop.
     pub fn drive<R: Terminal>(
@@ -166,10 +183,11 @@ impl Engine {
                     return Ok(Some(result));
                 }
                 Tick::Exhausted => return Ok(None),
-                Tick::Again => anyhow::ensure!(
-                    self.pending_refusal().is_none(),
-                    "automatic continuation refused after uncertain effects"
-                ),
+                Tick::Again => {
+                    if self.pending_refusal().is_some() {
+                        return Err(UncertainRefusal.into());
+                    }
+                }
             }
         }
     }

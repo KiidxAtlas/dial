@@ -106,6 +106,33 @@ fn reviewer_preserves_read_only_permissions_and_optional_schema() {
 }
 
 #[test]
+fn read_only_children_are_told_their_limits_before_the_first_call() {
+    let config = config(&[]);
+    let parse_one = |agent: &str| {
+        parse(
+            &json!({"agent":agent, "task":"t", "solution_space":"s"}),
+            &config,
+        )
+        .unwrap()
+    };
+    let root = Path::new("/repo");
+    let scout = parse_one("scout");
+    let with_shell = scout.jobs[0].system(root, &["read".into(), "bash".into()]);
+    assert!(with_shell.contains("READ-ONLY"), "{with_shell}");
+    assert!(with_shell.contains(&crate::agent::safety::approval::safe_bash_rule()));
+    // Without `bash` the shell rule is not restated.
+    let reviewer = parse_one("reviewer");
+    let without_shell = reviewer.jobs[0].system(root, &["read".into()]);
+    assert!(without_shell.contains("READ-ONLY") && !without_shell.contains("`cwd`"));
+    let worker = parse_one("worker");
+    assert!(
+        !worker.jobs[0]
+            .system(root, &["read".into(), "bash".into()])
+            .contains("READ-ONLY")
+    );
+}
+
+#[test]
 fn synchronous_previews_retain_complete_single_and_batch_reports() {
     use base64::Engine;
     let config = config(&[]);

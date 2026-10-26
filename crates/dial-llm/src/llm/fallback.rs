@@ -12,7 +12,11 @@ use crate::{
 /// Whether a request failure is one for which an alternate model may help under the
 /// `retry.fallback_on` policy. Usage limits are throttling and quota exhaustion.
 pub fn should_fallback(error: &anyhow::Error, on: FallbackOn) -> bool {
-    let class = errors::classify(error);
+    fallback_applies(&errors::classify(error), on)
+}
+
+/// [`should_fallback`] for an already classified failure.
+pub fn fallback_applies(class: &ErrorClass, on: FallbackOn) -> bool {
     let usage_limit = matches!(
         class,
         ErrorClass::RateLimited { .. } | ErrorClass::QuotaExhausted { .. }

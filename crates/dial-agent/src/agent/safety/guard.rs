@@ -147,17 +147,7 @@ impl RepeatedToolCall {
             else {
                 break;
             };
-            let parsed: Vec<(String, String, serde_json::Value)> = calls
-                .iter()
-                .map(|call| {
-                    let name = call["function"]["name"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_owned();
-                    let id = call["id"].as_str().unwrap_or_default().to_owned();
-                    (id, name, call_arguments(&call["function"]))
-                })
-                .collect();
+            let parsed = parsed_calls(calls);
             if parsed
                 .iter()
                 .all(|(_, name, _)| exempt.contains(&name.as_str()))
@@ -235,6 +225,96 @@ impl RepeatedToolCall {
                 )
             })
             .collect()
+    }
+}
+
+/// `(id, name, arguments)` for each call of one assistant message.
+fn parsed_calls(calls: &[serde_json::Value]) -> Vec<(String, String, serde_json::Value)> {
+    calls
+        .iter()
+        .map(|call| {
+            let name = call["function"]["name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            let id = call["id"].as_str().unwrap_or_default().to_owned();
+            (id, name, call_arguments(&call["function"]))
+        })
+        .collect()
+}
+
+/// The newest assistant turns cycling through the same short sequence of call sets
+/// (A, B, A, B, ...). [`RepeatedToolCall`] sees only identical consecutive turns, so a model
+/// alternating between two or three calls escapes it. Advisory only: nothing is refused.
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::agent) struct CallCycle {
+    pub period: usize,
+    pub turns: usize,
+    /// Tool names of one cycle, newest turn first.
+    pub tools: Vec<String>,
+}
+
+impl CallCycle {
+    /// Full cycles required before the pattern is reported.
+    const MIN_CYCLES: usize = 3;
+    /// Longest cycle looked for; longer ones are rarely loops and often legitimate work.
+    const MAX_PERIOD: usize = 3;
+
+    /// Walks assistant turns from the newest backwards, as [`RepeatedToolCall::detect`] does: a
+    /// turn with no calls, or with only exempt calls, ends the window.
+    pub(in crate::agent) fn detect(
+        messages: &[serde_json::Value],
+        exempt: &[&str],
+    ) -> Option<Self> {
+        let window = Self::MAX_PERIOD * Self::MIN_CYCLES;
+        let mut turns: Vec<(String, Vec<String>)> = Vec::new();
+        for message in messages.iter().rev() {
+            if turns.len() == window {
+                break;
+            }
+            if message["role"].as_str() != Some("assistant") {
+                continue;
+            }
+            let Some(calls) = message["tool_calls"]
+                .as_array()
+                .filter(|calls| !calls.is_empty())
+            else {
+                break;
+            };
+            let parsed = parsed_calls(calls);
+            if parsed
+                .iter()
+                .all(|(_, name, _)| exempt.contains(&name.as_str()))
+            {
+                break;
+            }
+            let names = parsed.iter().map(|(_, name, _)| name.clone()).collect();
+            turns.push((call_key(&parsed), names));
+        }
+        (2..=Self::MAX_PERIOD).find_map(|period| {
+            let span = period * Self::MIN_CYCLES;
+            let recent = turns.get(..span)?;
+            let cycles = (period..span).all(|i| recent[i].0 == recent[i - period].0);
+            // Identical turns are a period-one repeat, owned by `RepeatedToolCall`.
+            let varied = recent[..period].iter().any(|(key, _)| *key != recent[0].0);
+            (cycles && varied).then(|| Self {
+                period,
+                turns: span,
+                tools: recent[..period]
+                    .iter()
+                    .map(|(_, names)| names.join("+"))
+                    .collect(),
+            })
+        })
+    }
+
+    pub(in crate::agent) fn guidance(&self) -> String {
+        format!(
+            "[Dial] Your last {} tool rounds cycled through the same {} call sets ({}) with identical arguments. Repeating the cycle will not produce new information: use the results you already have, change the approach, or answer with what is known and what remains unresolved.",
+            self.turns,
+            self.period,
+            self.tools.join(" → ")
+        )
     }
 }
 
@@ -466,21 +546,30 @@ impl RepeatGuard {
 /// Steps a turn may spend. A step is a model call that did work; when a reply is unusable (cut off, unreadable
 /// call, a tool call written as plain text) the retry is refunded, up to `free` times, so a few bad generations do
 /// not eat the budget meant for real work. Evaluation runs get no refunds: their budget is what they measure.
+///
+/// Steps given back unconditionally are bounded separately: a turn whose recoveries keep starting steps without
+/// ever receiving a model reply (a compaction that frees nothing, flapping fallbacks) stops at
+/// [`StepBudget::MAX_STEPS_WITHOUT_REPLY`] instead of looping forever when the step limit is unlimited or refunded.
 pub struct StepBudget {
     max: u32,
     spent: u32,
     free: u32,
+    without_reply: u32,
 }
 
 impl StepBudget {
     /// Refunds a normal turn may use. Bounded so a model that can only produce unusable replies still stops.
     pub const FREE_RETRIES: u32 = 8;
+    /// Consecutive steps that may start without any model reply. Productive steps always receive a reply, so this
+    /// is not a global step limit; it only bounds recovery that never reaches the model.
+    pub const MAX_STEPS_WITHOUT_REPLY: u32 = 24;
 
     pub fn new(max: u32, free: u32) -> Self {
         StepBudget {
             max,
             spent: 0,
             free,
+            without_reply: 0,
         }
     }
 
@@ -489,16 +578,39 @@ impl StepBudget {
         self.spent
     }
 
+    /// The finite step limit, or zero when unlimited.
+    pub fn limit(&self) -> u32 {
+        self.max
+    }
+
+    /// The step just admitted is the last of a finite budget of at least two. A one-step budget
+    /// is all action, so it has no separate wrap-up step.
+    pub fn on_last_step(&self) -> bool {
+        self.max >= 2 && self.spent == self.max
+    }
+
     /// Start a step; false once a finite budget is used up. Zero means unlimited.
     pub fn begin(&mut self) -> bool {
         if self.max != 0 && self.spent >= self.max {
             return false;
         }
         self.spent = self.spent.saturating_add(1);
+        self.without_reply = self.without_reply.saturating_add(1);
         true
     }
 
-    /// Give back the current step if a free retry remains.
+    /// A model reply (usable or not) arrived in the current step.
+    pub fn replied(&mut self) {
+        self.without_reply = 0;
+    }
+
+    /// Whether recovery has started more consecutive steps without a reply than any legitimate sequence needs.
+    pub fn stalled_without_reply(&self) -> bool {
+        self.without_reply > Self::MAX_STEPS_WITHOUT_REPLY
+    }
+
+    /// Give back the current step if a free retry remains; false when the retry is charged as a real step.
+    #[must_use = "a refused refund means the retry spends a real step"]
     pub fn refund(&mut self) -> bool {
         if self.free == 0 || self.spent == 0 {
             return false;
@@ -508,7 +620,8 @@ impl StepBudget {
         true
     }
     /// Give the step back unconditionally. For retries that were not the model's doing (compacting after the
-    /// server rejected the prompt size); the caller bounds how often that can happen.
+    /// server rejected the prompt size); the caller bounds how often that can happen, and
+    /// [`StepBudget::stalled_without_reply`] bounds a sequence of them that never reaches the model.
     pub fn give_back(&mut self) {
         self.spent = self.spent.saturating_sub(1);
     }

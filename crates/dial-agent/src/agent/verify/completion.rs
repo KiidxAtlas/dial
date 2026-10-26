@@ -1,6 +1,7 @@
-//! Stop-time handling for open work. Text alone never closes pending todos: an accepted completed
-//! answer closes only the in-progress task (see `TodoList::complete_reported_work`), and not in goal
-//! mode. Continuations are bounded and need new tool evidence or a changed task list before another reminder is allowed.
+//! Stop-time handling for open work and missing evidence. Text alone never closes pending todos:
+//! an accepted completed answer closes only the in-progress task (see
+//! `TodoList::complete_reported_work`), and not in goal mode. Edits with no passing check earn
+//! one reminder per round; after it the answer is accepted, with the gap disclosed, not hidden.
 use crate::agent::workflow::todo::{Status, TodoList};
 use serde_json::{Value, json};
 
@@ -133,6 +134,16 @@ pub enum StopAction {
     Blocked(String),
 }
 
+/// What a completed answer owes for edits that no passing check covers.
+#[derive(Debug, PartialEq, Eq)]
+pub enum EvidenceGate {
+    Accept,
+    /// Ask once for a check, or for an explanation of why none can run.
+    Remind(String),
+    /// The reminder was spent: accept, and append this disclosure to the answer.
+    Disclose(String),
+}
+
 /// Explicit labels in plain reports use the same outcomes as typed finish calls.
 pub(in crate::agent) fn declared_outcome(text: &str) -> Option<TurnOutcome> {
     let first = text
@@ -184,8 +195,12 @@ pub(in crate::agent) fn awaiting_input(text: &str) -> bool {
     .any(|prefix| last.starts_with(prefix))
 }
 
+/// One reminder for edits that no passing check covers, per round of a turn. Unstarted todos earn
+/// none: an answer may cover them without another request, and the turn discloses open items.
 #[derive(Default)]
-pub struct CompletionGuard;
+pub struct CompletionGuard {
+    evidence_reminded: bool,
+}
 impl CompletionGuard {
     pub fn stopped(&mut self, todo: &TodoList) -> StopAction {
         let blocked = lines(todo, |status| status == Status::Blocked);
@@ -195,7 +210,28 @@ impl CompletionGuard {
             StopAction::Blocked(format!("Blocked tasks:\n{blocked}"))
         }
     }
-    pub fn reset_for_steering(&mut self) {}
+
+    /// `unverified` names the applicable checks when this turn's edits have no passing check on the
+    /// current revision, `None` when evidence is not owed. Without `can_remind`, or once the
+    /// reminder was spent, the gap is disclosed instead of blocking the answer.
+    pub fn evidence(&mut self, unverified: Option<&[String]>, can_remind: bool) -> EvidenceGate {
+        let Some(checks) = unverified else {
+            return EvidenceGate::Accept;
+        };
+        let applicable = checks.join(", ");
+        if !can_remind || std::mem::replace(&mut self.evidence_reminded, true) {
+            return EvidenceGate::Disclose(format!(
+                "\n\nUnverified: no relevant check passed after the last edit (applicable: {applicable})."
+            ));
+        }
+        EvidenceGate::Remind(format!(
+            "[Dial] Files changed this turn, but no relevant check has passed on the current revision (applicable: {applicable}). Run the relevant check now. If it cannot run here, say so and why in the final answer. This reminder is sent once."
+        ))
+    }
+
+    pub fn reset_for_steering(&mut self) {
+        *self = Self::default();
+    }
 }
 
 /// Plain reports receive actionable rejection feedback, just as explicit finish calls do.

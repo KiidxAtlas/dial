@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::TempDir;
 
 use super::*;
+use crate::commit::backend::Completion;
 use crate::config::types::Config;
 use crate::llm::{Chat, Reply};
 

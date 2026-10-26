@@ -208,7 +208,7 @@ pub(in crate::agent) fn parallel_tools(
                         }
                         _ => {}
                     }
-                    let mut output = crate::tools::exec::execution::native(
+                    let mut output = crate::tools::exec::execution::native_read(
                         &ToolContext { workspace, config, mutation_authorizer: None, confirm: None },
                         ext, &call.name, &call.arguments, &|_| {}, interrupt,
                     ).unwrap_or_else(|| ToolOutput::err("parallel tool unavailable"));

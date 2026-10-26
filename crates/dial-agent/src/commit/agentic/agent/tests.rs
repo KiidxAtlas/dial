@@ -1,6 +1,5 @@
 use super::*;
-use crate::commit::run::CommitBackend;
-use crate::commit::run::Completion;
+use crate::commit::backend::{CommitBackend, Completion};
 use crate::config::types::Config;
 use crate::llm::Reply;
 use std::sync::atomic::{AtomicUsize, Ordering};

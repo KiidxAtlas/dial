@@ -12,6 +12,33 @@ fn exit_codes_survive_artifact_footers() {
     assert_eq!(exit_code("[exit code: nope]\n"), None);
 }
 
+#[test]
+fn a_timed_out_or_killed_check_failed_but_a_cancelled_one_settles_nothing() {
+    let run = |exit_code, signal, timed_out, cancelled| {
+        check_failed(
+            &crate::runtime::tool_output::ToolOutput::err("check").with_process(
+                crate::runtime::execution::ProcessOutcome {
+                    started: true,
+                    exit_code,
+                    signal,
+                    timed_out,
+                    cancelled,
+                    output_complete: true,
+                },
+            ),
+        )
+    };
+    assert!(run(Some(1), None, false, false), "nonzero exit");
+    assert!(run(None, Some(9), true, false), "timed out and reaped");
+    assert!(run(None, Some(11), false, false), "crashed on a signal");
+    assert!(!run(None, Some(2), false, true), "the user cancelled it");
+    assert!(
+        !run(None, None, false, false),
+        "still running in the background"
+    );
+    assert!(!run(Some(0), None, false, false), "passed");
+}
+
 static NEXT_TEMP_DIR: AtomicUsize = AtomicUsize::new(0);
 
 struct TempDir(PathBuf);

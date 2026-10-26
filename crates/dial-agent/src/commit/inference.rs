@@ -5,11 +5,11 @@ use std::time::Duration;
 
 use serde_json::json;
 
+use super::backend::{CommitBackend, ProviderBackend};
 use super::cache::{
     self, CacheEntry, CacheKeyMaterial, ConventionalCache, FailureEntry, UsageRecord,
 };
 use super::config::GenerationConfig;
-use super::run::{CommitBackend, ProviderBackend};
 use crate::config::types::Config;
 use crate::llm::profiles::ReasoningEffort;
 use crate::llm::{Chat, Reply};

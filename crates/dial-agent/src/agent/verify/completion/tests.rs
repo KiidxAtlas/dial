@@ -48,9 +48,32 @@ fn todo() -> TodoList {
 #[test]
 fn optional_progress_does_not_force_bookkeeping_rounds() {
     assert!(matches!(
-        CompletionGuard.stopped(&todo()),
+        CompletionGuard::default().stopped(&todo()),
         StopAction::Accept
     ));
+}
+
+#[test]
+fn unverified_edits_earn_one_reminder_then_a_disclosure() {
+    let mut guard = CompletionGuard::default();
+    assert_eq!(guard.evidence(None, true), EvidenceGate::Accept);
+    let checks = ["cargo-check".to_owned()];
+    match guard.evidence(Some(&checks), true) {
+        EvidenceGate::Remind(note) => assert!(note.contains("cargo-check"), "{note}"),
+        other => panic!("first unverified answer is reminded: {other:?}"),
+    }
+    match guard.evidence(Some(&checks), true) {
+        EvidenceGate::Disclose(text) => assert!(text.contains("Unverified"), "{text}"),
+        other => panic!("the reminder is sent once: {other:?}"),
+    }
+    let mut limited = CompletionGuard::default();
+    assert!(
+        matches!(
+            limited.evidence(Some(&checks), false),
+            EvidenceGate::Disclose(_)
+        ),
+        "past a limit the gap is disclosed without another request"
+    );
 }
 
 #[test]
@@ -61,7 +84,7 @@ fn stopping_with_only_blocked_tasks_reports_the_blockers() {
             .call(&json!({"op":"block","reason":"needs the staging password"}))
             .is_error
     );
-    match CompletionGuard.stopped(&todo) {
+    match CompletionGuard::default().stopped(&todo) {
         StopAction::Blocked(text) => assert!(
             text.contains("1. write code (blocked: needs the staging password)"),
             "{text}"

@@ -272,3 +272,24 @@ fn duplicates_within_one_request_collapse_and_protocol_notes_stay() {
     assert_eq!(advice(&messages), ["narration"]);
     assert!(contents(&messages).contains(&"looks good"));
 }
+
+#[test]
+fn a_retracted_request_does_not_suppress_its_note_on_retry_but_a_confirmed_one_does() {
+    let mut emissions = Emissions::default();
+    let mut first = history();
+    first.push(note(Priority::Review, "check the diff"));
+    curate(&mut first, &mut emissions);
+    // The request was discarded before any reply: the retry must carry the same advice.
+    emissions.retract();
+    let mut retry = history();
+    retry.push(note(Priority::Review, "check the diff"));
+    curate(&mut retry, &mut emissions);
+    assert_eq!(advice(&retry), ["check the diff"]);
+    // Delivered: the next request suppresses the repeat as before.
+    emissions.confirm();
+    emissions.retract();
+    let mut next = history();
+    next.push(note(Priority::Review, "check the diff"));
+    curate(&mut next, &mut emissions);
+    assert!(advice(&next).is_empty());
+}

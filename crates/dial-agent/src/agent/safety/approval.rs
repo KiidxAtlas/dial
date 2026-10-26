@@ -294,6 +294,21 @@ fn collect_argvs(
     true
 }
 
+/// Programs `safe_bash` accepts, as told to agents that cannot ask for approval (read-only
+/// children). Commands outside this list need approval; `tests` keeps the list in step.
+pub(in crate::agent) const SAFE_BASH_PROGRAMS: &[&str] = &[
+    "ls", "pwd", "cat", "head", "tail", "wc", "stat", "file", "tree", "which", "echo", "printf",
+    "uname", "date", "grep", "find", "sed",
+];
+
+/// The shell policy a read-only agent works under: what `bash` runs without approval.
+pub(in crate::agent) fn safe_bash_rule() -> String {
+    format!(
+        "`bash` runs only one plain inspection command per call ({}; `find` without -exec, -ok or -delete; `sed` only as `sed -n 'Np'`). No `cd`, `&&`, `;`, pipes, redirection, `$` expansion or variable assignments: set the `cwd` argument instead of `cd`, and prefer read, grep and glob.",
+        SAFE_BASH_PROGRAMS.join(", ")
+    )
+}
+
 /// These are inspection commands, not build/test/package-script exemptions. Those execute code.
 pub fn safe_bash(command: &str) -> bool {
     let Some(words) = shell_words(command) else {

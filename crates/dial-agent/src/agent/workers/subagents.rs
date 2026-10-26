@@ -706,6 +706,15 @@ impl Job<'_> {
             out.push_str("Before proposing or making nontrivial changes, identify the owning module, relevant architecture documents, and existing helpers or analogous implementations to reuse. Cite source locations; justify any new abstraction. Review changes for duplicated logic and boundary violations. Distinguish documented intent from observed code and surface conflicts. Keep investigation task-local.\n");
         }
         out.push_str(&format!("Tools available: {}.\n", tools.join(", ")));
+        if !self.spec.mutates {
+            // State the read-only limits up front so the first call does not discover them.
+            out.push_str("READ-ONLY: you cannot change files or project state, and a call that would need approval is refused without asking anyone.");
+            if tools.iter().any(|name| name == "bash") {
+                out.push(' ');
+                out.push_str(&crate::agent::safety::approval::safe_bash_rule());
+            }
+            out.push('\n');
+        }
         if let Some(schema) = &self.schema {
             out.push_str(&format!("Your final message MUST be only a JSON value (no prose, no code fence) that validates against this JSON Schema:\n{schema}\n"));
         }

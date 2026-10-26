@@ -14,10 +14,10 @@ use std::process::{Command, Stdio};
 use super::state::{
     CommitProposal, ConventionalAnalysis, FileChange, SplitCommitGroup, SplitCommitPlan,
 };
+use crate::commit::CommitError;
 use crate::commit::commit_types::format_conventional_commit;
 use crate::commit::diff::parse_file_diffs;
 use crate::commit::execute::{commit_with_message, git_output, git_output_indexed};
-use crate::commit::run::CommitError;
 use crate::tools::vcs::git_patch::{file_header_and_hunks, line_patch};
 
 fn text(error: CommitError) -> String {

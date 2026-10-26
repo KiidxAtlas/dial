@@ -524,6 +524,26 @@ fn unknown_effects_keep_their_stop_over_edit_cycles() {
 }
 
 #[test]
+fn continuing_after_uncertain_effects_is_a_typed_refusal_adapters_can_stop_on() {
+    let mut edits = Edits::new();
+    let call = edits.edit_call("edit", "a.txt", "A");
+    edits.settle(
+        &call,
+        vec![edits.path("a.txt")],
+        ToolOutput::err("execution disappeared").with_effects(Effects::Unknown),
+    );
+    let error = edits
+        .engine
+        .drive(|_| Ok(Tick::<crate::agent::TurnReport>::Again))
+        .err()
+        .expect("an automatic continuation after uncertain effects is refused");
+    assert!(
+        error.downcast_ref::<UncertainRefusal>().is_some(),
+        "{error:#}"
+    );
+}
+
+#[test]
 fn reset_from_new_steering_clears_turn_local_cycle_state() {
     let mut edits = Edits::new();
     assert_eq!(edits.sequence("a.txt", "ABABA"), Some(4));

@@ -5,6 +5,7 @@
 
 pub(crate) mod agentic;
 pub mod ai_stage;
+pub mod backend;
 pub(crate) mod cache;
 pub(crate) mod changelog;
 pub mod cli;
@@ -25,7 +26,7 @@ mod stage;
 mod text;
 mod types;
 mod validation;
-pub use commit_types::format_conventional_commit;
+pub use commit_types::{CommitError, format_conventional_commit};
 
 use crate::config::types::Config;
 
@@ -38,12 +39,12 @@ pub fn generate(
     generation: &GenerationConfig,
     input: GenerationInput<'_>,
 ) -> Result<GenerationResult, String> {
-    generate_with_backend(&run::ProviderBackend, config, generation, input)
+    generate_with_backend(&backend::ProviderBackend, config, generation, input)
 }
 
 /// Like [`generate`], with model completions routed through `backend`.
 pub(crate) fn generate_with_backend(
-    backend: &dyn run::CommitBackend,
+    backend: &dyn backend::CommitBackend,
     config: &Config,
     generation: &GenerationConfig,
     input: GenerationInput<'_>,

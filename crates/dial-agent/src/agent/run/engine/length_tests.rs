@@ -47,7 +47,7 @@ fn unlimited_step_budget_still_stops_truncation_and_keeps_completed_effects() {
                 Ok(match nudge(engine, &reply) {
                     LengthAction::Nudge { partial, .. } => {
                         assert!(partial.is_none());
-                        budget.refund();
+                        let _ = budget.refund();
                         Tick::Again
                     }
                     LengthAction::Incomplete(text) => Tick::Finished(crate::agent::TurnReport {

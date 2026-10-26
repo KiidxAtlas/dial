@@ -207,9 +207,33 @@ fn promotion_clears_a_fallback_and_fallbacks_return_to_the_promoted_model() {
             assert!(agent.fail_over(&mut backend, &error, &mut ui));
             assert_eq!(agent.auth_config.model, "fb");
             agent.route.fallback.as_mut().unwrap().until = Instant::now();
-            assert!(agent.restore_primary_if_due(&mut backend, &mut ui).unwrap());
+            assert!(agent.restore_primary_if_due(&mut backend, &mut ui));
             assert_eq!(agent.auth_config.model, "big");
             assert!(agent.route.promoted.is_some());
+            agent.backend = Some(backend);
+        },
+    );
+}
+
+#[test]
+fn a_primary_that_cannot_be_rebuilt_keeps_the_fallback_instead_of_failing_the_turn() {
+    with_server_agent(
+        "http://127.0.0.1:9",
+        "[model_roles.coach]\nprovider='endpoint'\nmodel='fb'\nbase_url='http://127.0.0.1:9/v1'\n[retry.fallback_chains]\ndefault=['@coach']\n",
+        |agent| {
+            let mut backend = agent.backend.take().unwrap();
+            let mut ui = Events::default();
+            assert!(agent.fail_over(&mut backend, &anyhow::anyhow!("rate limited"), &mut ui));
+            // The primary's configuration no longer builds a backend (no model selected).
+            let mut broken = agent.effective_config().clone();
+            broken.model = String::new();
+            agent.route.promoted = Some(Promoted { config: broken });
+            agent.route.fallback.as_mut().unwrap().until = Instant::now();
+            assert!(!agent.restore_primary_if_due(&mut backend, &mut ui));
+            assert!(agent.route.on_fallback());
+            assert_eq!(agent.auth_config.model, "fb");
+            // The restore is retried after a fresh cooldown, not at every request.
+            assert!(agent.route.cooling_at(Instant::now()));
             agent.backend = Some(backend);
         },
     );

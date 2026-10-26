@@ -13,6 +13,9 @@ struct Fallback {
     primary_cap: Option<u32>,
 }
 
+/// How long a fallback stays installed after the primary could not be rebuilt at restore time.
+const PRIMARY_RESTORE_RETRY: Duration = Duration::from_secs(5 * 60);
+
 /// A larger-window model installed in place of the configured primary by context promotion. It
 /// becomes the route's primary: fallbacks fail over from it and return to it, never to the model it
 /// replaced, until the user switches models (`reset`).
@@ -80,24 +83,35 @@ impl Agent<'_> {
 
     /// Restores the configured primary once a fallback's cooldown has elapsed. Runs before the
     /// request is prepared, so compaction and the request are sized for the route that answers it.
-    /// Returns whether the route changed.
+    /// Returns whether the route changed. A primary that cannot be rebuilt (credentials or
+    /// configuration changed meanwhile) must not fail a turn the working fallback can answer: the
+    /// fallback stays installed and the restore is tried again after another cooldown.
     pub(in crate::agent) fn restore_primary_if_due(
         &mut self,
         backend: &mut Backend,
         ui: &mut dyn Ui,
-    ) -> Result<bool> {
+    ) -> bool {
         if !self.route.restore_due_at(Instant::now()) {
-            return Ok(false);
+            return false;
         }
         let primary_cap = self.route.fallback.as_ref().and_then(|f| f.primary_cap);
         let primary = self.primary_config();
-        self.install_route(backend, &primary, primary_cap)?;
+        if let Err(error) = self.install_route(backend, &primary, primary_cap) {
+            if let Some(fallback) = &mut self.route.fallback {
+                fallback.until = Instant::now() + PRIMARY_RESTORE_RETRY;
+            }
+            ui.diagnostic(&format!(
+                "Fallback cooldown elapsed, but the primary model could not be rebuilt ({error:#}); staying on the fallback and retrying in {} minutes",
+                PRIMARY_RESTORE_RETRY.as_secs() / 60
+            ));
+            return false;
+        }
         self.route.fallback = None;
         self.route.tried = 0;
         self.request_phase
             .recover("fallback cooldown elapsed; returning to the primary model");
         ui.diagnostic("Fallback cooldown elapsed; returning to the primary model");
-        Ok(true)
+        true
     }
 
     /// The configuration a fallback fails over from and returns to: the promoted model when context
@@ -236,6 +250,20 @@ impl Agent<'_> {
             return true;
         }
         false
+    }
+
+    /// Whether [`Self::fail_over`] still has a configured candidate to move to after a failure,
+    /// so the provider should hand such failures back quickly instead of retrying them at length.
+    pub(in crate::agent) fn fallback_ready(&self) -> bool {
+        let primary = self.primary_config();
+        let fallbacks =
+            crate::llm::fallback::fallback_models(&primary, "default", &primary.selection());
+        let tried = if self.route.fallback.is_some() {
+            self.route.tried
+        } else {
+            0
+        };
+        fallbacks.len() > tried
     }
 
     /// Says so when a fallback retained from an earlier request or turn is still the live route.

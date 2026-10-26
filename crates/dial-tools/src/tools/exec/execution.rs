@@ -91,12 +91,24 @@ pub fn with_dispatch(
 }
 
 pub fn run(cancel: &AtomicBool, action: impl FnOnce() -> ToolOutput) -> ToolOutput {
+    contained(cancel, Effects::Unknown, action)
+}
+
+fn contained(
+    cancel: &AtomicBool,
+    panic_effects: Effects,
+    action: impl FnOnce() -> ToolOutput,
+) -> ToolOutput {
     if cancel.load(Ordering::SeqCst) {
         return before_start();
     }
     let capture = Capture::begin();
-    let mut output = std::panic::catch_unwind(std::panic::AssertUnwindSafe(action))
-        .unwrap_or_else(|_| ToolOutput::err("tool worker panicked").with_effects(Effects::Unknown));
+    let mut panicked = false;
+    let mut output =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(action)).unwrap_or_else(|_| {
+            panicked = true;
+            ToolOutput::err("tool worker panicked").with_effects(panic_effects)
+        });
     // Timeouts come only from owners that kill and reap the process group first, so they are
     // ordinary known failures. An abort, or an error raised under cancellation, stays unsettled.
     if output.execution.effects == Effects::Unknown
@@ -118,7 +130,12 @@ pub fn run(cancel: &AtomicBool, action: impl FnOnce() -> ToolOutput) -> ToolOutp
     output.execution.changed_paths.extend(facts.changed_paths);
     output.execution.changed_paths.sort();
     output.execution.changed_paths.dedup();
-    if facts.effects == Effects::Unknown {
+    // A panic after a recorded commit is uncertain even for a call admitted as a read.
+    let committed_then_panicked = panicked && !output.execution.changed_paths.is_empty();
+    if committed_then_panicked && facts.effects != Effects::Unknown {
+        unsettled();
+    }
+    if facts.effects == Effects::Unknown || committed_then_panicked {
         output.with_effects(Effects::Unknown)
     } else {
         output
@@ -135,11 +152,49 @@ pub fn native(
     emit: &(dyn Fn(ToolEvent) + Sync),
     cancel: &AtomicBool,
 ) -> Option<ToolOutput> {
+    native_with(
+        Effects::Unknown,
+        context,
+        registry,
+        name,
+        args,
+        emit,
+        cancel,
+    )
+}
+
+/// [`native`] for a call the controller admitted as a parallel read. A panic is a known failure
+/// with no effects, except for shell commands: a process may have started and outlived it.
+pub fn native_read(
+    context: &ToolContext<'_>,
+    registry: &Registry,
+    name: &str,
+    args: &Value,
+    emit: &(dyn Fn(ToolEvent) + Sync),
+    cancel: &AtomicBool,
+) -> Option<ToolOutput> {
+    let panic_effects = if name == "bash" {
+        Effects::Unknown
+    } else {
+        Effects::None
+    };
+    native_with(panic_effects, context, registry, name, args, emit, cancel)
+}
+
+fn native_with(
+    panic_effects: Effects,
+    context: &ToolContext<'_>,
+    registry: &Registry,
+    name: &str,
+    args: &Value,
+    emit: &(dyn Fn(ToolEvent) + Sync),
+    cancel: &AtomicBool,
+) -> Option<ToolOutput> {
     if !crate::tools::BUILTIN.contains(&name) && name != "artifact_read" && !registry.contains(name)
     {
         return None;
     }
-    Some(run(cancel, || match name {
+    Some(contained(cancel, panic_effects, || match name {
         "bash" => {
             let stream = |bytes: &[u8]| {
                 emit(ToolEvent {

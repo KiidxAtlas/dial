@@ -201,10 +201,17 @@ pub(in crate::agent) fn is_content_free(text: &str) -> bool {
 /// Advisory notes already delivered, so the same advice is not repeated every round. Safety and
 /// failure-recovery notes are never counted or suppressed: they state enforced boundaries and
 /// recovery the model must always see.
+///
+/// `curate` remembers its selected note immediately. A controller that can discard a request
+/// before the model answers calls [`Emissions::retract`] before curating the retry, so an
+/// undelivered note is not suppressed as a repeat of itself, and [`Emissions::confirm`] once a
+/// reply proves delivery.
 #[derive(Debug, Default)]
 pub(in crate::agent) struct Emissions {
     requests: u64,
     delivered: std::collections::VecDeque<(u64, String)>,
+    /// The newest remembered note belongs to a request not yet confirmed as delivered.
+    unconfirmed: bool,
 }
 
 impl Emissions {
@@ -216,6 +223,18 @@ impl Emissions {
         self.delivered
             .iter()
             .any(|(at, seen)| seen == key && self.requests - at < REPEAT_WINDOW)
+    }
+
+    /// The last curated request reached the model.
+    pub(in crate::agent) fn confirm(&mut self) {
+        self.unconfirmed = false;
+    }
+
+    /// Forget the note selected for a request that was never answered.
+    pub(in crate::agent) fn retract(&mut self) {
+        if std::mem::take(&mut self.unconfirmed) {
+            self.delivered.pop_back();
+        }
     }
 }
 
@@ -255,6 +274,7 @@ pub(in crate::agent) fn curate(messages: &mut Vec<Value>, emissions: &mut Emissi
         .collect();
     dropped.reverse();
     dropped.extend(cap(messages));
+    emissions.unconfirmed = false;
     if let Some(kept) = messages[tail.min(messages.len())..]
         .iter()
         .find(|message| Priority::of(message).is_some_and(|priority| !Emissions::exempt(priority)))
@@ -262,6 +282,7 @@ pub(in crate::agent) fn curate(messages: &mut Vec<Value>, emissions: &mut Emissi
         let key = normalize(kept["content"].as_str().unwrap_or_default());
         let requests = emissions.requests;
         emissions.delivered.push_back((requests, key));
+        emissions.unconfirmed = true;
         while emissions.delivered.len() > REMEMBERED {
             emissions.delivered.pop_front();
         }

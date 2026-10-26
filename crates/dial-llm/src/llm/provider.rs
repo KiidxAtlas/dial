@@ -320,6 +320,7 @@ pub struct RequestControls {
     profile: Option<llm::profiles::ModelProfile>,
     local_hints: Option<llm::local_hints::LocalHints>,
     reasoning_guard: Option<crate::config::types::ReasoningGuardConfig>,
+    failover: Option<crate::config::types::FallbackOn>,
 }
 
 pub struct Backend {
@@ -339,6 +340,8 @@ pub struct Backend {
     protocol: Option<ApiProtocol>,
     headers: llm::model_config::RequestHeaders,
     next_reasoning_guard: Option<crate::config::types::ReasoningGuardConfig>,
+    /// A fallback model is ready for the next request; see [`Backend::next_request_failover`].
+    next_failover: Option<crate::config::types::FallbackOn>,
     steering_config: Option<crate::config::types::Config>,
     steering_runtime: serde_json::Value,
     usage_scope: Option<llm::usage::Scope>,
@@ -421,6 +424,7 @@ impl Backend {
             loop_penalty: None,
             loop_penalty_retries: 0,
             next_reasoning_guard: None,
+            next_failover: None,
             steering_config: None,
             steering_runtime: serde_json::json!({"state":"disabled","uses":0}),
             usage_scope: None,
@@ -886,6 +890,7 @@ impl Backend {
             profile: self.next_profile.clone(),
             local_hints: self.next_local_hints.clone(),
             reasoning_guard: self.next_reasoning_guard.clone(),
+            failover: self.next_failover,
         }
     }
     /// Re-arm only the controls consumed by a rejected attempt of the same logical request.
@@ -893,11 +898,18 @@ impl Backend {
         self.next_profile = controls.profile.clone();
         self.next_local_hints = controls.local_hints.clone();
         self.next_reasoning_guard = controls.reasoning_guard.clone();
+        self.next_failover = controls.failover;
     }
 
     /// Consumed once at the request boundary; transport retries keep the same profile.
     pub fn next_request_profile(&mut self, profile: Option<llm::profiles::ModelProfile>) {
         self.next_profile = profile;
+    }
+    /// The caller has a fallback model ready for failures of these classes: the next request
+    /// retries them briefly and returns the error so the caller can fail over, instead of
+    /// spending every `retry.max_attempts`. Consumed once at the request boundary.
+    pub fn next_request_failover(&mut self, on: Option<crate::config::types::FallbackOn>) {
+        self.next_failover = on;
     }
     /// Persistent local hints for every request of this backend.
     pub fn set_local_hints(&mut self, hints: llm::local_hints::LocalHints) {
@@ -1354,6 +1366,7 @@ impl Backend {
             "the resolved model declares tool calls unsupported; choose a tool-capable model"
         );
         let reasoning_guard = self.next_reasoning_guard.take();
+        let failover = self.next_failover.take();
         let interrupted = || interrupt.load(Ordering::SeqCst);
         let timeout_secs = self.response_timeout(timeout_secs);
         let vision = self.image_input_for(profile.as_ref());
@@ -1695,7 +1708,8 @@ impl Backend {
                 .map(|config| config.retry.clone())
                 .unwrap_or_default(),
             self.retry_backoff,
-        );
+        )
+        .with_failover(failover);
         // An endpoint that already refused the reasoning parameter is not asked again.
         let reasoning_scope = (url.clone(), model.to_owned());
         let mut reasoning_stripped = false;
@@ -2159,7 +2173,7 @@ impl Backend {
                 "{reason}: {cause}; retrying in {:.1}s (attempt {}/{})",
                 delay.as_secs_f64(),
                 attempt + 1,
-                retry_policy.max_attempts
+                retry_policy.attempts(&class)
             ));
             if !on_event(&llm::StreamEvent::Retry { waiting: true }) {
                 return Err(llm::Interrupted.into());

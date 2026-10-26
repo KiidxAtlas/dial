@@ -3,6 +3,8 @@
 use crate::agent::safety::stream_guards;
 
 const MAX_UNUSABLE_REPLIES: u32 = 8;
+/// Text before the final line that makes a reply a report rather than a bare announcement.
+const SUBSTANTIVE_REPORT_CHARS: usize = 160;
 
 #[derive(Default)]
 pub(in crate::agent) struct Recovery {
@@ -10,6 +12,8 @@ pub(in crate::agent) struct Recovery {
     empty: u32,
     promised: u32,
     stalled: u32,
+    /// A substantive report whose last line read as a promise already earned its continue.
+    report_challenged: bool,
 }
 
 pub(in crate::agent) enum StopAction {
@@ -19,6 +23,14 @@ pub(in crate::agent) enum StopAction {
         message: String,
     },
     Incomplete(String),
+}
+
+/// The phrase matchers only flag a final line. A reply that carries a real report before it is
+/// challenged once; repeating an answer after being told to answer directly confirms it.
+fn substantive_report(text: &str) -> bool {
+    let text = text.trim();
+    let body = text.rsplit_once('\n').map_or("", |(body, _)| body);
+    body.split_whitespace().map(str::len).sum::<usize>() >= SUBSTANTIVE_REPORT_CHARS
 }
 
 impl Recovery {
@@ -56,6 +68,10 @@ impl Recovery {
         } else if stream_guards::announces_unexpected_stop(text)
             || stream_guards::reports_unfinished_work(text)
         {
+            if substantive_report(text) && std::mem::replace(&mut self.report_challenged, true) {
+                self.reset();
+                return StopAction::Accept;
+            }
             self.promised += 1;
             (
                 self.promised,
@@ -69,9 +85,15 @@ impl Recovery {
         };
         self.stalled += 1;
         if attempt > cap || self.stalled >= MAX_UNUSABLE_REPLIES {
-            StopAction::Incomplete(format!(
+            let mut stop = format!(
                 "Stopped with incomplete work: {reason} after bounded recovery. Completed effects and the conversation are kept; no completion was recorded."
-            ))
+            );
+            // The user keeps what the model last said instead of only the harness's reason.
+            if !text.trim().is_empty() {
+                stop.push_str("\n\nLast model reply (not accepted as a completion):\n");
+                stop.push_str(text.trim());
+            }
+            StopAction::Incomplete(stop)
         } else {
             StopAction::Continue {
                 reason,

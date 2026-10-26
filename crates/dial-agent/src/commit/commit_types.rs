@@ -1,8 +1,38 @@
 //! Conventional commit types, scope normalization, and the shared commit data model.
 
+use std::fmt;
 use std::sync::LazyLock;
 
 use serde::Deserialize;
+
+/// Failure of the commit command. Maps to exit code 1 at the CLI boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitError {
+    /// Model generation or completion failed.
+    Model(String),
+    /// A git command (commit, push, diff) failed; the message carries git's own output.
+    Git(String),
+    /// The generated message failed validation and was not committed.
+    Validation(String),
+}
+
+impl fmt::Display for CommitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Model(message) | Self::Git(message) | Self::Validation(message) => {
+                f.write_str(message)
+            }
+        }
+    }
+}
+
+impl std::error::Error for CommitError {}
+
+impl From<String> for CommitError {
+    fn from(message: String) -> Self {
+        Self::Model(message)
+    }
+}
 
 /// Canonical commit types in their fixed order.
 pub(crate) const COMMIT_TYPE_ORDER: [&str; 22] = [

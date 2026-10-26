@@ -2,8 +2,15 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// How long [`Fake::requests`] waits for a connection while scripts remain unused. A client that
+/// stopped early (a failed test, an exhausted descriptor table) then fails the test instead of
+/// blocking it forever in `accept`.
+const ACCEPT_IDLE: Duration = Duration::from_secs(60);
 
 pub enum Script {
     /// Complete JSON response with `Content-Length`.
@@ -50,11 +57,15 @@ pub struct Fake {
     pub url: String,
     handle: parking_lot::Mutex<Option<JoinHandle<Vec<Vec<u8>>>>>,
     seen: parking_lot::Mutex<Option<Vec<Vec<u8>>>>,
+    accepted: Arc<AtomicUsize>,
+    scripts: usize,
+    idle: Duration,
 }
 
 impl Fake {
     /// Raw requests received, in order. Blocks until every script ran; repeat calls return the
-    /// same requests.
+    /// same requests. Panics when scripts remain unused and no connection arrived for the idle
+    /// limit, naming how many did.
     pub fn requests(&self) -> Vec<Vec<u8>> {
         let mut seen = self.seen.lock();
         if let Some(requests) = seen.as_ref() {
@@ -62,10 +73,59 @@ impl Fake {
         }
         let handle = self.handle.lock().take();
         let requests = handle
-            .map(|h| h.join().unwrap_or_default())
+            .map(|handle| {
+                self.await_scripts(&handle);
+                handle.join().unwrap_or_default()
+            })
             .unwrap_or_default();
         *seen = Some(requests.clone());
         requests
+    }
+
+    /// Waits until every script was accepted or the server stopped, resetting the idle clock on
+    /// each new connection.
+    fn await_scripts(&self, handle: &JoinHandle<Vec<Vec<u8>>>) {
+        let mut last = (self.accepted.load(Ordering::Acquire), Instant::now());
+        while !handle.is_finished() {
+            let accepted = self.accepted.load(Ordering::Acquire);
+            if accepted >= self.scripts {
+                return;
+            }
+            if accepted != last.0 {
+                last = (accepted, Instant::now());
+            } else if last.1.elapsed() >= self.idle {
+                panic!(
+                    "fake server at {}: {accepted} of {} scripted connections arrived, then none for {:?}",
+                    self.url, self.scripts, self.idle
+                );
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+/// Parallel tests each hold sockets, databases and child pipes; macOS defaults to 256 descriptors,
+/// which a parallel run exceeds. Raise this process's soft limit (never above the hard limit), once.
+pub fn raise_fd_limit() {
+    #[cfg(unix)]
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: plain getrlimit/setrlimit calls on a local, fully initialised struct.
+            unsafe {
+                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
+                    let target = limit.rlim_max.min(10_240);
+                    if limit.rlim_cur < target {
+                        limit.rlim_cur = target;
+                        libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+                    }
+                }
+            }
+        });
     }
 }
 
@@ -112,8 +172,25 @@ pub fn codex_exchange(
 }
 
 pub fn serve(scripts: Vec<Script>) -> Fake {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    raise_fd_limit();
+    serve_on(TcpListener::bind("127.0.0.1:0").expect("bind"), scripts)
+}
+
+/// [`serve`] on a listener the caller bound. What earlier servers on this address told the
+/// process-wide server caches is forgotten first: tests bind port 0, so a later test can get an
+/// earlier test's port, and a stale cache entry would skip a probe its scripts expect.
+pub(crate) fn serve_on(listener: TcpListener, scripts: Vec<Script>) -> Fake {
+    serve_with_idle(listener, scripts, ACCEPT_IDLE)
+}
+
+/// [`serve_on`] with an explicit [`Fake::requests`] idle limit.
+pub(crate) fn serve_with_idle(listener: TcpListener, scripts: Vec<Script>, idle: Duration) -> Fake {
     let url = format!("http://{}", listener.local_addr().expect("addr"));
+    super::catalog::forget_llama_props(&url);
+    super::local_server::forget(&url);
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let count = scripts.len();
+    let counter = Arc::clone(&accepted);
     let handle = std::thread::spawn(move || {
         let mut seen = Vec::new();
         let mut responders = Vec::new();
@@ -122,6 +199,7 @@ pub fn serve(scripts: Vec<Script>) -> Fake {
                 break;
             };
             seen.push(read_request(&mut stream));
+            counter.fetch_add(1, Ordering::Release);
             // Each connection gets its own responder: a stalled script must not queue the
             // client's retry behind it, or the retry's own deadline races the stall.
             responders.push(std::thread::spawn(move || respond(&mut stream, script)));
@@ -135,6 +213,9 @@ pub fn serve(scripts: Vec<Script>) -> Fake {
         url,
         handle: parking_lot::Mutex::new(Some(handle)),
         seen: parking_lot::Mutex::new(None),
+        accepted,
+        scripts: count,
+        idle,
     }
 }
 
@@ -312,3 +393,6 @@ fn respond(stream: &mut std::net::TcpStream, script: Script) {
     }
     let _ = stream.flush();
 }
+
+#[cfg(test)]
+mod tests;

@@ -101,6 +101,10 @@ fn rule_ui_publishes_assistant_prose_but_only_the_reasoning_phase() {
 
 /// Run one call as a child of type `agent`, with a harmless and an approval-needing extension tool installed.
 fn call_as(agent: &str, tool: &str, allow: bool) -> (ToolOutput, Vec<String>) {
+    call_with(agent, tool, json!({}), allow)
+}
+
+fn call_with(agent: &str, tool: &str, arguments: Value, allow: bool) -> (ToolOutput, Vec<String>) {
     let dir = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(dir.path()).unwrap();
     let (config, mut harness, interrupt) = (
@@ -146,7 +150,7 @@ fn call_as(agent: &str, tool: &str, allow: bool) -> (ToolOutput, Vec<String>) {
     let call = llm::ToolCall {
         id: "1".into(),
         name: tool.into(),
-        arguments: json!({}),
+        arguments,
         malformed_arguments: false,
     };
     let mut reviewer = Reviewer {
@@ -173,6 +177,27 @@ fn read_only_agents_use_extension_tools_that_need_no_approval_and_nothing_that_d
         out.text
     );
     assert!(asked.is_empty());
+}
+
+#[test]
+fn a_read_only_shell_refusal_states_what_the_child_may_run_instead() {
+    let (out, asked) = call_with(
+        "scout",
+        "bash",
+        json!({"command":"cd src && wc -l a.rs"}),
+        true,
+    );
+    assert!(
+        out.is_error
+            && out
+                .text
+                .starts_with("denied: read-only subagent cannot execute this operation")
+            && out.text.contains("`cwd`")
+            && out.text.contains("wc"),
+        "{}",
+        out.text
+    );
+    assert!(asked.is_empty(), "{asked:?}");
 }
 
 #[test]
