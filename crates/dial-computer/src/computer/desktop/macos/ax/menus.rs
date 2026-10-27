@@ -7,7 +7,7 @@ use super::{
     focused_window_id, mac_handle, perform_action, set_timeout, skylight, window_id,
 };
 use crate::computer::desktop::{
-    backend::AxBackend,
+    backend::{AxBackend, DeliveryMode},
     control,
     error::{CoreResult, DesktopError},
     menus::{DesktopMenuItem, match_index, require_command, require_enabled, validate_path},
@@ -24,9 +24,13 @@ pub(crate) fn items(window: &DesktopWindow, path: &[String]) -> CoreResult<Vec<D
     Ok(items)
 }
 
-pub(crate) fn select(window: &DesktopWindow, path: &[String]) -> CoreResult<()> {
+pub(crate) fn select(
+    window: &DesktopWindow,
+    path: &[String],
+    mode: DeliveryMode,
+) -> CoreResult<()> {
     validate_path(path, false)?;
-    with_window_menu(window, |app, pid, wid| {
+    with_window_menu(window, mode, |app, pid, wid| {
         let (menu, actual_path) = resolve_menu(app, &path[..path.len() - 1], pid)?;
         let (elements, items) = children(&menu, &actual_path, pid)?;
         let index = match_index(&items, &path[path.len() - 1])?;
@@ -76,26 +80,35 @@ fn window_menu_context(
 
 fn with_window_menu<T>(
     window: &DesktopWindow,
+    mode: DeliveryMode,
     action: impl FnOnce(&AXUIElement, libc::pid_t, u32) -> CoreResult<T>,
 ) -> CoreResult<T> {
     let (app, pid, wid) = window_menu_context(window)?;
     // Application menus dispatch through the key window, not their AX parent.
-    // Focus records change only this app's key context, never activate it or
-    // switch Spaces; the existing guards restore the user's keyboard context.
-    skylight::with_background_guard(pid, || {
-        skylight::with_focus_without_raise(pid, wid, || {
-            require_key_context(pid, wid)?;
-            action(&app, pid, wid)
-        })
-    })
+    // Never escalate after a refusal: the caller chooses the delivery mode.
+    let dispatch = || {
+        require_key_context(pid, wid)?;
+        action(&app, pid, wid)
+    };
+    match mode {
+        DeliveryMode::Background => skylight::with_background_guard(pid, || {
+            skylight::with_focus_without_raise(pid, wid, dispatch)
+        }),
+        DeliveryMode::Foreground => skylight::with_foreground(pid, wid, |_| dispatch()),
+    }
 }
 
 fn require_key_context(pid: libc::pid_t, wid: u32) -> CoreResult<()> {
     control::check()?;
-    if focused_window_id(pid) != Some(wid) {
+    require_exact_key_context(pid, wid, focused_window_id(pid))
+}
+
+fn require_exact_key_context(pid: libc::pid_t, wid: u32, focused: Option<u32>) -> CoreResult<()> {
+    if focused != Some(wid) {
         return Err(DesktopError::background_unavailable(format!(
             "menu dispatch requires window {wid} to be the exact key window of process {pid}; macOS \
-			 did not establish that context, so no command was dispatched"
+			 did not establish that context, so no command was dispatched; use menu.select(path, \
+			 {{takeover:true}}) if foreground control is authorized, or use an exact-window AX action"
         )));
     }
     Ok(())
@@ -250,3 +263,6 @@ fn shortcut(element: &AXUIElement) -> Option<String> {
     shortcut.push_str(&key);
     Some(shortcut)
 }
+
+#[cfg(test)]
+mod tests;

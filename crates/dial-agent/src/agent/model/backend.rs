@@ -58,7 +58,29 @@ pub(crate) fn profile_capped_output(backend: &Backend, requested: u32) -> u32 {
 
 pub fn make_backend(config: &Config) -> Result<Backend> {
     config.require_model()?;
-    let subscription_auth = crate::config::paths::subscription_auth_dir(&config.user_dir)?;
+    let provider = config.provider.as_deref().unwrap_or_default();
+    let method = config
+        .providers
+        .get(provider)
+        .map(|spec| spec.auth)
+        .unwrap_or_default();
+    // A custom Anthropic endpoint never inherits the canonical subscription's credentials.
+    let custom_anthropic = provider == "anthropic"
+        && config
+            .endpoint
+            .as_ref()
+            .is_some_and(|e| e.base_url != llm::anthropic::BASE_URL);
+    ensure!(
+        !custom_anthropic || method != llm::model_config::AuthMethod::OAuth,
+        "Claude subscription requires its official endpoint; select API-key authentication for a custom endpoint"
+    );
+    let signed_route = !custom_anthropic && llm::oauth::selected_auth(&config.user_dir, provider, method)
+        .context("Cannot select authentication; repair sign-in in /providers or explicitly select API key")?;
+    let subscription_auth = if signed_route && matches!(provider, "anthropic" | "chatgpt") {
+        crate::config::paths::subscription_auth_dir(&config.user_dir)?
+    } else {
+        config.user_dir.clone()
+    };
     let requested_account = config
         .endpoint
         .as_ref()
@@ -86,10 +108,9 @@ pub fn make_backend(config: &Config) -> Result<Backend> {
     } else {
         None
     };
-    let oauth = config
-        .provider
-        .as_deref()
-        .and_then(|provider| llm::oauth::Binding::for_provider(&config.user_dir, provider));
+    let oauth = signed_route
+        .then(|| llm::oauth::Binding::selected(&config.user_dir, provider))
+        .flatten();
     let kind = match (&config.provider, &config.endpoint) {
         (Some(provider), _) if provider == crate::llm::chatgpt::PROVIDER => {
             if let Some(endpoint) = &config.endpoint {
@@ -110,7 +131,7 @@ pub fn make_backend(config: &Config) -> Result<Backend> {
         (Some(provider), Some(endpoint))
             if provider == "anthropic"
                 && endpoint.base_url == crate::llm::anthropic::BASE_URL
-                && crate::llm::anthropic_oauth::signed_in(&subscription_auth) =>
+                && signed_route =>
         {
             ensure!(
                 endpoint
@@ -353,3 +374,6 @@ pub(in crate::agent) fn memory_authority_matches(
         && (generation.len() == 1 || !generation.starts_with('0'))
         && generation.parse::<u64>().ok() == Some(session.context_history_generation())
 }
+
+#[cfg(test)]
+mod tests;

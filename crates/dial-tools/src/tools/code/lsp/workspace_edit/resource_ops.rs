@@ -52,9 +52,7 @@ impl Preparation<'_> {
             self.snapshot.validate(self.workspace, path)?;
             Some(source)
         } else {
-            if self.snapshot.files.contains_key(path) {
-                return Err("resource disappeared after the server request".into());
-            }
+            self.snapshot.validate_absent(self.workspace, path)?;
             None
         };
         self.documents.insert(
@@ -136,11 +134,7 @@ impl Preparation<'_> {
                 text: edit["newText"].as_str().ok_or("text edit needs newText")?,
             });
         }
-        edits.sort_by_key(|edit| (edit.start, edit.end));
-        if edits
-            .windows(2)
-            .any(|pair| pair[0].end > pair[1].start || pair[0].start == pair[1].start)
-        {
+        if !super::sort_nonoverlapping(&mut edits) {
             return Err("overlapping or ambiguous text edits; nothing was written".into());
         }
         let mut updated = String::new();

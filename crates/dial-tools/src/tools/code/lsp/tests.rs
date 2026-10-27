@@ -514,6 +514,65 @@ fn position_actions_send_utf16_columns_and_print_character_columns() {
 }
 
 #[test]
+fn coincident_text_edits_preserve_server_order_and_reject_overlaps() {
+    for resources in [false, true] {
+        let h = Harness::new();
+        h.write("a.fk", "abcdef\n");
+        let (client, _) = fake_client(h.ws.root(), fast());
+        let path = h.ws.root().join("a.fk");
+        let extra = h.ws.root().join("extra.fk");
+        let uri = uri_from_path(&path);
+        let edit = |start, end, text| {
+            json!({
+                "range": {"start": {"line": 0, "character": start},
+                          "end": {"line": 0, "character": end}},
+                "newText": text
+            })
+        };
+        let workspace_edit = |edits: Vec<Value>| {
+            if resources {
+                json!({"documentChanges": [
+                    {"kind": "create", "uri": uri_from_path(&extra)},
+                    {"textDocument": {"uri": uri, "version": null}, "edits": edits}
+                ]})
+            } else {
+                json!({"changes": {uri.clone(): edits}})
+            }
+        };
+        let snapshot = super::workspace_edit::Snapshot::capture(&h.ws).unwrap();
+        for edits in [
+            vec![edit(1, 3, "R"), edit(1, 1, "I")],
+            vec![edit(1, 4, "R"), edit(2, 2, "I")],
+            vec![edit(1, 4, "R"), edit(3, 5, "S")],
+        ] {
+            assert!(
+                super::workspace_edit::Plan::prepare(
+                    &h.ws,
+                    &client,
+                    &snapshot,
+                    &workspace_edit(edits)
+                )
+                .is_err()
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "abcdef\n");
+            assert!(!extra.exists());
+        }
+        let edits = vec![
+            edit(5, 5, "Z"),
+            edit(1, 1, "A"),
+            edit(1, 1, "B"),
+            edit(1, 3, "R"),
+            edit(3, 3, "C"),
+        ];
+        let plan =
+            super::workspace_edit::Plan::prepare(&h.ws, &client, &snapshot, &workspace_edit(edits))
+                .unwrap();
+        plan.commit(&h.ws, &snapshot).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "aABRCdeZf\n");
+    }
+}
+
+#[test]
 fn ordered_file_resources_share_transaction_and_refuse_overwriting_external_recovery() {
     let h = Harness::new();
     h.write("before.fk", "original\n");

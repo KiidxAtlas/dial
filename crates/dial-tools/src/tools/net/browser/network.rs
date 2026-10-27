@@ -4,6 +4,9 @@ use super::*;
 use std::collections::HashMap;
 use std::sync::mpsc::{self, TryRecvError};
 
+// Large unbundled dev-server module graphs can exceed 1,024 requests. Concurrency and
+// bytes stay separately bounded; this finite ceiling still stops runaway request loops.
+const MAX_HTTP_JOBS: usize = 16_384;
 struct CancelOnDrop(Arc<AtomicBool>);
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
@@ -41,9 +44,9 @@ pub(super) fn exchange(
                     let size = event.to_string().len();
                     if jobs.len() >= 16
                         || bytes.saturating_add(size) > 2 * 1024 * 1024
-                        || admitted >= 1024
+                        || admitted >= MAX_HTTP_JOBS
                     {
-                        return Err("browser HTTP job budget exceeded".into());
+                        return Err(format!("browser HTTP job budget exceeded (active {}/16, request bytes {}/2097152, total {admitted}/{MAX_HTTP_JOBS})", jobs.len(), bytes.saturating_add(size)));
                     }
                     let timeout = remaining_timeout(end)?;
                     let id = event["callback_id"]

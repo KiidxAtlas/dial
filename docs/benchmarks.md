@@ -88,6 +88,10 @@ hash of the task/verification contract without retaining prompt text. `file_equa
 content, including trailing whitespace. Metric-only and manual-review cases are not counted as
 checked coding successes by the comparison tool; legacy reports lacking this metadata cannot
 establish checked success. Missing or incomplete provider usage stays unknown, not zero cost.
+The comparison's `correctness_nonregressing` is `null` when the baseline has no checked
+successes, because there is no baseline success to test for regression. The comparator exits 0
+for a nonregressing comparison, 1 for a regression, 3 for this inconclusive result, and 2 for
+invalid input or arguments. An inconclusive result is not evidence of preserved correctness.
 Comparisons validate recorded run contracts and reject different schema, suite or fixture-source
 identities. Executable and configuration identities may differ intentionally. Missing legacy run
 contracts are labelled `run_identity: legacy_unknown`, not a confirmed matched-source comparison.

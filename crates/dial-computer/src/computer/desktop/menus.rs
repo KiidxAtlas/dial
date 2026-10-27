@@ -15,6 +15,13 @@ pub struct DesktopMenuItem {
     pub shortcut: Option<String>,
 }
 
+/// Delivery options shared with window input: omission follows task control.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct MenuSelectOptions {
+    pub takeover: Option<bool>,
+}
+
 pub(crate) fn validate_path(path: &[String], allow_empty: bool) -> CoreResult<()> {
     if (!allow_empty && path.is_empty()) || path.len() > 32 {
         return Err(DesktopError::invalid_target(

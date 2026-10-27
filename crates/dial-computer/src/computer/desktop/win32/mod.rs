@@ -166,6 +166,7 @@ impl Backend for Win32Backend {
         &mut self,
         window: &DesktopWindow,
         path: &[String],
+        _mode: DeliveryMode,
         token: &OperationToken,
     ) -> CoreResult<()> {
         token.check()?;

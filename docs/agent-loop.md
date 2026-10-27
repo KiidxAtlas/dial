@@ -187,7 +187,9 @@ busy-input routing avoids inference when either concurrency limit leaves no work
 
 Session history is append-only; tree navigation selects an abandoned branch without deleting it, and branch summaries are optional context for navigation.
 
-Task-tool routing is local, deterministic and turn-scoped. The first request selects native specialists by workflow intent and MCP tools by indexed capabilities/domain relevance. Successful manifest reads can add dependency-domain signals from the existing result (currently complete single-target `package.json` only). Successful MCP discovery can expose matching same-server consumers for the following model request. Both serial and parallel results feed the same observer. Selection never executes tools or changes permissions; pinned harnesses, lean context profiles, child allowlists and ordinary approval policy remain authoritative. Automatic additions are monotonic within the turn, capped at six tools and 24 KiB of schemas; explicit unloads suppress reactivation until the next external request. Selection introduces no extra inference or project reads.
+Task-tool routing is local, deterministic and turn-scoped. The first request selects native specialists by workflow intent and MCP tools by indexed capabilities/domain relevance. Unique tool-name capabilities can also match explicit inspection requests without a server name; ambiguous and generic matches remain conservative. Complete single-target reads of `package.json`, `Cargo.toml` and `pyproject.toml` can add bounded dependency-domain signals; unsupported requirement forms are skipped. Successful MCP discovery can expose matching same-server consumers for the following model request, including one additional tool slot when the count budget is full. Both serial and parallel results feed the same observer. Selection never executes tools or changes permissions; pinned harnesses, child allowlists and ordinary approval policy remain authoritative. Automatic additions are monotonic within the turn, capped at six tools and 24 KiB of schemas (seven tools after a successful discovery). Lean and minimal local profiles route only MCP tools, capped at two tools and 8 KiB (three tools after discovery); the byte caps remain unchanged and overflow fallback disables automatic additions to preserve headroom. Explicit unloads suppress reactivation until the next external request. Selection introduces no extra inference or project reads.
+
+Lean and one-call prompts also include a bounded set of short, untrusted MCP capability descriptions alongside the loadable names. Some descriptions can be omitted when the hint budget is full; `tool_search` can discover other eligible tools. A server being connected does not guarantee selection or permission to execute a tool.
 
 When tool discovery is available, model guidance prefers relevant eligible native or MCP specialists already offered over generic shell/web substitutes. If a needed capability is missing, it asks for task/domain discovery and use of the returned next-round schemas, not rediscovery of offered tools. This guidance is not gated on an MCP inventory, does not require calls for tool-free answers and grants no execution permission. It is prompt guidance, not evidence of increased live-model tool use; routing limits and approval policy are unchanged.
 
@@ -323,6 +325,24 @@ It reuses current evidence, groups coherent edits, discourages repeated baseline
 routine narration, and verifies after the change rather than after each micro-edit. Dial retains
 its own approvals and untrusted-context boundaries.
 Custom operator guidance, fixed-prompt overrides and appended prompts remain supported.
+The built-in policy is shared across models, with no model-family prompt forks. Identical
+write, reporting and role-boundary rules are compile-time fragments in `prompts/system.rs`;
+engineering, trust and focused execution also have single shared sources. Existing lean,
+one-call, worked-example, concise-reporting, capability-scoping and delegation-preference
+adjustments are indexed with their selection and assembly owners in the prompt README.
+The shared-fragment and explicit workflow-composition refactors preserve prompt bytes. Separate
+wording changes make the active request contract override batching and todo pairing (including
+reliability recovery on full-tier routes), and make verification follow the selected delegation
+preference and existing check ownership rather than mere availability of delegation. Tool gating,
+context-overflow fallback, escalation and request enforcement are unchanged. New model-specific
+wording requires measured outcome differences, not a family-name assumption.
+
+Custom templates deduplicate complete normalized lines/blocks, including note bullets, rather
+than embedded substrings. Admitted notes are filtered individually, including when only some
+notes are rendered. Transformed or inline-wrapped values may be repeated conservatively; operator
+templates, replacement prompts and appended guidance remain supported. These selection and wording
+changes have assembly coverage, not measured model-quality or performance gains. Escalation decay
+or success-driven step-down remains deferred pending an explicit policy and outcome evidence.
 Prompt assembly tests and scripted harness checks do not establish reduced looping in a model;
 use the [efficiency benchmark](benchmarks.md#measuring-efficiency) for live-model comparisons. Rebuild/restart
 Dial to use source changes; existing custom/admitted operator guidance is not overwritten.
@@ -510,9 +530,9 @@ limits, reasoning budgets, approvals or verification requirements:
   loads it with `tool_load` in one round; schemas and recorded tool contracts are unchanged. The
   list changes only when a tool is loaded or unloaded, and the offer never reads live-worker state,
   so the provider's cached prefix survives ordinary rounds.
-  MCP tools are the one exception: a server with at most 6 tools is offered up front, whole
-  servers only, in server-name order, up to 16 MCP tools in total. Larger servers stay loadable.
-  Discovery, lean-local, pinned (`[harness] tools`), hermetic and selection-only offers skip this.
+  MCP schemas remain deferred unless selected for the current task or explicitly loaded. Routing
+  is disabled for pinned harnesses, hermetic runs and the context-overflow fallback; selection-only
+  offers do not inherit task-selected tools.
   `assistance.compact_tools=true` switches to discovery mode for small local models: a core set
   bounded by `assistance.initial_tool_limit` (default 16) plus `tool_search`/`tool_load`.
   `assistance.lean_local` defaults to `true`, which enables a lean profile whenever the main model
@@ -547,10 +567,11 @@ limits, reasoning budgets, approvals or verification requirements:
     this model that passed the two-call batch fixture keeps batching; `reliability.enabled = false`
     turns the one-call default off. The record is read once per session, so the mode and prompt do
     not change mid-session. Its offer is not simplified further.
-  - Worked example: the small tier's built-in guidance ends with one compact example loop (a
-    targeted `grep`, a ranged `read`, one `edit` in the active grammar's argument shape, a focused
-    `bash` check, a short answer). It is fixed per grammar, so the prompt stays byte-stable, and is
-    omitted when one of those tools is not offered or a replacement system prompt is configured.
+  - Worked example: when the small tier uses its one-call default, built-in guidance ends with one
+    compact example loop (targeted `grep`, ranged `read`, one `edit` in the active grammar's argument
+    shape, `check` when offered or otherwise a focused `bash` check, then a short answer). It is fixed
+    per grammar and offer. Passing saved batch evidence or disabled reliability omits it, as do
+    missing required capabilities, custom templates and replacement system prompts.
   - Prompt scope: tool-specific sentences of the fixed guidance (`skill`, saved project maps for
     `codebase_memory`, the LSP) appear only when that tool is offered, like the preview and
     delegation sections.
@@ -693,8 +714,9 @@ release a withheld read when its supporting file changes externally, without inv
 call feedback. Retrieval includes `source_sha256` so findings can be tied to the source version;
 hashes and storage history are identity/freshness information, not proof that a finding is correct.
 
-**Experimental workflows** are under `/settings` → **Experimental** and all default to off. Enable
-each independently:
+**Experimental workflows** are under `/settings` → **Experimental**. All default to off except the
+two check-before-change aids, `fault_witness` (on) and `repro_first` (`advise`). Set
+`fault_witness = false` or `repro_first = "off"` to opt out. Enable or disable each independently:
 
 - `experimental.work_packet_contracts` exposes a `work_packet` on single or batched `task` jobs:
   define `scope`, `interface`, and 1–16 `acceptance` conditions. The child must report evidence
@@ -709,7 +731,7 @@ each independently:
 - `experimental.profile_matching` exposes `model_profile` on a `task` call. The delegated call
   uses that named profile for all jobs in the call; only profiles already configured by the
   operator are accepted. This is explicit routing, not automatic benchmarking or model selection.
-- `experimental.fault_witness`: after a behavioral focused check (a related test or configured
+- `experimental.fault_witness` (default on): after a behavioral focused check (a related test or configured
   command) passes on a turn with edits, it is rerun once per evidence revision in an isolated copy
   with this turn's checkpointed changes reverted. The verdict (`fails_without_turn_changes`,
   `passes_without_turn_changes` or `inconclusive`) is appended to the check output and recorded
@@ -722,7 +744,7 @@ each independently:
   Both counterfactual settings are evidence only: they never change check status or the real
   workspace. Copies exclude dependency and build directories, so compiled checks rebuild from
   cold, and shell effects outside checkpoints are not reverted.
-- `experimental.repro_first` (`off`, `advise`, `gate`): on a debugging task, the first edit to a
+- `experimental.repro_first` (`off`, `advise`, `gate`; default `advise`): on a debugging task, the first edit to a
   non-test, non-documentation source file before any reproduction failed this turn (a failing
   `bash` test command or a `code_failed` `check`) gets a note (`advise`) or is refused once
   (`gate`). It fires at most once per turn; the next attempt proceeds.

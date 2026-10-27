@@ -402,6 +402,7 @@ impl Backend for WaylandBackend {
         &mut self,
         window: &DesktopWindow,
         path: &[String],
+        _mode: DeliveryMode,
         token: &OperationToken,
     ) -> CoreResult<()> {
         token.check()?;

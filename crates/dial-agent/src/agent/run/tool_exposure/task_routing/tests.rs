@@ -211,6 +211,55 @@ fn capability_match_works_without_named_servers_but_single_generic_words_do_not(
 }
 
 #[test]
+fn distinct_inspection_capability_is_selected_without_a_server_name() {
+    let migration = (
+        "mcp__database__list_migrations".into(),
+        "List database migrations".into(),
+    );
+    let candidates = vec![
+        migration.clone(),
+        ("mcp__other__search".into(), "Search files".into()),
+    ];
+    assert!(select("Show migrations", &BTreeSet::new(), &candidates).contains(&migration.0));
+    assert!(select("Fix migrations", &BTreeSet::new(), &candidates).is_empty());
+    let ambiguous = vec![
+        migration,
+        (
+            "mcp__another__list_migrations".into(),
+            "List migrations".into(),
+        ),
+    ];
+    assert!(select("Show migrations", &BTreeSet::new(), &ambiguous).is_empty());
+}
+
+#[test]
+fn lean_followup_can_use_one_more_slot_without_exceeding_schema_budget() {
+    with_agent("[assistance]\nlean_local=true", |agent| {
+        nuxt(agent);
+        register(agent, "mcp__other__search", "Search unrelated things");
+        agent.begin_tool_routing("Nuxt routing");
+        agent.add_task_tools(vec!["mcp__other__search".into()], false);
+        assert_eq!(agent.tool_routing.selected.len(), LEAN_TOOL_LIMIT);
+        let call = ToolCall {
+            id: "pages".into(),
+            name: "mcp__nuxt__list-documentation-pages".into(),
+            arguments: json!({}),
+            malformed_arguments: false,
+        };
+        agent.observe_tool_routing(&call, &ToolOutput::ok("/routing".into()));
+        assert!(selected(agent, "mcp__nuxt__get-documentation-page"));
+        assert_eq!(agent.tool_routing.selected.len(), LEAN_TOOL_LIMIT + 1);
+        let bytes: usize = agent
+            .schemas(&agent.tool_routing.selected)
+            .unwrap()
+            .iter()
+            .map(|schema| schema.to_string().len())
+            .sum();
+        assert!(bytes <= LEAN_SCHEMA_BYTES);
+    });
+}
+
+#[test]
 fn explicit_pins_persist_and_unloads_are_not_undone_by_new_observations() {
     with_agent("[assistance]\nlean_local=false", |agent| {
         nuxt(agent);
@@ -239,11 +288,62 @@ fn explicit_pins_persist_and_unloads_are_not_undone_by_new_observations() {
 }
 
 #[test]
+fn lean_local_routes_relevant_mcp_with_a_small_bounded_offer() {
+    with_agent("[assistance]\nlean_local=true", |agent| {
+        assert!(
+            agent.lean_local(),
+            "the test must exercise the lean local profile"
+        );
+        nuxt(agent);
+        register(agent, "mcp__other__search", "Search unrelated things");
+        agent.begin_tool_routing("Fix Nuxt routing and rendering");
+        assert!(selected(agent, "mcp__nuxt__list-documentation-pages"));
+        assert!(
+            agent
+                .offered()
+                .iter()
+                .any(|name| name == "mcp__nuxt__list-documentation-pages")
+        );
+        assert!(!selected(agent, "mcp__other__search"));
+        assert!(agent.tool_routing.selected.len() <= 2);
+        let size: usize = agent
+            .schemas(&agent.tool_routing.selected)
+            .unwrap()
+            .iter()
+            .map(|schema| schema.to_string().len())
+            .sum();
+        let call = ToolCall {
+            id: "pages".into(),
+            name: "mcp__nuxt__list-documentation-pages".into(),
+            arguments: json!({}),
+            malformed_arguments: false,
+        };
+        agent.observe_tool_routing(&call, &ToolOutput::ok("/routing".into()));
+        assert!(selected(agent, "mcp__nuxt__get-documentation-page"));
+        agent.local_escalation.stage = 1;
+        assert!(agent.minimal_tools());
+        agent.begin_tool_routing("Nuxt routing");
+        assert!(
+            agent
+                .offered()
+                .iter()
+                .any(|name| name == "mcp__nuxt__list-documentation-pages")
+        );
+        assert!(size <= 8 * 1024);
+        agent.lean_tools = true;
+        assert!(
+            !agent
+                .offered()
+                .iter()
+                .any(|name| name == "mcp__nuxt__list-documentation-pages")
+        );
+    });
+}
+#[test]
 fn restrictions_and_schema_budgets_are_enforced_before_selection() {
-    for overlay in [
-        "[assistance]\nlean_local=true",
-        "[harness]\ntools=['read','tool_search','tool_load']\n[assistance]\nlean_local=false",
-    ] {
+    for overlay in
+        ["[harness]\ntools=['read','tool_search','tool_load']\n[assistance]\nlean_local=false"]
+    {
         with_agent(overlay, |agent| {
             nuxt(agent);
             agent.begin_tool_routing("Nuxt routing");
@@ -324,6 +424,38 @@ fn runtime_inventory_remains_available_without_a_discovery_round() {
         register(agent, "mcp_servers", "Inspect MCP runtime status");
         assert!(agent.offered().iter().any(|name| name == "mcp_servers"));
     });
+}
+
+#[test]
+fn cargo_and_python_manifest_reads_route_matching_server() {
+    for (path, source) in [
+        ("Cargo.toml", "[dependencies]\nnuxt = '1'\n"),
+        ("pyproject.toml", "[project]\ndependencies = ['nuxt>=1']\n"),
+    ] {
+        with_agent("[assistance]\nlean_local=false", |agent| {
+            nuxt(agent);
+            agent.begin_tool_routing("Fix authentication");
+            std::fs::write(agent.workspace.root().join(path), source).unwrap();
+            let call = ToolCall {
+                id: "manifest".into(),
+                name: "read".into(),
+                arguments: json!({"path":path}),
+                malformed_arguments: false,
+            };
+            let output = crate::tools::read_tool_streaming(
+                &agent.workspace,
+                &call.arguments,
+                &std::sync::atomic::AtomicBool::new(false),
+                128 * 1024,
+            );
+            assert!(!output.is_error, "{}", output.text);
+            agent.observe_tool_routing(&call, &output);
+            assert!(
+                selected(agent, "mcp__nuxt__list-documentation-pages"),
+                "{path}"
+            );
+        });
+    }
 }
 
 #[test]

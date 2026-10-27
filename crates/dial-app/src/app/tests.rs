@@ -46,6 +46,27 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 #[test]
+fn provider_updates_persist_explicit_auth_method() {
+    use crate::llm::model_config::{AuthMethod, ProviderSpec};
+    for (auth, expected) in [
+        (AuthMethod::Auto, "auto"),
+        (AuthMethod::ApiKey, "api-key"),
+        (AuthMethod::OAuth, "oauth"),
+    ] {
+        let changes = crate::app::selection::provider_changes(
+            "anthropic",
+            &ProviderSpec {
+                auth,
+                ..Default::default()
+            },
+        );
+        assert!(changes.iter().any(|change| matches!(change,
+            Change::Set { path, value } if path == "providers.anthropic.auth" && value.as_str() == Some(expected)
+        )));
+    }
+}
+
+#[test]
 fn overlay_navigation_opens_roles_directly_in_every_lifecycle() {
     assert!(matches!(
         overlay_destination("open:roles"),

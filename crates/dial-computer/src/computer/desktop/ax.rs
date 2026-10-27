@@ -478,6 +478,28 @@ fn format_tree(
         let _ = write!(text, " \"{}\"", escaped_truncated(label, 80));
     }
     let _ = write!(text, " [ref={reference}]");
+    // A role alone is not a promise that AXPress is supported. Expose other
+    // advertised actions instead of encouraging a failed press (or treating a
+    // context-menu action as activation).
+    if !node.props.actions.is_empty()
+        && !node
+            .props
+            .actions
+            .iter()
+            .any(|action| matches!(action.as_str(), "press" | "AXPress"))
+    {
+        text.push_str(" actions=[");
+        for (index, action) in node.props.actions.iter().take(8).enumerate() {
+            if index > 0 {
+                text.push_str(", ");
+            }
+            text.push_str(&escaped_truncated(action, 80));
+        }
+        if node.props.actions.len() > 8 {
+            text.push_str(", …");
+        }
+        text.push(']');
+    }
     if depth == 0 {
         let _ = write!(text, " app={}", window.app);
     }
@@ -603,7 +625,9 @@ pub fn query(
                 actual.is_some_and(|text| text.to_lowercase().contains(needle))
             })
         };
-        if contains(Some(&node.props.role), role.as_ref())
+        if role
+            .as_ref()
+            .is_none_or(|expected| node.props.role.to_lowercase() == *expected)
             && contains(label(&node.props), title.as_ref())
             && contains(node.props.value.as_deref(), value.as_ref())
         {

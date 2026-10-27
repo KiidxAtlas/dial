@@ -165,3 +165,39 @@ fn signed_in_distinguishes_missing_from_corrupt_credentials() {
         "{error:#}"
     );
 }
+
+#[test]
+fn rejected_refresh_preserves_subscription_and_saved_api_key() {
+    let home = tempfile::tempdir().unwrap();
+    let previous = State {
+        tokens: Some(Tokens {
+            access_token: "sk-ant-oat01-expired-test".into(),
+            refresh_token: "refresh-test".into(),
+            expires_at: 0,
+        }),
+    };
+    save(home.path(), &previous).unwrap();
+    super::super::catalog::save_credential(
+        home.path(),
+        super::super::anthropic::BASE_URL,
+        "sk-ant-api03-key-test",
+    )
+    .unwrap();
+    let before = std::fs::read(credential_path(home.path())).unwrap();
+    let fake = fake::serve(vec![fake::json(
+        401,
+        &json!({"error": "refresh-secret-test-rejected"}),
+    )]);
+    let error =
+        access_token_at(home.path(), &fake.url, Arc::new(AtomicBool::new(false))).unwrap_err();
+    assert!(!format!("{error:#}").contains("refresh-secret-test-rejected"));
+    assert_eq!(std::fs::read(credential_path(home.path())).unwrap(), before);
+    assert!(signed_in_checked(home.path()).unwrap());
+    assert_eq!(
+        super::super::catalog::credential_token(home.path(), super::super::anthropic::BASE_URL)
+            .unwrap()
+            .as_deref(),
+        Some("sk-ant-api03-key-test")
+    );
+    assert_eq!(fake.requests().len(), 1);
+}

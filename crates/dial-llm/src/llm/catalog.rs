@@ -679,6 +679,63 @@ fn prepare(id: String, spec: ProviderSpec, user_dir: &Path) -> Probe {
             return probe;
         }
     };
+    // API-key selection must not read or refresh unrelated sign-in credentials.
+    if probe.id == "anthropic"
+        && probe.spec.auth == super::model_config::AuthMethod::OAuth
+        && probe.spec.base_url != super::anthropic::BASE_URL
+    {
+        probe.blocked = Some((
+            "unavailable",
+            "Claude subscription requires its official endpoint",
+        ));
+        return probe;
+    }
+    if probe.id == "anthropic" && probe.spec.base_url == super::anthropic::BASE_URL {
+        let subscription = super::oauth::selected_auth(user_dir, &probe.id, probe.spec.auth)
+            .and_then(|selected| {
+                if selected {
+                    crate::config::paths::subscription_auth_dir(user_dir).map(Some)
+                } else {
+                    Ok(None)
+                }
+            });
+        match subscription {
+            Ok(Some(dir)) => {
+                if !probe
+                    .spec
+                    .protocol
+                    .is_none_or(|p| p == ApiProtocol::Anthropic)
+                {
+                    probe.blocked = Some((
+                        "unavailable",
+                        "Claude subscription requires the Anthropic protocol",
+                    ));
+                    return probe;
+                }
+                apply_anthropic_oauth_access(
+                    &mut probe,
+                    super::anthropic_oauth::access_token(
+                        &dir,
+                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    ),
+                );
+                return probe;
+            }
+            Err(error) => {
+                apply_anthropic_oauth_access(&mut probe, Err(error));
+                return probe;
+            }
+            Ok(None) => {}
+        }
+    }
+    if probe.spec.auth == super::model_config::AuthMethod::OAuth {
+        // Generic sign-ins use the bundled catalog and attach grants at request time.
+        probe.blocked = Some((
+            "auth-required",
+            "Sign in from /providers to use the selected authentication method",
+        ));
+        return probe;
+    }
     let env = probe.spec.api_key_env.as_deref().or_else(|| {
         KNOWN
             .iter()
@@ -723,9 +780,18 @@ fn prepare(id: String, spec: ProviderSpec, user_dir: &Path) -> Probe {
     }
     probe
 }
-fn apply_anthropic_oauth_token(probe: &mut Probe, token: &super::auth::SecretToken) {
-    probe.token = Some(token.as_str().to_owned());
+fn apply_anthropic_oauth_access(probe: &mut Probe, access: Result<super::auth::SecretToken>) {
+    probe.token = None;
     probe.blocked = None;
+    match access {
+        Ok(token) => probe.token = Some(token.as_str().to_owned()),
+        Err(_) => {
+            probe.blocked = Some((
+                "auth-required",
+                "Claude subscription authentication failed; sign in again in /providers to repair credentials",
+            ));
+        }
+    }
 }
 fn status(probe: &Probe, state: &str, detail: &str, models: usize) -> ProviderStatus {
     ProviderStatus {
@@ -2466,6 +2532,10 @@ pub fn discover(
                     label: selection.provider.clone(),
                     base_url: base.clone(),
                     api_key_env: api_key_env.cloned(),
+                    auth: configured
+                        .get(&selection.provider)
+                        .map(|spec| spec.auth)
+                        .unwrap_or_default(),
                     allow_insecure: selection.allow_insecure,
                     protocol: selection.protocol,
                     headers: headers.cloned(),
@@ -2479,9 +2549,10 @@ pub fn discover(
     // list reports it unavailable and hides its bundled models, so `oauth_catalog` serves it.
     endpoints.retain(|(id, spec)| {
         !(spec.enabled
-            && spec.api_key_env.is_none()
+            && spec.auth != super::model_config::AuthMethod::ApiKey
+            && (spec.auth == super::model_config::AuthMethod::OAuth || spec.api_key_env.is_none())
             && spec.headers.as_ref().is_none_or(|h| h.is_empty())
-            && super::oauth::signed_in(&layout.user_dir, id)
+            && super::oauth::selected_auth(&layout.user_dir, id, spec.auth).unwrap_or(false)
             && super::oauth::flow(id)
                 .is_some_and(|flow| super::oauth::same_origin(&spec.base_url, flow.base_url)))
     });
@@ -2547,21 +2618,7 @@ pub fn discover(
                         blocked: Some(("unavailable", "Endpoint probe limit reached")),
                     }
                 } else {
-                    let mut probe = prepare(id.clone(), spec, &layout.user_dir);
-                    if id == "anthropic"
-                        && probe
-                            .spec
-                            .protocol
-                            .is_none_or(|p| p == ApiProtocol::Anthropic)
-                        && super::anthropic_oauth::signed_in(&layout.user_dir)
-                        && let Ok(token) = super::anthropic_oauth::access_token(
-                            &layout.user_dir,
-                            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                        )
-                    {
-                        apply_anthropic_oauth_token(&mut probe, &token);
-                    }
-                    probe
+                    prepare(id, spec, &layout.user_dir)
                 }
             })
             .collect();

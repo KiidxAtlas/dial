@@ -11,12 +11,15 @@ use super::client::Client;
 use super::text::{path_from_uri, read_source};
 use crate::tools::Workspace;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 mod resource_ops;
+
+#[cfg(test)]
+mod tests;
 
 const MAX_FILES: usize = 100_000;
 const MAX_TRANSACTION_BYTES: usize = crate::tools::edit::edit_transaction::MAX_BYTES;
@@ -46,49 +49,116 @@ impl Identity {
 }
 
 /// Capture identities before asking the server, including unopened cross-file edit targets.
-/// Symlinks are never followed by the traversal; canonical in-root targets are captured through
-/// their ordinary paths. Git internals are not refactoring targets.
+/// Only observed files and absent names in completely enumerated directories are eligible.
+/// Symlinks are not followed; dependency/build trees are deliberately not refactoring targets.
 pub(super) struct Snapshot {
     root: PathBuf,
     files: BTreeMap<PathBuf, Identity>,
+    present: BTreeSet<PathBuf>,
+    complete_dirs: BTreeMap<PathBuf, Identity>,
 }
 
 impl Snapshot {
     pub fn capture(ws: &Workspace) -> Result<Self, String> {
+        Self::capture_with_limit(ws, MAX_FILES)
+    }
+
+    fn capture_with_limit(ws: &Workspace, limit: usize) -> Result<Self, String> {
         let mut files = BTreeMap::new();
+        let mut present = BTreeSet::new();
+        let mut complete_dirs = BTreeMap::new();
         let mut dirs = vec![ws.root().to_owned()];
         let mut entries = 0usize;
         while let Some(dir) = dirs.pop() {
-            let iter = fs::read_dir(&dir)
-                .map_err(|e| format!("cannot snapshot {}: {e}", dir.display()))?;
+            let before = fs::symlink_metadata(&dir)
+                .ok()
+                .filter(|meta| meta.is_dir())
+                .and_then(|meta| Identity::of(&dir, &meta).ok());
+            let iter = match fs::read_dir(&dir) {
+                Ok(iter) => iter,
+                Err(e) if dir == ws.root() => {
+                    return Err(format!("cannot snapshot {}: {e}", dir.display()));
+                }
+                Err(_) => continue,
+            };
+            let mut complete = true;
             for entry in iter {
-                let entry = entry.map_err(|e| format!("cannot snapshot {}: {e}", dir.display()))?;
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(_) => {
+                        complete = false;
+                        break;
+                    }
+                };
+                if entries >= limit {
+                    complete = false;
+                    break;
+                }
                 entries += 1;
-                if entries > MAX_FILES {
-                    return Err(format!(
-                        "refactoring snapshot exceeds {MAX_FILES} entries; nothing was written"
-                    ));
-                }
-                if entry.file_name() == ".git" {
-                    continue;
-                }
                 let path = entry.path();
-                if ws.is_protected(&path) {
+                present.insert(path.clone());
+                if entry.file_name() == ".git" || ws.is_protected(&path) {
                     continue;
                 }
-                let meta = fs::symlink_metadata(&path)
-                    .map_err(|e| format!("cannot snapshot {}: {e}", path.display()))?;
+                let meta = match fs::symlink_metadata(&path) {
+                    Ok(meta) => meta,
+                    Err(_) => {
+                        complete = false;
+                        continue;
+                    }
+                };
                 if meta.is_dir() {
-                    dirs.push(path);
+                    // These trees commonly dwarf the source tree. Refuse edits to unobserved
+                    // targets within them rather than assuming their contents are unchanged.
+                    if !matches!(
+                        entry.file_name().to_str(),
+                        Some("node_modules" | "target" | ".venv" | "venv" | "__pycache__")
+                    ) {
+                        dirs.push(path);
+                    }
                 } else if meta.is_file() {
-                    files.insert(path.clone(), Identity::of(&path, &meta)?);
+                    match Identity::of(&path, &meta) {
+                        Ok(identity) => {
+                            files.insert(path, identity);
+                        }
+                        Err(_) => complete = false,
+                    }
+                }
+            }
+            if complete {
+                let after = fs::symlink_metadata(&dir)
+                    .ok()
+                    .filter(|meta| meta.is_dir())
+                    .and_then(|meta| Identity::of(&dir, &meta).ok());
+                if let Some(identity) = before.filter(|identity| Some(identity) == after.as_ref()) {
+                    complete_dirs.insert(dir, identity);
                 }
             }
         }
         Ok(Self {
             root: ws.root().to_owned(),
             files,
+            present,
+            complete_dirs,
         })
+    }
+
+    /// Prove an absent resource was absent at capture time; a skipped or incomplete directory
+    /// cannot establish that fact. This also detects a previously observed file disappearing.
+    fn validate_absent(&self, ws: &Workspace, path: &Path) -> Result<(), String> {
+        let witnessed = path.parent().and_then(|parent| {
+            let expected = self.complete_dirs.get(parent)?;
+            let meta = fs::symlink_metadata(parent).ok()?;
+            (meta.is_dir() && Identity::of(parent, &meta).ok().as_ref() == Some(expected))
+                .then_some(())
+        });
+        if self.root != ws.root() || self.present.contains(path) || witnessed.is_none() {
+            return Err(format!(
+                "{} was not witnessed absent in an unchanged directory before the server request; nothing was written",
+                path.display()
+            ));
+        }
+        Ok(())
     }
 
     pub fn validate(&self, ws: &Workspace, path: &Path) -> Result<(), String> {
@@ -144,6 +214,13 @@ struct Edit<'a> {
     start: usize,
     end: usize,
     text: &'a str,
+}
+
+// LSP permits ordered insertions at the same position, followed by one replacement.
+// Stable sorting preserves the server's order among edits with the same start.
+fn sort_nonoverlapping(edits: &mut [Edit<'_>]) -> bool {
+    edits.sort_by_key(|edit| edit.start);
+    !edits.windows(2).any(|pair| pair[0].end > pair[1].start)
 }
 
 /// Index line boundaries once per target, then convert each UTF-16 column strictly. Display
@@ -393,11 +470,7 @@ impl Plan {
                 }
                 edits.push(Edit { start, end, text });
             }
-            edits.sort_by_key(|edit| (edit.start, edit.end));
-            if edits
-                .windows(2)
-                .any(|pair| pair[0].end > pair[1].start || pair[0].start == pair[1].start)
-            {
+            if !sort_nonoverlapping(&mut edits) {
                 return Err(format!(
                     "overlapping or ambiguous edits for {}; nothing was written",
                     abs.display()
@@ -510,8 +583,8 @@ impl Plan {
         for change in &self.changes {
             if change.original.is_some() {
                 snapshot.validate(ws, &change.abs)?;
-            } else if snapshot.files.contains_key(&change.abs) {
-                return Err("new resource existed before the server request".into());
+            } else {
+                snapshot.validate_absent(ws, &change.abs)?;
             }
             if ws.resolve(change.abs.to_str().ok_or("path is not UTF-8")?)? != change.abs {
                 return Err(

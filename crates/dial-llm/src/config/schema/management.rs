@@ -107,7 +107,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         MO,
         "Configuration",
         "Provider definitions",
-        "Named providers, including protocol, request headers, account pin and context settings. Contents are masked; reference secret environment variables instead of literal tokens."
+        "Named providers, including auth (auto, api-key or oauth), protocol, request headers, account pin and context settings. Authentication selection does not delete credentials. Contents are masked; reference secret environment variables instead of literal tokens."
     ),
     structured!(
         "model_roles",

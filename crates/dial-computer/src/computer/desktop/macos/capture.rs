@@ -135,7 +135,7 @@ impl MacCapture {
     pub(super) fn window(&self, id: &str) -> CoreResult<DesktopWindow> {
         let missing = || {
             DesktopError::window_not_found(format!(
-                "window '{id}' was not found; it may be closed or minimized"
+                "window '{id}' is not currently available as an on-screen, shareable window; it may be closed, hidden, minimized, on another Space, or excluded by capture policy. Refresh windows() before choosing a target; no sibling window was substituted"
             ))
         };
         let id = id.parse::<u32>().map_err(|_| missing())?;

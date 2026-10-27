@@ -321,6 +321,12 @@ impl Shell {
                 providers.set_anthropic_signed_in(crate::llm::anthropic_oauth::signed_in(
                     &app.layout.user_dir,
                 ));
+                providers.set_oauth_signed_in(
+                    crate::llm::oauth::flows()
+                        .filter(|flow| crate::llm::oauth::signed_in(&app.layout.user_dir, flow.id))
+                        .map(|flow| flow.id.to_owned())
+                        .collect(),
+                );
                 providers.set_chatgpt_pending(
                     self.auth_job
                         .as_ref()

@@ -360,9 +360,10 @@ fn display_for(layout: &Layout, home: Option<&Path>, path: &Path) -> String {
     path.display().to_string()
 }
 
-/// `<user_dir>/SOUL.md`: the agent's identity and tone.
-pub fn soul(layout: &Layout) -> Option<String> {
-    let (text, cut) = read_text(&layout.user_dir.join("SOUL.md"), FILE_CAP)?;
+/// A whole-file prompt override: trimmed, `None` when missing, binary or blank, and marked when the
+/// size cap cut it.
+fn read_override(path: &Path) -> Option<String> {
+    let (text, cut) = read_text(path, FILE_CAP)?;
     let text = text.trim();
     (!text.is_empty()).then(|| {
         if cut {
@@ -373,19 +374,14 @@ pub fn soul(layout: &Layout) -> Option<String> {
     })
 }
 
+/// `<user_dir>/SOUL.md`: the agent's identity and tone.
+pub fn soul(layout: &Layout) -> Option<String> {
+    read_override(&layout.user_dir.join("SOUL.md"))
+}
+
 /// (`.dial/SYSTEM.md` replacing the base system prompt, `.dial/APPEND_SYSTEM.md` appended to it).
 pub fn system_overrides(layout: &Layout) -> (Option<String>, Option<String>) {
-    let load = |name: &str| {
-        let (text, cut) = read_text(&layout.project_dir.join(name), FILE_CAP)?;
-        let text = text.trim();
-        (!text.is_empty()).then(|| {
-            if cut {
-                format!("{text}\n[... truncated ...]")
-            } else {
-                text.to_string()
-            }
-        })
-    };
+    let load = |name: &str| read_override(&layout.project_dir.join(name));
     (load("SYSTEM.md"), load("APPEND_SYSTEM.md"))
 }
 
@@ -539,7 +535,9 @@ fn looks_like_path(token: &str) -> bool {
     token.contains('/') || token.contains('.') || token.starts_with('~')
 }
 
-fn xml_attr(s: &str) -> String {
+/// Attribute-safe text for the `<file>`, `<dir>`, `<context>` and `<mcp-server>` wrappers: control
+/// characters are dropped and `&`, `"` and `<` are escaped, so a name cannot end its attribute or tag.
+pub(in crate::agent) fn xml_attr(s: &str) -> String {
     s.chars()
         .filter(|c| !c.is_control())
         .collect::<String>()

@@ -45,18 +45,35 @@ test('missing tab selects one existing tab but never guesses among several', () 
   assert.throws(()=>h.run('tabFor({tab:999})'),/999 is not open/);
   assert.equal(h.run('tabFor({tab:4}).page.title'),'preview');
 });
-test('pending callbacks and bytes remain bounded and expire',async () => {
+test('pending callbacks and queued requests remain bounded on a flood',async () => {
   const h=harness();
   h.run('operationId = 42');
-  const promises=h.run('Array.from({length:1000},()=>http(fakeRequest).catch(error=>error.message))');
+  const promises=h.run('Array.from({length:5000},()=>http(fakeRequest).catch(error=>error.message))');
+  await Promise.resolve();
   assert.equal(h.run('callbacks.size'),16);
   assert(h.run('pendingBytes')<=2*1024*1024);
   assert.equal(h.frames.length,16);
+  assert.equal(h.run('httpQueue.length'),4096);
   assert(h.frames.every(frame=>frame.operation_id===42));
-  for (const timer of [...h.timers]) timer();
-  await Promise.all(promises);
+  h.run('cancelPending("test cleanup")');
+  const errors = await Promise.all(promises);
+  assert(errors.some(error=>error.includes('queue budget exceeded')));
+  assert.equal(h.run('queuedHttpBytes'),0);
   assert.equal(h.run('callbacks.size'),0);
   assert.equal(h.run('pendingBytes'),0);
+});
+
+test('pending callbacks expire and release their slots',async () => {
+  const h=harness();
+  h.run('operationId = 42');
+  const promises=h.run('Array.from({length:16},()=>http(fakeRequest).catch(error=>error.message))');
+  await Promise.resolve();
+  for (const timer of [...h.timers]) timer();
+  const errors = await Promise.all(promises);
+  assert(errors.every(error=>error.includes('expired')));
+  assert.equal(h.run('callbacks.size'),0);
+  assert.equal(h.run('pendingBytes'),0);
+  assert.equal(h.run('activeHttp'),0);
 });
 test('stdout backpressure rejects new frames without buffering',async () => {
   const h=harness();
@@ -71,11 +88,35 @@ test('callback byte budget prevents large concurrent uploads',async () => {
   const h=harness();
   h.run('operationId = 1; fakeRequest.postDataBuffer = () => Buffer.alloc(1024*1024)');
   const promises=h.run('Array.from({length:100},()=>http(fakeRequest).catch(error=>error.message))');
+  await Promise.resolve();
   assert.equal(h.run('callbacks.size'),1);
   assert(h.run('pendingBytes')<=2*1024*1024);
+  assert(h.run('queuedHttpBytes')<=8*1024*1024);
   h.run('cancelPending("test cleanup")');
-  await Promise.all(promises);
+  const errors = await Promise.all(promises);
+  assert(errors.some(error=>error.includes('queue byte budget exceeded')));
+  assert.equal(h.run('queuedHttpBytes'),0);
   assert.equal(h.run('pendingBytes'),0);
+});
+
+test('HTTP bursts wait for capacity instead of dropping requests, and cancellation clears the queue',async () => {
+  const h=harness();
+  h.run('operationId = 1');
+  const promises=h.run('Array.from({length:20},()=>http(fakeRequest).catch(error=>error.message))');
+  await Promise.resolve();
+  assert.equal(h.run('activeHttp'),16);
+  assert.equal(h.run('httpQueue.length'),4);
+  h.run('finishCallback(1, new Error("first request ended"))');
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(h.run('httpQueue.length'),3);
+  assert.equal(h.run('activeHttp'),16);
+  h.run('operationId = 0; cancelPending("operation finished")');
+  await Promise.all(promises);
+  assert.equal(h.run('activeHttp'),0);
+  assert.equal(h.run('httpQueue.length'),0);
+  assert.equal(h.run('callbacks.size'),0);
 });
 
 test('network failures lead with the current operation cause, not stale tab failures', () => {
@@ -84,6 +125,7 @@ test('network failures lead with the current operation cause, not stale tab fail
     {kind:'blocked',operation_id:1,error:'stale failure'},
     {kind:'blocked',operation_id:2,error:'refusing browser request to 127.0.0.1: loopback address'}
   ]})`);
+  h.run(`tabs.get(1).networkFailures = tabs.get(1).network`);
   const message=h.run(`failureMessage(new Error('page.goto: net::ERR_BLOCKED_BY_CLIENT'),2)`);
   assert(message.startsWith('Browser network failure: refusing browser request'));
   assert(message.includes('page.goto: net::ERR_BLOCKED_BY_CLIENT'));
@@ -130,4 +172,49 @@ test('run uses DOM globals and assert/sleep in the page realm, not Playwright or
   assert.equal(result.value, 'DOM title');
   await assert.rejects(runCode({ page, timeoutMs: 1000, code: 'return page.title();' }), /page is not defined/);
   await assert.rejects(runCode({ page, timeoutMs: 1000, code: "assert(false, 'DOM assertion failed');" }), /DOM assertion failed/);
+});
+
+test('navigation settlement includes response fulfillment and continues beyond one second', async () => {
+  const h = harness({realTimers:true});
+  h.run('activeRoutes = 1');
+  const result = h.run('settleRequests(null, 2500)');
+  await new Promise(resolve=>setTimeout(resolve,1200));
+  h.run('activeRoutes = 0');
+  assert.equal((await result).settled,true);
+});
+
+test('navigation settlement still respects the approved operation deadline', async () => {
+  const h = harness({realTimers:true});
+  h.run('activeRoutes = 1');
+  const start = Date.now();
+  assert.equal((await h.run('settleRequests(Date.now()+100,15000)')).settled,false);
+  assert(Date.now()-start < 1000);
+});
+
+test('module bursts exceeding the old queue are admitted, and never cross operation ownership', async () => {
+  const h = harness();
+  h.run('operationId=1');
+  const pending=h.run('Array.from({length:1500},()=>http(fakeRequest).catch(error=>error.message))');
+  await Promise.resolve();
+  assert.equal(h.run('httpQueue.length'),1484);
+  h.run('operationId=2; finishCallback(1,new Error("ended"))');
+  for (let i=0;i<10;i++) await Promise.resolve();
+  assert.equal(h.frames.length,16,'queued requests may not dispatch in the next operation');
+  h.run('cancelPending("cleanup")');
+  await Promise.all(pending);
+  assert.equal(h.run('activeHttp'),0);
+  assert.equal(h.run('queuedHttpBytes'),0);
+});
+
+test('blocked causes survive ordinary network history eviction with bounded storage and cursor filtering', () => {
+  const h = harness();
+  h.run(`tab={seq:0,page:{url(){return 'http://localhost/'}},console:[],network:[],dialogs:[],downloads:[],navigation:[]};
+    tabs.set(1,tab);
+    record(tab,'network',{kind:'blocked',operation_id:2,error:'queue exhausted'});
+    for(let i=0;i<150;i++) record(tab,'network',{kind:'response'});`);
+  assert.equal(h.run('tabEvents(tab).network_failures[0].error'),'queue exhausted');
+  assert.equal(h.run('tabEvents(tab,1).network_failures.length'),0);
+  assert(h.run(`failureMessage(new Error('timeout'),2)`).startsWith('Browser network failure: queue exhausted'));
+  h.run(`for(let i=0;i<150;i++) record(tab,'network',{kind:'blocked',error:'bounded'})`);
+  assert.equal(h.run('tab.networkFailures.length'),100);
 });

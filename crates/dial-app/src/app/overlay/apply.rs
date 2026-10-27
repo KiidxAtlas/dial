@@ -190,7 +190,11 @@ impl OverlayEnv<'_> {
             OverlayEvent::AddProvider { id, spec, scope } => {
                 *self.scope = scope;
                 let outcome = self.save(&provider_changes(&id, &spec), scope);
-                self.report(overlay, outcome.map(|_| format!("provider {id} added")));
+                if let (Ok(config), ActiveOverlay::Providers(providers)) = (&outcome, &mut *overlay)
+                {
+                    providers.set_configured(config.providers.clone());
+                }
+                self.report(overlay, outcome.map(|_| format!("provider {id} updated")));
                 self.catalog.refresh(self.app);
             }
             OverlayEvent::RemoveProvider { id, scope } => {
@@ -296,6 +300,11 @@ impl OverlayEnv<'_> {
                     self.auth_job.take();
                 }
                 let outcome = crate::llm::anthropic_oauth::sign_out(&self.app.layout.user_dir);
+                if outcome.is_ok()
+                    && let ActiveOverlay::Providers(providers) = &mut *overlay
+                {
+                    providers.set_anthropic_signed_in(false);
+                }
                 self.report(overlay, outcome);
                 self.catalog.refresh(self.app);
             }
@@ -322,6 +331,18 @@ impl OverlayEnv<'_> {
                         self.auth_job.take();
                     }
                     let outcome = crate::llm::oauth::sign_out(&self.app.layout.user_dir, flow.id);
+                    if outcome.is_ok()
+                        && let ActiveOverlay::Providers(providers) = &mut *overlay
+                    {
+                        providers.set_oauth_signed_in(
+                            crate::llm::oauth::flows()
+                                .filter(|flow| {
+                                    crate::llm::oauth::signed_in(&self.app.layout.user_dir, flow.id)
+                                })
+                                .map(|flow| flow.id.to_owned())
+                                .collect(),
+                        );
+                    }
                     self.report(overlay, outcome);
                     self.catalog.refresh(self.app);
                 }
@@ -332,18 +353,8 @@ impl OverlayEnv<'_> {
             },
             OverlayEvent::RemoveCredential { base_url } => {
                 let dir = self.app.layout.user_dir.clone();
-                let mut outcome = catalog::remove_credential(&dir, &base_url)
-                    .map(|_| "API key removed".to_owned());
-                // The Anthropic menu entry promises a sign-out too: drop a stored subscription grant.
-                if base_url.trim_end_matches('/') == crate::llm::anthropic::BASE_URL
-                    && crate::llm::anthropic_oauth::signed_in(&dir)
-                {
-                    outcome = outcome.and_then(|_| {
-                        crate::llm::anthropic_oauth::sign_out(&dir).map(|_| {
-                            "API key removed and Claude subscription signed out".to_owned()
-                        })
-                    });
-                }
+                let outcome = catalog::remove_credential(&dir, &base_url)
+                    .map(|_| "API key removed; sign-ins are unchanged".to_owned());
                 self.report(overlay, outcome);
                 self.catalog.refresh(self.app);
             }

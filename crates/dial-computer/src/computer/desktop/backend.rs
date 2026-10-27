@@ -184,6 +184,7 @@ pub trait Backend: Send {
         &mut self,
         window: &DesktopWindow,
         path: &[String],
+        mode: DeliveryMode,
         token: &OperationToken,
     ) -> CoreResult<()>;
     fn bring_to_current_space(&mut self, _id: &str, _token: &OperationToken) -> CoreResult<()> {

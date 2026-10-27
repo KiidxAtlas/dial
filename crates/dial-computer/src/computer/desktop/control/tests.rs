@@ -301,3 +301,34 @@ fn computer_evicted_cancellation_reason_is_unknown() {
             .contains("emergency stop")
     );
 }
+
+#[test]
+fn menu_delivery_defaults_follow_control_without_overriding_explicit_false() {
+    use super::super::{backend::DeliveryMode, delivery_mode};
+    let _serial = OWNERSHIP_TEST.lock();
+    let source = CancellationSource::default();
+    assert_eq!(
+        delivery_mode(None, &source.token()),
+        DeliveryMode::Background
+    );
+    assert_eq!(
+        delivery_mode(Some(true), &source.token()),
+        DeliveryMode::Foreground
+    );
+    grant_for_test(&source);
+    assert_eq!(
+        delivery_mode(None, &source.token()),
+        DeliveryMode::Foreground
+    );
+    assert_eq!(
+        delivery_mode(Some(false), &source.token()),
+        DeliveryMode::Background
+    );
+    source.release_control();
+    assert_eq!(
+        delivery_mode(None, &source.token()),
+        DeliveryMode::Background
+    );
+    drop(source);
+    remove_test_lock();
+}

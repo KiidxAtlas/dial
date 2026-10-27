@@ -55,6 +55,15 @@ impl Config {
         Ok(())
     }
 
+    fn anthropic_subscription_selected(&self) -> bool {
+        let method = self
+            .providers
+            .get("anthropic")
+            .map(|spec| spec.auth)
+            .unwrap_or_default();
+        crate::llm::oauth::selected_auth(&self.user_dir, "anthropic", method).unwrap_or(true)
+    }
+
     /// Custom request headers and ChatGPT account pinning for every configured selection.
     fn validate_request_headers(&self) -> Result<()> {
         for selection in std::iter::once(self.selection())
@@ -92,7 +101,7 @@ impl Config {
                     || (selection.provider != "chatgpt"
                         && !(selection.provider == "anthropic"
                             && base.as_deref() == Some(crate::llm::anthropic::BASE_URL)
-                            && crate::llm::anthropic_oauth::signed_in(&self.user_dir))),
+                            && self.anthropic_subscription_selected())),
                 "subscription providers do not permit custom request headers"
             );
             ensure!(
@@ -122,7 +131,7 @@ impl Config {
                     || (id != "chatgpt"
                         && !(id == "anthropic"
                             && spec.base_url == crate::llm::anthropic::BASE_URL
-                            && crate::llm::anthropic_oauth::signed_in(&self.user_dir))),
+                            && self.anthropic_subscription_selected())),
                 "subscription providers do not permit custom request headers"
             );
         }
@@ -216,7 +225,7 @@ impl Config {
             );
         }
         if self.provider.as_deref() == Some("anthropic")
-            && crate::llm::anthropic_oauth::signed_in(&self.user_dir)
+            && self.anthropic_subscription_selected()
             && let Some(endpoint) = &self.endpoint
             && endpoint.base_url == crate::llm::anthropic::BASE_URL
         {
@@ -386,7 +395,7 @@ impl Config {
             }
             if selection.provider == "anthropic"
                 && selection.base_url.as_deref() == Some(crate::llm::anthropic::BASE_URL)
-                && crate::llm::anthropic_oauth::signed_in(&self.user_dir)
+                && self.anthropic_subscription_selected()
             {
                 ensure!(
                     selection
@@ -443,6 +452,33 @@ impl Config {
                 "{id} is reserved for a built-in local provider"
             );
             crate::llm::provider::endpoint_url(&provider.base_url, provider.allow_insecure)?;
+            use crate::llm::model_config::AuthMethod;
+            ensure!(
+                id != "chatgpt" || provider.auth != AuthMethod::ApiKey,
+                "ChatGPT uses sign-in only; select openai for API-key billing"
+            );
+            if provider.auth == AuthMethod::OAuth {
+                ensure!(
+                    id == "anthropic" || id == "chatgpt" || crate::llm::oauth::flow(id).is_some(),
+                    "provider {id} has no sign-in route"
+                );
+                if id == "anthropic" {
+                    ensure!(
+                        provider.base_url == crate::llm::anthropic::BASE_URL,
+                        "Claude subscription requires its official endpoint"
+                    );
+                    ensure!(
+                        provider
+                            .protocol
+                            .is_none_or(|p| p == crate::llm::model_config::ApiProtocol::Anthropic),
+                        "Claude subscription requires Anthropic protocol"
+                    );
+                    ensure!(
+                        provider.headers.as_ref().is_none_or(|h| h.is_empty()),
+                        "subscription providers do not permit custom request headers"
+                    );
+                }
+            }
             ensure!(
                 provider.api_key_envs.len() <= 16
                     && provider.api_key_envs.iter().all(|name| {

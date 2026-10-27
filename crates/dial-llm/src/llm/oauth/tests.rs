@@ -152,6 +152,37 @@ fn a_grant_reaches_only_its_canonical_origin_and_protocol() {
 }
 
 #[test]
+fn explicit_methods_stay_independent_for_every_registered_flow() {
+    use super::super::model_config::{AuthMethod, ProviderSpec};
+    let home = tempfile::tempdir().unwrap();
+    for flow in flows() {
+        assert!(!selected_auth(home.path(), flow.id, AuthMethod::ApiKey).unwrap());
+        assert!(selected_auth(home.path(), flow.id, AuthMethod::OAuth).unwrap());
+        let binding = Binding::selected(home.path(), flow.id).unwrap();
+        assert!(binding.access(&Arc::new(AtomicBool::new(false))).is_err());
+        write_private(&path(home.path(), flow.id), b"corrupt-grant").unwrap();
+        assert!(!selected_auth(home.path(), flow.id, AuthMethod::ApiKey).unwrap());
+        assert!(selected_auth(home.path(), flow.id, AuthMethod::OAuth).unwrap());
+    }
+    assert!(selected_auth(home.path(), "openai", AuthMethod::OAuth).is_err());
+    assert!(selected_auth(home.path(), "chatgpt", AuthMethod::ApiKey).is_err());
+    let legacy: ProviderSpec = toml::from_str("base_url = 'https://example.test'").unwrap();
+    assert_eq!(legacy.auth, AuthMethod::Auto);
+    for (text, method) in [
+        ("api-key", AuthMethod::ApiKey),
+        ("oauth", AuthMethod::OAuth),
+    ] {
+        let spec: ProviderSpec = toml::from_str(&format!("auth = '{text}'")).unwrap();
+        assert_eq!(spec.auth, method);
+        assert_eq!(
+            toml::Value::try_from(&spec).unwrap()["auth"].as_str(),
+            Some(text)
+        );
+    }
+    assert!(toml::from_str::<ProviderSpec>("auth = 'fallback'").is_err());
+}
+
+#[test]
 fn every_flow_protocol_matches_its_provider_route() {
     // The binding refuses a route whose protocol differs from its flow's, so a flow that disagrees
     // with its provider's built-in protocol makes that signed-in provider unusable.

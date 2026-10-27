@@ -2269,7 +2269,7 @@ fn run_inner(
         let provider_request = provider_rewrite.as_ref().unwrap_or(&request);
         let prefix =
             request_prefix.observe(&env.config.selection().display_name(), provider_request);
-        if prefix.invalidation != "none" {
+        if prefix.invalidation != crate::agent::window::request_prefix::Invalidation::None {
             observer
                 .borrow_mut()
                 .notice(&format!("Request prefix: {}", prefix.invalidation));

@@ -336,7 +336,9 @@ pub fn login(dir: &Path, cancel: Arc<AtomicBool>) -> Result<String> {
     Ok("Claude subscription signed in; choose an Anthropic model in /models".into())
 }
 pub fn access_token(dir: &Path, cancel: Arc<AtomicBool>) -> Result<SecretToken> {
-    access_token_at(dir, TOKEN_URL, cancel)
+    access_token_at(dir, TOKEN_URL, cancel).context(
+        "Claude subscription authentication failed; sign in again in /providers to repair credentials",
+    )
 }
 fn access_token_at(dir: &Path, token_url: &str, cancel: Arc<AtomicBool>) -> Result<SecretToken> {
     let _lock = locked_cancellable(&dir.join(FILE), &cancel)?;

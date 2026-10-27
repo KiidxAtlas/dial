@@ -35,7 +35,7 @@ use error::CoreResult;
 pub use error::DesktopError;
 use frame::{FrameGeometry, apply_capture_caps, encode_png};
 use keys::{KeyName, parse_keys, parse_modifiers};
-pub use menus::DesktopMenuItem;
+pub use menus::{DesktopMenuItem, MenuSelectOptions};
 use parking_lot::Mutex;
 pub use types::*;
 
@@ -120,6 +120,7 @@ enum Request {
     MenuSelect {
         target: Target,
         path: Vec<String>,
+        takeover: Option<bool>,
         reply: Reply,
     },
     BringToCurrentSpace {
@@ -667,9 +668,19 @@ impl Worker {
                     self.backend()?.menu_items(&window, path)?,
                 ))
             }
-            Request::MenuSelect { target, path, .. } => {
+            Request::MenuSelect {
+                target,
+                path,
+                takeover,
+                ..
+            } => {
                 let window = self.explicit_window(target)?;
-                self.backend()?.menu_select(&window, path, token)?;
+                self.backend()?.menu_select(
+                    &window,
+                    path,
+                    delivery_mode(*takeover, token),
+                    token,
+                )?;
                 Ok(Response::Unit)
             }
             Request::BringToCurrentSpace { id, .. } => {
@@ -1410,10 +1421,16 @@ impl DesktopSession {
         }
     }
 
-    pub fn menu_select(&self, target: String, path: Vec<String>) -> CoreResult<()> {
+    pub fn menu_select(
+        &self,
+        target: String,
+        path: Vec<String>,
+        options: Option<menus::MenuSelectOptions>,
+    ) -> CoreResult<()> {
         self.unit(move |reply| Request::MenuSelect {
             target: Target::parse(&target),
             path,
+            takeover: options.unwrap_or_default().takeover,
             reply,
         })
     }

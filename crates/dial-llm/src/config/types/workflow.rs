@@ -29,8 +29,10 @@ impl Default for CommitConfig {
     }
 }
 
-/// Experimental agent workflow features; every feature is disabled unless explicitly enabled.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+/// Experimental agent workflow features. Every feature is disabled unless explicitly enabled,
+/// except the two check-before-change aids: `fault_witness` and `repro_first = advise` are on by
+/// default.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ExperimentalConfig {
     pub work_packet_contracts: bool,
@@ -61,14 +63,33 @@ pub struct ExperimentalConfig {
     pub check_predictions: bool,
 }
 
+impl Default for ExperimentalConfig {
+    fn default() -> Self {
+        Self {
+            work_packet_contracts: false,
+            verification_receipts: false,
+            context_overlap_dedup: false,
+            profile_matching: false,
+            tool_speculation: false,
+            turn_optimizer: false,
+            fault_witness: true,
+            repro_first: ReproFirst::default(),
+            edit_bisection_runs: 0,
+            outcome_gradient_rounds: 0,
+            streaming_dispatch: false,
+            check_predictions: false,
+        }
+    }
+}
+
 /// `experimental.repro_first`: how debugging tasks are steered toward a failing reproduction
 /// before the first source edit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReproFirst {
-    #[default]
     Off,
     /// One advisory note at the first unreproduced source edit.
+    #[default]
     Advise,
     /// Refuse the first unreproduced source edit once; a repeated attempt proceeds.
     Gate,

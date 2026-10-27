@@ -183,7 +183,10 @@ fn small_tier_defaults_to_one_call_with_a_worked_example() {
         assert!(!agent.local_one_call());
         let text = prompt_text(agent);
         assert!(text.contains("MUST batch"));
-        assert!(text.contains("# Example"));
+        assert!(
+            !text.contains("# Example"),
+            "passing batch evidence omits the single-call tutorial"
+        );
     });
     for overlay in [
         "context_window=65536",
@@ -192,6 +195,7 @@ fn small_tier_defaults_to_one_call_with_a_worked_example() {
     ] {
         with_agent(overlay, |agent| {
             assert!(!agent.local_one_call(), "{overlay}");
+            assert!(!prompt_text(agent).contains("# Example"), "{overlay}");
             assert!(
                 !prompt_text(agent).contains(
                     serde_json::to_string(crate::agent::prompts::system::LEAN_ONE_CALL)

@@ -168,11 +168,12 @@ impl Backend for MacosBackend {
         &mut self,
         window: &DesktopWindow,
         path: &[String],
+        mode: DeliveryMode,
         token: &OperationToken,
     ) -> CoreResult<()> {
         token.check()?;
         Self::require_input_permission()?;
-        menus::select(window, path)
+        menus::select(window, path, mode)
     }
 
     fn bring_to_current_space(&mut self, id: &str, token: &OperationToken) -> CoreResult<()> {

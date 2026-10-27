@@ -393,6 +393,13 @@ impl Backend {
     pub fn wire_observation(&self) -> Option<llm::wire::Observation> {
         self.wire.lock().latest()
     }
+
+    /// Inspect the selected authentication route without dispatching a request.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_provider_kind(&self) -> &ProviderKind {
+        &self.kind
+    }
+
     pub fn new(kind: ProviderKind, python: PathBuf, startup_timeout_secs: u64) -> Self {
         let account = match &kind {
             ProviderKind::ChatGpt { user_dir, .. } => {

@@ -386,11 +386,178 @@ fn claude_oauth_token_replaces_missing_api_key_block() {
         "auth-required",
         "Set the configured credential environment variable or save a URL-scoped token",
     ));
-    apply_anthropic_oauth_token(
+    apply_anthropic_oauth_access(
         &mut probe,
-        &super::super::auth::SecretToken::new("sk-ant-oat01-test".into()),
+        Ok(super::super::auth::SecretToken::new(
+            "sk-ant-oat01-test".into(),
+        )),
     );
     assert_eq!(probe.token.as_deref(), Some("sk-ant-oat01-test"));
+    assert!(probe.blocked.is_none());
+}
+
+#[test]
+fn claude_discovery_refresh_failure_clears_api_key_and_blocks_probe() {
+    let mut probe = test_probe(super::super::anthropic::BASE_URL.into(), "anthropic");
+    probe.token = Some("sk-ant-api03-key-test".into());
+    apply_anthropic_oauth_access(
+        &mut probe,
+        Err(anyhow::anyhow!("refresh rejected: secret-test-response")),
+    );
+    assert!(probe.token.is_none());
+    let (status, models) = probe_models(&probe);
+    assert_eq!(status.state, "auth-required");
+    assert!(!status.detail.contains("secret-test-response"));
+    assert!(models.is_empty());
+}
+
+fn claude_auth_fixture(dir: &Path) {
+    assert!(std::env::var_os(crate::config::paths::SUBSCRIPTION_AUTH_HOME).is_none());
+    crate::config::settings_store::write_private(
+        &super::super::anthropic_oauth::credential_path(dir),
+        &serde_json::to_vec(&serde_json::json!({"tokens": {
+            "access_token": "sk-ant-oat01-subscription-test",
+            "refresh_token": "refresh-test",
+            "expires_at": u64::MAX
+        }}))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn claude_discovery_subscription_wins_over_saved_key_and_signout_restores_key() {
+    let home = tempfile::tempdir().unwrap();
+    let base = super::super::anthropic::BASE_URL;
+    save_credential(home.path(), base, "sk-ant-api03-key-test").unwrap();
+    claude_auth_fixture(home.path());
+    let spec = ProviderSpec {
+        base_url: base.into(),
+        api_key_env: Some("DIAL_TEST_UNUSED_ANTHROPIC_AUTH_KEY".into()),
+        ..ProviderSpec::default()
+    };
+    let probe = prepare("anthropic".into(), spec.clone(), home.path());
+    assert!(probe.blocked.is_none());
+    assert_eq!(
+        probe.token.as_deref(),
+        Some("sk-ant-oat01-subscription-test")
+    );
+    super::super::anthropic_oauth::sign_out(home.path()).unwrap();
+    let probe = prepare("anthropic".into(), spec, home.path());
+    assert!(probe.blocked.is_none());
+    assert_eq!(probe.token.as_deref(), Some("sk-ant-api03-key-test"));
+}
+
+#[test]
+fn claude_discovery_subscription_ignores_unrelated_key_errors_and_rejects_wrong_protocol() {
+    let home = tempfile::tempdir().unwrap();
+    claude_auth_fixture(home.path());
+    crate::config::settings_store::write_private(
+        &home.path().join("credentials.json"),
+        b"{invalid-api-key-storage",
+    )
+    .unwrap();
+    let mut spec = ProviderSpec {
+        base_url: super::super::anthropic::BASE_URL.into(),
+        // This variable belongs to a different origin and must never be resolved here.
+        api_key_env: Some("OPENAI_API_KEY".into()),
+        ..ProviderSpec::default()
+    };
+    let probe = prepare("anthropic".into(), spec.clone(), home.path());
+    assert!(probe.blocked.is_none());
+    assert_eq!(
+        probe.token.as_deref(),
+        Some("sk-ant-oat01-subscription-test")
+    );
+    spec.protocol = Some(ApiProtocol::ChatCompletions);
+    let probe = prepare("anthropic".into(), spec, home.path());
+    assert!(probe.token.is_none());
+    assert_eq!(probe.blocked.map(|(state, _)| state), Some("unavailable"));
+}
+
+#[test]
+fn claude_discovery_corrupt_subscription_does_not_fall_back_to_saved_key() {
+    assert!(std::env::var_os(crate::config::paths::SUBSCRIPTION_AUTH_HOME).is_none());
+    let home = tempfile::tempdir().unwrap();
+    let base = super::super::anthropic::BASE_URL;
+    save_credential(home.path(), base, "sk-ant-api03-key-test").unwrap();
+    crate::config::settings_store::write_private(
+        &super::super::anthropic_oauth::credential_path(home.path()),
+        b"{invalid-subscription-secret",
+    )
+    .unwrap();
+    let spec = ProviderSpec {
+        base_url: base.into(),
+        ..ProviderSpec::default()
+    };
+    let probe = prepare("anthropic".into(), spec, home.path());
+    assert!(
+        probe.token.is_none(),
+        "must not silently select API-key billing"
+    );
+    assert_eq!(probe.blocked.map(|(state, _)| state), Some("auth-required"));
+    let (status, models) = probe_models(&probe);
+    assert_eq!(status.state, "auth-required");
+    assert!(!status.detail.contains("invalid-subscription-secret"));
+    assert!(models.is_empty());
+}
+
+#[test]
+fn claude_discovery_custom_endpoint_keeps_its_key_and_disabled_stays_disabled() {
+    let home = tempfile::tempdir().unwrap();
+    claude_auth_fixture(home.path());
+    let spec = ProviderSpec {
+        base_url: "https://proxy.example/v1".into(),
+        ..ProviderSpec::default()
+    };
+    save_credential(home.path(), &spec.base_url, "proxy-key-test").unwrap();
+    let probe = prepare("anthropic".into(), spec, home.path());
+    assert_eq!(probe.token.as_deref(), Some("proxy-key-test"));
+    assert!(probe.blocked.is_none());
+    let spec = ProviderSpec {
+        base_url: super::super::anthropic::BASE_URL.into(),
+        enabled: false,
+        ..ProviderSpec::default()
+    };
+    let probe = prepare("anthropic".into(), spec, home.path());
+    assert!(probe.token.is_none());
+    assert_eq!(probe.blocked.map(|(state, _)| state), Some("disabled"));
+}
+
+#[test]
+fn explicit_claude_discovery_auth_is_independent_of_saved_credentials() {
+    use super::super::model_config::AuthMethod;
+    let home = tempfile::tempdir().unwrap();
+    let base = super::super::anthropic::BASE_URL;
+    save_credential(home.path(), base, "sk-ant-api03-key-test").unwrap();
+    claude_auth_fixture(home.path());
+    let mut spec = ProviderSpec {
+        base_url: base.into(),
+        auth: AuthMethod::ApiKey,
+        ..Default::default()
+    };
+    let probe = prepare("anthropic".into(), spec.clone(), home.path());
+    assert_eq!(probe.token.as_deref(), Some("sk-ant-api03-key-test"));
+    assert!(probe.blocked.is_none());
+    assert!(super::super::anthropic_oauth::signed_in_checked(home.path()).unwrap());
+    spec.auth = AuthMethod::OAuth;
+    let probe = prepare("anthropic".into(), spec.clone(), home.path());
+    assert_eq!(
+        probe.token.as_deref(),
+        Some("sk-ant-oat01-subscription-test")
+    );
+    super::super::anthropic_oauth::sign_out(home.path()).unwrap();
+    let probe = prepare("anthropic".into(), spec.clone(), home.path());
+    assert!(probe.token.is_none());
+    assert_eq!(probe.blocked.map(|(s, _)| s), Some("auth-required"));
+    crate::config::settings_store::write_private(
+        &super::super::anthropic_oauth::credential_path(home.path()),
+        b"corrupt-subscription",
+    )
+    .unwrap();
+    spec.auth = AuthMethod::ApiKey;
+    let probe = prepare("anthropic".into(), spec, home.path());
+    assert_eq!(probe.token.as_deref(), Some("sk-ant-api03-key-test"));
     assert!(probe.blocked.is_none());
 }
 fn server(code: u16, body: String) -> (String, std::thread::JoinHandle<String>) {

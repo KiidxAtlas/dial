@@ -169,6 +169,7 @@ struct MenuItemsArgs {
 struct MenuSelectArgs {
     target: String,
     path: Vec<String>,
+    options: Option<crate::computer::desktop::MenuSelectOptions>,
 }
 
 #[derive(Deserialize)]
@@ -548,7 +549,7 @@ pub fn dispatch(session: &DesktopSession, method: &str, args: Value) -> Computer
         }
         "menuSelect" => {
             let a: MenuSelectArgs = parse(method, args)?;
-            unit(session.menu_select(a.target, a.path))
+            unit(session.menu_select(a.target, a.path, a.options))
         }
         "bringToCurrentSpace" => {
             let a: WindowIdArgs = parse(method, args)?;

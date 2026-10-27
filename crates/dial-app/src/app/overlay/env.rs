@@ -150,6 +150,14 @@ impl OverlayEnv<'_> {
                 providers.set_anthropic_signed_in(crate::llm::anthropic_oauth::signed_in(
                     &self.app.layout.user_dir,
                 ));
+                providers.set_oauth_signed_in(
+                    crate::llm::oauth::flows()
+                        .filter(|flow| {
+                            crate::llm::oauth::signed_in(&self.app.layout.user_dir, flow.id)
+                        })
+                        .map(|flow| flow.id.to_owned())
+                        .collect(),
+                );
             }
             let result = if provider == "Model" {
                 result.and_then(|message| {

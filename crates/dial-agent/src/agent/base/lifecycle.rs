@@ -708,8 +708,7 @@ impl<'a> Agent<'a> {
                 concise_guidance: self.config.efficiency.enabled && !self.hermetic,
                 prefer_subagents: self.config.task.prefer_subagents,
                 one_call: self.local_one_call(),
-                worked_example: self.local_tier()
-                    == Some(crate::agent::model::local_profile::Tier::Small),
+                worked_example: self.local_one_call(),
             });
         let mut messages = match built {
             Ok(messages) => {
@@ -752,11 +751,8 @@ impl<'a> Agent<'a> {
             .iter()
             .filter_map(|message| message["content"].as_str())
             .collect();
-        self.agents_messages = messages
-            .iter()
-            .filter(|message| message["dial_agents_md"] == true)
-            .cloned()
-            .collect();
+        self.agents_messages =
+            crate::agent::window::prompt::agents_md_messages(&self.parts.context);
         self.system_messages = messages;
     }
 

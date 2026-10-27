@@ -133,6 +133,89 @@ fn search_single_file_uses_lang_override_and_rejects_unknowns() {
 }
 
 #[test]
+fn explicit_unloadable_files_are_errors_for_search_and_edit() {
+    let (dir, ws) = workspace();
+    for (name, bytes, reason) in [
+        ("large.rs", vec![b'a'; 2 * 1024 * 1024 + 1], "2 MiB"),
+        ("binary.rs", b"fn f() {}\0".to_vec(), "binary"),
+        ("invalid.rs", vec![0xff], "UTF-8"),
+    ] {
+        fs::write(dir.path().join(name), bytes).unwrap();
+        for out in [
+            search(&ws, json!({"path": name, "pattern": "f()"})),
+            edit(
+                &ws,
+                json!({"path": name, "pattern": "f()", "rewrite": "g()"}),
+            ),
+        ] {
+            assert!(
+                out.is_error && out.text.contains(name) && out.text.contains(reason),
+                "{}",
+                out.text
+            );
+        }
+    }
+}
+
+#[test]
+fn explicit_file_removed_after_resolution_reports_io_error() {
+    let (dir, ws) = workspace();
+    let path = put(&dir, "gone.rs", "fn f() {}\n");
+    let target = Target::resolve(&ws, Some("gone.rs"), None).unwrap();
+    fs::remove_file(path).unwrap();
+    let mut queries = Queries::new("f()", None);
+    let error = match scan(&ws, &target, &mut queries, &mut |_, _| true) {
+        Err(error) => error,
+        Ok(_) => panic!("missing target must fail"),
+    };
+    assert!(error.contains("gone.rs"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn tree_reports_unreadable_source_as_unreadable() {
+    let (dir, ws) = workspace();
+    let path = put(&dir, "blocked.rs", "fn f() {}\n");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o0)).unwrap();
+    if fs::File::open(&path).is_ok() {
+        return; // Privileged users may bypass permissions.
+    }
+    let out = search(&ws, json!({"pattern": "f()"}));
+    assert!(
+        !out.is_error && out.text.contains("1 unreadable files skipped"),
+        "{}",
+        out.text
+    );
+    assert!(!out.text.contains("binary"), "{}", out.text);
+}
+
+#[test]
+fn tree_coverage_distinguishes_unreadable_files_from_content_skips() {
+    let (dir, ws) = workspace();
+    put(&dir, "a.rs", "fn a() {}\n");
+    put(&dir, "b.rs", "fn b() {}\n");
+    let target = Target::resolve(&ws, None, Some("rust")).unwrap();
+    let mut queries = Queries::new("fn $F() {}", None);
+    let coverage = scan(&ws, &target, &mut queries, &mut |file, _| {
+        if file.rel == "a.rs" {
+            fs::remove_file(dir.path().join("b.rs")).unwrap();
+        }
+        true
+    })
+    .unwrap();
+    assert!(
+        coverage.footer().contains("incomplete"),
+        "{}",
+        coverage.footer()
+    );
+    assert!(
+        !coverage.footer().contains("binary"),
+        "{}",
+        coverage.footer()
+    );
+}
+
+#[test]
 fn invalid_patterns_are_reported_not_ignored() {
     let (dir, ws) = workspace();
     put(&dir, "a.rs", "fn f() {}\n");

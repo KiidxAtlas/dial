@@ -15,7 +15,11 @@ fn call(arguments: serde_json::Value) -> ToolCall {
 
 fn read(source: &str, mode: EditMode, arguments: serde_json::Value) -> (ToolCall, ToolOutput) {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("package.json"), source).unwrap();
+    let filename = arguments
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("package.json");
+    std::fs::write(dir.path().join(filename.split(':').next().unwrap()), source).unwrap();
     let workspace = Workspace::new(dir.path()).unwrap().with_edit_mode(mode);
     let output = crate::tools::read_tool_streaming(
         &workspace,
@@ -132,11 +136,14 @@ fn bounds_are_deterministic_and_fail_closed_for_large_or_clipped_outputs() {
     assert_eq!(names.first().unwrap(), "package-000");
     assert_eq!(names.last().unwrap(), "package-031");
     assert!(signals(&call, &ToolOutput::ok("x".repeat(MAX_INPUT_BYTES + 1))).is_empty());
-    assert!(complete_source("     1\t{\n     3\t}\n").is_none());
-    assert!(complete_source("     1\t{} …[line truncated]\n").is_none());
+    assert!(complete_source("     1\t{\n     3\t}\n", "package.json").is_none());
+    assert!(complete_source("     1\t{} …[line truncated]\n", "package.json").is_none());
     assert!(
-        complete_source("     1\t{}\n[output truncated at the byte budget after line 1 of 2]\n")
-            .is_none()
+        complete_source(
+            "     1\t{}\n[output truncated at the byte budget after line 1 of 2]\n",
+            "package.json"
+        )
+        .is_none()
     );
 }
 
@@ -172,5 +179,50 @@ fn actual_failed_and_byte_capped_reads_supply_no_signals() {
         assert!(capped.text.contains("output truncated"), "{}", capped.text);
         assert!(signals(&call, &capped).is_empty());
         std::fs::remove_file(dir.path().join("package.json")).unwrap();
+    }
+}
+
+#[test]
+fn toml_manifests_extract_only_supported_dependencies() {
+    for mode in [EditMode::Hashline, EditMode::Replace] {
+        let cargo = r#"
+[package]
+name = "ignored"
+[dependencies]
+serde = "1"
+alias = { package = "real-package", version = "1" }
+[dev-dependencies]
+tokio = { workspace = true }
+[workspace.dependencies]
+clap = "4"
+[target.'cfg(unix)'.build-dependencies]
+cc = "1"
+"#;
+        let (call, output) = read(cargo, mode, json!({"path":"Cargo.toml"}));
+        assert_eq!(
+            signals(&call, &output),
+            ["cc", "clap", "real-package", "serde", "tokio"]
+        );
+        let python = r#"
+[project]
+name = "ignored"
+dependencies = ["Django>=4.2", "requests", "url @ https://example.test", "marked; python_version > '3'", "bad name"]
+[project.optional-dependencies]
+test = ["pytest==8.0", "requests"]
+[tool.poetry.dependencies]
+ignored = "1"
+"#;
+        let (call, output) = read(python, mode, json!({"path":"pyproject.toml"}));
+        assert_eq!(signals(&call, &output), ["django", "pytest", "requests"]);
+        let mut partial = call.clone();
+        partial.arguments["limit"] = json!(1);
+        assert!(signals(&partial, &output).is_empty());
+        assert!(signals(&call, &ToolOutput::err("failed")).is_empty());
+        let (call, output) = read(
+            "[dependencies\nserde = '1'",
+            mode,
+            json!({"path":"Cargo.toml"}),
+        );
+        assert!(signals(&call, &output).is_empty());
     }
 }

@@ -327,13 +327,14 @@ impl<'a> Agent<'a> {
         // A step this local model reached in an earlier session applies from the first request.
         self.seed_local_escalation();
         self.begin_local_turn(ui);
+        // The probed context can change the local profile and its routing budget.
+        self.probe_context();
         self.begin_tool_routing(user_text);
         // Offered tools can change with version/harness refresh or skill toggles; rebuild only if content changed.
         self.rebuild_system();
         for notice in self.ext.take_notices() {
             ui.notice(&notice);
         }
-        self.probe_context();
         if let Some(served) = self.context_cap {
             self.local_context_advice(served, ui);
         }

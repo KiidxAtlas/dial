@@ -308,6 +308,10 @@ pub(super) fn provider_changes(id: &str, spec: &ProviderSpec) -> Vec<Change> {
         set("base_url", spec.base_url.clone().into()),
         set("enabled", spec.enabled.into()),
         set("allow_insecure", spec.allow_insecure.into()),
+        set(
+            "auth",
+            toml::Value::try_from(spec.auth).expect("auth method is serializable"),
+        ),
     ];
     changes.push(set(
         "protocol",

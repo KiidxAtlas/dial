@@ -15,7 +15,7 @@ use super::{
 use crate::{
     config::settings_store::Scope,
     llm::catalog::{Discovery, ProviderStatus, UNREACHABLE_DETAIL},
-    llm::model_config::ProviderSpec,
+    llm::model_config::{AuthMethod, ProviderSpec},
     ui::{
         chrome::{self, Section, Status},
         editor::Editor,
@@ -151,6 +151,7 @@ enum ProviderAction {
     ChatGptCancel,
     OAuthLogin(String),
     OAuthSignOut(String),
+    UseAuth(AuthMethod),
 }
 
 struct Menu {
@@ -243,6 +244,7 @@ pub struct ProviderOverlay {
     chatgpt_pending: bool,
     chatgpt_accounts: Vec<crate::llm::chatgpt::AccountInfo>,
     anthropic_signed_in: bool,
+    oauth_signed_in: std::collections::BTreeSet<String>,
     discovery: Option<Discovery>,
     configured: BTreeMap<String, ProviderSpec>,
     has_key: Box<dyn Fn(&str) -> bool>,
@@ -312,6 +314,7 @@ impl ProviderOverlay {
             chatgpt_pending: false,
             chatgpt_accounts: Vec::new(),
             anthropic_signed_in: false,
+            oauth_signed_in: Default::default(),
             discovery,
             configured,
             has_key,
@@ -334,6 +337,12 @@ impl ProviderOverlay {
     }
     pub fn set_anthropic_signed_in(&mut self, signed_in: bool) {
         self.anthropic_signed_in = signed_in;
+    }
+    pub fn set_oauth_signed_in(&mut self, providers: std::collections::BTreeSet<String>) {
+        self.oauth_signed_in = providers;
+    }
+    pub fn set_configured(&mut self, configured: BTreeMap<String, ProviderSpec>) {
+        self.configured = configured;
     }
     /// Where each provider's key comes from, keyed by base URL. The caller
     /// resolves the saved key and the environment variable; this overlay only describes them.
@@ -589,6 +598,16 @@ impl ProviderOverlay {
                 }
                 .to_owned(),
             ));
+            if Self::supports_auth_choice(&entry) {
+                items.push((
+                    ProviderAction::UseAuth(AuthMethod::ApiKey),
+                    "Use API key".into(),
+                ));
+                items.push((
+                    ProviderAction::UseAuth(AuthMethod::OAuth),
+                    "Use sign-in or subscription".into(),
+                ));
+            }
             if entry.id == "anthropic"
                 && entry.base_url.as_deref() == Some(crate::llm::anthropic::BASE_URL)
             {
@@ -616,19 +635,19 @@ impl ProviderOverlay {
                     "Sign in with OpenRouter".to_owned(),
                 ));
             }
-            if let Some(flow) = crate::llm::oauth::flow(&entry.id)
-                && !flow.needs_terminal
-            {
-                let signed_out = entry.state == "auth-required";
-                items.push((
-                    ProviderAction::OAuthLogin(flow.id.to_owned()),
-                    if signed_out {
-                        format!("Sign in with {}", flow.name)
-                    } else {
-                        format!("Sign in again with {}", flow.name)
-                    },
-                ));
-                if !signed_out {
+            if let Some(flow) = crate::llm::oauth::flow(&entry.id) {
+                let signed_in = self.oauth_signed_in.contains(flow.id);
+                if !flow.needs_terminal {
+                    items.push((
+                        ProviderAction::OAuthLogin(flow.id.to_owned()),
+                        if signed_in {
+                            format!("Sign in again with {}", flow.name)
+                        } else {
+                            format!("Sign in with {}", flow.name)
+                        },
+                    ));
+                }
+                if signed_in {
                     items.push((
                         ProviderAction::OAuthSignOut(flow.id.to_owned()),
                         format!("Sign out of {}", flow.name),
@@ -636,15 +655,7 @@ impl ProviderOverlay {
                 }
             }
             if saved {
-                items.push((
-                    ProviderAction::RemoveKey,
-                    if entry.id == "anthropic" {
-                        "Remove saved credential / sign out"
-                    } else {
-                        "Remove API key"
-                    }
-                    .to_owned(),
-                ));
+                items.push((ProviderAction::RemoveKey, "Remove API key".to_owned()));
             }
             items.push((
                 ProviderAction::Toggle,
@@ -655,7 +666,13 @@ impl ProviderOverlay {
                 }
                 .to_owned(),
             ));
-            if entry.id != "anthropic" || !self.anthropic_signed_in {
+            if entry.id != "anthropic"
+                || !self.anthropic_signed_in
+                || entry
+                    .spec
+                    .as_ref()
+                    .is_some_and(|spec| spec.auth == AuthMethod::ApiKey)
+            {
                 items.push((ProviderAction::Headers, "Edit HTTP header rows".into()));
             }
         }
@@ -746,6 +763,20 @@ impl ProviderOverlay {
         }
         let entry = menu.entry.clone();
         let action = match &menu.items[menu.cursor].0 {
+            ProviderAction::UseAuth(auth) => {
+                let mut spec = entry.spec.clone().unwrap_or_else(|| ProviderSpec {
+                    label: entry.label.clone(),
+                    base_url: entry.base_url.clone().unwrap_or_default(),
+                    ..Default::default()
+                });
+                spec.auth = *auth;
+                self.mode = Mode::List;
+                return OverlayEvent::AddProvider {
+                    id: entry.id,
+                    spec,
+                    scope: self.scope,
+                };
+            }
             ProviderAction::Headers => {
                 let headers = entry.spec.as_ref().and_then(|spec| spec.headers.clone());
                 self.mode = Mode::Headers {
@@ -986,10 +1017,6 @@ impl ProviderOverlay {
                 ),
                 "  Its saved API key, if any, is kept until you remove it.".to_owned(),
             ),
-            Removal::SavedKey if entry.id == "anthropic" => (
-                "  Remove the saved credential and sign out of the Claude subscription?".to_owned(),
-                "  Dial stops using the saved key and the subscription login.".to_owned(),
-            ),
             Removal::SavedKey => (
                 format!("  Remove the saved API key for {label}?"),
                 "  Dial stops using that key; an environment variable, if set, still applies."
@@ -1068,6 +1095,7 @@ impl ProviderOverlay {
                         allow_insecure: false,
                         protocol: None,
                         headers: None,
+                        auth: AuthMethod::Auto,
                     };
                     self.mode = Mode::List;
                     self.message = Some((format!("Provider {id} sent for saving"), true));
@@ -1343,11 +1371,22 @@ impl ProviderOverlay {
                 ("sign-in needed".into(), Tok::Warning)
             };
         }
-        if entry.id == "anthropic" && self.anthropic_signed_in {
+        let method = entry
+            .spec
+            .as_ref()
+            .map(|spec| spec.auth)
+            .unwrap_or_default();
+        if method != AuthMethod::ApiKey && entry.id == "anthropic" && self.anthropic_signed_in {
             return (
                 format!("{} Claude subscription signed in", theme.sym(Sym::Check)),
                 Tok::Success,
             );
+        }
+        if method != AuthMethod::ApiKey && self.oauth_signed_in.contains(&entry.id) {
+            return ("sign-in saved".into(), Tok::Success);
+        }
+        if method == AuthMethod::OAuth {
+            return ("sign-in needed".into(), Tok::Warning);
         }
         if entry.base_url.is_none() {
             return (String::new(), Tok::Dim);
@@ -1374,7 +1413,15 @@ impl ProviderOverlay {
             return (!signed_in).then_some("Sign in");
         }
         let base_url = entry.base_url.as_deref()?;
-        if entry.id == "anthropic" && self.anthropic_signed_in {
+        let method = entry
+            .spec
+            .as_ref()
+            .map(|spec| spec.auth)
+            .unwrap_or_default();
+        if method == AuthMethod::OAuth {
+            return (entry.state == "auth-required").then_some("Sign in");
+        }
+        if method != AuthMethod::ApiKey && entry.id == "anthropic" && self.anthropic_signed_in {
             return None;
         }
         match entry.state.as_str() {
@@ -1390,10 +1437,31 @@ impl ProviderOverlay {
         }
     }
 
+    fn supports_auth_choice(entry: &Entry) -> bool {
+        (entry.id == "anthropic"
+            && entry.base_url.as_deref() == Some(crate::llm::anthropic::BASE_URL))
+            || crate::llm::oauth::flow(&entry.id).is_some()
+    }
+
     fn menu_body(&self, theme: &Theme, menu: &Menu, w: usize, rows: usize) -> Vec<Line<'static>> {
         let mut lines = vec![Line::from(fit(
             vec![Span::styled(
-                format!("  {}", text::one_line(&menu.entry.label)),
+                if Self::supports_auth_choice(&menu.entry) {
+                    let method = match menu
+                        .entry
+                        .spec
+                        .as_ref()
+                        .map(|spec| spec.auth)
+                        .unwrap_or_default()
+                    {
+                        AuthMethod::Auto => "automatic (legacy)",
+                        AuthMethod::ApiKey => "API key",
+                        AuthMethod::OAuth => "sign-in or subscription",
+                    };
+                    format!("  {} — auth: {method}", text::one_line(&menu.entry.label))
+                } else {
+                    format!("  {}", text::one_line(&menu.entry.label))
+                },
                 theme.fg(Tok::Accent).add_modifier(Modifier::BOLD),
             )],
             w,

@@ -361,7 +361,7 @@ fn numeric_defaults_lie_inside_their_ranges() {
     }
 }
 #[test]
-fn experimental_options_are_registered_in_their_tab_and_default_off() {
+fn experimental_options_are_registered_in_their_tab_with_their_defaults() {
     let paths = [
         "experimental.work_packet_contracts",
         "experimental.verification_receipts",
@@ -369,7 +369,6 @@ fn experimental_options_are_registered_in_their_tab_and_default_off() {
         "experimental.profile_matching",
         "experimental.tool_speculation",
         "experimental.turn_optimizer",
-        "experimental.fault_witness",
         "experimental.streaming_dispatch",
         "experimental.check_predictions",
     ];
@@ -392,9 +391,27 @@ fn experimental_options_are_registered_in_their_tab_and_default_off() {
         assert_eq!(setting(path).tab, "Experimental");
         assert_eq!(setting(path).default_value(), Some(Value::Integer(0)));
     }
+    // Check-before-change aids ship enabled; the rest stay opt-in.
+    let witness = setting("experimental.fault_witness");
+    assert_eq!(witness.tab, "Experimental");
+    assert_eq!(witness.kind, Kind::Bool);
+    assert_eq!(witness.default_value(), Some(Value::Boolean(true)));
     let repro = setting("experimental.repro_first");
     assert_eq!(repro.tab, "Experimental");
-    assert_eq!(repro.default_value(), Some(Value::String("off".into())));
+    assert_eq!(repro.default_value(), Some(Value::String("advise".into())));
+    let unset: Config = toml::from_str("").unwrap();
+    assert!(unset.experimental.fault_witness);
+    assert_eq!(
+        unset.experimental.repro_first,
+        crate::config::types::ReproFirst::Advise
+    );
+    let opted_out: Config =
+        toml::from_str("[experimental]\nfault_witness = false\nrepro_first = \"off\"").unwrap();
+    assert!(!opted_out.experimental.fault_witness);
+    assert_eq!(
+        opted_out.experimental.repro_first,
+        crate::config::types::ReproFirst::Off
+    );
     let config: Config = toml::from_str(
         "[experimental]\ncontext_overlap_dedup = true\nrepro_first = \"gate\"\nedit_bisection_runs = 4",
     )

@@ -396,6 +396,39 @@ fn access_inner(
     (flow.access)(&credentials)
 }
 
+/// Resolve the credential route without reading credentials for an explicitly selected API key.
+/// Explicit sign-in stays selected even when credentials are absent or need repair.
+pub fn selected_auth(
+    user_dir: &Path,
+    provider: &str,
+    method: super::model_config::AuthMethod,
+) -> Result<bool> {
+    use super::model_config::AuthMethod;
+    match method {
+        AuthMethod::ApiKey => {
+            ensure!(
+                provider != super::chatgpt::PROVIDER,
+                "ChatGPT uses sign-in only; select openai for API-key billing"
+            );
+            Ok(false)
+        }
+        AuthMethod::OAuth => {
+            ensure!(
+                provider == "anthropic"
+                    || provider == super::chatgpt::PROVIDER
+                    || flow(provider).is_some(),
+                "this provider has no sign-in route; select API-key authentication"
+            );
+            Ok(true)
+        }
+        AuthMethod::Auto if provider == "anthropic" => super::anthropic_oauth::signed_in_checked(
+            &crate::config::paths::subscription_auth_dir(user_dir)?,
+        ),
+        AuthMethod::Auto if provider == super::chatgpt::PROVIDER => Ok(true),
+        AuthMethod::Auto => Ok(flow(provider).is_some_and(|flow| signed_in(user_dir, flow.id))),
+    }
+}
+
 /// A provider route bound to a stored OAuth grant, resolved per request.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Binding {
@@ -414,6 +447,14 @@ impl Binding {
     pub fn for_provider(user_dir: &Path, provider: &str) -> Option<Self> {
         let flow = flow(provider)?;
         signed_in(user_dir, flow.id).then(|| Self {
+            id: flow.id,
+            user_dir: user_dir.to_path_buf(),
+        })
+    }
+    /// Bind the explicitly selected sign-in, even if the user still needs to sign in.
+    pub fn selected(user_dir: &Path, provider: &str) -> Option<Self> {
+        let flow = flow(provider)?;
+        Some(Self {
             id: flow.id,
             user_dir: user_dir.to_path_buf(),
         })

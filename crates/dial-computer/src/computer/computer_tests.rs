@@ -255,6 +255,9 @@ mod worker {
     #[cfg(test)]
     mod control_release_tests;
 
+    #[cfg(test)]
+    mod menu_tests;
+
     fn window(id: &str, title: &str) -> Value {
         json!({"id": id, "app": "Brave Browser", "title": title, "pid": 1,
             "x": 0, "y": 0, "width": 10, "height": 10, "focused": false})
@@ -271,6 +274,14 @@ mod worker {
         list_windows: impl Fn(usize) -> Value,
         read_only: bool,
     ) -> Value {
+        run_worker_with_natives(code, list_windows, read_only).0
+    }
+
+    fn run_worker_with_natives(
+        code: &str,
+        list_windows: impl Fn(usize) -> Value,
+        read_only: bool,
+    ) -> (Value, Vec<Value>) {
         let mut child = Command::new("node")
             .args(["--input-type=module", "-e", include_str!("js/worker.mjs")])
             .stdin(Stdio::piped())
@@ -294,6 +305,7 @@ mod worker {
         );
         let mut listings = 0;
         let mut control_active = true;
+        let mut natives = Vec::new();
         let result = loop {
             let line = received
                 .recv_timeout(Duration::from_secs(30))
@@ -302,6 +314,7 @@ mod worker {
             match message["type"].as_str() {
                 Some("result") => break message,
                 Some("native") => {
+                    natives.push(message.clone());
                     let value = match message["method"].as_str() {
                         Some("listWindows") => {
                             listings += 1;
@@ -365,7 +378,7 @@ mod worker {
         };
         let _ = child.kill();
         let _ = child.wait();
-        result
+        (result, natives)
     }
 
     fn brave(_: usize) -> Value {

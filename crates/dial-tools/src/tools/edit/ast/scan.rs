@@ -70,6 +70,8 @@ pub(super) struct SourceFile {
 pub(super) struct Coverage {
     /// Binary, oversized or non-UTF-8 files.
     pub skipped: usize,
+    /// Files that could not be opened or read.
+    pub unreadable: usize,
     /// Languages the pattern does not compile for (auto-detect mode only), with the reason.
     pub rejected: Vec<(SupportLang, String)>,
     pub truncated: bool,
@@ -85,12 +87,18 @@ impl Coverage {
                 self.skipped
             ));
         }
+        if self.unreadable > 0 {
+            out.push_str(&format!(
+                "[{} unreadable files skipped; results may be incomplete]\n",
+                self.unreadable
+            ));
+        }
         for (lang, why) in &self.rejected {
             out.push_str(&format!("[{lang} files skipped: {why}]\n"));
         }
         if self.truncated {
             out.push_str(
-                "[workspace walk truncated at its entry limit; results may be incomplete]\n",
+                "[workspace walk incomplete due to a limit or I/O error; results may be incomplete]\n",
             );
         }
         out
@@ -123,23 +131,46 @@ impl<'a> Queries<'a> {
     }
 }
 
-fn load(path: &Path, rel: String) -> Result<SourceFile, ()> {
-    let file = crate::tools::fs::walk::open_search_file(path).map_err(|_| ())?;
-    let meta = file.metadata().map_err(|_| ())?;
+#[derive(Debug)]
+enum LoadError {
+    Io(std::io::Error),
+    Oversized,
+    Binary,
+    NonUtf8,
+}
+
+impl LoadError {
+    fn message(&self, rel: &str) -> String {
+        match self {
+            Self::Io(error) => io_message("reading", rel, error),
+            Self::Oversized => format!(
+                "cannot scan {rel:?}: file exceeds the 2 MiB limit; narrow or split the file"
+            ),
+            Self::Binary => format!("cannot scan {rel:?}: file contains binary data (NUL bytes)"),
+            Self::NonUtf8 => {
+                format!("cannot scan {rel:?}: file is not UTF-8; convert it to UTF-8 first")
+            }
+        }
+    }
+}
+
+fn load(path: &Path, rel: String) -> Result<SourceFile, LoadError> {
+    let file = crate::tools::fs::walk::open_search_file(path).map_err(LoadError::Io)?;
+    let meta = file.metadata().map_err(LoadError::Io)?;
     if meta.len() > MAX_FILE {
-        return Err(());
+        return Err(LoadError::Oversized);
     }
     let mut bytes = Vec::new();
     file.take(MAX_FILE + 1)
         .read_to_end(&mut bytes)
-        .map_err(|_| ())?;
+        .map_err(LoadError::Io)?;
     if bytes.len() as u64 > MAX_FILE {
-        return Err(());
+        return Err(LoadError::Oversized);
     }
     if bytes.iter().take(8192).any(|&b| b == 0) {
-        return Err(());
+        return Err(LoadError::Binary);
     }
-    let text = String::from_utf8(bytes).map_err(|_| ())?;
+    let text = String::from_utf8(bytes).map_err(|_| LoadError::NonUtf8)?;
     Ok(SourceFile {
         abs: path.to_owned(),
         rel,
@@ -162,6 +193,7 @@ pub(super) fn scan(
         queries.get(lang).map_err(str::to_owned)?;
     }
     let mut compiled_any = false;
+    let mut load_error = None;
     let mut each = |path: &Path| -> bool {
         let Some(lang) = target.language(path) else {
             return true;
@@ -181,8 +213,14 @@ pub(super) fn scan(
                 coverage.files += 1;
                 visit(file, query)
             }
-            Err(()) => {
-                coverage.skipped += 1;
+            Err(error) => {
+                if target.is_file {
+                    load_error = Some(error.message(&ws.rel(path)));
+                } else if matches!(error, LoadError::Io(_)) {
+                    coverage.unreadable += 1;
+                } else {
+                    coverage.skipped += 1;
+                }
                 true
             }
         }
@@ -193,6 +231,9 @@ pub(super) fn scan(
         let mut walk = Walk::new(ws);
         walk.run(&target.start, &mut each);
         coverage.truncated = walk.truncated;
+    }
+    if let Some(error) = load_error {
+        return Err(error);
     }
     if !compiled_any && let Some((lang, why)) = coverage.rejected.first() {
         return Err(format!("pattern does not compile for {lang}: {why}"));

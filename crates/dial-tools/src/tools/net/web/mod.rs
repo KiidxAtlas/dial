@@ -103,16 +103,13 @@ impl WebFetch {
         let raw = opt_bool(args, "raw")?;
         let rendered =
             pipeline::render(&self.client, &config.web, workspace, url, raw, HTML_ACCEPT)?;
-        let text = if rendered.truncated {
-            format!(
-                "{}\n[the response exceeded {} bytes; the rest was not downloaded]",
-                rendered.text,
+        let mut text = content::truncate_chars(rendered.text, max_chars);
+        if rendered.truncated {
+            text.push_str(&format!(
+                "\n[the response exceeded {} bytes; the rest was not downloaded]",
                 fetch::MAX_BODY_BYTES
-            )
-        } else {
-            rendered.text
-        };
-        let text = content::truncate_chars(text, max_chars);
+            ));
+        }
         let requested = fetch::parse_url(url)?.to_string();
         let mut source = format!(
             "{} (HTTP {}, {})",

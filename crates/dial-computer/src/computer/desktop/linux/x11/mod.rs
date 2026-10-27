@@ -155,6 +155,7 @@ impl Backend for X11Backend {
         &mut self,
         window: &DesktopWindow,
         path: &[String],
+        _mode: DeliveryMode,
         token: &OperationToken,
     ) -> CoreResult<()> {
         token.check()?;

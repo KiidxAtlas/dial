@@ -27,6 +27,22 @@ fn bundled_provider_ids_resolve_without_user_endpoint_configuration() {
         "https://api.fireworks.ai/inference/v1"
     );
 }
+
+#[test]
+fn explicit_auth_selection_validates_and_survives_role_resolution() {
+    use crate::llm::model_config::{AuthMethod, ModelSelection};
+    let config = resolve("provider='anthropic'\nmodel='claude-test'\n[providers.anthropic]\nbase_url='https://api.anthropic.com'\nauth='api-key'\n").unwrap();
+    assert_eq!(config.providers["anthropic"].auth, AuthMethod::ApiKey);
+    let role = config.with_selection(&ModelSelection::new("anthropic", "claude-role"));
+    assert_eq!(role.providers["anthropic"].auth, AuthMethod::ApiKey);
+    for text in [
+        "provider='anthropic'\nmodel='claude-test'\n[providers.anthropic]\nbase_url='https://proxy.example/v1'\nauth='oauth'\n",
+        "provider='openai'\nmodel='test'\n[providers.openai]\nbase_url='https://api.openai.com/v1'\nauth='oauth'\n",
+        "provider='chatgpt'\nmodel='test'\n[providers.chatgpt]\nbase_url='https://chatgpt.com/backend-api'\nauth='api-key'\n",
+    ] {
+        assert!(resolve(text).is_err());
+    }
+}
 #[test]
 fn context_window_accepts_auto_and_numeric_values() {
     assert_eq!(

@@ -475,7 +475,7 @@ impl AxBackend for MacAx {
         let actions = copy_strings_from_action_names(element)?;
         if !actions.contains(&native) {
             return Err(DesktopError::ax_failed(format!(
-                "AX action '{native}' is not supported by this element; available actions: {}",
+                "AX action '{native}' is not supported by this element; available actions: {}. No action was dispatched. Inspect actions() and use perform(name) only for the intended operation; AXShowMenu opens a context menu, not activation. For activation without a press action, use the verified element's click() or a fresh window screenshot",
                 actions.join(", "),
             )));
         }

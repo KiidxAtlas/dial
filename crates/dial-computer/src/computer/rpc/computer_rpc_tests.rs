@@ -75,3 +75,42 @@ fn delayed_admitted_requests_cannot_cross_lifecycle_boundaries() {
         assert!(dispatch(&session.admit(), "controlState", Value::Null).is_ok());
     }
 }
+
+#[test]
+fn menu_select_options_preserve_omission_and_explicit_delivery() {
+    for (options, expected) in [
+        (Value::Null, None),
+        (json!({}), None),
+        (json!({"takeover": false}), Some(false)),
+        (json!({"takeover": true}), Some(true)),
+    ] {
+        let parsed: MenuSelectArgs = parse(
+            "menuSelect",
+            json!({
+                "target": "42103", "path": ["File", "New Window"], "options": options
+            }),
+        )
+        .unwrap();
+        assert_eq!(parsed.target, "42103");
+        assert_eq!(parsed.options.unwrap_or_default().takeover, expected);
+    }
+    let parsed: MenuSelectArgs = parse(
+        "menuSelect",
+        json!({
+            "target": "42103", "path": ["File", "New Window"]
+        }),
+    )
+    .unwrap();
+    assert!(parsed.options.is_none());
+    for options in [json!({"takeover": "true"}), json!({"button": "left"})] {
+        assert!(
+            parse::<MenuSelectArgs>(
+                "menuSelect",
+                json!({
+                    "target": "42103", "path": ["File", "New Window"], "options": options
+                })
+            )
+            .is_err()
+        );
+    }
+}

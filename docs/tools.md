@@ -92,6 +92,9 @@ The built-in tool roster, specialist integrations, safety model, context sources
     - **Automatic default:** the input-declaration requirement above applies to configured commands. The exact built-in isolated Python AST check can reuse passes without configuration on supported Unix CPython installations. It tracks source, environment and runtime identity; unknown dependencies fall back to execution. See [configuration.md](configuration.md) for runtime assumptions and snapshot bounds. Other built-in builds/tests still execute conservatively.
   - `revert_edit` (loadable): restores one file (`path`) to its content before Dial's most recent checkpointed change to it in this turn, or before the turn's first change with `to = "turn_start"`. It refuses files with no journaled change this turn and files changed outside Dial's checkpoint journal since that change (shell commands, external editors). The revert is itself a checkpointed edit: approvals and edit path rules apply as for `edit`, `/undo` still restores the turn, and the file must be read again before the next edit.
   - `ast_search` / `ast_edit`: structural search and rewrite with ast-grep patterns (`$VAR`, `$$$ARGS`) over 28 languages. `ast_edit` previews by default, and a dry run that found changes ends with an `apply_token`: calling `ast_edit` with only that token applies exactly the previewed rewrite (approval and checkpoints as for `dry_run: false`) and is refused if any affected file changed since the preview or the token is unknown, spent or evicted (the workspace keeps the last four previews, up to 32 MiB; previews with refused files are not staged); the full `dry_run: false` call still works; applying is all-or-nothing, atomic and checkpointed (`/undo` works). An invalid pattern is refused; a rewrite whose result no longer parses is applied with a syntax advisory, never vetoed. Both are loadable rather than in the default offer: the system prompt lists them and `tool_load` enables them for the next round.
+    An explicitly selected file that cannot be loaded as bounded UTF-8 source is an error,
+    not a successful no-match result. Tree scans report unreadable files separately from content or
+    size skips; any coverage warning means the results may be incomplete.
   - MCP: every tool of each `[mcp.<name>]` stdio server appears as `mcp__<server>__<tool>` and requires approval unless the entry sets `trust_read_only_hint = true` and the tool declares `readOnlyHint` (then it runs without approval and read-only subagents are offered it). A server's `readOnlyHint` is not an authorization boundary. Servers are trusted operator programs (unsandboxed); a server that fails to start only produces a notice. Server size no longer determines the default offer: tools are selected for the task, rather than loading every tool from every small server.
     The full-context offer includes `mcp_servers` for runtime status. Task routing selects up to **6 additional native/MCP tools**, with a **24 KiB total schema budget**, using the request, indexed capabilities and dependency names from complete `package.json` files already read during that turn. Library/API tasks can expose a generic documentation service without naming its server; named or observed framework domains select their own documentation tools. Native intents select rendered-browser inspection, dependency source, structural search/rewrite, symbol navigation, debugging or prior-session/change history when relevant. Successful MCP discovery exposes matching same-server get/read/query consumers for the next model request, without trusting instructions in result text.
     Routing is deterministic and local: it makes no extra model, filesystem or network calls, and does not execute tools, install servers, grant permissions, persist as pins or expand a child's allowlist. Additions are monotonic within a turn to avoid needless schema churn. Explicit unload suppresses automatic reactivation until the next external request; explicit pins remain durable. Unrelated turns reset automatic selection. Pinned harness lists and small/lean context profiles retain their existing limits. Other tools remain reachable through `tool_search`, which indexes bounded parameter help and enum choices as well as descriptions. Manifest routing currently ignores partial/raw/batched reads and non-`package.json` formats.
@@ -151,6 +154,36 @@ The built-in tool roster, specialist integrations, safety model, context sources
 - Custom slash commands: `.dial/commands/*.md` (`$ARGUMENTS`, `$1`…).
 - Session commands include `/help /new /sessions /resume /fork /tree /label /rename /export /copy /plan /permissions /cost /compact /undo /rollback /todo /skills /memory /commands /search /approval /outcome /context /improve /understanding /laya /reasoning /thinking /exit`. Launch-only modes have in-session switches: `/advisor on|off` (coach-role review of each turn, like `--advisor`), `/external-thinking on|off` (private scratchpad, like `--external-thinking`) and `/plan-yolo [MODEL|off]` (auto-approve the next plan and hand it to MODEL, like `--plan-yolo-into`). CLI maintenance runs in the background with its output in the transcript: `/gc [apply]`, `/anonymize [SESSION] [-o PATH]`, `/images [status|doctor|probe|purge]`, `/update [VERSION]` (then `/restart`), `/benchmark [flags]` and `/schedule list|add|remove|log|run`. `/relay start [ADDR]|stop|status` runs a local collaboration relay for `/collab`, and `/hooks` lists the configured lifecycle hooks. Independent supported read tools run concurrently with mutation barriers and ordered results; read-only `bash` commands (the safe-command gate) join those groups unless they set `session`, `background` or `async`, which stay serial. Interrupted tool-call groups are closed with explicit results for safe resume; automatic compaction is announced. Process startup and non-cancellable external tools may still delay interruption.
 - `/graphify [tree|html|callflow]` renders the project's [Graphify](https://github.com/Graphify-Labs/graphify) knowledge graph and opens it in the browser: `tree` (the default) is a collapsible tree by directory, `html` an interactive graph (one node per community above 5000 nodes) and `callflow` Mermaid architecture and call-flow diagrams. It reads `graphify-out/graph.json`, or the directory `$GRAPHIFY_OUT` names, runs Graphify's exporter through `uvx --from graphifyy` as a background job with its output in the transcript, and writes the page beside the graph (`GRAPH_TREE.html`, `graph.html` or `callflow.html`). [uv](https://docs.astral.sh/uv/) must be installed; without it the job reports that `uvx` was not found on PATH. It never builds the graph; when none exists it names the build command (`uvx --from graphifyy graphify extract . --code-only`). It runs at once even during a turn. With `DIAL_NO_BROWSER` set, or when no opener works, it reports the page path instead.
+
+## Desktop window targeting and recovery
+
+The `computer` tool distinguishes a running application from an available target window.
+On macOS, discovery lists at most 48 on-screen, shareable windows. Hidden/minimized windows,
+other Spaces and capture policy can exclude a window; absence does not prove it closed or
+justify reopening the app. Explicit IDs use targeted lookup rather than that list cap, but
+still require an available, capturable window. Refresh discovery and verify the intended
+target; never replace a missing main window with an application's popup.
+
+Background keystrokes on macOS are process-routed, not reliably window-routed. A non-minimized
+sibling (including a password-manager popup) therefore causes a safety refusal. Prefer an
+exact-window accessibility action; otherwise use authorized foreground input on the original
+window. A listed `focused` flag alone does not make process-routed keys safe.
+
+Native menus support `win.menu.select(["File", "New Tab"], {takeover: true})` for explicit
+foreground recovery after a background key-context refusal. Omitted `takeover` follows an
+acquired task-control grant, otherwise it defaults to background; explicit `false` remains
+background. macOS must establish that exact native window as key before traversal and again
+before command dispatch. There is no implicit escalation, sibling substitution or retry.
+Foreground input and task-control acquisition retain normal interactive approvals; menu
+commands with consequential effects require user authorization. If delivery or restoration
+may already have occurred, inspect the target before retrying rather than duplicating a command.
+
+Accessibility `find({role})` uses case-insensitive **exact normalized roles**: `tab` is not
+`tabgroup` or `table`. Title/value filters remain case-insensitive substring matches. Nodes
+advertising actions but no press action include bounded action hints in the text tree.
+Inspect `actions()` before choosing an operation: `AXShowMenu` opens a context menu and must
+not substitute for activation. Use the verified element's click or fresh window pixels when
+the intended control exposes no activation action. Unsupported actions fail without dispatch.
 
 ## Editing grammars and safety
 
@@ -290,6 +323,11 @@ use behavioral checks that cover the requested outcome.
 LSP workspace edits support ordered file create, rename, delete and text operations in one validated
 transaction. Directory operations and confirmation-required annotations are refused before writes;
 use the explicit directory workflow when needed. Revert refuses to overwrite external changes.
+Refactoring snapshots skip common dependency/build directories (`node_modules`, `target`, `.venv`,
+`venv`, and `__pycache__`) and continue past unreadable subdirectories. A server edit or resource
+creation in an unobserved or incompletely scanned directory is refused, rather than assuming its
+pre-request state. The snapshot is bounded to 100,000 entries; targets outside the captured set
+are likewise refused. Valid same-position insertions are applied in server order.
 
 `dial annotate artifact://HASH --note TEXT --start N --end N` stores bounded human feedback against
 an immutable artifact hash and source range. `--list` returns a paginated annotation record.

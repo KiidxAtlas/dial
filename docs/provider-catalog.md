@@ -32,16 +32,47 @@ can be incomplete: an unknown capability is not proof of support. Operator profi
 vision/tool support, context/output limits and supported request options; they do not install a new
 runtime or turn an embedding checkpoint into a chat model.
 
-## Anthropic subscription sign-in
+## Independent authentication methods
 
-Use Dial's browser OAuth flow for a Claude subscription: open `/providers`, select **Anthropic**,
-then choose **Sign in with Claude subscription** and complete authorization in your browser.
+In `/providers`, select a provider and choose **Use API key** or **Use sign-in or subscription**
+where both routes are supported. The choice is saved as `providers.<id>.auth` and applies to that
+provider's main and role backends. Switching methods keeps both credentials; signing in, signing
+out, replacing a key, and removing a key do not change an explicitly selected method.
+Changes apply between turns through the existing settings reload, without restarting Dial.
+
+```toml
+[providers.anthropic]
+base_url = "https://api.anthropic.com"
+auth = "api-key" # or "oauth" for Claude subscription sign-in
+```
+
+`api-key` uses only the API-key resolver (`--api-key`, environment, then saved URL-scoped key),
+without reading or refreshing sign-in credentials. `oauth` uses only the provider's sign-in flow;
+missing, unreadable, expired or rejected sign-in credentials never fall back to API-key billing.
+Quota exhaustion does not automatically switch methods. API-key selection does not make an
+OAuth-only provider endpoint accept API keys; the endpoint must support the chosen route.
+OpenAI API-key usage remains `openai`, and ChatGPT subscription usage remains `chatgpt`.
+OpenRouter browser sign-in creates an API key rather than a second subscription credential.
+
+For compatibility, omitted `auth` (or `auth = "auto"`) preserves legacy credential selection:
+canonical Anthropic prefers a stored subscription, and generic OAuth providers prefer a stored
+grant. Choose a method explicitly to stop sign-in state from affecting routing. Saving a key
+alone does not change this legacy choice. **Remove API key** removes only the saved key;
+subscription/OAuth sign-out removes only that sign-in. Environment keys remain independently set.
+
+### Anthropic subscription sign-in
+
+Open `/providers`, select **Anthropic**, choose **Sign in with Claude subscription**, and complete
+authorization in your browser. Select **Use sign-in or subscription** to pin that route, or
+**Use API key** to keep the subscription signed in while using API billing.
 Dial stores access and refresh tokens in its private user directory, refreshes access before
 requests, fingerprints harness requests with Claude Code's billing-header and body attestation,
-and sends subscription requests only to Anthropic's official API endpoint. An Anthropic API key
-remains supported; sign out of the subscription in `/providers` to use the API-key route.
-Providers with zero discovered models are hidden in `/models`, but remain in `/providers`
-so they can be configured.
+and sends subscription requests only to Anthropic's official API endpoint and protocol.
+Custom Anthropic endpoints use their own API keys; subscription tokens are not sent to them.
+Discovery follows the selected authentication method. Unreadable subscription storage can be
+repaired by signing in again, or bypassed by explicitly selecting API key. Sign-out itself requires
+readable state; it does not discard corrupt files. Providers with zero discovered models remain
+in `/providers` so they can be configured.
 
 ## Providers and discovery
 
@@ -202,6 +233,9 @@ to an API key. A partial or failed response never releases its tool calls. Dial 
 [Sign in with ChatGPT flow](https://developers.openai.com/siwc/token-sharing-open-source). Existing
 accounts created by Dial's older login flow must sign in again. Legacy
 `https://api.openai.com/v1` ChatGPT endpoint settings are migrated to the Codex backend on load.
+
+Selecting the separate `openai` provider uses API-key authentication, even while a ChatGPT account is
+signed in. Signing into ChatGPT does not change the credentials used by `openai`.
 
 `retry.rotate_accounts` permits automatic ChatGPT failover only for unbound requests with
 portable history. A successful account selection stays pinned on that backend for subsequent

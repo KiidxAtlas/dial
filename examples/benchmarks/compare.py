@@ -182,7 +182,7 @@ def compare(baseline, candidate, baseline_configuration=None, candidate_configur
         "regressed_cases": regressions,
         "matched_successful_cases": matched,
         "matched_success_latency_ratio": after_ms / before_ms if before_ms else None,
-        "correctness_nonregressing": not regressions,
+        "correctness_nonregressing": not regressions if any(checked_success(case) for case in before.values()) else None,
         "limitations": "Uses recorded checks, not new proof. Legacy reports without outcome-check metadata remain readable but cannot establish checked coding success. Use identical fixture versions, models and declared verifiers; compare real-model runs separately from scripted runs. Unknown token usage is null, not free. Metric-only and manually reviewed checks do not establish model quality.",
     }
 
@@ -204,6 +204,8 @@ def main():
     if args.output:
         args.output.write_text(text)
     print(text, end="")
+    if report["correctness_nonregressing"] is None:
+        return 3
     return 0 if report["correctness_nonregressing"] else 1
 
 

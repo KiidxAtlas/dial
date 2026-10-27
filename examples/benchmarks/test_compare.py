@@ -1,4 +1,9 @@
 import copy
+import json
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
 import unittest
 
 from compare import compare
@@ -34,6 +39,39 @@ class ComparisonTests(unittest.TestCase):
         empty["cases"][0].update(checks_total=0, checks_passed=0)
         empty["cases"][0]["evidence"]["outcome_checks"] = 0
         self.assertEqual(compare(empty, empty)["candidate"]["checked_successes"], 0)
+        self.assertIsNone(compare(manual, manual)["correctness_nonregressing"])
+        self.assertIsNone(compare(empty, empty)["correctness_nonregressing"])
+
+    def test_no_baseline_success_is_inconclusive_even_if_candidate_improves(self):
+        result = compare(report(False), report())
+        self.assertIsNone(result["correctness_nonregressing"])
+        self.assertEqual(result["regressed_cases"], [])
+        self.assertIsNone(result["matched_success_latency_ratio"])
+
+    def test_cli_exit_codes_and_json_distinguish_inconclusive(self):
+        script = Path(__file__).with_name("compare.py")
+        with tempfile.TemporaryDirectory() as directory:
+            before = Path(directory) / "before.json"
+            after = Path(directory) / "after.json"
+            output = Path(directory) / "comparison.json"
+            for baseline, candidate, code, correctness in (
+                (report(), report(), 0, True),
+                (report(), report(False), 1, False),
+                (report(False), report(), 3, None),
+            ):
+                with self.subTest(code=code):
+                    before.write_text(json.dumps(baseline))
+                    after.write_text(json.dumps(candidate))
+                    process = subprocess.run(
+                        [sys.executable, str(script), str(before), str(after), "--output", str(output)],
+                        capture_output=True, text=True, check=False)
+                    self.assertEqual(process.returncode, code, process.stderr)
+                    self.assertIs(json.loads(process.stdout)["correctness_nonregressing"], correctness)
+                    self.assertEqual(json.loads(output.read_text()), json.loads(process.stdout))
+            before.write_text("not json")
+            process = subprocess.run([sys.executable, str(script), str(before), str(after)],
+                                     capture_output=True, text=True, check=False)
+            self.assertEqual(process.returncode, 2)
 
     def test_mismatched_tasks_duplicate_cases_and_fabricated_passes_are_rejected(self):
         baseline = report()
@@ -126,6 +164,7 @@ class ComparisonTests(unittest.TestCase):
         legacy = report()
         del legacy["cases"][0]["evidence"]
         self.assertEqual(compare(legacy, legacy)["candidate"]["checked_successes"], 0)
+        self.assertIsNone(compare(legacy, legacy)["correctness_nonregressing"])
 
     def test_invalid_failure_evidence_is_rejected(self):
         measured = report()

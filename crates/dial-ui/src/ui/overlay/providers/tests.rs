@@ -150,6 +150,7 @@ fn configured() -> BTreeMap<String, ProviderSpec> {
             allow_insecure: false,
             protocol: None,
             headers: None,
+            auth: AuthMethod::Auto,
         },
     )])
 }
@@ -942,5 +943,149 @@ fn hostile_provider_text_is_sanitized() {
     for w in [30u16, 60, 120] {
         let shown = draw(&mut o, &rig, w, 20);
         assert!(!shown.contains('\u{1b}') && !shown.contains('\u{7}'));
+    }
+}
+
+#[test]
+fn auth_choices_preserve_provider_configuration_and_show_current_method() {
+    let rig = Rig::new();
+    for id in std::iter::once("anthropic").chain(crate::llm::oauth::flows().map(|flow| flow.id)) {
+        let base_url = if id == "anthropic" {
+            crate::llm::anthropic::BASE_URL
+        } else {
+            crate::llm::oauth::flow(id).unwrap().base_url
+        };
+        let original = ProviderSpec {
+            label: "Account".into(),
+            base_url: base_url.into(),
+            api_key_env: Some("EXAMPLE_KEY".into()),
+            enabled: false,
+            ..Default::default()
+        };
+        let mut o = ProviderOverlay::new(
+            None,
+            BTreeMap::from([(id.into(), original.clone())]),
+            Box::new(|_| true),
+            Scope::Project,
+        );
+        select(&mut o, id);
+        o.open_menu();
+        assert!(
+            draw(&mut o, &rig, 150, 32).contains("auth: automatic (legacy)"),
+            "{id}"
+        );
+        for (label, auth) in [
+            ("Use API key", AuthMethod::ApiKey),
+            ("Use sign-in or subscription", AuthMethod::OAuth),
+        ] {
+            o.open_menu();
+            pick(&mut o, label);
+            match send(&mut o, &rig, key(KeyCode::Enter)) {
+                OverlayEvent::AddProvider {
+                    id: actual,
+                    spec,
+                    scope,
+                } => {
+                    assert_eq!(actual, id);
+                    assert_eq!(scope, Scope::Project);
+                    let mut expected = original.clone();
+                    expected.auth = auth;
+                    assert_eq!(
+                        serde_json::to_value(&spec).unwrap(),
+                        serde_json::to_value(expected).unwrap()
+                    );
+                }
+                _ => panic!("missing auth selection for {id}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn anthropic_api_key_removal_is_independent_and_api_headers_remain_editable() {
+    let rig = Rig::new();
+    let mut o = ProviderOverlay::new(
+        None,
+        BTreeMap::from([(
+            "anthropic".into(),
+            ProviderSpec {
+                base_url: crate::llm::anthropic::BASE_URL.into(),
+                auth: AuthMethod::ApiKey,
+                ..Default::default()
+            },
+        )]),
+        Box::new(|_| true),
+        Scope::Global,
+    );
+    o.set_anthropic_signed_in(true);
+    select(&mut o, "anthropic");
+    o.open_menu();
+    assert!(draw(&mut o, &rig, 150, 32).contains("auth: API key"));
+    pick(&mut o, "Edit HTTP header rows");
+    send(&mut o, &rig, key(KeyCode::Enter));
+    assert!(matches!(o.mode, Mode::Headers { .. }));
+    send(&mut o, &rig, key(KeyCode::Esc));
+    o.open_menu();
+    pick(&mut o, "Remove API key");
+    send(&mut o, &rig, key(KeyCode::Enter));
+    let confirmation = draw(&mut o, &rig, 150, 32);
+    assert!(!confirmation.contains("sign out"));
+    assert!(matches!(
+        send(&mut o, &rig, key(KeyCode::Enter)),
+        OverlayEvent::RemoveCredential { .. }
+    ));
+    assert!(o.anthropic_signed_in);
+}
+
+#[test]
+fn oauth_signout_uses_grant_presence_not_selected_api_status() {
+    let rig = Rig::new();
+    for flow in crate::llm::oauth::flows() {
+        for state in ["auth-required", "reachable"] {
+            let mut d = discovery();
+            d.providers
+                .push(provider(flow.id, flow.name, state, 0, Some(flow.base_url)));
+            let mut overlay = ProviderOverlay::new(
+                Some(d),
+                BTreeMap::from([(
+                    flow.id.into(),
+                    ProviderSpec {
+                        base_url: flow.base_url.into(),
+                        auth: AuthMethod::ApiKey,
+                        ..Default::default()
+                    },
+                )]),
+                Box::new(|_| false),
+                Scope::Global,
+            );
+            select(&mut overlay, flow.id);
+            overlay.open_menu();
+            let Mode::Menu(menu) = &overlay.mode else {
+                panic!()
+            };
+            assert!(
+                !menu
+                    .items
+                    .iter()
+                    .any(|(action, _)| matches!(action, ProviderAction::OAuthSignOut(_)))
+            );
+            overlay.set_oauth_signed_in([flow.id.to_owned()].into());
+            overlay.open_menu();
+            let Mode::Menu(menu) = &overlay.mode else {
+                panic!()
+            };
+            let index = menu
+                .items
+                .iter()
+                .position(|(action, _)| matches!(action, ProviderAction::OAuthSignOut(_)))
+                .unwrap();
+            let Mode::Menu(menu) = &mut overlay.mode else {
+                panic!()
+            };
+            menu.cursor = index;
+            assert!(
+                matches!(send(&mut overlay, &rig, key(KeyCode::Enter)), OverlayEvent::OAuthSignOut { id } if id == flow.id)
+            );
+        }
     }
 }

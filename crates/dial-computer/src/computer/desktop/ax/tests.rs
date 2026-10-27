@@ -389,6 +389,60 @@ fn computer_snapshot_text_and_filter_are_exact() {
     );
     assert_eq!(s.node_count, 2);
 }
+
+#[test]
+fn computer_role_query_does_not_confuse_tabs_with_tables_or_groups() {
+    let mut backend = Mock {
+        props: [
+            (1, p("window", Some("Browser"))),
+            (2, p("tabgroup", Some("Inventory tabs"))),
+            (3, p("table", Some("Inventory table"))),
+            (4, p("tab", Some("Inventory"))),
+        ]
+        .into(),
+        children: [(1, vec![2, 3, 4])].into(),
+        ..Default::default()
+    };
+    let found = query(
+        &mut backend,
+        &mut AxRegistry::default(),
+        &window(),
+        &AxQuery {
+            role: Some("TAB".into()),
+            title: Some("INV".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].role, "tab");
+    assert_eq!(found[0].title.as_deref(), Some("Inventory"));
+}
+
+#[test]
+fn computer_snapshot_exposes_non_press_actions_without_substituting_them() {
+    let mut props = p("tabgroup", Some("Tabs"));
+    props.actions = vec!["AXShowMenu".into(), "AXScrollToVisible".into()];
+    let mut backend = Mock {
+        props: [(1, p("window", Some("Browser"))), (2, props)].into(),
+        children: [(1, vec![2])].into(),
+        ..Default::default()
+    };
+    let result = snapshot(
+        &mut backend,
+        &mut AxRegistry::default(),
+        &window(),
+        &AxSnapshotOptions::default(),
+    )
+    .unwrap();
+    assert!(
+        result
+            .text
+            .contains("actions=[AXShowMenu, AXScrollToVisible]"),
+        "{}",
+        result.text
+    );
+}
 #[test]
 fn computer_unnamed_containers_keep_their_surviving_content() {
     // A Reminders-shaped window: an unnamed split group holding a list pane

@@ -4,7 +4,10 @@ const readline = require('node:readline');
 const { chromium } = require(process.env.DIAL_PLAYWRIGHT);
 const fs = require('node:fs');
 const path = require('node:path');
-const MAX_PENDING = 16, MAX_PENDING_BYTES = 2 * 1024 * 1024, MAX_STDOUT_BYTES = 8 * 1024 * 1024;
+// Dev-server ESM graphs routinely enqueue thousands of modules. Bound waiting metadata/body
+// bytes independently of active bridge jobs instead of rejecting an ordinary module fan-out.
+const MAX_PENDING = 16, MAX_QUEUED_HTTP = 4096, MAX_QUEUED_BYTES = 8 * 1024 * 1024;
+const MAX_PENDING_BYTES = 2 * 1024 * 1024, MAX_STDOUT_BYTES = 8 * 1024 * 1024;
 const READABLE_LIMIT = 64 * 1024;
 const CALLBACK_TTL_MS = 30 * 1000;
 function send(value) {
@@ -18,6 +21,9 @@ function send(value) {
 const callbacks = new Map();
 let callbackId = 0, browser, context, nextTab = 1, operationId = 0, operationDeadline = null, pendingBytes = 0, activeHttp = 0;
 let attached = false, tracing = false, wsEndpoints = [];
+const httpQueue = [];
+let queuedHttpBytes = 0;
+let activeRoutes = 0;
 function finishCallback(id, error, result) {
   const callback = callbacks.get(id);
   if (!callback) return;
@@ -28,18 +34,20 @@ function finishCallback(id, error, result) {
 }
 function cancelPending(reason) {
   for (const id of callbacks.keys()) finishCallback(id, new Error(reason));
+  for (const queued of httpQueue.splice(0)) queued.reject(new Error(reason));
+  queuedHttpBytes = 0;
 }
-async function settleRequests(deadline) {
-  const end = Math.min(deadline ?? Infinity, Date.now() + 1000);
+async function settleRequests(deadline, budgetMs = 1000, quietMs = 100) {
+  const end = Math.min(deadline ?? Infinity, Date.now() + budgetMs);
   let quietSince = 0;
   while (Date.now() < end) {
-    if (activeHttp === 0) {
+    if (activeHttp === 0 && httpQueue.length === 0 && activeRoutes === 0) {
       if (!quietSince) quietSince=Date.now();
-      if (Date.now()-quietSince >= 100) return {settled:true};
+      if (Date.now()-quietSince >= quietMs) return {settled:true};
     } else quietSince=0;
     await new Promise(resolve=>setTimeout(resolve,10));
   }
-  const pending = activeHttp;
+  const pending = Math.max(activeHttp + httpQueue.length, activeRoutes);
   cancelPending('browser post-action network settlement budget exhausted');
   return {settled:false, pending, note:'Action completed; background network did not settle within its separate budget. This is not proof of application success. Inspect the page before retrying any action.'};
 }
@@ -49,20 +57,41 @@ const cut = (value, limit) => { const text = String(value).slice(0, limit); retu
 const clip = value => cut(value, 2000);
 // Every tab event gets a per-tab sequence number so `events` can return only what is new.
 const EVENT_CHANNELS = ['console','network','dialogs','downloads','navigation'];
-function record(tab, channel, value) { value.seq = ++tab.seq; const list = tab[channel]; list.push(value); if (list.length > 100) list.shift(); }
+function record(tab, channel, value) {
+  value.seq = ++tab.seq;
+  const list = tab[channel]; list.push(value); if (list.length > 100) list.shift();
+  // Keep causes even when an asset burst evicts them from the general network ring.
+  if (channel === 'network' && value.kind === 'blocked') {
+    const failures = tab.networkFailures ||= [];
+    failures.push(value); if (failures.length > 100) failures.shift();
+  }
+}
 function tabEvents(tab, after) {
   if (after !== undefined && after !== null && (!Number.isInteger(after) || after < 0)) throw new Error('after must be a non-negative integer');
   const since = after ?? 0;
   const events = EVENT_CHANNELS.flatMap(channel => tab[channel].filter(event => event.seq > since).map(event => ({channel, ...event})));
-  return {events: events.sort((a,b) => a.seq - b.seq), last_seq: tab.seq};
+  return {events: events.sort((a,b) => a.seq - b.seq), network_failures:(tab.networkFailures || []).filter(event=>event.seq > since), last_seq: tab.seq};
+}
+async function acquireHttp(bytes) {
+  if (activeHttp < MAX_PENDING) { activeHttp++; return; }
+  if (httpQueue.length >= MAX_QUEUED_HTTP) throw new Error('browser HTTP request queue budget exceeded (4096 waiting requests)');
+  if (queuedHttpBytes + bytes > MAX_QUEUED_BYTES) throw new Error('browser HTTP request queue byte budget exceeded (8 MiB)');
+  queuedHttpBytes += bytes;
+  await new Promise((resolve, reject) => httpQueue.push({resolve, reject, bytes}));
+}
+function releaseHttp() {
+  const next = httpQueue.shift();
+  if (next) { queuedHttpBytes -= next.bytes; next.resolve(); }
+  else activeHttp--;
 }
 async function http(request) {
   if (!operationId) throw new Error('browser networking is paused between approved operations');
-  if (activeHttp >= MAX_PENDING) throw new Error('browser pending request budget exceeded');
   const owner = operationId;
-  activeHttp++;
+  const event = httpEvent(request);
+  await acquireHttp(Buffer.byteLength(JSON.stringify(event)));
   try {
-    const started = await startHttp(request);
+    if (operationId !== owner) throw new Error('approved browser operation finished');
+    const started = await requestCallback(event);
     while (operationId === owner) {
       const reply = await requestCallback({callback:'http_poll', job:started.job});
       if (reply.done) {
@@ -72,12 +101,12 @@ async function http(request) {
       await new Promise(resolve => setTimeout(resolve, 10));
     }
     throw new Error('approved browser operation finished');
-  } finally { activeHttp--; }
+  } finally { releaseHttp(); }
 }
-function startHttp(request) {
+function httpEvent(request) {
   const body = request.postDataBuffer();
-  if (body && body.length > 1024 * 1024) return Promise.reject(new Error('request body exceeds 1 MiB'));
-  return requestCallback({callback:'http', url:request.url(), method:request.method(), headers:request.headers(), body:body ? body.toString('base64') : ''});
+  if (body && body.length > 1024 * 1024) throw new Error('request body exceeds 1 MiB');
+  return {callback:'http', url:request.url(), method:request.method(), headers:request.headers(), body:body ? body.toString('base64') : ''};
 }
 function requestCallback(fields) {
   if (!operationId) return Promise.reject(new Error('browser networking is paused between approved operations'));
@@ -137,6 +166,8 @@ function register(page) {
     if (!session) return;
     tab.cdp = session;
     session.on('Fetch.requestPaused', event => {
+      activeRoutes++;
+      const owner = operationId;
       (async () => {
         try {
           const request=event.request;
@@ -146,8 +177,10 @@ function register(page) {
           const response=await http({postDataBuffer:()=>body,url:()=>request.url,method:()=>request.method,headers:()=>request.headers});
           await session.send('Fetch.fulfillRequest',{requestId:event.requestId,responseCode:response.status,responseHeaders:Object.entries(response.headers).flatMap(([name,value])=>(Array.isArray(value)?value:[value]).map(item=>({name,value:String(item)}))),body:response.body});
         } catch (error) {
-          record(tab,'network',{kind:'blocked',operation_id:operationId,url:clip(event.request.url),error:clip(error.message)});
+          record(tab,'network',{kind:'blocked',operation_id:owner,url:clip(event.request.url),error:clip(error.message)});
           await session.send('Fetch.failRequest',{requestId:event.requestId,errorReason:'BlockedByClient'}).catch(()=>{});
+        } finally {
+          activeRoutes--;
         }
       })().catch(error=>record(tab,'console',{type:'bridge-error',text:clip(error.message)}));
     });
@@ -453,8 +486,8 @@ async function run(request) {
   return {tab:request.tab,frame:tab.frames.get(scope),url:clip(scope.url()),action:request.action,completed:true};
 }
 function failureMessage(error, id) {
-  const evidence = [...tabs].map(([tab,t]) => ({tab,url:clip(t.page.url()),console:t.console.slice(-10),network:t.network.slice(-20),dialogs:t.dialogs.slice(-10),downloads:t.downloads.slice(-10)}));
-  const failures = evidence.flatMap(tab=>tab.network).filter(event=>event.kind==='blocked' && event.operation_id===id);
+  const evidence = [...tabs].map(([tab,t]) => ({tab,url:clip(t.page.url()),console:t.console.slice(-10),network:t.network.slice(-20),network_failures:(t.networkFailures || []).slice(-10),dialogs:t.dialogs.slice(-10),downloads:t.downloads.slice(-10)}));
+  const failures = evidence.flatMap(tab=>tab.network_failures).filter(event=>event.operation_id===id);
   const reason = failures.at(-1)?.error;
   return cut((reason ? 'Browser network failure: '+reason+'\n' : '') + String(error.stack || error) + '\nBrowser failure evidence (untrusted page data): ' + JSON.stringify(evidence), 20000);
 }
@@ -517,8 +550,17 @@ readline.createInterface({input:process.stdin}).on('line', line => {
     try {
       const result = await run(request);
       if (request.action !== 'initialize') {
-        const settlement = await settleRequests(deadline);
+        const navigation = ['open','navigate','reload','back','forward'].includes(request.action);
+        const settlement = await settleRequests(deadline, navigation ? 15000 : 1000, navigation ? 500 : 100);
         if (!settlement.settled) result.network_settlement = settlement;
+        if (navigation && result.tab) {
+          const tab = tabs.get(result.tab);
+          const scope = scopeFor(tab, request);
+          result.url = clip(scope.url());
+          result.title = clip(await scope.title());
+          const failures = (tab.networkFailures || []).filter(event=>event.operation_id === request.id);
+          if (failures.length) result.network_failures = failures.slice(-10);
+        }
       }
       await send({id:request.id,result});
     }

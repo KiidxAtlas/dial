@@ -127,7 +127,7 @@ function createNativeSession() {
 		listApplications: options => native("listApplications", { options }),
 		openApplication: (id, options) => native("openApplication", { id, options }),
 		menuItems: (target, path) => native("menuItems", { target, path }),
-		menuSelect: (target, path) => native("menuSelect", { target, path }),
+		menuSelect: (target, path, options) => native("menuSelect", { target, path, options }),
 		observe: (target, caps, axOptions) => native("observe", { target, caps, axOptions }),
 		holdKeys: (target, keys, options) => native("holdKeys", { target, keys, options }),
 		holdMouse: (target, x, y, options) => native("holdMouse", { target, x, y, options }),
@@ -1539,11 +1539,11 @@ class Win {
 				if (segments !== undefined) validateKeys(segments, "menu path", { allowEmpty: true });
 				return await nativeCall(context.signal, () => this.#session.menuItems(this.id, segments));
 			},
-			select: async path => {
+			select: async (path, options) => {
 				const context = this.#getContext();
 				guardRun(context, "menu.select");
 				validateKeys(path, "menu path");
-				await nativeCall(context.signal, () => this.#session.menuSelect(this.id, path));
+				await nativeCall(context.signal, () => this.#session.menuSelect(this.id, path, options));
 			},
 		};
 	}

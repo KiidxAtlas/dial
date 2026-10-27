@@ -478,6 +478,9 @@ impl LocalApp {
                             }
                             return;
                         }
+                        if String::from_utf8_lossy(&request).starts_with("GET /burst?") {
+                            std::thread::sleep(Duration::from_millis(150));
+                        }
                         let response = if String::from_utf8_lossy(&request)
                             .starts_with("GET /redirect ")
                         {
@@ -485,15 +488,29 @@ impl LocalApp {
                                 "HTTP/1.1 302 Found\r\nLocation: http://localhost:{port}/blocked\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                             )
                         } else {
-                            let article =
-                                String::from_utf8_lossy(&request).starts_with("GET /article ");
-                            let body = if article {
-                                "<!doctype html><title>Dial article</title><article><h1>Dial article</h1><p>Local browser readable extraction keeps the substantive paragraphs of this fixture page, which is long enough for Readability to score it as an article rather than navigation chrome.</p><p>A second paragraph repeats the claim with more ordinary prose so the extracted text is clearly article content from the local fixture server.</p><p>A third paragraph adds further descriptive sentences about the local test page so the readable extraction has a stable body of text to return to the caller.</p></article>"
+                            let request = String::from_utf8_lossy(&request);
+                            let (body, content_type) = if request.starts_with("GET /module-graph ") {
+                                ("<!doctype html><title>Loading modules</title><script>import('/module-entry.js')</script>".to_owned(), "text/html")
+                            } else if request.starts_with("GET /module-entry.js ") {
+                                // DOMContentLoaded need not wait for dynamically discovered modules.
+                                // Exceed the previous settlement budget before discovering the graph.
+                                std::thread::sleep(Duration::from_millis(1200));
+                                let mut body = (0..1200).map(|i| format!("import '/module?{i}';\n")).collect::<String>();
+                                body.push_str("document.body.textContent='Module graph ready';document.title='Module graph ready';");
+                                (body, "text/javascript")
+                            } else if request.starts_with("GET /module?") {
+                                ("export default 1;".to_owned(), "text/javascript")
                             } else {
-                                "<!doctype html><title>Dial local smoke</title><input id='name'><button id='go' onclick=\"document.querySelector('#result').textContent=document.querySelector('#name').value;console.log('verified-click')\">Go</button><p id='result'></p>"
+                                let article = request.starts_with("GET /article ");
+                                let body = if article {
+                                    "<!doctype html><title>Dial article</title><article><h1>Dial article</h1><p>Local browser readable extraction keeps the substantive paragraphs of this fixture page, which is long enough for Readability to score it as an article rather than navigation chrome.</p><p>A second paragraph repeats the claim with more ordinary prose so the extracted text is clearly article content from the local fixture server.</p><p>A third paragraph adds further descriptive sentences about the local test page so the readable extraction has a stable body of text to return to the caller.</p></article>"
+                                } else {
+                                    "<!doctype html><title>Dial local smoke</title><input id='name'><button id='go' onclick=\"document.querySelector('#result').textContent=document.querySelector('#name').value;console.log('verified-click')\">Go</button><p id='result'></p>"
+                                };
+                                (body.to_owned(), "text/html")
                             };
                             format!(
-                                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                                 body.len()
                             )
                         };
@@ -594,7 +611,10 @@ fn chromium_approved_localhost_without_manual_allowlist() {
     };
     config.sandbox.mode = SandboxMode::Dev;
     config.sandbox.allow_network = true;
-    config.browser.playwright_module = std::env::var("DIAL_PLAYWRIGHT").unwrap();
+    config.browser.allow_install = false;
+    if let Ok(module) = std::env::var("DIAL_PLAYWRIGHT") {
+        config.browser.playwright_module = module;
+    }
     assert!(config.browser.allowed_hosts.is_empty());
     let tool = tools(&config).pop().unwrap();
     let ctx = ToolContext {
@@ -684,6 +704,14 @@ fn chromium_approved_localhost_without_manual_allowlist() {
     assert_eq!(result["status"], 200);
     assert_eq!(result["title"], "Dial local smoke");
     let tab = result["tab"].as_u64().unwrap();
+    // A page may start more than 16 HTTP requests at once; they must wait, not fail.
+    let burst = tool.call(&ctx, &json!({"action":"evaluate", "tab":tab,
+        "expression":"Promise.all(Array.from({length:40}, (_, i) => fetch('/burst?'+i).then(r => r.status)))"}));
+    assert!(!burst.is_error, "{}", burst.text);
+    let result: Value = serde_json::from_str(&burst.text).unwrap();
+    let statuses = result["value"].as_array().expect("burst returns statuses");
+    assert_eq!(statuses.len(), 40);
+    assert!(statuses.iter().all(|status| status == 200), "{result}");
     let screenshot = tool.call(&ctx, &json!({"action":"screenshot", "tab":tab}));
     assert!(!screenshot.is_error, "{}", screenshot.text);
     let screenshot: Value = serde_json::from_str(&screenshot.text).unwrap();
@@ -694,6 +722,25 @@ fn chromium_approved_localhost_without_manual_allowlist() {
     if let Ok(path) = std::env::var("DIAL_TEST_BROWSER_SCREENSHOT") {
         std::fs::write(path, &png).unwrap();
     }
+    // A realistic unbundled ESM graph exceeds both the old queue and total-job limits.
+    let graph = tool.call(
+        &ctx,
+        &json!({"action":"navigate", "tab":tab,
+        "url":format!("http://127.0.0.1:{}/module-graph", app.port)}),
+    );
+    assert!(!graph.is_error, "{}", graph.text);
+    let graph: Value = serde_json::from_str(&graph.text).unwrap();
+    assert_eq!(graph["title"], "Module graph ready", "{graph}");
+    assert!(graph.get("network_settlement").is_none(), "{graph}");
+    assert!(graph.get("network_failures").is_none(), "{graph}");
+    let rendered = tool.call(
+        &ctx,
+        &json!({"action":"evaluate", "tab":tab,
+        "expression":"document.body.textContent"}),
+    );
+    assert!(!rendered.is_error, "{}", rendered.text);
+    let rendered: Value = serde_json::from_str(&rendered.text).unwrap();
+    assert_eq!(rendered["value"], "Module graph ready");
     // An unapproved localhost alias in a redirect must still be blocked.
     let rejected = tool.call(&ctx, &json!({"action":"navigate", "tab":tab, "url":format!("http://127.0.0.1:{}/redirect", app.port)}));
     assert!(
@@ -702,6 +749,86 @@ fn chromium_approved_localhost_without_manual_allowlist() {
         rejected.text
     );
     tool.call(&ctx, &json!({"action":"shutdown"}));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "opt-in live localhost page; requires cached Chromium runtime and DIAL_TEST_BROWSER_URL"]
+fn chromium_live_local_page() {
+    let url = std::env::var("DIAL_TEST_BROWSER_URL").expect("set DIAL_TEST_BROWSER_URL");
+    let uri = parse_url(&url).unwrap();
+    assert!(matches!(uri.host(), Some("localhost" | "127.0.0.1")));
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = crate::tools::Workspace::new(dir.path()).unwrap();
+    let mut config = Config {
+        state_dir: dir.path().join("state"),
+        ..Config::default()
+    };
+    config.sandbox.mode = SandboxMode::Dev;
+    config.sandbox.allow_network = true;
+    config.browser.allow_install = false;
+    config.browser.cmux = false;
+    if let Ok(endpoint) = std::env::var("DIAL_TEST_BROWSER_API_URL") {
+        let uri = parse_url(&endpoint).unwrap();
+        assert!(matches!(uri.host(), Some("localhost" | "127.0.0.1")));
+        config
+            .browser
+            .allowed_hosts
+            .push(uri.authority().unwrap().to_string());
+        config.browser.validate_allowed_hosts().unwrap();
+    }
+    let tool = tools(&config).pop().unwrap();
+    let ctx = ToolContext {
+        workspace: &workspace,
+        config: &config,
+        mutation_authorizer: None,
+        confirm: None,
+    };
+    let opened = tool.call(&ctx, &json!({"action":"open", "url":url}));
+    eprintln!("live navigation: {}", opened.text);
+    let events = tool.call(&ctx, &json!({"action":"events"}));
+    if let Ok(events) = serde_json::from_str::<Value>(&events.text) {
+        let mut reasons = std::collections::BTreeSet::new();
+        for event in events["network_failures"].as_array().unwrap() {
+            if reasons.insert(event["error"].to_string()) {
+                eprintln!("blocked request: {} {}", event["error"], event["url"]);
+            }
+        }
+        for event in events["events"].as_array().unwrap() {
+            if event["type"] == "pageerror" {
+                eprintln!("page error: {}", event["text"]);
+            }
+        }
+    }
+    if let Ok(selector) = std::env::var("DIAL_TEST_BROWSER_SELECTOR") {
+        let waited = tool.call(&ctx, &json!({"action":"wait", "selector":selector}));
+        assert!(!waited.is_error, "{}", waited.text);
+        eprintln!("live locator: {}", waited.text);
+    }
+    let screenshot = tool.call(&ctx, &json!({"action":"screenshot"}));
+    assert!(!screenshot.is_error, "{}", screenshot.text);
+    if let Ok(path) = std::env::var("DIAL_TEST_BROWSER_SCREENSHOT") {
+        let image: Value = serde_json::from_str(&screenshot.text).unwrap();
+        std::fs::write(
+            path,
+            STANDARD
+                .decode(image["artifact"]["data"].as_str().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+    }
+    let rendered = tool.call(&ctx, &json!({"action":"evaluate",
+        "expression":"({rendered:document.body.innerText.trim().length > 0, readyState:document.readyState, url:location.href})"}));
+    let shutdown = tool.call(&ctx, &json!({"action":"shutdown"}));
+    assert!(!shutdown.is_error, "{}", shutdown.text);
+    assert!(!opened.is_error, "{}", opened.text);
+    assert!(!rendered.is_error, "{}", rendered.text);
+    let rendered: Value = serde_json::from_str(&rendered.text).unwrap();
+    eprintln!("live document: {rendered}");
+    assert_eq!(
+        rendered["value"]["rendered"], true,
+        "live page has no rendered text"
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -717,6 +844,8 @@ fn chromium_end_to_end_sandboxed() {
     };
     config.sandbox.mode = SandboxMode::Dev;
     config.sandbox.allow_network = true;
+    config.browser.allow_install = false;
+    config.browser.cmux = false;
     config.browser.auto_localhost = false;
     config.browser.allowed_hosts = vec![format!("127.0.0.1:{}", app.port)];
     if let Ok(module) = std::env::var("DIAL_PLAYWRIGHT") {

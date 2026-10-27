@@ -157,26 +157,25 @@ impl<'a> Agent<'a> {
             None,
         )?;
         if let Some(template) = template {
-            messages.retain(|m| {
-                m["dial_transient"] != true
-                    || (self.experimental_context_owner()
-                        && (m["dial_context_notes"] == true
-                            || m["dial_context_carry"] == true
-                            || m["dial_portable_rules"] == true
-                            || m["dial_task_context"] == true))
-            });
+            // The context owner re-projects its own notes, carry, rules and task context above, so
+            // those come from this projection and the rest of the transient tail from the request
+            // being previewed; the owner's one-shot pressure guidance is not carried over.
+            const OWNED: [&str; 4] = [
+                "dial_context_notes",
+                "dial_context_carry",
+                "dial_portable_rules",
+                "dial_task_context",
+            ];
+            let owner = self.experimental_context_owner();
+            let tagged = |m: &Value, flags: &[&str]| flags.iter().any(|flag| m[*flag] == true);
+            messages.retain(|m| m["dial_transient"] != true || (owner && tagged(m, &OWNED)));
             messages.extend(
                 template
                     .messages
                     .iter()
                     .filter(|m| {
                         m["dial_transient"] == true
-                            && (!self.experimental_context_owner()
-                                || (m["dial_context_notes"] != true
-                                    && m["dial_context_carry"] != true
-                                    && m["dial_portable_rules"] != true
-                                    && m["dial_task_context"] != true
-                                    && m["dial_context_pressure"] != true))
+                            && !(owner && (tagged(m, &OWNED) || m["dial_context_pressure"] == true))
                     })
                     .cloned(),
             );

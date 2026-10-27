@@ -5,6 +5,31 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 
 ## [Unreleased]
 
+### Added
+
+- Independent per-provider authentication selection in `/providers`: explicitly use API-key or sign-in/subscription credentials while keeping both saved. Explicit routes never fall back to the other billing method; API-key removal no longer signs out Claude. Existing configurations retain legacy automatic selection until a method is chosen (`docs/provider-catalog.md`).
+
+### Changed
+
+- Consolidated shared write, reporting and role-boundary guidance across full and lean prompts, preserving rendered policy text. Documented the existing capability-, configuration- and evidence-based adjustments; no model-family prompt forks, routing changes or live-model performance claims (`docs/agent-loop.md`).
+- Prompt assembly now composes lean workflow steps explicitly and uses named presentation inputs. Separate behavior changes give request-level one-call contracts precedence over batching/todo pairing, align verification with selected delegation and check ownership, deduplicate custom-template notes individually at complete-line boundaries, and show the small-tier worked example only in local one-call mode with the capabilities it demonstrates (`docs/agent-loop.md`). Escalation policy is unchanged; model-quality and performance effects have not been evaluated.
+- Two check-before-change aids are now on by default: `experimental.fault_witness` (after a behavioral focused check passes on a turn with edits, it is rerun once in an isolated copy with the turn's edits reverted, to show whether the check exercises the change) and `experimental.repro_first = "advise"` (on a debugging task, the first non-test source edit before any reproduction failed gets one advisory note). The fault witness costs one extra check run per evidence revision, often a cold build; the keyword task classifier can misfire on `repro_first`, which only advises. No live-model benchmark was run before this change. Opt out with `fault_witness = false` or `repro_first = "off"` under `[experimental]` (`docs/agent-loop.md`).
+- Prompt data framing is stricter. A project instruction file containing `</context>` can no longer end its `<context>` wrapper early, and context paths and MCP server names are attribute-escaped the same way as `@file` blocks. MCP servers that send blank instructions no longer add an empty block. Single-line previews (`truncate_chars`) now fold `\r` and `\r\n` as well as `\n`.
+
+### Fixed
+
+- Computer AX role queries no longer confuse tabs with tables or tab groups, and trees expose non-press action hints. Native menu selection accepts explicit foreground recovery while retaining exact-key-window safeguards; unavailable-window diagnostics and multi-window keyboard/AX recovery guidance now distinguish macOS limits from closed windows (`docs/tools.md`).
+- Browser navigation accommodates large unbundled module graphs with a larger count- and byte-bounded request queue and total admission ceiling, longer deadline-bounded navigation settlement, and retained blocked-request causes that survive asset-event bursts. Completed non-navigation actions retain their short settlement budget; exact-endpoint network safeguards remain unchanged (`docs/execution-and-web.md`).
+- Browser pages can queue bounded bursts of HTTP requests instead of dropping everything beyond 16 concurrent jobs; the existing network guard and active-job limit remain in force (`docs/execution-and-web.md`).
+- `web_fetch` preserves the download-size cutoff warning even when the displayed text is also truncated.
+- `ast_search` and `ast_edit` report errors for explicitly selected files they cannot scan, and distinguish unreadable files from content and size skips in tree coverage (`docs/tools.md`).
+- MCP discovery now gives lean prompts bounded capability hints, uses dependency names from complete Cargo and Python project manifest reads, recognizes distinctive inspection capabilities without a server name, and allows one bounded follow-up after discovery. Eligibility, approval and schema-byte limits remain unchanged (`docs/agent-loop.md`).
+- Lean and minimal local profiles now automatically offer relevant MCP capabilities within a smaller schema budget; the context-overflow fallback still drops automatic additions (`docs/agent-loop.md`).
+- LSP refactoring snapshots no longer fail an entire request on unrelated unreadable or common dependency/build trees; unobserved targets remain refused. Ordered same-position language-server insertions are accepted. Benchmark comparisons now report an inconclusive result and exit 3 when the baseline has no checked successes (`docs/tools.md`, `docs/benchmarks.md`).
+- Anthropic model discovery now follows inference's authentication selection only at the canonical endpoint (subscription-first in legacy automatic mode): custom endpoints retain their API keys, disabled providers stay disabled, and unreadable or unrefreshable selected subscription credentials report an authentication failure instead of silently probing with an API key. Backend construction also rejects unreadable selected Claude subscription state rather than switching to API-key billing. OpenAI API keys and ChatGPT subscriptions remain separate routes (`docs/provider-catalog.md`).
+- With `--system-prompt-template`, the rendered template now leads the system messages and `APPEND_SYSTEM.md` text comes last; before, the template was sorted behind the project-context and append messages. Harness blocks the template already renders (project context files, the append text, operator guidance, admitted notes, memory, skills, soul) are no longer sent a second time; notes and memory it does not render follow as separate messages, as with built-in guidance, so a memory change no longer alters the template message. Delegated workers still inherit `AGENTS.md` when the template renders it inline.
+- MCP server instructions that would overflow the 8,000-byte budget now skip only that server; later servers whose instructions still fit are kept instead of all being dropped.
+
 ## [0.2.1] - 2026-10-26
 
 ### Fixed

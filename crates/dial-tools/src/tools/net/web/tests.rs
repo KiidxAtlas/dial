@@ -254,8 +254,13 @@ fn caps_the_response_size() {
     assert!(!out.is_error, "{}", out.text);
     assert!(
         out.text
-            .contains("[the response exceeded 2097152 bytes; the rest was not downloaded]")
-            || out.text.contains("[truncated: showing 100000 of"),
+            .contains("[truncated: showing 100000 of 2097152 characters"),
+        "{}",
+        out.text
+    );
+    assert!(
+        out.text
+            .contains("[the response exceeded 2097152 bytes; the rest was not downloaded]"),
         "{}",
         out.text
     );

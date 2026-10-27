@@ -107,7 +107,7 @@ pub fn execute_notes(
 ) -> ToolOutput {
     match execute_notes_inner(session, args, owner_id, enabled, cancel) {
         Ok(output) => output,
-        Err(error) => ToolOutput::err(error.to_string()),
+        Err(error) => ToolOutput::err(format!("{error:#}")),
     }
 }
 
@@ -299,17 +299,21 @@ pub struct RolloverPlan {
     history_generation: u64,
 }
 
+/// Function name of a tool schema in either the chat-completions or the flat shape.
+fn tool_name(tool: &Value) -> Option<&str> {
+    tool["function"]["name"]
+        .as_str()
+        .or_else(|| tool["name"].as_str())
+}
+
+/// Identity of a plan and the exact request it was validated against. `plan.digest` itself is not
+/// part of it, so the same function both seals a plan and re-checks it before commit.
 fn plan_digest(
-    owner_id: &str,
-    leaf: Option<&str>,
-    boundary: Option<&str>,
-    notes: Option<&ContextNotesRevision>,
-    history: &[Value],
-    history_generation: u64,
+    plan: &RolloverPlan,
     projection: &Chat,
     budget: RolloverBudget<'_>,
 ) -> Result<String> {
-    let notes = notes.map(|notes| {
+    let notes = plan.notes.as_ref().map(|notes| {
         (
             notes.entry_id.as_str(),
             notes.revision.as_str(),
@@ -320,12 +324,12 @@ fn plan_digest(
         (
             "experimental-context-rollover",
             1,
-            owner_id,
-            leaf,
-            boundary,
+            &plan.owner_id,
+            plan.source_leaf.as_deref(),
+            plan.boundary_id.as_deref(),
             notes,
-            history,
-            history_generation,
+            &plan.history,
+            plan.history_generation,
         ),
         (
             &projection.messages,
@@ -399,21 +403,19 @@ pub fn prepare_rollover(
             .any(|message| matches!(message["role"].as_str(), Some("system" | "developer"))),
         "new context projection is missing its protected system context"
     );
+    let offered = |name: &str| {
+        projection
+            .tools
+            .iter()
+            .any(|tool| tool_name(tool) == Some(name))
+    };
     ensure!(
-        TOOL_NAMES.iter().all(
-            |name| projection.tools.iter().any(|tool| tool["function"]["name"]
-                .as_str()
-                .or_else(|| tool["name"].as_str())
-                == Some(*name))
-        ),
+        TOOL_NAMES.iter().all(|name| offered(name)),
         "new context projection no longer offers both experimental context tools"
     );
     ensure!(
         projection.tools.iter().any(|tool| {
-            let name = tool["function"]["name"]
-                .as_str()
-                .or_else(|| tool["name"].as_str());
-            name == Some("session_search")
+            tool_name(tool) == Some("session_search")
                 && (tool["function"]["parameters"]["properties"]["history"]["type"] == "boolean"
                     || tool["parameters"]["properties"]["history"]["type"] == "boolean")
         }),
@@ -430,26 +432,18 @@ pub fn prepare_rollover(
         .context_history_generation()
         .checked_add(1)
         .context("provider history generation exhausted")?;
-    let digest = plan_digest(
-        &request.owner_id,
-        source_leaf.as_deref(),
-        request.boundary_id.as_deref(),
-        notes.as_ref(),
-        &history,
-        history_generation,
-        projection,
-        budget,
-    )?;
-    Ok(RolloverPlan {
+    let mut plan = RolloverPlan {
         owner_id: request.owner_id.clone(),
         source_leaf,
         boundary_id: request.boundary_id.clone(),
         notes,
         history,
-        digest,
+        digest: String::new(),
         prompt_tokens: budget.prompt_tokens,
         history_generation,
-    })
+    };
+    plan.digest = plan_digest(&plan, projection, budget)?;
+    Ok(plan)
 }
 
 #[derive(Debug, Clone)]
@@ -483,16 +477,7 @@ pub fn commit_rollover(
         session.context_history_generation().checked_add(1) == Some(plan.history_generation),
         "new context provider generation changed; no reset committed"
     );
-    let digest = plan_digest(
-        &plan.owner_id,
-        plan.source_leaf.as_deref(),
-        plan.boundary_id.as_deref(),
-        plan.notes.as_ref(),
-        &plan.history,
-        plan.history_generation,
-        projection,
-        budget,
-    )?;
+    let digest = plan_digest(&plan, projection, budget)?;
     ensure!(
         digest == plan.digest && budget.prompt_tokens <= budget.prompt_budget,
         "new context projection changed after its budget validation; no reset was committed"
@@ -796,3 +781,6 @@ impl crate::agent::Agent<'_> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests;

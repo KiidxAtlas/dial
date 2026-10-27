@@ -5,6 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 const TOOL_LIMIT: usize = 6;
 const SCHEMA_BYTES: usize = 24 * 1024;
+const LEAN_TOOL_LIMIT: usize = 2;
+const LEAN_SCHEMA_BYTES: usize = 8 * 1024;
 const CONTEXT_LIMIT: usize = 24;
 
 #[derive(Default)]
@@ -32,6 +34,10 @@ fn words(text: &str) -> BTreeSet<String> {
             "apis" => "api".into(),
             "pages" => "page".into(),
             "modules" => "module".into(),
+            "logs" => "log".into(),
+            "migrations" => "migration".into(),
+            "projects" => "project".into(),
+            "tables" => "table".into(),
             other => other.to_owned(),
         })
         .collect()
@@ -139,11 +145,7 @@ fn ranked(query: &str, candidates: Vec<(String, String)>) -> Vec<String> {
 
 fn select(query: &str, context: &BTreeSet<String>, candidates: &[(String, String)]) -> Vec<String> {
     let terms = words(query);
-    let mut selected: Vec<String> = native(&terms)
-        .into_iter()
-        .filter(|name| candidates.iter().any(|entry| entry.0 == *name))
-        .map(str::to_owned)
-        .collect();
+    let mut selected = Vec::new();
     // Explicit tool names are strong evidence even if no workflow rule covers that specialist.
     selected.extend(
         candidates
@@ -154,6 +156,12 @@ fn select(query: &str, context: &BTreeSet<String>, candidates: &[(String, String
                     .any(|word| word.trim_matches(['`', ',', '.', '"']) == name)
             })
             .map(|entry| entry.0.clone()),
+    );
+    selected.extend(
+        native(&terms)
+            .into_iter()
+            .filter(|name| candidates.iter().any(|entry| entry.0 == *name))
+            .map(str::to_owned),
     );
     let mut domain_terms = terms.clone();
     if coding(&terms) {
@@ -269,9 +277,45 @@ fn select(query: &str, context: &BTreeSet<String>, candidates: &[(String, String
         .cloned()
         .collect();
     selected.extend(ranked(
-        &specific.into_iter().collect::<Vec<_>>().join(" "),
+        &specific.iter().cloned().collect::<Vec<_>>().join(" "),
         relevant,
     ));
+    // An explicit inspection request with a distinctive capability in exactly one server's tool
+    // names is useful even when the user does not know that server's name. Generic verbs and
+    // ambiguous capabilities still require stronger evidence.
+    if any(
+        &words(query),
+        &["inspect", "show", "check", "list", "audit", "view"],
+    ) {
+        let mut owners: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (name, _) in candidates {
+            if let Some((server, action)) = parts(name) {
+                for term in words(action).intersection(&specific) {
+                    if term.len() >= 4 || term == "log" {
+                        owners
+                            .entry(term.clone())
+                            .or_default()
+                            .insert(server.to_owned());
+                    }
+                }
+            }
+        }
+        let relevant = candidates
+            .iter()
+            .filter(|(name, _)| {
+                let Some((server, action)) = parts(name) else {
+                    return false;
+                };
+                words(action).iter().any(|term| {
+                    owners
+                        .get(term)
+                        .is_some_and(|servers| servers.len() == 1 && servers.contains(server))
+                })
+            })
+            .cloned()
+            .collect();
+        selected.extend(ranked(query, relevant));
+    }
     let mut seen = BTreeSet::new();
     selected.retain(|name| seen.insert(name.clone()));
     selected
@@ -347,7 +391,7 @@ impl Agent<'_> {
             && self.tool_routing.followed.insert(call.name.clone())
         {
             let matches = followups(&call.name, &self.task_tool_candidates());
-            changed |= self.add_task_tools(matches);
+            changed |= self.add_task_tools(matches, true);
         }
         if changed {
             self.rebuild_system();
@@ -356,9 +400,7 @@ impl Agent<'_> {
 
     fn automatic_tool_routing(&self) -> bool {
         !self.hermetic
-            && !self.lean_local()
             && !self.lean_tools
-            && !self.minimal_tools()
             && self.config.harness.tools == config::tools::default_tools()
     }
 
@@ -384,15 +426,27 @@ impl Agent<'_> {
             return false;
         }
         let candidates = self.task_tool_candidates();
-        self.add_task_tools(select(
+        let mut matches = select(
             &self.tool_routing.query,
             &self.tool_routing.context,
             &candidates,
-        ))
+        );
+        // Small contexts retain the core offer and route only the requested MCP capabilities.
+        if self.lean_local() || self.minimal_tools() {
+            matches.retain(|name| parts(name).is_some());
+        }
+        self.add_task_tools(matches, false)
     }
 
-    fn add_task_tools(&mut self, matches: Vec<String>) -> bool {
+    fn add_task_tools(&mut self, matches: Vec<String>, followup: bool) -> bool {
         let before = self.tool_routing.selected.len();
+        let (tool_limit, schema_limit) = if self.lean_local() || self.minimal_tools() {
+            (LEAN_TOOL_LIMIT, LEAN_SCHEMA_BYTES)
+        } else {
+            (TOOL_LIMIT, SCHEMA_BYTES)
+        };
+        // One follow-up can use an additional slot, but not additional schema bytes.
+        let tool_limit = tool_limit + usize::from(followup);
         let mut bytes = self
             .schemas(&self.tool_routing.selected)
             .map(|schemas| {
@@ -401,11 +455,11 @@ impl Agent<'_> {
                     .map(|schema| schema.to_string().len())
                     .sum::<usize>()
             })
-            .unwrap_or(SCHEMA_BYTES);
+            .unwrap_or(schema_limit);
         // Monotonic within a turn: new evidence may add tools, but never churn existing schemas.
         // Explicit unloads are suppressed until the next external request.
         for name in matches {
-            if self.tool_routing.selected.len() >= TOOL_LIMIT {
+            if self.tool_routing.selected.len() >= tool_limit {
                 break;
             }
             let Some(schema) = self
@@ -416,7 +470,7 @@ impl Agent<'_> {
                 continue;
             };
             let size = schema.to_string().len();
-            if size <= SCHEMA_BYTES.saturating_sub(bytes) {
+            if size <= schema_limit.saturating_sub(bytes) {
                 bytes += size;
                 self.tool_routing.selected.push(name);
             }

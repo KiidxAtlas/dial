@@ -20,6 +20,52 @@ loading, runtime reload, or installation asset copying is required. Existing pub
 instruction paths remain available via imports/re-exports where needed. This directory
 is crate-internal, not a new public prompt-registry API.
 
+## Shared policy and bounded adjustments
+
+There are no built-in model-family prompt forks. `system.rs` owns the shared `HEADER`
+(engineering, scope, user work and destructive-operation approval), `TRUST_RULE` (sandbox,
+untrusted data and secrets), and `FOCUSED_WORK` (evidence-driven execution). Its private
+`shared_rule!` fragments supply the write contract, honest reporting and role boundaries to
+both full and lean sections at compile time. Keep identical rules there; retain deliberately
+shorter wording in the full/lean workflow, delivery and delegation sections rather than
+silently expanding the lean budget. These fragments preserve the rendered prompt bytes.
+
+The existing adjustments are named below by their selection inputs. They are not family
+classifications, and each can be removed at its selection/assembly boundary without copying
+the common policy into model code.
+
+| Adjustment | Existing selection branch | Assembly/text owner |
+| --- | --- | --- |
+| Lean guidance (`lean`) | `base/lifecycle.rs::rebuild_system`: `lean_tools` (context-overflow fallback), `lean_local()` or `local_escalated()`; local tier/escalation decisions stay in `model/local_profile.rs` | `window/prompt.rs::full_guidance`, `system.rs::LEAN_*` |
+| One-call operation (`one_call`) | `model/local_profile.rs::local_one_call`: small local tier with reliability enabled and no passing saved batch fixture | `window/prompt.rs::full_guidance`: `LEAN_ONE_CALL` replaces `LEAN_BATCHING`; explicit workflow composition selects the standalone todo step. The active request contract overrides batching/todo pairing on every tier, including later reliability recovery |
+| Worked loop (`worked_example`) | `base/lifecycle.rs::rebuild_system`: `local_one_call()` | `window/prompt.rs::worked_example` / `example_edit`: active edit grammar; requires `grep`, `read`, `edit` and either `check` (preferred) or `bash`; built-in guidance only |
+| Concise reporting (`concise_guidance`) | `base/lifecycle.rs::rebuild_system`: efficiency enabled, non-hermetic run | `window/prompt.rs::full_guidance` / `scoped_guidance`: shorter delivery/delegation, not different tool policy or workflow |
+| Capability scoping | Configured tool offer, not transient tool loading | `window/prompt.rs::full_guidance` / `scoped_guidance`: tool-specific rules, visual/preview sections and delegation sections |
+| Delegation preference (`prefer_subagents`) | `base/lifecycle.rs::rebuild_system`: `task.prefer_subagents` | `window/prompt.rs::scoped_guidance`: shared selective/specialist policy, only when `task` is offered |
+
+Request settings (thinking, sampling, context, edit mode and tool allow-lists) remain in
+`dial-llm` model profiles and configuration, not in new family prompt files. Preserve
+operator replacement prompts/templates and appended guidance. No new model-specific wording
+is justified by this consolidation: future exceptions need repeatable outcome-based evidence,
+an explicit selection condition and evaluation again after model upgrades. Assembly tests
+alone do not establish a live-model improvement.
+
+Presentation inputs are named in `window/prompt.rs::Presentation`; one-call mode implies lean
+workflow, while concise reporting alone does not narrow workflow or tools. Tool loading does not
+rewrite these sections; local escalation can rebuild them at turn boundaries. Verification follows
+the selected delegation preference and existing check ownership, not merely tool availability.
+
+Custom-template deduplication recognizes complete normalized lines/blocks (including note bullets),
+not embedded substrings. Notes are filtered individually in both inline and message-band assembly.
+Transformed or inline-wrapped values may be repeated conservatively rather than silently omitted.
+Templates, replacement text and appended guidance remain operator-controlled.
+
+The composition refactor was checked against legacy rendered assembly before wording changes.
+Request-contract precedence, verification wording, template deduplication and example eligibility
+are intentional, independently located behavior changes; they are not byte-preserving tuning.
+Their effects on model outcomes remain unmeasured. Escalation persistence/step-down is unchanged:
+no replacement thresholds or success-driven decay policy have been established.
+
 ## Instructions deliberately kept with their domain owners
 
 Not every message is shared policy. Keep self-contained domain renderers, schema-bound

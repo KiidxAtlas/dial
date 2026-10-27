@@ -86,6 +86,8 @@ Supported platforms are macOS, Linux, and Windows with Chrome or Chromium that s
 ## Web access
 
 `web_fetch` and `web_search` require approval and are unavailable when the session sandbox disables networking. HTTP and HTTPS requests are resolved and checked against the SSRF policy at every redirect; private, loopback, link-local, and metadata endpoints remain blocked. Responses are bounded and returned as untrusted content.
+`web_fetch` reports both display truncation and the download-size cutoff when both apply; text beyond
+the download cap was not retrieved.
 
 Fetch handles supported binary documents (including PDF and Office formats) with the document converter. For HTML, it probes declared Markdown alternate links and `.md` siblings, tries Markdown content negotiation, then configured readers with a quality gate, then `llms.txt` candidates, before using built-in HTML conversion. Optional external readers are configured through `web.reader_chain`; they receive HTML on standard input. Common GitHub, npm, crates.io, PyPI, and Stack Overflow URLs use public APIs when available, with ordinary fetching as fallback.
 
@@ -151,6 +153,9 @@ session, so local development sites work without configuring each port. Redirect
 cannot grant access to another local endpoint. `/settings` → Tools → Browser controls this behavior;
 `auto_localhost=false` restores explicit allowlisting with `allowed_hosts=["127.0.0.1:3000"]`.
 Other private hosts still require operator allowlisting. Metadata/link-local addresses remain forbidden.
+For an app with a separate local API (for example, Supabase), allowlist its exact host and port as
+well as the app's if needed. `localhost` and `127.0.0.1` are distinct; inspect browser network events
+for the refused endpoint. Approved WebSockets are limited to exact allowlisted loopback endpoints.
 Use managed `bg` processes for previews: list/reuse a running server, start one if needed, wait for
 readiness, then open its HTTP URL. Foreground `bash` kills servers at its deadline. The browser accepts
 `about:blank`, and tab IDs may be omitted when exactly one tab is open; multiple tabs require an ID.
@@ -170,13 +175,21 @@ may already have taken effect.
 Action errors (for example, a selector that never becomes actionable) retain Playwright's diagnostic
 and preserve the tab. The action deadline leaves a small response margin before the outer watchdog;
 only transport failure/cancellation or an unresponsive action requires session retirement.
-After a successful action, background HTTP gets a separate settlement budget of at most one second,
-even when the action timeout is unlimited. If it expires, the result includes
+After successful navigation (`open`, `navigate`, `reload`, `back`, `forward`), background HTTP gets
+up to 15 seconds to settle, including response delivery to Chromium and 500 ms without requests.
+Other completed actions retain the separate one-second budget. Both budgets respect the remaining
+operation deadline, even when the configured action timeout is unlimited. If settlement expires, the result includes
 `network_settlement: { settled: false, pending, note }`: the action completed, but application-level
 success has not been established. Inspect the page rather than repeating the action.
-HTTP jobs are operation-owned, limited to 16 outstanding jobs and 2 MiB of queued request data,
-and cancelled/joined before the operation returns. Their network waits do not block reading driver
-completion/error messages. They retain the same guarded host, redirect and body-size policies.
+HTTP jobs are operation-owned, limited to 16 active jobs and 2 MiB of in-flight request data.
+Up to 4,096 additional page requests wait for capacity, with an independent 8 MiB bound on queued
+request data. The queue is cancelled at operation end. A single operation admits at most 16,384 HTTP jobs.
+Jobs are cancelled/joined before the operation returns. Their network waits do not block reading
+driver completion/error messages. They retain the guarded host, redirect and body-size policies.
+`events.network_failures` retains the latest 100 blocked-request causes separately from routine
+network traffic and honors the same `after` sequence cursor. Consult these causes before interpreting
+Chromium's generic `ERR_BLOCKED_BY_CLIENT`: a denied endpoint, resource limit, and unavailable server
+are different failures. A successful navigation status alone does not prove the application rendered.
 
 Browser `run` executes an async function body in the page realm: use DOM globals such as `document`,
 `assert(condition, message)` and `await sleep(ms)`, and `return` a JSON-serializable result.

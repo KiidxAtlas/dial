@@ -445,12 +445,27 @@ impl Default for ModelSelection {
     }
 }
 
+/// Credential route, independent of which credentials are currently saved.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuthMethod {
+    /// Preserve credential selection for configurations written before explicit selection existed.
+    #[default]
+    Auto,
+    /// Use only API-key credentials; never inspect or refresh a stored sign-in.
+    ApiKey,
+    /// Use only the provider's sign-in credentials; never fall back to an API key.
+    #[serde(rename = "oauth")]
+    OAuth,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProviderSpec {
     pub label: String,
     pub base_url: String,
     pub api_key_env: Option<String>,
+    pub auth: AuthMethod,
     pub enabled: bool,
     pub allow_insecure: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -472,6 +487,7 @@ impl Default for ProviderSpec {
             label: String::new(),
             base_url: String::new(),
             api_key_env: None,
+            auth: AuthMethod::default(),
             api_key_envs: Vec::new(),
             enabled: true,
             allow_insecure: false,
