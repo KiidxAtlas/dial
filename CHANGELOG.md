@@ -5,6 +5,8 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-10-28
+
 ### Fixed
 
 - Ordinary and detached Unix subprocesses now share the process-group spawn lock, preventing concurrent core spawns from inheriting unrelated output pipe writers on macOS and delaying cancellation EOF.
