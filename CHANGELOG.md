@@ -5,6 +5,10 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 
 ## [Unreleased]
 
+### Fixed
+
+- Terminal lifecycle smoke checks wait for Dial's side-answer cancellation acknowledgement before inspecting the saved exchange, avoiding a race between provider disconnection and persistence.
+
 ## [0.2.5] - 2026-10-28
 
 ### Fixed

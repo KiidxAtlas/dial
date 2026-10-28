@@ -569,6 +569,9 @@ def side_thread_case(server, binary, captures):
             terminal.capture("side-survives-main-cancel")
             terminal.command("/btw cancel")
             assert server.side_disconnected.wait(5), "side cancellation did not stop its request"
+            # Socket teardown precedes the UI's completion poll and durable exchange write.
+            # Wait for Dial's completion acknowledgement, not just the provider disconnect.
+            terminal.wait("CANCELLED; PARTIAL ANSWER")
             files = list(home.rglob("*.side.json"))
             assert len(files) == 1, files
             side_path = files[0]
