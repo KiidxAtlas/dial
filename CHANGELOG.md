@@ -5,6 +5,8 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-10-28
+
 ### Fixed
 
 - Desktop-disabled builds no longer compile unused native-only helpers; shared pointer coordinate mapping preserves gesture options without dead-code warnings.
