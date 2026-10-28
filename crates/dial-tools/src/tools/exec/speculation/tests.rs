@@ -136,3 +136,53 @@ fn third_party_names_and_cancelled_owners_do_not_supply_cached_authority() {
     assert!(pool.take(&workspace, &args, "owner").is_none());
     assert!(stop.load(Ordering::SeqCst));
 }
+#[test]
+fn only_the_exact_warmed_arguments_consume_the_prepared_result() {
+    let (_root, workspace, config, registry) = setup();
+    let pool = Pool::default();
+    let session = crate::runtime::cancellation::SessionCancellation::default();
+    let args = json!({"path":"a.rs","pattern":"old($A)"});
+    let divergent = json!({"path":"a.rs","pattern":"new($A)"});
+    assert!(pool.start(
+        &workspace,
+        config,
+        &registry,
+        args.clone(),
+        "owner".into(),
+        session.turn(Arc::new(std::sync::atomic::AtomicBool::new(false)))
+    ));
+    ready(&pool);
+    assert!(pool.take(&workspace, &divergent, "owner").is_none());
+    assert!(pool.pending("owner", &args));
+    assert_eq!(pool.stats().reused, 0);
+    let result = pool.take(&workspace, &args, "owner").unwrap();
+    assert!(result.text.contains("old(x)"));
+    assert_eq!(pool.stats().reused, 1);
+}
+#[test]
+fn only_local_native_ast_search_files_are_prepared() {
+    let (root, workspace, config, registry) = setup();
+    std::fs::create_dir(root.path().join("dir")).unwrap();
+    std::fs::create_dir(root.path().join(".git")).unwrap();
+    std::fs::write(root.path().join(".git/config"), "old(x)\n").unwrap();
+    let pool = Pool::default();
+    let session = crate::runtime::cancellation::SessionCancellation::default();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    for args in [
+        json!({"path":"dir","pattern":"old($A)"}),
+        json!({"path":".git/config","pattern":"old($A)"}),
+        json!({"path":"https://example.com/a.rs","pattern":"old($A)"}),
+        json!({"pattern":"old($A)"}),
+    ] {
+        assert!(!pool.start(
+            &workspace,
+            config.clone(),
+            &registry,
+            args,
+            "owner".into(),
+            session.turn(stop.clone())
+        ));
+    }
+    assert_eq!(pool.stats().started, 0);
+    assert!(!stop.load(Ordering::SeqCst));
+}

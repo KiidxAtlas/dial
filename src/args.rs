@@ -158,6 +158,36 @@ pub(crate) enum LayaCommand {
     Status,
 }
 
+#[derive(Subcommand)]
+pub(crate) enum AuthCommand {
+    /// Manage the stored accounts of an OAuth provider (the id shown in /providers).
+    Accounts {
+        provider: String,
+        #[command(subcommand)]
+        action: Option<AccountCommand>,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum AccountCommand {
+    /// List accounts; the active one is marked `*`. Also the default when no action is given.
+    List {
+        /// Print the accounts as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Make a stored account the active one.
+    Select {
+        /// Account key shown by `list`.
+        key: String,
+    },
+    /// Remove one stored account; the grant file is deleted with the last one.
+    Remove {
+        /// Account key shown by `list`.
+        key: String,
+    },
+}
+
 #[derive(Parser)]
 #[command(
     version = dial::build_info::VERSION,
@@ -179,12 +209,21 @@ pub(crate) struct Cli {
     /// Pre-approve these named tools in print mode (comma-separated); does not override readonly.
     #[arg(long, value_delimiter = ',', help_heading = section::RUN)]
     pub(crate) allow: Vec<String>,
+    /// Attach a PNG, JPEG, GIF or WebP image to the print turn (repeatable; vision models only).
+    /// Pass `-` to read the image bytes from stdin (format detected by magic bytes; stdin is then
+    /// not read as prompt text).
+    #[arg(long = "image", value_name = "PATH", help_heading = section::RUN)]
+    pub(crate) images: Vec<std::path::PathBuf>,
     /// Continue the most recent session in this project.
     #[arg(short = 'c', long = "continue", conflicts_with_all = ["resume", "no_session"], help_heading = section::SESSIONS)]
     pub(crate) continue_session: bool,
     /// Resume a session by id prefix (latest when no id is given). `dial sessions` lists ids.
     #[arg(short, long, alias = "session", num_args = 0..=1, default_missing_value = "", conflicts_with = "no_session", help_heading = section::SESSIONS)]
     pub(crate) resume: Option<String>,
+    /// Restore interrupted workers of the session being continued, leaving the editor unsubmitted.
+    /// Without a resume prefix this continues the most recent session in this project.
+    #[arg(long, conflicts_with_all = ["print", "mode", "no_session"], help_heading = section::SESSIONS)]
+    pub(crate) restore: bool,
     /// Do not write the session to disk.
     #[arg(long, help_heading = section::SESSIONS)]
     pub(crate) no_session: bool,
@@ -313,7 +352,8 @@ pub(crate) enum ReliabilityCommand {
 pub(crate) enum Command {
     // Declaration order is `dial --help` order: everyday work first, then integrations,
     // inspection and maintenance, and the learning/experimental tooling last.
-    /// List recent sessions in this project; export or rename one.
+    /// List recent sessions in this project; export, rename, pack or unpack one.
+    #[command(alias = "session")]
     Sessions {
         /// Include sessions from every project.
         #[arg(long, global = true)]
@@ -337,6 +377,11 @@ pub(crate) enum Command {
         /// Run the install after previewing it.
         #[arg(long, requires = "fix")]
         yes: bool,
+    },
+    /// Manage the stored sign-ins of an OAuth provider: list accounts, select one, or remove one.
+    Auth {
+        #[command(subcommand)]
+        action: AuthCommand,
     },
     /// Generate a commit message for the working tree and commit it.
     #[command(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -574,6 +619,18 @@ pub(crate) enum SessionCommand {
     },
     /// Give a session a title.
     Rename { id: String, title: String },
+    /// Pack a session and its side history, stream journal, subagent transcripts and referenced
+    /// artifacts into one verified, portable zip archive.
+    Pack {
+        id: String,
+        /// Archive to write (default: session-<id>.dialpack in the project root). Never replaces an
+        /// existing file.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// Unpack a session archive into this project. Refuses anything that would overwrite an
+    /// existing file, and records the transfer so the original path forks if reopened.
+    Unpack { file: PathBuf },
 }
 
 #[cfg(test)]

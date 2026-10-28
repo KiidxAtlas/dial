@@ -69,6 +69,24 @@ their optional descriptions; discovery still supplies those on demand. If immuta
 and pinned schemas still cannot fit, the request fails before inference without silently unloading
 explicit tools or discarding the session's unfinished work.
 
+Ambient provenance recall and saved-codebase blocks are appended only when their exact text is
+absent from the current visible branch (with efficiency enabled). Earlier messages and their
+cacheable prefixes are not rewritten. Changed blocks still reach the model, and compaction or
+branching that removes a block permits retrieval again. This is exact-block deduplication, not
+semantic merging of partially overlapping recall results or a combined ambient byte budget.
+
+Ordinary coding tasks no longer carry unrelated `web_search`/`web_fetch` schemas. Explicit web
+research or URL intent routes the relevant tools locally before inference; missing matches remain
+discoverable with `tool_search`/`tool_load`, and explicit pins, configured tool restrictions and
+hermetic offers retain their meaning. Routing does not itself call a model or execute a tool.
+
+With `thinking = "auto"`, the turn's effort judgment waits until an effective request profile
+declares selectable reasoning efforts. Requests with no profile or no declared efforts skip the
+otherwise unused judgment. A supported fallback can still trigger it; subsequent steps and repair
+rounds reuse the result (including a failed attempt) rather than asking again. External-thinking
+and hermetic exclusions, judgment output budgets and automatic-compaction defaults are unchanged.
+These changes have focused offline coverage, not a matched live-model token/cost benchmark.
+
 Streaming accounting retains the latest provider-reported counters from each failed/retried
 attempt, without adding cumulative snapshots together or counting the accepted final reply twice.
 `partial_reported_attempts` distinguishes these observations from complete responses; their
@@ -117,7 +135,7 @@ get an advisory note.
 
 When a configured fallback is ready, failures it accepts (`retry.fallback_on`) get two attempts
 and at most a 10 s wait on the primary before failing over. A primary that cannot be rebuilt when
-the fallback's cooldown ends keeps the fallback and is retried 5 minutes later.
+the fallback's cooldown ends keeps the fallback and is retried 5 minutes later. With `retry.fallback_revert = "never"` the session does not return at cooldown end at all; see [model routing](model-routing.md).
 
 Different successful lookups also have a shared foreground/worker synthesis boundary. After 12
 observation-bearing model rounds without a novel committed change or accepted task resolution,
@@ -245,6 +263,22 @@ coverage, and the cause-specific next action. Zero recorded paths does not asser
 changed; interrupted output remains partial evidence. The original diagnostic stays intact.
 These summaries neither replay operations nor grant permission. Unknown effects still stop
 automatic continuation, and earlier completed work is not rolled back by a later failure.
+
+An executed failed tool result immediately arms an execution-side **failed-operation retry barrier** in
+the shared parent/worker engine. The same tool with the same normalized arguments is refused
+before execution; changing a call ID, intent annotation or bash timeout does not evade it.
+Corrected arguments and different diagnostic calls remain available. Successful reads, todo
+updates, compaction and automatic/directed continuation do not release this barrier. A
+successful novel committed source mutation releases failed-call identities so the same check
+can verify a repair; new steering or coordination starts a new recovery context. A failed
+post-commit operation retains its effects but does not release the barrier. This is a
+normalized-call guard, not semantic equivalence checking: changed scripts can still repeat
+the same underlying mistake, and any successful novel source mutation can release it.
+Already-started parallel operations keep their real results; the guard does not retroactively
+claim they were unexecuted. Successful results containing background warnings (for example,
+Vue Router missing-route warnings) do not become failed executions by text matching.
+Typed preflight, schema and permission refusals do not arm it: they were not executed, and
+their existing admission requirements still govern the next call.
 Provider-generation failures separately explain that no tools were dispatched from that failed
 response, while earlier operations in the turn remain retained. The original error chain and
 provider retry classification are preserved; recovery guidance does not automatically replay tools.
@@ -289,6 +323,11 @@ hooks do not disable concurrency. Parent and worker hook rewrites both recheck t
 schema and path authority. Mutable authorization and recovery decisions are never cached for
 an entire turn.
 
+Parallel dispatch publishes each completed call and its timing immediately, correlated by call ID
+even when several calls use the same tool name. The return vector and persisted provider-facing
+settlement retain original call order. Presentation does not change schema/approval admission,
+hook authorization, effect accounting or journal-before-publication requirements.
+
 Unknown effects end the current turn as incomplete after saving results and skipping unstarted actions. They bypass automatic stall recovery, context transitions and memory maintenance. A refusal before execution records no effects. A timeout or interruption after execution starts does not imply rollback. Recovery from a missing durable tool result records an explicit unknown effect and never replays the call. Productive `max_steps = 0` remains unlimited.
 
 Successful edits can also loop: a model may keep inserting and removing the same lines, and each success used to clear repetition checkpoints. `agent/mutation_cycles.rs` hashes the actual committed content of each path the transaction owner reports in `Execution::changed_paths`, resolved and canonicalized through the workspace (including added roots). It never parses tool text or diffs. One return to an earlier version is an allowed revert. A version committed for the third time, with other versions in between, is an edit loop. An edit loop never ends the turn. The edit's result tells the model that its edits are undoing each other. The exact calls (normalized arguments) that produced the alternating versions are refused for the rest of the turn. Different edits, the same file through other arguments, other files and every other tool remain available, and the turn continues to completion. A mutation that only returns a file to content it already had is not progress, so it cannot clear other recovery restrictions. Consecutive identical versions count as one visit. Reads, todos and other files do not clear this history; only new steering resets it. History is bounded to 64 files, 16 recent versions per file and 64 refused calls, so novel edits remain unlimited. Uncertain effects keep their stop. Deleted, unreadable or files over 16 MiB are not tracked.
@@ -305,9 +344,22 @@ The gaps reviewed for this work and their implementation owners are:
 | Concurrent edits | `tools/document_transaction.rs` coordinates cooperating writers and rebases disjoint ordinary text proposals. |
 | Prompt stability | `llm/prompt.rs` bands and `llm/wire.rs` final outbound payload fingerprints. |
 | Historical tool contracts | `tools/contracts.rs` persists schema identity and tool revisions and requires explicit compatibility. |
-| Lifecycle regression gate | CI runs `examples/benchmarks/interactive_smoke.py` against the built binary and a local scripted provider. |
+| Terminal backpressure | `dial-ui` input/output pumps and frame pacing own bounded transport, paint admission and scrollback work; refused frames remain pending. |
+| Streaming presentation | Transcript reveal and call-ID argument previews are observational; incomplete arguments never enter tool execution. |
+| Side conversations | App side controller owns independent requests; storage owns checkpoints and session-bound sidecar lifecycle. |
+| Worker controls | Live runtime incarnation, retained worker editors and per-request settings revisions; pools retain only compatible logical backend/history state. |
+| Extension forms | SDK bounded declarative panels and app native dialogs, with typed outcomes and fail-closed generation handling. |
+| Identity matching | `llm/identity.rs` shares declarative scoped axes without widening unrelated detector/provider match sets. |
+| Lifecycle regression gate | CI runs all four real-terminal probes in `examples/benchmarks/` against the built binary and local scripted providers. |
 
-The terminal gate exercises real PTYs, resize, cancellation, busy-turn commands, file review, retained image pixels after deletion, and SIGKILL/reopen without replaying a completed write. These fixtures establish behavior, not real-model quality, cache savings, or relative harness performance. Provider-backed performance measurements belong in the efficiency benchmark described in [benchmarks.md](benchmarks.md#measuring-efficiency).
+The terminal gates exercise resize, cancellation, busy-turn commands, file review, retained image
+pixels after deletion, SIGKILL/reopen without replaying a completed write, worker restoration and
+focused controls, pool conversation reuse, draft-safe questions, side-stream recovery and lifecycle,
+concurrent-writer forks, native tree previews, extension panel submission/cancellation, quiet-stream
+reveal and incomplete write previews. Captures are terminal text, not pixel screenshots. These
+fixtures establish behavior, not real-model quality, cache savings or relative harness performance.
+Provider-backed performance measurements belong in the efficiency benchmark described in
+[benchmarks.md](benchmarks.md#measuring-efficiency).
 
 Execution metadata stays separate from tool payload and display text. Document transactions report actual committed paths; progress guards never parse diff prose. Presentation hooks cannot clear execution failures or effect uncertainty. Configured subprocess tools share cancellation and started-process uncertainty handling.
 
@@ -1002,7 +1054,7 @@ repeat schema, permission and rule admission; cached results require the same ow
 hash of the bytes actually observed. Edits, processes, directory scans, callback tools and third-party
 replacements are excluded. Batch teardown cancels unconsumed preparation. RPC and benchmark records
 report preparation, reuse and discarded work separately from model calls. No live-model efficiency
-improvement is implied by these counters.
+improvement is implied by these counters. A call reuses a prepared result only when its arguments match the warmed call exactly; a divergent call neither consumes nor disturbs it, and a changed source file discards it. Arguments that cannot be serialized are never prepared. Dependent (child) preparation, preparation of partially streamed arguments and preparation under hooks are intentionally absent: dependent or streamed calls would need commit and discard ordering across tools this batch owner does not have, and hooks may observe or rewrite the call, so preparation is disabled while any `pre_tool_use` hook is configured.
 
 ## Turn optimizer (experimental)
 

@@ -1,5 +1,10 @@
 //! Model setting declarations. Defaults derive from typed configuration fields.
 use super::*;
+const CACHE_WARM: EnumValues = &[
+    ("off", "Off"),
+    ("streaming", "While streaming"),
+    ("idle", "Streaming and idle"),
+];
 pub(super) static DECLARATIONS: &[SettingDef] = &[
     field!(
         "context_window",
@@ -407,5 +412,24 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Which failures move a request to its fallback chain: any recoverable failure, only usage limits (throttling and quota), or everything except usage limits.",
         Kind::Enum(FALLBACK_ON),
         true
+    ),
+    field!(
+        "retry.fallback_revert",
+        retry.fallback_revert,
+        MO,
+        "Roles & Sampling",
+        "Fallback revert",
+        "When the main session returns to its primary model after a fallback. Cooldown expiry returns at the first request after the fallback's cooldown; never stays on the fallback until you switch models. A request in flight is never switched.",
+        Kind::Enum(FALLBACK_REVERT),
+        true
+    ),
+    field!(
+        "cache.warm",
+        cache.warm,
+        MO,
+        "Cache warming",
+        "Prompt cache warming",
+        "Replays the settled prefix shortly before the provider's cache lifetime ends, when the saved cache read is worth more than the replay. Off never replays. Streaming replays only while a run is active. Idle also replays after the run ends, for up to an hour. Applies to native Anthropic endpoints only.",
+        Kind::Enum(CACHE_WARM)
     ),
 ];

@@ -15,6 +15,7 @@ fn dispatch(dir: &std::path::Path) -> StreamingDispatch {
             always: Vec::new(),
             schemas: vec![read, edit],
             names: vec!["read".into(), "edit".into()],
+            failed_calls: BTreeSet::new(),
         },
     )
 }
@@ -89,4 +90,41 @@ fn restart_drops_partial_calls_and_invalidation_discards_results() {
     stream.arguments(2, "c2", "read", "{}");
     stream.arguments(3, "c3", "read", "{}");
     assert_eq!(stream.started(), 0);
+}
+
+#[test]
+fn failed_reads_are_not_started_early_but_corrected_calls_remain_available() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("fixed.txt"), "fixed\n").unwrap();
+    let mut stream = dispatch(dir.path());
+    let failed = call("read", json!({"path":"missing.txt"}));
+    let mut engine = crate::agent::run::engine::Engine::default();
+    let mut output = ToolOutput::err("missing file");
+    engine.settle(
+        &stream.runner.workspace,
+        &failed,
+        &mut output,
+        false,
+        false,
+        |_| false,
+    );
+    stream.admission.failed_calls = engine.failed_calls();
+    stream.arguments(0, "repeat", "read", r#"{"path":"missing.txt"}"#);
+    stream.arguments(1, "corrected", "read", r#"{"path":"fixed.txt"}"#);
+    assert_eq!(
+        stream.started(),
+        0,
+        "the failed read must not execute while streaming"
+    );
+    stream.arguments(2, "end", "edit", "{}");
+    assert_eq!(
+        stream.started(),
+        1,
+        "a corrected read can still execute early"
+    );
+    assert!(stream.take(&failed, &mut NullUi).is_none());
+    let (output, _) = stream
+        .take(&call("read", json!({"path":"fixed.txt"})), &mut NullUi)
+        .unwrap();
+    assert!(!output.is_error, "{}", output.text);
 }

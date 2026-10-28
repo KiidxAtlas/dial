@@ -84,7 +84,6 @@ const EXECUTION_TOOLS: &[&str] = &[
     "bash",
     "bg",
     "eval",
-    "kernel",
     "notebook",
     "test",
     "ssh",

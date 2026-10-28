@@ -48,7 +48,7 @@ fn integration_defaults_and_legacy_registration_share_metadata() {
 
 #[test]
 fn execution_platform_reason_matches_launch_gate() {
-    for name in ["kernel", "eval"] {
+    for name in ["eval"] {
         let platform = execution_platform(name);
         assert_eq!(platform.available, platform.reason.is_none());
         assert_eq!(
@@ -58,7 +58,7 @@ fn execution_platform_reason_matches_launch_gate() {
         #[cfg(target_os = "linux")]
         assert!(!platform.available);
         #[cfg(windows)]
-        assert_eq!(platform.available, name == "kernel");
+        assert!(platform.available);
     }
 }
 #[test]
@@ -72,9 +72,7 @@ fn status_and_discovery_report_the_same_execution_platform() {
         mutation_authorizer: None,
         confirm: None,
     };
-    let tools = crate::tools::exec::kernel::tools(&config)
-        .into_iter()
-        .chain(crate::tools::exec::eval::tools(&config));
+    let tools = crate::tools::exec::eval::tools(&config).into_iter();
     for tool in tools {
         let schema = tool.schema();
         let catalog =

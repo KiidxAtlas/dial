@@ -1376,7 +1376,11 @@ fn image_references_reach_both_provider_wire_formats() {
     );
     let content = fake::body(&server.requests()[0])["messages"][0]["content"].clone();
     assert!(content.as_str().unwrap().starts_with("Describe @tiny.png"));
-    assert!(content.as_str().unwrap().contains("Image unavailable"));
+    let text = content.as_str().unwrap();
+    assert!(
+        text.contains("not viewable by this model") && text.contains("image/png"),
+        "{text}"
+    );
     assert!(!content.to_string().contains("image_url"));
 }
 
@@ -3173,4 +3177,51 @@ fn backend_for_local_route(config: &crate::config::secrets::Config, dir: &Path) 
     })
     .with_secrets(config, dir)
     .unwrap()
+}
+
+#[test]
+fn anthropic_cache_refusal_retries_without_markers_and_latches_for_later_requests() {
+    let refusal = json!({
+        "type": "error",
+        "error": {
+            "type": "invalid_request_error",
+            "message": "messages.0.content.0.cache_control: Extra inputs are not permitted"
+        }
+    });
+    let ok = json!({
+        "content": [{"type": "text", "text": "hello"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 2, "output_tokens": 1}
+    });
+    let server = fake::serve(vec![
+        fake::json(400, &refusal),
+        fake::json(200, &ok),
+        fake::json(200, &ok),
+    ]);
+    let mut remote = backend(anthropic_endpoint(&format!("{}/v1", server.url)));
+    assert_eq!(
+        remote.chat(None, &request(), 5, None).unwrap().text,
+        "hello"
+    );
+    assert_eq!(
+        remote.chat(None, &request(), 5, None).unwrap().text,
+        "hello"
+    );
+    let seen = server.requests();
+    assert_eq!(seen.len(), 3);
+    let first = fake::body(&seen[0]);
+    assert_eq!(
+        first["messages"][0]["content"][0]["cache_control"]["type"],
+        "ephemeral"
+    );
+    assert!(
+        fake::body(&seen[1])["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_none()
+    );
+    assert!(
+        fake::body(&seen[2])["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_none()
+    );
 }

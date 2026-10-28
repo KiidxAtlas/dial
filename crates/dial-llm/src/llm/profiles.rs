@@ -2,8 +2,9 @@
 use super::model_config::ModelSelection;
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "kebab-case")]
 pub enum ReasoningEffort {
     None,
@@ -81,14 +82,35 @@ pub struct ModelCapabilities {
     pub strict_tools: bool,
     pub parallel_tool_calls: Option<bool>,
     pub vision: Option<bool>,
+    /// Image-output protocol for this exact model; independent of image input (`vision`).
+    pub image_generation: Option<ImageGenerationApi>,
     pub reasoning: ReasoningApi,
     /// Only values documented by this provider for this exact model.
     pub reasoning_efforts: Vec<ReasoningEffort>,
+    /// Provider wire value for a declared effort when it differs from the Dial name (e.g.
+    /// Inception `minimal` → `instant`). Keys must be in `reasoning_efforts`; applied on the
+    /// chat-completions `reasoning_effort` field only.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub reasoning_effort_wire: BTreeMap<ReasoningEffort, String>,
     pub output_limit: OutputLimit,
     pub prompt_cache: bool,
     /// Endpoint-enforced JSON output for the constrained tool repair retry. Unset uses the
     /// provider default (lm-studio: json_schema, ollama: ollama_format); `none` disables it.
     pub structured_output: Option<StructuredOutput>,
+}
+
+/// Provider protocol used to generate images with the selected model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ImageGenerationApi {
+    /// Explicitly disable selected-model image generation.
+    Disabled,
+    /// OpenAI-compatible images/generations.
+    Images,
+    /// Responses hosted image_generation tool.
+    Responses,
+    /// Chat completions returning inline image data URLs (for example OpenRouter).
+    ChatCompletions,
 }
 
 /// Structured-output mechanism an endpoint enforces. Never inferred from model names.
@@ -601,6 +623,14 @@ impl ModelProfile {
         }
         Ok(())
     }
+    /// Provider wire string for an effort: the declared `reasoning_effort_wire` mapping, else the
+    /// Dial name. Every request builder that sends an effort value goes through this.
+    pub(crate) fn reasoning_effort_wire(&self, effort: ReasoningEffort) -> &str {
+        self.capabilities
+            .reasoning_effort_wire
+            .get(&effort)
+            .map_or(effort.as_str(), String::as_str)
+    }
     pub fn apply_openai(&self, body: &mut serde_json::Value) {
         use serde_json::json;
         if let Some(local) = &self.local_sampling {
@@ -648,7 +678,8 @@ impl ModelProfile {
             .reasoning_effort
             .or_else(|| (self.thinking == Some(false)).then_some(ReasoningEffort::None))
         {
-            object.insert("reasoning_effort".into(), json!(e.as_str()));
+            let wire = self.reasoning_effort_wire(e);
+            object.insert("reasoning_effort".into(), json!(wire));
         }
         if let Some(tier) = self.request_tiers.service_tier_for(&self.provider) {
             object.insert("service_tier".into(), json!(tier));

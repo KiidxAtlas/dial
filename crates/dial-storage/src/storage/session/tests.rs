@@ -128,21 +128,164 @@ fn empty_session_relocation_cannot_adopt_an_orphan_stream_journal() {
 }
 
 #[test]
-fn discarding_a_moved_copy_removes_only_stream_journals_the_move_created() {
+fn discarding_a_moved_copy_removes_only_companions_the_move_created() {
     let e = env();
     let dir = e.layout.sessions_dir();
     crate::platform::atomic::private_dir(&dir).unwrap();
     let dst = dir.join("moved.jsonl");
     let streams = crate::runtime::stream_journal::path(&dst);
+    let side = side_thread::path_for(&dst);
     fs::write(&dst, b"moved\n").unwrap();
     fs::write(&streams, b"foreign\n").unwrap();
-    discard_moved_copy(&dst, false);
+    fs::write(&side, b"foreign side\n").unwrap();
+    discard_moved_copy(&dst, CreatedCompanions::default());
     assert!(!dst.exists());
     assert_eq!(fs::read(&streams).unwrap(), b"foreign\n");
+    assert_eq!(fs::read(&side).unwrap(), b"foreign side\n");
     fs::write(&dst, b"moved\n").unwrap();
-    discard_moved_copy(&dst, true);
+    discard_moved_copy(
+        &dst,
+        CreatedCompanions {
+            streams: true,
+            side: false,
+        },
+    );
     assert!(!dst.exists());
     assert!(!streams.exists());
+    assert_eq!(fs::read(&side).unwrap(), b"foreign side\n");
+    fs::write(&dst, b"moved\n").unwrap();
+    fs::write(&streams, b"foreign\n").unwrap();
+    discard_moved_copy(
+        &dst,
+        CreatedCompanions {
+            streams: false,
+            side: true,
+        },
+    );
+    assert!(!dst.exists());
+    assert!(!side.exists());
+    assert_eq!(fs::read(&streams).unwrap(), b"foreign\n");
+}
+
+/// A pending side-thread exchange, stored verbatim by the side-thread owner.
+const PENDING_SIDE: &[u8] =
+    br#"{"thread":[],"pending":{"thread":"t","question":"q","answer":"partial"}}"#;
+
+#[test]
+fn relocation_moves_the_side_thread_verbatim_and_deletion_leaves_no_orphan() {
+    let e = env();
+    let session = new_session(&e);
+    let src = session.path().unwrap().to_owned();
+    let src_side = side_thread::path_for(&src);
+    fs::write(&src_side, PENDING_SIDE).unwrap();
+    let target_project = tempfile::tempdir().unwrap();
+    let target = Layout::with_user_dir(target_project.path(), e._home.path().join("dial")).unwrap();
+    let moved = session.relocate_to(&target).unwrap();
+    let dst = moved.path().unwrap().to_owned();
+    drop(moved);
+    assert_eq!(fs::read(side_thread::path_for(&dst)).unwrap(), PENDING_SIDE);
+    assert_eq!(fs::read(&src_side).unwrap(), PENDING_SIDE);
+    session.remove_file().unwrap();
+    assert!(!src.exists());
+    assert!(
+        !src_side.exists(),
+        "deleting a session must delete its side thread"
+    );
+    assert_eq!(fs::read(side_thread::path_for(&dst)).unwrap(), PENDING_SIDE);
+}
+
+#[test]
+fn deleting_a_session_removes_its_side_thread_and_root_listing_ignores_it() {
+    let e = env();
+    let session = new_session(&e);
+    let path = session.path().unwrap().to_owned();
+    let side = side_thread::path_for(&path);
+    fs::write(&side, PENDING_SIDE).unwrap();
+    assert_eq!(Session::list(&e.layout, 10).unwrap().len(), 1);
+    session.remove_file().unwrap();
+    assert!(!path.exists());
+    assert!(!side.exists());
+    assert!(Session::list(&e.layout, 10).unwrap().is_empty());
+}
+
+#[test]
+fn relocation_refuses_a_preexisting_destination_side_thread_and_writes_nothing() {
+    let e = env();
+    let session = new_session(&e);
+    let src = session.path().unwrap().to_owned();
+    let src_bytes = fs::read(&src).unwrap();
+    let src_side = side_thread::path_for(&src);
+    fs::write(&src_side, PENDING_SIDE).unwrap();
+    let target_project = tempfile::tempdir().unwrap();
+    let target = Layout::with_user_dir(target_project.path(), e._home.path().join("dial")).unwrap();
+    crate::platform::atomic::private_dir(&target.sessions_dir()).unwrap();
+    let dst = target.sessions_dir().join(src.file_name().unwrap());
+    let dst_side = side_thread::path_for(&dst);
+    let foreign = b"another session's side thread\n";
+    fs::write(&dst_side, foreign).unwrap();
+    assert!(session.relocate_to(&target).is_err());
+    assert!(!dst.exists(), "no main file may be created");
+    assert!(!crate::runtime::stream_journal::path(&dst).exists());
+    assert_eq!(fs::read(&dst_side).unwrap(), foreign);
+    assert_eq!(fs::read(&src).unwrap(), src_bytes);
+    assert_eq!(fs::read(&src_side).unwrap(), PENDING_SIDE);
+    #[cfg(unix)]
+    {
+        // A dangling symlink at the destination is a taken name too; it must not be followed.
+        fs::remove_file(&dst_side).unwrap();
+        std::os::unix::fs::symlink(target.sessions_dir().join("nowhere"), &dst_side).unwrap();
+        assert!(session.relocate_to(&target).is_err());
+        assert!(!dst.exists());
+        assert!(
+            fs::symlink_metadata(&dst_side)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+}
+
+#[test]
+fn failed_reopen_after_side_copy_removes_only_the_side_copy_it_created() {
+    let e = env();
+    let session = new_session(&e);
+    let src = session.path().unwrap().to_owned();
+    let src_side = side_thread::path_for(&src);
+    fs::write(&src_side, PENDING_SIDE).unwrap();
+    let target_project = tempfile::tempdir().unwrap();
+    let target = Layout::with_user_dir(target_project.path(), e._home.path().join("dial")).unwrap();
+    let dst = target.sessions_dir().join(src.file_name().unwrap());
+    let refuse = |_: &Path| -> Result<Session> { bail!("reopen refused") };
+    assert!(session.relocate_with(&target, refuse).is_err());
+    assert!(!dst.exists());
+    assert!(
+        !side_thread::path_for(&dst).exists(),
+        "the created side copy must be removed"
+    );
+    assert!(!crate::runtime::stream_journal::path(&dst).exists());
+    assert_eq!(fs::read(&src_side).unwrap(), PENDING_SIDE);
+    assert!(src.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_non_regular_source_side_thread_rolls_back_the_whole_move() {
+    let e = env();
+    let session = new_session(&e);
+    let src = session.path().unwrap().to_owned();
+    let src_side = side_thread::path_for(&src);
+    fs::create_dir(&src_side).unwrap();
+    let target_project = tempfile::tempdir().unwrap();
+    let target = Layout::with_user_dir(target_project.path(), e._home.path().join("dial")).unwrap();
+    let dst = target.sessions_dir().join(src.file_name().unwrap());
+    assert!(session.relocate_to(&target).is_err());
+    assert!(!dst.exists());
+    assert!(
+        !crate::runtime::stream_journal::path(&dst).exists(),
+        "the stream journal copied before the refusal must be removed"
+    );
+    assert!(src_side.is_dir());
+    assert!(src.exists());
 }
 
 #[cfg(unix)]
@@ -468,7 +611,7 @@ fn rename_persists_without_changing_messages_and_export_escapes_tools() {
             .layout
             .project_root
             .join(if html { "out.html" } else { "out.md" });
-        reopened.export(&path, html).unwrap();
+        reopened.export(&e.layout, &path, html).unwrap();
         let output = fs::read_to_string(&path).unwrap();
         assert!(output.contains("A named session"));
         assert!(output.contains("first prompt"));
@@ -482,7 +625,7 @@ fn rename_persists_without_changing_messages_and_export_escapes_tools() {
             assert!(output.contains("**Tool result**"));
         }
         assert!(
-            reopened.export(&path, html).is_err(),
+            reopened.export(&e.layout, &path, html).is_err(),
             "exports must not overwrite existing files"
         );
     }
@@ -1760,4 +1903,204 @@ fn message_deltas_visit_only_new_bodies_as_history_grows() {
             }
         );
     }
+}
+
+fn session_files(e: &Env) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = fs::read_dir(e.layout.sessions_dir())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "jsonl"))
+        .collect();
+    files.sort();
+    files
+}
+
+#[test]
+fn resume_opens_an_unowned_journal_in_place_without_forking() {
+    let e = env();
+    let mut s = new_session(&e);
+    s.append(user("resume me")).unwrap();
+    let path = s.path().unwrap().to_owned();
+    drop(s);
+    let before = session_files(&e);
+    match Session::open_or_fork(&e.layout, &path).unwrap() {
+        Resumed::Owned(resumed) => assert_eq!(contents(&resumed.messages()), ["resume me"]),
+        Resumed::Forked { .. } => panic!("an unowned journal must open in place"),
+    }
+    assert_eq!(session_files(&e), before);
+}
+
+#[test]
+fn busy_resume_forks_the_active_branch_and_leaves_the_owner_byte_for_byte() {
+    let e = env();
+    let mut owner = new_session(&e);
+    owner.append(user("older conversation")).unwrap();
+    owner.append(assistant("the answer")).unwrap();
+    let path = owner.path().unwrap().to_owned();
+    let owner_id = owner.id().to_owned();
+    let owner_bytes = fs::read(&path).unwrap();
+    let before = session_files(&e);
+    match Session::open_or_fork(&e.layout, &path).unwrap() {
+        Resumed::Forked { source_id, session } => {
+            assert_eq!(source_id, owner_id);
+            assert_ne!(session.id(), owner_id);
+            let fork_path = session.path().unwrap().to_owned();
+            assert_ne!(fork_path, path);
+            let header = fs::read_to_string(&fork_path).unwrap();
+            assert!(header.contains(&format!("\"forked_from\":\"{owner_id}\"")));
+            assert_eq!(
+                contents(&session.messages()),
+                ["older conversation", "the answer"]
+            );
+        }
+        Resumed::Owned(_) => panic!("a busy journal must not be claimed twice"),
+    }
+    assert_eq!(fs::read(&path).unwrap(), owner_bytes);
+    assert_eq!(session_files(&e).len(), before.len() + 1);
+    drop(owner);
+}
+
+#[test]
+fn busy_resume_fork_carries_the_owners_live_stream_supplement() {
+    let e = env();
+    let mut owner = new_session(&e);
+    owner.append(user("stream until interrupted")).unwrap();
+    let tree = owner.runtime();
+    let answer = tree.start("assistant", "answer", None);
+    answer.append("visible prefix");
+    let path = owner.path().unwrap().to_owned();
+    drop(answer);
+    drop(tree);
+    match Session::open_or_fork(&e.layout, &path).unwrap() {
+        Resumed::Forked { session, .. } => {
+            let bodies = session.runtime().bodies("assistant");
+            assert_eq!(bodies.len(), 1);
+            let body = bodies[0].snapshot();
+            assert_eq!(body.result.text, "visible prefix");
+            assert_eq!(body.result.phase, crate::runtime::Phase::Interrupted);
+        }
+        Resumed::Owned(_) => panic!("a busy journal must not be claimed twice"),
+    }
+    drop(owner);
+}
+
+#[test]
+fn busy_resume_tolerates_a_torn_tail_and_leaves_its_bytes_alone() {
+    let e = env();
+    let mut owner = new_session(&e);
+    owner.append(user("before the crash")).unwrap();
+    let path = owner.path().unwrap().to_owned();
+    let mut tail = OpenOptions::new().append(true).open(&path).unwrap();
+    tail.write_all(b"{\"type\":\"message\",\"id\":\"torn")
+        .unwrap();
+    drop(tail);
+    let owner_bytes = fs::read(&path).unwrap();
+    match Session::open_or_fork(&e.layout, &path).unwrap() {
+        Resumed::Forked { session, .. } => {
+            assert_eq!(contents(&session.messages()), ["before the crash"]);
+        }
+        Resumed::Owned(_) => panic!("a busy journal must not be claimed twice"),
+    }
+    assert_eq!(fs::read(&path).unwrap(), owner_bytes);
+    drop(owner);
+}
+
+#[test]
+fn busy_resume_refuses_to_fork_over_an_interior_integrity_issue() {
+    let e = env();
+    let mut owner = new_session(&e);
+    owner.append(user("first")).unwrap();
+    let path = owner.path().unwrap().to_owned();
+    let mut garbage = OpenOptions::new().append(true).open(&path).unwrap();
+    garbage.write_all(b"not json at all\n").unwrap();
+    drop(garbage);
+    owner.append(user("after the garbage")).unwrap();
+    let owner_bytes = fs::read(&path).unwrap();
+    let before = session_files(&e);
+    let error = Session::open_or_fork(&e.layout, &path)
+        .err()
+        .expect("corruption must be an error, not a fork");
+    assert!(format!("{error:#}").contains("integrity issue"));
+    assert_eq!(session_files(&e), before);
+    assert_eq!(fs::read(&path).unwrap(), owner_bytes);
+    drop(owner);
+}
+
+fn current_leaf(s: &Session) -> Option<String> {
+    s.tree().into_iter().find(|n| n.current).map(|n| n.id)
+}
+
+#[test]
+fn fork_at_an_old_anchor_excludes_the_later_main_branch_and_leaves_the_source_untouched() {
+    let e = env();
+    let mut owner = new_session(&e);
+    owner.append(user("q1")).unwrap();
+    let a1 = owner.append(assistant("a1")).unwrap();
+    let c = owner.append(user("main later")).unwrap();
+    owner.append(assistant("main answer")).unwrap();
+    // Rewind to before `main later` and ask a side question: the main branch is now inactive.
+    owner.navigate_to(&c).unwrap();
+    owner.append(user("side question")).unwrap();
+    let path = owner.path().unwrap().to_owned();
+    let owner_bytes = fs::read(&path).unwrap();
+    let leaf_before = current_leaf(&owner);
+    let active_before = contents(&owner.messages());
+    let before = session_files(&e);
+
+    let fork = owner.fork_at(&e.layout, Some(&a1)).unwrap();
+
+    assert_eq!(contents(&fork.messages()), ["q1", "a1"]);
+    assert_eq!(fs::read(&path).unwrap(), owner_bytes);
+    assert_eq!(current_leaf(&owner), leaf_before);
+    assert_eq!(contents(&owner.messages()), active_before);
+    assert_eq!(session_files(&e).len(), before.len() + 1);
+}
+
+#[test]
+fn fork_at_an_inactive_branch_entry_imports_that_branch_and_not_the_side_question() {
+    let e = env();
+    let mut owner = new_session(&e);
+    owner.append(user("q1")).unwrap();
+    owner.append(assistant("a1")).unwrap();
+    let c = owner.append(user("main later")).unwrap();
+    let d = owner.append(assistant("main answer")).unwrap();
+    owner.navigate_to(&c).unwrap();
+    owner.append(user("side question")).unwrap();
+
+    let fork = owner.fork_at(&e.layout, Some(&d)).unwrap();
+
+    assert_eq!(
+        contents(&fork.messages()),
+        ["q1", "a1", "main later", "main answer"]
+    );
+}
+
+#[test]
+fn fork_at_no_target_creates_an_empty_ancestry_and_leaves_the_source_untouched() {
+    let e = env();
+    let mut owner = new_session(&e);
+    owner.append(user("q1")).unwrap();
+    owner.append(assistant("a1")).unwrap();
+    let path = owner.path().unwrap().to_owned();
+    let owner_id = owner.id().to_owned();
+    let owner_bytes = fs::read(&path).unwrap();
+    let leaf_before = current_leaf(&owner);
+
+    let root = owner.fork_at(&e.layout, None).unwrap();
+
+    assert!(root.messages().is_empty());
+    assert_ne!(root.id(), owner_id);
+    assert_eq!(fs::read(&path).unwrap(), owner_bytes);
+    assert_eq!(current_leaf(&owner), leaf_before);
+}
+
+#[test]
+fn fork_at_an_unknown_entry_is_an_error_and_creates_no_file() {
+    let e = env();
+    let mut owner = new_session(&e);
+    owner.append(user("q1")).unwrap();
+    let before = session_files(&e);
+
+    assert!(owner.fork_at(&e.layout, Some("no-such-entry")).is_err());
+    assert_eq!(session_files(&e), before);
 }

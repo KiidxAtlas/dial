@@ -118,6 +118,7 @@ pub fn split_csv(raw: &str) -> Vec<String> {
 pub fn normalize_tool_names(raw: &str, known: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for name in split_csv(raw) {
+        let name = canonical_tool_name(&name).to_owned();
         let lower = name.to_ascii_lowercase();
         let normalized = if known.contains(&lower) { lower } else { name };
         if !out.contains(&normalized) {
@@ -140,13 +141,25 @@ pub fn validate_tool_names(requested: &[String], known: &[String]) -> Result<()>
     bail!("unknown tool(s) for --tools: {}", unknown.join(", "));
 }
 
-/// Integration-gated tools among `tools`. These are the only names that need
-/// `config.integrations` entries to be registered.
+/// Canonical name for a renamed tool. `kernel` was merged into `eval` (`language = "py"`), so
+/// `--tools kernel` and a `kernel` entry select `eval`. This is the single alias point for CLI
+/// tool and integration names.
+pub fn canonical_tool_name(name: &str) -> &str {
+    if name.eq_ignore_ascii_case("kernel") {
+        "eval"
+    } else {
+        name
+    }
+}
+
+/// Integration-gated tools among `tools`, after alias canonicalization. These are the only names
+/// that need `config.integrations` entries to be registered.
 pub fn integrations_for_tools(tools: &[String]) -> Vec<String> {
     tools
         .iter()
-        .filter(|name| INTEGRATION_TOOLS.contains(&name.as_str()))
-        .cloned()
+        .map(|name| canonical_tool_name(name))
+        .filter(|name| INTEGRATION_TOOLS.contains(name))
+        .map(str::to_owned)
         .collect()
 }
 

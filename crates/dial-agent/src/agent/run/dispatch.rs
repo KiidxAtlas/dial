@@ -3,6 +3,8 @@ use crate::config;
 
 use crate::agent::*;
 
+#[cfg(test)]
+mod image_question_tests;
 pub(in crate::agent::run) mod search_index;
 #[cfg(test)]
 mod search_tests;
@@ -35,6 +37,18 @@ pub(in crate::agent) fn callback_image(
     let reference = if call.name == "browser" || call.name == "computer" || call.name == "github" {
         crate::storage::artifact::capture_image(workspace.artifacts(), output)?
     } else if call.name == "read"
+        && output
+            .data
+            .as_ref()
+            .is_some_and(|data| data["artifact"]["data"].is_string())
+    {
+        // Derived media (SVG, HEIC, PDF pages, video) carries PNG pixels; the description text is
+        // the model-facing result and must survive capture.
+        let text = output.text.clone();
+        let reference = crate::storage::artifact::capture_image(workspace.artifacts(), output)?;
+        output.text = text;
+        reference
+    } else if call.name == "read"
         && let Some(path) = call.arguments["path"]
             .as_str()
             .filter(|path| llm::images::is_image(Path::new(path)))
@@ -56,6 +70,18 @@ pub(in crate::agent) fn callback_image(
             Ok((reference, bytes, mime))
         })
         .transpose()
+}
+
+/// `read IMAGE?q=QUESTION` is answered by the vision role instead of reading a file. Only image
+/// paths qualify, so other `?` names stay ordinary reads.
+pub(in crate::agent) fn image_question(call: &ToolCall) -> Option<(&str, &str)> {
+    if call.name != "read" {
+        return None;
+    }
+    let (path, question) = call.arguments["path"]
+        .as_str()
+        .and_then(llm::images::split_question)?;
+    llm::images::is_image(Path::new(path)).then_some((path, question))
 }
 
 pub(in crate::agent) fn callback_image_payload(
@@ -149,15 +175,19 @@ pub(in crate::agent) fn parallel_tools(
     interrupt: &AtomicBool,
     ui: &mut dyn Ui,
     pending_steering: &mut Vec<String>,
+    already_started: Option<&str>,
 ) -> Vec<(ToolOutput, f64)> {
     let signals = crate::tools::exec::signals::CallSignals::new();
     thread::scope(|scope| {
-        let mut receivers = Vec::with_capacity(calls.len());
+        let (completed, completions) = mpsc::channel();
         let mut unique: HashMap<(&str, String), usize> = HashMap::new();
         let mut sources = Vec::with_capacity(calls.len());
         let mut remaining = Vec::new();
         let mut first_calls: Vec<usize> = Vec::new();
         for (index, call) in calls.iter().enumerate() {
+            if already_started != Some(call.id.as_str()) {
+                ui.tool_call_with_args(&call.id, &call.name, &summarize(call), &call.arguments);
+            }
             let key = (
                 call.name.as_str(),
                 crate::agent::safety::guard::normalized_arguments(call).to_string(),
@@ -180,13 +210,19 @@ pub(in crate::agent) fn parallel_tools(
                 ));
                 continue;
             }
-            let source = receivers.len();
+            let source = first_calls.len();
             unique.insert(key, source);
             sources.push(source);
             remaining.push(1usize);
             first_calls.push(index);
-            let (tx, rx) = mpsc::sync_channel(1);
-            receivers.push(rx);
+            let completed = completed.clone();
+            if let Some(error) = ui.execution_error() {
+                let output = ToolOutput::err(error)
+                    .with_status(tools::ToolStatus::Blocked)
+                    .with_effects(crate::tools::surface::outcome::Effects::None);
+                let _ = completed.send((source, (output, 0.0), Vec::new(), None));
+                continue;
+            }
             let signals = signals.clone();
             scope.spawn(move || {
                 let started = Instant::now();
@@ -215,58 +251,83 @@ pub(in crate::agent) fn parallel_tools(
                     crate::agent::safety::hooks::post_tool_with(&config.hooks, plugins.as_deref(), workspace.root(), &call.name, &call.arguments, &mut output, interrupt, &mut |notice| notices.push(notice.to_owned()));
                     output
                 }));
-                let _ = tx.send(((output, started.elapsed().as_secs_f64()), notices, policy_reason));
+                let _ = completed.send((source, (output, started.elapsed().as_secs_f64()), notices, policy_reason));
             });
         }
-        let mut results: Vec<_> = receivers
-            .into_iter()
-            .enumerate()
-            .map(|(source, rx)| {
-                Some(loop {
-                    let steering = ui.take_steering();
-                    if !steering.is_empty() {
-                        signals.request_steering();
-                        signals.interrupt_waits();
-                        pending_steering.extend(steering);
-                        for call in calls {
-                            if let Some(tool) = ext
-                                .get(&call.name)
-                                .filter(|tool| tool.interruptible(&call.arguments))
-                            {
-                                tool.cancel_operation();
-                            }
-                        }
+        drop(completed);
+        let mut results: Vec<Option<(ToolOutput, f64)>> =
+            (0..first_calls.len()).map(|_| None).collect();
+        let mut outstanding = results.len();
+        while outstanding > 0 {
+            let steering = ui.take_steering();
+            if !steering.is_empty() {
+                signals.request_steering();
+                signals.interrupt_waits();
+                pending_steering.extend(steering);
+                for call in calls {
+                    if let Some(tool) = ext
+                        .get(&call.name)
+                        .filter(|tool| tool.interruptible(&call.arguments))
+                    {
+                        tool.cancel_operation();
                     }
-                    if interrupt.load(Ordering::SeqCst) {
-                        signals.interrupt_waits();
-                        for call in calls {
-                            if let Some(tool) = ext.get(&call.name) {
-                                tool.cancel_operation();
-                            }
-                        }
+                }
+            }
+            if interrupt.load(Ordering::SeqCst) {
+                signals.interrupt_waits();
+                for call in calls {
+                    if let Some(tool) = ext.get(&call.name) {
+                        tool.cancel_operation();
                     }
-                    match rx.recv_timeout(Duration::from_millis(80)) {
-                        Ok((result, notices, policy_reason)) => {
-                            if let Some(reason) = policy_reason {
-                                crate::agent::safety::approval::explain(
-                                    ui,
-                                    &calls[first_calls[source]],
-                                    reason,
-                                );
-                            }
-                            for notice in notices {
-                                ui.notice(&notice);
-                            }
-                            break result;
-                        }
-                        Err(RecvTimeoutError::Timeout) => ui.heartbeat(),
-                        Err(RecvTimeoutError::Disconnected) => {
-                            break (ToolOutput::err("tool worker disconnected"), 0.0);
-                        }
+                }
+            }
+            let (source, result, notices, policy_reason) =
+                match completions.recv_timeout(Duration::from_millis(80)) {
+                    Ok(completion) => completion,
+                    Err(RecvTimeoutError::Timeout) => {
+                        ui.heartbeat();
+                        continue;
                     }
-                })
-            })
-            .collect();
+                    Err(RecvTimeoutError::Disconnected) => {
+                        for (source, result) in results.iter_mut().enumerate() {
+                            if result.is_none() {
+                                let output = ToolOutput::err("tool worker disconnected");
+                                for (index, call) in calls.iter().enumerate() {
+                                    if sources[index] == source {
+                                        ui.tool_result_with_id(&call.id, &call.name, &output);
+                                    }
+                                }
+                                *result = Some((output, 0.0));
+                            }
+                        }
+                        break;
+                    }
+                };
+            if let Some(reason) = policy_reason {
+                crate::agent::safety::approval::explain(ui, &calls[first_calls[source]], reason);
+            }
+            for notice in notices {
+                ui.notice(&notice);
+            }
+            // Visible completion is independent of the ordered provider-history settlement.
+            // StateUi journals each result before forwarding it to any surface.
+            for (index, call) in calls.iter().enumerate() {
+                if sources[index] == source {
+                    ui.tool_timing(
+                        &call.id,
+                        &call.name,
+                        if index == first_calls[source] {
+                            result.1
+                        } else {
+                            0.0
+                        },
+                    );
+                    ui.tool_result_with_id(&call.id, &call.name, &result.0);
+                }
+            }
+            results[source] = Some(result);
+            outstanding -= 1;
+        }
         sources
             .into_iter()
             .enumerate()
@@ -383,6 +444,22 @@ impl<'a> Agent<'a> {
         }
     }
 
+    /// Queues an observational plugin event (`turn_start`, `tool_call`, ...). The payload is built
+    /// only when a protocol 2 plugin subscribes; the call never waits for plugins or changes the
+    /// turn. Hermetic runs emit nothing, like hooks.
+    pub(in crate::agent) fn emit_event(&self, event: &str, payload: impl FnOnce() -> Value) {
+        if let Some(plugins) = self.hook_plugins()
+            && plugins.observes(event)
+        {
+            plugins.emit(event, &payload());
+        }
+    }
+
+    /// The extension host that answers slash commands. Hermetic runs get none, like hooks.
+    pub fn extension_host(&self) -> Option<Arc<crate::tools::integrations::plugin::Host>> {
+        self.hook_plugins()
+    }
+
     /// `before_provider_request` for one model call made by this agent. Hook notices reach `ui`;
     /// `None` means send the borrowed request unchanged.
     pub(in crate::agent) fn provider_request_with(
@@ -422,6 +499,55 @@ impl<'a> Agent<'a> {
         let output = self.dispatch_call(backend, call, ui);
         modes::lifecycle::Lifecycle::dispatched(self, call, &output);
         output
+    }
+
+    /// `read path?q=question` on an image asks the `vision` role and returns only its answer. The
+    /// pixels travel in that one-shot request and never enter this conversation.
+    fn answer_image_question(&self, path: &str, question: &str) -> ToolOutput {
+        match self.image_answer(path, question) {
+            Ok(answer) => ToolOutput::ok(answer),
+            Err(error) => ToolOutput::err(format!("{error:#}")),
+        }
+    }
+
+    fn image_answer(&self, path: &str, question: &str) -> Result<String> {
+        const MAX_ANSWER_TOKENS: u32 = 1024;
+        ensure!(
+            llm::images::is_image(Path::new(path)),
+            "?q= answers questions about image files; {path} is not one"
+        );
+        ensure!(
+            self.config.role_selection("vision").is_some(),
+            "no vision model is configured; assign one to the `vision` role to answer ?q= questions"
+        );
+        let absolute = self.workspace.resolve(path).map_err(anyhow::Error::msg)?;
+        let relative = absolute.strip_prefix(self.workspace.root())?;
+        let reference = llm::images::attachment(self.workspace.root(), relative)?;
+        let image = llm::images::image_part(&reference)?;
+        let vision = self.config.for_role("vision");
+        let request = Chat {
+            messages: vec![
+                json!({"role": "user", "content": [{"type": "text", "text": question}, image]}),
+            ],
+            tools: Vec::new(),
+            temperature: 0.0,
+            max_tokens: vision
+                .active_model_profile()
+                .and_then(|profile| profile.max_tokens)
+                .unwrap_or(MAX_ANSWER_TOKENS),
+            seed: None,
+        };
+        let mut backend = make_backend(&vision)?;
+        let result = backend.chat_with_control(
+            None,
+            &request,
+            vision.worker_timeout_secs,
+            None,
+            &mut |_| {},
+            self.interrupt.clone(),
+        );
+        backend.release();
+        Ok(result?.text)
     }
 
     pub(in crate::agent) fn dispatch_call(
@@ -626,6 +752,9 @@ impl<'a> Agent<'a> {
         }
         if self.interrupt.load(Ordering::SeqCst) {
             return interrupted_tool();
+        }
+        if let Some((path, question)) = image_question(call) {
+            return self.answer_image_question(path, question);
         }
         if let Some(preview) = self.authorized_edit_preview(call) {
             self.edit_preview_intercepted = true;
@@ -1060,6 +1189,7 @@ impl<'a> Agent<'a> {
                 },
             },
             "task" => self.run_task(backend, args, ui),
+            "side_request" => self.side_question(args),
             "message" => {
                 crate::agent::workers::live_tasks::output(self.live_tasks.message_call(args))
             }
@@ -1091,6 +1221,9 @@ impl<'a> Agent<'a> {
             }
             other => match self.config.tools.get(other) {
                 Some(tool) => custom_tool_output(tool, args, &self.interrupt),
+                None if self.ext.is_retired_mcp(other) => denied(&format!(
+                    "MCP tool `{other}` was removed by its server; use the tools currently offered"
+                )),
                 None => denied(&format!("unknown tool: {other}")),
             },
         }
@@ -1224,7 +1357,7 @@ impl<'a> Agent<'a> {
         if let Some((reference, _, _)) = &image {
             ui.image(reference);
         }
-        ui.tool_timing(&call.name, started.elapsed().as_secs_f64());
+        ui.tool_timing(&call.id, &call.name, started.elapsed().as_secs_f64());
         ui.tool_result_with_id(&call.id, &call.name, &output);
         if call.name == "ask" {
             self.callback_question_results
@@ -1268,6 +1401,10 @@ impl<'a> Agent<'a> {
     pub(in crate::agent) fn await_background_jobs(&mut self, ui: &mut dyn Ui) -> bool {
         self.pump_subagents(ui);
         let jobs = self.awaited_background_jobs();
+        let questions = self.side_questions.running_ids();
+        if !questions.is_empty() && !self.interrupt.load(Ordering::Relaxed) {
+            self.background_notices.push(format!("[Side questions still running]\n{}\nContinue independent work or use bounded `side_request` wait; do not claim their answers are available yet.", questions.join("\n")));
+        }
         let workers = self.live_tasks.running_ids();
         if !self.interrupt.load(Ordering::Relaxed) {
             if !jobs.is_empty() {
@@ -1285,7 +1422,9 @@ impl<'a> Agent<'a> {
             }
         }
         // Finished worker results are queued for the next request: the turn continues to incorporate them.
-        !self.background_notices.is_empty() || !self.live_tasks.undelivered().is_empty()
+        !self.background_notices.is_empty()
+            || !self.live_tasks.undelivered().is_empty()
+            || self.side_questions.has_undelivered()
     }
 }
 

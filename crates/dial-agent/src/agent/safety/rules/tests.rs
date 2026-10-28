@@ -56,10 +56,10 @@ fn discovers_windsurf_rules() {
     let layout = layout(&project, &base.path().join("dial-user"));
 
     // Foreign user providers are opt-in: the home-level rule is absent by default.
-    let off = Catalog::discover_with(&layout, &project, Some(&home), &[]);
+    let off = Catalog::discover_with(&layout, &project, Some(&home), &[], &[]);
     assert_eq!(sources(&off), ["project:windsurf:.windsurf/rules/ts.md"]);
 
-    let on = Catalog::discover_with(&layout, &project, Some(&home), &["windsurf"]);
+    let on = Catalog::discover_with(&layout, &project, Some(&home), &["windsurf"], &[]);
     assert_eq!(
         sources(&on),
         [
@@ -87,7 +87,7 @@ fn discovers_cline_rules() {
     let layout = layout(&project, &base.path().join("dial-user"));
 
     // The walk reaches the git root, where the `.clinerules` directory lives.
-    let dir = Catalog::discover_with(&layout, &project, Some(&home), &[]);
+    let dir = Catalog::discover_with(&layout, &project, Some(&home), &[], &[]);
     assert_eq!(sources(&dir), ["project:cline:.clinerules/style.md"]);
 
     // The nearest `.clinerules` file wins over the directory above it.
@@ -95,7 +95,7 @@ fn discovers_cline_rules() {
         project.join(".clinerules"),
         "---\nglobs: \"*.ts\"\n---\nnearest",
     );
-    let file = Catalog::discover_with(&layout, &project, Some(&home), &[]);
+    let file = Catalog::discover_with(&layout, &project, Some(&home), &[], &[]);
     assert_eq!(sources(&file), ["project:cline:.clinerules"]);
     assert_eq!(file.rules[0].body.trim(), "nearest");
 }
@@ -116,7 +116,7 @@ fn portable_rules_precedence() {
     let layout = layout(&project, &base.path().join("dial-user"));
 
     // Same provider and name: the project file shadows the user file.
-    let got = Catalog::discover_with(&layout, &project, Some(&home), &["windsurf"]);
+    let got = Catalog::discover_with(&layout, &project, Some(&home), &["windsurf"], &[]);
     assert_eq!(
         sources(&got),
         ["project:windsurf:.windsurf/rules/global_rules.md"]
@@ -143,7 +143,45 @@ fn refuses_symlinked_windsurf_rule_outside_root() {
     .unwrap();
     let layout = layout(&project, &base.path().join("dial-user"));
 
-    let got = Catalog::discover_with(&layout, &project, Some(&home), &["windsurf"]);
+    let got = Catalog::discover_with(&layout, &project, Some(&home), &["windsurf"], &[]);
     assert!(got.rules.is_empty());
     assert!(got.warnings.iter().any(|w| w.contains("leak.md")));
+}
+
+#[test]
+fn copilot_instruction_dirs_load_apply_to_rules_as_user_rules() {
+    let base = tempfile::tempdir().unwrap();
+    let home = base.path().join("home");
+    let project = base.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    let ext = base.path().join("ext");
+    write(
+        ext.join(".github/instructions/rust.instructions.md"),
+        "---\napplyTo: \"**/*.rs\"\n---\ncopilot rule",
+    );
+    let ext = fs::canonicalize(&ext).unwrap();
+    let layout = layout(&project, &base.path().join("dial-user"));
+    let got = Catalog::discover_with(&layout, &project, Some(&home), &[], &[ext]);
+    let rule = got
+        .rules
+        .iter()
+        .find(|r| r.body.trim() == "copilot rule")
+        .expect("copilot instruction dir rule is loaded");
+    assert_eq!(rule.path_patterns, ["**/*.rs"]);
+}
+
+#[test]
+fn legacy_windsurfrules_file_loads_from_project_root() {
+    let base = tempfile::tempdir().unwrap();
+    let project = base.path().join("project");
+    write(project.join(".windsurfrules"), "legacy windsurf rule");
+    let layout = layout(&project, &base.path().join("dial-user"));
+    let got = Catalog::discover_with(&layout, &project, None, &[], &[]);
+    assert!(
+        got.rules.iter().any(
+            |r| r.source.ends_with(".windsurfrules") && r.body.trim() == "legacy windsurf rule"
+        ),
+        "{:?}",
+        sources(&got)
+    );
 }

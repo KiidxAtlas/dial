@@ -4,7 +4,6 @@
 //! generation. JS sources are evaluated in the shared REPL realm, so they must declare globals with
 //! `var`, function declarations or `globalThis.x = …` so a reinstall never redeclares a lexical binding.
 
-use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -56,10 +55,6 @@ struct Entry {
 static REGISTRY: RwLock<Vec<Entry>> = RwLock::new(Vec::new());
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
-thread_local! {
-    static DISPLAY: RefCell<String> = const { RefCell::new(String::new()) };
-}
-
 /// Registers a prelude. A later registration with the same name replaces the earlier one in place.
 pub fn register_prelude(def: PreludeDef, handler: PreludeHandler) {
     let mut registry = REGISTRY.write();
@@ -85,23 +80,28 @@ pub fn prelude_source_for(language: PreludeLanguage) -> String {
         .join(separator)
 }
 
-/// Appends text to the current cell's display buffer; it is prepended to that cell's stdout.
-pub fn display(text: String) {
-    DISPLAY.with(|buffer| {
-        let mut buffer = buffer.borrow_mut();
-        buffer.push_str(&text);
+/// Text a cell prints through `__dial_display__`. Each cell owns its buffer, so a cell moved to the
+/// background keeps its display output in its job.
+#[derive(Default)]
+pub(crate) struct DisplayBuffer(parking_lot::Mutex<String>);
+
+impl DisplayBuffer {
+    /// Appends one display entry; text without a trailing newline gets one.
+    pub(crate) fn push(&self, text: &str) {
+        let mut buffer = self.0.lock();
+        buffer.push_str(text);
         if !text.ends_with('\n') {
             buffer.push('\n');
         }
-    });
+    }
+
+    pub(crate) fn take(&self) -> String {
+        std::mem::take(&mut *self.0.lock())
+    }
 }
 
 pub(crate) fn generation() -> u64 {
     GENERATION.load(Ordering::Acquire)
-}
-
-pub(crate) fn take_display() -> String {
-    DISPLAY.with(|buffer| std::mem::take(&mut *buffer.borrow_mut()))
 }
 
 pub(crate) fn invoke(
@@ -122,6 +122,7 @@ pub(crate) fn invoke(
 /// Answers the `prelude` and `display` bridge callbacks; `None` for any other callback kind.
 pub(crate) fn bridge_reply(
     request: &Value,
+    display: &DisplayBuffer,
     dispatch: &mut dyn FnMut(ToolCallback) -> Result<ToolOutput, String>,
 ) -> Option<Result<Value, String>> {
     match request.get("callback").and_then(Value::as_str)? {
@@ -140,7 +141,7 @@ pub(crate) fn bridge_reply(
                 .get("text")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            display(text.to_owned());
+            display.push(text);
             Some(Ok(json!({"text":"","data":null,"is_error":false})))
         }
         _ => None,

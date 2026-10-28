@@ -3,15 +3,18 @@
 pub mod adaptive;
 pub mod agent_defs;
 pub mod ask;
+pub mod cache;
 pub mod checkpoint;
 pub mod collab;
 pub mod compaction;
 pub mod coordination;
 pub mod embeddings;
 pub mod hooks;
+pub mod image;
 pub mod isolation;
 pub mod laya;
 pub mod memory_backend;
+pub mod message_routing;
 pub mod paths;
 pub mod reliability;
 pub mod schema;
@@ -152,6 +155,35 @@ pub fn migrate_memory_tool_table(table: &mut toml::Table) -> bool {
     }
     changed
 }
+
+/// `kernel` was merged into the `eval` tool (`language = "py"`). Rename a saved `kernel` integration
+/// to `eval`, dropping it when `eval` is already listed, so old settings still load. Only the
+/// `kernel` entries are touched; other duplicates stay for validation to report. Returns whether
+/// anything changed.
+pub fn migrate_kernel_integration(table: &mut toml::Table) -> bool {
+    let Some(values) = table
+        .get_mut("integrations")
+        .and_then(toml::Value::as_array_mut)
+    else {
+        return false;
+    };
+    if !values.iter().any(|value| value.as_str() == Some("kernel")) {
+        return false;
+    }
+    let mut has_eval = values.iter().any(|value| value.as_str() == Some("eval"));
+    let mut migrated = Vec::with_capacity(values.len());
+    for value in values.drain(..) {
+        if value.as_str() != Some("kernel") {
+            migrated.push(value);
+        } else if !has_eval {
+            migrated.push(toml::Value::String("eval".to_owned()));
+            has_eval = true;
+        }
+    }
+    *values = migrated;
+    true
+}
+
 pub fn migrate_edit_configuration(table: &mut toml::Table) -> bool {
     let Some(mode) = table.remove("edit_mode") else {
         return false;
@@ -443,6 +475,7 @@ impl Config {
                 | migrate_edit_configuration(&mut part)
                 | migrate_model_role_table(&mut part)
                 | migrate_removed_settings(&mut part)
+                | migrate_kernel_integration(&mut part)
             {
                 migrations.push(path);
             }
@@ -488,6 +521,7 @@ impl Config {
                 | migrate_edit_configuration(&mut current)
                 | migrate_model_role_table(&mut current)
                 | migrate_removed_settings(&mut current)
+                | migrate_kernel_integration(&mut current)
                 | half.is_some_and(|key| drop_semantic_key(&mut current, key))
             {
                 write_private(&path, toml::to_string_pretty(&current)?.as_bytes())?;
@@ -1619,6 +1653,9 @@ mod chatgpt_tests;
 mod memory_migration_tests;
 
 #[cfg(test)]
+mod kernel_integration_tests;
+
+#[cfg(test)]
 mod tier_precedence_tests;
 
 #[cfg(test)]
@@ -1629,3 +1666,6 @@ mod model_role_tests;
 
 #[cfg(test)]
 mod requirement_tests;
+
+#[cfg(test)]
+mod budget_revert_tests;

@@ -9,7 +9,7 @@ use crate::embedded_shell::inprocess::{Request, Run};
 
 /// The environment the shell gets: Dial's, minus secrets, plus the same non-interactive settings
 /// the unsandboxed child-process backends set.
-fn environment(scratch: &Path) -> Vec<(String, String)> {
+fn environment(scratch: &Path, cargo_target: Option<&Path>) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = std::env::vars_os()
         .filter_map(|(key, value)| {
             let (key, value) = (key.into_string().ok()?, value.into_string().ok()?);
@@ -34,6 +34,11 @@ fn environment(scratch: &Path) -> Vec<(String, String)> {
     }
     set("GIT_TERMINAL_PROMPT", "0");
     set("GCM_INTERACTIVE", "never");
+    if std::env::var_os("CARGO_TARGET_DIR").is_none()
+        && let Some(target) = cargo_target
+    {
+        set("CARGO_TARGET_DIR", &target.to_string_lossy());
+    }
     env
 }
 
@@ -58,7 +63,7 @@ pub(super) fn run(
     let mut shell = Run::start(Request {
         script: command.to_owned(),
         cwd: cwd.to_owned(),
-        env: environment(&scratch),
+        env: environment(&scratch, ws.cargo_target_dir().as_deref()),
         output: writer,
     })?;
 

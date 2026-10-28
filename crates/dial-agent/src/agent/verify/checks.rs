@@ -404,7 +404,7 @@ impl<'a> Agent<'a> {
             // Even harness-launched commands without a complete contract may change hidden inputs.
             self.step_checks.evidence.invalidate_inputs();
         }
-        ui.tool_timing("bash", started.elapsed().as_secs_f64());
+        ui.tool_timing(&call_id, "bash", started.elapsed().as_secs_f64());
         ui.tool_result_with_id(&call_id, "bash", &output);
         self.note_verification_verdict(
             &ToolCall {
@@ -832,6 +832,12 @@ impl<'a> Agent<'a> {
             .any(|task| task.status == crate::agent::workflow::todo::Status::Blocked);
         if blocked {
             return Err("Explicitly blocked tasks remain. Resolve their prerequisites or report outcome=blocked.".into());
+        }
+        if !self.side_questions.running_ids().is_empty() {
+            return Err("cannot complete while side questions are running; use side_request wait or cancel and collect their results".into());
+        }
+        if self.side_questions.has_undelivered() {
+            return Err("cannot complete before completed side-question results have been delivered to the conversation".into());
         }
         let awaited = self.awaited_background_jobs();
         if !awaited.is_empty() {

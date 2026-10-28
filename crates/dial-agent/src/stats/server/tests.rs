@@ -72,3 +72,90 @@ fn trace_route_refuses_paths_outside_sessions_tree() {
     assert_eq!(route(user_dir, "/api/trace").0, "400 Bad Request");
     assert_eq!(route(user_dir, "/nope").0, "404 Not Found");
 }
+
+fn get(user_dir: &Path, host: &str, target: &str) -> (&'static str, &'static str, String) {
+    respond(
+        user_dir,
+        4100,
+        &format!("GET {target} HTTP/1.1\r\nHost: {host}\r\n\r\n"),
+    )
+}
+
+#[test]
+fn foreign_host_is_refused_before_any_route() {
+    let home = tempfile::tempdir().unwrap();
+    for target in ["/api/version", "/api/models", "/api/request/1"] {
+        assert_eq!(
+            get(home.path(), "evil.example:4100", target).0,
+            "403 Forbidden",
+            "{target}"
+        );
+    }
+}
+
+#[test]
+fn version_route_reports_build_info_json() {
+    let home = tempfile::tempdir().unwrap();
+    let (status, content_type, body) = get(home.path(), "127.0.0.1:4100", "/api/version");
+    assert_eq!(status, "200 OK");
+    assert_eq!(content_type, JSON);
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(value["version"].is_string());
+}
+
+#[test]
+fn dashboard_json_routes_answer_on_an_empty_home() {
+    let home = tempfile::tempdir().unwrap();
+    for target in [
+        "/api/stats",
+        "/api/models",
+        "/api/tools?range=7d",
+        "/api/requests?limit=5",
+        "/api/frustration?range=24h",
+    ] {
+        let (status, content_type, body) = get(home.path(), "127.0.0.1:4100", target);
+        assert_eq!(status, "200 OK", "{target}: {body}");
+        assert_eq!(content_type, JSON, "{target}");
+        serde_json::from_str::<serde_json::Value>(&body).unwrap();
+    }
+}
+
+#[test]
+fn live_route_is_not_found_without_a_session() {
+    let home = tempfile::tempdir().unwrap();
+    assert_eq!(
+        get(home.path(), "127.0.0.1:4100", "/api/live").0,
+        "404 Not Found"
+    );
+}
+
+#[test]
+fn request_detail_rejects_non_integer_ids_and_reports_missing_rows() {
+    let home = tempfile::tempdir().unwrap();
+    assert_eq!(
+        get(home.path(), "127.0.0.1:4100", "/api/request/abc").0,
+        "400 Bad Request"
+    );
+    assert_eq!(
+        get(home.path(), "127.0.0.1:4100", "/api/request/999999").0,
+        "404 Not Found"
+    );
+}
+
+#[test]
+fn list_routes_validate_limit_and_range() {
+    let home = tempfile::tempdir().unwrap();
+    for target in [
+        "/api/requests?limit=0",
+        "/api/requests?limit=501",
+        "/api/requests?limit=many",
+        "/api/models?range=bogus",
+        "/api/frustration?range=bogus",
+    ] {
+        assert_eq!(
+            get(home.path(), "127.0.0.1:4100", target).0,
+            "400 Bad Request",
+            "{target}"
+        );
+    }
+}

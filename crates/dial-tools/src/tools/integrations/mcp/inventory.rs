@@ -38,8 +38,8 @@ impl Inventory {
                     .iter()
                     .find(|session| session.name() == name)
                     .cloned();
-                let tools = loaded
-                    .tools
+                let offered = loaded.live.offered_tools();
+                let tools = offered
                     .iter()
                     .filter(|tool| tool.lifecycle_channel() == Some(name.as_str()))
                     .map(|tool| {

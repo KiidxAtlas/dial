@@ -45,6 +45,17 @@ for editing controls and surrounding setup navigation.
 During a turn, shell display changes apply immediately on panel close; agent-bound settings are saved
 and adopted at the next safe turn boundary.
 
+Settings saves and prompt-history access wait at most 250 ms for each occupied storage lock.
+Brief concurrent saves still serialize; longer contention reports a retryable error rather than
+freezing command dispatch. A failed settings save leaves the effective setting unchanged; a failed
+history save is reported without preventing the command from running.
+
+Agent-bound settings such as `/drafter` can rebuild the agent and reconnect configured MCP servers.
+The composer stays active during that connection pass, both at startup and after settings changes.
+Once Enter or another action is queued, subsequent input is held in order until tools are ready;
+it does not bypass initialization. Slow or unavailable servers still have their configured connection
+deadline and report connection failures normally.
+
 ## Unlimited execution defaults
 
 Most configurable execution limits and result/context size caps default to `0`, meaning **unlimited**:
@@ -92,6 +103,45 @@ semantics differ by provider, and late workers can update the live usage ledger 
 snapshot. Compare like-for-like tasks and correctness first; agent completion alone is not independent
 proof of correctness or subscription quota savings.
 
+## Cost budgets and fallback revert
+
+`[budget]` has two hard caps and two warnings, all in USD of observed cost (zero or unset disables
+each). `max_turn_cost_usd` and `max_session_cost_usd` stop work at a step boundary. `warn_turn_cost_usd`
+and `warn_session_cost_usd` only notify: each warns once when spend first reaches its threshold, and it
+warns again only after spend has dropped below the threshold and risen back. Work continues after a
+warning. The session total includes subagent spend because workers charge the same ledger. A session
+resumed already past a warning threshold is not warned again in that run. Thresholds are read live,
+so `/settings` changes apply to the next step. Validation requires finite nonnegative values.
+
+```toml
+[budget]
+max_session_cost_usd = 5.0     # hard stop for the session, subagents included
+warn_session_cost_usd = 2.0    # notice once when the session reaches $2
+warn_turn_cost_usd = 0.25      # notice once per turn that reaches $0.25
+```
+
+`[retry] fallback_revert` controls when a session returns to its primary model after it failed over to
+a fallback (see [model routing](model-routing.md)):
+
+- `cooldown-expiry` (default): the session returns at the first request after the fallback's cooldown
+  (the server's retry-after, else 5 minutes). This is the existing behavior, so upgrading changes
+  nothing unless you set it.
+- `never`: the session stays on the fallback until you switch models with `/model`, for operators who
+  prefer a stable route over returning to a primary that may still be rate-limited.
+
+A request in flight is never switched to another model; the return happens only at the next request
+boundary. The fallback's first successful reply and each return to the primary are announced.
+
+## Image generation (`[image]`)
+
+The `image_gen` tool calls an OpenAI-compatible `images/generations` endpoint. `base_url` (default `https://api.openai.com/v1`), `model` (default `gpt-image-1`) and `timeout_secs` (default `180`, `0` disables) are settings in the schema. `api_key_env` names the environment variable holding the key; when unset, Dial uses the provider's standard variable or a key saved through `/providers`.
+
+When `base_url` and `model` are left at their defaults, `api_key_env` is unset, and the session's provider serves image generation (OpenAI at `api.openai.com`, xAI at `api.x.ai` with `grok-imagine-image-2.0`), `image_gen` uses that provider's endpoint and key; it falls back to the `[image]` defaults when the session provider has no key. Changing `base_url` or `model`, or setting `api_key_env`, always uses the `[image]` settings as written. With `auto = true` (the default), the tool is offered whenever that resolution finds a key, without an `integrations` entry; only local credentials are read, nothing is sent until a call. If automatic registration fails, a redacted startup notice explains why the tool is unavailable. `auto = false` restores the explicit `integrations = ["image_gen"]` opt-in. Calls always require approval.
+
+## Context files (`[context_files]`)
+
+`context_files.extra` lists extra plain file names (for example `TEAM.md`) read beside each directory of the project hierarchy, after the built-in files. Names must be bare file names; path separators, `.`/`..`, empty entries, duplicates and the reserved built-ins (`AGENTS.md`, `AGENTS.local.md`, `CLAUDE.md`, `.cursorrules`, `GEMINI.md`) are rejected at validation. `foreign_sources` (for example `"windsurf"`) opts in to foreign user-level memory; `COPILOT_CUSTOM_INSTRUCTIONS_DIRS` adds Copilot instruction directories.
+
 ## Example configuration
 
 ```toml
@@ -118,6 +168,9 @@ composer_shape = "band"            # band | box | line
 symbols = "auto"                   # auto | unicode | nerd | ascii
 show_tools = true
 history_limit = 0
+
+[message_routing]         # routing of a message typed during a turn when no explicit option is chosen
+route = "steer"           # steer (deterministic, default) | classify (routing judge decides; failure steers)
 
 [secrets]                  # mask secrets in provider-bound messages; see llm-transport.md
 enabled = false

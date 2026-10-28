@@ -1048,3 +1048,61 @@ fn the_parents_message_tool_reports_receipts_and_refuses_finished_workers() {
         assert!(refused.contains("unknown or finished"), "{refused}");
     });
 }
+
+#[test]
+fn unrelated_coding_turn_does_not_pay_for_web_schemas() {
+    with_agent("[assistance]\nlean_local=false", |agent| {
+        for name in ["web_fetch", "web_search"] {
+            agent.ext.register(Arc::new(WebCapability(name)));
+        }
+        agent.begin_tool_routing("Fix the arithmetic bug in calc.py");
+        let offered = agent.offered();
+        let mut broad = offered.clone();
+        for name in ["web_fetch", "web_search"] {
+            assert!(agent.catalog().iter().any(|tool| tool == name));
+            broad.push(name.into());
+        }
+        broad.sort();
+        broad.dedup();
+        let before = schema_bytes(agent, &broad);
+        let after = schema_bytes(agent, &offered);
+        eprintln!("coding tool schemas without unrelated web tools: {before} -> {after} bytes");
+        assert!(
+            after < before,
+            "unrelated web schemas still offered: {offered:?}"
+        );
+        assert!(
+            agent
+                .discoverable_tools(&offered)
+                .iter()
+                .any(|(name, _)| name == "web_search")
+        );
+        agent.begin_tool_routing("Research this issue online");
+        for name in ["web_fetch", "web_search"] {
+            assert!(agent.offered().iter().any(|tool| tool == name));
+        }
+        assert!(
+            agent.enabled_tools.is_empty(),
+            "routing must not require a model discovery call"
+        );
+        agent.activate_tools(&["web_fetch".into()]).unwrap();
+        agent.begin_tool_routing("Fix the arithmetic bug in calc.py");
+        assert!(agent.offered().iter().any(|tool| tool == "web_fetch"));
+    });
+}
+
+struct WebCapability(&'static str);
+impl crate::tools::integrations::ext::Tool for WebCapability {
+    fn name(&self) -> &str {
+        self.0
+    }
+    fn schema(&self) -> Value {
+        json!({"type":"function","function":{"name":self.0,"description":"Web research capability", "parameters":{"type":"object","properties":{"query":{"type":"string"}}}}})
+    }
+    fn needs_approval(&self, _: &Value) -> bool {
+        true
+    }
+    fn call(&self, _: &crate::tools::integrations::ext::ToolContext, _: &Value) -> ToolOutput {
+        panic!("schema measurement must not execute a tool")
+    }
+}

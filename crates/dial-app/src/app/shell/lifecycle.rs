@@ -1,6 +1,7 @@
 //! Shell start, adoption of a new configuration, and teardown.
 
 use crate::agent;
+use crate::agent::Agent;
 use crate::agent::window::context;
 use crate::agent::workflow::todo::TodoList;
 use crate::app::command_registry::command_entries;
@@ -53,6 +54,7 @@ impl Shell {
         let mut shell = Shell {
             files: super::file_discovery::Files::new(),
             runtime_updates: Default::default(),
+            side: Default::default(),
             loop_mode: Default::default(),
             runtime: Default::default(),
             pending_result: None,
@@ -60,10 +62,12 @@ impl Shell {
             auth_job: None,
             extensions_pending: None,
             extensions_job: None,
+            extension_commands: Vec::new(),
             restart_requested: false,
             retry_noted: false,
             smithery_resume: None,
             commit_job: None,
+            worker_editors: Default::default(),
             term,
             themes,
             keys,
@@ -121,6 +125,7 @@ impl Shell {
             deferred: Default::default(),
             deferred_editor: false,
             deferred_approval_cycle: false,
+            plugin_chrome: Default::default(),
             held: Default::default(),
             live_tasks: None,
             workers: Default::default(),
@@ -146,6 +151,7 @@ impl Shell {
             voice_input: None,
             voice_gesture: Default::default(),
             speech: None,
+            frame_pacing: Default::default(),
         };
         for warning in warnings {
             shell.note("Key bindings", &warning);
@@ -164,12 +170,20 @@ impl Shell {
     /// Observe disk on a bounded timer. A running agent only receives a pending snapshot.
     pub(in crate::app) fn refresh_resources(&mut self, app: &App, force: bool, busy: bool) -> bool {
         let mut files_changed = false;
+        let side_bytes = self.side.streamed().map(|(_, text)| text.len());
+        let session_id = (!self.session_id.is_empty()).then_some(self.session_id.as_str());
+        let side_notes = self.side.drain(session_id);
+        files_changed |= side_bytes != self.side.streamed().map(|(_, text)| text.len());
+        for note in side_notes {
+            self.note(&note.title, &note.text);
+            files_changed = true;
+        }
         // Optional update checks never block startup or input, and never run in network-off mode.
         if app.config.sandbox.mode != crate::config::types::SandboxMode::Strict
             && app.config.sandbox.allow_network
         {
             if let Some(message) = self.runtime_updates.poll(&app.layout.user_dir) {
-                self.note("Runtime updates", message);
+                self.runtime_updates.retain_report(message);
                 files_changed = true;
             }
         }
@@ -303,8 +317,11 @@ impl Shell {
         // completion, palette, help and dispatch.
         self.commands = context::discover_commands(&app.layout);
         let found = skills::discover(&app.layout);
-        self.composer
-            .set_commands(command_entries(&self.commands, &found));
+        self.composer.set_commands(command_entries(
+            &self.commands,
+            &found,
+            &self.extension_commands,
+        ));
         let mut arguments =
             command_argument_completions(&app.config, &skills::discover_all(&app.layout));
         arguments.extend(
@@ -323,6 +340,20 @@ impl Shell {
     pub(super) fn refresh_commands(&mut self, app: &App) {
         self.refresh_command_resources(app);
         self.files.request(&app.layout.project_root);
+    }
+
+    /// Re-reads the commands the loaded extensions answer. Called when an agent is bound, since the
+    /// extension host is loaded with the agent; completion, palette and help all read the result.
+    pub(in crate::app) fn sync_extension_commands(&mut self, agent: &Agent<'_>) {
+        self.extension_commands = agent
+            .extension_host()
+            .map(|host| host.command_names())
+            .unwrap_or_default();
+        self.composer.set_commands(command_entries(
+            &self.commands,
+            &self.skills,
+            &self.extension_commands,
+        ));
     }
 
     /// Home screen and, for a resumed session, its earlier conversation.

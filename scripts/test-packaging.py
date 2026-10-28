@@ -40,6 +40,10 @@ end
 """
 
 
+def REAL_FORMULA():
+    return (Path(__file__).resolve().parent.parent / "Formula" / "dial.rb").read_text(encoding="utf-8")
+
+
 class PackagingTests(unittest.TestCase):
     def test_repository_packaging_is_consistent(self):
         _, problems = packaging.check()
@@ -106,6 +110,41 @@ class ReleaseBuildIdentityTests(unittest.TestCase):
                         self.assertEqual(result.returncode == 0, profile != "release", result.stderr)
                         if profile != "release":
                             self.assertIn(f"cargo:rustc-env=DIAL_BUILD_PROFILE={profile}", result.stdout)
+
+
+
+class FormulaUpdateTests(unittest.TestCase):
+    def load_updater(self):
+        path = Path(__file__).resolve().with_name("update-formula.py")
+        spec = importlib.util.spec_from_file_location("update_formula", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def sums_for(self, version, digests):
+        targets = ["aarch64-apple-darwin", "x86_64-apple-darwin",
+                   "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]
+        return {f"dial-v{version}-{target}.tar.gz": digests[target] for target in targets}
+
+    def test_generated_formula_covers_every_homebrew_target_and_stays_consistent(self):
+        updater = self.load_updater()
+        digests = {t: f"{i:064x}" for i, t in enumerate(
+            ["aarch64-apple-darwin", "x86_64-apple-darwin",
+             "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"], start=1)}
+        formula = updater.update_formula(REAL_FORMULA(), "0.2.0", self.sums_for("0.2.0", digests))
+        self.assertEqual(packaging.formula_problems(formula), [])
+        self.assertIn('  version "0.2.0"', formula)
+        for target, digest in digests.items():
+            self.assertIn(f'dial-v#{{version}}-{target}.tar.gz"\n      sha256 "{digest}"', formula)
+
+    def test_missing_homebrew_checksum_aborts_without_rendering(self):
+        updater = self.load_updater()
+        sums = self.sums_for("0.2.0", {t: "0" * 64 for t in [
+            "aarch64-apple-darwin", "x86_64-apple-darwin", "aarch64-unknown-linux-gnu",
+            "x86_64-unknown-linux-gnu"]})
+        del sums["dial-v0.2.0-aarch64-unknown-linux-gnu.tar.gz"]
+        with self.assertRaises(SystemExit):
+            updater.update_formula(REAL_FORMULA(), "0.2.0", sums)
 
 
 if __name__ == "__main__":

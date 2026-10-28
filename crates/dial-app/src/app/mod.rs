@@ -30,7 +30,9 @@ use std::time::{Duration, Instant};
 
 mod bridge;
 mod bridge_ui;
+mod clipboard;
 mod command_registry;
+pub(crate) use command_registry::builtin_commands;
 mod completions;
 mod core;
 mod discovery;
@@ -42,15 +44,20 @@ mod learning;
 mod notices;
 mod overlay;
 mod panel;
+mod print_attachments;
 mod replay;
 mod resources;
+mod restore;
 mod selection;
 mod shell;
+mod side;
 
 pub struct Options {
     pub session: Option<Session>,
     pub prompt: String,
     pub interactive: bool,
+    /// `--restore`: rebind the resumed session's interrupted workers before the user takes control.
+    pub restore: bool,
     /// Command-line flag overrides, layered on top of the config files every time the config is reloaded.
     pub overlay: toml::Table,
     /// Explicit launch notices for the transcript.
@@ -61,6 +68,10 @@ pub struct Options {
     pub launch: crate::agent::modes::Launch,
     /// `--add-dir`: extra workspace roots added to every agent in this process.
     pub add_dirs: Vec<std::path::PathBuf>,
+    /// `--image`: explicit image files attached to the print turn; empty for text-only turns.
+    pub images: Vec<std::path::PathBuf>,
+    /// `--image -`: image bytes read from stdin for the print turn; the format is detected from magic bytes.
+    pub stdin_image: Option<Vec<u8>>,
     /// `--plan`, `--prewalk`, and the other mode flags; `drive` applies the startup arm to the first agent.
     pub mode_flags: crate::cli::mode_flags::ModeFlags,
 }
@@ -86,7 +97,7 @@ pub fn run_interactive(layout: Layout, config: Config, options: Options) -> Resu
     for notice in &options.notices {
         shell.transcript.notice("Learning", notice);
     }
-    let outcome = drive(&mut app, &mut shell, options.session);
+    let outcome = drive(&mut app, &mut shell, options.session, options.restore);
     crate::app::commands::maintenance::stop_relay();
     let resume = shell.finish();
     #[cfg(unix)]
@@ -151,6 +162,11 @@ pub fn run_print(
         options.add_dirs,
         options.mode_flags,
     )?;
+    let image_count = options.images.len() + usize::from(options.stdin_image.is_some());
+    if image_count > 0 {
+        let backend = crate::agent::make_backend(&app.config)?;
+        print_attachments::ensure_image_input(backend.accepts_image_input(), image_count)?;
+    }
     // Print runs schedule no detached improvement workers: a one-shot command must
     // not leave processes behind that compete for local compute after it exits.
     let session = match options.session {
@@ -177,7 +193,25 @@ pub fn run_print(
     }
     ui.check_output()?;
     let completed_before = agent.metrics().turns_completed;
-    let result = agent.turn(options.prompt.trim(), &mut ui);
+    let result = if image_count == 0 {
+        agent.turn(options.prompt.trim(), &mut ui)
+    } else {
+        match print_attachments::prepare_turn(
+            &app.layout.project_root,
+            options.prompt.trim(),
+            &options.images,
+            options.stdin_image.as_deref(),
+            &app.interrupt,
+        ) {
+            Ok(turn) => {
+                for warning in &turn.warnings {
+                    ui.notice(warning);
+                }
+                agent.turn_prepared_preserving_interrupt(&turn.text, turn.message, &mut ui)
+            }
+            Err(error) => Err(error),
+        }
+    };
     let completed = agent.metrics().turns_completed > completed_before;
     ui.set_completed(completed);
     // A one-shot run has no idle loop: give the selected memory one bounded pass to retain this

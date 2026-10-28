@@ -20,7 +20,7 @@ and context-window override so the old route cannot mask the new choice.
 
 `retry.fallback_on` chooses which failures move a request to its chain: `"any"` (default) is throttling, quota, transient and authentication failures; `"usage-limit"` is throttling and quota exhaustion only; `"except-usage-limit"` is transient and authentication failures only. Payload, context-overflow and fatal errors never fall back.
 
-The main session returns to its primary model once the fallback's cooldown (the server's retry-after, else 5 minutes) elapses. Delegated workers consult the chain for their role after their configured routes. A worker moves to a fallback model only when its provider failed before it did any work, and is never restarted partway through a job; it does not return to the primary because each worker is a single job. A worker pinned to a named model profile is not substituted.
+The main session returns to its primary model once the fallback's cooldown (the server's retry-after, else 5 minutes) elapses, when `retry.fallback_revert` is `cooldown-expiry` (the default). With `never`, it stays on the fallback until you switch models with `/model`. A request already in flight is never switched; the return happens at the next request boundary, and both the fallback's first reply and the return to the primary are announced. Delegated workers consult the chain for their role after their configured routes. A worker moves to a fallback model only when its provider failed before it did any work, and is never restarted partway through a job; it does not return to the primary because each worker is a single job. A worker pinned to a named model profile is not substituted.
 
 Example:
 

@@ -78,11 +78,13 @@ fn rule_ui_publishes_assistant_prose_but_only_the_reasoning_phase() {
     }
     let mut observer = Observer::default();
     let shared = std::cell::RefCell::new(&mut observer as &mut dyn Approver);
+    let registry = Registry::new();
     let mut ui = RuleUi {
         observer: &shared,
         steps: 3,
         stream: None,
         stream_error: None,
+        registry: &registry,
     };
     ui.reasoning_delta("private reasoning must not enter the worker preview");
     ui.text_delta("The implementation is ready.");
@@ -613,7 +615,7 @@ fn scripted_worker(
         ) -> Result<(), approval::Denial> {
             Ok(())
         }
-        fn tool_started(&mut self, name: &str, _: &Registry) {
+        fn tool_started(&mut self, _call_id: &str, name: &str, _: &Registry) {
             self.0.push(name.into());
         }
     }
@@ -997,7 +999,7 @@ fn coordinated_worker(boundary: CoordinationBoundary) {
                 Vec::new()
             }
         }
-        fn tool_started(&mut self, name: &str, _: &Registry) {
+        fn tool_started(&mut self, _call_id: &str, name: &str, _: &Registry) {
             self.started.push(name.into());
         }
     }
@@ -1179,4 +1181,189 @@ fn coordination_cancels_streaming_inference_preserving_mail_usage_and_tools() {
 #[test]
 fn coordination_revalidates_prepared_requests_before_dispatch() {
     coordinated_worker(CoordinationBoundary::Prepared);
+}
+
+#[test]
+fn a_worker_refuses_a_failed_read_retry_but_can_read_a_corrected_path() {
+    let scripts = vec![
+        scripted_reply("", Some(("read", json!({"path":"missing.txt"})))),
+        scripted_reply("", Some(("read", json!({"path":"missing.txt"})))),
+        scripted_reply("", Some(("read", json!({"path":"source-0.txt"})))),
+        scripted_reply(
+            "Inspected the existing source file; the other path does not exist.",
+            None,
+        ),
+    ];
+    let (outcome, requests, _, started) = scripted_worker(scripts, 0, vec![]);
+    assert_eq!(outcome.status.phase, crate::runtime::Phase::Completed);
+    assert_eq!(requests.len(), 4);
+    assert_eq!(
+        started,
+        ["read", "read"],
+        "the repeated failed read must not reach execution"
+    );
+}
+
+#[test]
+fn queued_settings_switch_only_the_next_worker_request() {
+    use crate::agent::workers::live_tasks::control::WorkerSettings;
+
+    struct Lookup;
+    impl Tool for Lookup {
+        fn name(&self) -> &str {
+            "fixture_lookup"
+        }
+        fn schema(&self) -> Value {
+            json!({"type":"function","function":{"name":"fixture_lookup","parameters":{"type":"object","properties":{}}}})
+        }
+        fn needs_approval(&self, _: &Value) -> bool {
+            false
+        }
+        fn call(&self, _: &ToolContext, _: &Value) -> ToolOutput {
+            ToolOutput {
+                text: "observed source evidence".into(),
+                is_error: false,
+                execution: Default::default(),
+                data: None,
+            }
+        }
+    }
+
+    // Queues one model switch right after the first tool runs; the swap happens at the next request boundary.
+    #[derive(Default)]
+    struct Queued {
+        pending: Option<WorkerSettings>,
+        applied: Vec<WorkerSettings>,
+    }
+    impl Approver for Queued {
+        fn authorize(
+            &mut self,
+            _: &llm::ToolCall,
+            _: &str,
+            _: bool,
+        ) -> Result<(), approval::Denial> {
+            Ok(())
+        }
+        fn tool_started(&mut self, _call_id: &str, name: &str, _: &Registry) {
+            if name == "fixture_lookup" && self.pending.is_none() && self.applied.is_empty() {
+                self.pending = Some(WorkerSettings {
+                    model: Some("@small".into()),
+                    thinking: None,
+                });
+            }
+        }
+        fn take_worker_settings(&mut self) -> Option<WorkerSettings> {
+            self.pending.take()
+        }
+        fn worker_settings_applied(
+            &mut self,
+            settings: &WorkerSettings,
+            _resolved: &crate::config::types::Config,
+        ) {
+            self.applied.push(settings.clone());
+        }
+        fn worker_settings_failed(&mut self, reason: &str) {
+            panic!("valid worker model switch was rejected: {reason}");
+        }
+    }
+
+    let server = llm::fake::serve(vec![
+        scripted_reply("", Some(("fixture_lookup", json!({})))),
+        scripted_reply("done", None),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let base_url = format!("{}/v1", server.url);
+    let mut config = Config {
+        model: "default-model".into(),
+        ..Config::default()
+    };
+    config.compaction.enabled = false;
+    config.codebase.enabled = false;
+    config.memory.autolearn = false;
+    config.endpoint = Some(crate::config::types::EndpointConfig {
+        headers: None,
+        base_url: base_url.clone(),
+        api_key_env: None,
+        allow_insecure: false,
+        protocol: None,
+        account_id: None,
+    });
+    let mut second = config.selection();
+    second.model = "second-model".into();
+    config.model_roles.insert("small".into(), second);
+    let workspace = Workspace::new(dir.path()).unwrap();
+    let harness = Harness {
+        tools: vec!["fixture_lookup".into()],
+        ..Harness::default()
+    };
+    let mut ext = Registry::new();
+    ext.register(Arc::new(Lookup));
+    let interrupt = Arc::new(AtomicBool::new(false));
+    let env = Env {
+        config: &config,
+        workspace: &workspace,
+        ext: &ext,
+        layout: None,
+        harness: &harness,
+        interrupt: &interrupt,
+        usage: None,
+        context_cap: None,
+        memory: None,
+        agents_messages: &[],
+        plan_mode: false,
+    };
+    let parsed = subagents::parse(
+        &json!({"agent":"worker","task":"Inspect source","solution_space":"fixtures","max_steps":2}),
+        &config,
+    )
+    .unwrap();
+    let children = ChildBackends::new(env, None).unwrap();
+    let mut backend = Backend::new(
+        llm::provider::ProviderKind::Endpoint {
+            base_url,
+            model: "default-model".into(),
+            api_key: None,
+        },
+        std::path::PathBuf::new(),
+        5,
+    );
+    backend
+        .bind_session(&config, &mut children.journal.borrow_mut().session)
+        .unwrap();
+    let mut approver = Queued::default();
+    let outcome = run_inner(
+        env,
+        &parsed.jobs[0],
+        &mut backend,
+        None,
+        &mut approver,
+        &mut crate::agent::safety::rules::State::default(),
+        &children,
+    );
+
+    assert_eq!(outcome.status.phase, crate::runtime::Phase::Completed);
+    let models: Vec<String> = server
+        .requests()
+        .iter()
+        .map(|raw| {
+            llm::fake::body(raw)["model"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(
+        models,
+        ["default-model", "second-model"],
+        "actual worker history: {:?}",
+        outcome
+            .conversation
+            .as_ref()
+            .map(|conversation| &conversation.messages)
+    );
+    assert_eq!(approver.applied.len(), 1);
+    assert_eq!(
+        config.model, "default-model",
+        "the launched config stays unchanged"
+    );
 }

@@ -12,7 +12,7 @@ use crate::agent::{
     safety::guard::{LengthAction, clip_evidence},
     summarize,
     window::output_schema,
-    workers::subagents::{Approver, Env, Job, Outcome, Status, toolset},
+    workers::subagents::{Approver, ChildConversation, Env, Job, Outcome, Status, toolset},
     workflow::reasoning,
 };
 use crate::{
@@ -26,6 +26,7 @@ use std::{path::Path, sync::atomic::Ordering};
 
 struct RuleUi<'a, 'b, 'c> {
     observer: &'a std::cell::RefCell<&'b mut (dyn Approver + 'c)>,
+    registry: &'a crate::tools::integrations::ext::Registry,
     steps: u32,
     stream: Option<std::sync::Arc<crate::agent::workers::child_transcript::ChildTranscript>>,
     stream_error: Option<String>,
@@ -63,6 +64,22 @@ impl crate::agent::Ui for RuleUi<'_, '_, '_> {
             format!("calling {name}")
         };
         self.observer.borrow_mut().progress(self.steps, &phase, "");
+    }
+    // Parallel groups report each call as it starts and as its own result completes; the
+    // approver and the live transcript observe the same correlated pair per call.
+    fn tool_call_with_args(&mut self, call_id: &str, name: &str, _summary: &str, _args: &Value) {
+        self.observer
+            .borrow_mut()
+            .tool_started(call_id, name, self.registry);
+        if let Some(stream) = &self.stream {
+            stream.tool_started(call_id, name);
+        }
+    }
+    fn tool_result_with_id(&mut self, call_id: &str, _name: &str, _output: &ToolOutput) {
+        self.observer.borrow_mut().tool_finished(call_id);
+        if let Some(stream) = &self.stream {
+            stream.tool_finished(call_id);
+        }
     }
     fn notice(&mut self, message: &str) {
         self.observer.borrow_mut().notice(message);
@@ -730,6 +747,7 @@ fn child_role_chat(
                     steps: *steps,
                     stream: None,
                     stream_error: None,
+                    registry: env.ext,
                 },
                 &mut |_| {
                     if env.interrupt.load(Ordering::SeqCst)
@@ -1540,6 +1558,7 @@ fn compact_child(
         steps: *steps,
         stream: None,
         stream_error: None,
+        registry: env.ext,
     };
     let options = crate::config::compaction::CompactionOptions {
         reason,
@@ -1955,6 +1974,9 @@ fn run_inner(
     // After a failed compaction, retry only once the request grew by a real amount or must make
     // room: resetting the failure every tool step re-ran the whole method chain each step.
     let mut compaction_retry_floor: Option<u64> = None;
+    // Settings the current backend was bound with; `None` means the launch config.
+    let mut active_settings: Option<crate::agent::workers::live_tasks::control::WorkerSettings> =
+        None;
     let mut inspections = crate::agent::workflow::efficiency::Inspections::default();
     let driven = engine.drive(|engine| {
             if budget != 0 && steps >= budget { return Ok(crate::agent::run::engine::Tick::Exhausted); }
@@ -2056,6 +2078,20 @@ fn run_inner(
         let research_step = !summary_step && engine.research_required();
         if !summary_step && let Some(note) = engine.research_prompt() {
             messages.push(note);
+        }
+        // Queued owner settings apply here, at a request boundary, to this worker's backend only.
+        if let Some(settings) = approver.take_worker_settings() {
+            match swap_worker_backend(env, children, backend, approver, active_settings.as_ref(), &settings) {
+                Ok(resolved) => {
+                    active_settings = Some(settings.clone());
+                    approver.worker_settings_applied(&settings, &resolved);
+                }
+                Err(error) => {
+                    let reason = format!("{error:#}");
+                    approver.notice(&format!("worker settings not applied: {reason}"));
+                    approver.worker_settings_failed(&reason);
+                }
+            }
         }
         // Same advisory cap as the parent request tail.
         crate::agent::run::guidance::curate(&mut messages, &mut emissions);
@@ -2283,6 +2319,7 @@ fn run_inner(
             steps,
             stream: children.transcript.clone(),
             stream_error: None,
+            registry: env.ext,
         };
         let mut stream_ui = crate::agent::ui::state_ui::StateUi::with_registry(
             &mut rule_ui, children.journal.borrow().session.runtime(), None, env.ext.clone()
@@ -2760,6 +2797,7 @@ fn run_inner(
                         retryable_provider: false,
                         model_route: None,
                         inspections: Default::default(),
+                        conversation: None,
                     }));
                 }
                 Err(why) if schema_retries < env.config.task.max_schema_retries => {
@@ -2949,11 +2987,9 @@ fn run_inner(
                     })
                     .count();
                 if count > 0 {
-                    // Parallel reads skip `call_tool`; report them so the parent's agent tree
-                    // counts and names them like any other call.
-                    for batched in &reply.tool_calls[index..index + count] {
-                        approver.tool_started(&batched.name, env.ext);
-                    }
+                    // Parallel reads skip `call_tool`; RuleUi reports each call's start and
+                    // completion as parallel_tools emits them, so the parent's agent tree counts
+                    // and names them like any other call.
                     let observer = std::cell::RefCell::new(&mut *approver);
                     parallel = crate::agent::parallel_tools(
                         env.workspace,
@@ -2964,15 +3000,14 @@ fn run_inner(
                         &mut RuleUi {
                             observer: &observer,
                             steps,
-                            stream: None,
+                            stream: children.transcript.clone(),
                             stream_error: None,
+                            registry: env.ext,
                         },
                         &mut round_messages,
+                        None,
                     )
                     .into();
-                    for _ in 0..count {
-                        approver.tool_finished();
-                    }
                 }
             }
             let rejection = engine.rejection_at(env.workspace, call);
@@ -2988,7 +3023,7 @@ fn run_inner(
                     data: None,
                     text: rejection.unwrap(),
                     is_error: true,
-                },
+                }.with_status(tools::ToolStatus::Blocked).with_effects(tools::surface::outcome::Effects::None),
                 None => {
                     let callback_gate = std::sync::Mutex::new(crate::agent::safety::rules::CallbackGate::new(
                         crate::agent::safety::rules::CallbackRules {
@@ -2999,7 +3034,11 @@ fn run_inner(
                             max_regenerations: env.config.portable_rules.max_regenerations,
                         },
                     ));
-                    call_tool(
+                    let live = children.transcript.clone();
+                    if let Some(stream) = &live {
+                        stream.tool_started(&call.id, &call.name);
+                    }
+                    let output = call_tool(
                         env,
                         job,
                         &schemas,
@@ -3016,7 +3055,11 @@ fn run_inner(
                             capture: false,
                         }),
                         Some(&callback_gate),
-                    )
+                    );
+                    if let Some(stream) = &live {
+                        stream.tool_finished(&call.id);
+                    }
+                    output
                 }
             };
             if !blocked && !output.is_error {
@@ -3107,11 +3150,13 @@ fn run_inner(
             if let Some(image) = image {
                 message["dial_images"] = json!([image]);
             }
-            if call.name == "read"
-                && !output.is_error
-                && let Some(path) = call.arguments["path"]
-                    .as_str()
-                    .filter(|path| llm::images::is_image(Path::new(path)))
+            let attach = match call.name.as_str() {
+                "read" => call.arguments["path"].as_str(),
+                crate::tools::net::image_gen::TOOL => call.arguments["output"].as_str(),
+                _ => None,
+            };
+            if !output.is_error
+                && let Some(path) = attach.filter(|path| llm::images::is_image(Path::new(path)))
             {
                 let attachment = env
                     .workspace
@@ -3322,9 +3367,68 @@ fn run_inner(
         }
     };
     outcome.inspections = inspections;
+    // Moved out once: every finish path, including provider and budget exhaustion, keeps its history.
+    outcome.conversation = Some(ChildConversation {
+        messages,
+        tools: names,
+    });
     outcome
 }
 
+/// Rebuilds this worker's backend for queued settings. Every fallible step (build, bind, durable record) runs
+/// before the swap; only then is the previous backend released. A failure leaves the previous backend active.
+fn swap_worker_backend(
+    env: Env,
+    children: &ChildBackends,
+    backend: &mut Backend,
+    approver: &mut dyn Approver,
+    active: Option<&crate::agent::workers::live_tasks::control::WorkerSettings>,
+    settings: &crate::agent::workers::live_tasks::control::WorkerSettings,
+) -> Result<crate::config::types::Config> {
+    let next = crate::agent::workers::live_tasks::control::apply_settings(env.config, settings)?;
+    let mut fresh = crate::agent::make_backend(&next)?
+        .with_cache_namespace(&children.cache_namespace(), &next)?;
+    fresh.set_usage_scope(env.usage.map(|scope| scope.worker()));
+    if let Err(error) = fresh.bind_session(&next, &mut children.journal.borrow_mut().session) {
+        return Err(rebind_active(env, children, backend, active, error));
+    }
+    let recorded = match approver.transcript_sink() {
+        Some(sink) => sink.worker_settings(settings),
+        None => Ok(()),
+    };
+    if let Err(error) = recorded {
+        return Err(rebind_active(env, children, backend, active, error));
+    }
+    let mut previous = std::mem::replace(backend, fresh);
+    previous.release();
+    Ok(next)
+}
+
+/// After a failed swap, rebinds the still-active backend so the shared session matches it again.
+/// Its binding is recomputed from the settings it was last applied with, or the launch config.
+fn rebind_active(
+    env: Env,
+    children: &ChildBackends,
+    backend: &mut Backend,
+    active: Option<&crate::agent::workers::live_tasks::control::WorkerSettings>,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    let restored = match active {
+        Some(settings) => {
+            crate::agent::workers::live_tasks::control::apply_settings(env.config, settings)
+                .and_then(|config| {
+                    backend.bind_session(&config, &mut children.journal.borrow_mut().session)
+                })
+        }
+        None => backend.bind_session(env.config, &mut children.journal.borrow_mut().session),
+    };
+    match restored {
+        Ok(()) => error,
+        Err(restore) => error.context(format!(
+            "the previous backend could not rebind: {restore:#}"
+        )),
+    }
+}
 /// Shared salvage path for exhausted workers and refused final-step tool attempts.
 fn last_written_findings(messages: &[Value]) -> Option<&str> {
     messages
@@ -3472,6 +3576,7 @@ fn capture_child_memory(
             steps: *context.steps,
             stream: None,
             stream_error: None,
+            registry: env.ext,
         },
         &mut |_| {
             context
@@ -4044,9 +4149,11 @@ fn call_tool_inner(
     if env.interrupt.load(Ordering::SeqCst) {
         return crate::agent::interrupted_tool();
     }
-    approver.borrow_mut().tool_started(&call.name, env.ext);
+    approver
+        .borrow_mut()
+        .tool_started(&call.id, &call.name, env.ext);
     if env.interrupt.load(Ordering::SeqCst) {
-        approver.borrow_mut().tool_finished();
+        approver.borrow_mut().tool_finished(&call.id);
         return crate::agent::interrupted_tool();
     }
     let mut output = if let Some(tool) = code_tool {
@@ -4160,12 +4267,15 @@ fn call_tool_inner(
                     if nested.name == "ask" {
                         questions.push(json!({"parent":call.name,"arguments":nested.arguments,"text":output.text,"data":output.data,"is_error":output.is_error}));
                     }
-                    approver.borrow_mut().tool_started(&call.name, env.ext);
+                    approver
+                        .borrow_mut()
+                        .tool_started(&call.id, &call.name, env.ext);
                     output
                 }
             }
         };
         let mut output = crate::tools::exec::execution::with_dispatch(
+            env.ext,
             tool.as_ref(),
             &ToolContext {
                 workspace: env.workspace,
@@ -4382,7 +4492,7 @@ fn call_tool_inner(
         output.is_error = true;
         output.text.push_str("\n[An authorized completed edit preview failed; further callbacks and unstarted batch actions were refused.]");
     }
-    approver.borrow_mut().tool_finished();
+    approver.borrow_mut().tool_finished(&call.id);
     if !approval_denied.get() {
         crate::agent::safety::hooks::post_tool_with(
             &env.config.hooks,

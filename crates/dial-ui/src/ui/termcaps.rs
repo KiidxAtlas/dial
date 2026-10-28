@@ -4,7 +4,7 @@
 //! user variables, progress; see [`Integration`]).
 //! Detection checks the terminal's capabilities; multiplexers (tmux, Zellij, GNU
 //! screen) are accounted for.
-use std::{io::Write, sync::OnceLock};
+use std::sync::OnceLock;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TerminalId {
@@ -369,7 +369,7 @@ pub fn notification_sequence(
 }
 
 /// Raise a notification on the controlling terminal unless `DIAL_NOTIFICATIONS=off|0|false`.
-/// Written between frames, so it never splits a paint.
+/// Serialized through the active terminal owner so it cannot split an asynchronous paint.
 pub fn notify(kind: NotifyKind, title: &str, body: &str, session: &str) {
     let env = |name: &str| std::env::var(name).ok();
     if env("DIAL_NOTIFICATIONS")
@@ -378,9 +378,7 @@ pub fn notify(kind: NotifyKind, title: &str, body: &str, session: &str) {
         return;
     }
     let sequence = notification_sequence(&env, current(), kind, title, body, session);
-    let mut stdout = std::io::stdout().lock();
-    let _ = stdout.write_all(sequence.as_bytes());
-    let _ = stdout.flush();
+    let _ = super::term::write_control(sequence.into_bytes());
 }
 
 /// The notification for a finished turn, if any.

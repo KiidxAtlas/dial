@@ -24,11 +24,13 @@ pub(crate) fn chat(
     let config = config.for_coding();
     let notices: Vec<String> = Vec::new();
 
+    // `--restore` picks the same session as `--continue`; the restore itself runs in the app.
+    let continue_requested = cli.continue_session || cli.restore;
     let resume_prefix = cli.resume.clone();
     let flag_session = cli.session_flags.resolve(
         &layout.project_root,
         dial::cli::session_flags::Context {
-            continue_or_resume: cli.continue_session || resume_prefix.is_some(),
+            continue_or_resume: continue_requested || resume_prefix.is_some(),
             no_session: cli.no_session,
             protocol_mode: false,
         },
@@ -37,7 +39,7 @@ pub(crate) fn chat(
         Some(imported)
     } else if cli.no_session {
         Some(Session::ephemeral())
-    } else if cli.continue_session || resume_prefix.is_some() {
+    } else if continue_requested || resume_prefix.is_some() {
         let wanted = resume_prefix.unwrap_or_default();
         let catalogue = Session::list_by_activity(&layout, usize::MAX)?;
         let found = if wanted.is_empty() {
@@ -64,7 +66,15 @@ pub(crate) fn chat(
             matches.first().map(|s| s.path.clone())
         };
         match found {
-            Some(path) => Some(Session::open(&path)?),
+            Some(path) => match Session::open_or_fork(&layout, &path)? {
+                dial::storage::session::Resumed::Owned(session) => Some(session),
+                dial::storage::session::Resumed::Forked { source_id, session } => {
+                    eprintln!(
+                        "dial: session {source_id} is open in another process; resumed as a fork of it"
+                    );
+                    Some(session)
+                }
+            },
             None if wanted.is_empty() => None,
             None => bail!(
                 "no session in this project starts with {wanted:?}; run `dial sessions` to list ids, or `dial -c` to continue the latest"
@@ -75,7 +85,8 @@ pub(crate) fn chat(
     };
 
     let mut text = cli.prompt.join(" ");
-    if !tty {
+    let (images, stdin_image) = stdin_image_input(&cli.images, tty)?;
+    if !tty && stdin_image.is_none() {
         let mut piped = String::new();
         std::io::stdin().read_to_string(&mut piped)?;
         if !piped.trim().is_empty() {
@@ -91,16 +102,27 @@ pub(crate) fn chat(
         bail!("--print needs a prompt (argument or stdin)");
     }
     let interactive = interactive_capable && !cli.print && cli.output_format == OutputFormat::Text;
+    if cli.restore && !interactive {
+        bail!("--restore needs an interactive session; use it without --print");
+    }
+    if !cli.images.is_empty() && !cli.print {
+        bail!(
+            "--image is only available in print mode; interactive sessions attach images with @path"
+        );
+    }
     let options = Options {
         session,
         prompt: text,
         interactive,
+        restore: cli.restore,
         overlay,
         notices,
         print_thoughts: cli.print_thoughts,
         launch,
         add_dirs,
         mode_flags: mode,
+        images,
+        stdin_image,
     };
     if interactive {
         if !cli.allow.is_empty() {
@@ -127,4 +149,33 @@ fn longest_backtick_run(text: &str) -> usize {
         }
     }
     longest
+}
+
+/// `--image -` takes the image bytes from stdin, so stdin cannot also carry piped prompt text.
+fn stdin_image_input(
+    images: &[std::path::PathBuf],
+    tty: bool,
+) -> Result<(Vec<std::path::PathBuf>, Option<Vec<u8>>)> {
+    let dashes = images.iter().filter(|path| path.as_os_str() == "-").count();
+    if dashes == 0 {
+        return Ok((images.to_vec(), None));
+    }
+    if dashes > 1 {
+        bail!("--image - may be given once; stdin carries a single image");
+    }
+    if tty {
+        bail!("--image - reads the image bytes from stdin; pipe the image in");
+    }
+    let limit = dial::llm::images::MAX_IMAGE_SOURCE_BYTES;
+    let mut bytes = Vec::new();
+    std::io::stdin().take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        bail!("stdin image exceeds 64 MiB");
+    }
+    let files = images
+        .iter()
+        .filter(|path| path.as_os_str() != "-")
+        .cloned()
+        .collect();
+    Ok((files, Some(bytes)))
 }

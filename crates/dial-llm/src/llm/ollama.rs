@@ -319,7 +319,7 @@ fn request(
             body["think"] = if effort == ReasoningEffort::None {
                 json!(false)
             } else {
-                json!(effort.as_str())
+                json!(profile.reasoning_effort_wire(effort))
             };
         } else if let Some(thinking) = profile.thinking {
             body["think"] = json!(thinking);

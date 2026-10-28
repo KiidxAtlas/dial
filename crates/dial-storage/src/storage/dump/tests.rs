@@ -68,3 +68,45 @@ fn refuses_out_dir_inside_sessions() {
     assert!(err.to_string().contains("refusing"));
     let _ = root;
 }
+
+fn worker_fixture(layout: &Layout, parent: &str, body: &str) {
+    let dir = subagent::transcript_dir(layout, parent);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("task-1-1700000000000.jsonl"),
+        format!(
+            "{{\"type\":\"header\",\"id\":\"task-1\"}}\n{{\"type\":\"message\",\"message\":{{\"role\":\"user\",\"content\":\"{body}\"}}}}\n"
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
+fn all_archive_includes_worker_transcripts_verbatim() {
+    let (root, layout, session) = setup();
+    worker_fixture(&layout, "sess-1", "WORKER_RAW_MARKER");
+    let report = dump_session(&layout, &session, DumpKind::All, &root.path().join("out")).unwrap();
+    assert_eq!(report.subagents, 1);
+    assert!(
+        report
+            .entries
+            .contains(&"subagents/task-1-1700000000000.jsonl".to_string())
+    );
+    let body = read_member(&report.archive, "subagents/task-1-1700000000000.jsonl").unwrap();
+    assert!(body.contains("WORKER_RAW_MARKER"));
+}
+
+#[test]
+fn anon_archive_anonymizes_worker_transcripts() {
+    let (root, layout, session) = setup();
+    worker_fixture(
+        &layout,
+        "sess-1",
+        "WORKER_RAW_MARKER token ghp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    );
+    let report = dump_session(&layout, &session, DumpKind::Anon, &root.path().join("out")).unwrap();
+    assert_eq!(report.subagents, 1);
+    let body = read_member(&report.archive, "subagents/task-1-1700000000000.jsonl").unwrap();
+    assert!(!body.contains("WORKER_RAW_MARKER"));
+    assert!(!body.contains("ghp_bbbb"));
+}

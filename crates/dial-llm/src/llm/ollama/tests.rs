@@ -235,3 +235,29 @@ fn native_stream_without_done_fails_and_releases_no_partial_tool_call() {
         "{error:#}"
     );
 }
+
+#[test]
+fn reasoning_effort_wire_reaches_ollama_think() {
+    use crate::llm::profiles::{ModelCapabilities, ReasoningApi, ReasoningEffort};
+    use std::collections::BTreeMap;
+    let mut profile = ModelProfile {
+        provider: "ollama".into(),
+        model: "m".into(),
+        reasoning_effort: Some(ReasoningEffort::High),
+        capabilities: ModelCapabilities {
+            reasoning: ReasoningApi::OllamaThink,
+            reasoning_efforts: vec![ReasoningEffort::None, ReasoningEffort::High],
+            reasoning_effort_wire: BTreeMap::from([(ReasoningEffort::High, "medium".to_string())]),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let body = request(&ENDPOINT, &chat(), Some(&profile), None, "main").unwrap();
+    assert_eq!(body["think"], "medium");
+    profile.capabilities.reasoning_effort_wire.clear();
+    let body = request(&ENDPOINT, &chat(), Some(&profile), None, "main").unwrap();
+    assert_eq!(body["think"], "high");
+    profile.reasoning_effort = Some(ReasoningEffort::None);
+    let body = request(&ENDPOINT, &chat(), Some(&profile), None, "main").unwrap();
+    assert_eq!(body["think"], false);
+}

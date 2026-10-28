@@ -35,6 +35,8 @@ pub enum ApiProtocol {
     DevinAgent,
     /// Cursor's native agent protocol: Connect streaming plus a BidiAppend uplink (OAuth).
     Cursor,
+    /// GitLab Duo Agent Platform: workflow sessions over WebSocket (OAuth or GITLAB_TOKEN).
+    GitlabDuoAgent,
 }
 impl ApiProtocol {
     pub fn as_str(self) -> &'static str {
@@ -55,6 +57,7 @@ impl ApiProtocol {
             Self::FactoryDroid => "factory-droid",
             Self::DevinAgent => "devin-agent",
             Self::Cursor => "cursor",
+            Self::GitlabDuoAgent => "gitlab-duo-agent",
         }
     }
     pub fn builtin(provider: &str) -> Self {
@@ -590,6 +593,9 @@ pub struct UiConfig {
     /// Short, purposeful animation: the start-up sweep across the wordmark and the reveal when a
     /// panel opens. Off, or on a terminal without truecolor, ASCII glyphs or `NO_COLOR`, nothing moves.
     pub motion: bool,
+    /// Reveal a streaming answer gradually, a share of the pending text per frame, not in network
+    /// bursts. Finished, tool, and aborted output always appears whole at once.
+    pub smooth_reveal: bool,
     pub show_tools: bool,
     pub session_rail: bool,
     /// Pinned block above the composer listing running workers.
@@ -648,6 +654,7 @@ impl Default for UiConfig {
             welcome: true,
             tips: true,
             motion: true,
+            smooth_reveal: false,
             show_tools: true,
             session_rail: false,
             pinned_workers: PinnedWorkers::Collapsed,

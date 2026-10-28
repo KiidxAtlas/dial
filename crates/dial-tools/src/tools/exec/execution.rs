@@ -57,7 +57,20 @@ pub fn before_start() -> ToolOutput {
         .with_effects(Effects::None)
 }
 
+/// Hands a foreground job to the managed `bg` owner, which keeps it running after its controller
+/// returns.
+pub fn adopt_into(
+    registry: &Registry,
+    job: crate::tools::exec::background::AdoptedJob,
+) -> Result<String, String> {
+    registry
+        .get("bg")
+        .ok_or_else(|| "managed background tool is unavailable".to_string())?
+        .adopt_job(job)
+}
+
 pub fn with_dispatch(
+    registry: &Registry,
     tool: &dyn crate::tools::integrations::ext::Tool,
     context: &ToolContext<'_>,
     args: &Value,
@@ -68,17 +81,24 @@ pub fn with_dispatch(
     run(cancel, || {
         let mut uncertain = false;
         let mut changes = Vec::new();
-        let mut output = tool.call_with_dispatch(context, args, emit, cancel, &mut |request| {
-            if uncertain {
-                return ToolOutput::err("callback refused after uncertain effects")
-                    .with_status(ToolStatus::Skipped)
-                    .with_effects(Effects::None);
-            }
-            let output = dispatch(request);
-            changes.extend(output.execution.changed_paths.iter().cloned());
-            uncertain |= crate::tools::surface::outcome::effects(&output) == Effects::Unknown;
-            output
-        });
+        let mut output = tool.call_with_dispatch(
+            context,
+            args,
+            emit,
+            cancel,
+            &|job| adopt_into(registry, job),
+            &mut |request| {
+                if uncertain {
+                    return ToolOutput::err("callback refused after uncertain effects")
+                        .with_status(ToolStatus::Skipped)
+                        .with_effects(Effects::None);
+                }
+                let output = dispatch(request);
+                changes.extend(output.execution.changed_paths.iter().cloned());
+                uncertain |= crate::tools::surface::outcome::effects(&output) == Effects::Unknown;
+                output
+            },
+        );
         output.execution.changed_paths.extend(changes);
         output.execution.changed_paths.sort();
         output.execution.changed_paths.dedup();
@@ -205,10 +225,10 @@ fn native_with(
                 })
             };
             let adopt = |job| {
-                registry
-                    .get("bg")
-                    .ok_or_else(|| "managed background tool is unavailable".to_string())?
-                    .adopt_foreground(job)
+                adopt_into(
+                    registry,
+                    crate::tools::exec::background::AdoptedJob::Shell(Box::new(job)),
+                )
             };
             super::shell::bash_tool_streaming_with_adopter(
                 context.workspace,

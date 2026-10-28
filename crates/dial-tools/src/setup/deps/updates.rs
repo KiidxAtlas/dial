@@ -501,9 +501,8 @@ fn brew(
             None,
         );
     }
-    // Ownership was checked on canonical paths; match kegs the same way so a Cellar reached
-    // through a symlink (for example a relocated Homebrew prefix) is still recognised.
-    let keg_root = keg_root.canonicalize()?;
+    // `real` is canonical; `brew --cellar` may return a symlinked prefix (e.g. macOS /var -> /private/var).
+    let keg_root_real = keg_root.canonicalize()?;
     let installed = info["installed"]
         .as_array()
         .context("Homebrew installed version metadata missing")?;
@@ -520,7 +519,7 @@ fn brew(
                 } else {
                     format!("{v}_{revision}")
                 };
-                real.starts_with(keg_root.join(folder))
+                real.starts_with(keg_root_real.join(folder))
             })
         })
         .context("active binary does not match an installed formula keg")?;

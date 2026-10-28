@@ -9,11 +9,16 @@ const REPOSITORY: &str = "KiidxAtlas/dial";
 const SIGNING_KEY: Option<&str> = option_env!("DIAL_RELEASE_PUBLIC_KEY");
 
 fn target() -> Result<&'static str> {
+    // The libc is fixed at compile time: a musl build must fetch the musl archive, never the glibc one.
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
         ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
+        ("linux", "x86_64") if cfg!(target_env = "musl") => Ok("x86_64-unknown-linux-musl"),
         ("linux", "x86_64") => Ok("x86_64-unknown-linux-gnu"),
+        ("linux", "aarch64") if cfg!(target_env = "musl") => Ok("aarch64-unknown-linux-musl"),
+        ("linux", "aarch64") => Ok("aarch64-unknown-linux-gnu"),
         ("windows", "x86_64") => Ok("x86_64-pc-windows-msvc"),
+        ("windows", "aarch64") => Ok("aarch64-pc-windows-msvc"),
         _ => bail!(
             "automatic updates are not available for this platform; see https://github.com/{REPOSITORY}/releases"
         ),

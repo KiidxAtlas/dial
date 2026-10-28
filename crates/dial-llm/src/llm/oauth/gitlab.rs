@@ -14,6 +14,24 @@ pub const FLOW: Flow = Flow {
     refresh: Some(refresh),
     access,
 };
+/// OAuth flow for `gitlab-duo-agent`: same GitLab sign-in as `gitlab-duo`, but the
+/// route targets GitLab's REST/WebSocket host rather than the Anthropic proxy.
+pub const AGENT_FLOW: Flow = Flow {
+    id: "gitlab-duo-agent",
+    name: "GitLab Duo Agent",
+    base_url: "https://gitlab.com",
+    protocol: ApiProtocol::GitlabDuoAgent,
+    needs_terminal: false,
+    subscription: true,
+    login,
+    refresh: Some(refresh),
+    access: agent_access,
+};
+fn agent_access(c: &Credentials) -> Result<Access> {
+    let mut a = super::bearer(c)?;
+    a.base_url = Some("https://gitlab.com".into());
+    Ok(a)
+}
 /// Split an `http://host[:port]/path` redirect into the loopback listener's bind parts.
 fn callback_target(redirect: &str) -> Result<(String, u16, String)> {
     let rest = redirect

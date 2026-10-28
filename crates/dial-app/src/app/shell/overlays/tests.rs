@@ -86,3 +86,35 @@ fn busy_settings_command_can_be_reverted_before_agent_adoption() {
     }
     assert!(shell.pending_config.is_none());
 }
+
+#[test]
+fn busy_drafter_command_returns_on_lock_contention_and_can_be_retried() {
+    let (_home, _project, app, mut shell) = shell();
+    let original = app.config.experimental.turn_optimizer;
+    let command = if original {
+        "/drafter off"
+    } else {
+        "/drafter on"
+    };
+    let path = app.layout.config_files()[1].clone();
+    let lock = crate::config::settings_store::locked(&path).unwrap();
+    let started = std::time::Instant::now();
+    assert!(!shell.route_busy_command(&app, command.into()));
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    assert!(shell.pending_config.is_none());
+    assert_eq!(app.reload().unwrap().experimental.turn_optimizer, original);
+    drop(lock);
+    assert!(!shell.route_busy_command(&app, command.into()));
+    assert_eq!(
+        shell.settings_config(&app).experimental.turn_optimizer,
+        !original
+    );
+    assert_eq!(app.reload().unwrap().experimental.turn_optimizer, !original);
+    assert!(!shell.route_busy_command(&app, "/drafter".into()));
+    assert!(
+        shell.pending_config.is_none(),
+        "toggle uses the latest saved state"
+    );
+    assert!(shell.startup.is_none());
+    assert!(shell.deferred.is_empty());
+}

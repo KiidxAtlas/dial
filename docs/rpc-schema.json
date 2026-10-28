@@ -681,6 +681,268 @@
         {
           "type": "object",
           "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "set_model"},
+            "params": {
+              "type": "object",
+              "properties": {
+                "provider": {"type": "string", "minLength": 1},
+                "model_id": {"type": "string", "minLength": 1}
+              },
+              "additionalProperties": false,
+              "required": ["provider", "model_id"]
+            }
+          },
+          "required": ["method", "params"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "set_thinking"},
+            "params": {
+              "type": "object",
+              "properties": {
+                "level": {"type": "string", "minLength": 1}
+              },
+              "additionalProperties": false,
+              "required": ["level"]
+            }
+          },
+          "required": ["method", "params"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "get_session_stats"},
+            "params": {"type": "object", "properties": {}, "additionalProperties": false}
+          },
+          "required": ["method"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "hello"},
+            "params": {
+              "type": "object",
+              "properties": {"protocol_version": {"type": "integer", "minimum": 1}},
+              "required": ["protocol_version"],
+              "additionalProperties": false
+            }
+          },
+          "required": ["method", "params"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "get_available_commands"},
+            "params": {"type": "object", "properties": {}, "additionalProperties": false}
+          },
+          "required": ["method"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "export"},
+            "params": {
+              "type": "object",
+              "properties": {
+                "format": {"enum": ["html", "markdown"]},
+                "path": {"type": "string", "minLength": 1}
+              },
+              "additionalProperties": false
+            }
+          },
+          "required": ["method"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "set_host_tools"},
+            "params": {
+              "type": "object",
+              "properties": {
+                "tools": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 32,
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "name": {"type": "string", "pattern": "^[a-z0-9_]{1,64}$"},
+                      "description": {"type": "string", "minLength": 1, "maxLength": 1024},
+                      "parameters": {"type": "object"},
+                      "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 600000}
+                    },
+                    "additionalProperties": false,
+                    "required": ["name", "description", "parameters"]
+                  }
+                }
+              },
+              "additionalProperties": false,
+              "required": ["tools"]
+            }
+          },
+          "required": ["method", "params"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "host_tool_result"},
+            "params": {
+              "type": "object",
+              "properties": {
+                "call_id": {"type": "string", "minLength": 1},
+                "output": {"type": "string"},
+                "is_error": {"type": "boolean"}
+              },
+              "additionalProperties": false,
+              "required": ["call_id", "output"]
+            }
+          },
+          "required": ["method", "params"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "set_host_uri_schemes"},
+            "params": {
+              "type": "object",
+              "properties": {
+                "schemes": {
+                  "type": "array",
+                  "maxItems": 16,
+                  "uniqueItems": true,
+                  "items": {"type": "string", "pattern": "^[a-z][a-z0-9+.-]{0,31}$"}
+                }
+              },
+              "additionalProperties": false,
+              "required": ["schemes"]
+            }
+          },
+          "required": ["method", "params"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "host_uri_result"},
+            "params": {
+              "type": "object",
+              "properties": {
+                "call_id": {"type": "string", "minLength": 1},
+                "output": {"type": "string"},
+                "is_error": {"type": "boolean"}
+              },
+              "additionalProperties": false,
+              "required": ["call_id", "output"]
+            }
+          },
+          "required": ["method", "params"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "auth_providers"},
+            "params": {
+              "type": "object",
+              "properties": {},
+              "additionalProperties": false
+            }
+          },
+          "required": ["method"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "login"},
+            "params": {
+              "type": "object",
+              "properties": {
+                "provider": {"type": "string", "minLength": 1}
+              },
+              "additionalProperties": false,
+              "required": ["provider"]
+            }
+          },
+          "required": ["method", "params"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "auth_code"},
+            "params": {
+              "type": "object",
+              "properties": {
+                "prompt_id": {"type": "string", "minLength": 1},
+                "code": {"type": "string"}
+              },
+              "additionalProperties": false,
+              "required": ["prompt_id", "code"]
+            }
+          },
+          "required": ["method", "params"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "auth_cancel"},
+            "params": {
+              "type": "object",
+              "properties": {
+                "provider": {"type": "string", "minLength": 1}
+              },
+              "additionalProperties": false,
+              "required": ["provider"]
+            }
+          },
+          "required": ["method", "params"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "logout"},
+            "params": {
+              "type": "object",
+              "properties": {
+                "provider": {"type": "string", "minLength": 1}
+              },
+              "additionalProperties": false,
+              "required": ["provider"]
+            }
+          },
+          "required": ["method", "params"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
             "id": {
               "$ref": "#/$defs/id"
             },
@@ -744,6 +1006,68 @@
     },
     "event": {
       "oneOf": [
+        {
+          "type": "object",
+          "description": "Asks the host to run a host-declared tool; answer with host_tool_result using the same call_id.",
+          "properties": {
+            "event": {"const": "host_tool_call"},
+            "call_id": {"type": "string"},
+            "tool": {"type": "string"},
+            "arguments": {"type": "object"}
+          },
+          "required": ["event", "call_id", "tool", "arguments"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Asks the host to read a host-served URI scheme; answer with host_uri_result using the same call_id.",
+          "properties": {
+            "event": {"const": "host_uri_request"},
+            "call_id": {"type": "string"},
+            "scheme": {"type": "string"},
+            "operation": {"const": "read"},
+            "url": {"type": "string"}
+          },
+          "required": ["event", "call_id", "scheme", "operation", "url"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Sign-in URL (and device code, when given) to open in a browser. Carries no tokens.",
+          "properties": {
+            "event": {"const": "auth_url"},
+            "provider": {"type": "string"},
+            "url": {"type": "string"},
+            "instructions": {"type": ["string", "null"]}
+          },
+          "required": ["event", "provider", "url", "instructions"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Sign-in progress text for a provider. Carries no tokens.",
+          "properties": {
+            "event": {"const": "auth_progress"},
+            "provider": {"type": "string"},
+            "message": {"type": "string"}
+          },
+          "required": ["event", "provider", "message"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Asks the host for a typed sign-in value; answer with auth_code using the same prompt_id. The answer is never echoed.",
+          "properties": {
+            "event": {"const": "auth_prompt"},
+            "provider": {"type": "string"},
+            "prompt_id": {"type": "string"},
+            "message": {"type": "string"},
+            "placeholder": {"type": ["string", "null"]},
+            "allow_empty": {"type": "boolean"}
+          },
+          "required": ["event", "provider", "prompt_id", "message", "placeholder", "allow_empty"],
+          "additionalProperties": false
+        },
         {
           "type": "object",
           "description": "Observational policy provenance; never a permission grant or approval response.",
@@ -998,6 +1322,9 @@
           "properties": {
             "event": {
               "const": "tool_timing"
+            },
+            "call_id": {
+              "type": "string"
             },
             "name": {
               "type": "string"

@@ -387,9 +387,13 @@ pub struct Agent<'a> {
     local_session: model::local_profile::LocalSession,
     metrics: AgentMetrics,
     usage_scope: llm::usage::Scope,
+    /// Prompt-cache warmer for `cache.warm`; `None` while warming is off.
+    cache_warm: Option<model::cache_warm::CacheWarm>,
     compaction_runtime: compact::compaction_runtime::CompactionRuntime,
     memory_controller: memory::memory_controller::Controller,
     usage_cost_base: f64,
+    /// Warn-threshold crossing for session spend, armed lazily from the first observed total.
+    session_cost_warn: Option<run::turn::cost_warn::Crossing>,
     last_auto_thinking: Option<String>,
     workflow_metrics: std::cell::RefCell<crate::learn::workflow::Metrics>,
     efficiency_metrics: workflow::efficiency::Metrics,
@@ -401,6 +405,7 @@ pub struct Agent<'a> {
     task_packet: workers::task_packet::PacketCache,
     reasoning_recovery: workflow::reasoning::Recovery,
     live_tasks: workers::live_tasks::LiveTasks,
+    side_questions: workers::side_questions::Questions,
     superseded: workflow::evidence::Supersession,
     legacy_memory_migrated: bool,
     /// Live steering the server accepted for the reply in flight; journaled after that reply.

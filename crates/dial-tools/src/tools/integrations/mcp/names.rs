@@ -20,7 +20,7 @@ pub fn sanitize(text: &str) -> String {
 
 /// Hands out unique names. Two tools that sanitise or truncate to the same name get `_2`, `_3`, … so
 /// no remote tool shadows another.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Namer {
     taken: HashSet<String>,
 }

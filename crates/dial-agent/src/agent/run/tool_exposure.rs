@@ -199,8 +199,6 @@ impl<'a> Agent<'a> {
         "lsp",
         "bg",
         "git",
-        "web_fetch",
-        "web_search",
         "mcp_servers",
     ];
 
@@ -268,6 +266,9 @@ impl<'a> Agent<'a> {
     /// every registered integration just because the parent can call it.
     pub(in crate::agent) fn offered_for_children(&self) -> Vec<String> {
         self.offered_with(true)
+            .into_iter()
+            .filter(|name| name != "side_request")
+            .collect()
     }
 
     pub(in crate::agent) fn offered_with(&self, selection_only: bool) -> Vec<String> {
@@ -433,6 +434,16 @@ impl<'a> Agent<'a> {
             names.push("bg".into());
             names.sort();
         }
+        // Side reasoning must be callable while a long command runs, without a discovery
+        // round. Under the compact-tool budget it stays loadable through `tool_load` instead.
+        // Mode/profile restrictions and the minimal-context budget still apply below.
+        if !discovery
+            && catalog.iter().any(|name| name == "side_request")
+            && !names.iter().any(|name| name == "side_request")
+        {
+            names.push("side_request".into());
+            names.sort();
+        }
         // Late additions must obey the same restrictions as discovery and explicit loads.
         // Independent-session coordination belongs to the foreground controller, not its children.
         if selection_only {
@@ -507,6 +518,7 @@ impl<'a> Agent<'a> {
                 "goal" => modes::goal::schema(),
                 "ask" => crate::agent::workflow::questions::schema(),
                 "task" => crate::agent::workers::subagents::schema(self.config),
+                "side_request" => crate::agent::workers::side_questions::schema(),
                 "message" => crate::agent::workers::live_tasks::message_schema(),
                 "peers" => crate::agent::run::coordination::schema(),
                 "solve" => crate::agent::workflow::solve::schema(),

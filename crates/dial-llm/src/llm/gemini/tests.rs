@@ -30,3 +30,45 @@ fn accumulator_streams_wrapped_cca_parts_and_retains_signature_and_execution_id(
         "signed-native-value"
     );
 }
+
+#[test]
+fn reasoning_effort_wire_reaches_gemini_thinking_level_and_none_keeps_zero_budget() {
+    use crate::llm::profiles::{ModelCapabilities, ModelProfile, ReasoningApi, ReasoningEffort};
+    use std::collections::BTreeMap;
+    let chat = Chat {
+        messages: vec![serde_json::json!({"role":"user","content":"hi"})],
+        tools: vec![],
+        temperature: 0.2,
+        max_tokens: 64,
+        seed: None,
+    };
+    let endpoint = Endpoint {
+        url: "https://example.test",
+        auth: None,
+        model: "gemini-3.1-pro",
+        headers: &[],
+    };
+    let mut profile = ModelProfile {
+        provider: "gemini".into(),
+        model: "gemini-3.1-pro".into(),
+        reasoning_effort: Some(ReasoningEffort::High),
+        capabilities: ModelCapabilities {
+            reasoning: ReasoningApi::GeminiLevel,
+            reasoning_efforts: vec![ReasoningEffort::None, ReasoningEffort::High],
+            reasoning_effort_wire: BTreeMap::from([(ReasoningEffort::High, "medium".to_string())]),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let level = |body: &Value| body["generationConfig"]["thinkingConfig"]["thinkingLevel"].clone();
+    let body = request(&endpoint, &chat, Some(&profile), "main").unwrap();
+    assert_eq!(level(&body), "MEDIUM");
+    profile.capabilities.reasoning_effort_wire.clear();
+    let body = request(&endpoint, &chat, Some(&profile), "main").unwrap();
+    assert_eq!(level(&body), "HIGH");
+    profile.reasoning_effort = Some(ReasoningEffort::None);
+    let body = request(&endpoint, &chat, Some(&profile), "main").unwrap();
+    let thinking = &body["generationConfig"]["thinkingConfig"];
+    assert_eq!(thinking["thinkingBudget"], 0);
+    assert!(thinking.get("thinkingLevel").is_none());
+}

@@ -48,6 +48,7 @@ pub(super) fn is_extended(protocol: ApiProtocol) -> bool {
             | ApiProtocol::FactoryDroid
             | ApiProtocol::DevinAgent
             | ApiProtocol::Cursor
+            | ApiProtocol::GitlabDuoAgent
     )
 }
 
@@ -118,6 +119,15 @@ pub(super) fn exchange(
             )
         }
         ApiProtocol::GitlabDuo => super::gitlab_duo::exchange(
+            route,
+            req,
+            timeout_secs,
+            on_text,
+            interrupt,
+            profile,
+            on_event,
+        ),
+        ApiProtocol::GitlabDuoAgent => super::gitlab_duo_agent::exchange(
             route,
             req,
             timeout_secs,

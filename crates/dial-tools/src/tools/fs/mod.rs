@@ -4,6 +4,7 @@ pub mod archive;
 pub(in crate::tools) mod conflicts;
 pub mod documents;
 pub(in crate::tools) mod files;
+pub(in crate::tools) mod media;
 pub mod notebook;
 pub(in crate::tools) mod outline;
 pub(in crate::tools) mod search;

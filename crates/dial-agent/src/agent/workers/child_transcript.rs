@@ -20,17 +20,21 @@ use serde_json::{Value, json};
 
 use crate::config::paths::Layout;
 use crate::storage::redact::redact_value;
+use crate::storage::subagent::safe_component;
 
 /// Upper bound for one record; larger messages are replaced by a marker line.
 pub const MAX_RECORD: usize = 256 * 1024;
 /// Bytes read from the end of a transcript when the viewer loads it.
 pub const TAIL_BYTES: u64 = 2 * 1024 * 1024;
+/// Most in-flight tool calls one job exposes to live views; extra starts are not tracked.
+const MAX_LIVE_TOOLS: usize = 64;
 
 #[derive(Default)]
 struct PendingAssistant {
     revision: u64,
     text: String,
     overflow: bool,
+    tools: Vec<LiveTool>,
 }
 
 impl PendingAssistant {
@@ -65,6 +69,30 @@ pub fn pending_assistant(path: &Path, since: u64) -> Option<(u64, String)> {
     drop(pending);
     redact_value(&mut value);
     Some((revision, value["text"].as_str().unwrap_or("").to_owned()))
+}
+
+/// A tool call of a running job whose result is not yet archived. Live views show it until the
+/// settled tool message is recorded; the archive itself never carries these entries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveTool {
+    pub call_id: String,
+    pub name: String,
+    /// `false` once the tool finished, while its result still waits for the ordered archive write.
+    pub running: bool,
+}
+
+/// Live tool calls of the job at `path`, in start order. `since` works as for [`pending_assistant`].
+pub fn live_tools(path: &Path, since: u64) -> Option<(u64, Vec<LiveTool>)> {
+    let pending = PENDING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(path)?
+        .upgrade()?;
+    let pending = pending.lock().unwrap_or_else(|e| e.into_inner());
+    if pending.revision == since {
+        return None;
+    }
+    Some((pending.revision, pending.tools.clone()))
 }
 /// Append-only writer for one child job.
 pub struct ChildTranscript {
@@ -124,7 +152,18 @@ impl ChildTranscript {
             pending.clear();
             return Ok(());
         }
-        self.write_message(message)
+        self.write_message(message)?;
+        if message["role"] == "tool"
+            && let Some(id) = message["tool_call_id"].as_str()
+        {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            let before = pending.tools.len();
+            pending.tools.retain(|tool| tool.call_id != id);
+            if pending.tools.len() != before {
+                pending.changed();
+            }
+        }
+        Ok(())
     }
 
     fn write_message(&self, message: &Value) -> Result<()> {
@@ -162,6 +201,35 @@ impl ChildTranscript {
         Ok(())
     }
 
+    /// A tool call of this job started. Duplicate starts for one id are ignored.
+    pub fn tool_started(&self, call_id: &str, name: &str) {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if pending.tools.len() >= MAX_LIVE_TOOLS
+            || pending.tools.iter().any(|t| t.call_id == call_id)
+        {
+            return;
+        }
+        pending.tools.push(LiveTool {
+            call_id: call_id.to_owned(),
+            name: name.to_owned(),
+            running: true,
+        });
+        pending.changed();
+    }
+
+    /// A tool call of this job finished; its entry remains until the settled result is recorded.
+    pub fn tool_finished(&self, call_id: &str) {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(tool) = pending
+            .tools
+            .iter_mut()
+            .find(|t| t.running && t.call_id == call_id)
+        {
+            tool.running = false;
+            pending.changed();
+        }
+    }
+
     fn flush_pending(&self) -> Result<()> {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         if !pending.text.is_empty() {
@@ -175,9 +243,24 @@ impl ChildTranscript {
         self.write_line(&json!({"type":"execution_contract", "tools":tools, "model":model}))
     }
 
+    /// Records worker-only settings applied at a request boundary, so resume restores them.
+    pub fn worker_settings(
+        &self,
+        settings: &crate::agent::workers::live_tasks::control::WorkerSettings,
+    ) -> Result<()> {
+        self.write_line(&json!({"type":"worker_settings", "model":settings.model, "thinking":settings.thinking}))
+    }
+
     /// Closes the transcript with its final status.
     pub fn finish(&self, status: Value) -> Result<()> {
         self.flush_pending()?;
+        {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            if !pending.tools.is_empty() {
+                pending.tools.clear();
+                pending.changed();
+            }
+        }
         let mut status = status;
         redact_value(&mut status);
         let mut record = json!({"type": "status"});
@@ -215,10 +298,7 @@ impl Drop for ChildTranscript {
 
 /// Directory holding transcripts for one parent session.
 pub fn transcript_dir(layout: &Layout, parent_session: &str) -> PathBuf {
-    layout
-        .state_dir
-        .join("subagents")
-        .join(safe_component(parent_session))
+    crate::storage::subagent::transcript_dir(layout, parent_session)
 }
 
 /// Header and most recent status of one transcript, read without loading its messages.
@@ -313,24 +393,6 @@ fn read_status(path: &Path) -> Option<Value> {
         .rev()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .find(|record| record["type"] == "status")
-}
-
-fn safe_component(text: &str) -> String {
-    let cleaned: String = text
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if cleaned.is_empty() {
-        "session".to_owned()
-    } else {
-        cleaned
-    }
 }
 
 /// One readable line per archived message (`role: text`). Tool and other structured blocks are

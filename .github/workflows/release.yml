@@ -26,6 +26,12 @@ jobs:
             target: x86_64-apple-darwin
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-musl
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -34,7 +40,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install Linux sandbox
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap musl-tools
       - name: Install OpenSSL 3 on macOS
         if: runner.os == 'macOS'
         run: brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
@@ -45,6 +51,13 @@ jobs:
         run: |
           rustup show active-toolchain
           rustup target add "${{ matrix.target }}"
+      - name: Install installer test dependencies
+        run: python3 -m pip install --disable-pip-version-check cryptography
+      - name: Select musl C compiler
+        if: contains(matrix.target, '-musl')
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: echo "CC_${RELEASE_TARGET//-/_}=musl-gcc" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: release-${{ matrix.target }}
@@ -83,7 +96,7 @@ jobs:
           smoke="$(mktemp -d "${RUNNER_TEMP:-$PWD/dist}/dial-smoke.XXXXXX")"
           trap 'rm -rf "$smoke"' EXIT
           tar -xzf "dist/$package.tar.gz" -C "$smoke"
-          python3 scripts/check-artifact.py --dial "$smoke/$package/dial"
+          python3 scripts/check-artifact.py --dial "$smoke/$package/dial" --target "$RELEASE_TARGET"
           cd "$smoke/$package"
           ./dial --version | awk 'NR==1 {print $1, $2}' | grep -Fx "dial ${GITHUB_REF_NAME#v}"
           ./dial --help
@@ -96,17 +109,25 @@ jobs:
           if-no-files-found: error
 
   windows-build:
-    name: Build and package Windows release
-    runs-on: windows-latest
+    name: Build and package ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install pinned Rust
         run: |
           rustup show active-toolchain
-          rustup target add x86_64-pc-windows-msvc
+          rustup target add "${{ matrix.target }}"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          key: release-x86_64-pc-windows-msvc
+          key: release-${{ matrix.target }}
       - name: Validate release tag
         shell: pwsh
         env:
@@ -118,17 +139,19 @@ jobs:
       - name: Build release binary
         env:
           DIAL_RELEASE_PUBLIC_KEY: ${{ vars.DIAL_RELEASE_PUBLIC_KEY }}
-        run: cargo build --release --locked -p dial --target x86_64-pc-windows-msvc
+        run: cargo build --release --locked -p dial --target "${{ matrix.target }}"
       - name: Package and smoke-test outside the checkout
         shell: pwsh
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
         run: |
-          $package = "dial-${{ github.ref_name }}-x86_64-pc-windows-msvc"
+          $package = "dial-$env:GITHUB_REF_NAME-$env:RELEASE_TARGET"
           $dir = "dist/$package"
           New-Item -ItemType Directory -Force $dir | Out-Null
-          Copy-Item target/x86_64-pc-windows-msvc/release/dial.exe "$dir/dial.exe"
+          Copy-Item "target/$env:RELEASE_TARGET/release/dial.exe" "$dir/dial.exe"
           Copy-Item LICENSE, README.md, THIRD_PARTY_NOTICES, crates/dial-agent/src/agent/compact/snapcompact/fonts/Silver.LICENSE, crates/dial-agent/src/agent/compact/snapcompact/fonts/Unscii.LICENSE $dir
           Compress-Archive -Path $dir -DestinationPath "dist/$package.zip"
-          $expected = "${{ github.ref_name }}".Substring(1)
+          $expected = "$env:GITHUB_REF_NAME".Substring(1)
           # Capture all output first: piping into `Select-Object -First 1` stops the native
           # command early and leaves $LASTEXITCODE unset, which failed this check.
           $output = & "dist/$package/dial.exe" --version
@@ -140,15 +163,20 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
+      - name: Verify packaged binary format
+        shell: pwsh
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: python scripts/check-artifact.py --dial "dist/dial-$env:GITHUB_REF_NAME-$env:RELEASE_TARGET/dial.exe" --target "$env:RELEASE_TARGET" --format-only
       - name: Test installer under Windows PowerShell 5.1
         shell: powershell
-        run: ./scripts/test-install.ps1 -ArchivePath "${{ github.workspace }}/dist/dial-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip"
+        run: ./scripts/test-install.ps1 -ArchivePath "${{ github.workspace }}/dist/dial-${{ github.ref_name }}-${{ matrix.target }}.zip"
       - name: Test installer under PowerShell 7
         shell: pwsh
-        run: ./scripts/test-install.ps1 -ArchivePath "${{ github.workspace }}/dist/dial-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip"
+        run: ./scripts/test-install.ps1 -ArchivePath "${{ github.workspace }}/dist/dial-${{ github.ref_name }}-${{ matrix.target }}.zip"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: release-assets-x86_64-pc-windows-msvc
+          name: release-assets-${{ matrix.target }}
           path: dist/*.zip
           if-no-files-found: error
 
@@ -172,6 +200,7 @@ jobs:
     permissions:
       contents: write
       packages: write
+      pull-requests: write
       # Reads CI's result for the tagged commit.
       actions: read
     steps:
@@ -252,49 +281,39 @@ jobs:
           openssl pkeyutl -sign -inkey "$RUNNER_TEMP/release-key.pem" -rawin \
             -in dist/SHA256SUMS -out "$RUNNER_TEMP/SHA256SUMS.sig"
           base64 -w0 "$RUNNER_TEMP/SHA256SUMS.sig" > dist/SHA256SUMS.sig
-          gh release create "$RELEASE_TAG" dist/*.tar.gz dist/*.zip dist/SHA256SUMS dist/SHA256SUMS.sig dist/install.sh dist/install.ps1 \
+          python3 scripts/make-sshsig.py --openssl openssl --key "$RUNNER_TEMP/release-key.pem" \
+            --input dist/SHA256SUMS --output dist/SHA256SUMS.sshsig
+          gh release create "$RELEASE_TAG" dist/*.tar.gz dist/*.zip dist/SHA256SUMS dist/SHA256SUMS.sig dist/SHA256SUMS.sshsig dist/install.sh dist/install.ps1 \
             --verify-tag --generate-notes --title "Dial $RELEASE_TAG"
-      - name: Update Homebrew formula and Nix flake
+      - name: Open Homebrew formula update PR
         env:
           RELEASE_TAG: ${{ github.ref_name }}
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           version="${RELEASE_TAG#v}"
+          branch="release-packaging/$RELEASE_TAG"
           git fetch origin main
-          git checkout -B release-packaging origin/main
-          python3 - <<'PY'
-          import re
-          from pathlib import Path
-          version = __import__('os').environ['RELEASE_TAG'].removeprefix('v')
-          sums = {}
-          for line in Path('dist/SHA256SUMS').read_text().splitlines():
-              digest, name = line.split(maxsplit=1)
-              sums[name.lstrip('*')] = digest
-          formula_path = Path('Formula/dial.rb')
-          formula = formula_path.read_text()
-          formula = re.sub(r'^  version ".*"$', f'  version "{version}"', formula, count=1, flags=re.M)
-          targets = [
-              f'dial-v{version}-aarch64-apple-darwin.tar.gz',
-              f'dial-v{version}-x86_64-apple-darwin.tar.gz',
-              f'dial-v{version}-x86_64-unknown-linux-gnu.tar.gz',
-          ]
-          for archive in targets:
-              if archive not in sums:
-                  raise SystemExit(f'missing release checksum for {archive}')
-              # Formula urls use #{version}, so match on the target suffix, then the sha256 line that follows it.
-              suffix = archive.removeprefix(f'dial-v{version}')
-              pattern = r'(' + re.escape(suffix) + r'"\n\s*sha256 )(?::no_check|"[^"]*")'
-              formula, count = re.subn(pattern, lambda m: m.group(1) + f'"{sums[archive]}"', formula, count=1)
-              if count != 1:
-                  raise SystemExit(f'could not update formula checksum for {archive}')
-          formula_path.write_text(formula)
-          PY
+          git checkout -B "$branch" origin/main
+          python3 scripts/update-formula.py --version "$version" --sums dist/SHA256SUMS --formula Formula/dial.rb
+          python3 scripts/check-packaging.py
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add Formula/dial.rb
+          if git diff --cached --quiet; then
+            echo "Formula already matches $RELEASE_TAG; no pull request needed"
+            exit 0
+          fi
           git commit -m "release: update package metadata for $version"
-          git push origin HEAD:main
+          git push --force origin "HEAD:refs/heads/$branch"
+          if gh pr view "$branch" --json number >/dev/null 2>&1; then
+            echo "Pull request for $branch already exists"
+          else
+            gh pr create --base main --head "$branch" \
+              --title "release: Dial $RELEASE_TAG package metadata" \
+              --body "Automated Homebrew formula update for $RELEASE_TAG. Merge once the release is published."
+          fi
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.ref }}

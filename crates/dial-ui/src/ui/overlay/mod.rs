@@ -94,6 +94,16 @@ pub enum OverlayEvent {
     OAuthSignOut {
         id: String,
     },
+    /// Make a stored account of an OAuth provider the active one.
+    OAuthSelectAccount {
+        id: String,
+        key: String,
+    },
+    /// Remove one stored account of an OAuth provider (the grant file goes with the last one).
+    OAuthRemoveAccount {
+        id: String,
+        key: String,
+    },
     RemoveCredential {
         base_url: String,
     },
@@ -176,6 +186,8 @@ impl fmt::Debug for OverlayEvent {
             Self::ChatGptSignOut { .. } => f.write_str("ChatGptSignOut"),
             Self::OAuthLogin { .. } => f.write_str("OAuthLogin"),
             Self::OAuthSignOut { .. } => f.write_str("OAuthSignOut"),
+            Self::OAuthSelectAccount { .. } => f.write_str("OAuthSelectAccount"),
+            Self::OAuthRemoveAccount { .. } => f.write_str("OAuthRemoveAccount"),
             Self::RemoveCredential { base_url } => f
                 .debug_struct("RemoveCredential")
                 .field("base_url", base_url)

@@ -7,10 +7,11 @@ use crate::app::notices::RetryNotice;
 use crate::app::shell::TICK;
 use crate::runtime::tool_output::ToolOutput;
 use crate::ui::composer::SteerStage;
+use crate::ui::input::{poll, read};
 use crate::ui::status::Phase;
 use crate::ui::theme::Tok;
 use crate::ui::{tasks, text};
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, poll, read};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -162,7 +163,10 @@ impl Ui for Bridge<'_> {
         self.repaint(false);
     }
 
-    fn tool_arguments_delta(&mut self, _index: u64, _id: &str, name: &str, _delta: &str) {
+    fn tool_arguments_delta(&mut self, _index: u64, id: &str, name: &str, delta: &str) {
+        // Observational only: the card shows the arguments as they stream; nothing is executed
+        // until the completed call starts.
+        self.shell.transcript.tool_arguments_delta(id, name, delta);
         self.set_activity(&if name.is_empty() {
             "preparing tool call".into()
         } else {
@@ -243,6 +247,7 @@ impl Ui for Bridge<'_> {
         if !std::mem::take(&mut self.shell.shared_prose) {
             self.shell.transcript.assistant_delta(text);
         }
+        self.shell.transcript.advance_reveal(&self.shell.ui);
         self.set_activity("writing");
         self.repaint(false);
     }
@@ -467,6 +472,7 @@ impl Ui for Bridge<'_> {
     }
 
     fn heartbeat(&mut self) {
+        self.shell.transcript.advance_reveal(&self.shell.ui);
         self.repaint(false);
     }
 
@@ -595,6 +601,7 @@ impl Ui for Bridge<'_> {
         request: &agent::workflow::questions::QuestionRequest,
         cancel: &AtomicBool,
     ) -> agent::workflow::questions::QuestionOutcome {
+        use crate::app::shell::prompts::{DraftStep, Focus};
         use agent::workflow::questions::QuestionOutcome;
         let mut dialog = crate::ui::questions::Dialog::new(request, &self.app.layout.project_root);
         if request.notify && self.shell.ui.notify {
@@ -605,17 +612,32 @@ impl Ui for Bridge<'_> {
                 &self.shell.session_id,
             );
         }
+        self.shell.park_pending_input();
         let was_waiting = std::mem::replace(&mut self.shell.awaiting_user, true);
+        let mut focus = self.shell.initial_focus();
         let outcome = loop {
             if cancel.load(Ordering::SeqCst) || self.interrupt.load(Ordering::SeqCst) {
                 break QuestionOutcome::Cancelled;
             }
             let (width, height) = self.shell.term.size();
+            let draft_note = self.shell.draft_note(focus);
+            let draft_height = if draft_note.is_some() { 4 } else { 0 };
+            let inner_width = usize::from(width).saturating_sub(4);
+            let mut body = dialog.rows(
+                inner_width,
+                usize::from(height).saturating_sub(5 + draft_height),
+            );
+            if let Some(note) = draft_note {
+                body.extend(note.lines().take(draft_height).map(|line| {
+                    crate::ui::text::ellipsize(
+                        &crate::ui::text::sanitize(line),
+                        inner_width,
+                        self.shell.themes.current().ascii(),
+                    )
+                }));
+            }
             let rows = crate::ui::questions::framed(
-                dialog.rows(
-                    usize::from(width).saturating_sub(4),
-                    usize::from(height).saturating_sub(5),
-                ),
+                body,
                 usize::from(width),
                 usize::from(height).saturating_sub(1),
                 self.shell.themes.current(),
@@ -638,14 +660,79 @@ impl Ui for Bridge<'_> {
             }
             match read() {
                 Ok(Event::Key(key)) if key.kind != KeyEventKind::Release => {
+                    if focus == Focus::Draft {
+                        match self.shell.draft_step(key) {
+                            DraftStep::Stay => {}
+                            DraftStep::Choices => focus = Focus::Choices,
+                            DraftStep::Cancel => break QuestionOutcome::Cancelled,
+                        }
+                        continue;
+                    }
+                    if matches!(
+                        key.code,
+                        crossterm::event::KeyCode::Tab | crossterm::event::KeyCode::BackTab
+                    ) {
+                        focus = Focus::Draft;
+                        continue;
+                    }
                     if let Some(outcome) = dialog.key(key, &self.shell.keys) {
+                        break outcome;
+                    }
+                }
+                Ok(Event::Paste(value)) => match focus {
+                    Focus::Draft => self.shell.composer_paste(&value),
+                    Focus::Choices => dialog.paste(&value),
+                },
+                Ok(Event::Resize(..)) => self.shell.term.on_resize(),
+                Ok(_) => {}
+                Err(_) => break QuestionOutcome::Disconnected,
+            }
+        };
+        self.shell.awaiting_user = was_waiting;
+        self.repaint(true);
+        outcome
+    }
+
+    fn run_panel(
+        &mut self,
+        panel: &crate::extensions::panel::Panel,
+        cancel: &AtomicBool,
+    ) -> crate::extensions::panel::Outcome {
+        use crate::extensions::panel::Outcome;
+        let mut dialog = match crate::ui::panel::PanelDialog::new(panel.clone()) {
+            Ok(dialog) => dialog,
+            Err(error) => return Outcome::Unsupported(format!("{error:#}")),
+        };
+        self.shell.park_pending_input();
+        let was_waiting = std::mem::replace(&mut self.shell.awaiting_user, true);
+        let outcome = loop {
+            if cancel.load(Ordering::SeqCst) || self.interrupt.load(Ordering::SeqCst) {
+                break Outcome::Cancelled;
+            }
+            let (width, height) = self.shell.term.size();
+            let rows = dialog.rows(
+                usize::from(width),
+                usize::from(height).saturating_sub(1),
+                self.shell.themes.current(),
+            );
+            if self.shell.paint(Some(rows)).is_err() {
+                break Outcome::Cancelled;
+            }
+            match poll(Duration::from_millis(50)) {
+                Ok(false) => continue,
+                Err(_) => break Outcome::Cancelled,
+                Ok(true) => {}
+            }
+            match read() {
+                Ok(Event::Key(key)) => {
+                    if let Some(outcome) = dialog.key(key) {
                         break outcome;
                     }
                 }
                 Ok(Event::Paste(value)) => dialog.paste(&value),
                 Ok(Event::Resize(..)) => self.shell.term.on_resize(),
                 Ok(_) => {}
-                Err(_) => break QuestionOutcome::Disconnected,
+                Err(_) => break Outcome::Cancelled,
             }
         };
         self.shell.awaiting_user = was_waiting;
@@ -722,6 +809,7 @@ impl Ui for Bridge<'_> {
 
     fn approval_reason(&mut self) -> Option<String> {
         let mut editor = crate::ui::editor::Editor::default();
+        self.shell.park_pending_input();
         let was_waiting = std::mem::replace(&mut self.shell.awaiting_user, true);
         let reason = loop {
             let (width, _) = self.shell.term.size();

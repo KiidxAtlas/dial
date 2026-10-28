@@ -793,3 +793,31 @@ fn session_change_gates_refuse_with_the_hook_reason_and_honor_aliases() {
         Ok(())
     );
 }
+
+#[test]
+fn user_prompt_submit_prompt_rewrite_reaches_later_hooks_and_the_outcome() {
+    let dir = tempfile::tempdir().unwrap();
+    let interrupt = AtomicBool::new(false);
+    let rewrite = hook(
+        "user_prompt_submit",
+        None,
+        r#"printf '{"prompt":"rewritten"}'"#,
+    );
+    // The second hook sees the rewritten prompt in its payload; a miss blocks the prompt.
+    let check = hook(
+        "user_prompt_submit",
+        None,
+        r#"grep -q rewritten || { echo 'rewrite not visible' >&2; exit 2; }"#,
+    );
+    let outcome = fire_with(
+        &[rewrite, check],
+        None,
+        dir.path(),
+        "user_prompt_submit",
+        None,
+        json!({"prompt":"original"}),
+        &interrupt,
+    );
+    assert!(matches!(outcome.verdict, Verdict::Continue { .. }));
+    assert_eq!(outcome.prompt.as_deref(), Some("rewritten"));
+}

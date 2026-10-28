@@ -232,7 +232,13 @@ fn dispatched_methods() -> std::collections::BTreeSet<String> {
 }
 fn emitted_events() -> std::collections::BTreeSet<String> {
     let mut found = std::collections::BTreeSet::new();
-    for source in [include_str!("../rpc.rs"), include_str!("actor.rs")] {
+    for source in [
+        include_str!("../rpc.rs"),
+        include_str!("actor.rs"),
+        include_str!("host_tools.rs"),
+        include_str!("host_uris.rs"),
+        include_str!("auth.rs"),
+    ] {
         for piece in source.split("\"event\":\"").skip(1) {
             found.insert(piece.split('"').next().unwrap().to_owned());
         }
@@ -309,10 +315,11 @@ fn schema_limits_equal_the_enforced_constants() {
 #[test]
 fn ready_frame_announces_versions_limits_and_transport_capabilities() {
     let rpc = ready_frame("s1", "m", json!(["read"]), true, false);
-    assert_eq!(rpc["protocol_version"], PROTOCOL_VERSION);
+    // Connections start on protocol 1 until the client sends `hello`.
+    assert_eq!(rpc["protocol_version"], 1);
     assert_eq!(
         rpc["supported_protocol_versions"],
-        json!([PROTOCOL_VERSION])
+        json!([1, PROTOCOL_VERSION])
     );
     assert_eq!(rpc["limits"]["max_request_bytes"], MAX_REQUEST);
     let capability = |frame: &Value, name: &str| {
@@ -331,6 +338,23 @@ fn ready_frame_announces_versions_limits_and_transport_capabilities() {
     let methods = acp["methods"].as_array().unwrap();
     assert!(!methods.contains(&json!("live_start")) && methods.contains(&json!("send")));
     assert_eq!(acp["question_input"]["supported"], false);
+    assert!(capability(&rpc, "host_uris") && capability(&rpc, "auth"));
+    assert!(!capability(&acp, "host_tools") && !capability(&acp, "host_uris"));
+    assert!(!capability(&acp, "auth"));
+}
+
+#[test]
+fn hello_picks_the_highest_version_both_sides_speak() {
+    assert_eq!(negotiated_version(1).unwrap(), 1);
+    assert_eq!(negotiated_version(2).unwrap(), 2);
+    assert_eq!(negotiated_version(9).unwrap(), PROTOCOL_VERSION);
+}
+
+#[test]
+fn hello_below_every_served_version_is_refused_with_a_code() {
+    let err = negotiated_version(0).unwrap_err();
+    let error = err.downcast_ref::<RequestError>().unwrap();
+    assert_eq!(error.code, "unsupported_protocol_version");
 }
 
 #[test]

@@ -19,6 +19,7 @@ use super::{
     Rows,
     editor::Editor,
     keys::{Action, Keymap},
+    plugin_slots::PluginSlots,
     status::{InputMode, StatusData},
     statusline, text,
     theme::{Sym, Theme, Tok},
@@ -78,6 +79,7 @@ pub enum CommandKind {
     Builtin,
     Custom,
     Skill,
+    Extension,
     /// A project file offered by `@` mentions.
     File,
 }
@@ -205,7 +207,7 @@ impl BusyChoice {
 
     fn detail(self) -> &'static str {
         match self {
-            BusyChoice::Auto => "Dial decides: steer or worker",
+            BusyChoice::Auto => "steers this task unless [message_routing] classifies",
             BusyChoice::AfterTurn => "waits until Dial finishes",
             BusyChoice::KeepWorking => "the queue waits for this turn",
             BusyChoice::StopAndSend => "ends this turn now",
@@ -322,6 +324,12 @@ pub struct Composer {
     history_index: Option<usize>,
     saved_draft: Option<Editor>,
     commands: Vec<CommandEntry>,
+    /// The controller's command list, kept apart so plugin suggestions merge in and out of `commands`.
+    base_commands: Vec<CommandEntry>,
+    /// Suggestions plugins returned for the typed command name, merged into `commands`.
+    plugin_entries: Vec<CommandEntry>,
+    /// Header, footer, status and title contributions from plugins (see `plugin_slots`).
+    plugin_slots: PluginSlots,
     /// Push-to-talk is capturing: `Some(hold)` while recording (`hold` means release ends it).
     recording: Option<bool>,
     argument_completions: Vec<String>,
@@ -355,6 +363,8 @@ pub struct Composer {
     paste_count: usize,
     /// Keep pasted-image files alive for the session because message expansion happens after submit.
     pasted_images: Vec<tempfile::TempPath>,
+    /// A clipboard image being read on a worker thread; the shell attaches it when it arrives.
+    clipboard_read: Option<std::sync::mpsc::Receiver<anyhow::Result<Vec<u8>>>>,
     /// Learned words; `word_store` is the file they are saved to, when one is configured.
     words: WordModel,
     word_store: Option<std::path::PathBuf>,
@@ -382,6 +392,9 @@ impl Composer {
             history_index: None,
             saved_draft: None,
             commands: Vec::new(),
+            base_commands: Vec::new(),
+            plugin_entries: Vec::new(),
+            plugin_slots: PluginSlots::default(),
             menu: None,
             dismissed: None,
             search: None,
@@ -389,6 +402,7 @@ impl Composer {
             recording: None,
             exit_armed: false,
             pastes: Vec::new(),
+            clipboard_read: None,
             paste_count: 0,
             pasted_images: Vec::new(),
             queued: std::collections::VecDeque::new(),
@@ -430,16 +444,53 @@ impl Composer {
         self.refresh_history_search();
     }
 
-    /// Attach an image from the platform clipboard and insert its quoted path in the draft.
-    pub fn paste_clipboard_image(&mut self) -> anyhow::Result<()> {
+    /// Reads the platform clipboard image on a worker thread, so a slow clipboard tool (PowerShell
+    /// cold start, a hung X server) never freezes the UI. [`Self::finish_clipboard_image`] attaches
+    /// the result once it arrives.
+    pub fn start_clipboard_image(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.clipboard_read.is_none(),
+            "a clipboard image is already being read"
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("clipboard-image".into())
+            .spawn(move || {
+                let _ = tx.send(crate::ui::clipboard::read_image());
+            })
+            .map_err(|error| anyhow::anyhow!("starting the clipboard reader: {error}"))?;
+        self.clipboard_read = Some(rx);
+        Ok(())
+    }
+
+    /// True while a clipboard image read is in flight; the shell polls faster meanwhile.
+    pub fn clipboard_image_pending(&self) -> bool {
+        self.clipboard_read.is_some()
+    }
+
+    /// Attaches a finished clipboard read and inserts its quoted path in the draft. Returns `None`
+    /// while the read is still running.
+    pub fn finish_clipboard_image(&mut self) -> Option<anyhow::Result<()>> {
+        let rx = self.clipboard_read.as_ref()?;
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(anyhow::anyhow!("the clipboard reader stopped unexpectedly"))
+            }
+        };
+        self.clipboard_read = None;
+        Some(result.and_then(|bytes| self.attach_image_bytes(&bytes)))
+    }
+
+    fn attach_image_bytes(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
         use std::io::Write;
-        let bytes = clipboard_image_bytes()?;
         anyhow::ensure!(!bytes.is_empty(), "clipboard contains no image");
         let mut file = tempfile::Builder::new()
             .prefix("dial-paste-")
             .suffix(".png")
             .tempfile()?;
-        file.write_all(&bytes)?;
+        file.write_all(bytes)?;
         let owner = file.into_temp_path();
         let path = owner.to_string_lossy().into_owned();
         self.pasted_images.push(owner);
@@ -506,30 +557,61 @@ impl Composer {
     }
 
     /// Commands come from the controller so the menu matches real dispatch. Names that could not be
-    /// typed as a command (empty, whitespace, slashes, controls) and duplicates are dropped.
+    /// typed as a command (empty, padded with whitespace, slashes, controls) and duplicates are dropped.
     pub fn set_commands(&mut self, commands: Vec<CommandEntry>) {
+        self.base_commands = clean_commands(commands);
+        self.merge_commands();
+    }
+
+    /// Plugin suggestions for the command name being typed. A result applies only while the menu
+    /// still shows `query`, so a late answer never lands on a different word. Returns `true` when
+    /// the open menu changed and the caller should repaint.
+    pub fn set_plugin_suggestions(&mut self, query: &str, suggestions: Vec<CommandEntry>) -> bool {
+        if self.plugin_query() != Some(query) {
+            return false;
+        }
+        self.plugin_entries = clean_commands(suggestions);
+        self.merge_commands();
+        true
+    }
+
+    /// The command name being typed while the menu offers command names (no arguments, no `@file`),
+    /// so plugins can suggest names for it. `None` otherwise.
+    pub fn plugin_query(&self) -> Option<&str> {
+        match self.menu_query()? {
+            (query, None) if !query.is_empty() && !query.contains(char::is_whitespace) => {
+                Some(query)
+            }
+            _ => None,
+        }
+    }
+
+    /// Replaces the plugin chrome. Returns `true` when it changed, so the caller repaints only then.
+    pub fn set_plugin_slots(&mut self, slots: PluginSlots) -> bool {
+        if self.plugin_slots == slots {
+            return false;
+        }
+        self.plugin_slots = slots;
+        true
+    }
+
+    /// The plugin title that replaces the session title, if a plugin set one.
+    pub fn plugin_title(&self) -> Option<&str> {
+        self.plugin_slots.title()
+    }
+
+    /// Rebuilds the command list: controller commands first, then plugin suggestions whose names are
+    /// new. Keeps the menu selection where it was.
+    fn merge_commands(&mut self) {
         self.candidates_generation += 1;
         let selection = self.menu_selection();
         let mut seen = std::collections::HashSet::new();
-        self.commands = commands
-            .into_iter()
-            .filter_map(|c| {
-                let bad = c.name.is_empty()
-                    || c.name
-                        .chars()
-                        .any(|ch| ch.is_whitespace() || ch.is_control() || ch == '/');
-                if bad || !seen.insert(c.name.clone()) {
-                    return None;
-                }
-                Some(CommandEntry {
-                    description: text::one_line(&c.description),
-                    args_hint: c
-                        .args_hint
-                        .map(|a| text::one_line(&a))
-                        .filter(|a| !a.trim().is_empty()),
-                    ..c
-                })
-            })
+        self.commands = self
+            .base_commands
+            .iter()
+            .chain(self.plugin_entries.iter())
+            .filter(|c| seen.insert(c.name.clone()))
+            .cloned()
             .collect();
         self.menu = None;
         self.refresh();
@@ -1147,10 +1229,19 @@ impl Composer {
         let arguments = menu.arguments.is_some();
         let completed = if let Some(start) = menu.file_start {
             format!("{}@{} ", &self.editor.text[..start], entry.name)
-        } else if menu.arguments.is_some() {
-            format!("/{}", entry.name)
         } else {
-            format!("/{} ", entry.name)
+            // Plugin names may hold whitespace, so they are quoted; built-in and argument text is
+            // inserted as written.
+            let word = if matches!(entry.kind, CommandKind::Extension) {
+                command_word(&entry.name)
+            } else {
+                entry.name.clone()
+            };
+            if arguments {
+                format!("/{word}")
+            } else {
+                format!("/{word} ")
+            }
         };
         self.editor.set(&completed);
         self.dismissed = arguments.then_some(completed);
@@ -1758,8 +1849,9 @@ impl Composer {
         } else {
             ctx.ui
         };
-        let activity_rows = usize::from(activity.is_some());
-        let mut rows: Rows = activity.into_iter().collect();
+        let header_rows = self.plugin_slots.header_rows(w, theme);
+        let activity_rows = usize::from(activity.is_some()) + header_rows.len();
+        let mut rows: Rows = activity.into_iter().chain(header_rows).collect();
         let tint = theme.bg(Tok::UserBg);
         let band = |spans: Vec<Span<'static>>| band_row(spans, w, tint);
         // The band is a tinted card with an accent edge; the edge carries the input mode (accent
@@ -1874,6 +1966,9 @@ impl Composer {
                 w, &hints, bottom_l, bottom_r, bar, border, theme,
             ));
         }
+        // Plugin status and footer rows sit below the composer's bottom border.
+        rows.extend(self.plugin_slots.status_row(w, theme));
+        rows.extend(self.plugin_slots.footer_rows(w, theme));
 
         let mut cursor = cursor;
         if let Some(search) = &self.search {
@@ -2345,7 +2440,7 @@ impl Composer {
                 let command = &entries[found.index];
                 let icon = theme.sym(match command.kind {
                     CommandKind::Builtin => Sym::IconCommand,
-                    CommandKind::Custom => Sym::IconSettings,
+                    CommandKind::Custom | CommandKind::Extension => Sym::IconSettings,
                     CommandKind::Skill => Sym::IconSkill,
                     CommandKind::File => Sym::IconFile,
                 });
@@ -2539,46 +2634,6 @@ impl Composer {
         ));
         (rows, col.min(w - 1))
     }
-}
-fn clipboard_image_bytes() -> anyhow::Result<Vec<u8>> {
-    use std::process::Command;
-    #[cfg(target_os = "macos")]
-    let candidates: &[(&str, &[&str])] = &[("pngpaste", &["-"])];
-    #[cfg(target_os = "linux")]
-    let candidates: &[(&str, &[&str])] = &[
-        ("wl-paste", &["--no-newline", "--type", "image/png"]),
-        (
-            "xclip",
-            &["-selection", "clipboard", "-t", "image/png", "-o"],
-        ),
-    ];
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    let candidates: &[(&str, &[&str])] = &[];
-
-    let mut attempted = Vec::new();
-    for (program, args) in candidates {
-        let output = match Command::new(program).args(*args).output() {
-            Ok(output) => output,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                attempted.push(*program);
-                continue;
-            }
-            Err(error) => return Err(error.into()),
-        };
-        if output.status.success() && !output.stdout.is_empty() {
-            anyhow::ensure!(
-                output.stdout.len() as u64 <= crate::llm::images::MAX_IMAGE_BYTES,
-                "clipboard image exceeds the supported 5 MiB limit"
-            );
-            anyhow::ensure!(
-                image::guess_format(&output.stdout).is_ok(),
-                "clipboard data is not a supported image"
-            );
-            return Ok(output.stdout);
-        }
-        attempted.push(*program);
-    }
-    anyhow::bail!("no clipboard image found (tried {})", attempted.join(", "))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2939,7 +2994,7 @@ const MENU_GROUPS: [crate::ui::command_surface::Category; 10] = {
     ]
 };
 
-/// Where a command sits in the unfiltered menu: built-ins by category, then skills, then custom.
+/// Built-ins by category, then skills, custom commands, and loaded extension commands.
 fn group_rank(command: &CommandEntry) -> usize {
     match command.kind {
         CommandKind::Builtin => {
@@ -2951,7 +3006,8 @@ fn group_rank(command: &CommandEntry) -> usize {
         }
         CommandKind::Skill => MENU_GROUPS.len() + 1,
         CommandKind::Custom => MENU_GROUPS.len() + 2,
-        CommandKind::File => MENU_GROUPS.len() + 3,
+        CommandKind::Extension => MENU_GROUPS.len() + 3,
+        CommandKind::File => MENU_GROUPS.len() + 4,
     }
 }
 
@@ -2961,6 +3017,7 @@ fn group_of(command: &CommandEntry) -> &'static str {
         CommandKind::Builtin => crate::ui::command_surface::category(&command.name).tab(),
         CommandKind::Skill => "Skills",
         CommandKind::Custom => "Custom",
+        CommandKind::Extension => "Extensions",
         CommandKind::File => "",
     }
 }
@@ -3098,6 +3155,44 @@ fn expand_pastes(draft: &str, pastes: &[(String, String)]) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// Drops command names that could not be typed as a command (empty, padded with whitespace,
+/// slashes, controls) and duplicates, and reduces descriptions and argument hints to one line.
+fn clean_commands(commands: Vec<CommandEntry>) -> Vec<CommandEntry> {
+    let mut seen = std::collections::HashSet::new();
+    commands
+        .into_iter()
+        .filter_map(|c| {
+            let bad = c.name.is_empty()
+                || c.name.trim() != c.name
+                || c.name.chars().any(|ch| ch.is_control() || ch == '/');
+            if bad || !seen.insert(c.name.clone()) {
+                return None;
+            }
+            Some(CommandEntry {
+                description: text::one_line(&c.description),
+                args_hint: c
+                    .args_hint
+                    .map(|a| text::one_line(&a))
+                    .filter(|a| !a.trim().is_empty()),
+                ..c
+            })
+        })
+        .collect()
+}
+
+/// The text that names a command in the draft. A name with whitespace or quotes is single-quoted
+/// the POSIX way, so it reads back as one shell word, the same way `/commit` reads its arguments.
+fn command_word(name: &str) -> String {
+    if name
+        .chars()
+        .any(|ch| ch.is_whitespace() || ch == '\'' || ch == '"' || ch == '\\')
+    {
+        format!("'{}'", name.replace('\'', "'\\''"))
+    } else {
+        name.to_owned()
+    }
 }
 
 #[cfg(test)]

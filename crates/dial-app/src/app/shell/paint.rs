@@ -12,7 +12,7 @@ use crate::ui::keys::Action;
 use crate::ui::status::{Lora, Phase};
 use crate::ui::term::Viewport;
 use crate::ui::term_state::{Activity, Progress, Signals};
-use crate::ui::transcript::TranscriptCtx;
+use crate::ui::transcript::{Retire, TranscriptCtx};
 use crate::ui::{Rows, tasks};
 use anyhow::Result;
 use std::path::Path;
@@ -88,10 +88,48 @@ pub(super) fn terminal_signals(
     })
 }
 
+/// Live view of a streaming `/btw` answer: its thread, then the newest non-empty lines of text
+/// (at most `max` rows in all). The tail is kept because the newest words are what the user watches.
+fn side_rows(
+    thread: &str,
+    streamed: &str,
+    cols: usize,
+    theme: &crate::ui::theme::Theme,
+    max: usize,
+) -> Vec<ratatui::text::Line<'static>> {
+    const TAIL_LINES: usize = 3;
+    if max == 0 {
+        return Vec::new();
+    }
+    let header = format!("/btw {}", crate::ui::text::one_line(thread));
+    let mut rows = vec![ratatui::text::Line::from(ratatui::text::Span::styled(
+        crate::ui::text::ellipsize(&header, cols, theme.ascii()),
+        theme.fg(crate::ui::theme::Tok::Muted),
+    ))];
+    let budget = (max - 1).min(TAIL_LINES);
+    let tail: Vec<String> = streamed
+        .lines()
+        .rev()
+        .map(crate::ui::text::sanitize)
+        .filter(|line| !line.trim().is_empty())
+        .take(budget)
+        .collect();
+    for line in tail.into_iter().rev() {
+        rows.push(ratatui::text::Line::from(ratatui::text::Span::raw(
+            crate::ui::text::ellipsize_start(&line, cols, theme.ascii()),
+        )));
+    }
+    rows
+}
+
 impl Shell {
     // ----- painting -------------------------------------------------------------------------
 
     pub(in crate::app) fn paint(&mut self, panel: Option<Rows>) -> Result<()> {
+        if self.term.output_backlogged() {
+            self.term.defer_paint();
+            return Ok(());
+        }
         let files = if self.ui.session_rail {
             self.git.files(Path::new(&self.status.project_path))
         } else {
@@ -147,7 +185,10 @@ impl Shell {
             tools_expanded: *tools_expanded,
             expand_key: &expand_key,
         };
-        let (settled, images) = transcript.take_settled_with_images(cols, &tctx);
+        // Every paint retires a bounded slice of history, busy or idle, so a resumed transcript drains
+        // over successive frames instead of in one write.
+        let retire = Retire::frame(Instant::now());
+        let (settled, images) = transcript.retire_settled(cols, &tctx, retire);
         if !settled.is_empty() {
             if let Some(protocol) = term.image_protocol() {
                 term.commit_with_images(settled, images, protocol);
@@ -207,6 +248,18 @@ impl Shell {
                         theme,
                     ));
                 }
+                if available > bottom.len()
+                    && let Some(notice) = self.runtime_updates.notice()
+                {
+                    bottom.push(ratatui::text::Line::from(ratatui::text::Span::styled(
+                        crate::ui::text::ellipsize(notice, cols as usize, theme.ascii()),
+                        theme.fg(crate::ui::theme::Tok::Muted),
+                    )));
+                }
+                if let Some((thread, streamed)) = self.side.streamed() {
+                    let room = available.saturating_sub(bottom.len());
+                    bottom.extend(side_rows(thread, streamed, cols as usize, theme, room));
+                }
                 bottom.extend(tasks::rows(
                     todo,
                     cols as usize,
@@ -235,7 +288,7 @@ impl Shell {
         term.paint(&Viewport {
             rows: &live,
             cursor: cursor.map(|(row, col)| (above + row, col)),
-            title: Some(title.as_str()),
+            title: Some(self.composer.plugin_title().unwrap_or(title.as_str())),
             signals: signals.as_ref(),
         })
     }

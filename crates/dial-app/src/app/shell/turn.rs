@@ -118,6 +118,9 @@ impl Shell {
         self.status.tokens_per_second = None;
         self.status.activity = "thinking".into();
         let teach = self.teach_turn_start(app, agent);
+        if let Err(error) = self.side.prepare_turn(agent, text) {
+            self.note("BTW", format!("error: {error:#}"));
+        }
         let (result, failed, streamed_tokens) = {
             let mut bridge = Bridge {
                 app,
@@ -134,6 +137,7 @@ impl Shell {
             (result, bridge.failed, bridge.shell.turn_output_tokens)
         };
         app.interrupt.store(false, Ordering::SeqCst);
+        self.side.end_turn();
         crate::collab::room::sync_host(agent.session());
         self.composer.set_busy(false);
         self.save_history(app);

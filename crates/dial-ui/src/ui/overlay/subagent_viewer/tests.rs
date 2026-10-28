@@ -276,6 +276,17 @@ fn send_emits_steer_or_resume_and_keeps_the_draft_when_unavailable() {
     type_text(&mut view, &keys, "use the cache");
     let event = view.key(&key(KeyCode::Enter), &keys, Instant::now());
     assert_eq!(tag(event), "action:subagent-message:w1\nuse the cache");
+    assert_eq!(
+        view.draft.text, "use the cache",
+        "submission awaits delivery acknowledgement"
+    );
+    view.action_failed("worker mailbox unavailable");
+    assert_eq!(
+        view.draft.text, "use the cache",
+        "a failed delivery must be retryable"
+    );
+    view.key(&key(KeyCode::Enter), &keys, Instant::now());
+    view.action_succeeded("delivered");
     assert!(view.draft.text.is_empty());
 
     view.agent = Some(AgentEntry {
@@ -285,6 +296,7 @@ fn send_emits_steer_or_resume_and_keeps_the_draft_when_unavailable() {
     type_text(&mut view, &keys, "more");
     let event = view.key(&key(KeyCode::Enter), &keys, Instant::now());
     assert_eq!(tag(event), "action:subagent-resume:w1\nmore");
+    view.action_succeeded("resumed");
 
     view.agent = Some(agent(AgentStatus::Cancelled));
     type_text(&mut view, &keys, "hello");
@@ -295,20 +307,38 @@ fn send_emits_steer_or_resume_and_keeps_the_draft_when_unavailable() {
 }
 
 #[test]
-fn escape_clears_the_draft_then_leaves_to_the_hub_or_main() {
+fn leaving_a_worker_keeps_its_editor_and_cursor_separate_from_other_workers() {
     let keys = Keymap::defaults();
     let now = Instant::now();
-    let mut from_hub = viewer(None, true);
-    type_text(&mut from_hub, &keys, "h");
-    assert_eq!(tag(from_hub.key(&key(KeyCode::Esc), &keys, now)), "none");
-    assert!(from_hub.draft.text.is_empty());
+    let editors = WorkerEditors::default();
+    let mut first = viewer(None, true).with_editors(editors.clone());
+    type_text(&mut first, &keys, "hello");
+    first.key(&key(KeyCode::Left), &keys, now);
     assert_eq!(
-        tag(from_hub.key(&key(KeyCode::Esc), &keys, now)),
+        tag(first.key(&key(KeyCode::Esc), &keys, now)),
         "action:subagent-hub"
     );
+    drop(first);
 
-    let mut main = viewer(None, false);
-    assert_eq!(tag(main.key(&key(KeyCode::Esc), &keys, now)), "close");
+    let mut other = SubagentViewer::new(
+        "w2".into(),
+        "s1".into(),
+        None,
+        false,
+        UiConfig::default(),
+        now,
+    )
+    .with_editors(editors.clone());
+    type_text(&mut other, &keys, "other task");
+    drop(other);
+    let mut restored = viewer(None, false).with_editors(editors);
+    type_text(&mut restored, &keys, "!");
+    assert_eq!(restored.draft.text, "hell!o");
+    assert_eq!(tag(restored.key(&key(KeyCode::Esc), &keys, now)), "close");
+    assert_eq!(
+        restored.draft.text, "hell!o",
+        "returning to main never clears the worker draft"
+    );
 }
 
 #[test]
@@ -334,32 +364,7 @@ fn double_left_on_an_empty_draft_returns_to_the_hub() {
 }
 
 #[test]
-fn cancel_needs_a_second_x_and_only_when_cancellable() {
-    let keys = Keymap::defaults();
-    let now = Instant::now();
-    let mut view = viewer(None, false);
-    view.agent = Some(agent(AgentStatus::Done));
-    view.key(&key(KeyCode::Char('x')), &keys, now);
-    assert!(view.notice.is_some());
-    assert!(!view.armed_cancel, "finished workers are not cancellable");
-
-    view.agent = Some(AgentEntry {
-        cancellable: true,
-        ..agent(AgentStatus::Running)
-    });
-    assert_eq!(tag(view.key(&key(KeyCode::Char('x')), &keys, now)), "none");
-    assert_eq!(
-        tag(view.key(&key(KeyCode::Char('x')), &keys, now)),
-        "action:subagent-cancel:w1"
-    );
-    view.key(&key(KeyCode::Char('x')), &keys, now);
-    view.key(&key(KeyCode::Char('j')), &keys, now);
-    assert!(!view.armed_cancel, "any other key disarms");
-}
-
-#[test]
-fn a_held_x_does_not_confirm_its_own_cancellation() {
-    use crossterm::event::{KeyEventKind, KeyEventState};
+fn typing_cannot_cancel_or_navigate_away_and_ctrl_c_targets_only_the_worker() {
     let keys = Keymap::defaults();
     let now = Instant::now();
     let mut view = viewer(None, false);
@@ -367,29 +372,26 @@ fn a_held_x_does_not_confirm_its_own_cancellation() {
         cancellable: true,
         ..agent(AgentStatus::Running)
     });
-    let x = |kind| {
-        Event::Key(KeyEvent {
-            code: KeyCode::Char('x'),
-            modifiers: KeyModifiers::NONE,
-            kind,
-            state: KeyEventState::NONE,
-        })
-    };
-    assert_eq!(
-        tag(view.handle(&x(KeyEventKind::Press), &keys, now)),
-        "none"
-    );
-    for _ in 0..5 {
+    for character in "xjkgG".chars() {
         assert_eq!(
-            tag(view.handle(&x(KeyEventKind::Repeat), &keys, now)),
+            tag(view.key(&key(KeyCode::Char(character)), &keys, now)),
             "none"
         );
     }
-    assert!(view.armed_cancel, "repeats leave the confirmation armed");
     assert_eq!(
-        tag(view.handle(&x(KeyEventKind::Press), &keys, now)),
+        view.draft.text, "xjkgG",
+        "the first typed character must never be a viewer shortcut"
+    );
+    assert_eq!(
+        tag(view.key(&ctrl('c'), &keys, now)),
         "action:subagent-cancel:w1"
     );
+    assert_eq!(
+        view.draft.text, "xjkgG",
+        "aborting the worker preserves its unfinished direction"
+    );
+    view.agent = Some(agent(AgentStatus::Done));
+    assert_eq!(tag(view.key(&ctrl('c'), &keys, now)), "none");
 }
 
 #[test]
@@ -405,26 +407,19 @@ fn paste_goes_into_the_draft_without_sending() {
 }
 
 #[test]
-fn ctrl_o_toggles_tool_expansion_and_keys_scroll_without_a_draft() {
+fn ctrl_o_toggles_tool_expansion_and_arrow_keys_scroll() {
     let keys = Keymap::defaults();
     let now = Instant::now();
     let mut view = viewer(None, false);
     view.geometry = (100, 10);
     view.key(&ctrl('o'), &keys, now);
     assert!(view.expanded);
-    view.key(&key(KeyCode::Char('g')), &keys, now);
-    assert_eq!(view.scroll.top, 0);
-    view.key(&key(KeyCode::Char('G')), &keys, now);
-    assert!(view.scroll.follow);
-    view.key(&key(KeyCode::Char('k')), &keys, now);
+    view.key(&key(KeyCode::Up), &keys, now);
     assert_eq!((view.scroll.top, view.scroll.follow), (89, false));
-    view.key(&key(KeyCode::Char('k')), &keys, now);
-    view.key(&key(KeyCode::Char('j')), &keys, now);
+    view.key(&key(KeyCode::Up), &keys, now);
+    view.key(&key(KeyCode::Down), &keys, now);
     assert_eq!(view.scroll.top, 89);
-    assert!(
-        view.draft.text.is_empty(),
-        "j/k/g/G/x do not type when the draft is empty"
-    );
+    assert!(view.draft.text.is_empty());
 }
 
 #[test]
@@ -529,42 +524,6 @@ fn home_and_end_jump_without_a_draft_and_edit_with_one() {
         "Home moves the draft cursor, not the view"
     );
     assert_eq!(view.draft.text, "hi");
-}
-
-#[test]
-fn footer_hides_scroll_keys_while_typing_and_cancel_when_not_cancellable() {
-    let theme = Theme::dark();
-    let keys = Keymap::defaults();
-    let status = StatusData::default();
-    let preview = |_: &UiConfig, _: u16| Line::default();
-    let ctx = DrawCtx {
-        theme: &theme,
-        keys: &keys,
-        status: &status,
-        preview_status: &preview,
-    };
-    let text = |rows: Vec<Line<'static>>| -> String {
-        rows.iter().map(|l| l.to_string() + "\n").collect()
-    };
-    let mut view = viewer(None, true);
-    view.agent = Some(agent(AgentStatus::Done));
-    let idle = text(view.footer(200, &ctx));
-    assert!(idle.contains("j/k scroll"), "{idle}");
-    assert!(!idle.contains("cancel worker"), "{idle}");
-    view.agent = Some(AgentEntry {
-        cancellable: true,
-        steerable: true,
-        ..agent(AgentStatus::Running)
-    });
-    assert!(text(view.footer(200, &ctx)).contains("x cancel worker"));
-    type_text(&mut view, &keys, "go");
-    let typing = text(view.footer(200, &ctx));
-    assert!(!typing.contains("j/k scroll"), "{typing}");
-    assert!(
-        !typing.contains("x cancel"),
-        "x types while drafting: {typing}"
-    );
-    assert!(typing.contains("Enter send"), "{typing}");
 }
 
 #[test]

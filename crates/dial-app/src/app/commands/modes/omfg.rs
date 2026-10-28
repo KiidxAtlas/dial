@@ -4,9 +4,10 @@
 use crate::agent::Agent;
 use crate::agent::modes::omfg::{Candidate, Evaluation, MAX_ATTEMPTS, build_prompt};
 use crate::app::{App, Shell, Step};
+use crate::ui::input::read;
 use crate::ui::{text, theme::Tok};
 use anyhow::Result;
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, read};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::text::{Line, Span};
 
 const CHOICE_PROJECT: usize = 0;

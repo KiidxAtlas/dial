@@ -439,6 +439,98 @@ fn main() -> anyhow::Result<()> {
             &rows_buffer(rows, width, 22),
             light,
         );
+        // Every kind of activity in one turn: grouped lookups, framed heavy calls, a sent note,
+        // a failure, and a command still running (so the live view, not scrollback, is drawn).
+        let mut lifecycle = Transcript::new();
+        lifecycle
+            .push_user("Find why the parser drops trailing commas, fix it, tell the reviewer.");
+        for (id, path) in [
+            ("r1", "src/parser.rs"),
+            ("r2", "src/lexer.rs"),
+            ("r3", "tests/commas.rs"),
+        ] {
+            lifecycle.tool_start(id, "read", path, &format!(r#"{{"path":"{path}"}}"#));
+            lifecycle.tool_end(id, "1:fn parse() {}\n2:fn next() {}", false, 0.02);
+        }
+        for (id, pattern) in [("s1", "trailing"), ("s2", "Comma")] {
+            lifecycle.tool_start(
+                id,
+                "grep",
+                pattern,
+                &format!(r#"{{"pattern":"{pattern}"}}"#),
+            );
+            lifecycle.tool_end(id, "src/parser.rs:88: match tok", false, 0.03);
+        }
+        lifecycle.tool_start(
+            "w1",
+            "write",
+            "tests/trailing.rs",
+            r##"{"path":"tests/trailing.rs","content":"#[test]\nfn trailing_comma() {\n    assert!(parse(\"[1,]\").is_ok());\n}\n"}"##,
+        );
+        lifecycle.tool_end("w1", "created tests/trailing.rs", false, 0.01);
+        lifecycle.tool_start(
+            "t1",
+            "bash",
+            "cargo test trailing",
+            r#"{"command":"cargo test trailing"}"#,
+        );
+        lifecycle.tool_end(
+            "t1",
+            "test trailing_comma ... FAILED\nassertion failed: parse(\"[1,]\").is_ok()\n[exit code: 101]",
+            true,
+            2.4,
+        );
+        lifecycle.tool_start(
+            "m1",
+            "message",
+            "",
+            r#"{"to":"all","text":"Parser fix incoming; please hold reviews of src/parser.rs."}"#,
+        );
+        lifecycle.tool_end(
+            "m1",
+            r#"{"receipts":[{"to":"reviewer","status":"queued"},{"to":"scout#2","status":"refused","reason":"not running"}]}"#,
+            false,
+            0.01,
+        );
+        lifecycle.notice(
+            "Notice",
+            "Message from reviewer to parent: Ready for the parser fix.",
+        );
+        lifecycle.notice(
+            "Notice",
+            "Project peer session-42 sent a coordination message.",
+        );
+        lifecycle.tool_start(
+            "skill",
+            "skill",
+            "rust-best-practices",
+            r#"{"name":"rust-best-practices"}"#,
+        );
+        lifecycle.tool_end("skill", "Skill instructions loaded", false, 0.01);
+        lifecycle.tool_start("workers", "task", "3 workers", r#"{"action":"start"}"#);
+        lifecycle.tool_end("workers", "Workers started", false, 0.1);
+        lifecycle.tool_data("workers", &serde_json::json!([
+            {"name":"scout#1","status":"done","elapsed_ms":1200,"result":"Found the trailing comma branch.","assignment":{"task":"Inspect parser"}},
+            {"name":"reviewer","status":"running","elapsed_ms":2400,"assignment":{"task":"Review fix"}},
+            {"name":"tester","status":"failed","elapsed_ms":800,"result":"Fixture unavailable.","assignment":{"task":"Run fixture"}}
+        ]));
+        lifecycle.tool_start("t2", "bash", "cargo test", r#"{"command":"cargo test"}"#);
+        let (rows, _) = lifecycle.document(
+            width,
+            &TranscriptCtx {
+                theme: &theme,
+                ui: &ui,
+                tick: 0,
+                tools_expanded: false,
+                expand_key: &keys.label(dial_ui::ui::keys::Action::ToolsExpand),
+            },
+        );
+        screen(
+            &mut out,
+            &format!("Tool lifecycle / {name}"),
+            &rows_buffer(rows, width, 48),
+            light,
+        );
         let request = QuestionRequest {
             question_id: "review".into(),
             generation: 0,

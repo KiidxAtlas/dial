@@ -685,6 +685,10 @@ fn sweep_archive(
                 .push(format!("archive destination exists: {}", dest.display()));
             continue;
         }
+        if let Err(error) = crate::storage::session::ensure_side_thread_free(&dest) {
+            result.errors.push(format!("{error:#}"));
+            continue;
+        }
         if let Err(e) = fs::rename(&candidate.path, &dest) {
             result.errors.push(format!(
                 "moving {} to {}: {e}",
@@ -703,6 +707,18 @@ fn sweep_archive(
             };
             result.errors.push(format!(
                 "moving stream journal for {}: {error}{note}",
+                candidate.path.display()
+            ));
+            continue;
+        }
+        if let Err(error) = crate::storage::session::relocate_side_thread(&candidate.path, &dest) {
+            // Streams and the main file go back so the session is whole at its original path.
+            let note = match restore_archived(&dest, &candidate.path) {
+                Ok(()) => "; rolled back".to_string(),
+                Err(re) => format!("; rollback failed: {re}"),
+            };
+            result.errors.push(format!(
+                "moving side thread for {}: {error}{note}",
                 candidate.path.display()
             ));
             continue;
@@ -737,14 +753,19 @@ fn sweep_archive(
     result
 }
 
-/// Moves an archived session and its stream journal back. The main file returns first and the
-/// stream journal only after that succeeds, so a failed main rename leaves the pair together in the
-/// archive instead of splitting it.
+/// Moves an archived session, its stream journal and its side-thread file back. The main file returns
+/// first, then the companions, so a failed main rename leaves everything together in the archive.
 fn restore_archived(dest: &Path, original: &Path) -> Result<(), String> {
     fs::rename(dest, original).map_err(|e| format!("restoring {}: {e}", original.display()))?;
     crate::runtime::stream_journal::relocate(dest, original).map_err(|e| {
         format!(
             "restoring stream journal of {}: {e}; the session file is back",
+            original.display()
+        )
+    })?;
+    crate::storage::session::relocate_side_thread(dest, original).map_err(|e| {
+        format!(
+            "restoring side thread of {}: {e}; the session and its stream journal are back",
             original.display()
         )
     })

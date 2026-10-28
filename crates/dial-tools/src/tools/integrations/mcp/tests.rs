@@ -16,7 +16,7 @@ fn fake_server() {
     }
 }
 
-fn fake_config(flags: &str, timeout_secs: u64) -> McpServerConfig {
+pub(super) fn fake_config(flags: &str, timeout_secs: u64) -> McpServerConfig {
     McpServerConfig {
         program: std::env::current_exe().unwrap(),
         args: [
@@ -35,7 +35,7 @@ fn fake_config(flags: &str, timeout_secs: u64) -> McpServerConfig {
     }
 }
 
-fn config_with(servers: Vec<(&str, McpServerConfig)>) -> Config {
+pub(super) fn config_with(servers: Vec<(&str, McpServerConfig)>) -> Config {
     Config {
         mcp: servers
             .into_iter()
@@ -51,10 +51,14 @@ fn load_fake() -> McpLoad {
     loaded
 }
 
-fn tool<'a>(loaded: &'a McpLoad, name: &str) -> &'a Arc<dyn Tool> {
-    loaded
-        .tools
-        .iter()
+/// Every tool the loaded servers offer, synced the way the registry mounts them.
+fn tools_of(loaded: &McpLoad) -> Vec<Arc<dyn Tool>> {
+    loaded.live.offered_tools()
+}
+
+fn tool(loaded: &McpLoad, name: &str) -> Arc<dyn Tool> {
+    tools_of(loaded)
+        .into_iter()
         .find(|t| t.name() == name)
         .unwrap_or_else(|| panic!("no tool {name}"))
 }
@@ -130,12 +134,12 @@ fn relative_stdio_cwd_resolves_against_the_project_root() {
     let specs = BTreeMap::from([("relative".into(), wrapped(Some(".")))]);
     let loaded = connect_extra(&specs, &config);
     assert!(loaded.notices.is_empty(), "{:?}", loaded.notices);
-    assert!(!loaded.tools.is_empty());
+    assert!(!tools_of(&loaded).is_empty());
 
     let specs = BTreeMap::from([("unset".into(), wrapped(None))]);
     let loaded = connect_extra(&specs, &config);
     assert!(
-        loaded.tools.is_empty(),
+        tools_of(&loaded).is_empty(),
         "without cwd the server runs in Dial's directory"
     );
 }
@@ -153,7 +157,10 @@ fn explicit_health_check_connects_disabled_server_without_enabling_it() {
 #[test]
 fn handshake_follows_every_page_and_exposes_prefixed_tools() {
     let loaded = load_fake();
-    let names: BTreeSet<_> = loaded.tools.iter().map(|t| t.name().to_owned()).collect();
+    let names: BTreeSet<_> = tools_of(&loaded)
+        .iter()
+        .map(|t| t.name().to_owned())
+        .collect();
     let expected: BTreeSet<_> = [
         "echo", "plain", "fail", "mixed", "slow", "die", "pid", "a_b", "a_b_2", "big", "pong",
         "bare",
@@ -420,12 +427,11 @@ fn broken_servers_only_produce_notices_and_good_ones_still_load() {
     );
 
     assert!(
-        loaded
-            .tools
+        tools_of(&loaded)
             .iter()
             .all(|t| t.name().starts_with("mcp__good__"))
     );
-    assert_eq!(loaded.tools.len(), 12);
+    assert_eq!(tools_of(&loaded).len(), 12);
     let notice = |server: &str| {
         let prefix = format!("mcp `{server}`: ");
         let found: Vec<_> = loaded
@@ -451,7 +457,10 @@ fn tools_from_servers_with_alike_names_never_collide() {
         ("a_b", fake_config("", 30)),
     ]));
     assert!(loaded.notices.is_empty(), "{:?}", loaded.notices);
-    let names: BTreeSet<_> = loaded.tools.iter().map(|t| t.name().to_owned()).collect();
+    let names: BTreeSet<_> = tools_of(&loaded)
+        .iter()
+        .map(|t| t.name().to_owned())
+        .collect();
     assert_eq!(names.len(), 24, "no name was shadowed");
     assert!(names.iter().all(|n| n.len() <= 64));
 }
@@ -459,7 +468,7 @@ fn tools_from_servers_with_alike_names_never_collide() {
 #[test]
 fn nothing_is_started_without_configured_servers() {
     let loaded = load(&Config::default());
-    assert!(loaded.tools.is_empty() && loaded.notices.is_empty());
+    assert!(tools_of(&loaded).is_empty() && loaded.notices.is_empty());
 }
 
 #[test]
@@ -842,7 +851,7 @@ fn http_credential_failures_are_clear_and_config_needs_exactly_one_transport() {
     };
     let loaded = load(&config_with(vec![("web", server.clone())]));
     assert!(
-        loaded.tools.is_empty() && loaded.notices[0].contains("refused the credentials"),
+        tools_of(&loaded).is_empty() && loaded.notices[0].contains("refused the credentials"),
         "{:?}",
         loaded.notices
     );

@@ -19,13 +19,16 @@ pub fn protocol(
         .unwrap_or_else(|| crate::llm::model_config::ApiProtocol::builtin(&selection.provider))
 }
 
+/// Provider name that marks the `judge` role as TypeSafe System One; it is a hosted judgment API with no weights.
+pub const TYPESAFE_JUDGE_PROVIDER: &str = "typesafe";
+
 /// Whether selection must acquire chat/embedding weights before publishing settings.
-/// Laya loads its own typed checkpoint; its judge id `decision` is not a repository.
+/// Laya loads its own typed checkpoint; its judge id `decision` is not a repository. TypeSafe is hosted.
 pub fn requires_local_preparation(config: &Config, selection: &ModelSelection) -> bool {
     config.selection_endpoint(selection).is_none()
         && !matches!(
             selection.provider.as_str(),
-            crate::llm::apple::PROVIDER | super::laya::PROVIDER
+            crate::llm::apple::PROVIDER | super::laya::PROVIDER | TYPESAFE_JUDGE_PROVIDER
         )
 }
 

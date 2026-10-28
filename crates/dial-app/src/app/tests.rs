@@ -319,7 +319,7 @@ fn action_palette_uses_registered_commands_and_real_turn_policies() {
         source: skills::Scope::Project,
         origin: "Dial",
     };
-    let entries = palette_entries(&[custom], &[skill]);
+    let entries = palette_entries(&[custom], &[skill], &[]);
     let find = |name: &str| entries.iter().find(|e| e.command.name == name).unwrap();
     assert!(find("undo").during_turn.starts_with("Stops"));
     assert!(find("model").during_turn.starts_with("Opens now"));
@@ -1726,7 +1726,7 @@ fn command_menu_lists_builtins_then_custom_then_skills_and_builtins_win() {
         source: skills::Scope::Project,
         origin: "Dial",
     };
-    let entries = command_entries(&custom, &[skill]);
+    let entries = command_entries(&custom, &[skill], &[]);
     let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(
         names.iter().filter(|n| **n == "help").count(),

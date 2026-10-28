@@ -83,8 +83,12 @@ jobs:
           cargo install --locked --path . --profile ci --root target/installed
           make test-smoke DIAL=target/installed/bin/dial
       - name: Real terminal and crash lifecycle
-        timeout-minutes: 5
-        run: python3 examples/benchmarks/interactive_smoke.py --dial target/installed/bin/dial --captures target/pty-captures
+        timeout-minutes: 10
+        run: |
+          python3 examples/benchmarks/interactive_smoke.py --dial target/installed/bin/dial --captures target/pty-captures/main
+          python3 examples/benchmarks/interactive_surfaces.py --dial target/installed/bin/dial --captures target/pty-captures/surfaces
+          python3 examples/benchmarks/session_contention_smoke.py --dial target/installed/bin/dial --captures target/pty-captures/contention
+          python3 examples/benchmarks/side_lifecycle_smoke.py --dial target/installed/bin/dial --captures target/pty-captures/side-lifecycle
       - name: Record runtime overhead
         continue-on-error: true
         run: cargo run --locked --profile ci --example runtime_baseline -- target/runtime-baseline.json
@@ -113,7 +117,7 @@ jobs:
         with:
           key: lint
       - name: Clippy
-        run: cargo clippy --locked --workspace --all-targets -- -D clippy::correctness -D clippy::suspicious
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check

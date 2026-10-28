@@ -224,13 +224,11 @@ public static class DialInstallerEd25519V1
 
     $arch = $env:PROCESSOR_ARCHITEW6432
     if (-not $arch) { $arch = $env:PROCESSOR_ARCHITECTURE }
-    $emulated = $false
-    switch ($arch) {
-        'AMD64' { }
-        'ARM64' { $emulated = $true }
-        default { throw "Unsupported Windows architecture '$arch'. Dial publishes x86_64-pc-windows-msvc only." }
+    $target = switch ($arch) {
+        'AMD64' { 'x86_64-pc-windows-msvc' }
+        'ARM64' { 'aarch64-pc-windows-msvc' }
+        default { throw "Unsupported Windows architecture '$arch'. Dial publishes x86_64-pc-windows-msvc and aarch64-pc-windows-msvc." }
     }
-    $target = 'x86_64-pc-windows-msvc'
 
     if (-not $InstallDir) { $InstallDir = $env:DIAL_INSTALL_DIR }
     if (-not $InstallDir) { $InstallDir = Join-Path $HOME '.local\bin' }
@@ -374,7 +372,6 @@ public static class DialInstallerEd25519V1
 
         Write-Host "Installed Dial $versionNumber to $installed"
         Write-Host "$destination is on your user PATH and in this session's PATH."
-        if ($emulated) { Write-Host 'ARM64 Windows: this is the x86_64 build, running under x64 emulation.' }
         Write-Host ''
         Write-Host 'Next steps:'
         Write-Host '  1. Run dial from inside a project directory.'

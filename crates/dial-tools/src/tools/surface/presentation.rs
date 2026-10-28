@@ -33,7 +33,7 @@ pub fn render_call(name: &str, args: &Value) -> Presentation {
         "write" => ("Write", Edit, Write),
         "edit" | "ast_edit" => ("Edit", Edit, Diff),
         "bash" => ("Run", Shell, Text),
-        "kernel" | "eval" => ("Run", Tools, Text),
+        "eval" => ("Run", Tools, Text),
         "task" => ("Workers", Tone::Workers, BodyStyle::Workers),
         "todo" => ("Plan", Tools, Plan),
         "ask" => ("Ask", Tools, Text),
@@ -45,6 +45,8 @@ pub fn render_call(name: &str, args: &Value) -> Presentation {
         "tool_search" | "tool_load" => ("Tools", Tools, Quiet),
         // Loading instructions is context, not work: one quiet line naming the skill.
         "skill" => ("Skill", Tools, Quiet),
+        // Notes between agents; the terminal draws a sent note as a quoted IRC line.
+        "message" => ("IRC", Connect, Text),
         _ if name.starts_with("mcp__") => ("MCP", Connect, Text),
         _ => (name, Tools, Text),
     };
@@ -65,6 +67,7 @@ pub fn render_call(name: &str, args: &Value) -> Presentation {
                 }
             }),
         "todo" => one_line(field("op")),
+        "message" => one_line(field("to")),
         // The question the user is asked, not the call's JSON.
         "ask" => {
             let questions = args["questions"].as_array().map_or(&[][..], Vec::as_slice);

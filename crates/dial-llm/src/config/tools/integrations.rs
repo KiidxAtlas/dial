@@ -34,7 +34,6 @@ integrations! {
     ("git", true, false),
     ("ssh", true, false),
     ("browser", true, true),
-    ("kernel", true, true),
     ("eval", true, true),
     ("find", true, true),
     ("autoresearch", true, true),
@@ -44,4 +43,8 @@ integrations! {
     ("notebook", false, false),
     ("security_scan", false, false),
     ("computer", false, false),
+    ("glab_mr", false, false),
+    ("ida", false, false),
+    ("image_gen", false, false),
+    ("report_tool_issue", false, false),
 }

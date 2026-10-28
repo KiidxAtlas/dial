@@ -148,3 +148,35 @@ fn dropping_the_shell_cancels_without_waiting_for_the_worker() {
     assert!(before.elapsed() < Duration::from_secs(1));
     assert!(observed.recv_timeout(Duration::from_secs(3)).unwrap());
 }
+
+#[test]
+fn automatic_reports_do_not_enter_the_streamed_conversation() {
+    let (_home, _project, mut app, mut shell) = super::super::testkit::shell();
+    app.config.sandbox.allow_network = true;
+    let (send, receive) = mpsc::channel();
+    shell.runtime_updates.pending = Some(receive);
+    send.send("MAINTENANCE-DETAILS-MUST-STAY-OUTSIDE-ANSWER".into())
+        .unwrap();
+    shell.transcript.push_user("Keep working on the request");
+    shell
+        .transcript
+        .assistant_delta("The streamed answer stays continuous.");
+    shell.refresh_resources(&app, false, true);
+    shell.paint(None).unwrap();
+    let ctx = crate::ui::transcript::TranscriptCtx {
+        theme: shell.themes.current(),
+        ui: &shell.ui,
+        tick: 0,
+        tools_expanded: false,
+        expand_key: "expand",
+    };
+    let (rows, _) = shell.transcript.document(100, &ctx);
+    let text = rows
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("The streamed answer stays continuous."));
+    assert!(!text.contains("MAINTENANCE-DETAILS"));
+    assert!(shell.take_runtime_update_report().is_some());
+}

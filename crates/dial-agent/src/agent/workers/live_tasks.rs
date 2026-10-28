@@ -1,6 +1,6 @@
 //! Live jobs own their backends and conversations. Approval always returns to the controller.
 use crate::agent::{
-    Ui, make_backend,
+    Ui,
     safety::approval::{self, Denial, PermissionRule},
     workers::mailbox::{self, Team},
     workers::subagents::{self, Approver, Env, Outcome},
@@ -79,22 +79,65 @@ impl JobState {
 }
 /// Mailbox size used until a batch sets `task.inbox_limit`.
 const DEFAULT_INBOX_LIMIT: usize = 256;
+
+/// Result of a worker that unwound or panicked. Its effects are unknown, so it is never replayed.
+const WORKER_LOST: &str = "subagent worker panicked";
 /// Live jobs by id, for status, cancel and list. Messages travel on the team bus instead.
 type LiveJobs = Arc<Mutex<BTreeMap<String, Arc<ControlJob>>>>;
-type ActiveTool = Arc<Mutex<Option<Arc<dyn crate::tools::integrations::ext::Tool>>>>;
+/// Tool calls a job has in flight, keyed by call id. Weak: the registry owns the tools.
+type ActiveTool =
+    Arc<Mutex<BTreeMap<String, std::sync::Weak<dyn crate::tools::integrations::ext::Tool>>>>;
 struct ControlJob {
     interrupt: Arc<AtomicBool>,
     active_tool: ActiveTool,
     body: crate::runtime::Body,
     finished: AtomicBool,
+    /// Config the worker launched with; `configure` validates settings against it.
+    base: Config,
+    settings: Arc<Mutex<control::SettingsSlot>>,
 }
 
 fn body_status(body: &crate::runtime::Body) -> Value {
     body.read(|n| n.result.data.clone().unwrap_or(Value::Null))
 }
 
+/// Publishes settings state on the running worker body as typed data. The header reads `model`, which
+/// changes only when `applied_model` is given, so a requested-but-unapplied model never shows as active.
+fn publish_settings(
+    body: &crate::runtime::Body,
+    slot: &control::SettingsSlot,
+    applied_model: Option<String>,
+) {
+    let node = body.snapshot();
+    let mut data = node
+        .result
+        .data
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    data["phase"] = json!(slot.status());
+    data["config"] = slot.metadata();
+    if let Some(model) = applied_model {
+        data["model"] = json!(model);
+    }
+    body.settle(node.result.text, Some(data), crate::runtime::Phase::Running);
+}
+
 fn job_status(job: &ControlJob) -> Value {
     body_status(&job.body)
+}
+
+/// Interrupts every tool call a job has in flight. A call that finished was removed on its own,
+/// so only still-running calls are cancelled.
+fn cancel_active(active: &ActiveTool) {
+    let tools: Vec<_> = active
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .filter_map(std::sync::Weak::upgrade)
+        .collect();
+    for tool in tools {
+        tool.cancel_operation();
+    }
 }
 
 /// Publish the terminal result before exposing completion to control handles or releasing a lease.
@@ -150,6 +193,58 @@ impl LiveTaskControl {
     pub fn traffic(&self, id: &str) -> Vec<mailbox::Traffic> {
         self.team.traffic(id)
     }
+    /// Queues model and thinking changes for a live worker. They apply at its next request-safe
+    /// boundary, when its backend is swapped and the change is recorded in its transcript.
+    pub fn configure(
+        &self,
+        id: &str,
+        model: Option<&str>,
+        thinking: Option<&str>,
+    ) -> anyhow::Result<Value> {
+        let job = self
+            .jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .cloned();
+        let Some(job) = job else {
+            anyhow::bail!("unknown live worker {id}");
+        };
+        if job.finished.load(Ordering::SeqCst) {
+            anyhow::bail!("worker {id} has finished; start or resume it with new settings");
+        }
+        let update = control::WorkerSettings {
+            model: model.map(str::to_owned),
+            thinking: thinking.map(str::to_owned),
+        };
+        if update.is_empty() {
+            anyhow::bail!("configure needs a model or a thinking level");
+        }
+        let mut slot = job.settings.lock().unwrap_or_else(|e| e.into_inner());
+        let mut merged = slot.accepted.clone();
+        merged.merge(update);
+        control::apply_settings(&job.base, &merged)?;
+        slot.accepted = merged.clone();
+        slot.queued = true;
+        slot.revision += 1;
+        slot.failure = None;
+        publish_settings(&job.body, &slot, None);
+        Ok(
+            json!({"id": id, "status": "queued", "revision": slot.revision, "model": merged.model, "thinking": merged.thinking}),
+        )
+    }
+
+    /// A resumed worker keeps its public id but owns a new runtime node. Historical incarnations
+    /// remain in the journal and must not replace the current owner's state in UI projections.
+    pub fn current_node(&self, id: &str) -> Option<String> {
+        let job = self
+            .jobs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(id)
+            .cloned()?;
+        Some(job.body.read(|node| node.id.clone()))
+    }
     pub fn any_running(&self) -> bool {
         self.jobs
             .lock()
@@ -197,14 +292,7 @@ impl LiveTaskControl {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("job is unknown or finished"))?;
         job.interrupt.store(true, Ordering::SeqCst);
-        let active = job
-            .active_tool
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        if let Some(tool) = active {
-            tool.cancel_operation();
-        }
+        cancel_active(&job.active_tool);
         Ok(json!({"id":id,"cancellation_requested":true}))
     }
 }
@@ -275,8 +363,7 @@ impl Drop for WorkerExit {
         if self.reported {
             return;
         }
-        let value =
-            json!({"id":self.id,"status":"failed","steps":0,"result":"subagent worker panicked"});
+        let value = json!({"id":self.id,"status":"failed","steps":0,"result":WORKER_LOST});
         settle_result(&self.control.body, &value);
         self.team.retire(&self.id);
         self.control.finished.store(true, Ordering::SeqCst);
@@ -292,6 +379,9 @@ pub(in crate::agent) struct LiveTasks {
     registry: LiveJobs,
     team: Team,
     completed: Vec<Value>,
+    /// Reusable worker pools by `pool-N` id; see `pool.rs`.
+    pools: BTreeMap<String, pool::WorkerPool>,
+    next_pool: u64,
 }
 impl Default for LiveTasks {
     fn default() -> Self {
@@ -305,6 +395,8 @@ impl Default for LiveTasks {
             registry: Arc::default(),
             team: Team::open(DEFAULT_INBOX_LIMIT),
             completed: Vec::new(),
+            pools: BTreeMap::new(),
+            next_pool: 0,
         }
     }
 }
@@ -318,6 +410,7 @@ struct Bridge {
     id: String,
     active_tool: ActiveTool,
     transcript: Option<Arc<crate::agent::workers::child_transcript::ChildTranscript>>,
+    settings: Arc<Mutex<control::SettingsSlot>>,
 }
 impl Approver for Bridge {
     fn tool_signals(
@@ -340,6 +433,29 @@ impl Approver for Bridge {
         &self,
     ) -> Option<Arc<crate::agent::workers::child_transcript::ChildTranscript>> {
         self.transcript.clone()
+    }
+    fn take_worker_settings(&mut self) -> Option<control::WorkerSettings> {
+        let mut slot = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+        let accepted = slot.take();
+        if accepted.is_some() {
+            publish_settings(&self.body, &slot, None);
+        }
+        accepted
+    }
+    fn worker_settings_applied(
+        &mut self,
+        _settings: &control::WorkerSettings,
+        resolved: &crate::config::types::Config,
+    ) {
+        let mut slot = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+        slot.acknowledge();
+        // The header model changes only here, after the durable record and backend swap succeeded.
+        publish_settings(&self.body, &slot, Some(resolved.selection().display_name()));
+    }
+    fn worker_settings_failed(&mut self, error: &str) {
+        let mut slot = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+        slot.fail(error);
+        publish_settings(&self.body, &slot, None);
     }
     fn memory_capture_allowed(&mut self, cancel: &Arc<AtomicBool>) -> Result<bool, String> {
         if cancel.load(Ordering::SeqCst) || self.interrupt.load(Ordering::SeqCst) {
@@ -548,7 +664,7 @@ impl Approver for Bridge {
     fn live_coordination(&self) -> bool {
         true
     }
-    fn tool_started(&mut self, name: &str, registry: &Registry) {
+    fn tool_started(&mut self, call_id: &str, name: &str, registry: &Registry) {
         let steps = self.body.read(|n| {
             n.result
                 .data
@@ -557,10 +673,18 @@ impl Approver for Bridge {
                 .unwrap_or(0) as u32
         });
         self.body.progress(&format!("tool: {name}"), steps);
-        *self.active_tool.lock().unwrap_or_else(|e| e.into_inner()) = registry.get(name).cloned();
+        if let Some(tool) = registry.get(name) {
+            self.active_tool
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(call_id.to_owned(), Arc::downgrade(tool));
+        }
     }
-    fn tool_finished(&mut self) {
-        *self.active_tool.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    fn tool_finished(&mut self, call_id: &str) {
+        self.active_tool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(call_id);
     }
     fn peer_message(&mut self, args: &Value) -> Result<Value, String> {
         route(&self.team, &self.id, args)
@@ -630,6 +754,7 @@ impl LiveTasks {
             .iter()
             .filter(|(_, job)| job.running() || job.worker.is_some())
             .map(|(id, _)| id.clone())
+            .chain(self.pending_pool_ids())
             .collect()
     }
     /// Messages workers sent to the parent since the last call, in send order.
@@ -656,6 +781,16 @@ impl LiveTasks {
         }
     }
     pub fn start(&mut self, ctx: StartContext<'_>, args: &Value) -> Result<Value, String> {
+        self.start_inner(ctx, args, None)
+    }
+    /// Starts a worker, routing it onto a pool slot when `route` is set so the slot's backend and
+    /// carried conversation are reused.
+    fn start_inner(
+        &mut self,
+        ctx: StartContext<'_>,
+        args: &Value,
+        mut route: Option<SlotRoute>,
+    ) -> Result<Value, String> {
         let StartContext {
             config,
             workspace,
@@ -702,7 +837,13 @@ impl LiveTasks {
             None
         };
         let effective = resume.as_ref().map_or(args, |resume| &resume.task).clone();
-        let request = subagents::parse(&effective, &config)?;
+        let mut request = subagents::parse(&effective, &config)?;
+        subagents::seance::attach(
+            &mut request.jobs,
+            layout,
+            Some(session_id.as_str()),
+            &config,
+        )?;
         if self
             .jobs
             .values()
@@ -735,6 +876,12 @@ impl LiveTasks {
             {
                 return Err("worker model or agent definition changed; restore its original settings or start a new worker".into());
             }
+            let role = match resume.as_ref().and_then(|saved| saved.settings.as_ref()) {
+                Some(settings) => {
+                    control::apply_settings(&role, settings).map_err(|e| format!("{e:#}"))?
+                }
+                None => role,
+            };
             roles.push((role, job_harness));
         }
         let workspace_identity =
@@ -783,6 +930,8 @@ impl LiveTasks {
                 format!("task-{}", self.next)
             };
             let resume_tools = resume.as_ref().map(|saved| saved.tools.clone());
+            let resume_settings = resume.as_ref().and_then(|saved| saved.settings.clone());
+            let original_task = effective["original_task"].as_str().unwrap_or(&job.prompt);
             let lease = match resume.take() {
                 Some(saved) => Some(saved.lease),
                 None => match layout
@@ -834,10 +983,16 @@ impl LiveTasks {
                 assignment["work_packet"] = packet.clone();
                 task["work_packet"] = packet;
             }
-            let resume_contract = json!({"version":1,"workspace":workspace_identity,"task":task,"model":role.selection().display_name(),"definition":config.agents.get(job.kind)});
+            if let Some(seance) = &job.seance {
+                task["source_session"] = json!(seance.source);
+                if let Some(model) = &seance.model {
+                    task["model"] = json!(model);
+                }
+            }
+            let resume_contract = json!({"version":1,"workspace":workspace_identity,"task":task,"original_task":original_task,"model":role.selection().display_name(),"definition":config.agents.get(job.kind)});
             let started_ms = epoch_ms();
-            let status = json!({"id":id,"status":"running","name":job.label,"agent":job.kind,"model":role.selection().display_name(),"role":job.role,"model_source":job.model_routes[0].source,"phase":"starting","steps":0,"started_ms":started_ms,
-                "assignment":assignment});
+            let status = json!({"id":id,"runtime_node":body.read(|node| node.id.clone()),"status":"running","name":job.label,"agent":job.kind,"model":role.selection().display_name(),"role":job.role,"model_source":job.model_routes[0].source,"phase":"starting","steps":0,"started_ms":started_ms,
+                "assignment":assignment, "task":original_task, "instruction":job.prompt});
             body.settle(
                 String::new(),
                 Some(status.clone()),
@@ -852,9 +1007,13 @@ impl LiveTasks {
             let workspace = workspace.clone();
             let ext = ext.clone();
             let layout = layout.cloned();
+            let session_id = session_id.clone();
             let mut header = status.clone();
             header["started"] = json!(agent_timestamp());
             header["resume_contract"] = resume_contract.clone();
+            if let Some(seance) = &job.seance {
+                header["seance"] = json!({"source_session": seance.source});
+            }
             let transcript = match create_transcript(
                 config.task.persist,
                 layout.as_ref(),
@@ -883,11 +1042,24 @@ impl LiveTasks {
             let active = active_tool.clone();
             let signals = crate::tools::exec::signals::CallSignals::new();
             let interruptible = Arc::new(AtomicBool::new(false));
+            let (slot_store, continuation) = match route.take() {
+                Some(SlotRoute {
+                    store,
+                    continuation,
+                }) => (Some(store), continuation),
+                None => (None, None),
+            };
+            let settings = Arc::new(Mutex::new(control::SettingsSlot {
+                accepted: resume_settings.unwrap_or_default(),
+                ..Default::default()
+            }));
             let control = Arc::new(ControlJob {
                 interrupt: interrupt.clone(),
                 active_tool: active_tool.clone(),
                 body: body.clone(),
                 finished: AtomicBool::new(false),
+                base: role.clone(),
+                settings: settings.clone(),
             });
             let wake_signals = signals.clone();
             let wake_interruptible = interruptible.clone();
@@ -898,16 +1070,8 @@ impl LiveTasks {
                 Box::new(move || {
                     wake_signals.request_steering();
                     wake_signals.interrupt_waits();
-                    let active = if wake_interruptible.load(Ordering::SeqCst) {
-                        wake_active
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .clone()
-                    } else {
-                        None
-                    };
-                    if let Some(tool) = active {
-                        tool.cancel_operation();
+                    if wake_interruptible.load(Ordering::SeqCst) {
+                        cancel_active(&wake_active);
                     }
                 }),
             );
@@ -928,153 +1092,194 @@ impl LiveTasks {
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(id.clone(), control.clone());
             let team = self.team.clone();
-            let spawned = thread::Builder::new()
-                .name(format!("dial-{id}"))
-                .spawn(move || {
-                    let _lease = lease;
-                    let mut exit = WorkerExit {
-                        id: done_id.clone(),
-                        tx: tx.clone(),
-                        control: control.clone(),
-                        team: team.clone(),
-                        reported: false,
+            let work: SlotWork = Box::new(move |slot: &mut SlotState| {
+                let _lease = lease;
+                let mut exit = WorkerExit {
+                    id: done_id.clone(),
+                    tx: tx.clone(),
+                    control: control.clone(),
+                    team: team.clone(),
+                    reported: false,
+                };
+                let mut bridge = Bridge {
+                    signals,
+                    interruptible,
+                    body: shared_body,
+                    tx: tx.clone(),
+                    interrupt: cancel.clone(),
+                    team: team.clone(),
+                    id: done_id.clone(),
+                    active_tool: active,
+                    transcript: transcript.clone(),
+                    settings: settings.clone(),
+                };
+                let mut outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut request = match subagents::parse(&task, &config) {
+                        Ok(r) => r,
+                        Err(e) => return Outcome::failed(0, e),
                     };
-                    let mut bridge = Bridge {
-                        signals,
-                        interruptible,
-                        body: shared_body,
-                        tx: tx.clone(),
-                        interrupt: cancel.clone(),
-                        team: team.clone(),
-                        id: done_id.clone(),
-                        active_tool: active,
-                        transcript: transcript.clone(),
-                    };
-                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let mut request = match subagents::parse(&task, &config) {
-                            Ok(r) => r,
-                            Err(e) => return Outcome::failed(0, e),
-                        };
-                        request.jobs[0].resume_messages = resume_messages;
-                        request.jobs[0].resume_tools = resume_tools;
-                        handoff.apply(&mut request.jobs);
-                        if let Err(why) =
-                            subagents::preload_skills(&mut request.jobs, layout.as_ref())
+                    // The carried conversation belongs to the slot's retained backend; an item whose
+                    // config differs starts fresh instead of continuing another config's conversation.
+                    let compatible = slot.compatible(&role);
+                    let (messages, tools) = match (slot.carry.take(), continuation) {
+                        (Some(carry), Some(assignment))
+                            if resume_messages.is_empty() && compatible =>
                         {
-                            return Outcome::failed(0, why);
+                            let mut messages = carry.messages;
+                            messages.push(json!({"role":"user","content":assignment}));
+                            (messages, Some(carry.tools))
                         }
-                        let env = Env {
-                            config: &role,
-                            workspace: &workspace,
-                            ext: &ext,
-                            layout: layout.as_ref(),
-                            harness: &harness,
-                            interrupt: &cancel,
-                            usage: usage.as_ref(),
-                            context_cap,
-                            memory: memory.as_ref(),
-                            plan_mode,
-                            agents_messages: &agents_messages,
-                        };
-                        match make_backend(&role) {
-                            Ok(mut backend) => {
-                                let outcome = subagents::run_job(
+                        _ => (resume_messages, resume_tools),
+                    };
+                    request.jobs[0].resume_messages = messages;
+                    request.jobs[0].resume_tools = tools;
+                    if let Err(why) = subagents::seance::attach(
+                        &mut request.jobs,
+                        layout.as_ref(),
+                        Some(session_id.as_str()),
+                        &config,
+                    ) {
+                        return Outcome::failed(0, why);
+                    }
+                    handoff.apply(&mut request.jobs);
+                    if let Err(why) = subagents::preload_skills(&mut request.jobs, layout.as_ref())
+                    {
+                        return Outcome::failed(0, why);
+                    }
+                    let env = Env {
+                        config: &role,
+                        workspace: &workspace,
+                        ext: &ext,
+                        layout: layout.as_ref(),
+                        harness: &harness,
+                        interrupt: &cancel,
+                        usage: usage.as_ref(),
+                        context_cap,
+                        memory: memory.as_ref(),
+                        plan_mode,
+                        agents_messages: &agents_messages,
+                    };
+                    match slot.backend_for(&role) {
+                        Ok(backend) => subagents::run_job(
+                            env,
+                            &request.jobs[0],
+                            &mut bridge,
+                            |env, approver| {
+                                subagents::run_child(
                                     env,
                                     &request.jobs[0],
-                                    &mut bridge,
-                                    |env, approver| {
-                                        subagents::run_child(
-                                            env,
-                                            &request.jobs[0],
-                                            &mut backend,
-                                            None,
-                                            approver,
-                                        )
-                                    },
-                                );
-                                backend.release();
-                                outcome
-                            }
-                            Err(e) => Outcome::failed(0, format!("{e:#}")),
+                                    &mut *backend,
+                                    None,
+                                    approver,
+                                )
+                            },
+                        ),
+                        Err(e) => Outcome::failed(0, format!("{e:#}")),
+                    }
+                }))
+                .unwrap_or_else(|_| Outcome::failed(0, WORKER_LOST));
+                let lost = outcome.status.text.as_str() == WORKER_LOST;
+                slot.carry = outcome.conversation.take();
+                let applied =
+                    std::mem::take(&mut settings.lock().unwrap_or_else(|e| e.into_inner()).applied);
+                if lost || applied {
+                    slot.retire_backend();
+                }
+                let status = if outcome.status.phase == crate::runtime::Phase::Interrupted {
+                    "cancelled"
+                } else {
+                    outcome.status.wire()
+                };
+                let text = outcome.status.text;
+                let mut value =
+                    json!({"id":done_id,"status":status,"steps":outcome.steps,"result":text});
+                value["inspections"] = json!(outcome.inspections);
+                value["execution_id"] = json!(bridge.body.read(|node| node.id.clone()));
+                value["assignment"] = bridge.body.read(|node| {
+                    node.result
+                        .data
+                        .as_ref()
+                        .map(|data| data["assignment"].clone())
+                        .unwrap_or(Value::Null)
+                });
+                let route = bridge
+                    .body
+                    .read(|node| node.result.data.clone().unwrap_or(json!({})));
+                for key in ["role", "model", "model_source"] {
+                    value[key] = route[key].clone();
+                }
+                if let Some(data) = outcome.data {
+                    value["data"] = data;
+                }
+                if let Some(isolation) = outcome.isolation {
+                    // A successful structured result must stay valid JSON.
+                    if value.get("data").is_none() || status != "done" {
+                        let text = value["result"].as_str().unwrap_or("");
+                        value["result"] = json!(format!("{text}\n\n[{}]", isolation.describe()));
+                    }
+                    value["isolation_label"] = json!(isolation.describe());
+                    value["isolation"] = json!(isolation);
+                }
+                if let Some(rules) = outcome.portable_rules {
+                    value["portable_rules"] = rules;
+                }
+                let acceptance = value["assignment"]["work_packet"]["acceptance"]
+                    .as_array()
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                value["projection"] = subagents::result_projection(
+                    value["result"].as_str().unwrap_or(""),
+                    value.get("data"),
+                    &acceptance,
+                    Some(&workspace),
+                );
+                if let Some(store) = workspace.artifacts() {
+                    match subagents::retain_report(store, &value) {
+                        Ok(uri) => value["artifact"] = json!(uri),
+                        Err(e) => {
+                            value["status"] = json!("failed");
+                            value["artifact_error"] = json!(format!("{e:#}"));
                         }
-                    }))
-                    .unwrap_or_else(|_| Outcome::failed(0, "subagent worker panicked"));
-                    let status = if outcome.status.phase == crate::runtime::Phase::Interrupted { "cancelled" } else { outcome.status.wire() };
-                    let text = outcome.status.text;
-                    let mut value =
-                        json!({"id":done_id,"status":status,"steps":outcome.steps,"result":text});
-                    value["inspections"] = json!(outcome.inspections);
-                    value["execution_id"] = json!(bridge.body.read(|node| node.id.clone()));
-                    value["assignment"] = bridge.body.read(|node| {
-                        node.result
-                            .data
-                            .as_ref()
-                            .map(|data| data["assignment"].clone())
-                            .unwrap_or(Value::Null)
-                    });
-                    let route = bridge.body.read(|node| node.result.data.clone().unwrap_or(json!({})));
-                    for key in ["role", "model", "model_source"] {
-                        value[key] = route[key].clone();
                     }
-                    if let Some(data) = outcome.data {
-                        value["data"] = data;
-                    }
-                    if let Some(isolation) = outcome.isolation {
-                        // A successful structured result must stay valid JSON.
-                        if value.get("data").is_none() || status != "done" {
-                            let text = value["result"].as_str().unwrap_or("");
-                            value["result"] =
-                                json!(format!("{text}\n\n[{}]", isolation.describe()));
-                        }
-                        value["isolation_label"] = json!(isolation.describe());
-                        value["isolation"] = json!(isolation);
-                    }
-                    if let Some(rules) = outcome.portable_rules {
-                        value["portable_rules"] = rules;
-                    }
-                    let acceptance = value["assignment"]["work_packet"]["acceptance"].as_array()
-                        .map(|items| items.iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>()).unwrap_or_default();
-                    value["projection"] = subagents::result_projection(value["result"].as_str().unwrap_or(""), value.get("data"), &acceptance, Some(&workspace));
-                    if let Some(store) = workspace.artifacts() {
-                        match subagents::retain_report(store, &value) {
-                            Ok(uri) => value["artifact"] = json!(uri),
-                            Err(e) => {
-                                value["status"] = json!("failed");
-                                value["artifact_error"] = json!(format!("{e:#}"));
-                            }
-                        }
-                    }
-                    if let Some(sink) = &transcript {
-                        let finished_ms = epoch_ms();
-                        let artifacts = value["artifact"]
-                            .as_str()
-                            .map_or_else(|| json!([]), |uri| json!([["result", uri]]));
-                        if let Err(error) = sink.finish(json!({"status":value["status"],"steps":outcome.steps,"finished":agent_timestamp(),"finished_ms":finished_ms,"elapsed_ms":finished_ms.saturating_sub(started_ms),"artifacts":artifacts,"isolation":value.get("isolation_label").cloned(),"role":value["role"],"model":value["model"],"model_source":value["model_source"]})) {
+                }
+                if let Some(sink) = &transcript {
+                    let finished_ms = epoch_ms();
+                    let artifacts = value["artifact"]
+                        .as_str()
+                        .map_or_else(|| json!([]), |uri| json!([["result", uri]]));
+                    if let Err(error) = sink.finish(json!({"status":value["status"],"steps":outcome.steps,"finished":agent_timestamp(),"finished_ms":finished_ms,"elapsed_ms":finished_ms.saturating_sub(started_ms),"artifacts":artifacts,"isolation":value.get("isolation_label").cloned(),"role":value["role"],"model":value["model"],"model_source":value["model_source"]})) {
                             value["status"] = json!("failed");
                             value["transcript_error"] = json!(format!("{error:#}"));
                         }
-                    }
-                    settle_result(&control.body, &value);
-                    drop(_lease);
-                    exit.reported = true;
-                    team.retire(&done_id);
-                    control.finished.store(true, Ordering::SeqCst);
-                    let _ = tx.send(Event::Done(done_id, value));
-                })
-                .map_err(|e| {
-                    self.team.retire(&id);
-                    self.registry
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .remove(&id);
-                    let why = format!("starting live subagent: {e}");
-                    body.settle(
-                        why.clone(),
-                        Some(json!({"id":id,"status":"failed"})),
-                        crate::runtime::Phase::Failed,
-                    );
-                    why
-                });
+                }
+                settle_result(&control.body, &value);
+                drop(_lease);
+                exit.reported = true;
+                team.retire(&done_id);
+                control.finished.store(true, Ordering::SeqCst);
+                let _ = tx.send(Event::Done(done_id, value));
+            });
+            let store = slot_store.unwrap_or_default();
+            let spawned = slot::run_on(store, work, format!("dial-{id}")).map_err(|e| {
+                self.team.retire(&id);
+                self.registry
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&id);
+                let why = format!("starting live subagent: {e}");
+                body.settle(
+                    why.clone(),
+                    Some(json!({"id":id,"status":"failed"})),
+                    crate::runtime::Phase::Failed,
+                );
+                why
+            });
             let worker = match spawned {
                 Ok(worker) => worker,
                 Err(why) => {
@@ -1280,9 +1485,11 @@ impl LiveTasks {
                 }
             }
         }
+        self.advance_pools();
     }
     pub fn status(&self, id: Option<&str>) -> Result<Value, String> {
         match id {
+            Some(id) if self.is_pool(id) => self.pool_report(id, false),
             Some(id) => self
                 .jobs
                 .get(id)
@@ -1293,11 +1500,9 @@ impl LiveTasks {
                 jobs.sort_by_key(|(id, _)| {
                     id.trim_start_matches("task-").parse::<u64>().unwrap_or(0)
                 });
-                Ok(json!(
-                    jobs.into_iter()
-                        .map(|(_, j)| j.status())
-                        .collect::<Vec<_>>()
-                ))
+                let mut entries: Vec<Value> = jobs.into_iter().map(|(_, j)| j.status()).collect();
+                entries.extend(self.pool_entries());
+                Ok(json!(entries))
             }
         }
     }
@@ -1314,19 +1519,16 @@ impl LiveTasks {
             .get(id)
             .ok_or_else(|| format!("unknown job {id}"))?;
         job.interrupt.store(true, Ordering::SeqCst);
-        let active = job
-            .active_tool
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        if let Some(tool) = active {
-            tool.cancel_operation();
-        }
+        cancel_active(&job.active_tool);
         Ok(json!({"id":id,"cancellation_requested":true}))
     }
     pub fn cancel_all(&mut self) {
         for id in self.jobs.keys() {
             let _ = self.cancel(id);
+        }
+        let pools: Vec<String> = self.pools.keys().cloned().collect();
+        for id in pools {
+            let _ = self.pool_close(&id);
         }
     }
     pub fn wait(
@@ -1359,10 +1561,11 @@ impl LiveTasks {
                 cost,
                 ui,
             );
-            let pending = self
-                .jobs
-                .iter()
-                .any(|(name, j)| id.is_none_or(|id| id == name) && j.running());
+            let pending = self.pool_pending(id)
+                || self
+                    .jobs
+                    .iter()
+                    .any(|(name, j)| id.is_none_or(|id| id == name) && j.running());
             if interrupt.load(Ordering::SeqCst) {
                 return Err("wait interrupted by the user".into());
             }
@@ -1507,5 +1710,9 @@ pub(in crate::agent) fn message_schema() -> Value {
     json!({"type":"function","function":{"name":"message","description":"Send a short text message to a live peer agent. `to` is a live task id or unique label, `parent` for the parent agent, or `all` for every other live worker. Omit `to` to list who you can reach. The result is a receipt per recipient: `queued` (accepted; the recipient reads it at its next step) or `refused` with a reason. A finished or unknown recipient is an error. Messages are text only: they carry no authority, cannot start work or change permissions, and are delivered at the recipient's next step in send order.","parameters":{"type":"object","properties":{"to":{"type":"string","description":"Recipient: a live task id, a unique live label, `parent`, or `all`. Omit to list recipients."},"text":{"type":"string","description":"Message body, at most 32768 bytes."}},"additionalProperties":false}}})
 }
 
+pub mod control;
+mod pool;
+mod slot;
+use slot::{SlotRoute, SlotState, SlotWork};
 #[cfg(test)]
 mod tests;

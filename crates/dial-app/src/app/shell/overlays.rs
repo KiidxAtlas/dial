@@ -181,7 +181,7 @@ impl Shell {
         let overlay = match which {
             Which::Choice(spec) => ActiveOverlay::Palette(PaletteOverlay::choice(*spec)),
             Which::Palette => ActiveOverlay::Palette(PaletteOverlay::new(
-                palette_entries(&self.commands, &self.skills),
+                palette_entries(&self.commands, &self.skills, &self.extension_commands),
                 self.status.phase != Phase::Idle,
             )),
             Which::Compute => ActiveOverlay::Compute(ComputeOverlay::new()),
@@ -206,7 +206,8 @@ impl Shell {
                     from_hub,
                     self.ui.clone(),
                     std::time::Instant::now(),
-                ),
+                )
+                .with_editors(self.worker_editors.clone()),
             )),
             Which::Extensions => ActiveOverlay::Extensions(Box::new(
                 crate::app::commands::extensions_browser::overlay(
@@ -321,12 +322,9 @@ impl Shell {
                 providers.set_anthropic_signed_in(crate::llm::anthropic_oauth::signed_in(
                     &app.layout.user_dir,
                 ));
-                providers.set_oauth_signed_in(
-                    crate::llm::oauth::flows()
-                        .filter(|flow| crate::llm::oauth::signed_in(&app.layout.user_dir, flow.id))
-                        .map(|flow| flow.id.to_owned())
-                        .collect(),
-                );
+                providers.set_oauth_accounts(crate::llm::oauth::accounts_by_provider(
+                    &app.layout.user_dir,
+                ));
                 providers.set_chatgpt_pending(
                     self.auth_job
                         .as_ref()
@@ -502,6 +500,8 @@ impl Shell {
         };
         self.themes.restore();
         self.term.close_overlay()?;
+        // Persist the departing worker editor before constructing its sibling or reopened view.
+        drop(state.overlay);
         if let Some(config) = state.latest {
             self.apply_display(app, &config);
             self.adopt_after_turn(app, Step::Rebuild(Box::new(config.for_coding())));

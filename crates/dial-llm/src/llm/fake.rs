@@ -188,6 +188,7 @@ pub(crate) fn serve_with_idle(listener: TcpListener, scripts: Vec<Script>, idle:
     let url = format!("http://{}", listener.local_addr().expect("addr"));
     super::catalog::forget_llama_props(&url);
     super::local_server::forget(&url);
+    super::anthropic_cache::forget_refusals(&url);
     let accepted = Arc::new(AtomicUsize::new(0));
     let count = scripts.len();
     let counter = Arc::clone(&accepted);

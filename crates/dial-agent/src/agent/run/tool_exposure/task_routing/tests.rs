@@ -96,6 +96,10 @@ fn task_intents_select_native_specialists_without_discovery_calls() {
             vec!["code_history"],
         ),
         ("Debug the runtime crash at a breakpoint", vec!["dap"]),
+        (
+            "Generate a logo image for the landing page",
+            vec!["image_gen"],
+        ),
     ];
     for (query, expected) in cases {
         let candidates = expected

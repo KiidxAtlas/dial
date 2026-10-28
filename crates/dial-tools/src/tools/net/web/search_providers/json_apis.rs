@@ -21,7 +21,7 @@ const PARALLEL_URL: &str = "https://api.parallel.ai/v1beta/search";
 const ZAI_URL: &str = "https://api.z.ai/api/paas/v4/web_search";
 
 /// Result count within a provider's accepted range.
-fn count(limit: usize, max: usize) -> usize {
+pub(super) fn count(limit: usize, max: usize) -> usize {
     limit.clamp(1, max)
 }
 
@@ -78,6 +78,7 @@ pub fn tavily(query: &Query, key: &str) -> HttpRequest {
     if let Some(recency) = query.recency {
         body["time_range"] = json!(recency.name());
     }
+    native_domains(&mut body, query, "include_domains", "exclude_domains");
     HttpRequest::post(
         TAVILY_URL,
         vec![("Authorization", format!("Bearer {key}"))],
@@ -102,6 +103,18 @@ pub fn parse_tavily(value: &Value) -> Result<Parsed, String> {
     })
 }
 
+/// Narrows a request to whole hosts where the provider filters natively. A path entry is never sent
+/// natively, because a host-level filter would change its meaning; the post-filter enforces it.
+fn native_domains(body: &mut Value, query: &Query, include_key: &str, exclude_key: &str) {
+    if let Some(hosts) = query.filter.native_include() {
+        body[include_key] = json!(hosts);
+    }
+    let excluded = query.filter.native_exclude();
+    if !excluded.is_empty() {
+        body[exclude_key] = json!(excluded);
+    }
+}
+
 pub fn exa(query: &Query, key: &str) -> HttpRequest {
     let mut body = json!({
         "query": query.text,
@@ -113,6 +126,7 @@ pub fn exa(query: &Query, key: &str) -> HttpRequest {
         let start = iso_date(query.today - recency.days());
         body["startPublishedDate"] = json!(format!("{start}T00:00:00.000Z"));
     }
+    native_domains(&mut body, query, "includeDomains", "excludeDomains");
     HttpRequest::post(EXA_URL, vec![("x-api-key", key.to_owned())], body)
 }
 
@@ -478,7 +492,11 @@ pub fn parse_zai(value: &Value) -> Result<Parsed, String> {
 }
 
 /// A required array; a missing one means the response shape is not what this provider documents.
-fn array<'a>(value: &'a Value, pointer: &str, api: &str) -> Result<&'a Vec<Value>, String> {
+pub(super) fn array<'a>(
+    value: &'a Value,
+    pointer: &str,
+    api: &str,
+) -> Result<&'a Vec<Value>, String> {
     value
         .pointer(pointer)
         .and_then(Value::as_array)

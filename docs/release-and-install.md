@@ -8,7 +8,7 @@ The supported release installer is the asset `install.sh` on macOS and Linux:
 curl -fsSL https://github.com/KiidxAtlas/dial/releases/latest/download/install.sh | bash
 ```
 
-Published targets are `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, and `x86_64-pc-windows-msvc`. The Windows archive is `dial-<tag>-x86_64-pc-windows-msvc.zip` containing `dial.exe`; install it with the release's `install.ps1` in Windows PowerShell 5.1 or PowerShell 7 (one-line commands in [windows.md](windows.md)).
+Published targets are `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-musl`, `x86_64-pc-windows-msvc`, and `aarch64-pc-windows-msvc`. The Windows archives are `dial-<tag>-<target>.zip` containing `dial.exe`; install with the release's `install.ps1` in Windows PowerShell 5.1 or PowerShell 7 (one-line commands in [windows.md](windows.md)).
 
 The published installers (`install.sh` and `install.ps1`) embed the release's Ed25519 public key, select the host target, and check the archive digest against `SHA256SUMS` before extraction. `install.ps1` always verifies the detached signature over `SHA256SUMS`. `install.sh` verifies it whenever OpenSSL 3 is available (on `PATH`, Homebrew's `openssl@3`, or `DIAL_OPENSSL`); stock macOS ships LibreSSL, which cannot verify Ed25519, so without OpenSSL 3 the script prints a notice and relies on the HTTPS-fetched checksum alone. Set `DIAL_REQUIRE_SIGNATURE=1` to refuse installation instead. `install.sh` installs into `~/.local/bin` (override with `DIAL_INSTALL_DIR`), validates the binary version before and after activation, and restores the previous executable if activation fails. When the directory is not on `PATH`, it appends one `export PATH=…` line (`fish_add_path` for fish) to the login shell's profile (`~/.zshrc`, `~/.bash_profile` on macOS bash, `~/.bashrc` on Linux bash, otherwise `~/.profile`), once; `DIAL_NO_MODIFY_PATH=1` prints the line instead. For a pinned version, download `install.sh` and pass a tag such as `v0.1.1` to it. Release archives include `LICENSE`, `THIRD_PARTY_NOTICES`, and the Silver/Unscii font notices.
 
@@ -22,13 +22,13 @@ The workflow intentionally fails closed until repository signing inputs are conf
 - `DIAL_RELEASE_PUBLIC_KEY` as a GitHub Actions variable containing the matching raw 32-byte Ed25519 public key, base64 encoded. Release binaries embed this value at compile time.
 - `DIAL_RELEASE_PUBLIC_KEY_PEM` as a GitHub Actions variable containing the matching public key in PEM format. The published installer embeds it; the publish job derives and compares the raw key to the signing key before signing.
 
-The publish job signs the exact `SHA256SUMS` bytes with Ed25519 and publishes its base64-encoded detached signature as `SHA256SUMS.sig`. Missing or mismatched values fail the release; no example or generated signing key is trusted by production code.
+The publish job signs the exact `SHA256SUMS` bytes with Ed25519 and publishes the base64-encoded detached signature as `SHA256SUMS.sig`, plus an OpenSSH-format `SHA256SUMS.sshsig` for `ssh-keygen -Y verify`. Missing or mismatched values fail the release; no example or generated signing key is trusted by production code.
 
 For local use of the source-tree installers, provide the trusted public PEM before invoking them: `install.sh` reads `DIAL_RELEASE_PUBLIC_KEY`, and `scripts/install.ps1` reads `DIAL_RELEASE_PUBLIC_KEY_PEM`. Each refuses to proceed without it.
 
 ## Other distribution channels
 
-The Homebrew formula is in `Formula/dial.rb`; the Nix flake is `flake.nix`; the Docker image is built from `Dockerfile` and published to `ghcr.io/kiidxatlas/dial` on releases. Pin versions or image digests for reproducible deployment. The container is intended for non-interactive use; mount the project directory and persistent Dial state explicitly.
+The Homebrew formula is in `Formula/dial.rb`. Each release regenerates its checksums from `SHA256SUMS` with `scripts/update-formula.py` and opens a `release-packaging/<tag>` pull request for review; merge it after the release is published. The Nix flake is `flake.nix`; the Docker image is built from `Dockerfile` and published to `ghcr.io/kiidxatlas/dial` on releases. Pin versions or image digests for reproducible deployment. The container is intended for non-interactive use; mount the project directory and persistent Dial state explicitly.
 
 To build the container locally, pass the source revision explicitly because `.dockerignore`
 excludes Git metadata:
@@ -237,12 +237,12 @@ first requires a successful `CI` run (formatting, clippy, the full Rust suite in
 sandbox probes, and the terminal smoke test, on macOS arm64, macOS Intel and Ubuntu) for the exact
 tagged commit, waiting while that run is in progress; with no successful run it fails. Push the
 commit to `main` and let CI pass before tagging. The jobs then build Apple Silicon/Intel Mac and
-Linux x86-64 release binaries and smoke-test each extracted archive outside the checkout. Only
-after **all four** platform builds (macOS arm64, macOS Intel, Linux x86-64 and Windows x86-64) and the native Windows Rust contract job (`scripts/windows-contract.txt`, which lists its skipped tests with reasons) pass,
+Linux x86-64 and arm64 (glibc and musl) release binaries and smoke-test each extracted archive outside the checkout. Only
+after **all** platform builds (macOS arm64 and Intel, Linux x86-64 and arm64 in glibc and musl, Windows x86-64 and arm64) and the native Windows Rust contract job (`scripts/windows-contract.txt`, which lists its skipped tests with reasons) pass,
 does it create a GitHub release with the archives, bundled MIT license and README, a
-combined `SHA256SUMS` with its `SHA256SUMS.sig` signature, and generated notes. CI runs on both
+combined `SHA256SUMS` with its `SHA256SUMS.sig` and `SHA256SUMS.sshsig` signatures, and generated notes. CI runs on both
 macOS and Ubuntu without weakening host security. CI builds the `dial` library and its unit-test
 build one after the other: each peaks near 5 GB in rustc, and together they would swap on the
-7 GB macOS arm64 runner. The Windows release job builds `dial.exe`, smoke-tests the packaged archive (`--version`, `--help`), and runs `scripts/test-install.ps1` under Windows PowerShell 5.1 and PowerShell 7, as does the CI `installer-windows` job. The publish job builds `install.ps1` with the release key embedded and publishes it with `SHA256SUMS` and `SHA256SUMS.sig`.
+7 GB macOS arm64 runner. The Windows release jobs (x86-64 and ARM64) build `dial.exe`, smoke-test the packaged archive (`--version`, `--help`), verify the binary format for the target, and run `scripts/test-install.ps1` under Windows PowerShell 5.1 and PowerShell 7, as does the CI `installer-windows` job. The publish job builds `install.ps1` with the release key embedded and publishes it with `SHA256SUMS`, `SHA256SUMS.sig`, and `SHA256SUMS.sshsig`.
 The workflow preserves repository visibility. Dial is MIT licensed; see `LICENSE` for
 permission to use, modify, and redistribute it.

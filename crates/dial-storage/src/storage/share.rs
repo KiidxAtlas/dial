@@ -13,6 +13,9 @@ use std::io::Read;
 use std::io::Write;
 use std::path::Path;
 
+mod trim;
+pub use trim::{Fitted, SHARE_CAP_BYTES, Trim, fit_to_cap};
+
 const MAGIC: &[u8; 8] = b"DIALSHR1";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncryptedShare {
@@ -165,6 +168,14 @@ fn is_safe_share_url(url: &str) -> bool {
 
 /// Create a secret GitHub gist with ciphertext only. `gh` receives base64 data on stdin.
 pub fn upload_gist(encrypted: &EncryptedShare) -> Result<String> {
+    upload_gist_with("gh", encrypted)
+}
+
+/// [`upload_gist`] through `program`: the `gh` CLI in production, a fake binary in tests.
+fn upload_gist_with(
+    program: impl AsRef<std::ffi::OsStr>,
+    encrypted: &EncryptedShare,
+) -> Result<String> {
     use std::{
         io::Write,
         process::{Command, Stdio},
@@ -172,7 +183,7 @@ pub fn upload_gist(encrypted: &EncryptedShare) -> Result<String> {
         time::Duration,
     };
     const GH_GIST_TIMEOUT: Duration = Duration::from_secs(120);
-    let mut command = Command::new("gh");
+    let mut command = Command::new(program);
     command
         .args([
             "gist",

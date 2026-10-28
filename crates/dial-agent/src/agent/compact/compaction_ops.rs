@@ -527,6 +527,11 @@ impl<'a> Agent<'a> {
                 }
             }
         }
+        // The armed prefix was the pre-compaction history; replaying it would only rewrite a cache
+        // entry no future request reads.
+        if let Some(warm) = &self.cache_warm {
+            warm.context_changed();
+        }
         ui.context_usage(remaining, true);
         ui.event(
             &crate::agent::ui::ui_event::UiEvent::new(

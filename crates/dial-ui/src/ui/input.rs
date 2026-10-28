@@ -2,6 +2,10 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::time::{Duration, Instant};
 
+mod pump;
+
+pub use pump::{halt_for_panic, poll, read, start, stop};
+
 const PASTE_SETTLE: Duration = Duration::from_millis(150);
 
 #[derive(Default)]

@@ -215,6 +215,17 @@ fn read_target(
     budget: usize,
 ) -> Result<String, String> {
     let input = req_str(args, "path")?;
+    if crate::tools::net::web::read::is_url(input) {
+        return crate::tools::net::web::read::read(ws, args, cancel);
+    }
+    if let Some(resolver) = crate::tools::integrations::host_uri::scheme_of(input)
+        .and_then(|scheme| ws.host_uris().filter(|resolver| resolver.serves(&scheme)))
+    {
+        if opt_u64(args, "offset")?.is_some() || opt_u64(args, "limit")?.is_some() {
+            return Err("host URI schemes do not accept offset/limit".into());
+        }
+        return resolver.read(input, cancel);
+    }
     let scheme = crate::tools::integrations::resources::scheme(input)?;
     if !crate::tools::integrations::resources::descriptor(scheme).accepts_line_arguments
         && (opt_u64(args, "offset")?.is_some() || opt_u64(args, "limit")?.is_some())
@@ -328,8 +339,8 @@ fn read_target(
         }
         let path = ws.resolve(path_text)?;
         let meta = fs::metadata(&path).map_err(|e| io_message("reading image", input, &e))?;
-        if !meta.is_file() || meta.len() > crate::llm::images::MAX_IMAGE_BYTES {
-            return Err("image must be a regular file no larger than 5 MiB".into());
+        if !meta.is_file() || meta.len() > crate::llm::images::MAX_IMAGE_SOURCE_BYTES {
+            return Err("image must be a regular file no larger than 64 MiB".into());
         }
         return Ok(format!(
             "Image: {path_text} ({} bytes; attached to the next model request when vision is available)",

@@ -25,8 +25,169 @@ pub struct HistoricalCall {
 const ADDITIVE_PROPERTIES: &[(&str, &[&str])] = &[
     ("grep", &["output"]),
     ("edit", &["allow_syntax_errors"]),
+    ("task", &["source_session", "model"]),
     ("find", &["related"]),
+    ("lsp", &["payload"]),
+    ("eval", &["background", "title"]),
+    ("web_search", &["domains", "exclude_domains"]),
+    (
+        "browser",
+        &[
+            "request_id",
+            "format",
+            "quality",
+            "annotate",
+            "if_changed",
+            "record_restart",
+            "filter",
+            "resource_type",
+            "limit",
+            "content",
+            "pattern",
+            "route_action",
+            "status",
+            "headers",
+            "content_type",
+            "body",
+            "source",
+            "script_id",
+            "params",
+            "since",
+            "clear",
+            "x",
+            "y",
+            "dx",
+            "dy",
+            "target",
+            "button",
+            "duration",
+            "name",
+            "props",
+            "response",
+            "viewport",
+            "user_agent",
+            "ignore_https_errors",
+            "device",
+            "geolocation",
+            "timezone",
+            "locale",
+            "color_scheme",
+            "offline",
+            "urls",
+            "domain",
+            "include_values",
+            "cookies",
+            "names",
+            "area",
+            "operation",
+            "value",
+        ],
+    ),
 ];
+
+/// Enum values added after release. History recorded before them stays valid because the old
+/// schema is the current one with exactly these values removed.
+const ADDITIVE_ENUM_VALUES: &[(&str, &str, &[&str])] = &[
+    ("eval", "language", &["py"]),
+    ("lsp", "action", &["request"]),
+    (
+        "browser",
+        "action",
+        &[
+            "requests",
+            "request",
+            "route",
+            "unroute",
+            "routes",
+            "har_start",
+            "har_stop",
+            "add_init_script",
+            "remove_init_script",
+            "init_scripts",
+            "webmcp_list",
+            "webmcp_invoke",
+            "webmcp_events",
+        ],
+    ),
+    (
+        "browser",
+        "action",
+        &[
+            "scroll",
+            "dblclick",
+            "drag",
+            "click_at",
+            "mouse_move",
+            "mouse_down",
+            "mouse_up",
+            "wheel",
+            "key_down",
+            "key_up",
+            "highlight",
+            "text",
+            "html",
+            "value",
+            "attr",
+            "count",
+            "box",
+            "is_visible",
+            "is_enabled",
+            "is_checked",
+            "styles",
+        ],
+    ),
+    (
+        "browser",
+        "action",
+        &[
+            "pdf",
+            "record_start",
+            "record_stop",
+            "profile_start",
+            "profile_stop",
+            "metrics",
+            "vitals",
+        ],
+    ),
+    (
+        "browser",
+        "action",
+        &[
+            "cookies",
+            "set_cookies",
+            "clear_cookies",
+            "storage",
+            "emulate",
+            "devices",
+            "clipboard_read",
+            "clipboard_write",
+            "clipboard_copy",
+            "clipboard_paste",
+            "save_state",
+            "load_state",
+        ],
+    ),
+];
+
+/// Tools removed by a rename. A recorded call of the old name projects onto the successor: the
+/// name is rewritten and the arguments gain the value that selected the old behaviour. Nothing else
+/// about the old contract is reinterpreted; an unrecognised legacy shape is refused.
+const RENAMED_TOOLS: &[(&str, &str, &str, &str)] = &[("kernel", "eval", "language", "py")];
+
+/// Positions of call `id` in the assistant message at `index` and of its tool result.
+fn paired_call(messages: &[Value], index: usize, id: &str) -> Option<(usize, usize)> {
+    let call_index = messages[index]["tool_calls"]
+        .as_array()?
+        .iter()
+        .position(|call| call["id"] == id)?;
+    let result_index = messages
+        .iter()
+        .enumerate()
+        .skip(index + 1)
+        .take_while(|(_, message)| message["role"] == "tool")
+        .find_map(|(index, message)| (message["tool_call_id"] == id).then_some(index))?;
+    Some((call_index, result_index))
+}
 
 /// `check.expect`, offered only under `experimental.check_predictions`. The controller owns the
 /// `check` schema; this shape lives here so history recorded with or without it stays valid when
@@ -102,11 +263,97 @@ fn native_compatible(old: &Identity, new: &Identity, registry: &Registry) -> boo
                 properties.remove(*property);
             }
         }
-        [schema, before]
+        // The pre-widening schema is the current one without the values added since release.
+        let mut narrowed = before.clone();
+        if let Some(properties) = narrowed
+            .pointer_mut("/function/parameters/properties")
+            .and_then(Value::as_object_mut)
+        {
+            for (tool, property, values) in ADDITIVE_ENUM_VALUES {
+                let Some(options) = properties
+                    .get_mut(*property)
+                    .filter(|_| *tool == old.name)
+                    .and_then(|property| property.get_mut("enum"))
+                    .and_then(Value::as_array_mut)
+                else {
+                    continue;
+                };
+                options.retain(|value| !value.as_str().is_some_and(|s| values.contains(&s)));
+            }
+        }
+        [schema, before, narrowed]
     })
     .filter_map(|schema| identities(&[schema], &Registry::new()).remove(&old.name))
     .collect();
     known.contains(old) && known.contains(new)
+}
+
+/// The additive tables for tools that are not file/shell built-ins (registry tools such as `eval`,
+/// `lsp`, `browser`, `find`, `web_search`). History recorded before this release's additions matches
+/// the current schema with the listed optional properties and enum values removed, under the same
+/// tool revision. Any other difference is still refused.
+fn registry_additive_compatible(
+    old: &Identity,
+    new: &Identity,
+    schemas: &[Value],
+    registry: &Registry,
+) -> bool {
+    if old.revision != new.revision || crate::tools::BUILTIN.contains(&old.name.as_str()) {
+        return false;
+    }
+    let properties = ADDITIVE_PROPERTIES
+        .iter()
+        .find(|(name, _)| *name == old.name)
+        .map_or(&[][..], |(_, properties)| *properties);
+    let has_enum_values = ADDITIVE_ENUM_VALUES
+        .iter()
+        .any(|(tool, ..)| *tool == old.name);
+    if properties.is_empty() && !has_enum_values {
+        return false;
+    }
+    let Some(current) = schemas
+        .iter()
+        .find(|schema| schema.pointer("/function/name").and_then(Value::as_str) == Some(&old.name))
+    else {
+        return false;
+    };
+    let mut without_properties = current.clone();
+    if let Some(map) = without_properties
+        .pointer_mut("/function/parameters/properties")
+        .and_then(Value::as_object_mut)
+    {
+        for property in properties {
+            map.remove(*property);
+        }
+    }
+    let narrow = |schema: &Value| {
+        let mut narrowed = schema.clone();
+        if let Some(map) = narrowed
+            .pointer_mut("/function/parameters/properties")
+            .and_then(Value::as_object_mut)
+        {
+            for (tool, property, values) in ADDITIVE_ENUM_VALUES {
+                let Some(options) = map
+                    .get_mut(*property)
+                    .filter(|_| *tool == old.name)
+                    .and_then(|property| property.get_mut("enum"))
+                    .and_then(Value::as_array_mut)
+                else {
+                    continue;
+                };
+                options.retain(|value| !value.as_str().is_some_and(|s| values.contains(&s)));
+            }
+        }
+        narrowed
+    };
+    let candidates = [
+        narrow(current),
+        narrow(&without_properties),
+        without_properties,
+    ];
+    candidates.iter().any(|schema| {
+        identities(std::slice::from_ref(schema), registry).get(&old.name) == Some(old)
+    })
 }
 
 /// Recognize exact additive changes to controller-owned schemas. Historical calls remain inert,
@@ -117,7 +364,7 @@ fn controller_compatible(
     schemas: &[Value],
     registry: &Registry,
 ) -> bool {
-    if !matches!(old.name.as_str(), "working_state" | "check")
+    if !matches!(old.name.as_str(), "working_state" | "check" | "task")
         || new.name != old.name
         || old.revision != 1
         || new.revision != 1
@@ -155,6 +402,35 @@ fn controller_compatible(
             }
             properties["action"]["enum"] = json!(["view", "update"]);
         }
+        "task" => {
+            // Pool actions, `concurrency`, and the seance source/model are the only change since the
+            // prior release.
+            if properties.remove("concurrency").is_none()
+                || properties["action"]["enum"]
+                    != json!([
+                        "run", "start", "resume", "status", "wait", "cancel", "create", "push",
+                        "peek", "close"
+                    ])
+            {
+                return false;
+            }
+            properties["action"]["enum"] =
+                json!(["run", "start", "resume", "status", "wait", "cancel"]);
+            // Additive seance properties: strip when present; the identity comparison below still
+            // rejects any other change.
+            for property in ["source_session", "model"] {
+                properties.remove(property);
+            }
+            if let Some(items) = properties
+                .get_mut("tasks")
+                .and_then(|tasks| tasks.pointer_mut("/items/properties"))
+                .and_then(Value::as_object_mut)
+            {
+                for property in ["source_session", "model"] {
+                    items.remove(property);
+                }
+            }
+        }
         _ => return false,
     }
     identities(&[before], &Registry::new()).get(&old.name) == Some(old)
@@ -175,11 +451,61 @@ pub fn project_history(
         };
         let recorded: BTreeMap<String, Identity> = serde_json::from_value(recorded.clone())?;
         for (id, old) in &recorded {
+            if let Some(&(_, successor, field, value)) = RENAMED_TOOLS
+                .iter()
+                .find(|(from, ..)| *from == old.name)
+                .filter(|_| !current.contains_key(&old.name))
+            {
+                // Catalog-level callback identities are never replayed, so they stay inert.
+                if id.starts_with("callback:") {
+                    continue;
+                }
+                let target = current.get(successor).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "tool {} was renamed to {successor}, which is unavailable",
+                        old.name
+                    )
+                })?;
+                ensure!(
+                    old.revision == 1,
+                    "tool {} contract revision {} has no rename projection",
+                    old.name,
+                    old.revision
+                );
+                let (call_index, _) = paired_call(messages, index, id).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "tool {} history is unpaired; no rename projection",
+                        old.name
+                    )
+                })?;
+                let raw = &message["tool_calls"][call_index]["function"]["arguments"];
+                let mut arguments: Value = match raw.as_str() {
+                    Some(text) => serde_json::from_str(text)?,
+                    None => raw.clone(),
+                };
+                let action = arguments.get("action").and_then(Value::as_str);
+                // Legacy calls only selected the Python runtime; any other shape is refused.
+                ensure!(
+                    arguments.get(field).is_none()
+                        && action
+                            .is_some_and(|a| matches!(a, "eval" | "reset" | "cancel" | "status")),
+                    "tool {} history has an unrecognised legacy shape; no rename projection",
+                    old.name
+                );
+                arguments[field] = json!(value);
+                let projected = projected.get_or_insert_with(|| messages.to_vec());
+                projected[index]["tool_calls"][call_index]["function"]["name"] = json!(successor);
+                projected[index]["tool_calls"][call_index]["function"]["arguments"] =
+                    json!(arguments.to_string());
+                projected[index]["dial_tool_contracts"][id] = json!(target);
+                continue;
+            }
             let Some(new) = current.get(&old.name) else {
                 continue;
             };
             if old == new
                 || native_compatible(old, new, registry)
+                || registry_additive_compatible(old, new, schemas, registry)
                 || controller_compatible(old, new, schemas, registry)
                 || registry
                     .get(&old.name)

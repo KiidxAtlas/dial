@@ -204,6 +204,7 @@ pub fn snapshot(
     let summaries = child_transcript::scan(layout, session_id);
 
     let mut agents: Vec<AgentEntry> = Vec::new();
+    let mut recorded_nodes = HashMap::new();
     for summary in &summaries {
         let Some(id) = summary.header["id"].as_str() else {
             continue;
@@ -212,6 +213,9 @@ pub fn snapshot(
         if agents.iter().any(|agent| agent.id == id) {
             continue;
         }
+        if let Some(node) = summary.header["runtime_node"].as_str() {
+            recorded_nodes.insert(id, node);
+        }
         agents.push(entry_from_transcript(id, summary, &live_running));
     }
 
@@ -219,7 +223,17 @@ pub fn snapshot(
         let (node_id, phase, data) =
             body.read(|node| (node.id.clone(), node.result.phase, node.result.data.clone()));
         let data = data.unwrap_or(Value::Null);
-        let id = data["id"].as_str().map_or(node_id, str::to_owned);
+        let id = data["id"]
+            .as_str()
+            .map_or_else(|| node_id.clone(), str::to_owned);
+        let owned_node = live.and_then(|control| control.current_node(&id));
+        if owned_node
+            .as_deref()
+            .or_else(|| recorded_nodes.get(id.as_str()).copied())
+            .is_some_and(|current| current != node_id.as_str())
+        {
+            continue;
+        }
         let index = match agents.iter().position(|agent| agent.id == id) {
             Some(index) => index,
             None => {
@@ -344,12 +358,12 @@ fn entry_from_transcript(
         role: field("role"),
         model: field("model"),
         model_source: field("model_source"),
-        task: task_line(&header["assignment"]),
+        task: task_line(&header["task"]),
         transcript: Some(summary.path.clone()),
         ..AgentEntry::default()
     };
     if entry.task.is_empty() {
-        entry.task = task_line(&header["task"]);
+        entry.task = task_line(&header["assignment"]);
     }
     entry.started_ms = header["started_ms"].as_u64();
     entry.parent = header["parent"].as_str().map(str::to_owned);
@@ -461,8 +475,10 @@ fn finish_projection(agent: &mut AgentEntry, live: &HashSet<String>, now: u64) {
         // A background body still marked running but no longer owned by the live job.
         agent.status = AgentStatus::Cancelled;
     }
-    agent.steerable = agent.status == AgentStatus::Running && running_live;
-    agent.cancellable = agent.status == AgentStatus::Running && running_live;
+    let active =
+        matches!(agent.status, AgentStatus::Running | AgentStatus::Waiting) && running_live;
+    agent.steerable = active;
+    agent.cancellable = active;
     agent.resumable = agent.status.is_finished() && agent.transcript.is_some();
     if agent.status == AgentStatus::Running
         && let (Some(started), None) = (agent.started_ms, agent.elapsed_ms)
@@ -704,6 +720,23 @@ pub fn cancel(live: Option<&LiveTaskControl>, id: &str) -> Result<()> {
 /// - `subagent-message:<id>\n<text>`: steer a running worker; a finished one is resumed.
 /// - `subagent-resume:<id>\n<text>`: resume a finished worker.
 pub fn act(action: &str, live: Option<&LiveTaskControl>) -> Option<Result<ActionOutcome>> {
+    if let Some(body) = action.strip_prefix("subagent-config:") {
+        return Some((|| {
+            let (id, update) = body
+                .split_once('\n')
+                .ok_or_else(|| anyhow!("missing worker setting"))?;
+            let (axis, value) = update
+                .split_once('\n')
+                .ok_or_else(|| anyhow!("missing setting value"))?;
+            let live = live.ok_or_else(|| anyhow!("no live subagents in this session"))?;
+            let result = match axis {
+                "model" => live.configure(id, Some(value), None)?,
+                "thinking" => live.configure(id, None, Some(value))?,
+                _ => return Err(anyhow!("unknown worker setting")),
+            };
+            Ok(ActionOutcome::Banner(format!("{id}: {result}")))
+        })());
+    }
     if let Some(id) = action.strip_prefix("subagent-cancel:") {
         return Some(
             cancel(live, id).map(|()| ActionOutcome::Banner(format!("cancel sent to {id}"))),

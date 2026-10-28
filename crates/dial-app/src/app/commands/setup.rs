@@ -145,9 +145,13 @@ fn runtime_update_command(shell: &mut Shell, app: &App, action: UpdateAction<'_>
     }
     match action {
         UpdateAction::Check => {
-            spawn_job_streaming(shell, "Runtime updates", move |cancel, _| {
-                deps::updates::check(&env, &cancel).map(|report| report.text())
-            });
+            if let Some(report) = shell.take_runtime_update_report() {
+                shell.note("Runtime updates", report);
+            } else {
+                spawn_job_streaming(shell, "Runtime updates", move |cancel, _| {
+                    deps::updates::check(&env, &cancel).map(|report| report.text())
+                });
+            }
         }
         UpdateAction::Preview(id) => {
             let id = id.to_owned();

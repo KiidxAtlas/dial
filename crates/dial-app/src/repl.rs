@@ -376,8 +376,8 @@ impl Ui for PrintUi {
         }
         self.event(|| serde_json::json!({"type":"tool_call", "name":name, "summary":summary}));
     }
-    fn tool_timing(&mut self, name: &str, seconds: f64) {
-        if let Some(call) = self.calls.iter_mut().rev().find(|c| c["name"] == name) {
+    fn tool_timing(&mut self, call_id: &str, _name: &str, seconds: f64) {
+        if let Some(call) = self.calls.iter_mut().find(|c| c["call_id"] == call_id) {
             call["seconds"] = seconds.into();
         }
     }

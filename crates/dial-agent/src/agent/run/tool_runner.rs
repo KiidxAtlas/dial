@@ -255,7 +255,7 @@ impl Agent<'_> {
                                 }
                             }
                         };
-                        return crate::tools::exec::execution::with_dispatch(tool.as_ref(),
+                        return crate::tools::exec::execution::with_dispatch(&registry, tool.as_ref(),
                             &ToolContext {
                                 workspace: &workspace,
                                 config: &config,

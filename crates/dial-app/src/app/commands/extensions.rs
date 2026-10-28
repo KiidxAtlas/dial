@@ -17,7 +17,7 @@ use anyhow::{Result, anyhow, bail};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(super) const COMMANDS: &[super::CommandSpec] = &[
     super::CommandSpec {
@@ -37,6 +37,7 @@ pub(super) const COMMANDS: &[super::CommandSpec] = &[
             "logout",
             "resources",
             "prompts",
+            "prompt",
             "notifications",
             "smithery-search",
             "smithery-install",
@@ -195,6 +196,7 @@ pub(super) fn completions(config: &Config) -> Vec<String> {
         "reload",
         "resources",
         "prompts",
+        "prompt",
         "notifications",
     ] {
         out.push(format!("/mcp {sub}"));
@@ -309,6 +311,7 @@ fn mcp_live(shell: &mut Shell, app: &App, args: &str) -> Option<Result<Step>> {
             );
             Ok(Step::Done)
         }),
+        "prompt" => mcp_prompt(shell, &config, rest),
         "resources" | "prompts" | "notifications" => {
             let specs: BTreeMap<String, McpServerConfig> = app
                 .config
@@ -337,11 +340,142 @@ fn test_server(shell: &mut Shell, app: &App, name: String, mut server: McpServer
     spawn_job(shell, "MCP test", move |_| {
         let specs = BTreeMap::from([(name.clone(), server)]);
         let load = connect_extra(&specs, &config);
-        let mut lines = vec![format!("{name}: {} tool(s)", load.tools.len())];
-        lines.extend(load.tools.iter().map(|tool| format!("  {}", tool.name())));
+        let offered = load.live.offered_tools();
+        let mut lines = vec![format!("{name}: {} tool(s)", offered.len())];
+        lines.extend(offered.iter().map(|tool| format!("  {}", tool.name())));
         lines.extend(load.notices);
         Ok(lines.join("\n"))
     });
+}
+
+/// Label of the `/mcp prompt` background job. Its result is put in the composer by
+/// `Shell::report_job_result`.
+pub(crate) const MCP_PROMPT_LABEL: &str = "MCP prompt";
+
+/// `/mcp prompt <server> <name> [key=value…]`: fetches a prompt from a configured server on a
+/// background job, so the UI stays responsive. The messages land in the composer for review when
+/// the job finishes (see [`composed_draft`]); a server that fails to start fails the job instead.
+fn mcp_prompt(shell: &mut Shell, config: &Config, rest: &str) -> Result<Step> {
+    let request = parse_prompt_request(rest)?;
+    let Some(server_config) = config.mcp.get(&request.server) else {
+        bail!("No MCP server named {}.", request.server);
+    };
+    let specs = BTreeMap::from([(
+        request.server.clone(),
+        McpServerConfig {
+            enabled: true,
+            ..server_config.clone()
+        },
+    )]);
+    let config = config.clone();
+    spawn_job(shell, MCP_PROMPT_LABEL, move |cancel| {
+        let load = connect_extra(&specs, &config);
+        let Some(session) = load
+            .sessions
+            .iter()
+            .find(|session| session.name() == request.server.as_str())
+        else {
+            bail!(
+                "MCP server {} did not connect: {}",
+                request.server,
+                load.notices.join("; ")
+            );
+        };
+        let result = session.get_prompt(
+            &request.name,
+            serde_json::Value::Object(request.arguments),
+            &|| cancel.load(Ordering::Relaxed),
+        )?;
+        prompt_text(&result)
+    });
+    Ok(Step::Done)
+}
+
+/// A parsed `/mcp prompt` request.
+struct PromptRequest {
+    server: String,
+    name: String,
+    arguments: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Parses `<server> <name> [key=value…]`. Words are split the way a shell splits them, so a value
+/// with spaces is quoted: `key="a b"` passes `a b`.
+fn parse_prompt_request(rest: &str) -> Result<PromptRequest> {
+    const USAGE: &str = "Usage: /mcp prompt <server> <name> [key=value…]";
+    let words = shlex::split(rest)
+        .ok_or_else(|| anyhow!("Unclosed quote in /mcp prompt arguments. {USAGE}"))?;
+    let mut words = words.into_iter();
+    let (Some(server), Some(name)) = (words.next(), words.next()) else {
+        bail!(USAGE);
+    };
+    let mut arguments = serde_json::Map::new();
+    for word in words {
+        let Some((key, value)) = word.split_once('=').filter(|(key, _)| !key.is_empty()) else {
+            bail!("Prompt argument `{word}` must be key=value. {USAGE}");
+        };
+        if arguments
+            .insert(key.to_owned(), serde_json::Value::String(value.to_owned()))
+            .is_some()
+        {
+            bail!("Prompt argument `{key}` is given more than once. {USAGE}");
+        }
+    }
+    Ok(PromptRequest {
+        server,
+        name,
+        arguments,
+    })
+}
+
+/// The composer text once a prompt lands: appended below any draft already typed.
+pub(crate) fn composed_draft(draft: &str, text: &str) -> String {
+    if draft.trim().is_empty() {
+        text.to_owned()
+    } else {
+        format!("{draft}\n\n{text}")
+    }
+}
+
+/// Plain text for a `prompts/get` result: each message as `role: text`. Non-text content is
+/// named rather than dumped, and the whole text is sanitized before it reaches the composer.
+fn prompt_text(result: &serde_json::Value) -> Result<String> {
+    let lines: Vec<String> = result
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|message| {
+            let role = message
+                .get("role")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("message");
+            let content = message
+                .get("content")
+                .map_or_else(String::new, prompt_block_text);
+            format!("{role}: {content}")
+        })
+        .collect();
+    if lines.is_empty() {
+        bail!("The prompt returned no messages.");
+    }
+    Ok(crate::ui::text::sanitize(&lines.join("\n")))
+}
+
+fn prompt_block_text(block: &serde_json::Value) -> String {
+    match block.get("type").and_then(serde_json::Value::as_str) {
+        Some("text") => block
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        Some("resource") => block
+            .pointer("/resource/text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("[resource without text omitted]")
+            .to_owned(),
+        Some(kind) => format!("[{kind} content omitted]"),
+        None => "[unknown content omitted]".to_owned(),
+    }
 }
 
 /// `/mcp resources|prompts|notifications`: one section per connected server, from its live
@@ -431,7 +565,7 @@ fn json_text(value: &serde_json::Value, key: &str) -> String {
         .to_owned()
 }
 
-const MCP_HELP: &str = "/mcp list\n/mcp add <name> --url <url> [--transport http|sse] [--bearer-env VAR]\n/mcp add <name> [--scope project|user] -- <command> [args...]\n/mcp remove <name>\n/mcp enable <name>\n/mcp disable <name>\n/mcp test <name>\n/mcp login <name>\n/mcp logout <name>\n/mcp resources\n/mcp prompts\n/mcp notifications\n/mcp reload";
+const MCP_HELP: &str = "/mcp list\n/mcp add <name> --url <url> [--transport http|sse] [--bearer-env VAR]\n/mcp add <name> [--scope project|user] -- <command> [args...]\n/mcp remove <name>\n/mcp enable <name>\n/mcp disable <name>\n/mcp test <name>\n/mcp login <name>\n/mcp logout <name>\n/mcp resources\n/mcp prompts\n/mcp prompt <server> <name> [key=value…]\n/mcp notifications\n/mcp reload";
 
 fn mcp_list(config: &Config) -> String {
     if config.mcp.is_empty() {

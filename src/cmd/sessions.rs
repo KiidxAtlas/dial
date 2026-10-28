@@ -1,11 +1,11 @@
-//! Session listing, export, rename and encrypted sharing.
+//! Session listing, export, rename, portable pack/unpack and encrypted sharing.
 use crate::args::{Cli, SessionCommand};
 use crate::overlay::overlay;
 use anyhow::{Result, bail};
 use dial::config::{paths::Layout, types::Config};
-use dial::storage::session::{Session, SessionInfo};
+use dial::storage::session::{Session, SessionInfo, pack};
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The single session `id` names: an id-prefix lookup that parses only matching journals, or the
 /// all-projects listing when `all` asks for it. Missing and ambiguous prefixes are errors.
@@ -35,20 +35,21 @@ fn resolve_prefix(layout: &Layout, all: bool, id: &str) -> Result<SessionInfo> {
 
 pub(crate) fn run(layout: &Layout, all: bool, action: &Option<SessionCommand>) -> Result<()> {
     if let Some(action) = action {
-        let id = match action {
-            SessionCommand::Export { id, .. } | SessionCommand::Rename { id, .. } => id,
-        };
-        let info = &resolve_prefix(layout, all, id)?;
-        let mut session = match action {
-            SessionCommand::Rename { .. } => Session::open(&info.path)?,
-            SessionCommand::Export { .. } => Session::read(&info.path)?,
-        };
         match action {
-            SessionCommand::Rename { title, .. } => {
+            SessionCommand::Unpack { file } => unpack(layout, file)?,
+            SessionCommand::Pack { id, output } => {
+                let info = resolve_prefix(layout, all, id)?;
+                pack(layout, &info, output.as_deref())?;
+            }
+            SessionCommand::Rename { id, title } => {
+                let info = resolve_prefix(layout, all, id)?;
+                let mut session = Session::open(&info.path)?;
                 session.rename(title)?;
                 println!("Renamed {} to {}", info.id, session.title());
             }
-            SessionCommand::Export { path, html, .. } => {
+            SessionCommand::Export { id, path, html } => {
+                let info = resolve_prefix(layout, all, id)?;
+                let session = Session::read(&info.path)?;
                 let path = path.clone().unwrap_or_else(|| {
                     PathBuf::from(format!(
                         "session-{}.{}",
@@ -61,7 +62,7 @@ pub(crate) fn run(layout: &Layout, all: bool, action: &Option<SessionCommand>) -
                 } else {
                     layout.project_root.join(path)
                 };
-                session.export(&path, *html)?;
+                session.export(layout, &path, *html)?;
                 println!("{}", path.display());
             }
         }
@@ -113,6 +114,50 @@ pub(crate) fn run(layout: &Layout, all: bool, action: &Option<SessionCommand>) -
         }
     }
     Ok(())
+}
+
+/// Packs one session into a portable archive; a relative output lands in the project root.
+fn pack(layout: &Layout, info: &SessionInfo, output: Option<&Path>) -> Result<()> {
+    let path = output.map_or_else(
+        || {
+            layout
+                .project_root
+                .join(format!("session-{}.dialpack", info.id))
+        },
+        |path| resolve_in_project(layout, path),
+    );
+    let report = pack::pack_session(layout, &info.path, &path)?;
+    println!(
+        "Packed {} ({} member(s), {} artifact(s), {} subagent transcript(s), {} bytes) to {}",
+        report.session_id,
+        report.members,
+        report.artifacts,
+        report.subagents,
+        report.bytes,
+        path.display()
+    );
+    Ok(())
+}
+
+/// Installs an archive as a session of this project. Nothing existing is overwritten.
+fn unpack(layout: &Layout, file: &Path) -> Result<()> {
+    let report = pack::unpack_session(layout, &resolve_in_project(layout, file))?;
+    println!(
+        "Unpacked {} to {} ({} artifact(s), {} subagent transcript(s))",
+        report.session_id,
+        report.session_path.display(),
+        report.artifacts,
+        report.subagents
+    );
+    Ok(())
+}
+
+fn resolve_in_project(layout: &Layout, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        layout.project_root.join(path)
+    }
 }
 
 fn terminal_width() -> usize {
@@ -244,23 +289,26 @@ pub(crate) fn share(
         dial::storage::share::Scope::ActiveBranch
     };
     let transcript = dial::storage::share::transcript(&selected.path, scope)?;
-    let encrypted = dial::storage::share::encrypt_transcript(&transcript)?;
-    let link = if gist {
-        dial::storage::share::upload_gist(&encrypted)?
-    } else {
-        let endpoint = endpoint
-            .clone()
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                (!config.share.server_url.is_empty()).then(|| config.share.server_url.clone())
-            })
-            .or_else(|| std::env::var("DIAL_SHARE_SERVER").ok())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "set [share].server_url or DIAL_SHARE_SERVER, pass --endpoint, or use --gist"
-                )
-            })?;
-        dial::storage::share::upload(&encrypted, &endpoint)?
+    let fitted =
+        dial::storage::share::fit_to_cap(&transcript, dial::storage::share::SHARE_CAP_BYTES)?;
+    for trim in &fitted.trims {
+        eprintln!("share trimmed to fit the size cap: {trim}");
+    }
+    let encrypted = fitted.share;
+    let server = endpoint
+        .clone()
+        .filter(|s| !s.is_empty())
+        .or_else(|| (!config.share.server_url.is_empty()).then(|| config.share.server_url.clone()))
+        .or_else(|| {
+            std::env::var("DIAL_SHARE_SERVER")
+                .ok()
+                .filter(|s| !s.is_empty())
+        });
+    // A configured server is the default host. Without one, or with --gist, the share becomes a
+    // secret gist created through `gh`, which reports an actionable error when it is unavailable.
+    let link = match server {
+        Some(server) if !gist => dial::storage::share::upload(&encrypted, &server)?,
+        _ => dial::storage::share::upload_gist(&encrypted)?,
     };
     println!("{link}");
     Ok(())

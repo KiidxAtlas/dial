@@ -32,7 +32,12 @@ impl Config {
         self.validate_agents()?;
         self.validate_task_and_training()?;
         self.validate_protected()?;
+        self.validate_context_files()?;
         self.validate_harness(&self.harness)
+    }
+
+    fn validate_context_files(&self) -> Result<()> {
+        types::validate_context_file_names(&self.context_files.extra).map_err(anyhow::Error::msg)
     }
 
     /// Registry-declared value checks plus sections that own their own validation.
@@ -542,13 +547,15 @@ impl Config {
         for cap in [
             self.budget.max_session_cost_usd,
             self.budget.max_turn_cost_usd,
+            self.budget.warn_session_cost_usd,
+            self.budget.warn_turn_cost_usd,
         ]
         .into_iter()
         .flatten()
         {
             ensure!(
                 cap.is_finite() && cap >= 0.0,
-                "budget caps must be nonnegative numbers of USD; zero is unlimited"
+                "budget caps and warnings must be nonnegative numbers of USD; zero is unlimited or disabled"
             );
         }
         ensure!(self.hooks.len() <= 32, "at most 32 hooks are allowed");

@@ -34,6 +34,15 @@ Limits of the built-in shell:
 - `xargs` runs external programs only. A name that exists only as a shell builtin is not found and exits 127.
 - On Windows, bash, PowerShell, and the built-in shell all run only with the explicit unsandboxed command setting, because native isolation is unavailable there.
 
+## Per-session Cargo build output
+
+Commands Dial runs (`bash`, the built-in shell and background shell jobs) set `CARGO_TARGET_DIR` to a directory unique to the session: `<workspace>/.tmp/cargo-target/<session id>`. Concurrent sessions therefore stop contending for one `target/` build lock. The directory is fixed per session, not per command, so builds reuse their cache and the number of directories stays bounded by the sessions you run. It lives in the workspace scratch directory, which the sandbox already allows Dial to write.
+
+- An explicit `CARGO_TARGET_DIR` in Dial's inherited environment or named-shell state is kept as is.
+- A `--target-dir` flag on a Cargo command still wins, because Cargo applies it after the environment.
+- Copied workers (`isolation = "copy"`) run in their own root, so they get their own directory under that copy.
+- The setting applies only to commands Dial starts. It does not change your global environment or shell profile.
+
 ## In-process shell
 
 `shell.backend = "inprocess"` runs foreground `bash` commands without a host child process, so there is no isolation between the shell's builtins and Dial. That is why it needs `sandbox.mode = "off"` and fails closed otherwise. Working directory, the secret-scrubbed environment (`is_secret_env`), `TMPDIR`, output capture limits, artifacts, the `timeout` argument and cancellation behave as in the other backends. The banner shows `in-process shell (sandbox off only)`.
@@ -42,7 +51,7 @@ Differences and limits:
 
 - Timeout and interrupt abort the script at its next `await` (every external command, pipe or `sleep`) and kill the process groups of external commands the run started (Unix; found with `ps` and a per-run `DIAL_INPROCESS_RUN` marker in the command environment). A command that calls `setsid` or clears its environment escapes the kill.
 - A builtin loop that never yields (for example `while :; do :; done`) cannot be interrupted from outside its thread. Dial reports the timeout, abandons the thread and notes it in the output; the thread keeps using CPU until Dial exits. Use `system` or `embedded` when a hard kill matters.
-- Commands are not handed to `bg` automatically after `auto_background_secs`, and `async`/`background` requests and named `session`s use the child-process built-in shell instead.
+- In-process execution has no automatic background handoff. Explicit `async`/`background` requests use the child-process built-in shell instead, where the automatic-background threshold applies regardless of `timeout` (a shorter timeout still kills the command). Named `session`s also use the child-process shell, subject to their restrictions below.
 
 ## Named embedded sessions
 

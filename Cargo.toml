@@ -75,10 +75,17 @@ httpdate = "1"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 tar = "0.4"
 flate2 = "1"
+lzma-rs = "0.3"
+bzip2-rs = "0.1"
+ruzstd = "0.9"
+sevenz-rust = { version = "0.6", default-features = false }
+cab = "0.6"
+rars = { version = "0.12", default-features = false }
 parking_lot = "0.12"
 similar = { version = "2.7", default-features = false, features = ["text"] }
 shlex = "2"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+resvg = { version = "0.48.1", default-features = false }
 fontdue = "0.9"
 png = "0.18"
 notify = "8"

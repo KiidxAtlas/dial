@@ -14,6 +14,7 @@ fn query() -> Query<'static> {
         text: "rust async",
         limit: 3,
         recency: None,
+        filter: &super::domains::UNFILTERED,
         today: 19_723,
     }
 }
@@ -244,7 +245,15 @@ fn recency_note_flags_only_providers_that_do_not_honour_the_window() {
     let searxng = Provider::Searxng.recency_note(Recency::Week).unwrap();
     assert!(searxng.contains("past month"), "{searxng}");
     assert_eq!(Provider::Searxng.recency_note(Recency::Day), None);
-    for provider in [Provider::Mojeek, Provider::Ecosia] {
+    for provider in [
+        Provider::Mojeek,
+        Provider::Ecosia,
+        Provider::OpenAi,
+        Provider::Anthropic,
+        Provider::Gemini,
+        Provider::OpenRouter,
+        Provider::Codex,
+    ] {
         let note = provider.recency_note(Recency::Day).unwrap();
         assert!(
             note.contains(provider.name()) && note.contains("past day"),
@@ -261,6 +270,15 @@ fn recency_note_flags_only_providers_that_do_not_honour_the_window() {
                 | Provider::Mojeek
                 | Provider::Ecosia
                 | Provider::Xai
+                | Provider::Kimi
+                | Provider::Synthetic
+                | Provider::Ollama
+                | Provider::Public
+                | Provider::OpenAi
+                | Provider::Anthropic
+                | Provider::Gemini
+                | Provider::OpenRouter
+                | Provider::Codex
         )
     }) {
         for recency in [Recency::Day, Recency::Week, Recency::Month, Recency::Year] {
@@ -275,4 +293,29 @@ fn recency_names_and_windows() {
     assert_eq!(Recency::parse("hour"), None);
     assert_eq!(Recency::Year.name(), "year");
     assert_eq!(Recency::Month.days(), 31);
+}
+
+#[test]
+fn grounded_providers_are_named_only_and_need_their_keys() {
+    let env = env_from(&[("OPENAI_API_KEY", "o"), ("ANTHROPIC_API_KEY", "a")]);
+    assert!(!chain("auto", &env).unwrap().contains(&Provider::OpenAi));
+    assert_eq!(chain("openai", &env).unwrap(), vec![Provider::OpenAi]);
+    assert!(names().contains(&"openrouter"));
+    let missing = chain("gemini", &env_from(&[])).unwrap_err();
+    assert!(missing.contains("GEMINI_API_KEY"), "{missing}");
+}
+
+#[test]
+fn codex_is_named_only_and_needs_no_key_variable() {
+    assert!(
+        !chain("auto", &env_from(&[]))
+            .unwrap()
+            .contains(&Provider::Codex)
+    );
+    assert_eq!(
+        chain("codex", &env_from(&[])).unwrap(),
+        vec![Provider::Codex]
+    );
+    assert!(names().contains(&"codex"));
+    assert!(build(Provider::Codex, &query(), &env_from(&[])).is_err());
 }

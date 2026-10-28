@@ -149,3 +149,66 @@ fn only_section_labels_become_headings() {
         "a list row followed by indented detail is not a heading"
     );
 }
+
+#[test]
+fn received_messages_use_the_irc_lane_without_inventing_a_peer_body() {
+    let env = Env::new();
+    for ascii in [false, true] {
+        let theme = if ascii {
+            env.theme
+                .clone()
+                .with_glyphs(super::super::theme::Glyphs::Ascii)
+        } else {
+            env.theme.clone()
+        };
+        let ctx = TranscriptCtx {
+            theme: &theme,
+            ..env.ctx()
+        };
+        let worker = "Message from reviewer to parent: Parser looks good.";
+        let peer = "Project peer session-42 sent a coordination message.";
+        for width in [0, 1, 8, 40, 100] {
+            for body in [worker, peer] {
+                let rendered = rows("Notice", body, width, &ctx);
+                assert!(
+                    rendered
+                        .iter()
+                        .all(|r| text::line_width(r) <= width as usize)
+                );
+            }
+        }
+        let worker = plain(&rows("Notice", worker, 100, &ctx));
+        assert!(
+            worker[0].contains("IRC") && worker[0].contains("reviewer"),
+            "{worker:?}"
+        );
+        assert!(
+            worker[0].contains(if ascii { "<-" } else { "⟵" }),
+            "{worker:?}"
+        );
+        assert!(worker[1].contains("Parser looks good."), "{worker:?}");
+        let peer = plain(&rows("Notice", peer, 100, &ctx));
+        assert_eq!(
+            peer.len(),
+            1,
+            "arrival notices do not carry peer message bodies: {peer:?}"
+        );
+        assert!(
+            peer[0].contains("session-42") && peer[0].contains("coordination message received")
+        );
+        if ascii {
+            assert!(worker.iter().chain(&peer).all(|r| r.is_ascii()));
+        }
+    }
+    let ordinary = plain(&rows(
+        "Notice",
+        "Message from an unknown source",
+        100,
+        &env.ctx(),
+    ));
+    assert!(
+        ordinary
+            .iter()
+            .any(|r| r.contains("Message from an unknown source"))
+    );
+}

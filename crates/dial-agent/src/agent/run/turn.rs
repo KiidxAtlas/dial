@@ -6,6 +6,7 @@ use crate::agent::modes::lifecycle::Lifecycle;
 use crate::agent::*;
 
 mod begin;
+pub(in crate::agent) mod cost_warn;
 mod progress;
 mod round;
 mod settle;
@@ -87,6 +88,8 @@ pub(in crate::agent) struct TurnState<'a> {
     compaction_retry_floor: Option<u64>,
     /// The user was told once that a configured cost cap cannot trip on an unpriced model.
     unpriced_cap_noted: bool,
+    /// Warn-threshold crossing for this turn's spend; a turn starts with its ledger at zero.
+    turn_cost_warn: cost_warn::Crossing,
     /// The model was told once that most of the time or cost budget is used.
     wrap_up_noted: bool,
     /// The current step is the round's last: it must answer, not start tools.
@@ -98,6 +101,9 @@ pub(in crate::agent) struct TurnState<'a> {
     rejected_edit_previews: u32,
     reasoning_budget: Option<u32>,
     turn_effort: Option<crate::llm::profiles::ReasoningEffort>,
+    /// Auto effort is judged lazily, once a request profile can actually consume it. An
+    /// unsupported initial backend must not consume this opportunity before a supported fallback.
+    pending_thinking: Option<String>,
     // Guidance, coaching and planning.
     todo_recovery: crate::agent::workflow::todo_recovery::TodoRecovery,
     solo_todo_noted: bool,
@@ -341,29 +347,10 @@ impl Agent<'_> {
         let max_tokens = backend.output_budget(harness.max_tokens);
         self.report_retained_fallback(ui);
         let cancel = self.cancellation.turn(self.interrupt.clone());
-        // `thinking = "auto"`: judge this user turn's effort once from its prompt, not per step.
-        // External thinking promises provider reasoning off, so no judge runs for it.
-        let mut turn_effort: Option<crate::llm::profiles::ReasoningEffort> = None;
-        if self.config.thinking_auto
+        let pending_thinking = (self.config.thinking_auto
             && !self.hermetic
-            && self.external_thinking_instruction().is_none()
-        {
-            match crate::judgment::judge_turn_thinking(
-                &self.auth_config,
-                &self.config.user_dir,
-                &instruction,
-                Some(&self.usage_scope),
-                self.interrupt.clone(),
-            ) {
-                Ok(judged) => {
-                    turn_effort = crate::judgment::effort_for_choice(&judged.choice);
-                    self.last_auto_thinking = Some(judged.choice);
-                }
-                Err(error) => ui.diagnostic(&format!(
-                    "Auto thinking unavailable ({error:#}); using the model's default effort."
-                )),
-            }
-        }
+            && self.external_thinking_instruction().is_none())
+        .then_some(instruction);
         let measured = if self.hermetic
             || adapter.is_some()
             || self.config.steering.enabled
@@ -408,6 +395,7 @@ impl Agent<'_> {
             compaction_failed: false,
             compaction_retry_floor: None,
             unpriced_cap_noted: false,
+            turn_cost_warn: cost_warn::Crossing::new(true),
             wrap_up_noted: false,
             final_step: false,
             max_tokens,
@@ -416,7 +404,8 @@ impl Agent<'_> {
             stall_continues: 0,
             rejected_edit_previews: 0,
             reasoning_budget: None,
-            turn_effort,
+            turn_effort: None,
+            pending_thinking,
             todo_recovery: Default::default(),
             solo_todo_noted: false,
             pending_nudges: Vec::new(),
@@ -439,6 +428,40 @@ impl Agent<'_> {
             enrichment_epoch: 0,
             steering_pending: false,
         })
+    }
+
+    /// Called with the effective request profile, not the initially configured backend: fallbacks
+    /// can change capabilities. Consuming the prompt also bounds failed judgments to one attempt.
+    fn judge_turn_effort(
+        &mut self,
+        turn: &mut TurnState<'_>,
+        profile: Option<&crate::llm::profiles::ModelProfile>,
+        ui: &mut dyn Ui,
+    ) {
+        if self.hermetic
+            || self.external_thinking_instruction().is_some()
+            || !profile.is_some_and(|profile| !profile.capabilities.reasoning_efforts.is_empty())
+        {
+            return;
+        }
+        let Some(instruction) = turn.pending_thinking.take() else {
+            return;
+        };
+        match crate::judgment::judge_turn_thinking(
+            &self.auth_config,
+            &self.config.user_dir,
+            &instruction,
+            Some(&self.usage_scope),
+            self.interrupt.clone(),
+        ) {
+            Ok(judged) => {
+                turn.turn_effort = crate::judgment::effort_for_choice(&judged.choice);
+                self.last_auto_thinking = Some(judged.choice);
+            }
+            Err(error) => ui.diagnostic(&format!(
+                "Auto thinking unavailable ({error:#}); using the model's default effort."
+            )),
+        }
     }
 }
 
@@ -506,3 +529,6 @@ mod completion_tests;
 
 #[cfg(test)]
 mod reliability_tests;
+
+#[cfg(test)]
+mod thinking_tests;

@@ -4,15 +4,15 @@
 //! operator intent as `subagent-*` action strings for `subagent_model::act`.
 
 use std::{
+    collections::BTreeMap,
     fs::{self, File},
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
-use crossterm::event::{
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
-};
+use crossterm::event::{Event, KeyCode, KeyEvent, MouseEvent, MouseEventKind};
 use ratatui::{
     Frame,
     style::{Modifier, Style},
@@ -60,6 +60,9 @@ pub struct Conversation {
     /// can replace it without replaying or cloning the settled conversation.
     streaming: Transcript,
     pending_revision: u64,
+    /// Tool calls currently running (or settled but not yet recorded), with the revision read.
+    live: Vec<crate::agent::workers::child_transcript::LiveTool>,
+    live_revision: u64,
     /// First transcript block of each message record: `entries[i]` is entry `i`.
     entries: Vec<usize>,
     /// Bytes consumed so far. Always ends on a complete line.
@@ -139,6 +142,12 @@ impl Conversation {
     }
 
     fn follow_pending(&mut self, path: &Path) -> bool {
+        let streaming = self.follow_streaming(path);
+        let live = self.follow_live(path);
+        streaming || live
+    }
+
+    fn follow_streaming(&mut self, path: &Path) -> bool {
         let Some((revision, text)) =
             crate::agent::workers::child_transcript::pending_assistant(path, self.pending_revision)
         else {
@@ -149,6 +158,18 @@ impl Conversation {
         if !text.is_empty() {
             self.streaming.assistant_delta(&text);
         }
+        self.revision += 1;
+        true
+    }
+
+    fn follow_live(&mut self, path: &Path) -> bool {
+        let Some((revision, tools)) =
+            crate::agent::workers::child_transcript::live_tools(path, self.live_revision)
+        else {
+            return false;
+        };
+        self.live_revision = revision;
+        self.live = tools;
         self.revision += 1;
         true
     }
@@ -313,6 +334,20 @@ struct Cache {
     anchors: Vec<usize>,
 }
 
+/// Editors belong to the parent session controller, not a transient overlay. Closing or switching
+/// a worker view preserves its buffer, cursor and undo history without touching the main draft.
+#[derive(Clone, Default)]
+pub struct WorkerEditors(Arc<Mutex<BTreeMap<String, Editor>>>);
+
+impl WorkerEditors {
+    pub fn clear(&self, session: &str, worker: &str) {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&format!("{session}/{worker}"));
+    }
+}
+
 pub struct SubagentViewer {
     id: String,
     session_id: String,
@@ -329,8 +364,10 @@ pub struct SubagentViewer {
     pending_entry: Option<usize>,
     expanded: bool,
     draft: Editor,
+    editors: Option<WorkerEditors>,
+    editor_key: String,
+    pending_submit: bool,
     notice: Option<String>,
-    armed_cancel: bool,
     left_at: Option<Instant>,
     cache: Option<Cache>,
     /// Total rows and visible rows from the last draw, for paging and wheel scrolling.
@@ -347,6 +384,9 @@ impl SubagentViewer {
         now: Instant,
     ) -> Self {
         Self {
+            editor_key: format!("{session_id}/{id}"),
+            editors: None,
+            pending_submit: false,
             id,
             session_id,
             from_hub,
@@ -362,11 +402,35 @@ impl SubagentViewer {
             expanded: false,
             draft: Editor::default(),
             notice: None,
-            armed_cancel: false,
             left_at: None,
             cache: None,
             geometry: (0, 0),
         }
+    }
+    pub fn with_editors(mut self, editors: WorkerEditors) -> Self {
+        if let Some(editor) = editors
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.editor_key)
+        {
+            self.draft = editor;
+        }
+        self.editors = Some(editors);
+        self
+    }
+
+    /// A delivery failure keeps the submitted buffer available for correction or retry.
+    pub fn action_failed(&mut self, message: impl Into<String>) {
+        self.pending_submit = false;
+        self.set_notice(message);
+    }
+
+    pub fn action_succeeded(&mut self, message: impl Into<String>) {
+        if std::mem::take(&mut self.pending_submit) {
+            self.draft.set("");
+        }
+        self.set_notice(message);
     }
 
     pub fn id(&self) -> &str {
@@ -419,18 +483,9 @@ impl SubagentViewer {
 
     pub fn handle(&mut self, event: &Event, keys: &Keymap, now: Instant) -> OverlayEvent {
         match event {
-            // A held `x` must not confirm its own armed cancellation (the hub has the same rule).
-            Event::Key(key)
-                if key.kind == KeyEventKind::Repeat
-                    && key.code == KeyCode::Char('x')
-                    && self.draft.text.is_empty() =>
-            {
-                OverlayEvent::None
-            }
             Event::Key(key) if pressed(key) => self.key(key, keys, now),
             // Pasted steering goes into the draft (the editor sanitizes it); it never submits.
             Event::Paste(text) => {
-                self.armed_cancel = false;
                 self.notice = None;
                 self.draft.insert(text);
                 OverlayEvent::None
@@ -461,19 +516,22 @@ impl SubagentViewer {
     }
 
     fn key(&mut self, key: &KeyEvent, keys: &Keymap, now: Instant) -> OverlayEvent {
-        let armed = std::mem::take(&mut self.armed_cancel);
         self.notice = None;
         let empty = self.draft.text.is_empty();
 
         if keys.matches(Action::SelectCancel, key) {
-            if !empty {
-                self.draft.set("");
-                return OverlayEvent::None;
-            }
             return if self.from_hub {
                 OverlayEvent::Action("subagent-hub".to_owned())
             } else {
                 OverlayEvent::Close
+            };
+        }
+        if is_ctrl(key, 'c') {
+            return if self.agent.as_ref().is_some_and(|agent| agent.cancellable) {
+                OverlayEvent::Action(format!("subagent-cancel:{}", self.id))
+            } else {
+                self.notice = Some("This worker is not running".to_owned());
+                OverlayEvent::None
             };
         }
         if keys.matches(Action::Submit, key) {
@@ -481,13 +539,47 @@ impl SubagentViewer {
             if text.is_empty() {
                 return OverlayEvent::None;
             }
+            if text == "/back" {
+                self.draft.set("");
+                return OverlayEvent::Close;
+            }
+            for (command, axis) in [
+                ("/model", "model"),
+                ("/thinking", "thinking"),
+                ("/effort", "thinking"),
+            ] {
+                if text == command {
+                    self.notice = Some(format!(
+                        "Usage: {command} <{}>; changes this worker only",
+                        if axis == "model" {
+                            "profile or model"
+                        } else {
+                            "off|low|medium|high|ultra"
+                        }
+                    ));
+                    return OverlayEvent::None;
+                }
+                if let Some(value) = text
+                    .strip_prefix(command)
+                    .and_then(|rest| rest.strip_prefix(' '))
+                {
+                    let value = value.trim();
+                    if !value.is_empty() {
+                        self.pending_submit = true;
+                        return OverlayEvent::Action(format!(
+                            "subagent-config:{}\n{axis}\n{value}",
+                            self.id
+                        ));
+                    }
+                }
+            }
             return match route(self.agent.as_ref()) {
                 Route::Steer => {
-                    self.draft.set("");
+                    self.pending_submit = true;
                     OverlayEvent::Action(format!("subagent-message:{}\n{text}", self.id))
                 }
                 Route::Resume => {
-                    self.draft.set("");
+                    self.pending_submit = true;
                     OverlayEvent::Action(format!("subagent-resume:{}\n{text}", self.id))
                 }
                 Route::Unavailable(reason) => {
@@ -541,52 +633,7 @@ impl SubagentViewer {
             return OverlayEvent::None;
         }
 
-        if empty
-            && !is_ctrl(key, 'c')
-            && let KeyCode::Char(c) = key.code
-            && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
-        {
-            match c {
-                'j' => {
-                    self.scroll_by(1);
-                    return OverlayEvent::None;
-                }
-                'k' => {
-                    self.scroll_by(-1);
-                    return OverlayEvent::None;
-                }
-                'g' => {
-                    self.scroll.to_top();
-                    return OverlayEvent::None;
-                }
-                'G' => {
-                    self.scroll.to_bottom();
-                    return OverlayEvent::None;
-                }
-                'x' => return self.cancel(armed),
-                _ => {}
-            }
-        }
-
         self.draft.key_with(*key, keys);
-        OverlayEvent::None
-    }
-
-    /// Cancels the worker on the second `x`; the first only arms the confirmation.
-    fn cancel(&mut self, armed: bool) -> OverlayEvent {
-        match self.agent.as_ref() {
-            None => self.notice = Some("Loading worker state…".to_owned()),
-            Some(agent) if !agent.cancellable => {
-                self.notice = Some("This worker cannot be cancelled".to_owned());
-            }
-            Some(_) if armed => {
-                return OverlayEvent::Action(format!("subagent-cancel:{}", self.id));
-            }
-            Some(_) => {
-                self.armed_cancel = true;
-                self.notice = Some("Press x again to cancel this worker".to_owned());
-            }
-        }
         OverlayEvent::None
     }
 
@@ -695,6 +742,13 @@ impl SubagentViewer {
                 .document(width, &transcript_ctx)
                 .0,
         );
+        for tool in &self.conversation.live {
+            let state = if tool.running { "running" } else { "finished" };
+            rows.push(Line::from(Span::styled(
+                format!("▸ {} · {state}", tool.name),
+                ctx.theme.fg(Tok::Muted),
+            )));
+        }
         self.cache = Some(Cache { key, rows, anchors });
     }
 
@@ -810,21 +864,19 @@ impl SubagentViewer {
         }
         rows.push(filled(spans, width, Style::default()));
 
-        let back = if self.from_hub { "back" } else { "close" };
-        let esc = if self.draft.text.is_empty() {
-            back.to_owned()
+        let esc = if self.from_hub {
+            "back · draft kept"
         } else {
-            "clear draft".to_owned()
+            "main · draft kept"
         };
         let mut segments = Vec::new();
         // Scroll keys type into the draft once it has text, so they are offered only without one.
         if self.draft.text.is_empty() {
             segments.push(format!(
-                "{}/j/k scroll",
+                "{} scroll",
                 super::settings::arrows(theme, super::settings::Axis::Vertical)
             ));
             segments.push("PgUp/PgDn page".to_owned());
-            segments.push("g/G top/latest".to_owned());
         }
         segments.push(hint(
             ctx.keys,
@@ -843,13 +895,28 @@ impl SubagentViewer {
         if let Some(verb) = verb.filter(|_| !self.draft.text.is_empty()) {
             segments.push(hint(ctx.keys, Action::Submit, verb));
         }
-        if self.draft.text.is_empty() && self.agent.as_ref().is_some_and(|a| a.cancellable) {
-            segments.push("x cancel worker".to_owned());
+        if self.agent.as_ref().is_some_and(|agent| agent.cancellable) {
+            segments.push("Ctrl+C abort worker".to_owned());
         }
         segments.push(hint(ctx.keys, Action::SubagentsHub, "all workers"));
-        segments.push(hint(ctx.keys, Action::SelectCancel, &esc));
+        segments.push(hint(ctx.keys, Action::SelectCancel, esc));
+        segments.push("/model · /thinking · /back".to_owned());
         rows.push(hint_line(theme, &segments, width));
         rows
+    }
+}
+
+impl Drop for SubagentViewer {
+    fn drop(&mut self) {
+        if let Some(editors) = &self.editors {
+            let mut editors = editors.0.lock().unwrap_or_else(|error| error.into_inner());
+            if !self.draft.text.is_empty() {
+                editors.insert(
+                    std::mem::take(&mut self.editor_key),
+                    std::mem::take(&mut self.draft),
+                );
+            }
+        }
     }
 }
 

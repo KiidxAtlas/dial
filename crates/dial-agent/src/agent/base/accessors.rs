@@ -150,6 +150,7 @@ impl<'a> Agent<'a> {
         // previous session's spend is no longer counted against this session's caps.
         self.session_cost = None;
         self.usage_cost_base = -self.usage_scope.observed_cost().unwrap_or(0.0);
+        self.session_cost_warn = None;
         if let Some(layout) = &self.layout
             && self.checkpoints.is_some()
         {
@@ -371,6 +372,25 @@ impl<'a> Agent<'a> {
         self.rebuild_system();
         Ok(())
     }
+    /// Registers host-provided tools and offers them to the model for this session. Host tools are
+    /// extension tools: their schemas enter the catalog identity like any other extension.
+    pub fn register_host_tools(
+        &mut self,
+        tools: Vec<Arc<dyn crate::tools::integrations::ext::Tool>>,
+    ) -> Result<()> {
+        let names: Vec<String> = tools.iter().map(|tool| tool.name().to_owned()).collect();
+        self.register_tools(tools)?;
+        self.enabled_tools.extend(names);
+        Ok(())
+    }
+    /// Removes host-declared tools from this session; used when the session is switched or parked.
+    pub fn unregister_host_tools(&mut self, names: &[String]) {
+        for name in names {
+            self.ext.remove(name);
+            self.enabled_tools.remove(name);
+        }
+        self.rebuild_system();
+    }
     pub(in crate::agent) fn validate_tool_registration(
         &self,
         tool: &dyn crate::tools::integrations::ext::Tool,
@@ -496,6 +516,7 @@ impl<'a> Agent<'a> {
                         | "finish"
                         | "request_directory"
                         | "peers"
+                        | "side_request"
                         | "ask"
                         | "tool_search"
                         | "tool_load"
@@ -522,6 +543,7 @@ impl<'a> Agent<'a> {
         names.retain(|name| match name.as_str() {
             "check" => self.config.verification.enabled,
             "peers" => !self.hermetic && self.config.coordination.enabled && self.layout.is_some(),
+            "side_request" => !self.hermetic,
             "revert_edit" => self.checkpoints.is_some(),
             _ => true,
         });
@@ -596,8 +618,14 @@ impl<'a> Agent<'a> {
         self.plan_mode
     }
     pub fn set_plan_mode(&mut self, enabled: bool) {
+        let before = self.plan_mode;
         self.plan_mode = enabled && !self.hermetic;
         self.rebuild_system();
+        if before != self.plan_mode {
+            self.emit_event("mode_changed", || {
+                json!({"session_id": self.session.id(), "mode": "plan", "enabled": self.plan_mode})
+            });
+        }
     }
     /// Plan text that must survive a same-session rebuild: the latest proposal for `/plan-review`
     /// and an approved plan not yet delivered to a turn.

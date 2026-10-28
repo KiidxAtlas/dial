@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 mod assistance;
+mod context_files;
 mod execution;
 mod harness;
 mod integrations;
@@ -18,6 +19,7 @@ mod verification;
 mod workflow;
 
 pub use assistance::*;
+pub use context_files::*;
 pub use execution::*;
 pub use harness::*;
 pub use integrations::*;
@@ -87,6 +89,8 @@ pub struct Config {
     pub assistance: AssistanceConfig,
     pub efficiency: EfficiencyConfig,
     pub steering: config::steering::Config,
+    /// `[message_routing]`: how a message typed during a running turn is routed.
+    pub message_routing: config::message_routing::Config,
     pub local_runtime: crate::llm::local_runtime::LocalRuntime,
     pub adaptive: config::adaptive::Config,
     pub reliability: config::reliability::Config,
@@ -94,6 +98,7 @@ pub struct Config {
     pub stats: config::stats::StatsConfig,
     pub telemetry: config::telemetry::TelemetryConfig,
     pub voice: config::voice::VoiceConfig,
+    pub image: config::image::ImageConfig,
     pub collab: config::collab::Config,
     pub coordination: config::coordination::CoordinationConfig,
     pub share: crate::config::share::Config,
@@ -122,6 +127,7 @@ pub struct Config {
     pub edit_mode_override: Option<EditMode>,
     pub compaction: crate::config::compaction::CompactionConfig,
     pub ask: crate::config::ask::AskConfig,
+    pub cache: crate::config::cache::CacheConfig,
     pub checkpoint: crate::config::checkpoint::CheckpointConfig,
     pub tools: BTreeMap<String, ToolConfig>,
     pub subagents: BTreeMap<String, String>,
@@ -168,12 +174,16 @@ pub struct Config {
     pub lsp: crate::config::tools::lsp::LspConfig,
     /// Debug Adapter Protocol adapters keyed by adapter id.
     pub dap: BTreeMap<String, crate::config::tools::dap::DapAdapterConfig>,
+    /// `[ida]` IDA Pro runtime settings for the `ida` tool.
+    pub ida: crate::config::tools::ida::IdaConfig,
     /// Git hook/signing policy.
     pub git: crate::config::tools::git::GitConfig,
     /// `[worktree]`: what `/wt` does to the source checkout after moving the session into a worktree.
     pub worktree: WorktreeConfig,
     /// `[commit]`: persistent reply cache for `/commit` and `dial commit`.
     pub commit: CommitConfig,
+    /// `[context_files]`: extra instruction file names read beside each project `AGENTS.md`.
+    pub context_files: ContextFilesConfig,
     pub web: WebConfig,
     pub verification: VerificationConfig,
     /// Bounded isolated patch search. Requires explicit paths and executable checks.
@@ -237,6 +247,7 @@ impl Default for Config {
             assistance: AssistanceConfig::default(),
             efficiency: EfficiencyConfig::default(),
             steering: config::steering::Config::default(),
+            message_routing: config::message_routing::Config::default(),
             local_runtime: Default::default(),
             adaptive: config::adaptive::Config::default(),
             reliability: config::reliability::Config::default(),
@@ -245,6 +256,7 @@ impl Default for Config {
             stats: config::stats::StatsConfig::default(),
             telemetry: config::telemetry::TelemetryConfig::default(),
             voice: config::voice::VoiceConfig::default(),
+            image: config::image::ImageConfig::default(),
             collab: config::collab::Config::default(),
             coordination: Default::default(),
             share: crate::config::share::Config::default(),
@@ -262,6 +274,7 @@ impl Default for Config {
             edit_mode_override: None,
             compaction: crate::config::compaction::CompactionConfig::default(),
             ask: crate::config::ask::AskConfig::default(),
+            cache: crate::config::cache::CacheConfig::default(),
             checkpoint: crate::config::checkpoint::CheckpointConfig::default(),
             tools: BTreeMap::new(),
             subagents: BTreeMap::new(),
@@ -282,9 +295,11 @@ impl Default for Config {
             mcp: BTreeMap::new(),
             lsp: crate::config::tools::lsp::LspConfig::default(),
             dap: BTreeMap::new(),
+            ida: crate::config::tools::ida::IdaConfig::default(),
             git: Default::default(),
             worktree: Default::default(),
             commit: CommitConfig::default(),
+            context_files: ContextFilesConfig::default(),
             web: WebConfig::default(),
             verification: VerificationConfig::default(),
             solve: Default::default(),

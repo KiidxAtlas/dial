@@ -145,6 +145,17 @@ state, requests report `registry_default` routing.
 - Codex WebSocket setup uses one elapsed timeout budget across address attempts and TLS/HTTP upgrade, rather than restarting the budget for each address or read. Handshake network I/O checks cancellation at intervals of at most 100 ms; cancellation propagates without selecting SSE. System DNS, native certificate loading, and an in-flight blocking TCP connect cannot be preempted. Their elapsed time counts against the budget, but DNS/certificate loading can exceed it; with a zero timeout, TCP connect retains the OS timeout.
 - Cached Codex WebSockets bind cancellation and no-progress limits to each active request, including reads inside a partial frame. Ping/pong traffic does not renew model-progress deadlines. Request controls are detached before returning a connection to the cache, so an earlier request's cancellation cannot poison reuse.
 
+### Anthropic cache-control refusal and cache warming
+
+- Anthropic native requests mark cache breakpoints with `cache_control`. If the endpoint refuses that field (HTTP 400 whose body names `cache_control` and a rejection), Dial retries the request once with the next narrower form: first without the 1-hour TTL, then with no markers. Unrelated 400s are not treated as refusals. A refusal is remembered per endpoint (URL without query) and model for the process, so later requests start at the narrower form.
+- `cache.warm` (default `off`) can keep the settled prompt prefix warm after a turn ends, so a follow-up within the cache lifetime reads the cache instead of rewriting it. Each replay is a real billed request with `max_tokens = 1`; it costs the cache-read price on a hit and is recorded under the `cache_warm` purpose in usage and cost.
+  - `off`: no replays.
+  - `streaming`: replays only while an agent run is streaming a reply, for up to 30 minutes from the last settled prefix.
+  - `idle`: also replays between runs, for up to 60 minutes from the last settled prefix.
+- A replay is armed only when the economics favor it: the expected savings over the next replay must exceed $0.001 at catalog prices. Without catalog pricing for the model, warming does not start. Lifetimes are assumed to be the 5-minute default, so 1-hour cache writes are priced conservatively.
+- Warming stops when the mode changes to `off`, the model changes, the window ends, a replay wrote the cache instead of reading it, or the replay backend is unavailable. A round that settles a new prefix replaces the armed one. The reason is shown as a notice at the start of the next turn. Hermetic evaluation runs never replay.
+- Warming applies to native Anthropic routes only. Other providers and local servers have no equivalent cache control and never replay.
+
 ## Stable prompts and immutable media
 
 System assembly separates frozen guidance, stable project/tool context, and dynamic admitted memory. Transient guidance stays at the conversation tail; history is never sorted. Custom templates are treated as dynamic because their interpolation may include changing data. Parent and worker assembly use the same band ordering. Bookkeeping fields are removed before provider serialization and training-template validation.
@@ -220,7 +231,7 @@ Anthropic streams also retry within that bound, discarding the failed attempt's 
 calls. Completed tools from earlier requests are retained. Configured native Anthropic idle timeouts
 and transient streamed errors also retry; malformed events and authentication failures stop immediately. Exhausted retries pause the
 turn with a reason and instructions to continue. `@image.png` and image `read` calls attach actual
-PNG/JPEG/GIF/WebP pixels up to 5 MiB. To supply an image outside the project, explicitly reference its
+PNG/JPEG/GIF/WebP pixels, downscaled to fit 5 MiB when larger (sources up to 64 MiB). To supply an image outside the project, explicitly reference its
 absolute path or home path, such as `@"/Users/me/Desktop/Screenshot 1.png"` or `@~/Pictures/example.jpg`.
 Pasted standalone or quoted image paths also attach automatically without `@`. The model can reread
 exactly those supplied images; other external tool reads stay confined. Sessions store file references and content hashes, not base64;
@@ -281,7 +292,7 @@ Set `cache_retention="short"` to force five minutes or `"long"` to request one h
 that supports it. Long-lived cache writes can cost more for API keys; retention does not reduce
 generated reasoning/output tokens, and Claude subscription quota savings must be measured separately.
 
-Endpoint/model selections can declare `protocol = "chat-completions"`, `"responses"`, `"anthropic"`, `"gemini"` or `"ollama"`, or another of the recognized wire protocols (`bedrock`, `vertex`, `vertex-anthropic`, `azure-responses`, `copilot`, `cloud-code-assist`, `antigravity`, `gitlab-duo`, `factory-droid`, `devin-agent`). No provider-name guess converts a custom endpoint into a different wire
+Endpoint/model selections can declare `protocol = "chat-completions"`, `"responses"`, `"anthropic"`, `"gemini"` or `"ollama"`, or another of the recognized wire protocols (`bedrock`, `vertex`, `vertex-anthropic`, `azure-responses`, `copilot`, `cloud-code-assist`, `antigravity`, `gitlab-duo`, `gitlab-duo-agent`, `factory-droid`, `devin-agent`). No provider-name guess converts a custom endpoint into a different wire
 format. Native encrypted/signed history stays scoped to its real provider/model/endpoint/account;
 changing that identity requires a clean or safely reconstructed portable view.
 

@@ -42,3 +42,19 @@ fn html_embeds_verified_images_and_reports_missing_ones() {
     );
     assert!(text.contains("Stored image unavailable"), "{text}");
 }
+
+#[test]
+fn worker_transcripts_follow_the_parent_with_redaction() {
+    let parent = json!({"role": "user", "content": "parent question"});
+    let worker_msg = json!({"role": "assistant", "content": "worker token ghp_cccccccccccccccccccccccccccccccccccc"});
+    let workers = vec![Worker {
+        title: "task-9".into(),
+        messages: vec![worker_msg],
+    }];
+    let body = render_with_workers("t", &[&parent], &workers, false);
+    let parent_at = body.find("parent question").unwrap();
+    let worker_at = body.find("Subagent: task-9").unwrap();
+    assert!(parent_at < worker_at);
+    assert!(body.contains("worker token"));
+    assert!(!body.contains("ghp_cccc"));
+}

@@ -37,7 +37,7 @@ fn rebinding_cancels_old_workers_without_projecting_them_into_the_new_session() 
             body: old.clone(),
             interrupt: cancel.clone(),
             worker: None,
-            active_tool: Arc::new(Mutex::new(None)),
+            active_tool: Arc::default(),
             delivered: false,
         },
     );

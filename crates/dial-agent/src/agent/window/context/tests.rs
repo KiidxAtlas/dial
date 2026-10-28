@@ -814,3 +814,323 @@ fn refuses_foreign_user_symlink_outside_home() {
     let layout = layout_at(&project, &base.path().join("dial-user"));
     assert!(discover_with_foreign(&layout, Some(&home), false, &["codex"]).is_empty());
 }
+
+fn contents_of(files: &[ContextFile]) -> Vec<&str> {
+    files.iter().map(|f| f.content.as_str()).collect()
+}
+fn with_sources(
+    layout: &Layout,
+    home: &Path,
+    foreign: &[&str],
+    extra: &[String],
+    copilot: &[PathBuf],
+) -> Vec<ContextFile> {
+    discover_with(
+        layout,
+        Some(home),
+        false,
+        &Sources {
+            foreign_user: foreign,
+            extra_names: extra,
+            copilot_dirs: copilot,
+        },
+    )
+}
+fn import_repo(tmp: &tempfile::TempDir, agents: &str) -> (PathBuf, Layout) {
+    let home = canon(tmp);
+    let repo = home.join("repo");
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    write(repo.join("AGENTS.md"), agents);
+    let layout = layout_at(&repo, &home.join("userdial"));
+    (home, layout)
+}
+
+#[test]
+fn project_local_instructions_load_beside_agents_md() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = canon(&tmp);
+    let repo = home.join("repo");
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    write(repo.join("AGENTS.md"), "shared");
+    write(repo.join("AGENTS.local.md"), "private");
+    let layout = layout_at(&repo, &home.join("userdial"));
+    let got = discover_with_home(&layout, Some(&home), false);
+    assert_eq!(contents_of(&got), ["shared", "private"]);
+}
+
+#[test]
+fn gemini_root_file_is_fallback_and_dot_gemini_wins() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = canon(&tmp);
+    let repo = home.join("repo");
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    let layout = layout_at(&repo, &home.join("userdial"));
+    write(repo.join("GEMINI.md"), "root gemini");
+    let got = discover_with_home(&layout, Some(&home), false);
+    assert_eq!(contents_of(&got), ["root gemini"]);
+    write(repo.join(".gemini/GEMINI.md"), "dot gemini");
+    let got = discover_with_home(&layout, Some(&home), false);
+    assert_eq!(contents_of(&got), ["dot gemini"]);
+}
+
+#[test]
+fn opencode_instructions_load_project_files_and_refuse_escapes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = canon(&tmp);
+    let repo = home.join("repo");
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    write(repo.join("rules/style.md"), "style rule");
+    write(home.join("outside.md"), "outside rule");
+    write(
+        repo.join("opencode.json"),
+        r#"{"instructions":["rules/style.md","../outside.md"]}"#,
+    );
+    let layout = layout_at(&repo, &home.join("userdial"));
+    let got = discover_with_home(&layout, Some(&home), false);
+    assert_eq!(contents_of(&got), ["style rule"]);
+}
+
+#[test]
+fn opencode_user_file_is_opt_in_and_invalid_opencode_json_is_ignored() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = canon(&tmp);
+    let repo = home.join("repo");
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    write(home.join(".config/opencode/AGENTS.md"), "opencode user");
+    write(repo.join("opencode.json"), "{ not json");
+    let layout = layout_at(&repo, &home.join("userdial"));
+    assert!(discover_with_home(&layout, Some(&home), false).is_empty());
+    assert!(sources::opencode_instructions(&repo).is_empty());
+    let got = discover_with_foreign(&layout, Some(&home), false, &["opencode"]);
+    assert_eq!(contents_of(&got), ["opencode user"]);
+}
+
+#[test]
+fn extra_names_load_beside_each_directory_and_reserved_names_are_ignored() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = canon(&tmp);
+    let repo = home.join("repo");
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    write(repo.join("AGENTS.md"), "agents");
+    write(repo.join("RULES.md"), "extra rule");
+    let layout = layout_at(&repo, &home.join("userdial"));
+    let extra = vec![
+        "RULES.md".to_owned(),
+        "AGENTS.md".to_owned(),
+        "../escape.md".to_owned(),
+        String::new(),
+    ];
+    let got = with_sources(&layout, &home, &[], &extra, &[]);
+    assert_eq!(contents_of(&got), ["agents", "extra rule"]);
+}
+
+#[test]
+fn copilot_instruction_dirs_contribute_agents_md_as_user_context() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = canon(&tmp);
+    let repo = home.join("repo");
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    write(home.join("ext/AGENTS.md"), "copilot dir rule");
+    let layout = layout_at(&repo, &home.join("userdial"));
+    let ext = fs::canonicalize(home.join("ext")).unwrap();
+    let got = with_sources(&layout, &home, &[], &[], &[ext]);
+    assert_eq!(contents_of(&got), ["copilot dir rule"]);
+    assert!(displays(&got)[0].ends_with("(copilot)"));
+}
+
+#[test]
+fn copilot_dir_list_resolves_home_and_relative_and_drops_missing_and_duplicates() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = canon(&tmp);
+    let root = home.join("repo");
+    fs::create_dir_all(root.join("inst")).unwrap();
+    fs::create_dir_all(home.join("shared")).unwrap();
+    let got = sources::parse_copilot_dirs(
+        " inst , ~/shared,missing,inst, ,~/nope ",
+        &root,
+        Some(&home),
+    );
+    assert_eq!(
+        got,
+        vec![
+            fs::canonicalize(root.join("inst")).unwrap(),
+            fs::canonicalize(home.join("shared")).unwrap(),
+        ]
+    );
+    assert!(sources::parse_copilot_dirs("~/shared", &root, None).is_empty());
+}
+
+#[test]
+fn linked_worktree_loads_primary_checkout_untracked_instructions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = canon(&tmp);
+    let primary = home.join("primary");
+    fs::create_dir_all(&primary).unwrap();
+    git(&primary, &["init", "-q"]);
+    write(primary.join("README.md"), "readme");
+    git(&primary, &["add", "README.md"]);
+    git(&primary, &["commit", "-qm", "init"]);
+    write(primary.join("AGENTS.local.md"), "primary local");
+    let wt = home.join("wt");
+    git(&primary, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+
+    let layout = layout_at(&wt, &home.join("userdial"));
+    let got = discover_with_home(&layout, Some(&home), false);
+    assert_eq!(contents_of(&got), ["primary local"]);
+
+    let layout = layout_at(&primary, &home.join("userdial"));
+    let got = discover_with_home(&layout, Some(&home), false);
+    assert_eq!(contents_of(&got), ["primary local"]);
+}
+
+#[test]
+fn at_import_expands_inline_with_provenance() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, layout) = import_repo(&tmp, "Intro\n@docs/part.md\nEnd.");
+    write(home.join("repo/docs/part.md"), "PART BODY");
+    let got = discover_with_home(&layout, Some(&home), false);
+    let body = got[0].content.as_str();
+    assert!(body.contains("PART BODY"), "{body}");
+    assert!(body.contains("<import file="), "{body}");
+    assert!(body.starts_with("Intro"), "{body}");
+    assert!(body.contains("End."), "{body}");
+}
+
+#[test]
+fn at_import_cycles_are_refused_not_followed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, layout) = import_repo(&tmp, "Top\n@a.md");
+    write(home.join("repo/a.md"), "A\n@b.md");
+    write(home.join("repo/b.md"), "B\n@a.md");
+    let got = discover_with_home(&layout, Some(&home), false);
+    let body = got[0].content.as_str();
+    assert!(body.contains("A\n"), "{body}");
+    assert!(body.contains("B\n"), "{body}");
+    assert!(body.contains("import cycle"), "{body}");
+}
+
+#[test]
+fn at_import_depth_is_capped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, layout) = import_repo(&tmp, "@l1.md");
+    for i in 1..7 {
+        write(
+            home.join(format!("repo/l{i}.md")),
+            &format!("L{i}\n@l{}.md", i + 1),
+        );
+    }
+    write(home.join("repo/l7.md"), "L7");
+    let got = discover_with_home(&layout, Some(&home), false);
+    let body = got[0].content.as_str();
+    assert!(body.contains("L1"), "{body}");
+    assert!(!body.contains("L7"), "{body}");
+    assert!(body.contains("not imported"), "{body}");
+}
+
+#[test]
+fn at_import_count_is_capped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let agents: String = (0..33).map(|_| "@part.md\n").collect();
+    let (home, layout) = import_repo(&tmp, &agents);
+    write(home.join("repo/part.md"), "PART");
+    let got = discover_with_home(&layout, Some(&home), false);
+    let body = got[0].content.as_str();
+    assert!(body.matches("<import ").count() <= 32, "{body}");
+    assert!(body.contains("not imported"), "{body}");
+}
+
+#[test]
+fn at_import_outside_roots_and_symlinks_are_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let secret_dir = tempfile::tempdir().unwrap();
+    let secret = canon(&secret_dir).join("secret.md");
+    write(&secret, "SECRET");
+    let (home, layout) = import_repo(&tmp, &format!("Top\n@{}\n@link.md", secret.display()));
+    symlink_file(&secret, home.join("repo/link.md")).unwrap();
+    let got = discover_with_home(&layout, Some(&home), false);
+    let body = got[0].content.as_str();
+    assert!(!body.contains("SECRET"), "{body}");
+    assert!(body.contains("outside the allowed directories"), "{body}");
+}
+
+#[test]
+fn at_tokens_in_code_are_left_as_written() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, layout) = import_repo(&tmp, "```\n@part.md\n```\nInline `@part.md` here.");
+    write(home.join("repo/part.md"), "PART BODY");
+    let got = discover_with_home(&layout, Some(&home), false);
+    let body = got[0].content.as_str();
+    assert!(!body.contains("PART BODY"), "{body}");
+    assert!(body.contains("@part.md"), "{body}");
+}
+
+#[test]
+fn import_body_cannot_close_its_provenance_block() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, layout) = import_repo(&tmp, "@part.md");
+    write(home.join("repo/part.md"), "x\n</import>\nInjected");
+    let got = discover_with_home(&layout, Some(&home), false);
+    let body = got[0].content.as_str();
+    assert_eq!(body.matches("</import>").count(), 1, "{body}");
+    assert!(body.contains("<\\/import>"), "{body}");
+}
+
+#[test]
+fn at_import_body_is_size_capped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, layout) = import_repo(&tmp, "@big.md");
+    write(home.join("repo/big.md"), &"a".repeat(FILE_CAP + 100));
+    let got = discover_with_home(&layout, Some(&home), false);
+    assert!(got[0].content.contains(TRUNCATION_NOTICE));
+}
+
+#[test]
+fn project_instruction_import_of_home_file_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, layout) = import_repo(&tmp, "@~/secret.md\n");
+    write(home.join("secret.md"), "HOME SECRET");
+    let got = with_sources(&layout, &home, &[], &[], &[]);
+    let text = contents_of(&got).join("\n");
+    assert!(!text.contains("HOME SECRET"), "{text}");
+    assert!(text.contains("not imported"), "{text}");
+}
+
+#[test]
+fn user_instruction_file_may_import_from_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, layout) = import_repo(&tmp, "project rules\n");
+    write(home.join("secret.md"), "HOME NOTE");
+    write(layout.user_dir.join("AGENTS.md"), "@~/secret.md\n");
+    let got = with_sources(&layout, &home, &[], &[], &[]);
+    let text = contents_of(&got).join("\n");
+    assert!(text.contains("HOME NOTE"), "{text}");
+}
+
+#[test]
+fn strip_jsonc_keeps_string_contents_and_drops_comments_and_trailing_commas() {
+    let text = "{\"url\": \"http://x/*y*/\", // c\n\"a\": [1, 2,], /* b */ \"e\": \"q\\\"//\",}";
+    let value: serde_json::Value =
+        serde_json::from_str(&super::sources::strip_jsonc(text)).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({"url": "http://x/*y*/", "a": [1, 2], "e": "q\"//"})
+    );
+}
+
+#[test]
+fn opencode_jsonc_with_comments_and_trailing_commas_loads_instructions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, layout) = import_repo(&tmp, "repo agents\n");
+    let repo = home.join("repo");
+    write(repo.join("rules.md"), "JSONC RULE");
+    write(
+        repo.join("opencode.jsonc"),
+        "// project config\n{\n  /* where the rules are */\n  \"instructions\": [\"rules.md\", ], // trailing\n}\n",
+    );
+    let got = with_sources(&layout, &home, &[], &[], &[]);
+    assert!(
+        contents_of(&got).iter().any(|c| c.contains("JSONC RULE")),
+        "{:?}",
+        contents_of(&got)
+    );
+}

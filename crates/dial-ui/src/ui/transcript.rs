@@ -21,7 +21,7 @@ use super::{
     markdown::truncate_spans,
     text,
     theme::{Sym, Theme, Tok},
-    tool_cards::{AgentRow, Tool, ToolState, tool_rows},
+    tool_cards::{AgentRow, Tool, ToolState, lookup_group, lookup_tree, may_join, tool_rows},
 };
 use crate::llm::model_config::UiConfig;
 use ratatui::{
@@ -30,6 +30,8 @@ use ratatui::{
 };
 use serde_json::Value;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use unicode_segmentation::UnicodeSegmentation;
 
 // Tool lifecycle and card data are shared with the specialized card renderer.
 
@@ -63,6 +65,53 @@ pub struct TranscriptCtx<'a> {
     pub tools_expanded: bool,
     /// Label of the expand/collapse shortcut, as the keymap shows it (for example `Ctrl+O`).
     pub expand_key: &'a str,
+}
+
+/// How much settled history one paint may hand to scrollback. Retirement stops before the first
+/// block that would exceed the budget and leaves the rest, in order, for a later paint. The first
+/// block always retires, so one block larger than `rows` still makes progress.
+#[derive(Clone, Copy)]
+pub struct Retire {
+    /// Most blocks retired by one paint.
+    pub blocks: usize,
+    /// Most rows retired by one paint.
+    pub rows: usize,
+    /// Point after which no further block retires.
+    pub until: Option<Instant>,
+}
+
+impl Retire {
+    /// No budget: the whole finalized backlog retires.
+    pub const UNLIMITED: Self = Self {
+        blocks: usize::MAX,
+        rows: usize::MAX,
+        until: None,
+    };
+
+    /// Budget for one paint while a turn runs: a few blocks, bounded rows, and a few milliseconds.
+    pub fn frame(now: Instant) -> Self {
+        Self {
+            blocks: 32,
+            rows: 256,
+            until: Some(now + Duration::from_millis(4)),
+        }
+    }
+
+    /// Whether `blocks` retired blocks and `rows` rows already exhaust this budget.
+    fn spent(self, blocks: usize, rows: usize) -> bool {
+        blocks >= self.blocks
+            || rows >= self.rows
+            || self.until.is_some_and(|at| Instant::now() >= at)
+    }
+}
+
+/// A settled block whose rows are partly in scrollback. Its rows freeze at the width it started at,
+/// so the remainder keeps that wrapping across resizes. `next` is the first row not yet retired.
+struct Retiring {
+    rows: std::sync::Arc<Rows>,
+    next: usize,
+    /// Exclusive block end covered by these rows, including every member of a frozen lookup tree.
+    end: usize,
 }
 
 enum Kind {
@@ -106,6 +155,12 @@ struct Block {
     shared: Option<crate::runtime::Body>,
     revision: std::cell::Cell<u64>,
     rendered: std::cell::RefCell<Option<(RenderKey, u64, std::sync::Arc<Rows>)>>,
+    /// Visible byte prefix of a streaming answer under `ui.smooth_reveal`. `None` shows all
+    /// text. Inactive blocks ignore it, so every structural boundary flushes the full text.
+    revealed: Option<usize>,
+    /// A lookup run may not reach back across this block's start: it opens a new turn, or the
+    /// block that stood between it and its predecessor was removed.
+    breaks_run: bool,
 }
 
 #[derive(PartialEq)]
@@ -132,7 +187,62 @@ impl Block {
             shared: None,
             revision: std::cell::Cell::new(0),
             rendered: std::cell::RefCell::new(None),
+            revealed: None,
+            breaks_run: false,
         }
+    }
+
+    /// The visible streaming prefix, or the complete text at a structural boundary.
+    fn visible<'a>(&self, text: &'a str) -> &'a str {
+        match self.revealed {
+            Some(cut) if self.active => &text[..text.floor_char_boundary(cut.min(text.len()))],
+            _ => text,
+        }
+    }
+
+    /// Drop the render and streaming caches once the block is committed. `render` rebuilds them from
+    /// the body on demand, so replay and resize output stay identical.
+    fn release_caches(&self) {
+        *self.rendered.borrow_mut() = None;
+        *self.markdown.borrow_mut() = StreamingRows::default();
+    }
+
+    /// The call as it stands: a shared body carries the newest output, presentation and phase.
+    fn tool_view(&self) -> Option<std::borrow::Cow<'_, Tool>> {
+        let Kind::Tool(t) = &self.kind else {
+            return None;
+        };
+        Some(match &self.shared {
+            Some(b) => std::borrow::Cow::Owned(b.read(|n| {
+                let mut view = t.clone();
+                view.output = n.result.text.clone();
+                if let Some(presentation) = &n.presentation {
+                    view.presentation = presentation.clone();
+                }
+                view.state = n.result.phase;
+                view
+            })),
+            None => std::borrow::Cow::Borrowed(t),
+        })
+    }
+
+    /// Applies `f` to the call's current phase and presentation without copying its output.
+    fn tool_phase<R>(
+        &self,
+        f: impl FnOnce(ToolState, &crate::runtime::presentation::Presentation) -> R,
+    ) -> Option<R> {
+        let Kind::Tool(t) = &self.kind else {
+            return None;
+        };
+        Some(match &self.shared {
+            Some(b) => b.read(|n| {
+                f(
+                    n.result.phase,
+                    n.presentation.as_ref().unwrap_or(&t.presentation),
+                )
+            }),
+            None => f(t.state, &t.presentation),
+        })
     }
 
     fn prose(&self) -> Option<(Prose, std::borrow::Cow<'_, str>)> {
@@ -140,8 +250,10 @@ impl Block {
             Kind::Assistant(t) => Some((
                 Prose::Assistant,
                 self.shared.as_ref().map_or_else(
-                    || std::borrow::Cow::Borrowed(t.as_str()),
-                    |b| std::borrow::Cow::Owned(b.read(|n| n.result.text.clone())),
+                    || std::borrow::Cow::Borrowed(self.visible(t)),
+                    |b| {
+                        std::borrow::Cow::Owned(b.read(|n| self.visible(&n.result.text).to_owned()))
+                    },
                 ),
             )),
             Kind::Thinking(t) => Some((
@@ -198,27 +310,22 @@ impl Block {
                 Some(b) => b.read(|n| {
                     self.markdown
                         .borrow_mut()
-                        .render(&n.result.text, w, ctx.theme)
+                        .render(self.visible(&n.result.text), w, ctx.theme)
                 }),
-                None => self.markdown.borrow_mut().render(t, w, ctx.theme),
+                None => self
+                    .markdown
+                    .borrow_mut()
+                    .render(self.visible(t), w, ctx.theme),
             },
             Kind::Thinking(t) => Arc::new(match &self.shared {
                 Some(b) => b.read(|n| prose_rows(Prose::Thinking, &n.result.text, w, ctx)),
                 None => prose_rows(Prose::Thinking, t, w, ctx),
             }),
             // Work rows put their own status glyph in the shared icon gutter.
-            Kind::Tool(t) => Arc::new(match &self.shared {
-                Some(b) => b.read(|n| {
-                    let mut view = t.clone();
-                    view.output = n.result.text.clone();
-                    if let Some(presentation) = &n.presentation {
-                        view.presentation = presentation.clone();
-                    }
-                    view.state = n.result.phase;
-                    tool_rows(&view, w, ctx)
-                }),
-                None => tool_rows(t, w, ctx),
-            }),
+            Kind::Tool(_) => Arc::new(
+                self.tool_view()
+                    .map_or_else(Vec::new, |view| tool_rows(&view, w, ctx)),
+            ),
             Kind::Notice { title, text } => Arc::new(super::notice::rows(title, text, w, ctx)),
             Kind::Event(event) => Arc::new(super::lanes::rows(event, w, ctx)),
             Kind::Error(t) => Arc::new(error_rows(t, w, ctx)),
@@ -729,8 +836,12 @@ pub struct Transcript {
     /// Whether the last block handed to scrollback was a tool call; `None` before any. The blank
     /// separator after it is owed until the next block shows whether it belongs to the same group.
     owed_gap: Option<bool>,
+    /// The settled block split at a row cursor, if one is in progress. See `retire_settled`.
+    retiring: Option<Retiring>,
     /// How the running turn ended, waiting for the closing stats row that shows it.
     outcome: Option<TurnOutcome>,
+    /// A turn just ended: a trailing lookup run is complete, and the next block starts a new run.
+    sealed: bool,
 }
 
 /// Blocks are separated by one blank row, except consecutive members of the work group (tool
@@ -762,6 +873,84 @@ impl Transcript {
         for block in &self.blocks[self.cursor..] {
             block.revision.set(block.revision.get().saturating_add(1));
         }
+    }
+
+    /// The lookup run block `index` belongs to, as `(start, end, label)`: consecutive settled
+    /// reads, searches or finds of one kind, never across a finished turn. Only the collapsed view
+    /// groups; expanded and hidden tool views keep each call.
+    fn lookup_run(&self, index: usize, ctx: &TranscriptCtx) -> Option<(usize, usize, String)> {
+        if !ctx.ui.show_tools || ctx.tools_expanded {
+            return None;
+        }
+        let label = self.lookup_label(index)?;
+        let same = |i: usize| self.lookup_label(i).as_deref() == Some(label.as_str());
+        let mut start = index;
+        while start > 0 && !self.blocks[start].breaks_run && same(start - 1) {
+            start -= 1;
+        }
+        let mut end = index + 1;
+        while end < self.blocks.len() && !self.blocks[end].breaks_run && same(end) {
+            end += 1;
+        }
+        Some((start, end, label))
+    }
+
+    fn lookup_label(&self, index: usize) -> Option<String> {
+        self.blocks[index].tool_phase(lookup_group).flatten()
+    }
+
+    /// Whether block `index` heads a lookup run that may still grow: nothing after it has closed
+    /// the run yet, or the next call is a running lookup of the same kind.
+    fn lookup_waits(&self, index: usize, ctx: &TranscriptCtx) -> bool {
+        let Some((start, end, label)) = self.lookup_run(index, ctx) else {
+            return false;
+        };
+        if start != index {
+            return false;
+        }
+        match self.blocks.get(end) {
+            None => !self.sealed,
+            Some(next) => {
+                !next.breaks_run
+                    && next
+                        .tool_phase(|state, p| may_join(state, p, &label))
+                        .unwrap_or(false)
+            }
+        }
+    }
+
+    /// Block `index`'s rows. A run of two or more lookups renders as one tree at its first block
+    /// and as nothing at the others, so every path that lays out blocks agrees on the grouping.
+    fn rows_at(&self, index: usize, w: u16, ctx: &TranscriptCtx) -> std::sync::Arc<Rows> {
+        self.rows_in_range(index, w, ctx, 0..self.blocks.len())
+    }
+
+    /// A scrollback boundary may bisect a lookup run after Ctrl+O changes. Never include calls
+    /// outside the boundary being rendered, or suppress an unretired call behind a retired head.
+    fn rows_in_range(
+        &self,
+        index: usize,
+        w: u16,
+        ctx: &TranscriptCtx,
+        range: std::ops::Range<usize>,
+    ) -> std::sync::Arc<Rows> {
+        if let Some((start, end, _)) = self.lookup_run(index, ctx) {
+            let start = start.max(range.start);
+            let end = end.min(range.end);
+            if end - start <= 1 {
+                return self.blocks[index].render(w, ctx);
+            }
+            if index != start {
+                return Arc::new(Vec::new());
+            }
+            let views: Vec<_> = self.blocks[start..end]
+                .iter()
+                .filter_map(Block::tool_view)
+                .collect();
+            let tools: Vec<&Tool> = views.iter().map(|v| v.as_ref()).collect();
+            return Arc::new(lookup_tree(&tools, w, ctx));
+        }
+        self.blocks[index].render(w, ctx)
     }
 
     pub fn bind_prose(&mut self, body: &crate::runtime::Body) {
@@ -796,7 +985,7 @@ impl Transcript {
             body.read(|node| node.result.phase == crate::runtime::Phase::Running),
         );
         block.shared = Some(body.clone());
-        self.blocks.push(block);
+        self.push_block(block);
     }
 
     pub fn bind_tool(&mut self, id: &str, body: crate::runtime::Body) {
@@ -812,7 +1001,9 @@ impl Transcript {
             blocks: Vec::new(),
             cursor: 0,
             owed_gap: None,
+            retiring: None,
             outcome: None,
+            sealed: false,
         }
     }
 
@@ -849,7 +1040,13 @@ impl Transcript {
                 block.revision.set(block.revision.get().saturating_add(1));
             }
         }
-        self.blocks.push(Block::new(kind, active));
+        self.push_block(Block::new(kind, active));
+    }
+
+    /// Appends a block. The first block after a finished turn starts a new lookup run.
+    fn push_block(&mut self, mut block: Block) {
+        block.breaks_run = std::mem::take(&mut self.sealed);
+        self.blocks.push(block);
     }
 
     pub fn push_user(&mut self, text: &str) {
@@ -876,6 +1073,55 @@ impl Transcript {
         self.push(Kind::Assistant(text.to_owned()), true);
     }
 
+    /// Advance the visible prefix of the active answer for `ui.smooth_reveal`. Disabling the
+    /// setting drops the prefix so pending text shows at once; inactive blocks always show all text.
+    /// Called from input and heartbeat ticks rather than from `live`, so the reveal keeps moving
+    /// while the provider is quiet.
+    pub fn advance_reveal(&mut self, ui: &UiConfig) {
+        let Some(block) = self.blocks[self.cursor..]
+            .iter_mut()
+            .rev()
+            .find(|block| block.active && matches!(&block.kind, Kind::Assistant(_)))
+        else {
+            return;
+        };
+        let Kind::Assistant(text) = &block.kind else {
+            return;
+        };
+        if !block.active {
+            return;
+        }
+        let from = block.revealed.unwrap_or(0);
+        let next = ui.smooth_reveal.then(|| match &block.shared {
+            Some(body) => body.read(|node| Self::reveal_cut(&node.result.text, from)),
+            None => Self::reveal_cut(text, from),
+        });
+        if block.revealed == next {
+            return;
+        }
+        block.revealed = next;
+        block.revision.set(block.revision.get().saturating_add(1));
+    }
+
+    /// Next visible byte cut: a quarter of the pending text (at least a few bytes), moved forward to a
+    /// grapheme boundary and never past the newest grapheme, which a following combining mark may join.
+    fn reveal_cut(text: &str, from: usize) -> usize {
+        const REVEAL_MIN_BYTES: usize = 8;
+        let from = text.floor_char_boundary(from.min(text.len()));
+        let want = from + ((text.len() - from) / 4).max(REVEAL_MIN_BYTES);
+        let limit = text
+            .grapheme_indices(true)
+            .next_back()
+            .map_or(0, |(at, _)| at);
+        text[from..]
+            .grapheme_indices(true)
+            .map(|(at, _)| from + at)
+            .find(|&at| at >= want)
+            .unwrap_or(limit)
+            .min(limit)
+            .max(from)
+    }
+
     pub fn thinking_delta(&mut self, text: &str) {
         self.invalidate_tail();
         if text.is_empty() {
@@ -897,6 +1143,17 @@ impl Transcript {
 
     pub fn tool_start(&mut self, id: &str, name: &str, summary: &str, input: &str) {
         self.close_streaming_text();
+        // A card already showing this call's arguments as they streamed in becomes the started
+        // call in place, so the transcript never holds two cards for one call.
+        if let Some(tool) = self.live_running_tool(id) {
+            tool.name = name.to_owned();
+            tool.summary = summary.to_owned();
+            tool.presentation = crate::agent::legacy_tool_presentation(name, summary, input);
+            tool.input = input.to_owned();
+            tool.progress = None;
+            self.invalidate_tail();
+            return;
+        }
         self.push(
             Kind::Tool(Tool {
                 id: id.to_owned(),
@@ -914,6 +1171,73 @@ impl Transcript {
             true,
         );
     }
+
+    /// Show a call's arguments while the model is still writing them. The card is observational:
+    /// its `input` and `progress` hold the partial JSON text for display, and nothing dispatches
+    /// from it. `tool_start` replaces it with the completed call, which is the only executable form.
+    pub fn tool_arguments_delta(&mut self, id: &str, name: &str, delta: &str) {
+        if id.is_empty() {
+            return;
+        }
+        self.invalidate_tail();
+        if let Some(tool) = self.live_running_tool(id) {
+            Self::append_partial(&mut tool.input, delta);
+            tool.progress = Some(Self::tail_within(&tool.input, Self::PREVIEW_LIMIT).to_owned());
+            return;
+        }
+        self.close_streaming_text();
+        let mut input = String::new();
+        Self::append_partial(&mut input, delta);
+        let progress = Some(Self::tail_within(&input, Self::PREVIEW_LIMIT).to_owned());
+        self.push(
+            Kind::Tool(Tool {
+                id: id.to_owned(),
+                name: name.to_owned(),
+                summary: name.to_owned(),
+                presentation: crate::agent::legacy_tool_presentation(name, name, ""),
+                input,
+                state: ToolState::Running,
+                output: String::new(),
+                progress,
+                elapsed: None,
+                todo: None,
+                agents: Vec::new(),
+            }),
+            true,
+        );
+    }
+
+    /// The running card for call `id` in the live tail, if one exists.
+    fn live_running_tool(&mut self, id: &str) -> Option<&mut Tool> {
+        self.blocks[self.cursor..]
+            .iter_mut()
+            .rev()
+            .find_map(|b| match &mut b.kind {
+                Kind::Tool(t) if t.id == id && t.state == ToolState::Running => Some(t),
+                _ => None,
+            })
+    }
+
+    /// Retain the newest partial argument text, so a long streamed write stays bounded.
+    fn append_partial(target: &mut String, text: &str) {
+        target.push_str(text);
+        let keep = Self::tail_within(target.as_str(), Self::PARTIAL_ARGS_LIMIT).len();
+        let cut = target.len() - keep;
+        target.drain(..cut);
+    }
+
+    /// The last `limit` bytes of `text`, cut at a character boundary.
+    fn tail_within(text: &str, limit: usize) -> &str {
+        let mut cut = text.len().saturating_sub(limit);
+        while !text.is_char_boundary(cut) {
+            cut += 1;
+        }
+        &text[cut..]
+    }
+
+    /// Bounds for partial argument text: `PARTIAL_ARGS_LIMIT` is retained, `PREVIEW_LIMIT` shown.
+    const PARTIAL_ARGS_LIMIT: usize = 64 * 1024;
+    const PREVIEW_LIMIT: usize = 16 * 1024;
 
     /// Append a live chunk to a pending card; full output is retained separately in artifacts.
     pub fn tool_delta(&mut self, id: &str, text: &str) {
@@ -1335,6 +1659,11 @@ impl Transcript {
             {
                 if text == Self::JOB_STARTED {
                     self.blocks.remove(index);
+                    // Its neighbours were never adjacent, so their lookup runs stay apart.
+                    match self.blocks.get_mut(index) {
+                        Some(next) => next.breaks_run = true,
+                        None => self.sealed = true,
+                    }
                     continue;
                 }
                 block.active = false;
@@ -1378,11 +1707,47 @@ impl Transcript {
             }
             block.active = false;
         }
+        self.sealed = true;
     }
 
     #[cfg(test)]
     pub fn is_streaming(&self) -> bool {
         self.blocks[self.cursor..].iter().any(|b| b.active)
+    }
+
+    /// Whether the active answer has another reveal step. The newest grapheme waits for more text.
+    pub fn has_pending_reveal(&self) -> bool {
+        let Some(Block {
+            kind: Kind::Assistant(text),
+            active: true,
+            shared,
+            revealed: Some(cut),
+            ..
+        }) = self.blocks[self.cursor..]
+            .iter()
+            .rev()
+            .find(|block| block.active && matches!(&block.kind, Kind::Assistant(_)))
+        else {
+            return false;
+        };
+        match shared {
+            Some(body) => body.read(|node| Self::reveal_cut(&node.result.text, *cut) > *cut),
+            None => Self::reveal_cut(text, *cut) > *cut,
+        }
+    }
+
+    /// Finalized blocks not yet handed to scrollback.
+    pub fn settled_backlog(&self) -> usize {
+        self.blocks[self.cursor..]
+            .iter()
+            .take_while(|block| !block.active)
+            .count()
+    }
+
+    pub fn has_settled_backlog(&self) -> bool {
+        self.blocks
+            .get(self.cursor)
+            .is_some_and(|block| !block.active)
     }
 
     /// Rows of finalized blocks not handed out yet, each row exactly once; stops at the first block
@@ -1394,45 +1759,105 @@ impl Transcript {
     }
 
     /// Native overlays are anchored to the separator after the preview and emitted once, together
-    /// with settled history. Portable cells remain underneath as a fallback.
+    /// with settled history. Portable cells remain underneath as a fallback. Retires the whole backlog.
     pub fn take_settled_with_images(
         &mut self,
         width: u16,
         ctx: &TranscriptCtx,
     ) -> (Rows, Vec<(usize, super::images::NativeImage)>) {
-        let mut out = Vec::new();
+        self.retire_settled(width, ctx, Retire::UNLIMITED)
+    }
+
+    /// Like [`take_settled_with_images`](Self::take_settled_with_images), but retires at most `retire`'s
+    /// budget per call. A block that does not fit is split at a row cursor: its rows freeze at the width
+    /// they started at and the remainder waits in `self.retiring`, so each row reaches scrollback exactly
+    /// once and the remainder keeps its wrapping across resizes. A native image is indivisible and waits
+    /// whole for a call with room. Every call makes progress by at least one row.
+    pub fn retire_settled(
+        &mut self,
+        width: u16,
+        ctx: &TranscriptCtx,
+        retire: Retire,
+    ) -> (Rows, Vec<(usize, super::images::NativeImage)>) {
+        let mut out: Rows = Vec::new();
         let mut images = Vec::new();
-        while let Some(block) = self.blocks.get_mut(self.cursor) {
-            if block.active {
+        let mut finished = 0;
+        while self.cursor < self.blocks.len() {
+            let index = self.cursor;
+            if self.blocks[index].active {
                 break;
             }
-            let rows = block.render(width, ctx);
-            let skip = block.emitted(width, ctx);
-            let tool = block.is_tool();
-            if !rows.is_empty() || skip > 0 {
-                // A partly spilled block already paid its separator when its head was spilled.
-                if skip == 0 && self.owed_gap.is_some_and(|prev| gap_between(prev, tool)) {
-                    out.push(blank_row());
-                }
-                let mut image_separator = false;
-                if skip == 0
-                    && let Kind::Image(image) = &block.kind
-                    && let Some(native) = image.native(width)
-                {
-                    images.push((out.len() + rows.len(), native));
-                    image_separator = true;
-                }
-                out.extend(rows.iter().skip(skip).cloned());
-                if image_separator {
-                    // Native graphics draw upward from a reserved separator cell. It must exist
-                    // even when this image is the last settled block before the live composer.
-                    out.push(blank_row());
-                    self.owed_gap = None;
-                } else {
-                    self.owed_gap = Some(tool);
-                }
+            if (finished > 0 || !out.is_empty()) && retire.spent(finished, out.len()) {
+                break;
             }
-            self.cursor += 1;
+            // A lookup run that may still grow waits, so its tree reaches scrollback whole.
+            if self.retiring.is_none() && self.lookup_waits(index, ctx) {
+                break;
+            }
+            let tool = self.blocks[index].is_tool();
+            let (frozen, next, block_end) = match &self.retiring {
+                Some(state) => (std::sync::Arc::clone(&state.rows), state.next, state.end),
+                None => {
+                    let end = self
+                        .lookup_run(index, ctx)
+                        .map_or(index + 1, |(_, end, _)| end);
+                    (
+                        self.rows_in_range(index, width, ctx, index..self.blocks.len()),
+                        self.blocks[index].emitted(width, ctx),
+                        end,
+                    )
+                }
+            };
+            let native = match &self.blocks[index].kind {
+                Kind::Image(image) if next == 0 && !frozen.is_empty() => image.native(width),
+                _ => None,
+            };
+            let gap = next == 0
+                && !frozen.is_empty()
+                && self.owed_gap.is_some_and(|prev| gap_between(prev, tool));
+            let needed = if frozen.is_empty() {
+                0
+            } else if native.is_some() {
+                usize::from(gap) + frozen.len() + 1
+            } else {
+                usize::from(gap) + 1
+            };
+            if !out.is_empty() && out.len() + needed > retire.rows {
+                break;
+            }
+            if let Some(native) = native {
+                if gap {
+                    out.push(blank_row());
+                }
+                images.push((out.len() + frozen.len(), native));
+                out.extend(frozen.iter().cloned());
+                // Native graphics draw upward from a reserved separator cell. It must exist even when
+                // this image is the last settled block before the live composer.
+                out.push(blank_row());
+                self.owed_gap = None;
+            } else if !frozen.is_empty() {
+                if gap {
+                    out.push(blank_row());
+                }
+                let room = retire.rows.saturating_sub(out.len()).max(1);
+                let end = frozen.len().min(next.saturating_add(room));
+                out.extend(frozen[next..end].iter().cloned());
+                if end < frozen.len() {
+                    self.retiring = Some(Retiring {
+                        rows: frozen,
+                        next: end,
+                        end: block_end,
+                    });
+                    break;
+                }
+                self.owed_gap = Some(tool);
+            }
+            self.retiring = None;
+            for block in &self.blocks[index..block_end] {
+                block.release_caches();
+            }
+            self.cursor = block_end;
+            finished += block_end - index;
         }
         (out, images)
     }
@@ -1441,7 +1866,56 @@ impl Transcript {
     /// streaming block when the tail is taller than `max_rows`, each row returned once) and the rows
     /// to repaint, at most `max_rows`.
     pub fn live(&mut self, width: u16, ctx: &TranscriptCtx, max_rows: usize) -> (Rows, Rows) {
-        let Some((first, rest)) = self.blocks[self.cursor..].split_first_mut() else {
+        /// One block's rows in the tail, newest first. `skip` rows were already retired.
+        struct Piece {
+            head: bool,
+            tool: bool,
+            rows: std::sync::Arc<Rows>,
+            skip: usize,
+        }
+        /// Joins the tail oldest first, with the same separators `document` uses.
+        fn assemble(pieces: &[Piece], owed: Option<bool>, max_rows: usize) -> (Rows, usize) {
+            let mut total = 0usize;
+            let mut previous = None;
+            for piece in pieces.iter().rev() {
+                let before = if piece.head {
+                    owed.filter(|_| piece.skip == 0)
+                } else {
+                    previous
+                };
+                total += usize::from(before.is_some_and(|kind| gap_between(kind, piece.tool)));
+                total += piece.rows.len().saturating_sub(piece.skip);
+                previous = Some(piece.tool);
+            }
+            let trailing = previous.or(owed).is_some();
+            total += usize::from(trailing);
+            let mut out = Rows::with_capacity(total.min(max_rows));
+            let mut hidden = total.saturating_sub(max_rows);
+            let mut append = |rows: &[Line<'static>]| {
+                let skipped = hidden.min(rows.len());
+                hidden -= skipped;
+                out.extend(rows[skipped..].iter().cloned());
+            };
+            previous = None;
+            for piece in pieces.iter().rev() {
+                let before = if piece.head {
+                    owed.filter(|_| piece.skip == 0)
+                } else {
+                    previous
+                };
+                if before.is_some_and(|kind| gap_between(kind, piece.tool)) {
+                    append(std::slice::from_ref(&blank_row()));
+                }
+                append(&piece.rows[piece.skip.min(piece.rows.len())..]);
+                previous = Some(piece.tool);
+            }
+            if trailing {
+                append(std::slice::from_ref(&blank_row()));
+            }
+            (out, total)
+        }
+
+        let Some(first) = self.blocks.get_mut(self.cursor) else {
             // Idle: the owed separator keeps the last block off the composer.
             let gap = if self.owed_gap.is_some() {
                 vec![blank_row()]
@@ -1450,61 +1924,81 @@ impl Transcript {
             };
             return (Vec::new(), gap);
         };
-        let head = first.render(width, ctx);
-        let mut skip = first.emitted(width, ctx);
+        let cursor = self.cursor;
         let head_tool = first.is_tool();
-        let had_head = !head.is_empty() || skip > 0;
-        let rest_rows: Vec<(bool, std::sync::Arc<Rows>)> = rest
-            .iter()
-            .map(|b| (b.is_tool(), b.render(width, ctx)))
-            .collect();
+        let active = first.active;
         let owed = self.owed_gap;
-
-        let assemble = |head: &Rows, skip: usize| -> Rows {
-            let mut out: Rows = Vec::new();
-            if had_head && skip == 0 && owed.is_some_and(|prev| gap_between(prev, head_tool)) {
-                out.push(blank_row());
-            }
-            out.extend(head.iter().skip(skip).cloned());
-            let mut prev = had_head.then_some(head_tool).or(owed);
-            for (tool, piece) in &rest_rows {
-                if piece.is_empty() {
-                    continue;
-                }
-                if prev.is_some_and(|p| gap_between(p, *tool)) {
-                    out.push(blank_row());
-                }
-                out.extend(piece.iter().cloned());
-                prev = Some(*tool);
-            }
-            // The owed separator also keeps the transcript off the composer while idle.
-            if prev.is_some() {
-                out.push(blank_row());
-            }
-            out
+        // A streaming head may spill and a partly retired head keeps frozen rows, so both are fixed up
+        // front. Any other head renders only when the visible tail reaches it.
+        let pre: Option<(std::sync::Arc<Rows>, usize)> = match &self.retiring {
+            Some(state) => Some((std::sync::Arc::clone(&state.rows), state.next)),
+            None if active => Some((first.render(width, ctx), first.emitted(width, ctx))),
+            None => None,
         };
 
-        let mut display = assemble(&head, skip);
+        // Compose from the newest block back, stopping once the rows shown are full. Blocks above
+        // that point, including history far above the view, are never rendered.
+        let mut pieces: Vec<Piece> = Vec::new();
+        let mut visible = 0;
+        let mut index = self.blocks.len();
+        while index > cursor && visible < max_rows {
+            index -= 1;
+            if self
+                .retiring
+                .as_ref()
+                .is_some_and(|state| index > cursor && index < state.end)
+            {
+                continue;
+            }
+            let head = index == cursor;
+            let (rows, skip) = match (head, &pre) {
+                (true, Some((rows, next))) => (std::sync::Arc::clone(rows), *next),
+                (true, None) => (
+                    self.rows_in_range(index, width, ctx, cursor..self.blocks.len()),
+                    self.blocks[index].emitted(width, ctx),
+                ),
+                (false, _) => {
+                    let floor = self.retiring.as_ref().map_or(cursor, |state| state.end);
+                    (
+                        self.rows_in_range(index, width, ctx, floor..self.blocks.len()),
+                        0,
+                    )
+                }
+            };
+            if rows.is_empty() && skip == 0 {
+                continue;
+            }
+            visible += rows.len().saturating_sub(skip);
+            pieces.push(Piece {
+                head,
+                tool: self.blocks[index].is_tool(),
+                rows,
+                skip,
+            });
+        }
+
         let mut spilled = Vec::new();
-        if display.len() > max_rows
-            && first.active
-            && let Some((src, rows)) = first.spill_point(width, ctx, &head, skip)
+        let (mut display, total) = assemble(&pieces, owed, max_rows);
+        if total > max_rows
+            && active
+            && let Some((head_rows, head_skip)) = &pre
+            && let Some((src, rows)) =
+                self.blocks[cursor].spill_point(width, ctx, head_rows, *head_skip)
         {
-            if skip == 0 && owed.is_some_and(|prev| gap_between(prev, head_tool)) {
+            if *head_skip == 0 && owed.is_some_and(|prev| gap_between(prev, head_tool)) {
                 spilled.push(blank_row());
             }
-            spilled.extend(head[skip..rows].iter().cloned());
+            spilled.extend(head_rows[*head_skip..rows].iter().cloned());
             self.owed_gap = None;
-            first.spill = Spill {
+            self.blocks[cursor].spill = Spill {
                 src,
                 rows,
                 key: Some((width, ctx.ui.show_thinking)),
             };
-            skip = rows;
-            display = assemble(&head, skip);
-        }
-        if display.len() > max_rows {
-            display.drain(..display.len() - max_rows);
+            if let Some(piece) = pieces.iter_mut().find(|piece| piece.head) {
+                piece.skip = rows;
+            }
+            display = assemble(&pieces, owed, max_rows).0;
         }
         (spilled, display)
     }
@@ -1515,8 +2009,8 @@ impl Transcript {
         let mut out = Vec::new();
         let mut anchors = Vec::with_capacity(self.blocks.len());
         let mut prev: Option<bool> = None;
-        for block in &self.blocks {
-            let rows = block.render(width, ctx);
+        for (index, block) in self.blocks.iter().enumerate() {
+            let rows = self.rows_at(index, width, ctx);
             if rows.is_empty() {
                 anchors.push(out.len());
                 continue;
@@ -1546,7 +2040,11 @@ impl Transcript {
             if i > self.cursor {
                 break;
             }
-            let rows = block.render(width, ctx);
+            let rows = if i < self.cursor {
+                self.rows_in_range(i, width, ctx, 0..self.cursor)
+            } else {
+                self.rows_in_range(i, width, ctx, self.cursor..self.blocks.len())
+            };
             let gap = prev.is_some_and(|p| gap_between(p, block.is_tool()));
             if i < self.cursor {
                 if !rows.is_empty() {
@@ -1556,6 +2054,11 @@ impl Transcript {
                     out.extend(rows.iter().cloned());
                     prev = Some(block.is_tool());
                 }
+            } else if let Some(state) = self.retiring.as_ref() {
+                if gap {
+                    out.push(blank_row());
+                }
+                out.extend(state.rows.iter().take(state.next).cloned());
             } else if block.spill.src > 0 {
                 let n = match block.spill.key {
                     Some(key) if key == (width, ctx.ui.show_thinking) => block.spill.rows,

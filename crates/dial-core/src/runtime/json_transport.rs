@@ -196,9 +196,52 @@ impl JsonProcess {
         max_callbacks: usize,
         callback: impl FnMut(&Value) -> Result<Value, String>,
     ) -> Result<Value, String> {
+        self.finish(Some(value), end, check, &|| false, max_callbacks, callback)?
+            .ok_or_else(|| "adapter request yielded without a handoff".into())
+    }
+    /// Starts a request that may hand off: when `yield_now` trips while the reply is pending and no
+    /// callback is in flight, returns `Ok(None)` and leaves the request in flight for
+    /// [`Self::resume_yieldable`]. The request and driver state are never abandoned by a handoff.
+    pub fn request_yieldable(
+        &mut self,
+        value: Value,
+        end: Option<Instant>,
+        check: impl Fn() -> Result<(), String>,
+        yield_now: impl Fn() -> bool,
+        max_callbacks: usize,
+        callback: impl FnMut(&Value) -> Result<Value, String>,
+    ) -> Result<Option<Value>, String> {
+        self.finish(Some(value), end, check, &yield_now, max_callbacks, callback)
+    }
+    /// Continues a request yielded by [`Self::request_yieldable`].
+    pub fn resume_yieldable(
+        &mut self,
+        end: Option<Instant>,
+        check: impl Fn() -> Result<(), String>,
+        yield_now: impl Fn() -> bool,
+        max_callbacks: usize,
+        callback: impl FnMut(&Value) -> Result<Value, String>,
+    ) -> Result<Option<Value>, String> {
+        if !self.in_flight {
+            return Err("no adapter request is in flight".into());
+        }
+        self.finish(None, end, check, &yield_now, max_callbacks, callback)
+    }
+    fn finish(
+        &mut self,
+        value: Option<Value>,
+        end: Option<Instant>,
+        check: impl Fn() -> Result<(), String>,
+        yield_now: &dyn Fn() -> bool,
+        max_callbacks: usize,
+        callback: impl FnMut(&Value) -> Result<Value, String>,
+    ) -> Result<Option<Value>, String> {
         let tripped = std::cell::Cell::new(false);
         let watched = || check().inspect_err(|_| tripped.set(true));
-        let result = self.exchange(value, end, &watched, max_callbacks, callback);
+        let result = self.exchange(value, end, &watched, yield_now, max_callbacks, callback);
+        if matches!(result, Ok(None)) {
+            return result;
+        }
         if tripped.get() && self.in_flight {
             self.settle_interrupted();
         }
@@ -228,20 +271,23 @@ impl JsonProcess {
     }
     fn exchange(
         &mut self,
-        mut value: Value,
+        value: Option<Value>,
         end: Option<Instant>,
         check: &impl Fn() -> Result<(), String>,
+        yield_now: &dyn Fn() -> bool,
         max_callbacks: usize,
         mut callback: impl FnMut(&Value) -> Result<Value, String>,
-    ) -> Result<Value, String> {
-        check()?;
-        self.sequence = self
-            .sequence
-            .checked_add(1)
-            .ok_or("operation sequence exhausted")?;
-        value["id"] = json!(self.sequence);
-        self.write_frame(&value, end, &check)?;
-        self.in_flight = true;
+    ) -> Result<Option<Value>, String> {
+        if let Some(mut value) = value {
+            check()?;
+            self.sequence = self
+                .sequence
+                .checked_add(1)
+                .ok_or("operation sequence exhausted")?;
+            value["id"] = json!(self.sequence);
+            self.write_frame(&value, end, &check)?;
+            self.in_flight = true;
+        }
         let mut callbacks = 0usize;
         let mut scanned = 0;
         loop {
@@ -321,7 +367,10 @@ impl JsonProcess {
                 if end.is_some_and(|end| Instant::now() >= end) {
                     return Err("execution deadline exceeded; namespace/session discarded".into());
                 }
-                return Ok(result);
+                return Ok(Some(result));
+            }
+            if yield_now() {
+                return Ok(None);
             }
             // Previously inspected bytes cannot acquire a newline. Rescanning a growing
             // unterminated frame makes rejection quadratic and can starve the deadline.

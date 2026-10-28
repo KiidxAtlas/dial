@@ -11,6 +11,7 @@
 //! - `tasks`       the live todo panel pinned above the composer
 //! - `overlay`     settings, model selector, providers
 pub mod chrome;
+mod clipboard;
 pub mod command_surface;
 pub mod composer;
 pub mod editor;
@@ -22,6 +23,8 @@ mod lanes;
 pub mod markdown;
 mod notice;
 pub mod overlay;
+pub mod panel;
+pub mod plugin_slots;
 pub mod questions;
 pub mod rail;
 pub mod recovery;

@@ -1,10 +1,13 @@
 //! Loopback-only statistics dashboard and per-session trace routes.
 //!
 //! Routes: `/` (HTML page; `#/traces?s=<session file>` renders one session), `/api/stats`
-//! (all-time report) and `/api/trace?session=<session file>` (one session, files outside
+//! (all-time report), `/api/version`, `/api/live`, `/api/models`, `/api/tools`, `/api/requests`,
+//! `/api/request/<id>`, `/api/frustration`, all with an optional `range` (`24h`, `7d`, `all`),
+//! and `/api/trace?session=<session file>` (one session; files outside
 //! `<user_dir>/projects/*/sessions/` are refused with 403).
-use super::{Db, now_ms, session_file_in_tree};
+use super::{Db, now_ms, parse_range, session_file_in_tree};
 use anyhow::{Context, Result, bail};
+use serde::Serialize;
 use std::{
     io::{Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
@@ -61,16 +64,7 @@ pub fn serve_listener(listener: TcpListener, user_dir: PathBuf) -> Result<()> {
             continue;
         }
         let line = String::from_utf8_lossy(&request);
-        let target = line
-            .lines()
-            .next()
-            .and_then(|l| l.split_whitespace().nth(1))
-            .unwrap_or("/");
-        let (status, content_type, body) = if loopback_host(&line, port) {
-            route(&user_dir, target)
-        } else {
-            ("403 Forbidden", TEXT, "unexpected Host header\n".to_owned())
-        };
+        let (status, content_type, body) = respond(&user_dir, port, &line);
         let response = format!(
             "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n{body}",
             body.len()
@@ -104,22 +98,114 @@ fn loopback_host(request: &str, port: u16) -> bool {
         })
 }
 
+type Response = (&'static str, &'static str, String);
+
+/// Answers one raw HTTP request: the `Host` gate first, then routing. `port` is the listener's.
+fn respond(user_dir: &Path, port: u16, request: &str) -> Response {
+    if !loopback_host(request, port) {
+        return ("403 Forbidden", TEXT, "unexpected Host header\n".to_owned());
+    }
+    let target = request
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .unwrap_or("/");
+    route(user_dir, target)
+}
+
 /// Maps a request target (`/path?query`) to `(status, content type, body)`.
-fn route(user_dir: &Path, target: &str) -> (&'static str, &'static str, String) {
+fn route(user_dir: &Path, target: &str) -> Response {
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    if let Some(id) = path.strip_prefix("/api/request/") {
+        return api_request(user_dir, id);
+    }
     match path {
         "/" => ("200 OK", HTML, PAGE.to_owned()),
-        "/api/stats" => match (|| -> Result<String> {
-            let mut db = Db::open_default(user_dir)?;
-            db.sync_sessions(user_dir)?;
-            Ok(serde_json::to_string(&db.report(None, now_ms())?)?)
-        })() {
-            Ok(body) => ("200 OK", JSON, body),
-            Err(error) => ("500 Internal Server Error", TEXT, format!("{error:#}")),
+        "/api/version" => json_response(Ok(dial_build_info::build_info::report())),
+        "/api/stats" => json_response(with_db(user_dir, |db| db.report(None, now_ms()))),
+        "/api/live" => optional_json(
+            with_db(user_dir, |db| db.live(user_dir, now_ms())),
+            "no live session: the stats database has no session yet",
+        ),
+        "/api/models" => match range_since(query, now_ms()) {
+            Ok(since) => json_response(with_db(user_dir, |db| db.models(since))),
+            Err(error) => bad_request(error),
+        },
+        "/api/tools" => match range_since(query, now_ms()) {
+            Ok(since) => json_response(with_db(user_dir, |db| db.tools(since))),
+            Err(error) => bad_request(error),
+        },
+        "/api/requests" => api_requests(user_dir, query),
+        "/api/frustration" => match range_since(query, now_ms()) {
+            Ok(since) => json_response(with_db(user_dir, |db| db.frustration(user_dir, since))),
+            Err(error) => bad_request(error),
         },
         "/api/trace" => api_trace(user_dir, query),
         _ => ("404 Not Found", TEXT, "Not found".into()),
     }
+}
+
+/// Largest `limit` accepted by `/api/requests`; the default when none is given.
+const REQUEST_LIMIT_MAX: usize = 500;
+const REQUEST_LIMIT_DEFAULT: usize = 50;
+
+fn bad_request(error: impl std::fmt::Display) -> Response {
+    ("400 Bad Request", TEXT, format!("{error:#}"))
+}
+
+/// Serializes `result` as JSON (500 with the error text when it failed).
+fn json_response<T: Serialize>(result: Result<T>) -> Response {
+    match result.and_then(|value| Ok(serde_json::to_string(&value)?)) {
+        Ok(body) => ("200 OK", JSON, body),
+        Err(error) => ("500 Internal Server Error", TEXT, format!("{error:#}")),
+    }
+}
+
+/// Like [`json_response`], but `Ok(None)` is a 404 with `missing` as its text.
+fn optional_json<T: Serialize>(result: Result<Option<T>>, missing: &str) -> Response {
+    match result {
+        Ok(Some(value)) => json_response(Ok(value)),
+        Ok(None) => ("404 Not Found", TEXT, missing.to_owned()),
+        Err(error) => ("500 Internal Server Error", TEXT, format!("{error:#}")),
+    }
+}
+
+/// Opens the stats database, folds in new transcript activity, then runs `read`.
+fn with_db<T>(user_dir: &Path, read: impl FnOnce(&Db) -> Result<T>) -> Result<T> {
+    let mut db = Db::open_default(user_dir)?;
+    db.sync_sessions(user_dir)?;
+    read(&db)
+}
+
+/// The `range` query value (`24h`, `7d`, `all`, ...) as a lookback start; absent means all time.
+fn range_since(query: &str, now: i64) -> Result<Option<i64>> {
+    let range = query_param(query, "range").unwrap_or_else(|| "all".to_owned());
+    Ok(parse_range(&range)?.map(|window| now - window))
+}
+
+fn api_requests(user_dir: &Path, query: &str) -> Response {
+    let limit = match query_param(query, "limit") {
+        None => REQUEST_LIMIT_DEFAULT,
+        Some(text) => match text.parse::<usize>() {
+            Ok(n) if (1..=REQUEST_LIMIT_MAX).contains(&n) => n,
+            _ => {
+                return bad_request(format!(
+                    "limit must be an integer from 1 to {REQUEST_LIMIT_MAX}"
+                ));
+            }
+        },
+    };
+    match range_since(query, now_ms()) {
+        Ok(since) => json_response(with_db(user_dir, |db| db.recent_requests(since, limit))),
+        Err(error) => bad_request(error),
+    }
+}
+
+fn api_request(user_dir: &Path, id: &str) -> Response {
+    let Ok(id) = id.parse::<i64>() else {
+        return bad_request("request id must be an integer");
+    };
+    optional_json(with_db(user_dir, |db| db.request(id)), "request not found")
 }
 
 fn api_trace(user_dir: &Path, query: &str) -> (&'static str, &'static str, String) {

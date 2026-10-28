@@ -11,6 +11,8 @@ struct Fallback {
     until: Instant,
     /// The primary's loaded-window cap, restored together with the primary configuration.
     primary_cap: Option<u32>,
+    /// Whether this fallback has produced a reply. Set on its first reply, which is announced once.
+    served: bool,
 }
 
 /// How long a fallback stays installed after the primary could not be rebuilt at restore time.
@@ -91,6 +93,11 @@ impl Agent<'_> {
         backend: &mut Backend,
         ui: &mut dyn Ui,
     ) -> bool {
+        if self.effective_config().retry.fallback_revert
+            == crate::config::types::FallbackRevert::Never
+        {
+            return false;
+        }
         if !self.route.restore_due_at(Instant::now()) {
             return false;
         }
@@ -110,7 +117,10 @@ impl Agent<'_> {
         self.route.tried = 0;
         self.request_phase
             .recover("fallback cooldown elapsed; returning to the primary model");
-        ui.diagnostic("Fallback cooldown elapsed; returning to the primary model");
+        ui.event(&crate::agent::ui::ui_event::UiEvent::new(
+            crate::agent::ui::ui_event::EventKind::Model,
+            "Fallback cooldown elapsed; returning to the primary model",
+        ));
         true
     }
 
@@ -237,6 +247,7 @@ impl Agent<'_> {
             self.route.fallback = Some(Fallback {
                 until: Instant::now() + cooldown,
                 primary_cap,
+                served: false,
             });
             self.request_phase
                 .recover("switching to a configured fallback model");
@@ -268,13 +279,43 @@ impl Agent<'_> {
 
     /// Says so when a fallback retained from an earlier request or turn is still the live route.
     pub(in crate::agent) fn report_retained_fallback(&self, ui: &mut dyn Ui) {
-        if self.route.cooling_at(Instant::now()) {
-            let active = self.auth_config.selection();
+        if self.route.fallback.is_none() {
+            return;
+        }
+        let active = self.auth_config.selection();
+        if self.effective_config().retry.fallback_revert
+            == crate::config::types::FallbackRevert::Never
+        {
+            ui.diagnostic(&format!(
+                "Continuing on fallback {}/{}; retry.fallback_revert = \"never\" keeps it until you switch models.",
+                active.provider, active.model
+            ));
+        } else if self.route.cooling_at(Instant::now()) {
             ui.diagnostic(&format!(
                 "Continuing on fallback {}/{} until its cooldown ends; the configured primary returns afterwards.",
                 active.provider, active.model
             ));
         }
+    }
+
+    /// Records that the installed fallback produced a reply. The first such reply announces that the
+    /// fallback served the request; later replies are silent.
+    pub(in crate::agent) fn note_fallback_served(&mut self, ui: &mut dyn Ui) {
+        let Some(fallback) = self.route.fallback.as_mut() else {
+            return;
+        };
+        if fallback.served {
+            return;
+        }
+        fallback.served = true;
+        let active = self.auth_config.selection();
+        ui.event(&crate::agent::ui::ui_event::UiEvent::new(
+            crate::agent::ui::ui_event::EventKind::Model,
+            format!(
+                "Fallback {}/{} answered this request",
+                active.provider, active.model
+            ),
+        ));
     }
 }
 

@@ -123,6 +123,11 @@ impl Shell {
                 self.note("Hotkeys", text);
             }
             ("search", "") => self.note("Search", Self::SEARCH_USAGE),
+            ("btw", args) => {
+                let snapshot = self.side.busy_snapshot();
+                let text = self.side.command(args, snapshot.as_deref());
+                self.note("BTW", text);
+            }
             ("search", query) if !query.is_empty() => {
                 match Session::search(&app.layout, query, 8) {
                     Ok(hits) if hits.is_empty() => {
@@ -307,6 +312,15 @@ impl Shell {
             }
             // Streamed output already said everything; a bare "Finished." adds nothing.
             Ok(message) if message == "Finished." && self.transcript.notice_has_output(label) => {}
+            Ok(text) if label == crate::app::commands::extensions::MCP_PROMPT_LABEL => {
+                let draft =
+                    crate::app::commands::extensions::composed_draft(&self.composer.draft(), &text);
+                self.composer.set_draft(&draft);
+                self.transcript.notice_merge(
+                    label,
+                    "Put the prompt in the composer. Review it, then send.",
+                );
+            }
             Ok(message) => self.transcript.notice_merge(label, &message),
             Err(error) => self.transcript.notice_merge(label, &format!("{error:#}")),
         }

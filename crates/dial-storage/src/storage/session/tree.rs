@@ -25,6 +25,8 @@ pub enum TreeNodeKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeNode {
     pub id: String,
+    /// The nearest navigable node above this one; `None` at a root. Siblings share it.
+    pub parent: Option<String>,
     /// Indentation level: it grows only where the conversation forks.
     pub depth: usize,
     pub kind: TreeNodeKind,
@@ -170,6 +172,7 @@ impl Session {
             let forks = children[i].len() > 1;
             out.push(TreeNode {
                 id: entry.id.clone(),
+                parent: above[i].map(|p| self.entries[p].id.clone()),
                 depth,
                 kind,
                 text: truncate_chars(&text, NODE_PREVIEW_CHARS),
@@ -183,6 +186,39 @@ impl Session {
             stack.extend(children[i].iter().rev().map(|&c| (c, child_depth)));
         }
         out
+    }
+
+    /// The stored messages on the path from the root down to entry `target`, oldest first, shaped
+    /// as the transcript replays them on resume: user, assistant and tool messages, with a
+    /// compaction shown as its summary frame. Only the newest `limit` are returned. Abandoned
+    /// siblings, state records and synthetic context are left out.
+    pub fn path_messages_to(&self, target: &str, limit: usize) -> Result<Vec<Value>> {
+        ensure!(
+            self.by_id.contains_key(target),
+            "entry {target} is not in this session"
+        );
+        let mut out: Vec<Value> = self
+            .ancestry(Some(target))
+            .into_iter()
+            .filter_map(|i| match &self.entries[i].kind {
+                Kind::Message(m) if Self::is_replayed(m) => {
+                    let mut shown = m.clone();
+                    if let Some(typed) = typed_text(m) {
+                        shown["content"] = Value::String(typed.to_owned());
+                    }
+                    Some(shown)
+                }
+                Kind::Compaction { summary, .. } => Some(Self::compaction_message(summary)),
+                _ => None,
+            })
+            .collect();
+        out.drain(..out.len().saturating_sub(limit));
+        Ok(out)
+    }
+
+    /// Messages the transcript replays: conversation turns and their tool results.
+    fn is_replayed(message: &Value) -> bool {
+        matches!(role_of(message), "user" | "assistant" | "tool") && is_original_record(message)
     }
 
     /// Moves the active leaf to node `target` of [`Session::tree`]. A user message is entered from

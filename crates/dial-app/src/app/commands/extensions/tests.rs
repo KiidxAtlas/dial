@@ -81,3 +81,80 @@ fn mcp_list_hides_credentials_and_command_arguments() {
         assert!(!listing.contains(secret), "leaked {secret}: {listing}");
     }
 }
+
+#[test]
+fn prompt_request_reads_quoted_argument_values() {
+    let request =
+        parse_prompt_request(r#"docs review topic="a b c" lang=rust note='x = y' empty="""#)
+            .unwrap();
+    assert_eq!(request.server, "docs");
+    assert_eq!(request.name, "review");
+    assert_eq!(request.arguments["topic"], "a b c");
+    assert_eq!(request.arguments["lang"], "rust");
+    assert_eq!(request.arguments["note"], "x = y");
+    assert_eq!(request.arguments["empty"], "");
+}
+
+#[test]
+fn prompt_request_keeps_equals_inside_values() {
+    let request = parse_prompt_request("docs review expr=a=b").unwrap();
+    assert_eq!(request.arguments["expr"], "a=b");
+}
+
+#[test]
+fn prompt_request_rejects_bad_input() {
+    let usage = "Usage: /mcp prompt <server> <name> [key=value…]";
+    assert_eq!(
+        parse_prompt_request("docs").err().unwrap().to_string(),
+        usage
+    );
+    let unclosed = parse_prompt_request(r#"docs review topic="open"#)
+        .err()
+        .unwrap();
+    assert!(unclosed.to_string().starts_with("Unclosed quote"));
+    let bare = parse_prompt_request("docs review topic").err().unwrap();
+    assert!(
+        bare.to_string()
+            .starts_with("Prompt argument `topic` must be key=value.")
+    );
+    let empty_key = parse_prompt_request("docs review =x").err().unwrap();
+    assert!(empty_key.to_string().starts_with("Prompt argument `=x`"));
+    let twice = parse_prompt_request("docs review a=1 a=2").err().unwrap();
+    assert!(
+        twice
+            .to_string()
+            .starts_with("Prompt argument `a` is given more than once.")
+    );
+}
+
+#[test]
+fn composed_draft_appends_below_existing_text() {
+    assert_eq!(composed_draft("", "prompt"), "prompt");
+    assert_eq!(composed_draft("  \n", "prompt"), "prompt");
+    assert_eq!(composed_draft("first", "prompt"), "first\n\nprompt");
+}
+
+#[test]
+fn prompt_text_renders_messages_and_names_omitted_content() {
+    let result = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": {"type": "text", "text": "Review it"}},
+            {"role": "assistant", "content": {"type": "image", "data": "..."}},
+            {"role": "user", "content": {"type": "resource", "resource": {"uri": "x", "text": "body"}}}
+        ]
+    });
+    assert_eq!(
+        prompt_text(&result).unwrap(),
+        "user: Review it\nassistant: [image content omitted]\nuser: body"
+    );
+}
+
+#[test]
+fn prompt_text_fails_when_no_messages_come_back() {
+    let empty = serde_json::json!({"messages": []});
+    assert_eq!(
+        prompt_text(&empty).unwrap_err().to_string(),
+        "The prompt returned no messages."
+    );
+    assert!(prompt_text(&serde_json::json!({})).is_err());
+}

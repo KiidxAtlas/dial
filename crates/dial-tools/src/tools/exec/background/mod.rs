@@ -39,7 +39,15 @@ use serde_json::{Value, json};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+pub use table::CellJob;
 use table::{Ring, Snapshot, State, Table, kill_all_entries, kill_entry, lock};
+
+/// A foreground job transferred to the managed background owner: a shell command that outlived its
+/// wait, or a native eval cell moved off its controller.
+pub enum AdoptedJob {
+    Shell(Box<crate::tools::exec::shell::ForegroundJob>),
+    Cell(CellJob),
+}
 
 const MAX_COMMAND: usize = 64 * 1024;
 const MAX_PATTERN: usize = 512;
@@ -874,11 +882,11 @@ impl Tool for Background {
         self.interrupt.store(false, Ordering::Release);
         output
     }
-    fn adopt_foreground(
-        &self,
-        job: crate::tools::exec::shell::ForegroundJob,
-    ) -> Result<String, String> {
-        self.table().adopt(job)
+    fn adopt_job(&self, job: AdoptedJob) -> Result<String, String> {
+        match job {
+            AdoptedJob::Shell(job) => self.table().adopt(*job),
+            AdoptedJob::Cell(job) => self.table().adopt_cell(job),
+        }
     }
 
     fn call_streaming(

@@ -158,6 +158,17 @@ impl Anonymizer {
     /// the `session` header. Empty lines are skipped; non-object lines are counted
     /// as malformed and dropped. Every object record is kept, including unknown types.
     pub fn session_jsonl(&mut self, bytes: &[u8]) -> Result<AnonymizedSession> {
+        self.jsonl_records(bytes, true)
+    }
+
+    /// Anonymizes a child (subagent) transcript with the same record rules as
+    /// [`Self::session_jsonl`], but without the session-header requirement: worker transcripts
+    /// open with their own `header` record.
+    pub fn transcript_jsonl(&mut self, bytes: &[u8]) -> Result<AnonymizedSession> {
+        self.jsonl_records(bytes, false)
+    }
+
+    fn jsonl_records(&mut self, bytes: &[u8], require_header: bool) -> Result<AnonymizedSession> {
         let text = std::str::from_utf8(bytes).context("session file is not valid UTF-8")?;
         let redacted_before = self.redacted;
         let mut out = String::new();
@@ -178,7 +189,7 @@ impl Anonymizer {
                 malformed += 1;
                 continue;
             };
-            if !header_seen {
+            if require_header && !header_seen {
                 if map.get("type").and_then(Value::as_str) != Some("session") {
                     bail!("is not a valid session file: first record is not a session header");
                 }
@@ -188,7 +199,7 @@ impl Anonymizer {
             out.push_str(&serde_json::to_string(&record)?);
             out.push('\n');
         }
-        if !header_seen {
+        if require_header && !header_seen {
             bail!("is not a valid session file: no session header found");
         }
         Ok(AnonymizedSession {

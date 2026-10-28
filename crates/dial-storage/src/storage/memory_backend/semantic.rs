@@ -26,7 +26,11 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+mod recall_cache;
+
+use self::recall_cache::{CacheStats, Key as RecallKey, RecallCache};
 
 const EMBED_CHUNK: usize = 16;
 const SAVE_EMBED_MAX: usize = 16;
@@ -521,6 +525,12 @@ struct Semantic {
     embed_error: Option<String>,
     /// Why the latest recall used keyword results only.
     recall_note: Option<String>,
+    /// Cached project-bank recall results, valid only while the project store is unchanged.
+    project_cache: RecallCache,
+    /// Cached user-bank recall results, valid only while the user store is unchanged.
+    user_cache: RecallCache,
+    /// The most recent search, for status output.
+    last_recall: Option<LastRecall>,
 }
 
 /// The assigned `embedding` role as an embedding route. `Err` carries why the role cannot be
@@ -601,15 +611,37 @@ pub fn open(
         retain_note: None,
         embed_error: None,
         recall_note: None,
+        project_cache: RecallCache::default(),
+        user_cache: RecallCache::default(),
+        last_recall: None,
     }))
 }
 
+#[derive(Clone)]
 pub struct Recall {
     pub facts: Vec<Fact>,
     pub truncated: bool,
     pub mode: &'static str,
+    /// The rankings fused into this result: `recent`, `lexical`, `vector`, and `recency` when the
+    /// query names a time.
+    pub voices: Vec<&'static str>,
     pub embedding_error: Option<String>,
 }
+
+/// One search's outcome, kept for status output. Each bank's `*_cache` is `hit`, `miss`,
+/// `bypass`, or `skipped` when the user bank had no room left to fill.
+#[derive(Clone)]
+struct LastRecall {
+    at: i64,
+    mode: &'static str,
+    items: usize,
+    voices: Vec<&'static str>,
+    project_cache: &'static str,
+    user_cache: &'static str,
+}
+
+/// Recency window of the `recency` voice, matching OMP's seven-day temporal window.
+const RECENCY_WINDOW_SECS: i64 = 7 * 24 * 60 * 60;
 
 /// A query vector and the embedding model that produced it.
 struct QueryVector {
@@ -651,26 +683,34 @@ fn embed_query(
     }
 }
 
+fn cache_json(stats: &CacheStats) -> Value {
+    json!({"entries": stats.entries, "hits": stats.hits, "misses": stats.misses})
+}
+
 /// Lexical ranking, fused with a vector ranking when the query was embedded.
-fn ranked(
-    store: &Store,
-    query: &str,
-    vector: Option<&QueryVector>,
-    embedding_error: Option<String>,
-    limit: usize,
-    token_budget: usize,
-) -> Result<Recall> {
-    let candidates = (limit * 4).max(20);
+fn ranked(store: &Store, request: Request<'_>, at: i64) -> Result<Recall> {
+    let candidates = (request.limit * 4).max(20);
+    let blank = request.query.trim().is_empty();
     let mut lists = Vec::new();
-    if query.trim().is_empty() {
+    let mut voices = vec![];
+    if blank {
         lists.push(store.recent(candidates)?);
+        voices.push("recent");
     } else {
-        lists.push(store.lexical(query, candidates)?);
+        lists.push(store.lexical(request.query, candidates)?);
+        voices.push("lexical");
     }
     let mut mode = "lexical";
-    if let Some(vector) = vector {
+    if let Some(vector) = request.vector {
         lists.push(store.nearest(&vector.model, &vector.vector, candidates)?);
+        voices.push("vector");
         mode = "hybrid";
+    }
+    // A query that names a time adds the newest facts of the last week as one more voice, so
+    // recency breaks ties in the fused order, as OMP's temporal voice does.
+    if !blank && looks_temporal(request.query) {
+        lists.push(store.recent_since(at - RECENCY_WINDOW_SECS, candidates)?);
+        voices.push("recency");
     }
     let mut facts = Vec::new();
     for id in fuse(&lists) {
@@ -681,13 +721,96 @@ fn ranked(
             facts.push(fact);
         }
     }
-    let (facts, truncated) = fit_budget(facts, limit, token_budget);
+    let (facts, truncated) = fit_budget(facts, request.limit, request.token_budget);
     Ok(Recall {
         facts,
         truncated,
         mode,
-        embedding_error,
+        voices,
+        embedding_error: request.embedding_error,
     })
+}
+
+/// One recall: the query, its embedding when one was made, and the result bounds.
+struct Request<'a> {
+    query: &'a str,
+    vector: Option<&'a QueryVector>,
+    embedding_error: Option<String>,
+    limit: usize,
+    token_budget: usize,
+}
+
+/// Whether the query names a time. The keywords match OMP's temporal voice.
+fn looks_temporal(query: &str) -> bool {
+    let lower = query.to_lowercase();
+    [
+        "yesterday",
+        "today",
+        "recent",
+        "last",
+        "latest",
+        "this week",
+        "this month",
+        "ago",
+        "before",
+    ]
+    .iter()
+    .any(|keyword| lower.contains(keyword))
+}
+
+/// How a bank's recall was served: from the cache, ranked and then cached, ranked without the
+/// cache, or not run at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheOutcome {
+    Hit,
+    Miss,
+    Bypass,
+    Skipped,
+}
+
+impl CacheOutcome {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::Miss => "miss",
+            Self::Bypass => "bypass",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+/// Serves `request` from `cache` while the store is unchanged; otherwise ranks it and caches the
+/// result. Temporal queries bypass the cache because their window moves with the clock, and a
+/// degraded result (the embedding failed) is never cached.
+fn cached_ranked(
+    cache: &mut RecallCache,
+    store: &Store,
+    request: Request<'_>,
+    at: i64,
+) -> Result<(Recall, CacheOutcome)> {
+    let temporal = !request.query.trim().is_empty() && looks_temporal(request.query);
+    if temporal || request.embedding_error.is_some() {
+        return Ok((ranked(store, request, at)?, CacheOutcome::Bypass));
+    }
+    let token = store.write_token()?;
+    let key = RecallKey {
+        query: request.query.to_owned(),
+        limit: request.limit,
+        token_budget: request.token_budget,
+        vector: request.vector.map(|vector| {
+            (
+                vector.model.clone(),
+                vector.vector.iter().map(|value| value.to_bits()).collect(),
+            )
+        }),
+    };
+    let now = Instant::now();
+    if let Some(recall) = cache.get(&key, token, now) {
+        return Ok((recall, CacheOutcome::Hit));
+    }
+    let recall = ranked(store, request, at)?;
+    cache.put(key, recall.clone(), token, now);
+    Ok((recall, CacheOutcome::Miss))
 }
 
 #[cfg(test)]
@@ -703,11 +826,14 @@ pub fn recall(
     let (vector, embedding_error) = embed_query(embedder, query, None);
     ranked(
         store,
-        query,
-        vector.as_ref(),
-        embedding_error,
-        limit,
-        token_budget,
+        Request {
+            query,
+            vector: vector.as_ref(),
+            embedding_error,
+            limit,
+            token_budget,
+        },
+        now(),
     )
 }
 
@@ -975,8 +1101,22 @@ impl Driver for Semantic {
             "off"
         };
         let notes = self.notes(facts, embedded);
+        let recall = json!({
+            "cache": {
+                "project": cache_json(&self.project_cache.stats()),
+                "user": cache_json(&self.user_cache.stats()),
+            },
+            "last": self.last_recall.as_ref().map(|last| json!({
+                "at": last.at,
+                "mode": last.mode,
+                "items": last.items,
+                "projectCache": last.project_cache,
+                "userCache": last.user_cache,
+                "voices": last.voices,
+            })),
+        });
         Ok(
-            json!({"backend": "semantic", "count": facts, "facts": facts, "userFacts": user_facts, "forgotten": forgotten, "embedding": embedding, "autoRetain": auto_retain, "notes": notes}),
+            json!({"backend": "semantic", "count": facts, "facts": facts, "userFacts": user_facts, "forgotten": forgotten, "embedding": embedding, "autoRetain": auto_retain, "notes": notes, "recall": recall}),
         )
     }
 
@@ -999,13 +1139,18 @@ impl Driver for Semantic {
             self.recall_note = embedding_error.clone();
         }
         op.check()?;
-        let project = ranked(
+        let at = now();
+        let (project, project_cache) = cached_ranked(
+            &mut self.project_cache,
             &self.store,
-            query,
-            vector.as_ref(),
-            embedding_error,
-            limit,
-            self.token_budget,
+            Request {
+                query,
+                vector: vector.as_ref(),
+                embedding_error,
+                limit,
+                token_budget: self.token_budget,
+            },
+            at,
         )?;
         // The user bank only fills what the project bank left of the result and token budgets.
         let remaining_limit = limit - project.facts.len();
@@ -1016,25 +1161,42 @@ impl Driver for Semantic {
                 .map(|fact| estimate_tokens(&fact.content))
                 .sum(),
         );
-        let (user_facts, user_truncated) = if remaining_limit == 0 || remaining_budget == 0 {
-            (Vec::new(), !self.user.recent(1)?.is_empty())
-        } else {
-            let user = ranked(
-                &self.user,
-                query,
-                vector.as_ref(),
-                None,
-                remaining_limit,
-                remaining_budget,
-            )?;
-            (user.facts, user.truncated)
-        };
+        let (user_facts, user_truncated, user_cache) =
+            if remaining_limit == 0 || remaining_budget == 0 {
+                (
+                    Vec::new(),
+                    !self.user.recent(1)?.is_empty(),
+                    CacheOutcome::Skipped,
+                )
+            } else {
+                let (user, outcome) = cached_ranked(
+                    &mut self.user_cache,
+                    &self.user,
+                    Request {
+                        query,
+                        vector: vector.as_ref(),
+                        embedding_error: None,
+                        limit: remaining_limit,
+                        token_budget: remaining_budget,
+                    },
+                    at,
+                )?;
+                (user.facts, user.truncated, outcome)
+            };
         let mut items: Vec<Value> = project
             .facts
             .iter()
             .map(|fact| fact_json(fact, "project"))
             .collect();
         items.extend(user_facts.iter().map(|fact| fact_json(fact, USER_BANK)));
+        self.last_recall = Some(LastRecall {
+            at,
+            mode: project.mode,
+            items: items.len(),
+            voices: project.voices.clone(),
+            project_cache: project_cache.label(),
+            user_cache: user_cache.label(),
+        });
         Ok(json!({
             "backend": "semantic",
             "mode": project.mode,

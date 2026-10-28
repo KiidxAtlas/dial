@@ -3,7 +3,7 @@ use crate::app::{App, AuthJob, Shell, Step};
 use crate::config::paths::Layout;
 use crate::llm::{chatgpt, oauth};
 use crate::stats::{self, Db};
-use crate::storage::session::{Session, SessionMeta};
+use crate::storage::session::{Session, SessionMeta, pack};
 use crate::storage::session_pins;
 use crate::ui::text::one_line;
 use anyhow::{Context, Result, bail};
@@ -41,6 +41,12 @@ pub(super) const COMMANDS: &[super::CommandSpec] = &[
         name: "move",
         description: "Move the current session to a different directory",
         args_hint: "<dir>",
+        subcommands: &[],
+    },
+    super::CommandSpec {
+        name: "pack",
+        description: "Write this session as a portable archive (journal, side history, streams, subagent transcripts, artifacts)",
+        args_hint: "[path]",
         subcommands: &[],
     },
     super::CommandSpec {
@@ -105,6 +111,7 @@ pub(super) fn run(
         "delete" => delete_current(shell, app, agent),
         "pin" => pin_current(shell, app, agent),
         "move" => move_current(shell, app, agent, args),
+        "pack" => pack_current(shell, agent, args),
         "restart" => restart(shell),
         _ => return None,
     };
@@ -371,6 +378,40 @@ fn move_current(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str)
     Ok(Step::Done)
 }
 
+/// Writes this session to a portable archive (`/pack [path]`), the same format `dial session pack`
+/// writes. The default path is `session-<id>.dialpack` in the project root.
+fn pack_current(shell: &mut Shell, agent: &Agent<'_>, args: &str) -> Result<Step> {
+    let Some(source) = agent.session().path().map(ToOwned::to_owned) else {
+        shell.note("Pack", "No session file yet — send a message first.");
+        return Ok(Step::Done);
+    };
+    let layout = agent
+        .layout()
+        .ok_or_else(|| anyhow::anyhow!("agent has no project layout"))?;
+    let output = if args.is_empty() {
+        layout
+            .project_root
+            .join(format!("session-{}.dialpack", agent.session().id()))
+    } else {
+        layout.project_root.join(args)
+    };
+    match pack::pack_session(layout, &source, &output) {
+        Ok(report) => shell.note(
+            "Pack",
+            format!(
+                "packed {} ({} member(s), {} artifact(s), {} subagent transcript(s)) to {}",
+                report.session_id,
+                report.members,
+                report.artifacts,
+                report.subagents,
+                output.display()
+            ),
+        ),
+        Err(error) => shell.note("Pack", format!("{error:#}")),
+    }
+    Ok(Step::Done)
+}
+
 /// Whether the project transition moved the session, or refused and left it where it was.
 pub(super) enum MoveOutcome {
     /// The session now lives in this project root.
@@ -590,8 +631,14 @@ fn tree(shell: &mut Shell, agent: &mut Agent<'_>) -> Result<Step> {
                 "Moved the conversation here; the previous path is kept as a branch in /tree."
                     .to_owned();
             if let Some(text) = nav.prefill {
-                shell.composer.set_draft(&text);
-                body.push_str("\nThe message is in the composer to edit and resend.");
+                if shell.composer.draft().trim().is_empty() {
+                    shell.composer.set_draft(&text);
+                    body.push_str("\nThe message is in the composer to edit and resend.");
+                } else {
+                    body.push_str(
+                        "\nYour unsent draft is kept; the selected message was not loaded into the composer.",
+                    );
+                }
             }
             shell.note("Tree", body);
         }

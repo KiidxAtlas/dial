@@ -1527,7 +1527,7 @@ impl Tool for CodebaseTool {
                 "reason":{"type":"string","maxLength":1000},
                 "query":{"type":"string","maxLength":4096},
                 "topic":{"type":"string","maxLength":160},
-                "summary":{"type":"string","maxLength":MAX_SUMMARY_BYTES,"description":format!("Reusable finding; up to {MAX_SUMMARY_BYTES} UTF-8 bytes.")},
+                "summary":{"type":"string","maxLength":MAX_SUMMARY_BYTES,"description":format!("Reusable finding; up to {MAX_SUMMARY_BYTES} UTF-8 bytes. Keep a compact ```diagram fence of the relationships when one explains them better than prose.")},
                 "sources":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":8},
                 "expected_revision":{"type":"integer","minimum":0},
                 "max_bytes":{"type":"integer","minimum":1024,"maximum":24000}

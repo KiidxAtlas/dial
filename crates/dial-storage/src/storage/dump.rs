@@ -1,9 +1,8 @@
-//! Session dump archives: a zip containing the session JSONL and, when present,
-//! the last LLM request. `All` is verbatim; `Anon` is anonymized. The archive layout is
+//! Session dump archives: a zip containing the session JSONL, the last LLM request when
+//! present, and every subagent transcript the session spawned under `subagents/`.
+//! `All` is verbatim; `Anon` is anonymized (worker transcripts through the same anonymizer, so
+//! identities stay consistent across the parent and its workers). The archive layout is
 //! Dial-native.
-//!
-//! Subagent transcripts are never persisted in Dial (child sessions live in a
-//! dropped temp dir), so `subagents` is always 0.
 
 use std::{
     fmt,
@@ -18,6 +17,7 @@ use anyhow::{Context, Result, bail};
 use crate::config::paths::Layout;
 use crate::storage::anonymize::{Anonymizer, Identity, REVIEW_NOTE};
 use crate::storage::session::Session;
+use crate::storage::subagent;
 
 /// Whether the archive holds raw session data or an anonymized copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,7 +41,7 @@ pub struct DumpReport {
     pub archive: PathBuf,
     pub kind: DumpKind,
     pub entries: Vec<String>,
-    /// Subagent transcript count. Always 0 in Dial.
+    /// Subagent transcripts included under `subagents/`.
     pub subagents: usize,
     /// Malformed lines dropped during anonymization.
     pub malformed: usize,
@@ -113,6 +113,15 @@ pub fn is_within(child: &Path, parent: &Path) -> Result<bool> {
     Ok(resolve_allowing_missing(child)?.starts_with(resolve_allowing_missing(parent)?))
 }
 
+/// Archive member name for one subagent transcript file.
+fn worker_member(path: &Path) -> Result<String> {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .with_context(|| format!("subagent transcript has no UTF-8 name: {}", path.display()))?;
+    Ok(format!("subagents/{name}"))
+}
+
 /// Writes a dump archive of `session_path` into `out_dir`.
 ///
 /// Refuses an `out_dir` inside the session's own directory or the sessions
@@ -138,8 +147,9 @@ pub fn dump_session(
         .with_context(|| format!("failed to read session {}", session_path.display()))?;
     let session_id = session.id().to_string();
     let request = session.context_request();
+    let transcripts = subagent::transcript_files(layout, &session_id)?;
 
-    let (session_bytes, request_bytes, malformed, redacted) = match kind {
+    let (session_bytes, request_bytes, mut workers, malformed, redacted) = match kind {
         DumpKind::All => {
             let raw = fs::read(session_path)
                 .with_context(|| format!("failed to read {}", session_path.display()))?;
@@ -147,7 +157,13 @@ pub fn dump_session(
                 Some(value) => Some(serde_json::to_vec_pretty(value)?),
                 None => None,
             };
-            (raw, request_bytes, 0, 0)
+            let mut workers = Vec::with_capacity(transcripts.len());
+            for path in &transcripts {
+                let bytes =
+                    fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+                workers.push((worker_member(path)?, bytes));
+            }
+            (raw, request_bytes, workers, 0, 0)
         }
         DumpKind::Anon => {
             let raw = fs::read(session_path)
@@ -158,7 +174,17 @@ pub fn dump_session(
                 Some(value) => Some(serde_json::to_vec_pretty(&anonymizer.value(value))?),
                 None => None,
             };
-            (anon.bytes, request_bytes, anon.malformed, anon.redacted)
+            let (mut malformed, mut redacted) = (anon.malformed, anon.redacted);
+            let mut workers = Vec::with_capacity(transcripts.len());
+            for path in &transcripts {
+                let raw =
+                    fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+                let worker = anonymizer.transcript_jsonl(&raw)?;
+                malformed += worker.malformed;
+                redacted += worker.redacted;
+                workers.push((worker_member(path)?, worker.bytes));
+            }
+            (anon.bytes, request_bytes, workers, malformed, redacted)
         }
     };
 
@@ -173,10 +199,12 @@ pub fn dump_session(
         kind.label()
     ));
 
-    let mut members: Vec<(&str, Vec<u8>)> = vec![("session.jsonl", session_bytes)];
+    let mut members: Vec<(String, Vec<u8>)> = vec![("session.jsonl".to_string(), session_bytes)];
     if let Some(bytes) = request_bytes {
-        members.push(("llm-request.json", bytes));
+        members.push(("llm-request.json".to_string(), bytes));
     }
+    let subagents = workers.len();
+    members.append(&mut workers);
 
     let file = File::options()
         .write(true)
@@ -186,9 +214,9 @@ pub fn dump_session(
     let mut zip = zip::ZipWriter::new(file);
     let mut entries = Vec::with_capacity(members.len());
     for (name, bytes) in &members {
-        zip.start_file(*name, zip::write::SimpleFileOptions::default())?;
+        zip.start_file(name.as_str(), zip::write::SimpleFileOptions::default())?;
         zip.write_all(bytes)?;
-        entries.push((*name).to_string());
+        entries.push(name.clone());
     }
     zip.finish()?;
 
@@ -196,7 +224,7 @@ pub fn dump_session(
         archive,
         kind,
         entries,
-        subagents: 0,
+        subagents,
         malformed,
         redacted,
     })

@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+pub mod session;
+use session::{SessionClaim, admit, read_published};
 
 const DEFAULT_BASH_TIMEOUT_SECS: u64 = 300;
 
@@ -82,6 +84,8 @@ pub struct ForegroundJob {
     pub(crate) captured_total: u64,
     /// Complete-output artifact already being written before adoption.
     pub(crate) spool: Option<crate::storage::artifact::ArtifactSpool>,
+    /// Named session this command runs in; the claim keeps it busy until an adopted job settles.
+    pub(crate) session: Option<SessionClaim>,
 }
 
 /// The last lines of output captured before adoption, bounded so the adoption notice stays small.
@@ -94,22 +98,16 @@ fn output_tail(bytes: &[u8]) -> String {
 }
 
 /// The moment a foreground command is handed to the background owner, or `None` when it may not be.
-/// Named sessions keep their state in this foreground call, and a zero threshold disables
-/// automatic backgrounding, so neither gets a deadline (and no zero-length waits). An explicit
-/// `timeout` longer than the threshold is the caller saying it will wait that long: the command
-/// stays in the foreground until then, so a long build returns its result in this one call.
-fn adoption_deadline(
-    auto_background: Duration,
-    requested_wait: Option<Duration>,
-    named_session: bool,
-) -> Option<Duration> {
-    (!named_session && !auto_background.is_zero())
-        .then(|| requested_wait.map_or(auto_background, |wait| wait.max(auto_background)))
+/// A zero threshold disables automatic backgrounding, so it gets no deadline. Otherwise the deadline
+/// is the configured threshold, whatever the `timeout`: a command still running after it moves to
+/// `bg`, so an explicit `timeout` never keeps a command in the foreground past the threshold.
+fn adoption_deadline(auto_background: Duration) -> Option<Duration> {
+    (!auto_background.is_zero()).then_some(auto_background)
 }
 
-/// Whether the timeout kills the command on this pass. A command whose adoption deadline is not
-/// after its timeout is handed to `bg` at that deadline instead, as it always was before a timeout
-/// longer than the threshold could keep it in the foreground.
+/// Whether the timeout kills the command on this pass. A timeout at or after the adoption deadline
+/// never kills, because the command is handed to `bg` at the deadline first. Only a timeout shorter
+/// than the threshold kills, or any timeout when backgrounding is disabled.
 fn timeout_kills(timeout: Duration, elapsed: Duration, adopt_after: Option<Duration>) -> bool {
     !timeout.is_zero() && elapsed >= timeout && adopt_after.is_none_or(|adopt| adopt > timeout)
 }
@@ -129,31 +127,34 @@ fn may_adopt(cancelled: bool, due: bool) -> bool {
     !cancelled && due
 }
 
+/// The parts of a [`ForegroundJob`] that an adopter takes over; the job itself is not dropped.
+pub(crate) struct ForegroundParts {
+    pub(crate) workspace: Workspace,
+    pub(crate) command: String,
+    pub(crate) child: Child,
+    pub(crate) reader: io::PipeReader,
+    pub(crate) captured: Vec<u8>,
+    pub(crate) captured_total: u64,
+    pub(crate) spool: Option<crate::storage::artifact::ArtifactSpool>,
+    pub(crate) session: Option<SessionClaim>,
+}
+
 impl ForegroundJob {
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        Workspace,
-        String,
-        std::path::PathBuf,
-        Child,
-        io::PipeReader,
-        Vec<u8>,
-        u64,
-        Option<crate::storage::artifact::ArtifactSpool>,
-    ) {
+    pub(crate) fn into_parts(self) -> ForegroundParts {
         let job = std::mem::ManuallyDrop::new(self);
+        // The working directory is not handed over; release it here.
+        drop(unsafe { std::ptr::read(&job.cwd) });
         unsafe {
-            (
-                std::ptr::read(&job.workspace),
-                std::ptr::read(&job.command),
-                std::ptr::read(&job.cwd),
-                std::ptr::read(&job.child),
-                std::ptr::read(&job.reader),
-                std::ptr::read(&job.captured),
-                job.captured_total,
-                std::ptr::read(&job.spool),
-            )
+            ForegroundParts {
+                workspace: std::ptr::read(&job.workspace),
+                command: std::ptr::read(&job.command),
+                child: std::ptr::read(&job.child),
+                reader: std::ptr::read(&job.reader),
+                captured: std::ptr::read(&job.captured),
+                captured_total: job.captured_total,
+                spool: std::ptr::read(&job.spool),
+                session: std::ptr::read(&job.session),
+            }
         }
     }
 }
@@ -619,10 +620,10 @@ fn run_bash(
                     .into(),
             );
         }
-        if asynchronous || runner_for(ws)? != Runner::Embedded {
-            return Err(
-                "named shell state requires the embedded backend and foreground execution".into(),
-            );
+        // A named session may move to the background (explicitly or at the threshold); its state is
+        // written back when the job settles. Only the embedded runner keeps that state.
+        if runner_for(ws)? != Runner::Embedded {
+            return Err("named shell state requires the embedded backend".into());
         }
     }
     let mut sessions = session
@@ -632,6 +633,9 @@ fn run_bash(
                 .map_err(|_| "another named shell command is active in this workspace".to_string())
         })
         .transpose()?;
+    if let (Some(name), Some(sessions)) = (session, sessions.as_mut()) {
+        admit(ws, sessions, name)?;
+    }
     let seed = session.and_then(|name| sessions.as_ref()?.get(name).cloned());
     if sessions.as_ref().is_some_and(|sessions| {
         sessions.len() >= 128 && session.is_some_and(|name| !sessions.contains_key(name))
@@ -719,23 +723,19 @@ fn run_bash(
     let mut timed_out = false;
     let mut cancelled = false;
     let auto_background = Duration::from_secs(auto_background_secs);
-    let requested_wait = requested_timeout
-        .filter(|_| timeout_secs > 0)
-        .map(|_| Duration::from_secs(timeout_secs));
-    let adopt_after = adoption_deadline(auto_background, requested_wait, session.is_some());
+    let adopt_after = adoption_deadline(auto_background);
     let waiter = crate::platform::wake::Waiter::new()
         .map_err(|e| format!("creating command wait channel: {e}"))?;
     loop {
         // Hard cancellation is read once per pass and outranks adoption: a cancelled command stays
         // with this owner, and the group kill below reaps it.
         let cancel_now = cancel.load(Ordering::Acquire);
-        let adoption_wanted = session.is_none()
-            && adoption_due(
-                asynchronous,
-                crate::tools::exec::signals::steering_requested(),
-                started.elapsed(),
-                adopt_after,
-            );
+        let adoption_wanted = adoption_due(
+            asynchronous,
+            crate::tools::exec::signals::steering_requested(),
+            started.elapsed(),
+            adopt_after,
+        );
         if may_adopt(cancel_now, adoption_wanted) {
             crate::platform::io::set_blocking(&reader)
                 .map_err(|e| format!("restoring adopted output pipe mode: {e}"))?;
@@ -754,6 +754,9 @@ fn run_bash(
                 captured,
                 captured_total: capture.total as u64,
                 spool: spool.take(),
+                session: session
+                    .zip(exchange)
+                    .map(|(name, exchange)| SessionClaim::new(ws, name, exchange)),
             };
             return on_adopt(job).map(|id| {
                 let so_far = if so_far.is_empty() {
@@ -762,7 +765,7 @@ fn run_bash(
                     format!("Output so far:\n{so_far}\n")
                 };
                 ToolOutput::ok(format!(
-                    "command is running as background job {id} (after {}s): {command}\n{so_far}Keep working; you are notified when it finishes. bg wait returns its output when it exits; stop it with bg kill. To wait for a long command in one call, pass bash a `timeout` covering its run time.",
+                    "command is running as background job {id} (after {}s): {command}\n{so_far}Keep working; you are notified when it finishes. bg wait returns its output when it exits; stop it with bg kill. Do not poll it; continue independent work or use a bounded bg wait.",
                     started.elapsed().as_secs()
                 ))
             });
@@ -865,19 +868,7 @@ fn run_bash(
     {
         sessions.remove(name);
         if !cancelled && !timed_out && capture_error.is_none() {
-            match exchange.read().and_then(|state| {
-                if !state.completed {
-                    return Err("shell did not publish a completed state exchange".into());
-                }
-                let cwd = state
-                    .cwd
-                    .canonicalize()
-                    .map_err(|error| error.to_string())?;
-                if cwd.to_str().is_none_or(|cwd| ws.resolve(cwd).is_err()) || !cwd.is_dir() {
-                    return Err("shell state cwd is outside this workspace".into());
-                }
-                Ok(state)
-            }) {
+            match read_published(ws, exchange) {
                 Ok(state) => {
                     sessions.insert(name.to_owned(), state);
                 }
@@ -1149,6 +1140,7 @@ fn shell_command_with_state(
                 spawn.env(key, value);
             }
         }
+        crate::tools::exec::cargo_target::apply(&mut spawn, ws.cargo_target_dir());
         spawn
             .current_dir(cwd)
             .env("TEMP", &scratch)
@@ -1235,6 +1227,7 @@ fn shell_command_with_state(
                 spawn.env("PAGER", "cat").env("GIT_PAGER", "cat");
             }
         }
+        crate::tools::exec::cargo_target::apply(&mut spawn, ws.cargo_target_dir());
         spawn
             .current_dir(cwd)
             .env("TERM", "dumb")

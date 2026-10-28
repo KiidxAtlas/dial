@@ -677,3 +677,21 @@ fn waiting_for_the_browser_is_cancellable() {
     );
     assert!(start.elapsed() < Duration::from_millis(200));
 }
+
+#[test]
+fn stored_chatgpt_file_keeps_its_shape_through_the_shared_store() {
+    let dir = tempfile::tempdir().unwrap();
+    test_account(dir.path(), false);
+    let keys = |path: &Path| -> Vec<String> {
+        let value: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        value.as_object().unwrap().keys().cloned().collect()
+    };
+    let file = dir.path().join(FILE);
+    assert_eq!(keys(&file), vec!["accounts", "active"]);
+    let listed = accounts(dir.path()).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(listed[0].active);
+    select_account(dir.path(), "oaiapp_test").unwrap();
+    assert_eq!(keys(&file), vec!["accounts", "active"]);
+    assert!(accounts(dir.path()).unwrap()[0].active);
+}

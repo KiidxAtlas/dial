@@ -262,6 +262,44 @@ fn check_history_before_repro_preserves_saved_calls_and_callback_catalogs() {
     }
 }
 
+fn task_schema(actions: &[&str], pool_fields: bool) -> Value {
+    let mut properties = json!({
+        "action": {"type": "string", "enum": actions},
+        "task": {"type": "string"}
+    });
+    if pool_fields {
+        properties["concurrency"] = json!({"type": "integer", "minimum": 1, "maximum": 32});
+    }
+    json!({"type": "function", "function": {"name": "task", "strict": false,
+        "parameters": {"type": "object", "properties": properties, "required": ["action"]}}})
+}
+
+#[test]
+fn task_history_before_pool_actions_resumes_but_other_task_changes_are_rejected() {
+    let registry = Registry::new();
+    let prior = ["run", "start", "resume", "status", "wait", "cancel"];
+    let pooled = [
+        "run", "start", "resume", "status", "wait", "cancel", "create", "push", "peek", "close",
+    ];
+    let old = identities(&[task_schema(&prior, false)], &registry)["task"].clone();
+    let history = vec![
+        json!({"role":"assistant","tool_calls":[{"id":"call","type":"function","function":{"name":"task","arguments":"{\"action\":\"resume\",\"id\":\"task-1\"}"}}],"dial_tool_contracts":{"call":old}}),
+        json!({"role":"tool","tool_call_id":"call","content":"recorded resume result"}),
+    ];
+    assert!(
+        project_history(&history, &[task_schema(&pooled, true)], &registry)
+            .unwrap()
+            .is_none(),
+        "pool actions and concurrency are compatible with prior task history"
+    );
+    let mut unrelated = task_schema(&pooled, true);
+    unrelated["function"]["parameters"]["properties"]["output_schema"] = json!({"type": "object"});
+    assert!(
+        project_history(&history, &[unrelated], &registry).is_err(),
+        "an unrelated task schema change must still reject prior history"
+    );
+}
+
 /// `check.expect` comes and goes with `experimental.check_predictions`; history recorded on
 /// either side of the flag stays valid, while other changes are still refused.
 #[test]
@@ -347,6 +385,11 @@ fn web_search_history_recorded_before_added_providers_stays_valid() {
     }
     let mut before = current.clone();
     before["function"]["parameters"]["properties"]["provider"]["enum"] = json!(&names[..12]);
+    // History recorded before the added providers also predates the domain filters.
+    before["function"]["parameters"]["properties"]
+        .as_object_mut()
+        .unwrap()
+        .retain(|name, _| name != "domains" && name != "exclude_domains");
     let mut registry = Registry::new();
     registry.register(std::sync::Arc::new(tool));
     let old = identities(&[before.clone()], &Registry::new())["web_search"].clone();
@@ -362,5 +405,82 @@ fn web_search_history_recorded_before_added_providers_stays_valid() {
     let mut other = history;
     other[0]["dial_tool_contracts"]["id"] =
         json!(identities(&[changed], &Registry::new())["web_search"]);
+    assert!(validate_history(&other, &[current], &registry).is_err());
+}
+
+/// `kernel` became `eval` with `language:"py"`. Recorded Python cells resume as eval calls.
+#[test]
+fn recorded_kernel_cells_project_onto_eval_as_python() {
+    let registry = Registry::new();
+    let kernel = json!({"type":"function","function":{"name":"kernel","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["eval","reset","cancel","status"]},"code":{"type":"string"},"timeout":{"type":"integer"}}}}});
+    let old = identities(&[kernel], &registry)["kernel"].clone();
+    let current = crate::tools::exec::eval::tools(&crate::config::types::Config::default())
+        .pop()
+        .unwrap()
+        .schema();
+    let history = vec![
+        json!({"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"kernel","arguments":"{\"action\":\"eval\",\"code\":\"1\"}"}}],"dial_tool_contracts":{"c1":old}}),
+        json!({"role":"tool","tool_call_id":"c1","content":"1"}),
+    ];
+    let projected = project_history(&history, std::slice::from_ref(&current), &registry)
+        .unwrap()
+        .expect("a recorded kernel cell must be projected onto eval");
+    let call = &projected[0]["tool_calls"][0]["function"];
+    assert_eq!(call["name"], "eval");
+    let arguments: Value = serde_json::from_str(call["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        arguments,
+        json!({"action":"eval","code":"1","language":"py"})
+    );
+    assert!(
+        project_history(&projected, std::slice::from_ref(&current), &registry)
+            .unwrap()
+            .is_none(),
+        "an already projected history is idempotent"
+    );
+    validate_history(&projected, std::slice::from_ref(&current), &registry).unwrap();
+}
+
+/// A legacy kernel call that already names a language is not the shape the rename produced.
+#[test]
+fn recorded_kernel_calls_with_an_explicit_language_are_refused() {
+    let registry = Registry::new();
+    let kernel = json!({"type":"function","function":{"name":"kernel","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["eval","reset","cancel","status"]},"code":{"type":"string"}}}}});
+    let old = identities(&[kernel], &registry)["kernel"].clone();
+    let current = crate::tools::exec::eval::tools(&crate::config::types::Config::default())
+        .pop()
+        .unwrap()
+        .schema();
+    let history = vec![
+        json!({"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"kernel","arguments":"{\"action\":\"eval\",\"language\":\"js\",\"code\":\"1\"}"}}],"dial_tool_contracts":{"c1":old}}),
+        json!({"role":"tool","tool_call_id":"c1","content":"1"}),
+    ];
+    assert!(project_history(&history, std::slice::from_ref(&current), &registry).is_err());
+}
+
+/// `eval` gained `language:"py"`; sessions recorded when only JavaScript existed stay valid.
+#[test]
+fn eval_history_recorded_before_python_language_stays_valid() {
+    use crate::tools::integrations::ext::Tool;
+    let tool = crate::tools::exec::eval::tools(&crate::config::types::Config::default())
+        .pop()
+        .unwrap();
+    let current = tool.schema();
+    let mut before = current.clone();
+    before["function"]["parameters"]["properties"]["language"]["enum"] = json!(["js"]);
+    before["function"]["parameters"]["properties"]
+        .as_object_mut()
+        .unwrap()
+        .retain(|name, _| name != "background" && name != "title");
+    let mut registry = Registry::new();
+    registry.register(tool);
+    let old = identities(&[before.clone()], &Registry::new())["eval"].clone();
+    let history = vec![json!({"role":"assistant","dial_tool_contracts":{"c1":old}})];
+    validate_history(&history, std::slice::from_ref(&current), &registry).unwrap();
+
+    let mut changed = before;
+    changed["function"]["parameters"]["properties"]["code"]["type"] = json!("integer");
+    let other = vec![json!({"role":"assistant","dial_tool_contracts":{"c1":
+        identities(&[changed], &Registry::new())["eval"]}})];
     assert!(validate_history(&other, &[current], &registry).is_err());
 }

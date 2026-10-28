@@ -13,7 +13,9 @@
 use crate::config::stats::StatsConfig;
 
 pub mod local_models;
+pub mod requests;
 pub mod server;
+pub mod user_metrics;
 
 use crate::platform;
 use anyhow::{Context, Result, bail};
@@ -134,6 +136,8 @@ pub struct ToolGroup {
     pub duration_ms: u64,
     pub avg_ms: Option<f64>,
     pub error_rate: Option<f64>,
+    /// Outcome statuses of this tool's calls (`ok`, `error`, plus control outcomes).
+    pub outcomes: Vec<NamedCount>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -597,44 +601,35 @@ impl Db {
         Ok(report)
     }
 
-    /// Aggregate everything since `since_ms` (rounded down to the hour; None = all time).
-    pub fn report(&self, since_ms: Option<i64>, now_ms: i64) -> Result<Report> {
+    /// Totals per `column` of `request_hourly` for hours `>= hour`, busiest first.
+    fn grouped(&self, column: &str, hour: i64) -> Result<Vec<(String, Totals)>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {column}, {TOTALS_SQL} FROM request_hourly WHERE hour >= ?1 GROUP BY {column}
+             ORDER BY SUM(input) + SUM(output) DESC, SUM(requests) DESC"
+        ))?;
+        Ok(stmt
+            .query_map([hour], |r| Ok((r.get::<_, String>(0)?, read_totals(r, 1)?)))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Per-model totals since `since_ms` (None = all time), busiest first.
+    pub fn models(&self, since_ms: Option<i64>) -> Result<Vec<Group>> {
         let hour = since_ms.map_or(i64::MIN, |s| s.div_euclid(HOUR_MS));
-        let since = since_ms.unwrap_or(i64::MIN);
-        let labels = self.project_labels()?;
-        let label = |key: &str| labels.get(key).cloned().unwrap_or_else(|| key.to_owned());
-        let totals_sql = TOTALS_SQL;
-        let overall = self.conn.query_row(
-            &format!("SELECT {totals_sql} FROM request_hourly WHERE hour >= ?1"),
-            [hour],
-            |r| read_totals(r, 0),
-        )?;
-        let grouped = |column: &str| -> Result<Vec<(String, Totals)>> {
-            let mut stmt = self.conn.prepare(&format!(
-                "SELECT {column}, {totals_sql} FROM request_hourly WHERE hour >= ?1 GROUP BY {column}
-                 ORDER BY SUM(input) + SUM(output) DESC, SUM(requests) DESC"
-            ))?;
-            Ok(stmt
-                .query_map([hour], |r| Ok((r.get::<_, String>(0)?, read_totals(r, 1)?)))?
-                .collect::<rusqlite::Result<_>>()?)
-        };
-        let by_model = grouped("model")?
+        Ok(self
+            .grouped("model", hour)?
             .into_iter()
             .map(|(key, totals)| Group {
                 label: key.clone(),
                 key,
                 totals,
             })
-            .collect();
-        let by_project = grouped("project")?
-            .into_iter()
-            .map(|(key, totals)| Group {
-                label: label(&key),
-                key,
-                totals,
-            })
-            .collect();
-        let by_tool = {
+            .collect())
+    }
+
+    /// Per-tool calls, errors, timing and outcome statuses since `since_ms` (None = all time).
+    pub fn tools(&self, since_ms: Option<i64>) -> Result<Vec<ToolGroup>> {
+        let hour = since_ms.map_or(i64::MIN, |s| s.div_euclid(HOUR_MS));
+        let mut tools = {
             let mut stmt = self.conn.prepare(
                 "SELECT tool, SUM(calls), SUM(errors), SUM(duration_ms) FROM tool_hourly WHERE hour >= ?1
                  GROUP BY tool ORDER BY SUM(calls) DESC, tool",
@@ -650,10 +645,58 @@ impl Db {
                     duration_ms,
                     avg_ms: (calls > 0).then(|| duration_ms as f64 / calls as f64),
                     error_rate: (calls > 0).then(|| errors as f64 * 100.0 / calls as f64),
+                    outcomes: Vec::new(),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?
         };
+        let mut stmt = self.conn.prepare(
+            "SELECT c.tool, COALESCE(o.status, CASE WHEN c.error THEN 'error' ELSE 'ok' END) AS status, COUNT(*)
+             FROM tool_calls c LEFT JOIN tool_outcomes o ON o.call_id=c.id
+             WHERE c.ts >= ?1 GROUP BY c.tool, status ORDER BY c.tool, status",
+        )?;
+        let rows = stmt.query_map([hour.saturating_mul(HOUR_MS)], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (tool, status, count) = row?;
+            if let Some(group) = tools.iter_mut().find(|g| g.tool == tool) {
+                group.outcomes.push(NamedCount {
+                    name: status,
+                    count: count.max(0) as u64,
+                });
+            }
+        }
+        Ok(tools)
+    }
+
+    /// Aggregate everything since `since_ms` (rounded down to the hour; None = all time).
+    pub fn report(&self, since_ms: Option<i64>, now_ms: i64) -> Result<Report> {
+        let hour = since_ms.map_or(i64::MIN, |s| s.div_euclid(HOUR_MS));
+        let since = since_ms.unwrap_or(i64::MIN);
+        let labels = self.project_labels()?;
+        let label = |key: &str| labels.get(key).cloned().unwrap_or_else(|| key.to_owned());
+        let totals_sql = TOTALS_SQL;
+        let overall = self.conn.query_row(
+            &format!("SELECT {totals_sql} FROM request_hourly WHERE hour >= ?1"),
+            [hour],
+            |r| read_totals(r, 0),
+        )?;
+        let by_project = self
+            .grouped("project", hour)?
+            .into_iter()
+            .map(|(key, totals)| Group {
+                label: label(&key),
+                key,
+                totals,
+            })
+            .collect();
+        let by_model = self.models(since_ms)?;
+        let by_tool = self.tools(since_ms)?;
         let tool_outcomes = {
             let mut stmt = self.conn.prepare("SELECT COALESCE(o.status, CASE WHEN c.error THEN 'error' ELSE 'ok' END) AS status, COUNT(*) FROM tool_calls c LEFT JOIN tool_outcomes o ON o.call_id=c.id WHERE c.ts >= ?1 GROUP BY status ORDER BY status")?;
             stmt.query_map([hour.saturating_mul(HOUR_MS)], |r| {
@@ -1054,10 +1097,11 @@ fn injected(message: &Value) -> bool {
     .any(|flag| message[flag] == true)
 }
 
-fn summarize_transcript(path: &Path) -> Result<TranscriptSummary> {
+/// Calls `visit` with each parseable JSON record of a transcript, in file order. Lines longer
+/// than [`MAX_LINE`] are skipped whole, so one hostile line cannot exhaust memory.
+fn for_each_record(path: &Path, mut visit: impl FnMut(Value)) -> Result<()> {
     let file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut reader = BufReader::new(file);
-    let mut summary = TranscriptSummary::default();
     let mut buf = Vec::new();
     loop {
         buf.clear();
@@ -1073,48 +1117,57 @@ fn summarize_transcript(path: &Path) -> Result<TranscriptSummary> {
             reader.read_until(b'\n', &mut sink)?;
             continue;
         }
-        let Ok(value) = serde_json::from_slice::<Value>(&buf) else {
-            continue;
-        };
-        if value["type"] == "session" {
-            summary.session = value["id"].as_str().unwrap_or("").to_owned();
-            summary.cwd = value["cwd"].as_str().unwrap_or("").to_owned();
-            summary.model = value["model"].as_str().unwrap_or("").to_owned();
-            summary.started_ms = value["started"]
-                .as_str()
-                .and_then(parse_iso_ms)
-                .unwrap_or(0);
-            summary.last_ms = summary.last_ms.max(summary.started_ms);
-            continue;
-        }
-        if let Some(ts) = value["ts"].as_str().and_then(parse_iso_ms) {
-            summary.last_ms = summary.last_ms.max(ts);
-            if summary.started_ms == 0 {
-                summary.started_ms = ts;
-            }
-        }
-        if value["type"] != "message" {
-            continue;
-        }
-        let message = &value["message"];
-        match message["role"].as_str() {
-            Some("user") if !injected(message) => summary.user_msgs += 1,
-            Some("assistant") => {
-                summary.assistant_msgs += 1;
-                for call in message["tool_calls"].as_array().into_iter().flatten() {
-                    if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
-                        summary.tool_calls += 1;
-                        *summary.tools.entry(name.to_owned()).or_insert(0) += 1;
-                    }
-                }
-            }
-            _ => {}
+        if let Ok(value) = serde_json::from_slice::<Value>(&buf) {
+            visit(value);
         }
     }
+    Ok(())
+}
+
+fn summarize_transcript(path: &Path) -> Result<TranscriptSummary> {
+    let mut summary = TranscriptSummary::default();
+    for_each_record(path, |value| summarize_record(&mut summary, &value))?;
     if summary.session.is_empty() {
         bail!("{} has no session header", path.display());
     }
     Ok(summary)
+}
+
+fn summarize_record(summary: &mut TranscriptSummary, value: &Value) {
+    if value["type"] == "session" {
+        summary.session = value["id"].as_str().unwrap_or("").to_owned();
+        summary.cwd = value["cwd"].as_str().unwrap_or("").to_owned();
+        summary.model = value["model"].as_str().unwrap_or("").to_owned();
+        summary.started_ms = value["started"]
+            .as_str()
+            .and_then(parse_iso_ms)
+            .unwrap_or(0);
+        summary.last_ms = summary.last_ms.max(summary.started_ms);
+        return;
+    }
+    if let Some(ts) = value["ts"].as_str().and_then(parse_iso_ms) {
+        summary.last_ms = summary.last_ms.max(ts);
+        if summary.started_ms == 0 {
+            summary.started_ms = ts;
+        }
+    }
+    if value["type"] != "message" {
+        return;
+    }
+    let message = &value["message"];
+    match message["role"].as_str() {
+        Some("user") if !injected(message) => summary.user_msgs += 1,
+        Some("assistant") => {
+            summary.assistant_msgs += 1;
+            for call in message["tool_calls"].as_array().into_iter().flatten() {
+                if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
+                    summary.tool_calls += 1;
+                    *summary.tools.entry(name.to_owned()).or_insert(0) += 1;
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {

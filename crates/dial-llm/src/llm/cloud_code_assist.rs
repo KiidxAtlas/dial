@@ -1,4 +1,5 @@
 //! Google Cloud Code Assist / Gemini CLI streaming transport.
+use super::identity::{Axis, Family, Identity};
 use super::profiles::ModelProfile;
 use super::transports::{OnText, Route};
 use super::{Chat, Endpoint, Reply, StreamEvent};
@@ -202,7 +203,9 @@ fn envelope(route: &Route<'_>, mut request: Value, chat: &Chat, scope: &str) -> 
         let state = antigravity_state(route, chat, scope)?;
         request["sessionId"] = json!(state.session_id);
         let (model_enum, max_output_tokens) = antigravity_model_profile(route.model);
-        let used_claude = route.model.starts_with("claude").to_string();
+        let used_claude = (Identity::new(route.model).family(Axis::CloudCodeClaude)
+            == Some(Family::Claude))
+        .to_string();
         let mut labels = serde_json::Map::new();
         if let Some(id) = state.last_execution_id {
             labels.insert("last_execution_id".into(), json!(id));

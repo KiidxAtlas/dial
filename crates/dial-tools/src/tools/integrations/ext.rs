@@ -187,6 +187,7 @@ pub trait Tool: Send + Sync {
         args: &Value,
         on_event: &(dyn Fn(ToolEvent) + Sync),
         cancel: &std::sync::atomic::AtomicBool,
+        _adopt: &dyn Fn(crate::tools::exec::background::AdoptedJob) -> Result<String, String>,
         _dispatch: &mut dyn FnMut(ToolCallback) -> ToolOutput,
     ) -> ToolOutput {
         self.call_streaming(ctx, args, on_event, cancel)
@@ -232,13 +233,13 @@ pub trait Tool: Send + Sync {
     fn jobs_view(&self, _attached: Option<&str>) -> Option<JobsView> {
         None
     }
-    /// Transfer a foreground process to a managed background owner.
+    /// Transfer a foreground shell command or native cell to a managed background owner.
     #[doc(hidden)]
-    fn adopt_foreground(
+    fn adopt_job(
         &self,
-        _job: crate::tools::exec::shell::ForegroundJob,
+        _job: crate::tools::exec::background::AdoptedJob,
     ) -> Result<String, String> {
-        Err("this tool does not accept foreground processes".into())
+        Err("this tool does not accept foreground jobs".into())
     }
 
     /// Version of this tool's public extension lifecycle contract.
@@ -289,6 +290,8 @@ pub struct Registry {
     mcp_instructions: Vec<(String, String)>,
     plugins: Option<Arc<super::plugin::Host>>,
     origins: BTreeMap<String, crate::tools::surface::catalog::Origin>,
+    /// MCP tools mirrored from the connected servers; [`Registry::sync_mcp`] applies their changes.
+    mcp: super::mcp::Live,
 }
 
 impl Registry {
@@ -352,6 +355,7 @@ impl Registry {
             notices: Vec::new(),
             mcp_instructions: self.mcp_instructions.clone(),
             origins: self.origins.clone(),
+            mcp: self.mcp.clone(),
             plugins: self
                 .plugins
                 .as_ref()
@@ -374,12 +378,15 @@ impl Registry {
             super::ssh::tools(config),
             crate::tools::fs::notebook::tools(config),
             crate::tools::vcs::gh::tools(config),
+            crate::tools::vcs::glab::tools(config),
             native,
             crate::security::tools(config),
             crate::tools::net::browser::tools(config),
-            crate::tools::exec::kernel::tools(config),
+            crate::tools::net::image_gen::tools(config),
+            super::report_tool_issue::tools(config),
             crate::tools::exec::eval::tools(config),
             crate::tools::code::navigation::tools(config),
+            crate::tools::code::ida::tools(config),
             crate::tools::knowledge::autoresearch::tools(config),
             crate::tools::fs::archive::tools(config),
             crate::tools::knowledge::deps::tools(config),
@@ -401,11 +408,27 @@ impl Registry {
                 registry.register_native(tool);
             }
         }
-        let mcp = super::mcp::load(config);
-        registry.register_native(mcp.inventory_tool(config));
-        for tool in mcp.tools {
-            registry.register_native(tool);
+        // Offered without an `integrations` entry when its endpoint has a key (`image.auto`).
+        match crate::tools::net::image_gen::auto_tools(config) {
+            Ok(tools) => {
+                for tool in tools {
+                    if !registry.contains(tool.name()) {
+                        registry.register_native(tool);
+                    }
+                }
+            }
+            Err(error) if !registry.contains(crate::tools::net::image_gen::TOOL) => {
+                registry.notices.push(format!(
+                    "image_gen auto-registration unavailable: {}",
+                    crate::storage::redact::redact_text(&format!("{error:#}"))
+                ))
+            }
+            Err(_) => {}
         }
+        let mut mcp = super::mcp::load(config);
+        registry.register_native(mcp.inventory_tool(config));
+        registry.mcp = std::mem::take(&mut mcp.live);
+        registry.sync_mcp();
         let host = Arc::new(super::plugin::Host::default());
         host.load_configured(config);
         registry.notices.extend(host.take_notices());
@@ -447,6 +470,11 @@ impl Registry {
             self.notices
                 .push(format!("tool registration refused: {error:#}"));
         }
+    }
+    /// Removes a tool and its origin; returns whether it was registered.
+    pub fn remove(&mut self, name: &str) -> bool {
+        self.origins.remove(name);
+        self.tools.remove(name).is_some()
     }
     pub fn try_register(&mut self, tool: Arc<dyn Tool>) -> anyhow::Result<()> {
         crate::tools::surface::catalog::validate_tool(tool.as_ref())?;
@@ -502,6 +530,34 @@ impl Registry {
     }
     pub fn origin(&self, name: &str) -> Option<crate::tools::surface::catalog::Origin> {
         self.origins.get(name).copied()
+    }
+    /// Applies the MCP servers' current tool lists. Returns whether any registered tool changed,
+    /// so the caller rebuilds the offered schemas. Removed tools leave the registry; redefined
+    /// tools replace theirs.
+    pub fn sync_mcp(&mut self) -> bool {
+        let change = self.mcp.sync();
+        self.notices.extend(change.notices);
+        let changed = !(change.upserted.is_empty() && change.removed.is_empty());
+        for name in change.removed {
+            self.tools.remove(&name);
+            self.origins.remove(&name);
+        }
+        for (name, tool) in change.upserted {
+            self.origins
+                .insert(name.clone(), crate::tools::surface::catalog::Origin::Mcp);
+            self.tools.insert(name, tool);
+        }
+        changed
+    }
+
+    /// MCP events queued since the last call, for plugin subscribers (`mcp_notification`).
+    pub fn take_mcp_events(&self) -> Vec<super::mcp::McpEvent> {
+        self.mcp.take_events()
+    }
+
+    /// Whether `name` was an MCP tool its server withdrew and has not returned.
+    pub fn is_retired_mcp(&self, name: &str) -> bool {
+        self.mcp.is_retired(name)
     }
     pub fn get(&self, name: &str) -> Option<&Arc<dyn Tool>> {
         self.tools.get(name)

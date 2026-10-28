@@ -324,7 +324,7 @@ fn request(
         }
         if let Some(effort) = p.reasoning_effort {
             body["additionalModelRequestFields"]["output_config"] =
-                json!({"effort":effort.as_str()});
+                json!({"effort":p.reasoning_effort_wire(effort)});
         }
     }
     if !chat.tools.is_empty() {

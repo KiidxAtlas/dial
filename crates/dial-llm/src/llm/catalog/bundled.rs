@@ -13,7 +13,10 @@ use crate::llm::{
     profiles::ReasoningEffort,
 };
 use serde::Deserialize;
-use std::{collections::HashMap, sync::LazyLock};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::LazyLock,
+};
 
 const PROVIDERS_JSON: &str = include_str!("providers.json");
 const MODELS_JSON: &str = include_str!("models.json");
@@ -216,6 +219,8 @@ pub struct BundledModel {
     pub thinking: Option<ThinkingMode>,
     /// Supported reasoning levels, weakest first, exactly as documented for this model.
     pub thinking_efforts: Vec<ReasoningEffort>,
+    /// Provider wire value per declared effort (e.g. `minimal` sent as `instant`).
+    pub effort_wire: BTreeMap<ReasoningEffort, String>,
     pub default_effort: Option<ReasoningEffort>,
     /// Base list price per token; `None` when the upstream card is unknown or variable.
     pub pricing: Option<TokenPricing>,
@@ -255,6 +260,9 @@ struct Row {
     e: Vec<ReasoningEffort>,
     #[serde(default)]
     d: Option<ReasoningEffort>,
+    /// Provider wire value per declared effort when it differs from the Dial name.
+    #[serde(default)]
+    m: BTreeMap<ReasoningEffort, String>,
 }
 #[derive(Deserialize)]
 struct ScheduleRow {
@@ -277,6 +285,7 @@ struct Entry {
     thinking: Option<ThinkingMode>,
     efforts: Vec<ReasoningEffort>,
     default_effort: Option<ReasoningEffort>,
+    effort_wire: BTreeMap<ReasoningEffort, String>,
     price: Option<ListPrice>,
 }
 struct ProviderModels {
@@ -319,6 +328,28 @@ fn list_price(row: &Row) -> Option<ListPrice> {
     })
 }
 
+/// Wire-value overrides may name only efforts the row declares, and each must be a non-empty
+/// token without surrounding whitespace.
+fn validate_effort_wire(row: &Row) -> Result<(), String> {
+    for (effort, wire) in &row.m {
+        if !row.e.contains(effort) {
+            return Err(format!(
+                "{}: wire value for effort {} that is not declared",
+                row.id,
+                effort.as_str()
+            ));
+        }
+        if wire.is_empty() || wire.trim() != wire {
+            return Err(format!(
+                "{}: invalid wire value for {}",
+                row.id,
+                effort.as_str()
+            ));
+        }
+    }
+    Ok(())
+}
+
 static MODELS: LazyLock<HashMap<String, ProviderModels>> = LazyLock::new(|| {
     let file: ModelFile =
         serde_json::from_str(MODELS_JSON).expect("bundled models.json is generated valid JSON");
@@ -331,6 +362,8 @@ static MODELS: LazyLock<HashMap<String, ProviderModels>> = LazyLock::new(|| {
                 .enumerate()
                 .map(|(i, row)| {
                     index.entry(row.id.to_ascii_lowercase()).or_insert(i);
+                    validate_effort_wire(&row)
+                        .expect("bundled models.json effort wire map is valid");
                     Entry {
                         price: list_price(&row),
                         context_window: row.c.filter(|n| *n > 0),
@@ -340,6 +373,7 @@ static MODELS: LazyLock<HashMap<String, ProviderModels>> = LazyLock::new(|| {
                         thinking: row.t,
                         efforts: row.e,
                         default_effort: row.d,
+                        effort_wire: row.m,
                         id: row.id,
                     }
                 })
@@ -372,6 +406,7 @@ fn to_bundled(provider: &'static str, entry: &'static Entry) -> BundledModel {
         vision: entry.vision,
         thinking: entry.thinking,
         thinking_efforts: entry.efforts.clone(),
+        effort_wire: entry.effort_wire.clone(),
         default_effort: entry.default_effort,
         pricing: entry.price.as_ref().map(ListPrice::token_pricing),
         list_price: entry.price.as_ref(),

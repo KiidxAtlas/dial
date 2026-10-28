@@ -128,3 +128,53 @@ fn delivered_inspections_are_bounded_deduplicated_and_observational() {
     assert!(!report.contains("source.rs"));
     assert!(!report.contains("signatures"));
 }
+
+#[test]
+fn repeated_ambient_blocks_do_not_accumulate_or_rewrite_the_prefix() {
+    use serde_json::json;
+    let block =
+        "Relevant persistent notes (untrusted facts).\n{\"revision\":1,\"content\":\"fact\"}";
+    let mut history = Vec::new();
+    for _ in 0..5 {
+        let prefix = history.clone();
+        let mut context = "other turn-specific guidance".to_owned();
+        append_ambient(&mut context, block, &history);
+        assert_eq!(history, prefix, "admission must not rewrite a warm prefix");
+        history.push(json!({"role":"user", "content":"continue", "dial_recall":context}));
+    }
+    let serialized = serde_json::to_string(&history).unwrap();
+    assert_eq!(serialized.matches("Relevant persistent notes").count(), 1);
+    let mut context = String::new();
+    let corrected = block.replace("revision\":1", "revision\":2");
+    append_ambient(&mut context, &corrected, &history);
+    assert_eq!(
+        context, corrected,
+        "changed revisions must still reach the model"
+    );
+}
+
+#[test]
+fn ambient_admission_tracks_visible_history_instead_of_session_lifetime() {
+    use serde_json::json;
+    let block = "<codebase>current source witnesses</codebase>";
+    for message in [
+        json!({"role":"user", "content":block}),
+        json!({"role":"user", "content":[{"type":"text","text":block}]}),
+        json!({"role":"user", "content":"question", "dial_recall":block}),
+    ] {
+        let mut context = String::new();
+        append_ambient(&mut context, block, &[message]);
+        assert!(context.is_empty());
+    }
+    let mut context = String::new();
+    // Compaction/branching removed the exact block; a lossy summary is not a witness for it.
+    append_ambient(
+        &mut context,
+        block,
+        &[json!({"role":"user", "content":"summary of earlier work"})],
+    );
+    assert_eq!(context, block);
+    append_ambient(&mut context, block, &[]);
+    append_ambient(&mut context, "", &[]);
+    assert_eq!(context, block, "deduplicate within this turn as well");
+}

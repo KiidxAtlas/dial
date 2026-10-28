@@ -5,6 +5,7 @@ fn query(recency: Option<Recency>) -> Query<'static> {
         text: "latest rust release",
         limit: 5,
         recency,
+        filter: &super::super::domains::UNFILTERED,
         today: 19_723,
     }
 }

@@ -1,9 +1,10 @@
 //! Display-only context telemetry. Provider accounting remains separate from estimates.
+use crate::agent::window::context_breakdown::ContextBreakdown;
 use crate::agent::workflow::evidence;
 use crate::{
     llm::{
         Chat,
-        wire::{json_bytes, wire_message_bytes},
+        wire::{json_bytes, wire_parts},
     },
     storage::session::Session,
 };
@@ -15,6 +16,8 @@ pub(in crate::agent) struct ContextMeter {
     reported: bool,
     rebased: bool,
     anchor: usize,
+    /// Categories of the last request sent; `None` until one has been built.
+    breakdown: Option<ContextBreakdown>,
 }
 
 /// Disjoint provider-neutral wire byte estimates, not tokenizer counts or billed usage.
@@ -31,6 +34,8 @@ pub(in crate::agent) struct RequestOverhead {
     pub history_bytes: usize,
     #[serde(skip)]
     pub request_tail_bytes: usize,
+    #[serde(skip)]
+    pub breakdown: ContextBreakdown,
 }
 
 impl RequestOverhead {
@@ -49,8 +54,11 @@ pub(in crate::agent) fn overhead(request: &Chat) -> RequestOverhead {
         tool_schema_bytes: request.tools.iter().map(json_bytes).sum(),
         ..Default::default()
     };
+    out.breakdown.add_tools(&request.tools);
     for message in &request.messages {
-        let bytes = wire_message_bytes(message);
+        let parts = wire_parts(message);
+        let bytes = parts.total();
+        out.breakdown.add_message(message, parts);
         if matches!(message["role"].as_str(), Some("system" | "developer")) {
             out.economy_system_bytes += bytes;
         } else if message["dial_transient"] == true {
@@ -80,6 +88,15 @@ pub(in crate::agent) fn overhead(request: &Chat) -> RequestOverhead {
 mod overhead_tests;
 
 impl ContextMeter {
+    /// Records the categories of the request just built; they describe the last request only.
+    pub fn record_breakdown(&mut self, breakdown: ContextBreakdown) {
+        self.breakdown = Some(breakdown);
+    }
+
+    pub fn breakdown(&self) -> Option<&ContextBreakdown> {
+        self.breakdown.as_ref()
+    }
+
     pub fn predict(&self, estimate: u64) -> u64 {
         if self.reported && self.request_estimate > 0 {
             if estimate >= self.request_estimate {

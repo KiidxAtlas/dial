@@ -8,6 +8,31 @@ Delegation briefs avoid repeating automatic parent goals when the exact text alr
 
 For efficient handoffs, supply the outcome, owned files or subsystem, shared interfaces, relevant evidence references, and checks with an owner. Keep shared builds with one integration owner and wait for relevant edits to settle. Worker findings are evidence to use, not a reason to repeat the investigation; failed checks still need diagnosis, repair and rechecking.
 
+### Tool-free side questions
+
+`side_request` lets the main agent ask a reasoning question while a command or independent task
+runs. `action="start"` takes `question` and immediately returns an id; the answer uses an immutable
+snapshot of the conversation at start time, with no tools. Unlike a `task` worker, it cannot inspect
+new files, edit the workspace, run checks, or start nested workers. Answers are untrusted reasoning,
+not verification evidence. Use a scout when the question needs new source investigation.
+
+Completed answers are delivered to the main conversation at its next request boundary and survive
+there as ordinary session history. `status` lists requests (or takes `id`); `wait` requires `id`
+and waits up to `timeout` seconds (default 5, range 0–30; 0 is a nonblocking check); `cancel` requests
+cooperative cancellation by id. Completion is blocked while a side question still runs or a completed
+answer has not been delivered. At most two may run concurrently and eight recent results are retained
+for status queries. Session exit and main-turn interruption request cancellation; unfinished side
+questions are not resumed.
+
+Each question sends the snapshot context in a separate request using the session's effective model
+configuration, so it consumes model compute and may incur provider charges. Agent-initiated questions
+share the parent's worker-request budget and usage ledger (reported as auxiliary work), and respect
+observed session/turn cost stop boundaries. In-flight requests can still incur charges after a boundary
+is reached. There is no guaranteed speedup on a model server that handles only one request at a time.
+The tool is available to the main
+agent under the default harness, subject to tool selection and mode restrictions, not to subagents.
+It is independent of the user's `/btw` thread UI.
+
 ### Delegation preference
 
 Dial defaults to **selective delegation**: the main agent keeps coupled planning, implementation,
@@ -76,6 +101,14 @@ Provider-slot waits remain cancellable. Child memory-helper requests also check 
 
 Output-limit recovery has its own no-progress bound, even when `max_steps = 0`. After finite output-budget increases, eight nonproductive continuation nudges stop the run as incomplete without discarding completed effects. Empty output and incomplete tool calls count as nonproductive. Partial text uses constant-space periodic-cycle detection; once a cycle is detected, further truncated output cannot reset the stall count. Distinct advancing text can continue, and usable completed output or new steering resets recovery. This does not detect every semantically nonproductive prose stream.
 
+## Seance consultations
+
+`/seance <source> <question>` and the `seance` agent (`task` with `agent: "seance"`, `source_session`, `task`, optional `model`) ask a read-only consultant about a recorded session or one of its worker transcripts. `source` is a session id prefix or a worker id from the calling session. The consultant reads the source journal and every nested worker transcript as quoted data (delimited and sanitized, bounded to a fixed byte budget that keeps the start and latest lines), and its tools are only `read`, `glob`, and `grep`. It cannot spawn workers, use extensions or artifacts, or write the source. Its own transcript is kept under the calling session like any other worker.
+
+The consultant runs on the explicit `model` when given; otherwise on the source session's saved model. If that model is not available, the consultation fails with an error naming it and asking for `model`; it never substitutes another model silently. Missing persistent storage or an unknown or ambiguous `source` is also an explicit error. Both surfaces reject a `source_session` on other agents.
+
+Seance is not available from `solve`. Solve's candidate children always run as `worker` agents without a calling session, so a `seance` job cannot be attached there; the consultant requires the calling session to locate worker transcripts and reports `seance needs the calling session to find its worker transcripts` if one is ever attached without it. Use `/seance` or `task` with `agent: "seance"` from a session instead.
+
 ## Isolation and results
 
 A worker may request `isolation: "copy"` to work in a private project copy. A successful isolated run merges its edits; failed or interrupted work is retained as a recovery copy. Completed computation is not completed integration: parent conflicts make the task `incomplete`, and merge errors make it `failed`. Nonconflicting files may already have merged. The candidate structured result remains intact, with conflicts, applied paths, errors and recovery location reported separately in isolation metadata. Always inspect that metadata before relying on a worker's edits.
@@ -132,11 +165,34 @@ isolation and approval rules.
 
 `[task].persist = false` skips durable child conversation capture for newly started workers throughout their lifetime, including while live and after interruption or failure, and disables resume. Runtime status, progress and results remain in the current session's worker UI; the archived transcript view is unavailable for these workers. This does not delete historical transcripts or isolation recovery copies, and does not disable ordinary result artifacts or the parent session's own history. With `persist = true`, available session storage retains redacted transcripts for live viewing and continuation.
 
+## Managed worker pools
+
+`task` also accepts `create`, `push`, `peek` and `close`. `create` returns a pool ID and accepts
+`concurrency` from 1 to 32 plus initial `tasks`; `push` appends more tasks to that pool.
+Use the pool ID with `wait` or `status`, or use `peek` for its full item history. Ordinary provider,
+worker-budget, isolation and approval gates still apply. `close` cancels queued items before they
+start and interrupts running workers; a closed pool refuses new items.
+
+Each logical slot retains its backend and completed conversation for later items when their effective
+configuration matches. A different configuration invalidates that carry rather than silently keeping
+the old role or model. Automatic batch handoffs do not repeat earlier delivered items; explicit
+inspection retains the full history. Pools and queued items are in-memory controllers, not durable
+queues that restart work after a crash. Lost or uncertain executions are never automatically replayed.
+
+
 ## Continuing a retained worker
 
 Use `{"action":"resume","id":"task-1","message":"Follow up on the finding"}` in the same parent session. Dial restores the redacted conversation and the actual offered tool set, pins the recorded model and agent definition, and applies the current owner’s approvals to future actions. A process lease prevents two owners from resuming the same worker. Call intent and results are flushed to durable storage before proceeding.
 
 Resume refuses unknown tool effects, truncated or oversized history, changed workspace identity, model/definition changes, and histories that used a fallback model. It never replays saved calls. Released isolated workers remain transcript-only; start a new isolated task using their retained findings or recovery copy. A resumed worker does not regain private temporary notebooks, checkpoints, running processes, or native tool sessions; those capabilities start fresh.
+
+`dial --restore` resumes the parent session before reattaching eligible interrupted workers.
+`dial -r <id> --restore` chooses a parent explicitly; otherwise it continues the latest conversation.
+The main prompt is not submitted again. The newest saved instance of each worker decides eligibility:
+completed, failed and explicitly cancelled workers stay stopped. Each accepted restore still passes
+the ordinary history, effect-certainty, workspace, model/definition and lease checks above; setup
+failures are reported as rejections, not successful starts. Worker status is correlated with the new
+runtime node so an older interrupted instance cannot replace its live controls.
 
 ## Development copies
 
@@ -161,6 +217,10 @@ Dependency traversal is additionally capped at 500,000 entries and 128 nested le
 
 Safe extension calls with `Concurrency::Shared` can execute together; exclusive calls and operations requiring approval remain barriers. Each scheduled call still runs its pre/post hooks. A hook that changes scheduled arguments causes refusal and a request for resubmission through the normal controller. Hook-bearing batches do not deduplicate calls. Queued steering interrupts declared pure waits and preserves completed effects; shell work may transfer to the existing background-process manager.
 
+Shared parent and worker batches publish each tool's result and call-ID-correlated timing when it
+finishes, without waiting behind a slower sibling. The canonical provider conversation still settles
+the call group in its original order.
+
 `[compaction].preserve_prefix = true` keeps warm-history pruning from rewriting old messages solely to save a small number of tokens. Hard context limits and necessary compaction still apply. Parent request records include `request_prefix` diagnostics after hooks, with stable message bytes and explicit model, system, tool, or history invalidation reasons. These are provider-neutral measurements, not proof of a provider cache hit.
 
 Runtime telemetry records `ok`, `error`, `blocked`, `skipped`, `timeout`, and `aborted` separately. Tool journals and OTLP spans also distinguish `none`, `known`, and `unknown` effects. An uncertain result ends the worker as incomplete and prevents automatic continuation or resume. Stats reports include `tool_outcomes`; trace rows and OTLP tool events carry status. Known controller refusals, shell timeouts and interruption paths supply explicit statuses; ordinary unannotated tool failures remain `error`.
@@ -177,6 +237,12 @@ A definition's ordered model list provides bounded startup fallbacks after a rec
 
 `/workers` shows each child's role, selected model, assignment source and activity. It includes inline workers as well as background jobs. Press `r` to open model-role assignments; `/roles` and the model-role shortcut open the same view. A running worker keeps the model captured at launch when role settings change. Background jobs retain their cancellation and message controls; inline workers follow the current turn's interruption control.
 
+To change one live worker, open its transcript and use `/model <selector>` or `/thinking <level>`
+(`/effort` is an alias). Controls are local to that worker: they do not change the main session,
+saved defaults or sibling workers. A selection is validated against the exact model/profile and
+queued for the next request boundary; the banner distinguishes queued, applied and failed changes.
+Unsupported effort settings are refused. A failed backend switch retains the prior active backend.
+
 ## Delegation and model roles
 
 The `task` tool runs typed subagents (`scout`, `reviewer`, `planner`, `worker`, `test-runner`, or a configured agent) in parallel batches. Each batch takes one shared `context` and per-item `task`, `solution_space` and optional `skills`. Both synchronous `run` and fresh live `start` receive the same bounded parent goal, open todos and working state, alongside the unchanged explicit context and assignment, role prompt and preloaded skill bodies. Resume restores the saved conversation rather than replacing its brief with current parent state. Built-in roles cannot spawn children by default; configured definitions may permit synchronous descendants within their spawn policy and depth limit. Model-role preferences and fallback chains are listed above; results report each child's selected role and model.
@@ -185,7 +251,12 @@ The `task` tool runs typed subagents (`scout`, `reviewer`, `planner`, `worker`, 
 
 Open the worker hub with Alt+A (`app.subagents.hub`), Left twice on an empty composer, or `/workers` (`/agents` opens it too; `/jobs` and `/hub` are hidden aliases). `/bg` and `/processes` open the background process panel instead. The `subagent-hub:activity` action opens the hub directly on its Activity tab. Each child's conversation is saved as JSONL under the state directory (`subagents/<session>/<job>-<millis>.jsonl`), outside the workspace.
 
-Agents tab: Up/Down or `j`/`k` select a worker; Enter opens its transcript at the selected entry; `t` toggles flat and tree views; `/` filters by name, task or id; `m` messages a worker (steers a running one, resumes a finished one); `x` pressed twice within 2 seconds cancels a running worker; `r` opens model roles; PageUp/PageDown scroll the inspector. The roster order is stable while the hub is open: running and waiting workers first, then finished ones, then by recent activity.
+Agents tab: Up/Down or `j`/`k` select a worker; Enter opens its transcript at the selected entry; `t` toggles flat and tree views; `/` filters by name, task or id; `m` messages a worker (steers a running one, resumes a finished one); `x` pressed twice within 2 seconds cancels a running worker; `r` opens model roles; PageUp/PageDown scroll the inspector. Existing roster positions stay stable while the hub is open; workers waiting for input or reporting failure can rise for attention rather than continuously reordering by recent activity.
+
+The focused transcript has a full, independent editor. Escape returns to the hub and preserves its
+draft, cursor and undo state when reopened; `/back` exits the view. Ctrl+C stops only the selected
+worker. Ordinary letters, including `x`, are text there, not hub cancellation shortcuts. A submitted
+message clears only after delivery/start acknowledgement; a failed submission keeps the draft.
 
 Activity tab (`2`, or Tab on a wide layout): `f` cycles the kind filter (all, errors, responses, tools, messages); `s` cycles the scope (all, selected worker, selected subtree); Space toggles follow; `/` searches; Enter opens the entry in its transcript.
 

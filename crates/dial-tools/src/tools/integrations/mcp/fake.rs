@@ -3,7 +3,9 @@
 //!
 //! `flags` (comma separated, from the environment) switch off normal behavior:
 //! `bad-protocol` answers `initialize` with an unknown version, `silent` never answers it,
-//! `no-tools` lists nothing, `bad-list` answers `tools/list` with an error.
+//! `no-tools` lists nothing, `bad-list` answers `tools/list` with an error. `announce-burst` sends
+//! three `tools/list_changed` notices after the first list, `list-counts` adds a `seen-<n>` tool
+//! per refresh (n counts first-page lists), and `list-fails-after-first` errors every later list.
 
 use serde_json::{Value, json};
 use std::io::{BufRead, Write};
@@ -14,6 +16,7 @@ pub const ENV: &str = "DIAL_FAKE_MCP_SERVER";
 pub fn run(flags: &str) -> ! {
     let has = |flag: &str| flags.split(',').any(|f| f == flag);
     let mut ping_answered = false;
+    let mut lists = 0usize;
     for line in std::io::stdin().lock().lines().map_while(Result::ok) {
         let Ok(message) = serde_json::from_str::<Value>(&line) else {
             continue;
@@ -53,11 +56,20 @@ pub fn run(flags: &str) -> ! {
                     "serverInfo": {"name": "fake", "version": "0"},
                 }}));
             }
-            "tools/list" => send(&list(
-                &id,
-                message.pointer("/params/cursor").and_then(Value::as_str),
-                flags,
-            )),
+            "tools/list" => {
+                let cursor = message.pointer("/params/cursor").and_then(Value::as_str);
+                if cursor.is_none() {
+                    lists += 1;
+                }
+                send(&list(&id, cursor, flags, lists));
+                if has("announce-burst") && lists == 1 && cursor.is_none() {
+                    for _ in 0..3 {
+                        send(
+                            &json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}),
+                        );
+                    }
+                }
+            }
             "tools/call" => {
                 let name = message
                     .pointer("/params/name")
@@ -97,14 +109,15 @@ fn tool(name: &str, read_only: Option<bool>) -> Value {
     tool
 }
 
-fn list(id: &Value, cursor: Option<&str>, flags: &str) -> Value {
-    if flags.split(',').any(|f| f == "bad-list") {
+fn list(id: &Value, cursor: Option<&str>, flags: &str, lists: usize) -> Value {
+    let has = |flag: &str| flags.split(',').any(|f| f == flag);
+    if has("bad-list") || (has("list-fails-after-first") && lists > 1) {
         return json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32000, "message": "list exploded"}});
     }
-    if flags.split(',').any(|f| f == "no-tools") {
+    if has("no-tools") {
         return json!({"jsonrpc": "2.0", "id": id, "result": {"tools": []}});
     }
-    let (tools, next) = match cursor {
+    let (mut tools, next) = match cursor {
         None => (
             vec![
                 tool("echo", Some(true)),
@@ -137,6 +150,9 @@ fn list(id: &Value, cursor: Option<&str>, flags: &str) -> Value {
             )
         }
     };
+    if cursor.is_none() && has("list-counts") {
+        tools.push(tool(&format!("seen-{lists}"), None));
+    }
     let mut result = json!({"tools": tools});
     if let Some(next) = next {
         result["nextCursor"] = json!(next);

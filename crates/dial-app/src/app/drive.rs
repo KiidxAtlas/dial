@@ -21,11 +21,18 @@ pub(super) enum Step {
     Rebuild(Box<Config>),
 }
 
-pub(super) fn drive(app: &mut App, shell: &mut Shell, session: Option<Session>) -> Result<()> {
+pub(super) fn drive(
+    app: &mut App,
+    shell: &mut Shell,
+    session: Option<Session>,
+    restore: bool,
+) -> Result<()> {
     if !onboard(app, shell, session.as_ref())? {
         return Ok(());
     }
     let resumed = session.is_some();
+    // `--restore` runs once, for the first agent of the resumed session, before the user has control.
+    let mut restore_pending = restore && resumed;
     let mut session = match session {
         Some(session) => session,
         None => Session::create(
@@ -70,6 +77,10 @@ pub(super) fn drive(app: &mut App, shell: &mut Shell, session: Option<Session>) 
                 agent.continue_session_lifecycle();
             } else {
                 agent.begin_session_lifecycle();
+            }
+            shell.sync_extension_commands(&agent);
+            if std::mem::take(&mut restore_pending) {
+                super::restore::restore_interrupted(app, shell, &mut agent)?;
             }
             // Re-checked after every rebuild: a settings change can switch to a backend that
             // cannot open (a missing role, a half override), which must not go silent.
@@ -137,6 +148,14 @@ pub(super) fn drive(app: &mut App, shell: &mut Shell, session: Option<Session>) 
                 if !onboard(app, shell, Some(&session))? {
                     break;
                 }
+                // Rebuilds reconnect MCP too. Do not freeze the composer for their startup
+                // budget just because the initial startup prefetch has already been consumed.
+                crate::tools::integrations::mcp::prefetch(&app.config);
+                if crate::tools::integrations::mcp::prefetch_pending() {
+                    shell.note("Tools", "Reconnecting configured MCP servers. You can keep typing; commands wait until tools are ready.");
+                    shell.paint(None)?;
+                }
+                shell.edit_while(crate::tools::integrations::mcp::prefetch_pending);
             }
         }
     }

@@ -35,6 +35,10 @@ impl Shell {
         self.transcript.notice(title, text.as_ref());
     }
 
+    pub(in crate::app) fn take_runtime_update_report(&mut self) -> Option<String> {
+        self.runtime_updates.take_report()
+    }
+
     /// Opens a background job's panel; its progress and result fill it in place.
     pub(crate) fn note_pending(&mut self, title: &str) {
         self.transcript.notice_pending(title);

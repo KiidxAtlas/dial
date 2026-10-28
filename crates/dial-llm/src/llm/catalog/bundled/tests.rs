@@ -270,3 +270,23 @@ fn selection_pricing_follows_the_endpoint_origin() {
         Some("firepass")
     );
 }
+
+#[test]
+fn inception_minimal_is_sent_as_instant_and_wire_maps_are_validated_at_load() {
+    let model = bundled_model("inception", "mercury-2").expect("inception mercury-2 is bundled");
+    assert!(model.thinking_efforts.contains(&ReasoningEffort::Minimal));
+    assert_eq!(
+        model
+            .effort_wire
+            .get(&ReasoningEffort::Minimal)
+            .map(String::as_str),
+        Some("instant")
+    );
+
+    let undeclared: Row =
+        serde_json::from_str(r#"{"id":"x","e":["low"],"m":{"high":"h"}}"#).expect("row parses");
+    assert!(validate_effort_wire(&undeclared).is_err());
+    let blank: Row =
+        serde_json::from_str(r#"{"id":"x","e":["low"],"m":{"low":" "}}"#).expect("row parses");
+    assert!(validate_effort_wire(&blank).is_err());
+}

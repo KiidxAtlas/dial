@@ -201,21 +201,21 @@ impl Rule {
 }
 impl Catalog {
     pub fn discover(layout: &Layout, workspace: &Path) -> Self {
-        Self::discover_with(
-            layout,
-            workspace,
-            crate::agent::window::context::home_dir().as_deref(),
-            &[],
-        )
+        let home = crate::agent::window::context::home_dir();
+        let copilot =
+            crate::agent::window::context::copilot_instruction_dirs(workspace, home.as_deref());
+        Self::discover_with(layout, workspace, home.as_deref(), &[], &copilot)
     }
 
     /// `foreign_user` lists opted-in foreign providers (`windsurf`) whose user-level rules may load.
-    /// Foreign user providers are off by default, so production passes an empty list.
+    /// Foreign user providers are off by default, so production passes an empty list. `copilot_dirs`
+    /// are the `COPILOT_CUSTOM_INSTRUCTIONS_DIRS` entries; their `.github/instructions` load as user rules.
     fn discover_with(
         layout: &Layout,
         workspace: &Path,
         home: Option<&Path>,
         foreign_user: &[&str],
+        copilot_dirs: &[PathBuf],
     ) -> Self {
         let mut out = Self::default();
         let mut candidates = Vec::new();
@@ -240,6 +240,15 @@ impl Catalog {
                 home.to_path_buf(),
                 PathBuf::from(".cursor/rules"),
                 "cursor",
+                false,
+                true,
+            ));
+        }
+        for dir in copilot_dirs {
+            candidates.push((
+                dir.clone(),
+                PathBuf::from(".github/instructions"),
+                "github",
                 false,
                 true,
             ));
@@ -277,6 +286,14 @@ impl Catalog {
             "windsurf",
             true,
             true,
+        ));
+        // Legacy single-file Windsurf rules at the project root.
+        candidates.push((
+            workspace.into(),
+            PathBuf::from(".windsurfrules"),
+            "windsurf",
+            true,
+            false,
         ));
         // Cline reads the nearest `.clinerules` on the context walk, as a file or a directory.
         if let Some(dir) = crate::agent::window::context::walk_dirs(workspace, home)
@@ -403,12 +420,13 @@ impl Catalog {
                 } else {
                     text
                 };
-                match parse_rule(
-                    &text,
-                    &source,
-                    provider == "github" && directory,
-                    !directory && !matches!(provider, "windsurf" | "cline"),
-                ) {
+                // A single instruction file applies unconditionally, except Windsurf/Cline files
+                // whose own frontmatter selects activation. Legacy `.windsurfrules` has no
+                // frontmatter and Windsurf always applies it.
+                let always = !directory
+                    && (!matches!(provider, "windsurf" | "cline")
+                        || relative.as_path() == Path::new(".windsurfrules"));
+                match parse_rule(&text, &source, provider == "github" && directory, always) {
                     Ok(rule) => {
                         chosen.insert(key, (project, provider.to_string(), path, rule));
                     }

@@ -5313,6 +5313,14 @@
 {"id":"glm-5.3-flashx","c":1000000,"o":131072,"p":[0.37,1.25,0.075,0],"r":1,"v":1,"t":"budget","e":["minimal","low","medium","high","xhigh"]},
 {"id":"glm-5v-turbo","c":200000,"o":131072,"p":[1.2,4,0.24,0],"r":1,"v":1,"t":"budget","e":["minimal","low","medium","high","xhigh"]}
 ],
+"sambanova": [
+{"id":"gpt-oss-120b","c":131072,"o":null,"p":[0.22,0.59,0,0],"r":1,"t":"effort","e":["low","medium","high"]}
+],
+"inception": [
+{"id":"mercury-2","c":128000,"o":50000,"p":[0.25,0.75,0.025,0],"r":1,"t":"effort","e":["minimal","low","medium","high"],"m":{"minimal":"instant"},"d":"medium"},
+{"id":"mercury-2.5","c":260000,"o":65536,"p":[0.2,0.75,0.02,0],"r":1,"t":"effort","e":["minimal","low","medium","high"],"m":{"minimal":"instant"},"d":"medium"},
+{"id":"mercury-3","c":1000000,"o":131072,"p":[0.1,0.35,0.01,0],"r":1,"t":"effort","e":["minimal","low","medium","high"],"m":{"minimal":"instant"},"d":"low"}
+],
 "zenmux": [
 {"id":"alibaba/wan3.0-video","c":20000,"o":null,"v":1},
 {"id":"alibaba/wan3.0-video-prime","c":20000,"o":null,"v":1},

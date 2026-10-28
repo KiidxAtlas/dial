@@ -34,6 +34,9 @@ impl NoticeTracker {
     }
 }
 
+/// Largest source image read from disk or a snapshot. Decoding is guarded separately by
+/// [`MAX_IMAGE_PIXELS`]; the model-facing encoding is bounded by [`MAX_IMAGE_BYTES`].
+pub const MAX_IMAGE_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 pub fn is_image(path: &Path) -> bool {
     path.extension().and_then(|v| v.to_str()).is_some_and(|v| {
@@ -66,12 +69,16 @@ fn bytes(root: &Path, path: &Path) -> Result<(Vec<u8>, &'static str)> {
     let file = fs::File::open(real).context("image cannot be opened")?;
     let meta = file.metadata()?;
     ensure!(
-        meta.is_file() && meta.len() <= MAX_IMAGE_BYTES,
-        "image must be a regular file no larger than 5 MiB"
+        meta.is_file() && meta.len() <= MAX_IMAGE_SOURCE_BYTES,
+        "image must be a regular file no larger than 64 MiB"
     );
     let mut bytes = Vec::with_capacity(meta.len() as usize);
-    file.take(MAX_IMAGE_BYTES + 1).read_to_end(&mut bytes)?;
-    ensure!(bytes.len() as u64 <= MAX_IMAGE_BYTES, "image exceeds 5 MiB");
+    file.take(MAX_IMAGE_SOURCE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 <= MAX_IMAGE_SOURCE_BYTES,
+        "image exceeds 64 MiB"
+    );
     let mime = mime(&bytes)?;
     Ok((bytes, mime))
 }
@@ -95,6 +102,20 @@ pub fn attachment(root: &Path, path: &Path) -> Result<Value> {
     let root = root.canonicalize()?;
     let (bytes, _) = bytes(&root, path)?;
     Ok(json!({"root":root,"path":path,"sha256":format!("{:x}", Sha256::digest(&bytes))}))
+}
+
+/// Reference for image bytes supplied directly (stdin `--image -`). The format is detected from
+/// the magic bytes, so a non-image payload is refused before any reference exists.
+pub fn inline_attachment(bytes: &[u8]) -> Result<Value> {
+    ensure!(
+        bytes.len() as u64 <= MAX_IMAGE_SOURCE_BYTES,
+        "image exceeds 64 MiB"
+    );
+    mime(bytes)?;
+    Ok(json!({
+        "inline": STANDARD.encode(bytes),
+        "sha256": format!("{:x}", Sha256::digest(bytes)),
+    }))
 }
 
 /// An explicit user image reference may name a file outside the tool workspace.
@@ -165,13 +186,13 @@ pub fn verified_bytes(reference: &Value) -> Result<(Vec<u8>, &'static str)> {
     };
     let (bytes, mime) = if let Some(encoded) = reference.get("inline").and_then(Value::as_str) {
         ensure!(
-            encoded.len() as u64 <= MAX_IMAGE_BYTES.div_ceil(3) * 4,
-            "inline image exceeds 5 MiB"
+            encoded.len() as u64 <= MAX_IMAGE_SOURCE_BYTES.div_ceil(3) * 4,
+            "inline image exceeds 64 MiB"
         );
         let bytes = STANDARD.decode(encoded)?;
         ensure!(
-            bytes.len() as u64 <= MAX_IMAGE_BYTES,
-            "inline image exceeds 5 MiB"
+            bytes.len() as u64 <= MAX_IMAGE_SOURCE_BYTES,
+            "inline image exceeds 64 MiB"
         );
         let mime = mime(&bytes)?;
         (bytes, mime)
@@ -190,14 +211,86 @@ pub fn verified_bytes(reference: &Value) -> Result<(Vec<u8>, &'static str)> {
     );
     Ok((bytes, mime))
 }
-/// Resize an image to the shared remote-input bound, preserving its source format when re-encoding.
-/// Small inputs are returned unchanged without decoding or allocating a second image buffer.
-pub fn resize_for_model(bytes: &[u8], mime: &str) -> Result<(Vec<u8>, String)> {
-    let max_dimension = super::policy::image_edge();
+/// Decoded pixels beyond this are refused before any pixel buffer is allocated.
+pub const MAX_IMAGE_PIXELS: u64 = 64 * 1024 * 1024;
+
+/// Dimensions from the container header only; nothing is decoded. Oversized canvases are refused.
+pub fn dimensions(bytes: &[u8]) -> Result<(u32, u32)> {
+    let (width, height) = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()?
+        .into_dimensions()?;
     ensure!(
-        !bytes.is_empty() && bytes.len() as u64 <= MAX_IMAGE_BYTES,
-        "image is empty or exceeds 5 MiB"
+        u64::from(width) * u64::from(height) <= MAX_IMAGE_PIXELS,
+        "image has too many pixels to decode safely"
     );
+    Ok((width, height))
+}
+
+/// Decode with the dimension and allocation limits that keep a small compressed input bounded.
+fn decode(bytes: &[u8]) -> Result<image::DynamicImage> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(16_384);
+    limits.max_image_height = Some(16_384);
+    limits.max_alloc = Some(512 * 1024 * 1024);
+    reader.limits(limits);
+    Ok(reader.decode()?)
+}
+
+/// Scale-and-encode rounds before giving up; each round keeps 3/4 of the previous edges.
+const SHRINK_ROUNDS: usize = 12;
+
+/// Bring an image within the model's edge and encoded-size bounds. An image already within both is
+/// returned unchanged. Otherwise it is decoded once (guarded by [`dimensions`]), scaled to the edge
+/// bound, and encoded in its own format when that fits; otherwise as JPEG, shrinking until it fits.
+pub fn resize_for_model(bytes: &[u8], mime: &str) -> Result<(Vec<u8>, String)> {
+    ensure!(
+        !bytes.is_empty() && bytes.len() as u64 <= MAX_IMAGE_SOURCE_BYTES,
+        "image is empty or exceeds 64 MiB"
+    );
+    let max_dimension = super::policy::image_edge();
+    let (width, height) = dimensions(bytes)?;
+    if width <= max_dimension && height <= max_dimension && bytes.len() as u64 <= MAX_IMAGE_BYTES {
+        return Ok((bytes.to_vec(), mime.to_owned()));
+    }
+    let mut decoded = decode(bytes)?;
+    if width > max_dimension || height > max_dimension {
+        decoded = decoded.resize(
+            max_dimension,
+            max_dimension,
+            image::imageops::FilterType::Lanczos3,
+        );
+    }
+    encode_within_limit(decoded, mime)
+}
+
+fn encode_within_limit(mut current: image::DynamicImage, mime: &str) -> Result<(Vec<u8>, String)> {
+    for _ in 0..SHRINK_ROUNDS {
+        let preserved = encode_as(&current, mime)?;
+        if preserved.len() as u64 <= MAX_IMAGE_BYTES {
+            return Ok((preserved, mime.to_owned()));
+        }
+        let mut jpeg = Vec::new();
+        image::DynamicImage::ImageRgb8(current.to_rgb8()).write_with_encoder(
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 85),
+        )?;
+        if jpeg.len() as u64 <= MAX_IMAGE_BYTES {
+            return Ok((jpeg, "image/jpeg".to_owned()));
+        }
+        current = shrink(&current);
+    }
+    anyhow::bail!("image cannot be reduced to 5 MiB")
+}
+
+fn shrink(image: &image::DynamicImage) -> image::DynamicImage {
+    image.resize_exact(
+        (image.width() * 3 / 4).max(1),
+        (image.height() * 3 / 4).max(1),
+        image::imageops::FilterType::Lanczos3,
+    )
+}
+
+fn encode_as(image: &image::DynamicImage, mime: &str) -> Result<Vec<u8>> {
     let format = match mime {
         "image/png" => image::ImageFormat::Png,
         "image/jpeg" => image::ImageFormat::Jpeg,
@@ -205,27 +298,52 @@ pub fn resize_for_model(bytes: &[u8], mime: &str) -> Result<(Vec<u8>, String)> {
         "image/gif" => image::ImageFormat::Gif,
         _ => anyhow::bail!("unsupported image media type"),
     };
-    let reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?;
-    let (width, height) = reader.into_dimensions()?;
-    if width <= max_dimension && height <= max_dimension {
-        return Ok((bytes.to_vec(), mime.to_owned()));
-    }
-    let decoded = image::load_from_memory_with_format(bytes, format)?;
-    let resized = decoded.resize(
-        max_dimension,
-        max_dimension,
-        image::imageops::FilterType::Lanczos3,
-    );
     let mut output = Vec::new();
-    resized.write_to(&mut std::io::Cursor::new(&mut output), format)?;
-    ensure!(
-        output.len() as u64 <= MAX_IMAGE_BYTES,
-        "resized image exceeds 5 MiB"
-    );
-    Ok((output, mime.to_owned()))
+    if format == image::ImageFormat::Jpeg {
+        image::DynamicImage::ImageRgb8(image.to_rgb8())
+            .write_to(&mut std::io::Cursor::new(&mut output), format)?;
+    } else {
+        image.write_to(&mut std::io::Cursor::new(&mut output), format)?;
+    }
+    Ok(output)
 }
 
-fn image_part(reference: &Value) -> Result<Value> {
+/// A PNG derived on this machine (rasterized SVG, video frame, PDF page) that fits the model bound.
+/// Oversized PNGs are scaled down and re-encoded as PNG so the artifact channel keeps its format.
+pub fn fit_png(png: &[u8]) -> Result<Vec<u8>> {
+    ensure!(
+        !png.is_empty() && png.len() as u64 <= MAX_IMAGE_SOURCE_BYTES,
+        "derived image is empty or exceeds 64 MiB"
+    );
+    if png.len() as u64 <= MAX_IMAGE_BYTES {
+        return Ok(png.to_vec());
+    }
+    let mut current = decode(png)?;
+    for _ in 0..SHRINK_ROUNDS {
+        current = shrink(&current);
+        let encoded = encode_as(&current, "image/png")?;
+        if encoded.len() as u64 <= MAX_IMAGE_BYTES {
+            return Ok(encoded);
+        }
+    }
+    anyhow::bail!("derived image cannot be reduced to 5 MiB")
+}
+
+/// Text-only description for a model that cannot view the image: format, dimensions, size and hash prefix.
+pub fn describe(bytes: &[u8], mime: &str) -> String {
+    let dimensions = dimensions(bytes).map_or_else(
+        |_| "unknown dimensions".to_owned(),
+        |(width, height)| format!("{width}x{height}"),
+    );
+    let digest = format!("{:x}", Sha256::digest(bytes));
+    format!(
+        "{mime}, {dimensions}, {} bytes, sha256 {}",
+        bytes.len(),
+        &digest[..12]
+    )
+}
+
+pub fn image_part(reference: &Value) -> Result<Value> {
     let (bytes, mime) = verified_bytes(reference)?;
     let (bytes, mime) = resize_for_model(&bytes, mime)?;
     Ok(
@@ -289,10 +407,17 @@ pub fn prepare(
             let path = reference["path"].as_str().unwrap_or("image");
             if !vision {
                 let reason = format!(
-                    "this model cannot view images; {path} skipped. Select a vision-capable model to inspect it"
+                    "this model cannot view images; {path} described from metadata only. Select a vision-capable model to inspect it"
                 );
                 failures.push((failure_key(reference, &reason), reason));
-                parts.push(json!({"type":"text","text":format!("[Image unavailable: {path}; model lacks vision]")}));
+                let text = match verified_bytes(reference) {
+                    Ok((bytes, mime)) => format!(
+                        "[Image {path} not viewable by this model: {}]",
+                        describe(&bytes, mime)
+                    ),
+                    Err(error) => format!("[Image unavailable: {path}; {error}]"),
+                };
+                parts.push(json!({"type":"text","text":text}));
                 continue;
             }
             match image_part(reference) {
@@ -373,3 +498,10 @@ pub fn anthropic_content(content: &Value) -> Value {
 
 #[cfg(test)]
 mod tests;
+
+/// Splits a `path?q=question` read target. The question is everything after the first `?q=`, and an
+/// empty path or question is not a question read.
+pub fn split_question(target: &str) -> Option<(&str, &str)> {
+    let (path, question) = target.split_once("?q=")?;
+    (!path.is_empty() && !question.trim().is_empty()).then_some((path, question.trim()))
+}

@@ -10,6 +10,7 @@ use super::input::{Handle, Input};
 use super::wake;
 use crate::storage::artifact::ArtifactSpool;
 use crate::tools::Workspace;
+use crate::tools::exec::shell::session::SessionClaim;
 use crate::tools::exec::shell::{ProcessGroup, shell_command_mode};
 use crate::tools::integrations::ext::ToolEvent;
 use std::collections::VecDeque;
@@ -318,6 +319,12 @@ enum ManagedProcess {
         child: crate::platform::NativePtyChild,
         terminated: bool,
     },
+    /// A native cell moved to the background. Its work runs on the job's own thread; kill raises
+    /// `cancel`, and `done` is set once the work has finished.
+    Cell {
+        cancel: Arc<AtomicBool>,
+        done: Arc<AtomicBool>,
+    },
 }
 impl ManagedProcess {
     fn id(&self) -> u32 {
@@ -325,11 +332,13 @@ impl ManagedProcess {
             Self::Group(group) => group.child.id(),
             #[cfg(windows)]
             Self::Pty { child, .. } => child.id(),
+            Self::Cell { .. } => 0,
         }
     }
     fn terminate(&mut self) {
         match self {
             Self::Group(group) => group.terminate(),
+            Self::Cell { cancel, .. } => cancel.store(true, Ordering::Release),
             #[cfg(windows)]
             Self::Pty { child, terminated } => {
                 if !*terminated {
@@ -342,6 +351,7 @@ impl ManagedProcess {
     fn exited(&mut self) -> io::Result<bool> {
         match self {
             Self::Group(group) => group.exited(),
+            Self::Cell { done, .. } => Ok(done.load(Ordering::Acquire)),
             #[cfg(windows)]
             Self::Pty { child, .. } => child.try_wait().map(|status| status.is_some()),
         }
@@ -349,6 +359,7 @@ impl ManagedProcess {
     fn wait(&mut self) -> io::Result<ExitStatus> {
         match self {
             Self::Group(group) => group.child.wait(),
+            Self::Cell { .. } => Err(io::Error::other("cell has no process status")),
             #[cfg(windows)]
             Self::Pty { child, .. } => child.wait(),
         }
@@ -359,6 +370,14 @@ impl ManagedProcess {
             child.close_output();
         }
     }
+}
+
+/// Work moved to the background from a native cell. The worker receives the cancel flag that kill
+/// raises and returns the text the job keeps as its output.
+pub struct CellJob {
+    pub command: String,
+    pub network: bool,
+    pub work: Box<dyn FnOnce(Arc<AtomicBool>) -> String + Send>,
 }
 pub(super) struct Proc {
     pub(super) name: String,
@@ -378,6 +397,8 @@ pub(super) struct Proc {
     /// Started by a `bash` call that moved to the background (not an explicit `bg start`).
     /// Only these are awaited at turn end and block `finish`.
     adopted: bool,
+    /// Named shell session this job holds busy; settled when the process exits or is removed.
+    session: Option<SessionClaim>,
 }
 
 impl Proc {
@@ -557,6 +578,7 @@ impl Proc {
             notice_cursor: 0,
             completion_notified: false,
             adopted: false,
+            session: None,
         })
     }
 
@@ -596,10 +618,14 @@ impl Proc {
         self.stop.store(true, Ordering::Release);
         self.input.take();
         let status = self.group.wait().ok();
-        let detail = failure.unwrap_or_else(|| {
-            status
-                .map(describe)
-                .unwrap_or_else(|| "status unavailable".into())
+        let clean = failure.is_none() && status.as_ref().is_some_and(ExitStatus::success);
+        if let Some(claim) = self.session.take() {
+            claim.settle(clean);
+        }
+        let detail = failure.unwrap_or_else(|| match status {
+            Some(status) => describe(status),
+            None if matches!(self.group, ManagedProcess::Cell { .. }) => "completed".into(),
+            None => "status unavailable".into(),
         });
         self.state = State::Exited {
             at: Instant::now(),
@@ -677,6 +703,7 @@ impl Proc {
                 lock(&self.ring).resize_screen(rows, cols);
                 Ok(None)
             }
+            ManagedProcess::Cell { .. } => Err("resize requires a PTY process".into()),
             ManagedProcess::Group(_) => Ok(Some(PendingResize {
                 input: self.input.clone().ok_or("resize requires a PTY process")?,
                 ring: self.ring.clone(),
@@ -909,8 +936,17 @@ impl Table {
         &mut self,
         job: crate::tools::exec::shell::ForegroundJob,
     ) -> Result<String, String> {
-        let (workspace, command, _, child, reader, captured, captured_total, spool) =
-            job.into_parts();
+        let crate::tools::exec::shell::ForegroundParts {
+            workspace,
+            command,
+            child,
+            reader,
+            captured,
+            captured_total,
+            spool,
+            mut session,
+            ..
+        } = job.into_parts();
         let group = ManagedProcess::Group(ProcessGroup::new(child));
         self.refresh();
         if self.running() >= MAX_PROCESSES {
@@ -931,6 +967,9 @@ impl Table {
             .map_err(|error| format!("starting adopted output reader: {error}"))?;
         let pid = group.id();
         wake::watch_exit(pid);
+        if let Some(claim) = session.as_mut() {
+            claim.mark(&name);
+        }
         let proc = Proc {
             name: name.clone(),
             command,
@@ -947,6 +986,7 @@ impl Table {
             notice_cursor: 0,
             completion_notified: false,
             adopted: true,
+            session,
         };
         self.prune_finished();
         self.procs.push(proc);
@@ -954,6 +994,63 @@ impl Table {
             kind: "start".into(),
             name: name.clone(),
             text: format!("adopted foreground process (pid {pid})"),
+            artifact: None,
+        });
+        Ok(name)
+    }
+
+    /// Take ownership of a native cell's work; its output and completion are reported like a process's.
+    pub(super) fn adopt_cell(&mut self, job: CellJob) -> Result<String, String> {
+        self.refresh();
+        if self.running() >= MAX_PROCESSES {
+            return Err(format!(
+                "{MAX_PROCESSES} background processes are already running; cannot move the cell to the background"
+            ));
+        }
+        let name = self.fresh_name();
+        let ring = Arc::new(Mutex::new(Ring::new(MAX_BUFFER)));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let worker = (job.work, ring.clone(), cancel.clone(), done.clone());
+        let reader = std::thread::Builder::new()
+            .name("dial-bg-cell".into())
+            .spawn(move || {
+                let (work, ring, cancel, done) = worker;
+                let text = work(cancel);
+                {
+                    let mut ring = lock(&ring);
+                    ring.push(text.as_bytes());
+                    ring.reached_eof = true;
+                    ring.closed = true;
+                }
+                done.store(true, Ordering::Release);
+                wake::notify();
+            })
+            .map_err(|error| format!("starting background cell: {error}"))?;
+        let proc = Proc {
+            name: name.clone(),
+            command: job.command,
+            pid: 0,
+            group: ManagedProcess::Cell { cancel, done },
+            ring,
+            started: Instant::now(),
+            state: State::Running,
+            stop: Arc::new(AtomicBool::new(false)),
+            reader: Some(reader),
+            input: None,
+            terminal: false,
+            network: job.network,
+            notice_cursor: 0,
+            completion_notified: false,
+            adopted: true,
+            session: None,
+        };
+        self.prune_finished();
+        self.procs.push(proc);
+        self.notice(ToolEvent {
+            kind: "start".into(),
+            name: name.clone(),
+            text: "moved eval cell to the background".into(),
             artifact: None,
         });
         Ok(name)

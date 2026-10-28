@@ -6,6 +6,7 @@ fn query(recency: Option<Recency>) -> Query<'static> {
         text: "a+b c",
         limit: 4,
         recency,
+        filter: &super::super::domains::UNFILTERED,
         today: 19_723,
     }
 }

@@ -83,7 +83,7 @@ pub struct Signals {
 const VAR_LIMIT: usize = 200;
 
 /// Tracks what the terminal currently shows and writes the difference.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SignalWriter {
     caps: Integration,
     host: String,
@@ -122,7 +122,28 @@ impl SignalWriter {
 
     /// The bytes that move the terminal from what it shows to `want`.
     pub fn update(&mut self, want: &Signals) -> String {
-        let want = self.supported(want);
+        let (out, next) = self.prepare(Some(want));
+        self.accept(next);
+        out
+    }
+
+    /// Stage a diff without advancing the cache before an asynchronous frame is accepted.
+    pub(crate) fn prepare(&self, want: Option<&Signals>) -> (String, Signals) {
+        let next = want.map_or_else(
+            || Signals {
+                cwd: self.sent.cwd.clone(),
+                ..Signals::default()
+            },
+            |want| self.supported(want),
+        );
+        (self.diff(&next), next)
+    }
+
+    pub(crate) fn accept(&mut self, next: Signals) {
+        self.sent = next;
+    }
+
+    fn diff(&self, want: &Signals) -> String {
         let caps = self.caps;
         let mut out = String::new();
         if caps.tab_color && want.activity.tab_rgb() != self.sent.activity.tab_rgb() {
@@ -155,39 +176,19 @@ impl SignalWriter {
             // tmux keeps the pane's directory from OSC 7 itself, so it is never wrapped.
             out.push_str(&format!("\x1b]7;{url}\x1b\\"));
         }
-        self.sent = want;
         out
     }
 
     /// The bytes that restore tab color, progress, attention and variables, without recording it
     /// (the panic hook writes this).
     pub fn reset_sequence(&self) -> String {
-        let mut target = Signals {
-            cwd: self.sent.cwd.clone(),
-            ..Signals::default()
-        };
-        // Cleared variables are written as empty values rather than left behind.
-        target.vars = self
-            .sent
-            .vars
-            .iter()
-            .map(|(name, _)| (*name, String::new()))
-            .collect();
-        let mut probe = SignalWriter {
-            caps: self.caps,
-            host: self.host.clone(),
-            sent: self.sent.clone(),
-        };
-        probe.update(&target)
+        self.prepare(None).0
     }
 
     /// Restore the terminal and record that it shows nothing of Dial's.
     pub fn reset(&mut self) -> String {
-        let out = self.reset_sequence();
-        self.sent = Signals {
-            cwd: self.sent.cwd.take(),
-            ..Signals::default()
-        };
+        let (out, next) = self.prepare(None);
+        self.accept(next);
         out
     }
 

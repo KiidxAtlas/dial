@@ -340,7 +340,7 @@ fn request_inner(
         if let Some(effort) = profile.reasoning_effort.or_else(|| {
             (profile.thinking == Some(false)).then_some(super::profiles::ReasoningEffort::None)
         }) {
-            body["reasoning"] = json!({"effort":effort.as_str()});
+            body["reasoning"] = json!({"effort":profile.reasoning_effort_wire(effort)});
         }
         if let Some(tier) = profile.request_tiers.service_tier_for(&profile.provider) {
             body["service_tier"] = json!(tier);
@@ -476,6 +476,8 @@ fn reply_from_output(response: &Value, partial: bool) -> Result<Reply> {
                     }
                 }
             }
+            // Built-in web search runs inside the provider; it is kept as native output, never executed locally.
+            Some("web_search_call") => {}
             _ => bail!("Responses returned an unsupported output item"),
         }
         // Preserve native IDs, call namespaces and encrypted reasoning for the next HTTP request.
@@ -490,12 +492,28 @@ fn reply_from_output(response: &Value, partial: bool) -> Result<Reply> {
     reply.reasoning_tokens = usage["output_tokens_details"]["reasoning_tokens"].as_u64();
     Ok(reply)
 }
+/// An image turn accepts exactly one completed hosted image, never a partial preview.
+fn completed_image(response: &Value) -> Result<Reply> {
+    let mut response = response.clone();
+    let output = response["output"].as_array_mut().context("Responses completion has no output array")?;
+    let images: Vec<_> = output.iter().filter(|item| item["type"] == "image_generation_call").cloned().collect();
+    ensure!(images.len() == 1, "Responses image generation must return exactly one image");
+    let image = &images[0];
+    ensure!(image["status"] == "completed" && image["result"].as_str().is_some_and(|s| !s.is_empty()),
+        "Responses image generation is unfinished or has no image data");
+    output.retain(|item| item["type"] != "image_generation_call");
+    let mut reply = completed(&response)?;
+    reply.provider_content.push(json!({"type":"dial_response_item", "item":image}));
+    Ok(reply)
+}
+
 #[derive(Default)]
 pub(super) struct Accumulator {
     calls: BTreeMap<u64, (String, String)>,
     added: std::collections::HashSet<u64>,
     finished: BTreeMap<u64, Value>,
     result: Option<Reply>,
+    image_generation: bool,
 }
 impl Accumulator {
     pub(super) fn feed(
@@ -594,7 +612,11 @@ impl Accumulator {
                     );
                     response["output"] = json!(self.finished.values().collect::<Vec<_>>());
                 }
-                self.result = Some(completed(&response)?);
+                self.result = Some(if self.image_generation {
+                    completed_image(&response)?
+                } else {
+                    completed(&response)?
+                });
                 return Ok(true);
             }
             Some(kind @ ("response.failed" | "response.incomplete" | "error")) => {
@@ -609,6 +631,7 @@ impl Accumulator {
                     .and_then(Value::as_str)
                     .unwrap_or("");
                 if kind == "response.incomplete"
+                    && !self.image_generation
                     && reason == "max_output_tokens"
                     && code.is_empty()
                     && let Ok(reply) = self.truncated_reply(&event["response"])
@@ -682,7 +705,7 @@ type OnText<'a> = Option<&'a mut dyn FnMut(&str) -> bool>;
 
 /// Responses authentication and routing travel together; account IDs are only sent for Codex.
 #[derive(Clone, Copy)]
-pub(super) struct Endpoint<'a> {
+pub struct Endpoint<'a> {
     pub url: &'a str,
     pub token: &'a str,
     pub account_id: Option<&'a str>,
@@ -785,6 +808,24 @@ pub(super) fn exchange_codex(
         session_key,
     )
 }
+
+/// Grounded search turns the caller built; the stream is read by the same parser as chat turns.
+pub(super) fn exchange_codex_body(
+    endpoint: Endpoint<'_>,
+    body: &Value,
+    timeout: u64,
+    interrupt: Arc<AtomicBool>,
+) -> Result<Reply> {
+    stream_body(
+        endpoint,
+        body,
+        timeout,
+        &mut None,
+        interrupt,
+        &mut |_: &StreamEvent| true,
+        None,
+    )
+}
 fn exchange_inner(
     endpoint: Endpoint<'_>,
     chat: &Chat,
@@ -798,10 +839,9 @@ fn exchange_inner(
 ) -> Result<Reply> {
     let Endpoint {
         url,
-        token,
         account_id: codex_account_id,
         model,
-        headers: custom_headers,
+        ..
     } = endpoint;
     let replay_scope = validate_history(endpoint, chat)?;
     let mut body = if codex_account_id.is_some() {
@@ -817,6 +857,64 @@ fn exchange_inner(
     if codex_account_id.is_none() {
         apply_api_prompt_cache(&mut body, profile, url);
     }
+    let mut reply = stream_body(
+        endpoint,
+        &body,
+        timeout,
+        on_text,
+        interrupt,
+        on_event,
+        session_key,
+    )?;
+    stamp_history(&mut reply, &replay_scope);
+    Ok(reply)
+}
+
+/// Sends a prebuilt Responses body on the ChatGPT Codex path and reads it with the shared parser.
+fn stream_body(
+    endpoint: Endpoint<'_>,
+    body: &Value,
+    timeout: u64,
+    on_text: &mut OnText<'_>,
+    interrupt: Arc<AtomicBool>,
+    on_event: &mut dyn FnMut(&StreamEvent) -> bool,
+    session_key: Option<&str>,
+) -> Result<Reply> {
+    stream_body_inner(endpoint, body, timeout, on_text, interrupt, on_event, session_key, false)
+}
+
+/// Execute an approved image-only turn through the ordinary Responses transport.
+/// The caller owns account/origin validation and approval; this never retries or falls back.
+///
+/// # Errors
+/// Fails on transport errors, unfinished responses, missing or multiple images.
+pub fn generate_image(endpoint: Endpoint<'_>, body: &Value, timeout: u64) -> Result<String> {
+    let reply = stream_body_inner(endpoint, body, timeout, &mut None,
+        Arc::new(AtomicBool::new(false)), &mut |_| true, None, true)?;
+    reply.provider_content.iter()
+        .find(|part| part["item"]["type"] == "image_generation_call")
+        .and_then(|part| part["item"]["result"].as_str())
+        .map(str::to_owned)
+        .context("Responses returned no completed image")
+}
+
+fn stream_body_inner(
+    endpoint: Endpoint<'_>,
+    body: &Value,
+    timeout: u64,
+    on_text: &mut OnText<'_>,
+    interrupt: Arc<AtomicBool>,
+    on_event: &mut dyn FnMut(&StreamEvent) -> bool,
+    session_key: Option<&str>,
+    image_generation: bool,
+) -> Result<Reply> {
+    let Endpoint {
+        url,
+        token,
+        account_id: codex_account_id,
+        model,
+        headers: custom_headers,
+    } = endpoint;
     let patience = Patience::for_stream(
         timeout,
         super::host_of(url).is_some_and(|h| super::is_local_host(&h)),
@@ -923,13 +1021,14 @@ fn exchange_inner(
                 .eq_ignore_ascii_case("text/event-stream"))),
         "ChatGPT Responses requires an SSE stream"
     );
-    let mut accumulator = Accumulator::default();
+    let mut accumulator = Accumulator { image_generation, ..Default::default() };
     super::stream::read_events_with_progress(
         response.body_mut().as_reader(),
         super::MAX_STREAM_BYTES,
-        super::stream::MAX_LINE_BYTES,
+        if image_generation { super::MAX_STREAM_BYTES } else { super::stream::MAX_LINE_BYTES },
         patience,
-        advances_reply,
+        |data| advances_reply(data) || (image_generation && serde_json::from_str::<Value>(data).ok()
+            .and_then(|v| v["type"].as_str().map(|s| s.starts_with("response.image_generation_call."))) == Some(true)),
         |data| {
             accumulator.feed(
                 data,
@@ -945,8 +1044,7 @@ fn exchange_inner(
             super::response_error(e, Some(token))
         }
     })?;
-    let mut reply = accumulator.finish()?;
-    stamp_history(&mut reply, &replay_scope);
+    let reply = accumulator.finish()?;
     Ok(reply)
 }
 

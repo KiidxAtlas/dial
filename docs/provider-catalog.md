@@ -82,6 +82,12 @@ are served by dial's own MLX server (so LoRA training applies), and running LM S
 servers on their usual loopback ports. It also discovers OpenAI-compatible endpoints and Anthropic's
 Messages API. OpenAI, Anthropic, Google Gemini, OpenRouter, Groq, Mistral and DeepSeek have setup presets.
 
+SambaNova (`SAMBANOVA_API_KEY`, `https://api.sambanova.ai/v1`) and Inception (`INCEPTION_API_KEY`, `https://api.inceptionlabs.ai/v1`) are OpenAI-compatible chat-completions providers with bundled model cards (SambaNova `gpt-oss-120b`; Inception `mercury-2`, `mercury-2.5`, `mercury-3`). Inception's `minimal` reasoning rung is sent on the wire as `instant` (declared per model by the catalog's `m` effort-wire map); `low`, `medium` and `high` send their own names.
+
+TypeSafe System One is a judgment-only backend, not a chat provider. Assign it to the `judge` role (`provider = "typesafe"`, `model = "jev-latest"` by default) and set `TYPESAFE_API_KEY`; `TYPESAFE_BASE_URL` overrides `https://api.typesafe.ai`. Thinking judgments then POST `{base}/v1/systemone` with a typed `choice` question. A missing key is reported when a judgment runs; it is never silently replaced by another model.
+
+**GitLab Duo Agent** (`gitlab-duo-agent`, protocol `gitlab-duo-agent`, `https://gitlab.com`) runs GitLab's Duo Agent Platform workflows over a WebSocket. Authenticate with `GITLAB_TOKEN` (personal access token with `api` scope) or the `gitlab-duo-agent` OAuth sign-in. Set `GITLAB_DUO_PROJECT` to a full project path (`group/subgroup/project`) to choose the project; when unset, Dial uses the first project where the user has Developer or higher access. Nested projects resolve their root group from the namespace's full path. Dial creates a workflow for the conversation and streams the agent's checkpoint text as it arrives. Server-side `runMCPTool` actions become ordinary Dial tool calls, so approvals, sandbox confinement and tool output apply unchanged; results return to the same workflow. Workflow approval statuses that carry a tool action surface as that tool call through the normal approval gate, and a denial is sent back as the tool result. An approval status with no tool action still fails the turn. Workflows are reused across turns of one session. Resetting, cancelling or forgetting a session sends a best-effort REST stop (5-second cap) before closing the socket. Step-limit and transient "Duo Agent Platform" errors restart the workflow with the transcript (at most four step-limit restarts and one transient retry); text already streamed in the turn is not repeated after a restart.
+
 **Local model formats.** Dial detects the format from the files in the model directory. Both formats share the local route
 (`provider = "mlx"` in configuration), but `/models` names GGUF entries `gguf/…` and its detail line names the serving
 runtime; a GGUF entry's source notes when `llama-server` is not installed yet.
@@ -246,6 +252,27 @@ explicitly rebind portable history). Rotation also requires compatible cached mo
 unless an explicit configured model profile supplies the request contract. Account allowlists and
 native replay validation still apply.
 
+Other OAuth providers can store several grants. Each grant is one account, keyed by its account ID,
+else its email, else `account-N`. The first account added is active. Selection is per session and
+sticky: a session keeps its account until a failure rotates it. On a rate limit, quota exhaustion,
+or a rejected credential, the failed account cools down for its retry-after time (or the default
+cooldown) and the session moves to the next usable account in key order, when
+`retry.rotate_accounts` is enabled. When every account cools down, the request fails with the
+provider's error. Refreshing a grant holds a per-account file lock, so concurrent processes refresh
+one at a time and reuse the result. Existing single-grant `oauth-<provider>.json` files load as a
+one-account store and are rewritten in the multi-account shape on the next save. The ChatGPT
+`chatgpt-accounts.json` file already uses that shape and is unchanged.
+
+Manage those accounts from `/providers`. For an OAuth provider with a stored grant, choose **Manage
+<provider> accounts**: each account has **Use** (make it the account new sessions start on) and
+**Remove** rows, and **Add another <provider> account** starts a sign-in that adds one more grant.
+Removing the last account deletes the provider's grant file, as **Sign out of <provider>** does. The
+same operations are available from the shell: `dial auth accounts <provider>` (or
+`dial auth accounts <provider> list`, with `--json` for scripts) lists accounts and marks the active
+one and any cooling down, `dial auth accounts <provider> select <key>` makes an account active, and
+`dial auth accounts <provider> remove <key>` removes one. Use the keys that `list` prints. ChatGPT
+accounts are managed in its own rows above and are not part of these commands.
+
 Dial combines the account model list with visible models in a recent local Codex model metadata
 cache, when present, so newly released models can appear before the account list catches up.
 Those additions are labeled **Codex catalog**; their first completed request verifies account access.
@@ -283,6 +310,10 @@ For a server started with several slots (for example `llama-server --parallel 4`
 `task.provider_concurrency.<provider> = 4`.
 
 Use any OpenAI-compatible server instead of the local MLX model (LM Studio, Ollama, llama.cpp, a hosted API): `dial --endpoint http://localhost:1234/v1 --api-key-env KEY -m <model-name>`. Weight updates need the local MLX model.
+
+## Reasoning effort wire mapping
+
+A model's `m` (`reasoning_effort_wire`) map sends a declared effort under a provider-specific name, for example Inception's `minimal` → `instant`. The mapping applies to every request that carries an effort value: chat-completions `reasoning_effort`, Responses `reasoning.effort`, Gemini `thinkingLevel`, Bedrock `output_config.effort` and Ollama `think`. Efforts without an entry send their Dial name unchanged.
 
 ## Local MLX runtime tuning and cost accounting
 

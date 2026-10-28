@@ -18,7 +18,7 @@ pub mod dictation;
 pub mod endpointer;
 pub mod gesture;
 pub mod live;
-mod process;
+pub(crate) mod process;
 pub mod speakable;
 pub mod stt;
 pub mod tool;

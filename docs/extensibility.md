@@ -16,9 +16,128 @@ Supported lifecycle points include user prompt submission, session start/end, be
 
 Runtime plugins are operator-installed stdio programs: those declared under `[extensions.plugins.<name>]` and those installed with `dial plugin install` (started from the user `plugins` directory). Dial does not scan `~/.dial/extensions` or the project for plugin executables, so no project-local extension runs without an explicit configuration entry. Plugins communicate using JSON-RPC messages over stdio and may register tools, commands, shortcuts and flags, update active tools, and observe lifecycle events. They run with the privileges of the Dial process; only install code you trust. The Rust SDK is for embedding trusted native integrations and does not bypass tool approvals or workspace controls. Plugins and skills offered by marketplaces are found and installed in `/extensions`; see Marketplaces below.
 
+### Commands and declarative panels
+
+A stdio plugin advertises slash-command names in its `initialize` result, for example
+`{"commands":["demo"]}`. Command-only plugins need no event subscription. Names are nonempty ASCII
+graphic strings of at most 48 bytes, without a leading `/`. Commands appear in action navigation;
+built-ins keep precedence. Invocation sends `command` with `{"name":"demo","args":"..."}`.
+
+The result may contain `{"text":"..."}` or a `panel`:
+
+```json
+{
+  "panel": {
+    "title": "Review choice",
+    "generation": 7,
+    "elements": [
+      {"type": "input", "id": "name", "label": "Name", "value": ""},
+      {"type": "select", "id": "mode", "label": "Mode", "options": ["fast", "safe"], "selected": 1},
+      {"type": "button", "id": "save", "label": "Save", "primary": true}
+    ]
+  }
+}
+```
+
+Elements are `text`, `markdown` (wrapped source), `list`, `input`, `select` and `button`. A panel
+requires a title and a button. The layout budget is 64 widgets plus nested list rows/select choices;
+each author-supplied string is limited to 2048 bytes. Interactive IDs must be unique, at most 64
+ASCII letters, digits, `_` or `-`; selects require a valid starting option. Invalid layouts are
+refused rather than partially displayed.
+
+The UI owns focus, editing and cancellation. Closing sends `command.panel` with the command name,
+the opened `generation`, and an `outcome`: `{"status":"submitted","button":"save","values":{"name":"Ada","mode":1}}`,
+`{"status":"cancelled"}`, or `{"status":"unsupported","reason":"..."}` for a surface without panels.
+Input values are strings; select values are zero-based indexes. The close reply may contain text.
+Requests still use plugin timeout/cancellation and loaded-plugin checks; an unloaded plugin does
+not receive a fabricated successful close. Embedders use the same `Panel`/`Outcome` contract
+through `Ui::run_panel`. A panel outcome is human input, never tool approval or an expanded grant.
+
+### Protocol 2: capabilities, actions and UI slots
+
+The host's `initialize` request sends `protocolVersion: "2"`, `supportedProtocolVersions: ["1","2"]`,
+and an empty `capabilities` object. A plugin that answers with `"protocolVersion": "2"` and a
+`capabilities` array of names opts in. Plugins that omit the version, or answer `"1"`, stay legacy:
+they keep hooks, commands and panels, and any `actions` or `ui` entries they return are refused with
+a notice. An unsupported version fails startup. Unknown capability names are ignored.
+
+Protocol 2 replies may contain an `actions` array. Each entry needs a `type` and the capability it
+requires; an entry without its capability is refused with a notice while other entries still apply.
+
+- `ui` with `slot` (`status`, `header`, `footer`, `title`) and `lines`: display-only text, sanitized
+  (control sequences removed, newlines flattened) and clamped to 240 characters per line. Status and
+  title take one line; header and footer take up to 8. An empty `lines` clears the slot. Capabilities:
+  `ui.status`, `ui.header`, `ui.footer`, `ui.title`. Placement: header rows sit above the composer;
+  status and footer rows sit below it; a title replaces the session title in the terminal title.
+  Empty slots take no rows. When several plugins set a title, the first one wins.
+- `send_user_message` `{text}` (`actions.send_user_message`), `append_entry` `{kind,text}`
+  (`actions.append_entry`), `set_model` `{model,effort?}` (`actions.set_model`), `set_thinking`
+  `{effort}` (`actions.set_thinking`), `register_provider` `{name,config}` and `unregister_provider`
+  `{name}` (`actions.register_provider`, `actions.unregister_provider`). Names are ASCII letters,
+  digits and `._-/:`, at most 64 characters. Messages are capped at 256 KiB and entries at 64 KiB.
+  Replies carry at most 16 actions.
+
+Actions are requests, not commands. They are applied at the idle boundary, never mid-turn. Before
+applying one, Dial shows an approval prompt that names the plugin and the exact change. These require
+approval (Allow once or Deny): `send_user_message`, `set_model`, `set_thinking`, `register_provider` and
+`unregister_provider`. `append_entry` needs none. A declined action is reported as a notice and dropped.
+Model and thinking changes are session-only. Provider changes are saved to the global settings like a
+manual change. The provider prompt shows the endpoint and the name of the environment variable that
+holds the key, never the key or header values. A key given as a literal value is refused, and the
+refusal does not echo it.
+
+`append_entry` may carry an optional `renderer`: `{title?, fields?: [{label,value}], markdown?}`, with at
+most 12 fields and 4 KiB of markdown. Dial shows it as a transcript notice titled by `title` (default
+`<plugin>: <kind>`): fields first, then the markdown text. Markdown is shown as plain text and is never
+interpreted. Without a renderer the sanitized `text` is the body. Entries are recorded in the session
+under the `plugin.entry` custom type, which model context never reads. When a session is resumed, each
+entry is rebuilt into the transcript between the messages it followed, through the same renderer.
+
+Editor-mode contributions are not supported. Composer keystrokes, including typed secrets, would have to
+route to an external process, and protocol 2 has no declarative form that keeps them out.
+
+Autocomplete: a plugin that declares `autocomplete` receives `autocomplete` with `{"query":"..."}`
+and replies `{"items":[{"value","label?","description?"}]}`. At most 20 suggestions are shown, and
+empty values are dropped. Suggestions appear in the slash-command menu as extension commands while the
+command name is typed; built-in commands win on a name collision. A value with whitespace is kept and
+inserted single-quoted, as one shell word. Lookups run on a worker, bounded by the plugin timeout, and
+answers for a query the user has moved past are discarded, so a slow plugin never delays typing.
+
+Observational events are delivered in order on a background worker to protocol 2 plugins that list
+them in `events`. Each payload is a JSON object that carries `session_id`. Their replies may carry
+actions and UI slots but cannot block or rewrite the agent. A full queue of 256 drops events with a
+notice. Text fields are truncated to 8000 characters.
+
+- `turn_start` `{session_id, prompt}`: before `user_prompt_submit` hooks run; `prompt` is the original message.
+- `turn_end` `{session_id, outcome, steps, interrupted}`: once per turn, after the outcome is settled.
+- `message_start` `{session_id, step}`: before each model request.
+- `message_end` and `tool_call`/`tool_result` are not observer events: they are aliases of the blocking
+  hooks `assistant_message`, `pre_tool_use` and `post_tool_use`. Subscribe to those hook names to see
+  them; each is delivered once, through the blocking path, with its payload `{session_id, step, text, tool_calls}`
+  (`message_end`) or `{session_id, call_id, name, arguments}` / `{session_id, call_id, name, is_error, output}`.
+- `mode_changed` `{session_id, mode, enabled}`: when plan mode flips (`mode` is `"plan"`).
+- `model_changed` `{session_id, provider, model}`: after a model switch, including on session resume.
+- `mcp_notification` `{session_id, server, kind, added?, removed?, changed?, error?}`: an MCP change. `kind` is one of `tools_changed`, `tools_refreshed`, `tools_refresh_failed`, `prompts_changed`, `resources_changed`, or `resource_updated`. `added`, `removed`, and `changed` list tool names on `tools_refreshed`; `error` is set on `tools_refresh_failed`.
+
+Hook-alias names listed in `events` are delivered by the blocking path only, so the observer queue
+never sends them. Blocking hook events keep their synchronous `rewrite` contract.
+
+`user_prompt_submit` accepts a reply `{"prompt":"..."}` that replaces the user message for later hooks
+and the model request. The replacement must be non-empty and at most 256 KiB, or the turn fails.
+Approval events fire only from the turn's own UI reducer, so they cover the parent agent's tool calls
+(child workers are not observed).
+- `message_update` `{session_id, text}`: the accumulated answer text of the current assistant message.
+  Sent at most ten times a second, with the final text delivered before `message_end`. Text from a
+  discarded attempt is never sent. Subscribe only when you need streaming; other observers pay nothing.
+- `tool_approval_requested` `{session_id, call_id, name}`: a user prompt for a tool call is about to show.
+- `tool_approval_resolved` `{session_id, call_id, name, decision, source}`: the call was decided. `source`
+  is `user` after a prompt, or `rule` when a permission rule decided it without a prompt (no matching
+  requested event). `decision` is `allow`, `allow_always`, `allow_project` or `deny`; rule decisions are
+  `allow` or `deny`.
+
 ## Context and skills
 
-Instruction files such as `AGENTS.md` and `CLAUDE.md` are discovered from the project hierarchy. `@path` references in a user message are expanded into read-only, size-limited content confined to the project root (absolute, `..` and escaping symlinks are refused); instruction files themselves are not expanded. Dial also discovers supported context, command, and skill files from common coding-agent directories (including `.claude`, `.codex`, `.gemini`, `.cursor`, `.windsurf`, `.cline`, and `.github`). These files are model context, not executable configuration.
+Instruction files such as `AGENTS.md` and `CLAUDE.md` are discovered from the project hierarchy. Instruction files may import others with `@path` (for example `@docs/style.md`): imports expand in place inside an `<import file="…">` block naming their source, at most 5 levels deep, 32 imports per file, and 32 KiB per file. Targets must stay inside the project tree or the home directory; cycles, escapes (including symlinks), and `@` tokens inside fenced or inline code are left as written or refused with a visible `[@path not imported: …]` marker. `@path` references in a user message are expanded into read-only, size-limited content confined to the project root (absolute, `..` and escaping symlinks are refused). Dial also discovers supported context, command, and skill files from common coding-agent directories (including `.claude`, `.codex`, `.gemini`, `.cursor`, `.windsurf`, `.cline`, and `.github`). These files are model context, not executable configuration.
 
 ## Skill packages
 
@@ -261,6 +380,7 @@ requests. A turn's observed-cost allowance is shared across automatic verificati
 stop-hook continuations and auxiliary work; continuations do not reset it. These are observed-cost
 boundaries, not invoice ceilings: missing pricing/usage and in-flight requests can add charges.
 A model without known pricing cannot be stopped by an estimated charge (`/cost` shows pricing availability).
+`[budget] warn_session_cost_usd` and `warn_turn_cost_usd` only notify: each warns once when spend first reaches the threshold, never stops work, and is read from the live configuration. Session spend includes subagents, since they charge the same ledger.
 
 **Custom agents.** `[agents.<name>]` with `base` (`scout`, `reviewer` or `planner`), `prompt`,
 optional `description`, `tools` (can only narrow the base's tools) and `max_steps`. Writers are not
@@ -353,6 +473,10 @@ server that asks for an OAuth sign-in; the user then runs `/mcp login <name>`. A
 next session; `/mcp` shows its status. Smithery servers still install through their settings form
 (`/extensions` → `i`, or `/mcp smithery-install`). Archived upstream packages (Brave, Slack,
 GitLab, Puppeteer) are listed with that note because they still install.
+
+MCP lists refresh while the session runs. A server that sends `notifications/tools/list_changed`, `resources/list_changed`, or `prompts/list_changed` is re-listed once: tool announcements are debounced for 100 ms and a refresh that is already running is not repeated, so a burst of announcements costs one `tools/list`. Tools change only at the next model request, never mid-request. A tool the server removed refuses calls with "removed by its server", and a tool whose definition changed gets a new identity and is offered from the next request. A failed re-list keeps the previous list and shows a notice. Each session keeps at most 64 pending events and 16 notices, dropping the oldest first; hook plugins that observe `mcp_notification` receive these events. Resource and prompt listings are cached until the server announces a change.
+
+`/mcp prompt <server> <name> [key=value…]` fetches a prompt and puts its rendered messages in the composer for review; it is not sent. Arguments are split like shell words, so a value with spaces can be quoted (`topic="release notes"`); an unclosed quote or an argument without `=` is rejected with the usage line. Non-text content is shown as `[<type> content omitted]`. Output is sanitized before it reaches the composer. The fetch runs as a background job, so the UI stays responsive; when it finishes, the prompt is appended below any draft already in the composer. Cancel it with the usual job cancel, and only one background operation runs at a time.
 
 ## Structural guidance
 

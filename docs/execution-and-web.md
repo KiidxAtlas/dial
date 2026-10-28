@@ -24,11 +24,22 @@ retention caps can remove the middle of a stream even when capture reached EOF.
 
 ## Persistent kernels and evaluation
 
-Python kernels retain their namespace between successful cells. Interrupting a running cell first sends SIGINT; an interrupt that does not unwind within five seconds escalates to terminating the kernel. Failed transport, cancellation and timeout paths discard the namespace. Effects already performed remain; loss of the final cell result is recorded as uncertain. Kernel interpreters may be selected from the project virtual environment (`.venv`/`VIRTUAL_ENV`) or conda environment when configured/approved, but execution remains subject to the mandatory process-creation fence.
+The `eval` tool runs persistent cells in two languages selected by `language`: `js` (the default) and `py`. Each language keeps its own namespace between successful cells. Recorded `kernel` calls from earlier sessions replay as `eval` Python cells. Interrupting a running Python cell first sends SIGINT; an interrupt that does not unwind within five seconds escalates to terminating the kernel. Failed transport, cancellation and timeout paths discard the namespace. Effects already performed remain; loss of the final cell result is recorded as uncertain. Python interpreters may be selected from the project virtual environment (`.venv`/`VIRTUAL_ENV`) or conda environment when configured/approved, but execution remains subject to the mandatory process-creation fence. The cell deadline pauses while a tool callback requested by the cell is running, so callback time is not charged to the cell.
 
-`kernel` supports macOS process-fork containment and the Windows native no-child-process mitigation;
+### Backgrounding `eval` cells and named `bash` sessions
+
+An `eval` cell that is still running after the `[shell] auto_background_secs` threshold (default 15; `0` disables it) moves to the background. The threshold is measured from the start of the cell, including runtime startup. `background: true` starts the cell in the background at once; `background: false` keeps it in the foreground for its whole run. `title` (at most 256 bytes) labels the job.
+
+A moved cell is a `bg` job: read it with `output`, wait for it with `wait`, or stop it with `kill`, and it appears in `list`. Its runtime stays busy until the cell finishes; a foreground `eval` on the same runtime is refused with `runtime busy in background job <id>`. Host tool callbacks from a moved cell are refused with "this cell was moved to the background; host tool calls are unavailable there — rerun with `background:false` to keep it in the foreground". Killing the job stops the cell and discards its namespace.
+
+If the background table already holds its maximum of running processes, a cell that would move stays in the foreground and its result starts with `backgrounding unavailable: <reason>; the cell stayed in the foreground`. A `background: true` request is served the same way, so check the job list when you need the cell detached.
+
+A `bash` command that names a session (`session`) may move to the background under the same threshold. While the job runs, the session name is busy: a foreground command for it is refused with `session busy in background job <id>; wait or kill it`. When the job exits cleanly, the shell state it published (working directory and exported variables) is applied on the session's next use. A failed, timed-out, or killed job discards the session state, and killing a job releases the name.
+
+
+`eval` with `language: "py"` supports macOS process-fork containment and the Windows native no-child-process mitigation;
 Windows additionally requires the explicit unsandboxed setting because filesystem/network isolation
-is unavailable. `eval` supports macOS only. **Both fail closed on Linux**, even when Bubblewrap is
+is unavailable. `eval` with `language: "js"` supports macOS only. **Both fail closed on Linux**, even when Bubblewrap is
 available or filesystem sandboxing is disabled: Bubblewrap is not the mandatory process-creation
 fence. No Linux or unsandboxed fallback is provided. Tool discovery and `status` expose the same
 platform availability and reason used at startup; this describes platform support, not approval or
@@ -61,13 +72,27 @@ separate asynchronous supervisor protocol, with bounded frames and cancellable w
 oversized or interrupted transport is discarded rather than reused. No universal driver is assumed.
 
 Integration names, defaults and legacy always-registered behavior live in `tools/catalog.rs` alongside
-the existing canonical schema catalog. Saved integration lists still retain browser, kernel, eval,
-find, autoresearch and archive; computer and notebook remain opt-in. These declarations describe
+the existing canonical schema catalog. Saved integration lists still retain browser, eval, find, autoresearch and archive; a saved `kernel` entry is renamed to `eval` when configuration is loaded or saved, and computer and notebook remain opt-in. These declarations describe
 availability only and never grant execution authority.
 
 ## Browser
 
 Browser sessions support headless launch (the default), optional CDP attachment to an existing browser, and isolated persistent storage state per profile. Browser actions include snapshots, ARIA snapshots, accessibility audits, tracing, and action recording. Linux launches use Bubblewrap containment. Loopback WebSocket connections are permitted for local development servers (including HMR) without disabling the outbound network guard. Orphaned tabs from prior processes are reaped rather than accumulating.
+
+### Request log, routes, and HAR
+
+- `requests` lists the tab's recent requests, newest first (`filter` matches URL text, `resource_type`, `limit` 1–200, default 50). `request` returns one request by `request_id`, with its response body when the body is textual (up to 32 KiB; binary bodies are reported as `body_bytes` with an empty `body`). The log keeps the most recent 200 requests per tab.
+- `route` registers a glob route (`pattern`, `*` within a segment, `**` across segments, whole-URL match) with `route_action` `abort`, `continue`, or `fulfill` (`status`, `headers`, `content_type`, `body`; at most 64 KiB). `unroute` removes one pattern, or all routes when `pattern` is omitted. `routes` lists active routes without bodies. A tab holds at most 32 routes.
+- Precedence: the allowed-host guard runs first. A request the guard refuses is blocked even if a route would match. Routes apply only to requests the guard permits. The first matching route wins.
+- `har_start` begins recording and `har_stop` returns HAR 1.2 entries for requests made since the start, writes the file under the session artifacts directory, and reports `dropped` entries that aged out of the log. `content` is `none`, `text` (default, textual bodies), or `all` (non-textual bodies as base64). Bodies are capped at 64 KiB each and 2 MiB total per recording.
+- Authorization, Cookie, Set-Cookie, and API-key headers are redacted in every output and HAR entry. `Location` and `Referer` headers and request URLs keep their query parameter names but replace the value of sensitive parameters with `[redacted]` (names such as `token`, `key`, `secret`, `password`, `auth`, `sig`/`signature`, `code`, `session`, `credential`, `access_token` and `api_key`, matched case-insensitively against each word of the name). The same redacted URL appears in `requests`, `request`, and the HAR `request.url`, `queryString`, and `redirectURL`. Fragments and non-sensitive parameters are unchanged.
+
+### Init scripts and WebMCP
+
+- `add_init_script` adds a document-start script to the browser context, from inline `source` or a workspace file `path` (UTF-8, at most 64 KiB). It returns an `id` and byte count. `remove_init_script` (`script_id`) removes it, and `init_scripts` lists active scripts by `id` and size. Script text is never echoed or logged. Attached browsers receive the scripts on their existing context too.
+- `webmcp_list` reports tools registered through `navigator.modelContext` on the active tab's main frame, with bounded names and descriptions (at most 16 tools). Pass `name` for the exact tool's input schema. `webmcp_invoke` runs one tool with `params` (an object, at most 16 KiB) and returns its JSON result, capped at 64 KiB. `webmcp_events` returns registration changes after a `since` cursor (at most 256 buffered per tab) and clears them when `clear` is true.
+- A page loaded before the hook was installed reports `status: unavailable` with a reason, not an empty success. When the page exposes no WebMCP tools, `webmcp_list` says so explicitly. All WebMCP output is untrusted page text.
+- The bridge never calls the native `navigator.modelContext` getter, and it polyfills the object only when the browser provides none. Native browser-side WebMCP discovery is not supported.
 
 ### Browser relay
 
@@ -91,7 +116,9 @@ the download cap was not retrieved.
 
 Fetch handles supported binary documents (including PDF and Office formats) with the document converter. For HTML, it probes declared Markdown alternate links and `.md` siblings, tries Markdown content negotiation, then configured readers with a quality gate, then `llms.txt` candidates, before using built-in HTML conversion. Optional external readers are configured through `web.reader_chain`; they receive HTML on standard input. Common GitHub, npm, crates.io, PyPI, and Stack Overflow URLs use public APIs when available, with ordinary fetching as fallback.
 
-Search uses `web.search_provider` or a per-call provider selection. Supported backends include Brave, Tavily, Exa, Serper, SearXNG, Kagi, Perplexity, Jina, Google Custom Search, Bing, Firecrawl (`FIRECRAWL_API_KEY`), Parallel (`PARALLEL_API_KEY`), Z.AI (`ZAI_API_KEY`), xAI (`XAI_API_KEY`), and the keyless DuckDuckGo, Startpage, Mojeek and Ecosia HTML scrapers. `auto` tries configured keyed providers first and the keyless ones last; a scraper that meets a captcha, firewall or proof-of-work wall fails with an error so `auto` moves on. Provider credentials are supplied through their documented environment variables; no key is embedded in configuration or sent to a different origin. A custom `web.search_url` template remains supported and must contain `{query}`.
+Search uses `web.search_provider` or a per-call provider selection. Supported backends include Brave, Tavily, Exa, Serper, SearXNG, Kagi, Perplexity, Jina, Google Custom Search, Bing, Firecrawl (`FIRECRAWL_API_KEY`), Parallel (`PARALLEL_API_KEY`), Z.AI (`ZAI_API_KEY`), xAI (`XAI_API_KEY`), TinyFish (`TINYFISH_API_KEY`), DeepSeek (`DEEPSEEK_API_KEY`), Kimi (`KIMI_SEARCH_API_KEY`), Synthetic (`SYNTHETIC_API_KEY`), Ollama Cloud (`OLLAMA_API_KEY`), and the keyless DuckDuckGo, Startpage, Mojeek and Ecosia HTML scrapers. `auto` tries configured keyed providers first and the keyless ones last; a scraper that meets a captcha, firewall or proof-of-work wall fails with an error so `auto` moves on. `public` is explicit only: it queries Startpage, DuckDuckGo, Ecosia and Mojeek in turn, ranks a result several engines return ahead of others, and fails only when all four fail. Kimi, Synthetic, Ollama and `public` cannot enforce the recency window; the answer says so. Grounded answer providers run the provider's own web search and return its answer with the sources it cited: OpenAI (`openai`, Responses `web_search`, `OPENAI_API_KEY`), Anthropic (`anthropic`, server `web_search` tool, `ANTHROPIC_API_KEY`), Gemini (`gemini`, `google_search` grounding, `GEMINI_API_KEY`), OpenRouter (`openrouter`, web plugin, `OPENROUTER_API_KEY`) and Codex (`codex`, Responses `web_search` on the active ChatGPT subscription session, no API key). They are explicit only, so `auto` never selects them. Each API provider reads its key from the environment or a key saved for that provider. Codex uses the signed-in ChatGPT account from `/providers`, is refused when none is signed in, and its turn is streamed through the same Responses parser as the chat path; its model id is a default that a future release may change. Their native search has no hard date filter, so the recency window is an instruction in the prompt and the answer says so; `domains` and `exclude_domains` are applied to the returned sources. Gemini's grounding redirect links (`vertexaisearch.cloud.google.com/grounding-api-redirect/…`) are resolved to the final page through the guarded fetch client: at most four resolve at once, each within 5 seconds, and a link that fails keeps its redirect URL. A reply that did not run a search, or that carries no sources, is an error, not a result. Provider credentials are supplied through their documented environment variables; no key is embedded in configuration or sent to a different origin. A custom `web.search_url` template remains supported and must contain `{query}`.
+
+`domains` and `exclude_domains` restrict a search to, or drop results from, up to 20 sites each. An entry is a host such as `example.com`, which also matches its subdomains, or a host with a path such as `example.com/docs`, which matches that path and anything below it. TinyFish, Tavily, Exa and DeepSeek receive whole-host entries natively; every provider's results are also checked locally, so path entries and custom `web.search_url` endpoints are filtered too. If a list would remove every result, it is not applied and the answer says so.
 
 ## Coordinated edits
 
@@ -160,8 +187,8 @@ Use managed `bg` processes for previews: list/reuse a running server, start one 
 readiness, then open its HTTP URL. Foreground `bash` kills servers at its deadline. The browser accepts
 `about:blank`, and tab IDs may be omitted when exactly one tab is open; multiple tabs require an ID.
 Browser failures show the underlying network refusal before Chromium's generic error. Networking is
-paused between approved browser operations. Python and
-Poppler must also be installed when using kernel/PDF capabilities.
+paused between approved browser operations. Python eval cells need an installed Python; PDF
+capabilities need Poppler.
 
 Built-in Chromium operations have a 30-second overall deadline by default, including startup and
 network settlement. A missing or non-actionable click target must not wait indefinitely. Set
@@ -196,3 +223,38 @@ Browser `run` executes an async function body in the page realm: use DOM globals
 For example, `assert(document.querySelector('h1')); return document.title;` checks the page DOM.
 There is no injected Playwright `page`, `require`, or Node API; page CSP may block dynamic evaluation.
 Use browser actions or the allowlisted `call` chain for Playwright-backed operations.
+
+### Cookies, storage, emulation, clipboard and saved state
+
+`cookies` lists cookies for the browser context, filtered by `urls` or `domain`. Cookie values are
+redacted unless `include_values` is true; at most 200 cookies are returned. `set_cookies` takes up to
+32 cookies, each with exactly one of `url` or `domain`. `clear_cookies` removes `names`, or every
+cookie when `names` is omitted.
+
+`storage` reads, writes or clears `local` or `session` web storage for the current HTTP(S) origin
+(`area`, `operation`, `key`, `value`). Reads over 20,000 characters are refused; request one key at
+a time. `storage` is not available on `about:blank` or other non-HTTP(S) pages.
+
+`emulate` changes the current tab's `device` preset, `viewport` (width and height 1–7680, scale
+0.1–4), `user_agent`, `timezone`, `locale` and `color_scheme`. `offline` and `geolocation` apply to
+the whole browser context and are reported as `context_wide`. An empty `timezone` or `locale` resets
+it. `devices` lists the device presets available in the pinned Playwright runtime; ten device names
+from the reference catalogue are not in that runtime and are unavailable.
+`open` accepts `viewport` and `user_agent` for the new tab. `ignore_https_errors` is fixed when the
+browser session launches: set it on the first `open`, or run `shutdown` before reopening with a
+different value. It cannot be used with an attached browser (`DIAL_CDP_URL`), whose TLS settings the
+operator owns.
+
+Clipboard actions use the page's `navigator.clipboard` with granted read and write permissions.
+`clipboard_write` sets text (up to 64 KiB); `clipboard_read` returns it, truncated with a flag when
+larger. `clipboard_copy` and `clipboard_paste` send the platform copy and paste shortcut to the focused
+element. No clipboard shim is installed, so the result depends on the browser's clipboard support.
+
+`save_state` stores cookies and origin storage under `name` in the Dial state directory
+(`browser/states/<name>.json`). `load_state` restores those cookies and the current origin's
+`localStorage`; `sessionStorage` is not saved and is not restored, and other origins are reported
+as skipped.
+
+### Captures, recording and performance
+
+`screenshot` accepts `format` (`png` or `jpeg`), `quality` (1–100, JPEG only), `annotate` (overlays numbered boxes on visible interactive elements and returns each label with its CSS selector, which DOM actions accept) and `if_changed` (returns no image when the capture matches the previous one of the same tab and options). `pdf` writes a PDF to the session artifacts directory. `record_start` begins a screencast and `record_stop` encodes it to an MP4 with `ffmpeg`, which must be on `PATH`; a missing `ffmpeg` is reported as an error. `record_start` fails while a recording runs unless `record_restart` is set. `profile_start`/`profile_stop` write a CPU profile (`.cpuprofile`). `metrics` returns the page's Performance counters. `vitals` reports TTFB, FCP, LCP, CLS, INP and load timings from the buffered performance timeline, which can differ from the page's own live observers.

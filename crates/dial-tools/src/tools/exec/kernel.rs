@@ -5,20 +5,20 @@
 //! not unwind within [`INTERRUPT_GRACE`] is killed together with its session.
 use crate::config::tools::kernel::KernelConfig;
 
+use super::background::{AdoptedJob, CellJob};
 #[cfg(windows)]
 use super::sandbox::Sandbox;
 #[cfg(not(windows))]
 use super::shell::shell_command;
-use crate::config::types::Config;
-use crate::tools::integrations::ext::{Tool, ToolCallback, ToolContext, ToolEvent};
-use crate::tools::{ToolOutput, Workspace, exec::preludes, tool_schema};
+use crate::tools::integrations::ext::{ToolCallback, ToolContext};
+use crate::tools::{ToolOutput, Workspace, exec::preludes};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -34,15 +34,6 @@ pub(super) const FORK_FENCE: &str = "(version 1)(allow default)(deny process-for
 const BWRAP: &str = "/usr/bin/bwrap";
 const PYTHON_PREFLIGHT: &str = "import sys,json\nr=json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'result':{'executable':sys.executable,'version':list(sys.version_info[:2])}}),flush=True)";
 
-pub fn tools(config: &Config) -> Vec<Arc<dyn Tool>> {
-    vec![Arc::new(KernelTool {
-        config: config.kernel.clone(),
-        session: Mutex::new(None),
-        pid: Arc::new(AtomicI32::new(0)),
-        interrupt: AtomicBool::new(false),
-        active: AtomicUsize::new(0),
-    })]
-}
 pub(crate) struct ActiveGuard<'a>(&'a AtomicUsize);
 impl<'a> ActiveGuard<'a> {
     pub(crate) fn new(count: &'a AtomicUsize) -> Self {
@@ -55,121 +46,71 @@ impl Drop for ActiveGuard<'_> {
         self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
-struct KernelTool {
+/// Owner-local Python runtime: one persistent namespace session plus the cancellation and deadline
+/// state shared with the in-flight cell.
+pub(crate) struct PythonRuntime {
     config: KernelConfig,
-    session: Mutex<Option<NativeProcess>>,
+    session: Arc<Mutex<Option<NativeProcess>>>,
+    busy: Arc<Mutex<Option<String>>>,
     pid: Arc<AtomicI32>,
     interrupt: AtomicBool,
     active: AtomicUsize,
 }
-impl Tool for KernelTool {
-    fn name(&self) -> &str {
-        "kernel"
-    }
-    fn schema(&self) -> Value {
-        tool_schema(
-            "kernel",
-            &crate::tools::surface::catalog::execution_description(
-                "kernel",
-                "Persistent Python 3.8+ namespace with real top-level await. tool.<name>(**kwargs), tool.call(name,args), and tool.schemas return to the current controller for the same permissions, approvals, validation and observers as direct tools. Results retain text/data/is_error; denied or malformed calls raise ToolError. Each cell requires approval and runs under the workspace OS sandbox plus a mandatory process-creation fence, even when filesystem sandboxing is disabled. Windows requires explicit unsandboxed opt-in because filesystem/network isolation is unavailable; its trusted driver installs a native no-child-process mitigation before user code. stdout/stderr/final expression/tracebacks are bounded. Timeout/cancel destroys this owner's namespace; if a controller callback is pending its approval/nested operation is also cancelled. Reset starts fresh lazily. macOS containment or the Windows native fence and operator-installed Python are required.",
-            ),
-            json!({
-                "action":{"type":"string","enum":["eval","reset","cancel","status"]},
-                "code":{"type":"string","description":"Python cell, at most 64 KiB UTF-8."},
-                "timeout":{"type":"integer","minimum":0,"maximum":3600}
-            }),
-            &["action"],
-        )
-    }
-    fn needs_approval(&self, _: &Value) -> bool {
-        true
-    }
-    fn fork_session(&self) -> Option<Arc<dyn Tool>> {
-        Some(Arc::new(Self {
-            config: self.config.clone(),
-            session: Mutex::new(None),
+impl PythonRuntime {
+    pub(super) fn new(config: KernelConfig) -> Self {
+        Self {
+            config,
+            session: Arc::new(Mutex::new(None)),
+            busy: Arc::new(Mutex::new(None)),
             pid: Arc::new(AtomicI32::new(0)),
             interrupt: AtomicBool::new(false),
             active: AtomicUsize::new(0),
-        }))
+        }
     }
-    fn cancel_operation(&self) {
-        // The running operation's watcher delivers SIGINT and escalates to a kill after INTERRUPT_GRACE.
-        if self.active.load(Ordering::Acquire) > 0 {
+    pub(super) fn fork(&self) -> Self {
+        Self::new(self.config.clone())
+    }
+    /// Requests cancellation of the in-flight cell; a flag left behind would reject the next cell.
+    pub(super) fn cancel(&self) -> bool {
+        let requested = self.active.load(Ordering::Acquire) > 0;
+        if requested {
             self.interrupt.store(true, Ordering::Release);
         }
+        requested
     }
-    fn supports_tool_dispatch(&self) -> bool {
-        true
-    }
-    fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
-        self.call_with_dispatch(ctx, args, &|_| {}, &AtomicBool::new(false), &mut |_| {
-            ToolOutput::err("tool callbacks require an execution controller")
-        })
-    }
-    fn call_streaming(
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn run(
         &self,
         ctx: &ToolContext,
-        args: &Value,
-        on_event: &(dyn Fn(ToolEvent) + Sync),
-        cancel: &AtomicBool,
-    ) -> ToolOutput {
-        self.call_with_dispatch(ctx, args, on_event, cancel, &mut |_| {
-            ToolOutput::err("tool callbacks require an execution controller")
-        })
-    }
-    fn call_with_dispatch(
-        &self,
-        ctx: &ToolContext,
-        args: &Value,
-        _on_event: &(dyn Fn(ToolEvent) + Sync),
-        cancel: &AtomicBool,
-        dispatch: &mut dyn FnMut(ToolCallback) -> ToolOutput,
-    ) -> ToolOutput {
-        let started = AtomicBool::new(false);
-        let result = self.run(ctx, args, cancel, dispatch, &started);
-        let uncertain = result.is_err() && started.load(Ordering::Acquire);
-        let output = code_output(result);
-        if uncertain {
-            output.with_effects(crate::tools::surface::outcome::Effects::Unknown)
-        } else {
-            output
-        }
-    }
-}
-impl KernelTool {
-    fn run(
-        &self,
-        ctx: &ToolContext,
+        action: &str,
         args: &Value,
         cancel: &AtomicBool,
+        adopt: &dyn Fn(AdoptedJob) -> Result<String, String>,
         dispatch: &mut dyn FnMut(ToolCallback) -> ToolOutput,
         effect_started: &AtomicBool,
-    ) -> Result<Value, String> {
-        let action = args
-            .get("action")
-            .and_then(Value::as_str)
-            .ok_or("action is required")?;
-        if action == "cancel" {
-            // Only an in-flight operation has anything to interrupt; a flag left behind would reject the next cell.
-            let requested = self.active.load(Ordering::Acquire) > 0;
-            if requested {
-                self.cancel_operation();
-            }
-            return Ok(json!({"cancel_requested":requested}));
-        }
-        if !matches!(action, "eval" | "reset" | "status") {
-            return Err(format!("unsupported kernel action {action:?}"));
-        }
+    ) -> Result<CellOutcome, String> {
         // Counts the whole operation, including lock wait, so cancel reaches it before startup.
         let _active = ActiveGuard::new(&self.active);
-        let end = execution_deadline(deadline(args, self.config.timeout_secs)?);
+        let cell = Arc::new(Deadline::new(execution_deadline(deadline(
+            args,
+            self.config.timeout_secs,
+        )?)));
+        let end = &cell;
         // A pending execution cancellation must never admit another cell. Explicit control
         // operations may still inspect/reset the now-dead namespace.
         let pending_cancel = self.interrupt.swap(false, Ordering::AcqRel);
         if cancel.load(Ordering::Acquire) || (pending_cancel && action == "eval") {
-            return Err("kernel execution cancelled before startup".into());
+            return Err("python execution cancelled before startup".into());
         }
+        let policy = BackgroundPolicy::from_args(args, ctx.config.shell.auto_background_secs)?;
+        let handoff = Handoff {
+            label: cell_label(args, "py")?,
+            policy: &policy,
+            adopt,
+            session: self.session.clone(),
+            busy: self.busy.clone(),
+            pid: self.pid.clone(),
+        };
         let callback_wait = AtomicBool::new(false);
         let result = guarded_operation(
             end,
@@ -179,17 +120,25 @@ impl KernelTool {
             &callback_wait,
             || {
                 let mut slot = lock_session(&self.session, end, &self.interrupt, cancel)?;
+                if let Some(job) = busy_job(&self.busy) {
+                    if action == "status" {
+                        return Ok(CellOutcome::Value(json!({"running":true,"background":job,
+                            "language":"py",
+                            "platform":crate::tools::surface::catalog::execution_platform("eval")})));
+                    }
+                    return Err(format!("runtime busy in background job {job}"));
+                }
                 if action == "reset" {
                     slot.take();
-                    return Ok(json!({"reset":true}));
+                    return Ok(CellOutcome::Value(json!({"reset":true})));
                 }
                 if action == "status" {
-                    return Ok(
-                        json!({"running":slot.as_mut().is_some_and(NativeProcess::alive),
-                        "platform":crate::tools::surface::catalog::execution_platform("kernel")}),
-                    );
+                    return Ok(CellOutcome::Value(json!({
+                        "running":slot.as_mut().is_some_and(NativeProcess::alive),
+                        "language":"py",
+                        "platform":crate::tools::surface::catalog::execution_platform("eval")})));
                 }
-                require_fork_containment("kernel")?;
+                require_fork_containment("eval")?;
                 let code = args
                     .get("code")
                     .and_then(Value::as_str)
@@ -219,7 +168,7 @@ impl KernelTool {
                     }
                     if slot.is_none() {
                         let root = ctx.workspace.root();
-                        let timeout = remaining_timeout(end)?;
+                        let timeout = remaining_timeout(end.at())?;
                         let environment =
                             env::detect(root, &self.config.venv, &self.config.python, &|key| {
                                 std::env::var(key).ok()
@@ -298,7 +247,7 @@ impl KernelTool {
                             shell_command(ctx.workspace, &script, ctx.workspace.root())?
                         };
                         strip_runtime_injection(&mut command);
-                        require_fork_containment("kernel")?;
+                        require_fork_containment("eval")?;
                         check_operation(end, &self.interrupt, cancel)?;
                         *slot = Some(NativeProcess::start(command, self.pid.clone()).map_err(
                             |e| {
@@ -312,16 +261,14 @@ impl KernelTool {
                     slot.as_mut().unwrap().prelude_language =
                         Some(preludes::PreludeLanguage::Python);
                     effect_started.store(true, Ordering::Release);
-                    native_cell(
-                        slot.as_mut().unwrap(),
-                        ctx.workspace,
-                        code,
+                    let scope = CellScope {
+                        workspace: ctx.workspace,
                         end,
-                        &self.interrupt,
+                        interrupt: &self.interrupt,
                         cancel,
-                        &callback_wait,
-                        dispatch,
-                    )
+                        callback_wait: &callback_wait,
+                    };
+                    native_cell(slot.as_mut().unwrap(), &scope, code, dispatch, &handoff)
                 })();
                 if result.is_err() {
                     // Only this owner's namespace is discarded; a pending host callback additionally
@@ -601,12 +548,40 @@ pub(crate) fn require_fork_containment(label: &str) -> Result<(), String> {
     }
 }
 
-pub(crate) fn check_operation(
+/// Cell deadline with host-callback time excluded. A controller callback runs on the caller's
+/// clock, so its duration is credited back rather than charged to the cell.
+pub(crate) struct Deadline {
     end: Option<Instant>,
+    paused: AtomicU64,
+}
+
+impl Deadline {
+    pub(crate) fn new(end: Option<Instant>) -> Self {
+        Self {
+            end,
+            paused: AtomicU64::new(0),
+        }
+    }
+    /// The effective instant, extended by every completed callback.
+    pub(crate) fn at(&self) -> Option<Instant> {
+        let paused = Duration::from_nanos(self.paused.load(Ordering::Acquire));
+        self.end.map(|end| end + paused)
+    }
+    pub(crate) fn expired(&self) -> bool {
+        self.at().is_some_and(|end| Instant::now() >= end)
+    }
+    pub(crate) fn pause(&self, elapsed: Duration) {
+        let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        self.paused.fetch_add(nanos, Ordering::AcqRel);
+    }
+}
+
+pub(crate) fn check_operation(
+    end: &Deadline,
     interrupt: &AtomicBool,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
-    if end.is_some_and(|end| Instant::now() >= end) {
+    if end.expired() {
         return Err("execution deadline exceeded; namespace discarded".into());
     }
     if cancel.load(Ordering::Acquire) || interrupt.load(Ordering::Acquire) {
@@ -618,7 +593,7 @@ pub(crate) fn check_operation(
 /// Includes lock waits, startup, pipe I/O and controller callback waits in one budget.
 /// The controller observes the same flag and must propagate it to its nested operation.
 pub(crate) fn guarded_operation<T>(
-    end: Option<Instant>,
+    end: &Deadline,
     pid: &AtomicI32,
     interrupt: &AtomicBool,
     cancel: &AtomicBool,
@@ -636,7 +611,7 @@ pub(crate) fn guarded_operation<T>(
         scope.spawn(|| {
             let mut interrupted_at: Option<Instant> = None;
             while !done.load(Ordering::Acquire) {
-                let expired = end.is_some_and(|end| Instant::now() >= end);
+                let expired = !callback_wait.load(Ordering::Acquire) && end.expired();
                 if expired || cancel.load(Ordering::Acquire) || interrupt.load(Ordering::Acquire) {
                     if callback_wait.load(Ordering::Acquire) {
                         cancel.store(true, Ordering::Release);
@@ -689,7 +664,7 @@ fn deliver_interrupt(group: u32) -> bool {
 
 pub(crate) fn lock_session<'a>(
     session: &'a Mutex<Option<NativeProcess>>,
-    end: Option<Instant>,
+    end: &Deadline,
     interrupt: &AtomicBool,
     cancel: &AtomicBool,
 ) -> Result<parking_lot::MutexGuard<'a, Option<NativeProcess>>, String> {
@@ -704,7 +679,7 @@ pub(crate) fn lock_session<'a>(
 
 fn serial_operation<'a>(
     workspace: &'a Workspace,
-    end: Option<Instant>,
+    end: &Deadline,
     interrupt: &AtomicBool,
     cancel: &AtomicBool,
 ) -> Result<std::sync::MutexGuard<'a, ()>, String> {
@@ -716,7 +691,7 @@ fn serial_operation<'a>(
 fn dispatch_guarded<'a>(
     serial: &mut Option<std::sync::MutexGuard<'a, ()>>,
     workspace: &'a Workspace,
-    end: Option<Instant>,
+    end: &Deadline,
     interrupt: &AtomicBool,
     cancel: &AtomicBool,
     callback_wait: &AtomicBool,
@@ -733,7 +708,9 @@ fn dispatch_guarded<'a>(
     let waiting = CallbackWait(callback_wait);
     check_operation(end, interrupt, cancel)?;
     drop(serial.take());
+    let started = Instant::now();
     let output = dispatch(callback);
+    end.pause(started.elapsed());
     drop(waiting);
     if crate::tools::surface::outcome::effects(&output)
         == crate::tools::surface::outcome::Effects::Unknown
@@ -745,62 +722,133 @@ fn dispatch_guarded<'a>(
     Ok(output)
 }
 
+/// Background mode from the eval `background` argument: absent = auto, `false` = never, `true` = immediate.
+pub(crate) struct BackgroundPolicy {
+    mode: Option<bool>,
+    threshold: Duration,
+    started: Instant,
+}
+
+impl BackgroundPolicy {
+    pub(crate) fn from_args(args: &Value, threshold_secs: u64) -> Result<Self, String> {
+        let mode = match args.get("background") {
+            None | Some(Value::Null) => None,
+            Some(Value::Bool(flag)) => Some(*flag),
+            Some(_) => return Err("background must be a boolean".into()),
+        };
+        Ok(Self {
+            mode,
+            threshold: Duration::from_secs(threshold_secs),
+            started: Instant::now(),
+        })
+    }
+
+    /// Whether a cell that is waiting for output should move to the background now.
+    pub(crate) fn should_yield(&self) -> bool {
+        match self.mode {
+            Some(false) => false,
+            Some(true) => true,
+            None => self.started.elapsed() >= self.threshold,
+        }
+    }
+}
+
+/// Background owner for a cell: the job label, the runtime state the job keeps, and the adopter.
+pub(crate) struct Handoff<'a> {
+    pub label: String,
+    pub policy: &'a BackgroundPolicy,
+    pub adopt: &'a dyn Fn(AdoptedJob) -> Result<String, String>,
+    pub session: Arc<Mutex<Option<NativeProcess>>>,
+    pub busy: Arc<Mutex<Option<String>>>,
+    pub pid: Arc<AtomicI32>,
+}
+
+impl Handoff<'_> {
+    /// Adopts the yielded cell as a managed background job and marks the runtime busy under its id.
+    /// The caller still holds the session slot, so the job cannot take the kernel before this returns.
+    fn move_to_background(
+        &self,
+        end: &Arc<Deadline>,
+        display: Arc<preludes::DisplayBuffer>,
+    ) -> Result<String, String> {
+        let (end, session, busy, pid) = (
+            end.clone(),
+            self.session.clone(),
+            self.busy.clone(),
+            self.pid.clone(),
+        );
+        let job = CellJob {
+            command: self.label.clone(),
+            network: false,
+            work: Box::new(move |cancel: Arc<AtomicBool>| {
+                detached_cell(&session, &pid, &busy, &end, &cancel, &display)
+            }),
+        };
+        let name = (self.adopt)(AdoptedJob::Cell(job))?;
+        *self.busy.lock() = Some(name.clone());
+        Ok(name)
+    }
+}
+
+/// Borrowed state a foreground cell step needs.
+pub(crate) struct CellScope<'a> {
+    pub workspace: &'a Workspace,
+    pub end: &'a Arc<Deadline>,
+    pub interrupt: &'a AtomicBool,
+    pub cancel: &'a AtomicBool,
+    pub callback_wait: &'a AtomicBool,
+}
+
+/// Result of one foreground cell: its value, or the job id after the cell moved to the background.
+pub(crate) enum CellOutcome {
+    Value(Value),
+    Moved(String),
+}
+
+/// Host-tool refusal for callbacks issued by a cell that already runs in the background.
+pub(crate) const MOVED_CALLBACK_REFUSAL: &str = "this cell was moved to the background; host tool calls are unavailable there — rerun with background:false to keep it in the foreground";
+
+/// Job id of the background owner, if the runtime is busy.
+pub(crate) fn busy_job(busy: &Mutex<Option<String>>) -> Option<String> {
+    busy.lock().clone()
+}
+
+/// Label of a backgrounded cell: the optional `title` argument, else the runtime name.
+pub(crate) fn cell_label(args: &Value, language: &str) -> Result<String, String> {
+    match args.get("title") {
+        None | Some(Value::Null) => Ok(format!("eval cell ({language})")),
+        Some(Value::String(title)) if !title.trim().is_empty() && title.len() <= 256 => {
+            Ok(title.clone())
+        }
+        Some(_) => Err("title must be a non-empty string of at most 256 bytes".into()),
+    }
+}
+
+/// One protocol step: sends `code` (or resumes the in-flight cell when `None`). `Ok(None)` means the cell
+/// yielded to `yield_now` and is still in flight.
 fn native_cell_once(
     process: &mut NativeProcess,
-    workspace: &Workspace,
-    code: &str,
-    end: Option<Instant>,
-    interrupt: &AtomicBool,
-    cancel: &AtomicBool,
-    callback_wait: &AtomicBool,
+    scope: &CellScope<'_>,
+    code: Option<&str>,
+    display: &preludes::DisplayBuffer,
     dispatch: &mut dyn FnMut(ToolCallback) -> ToolOutput,
-) -> Result<Value, String> {
+    yield_now: &dyn Fn() -> bool,
+) -> Result<Option<Value>, String> {
+    let end: &Deadline = scope.end;
+    let (workspace, interrupt, cancel, callback_wait) = (
+        scope.workspace,
+        scope.interrupt,
+        scope.cancel,
+        scope.callback_wait,
+    );
     // Native code may write directly. Never run it concurrently with another workspace transaction.
     // The outer agent MUST NOT hold its own serial guard for supports_tool_dispatch() tools.
     let mut serial = Some(serial_operation(workspace, end, interrupt, cancel)?);
-    process.request_guarded(
-        json!({"code":code}),
-        end,
-        || check_operation(end, interrupt, cancel),
-        128,
-        |request| {
-            check_operation(end, interrupt, cancel)?;
-            let mut call = |callback: ToolCallback| {
-                dispatch_guarded(
-                    &mut serial,
-                    workspace,
-                    end,
-                    interrupt,
-                    cancel,
-                    callback_wait,
-                    dispatch,
-                    callback,
-                )
-            };
-            if let Some(reply) = preludes::bridge_reply(request, &mut call) {
-                return reply;
-            }
-            let callback = match request.get("callback").and_then(Value::as_str) {
-                Some("schemas") => ToolCallback::Schemas,
-                Some("tool") => {
-                    let name = request
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .filter(|name| !name.is_empty() && name.len() <= 256)
-                        .ok_or("malformed tool callback name")?;
-                    let arguments = request
-                        .get("arguments")
-                        .filter(|arguments| arguments.is_object())
-                        .ok_or("tool callback arguments must be an object")?;
-                    ToolCallback::Call {
-                        name: name.to_owned(),
-                        arguments: arguments.clone(),
-                    }
-                }
-                _ => return Err("unsupported code-mode callback".into()),
-            };
-            // Controller callbacks execute their own Workspace transaction, approvals and observers.
-            let output = dispatch_guarded(
+    let check = || check_operation(end, interrupt, cancel);
+    let callback = |request: &Value| {
+        check_operation(end, interrupt, cancel)?;
+        let mut call = |callback: ToolCallback| {
+            dispatch_guarded(
                 &mut serial,
                 workspace,
                 end,
@@ -809,24 +857,62 @@ fn native_cell_once(
                 callback_wait,
                 dispatch,
                 callback,
-            )?;
-            Ok(json!({"text":output.text,"data":output.data,"is_error":output.is_error}))
-        },
-    )
+            )
+        };
+        if let Some(reply) = preludes::bridge_reply(request, display, &mut call) {
+            return reply;
+        }
+        let callback = match request.get("callback").and_then(Value::as_str) {
+            Some("schemas") => ToolCallback::Schemas,
+            Some("tool") => {
+                let name = request
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty() && name.len() <= 256)
+                    .ok_or("malformed tool callback name")?;
+                let arguments = request
+                    .get("arguments")
+                    .filter(|arguments| arguments.is_object())
+                    .ok_or("tool callback arguments must be an object")?;
+                ToolCallback::Call {
+                    name: name.to_owned(),
+                    arguments: arguments.clone(),
+                }
+            }
+            _ => return Err("unsupported code-mode callback".into()),
+        };
+        // Controller callbacks execute their own Workspace transaction, approvals and observers.
+        let output = dispatch_guarded(
+            &mut serial,
+            workspace,
+            end,
+            interrupt,
+            cancel,
+            callback_wait,
+            dispatch,
+            callback,
+        )?;
+        Ok(json!({"text":output.text,"data":output.data,"is_error":output.is_error}))
+    };
+    match code {
+        Some(code) => {
+            process.request_yieldable(json!({"code":code}), None, check, yield_now, 128, callback)
+        }
+        None => process.resume_yieldable(None, check, yield_now, 128, callback),
+    }
 }
 
-/// Runs one cell after installing eval preludes when the registry changed; `__dial_display__` text
-/// is prepended to the cell's stdout.
+/// Runs one cell in the foreground after installing eval preludes when the registry changed; `__dial_display__`
+/// text is prepended to the cell's stdout. A cell that `handoff.policy` asks to move is adopted as a background
+/// job; if adoption is refused, the cell resumes in the foreground and finishes there.
 pub(crate) fn native_cell(
     process: &mut NativeProcess,
-    workspace: &Workspace,
+    scope: &CellScope<'_>,
     code: &str,
-    end: Option<Instant>,
-    interrupt: &AtomicBool,
-    cancel: &AtomicBool,
-    callback_wait: &AtomicBool,
     dispatch: &mut dyn FnMut(ToolCallback) -> ToolOutput,
-) -> Result<Value, String> {
+    handoff: &Handoff<'_>,
+) -> Result<CellOutcome, String> {
+    let never = || false;
     if let Some(language) = process.prelude_language {
         let generation = preludes::generation();
         if process.prelude_generation != generation {
@@ -834,14 +920,13 @@ pub(crate) fn native_cell(
             if !source.is_empty() {
                 let installed = native_cell_once(
                     process,
-                    workspace,
-                    &source,
-                    end,
-                    interrupt,
-                    cancel,
-                    callback_wait,
+                    scope,
+                    Some(&source),
+                    &preludes::DisplayBuffer::default(),
                     dispatch,
-                )?;
+                    &never,
+                )?
+                .ok_or("installing eval preludes yielded")?;
                 if installed.get("is_error").and_then(Value::as_bool) == Some(true) {
                     return Err(format!("installing eval preludes failed: {installed}"));
                 }
@@ -849,29 +934,82 @@ pub(crate) fn native_cell(
             process.prelude_generation = generation;
         }
     }
-    preludes::take_display();
-    let mut value = native_cell_once(
-        process,
-        workspace,
-        code,
-        end,
-        interrupt,
-        cancel,
-        callback_wait,
-        dispatch,
-    )?;
-    let displayed = preludes::take_display();
-    if !displayed.is_empty() {
+    let display = Arc::new(preludes::DisplayBuffer::default());
+    let yield_now = || handoff.policy.should_yield();
+    let mut notice = None;
+    let mut value =
+        match native_cell_once(process, scope, Some(code), &display, dispatch, &yield_now)? {
+            Some(value) => value,
+            None => match handoff.move_to_background(scope.end, display.clone()) {
+                Ok(name) => return Ok(CellOutcome::Moved(name)),
+                Err(error) => {
+                    notice = Some(format!(
+                        "backgrounding unavailable: {error}; the cell stayed in the foreground"
+                    ));
+                    native_cell_once(process, scope, None, &display, dispatch, &never)?
+                        .ok_or("eval cell yielded without a handoff")?
+                }
+            },
+        };
+    let mut shown = notice
+        .map(|notice| format!("[{notice}]\n"))
+        .unwrap_or_default();
+    shown.push_str(&display.take());
+    if !shown.is_empty() {
         let stdout = value
             .get("stdout")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let combined = format!("{displayed}{stdout}");
+        let combined = format!("{shown}{stdout}");
         if let Some(object) = value.as_object_mut() {
             object.insert("stdout".into(), Value::String(combined));
         }
     }
-    Ok(value)
+    Ok(CellOutcome::Value(value))
+}
+
+/// Background body of a moved cell. Waits until the foreground releases the kernel, resumes the in-flight cell
+/// without host callbacks, and returns the kernel to the runtime while it stays usable.
+fn detached_cell(
+    session: &Mutex<Option<NativeProcess>>,
+    pid: &AtomicI32,
+    busy: &Mutex<Option<String>>,
+    end: &Deadline,
+    cancel: &AtomicBool,
+    display: &preludes::DisplayBuffer,
+) -> String {
+    let interrupt = AtomicBool::new(false);
+    let callback_wait = AtomicBool::new(false);
+    let Some(mut process) = session.lock().take() else {
+        *busy.lock() = None;
+        return "eval cell lost its kernel before it moved to the background".into();
+    };
+    let result = guarded_operation(end, pid, &interrupt, cancel, &callback_wait, || {
+        process
+            .resume_yieldable(
+                None,
+                || check_operation(end, &interrupt, cancel),
+                || false,
+                128,
+                |request: &Value| {
+                    // Display text stays with the job; every other host callback is refused.
+                    preludes::bridge_reply(request, display, &mut |_: ToolCallback| {
+                        Err(MOVED_CALLBACK_REFUSAL.to_owned())
+                    })
+                    .unwrap_or_else(|| Err(MOVED_CALLBACK_REFUSAL.to_owned()))
+                },
+            )?
+            .ok_or_else(|| "background cell yielded again".to_owned())
+    });
+    let (text, keep) = match result {
+        Ok(value) => (code_output(Ok(value)).text, process.alive()),
+        Err(error) => (code_output(Err(error)).text, false),
+    };
+    if keep {
+        *session.lock() = Some(process);
+    }
+    *busy.lock() = None;
+    format!("{}{text}", display.take())
 }
 
 /// Tool-owned prelude state wraps the neutral transport; browser processes do not install preludes.

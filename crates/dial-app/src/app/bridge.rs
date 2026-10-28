@@ -1,11 +1,13 @@
 //! `Bridge`: the `Ui` adapter that carries agent events into the shell.
 
 use crate::app::core::App;
-use crate::app::shell::{PAINT_EVERY, Shell};
+use crate::app::shell::Shell;
+use crate::app::shell::frame_pacing::Phase;
 use crate::runtime::tool_output::ToolOutput;
 use crate::ui::composer::ComposerEvent;
+use crate::ui::input::{poll, read};
 use crate::ui::keys::Action;
-use crossterm::event::{Event, KeyEventKind, poll, read};
+use crossterm::event::{Event, KeyEventKind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -60,13 +62,33 @@ impl Bridge<'_> {
     }
 
     pub(super) fn repaint(&mut self, force: bool) {
-        if self.failed || (!force && self.last_paint.elapsed() < PAINT_EVERY) {
+        if self.failed {
             return;
         }
-        self.last_paint = Instant::now();
+        // Input is drained on every streaming callback, not only on paint ticks, so keys stay
+        // responsive while output streams past the paint throttle.
+        let input = Instant::now();
         self.pump();
+        self.shell
+            .frame_pacing
+            .record(Phase::Input, input.elapsed());
+        // A backlogged terminal defers composition entirely instead of composing a frame that would
+        // queue behind unsent output. Composition reads current state at paint time, so the next
+        // unforced repaint after the terminal drains paints everything; forced repaints still paint.
+        if !force
+            && (self.shell.term.output_backlogged()
+                || self.last_paint.elapsed() < self.shell.frame_pacing.interval())
+        {
+            return;
+        }
+        let frame = Instant::now();
+        self.last_paint = frame;
+        let refresh = Instant::now();
         self.shell.refresh_resources(self.app, false, true);
         self.shell.refresh_workers(self.app);
+        self.shell
+            .frame_pacing
+            .record(Phase::Refresh, refresh.elapsed());
         self.shell.status.elapsed_secs = self.started.elapsed().as_secs_f64();
         if let Some(monitor) = &self.shell.adapter_monitor {
             self.shell.status.lora = self
@@ -77,6 +99,7 @@ impl Bridge<'_> {
                 .2
                 .with_runtime(&monitor.lock());
         }
+        let paint = Instant::now();
         let paint_result = if self.shell.busy_overlay.is_some() {
             self.shell
                 .step_busy_overlay(self.app, None)
@@ -88,6 +111,10 @@ impl Bridge<'_> {
         } else {
             self.shell.paint(None)
         };
+        self.shell
+            .frame_pacing
+            .record(Phase::Paint, paint.elapsed());
+        self.shell.frame_pacing.record_frame(frame.elapsed());
         if paint_result.is_err() {
             self.failed = true;
             self.interrupt.store(true, Ordering::SeqCst);
@@ -228,7 +255,7 @@ impl Bridge<'_> {
                         }
                         ComposerEvent::Action(Action::DisplayReset) => shell.display_reset(),
                         ComposerEvent::Action(Action::PasteImage) => {
-                            if let Err(error) = shell.composer.paste_clipboard_image() {
+                            if let Err(error) = shell.composer.start_clipboard_image() {
                                 shell.note(
                                     "Image",
                                     format!("clipboard image unavailable: {error:#}"),

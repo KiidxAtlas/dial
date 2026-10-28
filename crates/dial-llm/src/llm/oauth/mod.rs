@@ -1,15 +1,19 @@
 //! Provider OAuth sign-in.
 //!
 //! Each provider module exposes a [`Flow`]: an interactive login that returns [`Credentials`], an
-//! optional refresh, and a request-time [`Access`] shaper. Grants are stored per provider in the
-//! private user directory (`oauth-<id>.json`, owner-only, cross-process locked) and refreshed
-//! under the lock immediately before a request; nothing is written inside the workspace.
+//! optional refresh, and a request-time [`Access`] shaper. Each provider keeps one or more stored accounts (`oauth-<id>.json`, owner-only, cross-process
+//! locked; see [`accounts`]). A session binds to one account and rotates to another after a rate
+//! limit, quota, or auth failure. Each grant refreshes under its account's own lock immediately
+//! before a request; nothing is written inside the workspace.
 //!
 //! Interaction is abstracted by [`Interaction`]: the TUI shows the verification URL/code as a
 //! banner and opens the browser, while `dial login <provider>` can also prompt on the terminal.
 use super::auth::SecretToken;
+use super::errors::ErrorClass;
 use super::model_config::ApiProtocol;
 use crate::config::settings_store::{locked, locked_cancellable, locked_for, write_private};
+use crate::llm::key_pool;
+use accounts::Store;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -17,8 +21,10 @@ use std::{
     fmt,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, atomic::AtomicBool},
+    time::{Duration, SystemTime},
 };
 
+pub mod accounts;
 pub mod util;
 
 mod alibaba_coding_plan;
@@ -195,6 +201,7 @@ static FLOWS: &[&Flow] = &[
     &zai::FLOW,
     &xai::FLOW,
     &gitlab::FLOW,
+    &gitlab::AGENT_FLOW,
     &perplexity::FLOW,
     &kilo::FLOW,
     &factory::FLOW,
@@ -230,35 +237,37 @@ fn path(user_dir: &Path, id: &str) -> PathBuf {
     user_dir.join(format!("oauth-{id}.json"))
 }
 
-fn load(path: &Path) -> Result<Option<Credentials>> {
-    let Some(bytes) = crate::platform::atomic::read_private(path)? else {
-        return Ok(None);
-    };
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .context("stored OAuth credentials are invalid; sign in again")
+type Grants = Store<Credentials>;
+
+/// Every account stored for a provider. A missing file holds none; a legacy single-grant file
+/// loads as one account (see [`accounts::parse`]).
+fn load(path: &Path) -> Result<Grants> {
+    match crate::platform::atomic::read_private(path)? {
+        Some(bytes) => accounts::parse(&bytes),
+        None => Ok(Grants::default()),
+    }
 }
 
-fn save(path: &Path, credentials: &Credentials) -> Result<()> {
-    write_private(path, &serde_json::to_vec(credentials)?)
+fn save(path: &Path, grants: &Grants) -> Result<()> {
+    write_private(path, &serde_json::to_vec(grants)?)
 }
 
 pub fn signed_in(user_dir: &Path, id: &str) -> bool {
-    flow(id).is_some() && load(&path(user_dir, id)).ok().flatten().is_some()
+    flow(id).is_some() && load(&path(user_dir, id)).is_ok_and(|grants| !grants.is_empty())
 }
 
-/// Public identity of a stored grant (email or account id), for display.
+/// Public identity of the active grant (email, organization or account id), for display.
 pub fn identity(user_dir: &Path, id: &str) -> Option<String> {
-    let credentials = load(&path(user_dir, id)).ok().flatten()?;
-    credentials
-        .email
-        .or(credentials.org_name)
-        .or(credentials.account_id)
+    load(&path(user_dir, id)).ok()?.active().and_then(label)
 }
 
-/// Enterprise host recorded at login (Copilot GitHub Enterprise), when the grant has one.
+/// Enterprise host recorded at login (Copilot GitHub Enterprise), when the active grant has one.
 pub fn enterprise_url(user_dir: &Path, id: &str) -> Option<String> {
-    load(&path(user_dir, id)).ok().flatten()?.enterprise_url
+    load(&path(user_dir, id))
+        .ok()?
+        .active()?
+        .enterprise_url
+        .clone()
 }
 
 /// The endpoint a signed-in grant routes to by itself (a Cloudflare gateway or Snowflake account
@@ -266,8 +275,8 @@ pub fn enterprise_url(user_dir: &Path, id: &str) -> Option<String> {
 /// so they name the same route.
 pub fn grant_route(user_dir: &Path, id: &str) -> Option<String> {
     let flow = flow(id)?;
-    let credentials = load(&path(user_dir, id)).ok().flatten()?;
-    (flow.access)(&credentials).ok()?.base_url
+    let grants = load(&path(user_dir, id)).ok()?;
+    (flow.access)(grants.active()?).ok()?.base_url
 }
 
 /// Sign-out generation per provider. A sign-out advances it while holding the grant lock, so a
@@ -320,7 +329,11 @@ fn publish(
         "{} sign-in was cancelled by sign-out; the grant was not saved",
         flow.name
     );
-    save(&path, credentials)?;
+    let mut grants = load(&path)?;
+    let key = account_key(&grants, credentials);
+    grants.insert(key.clone(), credentials.clone());
+    grants.select(&key);
+    save(&path, &grants)?;
     let who = credentials
         .email
         .as_deref()
@@ -343,57 +356,228 @@ pub fn sign_out(user_dir: &Path, id: &str) -> Result<String> {
     Ok(format!("Signed out of {}", flow.name))
 }
 
-/// Fresh request credentials, refreshing the stored grant under the lock when it is near expiry.
+/// Remove one stored account. The grant file is deleted together with its last account.
+pub fn sign_out_account(user_dir: &Path, id: &str, key: &str) -> Result<String> {
+    let flow = require(id)?;
+    let path = path(user_dir, id);
+    let _lock = locked_for(&path, None, std::time::Duration::from_secs(2))?;
+    let mut grants = load(&path)?;
+    let removed = grants
+        .remove(key)
+        .with_context(|| format!("no stored {} account to remove", flow.name))?;
+    if grants.is_empty() {
+        if path.exists() {
+            std::fs::remove_file(&path).context("could not remove the stored OAuth grant")?;
+        }
+    } else {
+        save(&path, &grants)?;
+    }
+    let who = label(&removed).unwrap_or_else(|| key.to_owned());
+    Ok(format!("Removed {} account {who}", flow.name))
+}
+
+/// One stored account as shown to the user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountSummary {
+    /// Stable key (account id, email, or `account-N`) for [`select_account`] and [`sign_out_account`].
+    pub key: String,
+    pub label: String,
+    pub active: bool,
+    /// Recently rate-limited, quota-spent, or rejected; new sessions skip it until the cooldown ends.
+    pub cooling: bool,
+}
+
+/// The stored accounts for `id`, in key order, with the active and cooling-down ones marked.
+pub fn list_accounts(user_dir: &Path, id: &str) -> Result<Vec<AccountSummary>> {
+    let flow = require(id)?;
+    let grants = load(&path(user_dir, id))?;
+    let active = grants.active_key().map(str::to_owned);
+    let scope = accounts::scope(flow.id, user_dir);
+    let blocks = key_pool::process_blocks();
+    Ok(grants
+        .accounts
+        .iter()
+        .map(|(key, credentials)| AccountSummary {
+            key: key.clone(),
+            label: label(credentials).unwrap_or_else(|| key.clone()),
+            active: active.as_deref() == Some(key.as_str()),
+            cooling: accounts::is_blocked(blocks, &scope, key),
+        })
+        .collect())
+}
+
+/// Stored accounts of every OAuth provider that has any, keyed by provider id. A store that cannot
+/// be read counts as signed out, as in [`signed_in`].
+pub fn accounts_by_provider(user_dir: &Path) -> BTreeMap<String, Vec<AccountSummary>> {
+    flows()
+        .filter_map(|flow| {
+            let accounts = list_accounts(user_dir, flow.id).ok()?;
+            (!accounts.is_empty()).then(|| (flow.id.to_owned(), accounts))
+        })
+        .collect()
+}
+
+/// Make `key` the account new sessions start on. Sessions already running keep their account.
+pub fn select_account(user_dir: &Path, id: &str, key: &str) -> Result<String> {
+    let flow = require(id)?;
+    let path = path(user_dir, id);
+    let _lock = locked_for(&path, None, std::time::Duration::from_secs(2))?;
+    let mut grants = load(&path)?;
+    ensure!(
+        grants.select(key),
+        "no stored {} account to select",
+        flow.name
+    );
+    save(&path, &grants)?;
+    Ok(format!("{} account selected", flow.name))
+}
+
+/// Fresh request credentials, refreshing the account under its own lock when it is near expiry.
 pub fn access(user_dir: &Path, id: &str, cancel: &Arc<AtomicBool>) -> Result<Access> {
-    access_inner(user_dir, id, cancel, false)
+    access_inner(user_dir, id, None, cancel, false)
 }
 
 /// Refresh unconditionally (after the provider rejected the current token), then shape access.
 pub fn refreshed_access(user_dir: &Path, id: &str, cancel: &Arc<AtomicBool>) -> Result<Access> {
-    access_inner(user_dir, id, cancel, true)
+    access_inner(user_dir, id, None, cancel, true)
 }
 
 fn access_inner(
     user_dir: &Path,
     id: &str,
+    account: Option<&str>,
     cancel: &Arc<AtomicBool>,
     force: bool,
 ) -> Result<Access> {
     let flow = require(id)?;
     let path = path(user_dir, id);
-    let _lock = locked_cancellable(&path, cancel)?;
-    let mut credentials = load(&path)?.with_context(|| {
+    let grants = snapshot(&path, cancel)?;
+    let key = match account {
+        Some(key) => key.to_owned(),
+        None => grants
+            .active_key()
+            .map(str::to_owned)
+            .with_context(|| not_signed_in(flow))?,
+    };
+    let loaded = grants
+        .accounts
+        .get(&key)
+        .cloned()
+        .with_context(|| not_signed_in(flow))?;
+    if !force && !loaded.expired(REFRESH_MARGIN_MS) {
+        return (flow.access)(&loaded);
+    }
+    // Refresh under this account's own lock: a process that waited reloads the grant and reuses
+    // the refresh the other process made, rather than spending the refresh token a second time.
+    let _refresh = locked_cancellable(&accounts::refresh_lock_path(user_dir, id, &key), cancel)?;
+    let mut credentials = snapshot(&path, cancel)?
+        .accounts
+        .get(&key)
+        .cloned()
+        .with_context(|| not_signed_in(flow))?;
+    let already_refreshed = if force {
+        credentials.access != loaded.access
+    } else {
+        !credentials.expired(REFRESH_MARGIN_MS)
+    };
+    if already_refreshed {
+        return (flow.access)(&credentials);
+    }
+    let Some(refresh) = flow.refresh else {
+        ensure!(
+            !credentials.expired(0),
+            "{} sign-in expired; sign in again from /providers",
+            flow.name
+        );
+        return (flow.access)(&credentials);
+    };
+    let mut fresh = refresh(&credentials, cancel).with_context(|| {
         format!(
-            "not signed in to {}; sign in from /providers or run `dial login {id}`",
+            "{} sign-in could not be refreshed; sign in again from /providers",
             flow.name
         )
     })?;
-    if force || credentials.expired(REFRESH_MARGIN_MS) {
-        match flow.refresh {
-            Some(refresh) => {
-                let mut fresh = refresh(&credentials, cancel).with_context(|| {
-                    format!(
-                        "{} sign-in could not be refreshed; sign in again from /providers",
-                        flow.name
-                    )
-                })?;
-                fresh.validate()?;
-                if fresh.refresh.is_empty() {
-                    fresh.refresh = std::mem::take(&mut credentials.refresh);
-                }
-                credentials = fresh;
-                save(&path, &credentials)?;
-            }
-            None if credentials.expired(0) => {
-                bail!(
-                    "{} sign-in expired; sign in again from /providers",
-                    flow.name
-                )
-            }
-            None => {}
-        }
+    fresh.validate()?;
+    if fresh.refresh.is_empty() {
+        fresh.refresh = std::mem::take(&mut credentials.refresh);
     }
-    (flow.access)(&credentials)
+    store_grant(&path, &key, &fresh, cancel)?;
+    (flow.access)(&fresh)
+}
+
+fn not_signed_in(flow: &Flow) -> String {
+    format!(
+        "not signed in to {}; sign in from /providers or run `dial login {}`",
+        flow.name, flow.id
+    )
+}
+
+/// The account store as it is on disk, read under its lock.
+fn snapshot(path: &Path, cancel: &AtomicBool) -> Result<Grants> {
+    let _lock = locked_cancellable(path, cancel)?;
+    load(path)
+}
+
+/// Write one account's refreshed grant under the store lock. An account removed meanwhile is not
+/// added back.
+fn store_grant(
+    path: &Path,
+    key: &str,
+    credentials: &Credentials,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    let _lock = locked_cancellable(path, cancel)?;
+    let mut grants = load(path)?;
+    if let Some(slot) = grants.accounts.get_mut(key) {
+        *slot = credentials.clone();
+        save(path, &grants)?;
+    }
+    Ok(())
+}
+
+/// The active account of a provider a new session binds to: the active one, or the next usable
+/// one while it cools down.
+fn pick_account(user_dir: &Path, id: &'static str) -> Option<String> {
+    let grants = load(&path(user_dir, id)).ok()?;
+    let active = grants.active_key()?.to_owned();
+    let scope = accounts::scope(id, user_dir);
+    let blocks = key_pool::process_blocks();
+    if !accounts::is_blocked(blocks, &scope, &active) {
+        return Some(active);
+    }
+    Some(
+        accounts::next_account(&grants, Some(&active), |key| {
+            accounts::is_blocked(blocks, &scope, key)
+        })
+        .unwrap_or(active),
+    )
+}
+
+/// Stable key for a new grant: its account id, else its email, else the next free `account-N`.
+/// Logging in again as the same account replaces that account's grant.
+fn account_key(grants: &Grants, credentials: &Credentials) -> String {
+    if let Some(key) = credentials
+        .account_id
+        .clone()
+        .or_else(|| credentials.email.clone())
+        .filter(|key| !key.is_empty())
+    {
+        return key;
+    }
+    let mut n = grants.accounts.len() + 1;
+    while grants.accounts.contains_key(&format!("account-{n}")) {
+        n += 1;
+    }
+    format!("account-{n}")
+}
+
+/// Display label of a grant: email, organization, or account id.
+fn label(credentials: &Credentials) -> Option<String> {
+    credentials
+        .email
+        .clone()
+        .or_else(|| credentials.org_name.clone())
+        .or_else(|| credentials.account_id.clone())
 }
 
 /// Resolve the credential route without reading credentials for an explicitly selected API key.
@@ -429,11 +613,15 @@ pub fn selected_auth(
     }
 }
 
-/// A provider route bound to a stored OAuth grant, resolved per request.
+/// A provider route bound to one stored OAuth account, resolved per request. The binding pins the
+/// account for its session (sticky); [`Binding::rotate`] moves it after a rate limit, quota, or
+/// auth failure.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Binding {
     pub id: &'static str,
     pub user_dir: PathBuf,
+    /// The account this session uses. `None` when the provider has no stored account.
+    pub account: Option<String>,
 }
 
 impl fmt::Debug for Binding {
@@ -443,12 +631,14 @@ impl fmt::Debug for Binding {
 }
 
 impl Binding {
-    /// Some when `provider` is an OAuth provider with a stored grant.
+    /// Some when `provider` is an OAuth provider with a stored account.
     pub fn for_provider(user_dir: &Path, provider: &str) -> Option<Self> {
         let flow = flow(provider)?;
-        signed_in(user_dir, flow.id).then(|| Self {
+        let account = pick_account(user_dir, flow.id)?;
+        Some(Self {
             id: flow.id,
             user_dir: user_dir.to_path_buf(),
+            account: Some(account),
         })
     }
     /// Bind the explicitly selected sign-in, even if the user still needs to sign in.
@@ -457,16 +647,55 @@ impl Binding {
         Some(Self {
             id: flow.id,
             user_dir: user_dir.to_path_buf(),
+            account: pick_account(user_dir, flow.id),
         })
     }
     pub fn flow(&self) -> &'static Flow {
         flow(self.id).expect("bindings are created from registered flows")
     }
     pub fn access(&self, cancel: &Arc<AtomicBool>) -> Result<Access> {
-        access(&self.user_dir, self.id, cancel)
+        access_inner(
+            &self.user_dir,
+            self.id,
+            self.account.as_deref(),
+            cancel,
+            false,
+        )
     }
     pub fn refreshed_access(&self, cancel: &Arc<AtomicBool>) -> Result<Access> {
-        refreshed_access(&self.user_dir, self.id, cancel)
+        access_inner(
+            &self.user_dir,
+            self.id,
+            self.account.as_deref(),
+            cancel,
+            true,
+        )
+    }
+
+    /// Move this session to the next usable account after `class` failed on the current one. The
+    /// failed account cools down ([`accounts::block_account`]); the switch lasts for this session.
+    /// Returns false when `class` does not rotate or no other account is usable.
+    pub fn rotate(&mut self, class: &ErrorClass, hinted: Option<Duration>) -> bool {
+        let Some(current) = self.account.clone() else {
+            return false;
+        };
+        let scope = accounts::scope(self.id, &self.user_dir);
+        let blocks = key_pool::process_blocks();
+        if !accounts::block_account(blocks, &scope, &current, class, hinted, SystemTime::now()) {
+            return false;
+        }
+        let Ok(grants) = load(&path(&self.user_dir, self.id)) else {
+            return false;
+        };
+        match accounts::next_account(&grants, Some(&current), |key| {
+            accounts::is_blocked(blocks, &scope, key)
+        }) {
+            Some(next) => {
+                self.account = Some(next);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Refuse to attach this grant to a route it does not authorize. A route the grant supplies

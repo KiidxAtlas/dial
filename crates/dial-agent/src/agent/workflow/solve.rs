@@ -333,6 +333,7 @@ fn search(parent: &mut subagents::Parent<'_>, args: &Value, ui: &mut dyn Ui) -> 
                 adapter: parent.adapter,
                 handoff: Default::default(),
             },
+            None,
             &json!({"agent":"worker","task":prompt,"solution_space":"one implementation slice: the spec is given","max_steps":env.config.solve.max_steps}),
             ui,
         );

@@ -33,6 +33,11 @@ const EMPTY: &str = "Nothing to show.";
 type Row = Vec<Span<'static>>;
 
 pub(super) fn rows(title: &str, body: &str, w: u16, ctx: &TranscriptCtx) -> Rows {
+    if title == "Notice"
+        && let Some(rows) = super::tool_cards::incoming_notice(body, w, ctx)
+    {
+        return rows;
+    }
     let w = w as usize;
     let theme = ctx.theme;
     let title = text::one_line(title);

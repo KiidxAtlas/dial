@@ -198,6 +198,35 @@ impl Shell {
                 match result { Ok(report) => self.note("Review", report), Err(error) => self.note("Review", format!("{error:#}")) }
             }
             "review-file" => self.review_checkpoints(agent, args),
+            "seance" => {
+                let (source, question) = args.split_once(char::is_whitespace).map_or(("", ""), |(source, question)| (source, question.trim()));
+                if source.is_empty() || question.is_empty() {
+                    self.note("Seance", "Usage: /seance <session id prefix or worker id> <question>");
+                    return Ok(Step::Done);
+                }
+                platform::interrupt::clear_interrupt();
+                self.live_tasks = Some(agent.live_task_control());
+                self.background_control = agent.background_control();
+                self.composer.set_busy(true);
+                self.status.phase = Phase::Working;
+                match self.wait_compute(app).and_then(|ready| if ready { self.prepare_local(app) } else { Ok(false) }) {
+                    Ok(true) => {}
+                    Ok(false) => { self.composer.set_busy(false); return Ok(Step::Done); }
+                    Err(error) => { self.composer.set_busy(false); self.note("Seance", format!("{error:#}")); return Ok(Step::Done); }
+                }
+                let started = Instant::now();
+                let result = {
+                    let mut bridge = Bridge { app, shell: self, interrupt: app.interrupt.clone(), started,
+                        last_paint: Instant::now() - PAINT_EVERY, failed: false, pending: Vec::new(), next_id: 0 };
+                    bridge.repaint(true);
+                    agent.run_seance(source, question, &mut bridge)
+                };
+                app.interrupt.store(false, Ordering::SeqCst);
+                self.composer.set_busy(false);
+                self.status.activity.clear();
+                self.refresh_status(app, agent);
+                match result { Ok(answer) => self.note("Seance", answer), Err(error) => self.note("Seance", format!("{error:#}")) }
+            }
             "model" if args == "restart" => {
                 if self.ask("Restart managed model?", "Unload only this session's Dial-managed local model. The same model reloads on the next request; files and conversation stay intact. External servers are never restarted.", &[("Restart", 'r'), ("Cancel", 'n')]) == Some(0) {
                     match agent.restart_managed_model() {
@@ -307,7 +336,11 @@ impl Shell {
                 } else {
                     path
                 };
-                match agent.session().export(Path::new(&path), html) {
+                let exported = match agent.layout() {
+                    Some(layout) => agent.session().export(layout, Path::new(&path), html),
+                    None => Err(anyhow::anyhow!("agent has no project layout")),
+                };
+                match exported {
                     Ok(()) => self.note("Export", format!("saved {path}")),
                     Err(error) => self.note("Export", format!("{error:#}")),
                 }
@@ -839,15 +872,24 @@ impl Shell {
                 let used = agent.last_prompt_tokens;
                 let window = u64::from(agent.context_window());
                 let percent = (used * 100).checked_div(window).unwrap_or(0);
-                self.note(
-                    "Context",
-                    format!(
-                        "used: {} of {} tokens ({percent}%) · messages: {}\n/compact summarizes older turns to free room; /new starts fresh.",
-                        group_digits(used),
-                        group_digits(window),
-                        agent.session().messages().len()
-                    ),
-                )
+                let mut text = format!(
+                    "used: {} of {} tokens ({percent}%) · messages: {}\n/compact summarizes older turns to free room; /new starts fresh.",
+                    group_digits(used),
+                    group_digits(window),
+                    agent.session().messages().len()
+                );
+                if let Some(breakdown) = agent.last_request_breakdown() {
+                    text.push_str("\n\nLast request, estimated tokens (bytes ÷ 4; images at a fixed cost):");
+                    for row in breakdown.rows() {
+                        text.push_str(&format!("\n  {:<32} {:>12}", row.label, group_digits(row.tokens)));
+                    }
+                    text.push_str(&format!(
+                        "\n  {:<32} {:>12}",
+                        "total",
+                        group_digits(breakdown.total_tokens())
+                    ));
+                }
+                self.note("Context", text)
             }
             "approval" => {
                 match args {

@@ -169,6 +169,123 @@ fn apply_archive_moves_session_and_records_it() {
 }
 
 #[test]
+fn apply_archive_moves_the_side_thread_with_its_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let l = layout(dir.path());
+    let path = write_session(
+        &l,
+        "20200101T000000000Z_side.jsonl",
+        "/proj",
+        Duration::from_secs(90 * 86_400),
+    );
+    let side = crate::storage::side_thread::path_for(&path);
+    fs::write(&side, "{\"pending\":true}\n").unwrap();
+    let mut a = args();
+    a.apply = true;
+    a.archive = true;
+    a.retain_newest_global = Some(0);
+    a.retain_newest_per_cwd = Some(0);
+    let archive = execute(&l, &a, retention::now_ms())
+        .unwrap()
+        .archive
+        .unwrap();
+    assert_eq!(archive.archived, 1, "errors: {:?}", archive.errors);
+    assert!(
+        !side.exists(),
+        "the side thread must leave with its session"
+    );
+    let dest = l
+        .sessions_dir()
+        .join(ARCHIVE_DIR)
+        .join(path.file_name().unwrap());
+    let archived_side = crate::storage::side_thread::path_for(&dest);
+    assert_eq!(fs::read(&archived_side).unwrap(), b"{\"pending\":true}\n");
+}
+
+#[test]
+fn archive_refuses_a_side_thread_already_at_the_destination() {
+    let dir = tempfile::tempdir().unwrap();
+    let l = layout(dir.path());
+    let path = write_session(
+        &l,
+        "20200101T000000000Z_taken.jsonl",
+        "/proj",
+        Duration::from_secs(90 * 86_400),
+    );
+    let side = crate::storage::side_thread::path_for(&path);
+    fs::write(&side, "mine\n").unwrap();
+    let archive_dir = l.sessions_dir().join(ARCHIVE_DIR);
+    fs::create_dir_all(&archive_dir).unwrap();
+    let dest = archive_dir.join(path.file_name().unwrap());
+    let dest_side = crate::storage::side_thread::path_for(&dest);
+    fs::write(&dest_side, "theirs\n").unwrap();
+    let mut a = args();
+    a.apply = true;
+    a.archive = true;
+    a.retain_newest_global = Some(0);
+    a.retain_newest_per_cwd = Some(0);
+    let archive = execute(&l, &a, retention::now_ms())
+        .unwrap()
+        .archive
+        .unwrap();
+    assert_eq!(archive.archived, 0);
+    assert!(
+        archive
+            .errors
+            .iter()
+            .any(|e| e.contains("side thread destination exists")),
+        "errors: {:?}",
+        archive.errors
+    );
+    assert!(path.exists() && !dest.exists());
+    assert_eq!(fs::read(&side).unwrap(), b"mine\n");
+    assert_eq!(fs::read(&dest_side).unwrap(), b"theirs\n");
+}
+
+#[test]
+fn a_failed_side_thread_move_puts_the_session_back_at_its_original_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let l = layout(dir.path());
+    let path = write_session(
+        &l,
+        "20200101T000000000Z_stuck.jsonl",
+        "/proj",
+        Duration::from_secs(90 * 86_400),
+    );
+    // A directory where the side thread should be is not a regular file and cannot be moved.
+    let side = crate::storage::side_thread::path_for(&path);
+    fs::create_dir(&side).unwrap();
+    let mut a = args();
+    a.apply = true;
+    a.archive = true;
+    a.retain_newest_global = Some(0);
+    a.retain_newest_per_cwd = Some(0);
+    let archive = execute(&l, &a, retention::now_ms())
+        .unwrap()
+        .archive
+        .unwrap();
+    assert_eq!(archive.archived, 0);
+    assert!(
+        archive
+            .errors
+            .iter()
+            .any(|e| e.contains("moving side thread") && e.contains("rolled back")),
+        "errors: {:?}",
+        archive.errors
+    );
+    let dest = l
+        .sessions_dir()
+        .join(ARCHIVE_DIR)
+        .join(path.file_name().unwrap());
+    assert!(
+        path.exists(),
+        "the session must return to its original path"
+    );
+    assert!(!dest.exists());
+    assert!(side.is_dir());
+}
+
+#[test]
 fn restore_archived_returns_the_pair_or_keeps_it_together_in_the_archive() {
     let dir = tempfile::tempdir().unwrap();
     let l = layout(dir.path());
@@ -201,6 +318,25 @@ fn restore_archived_returns_the_pair_or_keeps_it_together_in_the_archive() {
         "the stream journal must stay with its archived session"
     );
     assert!(!crate::runtime::stream_journal::path(&blocked).exists());
+}
+
+#[test]
+fn restore_archived_brings_the_side_thread_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let l = layout(dir.path());
+    let archive = l.sessions_dir().join(ARCHIVE_DIR);
+    fs::create_dir_all(&archive).unwrap();
+    let original = l.sessions_dir().join("20200101T000000000Z_sideback.jsonl");
+    let dest = archive.join("20200101T000000000Z_sideback.jsonl");
+    fs::write(&dest, "{}\n").unwrap();
+    let dest_side = crate::storage::side_thread::path_for(&dest);
+    fs::write(&dest_side, "pending\n").unwrap();
+    restore_archived(&dest, &original).unwrap();
+    assert_eq!(
+        fs::read(crate::storage::side_thread::path_for(&original)).unwrap(),
+        b"pending\n"
+    );
+    assert!(!dest_side.exists());
 }
 
 #[test]

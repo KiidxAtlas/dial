@@ -163,6 +163,7 @@ pub(super) fn reasoning_profile(
         capabilities: ModelCapabilities {
             reasoning,
             reasoning_efforts: model.thinking_efforts,
+            reasoning_effort_wire: model.effort_wire,
             ..Default::default()
         },
         reasoning_effort: model.default_effort,

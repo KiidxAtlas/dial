@@ -333,18 +333,28 @@ fn share_session(shell: &mut Shell, app: &App, agent: &Agent<'_>, args: &str) ->
             let path = path.context("No session file yet — send a message first.")?;
             // Same payload as `dial share`: the active branch unless the diagnostic scope is named.
             let transcript = share::transcript(&path, scope)?;
-            let encrypted = share::encrypt_transcript(&transcript)?;
-            let link = if gist {
+            let fitted = share::fit_to_cap(&transcript, share::SHARE_CAP_BYTES)?;
+            let trimmed = fitted
+                .trims
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ");
+            let encrypted = fitted.share;
+            // A configured server receives the share; without one, or with `/share gist`, it becomes
+            // a secret gist created through `gh`, which reports an actionable error when unavailable.
+            let link = if gist || endpoint.is_empty() {
                 share::upload_gist(&encrypted)?
             } else {
-                anyhow::ensure!(
-                    !endpoint.is_empty(),
-                    "set [share].server_url, or use /share gist"
-                );
                 share::upload(&encrypted, &endpoint)?
             };
+            let trim_note = if trimmed.is_empty() {
+                String::new()
+            } else {
+                format!("\nTrimmed to fit the size cap: {trimmed}.")
+            };
             Ok(format!(
-                "Share URL: {link}\nNote: the key is only in the URL fragment; anyone with the full link can read the session."
+                "Share URL: {link}\nNote: the key is only in the URL fragment; anyone with the full link can read the session.{trim_note}"
             ))
         })();
         result.map_err(|error| anyhow::anyhow!("Failed to share session: {error:#}"))
@@ -383,7 +393,7 @@ fn dump(shell: &mut Shell, app: &App, agent: &Agent<'_>, args: &str) -> Result<S
         .map(|d| d.as_nanos())
         .unwrap_or_default();
     let path = std::env::temp_dir().join(format!("dial-dump-{}-{stamp}.md", session.id()));
-    match session.export(&path, false) {
+    match session.export(&app.layout, &path, false) {
         Ok(()) => shell.note(
             "Dump",
             format!(

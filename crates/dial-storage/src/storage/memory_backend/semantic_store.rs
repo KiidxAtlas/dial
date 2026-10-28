@@ -459,6 +459,24 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Ids of live facts updated at or after `since`, newest first.
+    pub fn recent_since(&self, since: i64, limit: usize) -> Result<Vec<i64>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id FROM facts WHERE forgotten=0 AND updated>=?1 ORDER BY updated DESC, id DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![since, limit as i64], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// A value that changes whenever the stored facts may have changed: `data_version` moves when
+    /// another connection commits, `total_changes` when this one writes. Recall caches key on it.
+    pub fn write_token(&self) -> Result<(i64, u64)> {
+        let version: i64 = self
+            .conn
+            .query_row("PRAGMA data_version", [], |row| row.get(0))?;
+        Ok((version, self.conn.total_changes()))
+    }
+
     /// Exact top-k over the newest `MAX_VECTOR_ROWS` live facts for `model`.
     /// Rows are decoded one at a time; only `limit` scores and ids survive the scan.
     /// Memory is O(one vector's dimensions + limit), not O(rows * dimensions).

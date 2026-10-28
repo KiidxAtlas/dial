@@ -28,7 +28,7 @@ pub fn execution_platform(name: &str) -> PlatformAvailability {
     let reason = if cfg!(target_os = "macos") {
         crate::tools::exec::sandbox::Sandbox::detect().available().err().map(|error|
             format!("{name} requires OS process-fork containment even with filesystem sandboxing disabled: {error}"))
-    } else if cfg!(windows) && name == "kernel" {
+    } else if cfg!(windows) && name == "eval" {
         None // The trusted Python bootstrap installs the native no-child-process mitigation.
     } else {
         Some(format!(
@@ -106,7 +106,7 @@ impl Catalog {
                     origin,
                     identity,
                     schema: schema.clone(),
-                    platform: matches!(name, "kernel" | "eval").then(|| execution_platform(name)),
+                    platform: matches!(name, "eval").then(|| execution_platform(name)),
                 },
             );
         }

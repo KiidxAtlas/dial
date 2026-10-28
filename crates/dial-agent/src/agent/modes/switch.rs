@@ -7,6 +7,7 @@ use crate::llm::model_config::ModelSelection;
 use crate::llm::profiles::ReasoningEffort;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::BTreeMap;
 
 /// The session's `/switch` selection, stored in mode state so it survives agent rebuilds and session swaps.
@@ -26,6 +27,11 @@ const EFFORTS: [ReasoningEffort; 8] = [
     ReasoningEffort::Max,
     ReasoningEffort::Ultra,
 ];
+
+/// The reasoning level named by `name` (`none`, `minimal`, … `ultra`), if it is one of them.
+pub fn parse_effort(name: &str) -> Option<ReasoningEffort> {
+    EFFORTS.into_iter().find(|effort| effort.as_str() == name)
+}
 
 /// A `/switch` argument split into the model selector and an optional `:level` reasoning suffix.
 #[derive(Debug, PartialEq)]
@@ -195,6 +201,9 @@ impl Agent<'_> {
             effort,
         });
         self.save_modes()?;
+        self.emit_event("model_changed", || {
+            json!({"session_id": self.session.id(), "provider": selection.provider, "model": selection.model})
+        });
         Ok(())
     }
 
@@ -228,6 +237,35 @@ impl Agent<'_> {
         }
         Ok(())
     }
+}
+
+/// Whether `selection` names a model Dial can offer without a network round trip: a bundled catalog
+/// entry, a configured selection (current model, role, favorite or profile), or a downloaded local
+/// model. Discovered remote listings are not consulted here.
+pub fn is_known_model(
+    config: &Config,
+    user_dir: &std::path::Path,
+    selection: &ModelSelection,
+) -> bool {
+    let same = |a: &ModelSelection| a.provider == selection.provider && a.model == selection.model;
+    let mut configured = std::iter::once(config.selection())
+        .chain(config.model_roles.values().cloned())
+        .chain(config.model_favorites.iter().cloned())
+        .chain(
+            config
+                .model_profiles
+                .values()
+                .map(|profile| ModelSelection {
+                    provider: profile.provider.clone(),
+                    model: profile.model.clone(),
+                    ..Default::default()
+                }),
+        );
+    configured.any(|candidate| same(&candidate))
+        || crate::llm::catalog::bundled_model(&selection.provider, &selection.model).is_some()
+        || crate::llm::catalog::downloaded_local_models(user_dir)
+            .iter()
+            .any(|entry| same(&entry.selection))
 }
 
 #[cfg(test)]

@@ -17,7 +17,7 @@
 //! Load-time recovery: a torn final line (interrupted append) is tolerated; malformed or oversized
 //! interior lines, and entries whose parent is missing, are skipped and reported through
 //! `Session::take_recovery_diagnostics`. Loading never rewrites or truncates the file.
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
 use std::{
@@ -31,7 +31,7 @@ use std::{
 
 use crate::platform::fs as platform_fs;
 
-use super::session_pins;
+use super::{session_pins, side_thread};
 use crate::config::paths::Layout;
 use crate::runtime::tool_output::ToolOutput;
 
@@ -54,6 +54,29 @@ fn claim_writer(file: &File) -> io::Result<()> {
             result => return result,
         }
     }
+}
+
+/// Writer-claim outcome. Contention is a value so `open_or_fork` can fall back to a fork; every
+/// other claim failure stays an error.
+enum Claimed {
+    Owned(Session),
+    Contended(io::Error),
+}
+
+/// What an interactive resume got: the journal itself, or a sibling fork of it.
+pub enum Resumed {
+    /// The journal's writer lock was claimed; the caller resumes this session in place.
+    Owned(Session),
+    /// Another live writer holds the journal. `session` is a new file holding the active branch
+    /// and its runtime streams, with `forked_from` set to `source_id`.
+    Forked { source_id: String, session: Session },
+}
+
+fn busy_session_error(path: &Path, error: io::Error) -> anyhow::Error {
+    anyhow::Error::new(error).context(format!(
+        "session {} is already open for writing; close its owning Dial session before resuming or renaming it",
+        path.display()
+    ))
 }
 
 /// Longest line we write or read. Longer lines on disk are skipped; an oversized message append is
@@ -448,14 +471,103 @@ fn file_id(name: &str) -> Option<&str> {
 
 // ---------------------------------------------------------------- file helpers
 
-/// Removes a partially moved session. The move created the main file, so it always goes. The stream
-/// journal goes only when the move created it: a pre-existing journal at the destination is not ours.
-/// Source files are never touched. Best effort; the caller already has the error to report.
-fn discard_moved_copy(dst: &Path, streams_created: bool) {
-    if streams_created {
+/// Companion files a session move created at its destination. Discarding a moved copy removes only
+/// these: a companion that already existed there belongs to someone else and is never touched.
+#[derive(Clone, Copy, Default)]
+struct CreatedCompanions {
+    streams: bool,
+    side: bool,
+}
+
+/// Removes a partially moved session. The move created the main file, so it always goes; companions
+/// go only when the move created them. Source files are never touched. Best effort; the caller
+/// already has the error to report.
+fn discard_moved_copy(dst: &Path, created: CreatedCompanions) {
+    if created.streams {
         let _ = crate::runtime::stream_journal::remove(dst);
     }
+    if created.side {
+        let _ = fs::remove_file(side_thread::path_for(dst));
+    }
     let _ = fs::remove_file(dst);
+}
+
+/// Refuses a destination whose side-thread path is taken, even by a dangling symlink. A file there
+/// is never adopted or overwritten.
+pub fn ensure_side_thread_free(dst: &Path) -> Result<()> {
+    let side = side_thread::path_for(dst);
+    match fs::symlink_metadata(&side) {
+        Ok(_) => bail!("side thread destination exists: {}", side.display()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("checking {}", side.display())),
+    }
+}
+
+/// Copies the source's side-thread file verbatim, pending work included, to the destination's side
+/// path. Returns whether this call created the file; a failed copy removes only its own output.
+fn copy_side_thread(src: &Path, dst: &Path) -> Result<bool> {
+    let from = side_thread::path_for(src);
+    let to = side_thread::path_for(dst);
+    let mut input =
+        match platform_fs::open_nofollow_nonblocking(OpenOptions::new().read(true), &from) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error).with_context(|| format!("reading {}", from.display())),
+        };
+    ensure!(
+        input.metadata()?.is_file(),
+        "side thread {} is not a regular file",
+        from.display()
+    );
+    let mut out =
+        platform_fs::open_owner_only(OpenOptions::new().write(true).create_new(true), &to)
+            .with_context(|| format!("creating {}", to.display()))?;
+    let written = (|| -> io::Result<()> {
+        io::copy(&mut input, &mut out)?;
+        out.sync_all()?;
+        #[cfg(unix)]
+        if let Some(dir) = to.parent() {
+            fs::File::open(dir)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    drop(out);
+    if let Err(error) = written {
+        let _ = fs::remove_file(&to);
+        return Err(error).with_context(|| format!("copying side thread to {}", to.display()));
+    }
+    Ok(true)
+}
+
+/// Removes a session's side-thread file, if one exists.
+fn remove_side_thread(session: &Path) -> io::Result<()> {
+    match fs::remove_file(side_thread::path_for(session)) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
+/// Moves a session's side-thread file to its archived or restored path, never replacing an existing
+/// destination. A missing source is not an error; a non-regular source is refused untouched.
+pub fn relocate_side_thread(source: &Path, destination: &Path) -> io::Result<()> {
+    let from = side_thread::path_for(source);
+    match fs::symlink_metadata(&from) {
+        Ok(meta) if !meta.is_file() => {
+            return Err(io::Error::other(format!(
+                "side thread {} is not a regular file",
+                from.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    let to = side_thread::path_for(destination);
+    match crate::runtime::stream_journal::publish_no_replace(&from, &to) {
+        // A source that vanished between the check and the publish has nothing left to move.
+        Err(error) if error.kind() == io::ErrorKind::NotFound && !from.exists() => Ok(()),
+        result => result,
+    }
 }
 
 struct RawLine {
@@ -579,8 +691,12 @@ fn role_of(message: &Value) -> &str {
 
 /// Shared exclusion rules for original conversation records, not synthetic context.
 fn is_conversation_message(message: &Value) -> bool {
-    matches!(role_of(message), "user" | "assistant")
-        && message["dial_transient"] != true
+    matches!(role_of(message), "user" | "assistant") && is_original_record(message)
+}
+
+/// Records the user or model wrote or saw, not synthetic context or transient controls.
+fn is_original_record(message: &Value) -> bool {
+    message["dial_transient"] != true
         && message["dial_portable_rules"] != true
         && message["dial_context_notes"] != true
         && message["dial_context_rollover"] != true
@@ -876,6 +992,72 @@ impl Session {
     /// Opens an existing session for exclusive appending. A competing writer is
     /// refused before loading or repairing history; read-only inspection is separate.
     pub fn open(path: &Path) -> Result<Session> {
+        match Self::claim_open(path)? {
+            Claimed::Owned(session) => Ok(session),
+            Claimed::Contended(error) => Err(busy_session_error(path, error)),
+        }
+    }
+
+    /// Interactive resume. An owned journal opens for appending exactly as `open` does. Only when
+    /// another live writer holds the journal lock does the caller get a sibling fork of the active
+    /// branch: a new file whose header names this session as `forked_from`, carrying the branch's
+    /// runtime streams. The owner's files are never repaired, rewritten, or truncated, and any
+    /// integrity finding (malformed or oversized line, missing parent) is an error, never a fork.
+    pub fn open_or_fork(layout: &Layout, path: &Path) -> Result<Resumed> {
+        // A journal whose recorded move left this path is stale: its history lives at the
+        // destination, so resuming it in place would fork the destination's writer. Fork instead.
+        let moved = transfers::moved_away_from(layout, path)?;
+        if !moved.is_empty() {
+            let snapshot = Self::read(path)?;
+            if moved.iter().any(|t| t.session_id == snapshot.id) {
+                return Self::fork_snapshot(layout, path, snapshot, "moved away", "");
+            }
+        }
+        match Self::claim_open(path)? {
+            Claimed::Owned(session) => Ok(Resumed::Owned(session)),
+            Claimed::Contended(error) => {
+                let snapshot = Self::read(path)?;
+                Self::fork_snapshot(
+                    layout,
+                    path,
+                    snapshot,
+                    "open in another Dial process",
+                    &format!(": {error}"),
+                )
+            }
+        }
+    }
+
+    /// Forks an unowned snapshot after refusing any integrity finding other than a torn tail.
+    fn fork_snapshot(
+        layout: &Layout,
+        path: &Path,
+        snapshot: Session,
+        state: &str,
+        detail: &str,
+    ) -> Result<Resumed> {
+        if let Some(issue) = snapshot
+            .recovery
+            .iter()
+            .find(|d| d.kind != JournalIssueKind::TornTail)
+        {
+            bail!(
+                "session {} is {state} and has an integrity issue at line {} ({}); refusing to fork it{detail}",
+                path.display(),
+                issue.line,
+                issue.detail
+            );
+        }
+        let source_id = snapshot.id.clone();
+        let session = snapshot
+            .fork(layout)
+            .with_context(|| format!("forking session {}", path.display()))?;
+        Ok(Resumed::Forked { source_id, session })
+    }
+
+    /// Claims the writer for `path`. Only a busy lock is `Contended`; ownership, link, and load
+    /// failures are errors, so `open_or_fork` never forks over them.
+    fn claim_open(path: &Path) -> Result<Claimed> {
         crate::config::settings_store::validate_private_path(
             path.parent().context("session path has no parent")?,
         )?;
@@ -891,19 +1073,20 @@ impl Session {
                 && platform_fs::owned_by_current_user(&file)?,
             "session writer requires an owner-owned regular file without hard links"
         );
-        claim_writer(&file).with_context(|| {
-            format!(
-                "session {} is already open for writing; close its owning Dial session before resuming or renaming it",
-                path.display()
-            )
-        })?;
+        match claim_writer(&file) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                return Ok(Claimed::Contended(error));
+            }
+            Err(error) => return Err(busy_session_error(path, error)),
+        }
         // Parse the claimed inode, not a second path lookup that could have been replaced.
         let mut s = Self::load_file(path, file.try_clone()?)?;
         s.file = Some(file);
         s.runtime
             .journal(crate::runtime::stream_journal::Journal::open(path)?);
         s.repair_incomplete_tools()?;
-        Ok(s)
+        Ok(Claimed::Owned(s))
     }
 
     /// Inspect a persisted journal without claiming writer ownership or repairing it.
@@ -1272,8 +1455,9 @@ impl Session {
         Ok(found)
     }
 
-    /// Deletes this session's journal and releases its writer lock. Ephemeral and read-only
-    /// snapshots are refused. Callers drop the pin with `session_pins::unpin`.
+    /// Deletes this session's journal, stream supplement and side-thread file, and releases its
+    /// writer lock. Ephemeral and read-only snapshots are refused. Callers drop the pin with
+    /// `session_pins::unpin`.
     pub fn remove_file(self) -> Result<()> {
         let path = self
             .path
@@ -1285,20 +1469,28 @@ impl Session {
             path.display()
         );
         drop(self);
-        // The main file goes first: if its removal fails, the session and its streams both survive.
+        // The main file goes first: if its removal fails, the session and its companions all survive.
         fs::remove_file(&path).with_context(|| format!("deleting {}", path.display()))?;
         crate::runtime::stream_journal::remove(&path).with_context(|| {
             format!(
                 "session {} was deleted but its stream journal could not be removed",
                 path.display()
             )
+        })?;
+        remove_side_thread(&path).with_context(|| {
+            format!(
+                "session {} was deleted but its side thread file could not be removed",
+                path.display()
+            )
         })
     }
 
-    /// Copies this journal, stream supplement and referenced project-local artifacts into `target`,
-    /// with the header cwd rewritten, then opens the copy as its writer. The caller swaps the copy
-    /// in and calls `remove_file` on the old session. Failure removes the copied journals and leaves
-    /// the source untouched; reusable immutable imports may remain in the target artifact store.
+    /// Copies this journal, stream supplement, side-thread file and referenced project-local artifacts
+    /// into `target`, with the header cwd rewritten, then opens the copy as its writer. The caller
+    /// swaps the copy in and calls `remove_file` on the old session. A side-thread file already at the
+    /// destination is refused before anything is written. Failure removes the copies this call
+    /// created and leaves the source untouched; reusable immutable imports may remain in the target
+    /// artifact store.
     pub fn relocate_to(&self, target: &Layout) -> Result<Session> {
         self.relocate_with(target, Session::open)
     }
@@ -1334,6 +1526,7 @@ impl Session {
         crate::platform::atomic::private_dir(&dir)?;
         let name = src.file_name().context("session path has no file name")?;
         let dst = dir.join(name);
+        ensure_side_thread_free(&dst)?;
         let mut out =
             platform_fs::open_owner_only(OpenOptions::new().write(true).create_new(true), &dst)
                 .with_context(|| format!("creating {}", dst.display()))?;
@@ -1350,12 +1543,21 @@ impl Session {
         #[cfg(unix)]
         let written = written.and_then(|()| fs::File::open(&dir).and_then(|d| d.sync_all()));
         if let Err(err) = written {
-            discard_moved_copy(&dst, false);
+            discard_moved_copy(&dst, CreatedCompanions::default());
             return Err(err).context("writing moved session");
         }
+        let mut created = CreatedCompanions::default();
         if let Err(error) = crate::runtime::stream_journal::copy(src, &dst) {
-            discard_moved_copy(&dst, false);
+            discard_moved_copy(&dst, created);
             return Err(error);
+        }
+        created.streams = true;
+        match copy_side_thread(src, &dst) {
+            Ok(side) => created.side = side,
+            Err(error) => {
+                discard_moved_copy(&dst, created);
+                return Err(error);
+            }
         }
         let transfer = (|| -> Result<()> {
             let source_root = artifact_root(src)?;
@@ -1397,10 +1599,13 @@ impl Session {
             Ok(())
         })();
         if let Err(error) = transfer {
-            discard_moved_copy(&dst, true);
+            discard_moved_copy(&dst, created);
             return Err(error);
         }
-        reopen(dst.as_path()).inspect_err(|_| discard_moved_copy(&dst, true))
+        let moved = reopen(dst.as_path()).inspect_err(|_| discard_moved_copy(&dst, created))?;
+        transfers::record(target, self.id(), src, &dst)
+            .context("recording moved session in the transfer ledger")?;
+        Ok(moved)
     }
 
     /// Workspace roots added beyond the project root, as recorded in the session header.
@@ -1611,10 +1816,10 @@ impl Session {
         self.push(Kind::Title(title)).map(|_| ())
     }
 
-    /// Export the active conversation; credentials are redacted and HTML embeds verified images
-    /// (`storage::export`).
-    pub fn export(&self, path: &Path, html: bool) -> Result<()> {
-        let body = self.export_text(html);
+    /// Export the active conversation followed by every subagent transcript this session spawned.
+    /// Credentials are redacted and HTML embeds verified images (`storage::export`).
+    pub fn export(&self, layout: &Layout, path: &Path, html: bool) -> Result<()> {
+        let body = self.export_text(layout, html)?;
         let mut file =
             platform_fs::open_owner_only(OpenOptions::new().write(true).create_new(true), path)
                 .with_context(|| format!("creating export {}", path.display()))?;
@@ -1623,7 +1828,7 @@ impl Session {
     }
 
     /// The rendered export document (see `export`).
-    pub fn export_text(&self, html: bool) -> String {
+    pub fn export_text(&self, layout: &Layout, html: bool) -> Result<String> {
         let messages: Vec<&Value> = self
             .branch()
             .iter()
@@ -1632,7 +1837,13 @@ impl Session {
                 _ => None,
             })
             .collect();
-        super::export::render(&self.title(), &messages, html)
+        let workers = super::subagent::workers(layout, self.id())?;
+        Ok(super::export::render_with_workers(
+            &self.title(),
+            &messages,
+            &workers,
+            html,
+        ))
     }
 
     /// The share snapshot for the default scope: a session header, then the active branch in order.
@@ -1995,6 +2206,46 @@ impl Session {
             entry_id,
             durability_error,
         })
+    }
+
+    /// Appends a non-model record, such as a plugin transcript entry. Model context never reads
+    /// these entries; they exist for replay and display only.
+    pub fn append_custom_entry(
+        &mut self,
+        custom_type: &str,
+        data: serde_json::Value,
+    ) -> Result<JournalCommit> {
+        anyhow::ensure!(
+            !custom_type.is_empty() && custom_type.len() <= 64,
+            "custom entry type must be 1-64 bytes"
+        );
+        self.append_context_entry(Kind::Custom {
+            custom_type: custom_type.to_owned(),
+            data,
+        })
+    }
+
+    /// Records of one custom type on the active branch, oldest first. Each is paired with its
+    /// position in `messages()`: the number of messages that precede it on the branch, so a replay
+    /// can place it between the messages it followed. Records never enter model context.
+    pub fn custom_records(&self, custom_type: &str) -> Vec<(usize, serde_json::Value)> {
+        let kept: std::collections::HashSet<usize> = self.active.messages.iter().copied().collect();
+        let prefix = self.message_count() - self.active.messages.len();
+        let mut seen = 0;
+        let mut out = Vec::new();
+        for &i in &self.active.branch {
+            match &self.entries[i].kind {
+                Kind::Message(_) if kept.contains(&i) => seen += 1,
+                Kind::Custom {
+                    custom_type: t,
+                    data,
+                } if t == custom_type => {
+                    out.push((prefix + seen, data.clone()));
+                }
+                _ => {}
+            }
+        }
+        out
     }
 
     pub fn replace_context_notes(
@@ -3280,22 +3531,46 @@ impl Session {
         message
     }
 
+    /// A new session holding the ancestry of `target` (any entry, including one on an inactive
+    /// preserved branch), or an empty ancestry when `target` is `None`. The source is only read: its
+    /// journal, active leaf, and writer are untouched. A fork at an anchor imports persisted records
+    /// only; live stream supplements belong to the source's worker and are never carried.
+    pub fn fork_at(&self, layout: &Layout, target: Option<&str>) -> Result<Session> {
+        let chain = match target {
+            Some(id) => {
+                ensure!(
+                    self.by_id.contains_key(id),
+                    "session {} has no entry {id}",
+                    self.id
+                );
+                self.ancestry(Some(id))
+            }
+            None => Vec::new(),
+        };
+        self.fork_chain(layout, &chain, false)
+    }
+
     /// A new session file holding the active branch (rewind markers dropped, ids preserved).
     pub fn fork(&self, layout: &Layout) -> Result<Session> {
+        self.fork_chain(layout, self.branch(), true)
+    }
+
+    /// Creates the fork file for `chain` and fills it. Any failure after the header lands removes
+    /// the new file so no half-written fork is listed.
+    fn fork_chain(&self, layout: &Layout, chain: &[usize], live_root: bool) -> Result<Session> {
         let mut s = Self::create_file(layout, &self.model, Some(&self.id))?;
-        // Any failure after the header lands removes the new file so no half-written fork is listed.
-        if let Err(err) = self.fill_fork(&mut s) {
+        if let Err(err) = self.fill_fork(&mut s, chain, live_root) {
             let _ = s.remove_file();
             return Err(err);
         }
         Ok(s)
     }
 
-    fn fill_fork(&self, s: &mut Session) -> Result<()> {
+    fn fill_fork(&self, s: &mut Session, chain: &[usize], live_root: bool) -> Result<()> {
         // A fork resumes with the parent's roots; this rewrites the new header before the body lands.
         s.set_additional_dirs(&self.additional_dirs)?;
         let mut kept: Vec<Entry> = Vec::new();
-        for &i in self.branch() {
+        for &i in chain {
             if matches!(self.entries[i].kind, Kind::Meta { .. }) {
                 continue;
             }
@@ -3326,7 +3601,55 @@ impl Session {
             s.entries.push(e);
         }
         s.rebuild_active();
+        if live_root {
+            self.carry_stream_supplement(s)?;
+        }
         s.restore_runtime()?;
+        Ok(())
+    }
+
+    /// Copies the stream supplement recorded for this branch into the fork's own stream journal.
+    /// Frames are admitted by the ancestry rule `restore_runtime` applies, and a node parented on
+    /// this session is re-parented to the fork. An oversized or unreadable source supplement is an
+    /// error: a partial copy must not pass as the branch's history.
+    fn carry_stream_supplement(&self, s: &Session) -> Result<()> {
+        let Some(source) = self.path.as_deref() else {
+            return Ok(());
+        };
+        let Some(writer) = s.runtime.stream_writer() else {
+            return Ok(());
+        };
+        let mut known: HashSet<String> = self
+            .branch()
+            .iter()
+            .map(|&i| self.entries[i].id.clone())
+            .collect();
+        known.insert(self.id.clone());
+        let mut pending = crate::runtime::stream_journal::recover_complete(source)?;
+        let mut admitted = Vec::new();
+        loop {
+            let before = pending.len();
+            pending.retain(|node| {
+                if node.parent.as_ref().is_some_and(|p| known.contains(p)) {
+                    known.insert(node.id.clone());
+                    admitted.push(node.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            if pending.len() == before {
+                break;
+            }
+        }
+        for mut node in admitted {
+            if node.parent.as_deref() == Some(self.id.as_str()) {
+                node.parent = Some(s.id.clone());
+            }
+            writer.snapshot(&node);
+        }
+        writer.check().map_err(anyhow::Error::msg)?;
+        writer.sync()?;
         Ok(())
     }
 
@@ -3925,6 +4248,8 @@ pub mod session_search_tool {
 
 mod index;
 mod migrate;
+pub mod pack;
+mod transfers;
 mod tree;
 pub use tree::{MAX_LABEL_CHARS, Navigation, TreeNode, TreeNodeKind};
 #[cfg(test)]

@@ -39,7 +39,7 @@ fn stored_grants_round_trip_and_sign_out_removes_them() {
     };
     {
         let _lock = locked(&p).unwrap();
-        save(&p, &c).unwrap();
+        crate::config::settings_store::write_private(&p, &serde_json::to_vec(&c).unwrap()).unwrap();
     }
     assert!(signed_in(&user, "kilo"));
     assert_eq!(identity(&user, "kilo").as_deref(), Some("a@b"));
@@ -107,7 +107,8 @@ fn a_grant_reaches_only_its_canonical_origin_and_protocol() {
     {
         let p = path(&user, "kimi-code");
         let _lock = locked(&p).unwrap();
-        save(&p, &grant).unwrap();
+        crate::config::settings_store::write_private(&p, &serde_json::to_vec(&grant).unwrap())
+            .unwrap();
     }
     let binding = Binding::for_provider(&user, "kimi-code").unwrap();
     let chat = ApiProtocol::ChatCompletions;
@@ -213,11 +214,105 @@ fn a_gateway_grant_supplies_its_own_route() {
     {
         let p = path(&user, "cloudflare-ai-gateway");
         let _lock = locked(&p).unwrap();
-        save(&p, &grant).unwrap();
+        crate::config::settings_store::write_private(&p, &serde_json::to_vec(&grant).unwrap())
+            .unwrap();
     }
     assert_eq!(
         grant_route(&user, "cloudflare-ai-gateway").as_deref(),
         Some("https://gateway.ai.cloudflare.com/v1/acc/gw/anthropic")
     );
     assert!(grant_route(&user, "kimi-code").is_none());
+}
+
+#[test]
+fn rate_limited_session_rotates_to_the_next_account_and_new_sessions_follow() {
+    let dir = tempfile::tempdir().unwrap();
+    let user = dir.path().join("user");
+    let p = path(&user, "kilo");
+    let grant = |access: &str| Credentials {
+        access: access.into(),
+        expires_at_ms: util::NEVER_EXPIRES,
+        ..Default::default()
+    };
+    let mut store: accounts::Store<Credentials> = accounts::Store::default();
+    store.insert("a".into(), grant("tok-a"));
+    store.insert("b".into(), grant("tok-b"));
+    {
+        let _lock = locked(&p).unwrap();
+        crate::config::settings_store::write_private(&p, &serde_json::to_vec(&store).unwrap())
+            .unwrap();
+    }
+    let limited = crate::llm::errors::ErrorClass::RateLimited {
+        retry_after: Some(Duration::from_secs(30)),
+    };
+    let mut binding = Binding {
+        id: "kilo",
+        user_dir: user.clone(),
+        account: pick_account(&user, "kilo"),
+    };
+    assert_eq!(binding.account.as_deref(), Some("a"));
+    assert!(binding.rotate(&limited, None));
+    assert_eq!(binding.account.as_deref(), Some("b"));
+    // A new session starting while `a` cools down is pinned to `b`.
+    assert_eq!(pick_account(&user, "kilo").as_deref(), Some("b"));
+    // With both accounts cooling down, rotation reports no usable account instead of looping.
+    assert!(!binding.rotate(&limited, None));
+    assert_eq!(binding.account.as_deref(), Some("b"));
+}
+
+#[test]
+fn accounts_by_provider_lists_only_providers_with_stored_accounts() {
+    let dir = tempfile::tempdir().unwrap();
+    let user = dir.path().join("user");
+    let p = path(&user, "kilo");
+    let mut store: accounts::Store<Credentials> = accounts::Store::default();
+    store.insert(
+        "a".into(),
+        Credentials {
+            access: "tok-a".into(),
+            expires_at_ms: util::NEVER_EXPIRES,
+            email: Some("a@example.com".into()),
+            ..Default::default()
+        },
+    );
+    store.insert(
+        "b".into(),
+        Credentials {
+            access: "tok-b".into(),
+            expires_at_ms: util::NEVER_EXPIRES,
+            ..Default::default()
+        },
+    );
+    {
+        let _lock = locked(&p).unwrap();
+        crate::config::settings_store::write_private(&p, &serde_json::to_vec(&store).unwrap())
+            .unwrap();
+    }
+
+    let by_provider = accounts_by_provider(&user);
+    assert_eq!(
+        by_provider.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec!["kilo"]
+    );
+    let kilo = &by_provider["kilo"];
+    assert_eq!(kilo.len(), 2);
+    assert!(
+        kilo.iter()
+            .any(|a| a.key == "a" && a.label == "a@example.com")
+    );
+    // Without a stored identity the label falls back to the account key.
+    assert!(kilo.iter().any(|a| a.key == "b" && a.label == "b"));
+
+    select_account(&user, "kilo", "b").unwrap();
+    assert!(
+        list_accounts(&user, "kilo")
+            .unwrap()
+            .iter()
+            .any(|a| a.key == "b" && a.active)
+    );
+    sign_out_account(&user, "kilo", "a").unwrap();
+    assert_eq!(list_accounts(&user, "kilo").unwrap().len(), 1);
+
+    // A provider directory with no grant files has nothing to list.
+    assert!(accounts_by_provider(&dir.path().join("empty")).is_empty());
 }

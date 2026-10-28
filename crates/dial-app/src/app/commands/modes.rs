@@ -75,8 +75,8 @@ pub(super) const COMMANDS: &[super::CommandSpec] = &[
     super::CommandSpec {
         name: "btw",
         description: "Ask a side question without changing the transcript",
-        args_hint: "<question>",
-        subcommands: &[],
+        args_hint: "<question> | new <question> | threads | open <id> | copy | promote <id> | cancel",
+        subcommands: &["new", "threads", "open", "copy", "promote", "cancel"],
     },
     super::CommandSpec {
         name: "tan",

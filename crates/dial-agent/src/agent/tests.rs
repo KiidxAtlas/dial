@@ -122,6 +122,7 @@ fn shared_wait_receives_steering_without_losing_the_queued_instruction() {
         &AtomicBool::new(false),
         &mut Steering(true),
         &mut queued,
+        None,
     );
     assert!(!results[0].0.is_error);
     assert_eq!(queued, ["new instruction"]);
@@ -153,6 +154,7 @@ fn parallel_hooks_run_per_call_and_block_before_file_reads() {
         &AtomicBool::new(false),
         &mut NullUi,
         &mut Vec::new(),
+        None,
     );
     assert_eq!(
         std::fs::read_to_string(dir.path().join("hooks")).unwrap(),
@@ -232,6 +234,7 @@ fn independent_slow_reads_overlap_and_results_stay_ordered() {
         &AtomicBool::new(false),
         &mut NullUi,
         &mut Vec::new(),
+        None,
     );
     assert_eq!(
         read.entered.load(Ordering::SeqCst),
@@ -286,6 +289,7 @@ fn batched_read_only_bash_runs_through_parallel_tools_in_call_order() {
         &AtomicBool::new(false),
         &mut NullUi,
         &mut Vec::new(),
+        None,
     );
     assert_eq!(
         outputs
@@ -351,9 +355,11 @@ fn parallel_hook_refusals_report_policy_for_each_call_without_execution() {
             &AtomicBool::new(false),
             &mut ui,
             &mut Vec::new(),
+            None,
         );
         assert!(outputs.iter().all(|(output, _)| output.is_error
             && (output.text.contains("veto") || output.text.contains("changed a scheduled call"))));
+        ui.0.sort_by(|left, right| left.0.cmp(&right.0));
         assert_eq!(
             ui.0,
             [

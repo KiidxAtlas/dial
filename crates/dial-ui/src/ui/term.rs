@@ -20,6 +20,7 @@ use std::{
         Once,
         atomic::{AtomicBool, AtomicU16, Ordering},
     },
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -41,9 +42,13 @@ use ratatui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
+use super::input;
 use super::term_links::Linker;
 use super::term_state::{SignalWriter, Signals};
 use super::text;
+use output::Sink;
+
+mod output;
 
 /// Only one real terminal may own the screen at a time.
 static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -61,6 +66,11 @@ const SYNC_END: &str = "\x1b[?2026l";
 const CURSOR_HIDE: &str = "\x1b[?25l";
 const CURSOR_SHOW: &str = "\x1b[?25h";
 const WRAP_OFF: &str = "\x1b[?7l";
+
+/// Longest a barrier waits for queued terminal output before reporting a stalled reader.
+const FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+/// Panic-time drain bound: a stalled reader must not hang the panic report.
+const PANIC_FLUSH: Duration = Duration::from_millis(500);
 const WRAP_ON: &str = "\x1b[?7h";
 const ALT_ENTER: &str = "\x1b[?1049h";
 const ALT_LEAVE: &str = "\x1b[?1049l";
@@ -72,6 +82,12 @@ const LINK_END: &str = "\x1b]8;;\x1b\\";
 /// A row within this many cells of the width may have been hard-wrapped, so its last token is
 /// never linked (it could be the first half of a longer URL or path).
 const LINK_EDGE: usize = 4;
+
+/// Serialize out-of-band terminal controls (notifications and clipboard) with complete frames.
+/// Without an active terminal owner, this writes directly for standalone user commands.
+pub fn write_control(bytes: Vec<u8>) -> io::Result<()> {
+    output::write_control(bytes)
+}
 
 /// The live region: rows to repaint, where the hardware cursor goes, and an optional window title.
 pub struct Viewport<'a> {
@@ -88,7 +104,7 @@ pub struct Viewport<'a> {
 type Frame = (Vec<Line<'static>>, Option<(u16, u16)>);
 
 pub struct InlineTerminal {
-    out: Box<dyn Write>,
+    out: Sink,
     /// Talks to the real TTY (raw mode, size query, panic hook). `false` for `with_writer`.
     real: bool,
     /// Size reported by `size()` when not `real`.
@@ -111,6 +127,7 @@ pub struct InlineTerminal {
     last_size: (u16, u16),
     /// Erase from the viewport top down before painting (resize, overlay return).
     force_erase: bool,
+    deferred_paint: bool,
     title: Option<String>,
     last_frame: Option<Frame>,
     last_rendered: Vec<(String, usize)>,
@@ -169,7 +186,7 @@ impl InlineTerminal {
         let _ = io::stdout().write_all(b"\x1b[2J\x1b[3J\x1b[H");
         let _ = io::stdout().flush();
         let keyboard_flags = supports_keyboard_enhancement().unwrap_or(false);
-        let mut out: Box<dyn Write> = Box::new(io::stdout());
+        let mut out = Sink::queued(Box::new(io::stdout())).context("starting terminal output")?;
         let mut setup = String::new();
         if keyboard_flags {
             push_command(
@@ -186,10 +203,11 @@ impl InlineTerminal {
         *UI_THREAD.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::thread::current().id());
         install_panic_hook();
         let size = crossterm::terminal::size().unwrap_or((80, 24));
+        input::start().context("starting terminal input")?;
         Ok(Self::build(out, size, true, keyboard_flags))
     }
 
-    fn build(out: Box<dyn Write>, size: (u16, u16), real: bool, keyboard_flags: bool) -> Self {
+    fn build(out: Sink, size: (u16, u16), real: bool, keyboard_flags: bool) -> Self {
         let caps = if real {
             super::termcaps::integration()
         } else {
@@ -209,6 +227,7 @@ impl InlineTerminal {
             cursor_row: 0,
             last_size: (size.0.max(1), size.1.max(1)),
             force_erase: false,
+            deferred_paint: false,
             title: None,
             last_frame: None,
             last_rendered: Vec::new(),
@@ -218,6 +237,30 @@ impl InlineTerminal {
             linker: caps.hyperlinks.then(|| Linker::new(caps.line_fragments)),
             linking: false,
         }
+    }
+
+    /// Whether queued output is far enough behind that intermediate frames may be skipped.
+    /// Always false for a synchronous (non-TTY) sink.
+    pub fn output_backlogged(&self) -> bool {
+        self.out.backlogged()
+    }
+
+    /// Retry display work even when no more model or input events arrive.
+    pub fn needs_repaint(&self) -> bool {
+        self.deferred_paint || self.overlay.as_ref().is_some_and(|session| session.redraw)
+    }
+
+    /// Preserve redraw intent when composition is deferred by terminal backpressure.
+    pub fn defer_paint(&mut self) {
+        self.deferred_paint = true;
+    }
+
+    /// Barrier: wait until every byte written so far has reached the terminal. Errors when the
+    /// reader stops accepting output or a write fails.
+    pub fn flush_output(&mut self) -> Result<()> {
+        self.out
+            .drain(FLUSH_TIMEOUT)
+            .context("flushing terminal output")
     }
 
     /// Test seam: act as a terminal with these integrations.
@@ -387,14 +430,13 @@ impl InlineTerminal {
         buf.push_str(SYNC_BEGIN);
         buf.push_str(CURSOR_HIDE);
         buf.push_str(WRAP_OFF);
-        if let Some(title) = vp.title {
-            let clean = text::one_line(title);
-            if self.title.as_deref() != Some(clean.as_str()) {
-                buf.push_str(&format!("\x1b]0;{clean}\x07"));
-                self.title = Some(clean);
-            }
+        let next_title = vp.title.map(text::one_line);
+        if let Some(title) = &next_title
+            && self.title.as_deref() != Some(title.as_str())
+        {
+            buf.push_str(&format!("\x1b]0;{title}\x07"));
         }
-        let signals = self.signal_update(vp.signals);
+        let (signals, next_signals) = self.signals.prepare(vp.signals);
         buf.push_str(&signals);
         if up > 0 {
             buf.push_str(&format!("\x1b[{up}A"));
@@ -459,7 +501,19 @@ impl InlineTerminal {
         }
         buf.push_str(SYNC_END);
 
-        self.out.write_all(buf.as_bytes())?;
+        if !self.out.try_write_frame(buf.into_bytes())? {
+            self.deferred_paint = true;
+            return Ok(());
+        }
+        self.deferred_paint = false;
+        if let Some(title) = next_title {
+            self.title = Some(title);
+        }
+        self.signals.accept(next_signals);
+        if self.real && !signals.is_empty() {
+            *SIGNALS_RESET.lock().unwrap_or_else(|e| e.into_inner()) =
+                self.signals.reset_sequence();
+        }
         self.out.flush()?;
 
         self.history_written += history.len();
@@ -485,6 +539,7 @@ impl InlineTerminal {
     /// Display reset: erase screen and scrollback. Uncommitted rows are discarded; the controller
     /// re-commits whatever it wants to show again.
     pub fn clear_screen(&mut self) -> Result<()> {
+        self.flush_output()?;
         self.out.write_all(b"\x1b[2J\x1b[3J\x1b[H")?;
         self.out.flush()?;
         self.pending.clear();
@@ -508,6 +563,7 @@ impl InlineTerminal {
         if self.overlay.is_some() {
             return Ok(());
         }
+        self.flush_output()?;
         let mut enter = String::from(ALT_ENTER);
         if self.real {
             // Kitty keyboard flags are per screen: the alternate screen starts with none.
@@ -538,7 +594,11 @@ impl InlineTerminal {
             },
         ) {
             Ok(terminal) => {
-                self.overlay = Some(OverlaySession { terminal, buffer });
+                self.overlay = Some(OverlaySession {
+                    terminal,
+                    buffer,
+                    redraw: false,
+                });
                 Ok(())
             }
             Err(error) => {
@@ -573,6 +633,9 @@ impl InlineTerminal {
         let Some(session) = &mut self.overlay else {
             bail!("no panel is open");
         };
+        if session.redraw {
+            session.terminal.clear()?;
+        }
         let mut placements = Vec::new();
         session.terminal.draw(|frame| placements = f(frame))?;
         let bytes = std::mem::take(&mut *session.buffer.0.borrow_mut());
@@ -588,7 +651,11 @@ impl InlineTerminal {
             frame.extend_from_slice(images.as_bytes());
         }
         frame.extend_from_slice(SYNC_END.as_bytes());
-        self.out.write_all(&frame)?;
+        if !self.out.try_write_frame(frame)? {
+            session.redraw = true;
+            return Ok(());
+        }
+        session.redraw = false;
         self.out.flush()?;
         Ok(())
     }
@@ -625,9 +692,11 @@ impl InlineTerminal {
 
     /// Leave the alternate screen; the next paint redraws the inline viewport. Idempotent.
     pub fn close_overlay(&mut self) -> Result<()> {
-        if self.overlay.take().is_none() {
+        if self.overlay.is_none() {
             return Ok(());
         }
+        self.flush_output()?;
+        self.overlay.take();
         if self.image_protocol() == Some(super::images::ImageProtocol::Kitty) {
             self.out.write_all(b"\x1b_Ga=d,d=A,q=2\x1b\\")?;
             self.out.flush()?;
@@ -667,6 +736,9 @@ impl InlineTerminal {
         if self.left {
             return;
         }
+        if !self.real || ACTIVE.load(Ordering::SeqCst) {
+            let _ = self.out.drain(FLUSH_TIMEOUT);
+        }
         if self.overlay.take().is_some() {
             let _ = self.restore_inline_screen();
         }
@@ -692,9 +764,6 @@ impl InlineTerminal {
             }
             s.push_str("\r\n");
         }
-        self.history_written += self.pending.len();
-        self.pending.clear();
-        self.pending_images.clear();
         s.push_str(WRAP_ON);
         s.push_str(CURSOR_SHOW);
         if self.real {
@@ -704,12 +773,19 @@ impl InlineTerminal {
             push_command(&mut s, &DisableBracketedPaste);
         }
         s.push_str(&self.signal_update(None));
-        let _ = self.out.write_all(s.as_bytes());
-        let _ = self.out.flush();
-        self.painted_rows = 0;
-        self.cursor_row = 0;
-        UP_ROWS.store(0, Ordering::SeqCst);
+        if self.out.try_write_frame(s.into_bytes()).unwrap_or(false) {
+            let _ = self.out.flush();
+            self.history_written += self.pending.len();
+            self.pending.clear();
+            self.pending_images.clear();
+            self.painted_rows = 0;
+            self.cursor_row = 0;
+            UP_ROWS.store(0, Ordering::SeqCst);
+        }
         if self.real {
+            // Teardown barrier: the restored shell must not share the terminal with queued bytes.
+            let _ = self.out.drain(FLUSH_TIMEOUT);
+            input::stop();
             let _ = disable_raw_mode();
         }
     }
@@ -719,6 +795,7 @@ impl InlineTerminal {
     /// the viewport below wherever the cursor ended up. Committed rows (pending or already
     /// written) are neither dropped nor repeated. The terminal is re-armed even if `f` panics.
     pub fn suspend<R>(&mut self, f: impl FnOnce() -> R) -> Result<R> {
+        self.flush_output()?;
         // A panel never covers an external program; it comes back afterwards.
         let reopen = self.overlay.is_some();
         self.close_overlay()?;
@@ -745,7 +822,10 @@ impl InlineTerminal {
         // A failed raw-mode exit must not return early: the screen and keyboard flags were already
         // handed back, so the program is skipped and the terminal is re-armed below regardless.
         let left = if self.real {
-            disable_raw_mode().context("leaving raw mode")
+            self.flush_output().and_then(|()| {
+                input::stop();
+                disable_raw_mode().context("leaving raw mode")
+            })
         } else {
             Ok(())
         };
@@ -767,6 +847,7 @@ impl InlineTerminal {
         let rearm = (|| -> Result<()> {
             if self.real {
                 enable_raw_mode().context("re-enabling raw mode")?;
+                input::start().context("restarting terminal input")?;
             }
             let mut s = String::new();
             if self.keyboard_flags {
@@ -811,7 +892,7 @@ impl Drop for InlineTerminal {
 /// Test constructor: no TTY, no raw mode, no panic hook; everything is written to `out`.
 #[cfg(any(test, feature = "test-support"))]
 pub fn with_writer(out: Box<dyn Write>, size: (u16, u16)) -> InlineTerminal {
-    InlineTerminal::build(out, size, false, false)
+    InlineTerminal::build(Sink::direct(out), size, false, false)
 }
 
 /// `REPORT_EVENT_TYPES` makes the terminal send key releases, which hold-to-talk needs. Terminals
@@ -838,6 +919,9 @@ fn emergency_restore() {
     if ui_thread != Some(std::thread::current().id()) || !ACTIVE.swap(false, Ordering::SeqCst) {
         return;
     }
+    // Let queued output reach the terminal first, bounded: the reset below must come after it.
+    output::drain_current(PANIC_FLUSH);
+    input::halt_for_panic();
     let mut s = String::new();
     let keyboard = KEYBOARD_FLAGS.load(Ordering::SeqCst);
     if IN_ALT_SCREEN.swap(false, Ordering::SeqCst) {
@@ -886,6 +970,8 @@ fn install_panic_hook() {
 struct OverlaySession {
     terminal: Terminal<OverlayBackend<SharedBuffer>>,
     buffer: SharedBuffer,
+    /// Ratatui advanced its diff buffers, but the transport deferred the previous frame.
+    redraw: bool,
 }
 
 /// A writer the session keeps a second handle to, so frames can be moved to `InlineTerminal::out`.

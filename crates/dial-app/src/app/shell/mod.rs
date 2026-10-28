@@ -32,6 +32,7 @@ pub(in crate::app) mod busy;
 mod checkpoint_review;
 pub(in crate::app) mod command;
 mod file_discovery;
+pub(in crate::app) mod frame_pacing;
 pub(in crate::app) mod help;
 pub(in crate::app) mod improve;
 pub(in crate::app) mod input;
@@ -41,6 +42,8 @@ pub(in crate::app) mod notes;
 pub(in crate::app) mod overlays;
 pub(in crate::app) mod paint;
 pub(in crate::app) mod pickers;
+pub(in crate::app) mod plugin_chrome;
+pub(in crate::app) mod plugin_effects;
 pub(in crate::app) mod prompts;
 pub(in crate::app) mod run;
 mod runtime_updates;
@@ -69,6 +72,7 @@ pub(super) const PAINT_EVERY: Duration = Duration::from_millis(40);
 pub(super) struct Shell {
     files: file_discovery::Files,
     runtime_updates: runtime_updates::RuntimeUpdates,
+    pub(in crate::app) side: crate::app::side::SideThreadState,
     pub(super) loop_mode: crate::agent::modes::loop_runner::LoopMode,
     pub(super) runtime: crate::runtime::Tree,
     pub(super) pending_result: Option<crate::runtime::Body>,
@@ -78,6 +82,7 @@ pub(super) struct Shell {
     pub(crate) extensions_pending: Option<crate::app::commands::extensions_browser::Pending>,
     /// The running `/extensions` install, if any.
     pub(crate) extensions_job: Option<crate::app::commands::extensions_browser::InstallJob>,
+    pub(super) extension_commands: Vec<(String, String)>,
     /// Set by `/restart`; `run_interactive` relaunches the binary once the terminal is restored.
     pub(super) restart_requested: bool,
     /// A provider retry was already explained in this turn; later attempts update nothing new.
@@ -85,6 +90,7 @@ pub(super) struct Shell {
     pub(super) smithery_resume: Option<crate::app::commands::smithery::Resume>,
     pub(super) commit_job: Option<crate::app::commands::commit::CommitJob>,
     pub(super) busy_overlay: Option<BusyOverlay>,
+    pub(super) worker_editors: crate::ui::overlay::subagent_viewer::WorkerEditors,
     pub(super) term: InlineTerminal,
     pub(super) themes: ThemeManager,
     pub(super) keys: Keymap,
@@ -142,6 +148,8 @@ pub(super) struct Shell {
     pub(super) deferred_editor: bool,
     /// Shift+Tab pressed during a turn; applied at the next idle boundary.
     pub(super) deferred_approval_cycle: bool,
+    /// Plugin chrome refresh and autocomplete state.
+    pub(super) plugin_chrome: plugin_chrome::PluginChrome,
     /// Input read before the main loop could take it (typing while the first agent is built);
     /// the loop handles these before reading the terminal again.
     pub(super) held: std::collections::VecDeque<crossterm::event::Event>,
@@ -167,4 +175,6 @@ pub(super) struct Shell {
     voice_gesture: crate::voice::gesture::Gesture,
     /// The read-out of the last answer (`voice.tts.auto_speak`) and the flag that stops it.
     speech: Option<(Arc<AtomicBool>, std::thread::JoinHandle<anyhow::Result<()>>)>,
+    /// Adaptive repaint interval and bounded stall diagnostics for streaming output.
+    pub(in crate::app) frame_pacing: frame_pacing::FramePacing,
 }

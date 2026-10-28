@@ -151,6 +151,9 @@ enum ProviderAction {
     ChatGptCancel,
     OAuthLogin(String),
     OAuthSignOut(String),
+    OAuthAccounts(String),
+    OAuthSelectAccount(String, String),
+    OAuthRemoveAccount(String, String),
     UseAuth(AuthMethod),
 }
 
@@ -244,7 +247,7 @@ pub struct ProviderOverlay {
     chatgpt_pending: bool,
     chatgpt_accounts: Vec<crate::llm::chatgpt::AccountInfo>,
     anthropic_signed_in: bool,
-    oauth_signed_in: std::collections::BTreeSet<String>,
+    oauth_accounts: BTreeMap<String, Vec<crate::llm::oauth::AccountSummary>>,
     discovery: Option<Discovery>,
     configured: BTreeMap<String, ProviderSpec>,
     has_key: Box<dyn Fn(&str) -> bool>,
@@ -314,7 +317,7 @@ impl ProviderOverlay {
             chatgpt_pending: false,
             chatgpt_accounts: Vec::new(),
             anthropic_signed_in: false,
-            oauth_signed_in: Default::default(),
+            oauth_accounts: Default::default(),
             discovery,
             configured,
             has_key,
@@ -338,8 +341,11 @@ impl ProviderOverlay {
     pub fn set_anthropic_signed_in(&mut self, signed_in: bool) {
         self.anthropic_signed_in = signed_in;
     }
-    pub fn set_oauth_signed_in(&mut self, providers: std::collections::BTreeSet<String>) {
-        self.oauth_signed_in = providers;
+    pub fn set_oauth_accounts(
+        &mut self,
+        accounts: BTreeMap<String, Vec<crate::llm::oauth::AccountSummary>>,
+    ) {
+        self.oauth_accounts = accounts;
     }
     pub fn set_configured(&mut self, configured: BTreeMap<String, ProviderSpec>) {
         self.configured = configured;
@@ -636,7 +642,7 @@ impl ProviderOverlay {
                 ));
             }
             if let Some(flow) = crate::llm::oauth::flow(&entry.id) {
-                let signed_in = self.oauth_signed_in.contains(flow.id);
+                let signed_in = self.oauth_accounts.contains_key(flow.id);
                 if !flow.needs_terminal {
                     items.push((
                         ProviderAction::OAuthLogin(flow.id.to_owned()),
@@ -648,6 +654,11 @@ impl ProviderOverlay {
                     ));
                 }
                 if signed_in {
+                    let count = self.oauth_accounts.get(flow.id).map_or(0, Vec::len);
+                    items.push((
+                        ProviderAction::OAuthAccounts(flow.id.to_owned()),
+                        format!("Manage {} accounts ({count})", flow.name),
+                    ));
                     items.push((
                         ProviderAction::OAuthSignOut(flow.id.to_owned()),
                         format!("Sign out of {}", flow.name),
@@ -832,6 +843,30 @@ impl ProviderOverlay {
                 self.mode = Mode::List;
                 return OverlayEvent::OAuthSignOut { id };
             }
+            ProviderAction::OAuthAccounts(id) => {
+                let id = id.clone();
+                let items = self.oauth_account_items(&id);
+                if items.is_empty() {
+                    self.mode = Mode::List;
+                    return OverlayEvent::None;
+                }
+                self.mode = Mode::Menu(Menu {
+                    entry,
+                    items,
+                    cursor: 0,
+                });
+                return OverlayEvent::None;
+            }
+            ProviderAction::OAuthSelectAccount(id, key) => {
+                let (id, key) = (id.clone(), key.clone());
+                self.mode = Mode::List;
+                return OverlayEvent::OAuthSelectAccount { id, key };
+            }
+            ProviderAction::OAuthRemoveAccount(id, key) => {
+                let (id, key) = (id.clone(), key.clone());
+                self.mode = Mode::List;
+                return OverlayEvent::OAuthRemoveAccount { id, key };
+            }
             ProviderAction::ChooseModel => {
                 self.mode = Mode::List;
                 return OverlayEvent::Action("open:models".to_owned());
@@ -883,6 +918,39 @@ impl ProviderOverlay {
             spec,
             scope: self.scope,
         }
+    }
+
+    /// Rows of the Accounts submenu: use or remove each stored account, then add another sign-in.
+    fn oauth_account_items(&self, id: &str) -> Vec<(ProviderAction, String)> {
+        let mut items = Vec::new();
+        let Some(flow) = crate::llm::oauth::flow(id) else {
+            return items;
+        };
+        for account in self.oauth_accounts.get(id).into_iter().flatten() {
+            let label = text::one_line(&account.label);
+            let mut note = String::new();
+            if account.active {
+                note.push_str("  (active)");
+            }
+            if account.cooling {
+                note.push_str("  (cooling down)");
+            }
+            items.push((
+                ProviderAction::OAuthSelectAccount(id.to_owned(), account.key.clone()),
+                format!("Use {label}{note}"),
+            ));
+            items.push((
+                ProviderAction::OAuthRemoveAccount(id.to_owned(), account.key.clone()),
+                format!("Remove {label}"),
+            ));
+        }
+        if !flow.needs_terminal {
+            items.push((
+                ProviderAction::OAuthLogin(id.to_owned()),
+                format!("Add another {} account", flow.name),
+            ));
+        }
+        items
     }
 
     fn headers_key(&mut self, key: &KeyEvent, keys: &Keymap) -> OverlayEvent {
@@ -1382,7 +1450,7 @@ impl ProviderOverlay {
                 Tok::Success,
             );
         }
-        if method != AuthMethod::ApiKey && self.oauth_signed_in.contains(&entry.id) {
+        if method != AuthMethod::ApiKey && self.oauth_accounts.contains_key(&entry.id) {
             return ("sign-in saved".into(), Tok::Success);
         }
         if method == AuthMethod::OAuth {

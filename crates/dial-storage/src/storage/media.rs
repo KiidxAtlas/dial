@@ -1,5 +1,5 @@
 //! Own immutable image payloads independently of provider serialization.
-use crate::llm::images::MAX_IMAGE_BYTES;
+use crate::llm::images::MAX_IMAGE_SOURCE_BYTES;
 use anyhow::{Result, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
@@ -43,8 +43,8 @@ fn retain(message: &mut Value, store: Option<&crate::storage::artifact::Artifact
             let mut spool = store
                 .clone()
                 .with_limits(&crate::storage::artifact::ArtifactConfig {
-                    max_bytes: MAX_IMAGE_BYTES,
-                    head_bytes: MAX_IMAGE_BYTES,
+                    max_bytes: MAX_IMAGE_SOURCE_BYTES,
+                    head_bytes: MAX_IMAGE_SOURCE_BYTES,
                 })
                 .spool()?;
             spool.write_all(&bytes)?;

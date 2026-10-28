@@ -140,6 +140,37 @@ impl Metrics {
     }
 }
 
+/// Add an ambient block only if it is absent from the current model-visible branch. Looking at
+/// live history rather than a session-wide seen set lets compaction or branching re-admit it.
+/// Earlier messages are never rewritten, preserving their cacheable prefix and archived evidence.
+pub(in crate::agent) fn append_ambient(context: &mut String, block: &str, history: &[Value]) {
+    if block.trim().is_empty() || context.contains(block) {
+        return;
+    }
+    let contains = |message: &Value| {
+        message["dial_recall"]
+            .as_str()
+            .is_some_and(|text| text.contains(block))
+            || message["content"]
+                .as_str()
+                .is_some_and(|text| text.contains(block))
+            || message["content"].as_array().is_some_and(|parts| {
+                parts.iter().any(|part| {
+                    part["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains(block))
+                })
+            })
+    };
+    if history.iter().any(contains) {
+        return;
+    }
+    if !context.is_empty() {
+        context.push_str("\n\n");
+    }
+    context.push_str(block);
+}
+
 /// Normalize an optional byte cap for composition: zero means no cap.
 pub(in crate::agent) fn byte_limit(limit: usize) -> usize {
     if limit == 0 { usize::MAX } else { limit }

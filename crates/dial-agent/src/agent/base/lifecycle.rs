@@ -358,6 +358,8 @@ impl<'a> Agent<'a> {
         .with_artifacts(crate::storage::artifact::ArtifactStore::new(
             &layout.state_dir.join("artifacts"),
         )?);
+        // Cargo build output is scoped per session so concurrent sessions do not share one target lock.
+        let workspace = workspace.with_cargo_session(session.id());
         let skills = skills::discover(&layout);
         let parts = PromptParts {
             soul: crate::agent::window::context::soul(&layout),
@@ -366,6 +368,7 @@ impl<'a> Agent<'a> {
                 &layout,
                 config.experimental.context_overlap_dedup,
                 &config.foreign_sources,
+                &config.context_files.extra,
             ),
             skills: skills::catalog_block(&skills),
             // Standing memory guidance and auto-learn guidance; children receive the same text in `child.rs`.
@@ -468,13 +471,16 @@ impl<'a> Agent<'a> {
             local_session: Default::default(),
             metrics: AgentMetrics::default(),
             usage_scope: llm::usage::Scope::default().next_turn(config.harness.max_steps)?,
+            cache_warm: None,
             compaction_runtime:
                 crate::agent::compact::compaction_runtime::CompactionRuntime::default(),
             memory_controller: crate::agent::memory::memory_controller::Controller::default(),
             usage_cost_base: 0.0,
+            session_cost_warn: None,
             last_auto_thinking: None,
             reasoning_recovery: crate::agent::workflow::reasoning::Recovery::default(),
             live_tasks: crate::agent::workers::live_tasks::LiveTasks::default(),
+            side_questions: Default::default(),
             superseded: crate::agent::workflow::evidence::Supersession::default(),
             legacy_memory_migrated,
             accepted_live_steering: Vec::new(),
@@ -635,13 +641,16 @@ impl<'a> Agent<'a> {
             local_session: Default::default(),
             metrics: AgentMetrics::default(),
             usage_scope: llm::usage::Scope::default().next_turn(config.harness.max_steps)?,
+            cache_warm: None,
             compaction_runtime:
                 crate::agent::compact::compaction_runtime::CompactionRuntime::default(),
             memory_controller: crate::agent::memory::memory_controller::Controller::default(),
             usage_cost_base: 0.0,
+            session_cost_warn: None,
             last_auto_thinking: None,
             reasoning_recovery: crate::agent::workflow::reasoning::Recovery::default(),
             live_tasks: crate::agent::workers::live_tasks::LiveTasks::default(),
+            side_questions: Default::default(),
             superseded: crate::agent::workflow::evidence::Supersession::default(),
             legacy_memory_migrated,
             accepted_live_steering: Vec::new(),

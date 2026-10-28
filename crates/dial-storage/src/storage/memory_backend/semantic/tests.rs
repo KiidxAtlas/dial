@@ -88,6 +88,9 @@ fn semantic_with(embedder: Option<Box<dyn Embedder>>) -> Semantic {
         retain_note: None,
         embed_error: None,
         recall_note: None,
+        project_cache: RecallCache::default(),
+        user_cache: RecallCache::default(),
+        last_recall: None,
     }
 }
 
@@ -820,4 +823,121 @@ fn meta_values_round_trip_and_overwrite() {
         store.meta("last_consolidated").unwrap().as_deref(),
         Some("20")
     );
+}
+
+fn request(query: &str) -> Request<'_> {
+    Request {
+        query,
+        vector: None,
+        embedding_error: None,
+        limit: 8,
+        token_budget: 1500,
+    }
+}
+
+#[test]
+fn repeated_recall_is_served_from_cache_until_the_store_changes() {
+    let mut store = store();
+    store
+        .retain("the deploy vault token rotates monthly", "test", 1)
+        .unwrap();
+    let mut cache = RecallCache::default();
+    let (_, first) = cached_ranked(&mut cache, &store, request("deploy vault"), 10).unwrap();
+    let (second, again) = cached_ranked(&mut cache, &store, request("deploy vault"), 10).unwrap();
+    assert_eq!(first, CacheOutcome::Miss);
+    assert_eq!(again, CacheOutcome::Hit);
+    assert_eq!(second.facts.len(), 1);
+}
+
+#[test]
+fn a_write_to_the_store_invalidates_cached_recall() {
+    let mut store = store();
+    store
+        .retain("the deploy vault token rotates monthly", "test", 1)
+        .unwrap();
+    let mut cache = RecallCache::default();
+    cached_ranked(&mut cache, &store, request("deploy vault"), 10).unwrap();
+    store
+        .retain("the deploy vault key rotates weekly", "test", 2)
+        .unwrap();
+    let (recall, outcome) = cached_ranked(&mut cache, &store, request("deploy vault"), 10).unwrap();
+    assert_eq!(outcome, CacheOutcome::Miss);
+    assert_eq!(recall.facts.len(), 2);
+}
+
+#[test]
+fn a_write_through_another_connection_invalidates_cached_recall() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("memory.sqlite3");
+    let mut store = Store::new(Connection::open(&path).unwrap()).unwrap();
+    store
+        .retain("the deploy vault token rotates monthly", "test", 1)
+        .unwrap();
+    let mut cache = RecallCache::default();
+    cached_ranked(&mut cache, &store, request("deploy vault"), 10).unwrap();
+    let mut other = Store::new(Connection::open(&path).unwrap()).unwrap();
+    other
+        .retain("the deploy vault key rotates weekly", "test", 2)
+        .unwrap();
+    let (recall, outcome) = cached_ranked(&mut cache, &store, request("deploy vault"), 10).unwrap();
+    assert_eq!(outcome, CacheOutcome::Miss);
+    assert_eq!(recall.facts.len(), 2);
+}
+
+#[test]
+fn temporal_and_degraded_recall_bypass_the_cache() {
+    let mut store = store();
+    store
+        .retain("the deploy vault token rotates monthly", "test", 1)
+        .unwrap();
+    let mut cache = RecallCache::default();
+    let (_, temporal) =
+        cached_ranked(&mut cache, &store, request("deploy vault yesterday"), 10).unwrap();
+    let degraded = Request {
+        embedding_error: Some("endpoint down".into()),
+        ..request("deploy vault")
+    };
+    let (_, outcome) = cached_ranked(&mut cache, &store, degraded, 10).unwrap();
+    assert_eq!(temporal, CacheOutcome::Bypass);
+    assert_eq!(outcome, CacheOutcome::Bypass);
+    assert_eq!(cache.stats().entries, 0);
+}
+
+#[test]
+fn a_temporal_query_ranks_the_newest_facts_first() {
+    let mut store = store();
+    let now = 1_000_000;
+    store
+        .retain("deploy plan deploy plan from the old quarter", "test", 1)
+        .unwrap();
+    store
+        .retain("deploy plan revised this morning", "test", now - 3600)
+        .unwrap();
+    let plain = ranked(&store, request("deploy plan"), now).unwrap();
+    assert_eq!(plain.voices, ["lexical"]);
+    assert!(plain.facts[0].content.contains("old quarter"));
+    let temporal = ranked(&store, request("deploy plan yesterday"), now).unwrap();
+    assert_eq!(temporal.voices, ["lexical", "recency"]);
+    assert!(temporal.facts[0].content.contains("revised this morning"));
+}
+
+#[test]
+fn status_reports_cache_use_and_the_last_recall() {
+    let mut semantic = semantic_with(None);
+    semantic
+        .store
+        .retain("the deploy vault token rotates monthly", "test", 1)
+        .unwrap();
+    let op = Operation::for_test(authority("s"), scope(), None);
+    for _ in 0..2 {
+        semantic
+            .search(&op, "deploy vault", 8, &mut FakeRunner::new("{}"))
+            .unwrap();
+    }
+    let status = semantic.status(&op).unwrap();
+    assert_eq!(status["recall"]["cache"]["project"]["hits"], 1);
+    assert_eq!(status["recall"]["cache"]["project"]["misses"], 1);
+    assert_eq!(status["recall"]["last"]["projectCache"], "hit");
+    assert_eq!(status["recall"]["last"]["items"], 1);
+    assert_eq!(status["recall"]["last"]["voices"], json!(["lexical"]));
 }

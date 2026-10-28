@@ -334,14 +334,50 @@ impl OverlayEnv<'_> {
                     if outcome.is_ok()
                         && let ActiveOverlay::Providers(providers) = &mut *overlay
                     {
-                        providers.set_oauth_signed_in(
-                            crate::llm::oauth::flows()
-                                .filter(|flow| {
-                                    crate::llm::oauth::signed_in(&self.app.layout.user_dir, flow.id)
-                                })
-                                .map(|flow| flow.id.to_owned())
-                                .collect(),
-                        );
+                        providers.set_oauth_accounts(crate::llm::oauth::accounts_by_provider(
+                            &self.app.layout.user_dir,
+                        ));
+                    }
+                    self.report(overlay, outcome);
+                    self.catalog.refresh(self.app);
+                }
+                None => self.report(
+                    overlay,
+                    Err(anyhow::anyhow!("Unknown sign-in provider '{id}'")),
+                ),
+            },
+            OverlayEvent::OAuthSelectAccount { id, key } => match crate::llm::oauth::flow(&id) {
+                Some(flow) => {
+                    let outcome =
+                        crate::llm::oauth::select_account(&self.app.layout.user_dir, flow.id, &key);
+                    if outcome.is_ok()
+                        && let ActiveOverlay::Providers(providers) = &mut *overlay
+                    {
+                        providers.set_oauth_accounts(crate::llm::oauth::accounts_by_provider(
+                            &self.app.layout.user_dir,
+                        ));
+                    }
+                    self.report(overlay, outcome);
+                    self.catalog.refresh(self.app);
+                }
+                None => self.report(
+                    overlay,
+                    Err(anyhow::anyhow!("Unknown sign-in provider '{id}'")),
+                ),
+            },
+            OverlayEvent::OAuthRemoveAccount { id, key } => match crate::llm::oauth::flow(&id) {
+                Some(flow) => {
+                    let outcome = crate::llm::oauth::sign_out_account(
+                        &self.app.layout.user_dir,
+                        flow.id,
+                        &key,
+                    );
+                    if outcome.is_ok()
+                        && let ActiveOverlay::Providers(providers) = &mut *overlay
+                    {
+                        providers.set_oauth_accounts(crate::llm::oauth::accounts_by_provider(
+                            &self.app.layout.user_dir,
+                        ));
                     }
                     self.report(overlay, outcome);
                     self.catalog.refresh(self.app);
@@ -419,7 +455,7 @@ impl OverlayEnv<'_> {
                 {
                     match crate::ui::subagent_model::act(&action, self.live_tasks) {
                         Some(Ok(crate::ui::subagent_model::ActionOutcome::Banner(text))) => {
-                            viewer.set_notice(text);
+                            viewer.action_succeeded(text);
                         }
                         Some(Ok(crate::ui::subagent_model::ActionOutcome::Resume {
                             id,
@@ -428,7 +464,7 @@ impl OverlayEnv<'_> {
                             self.next = Some(format!("subagent-resume:{id}\n{message}"));
                             return true;
                         }
-                        Some(Err(error)) => viewer.set_notice(format!("{error:#}")),
+                        Some(Err(error)) => viewer.action_failed(format!("{error:#}")),
                         None => {}
                     }
                     return false;

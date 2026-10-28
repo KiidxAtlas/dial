@@ -40,6 +40,39 @@ fn runs_in_process_when_sandbox_is_off() {
     assert_eq!(pid.trim(), std::process::id().to_string());
 }
 
+#[cfg(feature = "embedded-shell")]
+#[test]
+fn cargo_session_directory_is_exported_without_overriding_shell_assignments() {
+    let (_dir, ws) = unsandboxed();
+    let ws = ws.with_cargo_session("session-1");
+    let inherited = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| ws.cargo_target_dir().unwrap());
+    let out = run_with(
+        &ws,
+        json!({"command":"printf '%s' \"$CARGO_TARGET_DIR\""}),
+        20,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert!(!out.is_error, "{}", out.text);
+    assert!(
+        out.text
+            .starts_with(&inherited.to_string_lossy().to_string()),
+        "{}",
+        out.text
+    );
+    let out = run_with(
+        &ws,
+        json!({"command":"export CARGO_TARGET_DIR=explicit; printf '%s' \"$CARGO_TARGET_DIR\""}),
+        20,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert!(!out.is_error, "{}", out.text);
+    assert!(out.text.starts_with("explicit"), "{}", out.text);
+}
+
 #[test]
 fn refuses_every_sandbox_mode_other_than_off_and_runs_nothing() {
     use crate::tools::exec::sandbox::Policy;

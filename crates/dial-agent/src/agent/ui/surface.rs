@@ -174,6 +174,17 @@ pub trait Ui {
             "Ask tool requires a connected human input surface".into(),
         )
     }
+    /// Shows an extension's declarative panel and waits for one outcome. A panel collects human
+    /// input only; it never authorizes a tool. Surfaces that cannot show it report `Unsupported`.
+    fn run_panel(
+        &mut self,
+        _panel: &crate::extensions::panel::Panel,
+        _cancel: &AtomicBool,
+    ) -> crate::extensions::panel::Outcome {
+        crate::extensions::panel::Outcome::Unsupported(
+            "Extension panels need an interactive terminal".into(),
+        )
+    }
     /// Distinguish an interactive cancellation from a UI that cannot collect input.
     fn interactive_input(&self) -> bool {
         false
@@ -191,6 +202,12 @@ pub trait Ui {
     fn inference_discarded(&mut self, reason: &str) {
         self.notice(reason);
     }
+    /// A model request for an assistant message is about to start. Streamed text still pending from
+    /// an earlier attempt is dropped; observers never see it.
+    fn message_started(&mut self) {}
+    /// The assistant message is complete, before its `message_end` event. Observers receive the
+    /// final accumulated text here.
+    fn message_settled(&mut self) {}
     /// Messages the user typed while the turn ran. Polled between steps; the agent appends them as user
     /// messages before the next model request so the model can change course without waiting for the turn to end.
     fn take_steering(&mut self) -> Vec<String> {
@@ -219,8 +236,8 @@ pub trait Ui {
     fn maintenance_ready(&mut self) -> bool {
         true
     }
-    /// A tool call finished running; `seconds` is its wall time. Structured surfaces (JSON output) use it.
-    fn tool_timing(&mut self, _name: &str, _seconds: f64) {}
+    /// Wall time of this exact call; concurrent calls with the same tool name remain distinct.
+    fn tool_timing(&mut self, _call_id: &str, _name: &str, _seconds: f64) {}
     /// The task list changed. Interactive surfaces keep it visible; structured outputs emit it as an event.
     fn todo(&mut self, _todo: &TodoList) {}
 }

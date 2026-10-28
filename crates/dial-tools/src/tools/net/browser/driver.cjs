@@ -72,6 +72,39 @@ function tabEvents(tab, after) {
   const events = EVENT_CHANNELS.flatMap(channel => tab[channel].filter(event => event.seq > since).map(event => ({channel, ...event})));
   return {events: events.sort((a,b) => a.seq - b.seq), network_failures:(tab.networkFailures || []).filter(event=>event.seq > since), last_seq: tab.seq};
 }
+// Request log, HAR and routes. Rust owns the allowed-host guard, header redaction and output shaping;
+// route verdicts come from the guarded Rust bridge, and this adapter acts on them.
+const REQUEST_LOG_MAX = 200, ROUTES_MAX = 32, REQUEST_BODY_TRANSFER_MAX = 64 * 1024, HAR_BODY_BUDGET = 2 * 1024 * 1024;
+let initScriptSeq = 0;
+const initScripts = new Map();
+function isTextualType(contentType) {
+  const kind = String(contentType || '').split(';')[0].trim().toLowerCase();
+  return kind.startsWith('text/') || kind.endsWith('+json') || kind.endsWith('+xml')
+    || ['application/json','application/javascript','application/xml','application/x-www-form-urlencoded','image/svg+xml'].includes(kind);
+}
+function publicRecord(record) {
+  const {_request, started_ms, finished, ...rest} = record;
+  return rest;
+}
+function routeSummary(route) {
+  return {id:route.id, pattern:route.pattern, resource_type:route.resource_type, kind:route.kind};
+}
+function logRequest(tab, record) {
+  tab.requestLog.push(record);
+  tab.byRequest.set(record._request, record);
+  if (tab.requestLog.length > REQUEST_LOG_MAX) tab.requestLog.shift();
+}
+async function responseBody(record) {
+  if (!record.finished) return null;
+  const response = await record._request.response().catch(() => null);
+  return response ? response.body().catch(() => null) : null;
+}
+function fulfillment(route, requestId) {
+  const spec = route.response || {};
+  const headers = {...(spec.headers || {})};
+  if (spec.content_type) headers['content-type'] = spec.content_type;
+  return {requestId, responseCode:spec.status ?? 200, responseHeaders:Object.entries(headers).map(([name, value]) => ({name, value:String(value)})), body:Buffer.from(spec.body ?? '', 'utf8').toString('base64')};
+}
 async function acquireHttp(bytes) {
   if (activeHttp < MAX_PENDING) { activeHttp++; return; }
   if (httpQueue.length >= MAX_QUEUED_HTTP) throw new Error('browser HTTP request queue budget exceeded (4096 waiting requests)');
@@ -84,10 +117,11 @@ function releaseHttp() {
   if (next) { queuedHttpBytes -= next.bytes; next.resolve(); }
   else activeHttp--;
 }
-async function http(request) {
+async function http(request, routing) {
   if (!operationId) throw new Error('browser networking is paused between approved operations');
   const owner = operationId;
   const event = httpEvent(request);
+  if (routing) Object.assign(event, routing);
   await acquireHttp(Buffer.byteLength(JSON.stringify(event)));
   try {
     if (operationId !== owner) throw new Error('approved browser operation finished');
@@ -136,7 +170,7 @@ function register(page) {
   for (const [id, tab] of tabs) if (tab.page === page) return id;
   if (tabs.size >= 16) { page.close().catch(() => {}); throw new Error('maximum 16 browser tabs'); }
   const id = nextTab++;
-  const tab = { page, seq: 0, console: [], network: [], dialogs: [], downloads: [], navigation: [], frames: new Map(), nextFrame: 1, dialogPolicy: null, downloadArmed: false };
+  const tab = { page, seq: 0, console: [], network: [], dialogs: [], downloads: [], navigation: [], frames: new Map(), nextFrame: 1, dialogPolicy: null, downloadArmed: false, requestLog: [], requestSeq: 0, byRequest: new WeakMap(), routes: [], routeSeq: 0, har: null };
   tabs.set(id, tab);
   page.on('console', message => { const location=message.location(); record(tab, 'console', { time:Date.now(), operation_id:operationId, type:message.type(), text:clip(message.text()), location:{...location,url:clip(location.url)} }); });
   page.on('pageerror', error => record(tab, 'console', { time:Date.now(), operation_id:operationId, type: 'pageerror', text: clip(error.message) }));
@@ -161,6 +195,10 @@ function register(page) {
     if (!armed) download.cancel().then(()=>download.delete()).catch(error=>record(tab,'console',{type:'download-cleanup-error',text:clip(error.message)}));
   });
   page.on('framedetached', frame => tab.frames.delete(frame));
+  page.on('request', request => logRequest(tab, {id:++tab.requestSeq, method:request.method(), url:clip(request.url()), resource_type:request.resourceType(), started:new Date().toISOString(), started_ms:Date.now(), request_headers:request.headers(), status:null, failure:null, duration_ms:null, response_headers:null, response_bytes:null, finished:false, _request:request}));
+  page.on('response', response => { const record = tab.byRequest.get(response.request()); if (record) { record.status = response.status(); record.response_headers = response.headers(); } });
+  page.on('requestfinished', request => { const record = tab.byRequest.get(request); if (!record) return; record.finished = true; record.duration_ms = Date.now() - record.started_ms; request.sizes().then(sizes => { record.response_bytes = sizes.responseBodySize; }, () => {}); });
+  page.on('requestfailed', request => { const record = tab.byRequest.get(request); if (!record) return; record.finished = true; record.failure = clip(request.failure()?.errorText || 'unknown'); record.duration_ms = Date.now() - record.started_ms; });
   // CDP Fetch reports every redirect hop. Playwright context.route only intercepts the initial URL.
   tab.ready = (attached ? page.routeWebSocket('**/*', guardSocket) : Promise.resolve()).then(() => context.newCDPSession(page)).then(async session => {
     if (!session) return;
@@ -174,7 +212,15 @@ function register(page) {
           const body=request.postDataEntries?.length
             ? Buffer.concat(request.postDataEntries.map(entry=>Buffer.from(entry.bytes || '','base64')))
             : request.postData === undefined ? null : Buffer.from(request.postData,'utf8');
-          const response=await http({postDataBuffer:()=>body,url:()=>request.url,method:()=>request.method,headers:()=>request.headers});
+          const routing = tab.routes.length ? {routes:tab.routes.map(routeSummary), resource_type:String(event.resourceType || '').toLowerCase()} : undefined;
+          const response=await http({postDataBuffer:()=>body,url:()=>request.url,method:()=>request.method,headers:()=>request.headers}, routing);
+          if (response.route) {
+            const route = tab.routes.find(entry => entry.id === response.route.id);
+            if (!route) throw new Error(`route ${response.route.id} was removed while the request was pending`);
+            if (response.route.kind === 'abort') throw new Error(`aborted by route ${response.route.id}`);
+            await session.send('Fetch.fulfillRequest', fulfillment(route, event.requestId));
+            return;
+          }
           await session.send('Fetch.fulfillRequest',{requestId:event.requestId,responseCode:response.status,responseHeaders:Object.entries(response.headers).flatMap(([name,value])=>(Array.isArray(value)?value:[value]).map(item=>({name,value:String(item)}))),body:response.body});
         } catch (error) {
           record(tab,'network',{kind:'blocked',operation_id:owner,url:clip(event.request.url),error:clip(error.message)});
@@ -193,6 +239,7 @@ function register(page) {
 async function initialize(request) {
   if (browser) return { initialized: true };
   attached = !!process.env.DIAL_CDP_URL;
+  if (attached && request.ignore_https_errors === true) throw new Error('ignore_https_errors cannot be applied to an attached browser (DIAL_CDP_URL); the operator browser owns its TLS settings');
   const viewport = { width:1280, height:720 };
   try {
     if (attached) {
@@ -203,7 +250,7 @@ async function initialize(request) {
       browser = await chromium.launch({ headless: request.headless !== false, executablePath: process.env.DIAL_CHROMIUM, timeout: request.timeout_ms ?? 0,
         args: ['--use-gl=angle', '--use-angle=swiftshader', '--disable-background-networking', '--disable-component-update', '--disable-sync', '--disable-quic', '--force-webrtc-ip-handling-policy=disable_non_proxied_udp', '--disable-features=WebRtcHideLocalIpsWithMdns', '--proxy-server=http://127.0.0.1:9', '--proxy-bypass-list=<-loopback>', ...(request.stealth?.args ?? [])],
         ...(request.stealth ? { ignoreDefaultArgs: request.stealth.ignoreDefaultArgs } : {}) });
-      context = await browser.newContext({ serviceWorkers: 'block', acceptDownloads: true, viewport,
+      context = await browser.newContext({ serviceWorkers: 'block', acceptDownloads: true, viewport, ignoreHTTPSErrors: request.ignore_https_errors === true,
         storageState: request.storage_state || undefined,
         recordVideo: request.record_video ? { dir: artifactsDir() } : undefined });
       if (request.stealth?.script) await context.addInitScript(request.stealth.script);
@@ -211,6 +258,7 @@ async function initialize(request) {
       // Only exact loopback endpoints approved by the Rust policy connect; everything else is closed.
       await context.routeWebSocket('**/*', guardSocket);
     }
+    await context.addInitScript(webmcpModule.installHook, webmcpModule.KEY);
     // Attached browsers already own pages; register them so tabs/tab-less actions see them.
     for (const page of context.pages()) { try { register(page); } catch (_) {} }
     context.on('page', page => { try { register(page); } catch (_) {} });
@@ -355,7 +403,34 @@ async function run(request) {
   wsEndpoints = Array.isArray(request.websocket_endpoints) ? request.websocket_endpoints.map(String) : wsEndpoints;
   if (request.action === 'initialize') return initialize(request);
   if (!context) throw new Error('browser is not initialized');
+  if (siteModule.ACTIONS.has(request.action)) return siteModule.run(request, { context, tabFor });
   if (request.action === 'storage_state') return {storage_state: await context.storageState()};
+  if (request.action === 'add_init_script') {
+    if (typeof request.source !== 'string' || !request.source) throw new Error('add_init_script requires source');
+    const disposable = await context.addInitScript({ content: request.source });
+    const id = `init-${++initScriptSeq}`;
+    const bytes = Buffer.byteLength(request.source);
+    initScripts.set(id, { disposable, bytes });
+    return { id, bytes };
+  }
+  if (request.action === 'remove_init_script') {
+    const entry = initScripts.get(request.script_id);
+    if (!entry) throw new Error(`No init script with id ${request.script_id}`);
+    await entry.disposable.dispose();
+    initScripts.delete(request.script_id);
+    return { removed: request.script_id };
+  }
+  if (request.action === 'init_scripts') return { scripts: [...initScripts].map(([id, entry]) => ({ id, bytes: entry.bytes })) };
+  if (request.action === 'webmcp_list') {
+    const raw = await tabFor(request).page.evaluate(webmcpModule.listInPage, { key: webmcpModule.KEY, name: request.name ?? null });
+    return { tab: request.tab, ...raw };
+  }
+  if (request.action === 'webmcp_invoke') {
+    return tabFor(request).page.evaluate(webmcpModule.invokeInPage, { key: webmcpModule.KEY, name: request.name, params: request.params ?? {} });
+  }
+  if (request.action === 'webmcp_events') {
+    return tabFor(request).page.evaluate(webmcpModule.eventsInPage, { key: webmcpModule.KEY, since: request.since ?? 0, clear: request.clear === true });
+  }
   if (request.action === 'trace_start') {
     if (tracing) throw new Error('tracing is already running');
     await context.tracing.start({screenshots:true,snapshots:true});
@@ -374,6 +449,7 @@ async function run(request) {
     const page = await context.newPage();
     const id = register(page);
     await tabs.get(id).ready;
+    if (request.emulation) await siteModule.applyTabEmulation(tabs.get(id), request.emulation);
     const response = await page.goto(required(request,'url'), {waitUntil:'domcontentloaded',timeout:request.timeout_ms});
     return { tab:id, url:clip(page.url()), title:clip(await page.title()), status:response?.status() };
   }
@@ -382,7 +458,9 @@ async function run(request) {
   page.setDefaultTimeout(request.timeout_ms);
   page.setDefaultNavigationTimeout(request.timeout_ms);
   const scope = scopeFor(tab,request);
+  if (pageActions.handles(request)) return pageActions.run(request,{tab,page,scope,frameId:tab.frames.get(scope),cut,clip});
   if (request.frame !== undefined && !['navigate','evaluate','snapshot','aria','audit','click','fill','type','readable','press','select','check','uncheck','hover','focus','wait','upload','download'].includes(request.action)) throw new Error(`frame is not supported for action=${request.action}`);
+  if (captureModule.handles(request)) return captureModule.run(request,{tab,page});
   switch (request.action) {
     case 'navigate': {
       const response = await scope.goto(required(request,'url'), {waitUntil:'domcontentloaded'});
@@ -455,17 +533,66 @@ async function run(request) {
     case 'hover': await scope.locator(required(request,'selector')).hover(); break;
     case 'focus': await scope.locator(required(request,'selector')).focus(); break;
     case 'wait': await scope.locator(required(request,'selector')).waitFor({state:request.state || 'visible'}); break;
-    case 'screenshot': {
-      if (request.full_page) {
-        const height = await page.evaluate(() => Math.max(document.body?.scrollHeight || 0, document.documentElement.scrollHeight));
-        if (height > 12000) throw new Error('full-page screenshot exceeds 12000px height; use viewport screenshot');
-      }
-      const bytes = await page.screenshot({type:'png',fullPage:!!request.full_page,timeout:request.timeout_ms});
-      if (bytes.length > 5 * 1024 * 1024) throw new Error('screenshot exceeds the provider attachment limit of 5 MiB; use a viewport screenshot');
-      return {tab:request.tab,url:clip(page.url()),artifact:{media_type:'image/png',encoding:'base64',data:bytes.toString('base64')}};
-    }
     case 'evidence': return {tab:request.tab,url:clip(page.url()),title:clip(await page.title()),console:tab.console,network:tab.network,dialogs:tab.dialogs,downloads:tab.downloads,navigation:tab.navigation,frames:frameEntries(tab)};
     case 'events': return {tab:request.tab,...tabEvents(tab,request.after)};
+    case 'requests': {
+      let list = tab.requestLog;
+      if (request.resource_type) list = list.filter(record => record.resource_type === request.resource_type);
+      if (request.filter) list = list.filter(record => record.url.includes(request.filter));
+      return {tab:request.tab, records: list.slice(-(request.limit ?? 50)).reverse().map(publicRecord)};
+    }
+    case 'request': {
+      const record = tab.requestLog.find(entry => entry.id === request.request_id);
+      if (!record) throw new Error(`no request ${request.request_id} in this tab's log; the log keeps the most recent ${REQUEST_LOG_MAX} requests`);
+      const contentType = (record.response_headers || {})['content-type'] || '';
+      const buffer = await responseBody(record);
+      const out = {record: publicRecord(record), content_type: clip(contentType)};
+      if (buffer) { out.body_bytes = buffer.length; out.body = isTextualType(contentType) ? buffer.subarray(0, REQUEST_BODY_TRANSFER_MAX).toString('utf8') : ''; }
+      return out;
+    }
+    case 'har_start': {
+      if (tab.har) throw new Error('a HAR recording is already running for this tab; call har_stop first');
+      tab.har = {startSeq: tab.requestSeq + 1, content: request.content ?? 'text'};
+      return {tab:request.tab, recording:true, content:tab.har.content};
+    }
+    case 'har_stop': {
+      if (!tab.har) throw new Error('no HAR recording is running for this tab');
+      const {startSeq, content} = tab.har;
+      tab.har = null;
+      const firstKept = tab.requestLog.length ? tab.requestLog[0].id : tab.requestSeq + 1;
+      let budget = HAR_BODY_BUDGET, bodiesOmitted = 0;
+      const entries = [];
+      for (const record of tab.requestLog) {
+        if (record.id < startSeq) continue;
+        const entry = publicRecord(record);
+        const contentType = (record.response_headers || {})['content-type'] || '';
+        const textual = isTextualType(contentType);
+        if (content !== 'none' && (textual || content === 'all')) {
+          const buffer = await responseBody(record);
+          if (buffer) {
+            const chunk = buffer.subarray(0, REQUEST_BODY_TRANSFER_MAX);
+            if (chunk.length <= budget) {
+              budget -= chunk.length;
+              if (textual) entry.body = chunk.toString('utf8'); else entry.body_base64 = chunk.toString('base64');
+            } else bodiesOmitted++;
+          }
+        }
+        entries.push(entry);
+      }
+      return {tab:request.tab, entries, dropped:Math.max(0, firstKept - startSeq), content, bodies_omitted:bodiesOmitted};
+    }
+    case 'route': {
+      if (tab.routes.length >= ROUTES_MAX) throw new Error(`a tab holds at most ${ROUTES_MAX} routes`);
+      const route = {id:++tab.routeSeq, pattern:required(request,'pattern'), resource_type:request.resource_type ?? null, kind:request.route_kind, response:request.response ?? null};
+      tab.routes.push(route);
+      return {tab:request.tab, route:routeSummary(route), routes:tab.routes.length};
+    }
+    case 'unroute': {
+      const before = tab.routes.length;
+      tab.routes = request.pattern == null ? [] : tab.routes.filter(route => route.pattern !== request.pattern);
+      return {tab:request.tab, removed:before - tab.routes.length, routes:tab.routes.length};
+    }
+    case 'routes': return {tab:request.tab, routes:tab.routes.map(routeSummary)};
     case 'back': case 'forward': case 'reload': {
       const options = {waitUntil:'domcontentloaded'};
       const response = await (request.action === 'back' ? page.goBack(options) : request.action === 'forward' ? page.goForward(options) : page.reload(options));

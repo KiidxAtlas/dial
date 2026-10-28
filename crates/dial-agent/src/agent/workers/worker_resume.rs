@@ -47,6 +47,8 @@ pub struct Resume {
     pub tools: Vec<String>,
     pub model: String,
     pub definition: Value,
+    /// The last settings the worker applied at a request boundary; `model` stays the launch model.
+    pub settings: Option<super::live_tasks::control::WorkerSettings>,
     pub lease: File,
 }
 
@@ -86,10 +88,14 @@ pub fn load(
     );
     let mut messages = Vec::new();
     let mut execution = None;
+    let mut settings: Option<super::live_tasks::control::WorkerSettings> = None;
     for line in BufReader::new(file).lines() {
         let value: Value = serde_json::from_str(&line?)?;
         if value["type"] == "execution_contract" {
             execution = Some(value.clone());
+        }
+        if value["type"] == "worker_settings" {
+            settings = Some(serde_json::from_value(value.clone())?);
         }
         if value["type"] == "message" {
             messages.push(value["message"].clone());
@@ -102,6 +108,10 @@ pub fn load(
         "worker used a fallback model; start a new worker with that model explicitly"
     );
     let mut task = contract["task"].clone();
+    task["original_task"] = contract
+        .get("original_task")
+        .cloned()
+        .unwrap_or_else(|| task["task"].take());
     task["task"] = json!(message);
     task["action"] = json!("start");
     Ok(Resume {
@@ -114,6 +124,7 @@ pub fn load(
             .context("missing worker model")?
             .into(),
         definition: contract["definition"].clone(),
+        settings,
     })
 }
 

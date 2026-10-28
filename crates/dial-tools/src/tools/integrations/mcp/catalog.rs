@@ -505,7 +505,7 @@ pub fn check(
     server.enabled = true;
     let specs = BTreeMap::from([(name.to_string(), server)]);
     let load = super::connect_extra(&specs, config);
-    let count = load.tools.len();
+    let count = load.live.offered_tools().len();
     if count == 0 {
         let why = load
             .notices

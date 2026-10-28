@@ -368,7 +368,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         MO,
         "Requests",
         "Cost budgets",
-        "Maximum turn and session cost in USD; zero disables each cap."
+        "Maximum turn and session cost in USD (hard caps; zero disables each), plus warn_session_cost_usd and warn_turn_cost_usd notices shown once per crossing without stopping work."
     ),
     structured!(
         "retry.fallback_chains",

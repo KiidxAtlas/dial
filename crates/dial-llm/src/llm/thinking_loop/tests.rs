@@ -159,7 +159,7 @@ fn gemini_header_run_trips_at_thirty_six() {
 }
 
 #[test]
-fn policy_scopes_semantic_and_header_detectors_by_model_class() {
+fn policy_scopes_semantic_and_header_detectors_by_model_family() {
     let gemini = policy_with("google/gemini-2.5-pro", false).unwrap();
     assert!(gemini.semantic && gemini.header);
     let deepseek = policy_with("deepseek-reasoner", false).unwrap();
@@ -170,5 +170,19 @@ fn policy_scopes_semantic_and_header_detectors_by_model_class() {
         policy_with("gemini-2.5-pro", true),
         None,
         "kill switch disables every detector"
+    );
+}
+
+#[test]
+fn loop_detectors_trust_only_a_leading_basename_family() {
+    let contained = policy_with("vertex-gemini-2", false).unwrap();
+    assert!(
+        !contained.semantic && !contained.header,
+        "name containment must not grant loop detectors"
+    );
+    let custom = policy_with("claude-gemini-proxy", false).unwrap();
+    assert!(
+        !custom.semantic && !custom.header,
+        "a custom name is neither rejected nor given gemini detectors"
     );
 }

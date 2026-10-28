@@ -8,6 +8,13 @@ impl<'a> Agent<'a> {
         self.context_meter.current(&self.session)
     }
 
+    /// Categories of the last request sent, as estimates; `None` before the first request.
+    pub fn last_request_breakdown(
+        &self,
+    ) -> Option<&crate::agent::window::context_breakdown::ContextBreakdown> {
+        self.context_meter.breakdown()
+    }
+
     /// The same history projection used for dispatch and compaction previews. Preview callers
     /// clone the two cache memos; only a real request freezes new placeholders.
     pub(in crate::agent) fn project_history(

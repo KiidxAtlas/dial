@@ -8,8 +8,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs};
 
 use anyhow::Result;
+use serde_json::Value;
 
 use crate::agent::Agent;
+use crate::agent::NullUi;
 use crate::agent::modes::debug::DebugSnapshot;
 use crate::app::{App, Shell, Step};
 use crate::config::paths::Layout;
@@ -26,6 +28,12 @@ enum Action {
     System,
     /// Exports the session as plain text to a temp file.
     Transcript,
+    /// Frame costs, the repaint interval, and recent UI stalls with the phase that caused them.
+    Performance,
+    /// The terminal's output backlog, history not yet written to scrollback, and smooth-reveal state.
+    Terminal,
+    /// The memory backend's own status: which backend is live, its counts, and the recall cache.
+    Memory,
     /// Action with no Dial equivalent; the reason is shown instead of running it.
     Unavailable(&'static str),
 }
@@ -46,7 +54,7 @@ const ITEMS: &[Item] = &[
     Item {
         name: "performance",
         label: "Report: performance issue",
-        action: Action::Unavailable("Dial has no CPU profiler or performance bundle"),
+        action: Action::Performance,
     },
     Item {
         name: "work",
@@ -61,7 +69,7 @@ const ITEMS: &[Item] = &[
     Item {
         name: "memory",
         label: "Report: memory issue",
-        action: Action::Unavailable("Dial collects no memory statistics"),
+        action: Action::Memory,
     },
     Item {
         name: "logs",
@@ -76,7 +84,7 @@ const ITEMS: &[Item] = &[
     Item {
         name: "terminal",
         label: "View: terminal state",
-        action: Action::Unavailable("terminal geometry and protocol state live in the TUI layer"),
+        action: Action::Terminal,
     },
     Item {
         name: "protocols",
@@ -127,7 +135,10 @@ pub(super) fn run(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &st
         Action::Artifacts => artifacts_text(session),
         Action::Dump => dump_text(&app.layout, session),
         Action::System => system_text(&app.layout.project_root),
-        Action::Transcript => transcript_text(session),
+        Action::Transcript => transcript_text(&app.layout, session),
+        Action::Performance => Ok(shell.frame_pacing.report()),
+        Action::Terminal => Ok(terminal_text(shell)),
+        Action::Memory => memory_text(agent),
         Action::Unavailable(reason) => Ok(format!("unavailable: {reason}")),
     };
     match text {
@@ -135,6 +146,73 @@ pub(super) fn run(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &st
         Err(error) => shell.note(item.label, format!("failed: {error:#}")),
     }
     Ok(Step::Done)
+}
+
+/// The terminal's write state, the history waiting for scrollback, and the reveal and pacing state.
+fn terminal_text(shell: &Shell) -> String {
+    format!(
+        "output backlogged: {}\nsettled history waiting for scrollback: {} block(s)\nsmooth reveal holding text back: {}\nrepaint interval: {} ms",
+        shell.term.output_backlogged(),
+        shell.transcript.settled_backlog(),
+        shell.transcript.has_pending_reveal(),
+        shell.frame_pacing.interval().as_millis(),
+    )
+}
+
+/// The memory backend's status and its read-only `diagnose` report, read without a UI so
+/// `/debug memory` never prompts. Fields the backend does not report are left out, not defaulted.
+fn memory_text(agent: &mut Agent<'_>) -> Result<String> {
+    let status = agent.selected_memory_command("status", &mut NullUi)?;
+    let diagnosis = agent.selected_memory_command("diagnose", &mut NullUi)?;
+    Ok(format!(
+        "{}\n\nDiagnose:\n{}",
+        memory_lines(&status),
+        serde_json::to_string_pretty(&diagnosis)?
+    ))
+}
+
+fn memory_lines(status: &Value) -> String {
+    let mut out = format!("Backend: {}", status["backend"].as_str().unwrap_or("none"));
+    for (label, key) in [
+        ("Facts", "count"),
+        ("User facts", "userFacts"),
+        ("Forgotten", "forgotten"),
+    ] {
+        if let Some(count) = status[key].as_u64() {
+            let _ = write!(out, "\n{label}: {count}");
+        }
+    }
+    if let Some(embedding) = status["embedding"].as_str() {
+        let _ = write!(out, "\nEmbedding: {embedding}");
+    }
+    if let Some(auto) = status["autoRetain"].as_bool() {
+        let _ = write!(out, "\nAuto-retain: {}", if auto { "on" } else { "off" });
+    }
+    let recall = &status["recall"];
+    if recall.is_object() {
+        for bank in ["project", "user"] {
+            let cache = &recall["cache"][bank];
+            let _ = write!(
+                out,
+                "\nRecall cache {bank}: {} hits, {} misses, {} entries",
+                cache["hits"], cache["misses"], cache["entries"]
+            );
+        }
+        match &recall["last"] {
+            Value::Null => out.push_str("\nLast recall: none yet"),
+            last => {
+                let _ = write!(
+                    out,
+                    "\nLast recall: {} mode, {} item(s), project cache {}, user cache {}",
+                    last["mode"].as_str().unwrap_or("unknown"),
+                    last["items"],
+                    last["projectCache"].as_str().unwrap_or("unknown"),
+                    last["userCache"].as_str().unwrap_or("unknown"),
+                );
+            }
+        }
+    }
+    out
 }
 
 /// The session's artifact folder: `<project>/artifacts`, the sibling of `sessions/` that
@@ -173,9 +251,9 @@ fn dump_text(layout: &Layout, session: &Session) -> Result<String> {
     ))
 }
 
-fn transcript_text(session: &Session) -> Result<String> {
+fn transcript_text(layout: &Layout, session: &Session) -> Result<String> {
     let path = scratch_path("dial-transcript", session.id()).with_extension("txt");
-    session.export(&path, false)?;
+    session.export(layout, &path, false)?;
     Ok(format!("Transcript: {}", path.display()))
 }
 

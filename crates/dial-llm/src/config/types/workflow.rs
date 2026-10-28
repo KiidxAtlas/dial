@@ -143,6 +143,11 @@ pub struct BudgetConfig {
     pub max_session_cost_usd: Option<f64>,
     /// Stop the turn once it alone has cost this much. `0` (the default) or unset disables this cap.
     pub max_turn_cost_usd: Option<f64>,
+    /// Notify once when the session (subagents included) first reaches this spend. Warnings never
+    /// stop work. `0` (the default) or unset disables the warning.
+    pub warn_session_cost_usd: Option<f64>,
+    /// Notify once when the current turn first reaches this spend. `0` (the default) or unset disables it.
+    pub warn_turn_cost_usd: Option<f64>,
 }
 
 impl Default for BudgetConfig {
@@ -150,6 +155,8 @@ impl Default for BudgetConfig {
         Self {
             max_session_cost_usd: Some(0.0),
             max_turn_cost_usd: Some(0.0),
+            warn_session_cost_usd: Some(0.0),
+            warn_turn_cost_usd: Some(0.0),
         }
     }
 }

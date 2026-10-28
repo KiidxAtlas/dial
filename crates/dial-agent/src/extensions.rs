@@ -7,6 +7,9 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use std::{collections::BTreeMap, sync::Arc};
 
+pub mod command;
+pub mod panel;
+
 pub const SDK_VERSION: u32 = 1;
 /// Extensions are operator-trusted native code, not executable workspace content.
 pub trait Extension: Send + Sync {

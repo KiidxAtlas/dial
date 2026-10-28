@@ -224,6 +224,13 @@ Lib tests report timings with `RUSTC_BOOTSTRAP=1 target/debug/deps/<crate>-<hash
 - `crates/dial-core/src/runtime/execution.rs` defines terminal status, effect certainty and committed paths. Tool payload and display text never authorize or reconstruct those facts. The shared tool boundary retains uncertainty through nested error handling, including a transaction whose rollback could not settle every path.
 - `crates/dial-core/src/runtime/cancellation.rs` separates session termination, turn interruption, inference/read/background scopes and mutation commitment. Atomic commits settle before interruption is reported; uncertain effects never imply rollback.
 - `crates/dial-core/src/runtime/stream_journal.rs` appends incremental runtime observations before publication. A body updates its observable state only after the journal accepts the change; write failure stops both callback publication and polling-visible changes. Session recovery overlays newer frames only on their active branch, marks open bodies interrupted, and never projects partial tool arguments as executable calls. Final snapshots live in the main journal. Session relocation, deletion and archiving handle both files.
+- `crates/dial-agent/src/agent/run/dispatch.rs` publishes shared-call completion and timing by call ID as each worker finishes; role adapters retain original-order provider conversation settlement.
+- `crates/dial-ui/src/ui/input/pump.rs` owns terminal reads. `crates/dial-ui/src/ui/term/output.rs` owns bounded FIFO output and control-sequence ordering. Frame admission is nonblocking; terminal diff/history state commits only on acceptance, and handoffs drain before ownership changes.
+- `crates/dial-app/src/app/shell/frame_pacing.rs` owns adaptive repaint cadence and bounded stall diagnostics. `crates/dial-ui/src/ui/transcript.rs` owns budgeted retirement, released render caches, replay and grapheme-safe reveal; presentation never dispatches partial tool arguments.
+- `crates/dial-app/src/app/side.rs` owns tools-free side requests over immutable turn context. `crates/dial-storage/src/storage/side_thread.rs` owns private thread history and live-prefix checkpoints; recovering a pending answer marks it interrupted, never reissues inference. Explicit promotion forks saved ancestry into a full sibling without changing the main branch.
+- `crates/dial-agent/src/agent/workers/live_tasks/pool.rs` owns in-memory bounded pool queues and retained logical slots. Each item keeps its own launch context; incompatible configuration invalidates reuse. Worker settings in `live_tasks/control.rs` are revisioned per worker and applied only at request boundaries.
+- `crates/dial-app/src/app/restore.rs` restores the parent conversation before eligible interrupted workers through the ordinary validated resume path. Startup acquires the live control handle before a foreground turn; worker projection correlates job IDs with their current runtime-node incarnation.
+- `crates/dial-llm/src/llm/identity.rs` owns scoped declarative identity selectors. Loop detection, Devin payload selection and Cloud Code Claude labeling retain their distinct prior matching semantics; a family fact for one axis is not authority for another.
 - `crates/dial-llm/src/config/schema.rs` owns shared settings metadata. Defaults come from `Config::default`; model-dependent output bounds use the selected profile. UI and CLI consume the same declaration. Cross-field and provider constraints remain in configuration validation.
 - `crates/dial-llm/src/config/selection.rs` owns model-selection setting changes shared by setup and interactive controllers. Preparation validates the explicit candidate before selection is published; presentation never reconstructs configuration precedence.
 - Embedding setup uses the same model-selection writer as other role pickers. Switching to a
@@ -234,8 +241,7 @@ Lib tests report timings with `RUSTC_BOOTSTRAP=1 target/debug/deps/<crate>-<hash
 - CI records runtime-journal overhead and markdown/terminal encoding p95 without imposing a host-dependent speed threshold.
 - RPC has one state projector for worker and cached queries. Typed notices expose their lane;
   ACP preserves source metadata in `_meta.dial` without requiring clients to change text handling.
-- Session relocation treats the main journal and incremental stream journal as one cleanup unit:
-  failure to reopen the destination removes both destination artifacts and preserves the source.
+- Session relocation, archive and deletion include the main journal, incremental stream journal and optional side-thread file. Failed destination cleanup removes only artifacts that operation created; source retirement follows successful destination publication and reopen.
 - Steering import, evaluation, automatic creation and promotion share per-vector mutation leases.
   Promotion holds both pending and active leases before checking state and uses the same admission
   gate as runtime loading; `--replace` never bypasses evaluation or a busy lease.
@@ -250,21 +256,26 @@ of each feature. The reviewed areas and resulting decisions are:
 | Parent/child agent loop, recovery and tool dispatch | Retain shared lifecycle, execution-effect and cancellation owners; do not add a second orchestration pipeline. |
 | Model configuration, setup and settings surfaces | Route embedding-role changes through the canonical selection writer; preserve explicit overrides and open-choice settings. |
 | Benchmarks and worker isolation | Share source copying and exclusion policy outside benchmark ownership; keep private dependency materialization semantics separate. |
-| Terminal, print CLI, RPC and ACP | Keep presentation adapters over shared agent events; preserve typed event metadata and use one RPC state projector. No terminal visual redesign was performed. |
-| Session persistence and runtime streams | Clean up both destination journals when relocation fails, preserving the source and its live runtime. |
+| Terminal, print CLI, RPC and ACP | Keep adapters over shared events; add independent terminal I/O, bounded rendering, draft-safe dialogs and native transcript navigation without moving execution authority into presentation. |
+| Session persistence and runtime streams | Preserve writer leases; contention creates an independent sibling. Move/archive/delete associated side history and roll back failed destination publication without damaging the source. |
+| Side conversations and worker controls | Freeze side context without borrowing the running agent; persist streamed prefixes. Keep worker editors and model revisions local, and restore only safely acknowledged starts. |
+| Extension panels | Validate bounded declarative layouts, report typed outcomes, and keep human input separate from tool permission. |
 | Steering, import and automatic improvement | Share mutation leases and admission checks rather than duplicating weaker promotion gates. |
-| Provider acquisition and optional learning | Retain existing acquisition ownership and compatibility exports; no model downloads, training runs or provider-policy changes were made for this review. |
+| Provider acquisition and optional learning | Retain acquisition ownership; centralize existing identity policy without changing its scope or running downloads/training. |
+| Background execution | Long `eval` cells and named shells hand off through the existing bash adopter into the `bg` table; handed-off cells refuse host callbacks and busy names/runtimes refuse new work. |
+| Media and remote reads | `read` keeps one dispatch path: hooks and approval run before vision questions; URL reads reuse the guarded web fetch client; archive formats share one admission walk with entry, size and decode limits. |
+| Plugin protocol 2 | `dial-tools` validates capabilities and queues effects; the app drains them at safe boundaries behind user approval; the UI renders sanitized slots. Observed events are asynchronous and never block the turn. |
+| Portable sessions | Packing is versioned and hash-verified; unpack never overwrites and refuses traversal, links and newer schemas. A global transfer ledger makes a moved-away source fork. |
+| Provider resilience | Cache-field refusals narrow a per-endpoint latch; cache warming runs on its own client and folds replay cost into session usage; OAuth accounts share one store and rotate like the API-key pool. |
+| Consultation and host integration | `seance` is a read-only worker over stored transcripts; RPC host tools and URI schemes are ordinary tools subject to approval and reset on session switch. |
 
-Verification covers focused library tests plus architecture, isolation, configuration, benchmark
-and RPC integration tests. It is not certification of every feature or platform. Native Windows
-ProjFS, Linux overlay mounts, real provider inference, training and third-party client rendering
-were not exercised. ACP metadata preservation does not establish client-side output replacement.
-The earlier full-suite failures remain unresolved except for the specifically corrected schema
-and MCP contract assertions; they have not all been established as pre-existing. Clippy's
-correctness/suspicious gate passed with warnings, not a warning-free result. Unrelated formatting
-differences were left intact.
+Verification includes the workspace build and Rust suite, Clippy with `-D warnings`, and real-PTY
+scripted-provider probes for streaming controls, worker restoration, panels, navigation, writer
+contention and side-session lifecycle.
+These checks are not certification of every platform or feature: native Windows ProjFS, Linux
+overlay mounts, real provider inference, training and third-party client rendering were not exercised.
+ACP metadata preservation does not establish client-side output replacement.
 
-**[INFERENCE]** Removing full-history cloning from RPC state queries and giving shared behavior
-one owner should reduce avoidable work and future drift. No wall-clock, allocation or model-success
-improvement was measured. Streaming execution, pruning defaults and broader protocol precedence
-changes require separate evidence before changing their behavior.
+No matched wall-clock, allocation, provider-cache-hit or real-model-success improvement is claimed.
+Bounded queues, render budgets and shared ownership establish concrete invariants; comparative
+performance and model-quality claims still require matched measurements.

@@ -37,6 +37,19 @@ fn activate_session(
     }
 }
 
+/// Host tools and schemes belong to the session they were declared in. Every session switch drops
+/// them from the session being left (so no parked session carries them) and resets the host
+/// registration, so the host must declare again after switching back.
+fn drop_host_tools(
+    agent: &mut Agent<'_>,
+    bridge: &host_tools::HostBridge,
+    uris: &host_uris::HostUris,
+) {
+    let names = bridge.reset();
+    agent.unregister_host_tools(&names);
+    uris.reset();
+}
+
 type Controls = (
     crate::agent::LiveTaskControl,
     crate::agent::compact::compaction_runtime::CompactionControl,
@@ -59,6 +72,8 @@ pub(super) struct Actor {
     pub worker_closing: Arc<AtomicBool>,
     pub worker_prompt_queued: Arc<AtomicBool>,
     pub worker_pending: Arc<Mutex<Option<String>>>,
+    pub worker_host: Arc<host_tools::HostBridge>,
+    pub worker_uris: Arc<host_uris::HostUris>,
     pub worker_questions: Arc<Mutex<Option<PendingQuestion>>>,
     pub worker_disconnected: Arc<AtomicBool>,
     pub worker_query_cache: Arc<Mutex<QueryProjection>>,
@@ -83,6 +98,8 @@ impl Actor {
             worker_closing,
             worker_prompt_queued,
             worker_pending,
+            worker_host,
+            worker_uris,
             worker_questions,
             worker_disconnected,
             worker_query_cache,
@@ -352,6 +369,118 @@ impl Actor {
                             );
                             Ok(json!({"enabled":agent.plan_mode()}))
                         }
+                        "set_model" => {
+                            let provider = params["provider"]
+                                .as_str()
+                                .context("set_model requires params.provider")?;
+                            let model_id = params["model_id"]
+                                .as_str()
+                                .context("set_model requires params.model_id")?;
+                            let selection = crate::agent::modes::switch::resolve(
+                                agent.effective_config(),
+                                &format!("{provider}/{model_id}"),
+                            )?;
+                            anyhow::ensure!(
+                                crate::agent::modes::switch::is_known_model(
+                                    agent.effective_config(),
+                                    &layout.user_dir,
+                                    &selection,
+                                ),
+                                "unknown model {provider}/{model_id}: not in the catalog, configured models or downloaded local models"
+                            );
+                            agent.switch_model(&selection, None)?;
+                            Ok(json!({"model":agent.effective_config().model}))
+                        }
+                        "set_thinking" => {
+                            let level = params["level"]
+                                .as_str()
+                                .context("set_thinking requires params.level")?;
+                            let effort = crate::agent::modes::switch::parse_effort(level)
+                                .with_context(|| format!("unknown reasoning level: {level}"))?;
+                            let selection = agent.effective_config().selection();
+                            agent.switch_model(&selection, Some(effort))?;
+                            Ok(json!({"level":effort.as_str()}))
+                        }
+                        "get_session_stats" => {
+                            let state = state_projection(&agent);
+                            Ok(json!({
+                                "session_id":state["session_id"],
+                                "messages":agent.session().messages().len(),
+                                "cost":state["cost"],
+                                "observed_cost":state["observed_cost"],
+                                "usage":state["usage"],
+                                "metrics":state["metrics"]
+                            }))
+                        }
+                        "get_available_commands" => {
+                            let commands: Vec<Value> = crate::app::builtin_commands()
+                                .iter()
+                                .map(|(name, usage, description)| {
+                                    json!({"name":name,"usage":usage,"description":description})
+                                })
+                                .collect();
+                            Ok(json!({"commands":commands}))
+                        }
+                        "export" => {
+                            let format = params["format"].as_str().unwrap_or("html");
+                            let html = if format == "html" {
+                                true
+                            } else if format == "markdown" {
+                                false
+                            } else {
+                                anyhow::bail!("unsupported export format: {format}");
+                            };
+                            let name = match params["path"].as_str() {
+                                Some(path) => path.to_owned(),
+                                None => format!(
+                                    "dial-session-{}.{}",
+                                    agent.session().id(),
+                                    if html { "html" } else { "md" }
+                                ),
+                            };
+                            let relative = std::path::Path::new(&name);
+                            anyhow::ensure!(
+                                relative
+                                    .components()
+                                    .all(|part| matches!(part, std::path::Component::Normal(_))),
+                                "export path must be relative to the project root without '..'"
+                            );
+                            agent.session().export(
+                                &layout,
+                                &layout.project_root.join(relative),
+                                html,
+                            )?;
+                            Ok(json!({"path":name,"format":format}))
+                        }
+                        "set_host_tools" => {
+                            let specs = host_tools::parse_specs(&params["tools"])?;
+                            worker_host.ensure_unregistered()?;
+                            let names: Vec<String> =
+                                specs.iter().map(|spec| spec.name.clone()).collect();
+                            let tools: Vec<Arc<dyn crate::tools::integrations::ext::Tool>> = specs
+                                .into_iter()
+                                .map(|spec| {
+                                    Arc::new(host_tools::HostTool::new(
+                                        spec,
+                                        worker_host.clone(),
+                                        worker_out.clone(),
+                                        flag.clone(),
+                                    ))
+                                        as Arc<dyn crate::tools::integrations::ext::Tool>
+                                })
+                                .collect();
+                            agent.register_host_tools(tools)?;
+                            worker_host.mark_registered(names.clone());
+                            Ok(json!({"tools": names}))
+                        }
+                        "set_host_uri_schemes" => {
+                            let schemes = host_uris::parse_schemes(&params["schemes"])?;
+                            worker_uris.declare(schemes.clone());
+                            agent.workspace_mut().set_host_uris(Some(Arc::new(
+                                host_uris::Resolver::new(worker_uris.clone(), worker_out.clone()),
+                            )));
+                            Ok(json!({"schemes": schemes}))
+                        }
                         "new_session" => {
                             agent
                                 .gate_session_change(
@@ -359,6 +488,7 @@ impl Actor {
                                     json!({"reason":"new"}),
                                 )
                                 .map_err(anyhow::Error::msg)?;
+                            drop_host_tools(&mut agent, &worker_host, &worker_uris);
                             let session = Session::create(
                                 &layout,
                                 SessionMeta {
@@ -442,7 +572,9 @@ impl Actor {
                                         json!({"reason":"resume","target_session_id":wanted}),
                                     )
                                     .map_err(anyhow::Error::msg)?;
+                                drop_host_tools(&mut agent, &worker_host, &worker_uris);
                             }
+                            let mut forked_from: Option<String> = None;
                             if acp {
                                 if !current || agent.session().id() != wanted {
                                     let session = if let Some(session) = parked.remove(wanted) {
@@ -452,7 +584,18 @@ impl Actor {
                                             .into_iter()
                                             .find(|s| s.id == wanted)
                                             .context("session id not found in launched project")?;
-                                        ParkedSession::fresh(&agent, Session::open(&info.path)?)
+                                        let (session, source) =
+                                            match Session::open_or_fork(&layout, &info.path)? {
+                                                crate::storage::session::Resumed::Owned(
+                                                    session,
+                                                ) => (session, None),
+                                                crate::storage::session::Resumed::Forked {
+                                                    source_id,
+                                                    session,
+                                                } => (session, Some(source_id)),
+                                            };
+                                        forked_from = source;
+                                        ParkedSession::fresh(&agent, session)
                                     };
                                     stop_owned_tasks(&mut agent, &mut ui);
                                     activate_session(&mut agent, session, &mut parked, current);
@@ -472,7 +615,7 @@ impl Actor {
                                     }
                                 }
                                 Ok(
-                                    json!({"session_id":agent.session().id(),"plan_mode":agent.plan_mode()}),
+                                    json!({"session_id":agent.session().id(),"plan_mode":agent.plan_mode(),"forked_from":forked_from}),
                                 )
                             } else {
                                 let matching = Session::find_prefix(&layout, wanted)?;
@@ -481,10 +624,23 @@ impl Actor {
                                     "session id missing or ambiguous"
                                 );
                                 if agent.session().id() != matching[0].id {
-                                    agent.swap_session(Session::open(&matching[0].path)?);
+                                    let (session, source) =
+                                        match Session::open_or_fork(&layout, &matching[0].path)? {
+                                            crate::storage::session::Resumed::Owned(session) => {
+                                                (session, None)
+                                            }
+                                            crate::storage::session::Resumed::Forked {
+                                                source_id,
+                                                session,
+                                            } => (session, Some(source_id)),
+                                        };
+                                    forked_from = source;
+                                    agent.swap_session(session);
                                     agent.set_plan_mode(false);
                                 }
-                                Ok(json!({"session_id":agent.session().id()}))
+                                Ok(
+                                    json!({"session_id":agent.session().id(),"forked_from":forked_from}),
+                                )
                             }
                         }
                         "fork_session" if acp => {
@@ -497,6 +653,7 @@ impl Actor {
                                     json!({"reason":"fork","source_session_id":wanted}),
                                 )
                                 .map_err(anyhow::Error::msg)?;
+                            drop_host_tools(&mut agent, &worker_host, &worker_uris);
                             let session = if current && agent.session().id() == wanted {
                                 stop_owned_tasks(&mut agent, &mut ui);
                                 agent.session().fork(&layout)?
@@ -526,6 +683,7 @@ impl Actor {
                                 .context("session_id required")?;
                             if current && agent.session().id() == wanted {
                                 stop_owned_tasks(&mut agent, &mut ui);
+                                drop_host_tools(&mut agent, &worker_host, &worker_uris);
                                 let tools = agent.fresh_session_tools();
                                 agent.replace_session_tools(tools);
                                 agent.swap_session(Session::ephemeral());
@@ -570,7 +728,10 @@ impl Actor {
                         "task_start" => agent.start_subagents(params, &mut ui),
                         "_cancel" if acp => Ok(json!({})),
                         "task_status" => agent.subagent_status(params["id"].as_str(), &mut ui),
-                        _ => anyhow::bail!("unknown RPC method"),
+                        _ => Err(anyhow::Error::new(RequestError {
+                            code: "unknown_method",
+                            message: "unknown RPC method".to_owned(),
+                        })),
                     }
                 })();
                 if acp && current && flag.load(Ordering::SeqCst) {

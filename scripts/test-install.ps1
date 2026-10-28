@@ -177,10 +177,10 @@ function New-ZipFromFile {
 
 # Builds <serve>/<Scenario>/ with the archive, SHA256SUMS, and SHA256SUMS.sig for $Tag.
 function New-Release {
-    param([string] $Scenario, [string] $Tag, [string] $ReportedVersion, [string] $KeyPath, [string] $ArchiveName)
+    param([string] $Scenario, [string] $Tag, [string] $ReportedVersion, [string] $KeyPath, [string] $ArchiveName, [string] $Target = 'x86_64-pc-windows-msvc')
     $dir = Join-Path $script:Serve $Scenario
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
-    $pkg = "dial-$Tag-x86_64-pc-windows-msvc"
+    $pkg = "dial-$Tag-$Target"
     if (-not $ArchiveName) { $ArchiveName = "$pkg.zip" }
     $stage = Join-Path $script:WorkRoot ('stage-' + [Guid]::NewGuid().ToString('N'))
     $binary = Join-Path $stage (Join-Path $pkg 'dial.exe')
@@ -276,6 +276,7 @@ try {
     New-Release -Scenario 'tampered' -Tag 'v0.1.0' -ReportedVersion '0.1.0' -KeyPath $keyA.Private | Out-Null
     New-Release -Scenario 'mismatch' -Tag 'v9.9.9' -ReportedVersion '0.1.0' -KeyPath $keyA.Private | Out-Null
     $manifestDir = New-Release -Scenario 'manifest-edit' -Tag 'v0.1.0' -ReportedVersion '0.1.0' -KeyPath $keyA.Private
+    New-Release -Scenario 'arm' -Tag 'v0.1.0' -ReportedVersion '0.1.0' -KeyPath $keyA.Private -Target 'aarch64-pc-windows-msvc' | Out-Null
 
     # Tamper the archive after the manifest was signed.
     $tamperedZip = Join-Path (Join-Path $script:Serve 'tampered') 'dial-v0.1.0-x86_64-pc-windows-msvc.zip'
@@ -381,14 +382,14 @@ try {
         Assert-True (Test-Path -LiteralPath (Join-Path $pathBin 'dial.exe.bak')) 'backup was not kept'
     }
 
-    Test-Case 'accepts ARM64 Windows with an emulation note' {
-        $envMap = Get-BaseEnvironment (Get-ScenarioUrl 'ok')
+    Test-Case 'installs the native aarch64 Windows build on ARM64 Windows' {
+        $envMap = Get-BaseEnvironment (Get-ScenarioUrl 'arm')
         $envMap['DIAL_RELEASE_PUBLIC_KEY_PEM'] = $keyA.PublicPem
         $envMap['PROCESSOR_ARCHITECTURE'] = 'ARM64'
         $armBin = Join-Path $script:WorkRoot 'bin-arm'
         $run = Invoke-Installer @('-Version', 'v0.1.0', '-InstallDir', $armBin) $envMap
         Assert-Equal 0 $run.Code "ARM64 exit code. Output: $($run.Output)"
-        Assert-Contains $run.Output 'ARM64'
+        Assert-Contains $run.Output 'Installed Dial 0.1.0'
     }
 
     Test-Case 'refuses unsupported architectures' {

@@ -6,13 +6,15 @@ use crate::app::core::App;
 use crate::app::display::local_time;
 use crate::app::drive::Step;
 use crate::app::overlay::auth::AuthJob;
+use crate::app::shell::plugin_effects::Drained;
 use crate::app::shell::{PAINT_EVERY, STATUS_TTL, Shell, TICK};
 use crate::ui::composer::ComposerEvent;
+use crate::ui::input::{poll, read};
 use crate::ui::status::Phase;
 use crate::ui::statusline;
 use crate::ui::welcome;
 use anyhow::Result;
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, poll, read};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use std::time::{Duration, Instant};
 
 impl Shell {
@@ -21,6 +23,8 @@ impl Shell {
     pub(in crate::app) fn run(&mut self, app: &App, agent: &mut Agent<'_>) -> Result<Step> {
         self.maintenance_control = Some(agent.background_compaction_control());
         self.background_control = agent.background_control();
+        // Restored workers exist before the first foreground turn binds its controls.
+        self.live_tasks = Some(agent.live_task_control());
         let mut dirty = true;
         let mut previous_status = None;
         loop {
@@ -34,6 +38,8 @@ impl Shell {
             dirty |= self.refresh_resources(app, false, false);
             // Large @file rankings finish on a worker; land them without waiting for a keystroke.
             dirty |= self.composer.poll_autocomplete();
+            // Plugin header, status, footer and title, plus autocomplete answers, once per pass.
+            dirty |= self.refresh_plugin_chrome(agent);
             if let Some(notice) = self.composer.take_word_notice() {
                 self.note("Word completion", notice);
             }
@@ -53,6 +59,12 @@ impl Shell {
             {
                 self.note("Notice", notice);
                 dirty = true;
+            }
+            // Plugin actions queued during the turn apply here, each behind its own approval.
+            match self.drain_plugin_effects(app, agent) {
+                Drained::Nothing => {}
+                Drained::Changed => dirty = true,
+                Drained::Rebuild(step) => return Ok(step),
             }
             if let Some(config) = self.pending_config.take() {
                 if let step @ Step::Rebuild(_) = self.config_changed(app, agent, config) {
@@ -89,6 +101,9 @@ impl Shell {
                 if !matches!(step, Step::Done) {
                     return Ok(step);
                 }
+                dirty = true;
+            }
+            if self.poll_clipboard_image() {
                 dirty = true;
             }
             crate::app::commands::commit::poll(self);
@@ -230,7 +245,18 @@ impl Shell {
                 self.themes.current(),
                 self.term.size().0,
             );
-            if self.busy_overlay.is_some() || dirty || previous_status.as_ref() != Some(&status) {
+            if self.transcript.has_pending_reveal() {
+                self.transcript.advance_reveal(&self.ui);
+            }
+            let frame_pending = self.term.needs_repaint()
+                || self.transcript.has_settled_backlog()
+                || self.transcript.has_pending_reveal()
+                || self.side.busy();
+            if self.busy_overlay.is_some()
+                || dirty
+                || frame_pending
+                || previous_status.as_ref() != Some(&status)
+            {
                 if self.busy_overlay.is_some() {
                     self.step_busy_overlay(app, None)?;
                 } else {
@@ -253,7 +279,8 @@ impl Shell {
                 || self.catalog.worker.is_some()
                 || self.pending_favorite.is_some()
                 || self.busy_overlay.is_some()
-                || self.composer.autocomplete_pending();
+                || self.composer.autocomplete_pending()
+                || frame_pending;
             let timeout = if status_pending {
                 TICK
             } else if left.iter().chain(&right).any(|s| s == "time") {
@@ -269,6 +296,11 @@ impl Shell {
             });
             let timeout = if self.loop_mode.is_awaiting_condition() {
                 timeout.min(crate::agent::modes::loop_runner::CONDITION_POLL)
+            } else {
+                timeout
+            };
+            let timeout = if self.composer.clipboard_image_pending() {
+                timeout.min(TICK)
             } else {
                 timeout
             };

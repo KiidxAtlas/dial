@@ -114,7 +114,7 @@ fn model_selected_steering_is_committed_once_and_changes_the_current_instruction
     let server = llm::fake::serve(vec![reply(
         r#"{"route":"steer","reason":"Change to the current approach"}"#,
     )]);
-    with_agent("", |agent| {
+    with_agent("[message_routing]\nroute='classify'", |agent| {
         active(agent);
         let text = "Use a state machine instead";
         let mut ui = Input {
@@ -150,7 +150,7 @@ fn model_selected_steering_is_committed_once_and_changes_the_current_instruction
 #[test]
 fn malformed_routing_response_falls_back_without_losing_or_rewriting_input() {
     let server = llm::fake::serve(vec![reply("I cannot decide.")]);
-    with_agent("", |agent| {
+    with_agent("[message_routing]\nroute='classify'", |agent| {
         active(agent);
         let text = "Could you change that?";
         let mut ui = Input {
@@ -180,7 +180,7 @@ fn independent_request_starts_real_worker_without_steering_parent() {
     ]);
     with_agent(
         &format!(
-            "[endpoint]\nbase_url='{}/v1'\n[assistance.local]\nenabled=false",
+            "[message_routing]\nroute='classify'\n[endpoint]\nbase_url='{}/v1'\n[assistance.local]\nenabled=false",
             server.url
         ),
         |agent| {
@@ -262,7 +262,7 @@ fn disabled_spawning_routes_exact_input_without_a_classification_request() {
 
 #[test]
 fn cancellation_restores_all_unhandled_messages_in_order_without_accepting_them() {
-    with_agent("", |agent| {
+    with_agent("[message_routing]\nroute='classify'", |agent| {
         active(agent);
         let mut ui = Input {
             pending: vec!["first".into(), "second".into()],
@@ -287,7 +287,7 @@ fn cancellation_restores_all_unhandled_messages_in_order_without_accepting_them(
 
 #[test]
 fn oversized_message_is_preserved_as_steering_without_a_classifier_request() {
-    with_agent("", |agent| {
+    with_agent("[message_routing]\nroute='classify'", |agent| {
         active(agent);
         let text = "a".repeat(16_001);
         let mut ui = Input {
@@ -315,7 +315,7 @@ fn denied_worker_admission_falls_back_to_steering_without_starting_work() {
     let server = llm::fake::serve(vec![reply(
         r#"{"route":"split","reason":"Independent question"}"#,
     )]);
-    with_agent("", |agent| {
+    with_agent("[message_routing]\nroute='classify'", |agent| {
         active(agent);
         agent
             .always
@@ -356,7 +356,7 @@ fn automatic_message_received_during_generation_replans_before_accepting_the_old
         reply(r#"{"route":"steer","reason":"Replaces the active question"}"#),
         reply("The answer is 6."),
     ]);
-    with_agent("", |agent| {
+    with_agent("[message_routing]\nroute='classify'", |agent| {
         agent.backend = Some(backend(&server.url));
         let mut ui = Input {
             during_reply: Some("Actually, what is 3 + 3?".into()),
@@ -396,7 +396,7 @@ fn occupied_worker_capacity_routes_next_input_without_classification() {
         ]);
         with_agent(
             &format!(
-                "{overlay}\n[endpoint]\nbase_url='{}/v1'\n[assistance.local]\nenabled=false",
+                "{overlay}\n[message_routing]\nroute='classify'\n[endpoint]\nbase_url='{}/v1'\n[assistance.local]\nenabled=false",
                 server.url
             ),
             |agent| {
@@ -495,61 +495,64 @@ fn settled_startup_failure_preserves_input_using_each_routes_failure_policy() {
             )]
         };
         let server = llm::fake::serve(scripts);
-        with_agent("[task]\npersist=true", |agent| {
-            active(agent);
-            // Make transcript creation fail after admission, returning Ok([{status: failed}])
-            // rather than an Err from the admission gate. No worker thread is launched.
-            let dir = crate::agent::workers::child_transcript::transcript_dir(
-                agent.layout.as_ref().unwrap(),
-                agent.session.id(),
-            );
-            std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
-            std::fs::write(&dir, "not a directory").unwrap();
-            let text = "Write the changelog";
-            let mut ui = Input::default();
-            if explicit {
-                ui.independent.push(text.into());
-            } else {
-                ui.pending.push(text.into());
-            }
-            assert_eq!(
-                agent
-                    .route_pending_messages(&mut backend(&server.url), &mut ui)
-                    .unwrap(),
-                !explicit
-            );
-            assert!(agent.live_tasks.running_ids().is_empty());
-            assert!(
-                ui.notices
-                    .iter()
-                    .any(|notice| notice.contains("startup did not succeed")),
-                "{:?}",
-                ui.notices
-            );
-            assert!(
-                ui.notices
-                    .iter()
-                    .any(|notice| notice.contains("Could not start an independent worker"))
-            );
-            assert!(
-                !ui.notices
-                    .iter()
-                    .any(|notice| notice.starts_with("Started an independent worker"))
-            );
-            if explicit {
-                assert_eq!(ui.deferred, [text]);
-                assert!(ui.accepted.is_empty() && ui.applied.is_empty());
-                assert_eq!(
-                    agent.session.control_state()["current_instruction"],
-                    "Fix the parser"
+        with_agent(
+            "[message_routing]\nroute='classify'\n[task]\npersist=true",
+            |agent| {
+                active(agent);
+                // Make transcript creation fail after admission, returning Ok([{status: failed}])
+                // rather than an Err from the admission gate. No worker thread is launched.
+                let dir = crate::agent::workers::child_transcript::transcript_dir(
+                    agent.layout.as_ref().unwrap(),
+                    agent.session.id(),
                 );
-            } else {
-                assert!(ui.deferred.is_empty());
-                assert_eq!(ui.accepted, [text]);
-                assert_eq!(ui.applied, [text]);
-                assert_eq!(agent.session.control_state()["current_instruction"], text);
-            }
-        });
+                std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+                std::fs::write(&dir, "not a directory").unwrap();
+                let text = "Write the changelog";
+                let mut ui = Input::default();
+                if explicit {
+                    ui.independent.push(text.into());
+                } else {
+                    ui.pending.push(text.into());
+                }
+                assert_eq!(
+                    agent
+                        .route_pending_messages(&mut backend(&server.url), &mut ui)
+                        .unwrap(),
+                    !explicit
+                );
+                assert!(agent.live_tasks.running_ids().is_empty());
+                assert!(
+                    ui.notices
+                        .iter()
+                        .any(|notice| notice.contains("startup did not succeed")),
+                    "{:?}",
+                    ui.notices
+                );
+                assert!(
+                    ui.notices
+                        .iter()
+                        .any(|notice| notice.contains("Could not start an independent worker"))
+                );
+                assert!(
+                    !ui.notices
+                        .iter()
+                        .any(|notice| notice.starts_with("Started an independent worker"))
+                );
+                if explicit {
+                    assert_eq!(ui.deferred, [text]);
+                    assert!(ui.accepted.is_empty() && ui.applied.is_empty());
+                    assert_eq!(
+                        agent.session.control_state()["current_instruction"],
+                        "Fix the parser"
+                    );
+                } else {
+                    assert!(ui.deferred.is_empty());
+                    assert_eq!(ui.accepted, [text]);
+                    assert_eq!(ui.applied, [text]);
+                    assert_eq!(agent.session.control_state()["current_instruction"], text);
+                }
+            },
+        );
         assert_eq!(server.requests().len(), usize::from(!explicit));
     }
 }
@@ -591,29 +594,32 @@ fn silent_routing_provider_falls_back_within_one_budget_and_preserves_input() {
     let server = llm::fake::serve(vec![llm::fake::Script::Stall {
         silence: Duration::from_secs(3),
     }]);
-    with_agent("worker_timeout_secs=1", |agent| {
-        active(agent);
-        let text = "Use a state machine instead";
-        let mut ui = Input {
-            pending: vec![text.into()],
-            ..Default::default()
-        };
-        let started = Instant::now();
-        assert!(
-            agent
-                .route_pending_messages(&mut backend(&server.url), &mut ui)
-                .unwrap()
-        );
-        assert!(started.elapsed() < Duration::from_secs(3));
-        assert!(!agent.interrupt.load(Ordering::SeqCst));
-        assert_eq!(ui.accepted, [text]);
-        assert_eq!(agent.session.control_state()["current_instruction"], text);
-        assert!(
-            ui.notices
-                .iter()
-                .any(|notice| notice.contains("keeping it as steering"))
-        );
-    });
+    with_agent(
+        "worker_timeout_secs=1\n[message_routing]\nroute='classify'",
+        |agent| {
+            active(agent);
+            let text = "Use a state machine instead";
+            let mut ui = Input {
+                pending: vec![text.into()],
+                ..Default::default()
+            };
+            let started = Instant::now();
+            assert!(
+                agent
+                    .route_pending_messages(&mut backend(&server.url), &mut ui)
+                    .unwrap()
+            );
+            assert!(started.elapsed() < Duration::from_secs(3));
+            assert!(!agent.interrupt.load(Ordering::SeqCst));
+            assert_eq!(ui.accepted, [text]);
+            assert_eq!(agent.session.control_state()["current_instruction"], text);
+            assert!(
+                ui.notices
+                    .iter()
+                    .any(|notice| notice.contains("keeping it as steering"))
+            );
+        },
+    );
     assert_eq!(server.requests().len(), 1);
 }
 
@@ -621,7 +627,10 @@ fn silent_routing_provider_falls_back_within_one_budget_and_preserves_input() {
 fn occupied_routing_provider_falls_back_without_waiting_or_making_a_request() {
     let server = llm::fake::serve(vec![]);
     with_agent(
-        &format!("[endpoint]\nbase_url='{}/v1'", server.url),
+        &format!(
+            "[message_routing]\nroute='classify'\n[endpoint]\nbase_url='{}/v1'",
+            server.url
+        ),
         |agent| {
             active(agent);
             let config = agent.auth_config.for_role("small");
@@ -653,7 +662,7 @@ fn configured_judge_answers_routing_instead_of_the_main_provider() {
     )]);
     with_agent(
         &format!(
-            "[model_roles.judge]\nprovider='endpoint'\nmodel='judge-test'\nbase_url='{}/v1'",
+            "[message_routing]\nroute='classify'\n[model_roles.judge]\nprovider='endpoint'\nmodel='judge-test'\nbase_url='{}/v1'",
             judge.url
         ),
         |agent| {
@@ -672,4 +681,36 @@ fn configured_judge_answers_routing_instead_of_the_main_provider() {
     );
     assert!(main.requests().is_empty());
     assert_eq!(judge.requests().len(), 1);
+}
+
+#[test]
+fn default_routing_steers_busy_messages_without_a_model_call_or_provider_slot() {
+    let server = llm::fake::serve(vec![]);
+    let overlay = format!("[endpoint]\nbase_url='{}/v1'", server.url);
+    with_agent(&overlay, |agent| {
+        active(agent);
+        // Occupy the routing provider: default routing must never need it.
+        let config = agent.auth_config.for_role("small");
+        let _occupied =
+            crate::agent::model::provider_slots::acquire(&config, &agent.interrupt).unwrap();
+        let mut ui = Input {
+            pending: vec!["What is 2 + 2?".into(), "Also rename it".into()],
+            ..Default::default()
+        };
+        let started = Instant::now();
+        assert!(
+            agent
+                .route_pending_messages(&mut backend(&server.url), &mut ui)
+                .unwrap()
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(ui.notices.iter().all(|notice| !notice.contains("Deciding")));
+        assert_eq!(ui.accepted, ["What is 2 + 2?", "Also rename it"]);
+        assert_eq!(
+            agent.session.control_state()["current_instruction"],
+            "Also rename it"
+        );
+        assert!(agent.live_tasks.running_ids().is_empty());
+    });
+    assert!(server.requests().is_empty());
 }

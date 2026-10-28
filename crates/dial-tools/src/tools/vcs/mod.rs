@@ -11,3 +11,4 @@ pub(in crate::tools) mod gh_search;
 pub(in crate::tools) mod gh_view;
 pub mod git;
 pub mod git_patch;
+pub mod glab;

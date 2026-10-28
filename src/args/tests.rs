@@ -115,3 +115,12 @@ fn subcommand_help_lists_its_own_options_before_grouped_global_flags() {
     );
     assert!(Cli::try_parse_from(["dial", "--sandbox", "nope"]).is_err());
 }
+
+#[test]
+fn restore_is_a_resume_flag_that_excludes_print_mode_and_no_session() {
+    let cli = Cli::try_parse_from(["dial", "--restore"]).unwrap();
+    assert!(cli.restore);
+    assert!(!cli.continue_session);
+    assert!(Cli::try_parse_from(["dial", "--restore", "--print", "hi"]).is_err());
+    assert!(Cli::try_parse_from(["dial", "--restore", "--no-session"]).is_err());
+}

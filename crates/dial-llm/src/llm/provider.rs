@@ -186,7 +186,8 @@ impl Wire {
             | ApiProtocol::GitlabDuo
             | ApiProtocol::FactoryDroid
             | ApiProtocol::DevinAgent
-            | ApiProtocol::Cursor => Self::Transport,
+            | ApiProtocol::Cursor
+            | ApiProtocol::GitlabDuoAgent => Self::Transport,
         }
     }
 }
@@ -1035,6 +1036,7 @@ impl Backend {
     /// Forgets the bound Codex WebSocket chain so the next request is sent unchained.
     pub fn reset_provider_stream(&mut self) {
         llm::codex_ws::forget(self.session_id.as_deref().unwrap_or("codex-default"));
+        llm::gitlab_duo_agent::forget(self.session_id.as_deref().unwrap_or(""));
     }
     /// After the caller's silence watchdog has settled an attempt, avoid retrying a stuck Codex
     /// WebSocket route. This backend uses HTTP streaming until rebuilt; configuration is unchanged.
@@ -2057,6 +2059,25 @@ impl Backend {
                 );
                 continue;
             }
+            // OAuth accounts: a rate limit, quota exhaustion, or rejected credential cools that
+            // account down and moves this session to the next stored one. ChatGPT keeps its own
+            // failover below, with its session-binding guards.
+            if attempt < retry_policy.max_attempts
+                && retry_policy.rotate_accounts
+                && !matches!(self.kind, ProviderKind::ChatGpt { .. })
+                && let Some(binding) = self.oauth.as_mut()
+                && binding.rotate(
+                    &class,
+                    error
+                        .downcast_ref::<llm::HttpError>()
+                        .and_then(|http| http.retry_after),
+                )
+            {
+                on_notice(
+                    "OAuth account was rate limited, out of quota, or rejected; retrying with another signed-in account",
+                );
+                continue;
+            }
             if attempt < retry_policy.max_attempts
                 && retry_policy.rotate_accounts
                 && matches!(
@@ -2274,14 +2295,11 @@ pub(super) fn anthropic_exchange_shaped(
     let mut body = anthropic_request_body(model, req, claude_code_oauth, profile)?;
     let streaming = on_text.is_some();
     body["stream"] = serde_json::json!(streaming);
-    llm::anthropic_cache::apply(
-        &mut body,
-        profile,
-        claude_code_oauth && llm::host_of(url).as_deref() == Some("api.anthropic.com"),
-    );
-    if let Some(shape) = shape {
-        shape(&mut body)?;
-    }
+    // Cache markers depend on the rung the endpoint last accepted, so each attempt rebuilds them.
+    let official_oauth =
+        claude_code_oauth && llm::host_of(url).as_deref() == Some("api.anthropic.com");
+    let ttl_applies = llm::anthropic_cache::ttl_applies(profile, official_oauth);
+    let mut cache_level = llm::anthropic_cache::latched(url, model);
     let use_proxy = !llm::host_of(url).is_some_and(|host| llm::is_local_host(&host));
     // Native Anthropic endpoints have no managed local worker to wait for,
     // even when reached through a loopback proxy. Bound first-event silence too.
@@ -2350,6 +2368,10 @@ pub(super) fn anthropic_exchange_shaped(
         }
         // Mutations happen on a per-attempt copy, so a speed retry never re-attests a sent body.
         let mut wire = body.clone();
+        llm::anthropic_cache::apply(&mut wire, profile, official_oauth, cache_level);
+        if let Some(shape) = shape {
+            shape(&mut wire)?;
+        }
         if fast {
             wire["speed"] = serde_json::json!("fast");
         }
@@ -2378,6 +2400,14 @@ pub(super) fn anthropic_exchange_shaped(
                 FAST_MODE_REJECTED.lock().insert(scope.clone());
             }
             fast = false;
+            continue;
+        }
+        // The endpoint refused cache markers: latch the next narrower rung and resend once.
+        if let Some(narrower) = cache_level.narrower(ttl_applies)
+            && llm::anthropic_cache::refused(status, &bytes.data)
+        {
+            llm::anthropic_cache::latch(url, model, narrower);
+            cache_level = narrower;
             continue;
         }
         // Classify from the real body (quota wording turns 401/403 into QuotaExhausted); only the

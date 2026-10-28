@@ -122,6 +122,20 @@ impl Client {
         post: Option<(&str, &[u8])>,
         limit: usize,
     ) -> Result<Response, String> {
+        self.send_limited_until(url, accept, headers, post, limit, &self.interrupt)
+    }
+
+    /// [`send_limited`](Self::send_limited) that stops when `cancel` is set instead of this
+    /// client's interrupt flag, so one-shot readers can own their cancellation.
+    pub fn send_limited_until(
+        &self,
+        url: &str,
+        accept: &str,
+        headers: &[(&str, &str)],
+        post: Option<(&str, &[u8])>,
+        limit: usize,
+        cancel: &AtomicBool,
+    ) -> Result<Response, String> {
         let agent = self.agent.clone();
         let url = url.to_owned();
         let accept = accept.to_owned();
@@ -147,7 +161,7 @@ impl Client {
             match rx.recv_timeout(INTERRUPT_POLL) {
                 Ok(result) => return result,
                 Err(RecvTimeoutError::Timeout) => {
-                    if self.interrupt.load(Ordering::Acquire) {
+                    if cancel.load(Ordering::Acquire) {
                         return Err("web request cancelled".into());
                     }
                 }

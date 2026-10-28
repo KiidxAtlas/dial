@@ -2,6 +2,39 @@
 use super::*;
 
 impl ArtifactStore {
+    /// Path of the blob for `uri`, after checking the identifier shape. The blob is not read.
+    pub(crate) fn blob_path(&self, uri: &str) -> Result<std::path::PathBuf> {
+        artifact_id(uri).map_err(anyhow::Error::msg)?;
+        self.path(uri)
+    }
+
+    /// Imports a staged blob whose SHA-256 must equal the id in `uri`. An existing blob with the same
+    /// id is kept after its content is verified; a corrupt existing blob is an error, never replaced.
+    pub(crate) fn import_blob(&self, uri: &str, staged: &std::path::Path) -> Result<()> {
+        let id = artifact_id(uri).map_err(anyhow::Error::msg)?;
+        ensure!(
+            file_sha256(staged)? == id,
+            "staged artifact {uri} has corrupt content"
+        );
+        let mut tmp = tempfile::NamedTempFile::new_in(&self.root)?;
+        crate::platform::fs::set_owner_only(tmp.path())?;
+        std::io::copy(&mut File::open(staged)?, tmp.as_file_mut())?;
+        tmp.as_file().sync_all()?;
+        match tmp.persist_noclobber(self.path(uri)?) {
+            Ok(_) => {}
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                ensure!(
+                    file_sha256(&self.path(uri)?)? == id,
+                    "target artifact {uri} has corrupt content"
+                );
+            }
+            Err(error) => return Err(error.error.into()),
+        }
+        #[cfg(unix)]
+        File::open(&self.root)?.sync_all()?;
+        Ok(())
+    }
+
     /// Import one referenced blob and its provenance without rewriting existing immutable records.
     /// A failed relocation may leave reusable imports, but never removes or mutates source data.
     pub(crate) fn transfer_to(&self, target: &Self, uri: &str) -> Result<()> {
@@ -193,4 +226,19 @@ pub(crate) fn collect_references(
         }
         _ => {}
     }
+}
+
+/// Streams a file through SHA-256 and returns the lowercase hex digest.
+pub(crate) fn file_sha256(path: &std::path::Path) -> Result<String> {
+    let mut file = File::open(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buffer[..n]);
+    }
+    Ok(format!("{:x}", hash.finalize()))
 }

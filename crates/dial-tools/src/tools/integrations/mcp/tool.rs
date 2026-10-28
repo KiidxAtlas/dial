@@ -117,6 +117,15 @@ impl McpTool {
             match self.session.client_until(cancel) {
                 Err(error) => integration_error(error, IntegrationFailure::Connection),
                 Ok(client) => {
+                    if !self.session.offers(&self.remote) {
+                        let mut output = ToolOutput::err("MCP tool was removed or its definition changed on the server; the next request offers the current definition").with_effects(Effects::None);
+                        output.execution.integration = Some(IntegrationExecution {
+                            dispatch: DispatchState::NotDispatched,
+                            failure: Some(IntegrationFailure::Admission),
+                            ..Default::default()
+                        });
+                        return attach_health(output, &self.session);
+                    }
                     if self.session.health().catalog == CatalogFreshness::Stale
                         || (self.remote.read_only_hint && !self.session.catalog_current())
                     {

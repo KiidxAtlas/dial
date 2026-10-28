@@ -6,8 +6,11 @@ if [ "$#" -gt 1 ] || [ "${1:-}" = '--help' ]; then
     echo "Usage: bash install.sh [vX.Y.Z|latest]" >&2
     # shellcheck disable=SC2016 # Print the variable literally in usage help.
     echo 'Optional destination: DIAL_INSTALL_DIR (default: $HOME/.local/bin)' >&2
-    echo 'DIAL_NO_MODIFY_PATH=1 leaves shell profiles unchanged; DIAL_REQUIRE_SIGNATURE=1 refuses' >&2
-    echo 'to install without Ed25519 verification; DIAL_OPENSSL selects the OpenSSL 3 binary.' >&2
+    echo 'DIAL_NO_MODIFY_PATH=1 leaves shell profiles unchanged.' >&2
+    echo 'Signature verifiers, tried in order: DIAL_OPENSSL (OpenSSL 3+), python3 with the' >&2
+    echo '`cryptography` package (DIAL_PYTHON selects it), and ssh-keygen (DIAL_SSH_KEYGEN selects it).' >&2
+    echo 'With none available the install is refused. DIAL_ALLOW_UNSIGNED_INSTALL=1 (insecure) installs' >&2
+    echo 'with only the SHA-256 checksum from the same release.' >&2
     [ "${1:-}" = '--help' ] && exit 0
     exit 1
 fi
@@ -15,8 +18,19 @@ fi
 case "$(uname -s):$(uname -m)" in
     Darwin:arm64) target=aarch64-apple-darwin ;;
     Darwin:x86_64) target=x86_64-apple-darwin ;;
-    Linux:x86_64) target=x86_64-unknown-linux-gnu ;;
-    *) echo 'Supported: macOS Apple Silicon/Intel or Linux x86-64. Native Windows: irm https://github.com/KiidxAtlas/dial/releases/latest/download/install.ps1 | iex' >&2; exit 1 ;;
+    Linux:x86_64 | Linux:amd64 | Linux:aarch64 | Linux:arm64)
+        case "$(uname -m)" in
+            x86_64 | amd64) linux_arch=x86_64 ;;
+            *) linux_arch=aarch64 ;;
+        esac
+        # Musl hosts (Alpine and similar) need the static musl build; glibc hosts keep the gnu build.
+        if compgen -G '/lib/ld-musl-*.so.1' >/dev/null || { ldd --version 2>&1 || true; } | grep -qi musl; then
+            target=$linux_arch-unknown-linux-musl
+        else
+            target=$linux_arch-unknown-linux-gnu
+        fi
+        ;;
+    *) echo 'Supported: macOS (Apple Silicon or Intel) or Linux (x86-64 or arm64). Native Windows: irm https://github.com/KiidxAtlas/dial/releases/latest/download/install.ps1 | iex' >&2; exit 1 ;;
 esac
 
 # Authenticated GitHub CLI also supports private releases without exposing tokens
@@ -30,8 +44,13 @@ if [ "$use_gh" = false ]; then required_tools="$required_tools curl"; fi
 for tool in $required_tools; do
     command -v "$tool" >/dev/null || { echo "Missing required tool: $tool" >&2; exit 1; }
 done
-# The Ed25519 signature on SHA256SUMS needs OpenSSL 3+ (`pkeyutl -rawin`). macOS ships LibreSSL as
-# `openssl`, which cannot verify Ed25519, so also try Homebrew's OpenSSL 3.
+
+# SHA256SUMS is signed with the release Ed25519 key. The first available verifier is used:
+#   1. OpenSSL 3+ (`pkeyutl -rawin`). macOS ships LibreSSL as `openssl`, which cannot verify
+#      Ed25519, so Homebrew's OpenSSL 3 is also tried.
+#   2. python3 with the `cryptography` package.
+#   3. OpenSSH `ssh-keygen -Y verify` over SHA256SUMS.sshsig (present on macOS and modern Linux).
+# If none is available the install is refused, unless DIAL_ALLOW_UNSIGNED_INSTALL=1 is set.
 openssl_bin=
 if [ -n "${DIAL_OPENSSL:-}" ]; then
     openssl_candidates=("$DIAL_OPENSSL")
@@ -46,18 +65,25 @@ for candidate in "${openssl_candidates[@]}"; do
         *-rawin*) openssl_bin=$candidate; break ;;
     esac
 done
+python_bin=${DIAL_PYTHON:-python3}
+ssh_keygen_bin=${DIAL_SSH_KEYGEN:-ssh-keygen}
 if [ -z "${DIAL_RELEASE_PUBLIC_KEY:-}" ]; then
     echo 'DIAL_RELEASE_PUBLIC_KEY must contain the trusted Ed25519 public key PEM; refusing unsigned installation.' >&2
     exit 1
 fi
-if [ -z "$openssl_bin" ]; then
-    if [ "${DIAL_REQUIRE_SIGNATURE:-0}" = 1 ]; then
-        echo 'DIAL_REQUIRE_SIGNATURE=1 needs OpenSSL 3 or newer to verify the Ed25519 release signature. On macOS: brew install openssl@3' >&2
-        exit 1
-    fi
-    # Without OpenSSL 3 the archive is still checked against the release's SHA256SUMS, fetched
-    # over HTTPS from the same GitHub release.
-    echo 'Note: OpenSSL 3 not found, so the release signature is not checked; verifying the SHA-256 checksum from the GitHub release instead. For signature verification: brew install openssl@3 (macOS) and rerun.' >&2
+signature_verifier=
+if [ -n "$openssl_bin" ]; then
+    signature_verifier=openssl
+elif command -v "$python_bin" >/dev/null && "$python_bin" -c 'import cryptography.hazmat.primitives.asymmetric.ed25519' >/dev/null 2>&1; then
+    signature_verifier=python
+elif command -v "$ssh_keygen_bin" >/dev/null; then
+    signature_verifier=ssh-keygen
+elif [ "${DIAL_ALLOW_UNSIGNED_INSTALL:-0}" = 1 ]; then
+    signature_verifier=none
+    echo 'WARNING: DIAL_ALLOW_UNSIGNED_INSTALL=1 and no signature verifier is available. The SHA-256 checksum from the GitHub release is checked, but the release signature is NOT. Install OpenSSL 3 (macOS: brew install openssl@3) to verify signatures.' >&2
+else
+    echo 'No release signature verifier found: install OpenSSL 3 (macOS: brew install openssl@3), or Python 3 with the cryptography package, or OpenSSH ssh-keygen. Refusing to install an unverified release. DIAL_ALLOW_UNSIGNED_INSTALL=1 installs with checksum verification only (insecure).' >&2
+    exit 1
 fi
 if command -v sha256sum >/dev/null; then
     hash_tool=sha256sum
@@ -89,28 +115,63 @@ archive="$package.tar.gz"
 base="$repository/releases/download/$version"
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/dial-install.XXXXXX")
 trap 'rm -rf "$scratch"; [ -z "${staged:-}" ] || rm -f "$staged"' EXIT
+# SHA256SUMS.sshsig exists only for releases that publish the OpenSSH signature; fetch it only
+# when ssh-keygen is the verifier, so older releases still install through OpenSSL or Python.
+assets=("$archive" SHA256SUMS SHA256SUMS.sig)
+if [ "$signature_verifier" = ssh-keygen ]; then assets+=(SHA256SUMS.sshsig); fi
 if [ "$use_gh" = true ]; then
-    gh release download "$version" --repo KiidxAtlas/dial --dir "$scratch" \
-        --pattern "$archive" --pattern SHA256SUMS --pattern SHA256SUMS.sig
+    patterns=()
+    for asset in "${assets[@]}"; do patterns+=(--pattern "$asset"); done
+    gh release download "$version" --repo KiidxAtlas/dial --dir "$scratch" "${patterns[@]}"
 else
-    for asset in "$archive" SHA256SUMS SHA256SUMS.sig; do
+    for asset in "${assets[@]}"; do
         curl --fail --silent --show-error --location --retry 2 "$base/$asset" --output "$scratch/$asset" || {
             echo "Could not download release asset $asset" >&2
             exit 1
         }
     done
 fi
-if [ -n "$openssl_bin" ]; then
-    printf '%s\n' "$DIAL_RELEASE_PUBLIC_KEY" > "$scratch/release-public.pem"
-    # Release signatures are one unwrapped line. Normalize optional wrapping before
-    # decoding: OpenSSL's default decoder otherwise waits for a newline and emits no bytes.
-    tr -d '[:space:]' < "$scratch/SHA256SUMS.sig" | "$openssl_bin" base64 -d -A > "$scratch/SHA256SUMS.sig.raw"
-    if ! "$openssl_bin" pkeyutl -verify -pubin -inkey "$scratch/release-public.pem" -rawin \
-        -in "$scratch/SHA256SUMS" -sigfile "$scratch/SHA256SUMS.sig.raw" >/dev/null; then
-        echo 'Release signature verification failed; nothing was installed.' >&2
-        exit 1
-    fi
-fi
+
+reject_signature() {
+    echo 'Release signature verification failed; nothing was installed.' >&2
+    exit 1
+}
+printf '%s\n' "$DIAL_RELEASE_PUBLIC_KEY" > "$scratch/release-public.pem"
+[ "$signature_verifier" = none ] || echo "Verifying release signature with $signature_verifier." >&2
+case "$signature_verifier" in
+    openssl | python)
+        # Release signatures are one unwrapped line; strip any wrapping before decoding.
+        tr -d '[:space:]' < "$scratch/SHA256SUMS.sig" | base64 -d > "$scratch/SHA256SUMS.sig.raw" || reject_signature
+        if [ "$signature_verifier" = openssl ]; then
+            "$openssl_bin" pkeyutl -verify -pubin -inkey "$scratch/release-public.pem" -rawin \
+                -in "$scratch/SHA256SUMS" -sigfile "$scratch/SHA256SUMS.sig.raw" >/dev/null 2>&1 || reject_signature
+        else
+            "$python_bin" - "$scratch/release-public.pem" "$scratch/SHA256SUMS" "$scratch/SHA256SUMS.sig.raw" <<'PY' >/dev/null 2>&1 || reject_signature
+import sys
+from cryptography.hazmat.primitives.serialization import load_pem_public_key
+
+with open(sys.argv[1], 'rb') as key_file:
+    public_key = load_pem_public_key(key_file.read())
+with open(sys.argv[2], 'rb') as data_file, open(sys.argv[3], 'rb') as sig_file:
+    public_key.verify(sig_file.read(), data_file.read())
+PY
+        fi
+        ;;
+    ssh-keygen)
+        # The OpenSSH public key blob is ssh-string("ssh-ed25519") + ssh-string(raw 32-byte key);
+        # the raw key is the last 32 bytes of the SPKI DER behind the PEM body.
+        pem_body=$(sed -n '/BEGIN PUBLIC KEY/,/END PUBLIC KEY/p' "$scratch/release-public.pem" | sed '1d;$d' | tr -d '[:space:]')
+        case "$pem_body" in
+            MCowBQYDK2VwAyEA*) ;;
+            *) echo 'DIAL_RELEASE_PUBLIC_KEY is not an Ed25519 public key; nothing was installed.' >&2; exit 1 ;;
+        esac
+        key_blob=$({ printf '\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20'; printf '%s' "$pem_body" | base64 -d | tail -c 32; } | base64 | tr -d '\n') || reject_signature
+        printf 'dial-release ssh-ed25519 %s\n' "$key_blob" > "$scratch/allowed_signers"
+        "$ssh_keygen_bin" -Y verify -f "$scratch/allowed_signers" -I dial-release -n dial-release \
+            -s "$scratch/SHA256SUMS.sshsig" < "$scratch/SHA256SUMS" >/dev/null 2>&1 || reject_signature
+        ;;
+    none) ;;
+esac
 line=$(awk -v name="$archive" '$2 == name || $2 == "*" name { print; exit }' "$scratch/SHA256SUMS")
 read -r expected filename <<< "$line"
 filename=${filename#\*}
@@ -190,6 +251,6 @@ esac
 printf 'Installed dial %s to %s/dial.\n' "${version#v}" "$destination"
 [ -z "$path_hint" ] || printf '%s\n' "$path_hint"
 echo 'Run dial in a project directory to get started.'
-if [ "$target" = x86_64-unknown-linux-gnu ]; then
-    echo 'Linux/WSL2: install bubblewrap and use a normal user; WSL Windows interop must be disabled (see README).'
-fi
+case "$target" in
+    *-linux-*) echo 'Linux/WSL2: install bubblewrap and use a normal user; WSL Windows interop must be disabled (see README).' ;;
+esac

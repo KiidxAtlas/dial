@@ -366,3 +366,48 @@ fn local_hints_fill_gaps_never_override_profile_values_and_stay_off_hosted_route
         assert!(body.get(key).is_none(), "{key} reached a hosted route");
     }
 }
+
+#[test]
+fn effort_wire_map_replaces_only_the_mapped_effort_on_chat_body() {
+    let profile = ModelProfile {
+        provider: "inception".into(),
+        model: "mercury-2".into(),
+        capabilities: ModelCapabilities {
+            reasoning_efforts: vec![ReasoningEffort::Minimal, ReasoningEffort::Low],
+            reasoning_effort_wire: BTreeMap::from([(
+                ReasoningEffort::Minimal,
+                "instant".to_string(),
+            )]),
+            ..Default::default()
+        },
+        reasoning_effort: Some(ReasoningEffort::Minimal),
+        ..Default::default()
+    };
+    let mut body = serde_json::json!({"model": "mercury-2"});
+    profile.apply_openai(&mut body);
+    assert_eq!(body["reasoning_effort"], "instant");
+
+    let mut low = profile.clone();
+    low.reasoning_effort = Some(ReasoningEffort::Low);
+    let mut body = serde_json::json!({"model": "mercury-2"});
+    low.apply_openai(&mut body);
+    assert_eq!(body["reasoning_effort"], "low");
+}
+
+#[test]
+fn reasoning_effort_wire_helper_maps_declared_efforts_and_falls_back_to_dial_name() {
+    let mut profile = ModelProfile {
+        provider: "openai".into(),
+        model: "wire-model".into(),
+        capabilities: ModelCapabilities {
+            reasoning_efforts: vec![ReasoningEffort::High, ReasoningEffort::Low],
+            reasoning_effort_wire: BTreeMap::from([(ReasoningEffort::High, "max".to_string())]),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert_eq!(profile.reasoning_effort_wire(ReasoningEffort::High), "max");
+    assert_eq!(profile.reasoning_effort_wire(ReasoningEffort::Low), "low");
+    profile.capabilities.reasoning_effort_wire.clear();
+    assert_eq!(profile.reasoning_effort_wire(ReasoningEffort::High), "high");
+}

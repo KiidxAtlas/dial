@@ -1,6 +1,7 @@
 //! Sign in with ChatGPT for Dial's own public OAuth registration. Credentials never enter config,
 //! model history, or API-key storage. Protected atomic records and a process lock serialize refresh.
 use super::auth::SecretToken;
+use super::oauth::accounts::Store;
 use super::oauth::util::decode;
 #[cfg(any(test, feature = "test-support"))]
 use crate::config::settings_store::locked;
@@ -129,11 +130,9 @@ fn save_catalog(dir: &Path, id: &str, catalog: &ModelCatalog) -> Result<()> {
     write_private(&path, &serde_json::to_vec(&catalogs)?)
 }
 
-#[derive(Serialize, Deserialize, Default)]
-struct State {
-    active: Option<String>,
-    accounts: BTreeMap<String, Account>,
-}
+/// The stored ChatGPT accounts: the same owner-private shape every OAuth provider uses
+/// ([`crate::llm::oauth::accounts::Store`]), so `chatgpt-accounts.json` keeps loading unchanged.
+type State = Store<Account>;
 #[derive(Serialize, Deserialize)]
 struct Account {
     client_id: String,
@@ -768,6 +767,29 @@ pub fn account_access(dir: &Path, cancel: Arc<AtomicBool>) -> Result<(String, Se
     account_token_at(dir, cancel, TOKEN_URL)
 }
 
+/// One grounded Codex turn on the active ChatGPT account. The caller owns the Responses body, built-in
+/// tools included; the stream is read by the same parser as chat turns, so reply content keeps the raw items.
+pub fn grounded_search(dir: &Path, body: &Value, timeout: u64) -> Result<super::Reply> {
+    let model = body["model"]
+        .as_str()
+        .context("grounded Codex body needs a model")?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (account, token) = account_access(dir, Arc::clone(&cancel))?;
+    let url = format!("{BASE_URL}/codex/responses");
+    super::responses::exchange_codex_body(
+        super::responses::Endpoint {
+            url: &url,
+            token: token.as_str(),
+            account_id: Some(account.as_str()),
+            model,
+            headers: &[],
+        },
+        body,
+        timeout,
+        cancel,
+    )
+}
+
 /// Capture the active default once; later global switches never retarget this identity.
 pub fn resolve_account(dir: &Path, selected: Option<&str>) -> Result<String> {
     let cancel = AtomicBool::new(false);
@@ -1048,6 +1070,7 @@ fn parse_models(value: &Value) -> Result<Vec<super::catalog::ModelEntry>> {
                 source: "ChatGPT plan (access unverified until inference)".into(),
                 available: true,
                 metadata: super::catalog::ModelMetadata {
+                    image_generation: super::catalog::image_generation_api(row),
                     vision: row["input_modalities"]
                         .as_array()
                         .map(|items| items.iter().any(|item| item == "image")),
@@ -1149,6 +1172,7 @@ fn build_catalog(value: &Value, supplemental: Option<&Value>) -> Result<ModelCat
             reasoning_effort: default,
             capabilities: ModelCapabilities {
                 vision: model.metadata.vision,
+                image_generation: model.metadata.image_generation,
                 reasoning: if efforts.is_empty() {
                     ReasoningApi::None
                 } else {

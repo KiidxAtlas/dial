@@ -80,6 +80,13 @@ fn coding(terms: &BTreeSet<String>) -> bool {
 /// a filename. The eligible catalog still decides which of these capabilities exists.
 fn native(terms: &BTreeSet<String>) -> Vec<&'static str> {
     let mut names = Vec::new();
+    // Web schemas are not a coding core. Offer them directly for web intent rather than
+    // making research pay for a discovery round, or every unrelated coding step pay for them.
+    if any(terms, &["web", "online", "internet", "research", "browse"]) {
+        names.extend(["web_search", "web_fetch"]);
+    } else if any(terms, &["http", "https", "url", "website"]) {
+        names.push("web_fetch");
+    }
     if any(terms, &["screenshot", "playwright", "browser"])
         || (any(terms, &["ui", "frontend", "layout", "css", "page"])
             && any(
@@ -131,6 +138,15 @@ fn native(terms: &BTreeSet<String>) -> Vec<&'static str> {
         || (terms.contains("debug") && any(terms, &["crash", "stack", "runtime"]))
     {
         names.push("dap");
+    }
+    // Creating pictures, not containers or image-processing code.
+    if any(
+        terms,
+        &["image", "picture", "illustration", "logo", "artwork"],
+    ) && any(terms, &["generate", "create", "draw", "make", "design"])
+        && !any(terms, &["docker", "container", "dockerfile", "oci"])
+    {
+        names.push("image_gen");
     }
     names
 }

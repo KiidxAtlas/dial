@@ -52,6 +52,11 @@ pub(super) const BUILTIN_COMMANDS: &[(&str, &str, &str)] = &[
         "keep or revert a checkpoint's changes; AI review is /review",
     ),
     (
+        "seance",
+        "<session id prefix or worker id> <question>",
+        "ask a read-only consultant about a recorded session",
+    ),
+    (
         "model",
         "[settings|defaults|local]",
         "choose the main model and assign roles",
@@ -370,6 +375,7 @@ pub(super) fn during_turn(name: &str, args: &str) -> DuringTurn {
     }
     let sub = args.split_whitespace().next().unwrap_or("");
     let live = match name {
+        "btw" => sub != "promote",
         "security" => !matches!(
             crate::security::command::parse(args),
             Ok(Some(invocation)) if matches!(invocation.op, "scan" | "validate")
@@ -413,10 +419,12 @@ pub(super) fn command_panel(name: &str, args: &str) -> Option<Which> {
     }
 }
 
-/// Built-ins always win at dispatch, so a custom command with a built-in's name is never offered.
+/// Built-ins always win at dispatch, so a custom or extension command with a built-in's name is
+/// never offered. `extensions` are the loaded extensions' `(command, owner)` pairs.
 pub(super) fn command_entries(
     custom: &[context::CommandDef],
     skills: &[skills::Skill],
+    extensions: &[(String, String)],
 ) -> Vec<CommandEntry> {
     let mut entries: Vec<CommandEntry> = BUILTIN_COMMANDS
         .iter()
@@ -461,6 +469,17 @@ pub(super) fn command_entries(
                 def.description.clone()
             },
             kind: CommandKind::Custom,
+            args_hint: None,
+        });
+    }
+    for (name, owner) in extensions {
+        if reserved(name) || entries.iter().any(|e| e.name == *name) {
+            continue;
+        }
+        entries.push(CommandEntry {
+            name: name.clone(),
+            description: format!("command from extension {owner}"),
+            kind: CommandKind::Extension,
             args_hint: None,
         });
     }
@@ -514,8 +533,9 @@ pub(super) fn during_turn_note(name: &str) -> &'static str {
 pub(super) fn palette_entries(
     custom: &[context::CommandDef],
     skills: &[skills::Skill],
+    extensions: &[(String, String)],
 ) -> Vec<PaletteEntry> {
-    let mut entries = command_entries(custom, skills)
+    let mut entries = command_entries(custom, skills, extensions)
         .into_iter()
         .map(|command| PaletteEntry {
             during_turn: during_turn_note(&command.name),
@@ -530,4 +550,9 @@ pub(super) fn palette_entries(
             .unwrap_or(usize::MAX)
     });
     entries
+}
+
+/// The built-in slash commands as `(name, usage, description)` rows, for RPC clients.
+pub(crate) fn builtin_commands() -> &'static [(&'static str, &'static str, &'static str)] {
+    BUILTIN_COMMANDS
 }

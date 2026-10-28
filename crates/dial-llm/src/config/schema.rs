@@ -251,6 +251,10 @@ const FALLBACK_ON: EnumValues = &[
     ("usage-limit", "Usage limits only"),
     ("except-usage-limit", "Everything but usage limits"),
 ];
+const FALLBACK_REVERT: EnumValues = &[
+    ("cooldown-expiry", "When the fallback cooldown ends"),
+    ("never", "Stay on the fallback until a model switch"),
+];
 const COMPACTION_STRATEGY: EnumValues = &[
     ("context-full", "Context full"),
     ("handoff", "Handoff"),
@@ -360,9 +364,12 @@ macro_rules! field {
 mod compaction;
 mod coordination;
 mod experimental;
+mod ida;
+mod image;
 mod improvement;
 mod management;
 mod memory;
+mod message_routing;
 mod model;
 mod tools;
 mod voice;
@@ -539,6 +546,15 @@ static UI: &[SettingDef] = &[
         Kind::Bool,
     ),
     field!(
+        "ui.smooth_reveal",
+        ui.smooth_reveal,
+        AP,
+        "Display",
+        "Smooth reveal",
+        "Show a streaming answer gradually instead of in network bursts. Finished and tool output always appears whole at once.",
+        Kind::Bool,
+    ),
+    field!(
         "ui.show_tools",
         ui.show_tools,
         AP,
@@ -699,6 +715,7 @@ static REGISTRY: &[SettingDef] = &[
     UI[27],
     UI[28],
     UI[29],
+    UI[30],
     model::DECLARATIONS[33],
     model::DECLARATIONS[0],
     model::DECLARATIONS[1],
@@ -735,6 +752,8 @@ static REGISTRY: &[SettingDef] = &[
     model::DECLARATIONS[30],
     model::DECLARATIONS[31],
     model::DECLARATIONS[32],
+    model::DECLARATIONS[36],
+    model::DECLARATIONS[37],
     memory::DECLARATIONS[0],
     memory::DECLARATIONS[1],
     memory::DECLARATIONS[2],
@@ -801,8 +820,8 @@ static REGISTRY: &[SettingDef] = &[
     memory::DECLARATIONS[63],
     memory::DECLARATIONS[64],
     memory::DECLARATIONS[65],
-    UI[30],
     UI[31],
+    UI[32],
     tools::DECLARATIONS[0],
     improvement::DECLARATIONS[0],
     improvement::DECLARATIONS[1],
@@ -970,10 +989,18 @@ static REGISTRY: &[SettingDef] = &[
     experimental::DECLARATIONS[10],
     experimental::DECLARATIONS[11],
     coordination::DECLARATIONS[0],
+    message_routing::DECLARATIONS[0],
     voice::DECLARATIONS[0],
     voice::DECLARATIONS[1],
     voice::DECLARATIONS[2],
     voice::DECLARATIONS[3],
+    ida::DECLARATIONS[0],
+    ida::DECLARATIONS[1],
+    ida::DECLARATIONS[2],
+    image::DECLARATIONS[0],
+    image::DECLARATIONS[1],
+    image::DECLARATIONS[2],
+    image::DECLARATIONS[3],
     tools::DECLARATIONS[35],
     tools::DECLARATIONS[36],
     tools::DECLARATIONS[37],
@@ -990,6 +1017,7 @@ static REGISTRY: &[SettingDef] = &[
     tools::DECLARATIONS[48],
     tools::DECLARATIONS[49],
     tools::DECLARATIONS[50],
+    tools::DECLARATIONS[52],
 ];
 const _: () = assert!(
     REGISTRY.len()
@@ -1001,7 +1029,10 @@ const _: () = assert!(
             + compaction::DECLARATIONS.len()
             + experimental::DECLARATIONS.len()
             + coordination::DECLARATIONS.len()
+            + message_routing::DECLARATIONS.len()
             + voice::DECLARATIONS.len()
+            + ida::DECLARATIONS.len()
+            + image::DECLARATIONS.len()
 );
 
 pub fn registry() -> &'static [SettingDef] {

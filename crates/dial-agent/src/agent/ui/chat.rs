@@ -311,7 +311,7 @@ pub(in crate::agent) fn chat_attempt_with_ui(
     }
     ui.request_phase(RequestPhase::Waiting);
     ui.model_wait(Duration::ZERO);
-    // Model class picks the detectors; `None` means the kill switch is set.
+    // Model family picks the detectors; `None` means the kill switch is set.
     let loop_policy = llm::thinking_loop::policy_for(backend.model_label());
     thread::scope(|scope| {
         let worker = thread::Builder::new()

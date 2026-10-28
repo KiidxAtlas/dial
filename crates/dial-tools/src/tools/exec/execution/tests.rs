@@ -81,6 +81,7 @@ fn callback_uncertainty_survives_a_tool_catching_errors() {
             _: &Value,
             _: &(dyn Fn(ToolEvent) + Sync),
             _: &AtomicBool,
+            _: &dyn Fn(crate::tools::exec::background::AdoptedJob) -> Result<String, String>,
             dispatch: &mut dyn FnMut(crate::tools::integrations::ext::ToolCallback) -> ToolOutput,
         ) -> ToolOutput {
             for _ in 0..2 {
@@ -103,6 +104,7 @@ fn callback_uncertainty_survives_a_tool_catching_errors() {
     };
     let mut count = 0;
     let output = with_dispatch(
+        &crate::tools::integrations::ext::Registry::new(),
         &Catching,
         &context,
         &Value::Null,

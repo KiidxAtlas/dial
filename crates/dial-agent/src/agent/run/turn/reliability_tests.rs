@@ -554,3 +554,66 @@ fn a_request_narrowed_by_the_planning_gate_leaves_the_turn_offer_intact() {
         .collect();
     assert_eq!(offered, ["finish".to_owned(), "todo".to_owned()].into());
 }
+
+#[test]
+fn a_failed_tool_cannot_execute_an_unchanged_retry_but_can_use_corrected_arguments() {
+    use crate::runtime::tool_output::ToolOutput;
+    use crate::tools::integrations::ext::{Tool, ToolContext};
+    struct Probe(Arc<std::sync::atomic::AtomicUsize>);
+    impl Tool for Probe {
+        fn name(&self) -> &str {
+            "retry_probe"
+        }
+        fn schema(&self) -> Value {
+            json!({"type":"function","function":{"name":"retry_probe","description":"Test probe", "parameters":{"type":"object","properties":{"fixed":{"type":"boolean"}},"required":["fixed"]}}})
+        }
+        fn needs_approval(&self, _: &Value) -> bool {
+            false
+        }
+        fn call(&self, _: &ToolContext, args: &Value) -> ToolOutput {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            if args["fixed"] == true {
+                ToolOutput::ok("corrected attempt succeeded".into())
+            } else {
+                ToolOutput::err("page.evaluate: Error: real CSS flag animation")
+            }
+        }
+    }
+    let server = llm::fake::serve(vec![
+        response("", Some(("retry_probe", json!({"fixed":false})))),
+        slots(),
+        response("", Some(("retry_probe", json!({"fixed":false})))),
+        response("", Some(("retry_probe", json!({"fixed":true})))),
+        response("The corrected probe passed.", None),
+    ]);
+    let executed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    with_agent("[compaction]\nenabled=false", |agent| {
+        connect(agent, &server.url);
+        agent.ext.register(Arc::new(Probe(executed.clone())));
+        agent.activate_tools(&["retry_probe".into()]).unwrap();
+        let report = agent.turn(
+            "Run the probe and correct any failed assertion.",
+            &mut NullUi,
+        );
+        assert_eq!(report.unwrap().outcome, TurnOutcome::Completed);
+    });
+    assert_eq!(
+        executed.load(Ordering::SeqCst),
+        2,
+        "the identical failed retry must never reach the tool"
+    );
+    let requests = completion_requests(&server);
+    assert_eq!(requests.len(), 4);
+    let tool_error = |request: &Value| {
+        request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|message| message["role"] == "tool")
+            .unwrap()["is_error"]
+            .as_bool()
+    };
+    assert_eq!(tool_error(&requests[2]), Some(true));
+    assert_eq!(tool_error(&requests[3]), Some(false));
+}

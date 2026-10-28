@@ -1,4 +1,5 @@
 use crate::config::tools::kernel::KernelConfig;
+use crate::config::types::Config;
 
 use super::*;
 #[test]
@@ -183,10 +184,10 @@ fn unavailable_sandbox_never_runs_model_code() {
         mutation_authorizer: None,
         confirm: None,
     };
-    let tool = tools(&config).pop().unwrap();
+    let tool = crate::tools::exec::eval::tools(&config).pop().unwrap();
     let out = tool.call(
         &ctx,
-        &json!({"action":"eval","code":"open('escaped', 'w').write('no')"}),
+        &json!({"action":"eval","language":"py","code":"open('escaped', 'w').write('no')"}),
     );
     assert!(
         out.is_error
@@ -205,23 +206,22 @@ fn cancellation_interrupts_an_inflight_kernel_without_session_lock() {
         .unwrap()
         .without_sandbox();
     let config = Config::default();
-    let tool = Arc::new(KernelTool {
-        config: KernelConfig::default(),
-        session: Mutex::new(None),
-        pid: Arc::new(AtomicI32::new(0)),
-        interrupt: AtomicBool::new(false),
-        active: AtomicUsize::new(0),
-    });
+    let tool = Arc::new(PythonRuntime::new(KernelConfig::default()));
     let running = tool.clone();
     let thread = std::thread::spawn(move || {
-        running.call(
+        running.run(
             &ToolContext {
                 workspace: &workspace,
                 config: &config,
                 mutation_authorizer: None,
                 confirm: None,
             },
-            &json!({"action":"eval","code":"while True: pass"}),
+            "eval",
+            &json!({"code":"while True: pass"}),
+            &AtomicBool::new(false),
+            &|_| Err("no background".to_owned()),
+            &mut |_| ToolOutput::err("no callbacks"),
+            &AtomicBool::new(false),
         )
     });
     let end = Instant::now() + Duration::from_secs(5);
@@ -229,8 +229,8 @@ fn cancellation_interrupts_an_inflight_kernel_without_session_lock() {
         std::thread::sleep(Duration::from_millis(1));
     }
     assert!(tool.pid.load(Ordering::Acquire) > 0);
-    tool.cancel_operation();
-    assert!(thread.join().unwrap().is_error);
+    tool.cancel();
+    assert!(thread.join().unwrap().is_err());
     assert_eq!(tool.pid.load(Ordering::Acquire), 0);
     assert!(tool.session.lock().is_none());
 }
@@ -245,7 +245,7 @@ fn kernel_denies_fork_spawn_and_detached_descendants_even_without_filesystem_san
         .unwrap()
         .without_sandbox();
     let config = Config::default();
-    let tool = tools(&config).pop().unwrap();
+    let tool = crate::tools::exec::eval::tools(&config).pop().unwrap();
     let ctx = ToolContext {
         workspace: &workspace,
         config: &config,
@@ -257,7 +257,7 @@ fn kernel_denies_fork_spawn_and_detached_descendants_even_without_filesystem_san
         "import os, sys\nos.posix_spawn(sys.executable, [sys.executable, '-c', 'import time; time.sleep(60)'], os.environ)",
         "import os\nos.fork()",
     ] {
-        let output = tool.call(&ctx, &json!({"action":"eval","code":code}));
+        let output = tool.call(&ctx, &json!({"action":"eval","language":"py","code":code}));
         // Clean up a spawned PID even if containment regresses, before failing the test.
         if !output.is_error {
             let value: Value = serde_json::from_str(&output.text).unwrap();
@@ -277,7 +277,11 @@ fn kernel_denies_fork_spawn_and_detached_descendants_even_without_filesystem_san
             output.text
         );
     }
-    assert!(!tool.call(&ctx, &json!({"action":"reset"})).is_error);
+    assert!(
+        !tool
+            .call(&ctx, &json!({"action":"reset","language":"py"}))
+            .is_error
+    );
 }
 #[test]
 fn expired_callback_operation_never_invokes_the_network_handler() {
@@ -348,4 +352,40 @@ fn persistent_reply_observation_and_retention_do_not_invent_child_success() {
         failed.execution.output.unwrap().capture,
         Completeness::Unknown
     );
+}
+
+#[test]
+fn background_flag_overrides_the_automatic_threshold() {
+    let foreground = BackgroundPolicy::from_args(&json!({"background": false}), 0).unwrap();
+    assert!(!foreground.should_yield());
+    let immediate = BackgroundPolicy::from_args(&json!({"background": true}), 3600).unwrap();
+    assert!(immediate.should_yield());
+}
+
+#[test]
+fn automatic_mode_yields_only_after_the_threshold() {
+    let automatic = BackgroundPolicy::from_args(&json!({}), 3600).unwrap();
+    assert!(!automatic.should_yield());
+}
+
+#[test]
+fn background_must_be_a_boolean() {
+    assert_eq!(
+        BackgroundPolicy::from_args(&json!({"background": "yes"}), 15)
+            .err()
+            .as_deref(),
+        Some("background must be a boolean")
+    );
+}
+
+#[test]
+fn cell_label_defaults_to_the_runtime_and_checks_titles() {
+    assert_eq!(cell_label(&json!({}), "py").unwrap(), "eval cell (py)");
+    assert_eq!(
+        cell_label(&json!({"title": "fit model"}), "py").unwrap(),
+        "fit model"
+    );
+    assert!(cell_label(&json!({"title": "  "}), "py").is_err());
+    assert!(cell_label(&json!({"title": 3}), "py").is_err());
+    assert!(cell_label(&json!({"title": "x".repeat(257)}), "py").is_err());
 }

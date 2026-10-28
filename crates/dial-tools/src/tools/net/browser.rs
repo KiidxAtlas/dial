@@ -26,26 +26,38 @@ use std::time::{Duration, Instant};
 use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
 use ureq::unversioned::transport::NextTimeout;
 
+mod actions;
 mod attach;
 #[cfg(target_os = "linux")]
 mod bwrap;
+mod capture;
 mod cmux;
 mod discover;
+mod emulation;
 mod external;
+mod init_scripts;
 mod network;
 mod orphans;
 mod profile;
+mod requests;
+mod routes;
 mod run;
 mod runtime;
+mod state;
 mod stealth;
+mod webmcp;
 mod ws;
 
 const BROWSER_DRIVER: &str = include_str!("browser/driver.cjs");
 const BROWSER_RUN: &str = include_str!("browser/run.cjs");
+const BROWSER_SITE: &str = include_str!("browser/site.cjs");
+const BROWSER_CAPTURE: &str = include_str!("browser/capture.cjs");
+const BROWSER_WEBMCP: &str = include_str!("browser/webmcp.cjs");
 /// Driver program for `node -e`. The run/call module is inlined as an IIFE because `-e` has no `require` base.
 fn driver_source() -> String {
     format!(
-        "'use strict';const runModule=(function(){{const module={{exports:{{}}}};{BROWSER_RUN}\n;return module.exports}})();\n{BROWSER_DRIVER}"
+        "'use strict';const runModule=(function(){{const module={{exports:{{}}}};{BROWSER_RUN}\n;return module.exports}})();\nconst pageActions=(function(){{const module={{exports:{{}}}};{PAGE_ACTIONS}\n;return module.exports}})();\nconst siteModule=(function(){{const module={{exports:{{}}}};{BROWSER_SITE}\n;return module.exports}})();\nconst captureModule=(function(){{const module={{exports:{{}}}};{BROWSER_CAPTURE}\n;return module.exports}})();\nconst webmcpModule=(function(){{const module={{exports:{{}}}};{BROWSER_WEBMCP}\n;return module.exports}})();\n{BROWSER_DRIVER}",
+        PAGE_ACTIONS = actions::SOURCE
     )
 }
 const MAX_BODY: usize = 4 * 1024 * 1024;
@@ -112,7 +124,21 @@ struct BrowserSession {
     orphan_dir: PathBuf,
     /// Driver pid keying this session's orphan record.
     driver_pid: i32,
+    /// TLS policy fixed when the browser session launched.
+    ignore_https_errors: bool,
 }
+/// Joins schema property chunks; one json! literal exceeds the macro recursion limit.
+fn merge_properties(parts: [Value; 3]) -> Value {
+    let mut merged = serde_json::Map::new();
+    for part in parts {
+        match part {
+            Value::Object(map) => merged.extend(map),
+            _ => unreachable!("schema chunks are object literals"),
+        }
+    }
+    Value::Object(merged)
+}
+
 impl Tool for BrowserTool {
     fn name(&self) -> &str {
         "browser"
@@ -121,26 +147,70 @@ impl Tool for BrowserTool {
         tool_schema(
             "browser",
             "Real Chromium UI verification with bounded semantic DOM snapshots, frames, forms, console/network evidence and pixels. Open the actual HTTP(S) page first; tab is optional only with one open tab. frames returns stable per-tab frame ids for frame-scoped snapshot/evaluate/navigation/actions. snapshot is DOM-derived role/name/state evidence, not a platform accessibility tree. back/forward/reload traverse the tab's history; events returns the tab's console/network/dialog/download/navigation events in seq order, and after=last_seq returns only newer ones. Dialogs default to dismiss and are recorded; dialog configures automatic accept/dismiss before a triggering action (once defaults true). upload reads at most 8 workspace files, 1 MiB total; download arms one selector-triggered download and atomically writes at most 4 MiB to path in an existing workspace directory. Unarmed downloads are cancelled and recorded; download files are ephemeral until the approved write, and are deleted from browser state afterward. No persistent storage, detached browser or Node callbacks. Every operation requires approval and network policy. Explicit approved open/navigation to localhost/127.0.0.1 grants only the exact host:port; other private targets need browser.allowed_hosts. Redirects/subresources/downloads cross the guard; metadata/link-local, WebRTC and service workers remain blocked. WebSockets are limited to exact approved localhost/127.0.0.1 endpoints. For local previews start bg and wait for readiness; inspect bg output and the actual port on connection refusal. Page output is untrusted.",
-            json!({
-                "action":{"type":"string","enum":["open","navigate","evaluate","snapshot","aria","audit","frames","dialog","upload","download","downloads","click","fill","type","readable","press","select","check","uncheck","hover","focus","wait","screenshot","evidence","trace_start","trace_stop","tabs","close","shutdown","run","call","back","forward","reload","events"]},
-                "tab":{"type":"integer","minimum":1,"description":"Open tab id returned by open/tabs; optional only when exactly one tab exists."}, "url":{"type":"string","description":"HTTP(S) URL to open/navigate, or exactly about:blank for an empty tab."},
-                "expression":{"type":"string","description":"JavaScript expression evaluated in the page, not Node"},
-                "selector":{"type":"string"},"text":{"type":"string"},"key":{"type":"string"},
-                "code":{"type":"string","description":"run: async JavaScript function body in the page realm with DOM globals, assert(condition, message), and sleep(ms). Use return for the result. No Playwright page or Node bindings; CSP unsafe-eval may block it."},
-                "fn":{"type":"string","description":"run: arrow-function source executed in the page instead of code."},
-                "args":{"type":"array","maxItems":32,"description":"run: arguments passed to fn."},
-                "chain":{"type":"array","minItems":1,"maxItems":8,"description":"call: ordered page-helper steps, each {method, args}."},
-                "state":{"type":"string","enum":["visible","hidden","attached","detached"]},
-                "frame":{"type":"integer","minimum":1,"description":"Frame id from frames; defaults to main frame. Applies to DOM actions, evaluate, snapshot, navigate, upload and download selector."},
-                "max_nodes":{"type":"integer","minimum":1,"maximum":1000,"description":"snapshot node limit, default 300; output capped at 20000 characters."},
-                "values":{"type":"array","items":{"type":"string"},"maxItems":32,"description":"select option values; text remains supported for a single value."},
-                "files":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":8,"description":"upload workspace paths; selector must identify a file input."},
-                "path":{"type":"string","description":"download destination within workspace; parent directory must already exist."},
-                "dialog_mode":{"type":"string","enum":["accept","dismiss"],"description":"dialog policy for the next dialog, or all dialogs with once=false; prompt reply uses text."},
-                "once":{"type":"boolean","description":"dialog policy applies once by default."},
-                "after":{"type":"integer","minimum":0,"description":"events: return tab events (console, network, dialogs, downloads, navigation) with seq greater than this; default 0."},
-                "full_page":{"type":"boolean"}, "timeout":{"type":"integer","minimum":0,"maximum":3600}
-            }),
+            merge_properties([
+                json!({
+                    "action":{"type":"string","enum":["open","navigate","evaluate","snapshot","aria","audit","frames","dialog","upload","download","downloads","click","fill","type","readable","press","select","check","uncheck","hover","focus","wait","screenshot","evidence","trace_start","trace_stop","tabs","close","shutdown","run","call","back","forward","reload","events","requests","request","route","unroute","routes","har_start","har_stop","scroll","dblclick","drag","click_at","mouse_move","mouse_down","mouse_up","wheel","key_down","key_up","highlight","text","html","value","attr","count","box","is_visible","is_enabled","is_checked","styles","cookies","set_cookies","clear_cookies","storage","emulate","devices","clipboard_read","clipboard_write","clipboard_copy","clipboard_paste","save_state","load_state","pdf","record_start","record_stop","profile_start","profile_stop","metrics","vitals","add_init_script","remove_init_script","init_scripts","webmcp_list","webmcp_invoke","webmcp_events"]},
+                    "tab":{"type":"integer","minimum":1,"description":"Open tab id returned by open/tabs; optional only when exactly one tab exists."}, "url":{"type":"string","description":"open/navigate: HTTP(S) URL, or exactly about:blank for an empty tab. wait: substring that the tab URL must contain."},
+                    "expression":{"type":"string","description":"JavaScript expression evaluated in the page, not Node"},
+                    "selector":{"type":"string"},"text":{"type":"string","description":"type/fill text; for wait, a substring that must appear in rendered text (inside selector when given)."},"key":{"type":"string"},"x":{"type":"number","description":"click_at/mouse_move: viewport x in CSS pixels."},"y":{"type":"number","description":"click_at/mouse_move: viewport y in CSS pixels."},"dx":{"type":"number","description":"scroll/wheel: horizontal pixels."},"dy":{"type":"number","description":"scroll/wheel: vertical pixels."},"target":{"type":"string","description":"drag: destination selector."},"button":{"type":"string","enum":["left","right","middle"]},"duration":{"type":"integer","minimum":0,"maximum":10000,"description":"highlight: overlay lifetime in ms, default 2000."},"name":{"type":"string","description":"attr: attribute name."},"props":{"type":"array","maxItems":32,"items":{"type":"string"},"description":"styles: computed CSS property names; defaults to common layout and text properties."},"response":{"type":"string","description":"wait: substring of a response URL to wait for."},
+                    "code":{"type":"string","description":"run: async JavaScript function body in the page realm with DOM globals, assert(condition, message), and sleep(ms). Use return for the result. No Playwright page or Node bindings; CSP unsafe-eval may block it."},
+                    "fn":{"type":"string","description":"run: arrow-function source executed in the page instead of code."},
+                    "args":{"type":"array","maxItems":32,"description":"run: arguments passed to fn."},
+                    "chain":{"type":"array","minItems":1,"maxItems":8,"description":"call: ordered page-helper steps, each {method, args}."},
+                    "state":{"type":"string","enum":["visible","hidden","attached","detached"]},
+                    "frame":{"type":"integer","minimum":1,"description":"Frame id from frames; defaults to main frame. Applies to DOM actions, evaluate, snapshot, navigate, upload and download selector."},
+                    "max_nodes":{"type":"integer","minimum":1,"maximum":1000,"description":"snapshot node limit, default 300; output capped at 20000 characters."},
+                    "values":{"type":"array","items":{"type":"string"},"maxItems":32,"description":"select option values; text remains supported for a single value."},
+                    "files":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":8,"description":"upload workspace paths; selector must identify a file input."},
+                    "path":{"type":"string","description":"download destination within workspace; parent directory must already exist."},
+                    "dialog_mode":{"type":"string","enum":["accept","dismiss"],"description":"dialog policy for the next dialog, or all dialogs with once=false; prompt reply uses text."},
+                    "once":{"type":"boolean","description":"dialog policy applies once by default."},
+                    "after":{"type":"integer","minimum":0,"description":"events: return tab events (console, network, dialogs, downloads, navigation) with seq greater than this; default 0."},
+                    "full_page":{"type":"boolean"}, "timeout":{"type":"integer","minimum":0,"maximum":3600},
+                }),
+                json!({
+                    "format":{"type":"string","enum":["png","jpeg"],"description":"screenshot: image format, default png."},
+                    "quality":{"type":"integer","minimum":1,"maximum":100,"description":"screenshot: JPEG quality; requires format jpeg."},
+                    "annotate":{"type":"boolean","description":"screenshot: overlay numbered boxes on interactive elements; the label-to-selector list is returned."},
+                    "if_changed":{"type":"boolean","description":"screenshot: return no image when identical to the previous capture of this tab with the same options."},
+                    "record_restart":{"type":"boolean","description":"record_start: replace a recording already in progress."},
+                    "request_id":{"type":"integer","minimum":1,"description":"request: id from requests."},
+                    "filter":{"type":"string","maxLength":2048,"description":"requests: keep records whose URL contains this text."},
+                    "resource_type":{"type":"string","maxLength":32,"description":"requests/route: resource type such as document, xhr, fetch, image or script."},
+                    "limit":{"type":"integer","minimum":1,"maximum":200,"description":"requests: most recent records returned, default 50."},
+                    "content":{"type":"string","enum":["text","all","none"],"description":"har_start: response bodies embedded in the HAR; text (default) embeds textual bodies only."},
+                    "pattern":{"type":"string","maxLength":512,"description":"route/unroute: glob over the full URL; * stays within one path segment, ** crosses segments. Routes apply only to URLs the allowed-host guard permits."},
+                    "route_action":{"type":"string","enum":["abort","fulfill","continue"],"description":"route: abort fails the request, fulfill answers it with status/headers/content_type/body, continue passes it through. Defaults to fulfill when response fields are given, else continue."},
+                    "status":{"type":"integer","minimum":100,"maximum":599,"description":"route fulfill: response status, default 200."},
+                    "headers":{"type":"object","additionalProperties":{"type":"string"},"description":"route fulfill: response headers."},
+                    "content_type":{"type":"string","description":"route fulfill: response Content-Type."},
+                    "body":{"description":"route fulfill: response body as a string, or a JSON value serialized as application/json. At most 64 KiB."},
+                "source":{"type":"string","maxLength":65536,"description":"add_init_script: inline script text run before page scripts on every document. Use path for a workspace file instead. At most 64 KiB."},
+                "script_id":{"type":"string","maxLength":64,"description":"remove_init_script: id returned by add_init_script."},
+                "params":{"type":"object","description":"webmcp_invoke: arguments object passed to the page tool."},
+                "since":{"type":"integer","minimum":0,"description":"webmcp_events: return only events after this cursor."},
+                "clear":{"type":"boolean","description":"webmcp_events: clear buffered events after reading."},
+                }),
+                json!({
+                    "viewport":{"type":"object","description":"open/emulate: {width,height,scale?} in CSS pixels, width and height 1-7680, scale 0.1-4. open applies it to the new tab; emulate to the current tab."},
+                    "user_agent":{"type":"string","maxLength":512,"description":"open/emulate: user agent override."},
+                    "ignore_https_errors":{"type":"boolean","description":"open: accept invalid TLS certificates. Fixed for the browser session: set on the first open or shut down first. Not supported with an attached browser."},
+                    "device":{"type":"string","description":"emulate: Playwright device preset name from action=devices."},
+                    "geolocation":{"description":"emulate: {latitude,longitude,accuracy?} for the whole context, or null to clear."},
+                    "timezone":{"type":"string","maxLength":64,"description":"emulate: IANA timezone id; empty string resets."},
+                    "locale":{"type":"string","maxLength":35,"description":"emulate: BCP 47 locale; empty string resets."},
+                    "color_scheme":{"type":"string","enum":["light","dark","no-preference"],"description":"emulate: prefers-color-scheme for the current tab."},
+                    "offline":{"type":"boolean","description":"emulate: take the whole browser context offline."},
+                    "urls":{"type":"array","maxItems":8,"items":{"type":"string"},"description":"cookies: only cookies that would be sent to these HTTP(S) URLs."},
+                    "domain":{"type":"string","maxLength":253,"description":"cookies: only cookies whose domain covers this hostname."},
+                    "include_values":{"type":"boolean","description":"cookies: include cookie values; redacted by default."},
+                    "cookies":{"type":"array","minItems":1,"maxItems":32,"description":"set_cookies: cookies, each with exactly one of url or domain.","items":{"type":"object","additionalProperties":false,"required":["name","value"],"properties":{"name":{"type":"string"},"value":{"type":"string"},"url":{"type":"string"},"domain":{"type":"string"},"path":{"type":"string"},"expires":{"type":"number","description":"Unix seconds, or -1 for a session cookie."},"httpOnly":{"type":"boolean"},"secure":{"type":"boolean"},"sameSite":{"type":"string","enum":["Strict","Lax","None"]}}}},
+                    "names":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"string"},"description":"clear_cookies: cookie names to clear; omit to clear all cookies."},
+                    "area":{"type":"string","enum":["local","session"],"description":"storage: web storage area of the current origin."},
+                    "operation":{"type":"string","enum":["get","set","clear"],"description":"storage: get reads entries, set writes key/value, clear empties the area."},
+                    "value":{"type":"string","maxLength":65536,"description":"storage set: value to store."},
+                }),
+            ]),
             &["action"],
         )
     }
@@ -233,43 +303,73 @@ impl BrowserTool {
                 "browser is unavailable: network access is disabled by sandbox policy".into(),
             );
         }
-        if !matches!(
-            action,
-            "open"
-                | "navigate"
-                | "evaluate"
-                | "snapshot"
-                | "aria"
-                | "audit"
-                | "trace_start"
-                | "trace_stop"
-                | "frames"
-                | "dialog"
-                | "upload"
-                | "download"
-                | "downloads"
-                | "check"
-                | "uncheck"
-                | "hover"
-                | "focus"
-                | "click"
-                | "fill"
-                | "type"
-                | "readable"
-                | "press"
-                | "select"
-                | "wait"
-                | "screenshot"
-                | "evidence"
-                | "tabs"
-                | "close"
-                | "run"
-                | "call"
-                | "back"
-                | "forward"
-                | "reload"
-                | "events"
-        ) {
+        actions::validate(action, args)?;
+        capture::validate(action, args)?;
+        if !actions::is_page_action(action, args)
+            && !capture::is_action(action)
+            && !matches!(
+                action,
+                "open"
+                    | "navigate"
+                    | "evaluate"
+                    | "snapshot"
+                    | "aria"
+                    | "audit"
+                    | "trace_start"
+                    | "trace_stop"
+                    | "frames"
+                    | "dialog"
+                    | "upload"
+                    | "download"
+                    | "downloads"
+                    | "check"
+                    | "uncheck"
+                    | "hover"
+                    | "focus"
+                    | "click"
+                    | "fill"
+                    | "type"
+                    | "readable"
+                    | "press"
+                    | "select"
+                    | "wait"
+                    | "screenshot"
+                    | "evidence"
+                    | "tabs"
+                    | "close"
+                    | "run"
+                    | "call"
+                    | "back"
+                    | "forward"
+                    | "reload"
+                    | "events"
+                    | "requests"
+                    | "request"
+                    | "route"
+                    | "unroute"
+                    | "routes"
+                    | "har_start"
+                    | "har_stop"
+                    | "add_init_script"
+                    | "remove_init_script"
+                    | "init_scripts"
+                    | "webmcp_list"
+                    | "webmcp_invoke"
+                    | "webmcp_events"
+                    | "cookies"
+                    | "set_cookies"
+                    | "clear_cookies"
+                    | "storage"
+                    | "emulate"
+                    | "devices"
+                    | "clipboard_read"
+                    | "clipboard_write"
+                    | "clipboard_copy"
+                    | "clipboard_paste"
+                    | "save_state"
+                    | "load_state"
+            )
+        {
             return Err(format!("unsupported browser action {action:?}"));
         }
         if matches!(action, "open" | "navigate") {
@@ -280,6 +380,22 @@ impl BrowserTool {
             if url != "about:blank" {
                 parse_url(url)?;
             }
+        }
+        let open_options = if action == "open" {
+            Some(emulation::parse_open(args)?)
+        } else {
+            None
+        };
+        let requested_tls = open_options
+            .as_ref()
+            .and_then(|options| options.ignore_https_errors);
+        if let (Some(requested), Some(session)) = (requested_tls, slot.as_ref())
+            && requested != session.ignore_https_errors
+        {
+            return Err(
+                "ignore_https_errors is fixed when the browser session starts; run action=shutdown, then open again"
+                    .into(),
+            );
         }
         let external_result = {
             let mut external = self.external.lock();
@@ -294,6 +410,25 @@ impl BrowserTool {
         let driver_request = match action {
             "run" => Some(run::parse_run(args)?.to_driver_json()),
             "call" => Some(run::parse_call(args)?.to_driver_json()),
+            "requests" | "request" | "har_start" | "har_stop" => {
+                Some(requests::parse(action, args)?)
+            }
+            "route" | "unroute" | "routes" => Some(routes::parse(action, args)?),
+            "add_init_script" | "remove_init_script" | "init_scripts" => {
+                Some(init_scripts::parse(action, args, |input| {
+                    ctx.workspace.resolve(input)
+                })?)
+            }
+            "webmcp_list" | "webmcp_invoke" | "webmcp_events" => Some(webmcp::parse(action, args)?),
+            "open" => open_options
+                .as_ref()
+                .and_then(|options| options.tab.as_ref())
+                .map(|tab| json!({"emulation": tab})),
+            "emulate" => Some(json!({"emulation": emulation::parse_emulate(args)?})),
+            "devices" => Some(json!({"devices": emulation::DEVICE_NAMES})),
+            "cookies" | "set_cookies" | "clear_cookies" | "storage" | "clipboard_read"
+            | "clipboard_write" | "clipboard_copy" | "clipboard_paste" | "save_state"
+            | "load_state" => state::prepare(action, args, &ctx.config.state_dir)?,
             _ => None,
         };
         if args.to_string().len() > 64 * 1024 {
@@ -348,6 +483,7 @@ impl BrowserTool {
                 remaining_timeout(end)?,
                 self.pid.clone(),
                 &self.interrupt,
+                requested_tls.unwrap_or(false),
             )?);
         }
         let remaining = remaining_timeout(end)?;
@@ -404,8 +540,21 @@ impl BrowserTool {
         if let Some(error) = result["browser_error"].as_str() {
             return Err(error.to_owned());
         }
+        state::finish(action, args, &ctx.config.state_dir, &mut result)?;
         if matches!(action, "run" | "call") {
             result = run::shape_output(&result, run::RUN_OUTPUT_MAX_BYTES);
+        }
+        match action {
+            "requests" => result = requests::shape_requests(&result),
+            "request" => result = requests::shape_request(&result),
+            "webmcp_list" => result = webmcp::shape_list(&result),
+            "webmcp_invoke" => result = webmcp::shape_invoke(&result)?,
+            "webmcp_events" => result = webmcp::shape_events(&result),
+            "har_stop" => {
+                result = requests::write_har(&result, &session._state.path().join("artifacts"))?;
+            }
+            "record_stop" => capture::finish_recording(&mut result, &self.interrupt)?,
+            _ => {}
         }
         if let Some(path) = download_path {
             let encoded = result
@@ -601,6 +750,7 @@ fn start(
     timeout: Duration,
     pid: Arc<AtomicI32>,
     interrupt: &AtomicBool,
+    ignore_https_errors: bool,
 ) -> Result<BrowserSession, String> {
     #[cfg(target_os = "macos")]
     Sandbox::detect()
@@ -788,6 +938,7 @@ fn start(
         profile: profile_file,
         orphan_dir,
         driver_pid,
+        ignore_https_errors,
     };
     if interrupt.load(Ordering::Acquire) {
         return Err("browser startup cancelled".into());
@@ -802,6 +953,7 @@ fn start(
             "timeout_ms":remaining.as_millis() as u64,
             "headless":config.headless,
             "record_video":config.record_video,
+            "ignore_https_errors":ignore_https_errors,
             "storage_state":storage_state,
             "websocket_endpoints":ws::websocket_endpoints(&config.allowed_hosts),
             "stealth":stealth_request
@@ -1111,6 +1263,51 @@ fn bridge(
     } else {
         timeout.min(Duration::from_millis(500))
     };
+    // User routes apply only after the allowed-host guard permits the URL; a refused URL fails here.
+    if let Some(rules) = event
+        .get("routes")
+        .and_then(Value::as_array)
+        .filter(|rules| !rules.is_empty())
+    {
+        let rules = routes::rules_from_json(&json!(rules))?;
+        let resource_type = event
+            .get("resource_type")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let guard = BrowserResolver {
+            allowed_hosts: allowed_hosts.to_vec(),
+            interrupt: interrupt.clone(),
+        };
+        let decision = routes::decide(
+            event["url"].as_str().unwrap_or(""),
+            resource_type,
+            &rules,
+            || {
+                guard
+                    .resolve(
+                        &uri,
+                        &ureq::config::Config::default(),
+                        NextTimeout {
+                            after: ureq::unversioned::transport::time::Duration::from(phase),
+                            reason: ureq::Timeout::Resolve,
+                        },
+                    )
+                    .map(|_| ())
+                    .map_err(|error| format!("browser guarded HTTP request: {error}"))
+            },
+        );
+        match decision {
+            routes::Decision::Blocked(reason) => return Err(reason),
+            routes::Decision::Matched {
+                kind: routes::Kind::Continue,
+                ..
+            }
+            | routes::Decision::Continue => {}
+            routes::Decision::Matched { id, kind } => {
+                return Ok(json!({"route": {"id": id, "kind": kind.as_str()}}));
+            }
+        }
+    }
     let config = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .max_redirects(0)

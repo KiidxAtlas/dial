@@ -319,3 +319,55 @@ fn concurrent_inserts_have_exactly_one_winner() {
         );
     });
 }
+
+// Release the held lock even on failure, so a regression fails instead of hanging the suite.
+fn assert_lock_wait_is_bounded(path: &Path, operation: impl FnOnce() -> Result<()> + Send) {
+    let lock = locked(path).unwrap();
+    std::thread::scope(|scope| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        scope.spawn(move || {
+            let _ = tx.send(operation());
+        });
+        let result = rx.recv_timeout(Duration::from_secs(1));
+        drop(lock);
+        assert!(
+            result.is_ok(),
+            "interactive storage operation waited for an occupied lock"
+        );
+        assert!(
+            result.unwrap().is_err(),
+            "an occupied record must not be modified"
+        );
+    });
+}
+
+#[test]
+fn command_settings_and_history_do_not_wait_for_occupied_records() {
+    let (_home, _project, layout) = fixture();
+    let changes = [Change::Set {
+        path: "experimental.turn_optimizer".into(),
+        value: true.into(),
+    }];
+    for scope in [Scope::Global, Scope::Project] {
+        let path = &layout.config_files()[usize::from(scope == Scope::Project)];
+        assert_lock_wait_is_bounded(path, || save_config(&layout, scope, &changes).map(|_| ()));
+        assert_lock_wait_is_bounded(path, || save(&layout, scope, &changes));
+        assert_lock_wait_is_bounded(path, || {
+            save_config_checked(&layout, scope, &changes, &toml::Table::new(), |_| Ok(()))
+        });
+        assert!(
+            !path.exists(),
+            "failed settings saves must leave disk unchanged"
+        );
+    }
+    let path = history_path(&layout).unwrap();
+    assert_lock_wait_is_bounded(&path, || save_history(&layout, &["/drafter".into()], 10));
+    assert_lock_wait_is_bounded(&path, || load_history(&layout, 10).map(|_| ()));
+    assert!(
+        !path.exists(),
+        "failed history saves must leave disk unchanged"
+    );
+    save_config(&layout, Scope::Project, &changes).unwrap();
+    save_history(&layout, &["/drafter".into()], 10).unwrap();
+    assert_eq!(load_history(&layout, 10).unwrap(), ["/drafter"]);
+}

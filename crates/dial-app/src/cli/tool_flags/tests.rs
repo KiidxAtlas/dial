@@ -33,6 +33,28 @@ fn integrations_for_tools_selects_only_gated_names() {
 }
 
 #[test]
+fn kernel_alias_resolves_to_eval_in_tools_and_integrations() {
+    assert_eq!(canonical_tool_name("kernel"), "eval");
+    assert_eq!(canonical_tool_name("Kernel"), "eval");
+    assert_eq!(canonical_tool_name("read"), "read");
+    assert_eq!(
+        normalize_tool_names("kernel, read, KERNEL", &known()),
+        vec!["eval", "read"]
+    );
+    let tools = vec!["kernel".to_owned(), "read".to_owned()];
+    assert_eq!(integrations_for_tools(&tools), vec!["eval"]);
+    let args = ToolFlagArgs {
+        tools: Some("kernel".into()),
+        ..Default::default()
+    };
+    let mut overlay = toml::Table::new();
+    let out = apply(&args, &mut overlay, &[], &[]).unwrap();
+    assert_eq!(out.tools, Some(vec!["eval".to_owned()]));
+    assert_eq!(overlay["harness"]["tools"][0].as_str(), Some("eval"));
+    assert_eq!(overlay["integrations"][0].as_str(), Some("eval"));
+}
+
+#[test]
 fn resolve_prompt_input_treats_newline_as_literal() {
     assert_eq!(
         resolve_prompt_input("line one\nline two"),

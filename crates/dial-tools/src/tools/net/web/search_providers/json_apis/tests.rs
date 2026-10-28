@@ -5,6 +5,7 @@ fn query(recency: Option<Recency>) -> Query<'static> {
         text: "rust & async",
         limit: 3,
         recency,
+        filter: &super::super::domains::UNFILTERED,
         today: 19_723, // 2024-01-01
     }
 }

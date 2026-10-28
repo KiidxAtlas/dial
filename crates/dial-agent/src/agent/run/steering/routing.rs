@@ -2,6 +2,7 @@
 //! never a task payload, permission grant or rewritten user message.
 
 use crate::agent::*;
+use crate::config::message_routing::RoutingMode;
 use serde::Deserialize;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -269,7 +270,14 @@ impl Agent<'_> {
             // Large pastes must not create an unbounded classification request. Preserve the exact
             // message as steering instead of asking a model to classify a truncated assignment.
             let can_split = self.can_split_now();
-            let choice = if !can_split {
+            let choice = if self.config.message_routing.route == RoutingMode::Steer {
+                // Default routing is deterministic: a busy message steers the running task. It makes no
+                // model request and takes no provider or local slot. Only `classify` asks the judge.
+                Ok(Decision {
+                    route: Route::Steer,
+                    reason: "Steering is the default message routing".into(),
+                })
+            } else if !can_split {
                 // There is only one admissible route. A classifier cannot change it, so do not
                 // spend a model request (or fail over to one) just to rediscover that boundary.
                 Ok(Decision {

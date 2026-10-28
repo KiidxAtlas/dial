@@ -81,10 +81,13 @@ impl Pool {
         self.counters.snapshot()
     }
     pub fn pending(&self, owner_key: &str, args: &Value) -> bool {
+        let Some(key) = key(owner_key, args) else {
+            return false;
+        };
         self.pending
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
-            .contains_key(&key(owner_key, args))
+            .contains_key(&key)
     }
     pub fn clear(&self) {
         let mut pending = self
@@ -124,7 +127,9 @@ impl Pool {
         let Some(source) = single_source(workspace, &args) else {
             return false;
         };
-        let key = key(&owner_key, &args);
+        let Some(key) = key(&owner_key, &args) else {
+            return false;
+        };
         let mut pending = self
             .pending
             .lock()
@@ -207,11 +212,12 @@ impl Pool {
     /// Ordinary owner admission runs again before this call. An unfinished/stale cache never waits
     /// or substitutes a different query: cancel it and run the ordinary tool instead.
     pub fn take(&self, workspace: &Workspace, args: &Value, owner_key: &str) -> Option<ToolOutput> {
+        let key = key(owner_key, args)?;
         let entry = self
             .pending
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
-            .remove(&key(owner_key, args))?;
+            .remove(&key)?;
         let result = if !entry.scope.is_cancelled()
             && entry.started.elapsed() <= Duration::from_secs(5)
             && single_source(workspace, args).as_ref() == Some(&entry.source)
@@ -242,11 +248,10 @@ impl Drop for Pool {
         self.clear();
     }
 }
-fn key(owner: &str, args: &Value) -> String {
-    format!(
-        "{:x}",
-        Sha256::digest(serde_json::to_vec(&(owner, args)).expect("JSON arguments serialize"))
-    )
+fn key(owner: &str, args: &Value) -> Option<String> {
+    // Arguments that cannot serialize have no exact identity, so they are never prepared or reused.
+    let bytes = serde_json::to_vec(&(owner, args)).ok()?;
+    Some(format!("{:x}", Sha256::digest(bytes)))
 }
 fn single_source(workspace: &Workspace, args: &Value) -> Option<PathBuf> {
     let input = args.get("path")?.as_str()?;

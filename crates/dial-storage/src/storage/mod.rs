@@ -20,8 +20,10 @@ pub mod retention;
 pub mod session;
 pub mod session_pins;
 pub mod share;
+pub mod side_thread;
 pub mod skills;
 pub mod store;
+pub mod subagent;
 pub mod transcript;
 
 pub mod media;

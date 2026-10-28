@@ -10,6 +10,7 @@ pub mod browser;
 pub mod dap;
 pub mod eval;
 pub mod git;
+pub mod ida;
 pub mod integrations;
 pub mod kernel;
 pub mod lsp;
@@ -101,6 +102,7 @@ pub const EXTRA_TOOLS: &[&str] = &[
     "todo",
     "finish",
     "task",
+    "side_request",
     "solve",
     "escalate",
     "skill",
@@ -137,6 +139,7 @@ pub fn default_tools() -> Vec<String> {
             [
                 "todo",
                 "task",
+                "side_request",
                 "skill",
                 "tool_search",
                 "tool_load",

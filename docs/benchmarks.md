@@ -360,14 +360,20 @@ After building the binary, exercise deterministic request recovery and evidence 
 
 ```sh
 python3 examples/benchmarks/smoke.py --dial target/debug/dial --suite recovery --report /tmp/dial-recovery.json
-python3 examples/benchmarks/interactive_smoke.py --dial target/debug/dial --captures /tmp/dial-pty-captures
+python3 examples/benchmarks/interactive_smoke.py --dial target/debug/dial --captures /tmp/dial-pty-captures/main
+python3 examples/benchmarks/interactive_surfaces.py --dial target/debug/dial --captures /tmp/dial-pty-captures/surfaces
+python3 examples/benchmarks/session_contention_smoke.py --dial target/debug/dial --captures /tmp/dial-pty-captures/contention
+python3 examples/benchmarks/side_lifecycle_smoke.py --dial target/debug/dial --captures /tmp/dial-pty-captures/side-lifecycle
 ```
 
-The second check requires Python 3.11+, Git and tmux and creates its own disposable Git root,
-private configuration, isolated tmux server and loopback provider. It exercises delayed-discovery
-favorite switching/cancellation, picker resizing, wrapped input cancellation, full blockers, and
-queue management, refused model restart and live help during a gated SSE reply. Streaming answer
-markers must appear exactly once, without cancelling or regenerating the request.
+The terminal probes require Python 3.11+, Git and tmux and create disposable Git roots, private
+configuration, isolated tmux servers and loopback providers. They exercise delayed-discovery favorite
+switching/cancellation, picker resizing, wrapped input cancellation, full blockers, queue management,
+refused model restart and live help during a gated SSE reply. They also cover worker restoration,
+focused draft/model controls, pool history reuse, side requests and crash checkpoints, independent
+forks under writer contention, native tree previews, declarative panel outcomes, quiet-stream reveal
+and incomplete write cancellation. Streaming markers must appear exactly once without regenerating
+the request; conversation navigation must not silently restore workspace files.
 Captures are real terminal text, **not pixel screenshots**. Scripted provider runs verify harness
 behavior, **not model quality or a measured model-speed improvement**. Run
 `examples/benchmarks/recovery.toml` through the benchmark CLI with a selected real model to obtain

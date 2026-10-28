@@ -545,12 +545,14 @@ struct Renderer<'a> {
     styles: Vec<Style>,
     /// Open links / images: destination and where their text starts in `inline`.
     links: Vec<(String, usize)>,
-    /// Open code block: info-string language and accumulated text.
+    /// Open code block: trimmed fence info string and accumulated text.
     code: Option<(String, String)>,
     table: Option<TableBuf>,
 }
 
 const MIN_CODE_GUTTER: usize = 8;
+/// Fence language that renders as a framed diagram panel: ```` ```diagram Optional title ````.
+const DIAGRAM_LANG: &str = "diagram";
 const MIN_COLUMN: usize = 3;
 
 impl<'a> Renderer<'a> {
@@ -704,15 +706,11 @@ impl<'a> Renderer<'a> {
             }
             Tag::CodeBlock(kind) => {
                 self.flush_inline();
-                let lang = match kind {
-                    CodeBlockKind::Fenced(info) => info
-                        .split(|c: char| c.is_whitespace() || c == ',' || c == '{')
-                        .next()
-                        .unwrap_or("")
-                        .to_owned(),
+                let info = match kind {
+                    CodeBlockKind::Fenced(info) => info.trim().to_owned(),
                     CodeBlockKind::Indented => String::new(),
                 };
-                self.code = Some((lang, String::new()));
+                self.code = Some((info, String::new()));
             }
             Tag::HtmlBlock => self.flush_inline(),
             Tag::List(start) => {
@@ -829,8 +827,8 @@ impl<'a> Renderer<'a> {
                 }
             }
             TagEnd::CodeBlock => {
-                if let Some((lang, body)) = self.code.take() {
-                    self.code_block(&lang, &body);
+                if let Some((info, body)) = self.code.take() {
+                    self.code_block(&info, &body);
                 }
             }
             TagEnd::List(_) => {
@@ -935,8 +933,8 @@ impl<'a> Renderer<'a> {
 
     fn finish(mut self) -> Rows {
         self.flush_inline();
-        if let Some((lang, body)) = self.code.take() {
-            self.code_block(&lang, &body);
+        if let Some((info, body)) = self.code.take() {
+            self.code_block(&info, &body);
         }
         while self.frames.len() > 1 {
             let frame = self.frames.pop().expect("checked length");
@@ -957,9 +955,17 @@ impl<'a> Renderer<'a> {
 
     // ---- code ----------------------------------------------------------------------------
 
-    fn code_block(&mut self, lang: &str, body: &str) {
+    fn code_block(&mut self, info: &str, body: &str) {
         let avail = self.avail();
         let theme = self.theme;
+        let lang = fence_lang(info);
+        if lang.eq_ignore_ascii_case(DIAGRAM_LANG) && avail >= MIN_CODE_GUTTER {
+            let title = info[lang.len()..].trim();
+            let rows = diagram_rows(theme, title, body, avail);
+            self.begin_block();
+            self.top().rows.extend(rows);
+            return;
+        }
         let diff = is_diff(lang, body);
         let body = body.strip_suffix('\n').unwrap_or(body);
         let mut block_comment = false;
@@ -1158,6 +1164,117 @@ fn is_diff(lang: &str, body: &str) -> bool {
         && body
             .lines()
             .any(|l| l.starts_with("@@ ") || l.starts_with("diff --git"))
+}
+
+/// The language word of a fence info string (`rust` in `rust,ignore` or `rust {.class}`).
+fn fence_lang(info: &str) -> &str {
+    info.split(|c: char| c.is_whitespace() || c == ',' || c == '{')
+        .next()
+        .unwrap_or("")
+}
+
+/// A diagram fence as a framed panel: an accent border with the title in its top edge, connector
+/// glyphs tinted and labels in the code color, all on the code background. Rows are clipped with
+/// an ellipsis, never wrapped, because a wrapped diagram no longer lines up. The full source stays
+/// in the transcript. Callers guarantee `avail >= MIN_CODE_GUTTER`.
+fn diagram_rows(theme: &Theme, title: &str, body: &str, avail: usize) -> Rows {
+    let border = theme.fg(Tok::BorderAccent);
+    let fill = theme.bg(Tok::MdCodeBlockBg);
+    let h = theme.sym(Sym::BoxH);
+    let v = theme.sym(Sym::BoxV);
+    let ellipsis = theme.sym(Sym::Ellipsis);
+    let body = body.strip_suffix('\n').unwrap_or(body);
+    let lines: Vec<&str> = if body.is_empty() {
+        Vec::new()
+    } else {
+        body.split('\n').collect()
+    };
+    // A row is `│ ` + inner + ` │`; the top edge is `╭─ ` + label + ` ` + rule (at least one) + `╮`.
+    let max_inner = avail - 4;
+    let (label_text, label_style) = if title.is_empty() {
+        (DIAGRAM_LANG.to_uppercase(), theme.fg(Tok::Muted))
+    } else {
+        (
+            title.to_owned(),
+            theme.fg(Tok::Accent).add_modifier(Modifier::BOLD),
+        )
+    };
+    let content_w = lines.iter().map(|l| text::width(l)).max().unwrap_or(0);
+    let inner = content_w.max(text::width(&label_text) + 2).min(max_inner);
+    let label = text::ellipsize(&label_text, inner - 2, theme.ascii());
+    let rule_w = inner - 1 - text::width(&label);
+    let mut rows: Rows = vec![Line::from(vec![
+        Span::styled(format!("{}{h} ", theme.sym(Sym::BoxTl)), border),
+        Span::styled(label, label_style),
+        Span::styled(
+            format!(" {}{}", h.repeat(rule_w), theme.sym(Sym::BoxTr)),
+            border,
+        ),
+    ])];
+    for line in lines {
+        let mut content = diagram_spans(theme, line);
+        if text::width(line) > inner {
+            content = truncate_spans(content, inner, ellipsis);
+        }
+        let used: usize = content.iter().map(|s| text::width(&s.content)).sum();
+        let mut spans = vec![Span::styled(v.to_owned(), border), Span::styled(" ", fill)];
+        spans.extend(content.into_iter().map(|mut s| {
+            s.style = s.style.patch(fill);
+            s
+        }));
+        spans.push(Span::styled(" ".repeat(inner - used + 1), fill));
+        spans.push(Span::styled(v.to_owned(), border));
+        rows.push(Line::from(spans));
+    }
+    rows.push(Line::from(Span::styled(
+        format!(
+            "{}{}{}",
+            theme.sym(Sym::BoxBl),
+            h.repeat(inner + 2),
+            theme.sym(Sym::BoxBr)
+        ),
+        border,
+    )));
+    rows
+}
+
+/// Diagram text with connectors (box drawing, arrows, `-->`, `|`, `[ ]`) in the accent color and
+/// everything else in the code color, so node labels stand apart from the lines between them.
+fn diagram_spans(theme: &Theme, line: &str) -> Vec<Span<'static>> {
+    let (wire, label) = (theme.fg(Tok::Accent), theme.fg(Tok::MdCodeBlock));
+    let graphemes: Vec<&str> = line.graphemes(true).collect();
+    let first = |i: usize| graphemes.get(i).and_then(|g| g.chars().next());
+    let mut spans = Vec::new();
+    for (i, g) in graphemes.iter().enumerate() {
+        let prev = i.checked_sub(1).and_then(first);
+        let connector = g
+            .chars()
+            .next()
+            .is_some_and(|c| is_connector(prev, c, first(i + 1)));
+        push_merged(&mut spans, g, if connector { wire } else { label });
+    }
+    spans
+}
+
+/// Whether `c`, between `prev` and `next`, draws part of a diagram rather than a label. Hyphens,
+/// equals signs and underscores count only beside another line glyph, so `dial-app` and
+/// `snake_case` stay labels while `-->` and `\___/` are drawn as connectors.
+fn is_connector(prev: Option<char>, c: char, next: Option<char>) -> bool {
+    let joins = |n: Option<char>| matches!(n, Some('-' | '=' | '<' | '>' | '+' | '|'));
+    let word = |n: Option<char>| n.is_some_and(char::is_alphanumeric);
+    let slope = |n: Option<char>| matches!(n, Some('_' | '/' | '\\'));
+    match c {
+        '|' | '+' | '<' | '>' | '^' | '[' | ']' => true,
+        '-' | '=' => joins(prev) || joins(next),
+        '_' => slope(prev) || slope(next),
+        '/' | '\\' => !word(prev) && !word(next),
+        // arrows, box drawing, block elements, geometric shapes, supplemental arrows
+        '\u{2190}'..='\u{21FF}'
+        | '\u{2500}'..='\u{25FF}'
+        | '\u{27F0}'..='\u{27FF}'
+        | '\u{2900}'..='\u{297F}' => true,
+        _ => false,
+    }
 }
 
 fn cell_width(cell: &[Span<'static>]) -> usize {

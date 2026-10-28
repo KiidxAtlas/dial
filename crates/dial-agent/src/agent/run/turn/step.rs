@@ -274,7 +274,9 @@ impl Agent<'_> {
                 request.messages.push(guidance);
             }
         }
-        let request_overhead = crate::agent::window::context_meter::overhead(&request);
+        let mut request_overhead = crate::agent::window::context_meter::overhead(&request);
+        self.context_meter
+            .record_breakdown(std::mem::take(&mut request_overhead.breakdown));
         let request_context = self
             .context_meter
             .predict(request_estimate)
@@ -486,6 +488,7 @@ impl Agent<'_> {
             {
                 profile.capabilities.parallel_tool_calls = Some(false);
             }
+            self.judge_turn_effort(turn, profile.as_ref(), ui);
             if let (Some(effort), Some(profile)) = (turn.turn_effort, profile.as_mut())
                 && let Some(clamped) =
                     crate::judgment::clamp_effort(effort, &profile.capabilities.reasoning_efforts)
@@ -646,6 +649,7 @@ impl Agent<'_> {
                         always: self.always.clone(),
                         schemas: provider_request.tools.clone(),
                         names: turn.names.clone(),
+                        failed_calls: engine.failed_calls(),
                     },
                 )
             });
@@ -654,6 +658,11 @@ impl Agent<'_> {
         backend.next_request_failover(
             (!self.hermetic && self.fallback_ready())
                 .then_some(self.effective_config().retry.fallback_on),
+        );
+        ui.message_started();
+        self.emit_event(
+            "message_start",
+            || json!({"session_id": self.session.id(), "step": step}),
         );
         let result = if self.hermetic {
             crate::learn::compute::background_call(self.config, backend, |backend, cancel| {
@@ -735,9 +744,13 @@ impl Agent<'_> {
         backend.next_request_profile(None);
         backend.next_request_failover(None);
         match &result {
-            Ok(reply) => self.observe_local_reply(reply, backend),
+            Ok(reply) => {
+                self.observe_local_reply(reply, backend);
+                self.note_fallback_served(ui);
+            }
             Err(error) => self.observe_local_failure(error, backend),
         }
+        self.observe_cost_warnings(&mut turn.turn_cost_warn, ui);
         // The projected request is not reused after inference: move its history instead of
         // deep-copying it each iteration. Recovery and training still see the exact bytes sent.
         let (context_before, request_tools) = match rewritten {
@@ -1436,6 +1449,7 @@ impl Agent<'_> {
             }
         }
         turn.stall_continues = 0;
+        ui.message_settled();
         if reply.tool_calls.is_empty() {
             self.push(json!({"role":"assistant","content":reply.text}))?;
             self.observe_assistant_message(&reply.text, step, ui);
@@ -1701,6 +1715,17 @@ impl Agent<'_> {
             let mut control = self.session.control_state();
             turn.rule_state.save(&mut control);
             self.session.set_control_state(control)?;
+        }
+        if let Some(warm) = &self.cache_warm {
+            // The settled prefix is the exact bytes sent: the warmer replays it near expiry.
+            let settled = llm::Chat {
+                messages: context_before.clone(),
+                tools: request_tools.clone(),
+                temperature: request.temperature,
+                max_tokens: request.max_tokens,
+                seed: request.seed,
+            };
+            warm.settled(&settled, reply.prompt_tokens, &self.usage_scope);
         }
         self.execute_round(
             turn,

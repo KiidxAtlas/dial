@@ -90,7 +90,7 @@ fn image_notices_distinguish_failure_changes_and_model_capabilities() {
 #[test]
 fn unavailable_images_are_explained_to_the_model_as_well_as_the_user() {
     let root = tempfile::tempdir().unwrap();
-    fs::write(root.path().join("tiny.png"), b"\x89PNG\r\n\x1a\noriginal").unwrap();
+    fs::write(root.path().join("tiny.png"), tiny_png()).unwrap();
     let reference = attachment(root.path(), Path::new("tiny.png")).unwrap();
     let req = super::super::Chat {
         messages: vec![json!({"role":"user","content":"inspect it","dial_images":[reference]})],
@@ -99,29 +99,38 @@ fn unavailable_images_are_explained_to_the_model_as_well_as_the_user() {
         max_tokens: 100,
         seed: None,
     };
-    for vision in [false, true] {
-        if vision {
-            fs::remove_file(root.path().join("tiny.png")).unwrap();
-        }
-        let mut notices = Vec::new();
-        let prepared = prepare(&req, vision, &NoticeTracker::default(), &mut |notice| {
-            notices.push(notice.to_string())
-        })
-        .unwrap();
-        assert_eq!(notices.len(), 1);
-        assert!(
-            prepared.messages[0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("Image unavailable")
-        );
-        assert!(
-            !prepared
-                .messages
-                .iter()
-                .any(|m| m.to_string().contains("image_url"))
-        );
-    }
+    let mut notices = Vec::new();
+    let text_only = prepare(&req, false, &NoticeTracker::default(), &mut |notice| {
+        notices.push(notice.to_string())
+    })
+    .unwrap();
+    assert_eq!(notices.len(), 1);
+    assert!(
+        !text_only
+            .messages
+            .iter()
+            .any(|m| m.to_string().contains("image_url"))
+    );
+
+    fs::remove_file(root.path().join("tiny.png")).unwrap();
+    let mut notices = Vec::new();
+    let prepared = prepare(&req, true, &NoticeTracker::default(), &mut |notice| {
+        notices.push(notice.to_string())
+    })
+    .unwrap();
+    assert_eq!(notices.len(), 1);
+    assert!(
+        prepared.messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Image unavailable")
+    );
+    assert!(
+        !prepared
+            .messages
+            .iter()
+            .any(|m| m.to_string().contains("image_url"))
+    );
 }
 #[test]
 fn compact_references_reject_changed_oversized_and_escaped_images() {
@@ -161,8 +170,43 @@ fn compact_references_reject_changed_oversized_and_escaped_images() {
         assert!(attachment(root.path(), Path::new("link.png")).is_err());
     }
     let large = fs::File::create(root.path().join("large.png")).unwrap();
-    large.set_len(MAX_IMAGE_BYTES + 1).unwrap();
+    large.set_len(MAX_IMAGE_SOURCE_BYTES + 1).unwrap();
     assert!(attachment(root.path(), Path::new("large.png")).is_err());
+}
+
+#[test]
+fn oversized_images_are_downscaled_under_the_model_cap() {
+    let (width, height) = (2000u32, 2000u32);
+    let mut state: u32 = 0x1234_5678;
+    let pixels: Vec<u8> = (0..width * height * 3)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        })
+        .collect();
+    let mut png = Vec::new();
+    image::RgbImage::from_raw(width, height, pixels)
+        .unwrap()
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    assert!(png.len() as u64 > MAX_IMAGE_BYTES);
+    let (bytes, mime) = resize_for_model(&png, "image/png").unwrap();
+    assert!(bytes.len() as u64 <= MAX_IMAGE_BYTES);
+    // Incompressible pixels cannot fit the cap as PNG; the encoder falls back to JPEG.
+    assert!(matches!(mime.as_str(), "image/png" | "image/jpeg"), "{mime}");
+    let decoded = image::load_from_memory(&bytes).unwrap();
+    assert!(decoded.width() <= width && decoded.width() > 0);
+}
+
+#[test]
+fn question_reads_split_only_on_a_non_empty_path_and_question() {
+    assert_eq!(
+        split_question("shot.png?q=what does this show?"),
+        Some(("shot.png", "what does this show?"))
+    );
+    assert_eq!(split_question("shot.png"), None);
+    assert_eq!(split_question("shot.png?q=   "), None);
+    assert_eq!(split_question("?q=what"), None);
 }
 
 /// A real 1x1 PNG; decoding validates the header chain before any pixels reach a provider.

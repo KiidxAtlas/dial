@@ -6,6 +6,7 @@ fn on_fallback_until(until: Instant) -> ActiveRoute {
         fallback: Some(Fallback {
             until,
             primary_cap: Some(8192),
+            served: false,
         }),
         promoted: None,
     }
@@ -234,6 +235,77 @@ fn a_primary_that_cannot_be_rebuilt_keeps_the_fallback_instead_of_failing_the_tu
             assert_eq!(agent.auth_config.model, "fb");
             // The restore is retried after a fresh cooldown, not at every request.
             assert!(agent.route.cooling_at(Instant::now()));
+            agent.backend = Some(backend);
+        },
+    );
+}
+
+#[test]
+fn never_revert_keeps_the_fallback_after_its_cooldown_until_a_model_switch() {
+    with_server_agent(
+        "http://127.0.0.1:9",
+        "[retry]\nfallback_revert='never'\n[model_roles.coach]\nprovider='endpoint'\nmodel='fb'\nbase_url='http://127.0.0.1:9/v1'\n[retry.fallback_chains]\ndefault=['@coach']\n",
+        |agent| {
+            let mut backend = agent.backend.take().unwrap();
+            let mut ui = Events::default();
+            assert!(agent.fail_over(&mut backend, &anyhow::anyhow!("rate limited"), &mut ui));
+            agent.route.fallback.as_mut().unwrap().until = Instant::now();
+            assert!(!agent.restore_primary_if_due(&mut backend, &mut ui));
+            assert!(agent.route.on_fallback());
+            assert_eq!(agent.auth_config.model, "fb");
+            agent.backend = Some(backend);
+        },
+    );
+}
+
+#[test]
+fn cooldown_expiry_restores_the_primary_and_announces_it_once() {
+    with_server_agent(
+        "http://127.0.0.1:9",
+        "[endpoint]\nbase_url='http://127.0.0.1:9/v1'\n[model_roles.coach]\nprovider='endpoint'\nmodel='fb'\nbase_url='http://127.0.0.1:9/v1'\n[retry.fallback_chains]\ndefault=['@coach']\n",
+        |agent| {
+            let mut backend = agent.backend.take().unwrap();
+            let mut ui = Events::default();
+            assert!(agent.fail_over(&mut backend, &anyhow::anyhow!("rate limited"), &mut ui));
+            // Failing over alone never returns to the primary within the same failure.
+            assert_eq!(agent.auth_config.model, "fb");
+            let cooldown_end = agent.route.fallback.as_ref().unwrap().until;
+            assert!(
+                agent
+                    .route
+                    .cooling_at(cooldown_end - Duration::from_millis(1))
+            );
+            agent.route.fallback.as_mut().unwrap().until = Instant::now();
+            assert!(agent.restore_primary_if_due(&mut backend, &mut ui));
+            assert_eq!(agent.auth_config.model, "test");
+            assert!(
+                ui.0.iter()
+                    .any(|text| text.contains("returning to the primary"))
+            );
+            agent.backend = Some(backend);
+        },
+    );
+}
+
+#[test]
+fn the_first_fallback_reply_is_announced_once() {
+    with_server_agent(
+        "http://127.0.0.1:9",
+        "[model_roles.coach]\nprovider='endpoint'\nmodel='fb'\nbase_url='http://127.0.0.1:9/v1'\n[retry.fallback_chains]\ndefault=['@coach']\n",
+        |agent| {
+            let mut backend = agent.backend.take().unwrap();
+            let mut ui = Events::default();
+            agent.note_fallback_served(&mut ui);
+            assert!(
+                ui.0.is_empty(),
+                "no fallback installed, nothing to announce"
+            );
+            assert!(agent.fail_over(&mut backend, &anyhow::anyhow!("rate limited"), &mut ui));
+            agent.note_fallback_served(&mut ui);
+            agent.note_fallback_served(&mut ui);
+            let served = ui.0.iter().filter(|text| text.contains("answered")).count();
+            assert_eq!(served, 1);
+            assert!(agent.route.fallback.as_ref().unwrap().served);
             agent.backend = Some(backend);
         },
     );

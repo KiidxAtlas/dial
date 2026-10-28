@@ -64,6 +64,32 @@ fn responses_send_only_advertised_max_and_ultra_reasoning_levels() {
     }
 }
 #[test]
+fn reasoning_effort_wire_reaches_responses_reasoning_effort() {
+    use super::super::profiles::{ModelCapabilities, ModelProfile, ReasoningApi, ReasoningEffort};
+    use std::collections::BTreeMap;
+    let mut profile = ModelProfile {
+        provider: "chatgpt".into(),
+        model: "account-model".into(),
+        reasoning_effort: Some(ReasoningEffort::High),
+        capabilities: ModelCapabilities {
+            reasoning: ReasoningApi::OpenaiResponses,
+            reasoning_efforts: vec![ReasoningEffort::High],
+            reasoning_effort_wire: BTreeMap::from([(ReasoningEffort::High, "max".to_string())]),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert_eq!(
+        request("account-model", &chat(), Some(&profile)).unwrap()["reasoning"]["effort"],
+        "max"
+    );
+    profile.capabilities.reasoning_effort_wire.clear();
+    assert_eq!(
+        request("account-model", &chat(), Some(&profile)).unwrap()["reasoning"]["effort"],
+        "high"
+    );
+}
+#[test]
 fn requests_use_namespaces_full_history_and_only_supported_parameters() {
     let body = request("account-model", &chat(), None).unwrap();
     assert_eq!(body["model"], "account-model");

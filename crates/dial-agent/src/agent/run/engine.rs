@@ -16,6 +16,9 @@ use crate::{
 #[derive(Default)]
 pub(in crate::agent) struct Engine {
     checkpoint: recovery_checkpoint::RecoveryCheckpoint,
+    /// Failed normalized calls stay withheld across continuations and compaction, until a
+    /// successful novel source mutation or new instruction changes the recovery context.
+    failed: std::collections::BTreeSet<[u8; 32]>,
     repeats: guard::RepeatGuard,
     investigation: investigation::InvestigationGuard,
     returned_reads: investigation::ReturnedReads,
@@ -210,6 +213,12 @@ impl Engine {
         }
     }
     pub fn rejection_at(&mut self, workspace: &Workspace, call: &ToolCall) -> Option<String> {
+        if self.failed.contains(&failed_identity(call)) {
+            return Some(format!(
+                "Failed-operation retry barrier: this unchanged `{}` call already failed and was not executed again. Inspect the retained diagnostic, use a different targeted observation, correct the arguments or repair the source before retrying. Todo updates and compaction do not release this barrier.",
+                call.name
+            ));
+        }
         if let Some(path) = self.cycles.blocked(&call_identity(call)) {
             return Some(format!(
                 "This call was not executed: it is one of the edits that kept returning `{}` to content it already had earlier in this turn. Read the file's current content, decide its final state, then make one different, complete edit (for example, write the full intended content) or continue with the rest of the task.",
@@ -217,6 +226,10 @@ impl Engine {
             ));
         }
         self.checkpoint.rejection_at(workspace, call)
+    }
+    /// Snapshot admission restrictions before experimental early reads can start.
+    pub fn failed_calls(&self) -> std::collections::BTreeSet<[u8; 32]> {
+        self.failed.clone()
     }
     pub fn apply(
         &self,
@@ -300,6 +313,13 @@ impl Engine {
             task_changed,
             mutated,
         );
+        if mutated && !output.is_error && !check_failed {
+            self.failed.clear();
+        }
+        if crate::runtime::execution::ToolStatus::from_output(output).failed() {
+            self.failed.insert(failed_identity(call));
+            output.text.push_str("\nFailed-operation retry barrier: unchanged arguments are now withheld. Correct the arguments, inspect a different source, or repair the source before retrying; completed effects are retained.");
+        }
         // Duplicate memory may only cite results the model still sees in full.
         self.investigation.retain_visible(&holds_result);
         let (duplicate, repeat, stop) = self.checkpoint.observe_at(
@@ -318,9 +338,9 @@ impl Engine {
         (pointer.or(duplicate), repeat, stop)
     }
 
-    /// Compaction rewrote what the model can see. Duplicate memory, pointers, cached observations
-    /// and withheld calls are released, so a repeat executes and returns full content. Failure
-    /// counters and the edit-cycle history are kept.
+    /// Compaction releases duplicate observations and pointers so successful reads can return
+    /// their full content again. Failed-operation identities, failure counters and edit-cycle
+    /// history remain: shortening history is not a repair.
     pub fn evidence_compacted(&mut self) {
         self.investigation.forget();
         self.returned_reads = Default::default();
@@ -331,6 +351,12 @@ impl Engine {
 /// Normalized identity shared with the recovery checkpoint, so equivalent retries match.
 fn call_identity(call: &ToolCall) -> String {
     format!("{}\0{}", call.name, guard::normalized_arguments(call))
+}
+
+/// Keep identities, not potentially large scripts, for every failed call in this turn.
+pub(in crate::agent) fn failed_identity(call: &ToolCall) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(call_identity(call).as_bytes()).into()
 }
 
 #[cfg(test)]

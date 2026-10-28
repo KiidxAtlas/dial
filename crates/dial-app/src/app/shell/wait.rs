@@ -13,10 +13,11 @@ use crate::learn::auto;
 use crate::llm::model_config::ModelSelection;
 use crate::storage::store::Store;
 use crate::ui::composer::ComposerEvent;
+use crate::ui::input::{poll, read};
 use crate::ui::keys::Action;
 use crate::ui::status::Phase;
 use anyhow::{Result, ensure};
-use crossterm::event::{Event, KeyEventKind, poll, read};
+use crossterm::event::{Event, KeyEventKind};
 use std::cell::RefCell;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -76,6 +77,7 @@ impl Shell {
             self.status.phase = Phase::WaitingCompute;
             self.status.elapsed_secs = elapsed_before_wait + waiting_since.elapsed().as_secs_f64();
             self.status.activity = "waiting for compute · Ctrl+, or /compute opens controls".into();
+            self.poll_clipboard_image();
             self.paint_waiting(app)?;
             if poll(TICK)? {
                 let event = read()?;
@@ -129,6 +131,7 @@ impl Shell {
                 }
             }
             self.status.activity = "preparing local model · Esc cancels".into();
+            self.poll_clipboard_image();
             self.paint_waiting(app)?;
             if poll(TICK)? {
                 let event = read()?;
@@ -253,7 +256,7 @@ impl Shell {
                 WaitFlow::Continue
             }
             ComposerEvent::Action(Action::PasteImage) => {
-                if let Err(error) = self.composer.paste_clipboard_image() {
+                if let Err(error) = self.composer.start_clipboard_image() {
                     self.note("Image", format!("clipboard image unavailable: {error:#}"));
                 }
                 WaitFlow::Continue

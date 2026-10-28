@@ -3,7 +3,11 @@
 //! Every text that leaves the session (title, messages, tool calls and results) passes through
 //! `storage::redact` first. HTML embeds verified image attachments as data URIs; Markdown keeps
 //! tool payloads in fenced blocks (no raw HTML) and notes images without inlining them.
+//!
+//! Subagent (worker) transcripts follow the parent conversation as separate sections, so an export
+//! shows what the workers did, not just the parent's summary of it.
 use super::redact::redact_text;
+use super::subagent::Worker;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::Value;
 
@@ -62,19 +66,8 @@ fn images(message: &Value) -> Vec<Image> {
         .collect()
 }
 
-/// Render the active branch. `messages` are chat messages in order (no control records).
-pub fn render(title: &str, messages: &[&Value], html: bool) -> String {
-    let title = redact_text(title);
-    let mut body = String::new();
-    if html {
-        body.push_str(&format!(
-            "<!doctype html><html><head><meta charset=\"utf-8\"><title>{}</title><style>body{{font:16px system-ui;max-width:900px;margin:2rem auto;padding:0 1rem;line-height:1.5}}pre{{white-space:pre-wrap;overflow-wrap:anywhere}}details{{border:1px solid #888;padding:.6rem;margin:1rem 0}}h2{{border-bottom:1px solid #888}}img{{max-width:100%;height:auto;border:1px solid #888;margin:.5rem 0}}</style></head><body><h1>{}</h1>",
-            escape(&title),
-            escape(&title)
-        ));
-    } else {
-        body.push_str(&format!("# {title}\n\n"));
-    }
+/// Append chat messages in order (no control records) to `body`.
+fn push_messages(body: &mut String, messages: &[&Value], html: bool) {
     for message in messages {
         let role = message["role"].as_str().unwrap_or("");
         let content = content_text(message);
@@ -150,6 +143,45 @@ pub fn render(title: &str, messages: &[&Value], html: bool) -> String {
                 }
             }
         }
+    }
+}
+
+/// Render the active branch. `messages` are chat messages in order (no control records).
+pub fn render(title: &str, messages: &[&Value], html: bool) -> String {
+    render_with_workers(title, messages, &[], html)
+}
+
+/// Render the active branch followed by one section per subagent transcript, in the order given.
+pub fn render_with_workers(
+    title: &str,
+    messages: &[&Value],
+    workers: &[Worker],
+    html: bool,
+) -> String {
+    let title = redact_text(title);
+    let mut body = String::new();
+    if html {
+        body.push_str(&format!(
+            "<!doctype html><html><head><meta charset=\"utf-8\"><title>{}</title><style>body{{font:16px system-ui;max-width:900px;margin:2rem auto;padding:0 1rem;line-height:1.5}}pre{{white-space:pre-wrap;overflow-wrap:anywhere}}details{{border:1px solid #888;padding:.6rem;margin:1rem 0}}h2{{border-bottom:1px solid #888}}img{{max-width:100%;height:auto;border:1px solid #888;margin:.5rem 0}}</style></head><body><h1>{}</h1>",
+            escape(&title),
+            escape(&title)
+        ));
+    } else {
+        body.push_str(&format!("# {title}\n\n"));
+    }
+    push_messages(&mut body, messages, html);
+    for worker in workers {
+        let worker_title = redact_text(&worker.title);
+        if html {
+            body.push_str(&format!(
+                "<hr><h1>Subagent: {}</h1>\n",
+                escape(&worker_title)
+            ));
+        } else {
+            body.push_str(&format!("---\n\n# Subagent: {worker_title}\n\n"));
+        }
+        let refs: Vec<&Value> = worker.messages.iter().collect();
+        push_messages(&mut body, &refs, html);
     }
     if html {
         body.push_str("</body></html>\n");

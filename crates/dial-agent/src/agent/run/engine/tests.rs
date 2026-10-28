@@ -648,3 +648,152 @@ fn shared_settlement_delivers_cause_specific_advice_without_changing_execution_f
     assert!(output.text.contains("permission_or_policy"));
     assert!(output.text.starts_with("denied by policy"));
 }
+
+#[test]
+fn first_failure_blocks_normalized_retries_but_not_corrected_calls_or_diagnostics() {
+    let mut edits = Edits::new();
+    let call = edits.call(
+        "bash",
+        serde_json::json!({"command":"cargo test", "timeout": 10}),
+    );
+    edits.settle(&call, vec![], ToolOutput::err("assertion failed"));
+    let retry = edits.call(
+        "bash",
+        serde_json::json!({"command":"cargo test", "timeout": 60, "__intent":"try again"}),
+    );
+    assert!(
+        edits
+            .engine
+            .rejection_at(&edits.workspace, &retry)
+            .is_some()
+    );
+    let corrected = edits.call(
+        "bash",
+        serde_json::json!({"command":"cargo test regression"}),
+    );
+    assert!(
+        edits
+            .engine
+            .rejection_at(&edits.workspace, &corrected)
+            .is_none()
+    );
+    let diagnostic = edits.call("read", serde_json::json!({"path":"src/main.rs"}));
+    assert!(
+        edits
+            .engine
+            .rejection_at(&edits.workspace, &diagnostic)
+            .is_none()
+    );
+    edits.neutral_progress();
+    edits.engine.evidence_compacted();
+    for reason in [
+        RecoveryTransition::AutomaticContinue,
+        RecoveryTransition::DirectedContinue,
+    ] {
+        edits.engine.transition(reason);
+        assert!(
+            edits
+                .engine
+                .rejection_at(&edits.workspace, &retry)
+                .is_some()
+        );
+    }
+    edits.commit("src.rs", "repaired source");
+    assert!(
+        edits
+            .engine
+            .rejection_at(&edits.workspace, &retry)
+            .is_none()
+    );
+}
+
+#[test]
+fn failed_calls_are_not_evicted_by_other_failures_and_new_steering_releases_them() {
+    let mut edits = Edits::new();
+    let first = edits.call(
+        "browser",
+        serde_json::json!({"action":"run", "script":"assert(false)"}),
+    );
+    edits.settle(
+        &first,
+        vec![],
+        ToolOutput::err("animation assertion failed"),
+    );
+    for index in 0..100 {
+        let call = edits.call(
+            "browser",
+            serde_json::json!({"action":"run", "script":index}),
+        );
+        edits.settle(&call, vec![], ToolOutput::err("different failure"));
+    }
+    assert!(
+        edits
+            .engine
+            .rejection_at(&edits.workspace, &first)
+            .is_some()
+    );
+    edits.engine.transition(RecoveryTransition::Steering);
+    assert!(
+        edits
+            .engine
+            .rejection_at(&edits.workspace, &first)
+            .is_none()
+    );
+}
+
+#[test]
+fn successful_background_warning_text_does_not_arm_a_failure_barrier() {
+    let mut edits = Edits::new();
+    let call = edits.call(
+        "browser",
+        serde_json::json!({"action":"evaluate", "script":"getAnimation()"}),
+    );
+    edits.settle(
+        &call,
+        vec![],
+        ToolOutput::ok("[VUE_ROUTER_R0004] No match found for /services".into()),
+    );
+    assert!(edits.engine.rejection_at(&edits.workspace, &call).is_none());
+}
+
+#[test]
+fn a_post_commit_failure_does_not_release_the_failed_operation() {
+    let mut edits = Edits::new();
+    let check = edits.call("bash", serde_json::json!({"command":"cargo test"}));
+    edits.settle(&check, vec![], ToolOutput::err("assertion failed"));
+    let edit = edits.edit_call("edit", "src.rs", "repaired source");
+    edits.write("src.rs", "repaired source");
+    edits.settle(
+        &edit,
+        vec![edits.path("src.rs")],
+        ToolOutput::err("formatter failed"),
+    );
+    assert!(
+        edits
+            .engine
+            .rejection_at(&edits.workspace, &check)
+            .is_some()
+    );
+    assert!(edits.engine.rejection_at(&edits.workspace, &edit).is_some());
+}
+
+#[test]
+fn nonexecuted_refusals_do_not_poison_an_otherwise_valid_retry() {
+    use crate::runtime::execution::ToolStatus;
+    for status in [ToolStatus::Blocked, ToolStatus::Skipped] {
+        let mut edits = Edits::new();
+        let call = edits.call("retry_probe", serde_json::json!({"fixed":false}));
+        edits.settle(
+            &call,
+            vec![],
+            ToolOutput::err("schema is available next round")
+                .with_status(status)
+                .with_effects(Effects::None),
+        );
+        assert!(
+            edits.engine.rejection_at(&edits.workspace, &call).is_none(),
+            "{status:?}"
+        );
+        assert!(edits.engine.failed_calls().is_empty());
+    }
+}

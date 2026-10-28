@@ -1,12 +1,15 @@
 //! Owner-local persistent Node code execution. The OS sandbox is the security boundary.
 use crate::config::tools::eval::EvalConfig;
 
+use super::background::AdoptedJob;
 use super::kernel::{
-    ActiveGuard, FORK_FENCE, MAX_CODE, NativeProcess, check_operation, code_output, deadline,
+    ActiveGuard, BackgroundPolicy, CellOutcome, CellScope, Deadline, FORK_FENCE, Handoff, MAX_CODE,
+    NativeProcess, PythonRuntime, busy_job, cell_label, check_operation, code_output, deadline,
     execution_deadline, guarded_operation, lock_session, native_cell, require_fork_containment,
     resolve_operator_executable, shell_quote, strip_runtime_injection,
 };
 use super::shell::shell_command;
+use crate::config::tools::kernel::KernelConfig;
 use crate::config::types::Config;
 use crate::tools::integrations::ext::{Tool, ToolCallback, ToolContext, ToolEvent};
 use crate::tools::{ToolOutput, tool_schema};
@@ -20,62 +23,91 @@ use std::sync::{
 const DRIVER: &str = include_str!("eval/driver.cjs");
 
 pub fn tools(config: &Config) -> Vec<Arc<dyn Tool>> {
-    vec![Arc::new(EvalTool::new(config.eval.clone()))]
+    vec![Arc::new(EvalTool::new(
+        config.eval.clone(),
+        config.kernel.clone(),
+    ))]
 }
 
+/// The single `eval` tool. Each cell runs in its language's persistent runtime; the namespaces are
+/// independent and never share state.
 struct EvalTool {
+    js: JsRuntime,
+    python: PythonRuntime,
+}
+impl EvalTool {
+    fn new(js: EvalConfig, python: KernelConfig) -> Self {
+        Self {
+            js: JsRuntime::new(js),
+            python: PythonRuntime::new(python),
+        }
+    }
+}
+
+/// Persistent Node.js namespace owned by one execution owner.
+struct JsRuntime {
     config: EvalConfig,
-    session: Mutex<Option<NativeProcess>>,
+    session: Arc<Mutex<Option<NativeProcess>>>,
+    busy: Arc<Mutex<Option<String>>>,
     pid: Arc<AtomicI32>,
     interrupt: AtomicBool,
     active: AtomicUsize,
 }
-impl EvalTool {
+impl JsRuntime {
     fn new(config: EvalConfig) -> Self {
         Self {
             config,
-            session: Mutex::new(None),
+            session: Arc::new(Mutex::new(None)),
+            busy: Arc::new(Mutex::new(None)),
             pid: Arc::new(AtomicI32::new(0)),
             interrupt: AtomicBool::new(false),
             active: AtomicUsize::new(0),
         }
     }
+    /// Cancels the in-flight cell and reports whether one was running. A flag left behind would
+    /// reject the next cell, so nothing is recorded when idle.
+    fn cancel(&self) -> bool {
+        if self.active.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        self.interrupt.store(true, Ordering::Release);
+        let pid = self.pid.load(Ordering::Acquire);
+        if pid > 0 {
+            let _ = crate::platform::process::kill_group(pid as u32);
+        }
+        true
+    }
+    #[allow(clippy::too_many_arguments)]
     fn run(
         &self,
         ctx: &ToolContext,
+        action: &str,
         args: &Value,
         cancel: &AtomicBool,
+        adopt: &dyn Fn(AdoptedJob) -> Result<String, String>,
         dispatch: &mut dyn FnMut(ToolCallback) -> ToolOutput,
         effect_started: &AtomicBool,
-    ) -> Result<Value, String> {
-        if args
-            .get("language")
-            .is_some_and(|language| !language.is_null() && language.as_str() != Some("js"))
-        {
-            return Err("eval language must be js; use kernel for Python".into());
-        }
-        let action = match args.get("action") {
-            None | Some(Value::Null) => "eval",
-            Some(value) => value.as_str().ok_or("action must be a string")?,
-        };
-        if action == "cancel" {
-            // Only an in-flight operation has anything to interrupt; a flag left behind would reject the next cell.
-            let cancelled = self.active.load(Ordering::Acquire) > 0;
-            if cancelled {
-                self.cancel_operation();
-            }
-            return Ok(json!({"cancelled":cancelled,"namespace_discarded":cancelled}));
-        }
-        if !matches!(action, "eval" | "reset" | "status") {
-            return Err(format!("unsupported eval action {action:?}"));
-        }
+    ) -> Result<CellOutcome, String> {
         // Counts the whole operation, including lock wait, so cancel reaches it before startup.
         let _active = ActiveGuard::new(&self.active);
-        let end = execution_deadline(deadline(args, self.config.timeout_secs)?);
+        let cell = Arc::new(Deadline::new(execution_deadline(deadline(
+            args,
+            self.config.timeout_secs,
+        )?)));
+        let end = &cell;
         let pending_cancel = self.interrupt.swap(false, Ordering::AcqRel);
         if cancel.load(Ordering::Acquire) || (pending_cancel && action == "eval") {
             return Err("JavaScript execution cancelled before startup".into());
         }
+        let policy = BackgroundPolicy::from_args(args, ctx.config.shell.auto_background_secs)?;
+        let handoff = Handoff {
+            label: cell_label(args, "js")?,
+            policy: &policy,
+            adopt,
+            session: self.session.clone(),
+            busy: self.busy.clone(),
+            pid: self.pid.clone(),
+        };
         let callback_wait = AtomicBool::new(false);
         let result = guarded_operation(
             end,
@@ -85,15 +117,24 @@ impl EvalTool {
             &callback_wait,
             || {
                 let mut slot = lock_session(&self.session, end, &self.interrupt, cancel)?;
+                if let Some(job) = busy_job(&self.busy) {
+                    if action == "status" {
+                        return Ok(CellOutcome::Value(
+                            json!({"running":true,"background":job,"language":"js",
+                                "platform":crate::tools::surface::catalog::execution_platform("eval")}),
+                        ));
+                    }
+                    return Err(format!("runtime busy in background job {job}"));
+                }
                 if action == "reset" {
                     slot.take();
-                    return Ok(json!({"reset":true}));
+                    return Ok(CellOutcome::Value(json!({"reset":true})));
                 }
                 if action == "status" {
-                    return Ok(
+                    return Ok(CellOutcome::Value(
                         json!({"running":slot.as_mut().is_some_and(NativeProcess::alive),"language":"js",
                             "platform":crate::tools::surface::catalog::execution_platform("eval")}),
-                    );
+                    ));
                 }
                 let code = args
                     .get("code")
@@ -102,6 +143,13 @@ impl EvalTool {
                 if code.len() > MAX_CODE {
                     return Err(format!("code exceeds {MAX_CODE} bytes"));
                 }
+                let scope = CellScope {
+                    workspace: ctx.workspace,
+                    end,
+                    interrupt: &self.interrupt,
+                    cancel,
+                    callback_wait: &callback_wait,
+                };
                 let result = (|| {
                     if slot.as_mut().is_some_and(|process| !process.alive()) {
                         slot.take();
@@ -139,16 +187,7 @@ impl EvalTool {
                     slot.as_mut().unwrap().prelude_language =
                         Some(crate::tools::exec::preludes::PreludeLanguage::Js);
                     effect_started.store(true, Ordering::Release);
-                    native_cell(
-                        slot.as_mut().unwrap(),
-                        ctx.workspace,
-                        code,
-                        end,
-                        &self.interrupt,
-                        cancel,
-                        &callback_wait,
-                        dispatch,
-                    )
+                    native_cell(slot.as_mut().unwrap(), &scope, code, dispatch, &handoff)
                 })();
                 if result.is_err() {
                     slot.take();
@@ -171,13 +210,15 @@ impl Tool for EvalTool {
             "eval",
             &crate::tools::surface::catalog::execution_description(
                 "eval",
-                "Persistent operator-installed Node 22+ JavaScript namespace (not browser page evaluation). action defaults to eval; reset/cancel/status manage only this execution owner's session. Real top-level await and lexical declarations persist. tool.<name>({...}), tool.call(name,args), and tool.schemas use the current controller's direct-tool authorization, approval, validation and write observers; callbacks are synchronous, and denied/malformed calls throw ToolError retaining result metadata. Returns bounded stdout/stderr/value/error; callback results retain text/data/is_error. Requires approval, macOS OS sandbox and mandatory process-fork containment, including when filesystem sandboxing is disabled. Node runtime threads are permitted; subprocess creation and native addons are denied. Timeout/cancel destroys this owner's namespace; if a controller callback is pending its approval/nested operation is also cancelled. Use kernel for Python.",
+                "Persistent per-language namespace: language js runs operator-installed Node 22+ JavaScript (not browser page evaluation); language py runs operator-installed Python 3.8+ with real top-level await. The two namespaces are independent. action defaults to eval; reset/cancel/status manage only this execution owner's session for the selected language (cancel without language cancels both). Lexical declarations and top-level bindings persist per language. Within a cell, tool.<name>(...), tool.call(name,args), and tool.schemas use the current controller's direct-tool authorization, approval, validation and observers; denied or malformed calls raise ToolError retaining result metadata. Results return bounded stdout/stderr/value/error; callback results retain text/data/is_error. Requires approval, macOS OS sandbox and mandatory process-fork containment, including when filesystem sandboxing is disabled. Subprocess creation and native addons are denied for js; py cells use the same process-creation fence and, on Windows, require explicit unsandboxed opt-in because filesystem/network isolation is unavailable. Timeout/cancel destroys the selected namespace; if a controller callback is pending its approval/nested operation is also cancelled. Host callback time is not charged to the cell timeout.",
             ),
             json!({
-                "language":{"type":"string","enum":["js"]},
+                "language":{"type":"string","enum":["js","py"],"description":"Runtime for this cell; defaults to js."},
                 "action":{"type":"string","enum":["eval","reset","cancel","status"]},
-                "code":{"type":"string","description":"JavaScript cell, at most 64 KiB UTF-8."},
-                "timeout":{"type":"integer","minimum":0,"maximum":3600}
+                "code":{"type":"string","description":"Cell source, at most 64 KiB UTF-8."},
+                "timeout":{"type":"integer","minimum":0,"maximum":3600},
+                "background":{"type":"boolean","description":"Omit for automatic handoff of a long-running cell to the background; false keeps it in the foreground; true moves it immediately."},
+                "title":{"type":"string","description":"Label for a backgrounded cell in the background job list."}
             }),
             &[],
         )
@@ -189,22 +230,24 @@ impl Tool for EvalTool {
         true
     }
     fn fork_session(&self) -> Option<Arc<dyn Tool>> {
-        Some(Arc::new(Self::new(self.config.clone())))
+        Some(Arc::new(Self {
+            js: JsRuntime::new(self.js.config.clone()),
+            python: self.python.fork(),
+        }))
     }
     fn cancel_operation(&self) {
-        if self.active.load(Ordering::Acquire) == 0 {
-            return;
-        }
-        self.interrupt.store(true, Ordering::Release);
-        let pid = self.pid.load(Ordering::Acquire);
-        if pid > 0 {
-            let _ = crate::platform::process::kill_group(pid as u32);
-        }
+        self.js.cancel();
+        self.python.cancel();
     }
     fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
-        self.call_with_dispatch(ctx, args, &|_| {}, &AtomicBool::new(false), &mut |_| {
-            ToolOutput::err("tool callbacks require an execution controller")
-        })
+        self.call_with_dispatch(
+            ctx,
+            args,
+            &|_| {},
+            &AtomicBool::new(false),
+            &no_background,
+            &mut |_| ToolOutput::err("tool callbacks require an execution controller"),
+        )
     }
     fn call_streaming(
         &self,
@@ -213,7 +256,7 @@ impl Tool for EvalTool {
         on_event: &(dyn Fn(ToolEvent) + Sync),
         cancel: &AtomicBool,
     ) -> ToolOutput {
-        self.call_with_dispatch(ctx, args, on_event, cancel, &mut |_| {
+        self.call_with_dispatch(ctx, args, on_event, cancel, &no_background, &mut |_| {
             ToolOutput::err("tool callbacks require an execution controller")
         })
     }
@@ -223,16 +266,84 @@ impl Tool for EvalTool {
         args: &Value,
         _on_event: &(dyn Fn(ToolEvent) + Sync),
         cancel: &AtomicBool,
+        adopt: &dyn Fn(AdoptedJob) -> Result<String, String>,
         dispatch: &mut dyn FnMut(ToolCallback) -> ToolOutput,
     ) -> ToolOutput {
         let started = AtomicBool::new(false);
-        let result = self.run(ctx, args, cancel, dispatch, &started);
+        let result = self.run(ctx, args, cancel, adopt, dispatch, &started);
         let uncertain = result.is_err() && started.load(Ordering::Acquire);
-        let output = code_output(result);
-        if uncertain {
-            output.with_effects(crate::tools::surface::outcome::Effects::Unknown)
-        } else {
-            output
+        match result {
+            Ok(CellOutcome::Value(value)) => code_output(Ok(value)),
+            Ok(CellOutcome::Moved(job)) => ToolOutput::ok(format!(
+                "eval cell moved to the background as job {job}; this runtime stays busy until it finishes. Use the bg tool to read its output, wait for it, or kill it."
+            ))
+            .with_effects(crate::tools::surface::outcome::Effects::Unknown),
+            Err(error) => {
+                let output = code_output(Err(error));
+                if uncertain {
+                    output.with_effects(crate::tools::surface::outcome::Effects::Unknown)
+                } else {
+                    output
+                }
+            }
+        }
+    }
+}
+
+/// Adopter for callers without a background owner; the cell then stays in the foreground.
+fn no_background(_job: AdoptedJob) -> Result<String, String> {
+    Err("eval cells cannot move to the background without an execution controller".into())
+}
+impl EvalTool {
+    fn run(
+        &self,
+        ctx: &ToolContext,
+        args: &Value,
+        cancel: &AtomicBool,
+        adopt: &dyn Fn(AdoptedJob) -> Result<String, String>,
+        dispatch: &mut dyn FnMut(ToolCallback) -> ToolOutput,
+        effect_started: &AtomicBool,
+    ) -> Result<CellOutcome, String> {
+        let action = match args.get("action") {
+            None | Some(Value::Null) => "eval",
+            Some(value) => value.as_str().ok_or("action must be a string")?,
+        };
+        if !matches!(action, "eval" | "reset" | "status" | "cancel") {
+            return Err(format!("unsupported eval action {action:?}"));
+        }
+        let language = match args.get("language") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(value.as_str().ok_or("language must be a string")?),
+        };
+        if action == "cancel" {
+            // Without a language, cancel reaches both namespaces.
+            let (js, python) = match language {
+                None => (true, true),
+                Some("js") => (true, false),
+                Some("py") => (false, true),
+                Some(other) => {
+                    return Err(format!("unsupported eval language {other:?}; use js or py"));
+                }
+            };
+            let mut cancelled = false;
+            if js {
+                cancelled |= self.js.cancel();
+            }
+            if python {
+                cancelled |= self.python.cancel();
+            }
+            return Ok(CellOutcome::Value(
+                json!({"cancelled":cancelled,"namespace_discarded":cancelled}),
+            ));
+        }
+        match language.unwrap_or("js") {
+            "js" => self
+                .js
+                .run(ctx, action, args, cancel, adopt, dispatch, effect_started),
+            "py" => self
+                .python
+                .run(ctx, action, args, cancel, adopt, dispatch, effect_started),
+            other => Err(format!("unsupported eval language {other:?}; use js or py")),
         }
     }
 }

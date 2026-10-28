@@ -20,6 +20,11 @@ use std::{
 use crate::config::paths::Layout;
 use crate::runtime::arguments::split_words;
 
+mod imports;
+mod sources;
+
+pub(in crate::agent) use sources::copilot_instruction_dirs;
+
 const FILE_CAP: usize = 32 * 1024;
 const TOTAL_CAP: usize = 128 * 1024;
 const MAX_WALK_LEVELS: usize = 8;
@@ -98,30 +103,77 @@ pub(in crate::agent) fn walk_dirs<'a>(root: &'a Path, home: Option<&Path>) -> Ve
 // ---------------------------------------------------------------- ambient context
 
 /// Project instruction files from the directory tree around the project plus user-level
-/// `AGENTS.md`, outermost first. See [`discover_with_foreign`].
+/// `AGENTS.md` (or an opted-in foreign user file), outermost first. See [`discover_with`].
 /// Portable GitHub/Cursor/native rules are selected separately by `rules::Catalog` at request
 /// and pre-tool boundaries. Never concatenate their path/agent-scoped bodies into ambient context.
 /// `overlap_dedup` mirrors `experimental.context_overlap_dedup`: when set, paragraphs repeated in a
 /// later file are also removed from earlier files (see [`dedupe_overlapping_paragraphs`]).
+/// `extra_names` mirrors `context_files.extra`: extra file names read beside every walked directory.
 pub fn discover(
     layout: &Layout,
     overlap_dedup: bool,
     foreign_sources: &[String],
+    extra_names: &[String],
 ) -> Vec<ContextFile> {
+    let home = home_dir();
     let foreign: Vec<&str> = foreign_sources.iter().map(String::as_str).collect();
-    discover_with_foreign(layout, home_dir().as_deref(), overlap_dedup, &foreign)
+    let copilot = sources::copilot_instruction_dirs(&layout.project_root, home.as_deref());
+    discover_with(
+        layout,
+        home.as_deref(),
+        overlap_dedup,
+        &Sources {
+            foreign_user: &foreign,
+            extra_names,
+            copilot_dirs: &copilot,
+        },
+    )
 }
 
-const PER_DIR_FILES: [&str; 4] = ["AGENTS.md", "CLAUDE.md", ".cursorrules", ".dial/AGENTS.md"];
+const PER_DIR_FILES: [&str; 5] = [
+    "AGENTS.md",
+    "AGENTS.local.md",
+    "CLAUDE.md",
+    ".cursorrules",
+    ".dial/AGENTS.md",
+];
 
-/// Read only from the working directory; ancestor directories are not consulted.
-const ROOT_ONLY_FILES: [&str; 1] = [".gemini/GEMINI.md"];
+/// Read only from the working directory; ancestor directories are not consulted. The first file
+/// that loads wins, so `GEMINI.md` is the fallback when `.gemini/GEMINI.md` is missing or empty.
+const ROOT_ONLY_FILES: [&str; 2] = [".gemini/GEMINI.md", "GEMINI.md"];
 
-/// Foreign user-level instruction files, highest precedence first (priorities: codex 70, gemini 60).
-const FOREIGN_USER_FILES: [(&str, &str); 2] = [
+/// Foreign user-level instruction files, highest precedence first (priorities: codex 70, gemini 60,
+/// opencode 50).
+const FOREIGN_USER_FILES: [(&str, &str); 3] = [
     ("codex", ".codex/AGENTS.md"),
     ("gemini", ".gemini/GEMINI.md"),
+    ("opencode", ".config/opencode/AGENTS.md"),
 ];
+
+/// Sources beyond the walked tree: opted-in foreign user providers, extra file names and the
+/// Copilot instruction directories.
+struct Sources<'a> {
+    foreign_user: &'a [&'a str],
+    extra_names: &'a [String],
+    copilot_dirs: &'a [PathBuf],
+}
+
+/// Extra names from `context_files.extra` that are safe to read as plain files beside each walked
+/// directory: no path separators, not `.`/`..`, and not a built-in name already read.
+fn extra_names(configured: &[String]) -> Vec<&str> {
+    let mut names: Vec<&str> = Vec::new();
+    for name in configured.iter().map(String::as_str) {
+        let plain = !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\']);
+        if plain
+            && !PER_DIR_FILES.contains(&name)
+            && !ROOT_ONLY_FILES.contains(&name)
+            && !names.contains(&name)
+        {
+            names.push(name);
+        }
+    }
+    names
+}
 
 /// The walk starts at the project root and climbs to the nearest directory containing `.git`. With no
 /// git root it climbs to `home` when the project lives under it, and otherwise stays in the project
@@ -137,68 +189,124 @@ fn discover_with_home(
     discover_with_foreign(layout, home, overlap_dedup, &[])
 }
 
-/// Same walk as [`discover_with_home`]. `foreign_user` lists opted-in foreign providers (`codex`,
-/// `gemini`) whose user-level files may stand in for the user `AGENTS.md`. Unknown names match no
-/// provider and are ignored. Production passes `config.foreign_sources`; every foreign user provider
-/// is off unless listed there.
+/// Same walk as [`discover_with_home`] with an explicit foreign-provider list. `foreign_user` lists
+/// opted-in foreign providers (`codex`, `gemini`, `opencode`) whose user-level files may stand in
+/// for the user `AGENTS.md`. Unknown names match no provider and are ignored.
+#[cfg(test)]
 fn discover_with_foreign(
     layout: &Layout,
     home: Option<&Path>,
     overlap_dedup: bool,
     foreign_user: &[&str],
 ) -> Vec<ContextFile> {
+    discover_with(
+        layout,
+        home,
+        overlap_dedup,
+        &Sources {
+            foreign_user,
+            extra_names: &[],
+            copilot_dirs: &[],
+        },
+    )
+}
+
+fn discover_with(
+    layout: &Layout,
+    home: Option<&Path>,
+    overlap_dedup: bool,
+    sources: &Sources,
+) -> Vec<ContextFile> {
     let root = layout.project_root.as_path();
     let dirs = walk_dirs(root, home);
     let boundary = dirs.last().copied().unwrap_or(root);
+    let per_dir: Vec<&str> = PER_DIR_FILES
+        .into_iter()
+        .chain(extra_names(sources.extra_names))
+        .collect();
 
     let mut budget = TOTAL_CAP;
     let mut seen: HashSet<String> = HashSet::new();
-    let mut groups: Vec<Vec<ContextFile>> = Vec::new();
-    for dir in &dirs {
-        let mut group = Vec::new();
-        for name in PER_DIR_FILES {
-            if let Some(file) = load_walked(
-                &dir.join(name),
+    let mut groups: Vec<Vec<ContextFile>> = dirs
+        .iter()
+        .map(|dir| {
+            load_dir(
+                dir,
+                &per_dir,
                 boundary,
                 layout,
                 home,
                 &mut budget,
                 &mut seen,
-            ) {
-                group.push(file);
-            }
-        }
-        groups.push(group);
-    }
+            )
+        })
+        .collect();
     // `dirs` starts at the project root, so the first group belongs to the working directory.
-    for name in ROOT_ONLY_FILES {
-        if let (Some(file), Some(group)) = (
-            load_walked(
-                &root.join(name),
-                boundary,
-                layout,
-                home,
-                &mut budget,
-                &mut seen,
-            ),
-            groups.first_mut(),
-        ) {
-            group.push(file);
-        }
-    }
-    let user_path = layout.user_dir.join("AGENTS.md");
-    let user = if user_path.exists() {
-        load_context_file(
-            &user_path,
-            format!("{} (user)", display_for(layout, home, &user_path)),
+    let root_only = ROOT_ONLY_FILES.iter().find_map(|name| {
+        load_walked(
+            &root.join(name),
+            boundary,
+            layout,
+            home,
             &mut budget,
             &mut seen,
         )
+    });
+    let opencode: Vec<ContextFile> = sources::opencode_instructions(root)
+        .iter()
+        .filter_map(|entry| {
+            load_walked(
+                &root.join(entry),
+                root,
+                layout,
+                home,
+                &mut budget,
+                &mut seen,
+            )
+        })
+        .collect();
+    if let Some(group) = groups.first_mut() {
+        group.extend(root_only);
+        group.extend(opencode);
+    }
+    let primary = sources::primary_checkout(root)
+        .map(|primary| {
+            load_dir(
+                &primary,
+                &per_dir,
+                &primary,
+                layout,
+                home,
+                &mut budget,
+                &mut seen,
+            )
+        })
+        .unwrap_or_default();
+    let user_path = layout.user_dir.join("AGENTS.md");
+    let user = if user_path.exists() {
+        let imports = user_import_scope(layout, home, &[layout.user_dir.as_path()]);
+        let display = format!("{} (user)", display_for(layout, home, &user_path));
+        load_context_file(&user_path, display, &imports, &mut budget, &mut seen)
     } else {
-        foreign_user_file(layout, home, foreign_user, &mut budget, &mut seen)
+        foreign_user_file(layout, home, sources.foreign_user, &mut budget, &mut seen)
     };
+    let mut copilot = Vec::new();
+    for dir in sources.copilot_dirs {
+        let path = dir.join("AGENTS.md");
+        let imports = user_import_scope(layout, home, &[dir.as_path()]);
+        let display = format!("{} (copilot)", display_for(layout, home, &path));
+        copilot.extend(load_context_file(
+            &path,
+            display,
+            &imports,
+            &mut budget,
+            &mut seen,
+        ));
+    }
 
     let mut out: Vec<ContextFile> = user.into_iter().collect();
+    out.extend(copilot);
+    out.extend(primary);
     out.extend(groups.into_iter().rev().flatten());
     let out = dedupe_contained_context(out);
     if overlap_dedup {
@@ -206,6 +314,55 @@ fn discover_with_foreign(
     } else {
         out
     }
+}
+
+/// Loads the named files found directly in `dir`, in order.
+fn load_dir(
+    dir: &Path,
+    names: &[&str],
+    boundary: &Path,
+    layout: &Layout,
+    home: Option<&Path>,
+    budget: &mut usize,
+    seen: &mut HashSet<String>,
+) -> Vec<ContextFile> {
+    names
+        .iter()
+        .filter_map(|name| load_walked(&dir.join(name), boundary, layout, home, budget, seen))
+        .collect()
+}
+
+/// What `@` imports in an instruction file may resolve to: `roots` (canonical) bound every target;
+/// `layout`/`home` render each import's provenance and resolve `~/`.
+pub(super) struct Imports<'a> {
+    layout: &'a Layout,
+    home: Option<&'a Path>,
+    roots: Vec<PathBuf>,
+}
+
+fn import_scope<'a>(layout: &'a Layout, home: Option<&'a Path>, roots: &[&Path]) -> Imports<'a> {
+    let roots = roots
+        .iter()
+        .copied()
+        .filter_map(|root| fs::canonicalize(root).ok())
+        .collect();
+    Imports {
+        layout,
+        home,
+        roots,
+    }
+}
+
+/// User-level instruction files (the user dir, copilot dirs, foreign user memory) may also import
+/// from the home directory; project files never may.
+fn user_import_scope<'a>(
+    layout: &'a Layout,
+    home: Option<&'a Path>,
+    roots: &[&Path],
+) -> Imports<'a> {
+    let mut all: Vec<&Path> = roots.to_vec();
+    all.extend(home);
+    import_scope(layout, home, &all)
 }
 
 /// Keep precedence order and original text; only remove an earlier file when its
@@ -279,11 +436,16 @@ fn dedupe_overlapping_paragraphs(files: Vec<ContextFile>) -> Vec<ContextFile> {
 fn load_context_file(
     path: &Path,
     display: String,
+    imports: &Imports,
     budget: &mut usize,
     seen: &mut HashSet<String>,
 ) -> Option<ContextFile> {
-    let (mut content, cut) = read_text(path, FILE_CAP)?;
-    if content.trim().is_empty() || *budget == 0 || !seen.insert(content.clone()) {
+    let (raw, cut) = read_text(path, FILE_CAP)?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    let mut content = imports::expand(&raw, path, imports);
+    if *budget == 0 || !seen.insert(content.clone()) {
         return None;
     }
     let mut cut = cut;
@@ -320,7 +482,14 @@ fn load_walked(
         Ok(real) if real.starts_with(boundary) => {}
         _ => return None,
     }
-    load_context_file(path, display_for(layout, home, path), budget, seen)
+    let imports = import_scope(layout, home, &[boundary]);
+    load_context_file(
+        path,
+        display_for(layout, home, path),
+        &imports,
+        budget,
+        seen,
+    )
 }
 
 /// The user instructions from the first listed, opted-in foreign provider file that exists. Like
@@ -345,7 +514,8 @@ fn foreign_user_file(
             _ => continue,
         }
         let display = format!("{} (user)", display_for(layout, Some(home), &path));
-        return load_context_file(&path, display, budget, seen);
+        let imports = user_import_scope(layout, Some(home), &[]);
+        return load_context_file(&path, display, &imports, budget, seen);
     }
     None
 }

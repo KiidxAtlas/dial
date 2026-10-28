@@ -149,6 +149,15 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         Kind::Table,
     ),
     field!(
+        "context_files.extra",
+        context_files.extra,
+        TO,
+        "Context",
+        "Extra context files",
+        "Extra plain file names (no path separators) read beside each project AGENTS.md, for example .rules.md. Reserved built-in names such as AGENTS.md are rejected.",
+        Kind::StringList,
+    ),
+    field!(
         "edit.fuzzy_match",
         edit.fuzzy_match,
         TO,

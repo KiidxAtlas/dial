@@ -8,6 +8,7 @@
 use super::Patience;
 use super::connect::{Enc, FLAG_COMPRESSED, FLAG_END_STREAM, Fields, Frames, frame, gunzip, gzip};
 use super::errors::{Classified, ErrorClass};
+use super::identity::{Axis, Family, Identity};
 use super::model_config::native_replay_scope;
 use super::profiles::ModelProfile;
 use super::transports::{OnText, Route};
@@ -448,8 +449,10 @@ fn chat_request(
     chat_model_uid: &str,
     assignment_jwt: Option<&str>,
 ) -> Result<Enc> {
-    let gemini = route_model.to_ascii_lowercase().contains("gemini")
-        || chat_model_uid.starts_with("MODEL_GOOGLE_GEMINI_");
+    let gemini = Identity::new(route_model)
+        .with_uid(chat_model_uid)
+        .family(Axis::DevinPayload)
+        == Some(Family::Gemini);
     let (system, prompts) = build_prompts(&req.messages, cascade, scope)?;
     let mut request = Enc::default();
     request.message(1, &metadata(&session.api_key, &session.user_jwt));

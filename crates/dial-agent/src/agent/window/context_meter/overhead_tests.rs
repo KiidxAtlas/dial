@@ -1,4 +1,5 @@
 use super::*;
+use crate::llm::wire::wire_message_bytes;
 use serde_json::json;
 #[test]
 fn categories_are_disjoint_and_preserve_the_total_estimate() {

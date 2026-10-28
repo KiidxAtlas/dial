@@ -81,6 +81,12 @@ pub(super) enum Job {
     },
     /// In-memory document; the bytes travel as the payload after the JSON header.
     Convert { format: String },
+    /// Archive held in memory (URL downloads); bytes travel as the payload, `name` picks the tar codec.
+    ArchiveBytes {
+        format: String,
+        name: String,
+        member: Option<String>,
+    },
     #[cfg(test)]
     Probe { action: String },
 }
@@ -373,6 +379,11 @@ fn execute(job: &Job, payload: &[u8]) -> Result<String, String> {
                 .map_err(|e| format!("rewinding parser input: {e}"))?;
             super::convert_stream(file, format)
         }
+        Job::ArchiveBytes {
+            format,
+            name,
+            member,
+        } => super::archives::read_bytes(format, name, payload, member.as_deref()),
         #[cfg(test)]
         Job::Probe { action } => probe(action),
     }

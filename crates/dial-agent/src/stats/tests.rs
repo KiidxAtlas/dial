@@ -478,3 +478,66 @@ fn legacy_tools_gain_typed_facts_without_rewriting_old_rows() {
         .unwrap();
     assert_eq!(historical, 0, "historical facts remain unknown");
 }
+
+#[test]
+fn models_group_requests_by_model_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Db::open_default(dir.path()).unwrap();
+    db.record_request(&request(1_000, "m-a", 100, 10, 0, None, 5))
+        .unwrap();
+    db.record_request(&request(2_000, "m-a", 50, 5, 0, None, 5))
+        .unwrap();
+    db.record_request(&request(3_000, "m-b", 1, 1, 0, None, 5))
+        .unwrap();
+    let mut counts: Vec<(String, u64)> = db
+        .models(None)
+        .unwrap()
+        .iter()
+        .map(|m| (m.key.clone(), m.totals.requests))
+        .collect();
+    counts.sort_unstable();
+    assert_eq!(counts, vec![("m-a".to_owned(), 2), ("m-b".to_owned(), 1)]);
+}
+
+#[test]
+fn tools_carry_their_outcome_statuses() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Db::open_default(dir.path()).unwrap();
+    for status in [
+        Some(crate::tools::ToolStatus::Blocked),
+        Some(crate::tools::ToolStatus::Timeout),
+    ] {
+        db.record_tool(&ToolRecord {
+            status,
+            ts_ms: 4_000,
+            tool: "bash".into(),
+            session: "s1".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    }
+    let tools = db.tools(None).unwrap();
+    let bash = tools.iter().find(|t| t.tool == "bash").unwrap();
+    assert_eq!(bash.calls, 2);
+    let mut outcomes: Vec<&str> = bash.outcomes.iter().map(|o| o.name.as_str()).collect();
+    outcomes.sort_unstable();
+    assert_eq!(outcomes, vec!["blocked", "timeout"]);
+}
+
+#[test]
+fn transcript_reader_skips_oversized_lines_and_keeps_the_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("t.jsonl");
+    let huge = "x".repeat(MAX_LINE + 10);
+    fs::write(
+        &file,
+        format!("{{\"type\":\"a\"}}\n{huge}\n{{\"type\":\"b\"}}\n"),
+    )
+    .unwrap();
+    let mut kinds = Vec::new();
+    for_each_record(&file, |value| {
+        kinds.push(value["type"].as_str().unwrap_or_default().to_owned());
+    })
+    .unwrap();
+    assert_eq!(kinds, vec!["a".to_owned(), "b".to_owned()]);
+}

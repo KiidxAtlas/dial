@@ -145,13 +145,8 @@ pub fn relocate(source: &Path, destination: &Path) -> std::io::Result<()> {
 /// silently overwrites on Unix, so a file created after the caller's check would be lost. A hard
 /// link fails atomically when the name exists and keeps the inode an open writer appends to.
 /// Filesystems without hard links fall back to a checked rename.
-fn publish_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
-    let exists = || {
-        std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "stream archive destination exists",
-        )
-    };
+pub fn publish_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    let exists = || std::io::Error::new(std::io::ErrorKind::AlreadyExists, "destination exists");
     match std::fs::hard_link(source, destination) {
         Ok(()) => std::fs::remove_file(source).inspect_err(|_| {
             // Leave the journal under its original name only.
@@ -476,6 +471,18 @@ fn skip_row(reader: &mut impl BufRead) -> std::io::Result<bool> {
 
 pub fn recover(session: &Path) -> anyhow::Result<Vec<Node>> {
     scan(session).map(|(nodes, _)| nodes)
+}
+
+/// Like `recover`, but refuses a journal with an oversized row instead of dropping it silently.
+/// Forks copy a supplement, so a partial read must not pass as the branch's complete history.
+pub fn recover_complete(session: &Path) -> anyhow::Result<Vec<Node>> {
+    let (nodes, complete) = scan(session)?;
+    anyhow::ensure!(
+        complete,
+        "stream journal {} has an oversized row; refusing to copy a partial supplement",
+        path(session).display()
+    );
+    Ok(nodes)
 }
 
 #[cfg(test)]

@@ -92,6 +92,9 @@
     "gitlab-duo": {
       "protocol": "gitlab-duo"
     },
+    "gitlab-duo-agent": {
+      "protocol": "gitlab-duo-agent"
+    },
     "factory-droid": {
       "protocol": "factory-droid"
     }

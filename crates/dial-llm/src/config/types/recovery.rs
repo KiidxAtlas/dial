@@ -62,6 +62,8 @@ pub struct RetryConfig {
     pub fallback_chains: std::collections::BTreeMap<String, Vec<String>>,
     /// Which terminal failures move a request on to its fallback chain.
     pub fallback_on: FallbackOn,
+    /// When a session returns to its configured primary after failing over to a fallback.
+    pub fallback_revert: FallbackRevert,
 }
 
 /// Failure classes that trigger `[retry.fallback_chains]` (`retry.fallback_on`).
@@ -76,6 +78,17 @@ pub enum FallbackOn {
     /// Transient failures and rejected credentials, never usage limits.
     ExceptUsageLimit,
 }
+
+/// When a session returns to its configured primary after it failed over to a fallback model.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FallbackRevert {
+    /// Return to the primary at the first request boundary after the fallback's cooldown elapses.
+    #[default]
+    CooldownExpiry,
+    /// Stay on the fallback until the user switches models.
+    Never,
+}
 impl Default for RetryConfig {
     fn default() -> Self {
         Self {
@@ -85,6 +98,7 @@ impl Default for RetryConfig {
             rotate_accounts: true,
             fallback_chains: std::collections::BTreeMap::new(),
             fallback_on: FallbackOn::default(),
+            fallback_revert: FallbackRevert::default(),
         }
     }
 }

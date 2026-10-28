@@ -19,9 +19,16 @@ use std::{
 };
 
 mod actor;
-pub const PROTOCOL_VERSION: u32 = 1;
+mod auth;
+mod host_tools;
+mod host_uris;
+/// Latest control protocol version this build speaks. A connection starts at
+/// `DEFAULT_PROTOCOL_VERSION` and moves up only when the client sends `hello`.
+pub const PROTOCOL_VERSION: u32 = 2;
+/// Version of connections that never send `hello`; keeps existing clients unchanged.
+const DEFAULT_PROTOCOL_VERSION: u32 = 1;
 /// Protocol versions this build serves, announced in `ready` so clients can negotiate.
-const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[PROTOCOL_VERSION];
+const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[DEFAULT_PROTOCOL_VERSION, PROTOCOL_VERSION];
 const MAX_REQUEST: usize = 1024 * 1024;
 /// ACP clients may send larger frames (embedded resources and images).
 const MAX_ACP_REQUEST: usize = 8 * MAX_REQUEST;
@@ -39,11 +46,26 @@ const TOOL_RESULT_EVENT_BYTES: usize = 24 * 1024;
 /// frame derives its method and capability lists from this table, `docs/rpc-schema.json` is
 /// tested against it, and a source scan test keeps it equal to the methods the dispatchers match.
 const METHODS: &[(&str, &str)] = &[
+    ("hello", "query"),
     ("send", "prompt"),
     ("state", "query"),
     ("messages", "query"),
     ("messages_page", "query"),
     ("plan", "plan_mode"),
+    ("set_model", "model"),
+    ("set_thinking", "model"),
+    ("get_session_stats", "query"),
+    ("get_available_commands", "query"),
+    ("export", "export"),
+    ("set_host_tools", "host_tools"),
+    ("host_tool_result", "host_tools"),
+    ("set_host_uri_schemes", "host_uris"),
+    ("host_uri_result", "host_uris"),
+    ("auth_providers", "auth"),
+    ("login", "auth"),
+    ("auth_code", "auth"),
+    ("auth_cancel", "auth"),
+    ("logout", "auth"),
     ("new_session", "sessions"),
     ("resume", "sessions"),
     ("rename", "sessions"),
@@ -71,9 +93,14 @@ fn request_limit(acp: bool) -> usize {
     if acp { MAX_ACP_REQUEST } else { MAX_REQUEST }
 }
 
-/// Capabilities a transport lacks: ACP has no custom question input and no live voice.
+/// Capabilities a transport lacks: ACP has no custom question input, no live voice, no host tool or
+/// host URI bridge, and no provider sign-in (these are native `dial rpc` capabilities).
 fn capability_available(capability: &str, acp: bool) -> bool {
-    !(acp && matches!(capability, "questions" | "live_voice"))
+    !(acp
+        && matches!(
+            capability,
+            "questions" | "live_voice" | "host_tools" | "host_uris" | "auth"
+        ))
 }
 
 /// The first event of every connection: identity, negotiation data and the limits the reader and
@@ -103,7 +130,7 @@ pub(crate) fn ready_frame(
     };
     json!({
         "event":"ready",
-        "protocol_version":PROTOCOL_VERSION,
+        "protocol_version":DEFAULT_PROTOCOL_VERSION,
         "supported_protocol_versions":SUPPORTED_PROTOCOL_VERSIONS,
         "session_id":session_id,
         "model":model,
@@ -126,6 +153,38 @@ pub(crate) fn ready_frame(
 }
 struct Output {
     acp: Option<crate::acp::Adapter>,
+    /// Negotiated protocol version; `DEFAULT_PROTOCOL_VERSION` until the client sends `hello`.
+    protocol: u32,
+}
+/// A request failure with a stable machine code. Protocol 2 clients receive the code next to the
+/// message; protocol 1 clients receive the message alone.
+#[derive(Debug)]
+pub(super) struct RequestError {
+    pub(super) code: &'static str,
+    pub(super) message: String,
+}
+impl std::fmt::Display for RequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for RequestError {}
+/// Highest served protocol version the client can speak. A client that asks for a version older
+/// than every served one gets a coded error listing what this build serves.
+fn negotiated_version(requested: u64) -> Result<u32> {
+    SUPPORTED_PROTOCOL_VERSIONS
+        .iter()
+        .copied()
+        .filter(|version| u64::from(*version) <= requested)
+        .max()
+        .ok_or_else(|| {
+            anyhow::Error::new(RequestError {
+                code: "unsupported_protocol_version",
+                message: format!(
+                    "protocol_version {requested} is not supported; supported: {SUPPORTED_PROTOCOL_VERSIONS:?}"
+                ),
+            })
+        })
 }
 enum Batch {
     Single(Value),
@@ -226,9 +285,25 @@ impl Sender {
         }
         result
     }
+    /// Negotiated protocol version of this connection.
+    fn protocol(&self) -> u32 {
+        self.mapping()
+            .map_or(DEFAULT_PROTOCOL_VERSION, |output| output.protocol)
+    }
+    fn negotiate(&self, version: u32) -> Result<()> {
+        self.mapping()?.protocol = version;
+        Ok(())
+    }
     fn result(&self, id: &Value, result: Result<Value>) {
+        let v2 = self.protocol() >= 2;
         self.emit(match result {
             Ok(v) => json!({"id":id,"result":v}),
+            Err(e) if v2 => {
+                let code = e
+                    .downcast_ref::<RequestError>()
+                    .map_or("failed", |error| error.code);
+                json!({"id":id,"error":{"code":code,"message":format!("{e:#}")}})
+            }
             Err(e) => json!({"id":id,"error":{"message":format!("{e:#}")}}),
         });
     }
@@ -417,9 +492,9 @@ impl Ui for RpcUi {
     fn efficiency(&mut self, report: &Value) {
         self.out.emit(json!({"event":"efficiency","report":report}));
     }
-    fn tool_timing(&mut self, name: &str, seconds: f64) {
+    fn tool_timing(&mut self, call_id: &str, name: &str, seconds: f64) {
         self.out
-            .emit(json!({"event":"tool_timing","name":name,"seconds":seconds}));
+            .emit(json!({"event":"tool_timing","call_id":call_id,"name":name,"seconds":seconds}));
     }
     fn tool_output(&mut self, name: &str, text: &str) {
         self.out
@@ -862,6 +937,7 @@ fn run_control(
     let out = Sender {
         output: Arc::new(Mutex::new(Output {
             acp: acp.then(|| crate::acp::Adapter::new(layout.clone())),
+            protocol: DEFAULT_PROTOCOL_VERSION,
         })),
         writer,
         failed: Arc::new(AtomicBool::new(false)),
@@ -875,6 +951,12 @@ fn run_control(
     let (approval_tx, approval_rx) = mpsc::channel();
     let pending_approval = Arc::new(Mutex::new(None::<String>));
     let worker_pending = pending_approval.clone();
+    let host_bridge = Arc::new(host_tools::HostBridge::default());
+    let worker_host = host_bridge.clone();
+    let uris = Arc::new(host_uris::HostUris::default());
+    let worker_uris = uris.clone();
+    let auth_state = Arc::new(auth::AuthState::default());
+    let auth_dir = layout.user_dir.clone();
     let (question_tx, question_rx) = mpsc::channel();
     let pending_question = Arc::new(Mutex::new(None::<PendingQuestion>));
     let worker_questions = pending_question.clone();
@@ -908,6 +990,8 @@ fn run_control(
         worker_closing,
         worker_prompt_queued,
         worker_pending,
+        worker_host,
+        worker_uris,
         worker_questions,
         worker_disconnected,
         worker_query_cache,
@@ -1171,6 +1255,83 @@ fn run_control(
                         *pending = None;
                         approval_tx.send((approval_id.to_owned(), decision))?;
                         Ok(json!({"received":true}))
+                    })();
+                    out.result(&id, result);
+                }
+                "auth_providers" => {
+                    let result = (|| -> Result<Value> {
+                        auth::ensure_v2(&out)?;
+                        Ok(auth::providers(&auth_dir))
+                    })();
+                    out.result(&id, result);
+                }
+                "login" => {
+                    let result = auth::ensure_v2(&out).and_then(|()| {
+                        auth::start_login(&auth_state, &out, &auth_dir, &id, &request["params"])
+                    });
+                    if let Err(error) = result {
+                        out.result(&id, Err(error));
+                    }
+                }
+                "auth_code" => {
+                    let result = (|| -> Result<Value> {
+                        auth::ensure_v2(&out)?;
+                        auth::submit_code(&auth_state, &request["params"])
+                    })();
+                    out.result(&id, result);
+                }
+                "auth_cancel" => {
+                    let result = (|| -> Result<Value> {
+                        auth::ensure_v2(&out)?;
+                        auth::cancel_login(&auth_state, &request["params"])
+                    })();
+                    out.result(&id, result);
+                }
+                "logout" => {
+                    let result = (|| -> Result<Value> {
+                        auth::ensure_v2(&out)?;
+                        auth::logout(&auth_state, &auth_dir, &request["params"])
+                    })();
+                    out.result(&id, result);
+                }
+                "host_uri_result" => {
+                    let result = (|| -> Result<Value> {
+                        let call_id = request["params"]["call_id"]
+                            .as_str()
+                            .context("call_id required")?;
+                        let output = request["params"]["output"]
+                            .as_str()
+                            .context("output must be a string")?;
+                        let is_error = request["params"]["is_error"].as_bool().unwrap_or(false);
+                        uris.complete(call_id, output.to_owned(), is_error)?;
+                        Ok(json!({"received":true}))
+                    })();
+                    out.result(&id, result);
+                }
+                "host_tool_result" => {
+                    let result = (|| -> Result<Value> {
+                        let call_id = request["params"]["call_id"]
+                            .as_str()
+                            .context("call_id required")?;
+                        let output = request["params"]["output"]
+                            .as_str()
+                            .context("output must be a string")?;
+                        let is_error = request["params"]["is_error"].as_bool().unwrap_or(false);
+                        host_bridge.complete(call_id, output.to_owned(), is_error)?;
+                        Ok(json!({"received":true}))
+                    })();
+                    out.result(&id, result);
+                }
+                "hello" => {
+                    let result = (|| -> Result<Value> {
+                        let requested = request["params"]["protocol_version"]
+                            .as_u64()
+                            .context("protocol_version required")?;
+                        let version = negotiated_version(requested)?;
+                        out.negotiate(version)?;
+                        Ok(
+                            json!({"protocol_version":version,"supported_protocol_versions":SUPPORTED_PROTOCOL_VERSIONS}),
+                        )
                     })();
                     out.result(&id, result);
                 }

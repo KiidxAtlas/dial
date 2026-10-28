@@ -716,6 +716,9 @@ fn a_new_kind_of_block_ends_the_streaming_one() {
         "the pending tool blocks only itself: {mid}"
     );
     t.tool_end("1", "x", false, 0.1);
+    // A settled lookup waits for what follows it, which may be another lookup to group with.
+    assert!(!text_of(&t.take_settled(40, &ctx)).contains("Read"));
+    t.finish_turn();
     assert!(text_of(&t.take_settled(40, &ctx)).contains("Read"));
 }
 
@@ -846,8 +849,13 @@ fn errors_and_notices_wrap_with_hanging_indent() {
 
 // ---- tools ----
 
+/// A framed body row's content, without the `│ ` / ` │` sides.
+fn unframed(row: &str) -> &str {
+    row.trim_matches(|c: char| c == '│' || c == ' ')
+}
+
 #[test]
-fn bash_tool_has_a_compact_header_and_output_without_bookkeeping() {
+fn bash_tool_is_framed_with_output_and_no_bookkeeping() {
     let env = Env::new();
     let ctx = env.ctx();
     let mut t = Transcript::new();
@@ -861,24 +869,29 @@ fn bash_tool_has_a_compact_header_and_output_without_bookkeeping() {
     let rows = t.take_settled(40, &ctx);
     let text = plain(&rows);
     assert!(
-        text[0].starts_with('·')
-            && text[0].contains("Run")
-            && text[0].contains("ls -la")
-            && text[0].ends_with("0.06s"),
+        text[0].starts_with("╭─ ·") && text[0].contains("$ ls -la") && text[0].ends_with('╮'),
         "{text:?}"
     );
-    assert!(text[1].contains("total 0") && text[2].contains("file.txt"));
-    assert!(!text_of(&rows).contains("exit code") && !text_of(&rows).contains("artifact://"));
-    // Shell bookkeeping stays out of the body; the run time sits in the header row.
-    // The block ends with its separating blank row.
-    assert_eq!(text.len(), 3, "{text:?}");
-    assert_eq!(text::line_width(&rows[0]), 40);
-    // The verb is bold; the gutter glyph of a settled call is quiet.
     assert_eq!(
-        rows[0].spans[2].style,
+        (unframed(&text[1]), unframed(&text[2])),
+        ("total 0", "file.txt")
+    );
+    assert!(!text_of(&rows).contains("exit code") && !text_of(&rows).contains("artifact://"));
+    // Shell bookkeeping stays out of the body; the run time sits in the bottom edge.
+    assert!(
+        text[3].starts_with("╰─") && text[3].contains("0.06s"),
+        "{text:?}"
+    );
+    // Top edge, two output rows, bottom edge: nothing else.
+    assert_eq!(text.len(), 4, "{text:?}");
+    assert!(rows.iter().all(|r| text::line_width(r) == 40));
+    // The prompt is bold; the glyph of a settled call is quiet.
+    let span = |needle: &str| rows[0].spans.iter().find(|s| s.content == needle).unwrap();
+    assert_eq!(
+        span("$").style,
         env.theme.fg(Tok::ToolTitle).add_modifier(Modifier::BOLD)
     );
-    assert_eq!(rows[0].spans[0].style.fg, env.theme.fg(Tok::Dim).fg);
+    assert_eq!(span("·").style.fg, env.theme.fg(Tok::Dim).fg);
 }
 
 #[test]
@@ -921,13 +934,21 @@ fn tool_gutter_marks_running_settled_and_failed_calls() {
     let pending = render(None);
     let ok = render(Some(false));
     let err = render(Some(true));
-    // Span 0 is the gutter glyph; the verb follows at the shared content column.
-    let gutter = |rows: &Rows| rows[0].spans[0].style.fg;
-    assert_eq!(gutter(&pending), env.theme.fg(Tok::Accent).fg);
-    assert_eq!(gutter(&ok), env.theme.fg(Tok::Dim).fg);
-    assert_eq!(gutter(&err), env.theme.fg(Tok::Error).fg);
-    assert!(plain(&ok)[0].starts_with('·'));
-    assert!(plain(&err)[0].starts_with('✗'));
+    // Unframed rows keep the glyph in span 0; framed cards lead their top edge with it.
+    let glyph = |rows: &Rows, g: &str| {
+        rows[0]
+            .spans
+            .iter()
+            .find(|s| s.content == g)
+            .unwrap()
+            .style
+            .fg
+    };
+    assert_eq!(pending[0].spans[0].style.fg, env.theme.fg(Tok::Accent).fg);
+    assert_eq!(glyph(&ok, "·"), env.theme.fg(Tok::Dim).fg);
+    assert_eq!(glyph(&err, "✗"), env.theme.fg(Tok::Error).fg);
+    assert!(plain(&ok)[0].starts_with("╭─ ·"));
+    assert!(plain(&err)[0].starts_with("╭─ ✗"));
     let body = err
         .iter()
         .flat_map(|r| &r.spans)
@@ -962,14 +983,16 @@ fn pending_spinner_animates_with_tick() {
 }
 
 #[test]
-fn tool_calls_share_the_gutter_with_prose_and_bodies_hang_off_a_hook() {
+fn tool_calls_share_the_gutter_light_bodies_hang_off_a_hook_and_heavy_ones_are_framed() {
     let env = Env::new();
     let mut t = Transcript::new();
     t.push_user("fix it");
     t.tool_start("1", "read", "a.rs", "");
     t.tool_end("1", "1: fn a() {}", false, 0.1);
-    t.tool_start("2", "bash", "cargo test", "");
-    t.tool_end("2", "error: one failed\nmore\n", true, 0.2);
+    t.tool_start("2", "grep", "needle", "");
+    t.tool_end("2", "error: bad pattern\nmore\n", true, 0.1);
+    t.tool_start("3", "bash", "cargo test", "");
+    t.tool_end("3", "error: one failed\nmore\n", true, 0.2);
     t.assistant_delta("Done.");
     t.finish_turn();
     let column = |row: &str, needle: &str| text::width(&row[..row.find(needle).unwrap()]);
@@ -980,13 +1003,18 @@ fn tool_calls_share_the_gutter_with_prose_and_bodies_hang_off_a_hook() {
         let read = text.iter().find(|r| r.contains("Read")).unwrap();
         let done = text.iter().find(|r| r.contains("Done.")).unwrap();
         assert_eq!(column(read, "Read"), column(done, "Done."), "{text:?}");
-        let failed = text.iter().position(|r| r.contains("one failed")).unwrap();
-        assert!(text[failed].trim_start().starts_with('└'), "{text:?}");
+        let search = text.iter().position(|r| r.contains("bad pattern")).unwrap();
+        assert!(text[search].trim_start().starts_with('└'), "{text:?}");
         assert!(
-            text[failed + 1].starts_with("     more"),
+            text[search + 1].starts_with("     more"),
             "later body rows keep the indent: {text:?}"
         );
-        assert!(text.iter().all(|r| !r.starts_with('│')), "{text:?}");
+        let failed = text.iter().position(|r| r.contains("one failed")).unwrap();
+        assert!(text[failed].starts_with('│'), "{text:?}");
+        assert!(
+            text[failed - 1].starts_with("╭─ ✗") && text[failed - 1].contains("cargo test"),
+            "{text:?}"
+        );
     }
 }
 
@@ -1073,9 +1101,9 @@ fn output_lines_setting_controls_the_cap() {
     t.tool_end("1", "a\nb\nc", false, 1.0);
     let text = text_of(&t.all_rows(40, &env.ctx()));
     assert!(
-        text.contains("└ a")
-            && text.lines().any(|l| l.trim() == "b")
-            && !text.lines().any(|l| l.trim() == "c")
+        text.lines().any(|l| unframed(l) == "a")
+            && text.lines().any(|l| unframed(l) == "b")
+            && !text.lines().any(|l| unframed(l) == "c")
             && text.contains("1 more line (Ctrl+O"),
         "{text}"
     );
@@ -1107,29 +1135,39 @@ fn edit_output_colors_diff_lines_and_hashline_previews() {
     assert_eq!(style("#AB12"), env.theme.fg(Tok::Accent).fg);
     assert_eq!(style("3:"), env.theme.fg(Tok::Dim).fg);
     assert_eq!(style("context"), env.theme.fg(Tok::ToolOutput).fg);
+    let text = plain(&rows);
     assert!(
-        plain(&rows)
-            .iter()
-            .any(|r| r.starts_with('·') && r.contains("Edit") && r.ends_with("0.50s"))
+        text.iter()
+            .any(|r| r.starts_with("╭─ ·") && r.contains("Edit")),
+        "{text:?}"
+    );
+    assert!(
+        text.iter()
+            .any(|r| r.starts_with("╰─") && r.contains("0.50s")),
+        "{text:?}"
     );
 }
 
 #[test]
-fn a_failing_exit_code_is_flagged_in_the_card_header() {
+fn a_failing_exit_code_is_flagged_on_the_card_edge() {
     let env = Env::new();
     let mut t = Transcript::new();
     t.tool_start("1", "bash", "cargo test", "");
     t.tool_end("1", "1 failed\n[exit code: 101]", true, 2.0);
     let rows = t.all_rows(50, &env.ctx());
-    let header = &rows[0];
-    let exit = header
+    let edge = rows
+        .iter()
+        .find(|r| r.spans.iter().any(|s| s.content.contains("exit 101")))
+        .expect("exit badge");
+    let exit = edge
         .spans
         .iter()
         .find(|s| s.content.contains("exit 101"))
-        .expect("exit badge");
+        .unwrap();
     assert_eq!(exit.style.fg, env.theme.fg(Tok::Error).fg);
-    assert!(!text_of(&rows[..rows.len() - 1].to_vec()).contains("exit code"));
-    assert_eq!(text::line_width(header), 50);
+    assert!(plain(&vec![edge.clone()])[0].starts_with('╰'));
+    assert!(!text_of(&rows).contains("exit code"));
+    assert_eq!(text::line_width(edge), 50);
 }
 
 #[test]
@@ -1148,7 +1186,7 @@ fn edit_cards_show_the_numbered_diff_not_the_model_facing_preview() {
     );
     let body: Vec<&str> = text
         .iter()
-        .map(|r| r.trim_matches(|c: char| c == '└' || c == ' '))
+        .map(|r| r.trim_matches(|c: char| c == '└' || c == '│' || c == ' '))
         .collect();
     for expected in [
         "src/a.rs",
@@ -1178,9 +1216,12 @@ fn edit_cards_show_the_numbered_diff_not_the_model_facing_preview() {
     assert_eq!(style("+    new();"), env.theme.fg(Tok::DiffAdded).fg);
     assert_eq!(style("-    old();"), env.theme.fg(Tok::DiffRemoved).fg);
     assert!(!text_of(&rows).contains("change preview"));
+    let edge = text.iter().find(|r| r.starts_with('╰')).unwrap();
     assert!(
-        text[0].contains("+1 −1") && !text_of(&rows).contains("updated ("),
-        "the change size is stated once, in the header: {text:?}"
+        edge.contains("+1 −1")
+            && text.iter().filter(|r| r.contains("+1 −1")).count() == 1
+            && !text_of(&rows).contains("updated ("),
+        "the change size is stated once, on the bottom edge: {text:?}"
     );
 }
 
@@ -1328,6 +1369,79 @@ fn hidden_tools_leave_no_stray_blank_rows() {
     t.tool_end("1", "y", false, 0.1);
     t.notice("", "b");
     assert_eq!(plain(&t.take_settled(20, &ctx)), ["a", "", "b"]);
+}
+
+#[test]
+fn consecutive_lookups_fold_into_one_tree_that_reaches_scrollback_whole() {
+    let env = Env::new();
+    let ctx = env.ctx();
+    let mut t = Transcript::new();
+    t.push_user("look around");
+    for (id, path) in [("1", "src/a.rs"), ("2", "src/b.rs")] {
+        t.tool_start(id, "read", path, "");
+        t.tool_end(id, "x\ny", false, 0.1);
+    }
+    let mut retired = plain(&t.take_settled(60, &ctx));
+    assert!(
+        !retired.iter().any(|r| r.contains("Read")),
+        "the run may still grow: {retired:?}"
+    );
+    // A running read of the same kind keeps the run open.
+    t.tool_start("3", "read", "src/c.rs", "");
+    retired.extend(plain(&t.take_settled(60, &ctx)));
+    assert!(!retired.iter().any(|r| r.contains("Read")));
+    t.tool_end("3", "z", false, 0.1);
+    t.tool_start("4", "bash", "cargo test", "");
+    retired.extend(plain(&t.take_settled(60, &ctx)));
+    let head = retired
+        .iter()
+        .position(|r| r.contains("Read (3)"))
+        .expect("one tree");
+    assert!(retired[head + 1].contains("├─ src/a.rs"), "{retired:?}");
+    assert!(retired[head + 2].contains("├─ src/b.rs"), "{retired:?}");
+    assert!(retired[head + 3].contains("└─ src/c.rs"), "{retired:?}");
+    assert_eq!(retired.iter().filter(|r| r.contains("src/a.rs")).count(), 1);
+    t.tool_end("4", "ok", false, 0.1);
+    t.finish_turn();
+    retired.extend(plain(&t.take_settled(60, &ctx)));
+    // Scrollback matches a from-scratch layout row for row.
+    assert_eq!(retired, plain(&t.all_rows(60, &ctx)));
+}
+
+#[test]
+fn lookup_trees_stay_within_a_turn_and_the_collapsed_view() {
+    let env = Env::new();
+    let mut t = Transcript::new();
+    t.tool_start("1", "read", "a.rs", "");
+    t.tool_end("1", "x", false, 0.1);
+    t.finish_turn();
+    for (id, name, target) in [
+        ("2", "read", "b.rs"),
+        ("3", "read", "c.rs"),
+        ("4", "grep", "needle"),
+    ] {
+        t.tool_start(id, name, target, "");
+        t.tool_end(id, "x", false, 0.1);
+    }
+    t.finish_turn();
+    let text = plain(&t.all_rows(60, &env.ctx()));
+    assert_eq!(
+        text.iter().filter(|r| r.contains("Read (2)")).count(),
+        1,
+        "{text:?}"
+    );
+    assert!(
+        text.iter()
+            .any(|r| r.contains("Read") && r.contains("a.rs")),
+        "the earlier turn keeps its own row: {text:?}"
+    );
+    assert!(text.iter().all(|r| !r.contains("Search (")), "{text:?}");
+    let expanded = TranscriptCtx {
+        tools_expanded: true,
+        ..env.ctx()
+    };
+    let text = text_of(&t.all_rows(60, &expanded));
+    assert!(!text.contains("Read ("), "{text}");
 }
 
 #[test]
@@ -1636,5 +1750,374 @@ fn unnamed_turn_outcome_is_unknown_not_failed() {
     assert!(
         line.contains("unknown") && !line.contains("failed"),
         "{line}"
+    );
+}
+
+#[test]
+fn streamed_arguments_show_observationally_then_merge_into_the_started_call() {
+    let env = Env::new();
+    let mut t = Transcript::new();
+    t.tool_arguments_delta(
+        "call-1",
+        "write",
+        r#"{"path":"partial.txt","content":"DRAFT-CONTENT"#,
+    );
+    let preparing = text_of(&t.all_rows(100, &env.ctx()));
+    assert!(
+        preparing.contains("partial.txt") && preparing.contains("DRAFT-CONTENT"),
+        "{preparing}"
+    );
+    t.tool_start(
+        "call-1",
+        "write",
+        "partial.txt",
+        r#"{"path":"partial.txt","content":"FINAL-CONTENT"}"#,
+    );
+    let started = text_of(&t.all_rows(100, &env.ctx()));
+    assert_eq!(started.matches("partial.txt").count(), 1, "{started}");
+    assert_eq!(started.matches("FINAL-CONTENT").count(), 1, "{started}");
+    assert!(!started.contains("DRAFT-CONTENT"), "{started}");
+}
+
+#[test]
+fn partial_arguments_stay_bounded_and_empty_ids_are_ignored() {
+    let mut t = Transcript::new();
+    t.tool_arguments_delta("", "write", "ignored");
+    assert!(t.blocks.is_empty());
+    let chunk = "x".repeat(Transcript::PARTIAL_ARGS_LIMIT);
+    t.tool_arguments_delta("call-2", "write", &chunk);
+    t.tool_arguments_delta("call-2", "write", &chunk);
+    let Kind::Tool(card) = &t.blocks[0].kind else {
+        panic!("preparing card expected");
+    };
+    assert_eq!(card.input.len(), Transcript::PARTIAL_ARGS_LIMIT);
+    assert_eq!(
+        card.progress.as_deref().map(str::len),
+        Some(Transcript::PREVIEW_LIMIT)
+    );
+}
+
+#[test]
+fn reveal_cuts_land_on_grapheme_boundaries_and_hold_back_the_newest() {
+    let text = "e\u{301}xyzabcdefghijkl\u{1F468}\u{200D}\u{1F469}z";
+    let mut at = 0;
+    let mut cuts = Vec::new();
+    loop {
+        let next = Transcript::reveal_cut(text, at);
+        if next == at {
+            break;
+        }
+        assert!(
+            text.grapheme_indices(true).any(|(i, _)| i == next),
+            "cut {next} splits a grapheme"
+        );
+        at = next;
+        cuts.push(at);
+    }
+    assert_eq!(
+        at,
+        text.len() - 1,
+        "the newest grapheme waits for its successor: {cuts:?}"
+    );
+    // A combining mark arriving after a cut joins its base: the cut must not separate them.
+    let joined = "ab\u{301}c";
+    assert_eq!(Transcript::reveal_cut("ab", 0), 1);
+    assert_eq!(Transcript::reveal_cut(joined, 1), 4);
+}
+
+#[test]
+fn smooth_reveal_shows_a_growing_prefix_and_flushes_at_turn_end() {
+    let mut env = Env::new();
+    env.ui.smooth_reveal = true;
+    let ctx = env.ctx();
+    let answer = "The quick brown fox jumps over the lazy dog, again and again.";
+    for shared in [false, true] {
+        let tree = crate::runtime::Tree::default();
+        let body = shared.then(|| tree.start("assistant", "assistant", None));
+        let mut t = Transcript::new();
+        if let Some(body) = &body {
+            body.append(answer);
+            t.bind_prose(body);
+        } else {
+            t.assistant_delta(answer);
+        }
+        t.advance_reveal(&env.ui);
+        let partial = text_of(&t.live(80, &ctx, 100).1);
+        assert!(partial.contains("quick"), "{partial}");
+        assert!(
+            !partial.contains("again"),
+            "the tail is held back: {partial}"
+        );
+        assert!(t.has_pending_reveal());
+        // Rendering alone never advances the visible prefix.
+        assert_eq!(text_of(&t.live(80, &ctx, 100).1), partial);
+        if shared {
+            t.notice(
+                "Background",
+                "An observational notice while the answer is active.",
+            );
+            t.advance_reveal(&env.ui);
+            assert!(
+                text_of(&t.live(80, &ctx, 100).1).contains("jumps"),
+                "a notice must not freeze the active shared answer"
+            );
+        }
+        for _ in 0..200 {
+            t.advance_reveal(&env.ui);
+        }
+        assert!(!t.has_pending_reveal());
+        assert!(text_of(&t.live(80, &ctx, 100).1).contains("again"));
+        if let Some(body) = &body {
+            body.settle(answer.into(), None, crate::runtime::Phase::Completed);
+            t.bind_prose(body);
+        } else {
+            t.finish_turn();
+        }
+        assert!(text_of(&t.document(80, &ctx).0).contains("again and again."));
+    }
+}
+
+#[test]
+fn committed_blocks_release_their_caches_and_replay_reconstructs_them() {
+    let env = Env::new();
+    let ctx = env.ctx();
+    let mut t = Transcript::new();
+    t.push_user("hi");
+    t.assistant_delta("Answer with **bold** text.");
+    t.finish_turn();
+    let before = text_of(&t.document(60, &ctx).0);
+    assert!(!t.take_settled(60, &ctx).is_empty());
+    assert!(
+        t.blocks[..t.cursor]
+            .iter()
+            .all(|b| b.rendered.borrow().is_none()),
+        "committed blocks keep no render cache"
+    );
+    assert_eq!(text_of(&t.document(60, &ctx).0), before);
+}
+
+#[test]
+fn budgeted_retirement_keeps_order_and_hands_out_each_row_once() {
+    let env = Env::new();
+    let ctx = env.ctx();
+    let mut t = Transcript::new();
+    for i in 0..5 {
+        t.push_user(&format!("question {i}"));
+        t.finish_turn();
+    }
+    let budget = Retire {
+        blocks: 2,
+        rows: usize::MAX,
+        until: None,
+    };
+    let mut batches = Vec::new();
+    loop {
+        let (rows, _) = t.retire_settled(60, &ctx, budget);
+        if rows.is_empty() {
+            break;
+        }
+        batches.push(text_of(&rows));
+    }
+    assert!(
+        batches.len() >= 3,
+        "two blocks per paint: {}",
+        batches.len()
+    );
+    assert!(batches[0].contains("question 0") && !batches[0].contains("question 2"));
+    let joined = batches.concat();
+    let mut last = 0;
+    for i in 0..5 {
+        let needle = format!("question {i}");
+        assert_eq!(joined.matches(&needle).count(), 1, "{needle} once");
+        let at = joined.find(&needle).expect("question is retired");
+        assert!(at >= last, "history keeps its order");
+        last = at;
+    }
+}
+
+#[test]
+fn lookup_tree_retires_in_budgeted_chunks_without_duplicates_after_resize() {
+    let env = Env::new();
+    let ctx = env.ctx();
+    let mut t = Transcript::new();
+    for i in 0..6 {
+        let id = i.to_string();
+        t.tool_start(&id, "read", &format!("src/file_{i}.rs"), "");
+        t.tool_end(&id, "source", false, 0.1);
+    }
+    t.finish_turn();
+    let want = t.all_rows(60, &ctx);
+    let budget = Retire {
+        blocks: 1,
+        rows: 2,
+        until: None,
+    };
+    let (mut retired, _) = t.retire_settled(60, &ctx, budget);
+    assert_eq!(retired, want[..2]);
+    let (_, live) = t.live(60, &ctx, usize::MAX);
+    assert_eq!(&live[..want.len() - 2], &want[2..]);
+    for _ in 0..12 {
+        let (rows, _) = t.retire_settled(40, &ctx, budget);
+        assert!(rows.len() <= 2);
+        retired.extend(rows);
+        if !t.has_settled_backlog() {
+            break;
+        }
+    }
+    assert_eq!(
+        retired, want,
+        "the frozen tree reaches scrollback once across resize"
+    );
+    assert!(!t.has_settled_backlog());
+}
+
+#[test]
+fn expansion_changes_during_lookup_retirement_never_lose_or_repeat_calls() {
+    let env = Env::new();
+    for expanded_first in [false, true] {
+        let before = TranscriptCtx {
+            tools_expanded: expanded_first,
+            ..env.ctx()
+        };
+        let after = TranscriptCtx {
+            tools_expanded: !expanded_first,
+            ..env.ctx()
+        };
+        let mut t = Transcript::new();
+        for (id, path) in [("a", "first.rs"), ("b", "second.rs")] {
+            t.tool_start(id, "read", path, "");
+            t.tool_end(id, "line one\nline two\nline three", false, 0.1);
+        }
+        t.finish_turn();
+        let budget = Retire {
+            blocks: 1,
+            rows: 1,
+            until: None,
+        };
+        let (mut retired, _) = t.retire_settled(80, &before, budget);
+        assert!(
+            t.retiring.is_some(),
+            "fixture must stop midway through a card"
+        );
+        let (_, live) = t.live(80, &after, usize::MAX);
+        let mut visible = retired.clone();
+        visible.extend(live);
+        let visible = text_of(&visible);
+        assert_eq!(visible.matches("first.rs").count(), 1, "{visible}");
+        assert_eq!(visible.matches("second.rs").count(), 1, "{visible}");
+        for _ in 0..24 {
+            let (rows, _) = t.retire_settled(80, &after, budget);
+            retired.extend(rows);
+            if !t.has_settled_backlog() {
+                break;
+            }
+        }
+        assert!(!t.has_settled_backlog());
+        let retired = text_of(&retired);
+        assert_eq!(retired.matches("first.rs").count(), 1, "{retired}");
+        assert_eq!(retired.matches("second.rs").count(), 1, "{retired}");
+        let replay = text_of(&t.committed_rows(80, &after));
+        assert_eq!(replay.matches("first.rs").count(), 1, "{replay}");
+        assert_eq!(replay.matches("second.rs").count(), 1, "{replay}");
+    }
+}
+
+#[test]
+fn huge_block_retires_in_row_bounded_chunks_exactly_once_across_resize() {
+    let env = Env::new();
+    let ctx = env.ctx();
+    let body: String = (0..400)
+        .map(|i| format!("Paragraph {i} with a few words to wrap across the row.\n\n"))
+        .collect();
+    let mut reference = Transcript::new();
+    reference.assistant_delta(&body);
+    reference.finish_turn();
+    let (want, _) = reference.retire_settled(60, &ctx, Retire::UNLIMITED);
+    assert!(
+        want.len() > 300,
+        "the block spans many rows: {}",
+        want.len()
+    );
+
+    let mut t = Transcript::new();
+    t.assistant_delta(&body);
+    t.finish_turn();
+    let budget = Retire {
+        blocks: usize::MAX,
+        rows: 100,
+        until: None,
+    };
+    let (first, _) = t.retire_settled(60, &ctx, budget);
+    assert_eq!(first.len(), 100, "one paint retires exactly its row budget");
+    assert_eq!(first, want[..100].to_vec());
+    assert!(
+        t.blocks[t.cursor].rendered.borrow().is_some(),
+        "caches stay until the block is done"
+    );
+
+    let (_, live) = t.live(60, &ctx, usize::MAX);
+    assert_eq!(
+        live.first(),
+        want.get(100),
+        "live starts after the retired rows"
+    );
+
+    // The terminal is resized mid-block: the remainder keeps the wrapping it started with.
+    let mut all = first;
+    loop {
+        let (rows, _) = t.retire_settled(40, &ctx, budget);
+        if rows.is_empty() {
+            break;
+        }
+        assert!(rows.len() <= 100, "row-bounded chunk: {}", rows.len());
+        all.extend(rows);
+    }
+    assert_eq!(all.len(), want.len(), "every row reaches scrollback");
+    assert!(all == want, "exactly once, same wrapping across the resize");
+    assert!(t.retiring.is_none());
+    assert!(
+        t.blocks[..t.cursor]
+            .iter()
+            .all(|b| b.rendered.borrow().is_none()),
+        "caches are released once the block is done"
+    );
+}
+
+#[test]
+fn live_tail_renders_only_the_blocks_it_shows_on_a_long_backlog() {
+    let env = Env::new();
+    let ctx = env.ctx();
+    let build = || {
+        let mut t = Transcript::new();
+        for i in 0..400 {
+            t.push_user(&format!("question {i}"));
+            t.finish_turn();
+        }
+        t
+    };
+    let mut want = build().all_rows(60, &ctx);
+    want.push(blank_row());
+
+    let mut t = build();
+    let (spilled, live) = t.live(60, &ctx, 12);
+    assert!(spilled.is_empty());
+    assert_eq!(live.len(), 12);
+    assert!(
+        live == want[want.len() - 12..].to_vec(),
+        "the visible tail matches the full document"
+    );
+    // The render cache is the counted seam: only blocks the tail reaches are ever rendered.
+    let rendered = t
+        .blocks
+        .iter()
+        .filter(|b| b.rendered.borrow().is_some())
+        .count();
+    assert!(
+        rendered > 0 && rendered <= 12,
+        "rendered {rendered} of 400 blocks"
+    );
+    assert!(
+        t.blocks[0].rendered.borrow().is_none(),
+        "the historical head is never rendered"
     );
 }

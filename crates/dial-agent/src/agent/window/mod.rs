@@ -1,6 +1,7 @@
 //! Context window: context files and meter, projection, prompt assembly and output schemas.
 
 pub mod context;
+pub mod context_breakdown;
 pub(in crate::agent) mod context_meter;
 pub(in crate::agent) mod context_notes;
 pub mod output_schema;

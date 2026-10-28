@@ -132,6 +132,11 @@ fn plain(rows: &Rows) -> Vec<String> {
         .collect()
 }
 
+/// A framed body row's content, without its sides.
+fn inside(row: &str) -> &str {
+    row.trim_matches(|c: char| c == '|' || c == '│' || c == ' ')
+}
+
 fn settled(name: &str, input: &str, output: &str, failed: bool, secs: f64) -> Tool {
     let mut t = tool(name, ToolState::Running);
     t.input = input.into();
@@ -160,8 +165,8 @@ fn result_previews_wrap_on_word_boundaries() {
         1.2,
     );
     let rows = plain(&tool_rows(&t, 38, &ctx_for(&theme, &ui, false)));
-    assert!(rows.iter().all(|r| !r.ends_with("fai")), "{rows:?}");
-    assert!(rows.iter().any(|r| r.trim() == "failed"), "{rows:?}");
+    assert!(rows.iter().all(|r| !inside(r).ends_with("fai")), "{rows:?}");
+    assert!(rows.iter().any(|r| inside(r) == "failed"), "{rows:?}");
 }
 
 #[test]
@@ -207,14 +212,16 @@ fn clipped_targets_end_with_an_ellipsis_and_paths_keep_their_file_name() {
         true,
         3.4,
     );
-    let head = &plain(&tool_rows(&cmd, 38, &ctx))[0];
+    let rows = plain(&tool_rows(&cmd, 38, &ctx));
+    let head = &rows[0];
     assert!(
         head.contains("cargo build") && head.contains("..."),
         "{head:?}"
     );
+    let foot = rows.last().unwrap();
     assert!(
-        head.contains("exit 101") && !head.contains("failed"),
-        "{head:?}"
+        foot.contains("exit 101") && !foot.contains("failed"),
+        "the exit code already says it failed: {rows:?}"
     );
     let read = settled(
         "read",
@@ -237,7 +244,7 @@ fn wrapped_diff_lines_hang_under_the_code_column() {
     let output = "[src/lib.rs#EF7D]\nupdated (+1 -1 lines)\n\nchange preview (+1 -1 lines)\n@@ -1,2 +1,2 @@\n fn a() {\n-    old_function_name_that_is_long(argument_one, argument_two);\n+    new();\n";
     let t = settled("edit", r#"{"path":"src/lib.rs"}"#, output, false, 0.1);
     let rows = plain(&tool_rows(&t, 40, &ctx_for(&theme, &ui, false)));
-    assert!(rows[0].contains("+1 −1"), "{rows:?}");
+    assert!(rows.last().unwrap().contains("+1 −1"), "{rows:?}");
     let at = rows
         .iter()
         .position(|r| r.contains("old_function"))
@@ -245,7 +252,10 @@ fn wrapped_diff_lines_hang_under_the_code_column() {
     let next = &rows[at + 1];
     let code_col = rows[at].find("-    old").unwrap();
     assert!(
-        next[..code_col].trim().is_empty() && !next[code_col..].starts_with(' '),
+        next[..code_col]
+            .trim_matches(|c: char| c == ' ' || c == '│')
+            .is_empty()
+            && !next[code_col..].starts_with(' '),
         "continuation starts at the code column: {rows:?}"
     );
     assert!(
@@ -270,4 +280,101 @@ fn a_finished_plan_says_so() {
     t.todo = Some(crate::ui::tasks::changes(&before, &after));
     let rows = plain(&tool_rows(&t, 60, &ctx_for(&theme, &ui, false)));
     assert!(rows[0].contains("all 2 done"), "{rows:?}");
+}
+
+#[test]
+fn heavy_families_are_framed_and_lookups_stay_on_the_gutter() {
+    let theme = Theme::builtin("dial-dark").unwrap();
+    let ui = UiConfig::default();
+    let ctx = ctx_for(&theme, &ui, false);
+    for (name, input) in [
+        ("bash", r#"{"command":"ls"}"#),
+        ("bg", r#"{"action":"list"}"#),
+        ("eval", r#"{"code":"1 + 1"}"#),
+        ("web_fetch", r#"{"url":"https://example.com"}"#),
+    ] {
+        for failed in [false, true] {
+            let t = settled(name, input, "first\nsecond", failed, 0.4);
+            for width in [frame::MIN_W as u16, 40, 80] {
+                let rows = tool_rows(&t, width, &ctx);
+                assert!(rows.iter().all(|r| text::line_width(r) <= width as usize));
+                let lines = plain(&rows);
+                assert!(lines[0].starts_with('╭'), "{name} at {width}: {lines:?}");
+                assert!(lines.last().unwrap().starts_with('╰'), "{name}: {lines:?}");
+            }
+            // Below the frame's minimum the call falls back to the gutter row.
+            let narrow = plain(&tool_rows(&t, frame::MIN_W as u16 - 1, &ctx));
+            assert!(!narrow[0].starts_with('╭'), "{name}: {narrow:?}");
+        }
+    }
+    let read = settled("read", r#"{"path":"a.rs"}"#, "1: fn a() {}", false, 0.1);
+    let rows = plain(&tool_rows(&read, 80, &ctx));
+    assert!(rows.iter().all(|r| !r.starts_with('╭')), "{rows:?}");
+}
+
+#[test]
+fn worker_cards_show_phase_chips_totals_time_and_reports() {
+    let ui = UiConfig::default();
+    for ascii in [false, true] {
+        let theme = Theme::dark();
+        let theme = if ascii {
+            theme.with_glyphs(super::super::theme::Glyphs::Ascii)
+        } else {
+            theme
+        };
+        let ctx = TranscriptCtx {
+            theme: &theme,
+            ui: &ui,
+            tick: 0,
+            tools_expanded: false,
+            expand_key: "ctrl+o",
+        };
+        let mut t = tool("task", ToolState::Completed);
+        t.presentation.label = "Workers".into();
+        t.presentation.body = crate::runtime::presentation::BodyStyle::Workers;
+        t.agents = [
+            ("scout", ToolState::Completed, "Found the parser branch."),
+            ("reviewer", ToolState::Running, "Reviewing parser"),
+            ("tester", ToolState::Failed, "Fixture unavailable."),
+        ]
+        .into_iter()
+        .map(|(name, state, preview)| AgentRow {
+            name: name.into(),
+            state,
+            preview: preview.into(),
+            elapsed_ms: Some(2400),
+            tools: 3,
+            ..Default::default()
+        })
+        .collect();
+        let rows = plain(&tool_rows(&t, 120, &ctx));
+        for fact in ["1 done", "1 running", "1 failed"] {
+            assert!(rows[0].contains(fact), "{rows:?}");
+        }
+        for (name, phase) in [
+            ("scout", "done"),
+            ("reviewer", "running"),
+            ("tester", "failed"),
+        ] {
+            let chip = if ascii {
+                format!("[{phase}]")
+            } else {
+                format!("⟦{phase}⟧")
+            };
+            assert!(
+                rows.iter()
+                    .any(|r| r.contains(name) && r.contains(&chip) && r.contains("2s")),
+                "{rows:?}"
+            );
+        }
+        assert!(rows.iter().any(|r| r.contains("Found the parser branch.")));
+        assert!(rows.iter().any(|r| r.contains("Fixture unavailable.")));
+        for width in [0, 1, 8, 24, 60] {
+            assert!(
+                tool_rows(&t, width, &ctx)
+                    .iter()
+                    .all(|r| text::line_width(r) <= width as usize)
+            );
+        }
+    }
 }

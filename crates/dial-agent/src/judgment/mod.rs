@@ -5,6 +5,7 @@
 
 pub mod cache;
 pub mod resources;
+pub mod typesafe;
 
 use std::sync::{Arc, atomic::AtomicBool};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -214,6 +215,13 @@ pub fn judge_uses_laya(config: &Config) -> bool {
         .is_some_and(|selection| selection.provider == crate::config::laya::PROVIDER)
 }
 
+/// Whether the `judge` role is assigned to TypeSafe System One rather than a chat model.
+pub fn judge_uses_typesafe(config: &Config) -> bool {
+    config
+        .role_selection("judge")
+        .is_some_and(|selection| selection.provider == typesafe::PROVIDER)
+}
+
 /// Days a judged thinking choice stays valid before it is asked again.
 const THINKING_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 /// Most judgments kept on disk; least recently used rows go first.
@@ -257,6 +265,18 @@ pub fn judge_turn_thinking(
             prompt,
             now_secs(),
         );
+    }
+    if judge_uses_typesafe(main) {
+        let selection = main
+            .role_selection("judge")
+            .ok_or_else(|| anyhow!("the judge role is not assigned"))?;
+        let mut backend = typesafe::TypesafeBackend::from_env(
+            &selection.model,
+            main.worker_timeout_secs,
+            cancel,
+        )?;
+        let model = format!("{}:{}", typesafe::PROVIDER, backend.model());
+        return judge_thinking(cache.as_ref(), &mut backend, &model, prompt, now_secs());
     }
     let judge = judge_config(main);
     let model = judge.selection().display_name();

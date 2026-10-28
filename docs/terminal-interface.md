@@ -58,10 +58,24 @@ turn finishes. See [Session coordination](session-coordination.md) for delivery,
   selection. Dark, light, monochrome, Gruvbox, Nord and Paper themes; custom JSON themes, symbol
   presets, band, box or line composer, styled headings/code/diffs, expandable tool results, and
   `NO_COLOR`.
+- Activity reads apart at a glance. Commands, code cells, edits and web calls are framed cards
+  with the exit code and time on the bottom edge. Runs of reads and searches fold into `Read (N)` /
+  `Search (N)` trees. Notes sent to other agents show as quoted `✉ IRC` lines with delivery
+  receipts. Skill and tool loading stays in the quiet `◆` context lane.
 - Unicode-aware multiline editing, bracketed paste, persistent per-project prompt history and history
   search. Secret provider inputs are masked and never enter prompt history.
 - Pasted text stays in the draft. Buffered unbracketed paste preserves line breaks, and an immediate
   trailing Enter after bracketed paste is ignored. Press Enter after the paste settles to send it.
+- **Clipboard images:** the paste-image key (`app.clipboard.pasteImage`) attaches the clipboard image
+  as a quoted PNG path in the draft. Sources by platform: macOS reads the pasteboard (PNG, TIFF,
+  JPEG, including screenshots) and then an image file copied in Finder; Windows and WSL read the
+  Windows clipboard through `powershell.exe`; Wayland uses `wl-paste` and X11 uses `xclip`. Termux
+  has no clipboard image API (`termux-clipboard-get` is text only) and reports that explicitly.
+  Every image is normalized to PNG and downscaled to fit the 5 MiB attachment limit. If nothing
+  usable is found, the error lists each reader that was tried and why it produced no image.
+- Questions and approvals quarantine input queued before the dialog opens, so a buffered Enter
+  cannot approve an unseen action. A question opened over a nonempty draft starts with draft
+  focus: Enter edits that draft, Tab/Escape moves to the choices, and Ctrl+C cancels the question.
 - **Inline suggestions:** command arguments offer valid choices as dim ghost text even before you have
   used them: `/understanding ` suggests `architecture`, `/skills s` suggests `sources`, and
   `/skills enable ` suggests an installed skill name (including disabled skills). Built-in choices
@@ -75,7 +89,8 @@ turn finishes. See [Session coordination](session-coordination.md) for delivery,
   exception: `Enter` completes the highlighted file. Built-ins win over a custom command with the same name.
 - While a turn runs, submitting a non-command draft opens **a message-intent chooser**. Nothing is
   sent just by opening it; Escape returns to the unchanged draft. The options are:
-  **Send now** (Dial decides whether it steers this task or starts an independent worker),
+  **Send now** (by default steers this task with no model call; `[message_routing] route = "classify"`
+  lets a routing judge decide between steering and an independent worker, and a failed decision steers),
   **Send after this turn** (queued, unchanged), **Steer now** and **Independent worker**.
   **Steer now** is an explicit redirect: it cancels the pending model request or discards its stale
   response before any of its tool calls run. A tool already running may finish (only waits that
@@ -100,6 +115,9 @@ turn finishes. See [Session coordination](session-coordination.md) for delivery,
   The status line reports stopping immediately; interrupted turns do not send a finished notification.
   Slash commands never become model steering: `/hotkeys`, `/todo`, `/skills`, `/commands`, `/context`, `/search`, `/workers`, `/message`,
   `/cancel`, `/policy`, `/reliability`, and `/improve status|jobs|stop` run at once without stopping the turn.
+  `/context` also lists the last request's estimated tokens by category: system prompt, context files, tool definitions,
+  user and assistant messages, one row per tool's output, images at a fixed estimate, and provider replay shown by size only.
+  These are byte-based estimates, not billed usage; during a running turn it shows only the summary line.
   `/help` opens the action palette while idle or busy; `/help text` and `/help all` list commands and their scheduling policies,
   also used by dispatch and palette notes. `/model` and `/models` share the same policy, including
   `settings` (`setting`), `defaults`, `local` and `memory`: these panels open immediately, even during
@@ -167,8 +185,8 @@ turn finishes. See [Session coordination](session-coordination.md) for delivery,
   current session is deleted with `/delete`); **Ctrl-G** toggles this project and all projects (all
   projects shows each session's project directory; resuming a session from another project is
   refused with a pointer to `/move`); **Home/End** and **PageUp/PageDown** navigate; **Enter**
-  resumes. A session another Dial process has open is marked `[open elsewhere]`; choosing it keeps
-  the picker open with the reason.
+  resumes. A session another Dial process has open is marked `[open elsewhere]`; choosing it creates
+  an independent sibling fork and identifies the source, without taking over its writer or changing its bytes.
   `/resume <id-prefix>` opens a unique ID directly, including empty sessions; an ambiguous prefix
   opens the picker with that prefix as its search. Choosing the current session notes
   `Already in session`. After a resume, the note shows the title, model, last activity and the
@@ -176,16 +194,38 @@ turn finishes. See [Session coordination](session-coordination.md) for delivery,
   parent, and siblings are ordered most recent first; it includes empty sessions initially. The picker
   keeps up to 200 conversations and 200 empty sessions; listing occurs once per open, and each action
   reloads the list rather than running per keystroke.
+  `dial --restore` opens the parent conversation first, then explicitly rebinds eligible interrupted
+  workers through the normal safe resume path. Use `-r <id> --restore` to name the parent; without
+  an ID it continues the latest conversation. It does not resubmit the main prompt, replay completed
+  calls or restart completed/cancelled workers. Refused workers remain interrupted with a reason.
 - `/tree` opens the session's own entry tree: every user message and labeled entry, including
   branches abandoned by a rewind, indented where the conversation forked (filled markers are on the
   branch the model sees, hollow ones are abandoned; `<- here` marks where you are). Type to filter
-  by text or label, **Enter** moves there. Choosing a user message rewinds to just before it and
-  puts its text in the composer to edit and resend; choosing a labeled answer continues from it.
-  The move appends a branch marker, so nothing is deleted and the previous path stays in the tree.
+  by text or label, **Enter** moves there. The preview uses the conversation's native transcript
+  renderer, including tool evidence. **Ctrl-Up/Down** jump between user turns, **Ctrl-Left** goes
+  to the visible parent, and **Left/Right** select siblings. Choosing a user message rewinds to just
+  before it and loads its text only when the composer is empty; an existing draft is preserved.
+  Choosing a labeled answer continues from it. The move appends a branch marker, so nothing is
+  deleted and the previous path stays in the tree. This is conversation navigation, not file rollback;
+  use the checkpoint/review controls to change workspace files.
   `/label <text>` bookmarks the latest message (up to 60 characters; `/label` alone clears it;
   the newest label on an entry wins). Labels are journal records the model never sees. Session
   journals carry an integer `schema_version` in their header; older journals load unchanged and a
   journal from a newer Dial is refused with a message to update.
+- `/btw <question>` starts a streamed, tools-free side conversation without stopping the main turn.
+  Busy questions use the frozen turn-start context, including its active user prompt; they do not
+  read the running agent's mutable state. Follow-up questions continue the open thread, and
+  `/btw new <question>` starts another. `/btw threads` lists them, `/btw open <id>` displays one,
+  `/btw copy` copies its last completed answer, and `/btw cancel` stops only the side request.
+  Stopping the main turn does not cancel a side answer. Saved side history is private and bound to
+  its parent session; it is not injected into the main model conversation.
+  Admitted questions and streamed prefixes are checkpointed before display. Reopening after a
+  crash retains the observed prefix as an interrupted exchange and does not repeat the request.
+  The private sidecar follows session move/archive/delete operations; independent forks do not
+  take over a live side request.
+  `/btw promote <id>` creates a full sibling conversation from the saved ancestry and completed
+  exchanges. It leaves the main branch, draft and jobs unchanged and returns a `/resume` target.
+  Promotion waits for an idle main owner; ordinary side commands run while it is busy.
 - `/branch` with no argument opens a list of the nine most recent user messages (keys 1-9);
   `/branch <n>` names one directly. Either way the rewind asks first and says how many messages
   leave the view. `/delete` and `/session delete` ask before removing the current session file;
@@ -193,6 +233,24 @@ turn finishes. See [Session coordination](session-coordination.md) for delivery,
 - `/rename <title>` names a session; `/export [path] [--html]` exports Markdown or self-contained
   HTML without overwriting existing files. `/copy` copies the last answer; `Ctrl-G` opens the
   draft in an external editor.
+- `/pack [path]` writes the same archive as `dial session pack`: one zip with the journal, side
+  history, stream journal, subagent transcripts and referenced artifacts, each recorded in a manifest with
+  a SHA-256 and byte count. `dial session unpack <file>` (or `dial sessions unpack`) installs it into the
+  current project. Unpacking verifies every member and artifact before anything is written, refuses path
+  traversal, absolute or backslash names, symlinks, oversized members, corrupt bytes, and archives whose
+  format or journal schema is newer than this Dial, and never overwrites an existing file. The transfer is
+  recorded, so reopening the original path after the session moved away forks a sibling instead of
+  reattaching to it.
+- `/export` and `dial sessions export` (Markdown or HTML) and `/dump all` include the subagent transcripts
+  that belong to the session, after the parent conversation and with the same redaction. `/dump anon`
+  anonymizes them the same way it anonymizes the session.
+- `/share` and `dial sessions share` seal the transcript under an 8 MiB cap. When it does not fit, they
+  trim in order: inline images are replaced with an `unavailable` marker, long strings are truncated at
+  32768, 8192, 2048, then 512 characters, and only then the oldest records are dropped (the session header
+  is always kept). Each trim applied is reported. A configured `[share].server_url` (or
+  `DIAL_SHARE_SERVER`) receives the share; without one, or with `--gist`, it becomes a secret GitHub gist
+  created through `gh`. If `gh` is missing or unauthenticated the command fails with an actionable error
+  and does not fall back to another host.
 - A turn that edited files, was interrupted or failed ends with a **Turn report** note: outcome, changed
   files, recorded checks (and whether they are current with the final edits), open tasks, what `/undo`
   can revert, and which shell or extension calls ran outside checkpoints and cannot be undone. Plain
@@ -239,7 +297,12 @@ turn finishes. See [Session coordination](session-coordination.md) for delivery,
   `/permissions allow --persist bash cargo test` persists a project rule outside the workspace.
   Deny rules take precedence, including in automatic approval mode.
 - Idle terminal frames are not rewritten. Fenced code gets theme-aware lexical highlighting,
-  and completed Markdown prefixes are cached while streaming. Edit and write cards show the change as a
+  and a `diagram` fence (```` ```diagram Optional title ````) is drawn as a framed panel: an accent
+  border with the title in its top edge, connector glyphs (`-->`, `|`, box drawing, arrows) tinted
+  apart from the labels, and the theme's code background. Diagram rows are clipped with an ellipsis
+  rather than wrapped, so their columns stay aligned; the source text is unchanged in the transcript.
+  The agent is prompted to use these for structure and flow instead of long prose.
+  Completed Markdown prefixes are cached while streaming. Edit and write cards show the change as a
   numbered, coloured diff (separate hunks with two lines of context, per file); the anchored preview rows
   and removed-lines report the model gets are left out. Each todo call renders the list as it now stands,
   with the steps that call closed struck through and emphasized. Passing automatic checks are one line.

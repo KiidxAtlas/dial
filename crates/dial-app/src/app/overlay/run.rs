@@ -9,12 +9,13 @@ use crate::app::overlay::settings::settings_embedding_models;
 use crate::app::shell::TICK;
 use crate::config::types::Config;
 use crate::llm::model_config::{ModelSelection, UiConfig};
+use crate::ui::input::{poll, read};
 use crate::ui::overlay::DrawCtx;
 use crate::ui::status::Phase;
 use crate::ui::statusline;
 use crate::ui::term::OverlayTerminal;
 use anyhow::Result;
-use crossterm::event::{Event, poll, read};
+use crossterm::event::Event;
 use std::time::{Duration, Instant};
 
 /// What a blocking wait (compute lock, local preparation) does after one terminal event.

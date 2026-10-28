@@ -22,7 +22,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
-const MAX_INPUT: u64 = 64 * 1024 * 1024;
+pub(in crate::tools) const MAX_INPUT: u64 = 64 * 1024 * 1024;
 const PARSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 pub(in crate::tools) const MAX_CONTENT: u64 = 8 * 1024 * 1024;
 
@@ -52,9 +52,12 @@ pub(in crate::tools) fn kind(path: &str) -> Option<&'static str> {
         .any(|s| lower.ends_with(s))
     {
         Some("zip")
-    } else if [".tar", ".tar.gz", ".tgz"]
-        .iter()
-        .any(|s| lower.ends_with(s))
+    } else if [
+        ".tar", ".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.bz2", ".tbz", ".tbz2", ".tar.zst",
+        ".tzst",
+    ]
+    .iter()
+    .any(|s| lower.ends_with(s))
     {
         Some("tar")
     } else if lower.ends_with(".gz") {
@@ -64,11 +67,19 @@ pub(in crate::tools) fn kind(path: &str) -> Option<&'static str> {
         .any(|s| lower.ends_with(s))
     {
         Some("sqlite")
-    } else if [".7z", ".rar", ".xz", ".bz2", ".zst", ".iso", ".cab"]
-        .iter()
-        .any(|s| lower.ends_with(s))
+    } else if let Some(format) = [
+        (".7z", "7z"),
+        (".rar", "rar"),
+        (".cab", "cab"),
+        (".iso", "iso"),
+        (".xz", "xz"),
+        (".bz2", "bz2"),
+        (".zst", "zst"),
+    ]
+    .iter()
+    .find_map(|(suffix, format)| lower.ends_with(suffix).then_some(*format))
     {
-        Some("unsupported-archive")
+        Some(format)
     } else {
         None
     }
@@ -177,16 +188,46 @@ pub(in crate::tools) fn read_streaming(
             opened.validate(ws)?;
             Arc::new(text)
         } else {
-            cache::extracted(&opened, ws, format, member, || {
-                match format {
-                "notebook" => parse_isolated("notebook", Job::Notebook { path: path.clone(), member: member.map(str::to_owned) }, cancel),
-                "zip" | "tar" | "gzip" => parse_isolated("archive", Job::Archive { root: ws.root().to_owned(), path: path.clone(), format: format.to_owned(), member: member.map(str::to_owned) }, cancel),
+            cache::extracted(&opened, ws, format, member, || match format {
+                "notebook" => parse_isolated(
+                    "notebook",
+                    Job::Notebook {
+                        path: path.clone(),
+                        member: member.map(str::to_owned),
+                    },
+                    cancel,
+                ),
+                "zip" | "tar" | "gzip" | "xz" | "bz2" | "zst" | "7z" | "rar" | "cab" | "iso" => {
+                    parse_isolated(
+                        "archive",
+                        Job::Archive {
+                            root: ws.root().to_owned(),
+                            path: path.clone(),
+                            format: format.to_owned(),
+                            member: member.map(str::to_owned),
+                        },
+                        cancel,
+                    )
+                }
                 "pdf" => pdf::read(ws, &opened.file, member, cancel),
-                "docx" | "xlsx" | "pptx" => parse_isolated("document", Job::Office { path: path.clone(), format: format.to_owned(), member: member.map(str::to_owned) }, cancel),
-                "epub" => parse_isolated("epub", Job::Epub { path: path.clone(), member: member.map(str::to_owned) }, cancel),
-                "unsupported-archive" => Err("unsupported archive type; native rich read supports ZIP/JAR/WHL/APK, TAR/TAR.GZ/TGZ, and gzip only. No external extractor is run automatically".into()),
+                "docx" | "xlsx" | "pptx" => parse_isolated(
+                    "document",
+                    Job::Office {
+                        path: path.clone(),
+                        format: format.to_owned(),
+                        member: member.map(str::to_owned),
+                    },
+                    cancel,
+                ),
+                "epub" => parse_isolated(
+                    "epub",
+                    Job::Epub {
+                        path: path.clone(),
+                        member: member.map(str::to_owned),
+                    },
+                    cancel,
+                ),
                 _ => unreachable!(),
-            }
             })?
         };
         render(
@@ -203,6 +244,32 @@ pub(in crate::tools) fn read_streaming(
 /// cannot take down the agent. PDF runs its own `pdftotext` child and is never routed through here.
 fn parse_isolated(label: &str, job: Job, cancel: &AtomicBool) -> Result<String, String> {
     isolate::run(label, &job, &[], PARSE_DEADLINE, cancel)
+}
+
+/// Whether `format` (as [`kind`] reports it) is an archive or compressed stream.
+pub(in crate::tools) fn is_archive(format: &str) -> bool {
+    matches!(
+        format,
+        "zip" | "tar" | "gzip" | "xz" | "bz2" | "zst" | "7z" | "rar" | "cab" | "iso"
+    )
+}
+
+/// Read an archive held in memory (a URL download) through the isolated parser. `name` is the URL
+/// path, whose suffix selects the tar compression; `label` names the source in errors.
+pub(in crate::tools) fn read_archive_bytes(
+    label: &str,
+    name: &str,
+    format: &str,
+    member: Option<&str>,
+    bytes: &[u8],
+    cancel: &AtomicBool,
+) -> Result<String, String> {
+    let job = Job::ArchiveBytes {
+        format: format.to_owned(),
+        name: name.to_owned(),
+        member: member.map(str::to_owned),
+    };
+    isolate::run(label, &job, bytes, PARSE_DEADLINE, cancel)
 }
 
 pub(in crate::tools) fn bounded(reader: impl Read) -> Result<Vec<u8>, String> {
@@ -298,7 +365,7 @@ fn notebook(file: fs::File, member: Option<&str>) -> Result<String, String> {
     }
     Ok(out)
 }
-fn render(
+pub(in crate::tools) fn render(
     ws: &Workspace,
     label: &str,
     text: &str,

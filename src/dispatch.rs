@@ -107,6 +107,9 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
         Some(Command::Doctor { fix, yes }) => {
             return cmd::doctor::run(&cli, &layout, fix, *yes);
         }
+        Some(Command::Auth { action }) => {
+            return cmd::auth::run(&layout, action);
+        }
         Some(Command::Sessions { all, action }) => {
             return cmd::sessions::run(&layout, *all, action);
         }
@@ -174,7 +177,7 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
                 && std::io::stdout().is_terminal()
                 && !cli.print
                 && cli.output_format == OutputFormat::Text,
-            resumes_session: cli.continue_session || cli.resume.is_some(),
+            resumes_session: cli.continue_session || cli.restore || cli.resume.is_some(),
             has_positional_prompt: !cli.prompt.is_empty(),
             has_piped_input: !std::io::stdin().is_terminal(),
             no_tools: cli.tool_flags.no_tools,

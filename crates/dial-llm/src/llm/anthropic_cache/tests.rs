@@ -25,7 +25,7 @@ fn tool_free_requests_do_not_gain_null_optional_fields() {
             ..Default::default()
         };
         let mut body = json!({"messages":[{"role":"user","content":"summarize history"}]});
-        apply(&mut body, Some(&profile), false);
+        apply(&mut body, Some(&profile), false, Level::Full);
         assert!(!body.as_object().unwrap().contains_key("tools"), "{body}");
         assert!(!body.as_object().unwrap().contains_key("system"), "{body}");
     }
@@ -33,7 +33,7 @@ fn tool_free_requests_do_not_gain_null_optional_fields() {
 #[test]
 fn growing_history_keeps_the_previous_tail_and_four_marker_budget() {
     let mut first = body();
-    apply(&mut first, None, false);
+    apply(&mut first, None, false, Level::Full);
     assert_eq!(count(&first), 4);
     assert_eq!(
         first["messages"][2]["content"][0]["cache_control"],
@@ -43,7 +43,7 @@ fn growing_history_keeps_the_previous_tail_and_four_marker_budget() {
     next["messages"].as_array_mut().unwrap().push(json!({
         "role":"assistant","content":[{"type":"text","text":"fixed"}]
     }));
-    apply(&mut next, None, false);
+    apply(&mut next, None, false, Level::Full);
     assert_eq!(count(&next), 4);
     assert_eq!(first["messages"][2], next["messages"][2]);
     assert_eq!(first["tools"], next["tools"]);
@@ -60,7 +60,7 @@ fn transient_guidance_and_signed_thinking_are_never_cache_anchors() {
         json!({"role":"user","dial_transient":true,"content":[{"type":"text","text":"changing guidance"}]}),
         json!({"role":"user","content":[{"type":"text","text":"also unstable"}]})
     ]);
-    apply(&mut body, None, false);
+    apply(&mut body, None, false, Level::Full);
     assert_eq!(body["messages"][3]["content"][0], signed);
     assert!(body["messages"][4].get("dial_transient").is_none());
     assert!(
@@ -89,7 +89,7 @@ fn retention_and_opt_out_follow_auth_and_explicit_configuration() {
             cache_retention: retention,
             ..Default::default()
         };
-        apply(&mut body, Some(&profile), oauth);
+        apply(&mut body, Some(&profile), oauth, Level::Full);
         assert_eq!(
             body["system"][0]["cache_control"]["ttl"].as_str(),
             expected_long.then_some("1h")
@@ -108,6 +108,7 @@ fn retention_and_opt_out_follow_auth_and_explicit_configuration() {
             ..Default::default()
         }),
         true,
+        Level::Full,
     );
     assert_eq!(count(&disabled), 0);
     assert!(disabled["messages"][2].get("dial_transient").is_none());
@@ -118,15 +119,15 @@ fn tool_order_is_stable_but_withdrawn_tools_are_not_reintroduced() {
     let mut a = body();
     let mut b = body();
     b["tools"].as_array_mut().unwrap().reverse();
-    apply(&mut a, None, false);
-    apply(&mut b, None, false);
+    apply(&mut a, None, false, Level::Full);
+    apply(&mut b, None, false, Level::Full);
     assert_eq!(a["tools"], b["tools"]);
     let mut withdrawn = body();
     withdrawn["tools"]
         .as_array_mut()
         .unwrap()
         .retain(|t| t["name"] == "read");
-    apply(&mut withdrawn, None, false);
+    apply(&mut withdrawn, None, false, Level::Full);
     assert_eq!(withdrawn["tools"].as_array().unwrap().len(), 1);
     assert_eq!(withdrawn["tools"][0]["name"], "read");
 }
@@ -138,10 +139,62 @@ fn plain_text_history_is_cacheable_and_transient_text_stays_unmarked() {
         {"role":"assistant","content":"reply"},
         {"role":"user","content":"changing guidance","dial_transient":true}
     ]});
-    apply(&mut body, None, false);
+    apply(&mut body, None, false, Level::Full);
     assert_eq!(count(&body), 2);
     assert_eq!(body["messages"][0]["content"][0]["text"], "hello");
     assert_eq!(body["messages"][1]["content"][0]["text"], "reply");
     assert_eq!(body["messages"][2]["content"], "changing guidance");
     assert!(body["messages"][2].get("dial_transient").is_none());
+}
+
+#[test]
+fn refusal_ladder_drops_ttl_before_markers_and_skips_rungs_that_change_nothing() {
+    assert_eq!(Level::Full.narrower(true), Some(Level::WithoutTtl));
+    assert_eq!(Level::WithoutTtl.narrower(true), Some(Level::Off));
+    assert_eq!(Level::Full.narrower(false), Some(Level::Off));
+    assert_eq!(Level::Off.narrower(true), None);
+
+    let mut body = body();
+    apply(&mut body, None, true, Level::WithoutTtl);
+    assert_eq!(
+        body["system"][0]["cache_control"],
+        json!({"type":"ephemeral"})
+    );
+    assert_eq!(count(&body), 4);
+
+    let mut off = self::body();
+    apply(&mut off, None, true, Level::Off);
+    assert_eq!(count(&off), 0);
+}
+
+#[test]
+fn only_a_400_naming_cache_control_with_a_rejection_steps_the_ladder() {
+    let refusal = br#"{"error":{"message":"cache_control.ttl: Extra inputs are not permitted"}}"#;
+    assert!(refused(400, refusal));
+    assert!(!refused(500, refusal));
+    assert!(!refused(
+        400,
+        br#"{"error":{"message":"invalid x-api-key"}}"#
+    ));
+    assert!(!refused(
+        400,
+        br#"{"error":{"message":"cache_control is required"}}"#
+    ));
+    assert!(!refused(
+        400,
+        br#"{"error":{"message":"cache_controlled: unsupported"}}"#
+    ));
+}
+
+#[test]
+fn latched_refusals_start_later_requests_narrow_and_never_widen() {
+    let url = "https://ladder-latch.invalid/v1/messages?beta=1";
+    assert_eq!(latched(url, "model-a"), Level::Full);
+    latch(url, "model-a", Level::Off);
+    assert_eq!(latched(url, "model-a"), Level::Off);
+    latch(url, "model-a", Level::WithoutTtl);
+    assert_eq!(latched(url, "model-a"), Level::Off);
+    assert_eq!(latched(url, "model-b"), Level::Full);
+    forget_refusals("https://ladder-latch.invalid");
+    assert_eq!(latched(url, "model-a"), Level::Full);
 }

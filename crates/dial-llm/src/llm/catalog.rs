@@ -128,6 +128,9 @@ impl ModelEntry {
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct ModelMetadata {
     pub vision: Option<bool>,
+    /// Declared image-output transport; image-input support does not imply this capability.
+    #[serde(default)]
+    pub image_generation: Option<super::profiles::ImageGenerationApi>,
     #[serde(default)]
     pub tools: Option<bool>,
     #[serde(default)]
@@ -235,6 +238,27 @@ impl CacheWriteSplit {
     }
 }
 
+/// Image output declared by provider metadata, never inferred from a model name or vision.
+pub fn image_generation_api(row: &Value) -> Option<super::profiles::ImageGenerationApi> {
+    use super::profiles::ImageGenerationApi;
+    let hosted = row.get("experimental_supported_tools")
+        .or_else(|| row.get("supported_tools"))
+        .and_then(Value::as_array);
+    if hosted.is_some_and(|tools| tools.iter().any(|tool| {
+        tool == "image_generation" || tool["type"] == "image_generation"
+    })) {
+        return Some(ImageGenerationApi::Responses);
+    }
+    row.pointer("/architecture/output_modalities")
+        .or_else(|| row.get("output_modalities"))
+        .and_then(Value::as_array)
+        .map(|items| if items.iter().any(|item| item == "image") {
+            ImageGenerationApi::ChatCompletions
+        } else {
+            ImageGenerationApi::Disabled
+        })
+}
+
 fn metadata(row: &Value) -> ModelMetadata {
     let modalities = row
         .pointer("/architecture/input_modalities")
@@ -305,6 +329,7 @@ fn metadata(row: &Value) -> ModelMetadata {
         });
     ModelMetadata {
         vision,
+        image_generation: image_generation_api(row),
         tools,
         reasoning,
         max_output_tokens: [
@@ -420,15 +445,14 @@ fn classify_template(info: &mut ModelMetadata, template: &str) {
 /// Cache-only lookup: never make a metadata request in the inference hot path.
 pub fn model_metadata(layout: &Layout, selection: &ModelSelection) -> ModelMetadata {
     if selection.provider == super::chatgpt::PROVIDER {
+        let profile = super::chatgpt::scoped_model_profile(
+            &layout.user_dir,
+            selection.account_id.as_deref(),
+            &selection.model,
+        ).ok().flatten();
         return ModelMetadata {
-            vision: super::chatgpt::scoped_model_profile(
-                &layout.user_dir,
-                selection.account_id.as_deref(),
-                &selection.model,
-            )
-            .ok()
-            .flatten()
-            .and_then(|profile| profile.capabilities.vision),
+            vision: profile.as_ref().and_then(|p| p.capabilities.vision),
+            image_generation: profile.and_then(|p| p.capabilities.image_generation),
             ..Default::default()
         };
     }

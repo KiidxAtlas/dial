@@ -107,8 +107,9 @@ fn computer_prelude_mutation_follows_dispatch_approval() {
 
 #[test]
 fn computer_display_appends_lines() {
-    display("first".into());
-    display("second\n".into());
-    assert_eq!(take_display(), "first\nsecond\n");
-    assert_eq!(take_display(), "");
+    let display = DisplayBuffer::default();
+    display.push("first");
+    display.push("second\n");
+    assert_eq!(display.take(), "first\nsecond\n");
+    assert_eq!(display.take(), "");
 }

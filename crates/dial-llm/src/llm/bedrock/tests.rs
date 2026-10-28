@@ -133,3 +133,35 @@ fn redacted_reasoning_chunks_replay_as_one_binary_value_and_reject_foreign_scope
     );
     assert!(request("anthropic.claude-v2", &chat, None, "account-b").is_err());
 }
+
+#[test]
+fn reasoning_effort_wire_reaches_bedrock_output_config() {
+    use crate::llm::profiles::{ModelCapabilities, ModelProfile, ReasoningApi, ReasoningEffort};
+    use std::collections::BTreeMap;
+    let chat = Chat {
+        messages: vec![json!({"role":"user","content":"hi"})],
+        tools: vec![],
+        temperature: 0.2,
+        max_tokens: 64,
+        seed: None,
+    };
+    let mut profile = ModelProfile {
+        provider: "bedrock".into(),
+        model: "anthropic.claude-v2".into(),
+        reasoning_effort: Some(ReasoningEffort::High),
+        capabilities: ModelCapabilities {
+            reasoning: ReasoningApi::AnthropicAdaptive,
+            reasoning_efforts: vec![ReasoningEffort::High],
+            reasoning_effort_wire: BTreeMap::from([(ReasoningEffort::High, "max".to_string())]),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let effort =
+        |body: &Value| body["additionalModelRequestFields"]["output_config"]["effort"].clone();
+    let body = request("anthropic.claude-v2", &chat, Some(&profile), "main").unwrap();
+    assert_eq!(effort(&body), "max");
+    profile.capabilities.reasoning_effort_wire.clear();
+    let body = request("anthropic.claude-v2", &chat, Some(&profile), "main").unwrap();
+    assert_eq!(effort(&body), "high");
+}

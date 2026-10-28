@@ -132,3 +132,31 @@ fn read_only_snapshots_cannot_move_or_label() {
     assert!(snapshot.label_leaf("x").is_err());
     assert!(snapshot.navigate_to(&u).is_err());
 }
+
+#[test]
+fn path_messages_are_the_branch_to_the_node_and_parents_name_the_fork() {
+    let mut s = Session::ephemeral();
+    s.append(user("one")).unwrap();
+    let a1 = s.append(assistant("a1")).unwrap();
+    s.label_leaf("fork point").unwrap();
+    let u2 = s.append(user("two")).unwrap();
+    s.append(assistant("a2")).unwrap();
+    s.navigate_to(&u2).unwrap();
+    let u3 = s.append(user("three")).unwrap();
+    let tree = s.tree();
+    let by = |id: &str| tree.iter().find(|n| n.id == id).unwrap();
+    assert_eq!(by(&u2).parent.as_deref(), Some(a1.as_str()));
+    assert_eq!(by(&u3).parent.as_deref(), Some(a1.as_str()));
+    let texts = |target: &str, limit: usize| -> Vec<String> {
+        s.path_messages_to(target, limit)
+            .unwrap()
+            .into_iter()
+            .map(|m| m["content"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    };
+    assert_eq!(texts(&u3, 100), ["one", "a1", "three"]);
+    assert_eq!(texts(&u2, 100), ["one", "a1", "two"]);
+    assert_eq!(texts(&u3, 2), ["a1", "three"]);
+    assert!(texts(&u3, 0).is_empty());
+    assert!(s.path_messages_to("missing", 10).is_err());
+}

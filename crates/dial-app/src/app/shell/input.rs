@@ -6,11 +6,12 @@ use crate::app::drive::Step;
 use crate::app::overlay::Which;
 use crate::app::shell::Shell;
 use crate::ui::composer::{ComposerCtx, ComposerEvent};
+use crate::ui::input::{poll, read};
 use crate::ui::keys::Action;
 use crate::ui::transcript::TranscriptCtx;
 use crate::ui::welcome;
 use anyhow::Result;
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, poll, read};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -44,28 +45,59 @@ impl Shell {
         }
     }
 
-    /// Keep the home and composer live while `busy` (the first agent is still being built):
-    /// typing, editing keys and pastes change the draft at once. Any other input (Enter, a
-    /// shortcut, a resize) stops the wait and is held for the main loop, in order.
+    /// Attaches a clipboard image whose worker read has finished. True when the draft was updated.
+    pub(in crate::app) fn poll_clipboard_image(&mut self) -> bool {
+        match self.composer.finish_clipboard_image() {
+            None => false,
+            Some(Ok(())) => {
+                self.note("Image", "clipboard image attached to the draft");
+                true
+            }
+            Some(Err(error)) => {
+                self.note("Image", format!("clipboard image unavailable: {error:#}"));
+                true
+            }
+        }
+    }
+
+    /// Keep typing live while an agent's tools connect, including same-session rebuilds.
+    /// Once an action is held, queue later input in order until the connection pass finishes.
     pub(in crate::app) fn edit_while(&mut self, busy: impl Fn() -> bool) {
-        while self.held.is_empty() && busy() {
+        self.edit_while_events(busy, |frame| {
+            if poll(frame)? {
+                read().map(Some)
+            } else {
+                Ok(None)
+            }
+        });
+    }
+
+    fn edit_while_events(
+        &mut self,
+        busy: impl Fn() -> bool,
+        mut next: impl FnMut(Duration) -> std::io::Result<Option<Event>>,
+    ) {
+        while busy() {
             let animating = self.home.as_ref().is_some_and(welcome::Home::animating);
             let frame = if animating {
                 crate::ui::fx::FRAME
             } else {
                 Duration::from_millis(16)
             };
-            match poll(frame) {
-                Ok(true) => {}
-                Ok(false) => {
+            let event = match next(frame) {
+                Ok(Some(event)) => event,
+                Ok(None) => {
                     if animating {
                         let _ = self.paint(None);
                     }
                     continue;
                 }
                 Err(_) => return,
+            };
+            if !self.held.is_empty() {
+                self.held.push_back(event);
+                continue;
             }
-            let Ok(event) = read() else { return };
             match event {
                 Event::Key(key) if key.kind == KeyEventKind::Release => continue,
                 Event::Key(key)
@@ -82,10 +114,7 @@ impl Shell {
                     self.composer_key(key);
                 }
                 Event::Paste(text) => self.composer_paste(&text),
-                other => {
-                    self.held.push_back(other);
-                    return;
-                }
+                other => self.held.push_back(other),
             }
             let _ = self.paint(None);
         }
@@ -187,11 +216,8 @@ impl Shell {
                 Ok(Step::Done)
             }
             Action::PasteImage => {
-                match self.composer.paste_clipboard_image() {
-                    Ok(()) => self.note("Image", "clipboard image attached to the draft"),
-                    Err(error) => {
-                        self.note("Image", format!("clipboard image unavailable: {error:#}"))
-                    }
+                if let Err(error) = self.composer.start_clipboard_image() {
+                    self.note("Image", format!("clipboard image unavailable: {error:#}"));
                 }
                 Ok(Step::Done)
             }
@@ -327,3 +353,6 @@ impl Shell {
         let _ = std::fs::remove_file(&path);
     }
 }
+
+#[cfg(test)]
+mod tests;

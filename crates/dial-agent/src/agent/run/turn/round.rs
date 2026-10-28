@@ -306,11 +306,13 @@ impl Agent<'_> {
                     is_error: true,
                 };
                 ui.tool_call_with_args(&call.id, &call.name, &summarize(call), &call.arguments);
-                ui.tool_timing(&call.name, 0.0);
+                ui.tool_timing(&call.id, &call.name, 0.0);
                 ui.tool_result_with_id(&call.id, &call.name, &output);
                 output
             } else {
-                ui.tool_call_with_args(&call.id, &call.name, &summarize(call), &call.arguments);
+                if parallel.is_empty() {
+                    ui.tool_call_with_args(&call.id, &call.name, &summarize(call), &call.arguments);
+                }
                 self.record(
                     step,
                     "tool_call",
@@ -363,6 +365,20 @@ impl Agent<'_> {
                     };
                     let reused = early.iter().flatten().count();
                     if count > 1 || reused > 0 {
+                        for (position, (batched, result)) in group.iter().zip(&early).enumerate() {
+                            if let Some((output, seconds)) = result {
+                                if position > 0 {
+                                    ui.tool_call_with_args(
+                                        &batched.id,
+                                        &batched.name,
+                                        &summarize(batched),
+                                        &batched.arguments,
+                                    );
+                                }
+                                ui.tool_timing(&batched.id, &batched.name, *seconds);
+                                ui.tool_result_with_id(&batched.id, &batched.name, output);
+                            }
+                        }
                         let rest: Vec<ToolCall> = group
                             .iter()
                             .zip(&early)
@@ -381,6 +397,7 @@ impl Agent<'_> {
                                 &self.interrupt,
                                 ui,
                                 &mut steering,
+                                Some(&call.id),
                             )
                         }
                         .into_iter();
@@ -399,6 +416,7 @@ impl Agent<'_> {
                         }
                     }
                 }
+                let result_presented = !parallel.is_empty();
                 let (mut out, seconds, executed) = match parallel.pop_front() {
                         Some(result) => {
                             // Batched bash skips `dispatch`; record verification evidence as the serial path does.
@@ -409,7 +427,7 @@ impl Agent<'_> {
                         }
                         None if call.name == "finish" && call.arguments["outcome"] == "completed" && (execution_failed || !form_kinds.is_empty()) => {
                             (ToolOutput { execution: Default::default(),  data: None,
-text: "finish completed cannot follow a failed call in the same batch; address its error first".into(), is_error: true }, 0.0, false)
+text: "finish completed cannot follow a failed call in the same batch; address its error first".into(), is_error: true }.with_status(tools::ToolStatus::Blocked), 0.0, false)
                         }
                         None => {
                             // Anything executed serially may change what an early read observed.
@@ -444,7 +462,9 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                         }
                     }
                 }
-                ui.tool_timing(&call.name, seconds);
+                if !result_presented {
+                    ui.tool_timing(&call.id, &call.name, seconds);
+                }
                 tool_seconds = seconds;
                 self.settled(call, &out);
                 if call.name == "task"
@@ -453,7 +473,9 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                     self.efficiency_metrics.worker_results(data);
                 }
                 self.observe_tool_routing(call, &out);
-                ui.tool_result_with_id(&call.id, &call.name, &out);
+                if !result_presented {
+                    ui.tool_result_with_id(&call.id, &call.name, &out);
+                }
                 out
             };
             let status = if controller_blocked {
@@ -461,6 +483,10 @@ text: "finish completed cannot follow a failed call in the same batch; address i
             } else {
                 tools::ToolStatus::from_output(&output)
             };
+            if controller_blocked {
+                output.execution.status = Some(status);
+                output.execution.effects = tools::surface::outcome::Effects::None;
+            }
             self.record(step, "tool_outcome", json!({"name":call.name,"id":call.id,"status":status,"effects":tools::surface::outcome::effects(&output),"duration_ms":tool_seconds*1000.0}))?;
             let callback_intercepted = std::mem::take(&mut self.portable_callback_intercepted);
             if callback_intercepted || self.ext.contains(&call.name) {
@@ -892,15 +918,24 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                 std::mem::take(&mut self.callback_question_results),
                 limit,
             );
-            if call.name == "read"
-                && !output.is_error
+            // A read image, or the file `image_gen` just wrote, is attached so a vision model can
+            // inspect it (and regenerate when it misses the request).
+            let attach = match call.name.as_str() {
+                "read" => call.arguments["path"].as_str(),
+                crate::tools::net::image_gen::TOOL => call.arguments["output"].as_str(),
+                _ => None,
+            };
+            if !output.is_error
                 && !self.hermetic
-                && let Some(path) = call.arguments["path"].as_str()
+                && let Some(path) = attach
             {
                 let path = Path::new(path);
                 if llm::images::is_image(path) {
-                    let authorized =
-                        llm::images::authorized_user_reference(&self.session.messages(), path);
+                    let authorized = (call.name == "read")
+                        .then(|| {
+                            llm::images::authorized_user_reference(&self.session.messages(), path)
+                        })
+                        .flatten();
                     let attachment = if let Some(image) = authorized {
                         Ok(image)
                     } else {

@@ -410,7 +410,8 @@ fn request(
                     if effort == ReasoningEffort::None {
                         thinking["thinkingBudget"] = json!(0);
                     } else {
-                        thinking["thinkingLevel"] = json!(effort.as_str().to_ascii_uppercase());
+                        thinking["thinkingLevel"] =
+                            json!(profile.reasoning_effort_wire(effort).to_ascii_uppercase());
                     }
                 }
                 generation["thinkingConfig"] = thinking;

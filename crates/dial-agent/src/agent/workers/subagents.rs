@@ -17,6 +17,7 @@
 //! per-file conflict checks. Approval prompts from concurrent children are funnelled
 //! to the calling thread, the only one that owns the [`Ui`].
 mod handoff;
+pub(in crate::agent) mod seance;
 
 use crate::config::subagents::AGENTS;
 use crate::config::subagents::AgentSpec;
@@ -64,6 +65,7 @@ const RESULT_BUDGET: usize = 14_000;
 fn role_for_agent(spec: &AgentSpec) -> &'static str {
     match spec.name {
         "reviewer" | "test-runner" => "tester",
+        "seance" => "main",
         "planner" => "planner",
         _ if spec.mutates => "task",
         _ => "small",
@@ -119,6 +121,11 @@ pub fn toolset(spec: &AgentSpec, enabled: &[String], ext: &Registry) -> Vec<Stri
         .iter()
         .filter(|tool| enabled.iter().any(|e| e == **tool))
         .map(|tool| (*tool).to_owned());
+    // A consultant answers from the quoted record and the files it can read: extension, artifact
+    // and other tools are withheld whatever the harness enabled.
+    if spec.name == "seance" {
+        return own.collect();
+    }
     // Read-only agents get recall extensions (codebase, memory, `find`, `dep_source`), not
     // integrations such as browsers or archive inspection, even when those need no approval.
     let extra = ext
@@ -220,6 +227,8 @@ pub fn schema(config: &Config) -> Value {
         "output_schema":{"type":"object","description":"JSON Schema the final answer must satisfy."},
         "isolation":{"type":"string","enum":["copy"],"description":"Workers only: use a private copy and native-tool session. Successful changed files merge unless the parent changed them. Failed/interrupted edits remain in a recovery copy. The result's separate isolation metadata reports applied files, conflicts, I/O errors and recovery_location; output_schema data is never altered."}
     });
+    entry_properties.as_object_mut().unwrap().insert("source_session".into(), json!({"type":"string","minLength":1,"description":"agent seance only: a session id prefix or a worker id from this session whose record the consultant reads."}));
+    entry_properties.as_object_mut().unwrap().insert("model".into(), json!({"type":"string","description":"agent seance only: model to answer on; default is the source session's saved model, else the main model."}));
     if config.experimental.work_packet_contracts {
         entry_properties.as_object_mut().unwrap().insert("work_packet".into(), json!({
             "type":"object",
@@ -238,11 +247,11 @@ pub fn schema(config: &Config) -> Value {
     let mut properties = serde_json::Map::from_iter([
         (
             "action".into(),
-            json!({"type":"string","enum":["run","start","resume","status","wait","cancel"],"description":"Default run waits for results and blocks you until every task finishes; for work that may take more than a few minutes, use start and then wait, so you can keep working and check progress. start returns live job IDs. resume continues a retained worker by id and message, only after its previous execution stopped safely. Use the message tool to talk to a live worker."}),
+            json!({"type":"string","enum":["run","start","resume","status","wait","cancel","create","push","peek","close"],"description":"Default run waits for results and blocks you until every task finishes; for work that may take more than a few minutes, use start and then wait, so you can keep working and check progress. start returns live job IDs. resume continues a retained worker by id and message, only after its previous execution stopped safely. create opens a worker pool with its first tasks, push adds tasks to a pool id, peek reports a pool id's status, and close (or cancel with a pool id) closes a pool. Use the message tool to talk to a live worker."}),
         ),
         (
             "id".into(),
-            json!({"type":"string","description":"Job ID for resume/status/wait/cancel; omit status/wait ID for all jobs."}),
+            json!({"type":"string","description":"Job ID (task-N) for resume/status/wait/cancel, or pool ID (pool-N) for push/peek/close; omit status/wait ID for all jobs."}),
         ),
         (
             "message".into(),
@@ -277,6 +286,10 @@ pub fn schema(config: &Config) -> Value {
             json!({"type":"integer","minimum":0,"description":"Model step limit for a single task; default 0 means unlimited."}),
         ),
         (
+            "concurrency".into(),
+            json!({"type":"integer","minimum":1,"maximum":32,"description":"create only: most pool workers running at once; default follows task.max_concurrency, clamped to 1..4."}),
+        ),
+        (
             "name".into(),
             json!({"type":"string","description":"Optional label for a single task."}),
         ),
@@ -293,6 +306,8 @@ pub fn schema(config: &Config) -> Value {
             json!({"type":"array","maxItems":MAX_BATCH,"items":entry,"description":"Independent tasks to run instead of `task`; each needs its own task and solution_space."}),
         ),
     ]);
+    properties.insert("source_session".into(), json!({"type":"string","minLength":1,"description":"agent seance only: a session id prefix or a worker id from this session whose record the consultant reads. Other agents reject this field."}));
+    properties.insert("model".into(), json!({"type":"string","description":"agent seance only: model to answer on; default is the source session's saved model, else the main model. Other agents reject this field."}));
     if config.experimental.work_packet_contracts {
         properties.insert("work_packet".into(), json!({
             "type":"object",
@@ -386,7 +401,9 @@ impl Handoff {
     /// Fresh runs receive current parent background; resumed conversations keep their saved brief.
     pub(in crate::agent) fn apply(&self, jobs: &mut [Job<'_>]) {
         for job in jobs {
-            if job.resume_tools.is_none() && job.resume_messages.is_empty() {
+            // A consultant answers about the source record, not the parent's current request.
+            if job.seance.is_none() && job.resume_tools.is_none() && job.resume_messages.is_empty()
+            {
                 job.handoff = self.clone();
             }
         }
@@ -461,6 +478,8 @@ pub(in crate::agent) struct Job<'c> {
     /// Skills the agent definition autoloads; `preloaded` holds their rendered bodies once resolved.
     pub autoload_skills: Vec<String>,
     pub preloaded: String,
+    /// Set for `agent: seance`: the source it consults and the model it runs on.
+    pub(in crate::agent) seance: Option<seance::Seance>,
 }
 
 #[derive(Clone)]
@@ -483,7 +502,10 @@ fn model_routes(
 ) -> Result<Vec<ModelRoute>, String> {
     let definition = config.agents.get(job.kind);
     let selectors = definition.map(|d| d.model.as_slice()).unwrap_or_default();
-    let selectors: Vec<Option<&str>> = if selectors.is_empty() || profile.is_some() {
+    // A consultation runs on its explicit or source model only; profiles and definitions do not apply.
+    let selectors: Vec<Option<&str>> = if let Some(seance) = &job.seance {
+        vec![seance.model.as_deref()]
+    } else if selectors.is_empty() || profile.is_some() {
         vec![None]
     } else {
         selectors.iter().map(|s| Some(s.as_str())).collect()
@@ -552,6 +574,8 @@ fn model_routes(
             }
             let source = if profile.is_some() {
                 "profile"
+            } else if job.seance.is_some() && selector.is_some() {
+                "seance"
             } else if selector.is_some() {
                 "definition"
             } else if role == "main" {
@@ -571,7 +595,9 @@ fn model_routes(
     // Configured `[retry.fallback_chains]` for the worker's role extend the route list. `run_child`
     // tries them only while the child has done no work, so a half-finished job is never restarted.
     // An operator-named profile is exact and is not substituted.
+    // A consultation names its model; a fallback would answer on a model nobody asked for.
     if profile.is_none()
+        && job.seance.is_none()
         && let Some(primary) = routes.first()
     {
         let role = primary.role;
@@ -662,6 +688,11 @@ impl Job<'_> {
         }
         if let Some(context) = &self.shared_context {
             out.push_str(&format!("Shared context:\n{context}\n\n"));
+        }
+        if let Some(seance) = &self.seance
+            && !seance.record.is_empty()
+        {
+            out.push_str(&format!("{}\n\n", seance.record));
         }
         out.push_str(&format!(
             "Scope: {}\n\nAssignment:\n{}",
@@ -920,6 +951,29 @@ fn parse_job<'c>(
         }
         Some(value) => Some(parse_work_packet(value)?),
     };
+    let seance = if spec.name == "seance" {
+        let source = optional_str(entry, "source_session")?
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or("agent seance needs a non-empty `source_session`: a session id prefix or a worker id from this session")?;
+        if !skills.is_empty() {
+            return Err(
+                "agent seance reads only the record it is given; `skills` does not apply".into(),
+            );
+        }
+        let model = optional_str(entry, "model")?
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_owned);
+        Some(seance::Seance::new(source.to_owned(), model))
+    } else {
+        if optional_str(entry, "source_session")?.is_some()
+            || optional_str(entry, "model")?.is_some()
+        {
+            return Err("`source_session` and `model` apply only to agent seance".into());
+        }
+        None
+    };
     let mut autoload_skills = autoload.to_vec();
     for skill in skills {
         if !autoload_skills.contains(&skill) {
@@ -949,6 +1003,7 @@ fn parse_job<'c>(
         work_packet,
         autoload_skills,
         preloaded: String::new(),
+        seance,
     })
 }
 
@@ -1109,6 +1164,13 @@ pub(in crate::agent) struct Outcome {
     pub model_route: Option<Value>,
     /// Controller-owned exact inspection identities; never part of the worker's validated answer.
     pub inspections: crate::agent::workflow::efficiency::Inspections,
+    /// The child's conversation at finish, moved out so a retained slot can continue it.
+    pub conversation: Option<ChildConversation>,
+}
+/// A finished child's validated history and the tool names it was run with.
+pub(in crate::agent) struct ChildConversation {
+    pub messages: Vec<Value>,
+    pub tools: Vec<String>,
 }
 impl crate::agent::run::engine::Terminal for Outcome {
     fn prevent_completion(&mut self, reason: &str) {
@@ -1130,6 +1192,7 @@ impl Outcome {
             retryable_provider: false,
             model_route: None,
             inspections: Default::default(),
+            conversation: None,
         }
     }
     pub fn failed(steps: u32, why: impl Into<String>) -> Self {
@@ -1142,6 +1205,7 @@ impl Outcome {
             retryable_provider: false,
             model_route: None,
             inspections: Default::default(),
+            conversation: None,
         }
     }
     pub fn interrupted(steps: u32) -> Self {
@@ -1154,6 +1218,7 @@ impl Outcome {
             retryable_provider: false,
             model_route: None,
             inspections: Default::default(),
+            conversation: None,
         }
     }
     pub fn provider_failed(
@@ -1265,8 +1330,24 @@ pub(in crate::agent) trait Approver {
     fn peer_message(&mut self, _args: &Value) -> Result<Value, String> {
         Err("peer messaging unavailable in a synchronous task".into())
     }
-    fn tool_started(&mut self, _name: &str, _registry: &Registry) {}
-    fn tool_finished(&mut self) {}
+    fn tool_started(&mut self, _call_id: &str, _name: &str, _registry: &Registry) {}
+    fn tool_finished(&mut self, _call_id: &str) {}
+    /// Worker-only settings queued by the owner; applied at the next request boundary, never global.
+    fn take_worker_settings(
+        &mut self,
+    ) -> Option<crate::agent::workers::live_tasks::control::WorkerSettings> {
+        None
+    }
+    /// Called after a queued settings update took effect. `resolved` is the worker's effective config,
+    /// which owns the model the worker header shows.
+    fn worker_settings_applied(
+        &mut self,
+        _settings: &crate::agent::workers::live_tasks::control::WorkerSettings,
+        _resolved: &crate::config::types::Config,
+    ) {
+    }
+    /// Called when a queued settings update could not be applied; the worker keeps its previous backend.
+    fn worker_settings_failed(&mut self, _error: &str) {}
     /// Durable transcript for this job, when the runtime records one.
     fn transcript_sink(
         &self,
@@ -1475,8 +1556,12 @@ enum Message {
         reply: mpsc::Sender<Result<(), String>>,
     },
     Done(usize, Box<Outcome>),
-    ToolStarted(usize, Weak<dyn crate::tools::integrations::ext::Tool>),
-    ToolFinished(usize),
+    ToolStarted(
+        usize,
+        String,
+        Weak<dyn crate::tools::integrations::ext::Tool>,
+    ),
+    ToolFinished(usize, String),
     Notice(String),
     Cost(f64),
 }
@@ -1557,11 +1642,13 @@ impl Approver for Remote {
             }
         }
     }
-    fn tool_started(&mut self, name: &str, registry: &Registry) {
+    fn tool_started(&mut self, call_id: &str, name: &str, registry: &Registry) {
         if let Some(tool) = registry.get(name) {
-            let _ = self
-                .0
-                .send(Message::ToolStarted(self.2, Arc::downgrade(tool)));
+            let _ = self.0.send(Message::ToolStarted(
+                self.2,
+                call_id.to_owned(),
+                Arc::downgrade(tool),
+            ));
         }
         if let Some(body) = &self.1 {
             let steps = body.read(|n| {
@@ -1574,8 +1661,10 @@ impl Approver for Remote {
             body.tool_started(name, steps);
         }
     }
-    fn tool_finished(&mut self) {
-        let _ = self.0.send(Message::ToolFinished(self.2));
+    fn tool_finished(&mut self, call_id: &str) {
+        let _ = self
+            .0
+            .send(Message::ToolFinished(self.2, call_id.to_owned()));
     }
     fn progress(&mut self, steps: u32, phase: &str, text: &str) {
         if let Some(body) = &self.1 {
@@ -1723,7 +1812,12 @@ pub(in crate::agent) struct Parent<'a> {
 }
 
 /// Run a `task` call to completion and format the result for the model.
-pub(in crate::agent) fn run(parent: Parent<'_>, args: &Value, ui: &mut dyn Ui) -> ToolOutput {
+pub(in crate::agent) fn run(
+    parent: Parent<'_>,
+    session_id: Option<&str>,
+    args: &Value,
+    ui: &mut dyn Ui,
+) -> ToolOutput {
     let Parent {
         env,
         approval,
@@ -1749,6 +1843,14 @@ pub(in crate::agent) fn run(parent: Parent<'_>, args: &Value, ui: &mut dyn Ui) -
             };
         }
     };
+    if let Err(why) = seance::attach(&mut request.jobs, env.layout, session_id, &config) {
+        return ToolOutput {
+            execution: Default::default(),
+            data: None,
+            text: why,
+            is_error: true,
+        };
+    }
     handoff.apply(&mut request.jobs);
     if let Err(why) = preload_skills(&mut request.jobs, env.layout) {
         return ToolOutput {
@@ -2381,17 +2483,32 @@ impl Approver for Rebase<'_> {
     ) -> Option<std::sync::Arc<crate::agent::workers::child_transcript::ChildTranscript>> {
         self.inner.transcript_sink()
     }
+    fn take_worker_settings(
+        &mut self,
+    ) -> Option<crate::agent::workers::live_tasks::control::WorkerSettings> {
+        self.inner.take_worker_settings()
+    }
+    fn worker_settings_applied(
+        &mut self,
+        settings: &crate::agent::workers::live_tasks::control::WorkerSettings,
+        resolved: &crate::config::types::Config,
+    ) {
+        self.inner.worker_settings_applied(settings, resolved)
+    }
+    fn worker_settings_failed(&mut self, error: &str) {
+        self.inner.worker_settings_failed(error)
+    }
     fn live_coordination(&self) -> bool {
         self.inner.live_coordination()
     }
     fn peer_message(&mut self, args: &Value) -> Result<Value, String> {
         self.inner.peer_message(args)
     }
-    fn tool_started(&mut self, name: &str, registry: &Registry) {
-        self.inner.tool_started(name, registry)
+    fn tool_started(&mut self, call_id: &str, name: &str, registry: &Registry) {
+        self.inner.tool_started(call_id, name, registry)
     }
-    fn tool_finished(&mut self) {
-        self.inner.tool_finished()
+    fn tool_finished(&mut self, call_id: &str) {
+        self.inner.tool_finished(call_id)
     }
 }
 
@@ -2422,7 +2539,6 @@ pub(in crate::agent) fn run_job(
         let outcome =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(owner_env, approver)))
                 .unwrap_or_else(|_| Outcome::failed(0, "subagent worker panicked"));
-        approver.tool_finished();
         return outcome;
     }
     let isolated = match crate::agent::workers::isolation::Isolated::with_config(
@@ -2450,7 +2566,6 @@ pub(in crate::agent) fn run_job(
     let mut outcome =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(copy_env, &mut rebase)))
             .unwrap_or_else(|_| Outcome::failed(0, "subagent worker panicked"));
-    rebase.tool_finished();
     // Stop owned processes before inspecting changes: no background writer/client
     // may keep modifying the copy while it is being merged or retained for recovery.
     drop(registry);
@@ -2642,7 +2757,7 @@ fn pump_messages(
 ) {
     // Weak handles cannot keep an owned process alive after its registry is dropped
     // for copy merge/recovery. They are upgraded only to cancel the active operation.
-    let mut active: BTreeMap<usize, Weak<dyn crate::tools::integrations::ext::Tool>> =
+    let mut active: BTreeMap<(usize, String), Weak<dyn crate::tools::integrations::ext::Tool>> =
         BTreeMap::new();
     loop {
         let message = rx.recv_timeout(std::time::Duration::from_millis(100));
@@ -2670,17 +2785,17 @@ fn pump_messages(
             }
             Ok(Message::Notice(message)) => direct.notice(&message),
             Ok(Message::Cost(cost)) => direct.add_cost(cost),
-            Ok(Message::ToolStarted(index, tool)) => {
+            Ok(Message::ToolStarted(index, call_id, tool)) => {
                 if env.interrupt.load(Ordering::SeqCst) {
                     if let Some(tool) = tool.upgrade() {
                         tool.cancel_operation();
                     }
                 } else {
-                    active.insert(index, tool);
+                    active.insert((index, call_id), tool);
                 }
             }
-            Ok(Message::ToolFinished(index)) => {
-                active.remove(&index);
+            Ok(Message::ToolFinished(index, call_id)) => {
+                active.remove(&(index, call_id));
             }
             Ok(Message::Question {
                 request,
@@ -2740,7 +2855,7 @@ fn pump_messages(
                 let _ = reply.send(result);
             }
             Ok(Message::Done(index, outcome)) => {
-                active.remove(&index);
+                active.retain(|(job, _), _| *job != index);
                 if let Some(job) = jobs.iter().find(|job| job.index == index) {
                     announce_end(direct.ui, job, &outcome);
                 }

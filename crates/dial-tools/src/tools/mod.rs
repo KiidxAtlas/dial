@@ -145,6 +145,9 @@ pub struct Workspace {
     credential_paths: Vec<PathBuf>,
     sandbox: Option<Sandbox>,
     allow_network: bool,
+    /// Why web fetches and URL reads are refused, or `None` when they may reach the network.
+    /// A workspace with no session network policy attached refuses them.
+    web_network_block: Option<&'static str>,
     policy: Option<exec::sandbox::Policy>,
     unsandboxed: bool,
     /// Shell that runs `bash` commands (`shell.backend`).
@@ -168,6 +171,8 @@ pub struct Workspace {
     ssh: crate::config::tools::ssh::SshConfig,
     /// Connection targets for `ssh://` hosts, keyed by name (see [`Workspace::with_ssh_hosts`]).
     ssh_hosts: Arc<BTreeMap<String, integrations::ssh::Target>>,
+    /// Resolver for host-served resource schemes (see [`integrations::host_uri`]); `None` serves none.
+    host_uris: Option<Arc<dyn integrations::host_uri::HostUriResolver>>,
     edit_repair: edit::editing::RepairSlot,
     edit_blackbox_dir: Option<PathBuf>,
     native_edits: Arc<edit::edit_native::store::EditStore>,
@@ -177,8 +182,12 @@ pub struct Workspace {
     /// `ast_edit` dry-run previews awaiting an `apply_token`; shared by clones.
     staged_rewrites: Arc<edit::ast::StagedPreviews>,
     artifacts: Option<artifact::ArtifactStore>,
+    /// Session name scoping Cargo build output (see [`exec::cargo_target`]); `None` leaves it unset.
+    cargo_session: Option<String>,
     operations: Arc<Mutex<()>>,
     shell_sessions: Arc<Mutex<BTreeMap<String, crate::embedded_shell::state::State>>>,
+    /// Named sessions a background shell job holds, or settled since their last use.
+    shell_busy: Arc<Mutex<BTreeMap<String, exec::shell::session::SessionBusy>>>,
     pub speculation: Arc<exec::speculation::Pool>,
 }
 
@@ -206,6 +215,7 @@ impl Workspace {
             credential_paths: Vec::new(),
             sandbox: None,
             allow_network: false,
+            web_network_block: Some("no session network policy is attached"),
             policy: None,
             unsandboxed: false,
             shell_backend: crate::config::types::ShellBackend::Auto,
@@ -217,6 +227,7 @@ impl Workspace {
             bash_interceptor: None,
             ssh: crate::config::tools::ssh::SshConfig::default(),
             ssh_hosts: Arc::default(),
+            host_uris: None,
             edit_repair: edit::editing::RepairSlot::default(),
             edit_blackbox_dir: None,
             native_edits: Arc::default(),
@@ -224,8 +235,10 @@ impl Workspace {
             edits: Arc::default(),
             staged_rewrites: Arc::default(),
             artifacts: None,
+            cargo_session: None,
             operations: Arc::default(),
             shell_sessions: Arc::default(),
+            shell_busy: Arc::default(),
             speculation: Arc::default(),
         })
     }
@@ -246,6 +259,18 @@ impl Workspace {
     }
     pub fn artifacts(&self) -> Option<&artifact::ArtifactStore> {
         self.artifacts.as_ref()
+    }
+    /// Scopes Cargo build output to one session under the workspace scratch dir. An invalid
+    /// name leaves isolation off rather than building a path from unchecked text.
+    pub fn with_cargo_session(mut self, session: &str) -> Self {
+        self.cargo_session = exec::cargo_target::valid_session(session).then(|| session.to_owned());
+        self
+    }
+    /// Cargo target directory for commands run in this workspace, or `None` without a session scope.
+    pub fn cargo_target_dir(&self) -> Option<PathBuf> {
+        self.cargo_session
+            .as_deref()
+            .map(|session| exec::cargo_target::dir_for(&self.root, session))
     }
     pub fn serial_operation(&self) -> MutexGuard<'_, ()> {
         self.operations.lock().unwrap_or_else(|e| e.into_inner())
@@ -284,6 +309,16 @@ impl Workspace {
     pub fn with_network(mut self, allow: bool) -> Self {
         self.allow_network = allow;
         self
+    }
+
+    /// Set the web network gate from the session's sandbox policy (`None` allows the network).
+    pub(in crate::tools) fn with_web_network_block(mut self, block: Option<&'static str>) -> Self {
+        self.web_network_block = block;
+        self
+    }
+
+    pub(in crate::tools) fn web_network_block(&self) -> Option<&'static str> {
+        self.web_network_block
     }
 
     /// Run bash under an explicit sandbox policy (strict or developer).
@@ -439,6 +474,16 @@ impl Workspace {
     pub fn ssh_hosts(&self) -> &BTreeMap<String, integrations::ssh::Target> {
         &self.ssh_hosts
     }
+    /// Installs (or with `None` removes) the resolver for host-served resource schemes.
+    pub fn set_host_uris(
+        &mut self,
+        resolver: Option<Arc<dyn integrations::host_uri::HostUriResolver>>,
+    ) {
+        self.host_uris = resolver;
+    }
+    pub fn host_uris(&self) -> Option<&Arc<dyn integrations::host_uri::HostUriResolver>> {
+        self.host_uris.as_ref()
+    }
     pub fn with_edit_repair(mut self, repair: Arc<dyn EditRepair>) -> Self {
         self.edit_repair = edit::editing::RepairSlot(Some(repair));
         self
@@ -499,6 +544,8 @@ impl Workspace {
         let mut copy = Workspace::new(root)?;
         copy.sandbox = self.sandbox.clone();
         copy.allow_network = self.allow_network;
+        copy.web_network_block = self.web_network_block;
+        copy.host_uris = self.host_uris.clone();
         copy.policy = self.policy.clone();
         copy.protected_paths = self.protected_paths.clone();
         copy.credential_paths = self.credential_paths.clone();
@@ -516,6 +563,7 @@ impl Workspace {
         copy.ssh = self.ssh.clone();
         copy.ssh_hosts = Arc::clone(&self.ssh_hosts);
         copy.artifacts = self.artifacts.clone();
+        copy.cargo_session = self.cargo_session.clone();
         Ok(copy)
     }
 
@@ -1016,7 +1064,7 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
                     REPLACE_READ_DESC
                 },
                 json!({
-                    "path": {"type": "string", "description": "Workspace file/directory or `ssh://host/path` remote file. SSH URL reads require explicit approval; absolute and `~/` remote paths supported. `pr://N[/diff]` and `issue://N` read GitHub through gh; `conflict://` lists unmerged paths and `conflict://PATH` reads its merge-conflict hunks with edit anchors. Use paths instead to read several targets in one call."},
+                    "path": {"type": "string", "description": "Workspace file/directory, `ssh://host/path` remote file, or `http(s)://` URL. SSH URL reads require explicit approval; absolute and `~/` remote paths supported. HTTP(S) URLs are fetched through the web network gate (approval required) with selectors and archive `:member` supported. `pr://N[/diff]` and `issue://N` read GitHub through gh; `conflict://` lists unmerged paths and `conflict://PATH` reads its merge-conflict hunks with edit anchors. Use paths instead to read several targets in one call."},
                     "offset": {"type": "integer", "minimum": 1, "description": "1-based line to start at (default 1); not together with a path selector."},
                     "limit": {"type": "integer", "minimum": 1, "description": "Maximum number of lines (default 2000)."},
                     "paths": {"type": "array", "items": {"type": "string"}, "maxItems": 16, "description": "Several targets read in one call, each a path with its own optional selector (e.g. `src/a.rs:1-80`); results come back in order. Use instead of path."},
@@ -1098,7 +1146,7 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
                 "command": {"type": "string", "description": "Shell command to run."},
                 "cwd": {"type": "string", "description": "Working directory: relative to the primary workspace root, or absolute inside the primary root or an added workspace root. Default is the project root: do not prefix commands with `cd <root> &&`."},
                 "session": {"type":"string", "description":"With the embedded backend, retain cwd and exported string variables between completed foreground commands in this named workspace session. Does not retain functions, unexported variables or background jobs. Cancelled/timed-out exchanges invalidate the state."},
-                "timeout": {"type": "integer", "minimum": 1, "description": "Seconds to wait in the foreground, capped by the configured bash timeout. Longer than ~15s keeps the command in this call until then; a command still running at that point moves to bg instead of being killed."},
+                "timeout": {"type": "integer", "minimum": 1, "description": "Seconds the command may run before it is killed. A command still running after `shell.auto_background_secs` (15 by default) moves to bg whatever the timeout, so set a timeout only as an upper bound; it does not keep the command in the foreground."},
                 "background": {"type": "boolean", "description": "Start this command as a managed background job now (servers, watchers, work to overlap). Without `timeout`, commands still running after ~15s move to background automatically. Check or stop jobs with the bg tool."},
                 "async": {"type": "boolean", "description": "Alias of background."},
             }),
@@ -1139,6 +1187,9 @@ pub fn read_tool_streaming(
         return ToolOutput::err("tool arguments must be a JSON object");
     }
     exec::execution::run(cancel, || {
+        if let Some(result) = fs::media::read(ws, args, cancel) {
+            return result.unwrap_or_else(ToolOutput::err);
+        }
         match fs::files::read_tool_streaming(ws, args, cancel, budget) {
             Ok(text) => ToolOutput::ok(text),
             Err(error) => ToolOutput::err(error),
@@ -1433,7 +1484,10 @@ fn dispatch(
         return Err("tool arguments must be a JSON object".to_string());
     }
     match name {
-        "read" => fs::files::read_tool(ws, args).map(ToolOutput::ok),
+        "read" => match fs::media::read(ws, args, &std::sync::atomic::AtomicBool::new(false)) {
+            Some(result) => result,
+            None => fs::files::read_tool(ws, args).map(ToolOutput::ok),
+        },
         "write" => fs::files::write_tool(ws, args).map(ToolOutput::ok),
         "edit" => edit::editing::edit(ws, args)
             .map(ToolOutput::ok)
@@ -1513,7 +1567,7 @@ pub fn apply_sandbox_config(
         ]),
         None => ws,
     };
-    let mut ws = ws;
+    let mut ws = ws.with_web_network_block(net::web::network_disabled(config));
     if let Some((_, user)) = protected {
         let auth = crate::config::paths::subscription_auth_dir(user)?;
         ws.credential_paths = vec![

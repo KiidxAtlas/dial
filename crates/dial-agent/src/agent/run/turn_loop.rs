@@ -53,6 +53,20 @@ impl<'a> Agent<'a> {
                 }
             }
         };
+        // Hermetic evaluation must not spend money on background replays.
+        let stops = if self.hermetic {
+            Vec::new()
+        } else {
+            model::cache_warm::CacheWarm::sync(&mut self.cache_warm, &self.config)?
+        };
+        for stop in stops {
+            ui.notice(&format!(
+                "Cache warming stopped: {}",
+                model::cache_warm::describe(stop)
+            ));
+        }
+        // Dropped on every exit path, so the warmer learns when the run ends.
+        let _cache_warm_run = self.cache_warm.as_ref().map(|warm| warm.run_guard());
         // Reset current-turn evidence before any admission step can fail. Historical receipts
         // remain separately labelled and must still pass freshness checks before reuse.
         self.step_checks = StepChecks::default();
@@ -92,12 +106,16 @@ impl<'a> Agent<'a> {
         for backend in self.role_backends.values_mut() {
             backend.set_usage_scope(Some(self.usage_scope.clone()));
         }
+        let plugins = self
+            .hook_plugins()
+            .map(|host| host as std::sync::Arc<dyn crate::agent::ui::state_ui::EventSink>);
         let mut observed = crate::agent::ui::state_ui::StateUi::with_registry(
             ui,
             self.session.runtime(),
             None,
             self.ext.clone(),
-        );
+        )
+        .observed_by(plugins, self.session.id());
         self.live_tasks.bind(self.session.runtime());
         let turn_clock = Instant::now();
         self.coordination_phase("working", Some(user_text));
@@ -173,6 +191,9 @@ impl<'a> Agent<'a> {
             ),
             Err(_) => ("failed".to_string(), 0),
         };
+        self.emit_event("turn_end", || {
+            json!({"session_id": self.session.id(), "outcome": outcome.clone(), "steps": steps, "interrupted": result.as_ref().is_ok_and(|report| report.interrupted)})
+        });
         // A failed turn keeps its cause in the journal; the transcript alone loses it on resume.
         let (error, error_class) = match &result {
             Err(error) => (
@@ -237,6 +258,10 @@ impl<'a> Agent<'a> {
         if reset_interrupt {
             self.interrupt.store(false, Ordering::SeqCst);
         }
+        let mut prompt_rewrite: Option<String> = None;
+        self.emit_event("turn_start", || {
+            json!({"session_id": self.session.id(), "prompt": crate::agent::window::prompt::truncate_chars(user_text, 8000)})
+        });
         let plugins = self.hook_plugins();
         if crate::agent::safety::hooks::wanted(
             self.tool_hooks(),
@@ -247,7 +272,7 @@ impl<'a> Agent<'a> {
             let root = self.workspace.root();
             let interrupt = self.interrupt.as_ref();
             let payload = json!({"prompt":user_text,"session_id":self.session.id()});
-            let (verdict, notices, context) =
+            let (verdict, notices, context, prompt) =
                 crate::agent::safety::hooks::with_heartbeat(ui, || {
                     let outcome = crate::agent::safety::hooks::fire_with(
                         configured_hooks,
@@ -259,8 +284,9 @@ impl<'a> Agent<'a> {
                         interrupt,
                     );
                     let context = outcome.context_note();
-                    (outcome.verdict, outcome.notices, context)
+                    (outcome.verdict, outcome.notices, context, outcome.prompt)
                 });
+            prompt_rewrite = prompt;
             self.queue_hook_context(context);
             notices.iter().for_each(|n| {
                 ui.event(&crate::agent::ui::ui_event::UiEvent::new(
@@ -282,6 +308,13 @@ impl<'a> Agent<'a> {
                 }
             }
         }
+        if let Some(text) = &prompt_rewrite {
+            ensure!(
+                !text.trim().is_empty() && text.len() <= 262_144,
+                "rewritten message must be 1..262144 bytes"
+            );
+        }
+        let user_text = prompt_rewrite.as_deref().unwrap_or(user_text);
         // Turn optimizer: steering left from an earlier turn, then this message, pass through the
         // drafter before anything else reads them. From here on the turn runs on the drafted text;
         // the typed text is kept only as message metadata for display and memory.
@@ -500,6 +533,12 @@ impl<'a> Agent<'a> {
             }))?);
             context.push_str("\nRun the named configured checks against the final result; required visuals need delivered browser pixels. Missing, stale, failed or unavailable evidence remains uncovered. Do not weaken checks or edit code to hide environment failures.");
         }
+        // Only inspect the current branch/tail: archived pre-compaction context is not visible.
+        let ambient_history = if self.config.efficiency.enabled {
+            self.session.messages()
+        } else {
+            Vec::new()
+        };
         if let Some(memory) = &self.memory {
             // The lookup is a search query, not the prompt: a pasted file or log must not fail the turn.
             let query = crate::agent::window::prompt::truncate_chars(user_text, RECALL_QUERY_CHARS);
@@ -517,7 +556,11 @@ impl<'a> Agent<'a> {
                     usize::MAX
                 }),
             ) {
-                Ok(recalled) => context.push_str(&recalled),
+                Ok(recalled) => crate::agent::workflow::efficiency::append_ambient(
+                    &mut context,
+                    &recalled,
+                    &ambient_history,
+                ),
                 Err(error) => {
                     ui.diagnostic(&format!("Provenance memory lookup unavailable: {error:#}"))
                 }
@@ -529,10 +572,11 @@ impl<'a> Agent<'a> {
                 ui,
             )
         {
-            if !context.is_empty() {
-                context.push_str("\n\n");
-            }
-            context.push_str(&saved);
+            crate::agent::workflow::efficiency::append_ambient(
+                &mut context,
+                &saved,
+                &ambient_history,
+            );
         }
         if let Some(hints) = self.repair_context(user_text, ui) {
             if !context.is_empty() {

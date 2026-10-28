@@ -75,6 +75,8 @@ pub struct Reply {
     /// Replacement message list for a `context` hook (`{"messages":[..]}`), validated by the
     /// caller before use.
     pub messages: Option<Value>,
+    /// Replacement user message text for a `user_prompt_submit` hook (`{"prompt":".."}`).
+    pub prompt: Option<String>,
 }
 
 impl Reply {
@@ -115,6 +117,7 @@ impl Reply {
         reply.is_error = object.get("is_error").and_then(Value::as_bool);
         reply.payload = object.get("payload").cloned();
         reply.messages = object.get("messages").cloned();
+        reply.prompt = text("prompt");
         reply.additional_context = ["additional_context", "additionalContext"]
             .into_iter()
             .find_map(text)
@@ -157,6 +160,8 @@ pub struct Outcome {
     pub context: Vec<String>,
     /// Replacement `context` message list, not yet validated.
     pub messages: Option<Value>,
+    /// Replacement `user_prompt_submit` message text (`{"prompt":".."}`); the caller checks its size.
+    pub prompt: Option<String>,
 }
 
 impl Outcome {
@@ -630,6 +635,13 @@ fn apply(
                 outcome.messages = Some(messages);
             }
         }
+        "user_prompt_submit" => {
+            if let Some(prompt) = reply.prompt {
+                // Later hooks and plugins see the rewritten message.
+                payload["prompt"] = json!(prompt);
+                outcome.prompt = Some(prompt);
+            }
+        }
         _ => {}
     }
     None
@@ -661,6 +673,7 @@ pub fn fire_with(
         request: None,
         context: Vec::new(),
         messages: None,
+        prompt: None,
     };
     let mut output = Vec::new();
     let block = |outcome: &mut Outcome, reason: String, source: &str| {

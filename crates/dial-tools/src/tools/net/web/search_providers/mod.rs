@@ -6,16 +6,32 @@
 //! environment variables, travel only in headers (Google CSE: its query string) to the provider's
 //! own https origin, and never appear in results, errors or logs.
 
+mod anthropic;
+mod codex;
+mod deepseek;
+mod domains;
+mod gemini;
+mod grounded;
 mod json_apis;
+mod kimi;
+mod ollama;
+mod openai;
+mod openrouter;
 mod perplexity;
+mod public;
 mod scrapers;
 mod searxng;
+mod synthetic;
+mod tinyfish;
 mod xai;
+pub use domains::DomainFilter;
+pub use grounded::saved_key;
 
 use super::content;
 use super::fetch::{Client, Response, percent_encode};
 use super::search::{self, SearchResult};
 use serde_json::Value;
+use std::path::Path;
 
 const ACCEPT: &str = "application/json,text/html;q=0.8,*/*;q=0.5";
 
@@ -43,11 +59,22 @@ pub enum Provider {
     Startpage,
     Mojeek,
     Ecosia,
+    Tinyfish,
+    Deepseek,
+    Kimi,
+    Synthetic,
+    Ollama,
+    Public,
+    OpenAi,
+    Anthropic,
+    Gemini,
+    OpenRouter,
+    Codex,
 }
 
 /// Every provider, in the order `names()` lists them. Providers added after the first release are
 /// appended after the first [`ORIGINAL_COUNT`].
-const ALL: [Provider; 18] = [
+const ALL: [Provider; 29] = [
     Provider::Brave,
     Provider::Tavily,
     Provider::Exa,
@@ -66,12 +93,23 @@ const ALL: [Provider; 18] = [
     Provider::Startpage,
     Provider::Mojeek,
     Provider::Ecosia,
+    Provider::Tinyfish,
+    Provider::Deepseek,
+    Provider::Kimi,
+    Provider::Synthetic,
+    Provider::Ollama,
+    Provider::Public,
+    Provider::OpenAi,
+    Provider::Anthropic,
+    Provider::Gemini,
+    Provider::OpenRouter,
+    Provider::Codex,
 ];
 
 /// Order used by `auto`: configured keyed providers first, then SearXNG, then the keyless DuckDuckGo
 /// HTML endpoint (always available) and the keyless scrapers as further fallbacks. A scraper that hits a
 /// bot wall fails with an error, so the next entry is tried.
-const AUTO_ORDER: [Provider; 18] = [
+const AUTO_ORDER: [Provider; 23] = [
     Provider::Exa,
     Provider::Brave,
     Provider::Tavily,
@@ -83,6 +121,11 @@ const AUTO_ORDER: [Provider; 18] = [
     Provider::Parallel,
     Provider::Zai,
     Provider::Xai,
+    Provider::Tinyfish,
+    Provider::Deepseek,
+    Provider::Kimi,
+    Provider::Synthetic,
+    Provider::Ollama,
     Provider::Bing,
     Provider::Google,
     Provider::Searxng,
@@ -113,6 +156,17 @@ impl Provider {
             Provider::Startpage => "startpage",
             Provider::Mojeek => "mojeek",
             Provider::Ecosia => "ecosia",
+            Provider::Tinyfish => "tinyfish",
+            Provider::Deepseek => "deepseek",
+            Provider::Kimi => "kimi",
+            Provider::Synthetic => "synthetic",
+            Provider::Ollama => "ollama",
+            Provider::Public => "public",
+            Provider::OpenAi => "openai",
+            Provider::Anthropic => "anthropic",
+            Provider::Gemini => "gemini",
+            Provider::OpenRouter => "openrouter",
+            Provider::Codex => "codex",
         }
     }
 
@@ -133,7 +187,21 @@ impl Provider {
             Provider::Parallel => &["PARALLEL_API_KEY"],
             Provider::Zai => &["ZAI_API_KEY"],
             Provider::Xai => &["XAI_API_KEY"],
-            Provider::DuckDuckGo | Provider::Startpage | Provider::Mojeek | Provider::Ecosia => &[],
+            Provider::Tinyfish => &["TINYFISH_API_KEY"],
+            Provider::Deepseek => &["DEEPSEEK_API_KEY"],
+            Provider::Kimi => &["KIMI_SEARCH_API_KEY"],
+            Provider::Synthetic => &["SYNTHETIC_API_KEY"],
+            Provider::Ollama => &["OLLAMA_API_KEY"],
+            Provider::OpenAi => &["OPENAI_API_KEY"],
+            Provider::Anthropic => &["ANTHROPIC_API_KEY"],
+            Provider::Gemini => &["GEMINI_API_KEY"],
+            Provider::OpenRouter => &["OPENROUTER_API_KEY"],
+            Provider::Codex => &[],
+            Provider::DuckDuckGo
+            | Provider::Startpage
+            | Provider::Mojeek
+            | Provider::Ecosia
+            | Provider::Public => &[],
         }
     }
 
@@ -145,13 +213,37 @@ impl Provider {
     /// say so instead of presenting unfiltered results as recent ones.
     pub fn recency_note(self, recency: Recency) -> Option<String> {
         match (self, recency) {
-            (Provider::Jina | Provider::Mojeek | Provider::Ecosia, _) => Some(format!(
+            (
+                Provider::Jina
+                | Provider::Mojeek
+                | Provider::Ecosia
+                | Provider::Kimi
+                | Provider::Synthetic
+                | Provider::Ollama,
+                _,
+            ) => Some(format!(
                 "{} does not support the recency filter, so results are not limited to the past {}",
                 self.name(),
                 recency.name()
             )),
             (Provider::Xai, _) => Some(format!(
                 "xai applies the recency window as an instruction to the model, not a hard filter, so results may fall outside the past {}",
+                recency.name()
+            )),
+            (
+                Provider::OpenAi
+                | Provider::Anthropic
+                | Provider::Gemini
+                | Provider::OpenRouter
+                | Provider::Codex,
+                _,
+            ) => Some(format!(
+                "{} applies the recency window as an instruction to the model, not a hard filter, so results may fall outside the past {}",
+                self.name(),
+                recency.name()
+            )),
+            (Provider::Public, _) => Some(format!(
+                "public merges four engines, and mojeek and ecosia do not support the recency filter, so results may fall outside the past {}",
                 recency.name()
             )),
             (Provider::Searxng, Recency::Week) => {
@@ -166,18 +258,22 @@ impl Provider {
 /// appended to [`ALL`] after them.
 const ORIGINAL_COUNT: usize = 11;
 
-/// The first-release `provider` names, so history recorded against that enum stays valid.
-pub fn original_names() -> Vec<&'static str> {
+/// `auto` followed by the first `count` providers in [`ALL`] order.
+fn names_prefix(count: usize) -> Vec<&'static str> {
     std::iter::once("auto")
-        .chain(ALL.into_iter().take(ORIGINAL_COUNT).map(Provider::name))
+        .chain(ALL.into_iter().take(count).map(Provider::name))
         .collect()
 }
 
 /// Names accepted by `web.search_provider` and the `provider` tool argument, `auto` first.
 pub fn names() -> Vec<&'static str> {
-    std::iter::once("auto")
-        .chain(ALL.into_iter().map(Provider::name))
-        .collect()
+    names_prefix(ALL.len())
+}
+
+/// Every `provider` enum a recorded `web_search` contract can carry: the first release, then each
+/// later one, since each release only appended providers.
+pub fn historical_names() -> Vec<Vec<&'static str>> {
+    (ORIGINAL_COUNT..=ALL.len()).map(names_prefix).collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,6 +322,7 @@ pub struct Query<'a> {
     pub limit: usize,
     pub recency: Option<Recency>,
     pub today: i64,
+    pub filter: &'a domains::DomainFilter,
 }
 
 /// A provider's HTTP exchange. A body makes it a POST with a JSON document.
@@ -271,6 +368,7 @@ pub struct Found {
     pub provider: Provider,
     pub answer: Option<String>,
     pub results: Vec<SearchResult>,
+    pub domain_note: Option<String>,
 }
 
 /// Providers to try, in order, for a setting (`web.search_provider` or a per-call override). An empty
@@ -318,17 +416,24 @@ pub fn search(
     chain: &[Provider],
     query: &Query,
     env: Env,
+    user_dir: &Path,
 ) -> Result<Found, String> {
     let mut failures = Vec::new();
     for &provider in chain {
-        match attempt(client, provider, query, env) {
-            Ok(mut parsed) => {
-                parsed.results.retain(|result| !result.url.is_empty());
-                parsed.results.truncate(query.limit);
+        match attempt(client, provider, query, env, user_dir) {
+            Ok(parsed) => {
+                let present: Vec<SearchResult> = parsed
+                    .results
+                    .into_iter()
+                    .filter(|result| !result.url.is_empty())
+                    .collect();
+                let (mut results, domain_note) = query.filter.apply(present);
+                results.truncate(query.limit);
                 return Ok(Found {
                     provider,
                     answer: parsed.answer,
-                    results: parsed.results,
+                    results,
+                    domain_note,
                 });
             }
             Err(message) => failures.push(format!("{}: {message}", provider.name())),
@@ -340,7 +445,19 @@ pub fn search(
     Err(failures.join("; "))
 }
 
-fn attempt(client: &Client, provider: Provider, query: &Query, env: Env) -> Result<Parsed, String> {
+fn attempt(
+    client: &Client,
+    provider: Provider,
+    query: &Query,
+    env: Env,
+    user_dir: &Path,
+) -> Result<Parsed, String> {
+    if provider == Provider::Public {
+        return public::search(client, query, env, user_dir);
+    }
+    if provider == Provider::Codex {
+        return codex::search(user_dir, query);
+    }
     let request = build(provider, query, env)?;
     let headers: Vec<(&str, &str)> = request
         .headers
@@ -358,12 +475,33 @@ fn attempt(client: &Client, provider: Provider, query: &Query, env: Env) -> Resu
     if !(200..300).contains(&response.status) {
         return Err(format!("HTTP {}", response.status));
     }
-    parse(provider, &response)
+    let mut parsed = parse(provider, &response)?;
+    if provider == Provider::Gemini {
+        gemini::resolve_redirects(client, &mut parsed.results);
+    }
+    Ok(parsed)
 }
 
 /// Pure: the exchange this provider needs for `query`, with keys from `env`.
 pub fn build(provider: Provider, query: &Query, env: Env) -> Result<HttpRequest, String> {
     Ok(match provider {
+        Provider::Tinyfish => tinyfish::build(query, &secret(env, "TINYFISH_API_KEY")?)?,
+        Provider::Deepseek => deepseek::build(query, &secret(env, "DEEPSEEK_API_KEY")?)?,
+        Provider::Kimi => kimi::build(query, &secret(env, "KIMI_SEARCH_API_KEY")?),
+        Provider::Synthetic => synthetic::build(query, &secret(env, "SYNTHETIC_API_KEY")?),
+        Provider::Ollama => ollama::build(query, &secret(env, "OLLAMA_API_KEY")?),
+        Provider::OpenAi => openai::build(query, &secret(env, "OPENAI_API_KEY")?),
+        Provider::Anthropic => anthropic::build(query, &secret(env, "ANTHROPIC_API_KEY")?),
+        Provider::Gemini => gemini::build(query, &secret(env, "GEMINI_API_KEY")?),
+        Provider::OpenRouter => openrouter::build(query, &secret(env, "OPENROUTER_API_KEY")?),
+        Provider::Codex => {
+            return Err("codex answers through the ChatGPT session, not an HTTP exchange".into());
+        }
+        Provider::Public => {
+            return Err(
+                "public fans out over the keyless engines and has no single request".into(),
+            );
+        }
         Provider::Brave => json_apis::brave(query, &secret(env, "BRAVE_API_KEY")?),
         Provider::Tavily => json_apis::tavily(query, &secret(env, "TAVILY_API_KEY")?),
         Provider::Exa => json_apis::exa(query, &secret(env, "EXA_API_KEY")?),
@@ -431,6 +569,17 @@ fn parse(provider: Provider, response: &Response) -> Result<Parsed, String> {
         Provider::Perplexity => perplexity::parse(&json()?),
         Provider::Xai => xai::parse(&json()?),
         Provider::Searxng => searxng::parse(&json()?),
+        Provider::Tinyfish => tinyfish::parse(&json()?),
+        Provider::Deepseek => deepseek::parse(&json()?),
+        Provider::Kimi => kimi::parse(&json()?),
+        Provider::Synthetic => synthetic::parse(&json()?),
+        Provider::Ollama => ollama::parse(&json()?),
+        Provider::OpenAi => openai::parse(&json()?),
+        Provider::Anthropic => anthropic::parse(&json()?),
+        Provider::Gemini => gemini::parse(&json()?),
+        Provider::OpenRouter => openrouter::parse(&json()?),
+        Provider::Codex => Err("codex parses its own stream, not an HTTP reply".into()),
+        Provider::Public => Err("public parses each engine's reply separately".into()),
     }
 }
 

@@ -68,6 +68,12 @@ pub fn locked(path: &Path) -> Result<File> {
     Ok(lock)
 }
 
+// Command submission and settings adoption run on the UI thread. Allow brief competing
+// atomic saves, but never wait indefinitely for another process to release a record.
+fn interactive_lock(path: &Path) -> Result<File> {
+    locked_for(path, None, Duration::from_millis(250))
+}
+
 /// A long-running owner must refuse an occupied record rather than overwrite another run.
 pub fn try_locked(path: &Path) -> Result<File> {
     let lock = open_lock(path)?;
@@ -98,7 +104,7 @@ pub(crate) fn locked_for(
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 ensure!(
                     Instant::now() < deadline,
-                    "authentication storage lock timed out"
+                    "storage record is busy; retry the command after the other operation finishes"
                 );
                 std::thread::sleep(Duration::from_millis(25));
             }
@@ -197,8 +203,8 @@ pub fn save(layout: &Layout, scope: Scope, changes: &[Change]) -> Result<()> {
     let inserts = changes
         .iter()
         .any(|change| matches!(change, Change::Insert { .. }));
-    let _lock = locked(&files[if inserts { 0 } else { selected }])?;
-    let _project_lock = inserts.then(|| locked(&files[1])).transpose()?;
+    let _lock = interactive_lock(&files[if inserts { 0 } else { selected }])?;
+    let _project_lock = inserts.then(|| interactive_lock(&files[1])).transpose()?;
     check_other_layer_inserts(layout, scope, changes)?;
     let doc = changed_document(&files[selected], changes)?;
     write_private(&files[selected], toml::to_string_pretty(&doc)?.as_bytes())
@@ -259,8 +265,8 @@ pub fn save_config_checked(
 ) -> Result<()> {
     layout.ensure_project_outside_storage()?;
     let files = layout.config_files();
-    let _global = locked(&files[0])?;
-    let _project = locked(&files[1])?;
+    let _global = interactive_lock(&files[0])?;
+    let _project = interactive_lock(&files[1])?;
     let (layers, config) = prepare_config(layout, scope, changes, &[])?;
     check(&config)?;
     if scope == Scope::Global {
@@ -320,8 +326,8 @@ fn save_config_with_project_resets(
         .any(|change| matches!(change, Change::Insert { .. }));
     let reset_project = scope == Scope::Global && !project_resets.is_empty();
     let both = inserts || reset_project;
-    let _lock = locked(&files[if both { 0 } else { selected }])?;
-    let _project_lock = both.then(|| locked(&files[1])).transpose()?;
+    let _lock = interactive_lock(&files[if both { 0 } else { selected }])?;
+    let _project_lock = both.then(|| interactive_lock(&files[1])).transpose()?;
     let (layers, config) = prepare_config(layout, scope, changes, project_resets)?;
     let selected_bytes = toml::to_string_pretty(&layers[selected])?;
     if reset_project {
@@ -366,6 +372,7 @@ fn prepare_config(
         crate::config::migrate_edit_configuration(&mut layer);
         crate::config::migrate_model_role_table(&mut layer);
         crate::config::migrate_removed_settings(&mut layer);
+        crate::config::migrate_kernel_integration(&mut layer);
         if scope == Scope::Global && index == 1 {
             // Clear canonical roles after migrating legacy assignments too.
             for reset in project_resets {
@@ -573,7 +580,7 @@ pub fn load_history(layout: &Layout, limit: usize) -> Result<Vec<String>> {
     let mut baselines = HISTORY_BASELINES
         .lock()
         .map_err(|_| anyhow::anyhow!("history lock is poisoned"))?;
-    let _lock = locked(&path)?;
+    let _lock = interactive_lock(&path)?;
     let mut history = history_read(&path)?;
     bound(&mut history, limit);
     baselines.insert(path, history.clone());
@@ -584,7 +591,7 @@ pub fn save_history(layout: &Layout, history: &[String], limit: usize) -> Result
     let mut baselines = HISTORY_BASELINES
         .lock()
         .map_err(|_| anyhow::anyhow!("history lock is poisoned"))?;
-    let _lock = locked(&path)?;
+    let _lock = interactive_lock(&path)?;
     let mut disk = history_read(&path)?;
     let baseline = baselines.get(&path).map(Vec::as_slice).unwrap_or(&disk);
     // Editors may have trimmed the oldest entries. Match their retained prefix

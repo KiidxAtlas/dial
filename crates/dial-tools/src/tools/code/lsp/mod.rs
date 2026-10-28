@@ -21,6 +21,7 @@ mod format;
 mod framing;
 #[cfg(all(test, unix))]
 mod reliability_tests;
+mod request;
 mod servers;
 #[cfg(all(test, unix))]
 mod tests;
@@ -408,7 +409,7 @@ approved call with action_id; unsandboxed command effects cannot be rolled back 
 requests are refused. Stale versions/files, invalid UTF-16 ranges, overlaps and outside-root edits \
 fail before writing. `status` lists existing sessions without starting servers; `capabilities` \
 shows a selected live session's real initialize/dynamic capabilities; approved `reload` stops and \
-restarts the selected session. First startup and reload run project code outside the sandbox.";
+restarts the selected session. `request` sends one raw LSP method named by `query` to a session that advertises it; `payload` is a JSON object of params, with `textDocument` and `position` defaulted from `path` and `line`; a WorkspaceEdit result is validated and previewed, never applied. First startup and reload run project code outside the sandbox.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
@@ -430,9 +431,10 @@ enum Action {
     Status,
     Reload,
     Capabilities,
+    Request,
 }
 
-const ACTIONS: [(&str, Action); 18] = [
+const ACTIONS: [(&str, Action); 19] = [
     ("definition", Action::Definition),
     ("references", Action::References),
     ("hover", Action::Hover),
@@ -451,6 +453,7 @@ const ACTIONS: [(&str, Action); 18] = [
     ("status", Action::Status),
     ("reload", Action::Reload),
     ("capabilities", Action::Capabilities),
+    ("request", Action::Request),
 ];
 
 impl Action {
@@ -908,7 +911,9 @@ impl LspTool {
         }
         let source = read_source(&abs).map_err(|e| io_message("read", file, &e))?;
         // Resolve the position first so a bad request never starts a server.
-        let cursor = if action.needs_position() {
+        let cursor = if action.needs_position()
+            || (action == Action::Request && opt_u64(args, "line")?.is_some())
+        {
             Some(cursor(args, &source)?)
         } else {
             None
@@ -927,6 +932,16 @@ impl LspTool {
                     .filter(|n| !n.is_empty())
                     .ok_or("rename and rename_preview need `new_name`")?,
             ),
+            _ => None,
+        };
+        // A raw request is validated before any server starts; its position is the cursor if given.
+        let request_call = match action {
+            Action::Request => Some(request::prepare(
+                opt_str(args, "query")?,
+                args.get("payload"),
+                &uri_from_path(&abs),
+                cursor.as_ref().map(|c| (c.line, c.character)),
+            )?),
             _ => None,
         };
 
@@ -1037,6 +1052,12 @@ impl LspTool {
                     server.language
                 ),
             },
+            Action::Request => {
+                let call = request_call
+                    .as_ref()
+                    .ok_or("lsp request lost its prepared call")?;
+                request::send(ws, &client, &server.language, &abs, &source, call, cancel)?
+            }
             Action::RenamePreview | Action::Rename => {
                 let snapshot = Snapshot::capture(ws)?;
                 snapshot.validate_source(ws, &abs, &source)?;
@@ -1566,6 +1587,7 @@ impl Tool for LspTool {
                 "action_id": {"type": "string", "description": "Session-local ID from code_actions; required for code_action_resolve/code_action_apply/execute_command."},
                 "end_line": {"type": "integer", "minimum": 1, "description": "code_actions: optional 1-based end line; needs end_column."},
                 "end_column": {"type": "integer", "minimum": 1, "description": "code_actions: 1-based end character column."},
+                "payload": {"type": "object", "description": "request only: JSON object of LSP params for `query`. Absent textDocument/position fields are filled from `path` and `line`."},
             }),
             &["action"],
         )
@@ -1583,7 +1605,8 @@ impl Tool for LspTool {
                 | Action::RenameFile
                 | Action::CodeActionApply
                 | Action::ExecuteCommand
-                | Action::Reload,
+                | Action::Reload
+                | Action::Request,
             ) => return true,
             Some(Action::Status | Action::Capabilities | Action::CodeActionResolve) => {
                 return false;
@@ -1605,7 +1628,7 @@ impl Tool for LspTool {
             .and_then(|name| Action::parse(name).ok())
         {
             Some(Action::Rename | Action::CodeActionApply | Action::RenameFile) => false, // every write is observed
-            Some(Action::ExecuteCommand | Action::Reload) => true, // project code outside sandbox
+            Some(Action::ExecuteCommand | Action::Reload | Action::Request) => true, // project code outside sandbox; raw requests reach any advertised method
             _ => self.needs_approval(args),
         }
     }

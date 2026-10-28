@@ -20,6 +20,8 @@ pub enum Purpose {
     Repair,
     Judgment,
     Auxiliary,
+    /// Prompt-cache replay (`max_tokens: 1`); costed like any request so warming shows in spend.
+    CacheWarm,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize)]

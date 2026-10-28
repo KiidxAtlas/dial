@@ -8,11 +8,11 @@ use crate::app::replay::replay_session;
 use crate::app::shell::{PAINT_EVERY, Shell};
 use crate::config::paths::Layout;
 use crate::storage::session::Session;
+use crate::ui::input::{poll, read};
 use crate::ui::text;
 use crate::ui::transcript::Transcript;
 use anyhow::{Context, Result};
-use crossterm::event::{Event, poll, read};
-use std::process::{Command, Stdio};
+use crossterm::event::Event;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -22,6 +22,20 @@ const PICKER_SESSION_LIMIT: usize = 200;
 
 /// A preview being loaded off the UI thread: the session id and the channel its lines arrive on.
 type PendingPreview = (String, mpsc::Receiver<Vec<(String, String)>>);
+
+/// Opens a journal to resume it. When another live process holds the writer, the session resumes
+/// as a fork of it; the source id is returned so the caller can say so.
+pub(crate) fn open_resumed(
+    layout: &Layout,
+    path: &std::path::Path,
+) -> Result<(Session, Option<String>)> {
+    Ok(match Session::open_or_fork(layout, path)? {
+        crate::storage::session::Resumed::Owned(session) => (session, None),
+        crate::storage::session::Resumed::Forked { source_id, session } => {
+            (session, Some(source_id))
+        }
+    })
+}
 
 impl Shell {
     /// Refresh the listing index off the UI thread, so the first `/resume` after new or changed
@@ -64,7 +78,13 @@ impl Shell {
                     self.note("Session", format!("Already in session {name}"));
                     return Ok(None);
                 }
-                [only] => return Session::open(&only.path).map(Some),
+                [only] => {
+                    let (session, forked) = open_resumed(&layout, &only.path)?;
+                    if let Some(source) = forked {
+                        self.note("Session", format!("resumed as a fork of {source}"));
+                    }
+                    return Ok(Some(session));
+                }
                 // No match, or an ambiguous prefix: the picker opens with the prefix as its search.
                 _ => {}
             }
@@ -141,8 +161,13 @@ impl Shell {
                         ));
                         continue;
                     }
-                    match Session::open(&path) {
-                        Ok(session) => return Ok(Some(session)),
+                    match open_resumed(&layout, &path) {
+                        Ok((session, forked)) => {
+                            if let Some(source) = forked {
+                                self.note("Session", format!("resumed as a fork of {source}"));
+                            }
+                            return Ok(Some(session));
+                        }
                         // The picker stays open so another session can be chosen.
                         Err(error) => picker.set_notice(format!("{error:#}")),
                     }
@@ -341,7 +366,6 @@ impl Shell {
     }
 
     pub(super) fn copy_answer(&mut self, agent: &Agent<'_>) {
-        use std::io::Write;
         let messages = agent.session().messages();
         let Some(answer) = messages
             .iter()
@@ -352,40 +376,9 @@ impl Shell {
             self.note("Copy", "no assistant answer yet");
             return;
         };
-        for (program, args) in [
-            ("pbcopy", &[][..]),
-            ("wl-copy", &[][..]),
-            ("xclip", &["-selection", "clipboard"][..]),
-        ] {
-            let Ok(mut child) = Command::new(program)
-                .args(args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-            else {
-                continue;
-            };
-            let wrote = child
-                .stdin
-                .take()
-                .is_some_and(|mut stdin| stdin.write_all(answer.as_bytes()).is_ok());
-            if child.wait().is_ok_and(|status| status.success()) && wrote {
-                self.note("Copy", "answer copied");
-                return;
-            }
-        }
-        use base64::Engine;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(answer);
-        let mut stdout = std::io::stdout().lock();
-        let sent = write!(stdout, "\x1b]52;c;{encoded}\x07").and_then(|_| stdout.flush());
-        drop(stdout);
-        match sent {
-            Ok(()) => self.note(
-                "Copy",
-                "clipboard sent via OSC52 (terminal support required)",
-            ),
-            Err(error) => self.note("Copy", format!("{error}")),
+        match crate::app::clipboard::copy_text(answer) {
+            Ok(message) => self.note("Copy", message),
+            Err(error) => self.note("Copy", format!("{error:#}")),
         }
     }
 
@@ -417,8 +410,12 @@ impl Shell {
         if failed {
             anyhow::bail!("terminal draw failed");
         }
+        let result = result.and_then(|value| crate::app::restore::check_started(&value, id));
         match result {
-            Ok(_) => self.note("Subagents", format!("Resumed {id}.")),
+            Ok(_) => {
+                self.worker_editors.clear(&self.session_id, id);
+                self.note("Subagents", format!("Resumed {id}."));
+            }
             Err(error) => self.note("Subagents", format!("Cannot resume {id}: {error:#}")),
         }
         Ok(())

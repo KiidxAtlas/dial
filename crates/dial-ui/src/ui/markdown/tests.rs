@@ -478,3 +478,78 @@ fn ascii_mode_uses_ascii_glyphs_for_structure() {
         assert!(row.is_ascii(), "{row:?}");
     }
 }
+
+const DIAGRAM: &str =
+    "```diagram Request flow\n[User] --> [Agent] --> dial-app\n   |\n   v\n[Tool]\n```";
+
+#[test]
+fn diagram_fence_renders_a_titled_frame_of_equal_width_rows() {
+    let rows = md(DIAGRAM, 60);
+    let text = plain(&rows);
+    assert_eq!(text.len(), 6, "{text:?}");
+    assert!(text[0].starts_with("╭─ Request flow ─"), "{text:?}");
+    assert!(text[0].ends_with('╮') && text[5].starts_with('╰') && text[5].ends_with('╯'));
+    assert_eq!(text[1], "│ [User] --> [Agent] --> dial-app │");
+    assert_eq!(text[4], "│ [Tool]                          │");
+    let widths: Vec<usize> = text.iter().map(|r| text::width(r)).collect();
+    assert!(widths.iter().all(|&w| w == widths[0]), "{widths:?}");
+    // an untitled diagram is labelled like any other fence
+    assert!(plain(&md("```diagram\na -> b\n```", 40))[0].starts_with("╭─ DIAGRAM ─"));
+}
+
+#[test]
+fn diagram_connectors_are_accented_and_labels_are_not() {
+    let t = theme();
+    let rows = md(DIAGRAM, 60);
+    assert_eq!(style_of(&rows, "-->").fg, t.fg(Tok::Accent).fg);
+    assert_eq!(style_of(&rows, "Agent").fg, t.fg(Tok::MdCodeBlock).fg);
+    // a hyphen inside a word is part of the label
+    assert_eq!(style_of(&rows, "dial-app").fg, t.fg(Tok::MdCodeBlock).fg);
+    assert_eq!(style_of(&rows, "Request flow").fg, t.fg(Tok::Accent).fg);
+    assert_eq!(style_of(&rows, "╭").fg, t.fg(Tok::BorderAccent).fg);
+    // underscores draw lines only beside other line glyphs
+    let slopes = md("```diagram\n\\___/ snake_case\n```", 40);
+    assert_eq!(style_of(&slopes, "\\___/").fg, t.fg(Tok::Accent).fg);
+    assert_eq!(
+        style_of(&slopes, "snake_case").fg,
+        t.fg(Tok::MdCodeBlock).fg
+    );
+}
+
+#[test]
+fn wide_diagram_rows_are_clipped_never_wrapped() {
+    let src = format!("```diagram\n{}\nshort\n```", "A --> B ".repeat(20));
+    for width in 8..=60u16 {
+        let rows = md(&src, width);
+        assert_fits(&rows, width);
+        assert_eq!(rows.len(), 4, "width {width}: {:?}", plain(&rows));
+    }
+    assert!(plain(&md(&src, 40))[1].contains('…'));
+}
+
+#[test]
+fn diagrams_fit_every_width_and_fall_back_when_too_narrow() {
+    for width in 1..=100u16 {
+        assert_fits(&md(DIAGRAM, width), width);
+        // still streaming: the fence is not closed yet
+        assert_fits(&md("```diagram Flow\n[a] --> [b", width), width);
+    }
+    // too narrow for a frame: the ordinary code listing keeps every character
+    let narrow = plain(&md("```diagram\nab\n```", 5));
+    assert!(narrow.iter().all(|r| !r.contains('╭')), "{narrow:?}");
+    assert!(narrow.concat().contains("ab"));
+}
+
+#[test]
+fn ascii_mode_frames_diagrams_with_ascii_glyphs() {
+    let text = plain(&render(DIAGRAM, 60, &theme(), true));
+    assert!(text[0].starts_with("+- Request flow -"), "{text:?}");
+    assert!(text[1].starts_with("| [User]"), "{text:?}");
+}
+
+#[test]
+fn other_fences_keep_their_language_label_with_extra_info() {
+    let text = plain(&md("```rust,ignore title\nlet x = 1;\n```", 30));
+    let bar = theme().sym(Sym::Quote).to_owned();
+    assert_eq!(text[0], format!("{bar} RUST"));
+}

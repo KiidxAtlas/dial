@@ -138,7 +138,7 @@ fn explicit_background_and_threshold_both_adopt_with_a_notice() {
 
 #[cfg(unix)]
 #[test]
-fn an_explicit_timeout_keeps_a_long_command_in_the_foreground_then_adopts_it() {
+fn an_explicit_timeout_does_not_keep_a_long_command_in_the_foreground() {
     let (_dir, ws) = workspace();
     let ws = ws.without_sandbox();
     let cancel = AtomicBool::new(false);
@@ -147,10 +147,10 @@ fn an_explicit_timeout_keeps_a_long_command_in_the_foreground_then_adopts_it() {
         *adopted.lock() += 1;
         Ok("bg7".to_owned())
     };
-    // Runs past the 1s threshold but within its 10s timeout: one call returns the result.
+    // Finishes inside the 1s threshold: the result returns in this one call.
     let finished = bash_tool_streaming_with_adopter(
         &ws,
-        &json!({"command": "sleep 1.5; echo built", "timeout": 10}),
+        &json!({"command": "sleep 0.2; echo built", "timeout": 10}),
         0,
         1,
         &|_: &[u8]| {},
@@ -164,10 +164,10 @@ fn an_explicit_timeout_keeps_a_long_command_in_the_foreground_then_adopts_it() {
         finished.text
     );
     assert_eq!(*adopted.lock(), 0);
-    // Still running at its 2s timeout: moved to bg rather than killed.
+    // Still running past the 1s threshold though its timeout is 10s: moved to bg at the threshold.
     let long = bash_tool_streaming_with_adopter(
         &ws,
-        &json!({"command": "sleep 5", "timeout": 2}),
+        &json!({"command": "sleep 5", "timeout": 10}),
         0,
         1,
         &|_: &[u8]| {},
@@ -176,6 +176,19 @@ fn an_explicit_timeout_keeps_a_long_command_in_the_foreground_then_adopts_it() {
     )
     .unwrap();
     assert!(long.text.contains("background job bg7"), "{}", long.text);
+    assert_eq!(*adopted.lock(), 1);
+    // A timeout shorter than the threshold still kills the group rather than adopting it.
+    let killed = bash_tool_streaming_with_adopter(
+        &ws,
+        &json!({"command": "sleep 5", "timeout": 1}),
+        0,
+        5,
+        &|_: &[u8]| {},
+        &cancel,
+        &on_adopt,
+    )
+    .unwrap();
+    assert!(killed.text.contains("timed out"), "{}", killed.text);
     assert_eq!(*adopted.lock(), 1);
 }
 #[cfg(unix)]
@@ -224,30 +237,23 @@ fn hard_cancel_with_steering_kills_the_command_instead_of_adopting_it() {
 }
 
 #[test]
-fn named_sessions_never_get_an_adoption_deadline() {
+fn named_sessions_get_the_same_adoption_deadline() {
     let threshold = Duration::from_secs(5);
-    assert_eq!(adoption_deadline(threshold, None, false), Some(threshold));
-    assert_eq!(adoption_deadline(threshold, None, true), None);
-    assert_eq!(adoption_deadline(Duration::ZERO, None, false), None);
-    assert_eq!(adoption_deadline(Duration::ZERO, None, true), None);
-    let long = Some(Duration::from_secs(600));
-    assert_eq!(adoption_deadline(threshold, long, true), None);
-    assert_eq!(adoption_deadline(Duration::ZERO, long, false), None);
+    assert_eq!(adoption_deadline(threshold), Some(threshold));
+    assert_eq!(adoption_deadline(Duration::ZERO), None);
 }
 
 #[test]
-fn an_explicit_timeout_extends_the_foreground_wait_but_never_shortens_it() {
+fn an_explicit_timeout_never_postpones_adoption() {
     let threshold = Duration::from_secs(15);
     let long = Duration::from_secs(600);
-    assert_eq!(adoption_deadline(threshold, Some(long), false), Some(long));
+    // The threshold is the deadline whatever the timeout; a long timeout does not move it.
+    assert_eq!(adoption_deadline(threshold), Some(threshold));
+    // A timeout at or after the deadline never kills: adoption happens first.
+    assert!(!timeout_kills(long, long, Some(threshold)));
+    assert!(!timeout_kills(threshold, threshold, Some(threshold)));
+    // A timeout shorter than the threshold still kills, and so does any timeout without backgrounding.
     let short = Duration::from_secs(5);
-    assert_eq!(
-        adoption_deadline(threshold, Some(short), false),
-        Some(threshold)
-    );
-    // At a long explicit timeout the command moves to bg rather than being killed ...
-    assert!(!timeout_kills(long, long, Some(long)));
-    // ... while a timeout shorter than the threshold still kills, as before.
     assert!(timeout_kills(short, short, Some(threshold)));
     assert!(timeout_kills(short, short, None));
     assert!(!timeout_kills(Duration::ZERO, long, None));
@@ -1023,4 +1029,78 @@ fn artifact_cap_is_reported_separately_from_capture() {
     assert_eq!(integrity.original_bytes, Some(16));
     assert_eq!(integrity.retained_bytes, Some(8));
     assert_eq!(integrity.omitted_bytes, Some(8));
+}
+
+#[cfg(unix)]
+#[test]
+fn named_session_restores_cwd_and_env_after_a_job_and_refuses_while_busy() {
+    use crate::config::types::Config;
+    use crate::tools::integrations::ext::ToolContext;
+    let (dir, ws) = workspace();
+    fs::create_dir(dir.path().join("src")).unwrap();
+    let ws = ws.without_sandbox();
+    let config = Config::default();
+    let bg = crate::tools::exec::background::tools(&config)
+        .into_iter()
+        .next()
+        .expect("the background tool is registered");
+    let ctx = ToolContext {
+        workspace: &ws,
+        config: &config,
+        mutation_authorizer: None,
+        confirm: None,
+    };
+    let cancel = AtomicBool::new(false);
+    let adopt = |job: ForegroundJob| {
+        bg.adopt_job(crate::tools::exec::background::AdoptedJob::Shell(Box::new(
+            job,
+        )))
+    };
+    let started = bash_tool_streaming_with_adopter(
+        &ws,
+        &json!({"command": "cd src && export NAMED_VAR=kept && sleep 2", "session": "s1", "background": true}),
+        0,
+        0,
+        &|_: &[u8]| {},
+        &cancel,
+        &adopt,
+    )
+    .unwrap();
+    let job = started
+        .text
+        .split("background job ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("the command reports its background job")
+        .trim_end_matches(|c: char| !c.is_alphanumeric())
+        .to_owned();
+    let busy = bash_tool_streaming_with_adopter(
+        &ws,
+        &json!({"command": "pwd", "session": "s1"}),
+        0,
+        0,
+        &|_: &[u8]| {},
+        &cancel,
+        &adopt,
+    )
+    .err()
+    .expect("a busy session is refused");
+    assert!(
+        busy.contains(&format!("session busy in background job {job}")),
+        "{busy}"
+    );
+    let waited = bg.call(&ctx, &json!({"action": "wait", "name": job, "timeout": 30}));
+    assert!(!waited.is_error, "{}", waited.text);
+    let restored = bash_tool_streaming_with_adopter(
+        &ws,
+        &json!({"command": "pwd; echo $NAMED_VAR", "session": "s1"}),
+        0,
+        0,
+        &|_: &[u8]| {},
+        &cancel,
+        &adopt,
+    )
+    .unwrap();
+    assert!(restored.text.contains("/src"), "{}", restored.text);
+    assert!(restored.text.contains("kept"), "{}", restored.text);
 }

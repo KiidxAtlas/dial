@@ -2,6 +2,7 @@
 
 pub mod background;
 pub mod bash_interceptor;
+pub mod cargo_target;
 pub mod eval;
 pub mod execution;
 pub mod git_guard;

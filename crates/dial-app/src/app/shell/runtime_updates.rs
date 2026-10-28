@@ -15,6 +15,7 @@ pub(super) struct RuntimeUpdates {
     loaded: bool,
     last_attempt: Option<u64>,
     pending: Option<Receiver<String>>,
+    report: Option<String>,
     cancel: Arc<AtomicBool>,
 }
 
@@ -25,6 +26,21 @@ fn due(now: u64, last: u64) -> bool {
 }
 
 impl RuntimeUpdates {
+    /// Background maintenance is editor chrome, never conversation history.
+    pub fn notice(&self) -> Option<&'static str> {
+        self.report
+            .as_ref()
+            .map(|_| "Runtime update report ready · /setup updates")
+    }
+
+    pub fn retain_report(&mut self, report: String) {
+        self.report = Some(report);
+    }
+
+    pub fn take_report(&mut self) -> Option<String> {
+        self.report.take()
+    }
+
     pub fn poll(&mut self, user_dir: &Path) -> Option<String> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
         let env = Env::current(user_dir);

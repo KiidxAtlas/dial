@@ -423,6 +423,8 @@ pub fn is_read_only(ext: &Registry, name: &str, args: &Value) -> bool {
             collect_declared_paths(args, &mut targets);
             !targets.iter().any(|path| {
                 crate::tools::integrations::ssh::url::is_ssh_url(path)
+                    || crate::tools::integrations::host_uri::is_foreign_target(path)
+                    || crate::tools::net::web::is_url(path)
                     || crate::tools::fs::documents::needs_approval(
                         &serde_json::json!({ "path": path }),
                     )
@@ -437,6 +439,7 @@ pub fn is_read_only(ext: &Registry, name: &str, args: &Value) -> bool {
         }
         "bash" => args["command"].as_str().is_some_and(safe_bash),
         "task" => !subagents::launches_worker(args),
+        "side_request" => true,
         "context_notes" => crate::agent::window::context_notes::readonly(name, args),
         "new_context" => false,
         "checkpoint" | "rewind" => true,

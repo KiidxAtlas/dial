@@ -119,10 +119,12 @@ impl Agent<'_> {
                 turn.max_tokens = backend.output_budget(turn.harness.max_tokens);
             }
         }
+        self.observe_cost_warnings(&mut turn.turn_cost_warn, ui);
         // A fallback whose cooldown elapsed returns to the primary before anything is sized for it.
         if self.restore_primary_if_due(backend, ui) {
             turn.max_tokens = backend.output_budget(turn.harness.max_tokens);
         }
+        self.sync_mcp_tools(schemas, ui)?;
         Ok(ControlFlow::Continue(step))
     }
 }
@@ -132,7 +134,7 @@ impl Agent<'_> {
     /// observed session/turn cost cap. Checked when a step is admitted, between the calls of one
     /// tool round and before settlement makes further model calls, so a long round cannot run
     /// far past a boundary. The interrupt flag is separate: it ends a turn as interrupted.
-    pub(super) fn stop_boundary(&self) -> Option<String> {
+    pub(in crate::agent) fn stop_boundary(&self) -> Option<String> {
         if self.modes.launch.expired() {
             return Some("Stopped: --max-time deadline reached.".into());
         }
@@ -206,6 +208,42 @@ impl Agent<'_> {
                 .deadline
                 .map(|deadline| deadline.saturating_duration_since(Instant::now())),
         )
+    }
+
+    /// Applies MCP tool-list changes at a request boundary: the offered schemas and the system
+    /// prompt follow the registry, and queued MCP notices and events reach the UI and
+    /// `mcp_notification` subscribers.
+    fn sync_mcp_tools(&mut self, schemas: &mut Vec<Value>, ui: &mut dyn Ui) -> Result<()> {
+        if self.ext.sync_mcp() {
+            let names = self.offered();
+            *schemas = self.schemas(&names)?;
+            self.rebuild_system();
+        }
+        for notice in self.ext.take_notices() {
+            ui.notice(&notice);
+        }
+        let events = self.ext.take_mcp_events();
+        if !events.is_empty() {
+            let root = self.workspace.root().to_path_buf();
+            for event in events {
+                let payload = event.to_json();
+                // Shell hooks keep their blocking path; plugins get the queued observer event.
+                for notice in crate::agent::safety::hooks::observe(
+                    self.tool_hooks(),
+                    None,
+                    &root,
+                    "mcp_notification",
+                    payload.clone(),
+                    self.interrupt.as_ref(),
+                ) {
+                    ui.notice(&notice);
+                }
+                let mut plugin_payload = payload;
+                plugin_payload["session_id"] = json!(self.session.id());
+                self.emit_event("mcp_notification", || plugin_payload);
+            }
+        }
+        Ok(())
     }
 }
 

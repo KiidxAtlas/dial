@@ -1069,7 +1069,15 @@ fn oauth_signout_uses_grant_presence_not_selected_api_status() {
                     .iter()
                     .any(|(action, _)| matches!(action, ProviderAction::OAuthSignOut(_)))
             );
-            overlay.set_oauth_signed_in([flow.id.to_owned()].into());
+            overlay.set_oauth_accounts(BTreeMap::from([(
+                flow.id.to_owned(),
+                vec![crate::llm::oauth::AccountSummary {
+                    key: "default".into(),
+                    label: "default".into(),
+                    active: true,
+                    cooling: false,
+                }],
+            )]));
             overlay.open_menu();
             let Mode::Menu(menu) = &overlay.mode else {
                 panic!()
@@ -1088,4 +1096,103 @@ fn oauth_signout_uses_grant_presence_not_selected_api_status() {
             );
         }
     }
+}
+
+fn oauth_menu_index(overlay: &ProviderOverlay, matches: impl Fn(&ProviderAction) -> bool) -> usize {
+    let Mode::Menu(menu) = &overlay.mode else {
+        panic!("provider menu is not open")
+    };
+    menu.items
+        .iter()
+        .position(|(action, _)| matches(action))
+        .expect("menu row present")
+}
+
+fn oauth_choose(overlay: &mut ProviderOverlay, index: usize) {
+    let Mode::Menu(menu) = &mut overlay.mode else {
+        panic!("provider menu is not open")
+    };
+    menu.cursor = index;
+}
+
+#[test]
+fn oauth_accounts_submenu_selects_and_removes_one_account() {
+    let rig = Rig::new();
+    let Some(flow) = crate::llm::oauth::flows().next() else {
+        panic!("no OAuth provider registered")
+    };
+    let mut d = discovery();
+    d.providers.push(provider(
+        flow.id,
+        flow.name,
+        "reachable",
+        0,
+        Some(flow.base_url),
+    ));
+    let mut overlay = ProviderOverlay::new(
+        Some(d),
+        BTreeMap::from([(
+            flow.id.into(),
+            ProviderSpec {
+                base_url: flow.base_url.into(),
+                auth: AuthMethod::ApiKey,
+                ..Default::default()
+            },
+        )]),
+        Box::new(|_| false),
+        Scope::Global,
+    );
+    select(&mut overlay, flow.id);
+    let account =
+        |key: &str, label: &str, active: bool, cooling: bool| crate::llm::oauth::AccountSummary {
+            key: key.into(),
+            label: label.into(),
+            active,
+            cooling,
+        };
+    overlay.set_oauth_accounts(BTreeMap::from([(
+        flow.id.to_owned(),
+        vec![
+            account("a", "one@example.com", true, false),
+            account("b", "two@example.com", false, true),
+        ],
+    )]));
+
+    overlay.open_menu();
+    let index = oauth_menu_index(&overlay, |a| matches!(a, ProviderAction::OAuthAccounts(_)));
+    oauth_choose(&mut overlay, index);
+    assert!(matches!(
+        send(&mut overlay, &rig, key(KeyCode::Enter)),
+        OverlayEvent::None
+    ));
+    let Mode::Menu(menu) = &overlay.mode else {
+        panic!("accounts submenu is not open")
+    };
+    let labels: Vec<&str> = menu.items.iter().map(|(_, label)| label.as_str()).collect();
+    assert!(labels.contains(&"Use one@example.com  (active)"));
+    assert!(labels.contains(&"Use two@example.com  (cooling down)"));
+
+    let index = oauth_menu_index(
+        &overlay,
+        |a| matches!(a, ProviderAction::OAuthSelectAccount(_, key) if key == "b"),
+    );
+    oauth_choose(&mut overlay, index);
+    assert!(matches!(
+        send(&mut overlay, &rig, key(KeyCode::Enter)),
+        OverlayEvent::OAuthSelectAccount { id, key } if id == flow.id && key == "b"
+    ));
+
+    overlay.open_menu();
+    let index = oauth_menu_index(&overlay, |a| matches!(a, ProviderAction::OAuthAccounts(_)));
+    oauth_choose(&mut overlay, index);
+    send(&mut overlay, &rig, key(KeyCode::Enter));
+    let index = oauth_menu_index(
+        &overlay,
+        |a| matches!(a, ProviderAction::OAuthRemoveAccount(_, key) if key == "a"),
+    );
+    oauth_choose(&mut overlay, index);
+    assert!(matches!(
+        send(&mut overlay, &rig, key(KeyCode::Enter)),
+        OverlayEvent::OAuthRemoveAccount { id, key } if id == flow.id && key == "a"
+    ));
 }

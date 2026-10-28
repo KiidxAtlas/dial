@@ -484,7 +484,12 @@ impl Agent<'_> {
                         adapter: self.version.adapter.as_deref(),
                         handoff: Default::default(),
                     };
-                    crate::agent::workers::subagents::run(parent, &args, ui)
+                    crate::agent::workers::subagents::run(
+                        parent,
+                        Some(self.session.id()),
+                        &args,
+                        ui,
+                    )
                 } else {
                     self.run_task(&mut backend, &args, ui)
                 };

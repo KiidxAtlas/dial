@@ -82,3 +82,40 @@ fn json_transport_stale_callback_never_reaches_controller() {
             .contains("expired operation")
     );
 }
+
+#[test]
+fn yieldable_request_hands_off_and_resumes_to_the_same_reply() {
+    let mut process = fake(
+        "import sys,json,time\nfor line in sys.stdin:\n r=json.loads(line);time.sleep(0.5);print(json.dumps({'id':r['id'],'result':{'value':r['value']}}),flush=True)",
+    );
+    let handed = process
+        .request_yieldable(
+            json!({"value":7}),
+            None,
+            || Ok(()),
+            || true,
+            usize::MAX,
+            |_| unreachable!(),
+        )
+        .unwrap();
+    assert!(handed.is_none(), "the request should still be in flight");
+    let reply = process
+        .resume_yieldable(
+            Some(Instant::now() + Duration::from_secs(5)),
+            || Ok(()),
+            || false,
+            usize::MAX,
+            |_| unreachable!(),
+        )
+        .unwrap();
+    assert_eq!(reply.unwrap()["value"], 7);
+}
+
+#[test]
+fn resume_without_an_in_flight_request_is_refused() {
+    let mut process = fake("import sys\nfor line in sys.stdin:\n pass");
+    let error = process
+        .resume_yieldable(None, || Ok(()), || false, usize::MAX, |_| unreachable!())
+        .unwrap_err();
+    assert!(error.contains("no adapter request is in flight"), "{error}");
+}

@@ -22,7 +22,8 @@ mod collab;
 pub(crate) mod commit;
 mod config_cmds;
 pub(crate) use config_cmds::UsageStatus;
-mod extensions;
+mod extension_commands;
+pub(crate) mod extensions;
 pub(crate) mod extensions_browser;
 mod graphify;
 pub(crate) mod maintenance;
@@ -102,6 +103,9 @@ pub(super) fn run(
         return Some(result);
     }
     if let Some(result) = setup::run_command(shell, app, agent, name, args) {
+        return Some(result);
+    }
+    if let Some(result) = extension_commands::run(shell, app, agent, name, args) {
         return Some(result);
     }
     modes::run(shell, app, agent, name, args)

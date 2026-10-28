@@ -174,12 +174,31 @@ pub fn json_bytes(value: &serde_json::Value) -> usize {
 /// Conservative wire cost of one attached image; `dial_images` stores only small JSON pointers.
 pub const IMAGE_ESTIMATE_TOKENS: usize = 1_600;
 
-/// Serialized bytes of a message as a provider receives it. Harness bookkeeping (`dial_*`) never
-/// reaches the wire. Provider-native replay content is sent instead of, not beside, the portable
-/// content/tool-call fields, so the larger of the two counts rather than their sum.
-pub fn wire_message_bytes(message: &serde_json::Value) -> usize {
+/// One message's wire bytes split by what the provider receives: the portable copy, the
+/// provider-native replay, and attached images (each image costs `IMAGE_ESTIMATE_TOKENS` tokens).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct WireParts {
+    pub portable: usize,
+    pub native: usize,
+    pub images: usize,
+}
+
+impl WireParts {
+    /// Bytes the request carries: provider-native replay replaces the portable copy when larger.
+    pub fn total(self) -> usize {
+        self.portable.max(self.native) + self.images
+    }
+}
+
+/// Serialized bytes of a message as a provider receives it, split into parts. Harness bookkeeping
+/// (`dial_*`) never reaches the wire. Provider-native replay content is sent instead of, not beside,
+/// the portable content/tool-call fields, so the larger of the two counts rather than their sum.
+pub fn wire_parts(message: &serde_json::Value) -> WireParts {
     let Some(object) = message.as_object() else {
-        return json_bytes(message);
+        return WireParts {
+            portable: json_bytes(message),
+            ..WireParts::default()
+        };
     };
     let portable = object
         .iter()
@@ -197,7 +216,16 @@ pub fn wire_message_bytes(message: &serde_json::Value) -> usize {
         .get("dial_images")
         .and_then(serde_json::Value::as_array)
         .map_or(0, Vec::len);
-    portable.max(native) + images * IMAGE_ESTIMATE_TOKENS * 4
+    WireParts {
+        portable,
+        native,
+        images: images * IMAGE_ESTIMATE_TOKENS * 4,
+    }
+}
+
+/// Serialized wire bytes of a message: see [`wire_parts`].
+pub fn wire_message_bytes(message: &serde_json::Value) -> usize {
+    wire_parts(message).total()
 }
 
 pub fn estimate_parts(messages: &[serde_json::Value], tools: &[serde_json::Value]) -> u64 {

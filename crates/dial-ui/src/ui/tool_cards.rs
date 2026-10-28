@@ -110,6 +110,9 @@ pub(super) fn tool_rows(t: &Tool, w: u16, ctx: &TranscriptCtx) -> Rows {
     {
         return mcp_card(t, server, action, w as usize, ctx);
     }
+    if let Some(rows) = irc::irc_card(t, w as usize, ctx) {
+        return rows;
+    }
     if t.presentation.body == crate::runtime::presentation::BodyStyle::Plan
         && t.todo.is_some()
         && t.state == ToolState::Completed
@@ -125,47 +128,30 @@ pub(super) fn tool_rows(t: &Tool, w: u16, ctx: &TranscriptCtx) -> Rows {
 fn mcp_card(t: &Tool, server: &str, action: &str, w: usize, ctx: &TranscriptCtx) -> Rows {
     let theme = ctx.theme;
     let fill = theme.bg(Tok::PanelBg);
-    let border = theme.fg(Tok::SectionConnect).patch(fill);
-    let (tl, tr, bl, br, h, v) = if theme.ascii() {
-        ("+", "+", "+", "+", "-", "|")
-    } else {
-        ("╭", "╮", "╰", "╯", "─", "│")
-    };
+    let border = theme.fg(Tok::SectionConnect);
     // At tiny widths retain the identity, without overflowing or subtracting past zero.
     if w < 6 {
         return vec![fitted(
-            vec![Span::styled(format!("MCP {server}"), border)],
+            vec![Span::styled(format!("MCP {server}"), fill.patch(border))],
             w,
             theme,
         )];
     }
-    let inner = w - 4;
     let separator = if theme.ascii() { ":" } else { "·" };
-    let title = text::clip(
-        &format!(" MCP {separator} {} ", text::one_line(server)),
-        w - 2,
+    let mut frame = frame::Frame::new(
+        vec![Span::styled(
+            format!("MCP {separator} {}", text::one_line(server)),
+            border,
+        )],
+        border,
     );
-    let mut rows = vec![Line::from(Span::styled(
-        format!("{tl}{title}{}{tr}", h.repeat(w - 2 - text::width(&title))),
-        border,
-    ))];
+    frame.fill = fill;
     // The server is already in the frame title, so the inner row names only the action.
-    for mut row in card_with(t, inner, ctx, text::one_line(action)) {
-        let used = text::line_width(&row);
-        let mut spans = vec![Span::styled(format!("{v} "), border)];
-        for span in &mut row.spans {
-            span.style = fill.patch(row.style).patch(span.style);
-        }
-        spans.extend(row.spans);
-        spans.push(Span::styled(" ".repeat(inner.saturating_sub(used)), fill));
-        spans.push(Span::styled(format!(" {v}"), border));
-        rows.push(Line::from(spans));
-    }
-    rows.push(Line::from(Span::styled(
-        format!("{bl}{}{br}", h.repeat(w - 2)),
-        border,
-    )));
-    rows
+    let inner = w.saturating_sub(frame::CHROME_W).max(1);
+    frame
+        .sections
+        .push((None, card_with(t, inner, ctx, text::one_line(action))));
+    frame.rows(theme, w)
 }
 
 /// Width of the verb column, so targets line up down the transcript.
@@ -236,16 +222,16 @@ fn facts(t: &Tool, theme: &Theme) -> Vec<Fact> {
     if t.presentation.body == crate::runtime::presentation::BodyStyle::Workers
         && !t.agents.is_empty()
     {
-        let running = t
-            .agents
-            .iter()
-            .filter(|a| a.state == ToolState::Running)
-            .count();
-        let failed = t
-            .agents
-            .iter()
-            .filter(|a| a.state == ToolState::Failed)
-            .count();
+        let count = |state: ToolState| t.agents.iter().filter(|a| a.state == state).count();
+        let (running, failed, done) = (
+            count(ToolState::Running),
+            count(ToolState::Failed),
+            count(ToolState::Completed),
+        );
+        // Totals only once the workers disagree: "3 done" under a settled card is just noise.
+        if done > 0 && done < t.agents.len() {
+            out.push(keep(format!("{done} done")));
+        }
         if running > 0 {
             out.push(keep(format!("{running} running")));
         }
@@ -358,8 +344,159 @@ fn write_preview(t: &Tool, inner: usize, ctx: &TranscriptCtx) -> Option<(Rows, u
 /// One tool call: a header row (status glyph in the gutter, bold verb, muted target, facts at the
 /// right edge), then, when it says something, the body hanging off a `└` under the verb: the diff
 /// for edits, the new lines for writes, output for commands, the first error lines for failures.
+/// Heavy calls (commands, code cells, edits, network calls) whose body says something are drawn in
+/// a frame instead, see [`framed_card`].
 fn card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Rows {
+    if let Some(family) = family(t)
+        && w >= frame::MIN_W
+        && !quiet(t, ctx)
+    {
+        let (body, hidden) = body_rows(t, w - frame::CHROME_W, ctx);
+        if !body.is_empty() {
+            return framed_card(t, family, body, hidden, w, ctx);
+        }
+    }
     card_with(t, w, ctx, verb(t))
+}
+
+/// The kinds of call that are drawn in a frame once they have a body. Each has its own border.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Family {
+    /// Shell commands and background jobs.
+    Shell,
+    /// Code cells and code intelligence: eval, kernel, lsp, debuggers, disassemblers.
+    Code,
+    /// File changes.
+    Edit,
+    /// Calls that leave the machine: web, GitHub, browser.
+    Connect,
+}
+
+fn family(t: &Tool) -> Option<Family> {
+    use crate::runtime::presentation::{BodyStyle, Tone};
+    // MCP calls have their own service frame; plans and workers have their own layouts.
+    if t.name.starts_with("mcp__")
+        || matches!(t.presentation.body, BodyStyle::Plan | BodyStyle::Workers)
+    {
+        return None;
+    }
+    match t.name.as_str() {
+        "bg" | "ssh" => return Some(Family::Shell),
+        "eval" | "kernel" | "lsp" | "ida" | "dap" => return Some(Family::Code),
+        name if name.starts_with("dap_") => return Some(Family::Code),
+        _ => {}
+    }
+    match t.presentation.tone {
+        Tone::Shell => Some(Family::Shell),
+        Tone::Edit => Some(Family::Edit),
+        Tone::Connect => Some(Family::Connect),
+        Tone::Tools | Tone::Workers => None,
+    }
+}
+
+impl Family {
+    fn border(self) -> Tok {
+        match self {
+            Family::Shell => Tok::Border,
+            Family::Code => Tok::SectionTools,
+            Family::Edit => Tok::BorderAccent,
+            Family::Connect => Tok::SectionConnect,
+        }
+    }
+}
+
+/// A settled lookup or passing check says nothing more than its header until expanded.
+fn quiet(t: &Tool, ctx: &TranscriptCtx) -> bool {
+    !ctx.tools_expanded
+        && t.state == ToolState::Completed
+        && t.presentation.body == crate::runtime::presentation::BodyStyle::Quiet
+}
+
+/// What a call's body shows at `inner` cells: the first error lines for failures, the diff for
+/// edits, the new lines for writes, otherwise its output. Returns the rows and how many were hidden.
+fn body_rows(t: &Tool, inner: usize, ctx: &TranscriptCtx) -> (Rows, usize) {
+    if t.state == ToolState::Failed {
+        output_rows(t, inner, ctx, Some(COMPACT_ERROR_ROWS))
+    } else if let Some(diff) = diff_rows(t, inner, ctx) {
+        diff
+    } else if t.presentation.body == crate::runtime::presentation::BodyStyle::Write {
+        write_preview(t, inner, ctx).unwrap_or_else(|| output_rows(t, inner, ctx, None))
+    } else {
+        output_rows(t, inner, ctx, None)
+    }
+}
+
+/// `╭─ · $ cargo test ─╮`, the body, then `╰─ exit 101 · 1.20s ─╯`. The status glyph and verb
+/// lead the top edge, the facts sit in the bottom edge, and a failed call's border turns red.
+/// A shell command reads as a prompt (`$ cmd`) rather than under the `Run` verb.
+fn framed_card(
+    t: &Tool,
+    family: Family,
+    body: Rows,
+    hidden: usize,
+    w: usize,
+    ctx: &TranscriptCtx,
+) -> Rows {
+    let theme = ctx.theme;
+    let failed = t.state == ToolState::Failed;
+    let (glyph, glyph_style) = tool_glyph(t, ctx);
+    let verb_text = verb(t);
+    let verb_text = if family == Family::Shell && verb_text == "Run" {
+        "$".to_owned()
+    } else {
+        verb_text
+    };
+    let verb_style = if failed {
+        theme.fg(Tok::Error).add_modifier(Modifier::BOLD)
+    } else {
+        theme.fg(Tok::ToolTitle).add_modifier(Modifier::BOLD)
+    };
+    let full_target = target(t);
+    // The edge keeps two corner cells, a rule cell and a space on each side of its label.
+    let fixed = text::width(&glyph) + 1 + text::width(&verb_text) + 1;
+    let room = w.saturating_sub(6 + fixed);
+    let target_text = fit_target(&full_target, room, theme.ascii());
+    let mut head = vec![
+        Span::styled(glyph, glyph_style),
+        Span::raw(" "),
+        Span::styled(verb_text, verb_style),
+    ];
+    if !target_text.is_empty() {
+        head.push(Span::raw(" "));
+        head.push(Span::styled(target_text.clone(), theme.fg(Tok::Muted)));
+    }
+    let border = theme.fg(if failed { Tok::Error } else { family.border() });
+    let mut frame = frame::Frame::new(head, border);
+    let inner = w - frame::CHROME_W;
+    if ctx.tools_expanded && target_text != full_target {
+        frame.sections.push((
+            None,
+            text::wrap_words(&full_target, inner)
+                .into_iter()
+                .map(|line| Line::from(Span::styled(line, theme.fg(Tok::Muted))))
+                .collect(),
+        ));
+    }
+    let mut body = body;
+    if hidden > 0 {
+        body.push(Line::from(hidden_hint(hidden, ctx.expand_key, theme)));
+    }
+    // A divider is only worth its row when it separates the body from the full target above.
+    let label = (!frame.sections.is_empty()).then_some(if failed { "Error" } else { "Output" });
+    frame.sections.push((label.map(str::to_owned), body));
+    let sep = format!(" {} ", theme.sym(Sym::Dot));
+    let facts = facts(t, theme)
+        .into_iter()
+        .map(|f| f.text)
+        .collect::<Vec<_>>()
+        .join(&sep);
+    if !facts.is_empty() {
+        frame.foot = vec![Span::styled(
+            facts,
+            theme.fg(if failed { Tok::Error } else { Tok::Dim }),
+        )];
+    }
+    frame.rows(theme, w)
 }
 
 /// A card whose verb column reads `verb_text` (an MCP call's service-local action).
@@ -380,29 +517,8 @@ fn card_with(t: &Tool, w: usize, ctx: &TranscriptCtx, verb_text: String) -> Rows
     let lead_w: usize = lead.iter().map(|s| text::width(&s.content)).sum();
     let left_fixed = lead_w + VERB_W.max(text::width(&verb_text)) + 1;
     // Narrow rows give up timing, then a status the gutter glyph already shows, before the target.
-    let mut facts = facts(t, theme);
     let want = text::width(&full_target).min(TARGET_MIN);
-    let (facts_text, room) = loop {
-        let joined = facts
-            .iter()
-            .map(|f| f.text.as_str())
-            .collect::<Vec<_>>()
-            .join(&sep);
-        let right_w = text::width(&joined);
-        let room = w.saturating_sub(left_fixed + right_w + if right_w > 0 { 2 } else { 0 });
-        let droppable = facts
-            .iter()
-            .enumerate()
-            .filter(|(_, f)| f.drop > 0)
-            .max_by_key(|(i, f)| (f.drop, *i))
-            .map(|(i, _)| i);
-        match droppable {
-            Some(i) if room < want => {
-                facts.remove(i);
-            }
-            _ => break (joined, room),
-        }
-    };
+    let (facts_text, room) = fit_facts(facts(t, theme), w, left_fixed, want, &sep);
     let right_w = text::width(&facts_text);
     let target_text = fit_target(&full_target, room, theme.ascii());
     let target_clipped = full_target != target_text;
@@ -440,10 +556,7 @@ fn card_with(t: &Tool, w: usize, ctx: &TranscriptCtx, verb_text: String) -> Rows
     }
 
     // The body: nothing for reads, searches and passing checks; otherwise what changed or printed.
-    let quiet = !ctx.tools_expanded
-        && t.state == ToolState::Completed
-        && t.presentation.body == crate::runtime::presentation::BodyStyle::Quiet;
-    if quiet {
+    if quiet(t, ctx) {
         return rows;
     }
     if t.presentation.body == crate::runtime::presentation::BodyStyle::Workers
@@ -453,15 +566,7 @@ fn card_with(t: &Tool, w: usize, ctx: &TranscriptCtx, verb_text: String) -> Rows
         return rows;
     }
     let inner = w.saturating_sub(GUTTER + 2).max(1);
-    let (body, hidden) = if t.state == ToolState::Failed {
-        output_rows(t, inner, ctx, Some(COMPACT_ERROR_ROWS))
-    } else if let Some(diff) = diff_rows(t, inner, ctx) {
-        diff
-    } else if t.presentation.body == crate::runtime::presentation::BodyStyle::Write {
-        write_preview(t, inner, ctx).unwrap_or_default()
-    } else {
-        output_rows(t, inner, ctx, None)
-    };
+    let (body, hidden) = body_rows(t, inner, ctx);
     let hook_style = theme.fg(if t.state == ToolState::Failed {
         Tok::Error
     } else {
@@ -488,6 +593,113 @@ fn card_with(t: &Tool, w: usize, ctx: &TranscriptCtx, verb_text: String) -> Rows
             w,
             theme,
         ));
+    }
+    rows
+}
+
+/// Joins the facts that fit on a `w`-cell row whose fixed left part takes `left_fixed` cells,
+/// giving up the most droppable first while the target would get fewer than `want` cells.
+/// Returns the joined facts and the room left for the target.
+fn fit_facts(
+    mut facts: Vec<Fact>,
+    w: usize,
+    left_fixed: usize,
+    want: usize,
+    sep: &str,
+) -> (String, usize) {
+    loop {
+        let joined = facts
+            .iter()
+            .map(|f| f.text.as_str())
+            .collect::<Vec<_>>()
+            .join(sep);
+        let right_w = text::width(&joined);
+        let room = w.saturating_sub(left_fixed + right_w + if right_w > 0 { 2 } else { 0 });
+        let droppable = facts
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.drop > 0)
+            .max_by_key(|(i, f)| (f.drop, *i))
+            .map(|(i, _)| i);
+        match droppable {
+            Some(i) if room < want => {
+                facts.remove(i);
+            }
+            _ => break (joined, room),
+        }
+    }
+}
+
+/// The group label (`Read`, `Search`, `Find`) a settled lookup folds into, so consecutive
+/// lookups read as one tree instead of a column of near-identical rows.
+pub(super) fn lookup_group(
+    state: ToolState,
+    presentation: &crate::runtime::presentation::Presentation,
+) -> Option<String> {
+    let label = text::one_line(&presentation.label);
+    (state == ToolState::Completed
+        && presentation.body == crate::runtime::presentation::BodyStyle::Quiet
+        && matches!(label.as_str(), "Read" | "Search" | "Find"))
+    .then_some(label)
+}
+
+/// Whether a call still running may settle into the `label` group.
+pub(super) fn may_join(
+    state: ToolState,
+    presentation: &crate::runtime::presentation::Presentation,
+    label: &str,
+) -> bool {
+    state == ToolState::Running
+        && presentation.body == crate::runtime::presentation::BodyStyle::Quiet
+        && text::one_line(&presentation.label) == label
+}
+
+/// `·  Read (3)` and one branch per call: its target, and its own facts at the right edge.
+pub(super) fn lookup_tree(tools: &[&Tool], w: u16, ctx: &TranscriptCtx) -> Rows {
+    let w = w as usize;
+    let Some(first) = tools.first().filter(|_| w > 0) else {
+        return Vec::new();
+    };
+    let theme = ctx.theme;
+    let (glyph, glyph_style) = phase_glyph(ToolState::Completed, ctx);
+    let mut head = gutter_span(glyph, glyph_style);
+    head.push(Span::styled(
+        verb(first),
+        theme.fg(Tok::ToolTitle).add_modifier(Modifier::BOLD),
+    ));
+    head.push(Span::styled(
+        format!(" ({})", tools.len()),
+        theme.fg(Tok::Dim),
+    ));
+    let mut rows = vec![fitted(head, w, theme)];
+    let (branch, last) = if theme.ascii() {
+        ("|-", "`-")
+    } else {
+        ("├─", "└─")
+    };
+    let sep = format!(" {} ", theme.sym(Sym::Dot));
+    for (i, t) in tools.iter().enumerate() {
+        let rail = format!(
+            "{}{} ",
+            " ".repeat(GUTTER),
+            if i + 1 == tools.len() { last } else { branch }
+        );
+        let full = target(t);
+        let want = text::width(&full).min(TARGET_MIN);
+        let (facts_text, room) = fit_facts(facts(t, theme), w, text::width(&rail), want, &sep);
+        let mut row = vec![
+            Span::styled(rail, theme.fg(Tok::Border)),
+            Span::styled(fit_target(&full, room, theme.ascii()), theme.fg(Tok::Muted)),
+        ];
+        if !facts_text.is_empty() {
+            let used: usize = row.iter().map(|s| text::width(&s.content)).sum();
+            let right_w = text::width(&facts_text);
+            row.push(Span::raw(
+                " ".repeat(w.saturating_sub(used + right_w).max(1)),
+            ));
+            row.push(Span::styled(facts_text, theme.fg(Tok::Dim)));
+        }
+        rows.push(fitted(row, w, theme));
     }
     rows
 }
@@ -520,9 +732,7 @@ fn agent_tree(agents: &[AgentRow], w: usize, ctx: &TranscriptCtx) -> Rows {
         let is_last = i + 1 == agents.len();
         let (glyph, glyph_style) = phase_glyph(a.state, ctx);
         let mut facts = Vec::new();
-        if !matches!(a.state, ToolState::Running | ToolState::Completed) {
-            facts.push(a.state.label().into());
-        }
+        // The explicit chip below carries phase; right-side facts are counts and time only.
         if a.tools > 0 {
             facts.push(plural(a.tools as usize, "tool"));
         } else if a.state == ToolState::Running && a.steps > 0 {
@@ -545,6 +755,21 @@ fn agent_tree(agents: &[AgentRow], w: usize, ctx: &TranscriptCtx) -> Rows {
                 },
             ),
         ];
+        left.push(Span::raw(" "));
+        left.push(frame::chip(
+            theme,
+            if a.state == ToolState::Completed {
+                "done"
+            } else {
+                a.state.label()
+            },
+            match a.state {
+                ToolState::Failed => Tok::Error,
+                ToolState::Running => Tok::Accent,
+                ToolState::Completed => Tok::Dim,
+                _ => Tok::Warning,
+            },
+        ));
         // The kind is only worth a badge when the name does not already say it (`scout#1`).
         let kind = a.agent.trim();
         if !kind.is_empty()
@@ -919,6 +1144,10 @@ fn elapsed_label(secs: f64) -> String {
 
 /// Rows of a compact (one-line) tool's error shown before Ctrl+O expands it.
 const COMPACT_ERROR_ROWS: usize = 2;
+
+mod frame;
+mod irc;
+pub(super) use irc::incoming_notice;
 
 #[cfg(test)]
 mod tests;

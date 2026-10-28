@@ -5,6 +5,7 @@
 //! normalized call and are offered only to the ordinary parallel-read admission after the reply
 //! ends, so a mis-detected or changed call simply runs as usual. Once any call in the reply runs
 //! outside the parallel-read path, every remaining result is discarded as possibly stale.
+use crate::agent::run::dispatch::image_question;
 use crate::agent::*;
 use std::collections::BTreeSet;
 
@@ -31,6 +32,7 @@ pub(in crate::agent) struct Admission {
     pub(in crate::agent) always: Vec<crate::agent::safety::approval::PermissionRule>,
     pub(in crate::agent) schemas: Vec<Value>,
     pub(in crate::agent) names: Vec<String>,
+    pub(in crate::agent) failed_calls: BTreeSet<[u8; 32]>,
 }
 
 #[derive(Default)]
@@ -90,7 +92,14 @@ impl StreamingDispatch {
     fn admits(&self, call: &ToolCall) -> bool {
         let runner = &self.runner;
         let admission = &self.admission;
-        crate::agent::safety::approval::parallel_read(&runner.ext, &call.name, &call.arguments)
+        !admission
+            .failed_calls
+            .contains(&crate::agent::run::engine::failed_identity(call))
+            && crate::agent::safety::approval::parallel_read(
+                &runner.ext,
+                &call.name,
+                &call.arguments,
+            )
             && ["pre_tool_use", "post_tool_use"].iter().all(|event| {
                 !crate::agent::safety::hooks::wanted_for_tool(
                     &admission.hooks,
@@ -104,6 +113,7 @@ impl StreamingDispatch {
                 call,
                 runner.workspace.root(),
             )
+            && image_question(call).is_none()
             && call_form_error(call, &admission.schemas, &admission.names).is_none()
     }
 

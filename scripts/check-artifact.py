@@ -9,11 +9,71 @@ import tempfile
 from pathlib import Path
 
 
+ELF_MACHINES = {"x86_64": 0x3E, "aarch64": 0xB7}
+MACH_O_CPU_TYPES = {"x86_64": 0x01000007, "aarch64": 0x0100000C}
+PE_MACHINES = {"x86_64": 0x8664, "aarch64": 0xAA64}
+PT_INTERP = 3
+
+
+def elf_interpreter(data):
+    """Returns the PT_INTERP loader path of a 64-bit little-endian ELF, or None when there is none."""
+    program_table = int.from_bytes(data[32:40], "little")
+    entry_size = int.from_bytes(data[54:56], "little")
+    entry_count = int.from_bytes(data[56:58], "little")
+    for index in range(entry_count):
+        entry = program_table + index * entry_size
+        if int.from_bytes(data[entry:entry + 4], "little") == PT_INTERP:
+            offset = int.from_bytes(data[entry + 8:entry + 16], "little")
+            size = int.from_bytes(data[entry + 32:entry + 40], "little")
+            return data[offset:offset + size].rstrip(b"\0").decode("utf-8", "replace")
+    return None
+
+
+def check_target_format(executable, target):
+    """Fails unless the binary header matches the release target's OS, CPU, and C library."""
+    arch = target.partition("-")[0]
+    data = executable.read_bytes()
+    if "apple-darwin" in target:
+        cpu = int.from_bytes(data[4:8], "little") if data[:4] == b"\xcf\xfa\xed\xfe" else None
+        if arch not in MACH_O_CPU_TYPES or cpu != MACH_O_CPU_TYPES[arch]:
+            raise RuntimeError(f"{executable.name} is not a 64-bit Mach-O {arch} binary")
+    elif "windows" in target:
+        pe = int.from_bytes(data[0x3C:0x40], "little") if data[:2] == b"MZ" else None
+        if pe is None or data[pe:pe + 4] != b"PE\0\0" or arch not in PE_MACHINES \
+                or int.from_bytes(data[pe + 4:pe + 6], "little") != PE_MACHINES[arch]:
+            raise RuntimeError(f"{executable.name} is not a PE {arch} binary")
+    elif "linux" in target:
+        if data[:5] != b"\x7fELF\x02\x01" or arch not in ELF_MACHINES \
+                or int.from_bytes(data[18:20], "little") != ELF_MACHINES[arch]:
+            raise RuntimeError(f"{executable.name} is not a 64-bit little-endian ELF {arch} binary")
+        interpreter = elf_interpreter(data)
+        if target.endswith("-musl"):
+            if interpreter is not None and "ld-musl" not in interpreter:
+                raise RuntimeError(f"musl target links the glibc loader {interpreter!r}")
+        elif interpreter is None or "ld-linux" not in interpreter:
+            raise RuntimeError(f"glibc target {target} does not link ld-linux (got {interpreter!r})")
+    else:
+        raise RuntimeError(f"unknown release target {target!r}")
+
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dial", type=Path, required=True)
+    parser.add_argument("--target", help="release target triple; verifies the binary format for it")
+    parser.add_argument("--format-only", action="store_true",
+                        help="verify only the --target binary format without executing the artifact")
     args = parser.parse_args()
     executable = args.dial.resolve(strict=True)
+    checks = []
+    if args.target:
+        check_target_format(executable, args.target)
+        checks.append("target-format")
+    if args.format_only:
+        if not args.target:
+            parser.error("--format-only requires --target")
+        print(json.dumps({"schema_version": 1, "executable": str(executable), "checks": checks}))
+        return
     with tempfile.TemporaryDirectory(prefix="dial-artifact-") as temporary:
         root = Path(temporary)
         workspace = root / "workspace"
@@ -80,7 +140,7 @@ def main():
         assert artifact.read_bytes() == source
         print(json.dumps({"schema_version": 1, "executable": str(executable),
                           "executable_sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
-                          "checks": ["entry", "metadata", "completions", "shell-host", "shell-state", "annotation"]}))
+                          "checks": [*checks, "entry", "metadata", "completions", "shell-host", "shell-state", "annotation"]}))
 
 
 if __name__ == "__main__":

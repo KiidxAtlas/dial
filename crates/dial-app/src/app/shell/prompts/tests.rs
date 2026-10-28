@@ -63,3 +63,17 @@ fn cancellation_overrides_accept_all_and_does_not_record_racing_consent() {
         "consent must not override cancellation"
     )));
 }
+
+#[test]
+fn draft_focus_cannot_submit_or_approve_and_handoff_preserves_the_text() {
+    let (_home, _project, _app, mut shell) = shell();
+    shell.composer.set_draft("keep");
+    assert!(shell.initial_focus() == Focus::Draft);
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    assert!(shell.draft_step(key(KeyCode::Char('y'))) == DraftStep::Stay);
+    assert!(shell.draft_step(key(KeyCode::Enter)) == DraftStep::Stay);
+    assert_eq!(shell.composer.draft(), "keepy\n");
+    assert!(shell.draft_step(key(KeyCode::Tab)) == DraftStep::Choices);
+    assert!(shell.draft_step(key(KeyCode::Esc)) == DraftStep::Choices);
+    assert_eq!(shell.composer.draft(), "keepy\n");
+}

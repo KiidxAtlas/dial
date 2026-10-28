@@ -14,6 +14,8 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
+use super::identity::{Axis, Family, Identity};
+
 const EXACT_TAIL_WINDOW: usize = 4096;
 const EXACT_MAX_UNIT: usize = 1024;
 const EXACT_CHECK_STRIDE: usize = 128;
@@ -33,33 +35,6 @@ const LEX_STALL_MIN_RUN: usize = 8;
 /// Reasoning-summary headers in one generation before the gemini header runaway trips.
 pub(crate) const GEMINI_HEADER_RUNAWAY_THRESHOLD: usize = 36;
 
-/// Model families whose reasoning is prone to loops, and which the semantic and header
-/// heuristics target.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ModelClass {
-    Gemini,
-    DeepSeek,
-    Xai,
-    Other,
-}
-
-pub(crate) fn model_class(model: &str) -> ModelClass {
-    let id = model
-        .rsplit('/')
-        .next()
-        .unwrap_or(model)
-        .to_ascii_lowercase();
-    if id.starts_with("gemini") {
-        ModelClass::Gemini
-    } else if id.starts_with("deepseek") {
-        ModelClass::DeepSeek
-    } else if id.starts_with("grok") || id.starts_with("xai") {
-        ModelClass::Xai
-    } else {
-        ModelClass::Other
-    }
-}
-
 /// Which detectors run for a model. The exact cycle detector runs for every model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoopPolicy {
@@ -67,11 +42,25 @@ pub struct LoopPolicy {
     pub header: bool,
 }
 
+impl LoopPolicy {
+    /// Loop-prone families get the semantic detectors; gemini also gets the header runaway.
+    fn for_family(family: Option<Family>) -> Self {
+        Self {
+            semantic: matches!(
+                family,
+                Some(Family::Gemini | Family::DeepSeek | Family::Xai)
+            ),
+            header: family == Some(Family::Gemini),
+        }
+    }
+}
+
 /// `DIAL_NO_THINKING_LOOP_GUARD=1` disables every stream loop detector.
 pub(crate) fn disabled_by_env() -> bool {
     std::env::var("DIAL_NO_THINKING_LOOP_GUARD").is_ok_and(|value| value == "1")
 }
 
+/// The detectors for `model`. `None` means the kill switch is set.
 pub fn policy_for(model: &str) -> Option<LoopPolicy> {
     policy_with(model, disabled_by_env())
 }
@@ -80,14 +69,8 @@ fn policy_with(model: &str, disabled: bool) -> Option<LoopPolicy> {
     if disabled {
         return None;
     }
-    let class = model_class(model);
-    Some(LoopPolicy {
-        semantic: matches!(
-            class,
-            ModelClass::Gemini | ModelClass::DeepSeek | ModelClass::Xai
-        ),
-        header: class == ModelClass::Gemini,
-    })
+    let family = Identity::new(model).family(Axis::LoopDetectors);
+    Some(LoopPolicy::for_family(family))
 }
 
 #[derive(Debug)]
