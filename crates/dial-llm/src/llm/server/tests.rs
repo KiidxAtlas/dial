@@ -249,7 +249,8 @@ fn gguf_launch_refuses_settings_llama_cpp_cannot_honor() {
 use super::fixtures::fake_python;
 
 fn alive(pid: i64) -> bool {
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    // An exited helper may remain a zombie until its adopting parent reaps it.
+    crate::platform::procinfo::ProcId::of(pid as i32).is_some()
 }
 
 fn wait_dead(pid: i64) -> bool {

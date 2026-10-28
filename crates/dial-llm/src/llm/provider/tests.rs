@@ -1531,6 +1531,15 @@ fn failed_local_inference_preserves_diagnostics_and_restarts_before_reuse() {
         server::fixtures::fake_python(root.path()),
         30,
     );
+    local.chat(None, &request(), 5, None).unwrap();
+    let old: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(model.join("info.json")).unwrap()).unwrap();
+    let processes = ["pid", "child"].map(|key| {
+        let pid = old[key].as_i64().unwrap() as i32;
+        let identity =
+            crate::platform::procinfo::ProcId::of(pid).expect("fixture process is alive");
+        (key, identity)
+    });
     let mut failing = request();
     failing.messages = vec![json!({"role":"user","content":"dial-test-fail"})];
     let error = local.chat(None, &failing, 5, None).unwrap_err();
@@ -1543,15 +1552,10 @@ fn failed_local_inference_preserves_diagnostics_and_restarts_before_reuse() {
         "classification must survive diagnostics"
     );
     assert!(!local.server.as_ref().unwrap().is_running());
-    let old: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(model.join("info.json")).unwrap()).unwrap();
-    for key in ["pid", "child"] {
-        let pid = old[key].as_i64().unwrap() as libc::pid_t;
-        assert_eq!(
-            unsafe { libc::kill(pid, 0) },
-            -1,
-            "{key} must be stopped before retry"
-        );
+    // Signal zero also succeeds for exited grandchildren awaiting reaping by init. Check the
+    // original identities instead: neither process may still be executing before the retry.
+    for (key, identity) in processes {
+        assert!(!identity.alive(), "{key} must be stopped before retry");
     }
     local.chat(None, &request(), 5, None).unwrap();
     let new: serde_json::Value =

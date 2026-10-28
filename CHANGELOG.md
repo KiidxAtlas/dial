@@ -5,6 +5,10 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 
 ## [Unreleased]
 
+### Fixed
+
+- Local-server shutdown tests distinguish exited Linux zombies from running processes, avoiding false failures while still checking that the failed server and its helper stop before retry.
+
 ## [0.2.6] - 2026-10-28
 
 ### Fixed
