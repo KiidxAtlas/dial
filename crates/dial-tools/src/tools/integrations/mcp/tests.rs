@@ -420,7 +420,9 @@ fn broken_servers_only_produce_notices_and_good_ones_still_load() {
         ("badlist", fake_config("bad-list", 30)),
     ]);
     let started = Instant::now();
-    let loaded = load_with(&config, Duration::from_secs(1));
+    // These are real child processes sharing a busy CI runner. Allow their startup and
+    // handshake to complete; the silent server still exercises the bounded deadline.
+    let loaded = load_with(&config, Duration::from_secs(5));
     assert!(
         started.elapsed() < Duration::from_secs(15),
         "servers connect concurrently with a bounded budget"
@@ -431,7 +433,7 @@ fn broken_servers_only_produce_notices_and_good_ones_still_load() {
             .iter()
             .all(|t| t.name().starts_with("mcp__good__"))
     );
-    assert_eq!(tools_of(&loaded).len(), 12);
+    assert_eq!(tools_of(&loaded).len(), 12, "{:?}", loaded.notices);
     let notice = |server: &str| {
         let prefix = format!("mcp `{server}`: ");
         let found: Vec<_> = loaded

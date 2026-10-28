@@ -113,8 +113,8 @@ impl PortalGeometry {
         };
         let scale_x = f64::from(self.pixel_width) / f64::from(self.logical_width.max(1));
         let scale_y = f64::from(self.pixel_height) / f64::from(self.logical_height.max(1));
-        let rel_x = window.x.checked_sub(self.logical_x).ok_or_else(&outside)?;
-        let rel_y = window.y.checked_sub(self.logical_y).ok_or_else(&outside)?;
+        let rel_x = window.x.checked_sub(self.logical_x).ok_or_else(outside)?;
+        let rel_y = window.y.checked_sub(self.logical_y).ok_or_else(outside)?;
         if rel_x < 0 || rel_y < 0 {
             return Err(outside());
         }

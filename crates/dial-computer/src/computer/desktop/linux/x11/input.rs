@@ -65,6 +65,15 @@ const FOREGROUND_RESTORE_SETTLE: Duration = Duration::from_millis(150);
 /// Bound on re-activating the user's window after a foreground action.
 const FOREGROUND_RESTORE_BUDGET: Duration = Duration::from_millis(400);
 
+/// A pointer location in both root and destination-window coordinate spaces.
+#[derive(Clone, Copy)]
+struct EventCoordinates {
+    root_x: i16,
+    root_y: i16,
+    event_x: i16,
+    event_y: i16,
+}
+
 pub struct X11Input {
     conn: Arc<RustConnection>,
     root: Window,
@@ -506,22 +515,18 @@ impl X11Input {
                 count,
                 modifiers,
             } => {
-                let (root_x, root_y, event_x, event_y) = self.coordinates(window, *x, *y)?;
+                let coordinates = self.coordinates(window, *x, *y)?;
                 let detail = button_detail(*button);
                 let mut state = modifier_mask(*modifiers);
                 for _ in 0..(*count).max(1) {
                     control::check()?;
-                    let pressed = self.send_button(
-                        window, detail, true, root_x, root_y, event_x, event_y, state,
-                    );
+                    let pressed = self.send_button(window, detail, true, coordinates, state);
                     if let Some(mask) = button_mask(detail) {
                         state |= mask;
                     }
                     let held = pressed.and_then(|()| control::wait(CLICK_DELAY));
                     let released = control::cleanup(|| {
-                        self.send_button(
-                            window, detail, false, root_x, root_y, event_x, event_y, state,
-                        )
+                        self.send_button(window, detail, false, coordinates, state)
                     });
                     held.and(released)?;
                     if let Some(mask) = button_mask(detail) {
@@ -537,23 +542,16 @@ impl X11Input {
                 keys,
                 duration,
             } => {
-                let (rx, ry, ex, ey) = self.coordinates(window, *x, *y)?;
+                let coordinates = self.coordinates(window, *x, *y)?;
                 let detail = button_detail(*button);
                 let state = modifier_mask(control::key_modifiers(keys));
                 control::bounded_hold(*duration, |down| {
-                    self.send_button(window, detail, down, rx, ry, ex, ey, state)
+                    self.send_button(window, detail, down, coordinates, state)
                 })?;
             }
             PointerEvent::Move { x, y } => {
-                let (root_x, root_y, event_x, event_y) = self.coordinates(window, *x, *y)?;
-                self.send_motion(
-                    window,
-                    root_x,
-                    root_y,
-                    event_x,
-                    event_y,
-                    KeyButMask::default(),
-                )?;
+                let coordinates = self.coordinates(window, *x, *y)?;
+                self.send_motion(window, coordinates, KeyButMask::default())?;
             }
             PointerEvent::Drag {
                 path,
@@ -565,36 +563,32 @@ impl X11Input {
                     return Err(DesktopError::input_failed("drag path is empty"));
                 };
                 let detail = button_detail(*button);
-                let (root_x, root_y, event_x, event_y) =
-                    self.coordinates(window, first_x, first_y)?;
+                let coordinates = self.coordinates(window, first_x, first_y)?;
                 let mut state =
                     modifier_mask(*modifiers) | modifier_mask(control::key_modifiers(keys));
                 control::check()?;
-                let pressed = self.send_button(
-                    window, detail, true, root_x, root_y, event_x, event_y, state,
-                );
+                let pressed = self.send_button(window, detail, true, coordinates, state);
                 if let Some(mask) = button_mask(detail) {
                     state |= mask;
                 }
-                let mut last = (root_x, root_y, event_x, event_y);
+                let mut last = coordinates;
                 let moved = (|| {
                     pressed?;
                     for &(x, y) in path.iter().skip(1) {
                         control::check()?;
                         last = self.coordinates(window, x, y)?;
-                        self.send_motion(window, last.0, last.1, last.2, last.3, state)?;
+                        self.send_motion(window, last, state)?;
                         control::wait(DRAG_STEP_DELAY)?;
                     }
                     Ok(())
                 })();
-                let released = control::cleanup(|| {
-                    self.send_button(window, detail, false, last.0, last.1, last.2, last.3, state)
-                });
+                let released =
+                    control::cleanup(|| self.send_button(window, detail, false, last, state));
                 moved.and(released)?;
             }
             PointerEvent::Scroll { x, y, dx, dy } => {
-                let (root_x, root_y, event_x, event_y) = self.coordinates(window, *x, *y)?;
-                self.scroll_send_event(window, root_x, root_y, event_x, event_y, *dx, *dy)?;
+                let coordinates = self.coordinates(window, *x, *y)?;
+                self.scroll_send_event(window, coordinates, *dx, *dy)?;
             }
         }
         self.conn.flush().map_err(input_failed)
@@ -817,7 +811,7 @@ impl X11Input {
             .map_err(input_failed)
     }
 
-    fn coordinates(&self, window: Window, x: f64, y: f64) -> CoreResult<(i16, i16, i16, i16)> {
+    fn coordinates(&self, window: Window, x: f64, y: f64) -> CoreResult<EventCoordinates> {
         let root_x = checked_i16(x, "x")?;
         let root_y = checked_i16(y, "y")?;
         let translated = self
@@ -826,7 +820,12 @@ impl X11Input {
             .map_err(input_failed)?
             .reply()
             .map_err(input_failed)?;
-        Ok((root_x, root_y, translated.dst_x, translated.dst_y))
+        Ok(EventCoordinates {
+            root_x,
+            root_y,
+            event_x: translated.dst_x,
+            event_y: translated.dst_y,
+        })
     }
 
     fn send_button(
@@ -834,10 +833,7 @@ impl X11Input {
         window: Window,
         detail: u8,
         press: bool,
-        root_x: i16,
-        root_y: i16,
-        event_x: i16,
-        event_y: i16,
+        coordinates: EventCoordinates,
         state: KeyButMask,
     ) -> CoreResult<()> {
         control::check()?;
@@ -853,10 +849,10 @@ impl X11Input {
             root: self.root,
             event: window,
             child: 0,
-            root_x,
-            root_y,
-            event_x,
-            event_y,
+            root_x: coordinates.root_x,
+            root_y: coordinates.root_y,
+            event_x: coordinates.event_x,
+            event_y: coordinates.event_y,
             state,
             same_screen: true,
         };
@@ -879,10 +875,7 @@ impl X11Input {
     fn send_motion(
         &self,
         window: Window,
-        root_x: i16,
-        root_y: i16,
-        event_x: i16,
-        event_y: i16,
+        coordinates: EventCoordinates,
         state: KeyButMask,
     ) -> CoreResult<()> {
         control::check()?;
@@ -894,10 +887,10 @@ impl X11Input {
             root: self.root,
             event: window,
             child: 0,
-            root_x,
-            root_y,
-            event_x,
-            event_y,
+            root_x: coordinates.root_x,
+            root_y: coordinates.root_y,
+            event_x: coordinates.event_x,
+            event_y: coordinates.event_y,
             state,
             same_screen: true,
         };
@@ -911,37 +904,17 @@ impl X11Input {
     fn scroll_send_event(
         &self,
         window: Window,
-        root_x: i16,
-        root_y: i16,
-        event_x: i16,
-        event_y: i16,
+        coordinates: EventCoordinates,
         dx: f64,
         dy: f64,
     ) -> CoreResult<()> {
         for (detail, count) in scroll_buttons(dx, dy) {
             for _ in 0..count {
                 control::check()?;
-                let pressed = self.send_button(
-                    window,
-                    detail,
-                    true,
-                    root_x,
-                    root_y,
-                    event_x,
-                    event_y,
-                    KeyButMask::default(),
-                );
+                let pressed =
+                    self.send_button(window, detail, true, coordinates, KeyButMask::default());
                 let released = control::cleanup(|| {
-                    self.send_button(
-                        window,
-                        detail,
-                        false,
-                        root_x,
-                        root_y,
-                        event_x,
-                        event_y,
-                        KeyButMask::default(),
-                    )
+                    self.send_button(window, detail, false, coordinates, KeyButMask::default())
                 });
                 pressed.and(released)?;
             }

@@ -8,8 +8,8 @@ use x11rb::{
         ErrorKind,
         randr::ConnectionExt as _,
         xproto::{
-            Atom, AtomEnum, ConnectionExt as _, ImageFormat, ImageOrder, MapState, VisualClass,
-            Window,
+            Atom, AtomEnum, ConnectionExt as _, Format, ImageFormat, ImageOrder, MapState,
+            VisualClass, Window,
         },
     },
     rust_connection::RustConnection,
@@ -442,9 +442,7 @@ impl X11Capture {
             &reply.data,
             width,
             height,
-            reply.depth,
-            format.bits_per_pixel,
-            format.scanline_pad,
+            format,
             setup.image_byte_order == ImageOrder::LSB_FIRST,
             self.masks,
         )
@@ -502,12 +500,16 @@ fn zpixmap_to_rgba(
     data: &[u8],
     width: u32,
     height: u32,
-    depth: u8,
-    bits_per_pixel: u8,
-    scanline_pad: u8,
+    format: &Format,
     lsb_first: bool,
     masks: ColorMasks,
 ) -> CoreResult<RgbaImage> {
+    let Format {
+        depth,
+        bits_per_pixel,
+        scanline_pad,
+        ..
+    } = *format;
     if !(24..=32).contains(&depth) {
         return Err(DesktopError::capture_failed(format!(
             "unsupported X11 image depth {depth}; TrueColor depth 24 through 32 is required"
@@ -571,3 +573,6 @@ fn zpixmap_to_rgba(
     RgbaImage::from_raw(width, height, rgba)
         .ok_or_else(|| DesktopError::capture_failed("X11 image dimensions are inconsistent"))
 }
+
+#[cfg(test)]
+mod tests;
