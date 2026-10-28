@@ -5,6 +5,8 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-10-28
+
 ### Added
 
 - Project peers can guide the next step of an existing task and wake an incomplete task in an open terminal. Wake-ups are deduplicated, limited to three per user turn with a 30-second cooldown, and disabled with `coordination.auto_wake = false`; completed, blocked, failed, cancelled and human-input-waiting tasks stay asleep (`docs/session-coordination.md`).
