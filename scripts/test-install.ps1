@@ -255,16 +255,33 @@ if ($opensslCommand) {
     if (Test-Path -LiteralPath $gitOpenSsl) { $script:OpenSsl = $gitOpenSsl }
 }
 
-$tagFromArchive = $null
-if ($ArchivePath) {
-    $archiveLeaf = Split-Path -Leaf $ArchivePath
-    $nameMatch = [regex]::Match($archiveLeaf, '^dial-(.+)-x86_64-pc-windows-msvc\.zip$')
-    Assert-True $nameMatch.Success "ArchivePath must be named dial-<tag>-x86_64-pc-windows-msvc.zip (got $archiveLeaf)"
-    $tagFromArchive = $nameMatch.Groups[1].Value
+function Get-ArchiveIdentity {
+    param([string] $Path)
+    $archiveLeaf = Split-Path -Leaf $Path
+    $nameMatch = [regex]::Match($archiveLeaf, '^dial-(.+)-(x86_64|aarch64)-pc-windows-msvc\.zip$')
+    Assert-True $nameMatch.Success "ArchivePath must be named dial-<tag>-<x86_64|aarch64>-pc-windows-msvc.zip (got $archiveLeaf)"
+    return [pscustomobject]@{
+        Tag = $nameMatch.Groups[1].Value
+        Architecture = if ($nameMatch.Groups[2].Value -eq 'aarch64') { 'ARM64' } else { 'AMD64' }
+    }
 }
+
+$archiveIdentity = if ($ArchivePath) { Get-ArchiveIdentity $ArchivePath } else { $null }
+$tagFromArchive = if ($archiveIdentity) { $archiveIdentity.Tag } else { $null }
 
 try {
     New-Item -ItemType Directory -Force -Path $script:Serve | Out-Null
+    Test-Case 'recognizes both published Windows archive targets and rejects unknown targets' {
+        foreach ($case in @(@('x86_64', 'AMD64'), @('aarch64', 'ARM64'))) {
+            $identity = Get-ArchiveIdentity "dial-v0.2.2-$($case[0])-pc-windows-msvc.zip"
+            Assert-Equal 'v0.2.2' $identity.Tag 'archive tag'
+            Assert-Equal $case[1] $identity.Architecture 'archive architecture'
+        }
+        $rejected = $false
+        try { Get-ArchiveIdentity 'dial-v0.2.2-i686-pc-windows-msvc.zip' } catch { $rejected = $true }
+        Assert-True $rejected 'unsupported archive target was accepted'
+    }
+
     Assert-True ([bool] $script:OpenSsl) 'openssl is required to run the installer tests'
 
     $keyA = New-SigningKey -Name 'key-a'
@@ -510,6 +527,7 @@ try {
     if ($tagFromArchive) {
         Test-Case "installs the real archive $(Split-Path -Leaf $ArchivePath) end to end" {
             $envMap = Get-BaseEnvironment (Get-ScenarioUrl 'real')
+            $envMap['PROCESSOR_ARCHITECTURE'] = $archiveIdentity.Architecture
             $envMap['DIAL_RELEASE_PUBLIC_KEY_PEM'] = $keyA.PublicPem
             $dir = Join-Path $script:WorkRoot 'bin-real'
             $run = Invoke-Installer @('-Version', $tagFromArchive, '-InstallDir', $dir) $envMap
