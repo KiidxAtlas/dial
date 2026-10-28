@@ -71,7 +71,9 @@ mod linux;
 use std::ffi::OsString;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(not(target_os = "linux"))]
+use std::process::Stdio;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
