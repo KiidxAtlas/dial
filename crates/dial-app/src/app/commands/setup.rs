@@ -15,6 +15,7 @@ use crate::setup::embeddings;
 use crate::setup::memory::{
     BACKENDS, backend_label, backend_missing, parse_backend, selected, status_summary,
 };
+use crate::setup::vision_models::{self, Kind};
 use crate::ui::overlay::palette::{ChoiceItem, ChoiceSpec};
 use anyhow::Result;
 use std::sync::Arc;
@@ -24,7 +25,7 @@ mod presets;
 
 const TITLE: &str = "Setup";
 
-const USAGE: &str = "/setup                 guided setup: search, review, then confirm\n/setup presets [local-only|local-assisted|hosted] [project|global]   review and save a model-routing setup\n/setup list            list capabilities and their status as text\n/setup updates         check installed external runtimes/tools for updates (no installs)\n/setup update <id>     review update commands and destination\n/setup update <id> yes explicitly approve and run that update\n/setup <id>            preview what would run and where it installs\n/setup <id> yes        set it up (prerequisites first), then save its settings\n/setup providers       connect a model provider\n/setup memory          choose a memory backend: what each needs and whether it is ready\n/setup memory <backend>   switch memory to off, provenance, local, hindsight, sharpshooter or semantic (all projects)\n/setup embeddings      list local embedding models (Ollama)\n/setup embeddings:<model> [yes]   preview, then pull the model and assign it to the embedding role (used by the semantic memory backend)";
+const USAGE: &str = "/setup                 guided setup: search, review, then confirm\n/setup presets [local-only|local-assisted|hosted] [project|global]   review and save a model-routing setup\n/setup list            list capabilities and their status as text\n/setup updates         check installed external runtimes/tools for updates (no installs)\n/setup update <id>     review update commands and destination\n/setup update <id> yes explicitly approve and run that update\n/setup <id>            preview what would run and where it installs\n/setup <id> yes        set it up (prerequisites first), then save its settings\n/setup providers       connect a model provider\n/setup memory          choose a memory backend: what each needs and whether it is ready\n/setup memory <backend>   switch memory to off, provenance, local, hindsight, sharpshooter or semantic (all projects)\n/setup embeddings      list local embedding models (Ollama)\n/setup embeddings:<model> [yes]   preview, then pull the model and assign it to the embedding role (used by the semantic memory backend)\n/setup grounding [yes] list, or set up the default UI grounding model (computer/browser locate)\n/setup grounding:<repo> [yes]   preview, then download an MLX grounding model and assign it to the grounding role\n/setup image-embeddings [yes]   list, or set up the default image embedding model (image_search)\n/setup image-embeddings:<repo> [yes]   preview, then download an MLX image embedding model and assign it to the image_embedding role";
 
 pub(super) const COMMANDS: &[super::CommandSpec] = &[super::CommandSpec {
     name: "setup",
@@ -35,6 +36,8 @@ pub(super) const COMMANDS: &[super::CommandSpec] = &[super::CommandSpec {
         "providers",
         "memory",
         "embeddings",
+        "grounding",
+        "image-embeddings",
         "list",
         "updates",
         "update",
@@ -91,6 +94,14 @@ pub(super) fn run_live(
     }
     if parts.first().is_some_and(|id| id.starts_with("embeddings")) {
         embedding_command(shell, app, &parts);
+        return Some(Ok(Step::Done));
+    }
+    if let Some(&id) = parts.first()
+        && Kind::ALL
+            .iter()
+            .any(|kind| id == kind.id() || id.starts_with(&format!("{}:", kind.id())))
+    {
+        vision_command(shell, app, &parts);
         return Some(Ok(Step::Done));
     }
     let env = Env::current(&app.layout.user_dir);
@@ -196,6 +207,21 @@ fn setup_choices(env: &Env) -> ChoiceSpec {
             detail: "Choose a local Ollama model; review download size before confirming".into(),
             current: false,
         },
+        ChoiceItem {
+            value: Kind::Grounding.id().into(),
+            label: "Set up a UI grounding model".into(),
+            detail:
+                "Local MLX vision model for computer/browser locate; review download size first"
+                    .into(),
+            current: false,
+        },
+        ChoiceItem {
+            value: Kind::ImageEmbedding.id().into(),
+            label: "Set up an image embedding model".into(),
+            detail: "Local MLX model for image_search by text, similarity and prompt scoring"
+                .into(),
+            current: false,
+        },
     ];
     items.extend(deps::report(env).into_iter().map(|row| ChoiceItem {
         value: row.id.to_owned(),
@@ -232,6 +258,21 @@ fn embedding_choices() -> ChoiceSpec {
     )
 }
 
+fn vision_choices(kind: Kind) -> ChoiceSpec {
+    choice_spec(
+        &format!("Setup · choose a {}", kind.title().to_lowercase()),
+        kind.catalog()
+            .iter()
+            .map(|model| ChoiceItem {
+                value: vision_models::setup_id(kind, model.repo),
+                label: model.repo.to_owned(),
+                detail: format!("{} MB · {}", model.size_mb, model.description),
+                current: false,
+            })
+            .collect(),
+    )
+}
+
 fn choice_spec(title: &str, items: Vec<ChoiceItem>) -> ChoiceSpec {
     ChoiceSpec {
         title: title.to_owned(),
@@ -246,6 +287,9 @@ fn choice_spec(title: &str, items: Vec<ChoiceItem>) -> ChoiceSpec {
 /// Validate before offering installation. Errors retain the existing preview/manual guidance.
 /// This reads local state only: no probes, network requests, downloads or settings writes.
 fn review_plan(id: &str, env: &Env) -> std::result::Result<String, String> {
+    if let Some((kind, repo)) = vision_models::parse_id(id) {
+        return Ok(vision_models::preview_text(kind, repo, &env.user_dir));
+    }
     if id.starts_with("embeddings") {
         let model = embeddings::model_from_id(id)
             .ok_or_else(|| format!("Invalid embedding setup id `{id}`. Use /setup embeddings."))?;
@@ -283,6 +327,14 @@ fn guided_command(
             return shell.open(app, agent, Which::Choice(Box::new(embedding_choices())));
         }
         "memory" => return memory_command(shell, app, agent, &[]),
+        "grounding" => {
+            let choices = vision_choices(Kind::Grounding);
+            return shell.open(app, agent, Which::Choice(Box::new(choices)));
+        }
+        "image-embeddings" => {
+            let choices = vision_choices(Kind::ImageEmbedding);
+            return shell.open(app, agent, Which::Choice(Box::new(choices)));
+        }
         _ => {}
     }
     if let Some(backend) = id.strip_prefix("memory:") {
@@ -312,6 +364,8 @@ fn guided_command(
     }
     if embeddings::model_from_id(id).is_some() {
         embedding_command(shell, app, &[id, "yes"]);
+    } else if vision_models::parse_id(id).is_some() {
+        vision_command(shell, app, &[id, "yes"]);
     } else {
         start(shell, app, id);
     }
@@ -351,6 +405,34 @@ fn embedding_command(shell: &mut Shell, app: &App, parts: &[&str]) {
             let model = model.to_owned();
             spawn_job_streaming(shell, "Setup", move |cancel: Arc<AtomicBool>, progress| {
                 embeddings::setup(&layout, &model, &cancel, progress)
+            });
+        }
+        _ => shell.note(TITLE, USAGE),
+    }
+}
+
+/// `/setup grounding` / `/setup image-embeddings` list the curated catalog; `<id>:<repo>` previews,
+/// and `... yes` (also on the bare id, meaning the default) downloads it in the background and
+/// assigns it to the role.
+fn vision_command(shell: &mut Shell, app: &App, parts: &[&str]) {
+    let Some((kind, repo)) = parts.first().and_then(|id| vision_models::parse_id(id)) else {
+        shell.note(
+            TITLE,
+            "Invalid model id. Use /setup grounding or /setup image-embeddings to list models, then /setup <id>:<owner/name> yes.",
+        );
+        return;
+    };
+    match parts {
+        [id] if *id == kind.id() => shell.note(TITLE, vision_models::catalog_text(kind)),
+        [_] => shell.note(
+            TITLE,
+            vision_models::preview_text(kind, repo, &app.layout.user_dir),
+        ),
+        [_, "yes"] => {
+            let layout = app.layout.clone();
+            let repo = repo.to_owned();
+            spawn_job_streaming(shell, "Setup", move |cancel: Arc<AtomicBool>, progress| {
+                vision_models::setup(&layout, kind, &repo, &cancel, progress)
             });
         }
         _ => shell.note(TITLE, USAGE),

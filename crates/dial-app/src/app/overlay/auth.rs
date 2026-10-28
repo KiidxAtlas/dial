@@ -6,9 +6,11 @@ use anyhow::{Result, ensure};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// Settings to save once a background model download succeeds; nothing is written before then.
 pub(in crate::app) struct PreparedModel {
     pub(in crate::app) changes: Vec<Change>,
-    pub(in crate::app) role: String,
+    /// The model role the changes assign; `None` for a plain setting such as a draft model.
+    pub(in crate::app) role: Option<String>,
     pub(in crate::app) scope: Scope,
 }
 
@@ -61,7 +63,7 @@ impl AuthJob {
             let result = result.and_then(|message| {
                 ensure!(!job.cancel.load(Ordering::SeqCst), "operation cancelled");
                 if let Some(model) = &job.model {
-                    app.save_settings(model.scope, &model.changes, Some(&model.role))?;
+                    app.save_settings(model.scope, &model.changes, model.role.as_deref())?;
                 }
                 Ok(message)
             });
@@ -69,3 +71,6 @@ impl AuthJob {
         })
     }
 }
+
+#[cfg(test)]
+mod tests;

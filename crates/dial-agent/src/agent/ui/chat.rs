@@ -15,6 +15,12 @@ pub(in crate::agent) enum ChatEvent {
         name: String,
         delta: String,
     },
+    ToolCallComplete {
+        index: u64,
+        id: String,
+        name: String,
+        arguments: String,
+    },
     Notice(String),
     Finished(Box<Result<llm::Reply>>),
 }
@@ -348,7 +354,7 @@ pub(in crate::agent) fn chat_attempt_with_ui(
     ui.model_wait(Duration::ZERO);
     // Model family picks the detectors; `None` means the kill switch is set.
     let loop_policy = llm::thinking_loop::policy_for(backend.model_label());
-    thread::scope(|scope| {
+    let result = thread::scope(|scope| {
         let worker = thread::Builder::new()
             .name("dial-model".to_owned())
             .spawn_scoped(scope, move || {
@@ -381,6 +387,19 @@ pub(in crate::agent) fn chat_attempt_with_ui(
                                 id: id.clone(),
                                 name: name.clone(),
                                 delta: delta.clone(),
+                            });
+                        }
+                        llm::StreamEvent::ToolCallComplete {
+                            index,
+                            id,
+                            name,
+                            arguments,
+                        } => {
+                            let _ = tx.send(ChatEvent::ToolCallComplete {
+                                index: *index,
+                                id: id.clone(),
+                                name: name.clone(),
+                                arguments: arguments.clone(),
                             });
                         }
                     }
@@ -470,7 +489,7 @@ pub(in crate::agent) fn chat_attempt_with_ui(
                 Ok(_) if stalled.is_some() => {} // Never expose the cancelled attempt's late partial output.
                 Ok(ChatEvent::Retry { waiting }) => {
                     ui.request_phase(if waiting {
-                        RequestPhase::Waiting
+                        RequestPhase::Backoff
                     } else {
                         RequestPhase::Retrying
                     });
@@ -616,6 +635,11 @@ pub(in crate::agent) fn chat_attempt_with_ui(
                     name,
                     delta,
                 }) => {
+                    if cancel_request.load(Ordering::SeqCst)
+                        || external_interrupt.load(Ordering::SeqCst)
+                    {
+                        continue;
+                    }
                     if rules
                         .as_deref_mut()
                         .is_some_and(|m| !m.tool(index.try_into().unwrap(), &name, &delta))
@@ -626,7 +650,10 @@ pub(in crate::agent) fn chat_attempt_with_ui(
                     }
                     // A tool call starts the tool phase: the text detector stops watching.
                     text_loop = None;
-                    if let Some(stream) = stream.as_deref_mut() {
+                    if !cancel_request.load(Ordering::SeqCst)
+                        && !external_interrupt.load(Ordering::SeqCst)
+                        && let Some(stream) = stream.as_deref_mut()
+                    {
                         stream.arguments(index, &id, &name, &delta);
                     }
                     if !name.is_empty()
@@ -648,6 +675,45 @@ pub(in crate::agent) fn chat_attempt_with_ui(
                             ui.context_usage(context.observe(&delta), context.estimated());
                         }
                         ui.tool_arguments_delta(index, &id, &name, &delta);
+                    }
+                }
+                Ok(ChatEvent::ToolCallComplete {
+                    index,
+                    id,
+                    name,
+                    arguments,
+                }) => {
+                    if cancel_request.load(Ordering::SeqCst)
+                        || external_interrupt.load(Ordering::SeqCst)
+                    {
+                        continue;
+                    }
+                    // Completion-only providers must pass the same portable guidance boundary.
+                    // Never repair malformed JSON to make a speculative call executable.
+                    let Ok(value) = serde_json::from_str::<Value>(&arguments) else {
+                        continue;
+                    };
+                    if !value.is_object() {
+                        continue;
+                    }
+                    let call = ToolCall {
+                        id: id.clone(),
+                        name: name.clone(),
+                        arguments: value,
+                        malformed_arguments: false,
+                    };
+                    if rules.as_deref_mut().is_some_and(|monitor| {
+                        !monitor.completed_tool(index.try_into().unwrap(), &call)
+                    }) {
+                        cancel_request.store(true, Ordering::SeqCst);
+                        ui.inference_discarded("Portable tool guidance intercepted this inference (match or coverage limit); no completed tool call will execute.");
+                        continue;
+                    }
+                    if !cancel_request.load(Ordering::SeqCst)
+                        && !external_interrupt.load(Ordering::SeqCst)
+                        && let Some(stream) = stream.as_deref_mut()
+                    {
+                        stream.completed(index, &id, &name, &arguments);
                     }
                 }
                 Ok(ChatEvent::Finished(result)) => {
@@ -732,8 +798,13 @@ pub(in crate::agent) fn chat_attempt_with_ui(
             return Err(anyhow::Error::new(llm::errors::ThinkingLoop(reason)));
         }
         result
-    })
+    });
+    ui.request_finished(result.is_ok());
+    result
 }
 
 #[cfg(test)]
 mod silence_tests;
+
+#[cfg(test)]
+mod streaming_safety_tests;

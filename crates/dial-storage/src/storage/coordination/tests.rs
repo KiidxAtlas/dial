@@ -235,6 +235,11 @@ fn full_inbox_rejects_without_eviction_and_drain_is_exact() {
         );
     }
     assert!(recipient.drain().unwrap().is_empty());
+    assert!(!recipient.has_mail().unwrap());
+    sender.send(recipient.id(), "peek").unwrap();
+    assert!(recipient.has_mail().unwrap());
+    assert!(recipient.has_mail().unwrap(), "peeking must not consume");
+    assert_eq!(recipient.drain().unwrap()[0].text, "peek");
     let large = "x".repeat(MAX_TEXT);
     let mut accepted = 0;
     while sender.send(recipient.id(), &large).is_ok() {
@@ -258,6 +263,69 @@ fn full_inbox_rejects_without_eviction_and_drain_is_exact() {
             .is_err()
     );
     assert!(sender.send(recipient.id(), "\0").is_err());
+}
+
+#[test]
+fn run_ledger_shares_finished_results_and_live_runs_only_for_the_same_tree() {
+    let fixture = Fixture::new();
+    let owner = Participant::join(&fixture.layout, "owner").unwrap();
+    let reader = Participant::join(&fixture.layout, "reader").unwrap();
+    owner.begin_run("owner", "cargo test", "tree-a").unwrap();
+    // Never one's own run, and never another tree's.
+    assert!(owner.shared_run("cargo test", "tree-a").unwrap().is_none());
+    assert!(reader.shared_run("cargo test", "tree-b").unwrap().is_none());
+    let running = reader.shared_run("cargo test", "tree-a").unwrap().unwrap();
+    assert_eq!(running.status, RunStatus::Running);
+    assert_eq!(reader.running_runs().unwrap().len(), 1);
+    owner
+        .finish_run(
+            "cargo test",
+            "tree-a",
+            Some(RunResult {
+                exit_code: 101,
+                summary: "error[E0433]: failed to resolve",
+                artifact: Some("artifact://abc"),
+                unchanged: true,
+            }),
+        )
+        .unwrap();
+    let done = reader.shared_run("cargo test", "tree-a").unwrap().unwrap();
+    assert_eq!(
+        (done.status, done.exit_code, done.artifact.as_deref()),
+        (RunStatus::Failed, Some(101), Some("artifact://abc"))
+    );
+    assert!(reader.running_runs().unwrap().is_empty());
+
+    // A tree that changed during the run withdraws the announcement instead of publishing.
+    owner.begin_run("owner", "cargo check", "tree-a").unwrap();
+    owner
+        .finish_run(
+            "cargo check",
+            "tree-a",
+            Some(RunResult {
+                exit_code: 0,
+                summary: "",
+                artifact: None,
+                unchanged: false,
+            }),
+        )
+        .unwrap();
+    assert!(reader.shared_run("cargo check", "tree-a").unwrap().is_none());
+
+    // A run whose owner exits without finishing is no longer advertised; results stay.
+    owner.begin_run("owner", "cargo build", "tree-a").unwrap();
+    drop(owner);
+    assert!(reader.shared_run("cargo build", "tree-a").unwrap().is_none());
+    assert!(reader.shared_run("cargo test", "tree-a").unwrap().is_some());
+    // The ledger file does not count as a peer.
+    assert!(reader.peers().unwrap().is_empty());
+}
+
+#[test]
+fn run_summaries_keep_the_tail_on_a_character_boundary() {
+    assert_eq!(tail("héllo", 4), "llo");
+    assert_eq!(tail("ab\u{1b}c", 10), "abc");
+    assert_eq!(tail("short", MAX_SUMMARY), "short");
 }
 
 #[test]

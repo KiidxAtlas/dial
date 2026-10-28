@@ -76,6 +76,8 @@ In the picker, `Tab` switches between the sidebar and the list; `Enter` or `Righ
 | `decision` | Laya decision engine: the assigned value is the Laya checkpoint (local path or HF repo id), passed to the managed service as `DIAL_LAYA_CHECKPOINT`. Set with `dial laya install --checkpoint` or /roles | Installed Laya checkpoint (shown as “Laya · <checkpoint>”), else not set |
 | `embedding` | Semantic memory recall through an embedding-capable endpoint | Lexical recall |
 | `image` | Image generation through `image_gen`, including image models served by MLX-Serve | Try `main`, then shared configured image profiles and keyed provider defaults. ChatGPT may offer an unverified hosted-image attempt when metadata is absent. Explicit `[image]` overrides still win. |
+| `grounding` | Finding a described UI element in a screenshot: computer `target.locate()` and browser `action=locate`. Set up with `/setup grounding` (see [model-vision](model-vision.md)) | Not set; locate calls fail with setup guidance |
+| `image_embedding` | Multimodal (text and image) vectors for the read-only `image_search` tool and the prompt-similarity line after `image_gen`. Set up with `/setup image-embeddings` | Not set; `image_search` is not offered |
 | `turn_drafter` | Experimental turn optimizer: rewrites each user message into a structured prompt before the main model sees it. Listed in /roles only while `experimental.turn_optimizer` is on (see [agent-loop](agent-loop.md#turn-optimizer-experimental)) | `main` (a separate request with the drafter's own system prompt) |
 
 ### Task-tool routing and deliberate overrides

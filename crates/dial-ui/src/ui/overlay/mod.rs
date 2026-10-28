@@ -6,12 +6,14 @@ pub mod compute;
 pub mod extensions;
 pub mod git;
 mod headers;
+pub mod image_settings;
 pub mod improve;
 pub mod jobs;
 mod model_download;
 pub mod model_settings;
 pub mod models;
 pub mod palette;
+pub mod path_browser;
 pub mod providers;
 pub mod settings;
 pub mod shortcuts;
@@ -49,6 +51,13 @@ pub enum OverlayEvent {
     AssignModel {
         role: String,
         selection: ModelSelection,
+        scope: Scope,
+    },
+    /// Download the local model `value` names, then save it to `path` in `scope`. Nothing is
+    /// saved when the download fails or is cancelled.
+    DownloadSetting {
+        path: String,
+        value: String,
         scope: Scope,
     },
     /// Make `role` follow the main model again.
@@ -151,6 +160,12 @@ impl fmt::Debug for OverlayEvent {
                 .debug_struct("AssignModel")
                 .field("role", role)
                 .field("selection", selection)
+                .field("scope", scope)
+                .finish(),
+            Self::DownloadSetting { path, value, scope } => f
+                .debug_struct("DownloadSetting")
+                .field("path", path)
+                .field("value", value)
                 .field("scope", scope)
                 .finish(),
             Self::ClearRole { role, scope } => f

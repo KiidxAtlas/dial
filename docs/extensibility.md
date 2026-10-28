@@ -99,9 +99,10 @@ route to an external process, and protocol 2 has no declarative form that keeps 
 Autocomplete: a plugin that declares `autocomplete` receives `autocomplete` with `{"query":"..."}`
 and replies `{"items":[{"value","label?","description?"}]}`. At most 20 suggestions are shown, and
 empty values are dropped. Suggestions appear in the slash-command menu as extension commands while the
-command name is typed; built-in commands win on a name collision. A value with whitespace is kept and
-inserted single-quoted, as one shell word. Lookups run on a worker, bounded by the plugin timeout, and
-answers for a query the user has moved past are discarded, so a slow plugin never delays typing.
+command name is typed; built-in commands win on a name collision. Values are inserted as command text,
+without added shell quoting; whitespace separates the command from its arguments, and any quotes or
+backslashes supplied in the value are preserved. Lookups run on a worker, bounded by the plugin timeout,
+and answers for a query the user has moved past are discarded, so a slow plugin never delays typing.
 
 Observational events are delivered in order on a background worker to protocol 2 plugins that list
 them in `events`. Each payload is a JSON object that carries `session_id`. Their replies may carry

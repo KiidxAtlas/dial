@@ -31,6 +31,7 @@ const ADDITIVE_PROPERTIES: &[(&str, &[&str])] = &[
     ("lsp", &["payload"]),
     ("eval", &["background", "title"]),
     ("web_search", &["domains", "exclude_domains"]),
+    ("image_gen", &["image"]),
     (
         "browser",
         &[
@@ -82,6 +83,7 @@ const ADDITIVE_PROPERTIES: &[(&str, &[&str])] = &[
             "area",
             "operation",
             "value",
+            "description",
         ],
     ),
 ];
@@ -168,6 +170,7 @@ const ADDITIVE_ENUM_VALUES: &[(&str, &str, &[&str])] = &[
             "load_state",
         ],
     ),
+    ("browser", "action", &["locate"]),
 ];
 
 /// Tools removed by a rename. A recorded call of the old name projects onto the successor: the

@@ -53,6 +53,7 @@
 	const windowValueMethods = [
 		"screenshot",
 		"zoom",
+		"locate",
 		"click",
 		"doubleClick",
 		"move",
@@ -86,6 +87,7 @@
 		"windows",
 		"screenshot",
 		"zoom",
+		"locate",
 		"click",
 		"doubleClick",
 		"move",

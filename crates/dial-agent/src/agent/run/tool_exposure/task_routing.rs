@@ -103,11 +103,15 @@ fn native(terms: &BTreeSet<String>) -> Vec<&'static str> {
     {
         names.push("dep_source");
     }
-    if any(terms, &["structural", "ast"])
+    if (any(terms, &["structural", "ast", "syntax", "pattern"])
         && any(
             terms,
-            &["search", "find", "match", "replace", "rewrite", "refactor"],
-        )
+            &[
+                "search", "find", "match", "replace", "rewrite", "refactor", "tree", "node",
+            ],
+        ))
+        || (any(terms, &["callers", "usages", "occurrences"])
+            && any(terms, &["replace", "rewrite", "refactor"]))
     {
         names.push("ast_search");
         if any(terms, &["replace", "rewrite", "refactor"]) {
@@ -116,22 +120,60 @@ fn native(terms: &BTreeSet<String>) -> Vec<&'static str> {
     }
     if any(
         terms,
-        &["rename", "references", "definition", "implementations"],
-    ) && any(terms, &["symbol", "function", "method", "class", "type"])
-    {
+        &[
+            "rename",
+            "references",
+            "definition",
+            "definitions",
+            "implementations",
+            "implementation",
+            "callers",
+            "usages",
+            "hover",
+            "signature",
+            "diagnostics",
+        ],
+    ) && any(
+        terms,
+        &[
+            "symbol",
+            "symbols",
+            "function",
+            "method",
+            "class",
+            "type",
+            "struct",
+            "trait",
+            "interface",
+            "enum",
+            "module",
+        ],
+    ) {
         names.push("lsp");
     }
-    if any(terms, &["previous", "earlier", "past"])
-        && any(terms, &["conversation", "session", "discussed"])
+    if any(terms, &["previous", "earlier", "past", "prior", "archived"])
+        && any(
+            terms,
+            &["conversation", "session", "discussed", "turn", "transcript"],
+        )
     {
         names.push("session_search");
     }
-    if any(terms, &["history", "regression", "yesterday"])
-        && any(
-            terms,
-            &["changed", "changes", "change", "introduced", "diff"],
-        )
-    {
+    if any(
+        terms,
+        &["history", "regression", "yesterday", "blame", "recent"],
+    ) && any(
+        terms,
+        &[
+            "changed",
+            "changes",
+            "change",
+            "introduced",
+            "diff",
+            "broke",
+            "modified",
+        ],
+    ) {
         names.push("code_history");
     }
     if any(terms, &["breakpoint", "breakpoints"])

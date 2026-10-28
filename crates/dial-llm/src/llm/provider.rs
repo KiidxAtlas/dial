@@ -2463,6 +2463,7 @@ pub(super) fn anthropic_exchange_shaped(
         let mut reply = accumulator
             .finish()
             .map_err(|error| llm::response_error(error, api_key))?;
+        reply.cache_warm_tier = llm::anthropic_cache::tier(profile, official_oauth, cache_level);
         if claude_code_oauth {
             for call in &mut reply.tool_calls {
                 if let Some(name) = call.name.strip_prefix('_') {
@@ -2486,6 +2487,7 @@ pub(super) fn anthropic_exchange_shaped(
     );
     let mut reply =
         anthropic_reply(&serde_json::from_slice(&bytes).context("invalid Anthropic response")?)?;
+    reply.cache_warm_tier = llm::anthropic_cache::tier(profile, official_oauth, cache_level);
     if claude_code_oauth {
         for call in &mut reply.tool_calls {
             if let Some(name) = call.name.strip_prefix('_') {

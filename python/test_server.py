@@ -24,6 +24,25 @@ class EngineTests(unittest.TestCase):
         server.main.assert_called_once_with()
         steering.install_vision_server.assert_called_once_with(server, None)
 
+    def test_embedding_runner_maps_vlm_checkpoints_to_their_embedding_model(self):
+        server = SimpleNamespace(main=mock.Mock())
+        loader = SimpleNamespace(EMBEDDING_MODEL_REMAPPING={"siglip": "siglip"})
+        with mock.patch.dict(os.environ, {"DIAL_MODEL_ENGINE": "mlx-vlm-embedding"}), \
+             mock.patch.dict(sys.modules, {"mlx_vlm": SimpleNamespace(server=server),
+                                           "mlx_vlm.server": server,
+                                           "mlx_vlm.embedding_loader": loader,
+                                           "mlx_lm": None}), \
+             mock.patch.object(dial_server, "watch_parent"):
+            dial_server.main()
+        server.main.assert_called_once_with()
+        self.assertEqual(loader.EMBEDDING_MODEL_REMAPPING,
+                         {"siglip": "siglip", "qwen3_vl": "qwen3_vl_embedding"})
+
+    def test_embedding_remapping_keeps_an_existing_upstream_mapping(self):
+        loader = SimpleNamespace(EMBEDDING_MODEL_REMAPPING={"qwen3_vl": "upstream"})
+        dial_server.install_embedding_remapping(loader)
+        self.assertEqual(loader.EMBEDDING_MODEL_REMAPPING["qwen3_vl"], "upstream")
+
 
 class ParentLifetimeTests(unittest.TestCase):
     def test_model_processes_exit_when_their_dial_parent_is_killed(self):

@@ -46,6 +46,20 @@ const ALL_SEPARATORS: [StatusSeparator; 7] = [
 ];
 
 #[test]
+fn settings_offers_exactly_the_segments_the_renderer_understands() {
+    for name in crate::config::schema::STATUS_SEGMENTS {
+        assert_eq!(
+            canonical(name).map(|(canonical, _)| canonical),
+            Some(*name),
+            "{name}"
+        );
+    }
+    let offered: std::collections::BTreeSet<_> =
+        crate::config::schema::STATUS_SEGMENTS.iter().collect();
+    assert_eq!(offered.len(), crate::config::schema::STATUS_SEGMENTS.len());
+}
+
+#[test]
 fn custom_thinking_segment_is_not_hidden_when_inference_is_not_requested() {
     let status = StatusData {
         thinking: "high".into(),

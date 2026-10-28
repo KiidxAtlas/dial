@@ -6,7 +6,7 @@
 
 use crate::agent::*;
 use crate::llm::cache_warmer::worker::{Clock, Event, Factory, Handle, Replayer, Report, RunGuard};
-use crate::llm::cache_warmer::{Mode, Stop, Tier};
+use crate::llm::cache_warmer::{Mode, Stop};
 use crate::llm::catalog::TokenPricing;
 use crate::llm::usage::{Purpose, Scope};
 use std::time::Instant;
@@ -76,20 +76,19 @@ impl CacheWarm {
         })
     }
 
-    /// Records the prefix a request just settled on. Skipped when the reply reports no prompt
-    /// size, because the economics gate cannot be evaluated without it.
-    pub(in crate::agent) fn settled(&self, chat: &Chat, prompt_tokens: Option<u64>, scope: &Scope) {
-        let Some(prompt_tokens) = prompt_tokens else {
+    /// Records an accepted request's prefix. Unknown prompt size or retention disarms the
+    /// previous prefix: neither its economics nor its expiry can safely be assumed.
+    pub(in crate::agent) fn settled(&self, chat: &Chat, reply: &llm::Reply, scope: &Scope) {
+        let (Some(prompt_tokens), Some(tier)) = (reply.prompt_tokens, reply.cache_warm_tier) else {
+            self.context_changed();
             return;
         };
-        // Tier::Short is assumed: the default 5-minute cache. Anthropic's 1-hour writes are
-        // priced higher, so the gate is conservative about them.
         self.handle.send(Event::Settled {
             chat: chat.clone(),
             model: self.model.clone(),
             prompt_tokens,
             pricing: self.pricing,
-            tier: Tier::Short,
+            tier,
             scope: Some(scope.clone()),
         });
     }
@@ -151,3 +150,6 @@ impl Replayer for BackendReplayer {
         Ok(reply?.cached_prompt_tokens)
     }
 }
+
+#[cfg(test)]
+mod tests;

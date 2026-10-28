@@ -852,6 +852,13 @@ impl Composer {
         !self.queued.is_empty()
     }
 
+    /// Busy input the agent will take at its next step boundary: routable queued messages and
+    /// untaken explicit messages. Follow-ups deferred until after the turn do not count.
+    pub fn has_pending_input(&self) -> bool {
+        self.queued.iter().any(|(_, follow_up)| !follow_up)
+            || self.explicit.iter().any(|item| item.untaken)
+    }
+
     pub fn queued_messages(&self) -> Vec<(String, bool)> {
         self.queued.iter().cloned().collect()
     }
@@ -1232,13 +1239,9 @@ impl Composer {
         let completed = if let Some(start) = menu.file_start {
             format!("{}@{} ", &self.editor.text[..start], entry.name)
         } else {
-            // Plugin names may hold whitespace, so they are quoted; built-in and argument text is
-            // inserted as written.
-            let word = if matches!(entry.kind, CommandKind::Extension) {
-                command_word(&entry.name)
-            } else {
-                entry.name.clone()
-            };
+            // Slash commands are not shell words. Preserve the command and its arguments,
+            // including any quoting supplied by the suggestion itself.
+            let word = &entry.name;
             if arguments {
                 format!("/{word}")
             } else {
@@ -3193,19 +3196,6 @@ fn clean_commands(commands: Vec<CommandEntry>) -> Vec<CommandEntry> {
             })
         })
         .collect()
-}
-
-/// The text that names a command in the draft. A name with whitespace or quotes is single-quoted
-/// the POSIX way, so it reads back as one shell word, the same way `/commit` reads its arguments.
-fn command_word(name: &str) -> String {
-    if name
-        .chars()
-        .any(|ch| ch.is_whitespace() || ch == '\'' || ch == '"' || ch == '\\')
-    {
-        format!("'{}'", name.replace('\'', "'\\''"))
-    } else {
-        name.to_owned()
-    }
 }
 
 #[cfg(test)]

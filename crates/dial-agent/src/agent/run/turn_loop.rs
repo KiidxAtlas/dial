@@ -38,6 +38,7 @@ impl<'a> Agent<'a> {
         prepared: Option<Value>,
         origin: TurnOrigin,
     ) -> Result<TurnReport> {
+        self.coordination_turn_started(origin);
         // The turn owns the assertion, not the session: idle prompts must allow sleep.
         // Hermetic evaluation must not change host power state.
         let _idle_sleep = if self.hermetic {
@@ -237,6 +238,7 @@ impl<'a> Agent<'a> {
                 report.outcome == TurnOutcome::Completed && !report.interrupted
             }),
         );
+        self.coordination_turn_settled(origin, &result);
         result
     }
     pub(in crate::agent) fn turn_inner(
@@ -263,11 +265,13 @@ impl<'a> Agent<'a> {
             json!({"session_id": self.session.id(), "prompt": crate::agent::window::prompt::truncate_chars(user_text, 8000)})
         });
         let plugins = self.hook_plugins();
-        if crate::agent::safety::hooks::wanted(
-            self.tool_hooks(),
-            plugins.as_deref(),
-            "user_prompt_submit",
-        ) {
+        if origin != TurnOrigin::Peer
+            && crate::agent::safety::hooks::wanted(
+                self.tool_hooks(),
+                plugins.as_deref(),
+                "user_prompt_submit",
+            )
+        {
             let configured_hooks = self.tool_hooks();
             let root = self.workspace.root();
             let interrupt = self.interrupt.as_ref();
@@ -323,7 +327,7 @@ impl<'a> Agent<'a> {
             self.draft_leftover_steering(ui)?;
             match origin {
                 TurnOrigin::User => Some(self.draft_turn_text(typed_text, ui)?),
-                TurnOrigin::Harness => None,
+                TurnOrigin::Harness | TurnOrigin::Peer => None,
             }
         } else {
             None
@@ -679,14 +683,16 @@ impl<'a> Agent<'a> {
             memory.bind(memory_authority(&self.session, 0));
         }
         let mut state = self.session.control_state();
-        state["current_instruction_entry_id"] = json!(self.session.branch_leaf());
-        if state["original_goal"].is_null() {
-            state["original_goal"] = json!(crate::agent::window::prompt::truncate_chars(
-                user_text, 4096
-            ));
+        if origin != TurnOrigin::Peer {
+            state["current_instruction_entry_id"] = json!(self.session.branch_leaf());
+            if state["original_goal"].is_null() {
+                state["original_goal"] = json!(crate::agent::window::prompt::truncate_chars(
+                    user_text, 4096
+                ));
+            }
+            state["current_instruction"] = json!(user_text);
         }
         state["turn_outcome"] = Value::Null;
-        state["current_instruction"] = json!(user_text);
         state["steering_active"] = json!(false);
         self.session.set_control_state(state)?;
         if let Some(advice) = self.laya_advice(user_text, ui) {
@@ -1144,6 +1150,7 @@ impl<'a> Agent<'a> {
             "completed":result.as_ref().is_ok_and(|r| r.outcome == TurnOutcome::Completed),
             "outcome":result.as_ref().map(|r| r.outcome).ok(),
             "duration_ms":self.workflow_started.elapsed().as_millis(),
+            "inference_latency":ui.request_latency(),
             "usage":usage,
             "completion_evidence":completion_evidence,
             "projection_bytes":self.efficiency_metrics,

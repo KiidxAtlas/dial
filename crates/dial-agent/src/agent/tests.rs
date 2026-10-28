@@ -130,6 +130,81 @@ fn shared_wait_receives_steering_without_losing_the_queued_instruction() {
     assert_eq!(queued, ["new instruction"]);
 }
 
+#[test]
+fn ordinary_queued_input_ends_a_shared_wait_without_consuming_the_message() {
+    struct Wait;
+    impl crate::tools::integrations::ext::Tool for Wait {
+        fn name(&self) -> &str {
+            "wait_probe"
+        }
+        fn schema(&self) -> Value {
+            json!({"type":"function","function":{"name":"wait_probe","description":"fake","parameters":{"type":"object","properties":{}}}})
+        }
+        fn needs_approval(&self, _: &Value) -> bool {
+            false
+        }
+        fn concurrency(&self, _: &Value) -> crate::tools::integrations::ext::Concurrency {
+            crate::tools::integrations::ext::Concurrency::Shared
+        }
+        fn call(&self, _: &ToolContext, _: &Value) -> ToolOutput {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !crate::tools::exec::signals::wait_interrupted() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(2));
+            }
+            let stepped_aside = crate::tools::exec::signals::wait_interrupted()
+                && crate::tools::exec::signals::steering_requested();
+            ToolOutput {
+                execution: Default::default(),
+                data: None,
+                text: "wait ended".into(),
+                is_error: !stepped_aside,
+            }
+        }
+    }
+    /// A routable busy message is queued; only the step boundary may take it.
+    struct Queued {
+        checks: usize,
+    }
+    impl Ui for Queued {
+        fn pending_input(&mut self) -> bool {
+            self.checks += 1;
+            true
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(dir.path()).unwrap();
+    let mut registry = Registry::new();
+    registry.register(Arc::new(Wait));
+    let call = ToolCall {
+        id: "wait".into(),
+        name: "wait_probe".into(),
+        arguments: json!({}),
+        malformed_arguments: false,
+    };
+    let mut queued = Vec::new();
+    let mut ui = Queued { checks: 0 };
+    let started = Instant::now();
+    let results = parallel_tools(
+        ParallelToolContext {
+            workspace: &workspace,
+            config: &Config::default(),
+            ext: &registry,
+            interrupt: &AtomicBool::new(false),
+            ui: &mut ui,
+            pending_steering: &mut queued,
+        },
+        &[call],
+        None,
+    );
+    assert!(
+        !results[0].0.is_error,
+        "the wait stepped aside for queued input"
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(queued.is_empty(), "the message stays queued for routing");
+    assert_eq!(ui.checks, 1, "the signal is raised once, not every poll");
+}
+
 #[cfg(unix)]
 #[test]
 fn parallel_hooks_run_per_call_and_block_before_file_reads() {

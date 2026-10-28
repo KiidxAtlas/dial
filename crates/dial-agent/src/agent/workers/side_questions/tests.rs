@@ -1,5 +1,66 @@
 use super::*;
 
+fn query(questions: &mut Questions, args: &Value, interrupt: &AtomicBool) -> Result<Value> {
+    questions
+        .query(args, interrupt, &mut || false)
+        .map(|(value, stopped)| {
+            assert!(!stopped, "no input was pending");
+            value
+        })
+}
+
+#[test]
+fn pending_user_input_ends_a_wait_without_cancelling_the_question() {
+    let mut questions = Questions::default();
+    let (send, receive) = mpsc::channel::<String>();
+    let id = questions
+        .start(move |_| receive.recv().map_err(|e| e.to_string()))
+        .unwrap();
+    let started = Instant::now();
+    let mut checks = 0;
+    let (result, stopped) = questions
+        .query(
+            &json!({"action":"wait","id":id,"timeout":30}),
+            &AtomicBool::new(false),
+            &mut || {
+                checks += 1;
+                checks > 2
+            },
+        )
+        .unwrap();
+    assert!(stopped);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(result[0]["status"], "running");
+    // The question keeps running and still delivers its answer.
+    send.send("answer".into()).unwrap();
+    let result = query(
+        &mut questions,
+        &json!({"action":"wait","id":id,"timeout":2}),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(result[0]["answer"], "answer");
+}
+
+#[test]
+fn pending_input_is_not_checked_once_the_wait_is_already_satisfied() {
+    let mut questions = Questions::default();
+    let id = questions.start(|_| Ok("done".into())).unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    let (result, stopped) = questions
+        .query(
+            &json!({"action":"wait","id":id,"timeout":2}),
+            &AtomicBool::new(false),
+            &mut || true,
+        )
+        .unwrap();
+    assert!(
+        !stopped,
+        "a finished answer is reported as a normal completion"
+    );
+    assert_eq!(result[0]["answer"], "done");
+}
+
 #[test]
 fn start_returns_while_work_is_blocked_and_delivers_once_acknowledged() {
     let mut questions = Questions::default();
@@ -10,12 +71,12 @@ fn start_returns_while_work_is_blocked_and_delivers_once_acknowledged() {
     assert_eq!(questions.running_ids(), std::slice::from_ref(&id));
     assert!(questions.undelivered().is_empty());
     send.send("answer".into()).unwrap();
-    let result = questions
-        .query(
-            &json!({"action":"wait","id":id,"timeout":2}),
-            &AtomicBool::new(false),
-        )
-        .unwrap();
+    let result = query(
+        &mut questions,
+        &json!({"action":"wait","id":id,"timeout":2}),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
     assert_eq!(result[0]["answer"], "answer");
     assert_eq!(questions.undelivered().len(), 1);
     questions.deliver(&id);
@@ -39,12 +100,12 @@ fn concurrency_limit_cancel_and_failure_are_visible() {
     assert!(questions.start(|_| Ok("extra".into())).is_err());
     questions.cancel_all();
     for id in questions.running_ids() {
-        let result = questions
-            .query(
-                &json!({"action":"wait","id":id,"timeout":2}),
-                &AtomicBool::new(false),
-            )
-            .unwrap();
+        let result = query(
+            &mut questions,
+            &json!({"action":"wait","id":id,"timeout":2}),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert_eq!(result[0]["status"], "failed");
         assert_eq!(result[0]["error"], "side question cancelled");
     }
@@ -60,7 +121,7 @@ fn unknown_ids_invalid_wait_and_actions_fail_without_starting_work() {
         json!({"action":"status","timeout":31}),
         json!({"action":"bad"}),
     ] {
-        assert!(questions.query(&args, &interrupt).is_err(), "{args}");
+        assert!(query(&mut questions, &args, &interrupt).is_err(), "{args}");
     }
     assert!(questions.running_ids().is_empty());
 }
@@ -70,12 +131,12 @@ fn undelivered_results_are_not_evicted_and_delivered_results_are_bounded() {
     let mut questions = Questions::default();
     for _ in 0..MAX_RETAINED {
         let id = questions.start(|_| Err("provider failure".into())).unwrap();
-        let result = questions
-            .query(
-                &json!({"action":"wait","id":id,"timeout":2}),
-                &AtomicBool::new(false),
-            )
-            .unwrap();
+        let result = query(
+            &mut questions,
+            &json!({"action":"wait","id":id,"timeout":2}),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert_eq!(result[0]["error"], "provider failure");
     }
     assert!(questions.start(|_| Ok("overflow".into())).is_err());

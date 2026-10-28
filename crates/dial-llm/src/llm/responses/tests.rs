@@ -883,3 +883,32 @@ fn image_stream_accepts_large_inline_images_but_never_partial_or_failed_turns() 
         server.requests();
     }
 }
+
+#[test]
+fn done_only_call_signals_completion_before_response_and_honors_cancellation() {
+    for cancel in [false, true] {
+        let mut acc = Accumulator::default();
+        acc.feed(
+            &json!({"type":"response.output_item.added","output_index":0,"item":call()})
+                .to_string(),
+            &mut |_| true,
+            &mut |_| true,
+        )
+        .unwrap();
+        let mut seen = Vec::new();
+        let result = acc.feed(
+            &json!({"type":"response.output_item.done","output_index":0,"item":call()}).to_string(),
+            &mut |_| true,
+            &mut |e| {
+                seen.push(e.clone());
+                !cancel
+            },
+        );
+        assert_eq!(result.is_err(), cancel);
+        assert!(
+            matches!(&seen[0], StreamEvent::ToolCallComplete { index:0, name, arguments, .. }
+            if name == "write" && arguments == call()["arguments"].as_str().unwrap())
+        );
+        assert!(acc.finish().is_err());
+    }
+}

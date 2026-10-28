@@ -1,7 +1,7 @@
 //! Experimental `streaming_dispatch`: start admitted read-only calls while the reply still streams.
 //!
-//! A streamed call is complete once the provider moves on to a later tool index; the last call of
-//! a reply completes with the reply itself and gains nothing. Results are keyed by the exact
+//! A streamed call is complete when the provider explicitly closes it, or moves to a later index.
+//! Without a provider completion signal, the last call waits for the reply. Results are keyed by the exact
 //! normalized call and are offered only to the ordinary parallel-read admission after the reply
 //! ends, so a mis-detected or changed call simply runs as usual. Once any call in the reply runs
 //! outside the parallel-read path, every remaining result is discarded as possibly stale.
@@ -13,6 +13,8 @@ use std::collections::BTreeSet;
 pub(in crate::agent) trait ToolStream {
     /// One argument fragment for the tool call at `index`.
     fn arguments(&mut self, index: u64, id: &str, name: &str, delta: &str);
+    /// An explicitly closed provider call; arguments replace accumulated fragments.
+    fn completed(&mut self, index: u64, id: &str, name: &str, arguments: &str);
     /// A new attempt begins: partial calls from the discarded attempt never complete.
     fn restart(&mut self);
 }
@@ -223,6 +225,18 @@ impl ToolStream for StreamingDispatch {
             entry.name = name.to_owned();
         }
         entry.arguments.push_str(delta);
+    }
+
+    fn completed(&mut self, index: u64, id: &str, name: &str, arguments: &str) {
+        if !self.clean || !self.closed.insert(index) {
+            return;
+        }
+        self.partial.remove(&index);
+        self.complete(Partial {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            arguments: arguments.to_owned(),
+        });
     }
 
     fn restart(&mut self) {

@@ -60,3 +60,44 @@ fn cache_writes_absent_everywhere_stay_none() {
         (None, None, None)
     );
 }
+
+#[test]
+fn tool_completion_precedes_message_end_and_honors_cancellation() {
+    for cancel in [false, true] {
+        let mut acc = Accumulator::default();
+        let mut seen = Vec::new();
+        for event in [
+            START,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"c0","name":"read","input":{}}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a.txt\"}"}}"#,
+        ] {
+            acc.feed(event, &mut |_| true, &mut |e| {
+                seen.push(e.clone());
+                true
+            })
+            .unwrap();
+        }
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, StreamEvent::ToolCallComplete { .. }))
+        );
+        let result = acc.feed(
+            r#"{"type":"content_block_stop","index":0}"#,
+            &mut |_| true,
+            &mut |e| {
+                seen.push(e.clone());
+                !cancel
+            },
+        );
+        assert_eq!(result.is_err(), cancel);
+        assert!(
+            matches!(seen.last().unwrap(), StreamEvent::ToolCallComplete { index:0, name, arguments, .. }
+            if name == "read" && arguments == r#"{"path":"a.txt"}"#)
+        );
+        assert!(
+            acc.finish().is_err(),
+            "call completion is not response completion"
+        );
+    }
+}

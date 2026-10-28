@@ -16,6 +16,11 @@ use anyhow::Result;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
+enum TurnInput<'a> {
+    User(&'a str),
+    Peer,
+}
+
 impl Shell {
     /// Alt+Up / Alt+Down: rate the last finished turn for "Teach this model".
     pub(super) fn rate_last_turn(&mut self, app: &App, good: bool) {
@@ -69,9 +74,27 @@ impl Shell {
         agent: &mut Agent<'_>,
         text: &str,
     ) -> Result<Step> {
+        self.run_turn_input(app, agent, TurnInput::User(text))
+    }
+
+    pub(super) fn run_peer_turn(&mut self, app: &App, agent: &mut Agent<'_>) -> Result<Step> {
+        self.run_turn_input(app, agent, TurnInput::Peer)
+    }
+
+    fn run_turn_input(
+        &mut self,
+        app: &App,
+        agent: &mut Agent<'_>,
+        input: TurnInput<'_>,
+    ) -> Result<Step> {
+        let peer = matches!(input, TurnInput::Peer);
+        let text = match input {
+            TurnInput::User(text) => text,
+            TurnInput::Peer => "Continuing the unfinished task for peer context",
+        };
         // A joined guest's prompts belong to the host agent: send them there or refuse. The local
         // agent never runs them.
-        if let Some(routed) = crate::collab::room::route_guest_prompt(text) {
+        if !peer && let Some(routed) = crate::collab::room::route_guest_prompt(text) {
             let message = match routed {
                 Ok(()) => "Sent to the host agent; its replies arrive as collab entries.",
                 Err(message) => message,
@@ -79,16 +102,24 @@ impl Shell {
             self.note("Collab", message);
             return Ok(Step::Done);
         }
-        self.loop_mode.turn_started(text);
+        if !peer {
+            // A new user submission supersedes an older wake even if preflight never reaches Agent::turn.
+            agent.cancel_peer_wake();
+            self.loop_mode.turn_started(text);
+            platform::interrupt::clear_interrupt();
+            app.interrupt.store(false, Ordering::SeqCst);
+        }
         self.retry_noted = false;
-        platform::interrupt::clear_interrupt();
-        app.interrupt.store(false, Ordering::SeqCst);
         self.stop_speech();
         self.live_tasks = Some(agent.live_task_control());
         self.background_control = agent.background_control();
         let started = Instant::now();
         self.status.elapsed_secs = 0.0;
-        self.transcript.push_user(text);
+        if peer {
+            self.note("Project peers", text);
+        } else {
+            self.transcript.push_user(text);
+        }
         self.composer.set_busy(true);
         self.status.phase = Phase::Working;
         let ready = self.wait_compute(app).and_then(|ready| {
@@ -101,11 +132,17 @@ impl Shell {
         match ready {
             Ok(true) => {}
             Ok(false) => {
+                if peer {
+                    agent.cancel_peer_wake();
+                }
                 self.composer.set_busy(false);
                 self.loop_mode.pause();
                 return Ok(Step::Done);
             }
             Err(error) => {
+                if peer {
+                    agent.cancel_peer_wake();
+                }
                 self.transcript.error(&format!("{error:#}"));
                 self.composer.set_busy(false);
                 self.loop_mode.pause();
@@ -118,7 +155,7 @@ impl Shell {
         self.status.tokens_per_second = None;
         self.status.activity = "thinking".into();
         let teach = self.teach_turn_start(app, agent);
-        if let Err(error) = self.side.prepare_turn(agent, text) {
+        if !peer && let Err(error) = self.side.prepare_turn(agent, text) {
             self.note("BTW", format!("error: {error:#}"));
         }
         let (result, failed, streamed_tokens) = {
@@ -133,7 +170,11 @@ impl Shell {
                 next_id: 0,
             };
             bridge.repaint(true);
-            let result = agent.turn(text, &mut bridge);
+            let result = if peer {
+                agent.resume_from_peer(&mut bridge)
+            } else {
+                agent.turn(text, &mut bridge)
+            };
             (result, bridge.failed, bridge.shell.turn_output_tokens)
         };
         app.interrupt.store(false, Ordering::SeqCst);
@@ -210,7 +251,9 @@ impl Shell {
         let halted = result
             .as_ref()
             .map_or(true, |report| report.halts_automation());
-        self.loop_mode.turn_settled(Instant::now(), halted);
+        if !peer {
+            self.loop_mode.turn_settled(Instant::now(), halted);
+        }
         if failed {
             anyhow::bail!("terminal draw failed; the screen was restored");
         }

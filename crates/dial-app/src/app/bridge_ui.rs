@@ -77,6 +77,11 @@ impl Ui for Bridge<'_> {
         self.repaint(true);
     }
 
+    fn pending_input(&mut self) -> bool {
+        self.pump();
+        self.shell.composer.has_pending_input()
+    }
+
     /// Explicit "Steer now" input. Taking it is what lets the agent cancel a stale model reply and
     /// interrupt only waits that are safe to interrupt; running effects are never torn down here.
     fn take_steering(&mut self) -> Vec<String> {
@@ -495,6 +500,7 @@ impl Ui for Bridge<'_> {
         if matches!(
             phase,
             agent::RequestPhase::Waiting
+                | agent::RequestPhase::Backoff
                 | agent::RequestPhase::Retrying
                 | agent::RequestPhase::Cancelling
         ) {

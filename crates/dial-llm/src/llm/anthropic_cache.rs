@@ -39,6 +39,22 @@ pub(super) fn ttl_applies(profile: Option<&ModelProfile>, official_oauth: bool) 
     retention == CacheRetention::Long || (retention == CacheRetention::Auto && official_oauth)
 }
 
+/// Effective retention, shared by wire markers and the paid warming schedule.
+pub(super) fn tier(
+    profile: Option<&ModelProfile>,
+    official_oauth: bool,
+    level: Level,
+) -> Option<super::cache_warmer::Tier> {
+    use super::cache_warmer::Tier;
+    if level == Level::Off || profile.and_then(|p| p.prompt_cache) == Some(false) {
+        None
+    } else if level == Level::Full && ttl_applies(profile, official_oauth) {
+        Some(Tier::Long)
+    } else {
+        Some(Tier::Short)
+    }
+}
+
 /// Apply after schema/profile transforms and before OAuth body attestation.
 /// Native-compatible endpoints can opt out with prompt_cache=false.
 pub(super) fn apply(
@@ -47,8 +63,9 @@ pub(super) fn apply(
     official_oauth: bool,
     level: Level,
 ) {
-    let enabled = level != Level::Off && profile.and_then(|p| p.prompt_cache).unwrap_or(true);
-    let long = level == Level::Full && ttl_applies(profile, official_oauth);
+    let tier = tier(profile, official_oauth, level);
+    let enabled = tier.is_some();
+    let long = tier == Some(super::cache_warmer::Tier::Long);
     let control = if long {
         json!({"type":"ephemeral", "ttl":"1h"})
     } else {

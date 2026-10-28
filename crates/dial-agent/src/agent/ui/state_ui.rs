@@ -66,6 +66,10 @@ pub(in crate::agent) struct StateUi<'a> {
     prose: Option<Body>,
     reasoning: Option<Body>,
     inference: Option<Body>,
+    // Keep the request identity through discard/cancellation until its worker actually finishes.
+    timing_body: Option<Body>,
+    request_clock: Option<super::request_timing::RequestClock>,
+    request_timing: super::request_timing::Timing,
     tools: Vec<PendingTool>,
     registry: crate::tools::integrations::ext::Registry,
     observers: Option<Observers>,
@@ -110,6 +114,9 @@ impl<'a> StateUi<'a> {
             tree,
             parent,
             inference: None,
+            timing_body: None,
+            request_clock: None,
+            request_timing: Default::default(),
             prose: None,
             reasoning: None,
             tools: Vec::new(),
@@ -562,9 +569,28 @@ impl Ui for StateUi<'_> {
     fn model_wait(&mut self, s: Duration) {
         self.inner.model_wait(s)
     }
+    fn request_finished(&mut self, succeeded: bool) {
+        if let Some(clock) = self.request_clock.take() {
+            let (timing, report) = clock.finish(succeeded, Instant::now());
+            self.request_timing.add(&timing);
+            if let Some(body) = self.timing_body.take() {
+                let state = body.snapshot();
+                let mut data = state.result.data.unwrap_or_else(|| json!({}));
+                data["latency"] = report;
+                body.settle(state.result.text, Some(data), state.result.phase);
+                self.publish(|ui| ui.result_node(&body));
+            }
+        }
+        self.inner.request_finished(succeeded);
+    }
+    fn request_latency(&self) -> Value {
+        self.request_timing.snapshot()
+    }
     fn request_phase(&mut self, phase: crate::agent::RequestPhase) {
         use crate::agent::RequestPhase;
         if phase == RequestPhase::Waiting {
+            self.request_finished(false);
+            self.request_clock = Some(super::request_timing::RequestClock::new(Instant::now()));
             // Each model request answers on its own: the previous reply is a finished message,
             // so the next one must not continue it mid-sentence.
             self.close_prose();
@@ -574,6 +600,10 @@ impl Ui for StateUi<'_> {
                 "Model request",
                 self.parent.clone(),
             ));
+            self.timing_body = self.inference.clone();
+        }
+        if let Some(clock) = &mut self.request_clock {
+            clock.phase(phase, Instant::now());
         }
         if let Some(body) = &self.inference {
             let state = if phase == RequestPhase::Cancelling {
@@ -593,6 +623,9 @@ impl Ui for StateUi<'_> {
     }
     fn take_steering(&mut self) -> Vec<String> {
         self.inner.take_steering()
+    }
+    fn pending_input(&mut self) -> bool {
+        self.inner.pending_input()
     }
     fn take_pending_messages(&mut self) -> Vec<String> {
         self.inner.take_pending_messages()

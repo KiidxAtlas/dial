@@ -3201,14 +3201,11 @@ fn anthropic_cache_refusal_retries_without_markers_and_latches_for_later_request
         fake::json(200, &ok),
     ]);
     let mut remote = backend(anthropic_endpoint(&format!("{}/v1", server.url)));
-    assert_eq!(
-        remote.chat(None, &request(), 5, None).unwrap().text,
-        "hello"
-    );
-    assert_eq!(
-        remote.chat(None, &request(), 5, None).unwrap().text,
-        "hello"
-    );
+    for _ in 0..2 {
+        let reply = remote.chat(None, &request(), 5, None).unwrap();
+        assert_eq!(reply.text, "hello");
+        assert_eq!(reply.cache_warm_tier, None);
+    }
     let seen = server.requests();
     assert_eq!(seen.len(), 3);
     let first = fake::body(&seen[0]);
@@ -3226,4 +3223,47 @@ fn anthropic_cache_refusal_retries_without_markers_and_latches_for_later_request
             .get("cache_control")
             .is_none()
     );
+}
+
+#[test]
+fn anthropic_cache_warm_tier_tracks_accepted_ttl_and_latched_fallback() {
+    use llm::cache_warmer::Tier;
+    for refused in [false, true] {
+        let ok = json!({
+            "content": [{"type":"text", "text":"hello"}],
+            "stop_reason":"end_turn",
+            "usage":{"input_tokens":2,"output_tokens":1}
+        });
+        let mut scripts = Vec::new();
+        if refused {
+            scripts.push(fake::json(
+                400,
+                &json!({"error": {
+                    "message":"cache_control.ttl: Extra inputs are not permitted"
+                }}),
+            ));
+        }
+        scripts.extend([fake::json(200, &ok), fake::json(200, &ok)]);
+        let server = fake::serve(scripts);
+        let mut remote = backend(anthropic_endpoint(&format!("{}/v1", server.url))).with_profile(
+            llm::profiles::ModelProfile {
+                provider: "anthropic".into(),
+                model: "claude-test".into(),
+                cache_retention: llm::profiles::CacheRetention::Long,
+                ..Default::default()
+            },
+        );
+        for _ in 0..2 {
+            let reply = remote.chat(None, &request(), 5, None).unwrap();
+            assert_eq!(
+                reply.cache_warm_tier,
+                Some(if refused { Tier::Short } else { Tier::Long })
+            );
+        }
+        let seen = server.requests();
+        let last = fake::body(seen.last().unwrap());
+        let control = &last["messages"][0]["content"][0]["cache_control"];
+        assert_eq!(control["type"], "ephemeral");
+        assert_eq!(control["ttl"].as_str(), (!refused).then_some("1h"));
+    }
 }

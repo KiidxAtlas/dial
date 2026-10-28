@@ -520,6 +520,33 @@ fn assembled_delegation_requests_deduplicate_background_without_losing_contracts
         assert_eq!(brief.matches(&goal).count(), 1);
         assert!(brief.contains("takes precedence"));
 
+        assert!(
+            !messages.iter().any(|m| m["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("private temporary journal"))),
+            "private journal boilerplate must be omitted when history/notebook tools are absent"
+        );
+        assert!(
+            !messages.iter().any(|m| m["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("side_request"))),
+            "child without side_request/task must receive child-scoped execution guidance"
+        );
+        let with_journal = initial_messages(
+            env,
+            job,
+            &["read".into(), "session_search".into(), "task".into()],
+        );
+        assert!(with_journal.iter().any(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("private temporary journal"))
+        }));
+        assert!(with_journal.iter().any(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("side_request"))
+        }));
         // Reconstruct the pre-dedup initial request with identical system messages
         // and tool schemas: this measures assembled request bytes, not a template.
         let baseline_brief = format!(

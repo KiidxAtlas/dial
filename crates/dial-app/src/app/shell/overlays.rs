@@ -14,6 +14,7 @@ use crate::app::overlay::run::{
 };
 use crate::app::overlay::settings::{
     apply_settings_hints, embedding_setup_offers, setting_setup_offers, settings_embedding_models,
+    settings_value_choices,
 };
 use crate::app::overlay::{ActiveOverlay, OverlayOutcome, Which, overlay_destination};
 use crate::app::selection::{local_suggestion_base, model_settings_profile};
@@ -238,6 +239,20 @@ impl Shell {
                 }
                 ActiveOverlay::ModelSettings(Box::new(overlay))
             }
+            Which::ImageSettings => {
+                let route = crate::tools::net::image_gen::current_route(&effective)
+                    .map_err(|error| anyhow::anyhow!("No image model to configure: {error:#}"))?;
+                let (key, settings) = effective.image.entry_for(&route.model);
+                ActiveOverlay::ImageSettings(Box::new(
+                    crate::ui::overlay::image_settings::ImageSettingsOverlay::new(
+                        key,
+                        route.api,
+                        settings,
+                        route.settings,
+                        &crate::config::image::installed_loras(),
+                    ),
+                ))
+            }
             Which::Settings | Which::LearningSettings | Which::ContextDefaults => {
                 let (values, global, project) = settings_tables(app, &effective)?;
                 let themes = self
@@ -266,6 +281,13 @@ impl Shell {
                 }
                 overlay.set_embedding_models(settings_embedding_models(discovery.as_ref()));
                 overlay.set_embedding_setups(embedding_setup_offers(&app.layout.user_dir));
+                // Model, provider and profile rows offer choices; path rows browse from the project.
+                overlay.set_value_choices(settings_value_choices(
+                    &effective,
+                    discovery.as_ref(),
+                    &app.layout.user_dir,
+                ));
+                overlay.set_base_dir(app.layout.project_root.clone());
                 ActiveOverlay::Settings(Box::new(overlay))
             }
             Which::Models

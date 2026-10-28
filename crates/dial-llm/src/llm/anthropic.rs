@@ -317,6 +317,28 @@ impl Accumulator {
                     self.open.remove(&index),
                     "Anthropic stop for unknown or closed block"
                 );
+                let block = &self.blocks[&index];
+                if block["type"] == "tool_use" {
+                    let name = block["name"].as_str().unwrap_or_default();
+                    let name = if self.claude_code_oauth {
+                        name.strip_prefix('_').unwrap_or(name)
+                    } else {
+                        name
+                    };
+                    let arguments = self
+                        .arguments
+                        .get(&index)
+                        .cloned()
+                        .unwrap_or_else(|| block["input"].to_string());
+                    if !on_event(&StreamEvent::ToolCallComplete {
+                        index,
+                        id: block["id"].as_str().unwrap_or_default().to_owned(),
+                        name: name.to_owned(),
+                        arguments,
+                    }) {
+                        return Err(Interrupted.into());
+                    }
+                }
                 if let Some(raw) = self.arguments.remove(&index) {
                     // No-argument tools stream a single empty `partial_json`; that means `{}`.
                     self.blocks.get_mut(&index).unwrap()["input"] = if raw.trim().is_empty() {

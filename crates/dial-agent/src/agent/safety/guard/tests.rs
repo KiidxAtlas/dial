@@ -581,6 +581,32 @@ fn only_complete_runs_of_scannable_commands_are_remembered() {
 }
 
 #[test]
+fn repeated_directory_and_variable_prefixes_are_not_reruns() {
+    let mut pace = PaceGuard::default();
+    pace.call(&shell("cd crates/x && ls"), &ok_output());
+    assert!(
+        pace.call(&shell("cd crates/x && git status"), &ok_output())
+            .is_none(),
+        "a shared `cd` prefix is not a repeated command"
+    );
+    // The real command repeated after the same prefix is still flagged.
+    assert!(
+        pace.call(&shell("cd crates/x && git status"), &ok_output())
+            .unwrap()
+            .contains("`git status`")
+    );
+    pace.call(&shell("export RUST_LOG=debug; ls src"), &ok_output());
+    assert!(
+        pace.call(&shell("export RUST_LOG=debug; ls docs"), &ok_output())
+            .is_none()
+    );
+    pace.call(&shell("A=1 && ls lib"), &ok_output());
+    assert!(pace.call(&shell("A=1 && ls bin"), &ok_output()).is_none());
+    assert!(!only_sets_shell_state("cargo test"));
+    assert!(!only_sets_shell_state("A=1 cargo test"));
+}
+
+#[test]
 fn a_long_run_of_single_lookups_is_told_once_per_streak_to_batch() {
     let mut pace = PaceGuard::default();
     let lookup = [call("read", json!({"path": "a"}))];

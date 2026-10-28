@@ -122,7 +122,14 @@ impl Questions {
         }
     }
 
-    fn query(&mut self, args: &Value, interrupt: &AtomicBool) -> Result<Value> {
+    /// Returns the selected views and whether a wait ended early because `input_pending` became
+    /// true (the user typed a message); running questions are never cancelled for that.
+    fn query(
+        &mut self,
+        args: &Value,
+        interrupt: &AtomicBool,
+        input_pending: &mut dyn FnMut() -> bool,
+    ) -> Result<(Value, bool)> {
         let action = args["action"].as_str().unwrap_or("start");
         ensure!(
             matches!(action, "status" | "wait" | "cancel"),
@@ -161,12 +168,16 @@ impl Questions {
                 .iter()
                 .filter(|job| id.is_none_or(|id| job.id == id))
                 .collect();
-            if action != "wait"
+            let done = action != "wait"
                 || selected.iter().all(|job| job.result.is_some())
                 || Instant::now() >= deadline
-                || interrupt.load(Ordering::Relaxed)
-            {
-                return Ok(Value::Array(selected.into_iter().map(view).collect()));
+                || interrupt.load(Ordering::Relaxed);
+            let stopped = !done && input_pending();
+            if done || stopped {
+                return Ok((
+                    Value::Array(selected.into_iter().map(view).collect()),
+                    stopped,
+                ));
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -190,10 +201,25 @@ fn view(job: &Job) -> Value {
 }
 
 impl Agent<'_> {
+    #[cfg(test)]
     pub(in crate::agent) fn side_question(&mut self, args: &Value) -> ToolOutput {
+        self.side_question_with_input(args, &mut || false)
+    }
+
+    /// `side_request` from the controller: a wait also ends when the user types input.
+    pub(in crate::agent) fn side_question_with_input(
+        &mut self,
+        args: &Value,
+        input_pending: &mut dyn FnMut() -> bool,
+    ) -> ToolOutput {
+        let mut stopped_for_input = false;
         let result = (|| -> Result<Value> {
             if args["action"].as_str().unwrap_or("start") != "start" {
-                return self.side_questions.query(args, &self.interrupt);
+                let (value, stopped) =
+                    self.side_questions
+                        .query(args, &self.interrupt, input_pending)?;
+                stopped_for_input = stopped;
+                return Ok(value);
             }
             ensure!(
                 !self.interrupt.load(Ordering::Relaxed),
@@ -230,7 +256,14 @@ impl Agent<'_> {
         })();
         match result {
             Ok(value) => ToolOutput {
-                text: value.to_string(),
+                text: if stopped_for_input {
+                    format!(
+                        "{value}{}",
+                        crate::agent::workers::live_tasks::STOPPED_FOR_INPUT
+                    )
+                } else {
+                    value.to_string()
+                },
                 data: Some(value),
                 is_error: false,
                 execution: Default::default(),

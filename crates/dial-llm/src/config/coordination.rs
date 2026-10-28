@@ -5,11 +5,16 @@ use serde::{Deserialize, Serialize};
 #[serde(default, deny_unknown_fields)]
 pub struct CoordinationConfig {
     pub enabled: bool,
+    /// Let open interactive sessions resume unfinished tasks when fresh peer mail arrives.
+    pub auto_wake: bool,
 }
 
 impl Default for CoordinationConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            auto_wake: true,
+        }
     }
 }
 

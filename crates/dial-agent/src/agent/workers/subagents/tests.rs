@@ -799,15 +799,25 @@ fn the_harness_can_withhold_tools_from_every_type() {
 /// leaves the package root, unlike other integrations they are denied.
 #[test]
 fn read_only_agents_get_dependency_source() {
-    let enabled: Vec<String> = ["read", "dep_source"].map(String::from).into();
+    let enabled: Vec<String> = ["read", "dep_source", "git", "ast_search"]
+        .map(String::from)
+        .into();
     let mut ext = Registry::new();
     for tool in crate::tools::knowledge::deps::tools(&crate::config::Config::default()) {
         ext.register(tool);
     }
-    assert_eq!(
-        toolset(builtin("scout").unwrap(), &enabled, &ext),
-        ["read", "dep_source"]
-    );
+    for tool in crate::tools::vcs::git::tools(&crate::config::Config::default()) {
+        ext.register(tool);
+    }
+    for tool in crate::tools::edit::ast::tools(&crate::config::Config::default()) {
+        ext.register(tool);
+    }
+    let tools = toolset(builtin("scout").unwrap(), &enabled, &ext);
+    assert!(tools.contains(&"read".to_owned()));
+    assert!(tools.contains(&"dep_source".to_owned()));
+    assert!(tools.contains(&"git".to_owned()));
+    assert!(tools.contains(&"ast_search".to_owned()));
+    assert!(!tools.contains(&"ast_edit".to_owned()));
 }
 
 #[test]

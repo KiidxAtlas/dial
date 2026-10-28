@@ -103,6 +103,28 @@ semantics differ by provider, and late workers can update the live usage ledger 
 snapshot. Compare like-for-like tasks and correctness first; agent completion alone is not independent
 proof of correctness or subscription quota savings.
 
+The `inference_latency` object separates observed response wait, model loading, prompt processing,
+generation, provider retry backoff, and cancellation in milliseconds, with request/failure/retry
+counts. Each inference runtime result also retains its own latency breakdown and nullable
+`first_generation_ms`. These are harness-observed wall times, not provider compute or exact token
+timestamps: a provider that sends no progress events leaves network, queueing and prefill combined
+under response wait. Generation includes reasoning and tool arguments. Concurrent worker timings
+must not be added to estimate turn duration; compare the report's `duration_ms` separately.
+The status distinguishes **waiting for first response** from **provider retry backoff**.
+
+For reproducible local scheduling measurements (no paid model calls), run:
+
+```sh
+cargo test --locked --test integration scheduling_measurements -- --nocapture --test-threads=1
+cargo test --locked --test integration scheduling_measurements -- --ignored --nocapture --test-threads=1
+```
+
+The first command verifies actual read results, reduced provider round trips from batching, and
+managed background work overlapping independent foreground work. The second prints five alternating
+serial/batched and foreground/background samples. The read fixture uses a scripted local provider;
+the shell fixture simulates latency with two 200 ms waits. Neither measures a real model speedup,
+and no timing threshold is used as a correctness assertion.
+
 ## Cost budgets and fallback revert
 
 `[budget]` has two hard caps and two warnings, all in USD of observed cost (zero or unset disables
@@ -155,6 +177,34 @@ Explicit `[image]` overrides take precedence over all automatic routing. `base_u
 Without overrides or an assigned role, automatic routing uses main's supported route (including ChatGPT's unverified hosted-tool attempt), then the active OpenAI/xAI provider's image model, then configured image-capable profiles in name order. Capability declarations can come from each profile or its cached catalog; ChatGPT profiles with unknown hosted-tool support are considered after the other profiles. Unavailable automatic candidates and disabled providers are skipped. The default OpenAI Images API is next, then xAI's image default if keyed. This lets local and other chat models use separately configured image services without changing main. Assign the image role to pin a model instead of relying on automatic selection.
 
 With `auto = true` (default), the tool is exposed when a route resolves with the required credentials (including ChatGPT sign-in), or a local no-key endpoint. Discovery reads local state only: no generation, network probing or OAuth refresh occurs. `auto = false` restores the explicit `integrations = ["image_gen"]` opt-in. Calls always require approval. Customized routes and assigned-role errors are reported rather than silently hidden. A provider rejection never triggers another generation route. Output files are validated, never overwritten, and only published after successful completion; previews, incomplete responses and remote image URLs are not accepted as a completed image.
+
+### Per-model image settings (`[image.models.<key>]`)
+
+`/image settings` opens a panel for the image model the next `image_gen` call would use, through the same routing as above. It works like `/model settings`: `↑/↓` move, `←/→` cycle a choice or step a number, `Enter` types an exact value, `r` resets a row, `s` switches between project and global storage, and every change validates and saves immediately. Each entry matches one exact model identifier. The key is any bare TOML name; the panel derives `image_<16 hex>` from the model. Unset values leave the endpoint's own default. Saving never changes the chat model or its profile.
+
+```toml
+[image.models.flux]
+model = "mlx-community/flux2-klein-9b-4bit"
+size = "1024x1536"   # default when a call omits size; an explicit call size wins
+steps = 8            # MLX-Serve, 1–200
+seed = 42            # MLX-Serve, 0–4294967295; unset picks a random seed per image
+strength = 0.6       # MLX-Serve edits only, 0–1: how far an edit may move from its source
+loras = [{ path = "style.safetensors", scale = 1.25 }]   # MLX-Serve, at most 8
+
+[image.models.gpt]
+model = "gpt-image-1"
+quality = "high"          # auto, low, medium, high (DALL·E 3: standard, hd)
+background = "transparent"
+moderation = "low"        # auto, low
+```
+
+Each image API receives only the settings it accepts, and the panel shows only those rows:
+
+- MLX-Serve: `size`, `steps`, `seed`, `strength` (edits only) and `loras`.
+- OpenAI Images and the Responses hosted image tool: `size`, `quality`, `background` and `moderation`. DALL·E takes only `size` and `quality`.
+- xAI and inline chat-image output: only `size`.
+
+Values set for another API are kept but not sent. A LoRA `path` is absolute, or a `.safetensors` file name inside `~/.mlx-serve/models/loras`; the panel offers the files installed there, and **All LoRAs** edits the full list for stacking. LoRA scales range from −8 to 8, and 1.0 (the default) is full strength. The provider still checks values against the specific model, and rejects any it does not support.
 
 ## Context files (`[context_files]`)
 

@@ -185,3 +185,85 @@ fn legacy_windsurfrules_file_loads_from_project_root() {
         sources(&got)
     );
 }
+
+#[test]
+fn completed_tool_replaces_fragments_without_resetting_other_evidence() {
+    let base = tempfile::tempdir().unwrap();
+    let project = base.path().join("project");
+    write(
+        project.join(".dial/rules/text.md"),
+        "---\ncondition: before-after\nscope: text\n---\nguard",
+    );
+    write(
+        project.join(".dial/rules/tool.md"),
+        "---\ncondition: secret\nscope: tool:read\n---\nguard",
+    );
+    let layout = layout(&project, &base.path().join("home"));
+    let catalog = Catalog::discover_with(&layout, &project, None, &[], &[]);
+    let state = State::default();
+    let mut monitor = catalog.monitor(&project, &state, "main");
+    assert!(monitor.text("before-", false));
+    assert!(monitor.tool(0, "read", "{\"path\":"));
+    assert!(monitor.tool(1, "read", "{\"path\":\"sec"));
+    let call = ToolCall {
+        id: "c0".into(),
+        name: "read".into(),
+        arguments: serde_json::json!({"path":"public.txt"}),
+        malformed_arguments: false,
+    };
+    assert!(monitor.completed_tool(0, &call));
+    assert_eq!(monitor.tools[&0].1, call.arguments.to_string());
+    assert_eq!(
+        monitor.bytes,
+        monitor.text.len()
+            + monitor
+                .tools
+                .values()
+                .map(|(_, value)| value.len())
+                .sum::<usize>()
+    );
+    assert!(
+        !monitor.text("after", false),
+        "text evidence survives call completion"
+    );
+    assert!(
+        !monitor.completed_tool(2, &call),
+        "an existing hit cannot be cleared"
+    );
+
+    monitor.restart();
+    assert!(monitor.tool(1, "read", "{\"path\":\"sec"));
+    assert!(monitor.completed_tool(0, &call));
+    assert!(
+        !monitor.tool(1, "", "ret.txt\"}"),
+        "other call evidence survives completion"
+    );
+}
+
+#[test]
+fn completed_tool_keeps_cumulative_coverage_limits_and_latched_failure() {
+    let base = tempfile::tempdir().unwrap();
+    let project = base.path().join("project");
+    write(
+        project.join(".dial/rules/guard.md"),
+        "---\ncondition: never-match\nscope: [text, thinking, tool:read]\n---\nguard",
+    );
+    let layout = layout(&project, &base.path().join("home"));
+    let catalog = Catalog::discover_with(&layout, &project, None, &[], &[]);
+    let state = State::default();
+    let mut monitor = catalog.monitor(&project, &state, "main");
+    assert!(monitor.text(&"x".repeat(STREAM_BYTES), false));
+    assert!(monitor.text(&"y".repeat(STREAM_BYTES), true));
+    let call = ToolCall {
+        id: "c0".into(),
+        name: "read".into(),
+        arguments: serde_json::json!({"path":"public.txt"}),
+        malformed_arguments: false,
+    };
+    assert!(!monitor.completed_tool(0, &call));
+    let failure = monitor.failure.clone();
+    assert!(failure.is_some());
+    assert_eq!(monitor.bytes, TOTAL_BYTES);
+    assert!(!monitor.completed_tool(0, &call));
+    assert_eq!(monitor.failure, failure);
+}

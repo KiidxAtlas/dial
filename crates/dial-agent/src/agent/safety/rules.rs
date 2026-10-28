@@ -875,6 +875,21 @@ impl Monitor<'_> {
             }
         }
     }
+    /// Replace one streamed call with authoritative arguments without resetting other evidence.
+    pub fn completed_tool(&mut self, index: usize, call: &ToolCall) -> bool {
+        if self.hit.is_some() || self.failure.is_some() {
+            return false;
+        }
+        if let Some((_, arguments)) = self.tools.remove(&index) {
+            self.bytes -= arguments.len();
+        }
+        if !self.tool(index, &call.name, &call.arguments.to_string()) {
+            return false;
+        }
+        self.structural(call);
+        self.hit.is_none() && self.failure.is_none()
+    }
+
     pub fn completed(&mut self, reply: &crate::llm::Reply) -> Option<Hit> {
         // Providers without argument deltas still have a pre-execution boundary.
         if self.rules.is_empty() || self.failure.is_some() {

@@ -19,16 +19,18 @@ pub enum RequestPhase {
     Loading,
     Processing,
     Generating,
+    Backoff,
     Retrying,
     Cancelling,
 }
 impl RequestPhase {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Waiting => "waiting for model",
+            Self::Waiting => "waiting for first response",
             Self::Loading => "loading model",
             Self::Processing => "processing prompt",
             Self::Generating => "generating",
+            Self::Backoff => "provider retry backoff",
             Self::Retrying => "retrying request",
             Self::Cancelling => "cancelling request",
         }
@@ -197,6 +199,12 @@ pub trait Ui {
     /// Elapsed time without visible model output while its request is still pending.
     fn model_wait(&mut self, _silence: Duration) {}
     fn request_phase(&mut self, _phase: RequestPhase) {}
+    /// Ends an inference attempt, including errors and cancellations, before tool execution.
+    fn request_finished(&mut self, _succeeded: bool) {}
+    /// Observed inference-phase wall time for this surface's current turn.
+    fn request_latency(&self) -> Value {
+        Value::Null
+    }
     fn completion(&mut self, _summary: &Value) {}
     /// Mark only a failed inference attempt as discarded; completed work is untouched.
     fn inference_discarded(&mut self, reason: &str) {
@@ -212,6 +220,13 @@ pub trait Ui {
     /// messages before the next model request so the model can change course without waiting for the turn to end.
     fn take_steering(&mut self) -> Vec<String> {
         Vec::new()
+    }
+    /// Whether the user has typed input the agent has not taken yet (routable busy messages,
+    /// explicit steering or independent-worker requests). Must not consume anything. Pure waits
+    /// end early when this is true, so the input is handled at the next step boundary instead of
+    /// after the wait. Input deferred until after the turn does not count.
+    fn pending_input(&mut self) -> bool {
+        false
     }
     /// Busy input whose intent is undecided. Unlike explicit steering, this must not cancel work
     /// until the agent has decided whether to steer or start an independent worker.

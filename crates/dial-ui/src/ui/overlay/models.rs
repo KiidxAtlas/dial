@@ -259,8 +259,31 @@ fn role_accepts(role: &str, entry: &ModelEntry) -> bool {
         "decision" => false,
         "embedding" => is_embedding(entry),
         "image" => entry.supports_images(),
-        _ => entry.supports_chat(),
+        // Grounding reads screenshots: a chat model that does not declare itself text-only.
+        "grounding" => entry.supports_chat() && entry.metadata.vision != Some(false),
+        // Multimodal embedders are VLM checkpoints (Qwen3-VL-Embedding) that catalogs list as
+        // chat models; a text-only embedder (nomic-embed) cannot embed images.
+        "image_embedding" => {
+            let model = entry.selection.model.to_ascii_lowercase();
+            is_image_embedder(entry)
+                || (model.contains("embed")
+                    && (entry.metadata.vision == Some(true)
+                        || ["-vl", "vl-", "clip", "siglip", "multimodal"]
+                            .iter()
+                            .any(|marker| model.contains(marker))))
+        }
+        _ => entry.supports_chat() && !is_image_embedder(entry),
     }
+}
+
+/// A VLM embedding checkpoint cannot chat even though its architecture is a chat VLM.
+fn is_image_embedder(entry: &ModelEntry) -> bool {
+    entry.metadata.vision == Some(true)
+        && entry
+            .selection
+            .model
+            .to_ascii_lowercase()
+            .contains("embedding")
 }
 
 /// [`role_accepts`] for the list picked from a role row. The embedding role picker also offers

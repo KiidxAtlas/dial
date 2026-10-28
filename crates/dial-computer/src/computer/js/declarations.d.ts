@@ -145,6 +145,18 @@ interface ComputerScreenshotResult {
 	region?: CaptureRegion;
 }
 
+/** Point from `locate`, in pixels of the silent full screenshot it captured (now the input frame). */
+interface ComputerLocateResult {
+	x: number;
+	y: number;
+	/** Size of the screenshot the point refers to. */
+	width: number;
+	height: number;
+	target: string;
+	/** Grounding model that answered. */
+	model: string;
+}
+
 /** Native desktop backend and permission state. */
 interface ComputerCapabilities {
 	/** Active native backend identifier. */
@@ -203,6 +215,8 @@ interface ComputerInputTarget {
 	screenshot(options?: ComputerScreenshotOptions): Promise<ComputerScreenshotResult>;
 	/** Display a detailed region without replacing the input frame. Use base full screenshot coordinates for subsequent input, not zoom pixels. */
 	zoom(region: CaptureRegion, options?: ComputerScreenshotOptions): Promise<ComputerScreenshotResult>;
+	/** Ask the `grounding` model where a described element is; captures a silent full screenshot (the new input frame) and never clicks. */
+	locate(description: string): Promise<ComputerLocateResult>;
 	click(x: number, y: number, options?: ComputerClickOptions): Promise<void>;
 	doubleClick(x: number, y: number, options?: Omit<ComputerClickOptions, "count">): Promise<void>;
 	move(x: number, y: number): Promise<void>;

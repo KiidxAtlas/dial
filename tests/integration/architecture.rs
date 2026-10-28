@@ -596,9 +596,10 @@ fn modules_respect_their_dependency_boundaries() {
     // (module, forbidden `crate::<x>` paths, allowed sub-paths of a forbidden module)
     let rules: &[(&str, &[&str], &[&str])] = &[
         // ui reads the settings declarations (`config::schema`), persists settings through
-        // `config::settings_store`, and uses the dial directory layout (`config::paths`) and the
-        // Laya provider constants (`config::laya`). Any other `config` path is a new dependency
-        // and must be added here deliberately.
+        // `config::settings_store`, and uses the dial directory layout (`config::paths`), the
+        // Laya provider constants (`config::laya`) and the per-model image settings types and
+        // limits that `/image settings` edits (`config::image`). Any other `config` path is a new
+        // dependency and must be added here deliberately.
         (
             "ui",
             &["learn", "tools", "config"],
@@ -607,6 +608,7 @@ fn modules_respect_their_dependency_boundaries() {
                 "config::settings_store",
                 "config::paths",
                 "config::laya",
+                "config::image",
             ],
         ),
         ("llm", &["ui", "learn", "tools"], &[]),

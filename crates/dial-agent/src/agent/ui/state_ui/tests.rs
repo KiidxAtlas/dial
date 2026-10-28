@@ -418,3 +418,54 @@ fn turns_without_observers_build_and_emit_nothing() {
     );
     assert!(ui.observers.is_none());
 }
+
+#[test]
+fn retry_backoff_stays_in_one_request_and_timings_survive_settlement() {
+    use crate::agent::RequestPhase;
+    struct Sink;
+    impl Ui for Sink {}
+    let tree = Tree::default();
+    let mut sink = Sink;
+    let mut ui = StateUi::new(&mut sink, tree.clone(), None);
+    ui.request_phase(RequestPhase::Waiting);
+    ui.request_phase(RequestPhase::Backoff);
+    ui.request_phase(RequestPhase::Retrying);
+    ui.request_phase(RequestPhase::Generating);
+    ui.request_finished(true);
+    ui.request_finished(true); // repeated settlement must not double count
+    assert_eq!(ui.request_latency()["requests"], 1);
+    assert_eq!(ui.request_latency()["retry_backoffs"], 1);
+    ui.finish(false);
+    let nodes = tree.snapshots();
+    let requests: Vec<_> = nodes
+        .iter()
+        .filter(|node| node.kind == "inference")
+        .collect();
+    assert_eq!(requests.len(), 1);
+    let data = requests[0].result.data.as_ref().unwrap();
+    assert_eq!(data["latency"]["requests"], 1);
+    assert_eq!(data["latency"]["failed_requests"], 0);
+    assert!(data["latency"]["first_generation_ms"].is_number());
+}
+
+#[test]
+fn discarded_request_retains_failed_latency_without_reopening_its_node() {
+    use crate::agent::RequestPhase;
+    struct Sink;
+    impl Ui for Sink {}
+    let tree = Tree::default();
+    let mut sink = Sink;
+    let mut ui = StateUi::new(&mut sink, tree.clone(), None);
+    ui.request_phase(RequestPhase::Waiting);
+    ui.request_phase(RequestPhase::Cancelling);
+    ui.inference_discarded("silent request");
+    ui.request_finished(false);
+    let nodes = tree.snapshots();
+    let request = nodes.iter().find(|node| node.kind == "inference").unwrap();
+    assert_eq!(request.result.phase, Phase::Interrupted);
+    assert_eq!(
+        request.result.data.as_ref().unwrap()["latency"]["failed_requests"],
+        1
+    );
+    assert_eq!(ui.request_latency()["failed_requests"], 1);
+}

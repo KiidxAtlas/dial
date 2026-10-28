@@ -265,10 +265,21 @@ impl<'a> Agent<'a> {
     /// explicitly loaded tools, as before catalog-wide offers. Read-only children must not inherit
     /// every registered integration just because the parent can call it.
     pub(in crate::agent) fn offered_for_children(&self) -> Vec<String> {
-        self.offered_with(true)
+        let mut out: Vec<String> = self
+            .offered_with(true)
             .into_iter()
             .filter(|name| name != "side_request")
-            .collect()
+            .collect();
+        let pinned = self.config.harness.tools != config::tools::default_tools();
+        if !pinned && !self.hermetic && !self.lean_tools {
+            let catalog = self.catalog();
+            for tool in ["lsp", "git", "ast_search", "code_history", "dep_source"] {
+                if catalog.iter().any(|name| name == tool) && !out.iter().any(|name| name == tool) {
+                    out.push(tool.into());
+                }
+            }
+        }
+        out
     }
 
     pub(in crate::agent) fn offered_with(&self, selection_only: bool) -> Vec<String> {

@@ -530,3 +530,79 @@ fn optional_and_ui_fields_have_routes_too() {
         );
     }
 }
+
+#[test]
+fn value_sources_match_registered_setting_kinds() {
+    let sourced: Vec<_> = registry()
+        .iter()
+        .filter_map(|def| def.source().map(|source| (def, source)))
+        .collect();
+    let paths: HashSet<_> = sourced.iter().map(|(def, _)| def.path).collect();
+    for expected in [
+        "python",
+        "worker",
+        "eval.node",
+        "ida.python",
+        "ida.idadir",
+        "sandbox.extra_write",
+        "lsp.rust-analyzer.program",
+        "local_runtime.draft_model",
+        "codebase.architecture_model",
+        "memory.sharpshooter.model",
+        "training.learn_from",
+        "image.model",
+        "model",
+        "provider",
+        "model_profile",
+        "ui.status_left",
+        "ui.status_right",
+        "compaction.method_order",
+        "integrations",
+        "foreign_sources",
+        "memory.hindsight.recall_types",
+    ] {
+        assert!(paths.contains(expected), "{expected} has no value source");
+    }
+    for (def, source) in sourced {
+        let list = matches!(def.kind, Kind::StringList);
+        let single = matches!(def.kind, Kind::Text | Kind::Choice(_));
+        let ok = match source {
+            Source::Values { .. } => list,
+            Source::Path(PathKind::Directory) if def.path == "sandbox.extra_write" => list,
+            Source::Model(_) if def.path == "training.learn_from" => list,
+            _ => single,
+        };
+        assert!(
+            ok,
+            "{} source {source:?} does not fit {:?}",
+            def.path, def.kind
+        );
+    }
+}
+
+#[test]
+fn known_list_values_are_accepted_by_their_settings() {
+    for (path, values) in [
+        ("compaction.method_order", COMPACTION_METHODS),
+        ("foreign_sources", FOREIGN_SOURCES),
+        ("memory.hindsight.recall_types", RECALL_TYPES),
+        (
+            "integrations",
+            crate::config::tools::integrations::INTEGRATION_TOOLS,
+        ),
+    ] {
+        let value = Value::Array(values.iter().map(|v| Value::String((*v).into())).collect());
+        let mut table = default_table();
+        check_value_for(&table, path, &value).unwrap_or_else(|e| panic!("{path}: {e}"));
+        set(&mut table, path, value);
+        let config: Config = table.try_into().unwrap_or_else(|e| panic!("{path}: {e}"));
+        config
+            .validate()
+            .unwrap_or_else(|e| panic!("{path}: {e:#}"));
+    }
+    let methods: Vec<crate::config::compaction::CompactionMethod> = COMPACTION_METHODS
+        .iter()
+        .map(|m| serde_json::from_value(serde_json::json!(m)).unwrap())
+        .collect();
+    assert_eq!(methods, Config::default().compaction.method_order);
+}

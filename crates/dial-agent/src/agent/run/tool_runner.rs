@@ -68,6 +68,51 @@ impl Agent<'_> {
             owner,
         )
     }
+    /// `/image generate` and `/image edit`: one user-requested `image_gen` call outside a model
+    /// turn. It refreshes image availability like a turn boundary, then takes the same approval,
+    /// plan-mode and mutation authority a model call gets. `output` must be a new
+    /// workspace-relative file; `source`, when given, is the workspace image to edit.
+    ///
+    /// # Errors
+    /// Returns an unavailable image route or a refused approval; generation failures are the
+    /// returned error output.
+    pub fn generate_image(
+        &mut self,
+        prompt: &str,
+        output: &str,
+        source: Option<&str>,
+        ui: &mut dyn Ui,
+    ) -> Result<ToolOutput> {
+        let name = crate::tools::net::image_gen::TOOL;
+        ensure!(
+            !self.hermetic,
+            "image generation is unavailable in hermetic runs"
+        );
+        self.ext.sync_image_generation(&self.auth_config)?;
+        ensure!(
+            self.ext.get(name).is_some(),
+            "image_gen is not enabled; set image.auto = true or add \"image_gen\" to integrations"
+        );
+        let mut arguments = json!({"prompt": prompt, "output": output});
+        if let Some(source) = source {
+            arguments["image"] = json!(source);
+        }
+        let call = ToolCall {
+            id: String::new(),
+            name: name.into(),
+            arguments,
+            malformed_arguments: false,
+        };
+        if let Err(denial) = self.authorize_call(&call, ui) {
+            bail!("{}", denial.message());
+        }
+        ui.tool_call(name, output);
+        let result = self
+            .run_background_tool(name, &call.arguments, ui, None)
+            .context("image_gen is not registered")?;
+        ui.tool_result(name, &result);
+        Ok(result)
+    }
     /// Blocking I/O tools run off the controller thread so the inline UI can repaint and process input.
     pub(in crate::agent) fn run_background_tool(
         &mut self,
@@ -122,6 +167,9 @@ impl Agent<'_> {
             .as_ref()
             .is_some_and(|tool| tool.interruptible(args));
         let mut steering = Vec::new();
+        // Ordinary queued input is not taken here (routing happens at the step boundary), but it
+        // must not sit behind a pure wait or a foreground command that could step aside.
+        let mut input_signalled = false;
         let active = Arc::new(AtomicBool::new(false));
         let started = active.clone();
         let serial = !matches!(name.as_str(), "edit" | "write")
@@ -328,6 +376,11 @@ impl Agent<'_> {
                 if interruptible && let Some(tool) = &cancellation {
                     tool.cancel_operation();
                 }
+            } else if !input_signalled && ui.pending_input() {
+                // Cooperative only: waits end and long commands move to bg; nothing is killed.
+                input_signalled = true;
+                signals.request_steering();
+                signals.interrupt_waits();
             }
 
             match rx.recv_timeout(Duration::from_millis(80)) {

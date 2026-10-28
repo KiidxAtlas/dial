@@ -71,6 +71,7 @@ pub fn capabilities() -> Result<Value, String> {
         &cwd,
         false,
         None,
+        None,
         &AbortSignal::new(),
     );
     let _ = session.supervisor.close();
@@ -185,6 +186,8 @@ struct RunSettings<'a> {
     coordinate_safe: bool,
     read_only: bool,
     timeout: Option<f64>,
+    /// Config for `win.locate`, present only while the `grounding` role is assigned.
+    grounding: Option<&'a Config>,
 }
 
 /// Confirmation request forwarded from a worker control thread to the tool thread.
@@ -194,9 +197,11 @@ struct ConfirmRequest {
 }
 
 /// Host for worker callbacks. Control grants are forwarded to the tool thread, which asks the
-/// tool context's confirm callback; with no callback, grants are denied.
+/// tool context's confirm callback; with no callback, grants are denied. `grounding.locate`
+/// asks the configured grounding model about a screenshot the worker just saved.
 struct ToolHost {
     requests: flume::Sender<ConfirmRequest>,
+    grounding: Option<Arc<Config>>,
 }
 
 impl ComputerHost for ToolHost {
@@ -217,11 +222,59 @@ impl ComputerHost for ToolHost {
         Ok(answer.recv().unwrap_or(false))
     }
 
-    fn call_tool(&self, name: &str, _args: Value, _signal: &AbortSignal) -> ComputerResult<Value> {
-        Err(ComputerError::tool(format!(
-            "Unknown computer host tool \"{name}\"."
-        )))
+    fn call_tool(&self, name: &str, args: Value, signal: &AbortSignal) -> ComputerResult<Value> {
+        if name != GROUNDING_LOCATE {
+            return Err(ComputerError::tool(format!(
+                "Unknown computer host tool \"{name}\"."
+            )));
+        }
+        let Some(config) = &self.grounding else {
+            return Err(ComputerError::tool(
+                "locate needs a grounding model: run `/setup grounding` or assign one to the `grounding` role in Alt+M",
+            ));
+        };
+        locate_screenshot(config, &args, signal)
+            .map_err(|error| ComputerError::tool(format!("{error:#}")))
     }
+}
+
+const GROUNDING_LOCATE: &str = "grounding.locate";
+
+/// Ground `args.description` in the worker's screenshot `args.path`, a PNG this run just wrote to
+/// the temporary directory. The point is in that screenshot's pixels.
+fn locate_screenshot(config: &Config, args: &Value, signal: &AbortSignal) -> anyhow::Result<Value> {
+    let path = args["path"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("locate is missing the screenshot path"))?;
+    let description = args["description"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("locate is missing the element description"))?;
+    let path = std::path::Path::new(path);
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    anyhow::ensure!(
+        path.parent() == Some(std::env::temp_dir().as_path())
+            || path
+                .parent()
+                .map(std::path::Path::canonicalize)
+                .and_then(Result::ok)
+                == std::env::temp_dir().canonicalize().ok(),
+        "locate reads only screenshots this computer run captured"
+    );
+    anyhow::ensure!(
+        name.starts_with("dial-computer-") && name.ends_with(".png"),
+        "locate reads only screenshots this computer run captured"
+    );
+    anyhow::ensure!(
+        std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file()),
+        "locate reads only screenshots this computer run captured"
+    );
+    let bytes = std::fs::read(path)?;
+    let located =
+        crate::tools::vision::grounding::locate(config, &bytes, description, signal.flag())?;
+    Ok(located.to_json())
 }
 
 struct ComputerSession {
@@ -258,6 +311,7 @@ impl ComputerSession {
         action: ComputerAction,
         cwd: &str,
         coordinate_safe: bool,
+        grounding: Option<&Config>,
         confirm: Option<&dyn Fn(&str) -> bool>,
         signal: &AbortSignal,
     ) -> ComputerResult<Value> {
@@ -299,6 +353,7 @@ impl ComputerSession {
                         coordinate_safe,
                         read_only,
                         timeout,
+                        grounding,
                     },
                     confirm,
                     signal,
@@ -317,6 +372,7 @@ impl ComputerSession {
                         coordinate_safe,
                         read_only,
                         timeout,
+                        grounding,
                     },
                     confirm,
                     signal,
@@ -339,6 +395,7 @@ impl ComputerSession {
             coordinate_safe,
             read_only,
             timeout,
+            grounding,
         } = settings;
         let timeout = clamp_timeout(timeout);
         let request = RunRequest {
@@ -348,7 +405,10 @@ impl ComputerSession {
             cwd: std::path::PathBuf::from(cwd),
         };
         let (requests, confirm_requests) = flume::unbounded::<ConfirmRequest>();
-        let host: Arc<dyn ComputerHost> = Arc::new(ToolHost { requests });
+        let host: Arc<dyn ComputerHost> = Arc::new(ToolHost {
+            requests,
+            grounding: grounding.map(|config| Arc::new(config.clone())),
+        });
         std::thread::scope(|scope| {
             let run = scope.spawn(move || self.supervisor.run(&request, host, signal));
             loop {
@@ -507,9 +567,17 @@ impl Computer {
         let is_capabilities = matches!(action, ComputerAction::Capabilities);
         let cwd = ctx.workspace.root().display().to_string();
         let coordinate_safe = coordinate_safe_frames(ctx.config);
+        let grounding =
+            crate::tools::vision::grounding::configured(ctx.config).then_some(ctx.config);
         let result = with_cancel(cancel, |signal| {
-            self.session
-                .execute(action, &cwd, coordinate_safe, ctx.confirm, signal)
+            self.session.execute(
+                action,
+                &cwd,
+                coordinate_safe,
+                grounding,
+                ctx.confirm,
+                signal,
+            )
         });
         let value = match result {
             Ok(value) => value,

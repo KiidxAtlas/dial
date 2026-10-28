@@ -44,6 +44,7 @@ pub const DESKTOP_METHODS: MethodPolicies = &[
     ("focusedWindow", Read),
     ("screenshot", Read),
     ("zoom", Read),
+    ("locate", Read),
     ("click", Exec),
     ("doubleClick", Exec),
     ("move", Exec),
@@ -62,6 +63,7 @@ pub const DESKTOP_METHODS: MethodPolicies = &[
 pub const DISPLAY_METHODS: MethodPolicies = &[
     ("screenshot", Read),
     ("zoom", Read),
+    ("locate", Read),
     ("click", Exec),
     ("doubleClick", Exec),
     ("move", Exec),
@@ -83,6 +85,7 @@ pub const WINDOW_METHODS: MethodPolicies = &[
     ("holdMouse", Exec),
     ("screenshot", Read),
     ("zoom", Read),
+    ("locate", Read),
     ("click", Exec),
     ("doubleClick", Exec),
     ("move", Exec),

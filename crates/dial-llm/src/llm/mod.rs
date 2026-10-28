@@ -281,6 +281,9 @@ pub struct Reply {
     /// Anthropic 1-hour cache writes (`usage.cache_creation.ephemeral_1h_input_tokens`).
     /// `None` when the provider did not report the split; never invented as zero.
     pub cache_creation_1h_tokens: Option<u64>,
+    /// Effective native cache lifetime accepted for this request, after refusal fallback.
+    /// `None` when caching is disabled or the provider's retention is unknown.
+    pub cache_warm_tier: Option<cache_warmer::Tier>,
     /// Native content blocks (including signed/redacted thinking) required for tool-turn replay.
     pub provider_content: Vec<Value>,
     /// Provider credit metering for the turn (Devin `creditCost`, `committedCreditCost`,
@@ -383,6 +386,13 @@ pub enum StreamEvent {
         id: String,
         name: String,
         delta: String,
+    },
+    /// Provider-confirmed complete call, with authoritative arguments (not a JSON heuristic).
+    ToolCallComplete {
+        index: u64,
+        id: String,
+        name: String,
+        arguments: String,
     },
 }
 

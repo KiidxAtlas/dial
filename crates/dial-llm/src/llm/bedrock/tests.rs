@@ -165,3 +165,45 @@ fn reasoning_effort_wire_reaches_bedrock_output_config() {
     let body = request("anthropic.claude-v2", &chat, Some(&profile), "main").unwrap();
     assert_eq!(effort(&body), "high");
 }
+
+#[test]
+fn closed_tool_signals_completion_before_message_end_and_honors_cancellation() {
+    for cancel in [false, true] {
+        let mut state = Accumulator::default();
+        let mut text = None;
+        for (event, value) in [
+            ("messageStart", json!({"role":"assistant"})),
+            (
+                "contentBlockStart",
+                json!({"contentBlockIndex":0,"start":{"toolUse":{"toolUseId":"c0","name":"read"}}}),
+            ),
+            (
+                "contentBlockDelta",
+                json!({"contentBlockIndex":0,"delta":{"toolUse":{"input":"{\"path\":\"a.txt\"}"}}}),
+            ),
+        ] {
+            state
+                .feed(event, value, &mut text, &mut |e| {
+                    assert!(!matches!(e, StreamEvent::ToolCallComplete { .. }));
+                    true
+                })
+                .unwrap();
+        }
+        let mut seen = Vec::new();
+        let result = state.feed(
+            "contentBlockStop",
+            json!({"contentBlockIndex":0}),
+            &mut text,
+            &mut |e| {
+                seen.push(e.clone());
+                !cancel
+            },
+        );
+        assert_eq!(result.is_err(), cancel);
+        assert!(
+            matches!(&seen[0], StreamEvent::ToolCallComplete { index:0, name, arguments, .. }
+            if name == "read" && arguments == r#"{"path":"a.txt"}"#)
+        );
+        assert!(state.finish("scope").is_err());
+    }
+}

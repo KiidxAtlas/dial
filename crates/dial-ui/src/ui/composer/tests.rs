@@ -1235,6 +1235,33 @@ fn busy_queue_distinguishes_steering_followups_and_survives_interrupt() {
 }
 
 #[test]
+fn pending_input_counts_routable_and_explicit_messages_but_not_deferred_follow_ups() {
+    let env = Env::new();
+    let mut c = composer();
+    c.set_busy(true);
+    assert!(!c.has_pending_input());
+    typed(&mut c, &env, "later");
+    key(&mut c, &env, KeyCode::Enter, KeyModifiers::ALT);
+    assert!(
+        !c.has_pending_input(),
+        "an after-turn follow-up must not end waits"
+    );
+    typed(&mut c, &env, "steer");
+    press(&mut c, &env, KeyCode::Enter);
+    press(&mut c, &env, KeyCode::Enter);
+    assert!(c.has_pending_input());
+    assert!(c.has_pending_input(), "checking never consumes the input");
+    assert_eq!(c.take_steering(), vec!["steer"]);
+    assert!(!c.has_pending_input());
+    // Input the agent could not route is deferred and stops counting, so waits cannot loop.
+    c.defer_messages(vec!["deferred".into()]);
+    assert!(!c.has_pending_input());
+    // Restored routable input counts again.
+    c.restore_pending_messages(vec!["restored".into()]);
+    assert!(c.has_pending_input());
+}
+
+#[test]
 fn busy_hints_follow_the_draft_and_queue() {
     let env = Env::new();
     let mut c = composer();
@@ -3742,17 +3769,46 @@ fn plugin_header_status_and_footer_frame_the_composer_and_stay_sanitized() {
 }
 
 #[test]
-fn plugin_values_with_whitespace_stay_in_the_menu_and_insert_quoted() {
+fn plugin_suggestions_insert_command_text_without_shell_quoting() {
     let env = Env::new();
-    let mut c = with_commands();
-    typed(&mut c, &env, "/zz");
-    assert!(c.set_plugin_suggestions(
-        "zz",
-        vec![cmd("zz words", "Spaced value", CommandKind::Extension)]
-    ));
-    let rows = screen(&c, &env, 80).join("\n");
-    assert!(rows.contains("zz words"), "{rows}");
-    // Tab inserts the value as one shell word, the way `/commit` reads its arguments.
+    for value in [
+        "zz words",
+        "zz 'two words'",
+        "zz \"two words\"",
+        "zz path\\name",
+    ] {
+        for accept in [KeyCode::Tab, KeyCode::Right] {
+            let mut c = with_commands();
+            typed(&mut c, &env, "/zz");
+            assert!(c.set_plugin_suggestions(
+                "zz",
+                vec![cmd(value, "Suggested command", CommandKind::Extension)]
+            ));
+            let rows = screen(&c, &env, 80).join("\n");
+            assert!(rows.contains(value), "{rows}");
+            press(&mut c, &env, accept);
+            let expected = format!("/{value} ");
+            assert_eq!(c.editor.text, expected);
+            // Tab/Right leave a space for more arguments; submission preserves that draft.
+            assert_eq!(
+                press(&mut c, &env, KeyCode::Enter),
+                ComposerEvent::Submit(expected)
+            );
+        }
+    }
+}
+
+#[test]
+fn extension_argument_completion_keeps_the_command_and_arguments_separate() {
+    let env = Env::new();
+    let mut c = composer();
+    c.set_commands(vec![cmd("zz", "Extension command", CommandKind::Extension)]);
+    c.set_argument_completions(vec!["/zz words".into()]);
+    typed(&mut c, &env, "/zz w");
     press(&mut c, &env, KeyCode::Tab);
-    assert_eq!(c.editor.text, "/'zz words' ");
+    assert_eq!(c.editor.text, "/zz words");
+    assert_eq!(
+        press(&mut c, &env, KeyCode::Enter),
+        ComposerEvent::Submit("/zz words".into())
+    );
 }

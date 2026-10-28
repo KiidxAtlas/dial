@@ -4,8 +4,9 @@
 //! [`SettingsOverlay::settled`].
 //!
 //! This file also holds the small drawing helpers shared by the model and provider panels.
+use super::path_browser::{BrowseStep, PathBrowser};
 use super::{DrawCtx, OverlayEvent};
-use crate::config::schema::{Kind, SettingDef};
+use crate::config::schema::{Kind, PathKind, SettingDef, Source};
 use crate::config::settings_store::Scope;
 use crate::llm::model_config::{ModelSelection, UiConfig};
 use crate::ui::chrome::{self, Section, Status, status_chip};
@@ -21,8 +22,12 @@ use ratatui::{
     widgets::Paragraph,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use toml::{Table, Value};
 use unicode_segmentation::UnicodeSegmentation;
+use value_editors::{AddBy, EntriesEditor, ListEditor, Step, View};
+
+mod value_editors;
 
 // ---------------------------------------------------------------------------------------------
 // Shared helpers (also used by `models` and `providers`)
@@ -382,11 +387,22 @@ fn pick_matches(labels: &[String], choices: &[String], filter: &str) -> Vec<usiz
     let terms: Vec<String> = filter.split_whitespace().map(str::to_lowercase).collect();
     (0..choices.len())
         .filter(|&n| {
-            let haystack = format!("{} {}", labels[n], choices[n]).to_lowercase();
+            // Internal rows (offers, "type another value") match by label only.
+            let raw = if choices[n].starts_with('\u{1}') {
+                ""
+            } else {
+                choices[n].as_str()
+            };
+            let haystack = format!("{} {raw}", labels[n]).to_lowercase();
             terms.iter().all(|term| haystack.contains(term.as_str()))
         })
         .collect()
 }
+
+/// Picker row that leaves for the plain text editor; never a saved value.
+const TYPE_CHOICE: &str = "\u{1}type";
+/// Prefix of picker rows standing for `value_choices[path][index]`.
+const OFFER_PREFIX: &str = "\u{1}offer:";
 
 const PROVIDERS_TAB: &str = "Setup";
 const LINK_SECTION: &str = "Models, connections & controls";
@@ -440,6 +456,21 @@ enum Mode {
         /// Type-to-filter text. Matches a choice's label or raw value, ignoring case.
         filter: Editor,
     },
+    /// A file or folder browser for a path setting.
+    Path {
+        def: &'static SettingDef,
+        browser: Box<PathBrowser>,
+    },
+    /// Check, order and add values of a list setting.
+    List {
+        def: &'static SettingDef,
+        editor: Box<ListEditor>,
+    },
+    /// A TOML map or array edited one entry at a time.
+    Entries {
+        def: &'static SettingDef,
+        editor: Box<EntriesEditor>,
+    },
 }
 
 enum Item {
@@ -464,6 +495,33 @@ enum Item {
         shown: usize,
         total: usize,
     },
+    /// An open one-line input of a structured editor.
+    Input {
+        prompt: &'static str,
+        editor: Editor,
+    },
+}
+
+/// What choosing an offered value does.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ChoiceAction {
+    /// Save the value.
+    Set,
+    /// Download the local model the value names (a second Enter confirms), then save it.
+    Download,
+    /// Assign the model to a role through the canonical selection writer.
+    Assign {
+        role: String,
+        selection: ModelSelection,
+    },
+}
+
+/// A value a setting can take, offered by the controller (discovered models, configured names).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ValueChoice {
+    pub value: String,
+    pub label: String,
+    pub action: ChoiceAction,
 }
 
 /// A missing dependency that a setting path needs: what to install and the plan to show first.
@@ -540,6 +598,12 @@ pub struct SettingsOverlay {
     embedding_setups: BTreeMap<String, SetupOffer>,
     /// One half of the embedding override pair, held until its partner is set so both save together.
     staged_pair: Option<(&'static str, Value)>,
+    /// Offered values for model and name settings, by setting path (supplied by the controller).
+    value_choices: BTreeMap<String, Vec<ValueChoice>>,
+    /// Where path browsers start when a setting has no value.
+    base_dir: PathBuf,
+    /// The not-yet-downloaded model whose first Enter asked for confirmation.
+    download_armed: Option<String>,
 }
 
 /// Plain-language summary of a memory backend. `models` is the chord that opens the model selector
@@ -968,6 +1032,9 @@ impl SettingsOverlay {
             embedding_models: Vec::new(),
             embedding_setups: BTreeMap::new(),
             staged_pair: None,
+            value_choices: BTreeMap::new(),
+            base_dir: std::env::current_dir().unwrap_or_default(),
+            download_armed: None,
             feedback: None,
             load_error: None,
         }
@@ -1054,6 +1121,16 @@ impl SettingsOverlay {
     /// Discovered models the embedding role can take, listed on the Embedding model row.
     pub fn set_embedding_models(&mut self, models: Vec<EmbeddingModel>) {
         self.embedding_models = models;
+    }
+
+    /// Values the model and name settings offer, by setting path.
+    pub fn set_value_choices(&mut self, choices: BTreeMap<String, Vec<ValueChoice>>) {
+        self.value_choices = choices;
+    }
+
+    /// The folder path browsers start in when a setting has no value (the project root).
+    pub fn set_base_dir(&mut self, dir: PathBuf) {
+        self.base_dir = dir;
     }
 
     /// Setup offers for the curated embedding models, by model name; picking one on the Embedding
@@ -1584,6 +1661,8 @@ impl SettingsOverlay {
                 Mode::Browse => self.browse_key(key, keys),
                 Mode::Edit { .. } => self.edit_key(key, keys),
                 Mode::Pick { .. } => self.pick_key(key, keys),
+                Mode::Path { .. } => self.path_key(key, keys),
+                Mode::List { .. } | Mode::Entries { .. } => self.structured_key(key, keys),
             },
             Event::Paste(pasted) => {
                 let pasted = text::one_line(pasted);
@@ -1600,6 +1679,9 @@ impl SettingsOverlay {
                     Mode::Pick { filter, .. } => {
                         filter.insert(&pasted);
                     }
+                    Mode::Path { browser, .. } => browser.paste(&pasted),
+                    Mode::List { editor, .. } => editor.paste(&pasted),
+                    Mode::Entries { editor, .. } => editor.paste(&pasted),
                 }
                 self.refit_pick()
             }
@@ -1798,6 +1880,11 @@ impl SettingsOverlay {
             None => return OverlayEvent::None,
         };
         let current = self.current(def);
+        if !def.sensitive()
+            && let Some(event) = self.open_source(def, &current)
+        {
+            return event;
+        }
         match def.kind_for(&self.effective) {
             Kind::Bool => {
                 let next = !current.as_bool().unwrap_or(false);
@@ -1874,6 +1961,18 @@ impl SettingsOverlay {
                 };
                 OverlayEvent::None
             }
+            Kind::Table | Kind::Toml if !def.sensitive() => {
+                let seed = self.edit_seed(def);
+                if !matches!(seed, Value::Table(_) | Value::Array(_)) {
+                    return self.open_text_editor(def, &seed);
+                }
+                self.notes.remove(def.path);
+                self.mode = Mode::Entries {
+                    def,
+                    editor: Box::new(EntriesEditor::new(seed)),
+                };
+                OverlayEvent::None
+            }
             Kind::Int { .. }
             | Kind::AutoInt { .. }
             | Kind::Float { .. }
@@ -1882,12 +1981,241 @@ impl SettingsOverlay {
             | Kind::StringList
             | Kind::Table
             | Kind::Toml => {
-                let mut editor = Editor::default();
-                editor.set(&setting_edit_text(def, &self.edit_seed(def)));
-                self.reveal_sensitive = false;
-                self.notes.remove(def.path);
-                self.mode = Mode::Edit { def, editor };
+                let seed = self.edit_seed(def);
+                self.open_text_editor(def, &seed)
+            }
+        }
+    }
+
+    fn open_text_editor(&mut self, def: &'static SettingDef, seed: &Value) -> OverlayEvent {
+        let mut editor = Editor::default();
+        editor.set(&setting_edit_text(def, seed));
+        self.reveal_sensitive = false;
+        self.notes.remove(def.path);
+        self.mode = Mode::Edit { def, editor };
+        OverlayEvent::None
+    }
+
+    /// Open the chooser a setting's value source offers (see `SettingDef::source`); `None` keeps
+    /// the kind's own editor.
+    fn open_source(&mut self, def: &'static SettingDef, current: &Value) -> Option<OverlayEvent> {
+        let source = def.source()?;
+        self.download_armed = None;
+        let mode = match (source, def.kind_for(&self.effective)) {
+            (Source::Path(kind), Kind::Text) => Mode::Path {
+                def,
+                browser: Box::new(PathBrowser::open(
+                    kind,
+                    current.as_str().unwrap_or_default(),
+                    &self.base_dir,
+                )),
+            },
+            (Source::Path(PathKind::Directory), Kind::StringList) => Mode::List {
+                def,
+                editor: Box::new(ListEditor::new(
+                    current,
+                    Vec::new(),
+                    false,
+                    AddBy::Folder,
+                    &self.base_dir,
+                )),
+            },
+            (Source::Values { values, ordered }, Kind::StringList) => Mode::List {
+                def,
+                editor: Box::new(ListEditor::new(
+                    current,
+                    values
+                        .iter()
+                        .map(|value| ((*value).to_owned(), (*value).to_owned()))
+                        .collect(),
+                    ordered,
+                    AddBy::Text,
+                    &self.base_dir,
+                )),
+            },
+            // A list of models: check discovered ones, or add any other name.
+            (Source::Model(_), Kind::StringList) => Mode::List {
+                def,
+                editor: Box::new(ListEditor::new(
+                    current,
+                    self.value_choices
+                        .get(def.path)
+                        .into_iter()
+                        .flatten()
+                        .map(|offer| (offer.value.clone(), offer.label.clone()))
+                        .collect(),
+                    false,
+                    AddBy::Text,
+                    &self.base_dir,
+                )),
+            },
+            (Source::Model(_) | Source::Names(_), Kind::Text | Kind::Choice(_) | Kind::Enum(_)) => {
+                return self.open_offers(def, current);
+            }
+            _ => return None,
+        };
+        self.notes.remove(def.path);
+        self.mode = mode;
+        Some(OverlayEvent::None)
+    }
+
+    /// A picker over the controller's offered values, the setting's own options and its current
+    /// value, ending with a row that types any other value. `None` when nothing is offered.
+    fn open_offers(&mut self, def: &'static SettingDef, current: &Value) -> Option<OverlayEvent> {
+        let offers = self
+            .value_choices
+            .get(def.path)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let mut choices: Vec<String> = (0..offers.len())
+            .map(|i| format!("{OFFER_PREFIX}{i}"))
+            .collect();
+        if let Kind::Choice(options) | Kind::Enum(options) = def.kind {
+            choices.extend(
+                options
+                    .iter()
+                    .filter(|(value, _)| !offers.iter().any(|offer| offer.value == *value))
+                    .map(|(value, _)| (*value).to_owned()),
+            );
+        }
+        let current = current.as_str().unwrap_or_default();
+        let mut cursor = choices
+            .iter()
+            .position(|choice| self.choice_raw(def.path, choice) == current);
+        if cursor.is_none() && !current.is_empty() {
+            cursor = Some(choices.len());
+            choices.push(current.to_owned());
+        }
+        if choices.is_empty() {
+            return None;
+        }
+        choices.push(TYPE_CHOICE.to_owned());
+        self.notes.remove(def.path);
+        self.mode = Mode::Pick {
+            def,
+            choices,
+            cursor: cursor.unwrap_or(0),
+            filter: Editor::default(),
+        };
+        Some(OverlayEvent::None)
+    }
+
+    fn offer(&self, path: &str, choice: &str) -> Option<&ValueChoice> {
+        let index = choice.strip_prefix(OFFER_PREFIX)?.parse::<usize>().ok()?;
+        self.value_choices.get(path)?.get(index)
+    }
+
+    /// The value a picker row stands for.
+    fn choice_raw<'a>(&'a self, path: &str, choice: &'a str) -> &'a str {
+        self.offer(path, choice)
+            .map_or(choice, |offer| offer.value.as_str())
+    }
+
+    /// Choosing an offered value: save it, assign the model role, or download then save. The
+    /// first Enter on a model that is not downloaded only asks; the picker stays open.
+    fn pick_offer(&mut self, def: &'static SettingDef, offer: ValueChoice) -> OverlayEvent {
+        match offer.action {
+            ChoiceAction::Download
+                if self.download_armed.as_deref() != Some(offer.value.as_str()) =>
+            {
+                self.feedback = Some(format!(
+                    "{} is not downloaded yet. Press Enter again to download it and save {}; Esc cancels.",
+                    offer.label, def.label
+                ));
+                self.download_armed = Some(offer.value);
                 OverlayEvent::None
+            }
+            ChoiceAction::Download => {
+                self.download_armed = None;
+                self.mode = Mode::Browse;
+                self.notes.remove(def.path);
+                self.feedback = Some(format!(
+                    "Downloading {}; {} is saved once the download finishes",
+                    offer.label, def.label
+                ));
+                OverlayEvent::DownloadSetting {
+                    path: def.path.to_owned(),
+                    value: offer.value,
+                    scope: self.scope,
+                }
+            }
+            ChoiceAction::Assign { role, selection } => {
+                self.download_armed = None;
+                self.mode = Mode::Browse;
+                self.feedback = None;
+                OverlayEvent::AssignModel {
+                    role,
+                    selection,
+                    scope: self.scope,
+                }
+            }
+            ChoiceAction::Set => {
+                self.download_armed = None;
+                self.mode = Mode::Browse;
+                let value = Value::String(offer.value);
+                if self.current(def) == value {
+                    OverlayEvent::None
+                } else {
+                    self.emit_set(def, value)
+                }
+            }
+        }
+    }
+
+    fn path_key(&mut self, key: &KeyEvent, keys: &Keymap) -> OverlayEvent {
+        let Mode::Path { def, browser } = &mut self.mode else {
+            return OverlayEvent::None;
+        };
+        let def: &'static SettingDef = def;
+        match browser.key(key, keys) {
+            BrowseStep::Stay => OverlayEvent::None,
+            BrowseStep::Cancel => {
+                self.mode = Mode::Browse;
+                OverlayEvent::None
+            }
+            BrowseStep::Type => {
+                let seed = self.edit_seed(def);
+                self.open_text_editor(def, &seed)
+            }
+            BrowseStep::Chosen(path) => {
+                self.mode = Mode::Browse;
+                let value = Value::String(path.display().to_string());
+                if self.current(def) == value {
+                    OverlayEvent::None
+                } else {
+                    self.emit_set(def, value)
+                }
+            }
+        }
+    }
+
+    fn structured_key(&mut self, key: &KeyEvent, keys: &Keymap) -> OverlayEvent {
+        let (def, step, working) = match &mut self.mode {
+            Mode::List { def, editor } => {
+                let step = editor.key(key, keys);
+                (*def, step, editor.value())
+            }
+            Mode::Entries { def, editor } => {
+                let step = editor.key(key, keys);
+                (*def, step, editor.value().clone())
+            }
+            _ => return OverlayEvent::None,
+        };
+        match step {
+            Step::Stay => OverlayEvent::None,
+            Step::Cancel => {
+                self.mode = Mode::Browse;
+                OverlayEvent::None
+            }
+            // The text editor starts from the working copy, so switching loses nothing.
+            Step::Type => self.open_text_editor(def, &working),
+            Step::Save(value) => {
+                self.mode = Mode::Browse;
+                if self.edit_seed(def) == value {
+                    OverlayEvent::None
+                } else {
+                    self.emit_set(def, value)
+                }
             }
         }
     }
@@ -1989,6 +2317,9 @@ impl SettingsOverlay {
                 return OverlayEvent::None;
             }
             self.mode = Mode::Browse;
+            if self.download_armed.take().is_some() {
+                self.feedback = None;
+            }
             if def.path == "memory.backend" {
                 self.memory_intent = None;
             }
@@ -2004,6 +2335,14 @@ impl SettingsOverlay {
                 return OverlayEvent::None;
             }
             let chosen = choices[at].clone();
+            if chosen == TYPE_CHOICE {
+                self.download_armed = None;
+                let seed = self.edit_seed(def);
+                return self.open_text_editor(def, &seed);
+            }
+            if let Some(offer) = self.offer(def.path, &chosen).cloned() {
+                return self.pick_offer(def, offer);
+            }
             let value = choice_value(def.kind_for(&self.effective), &chosen);
             let unchanged = self.current(def) == value;
             self.mode = Mode::Browse;
@@ -2126,6 +2465,15 @@ impl SettingsOverlay {
 
     /// What a picker row shows for a raw choice value. The saved value is always the raw one.
     fn choice_label(&self, def: &SettingDef, choice: &str) -> String {
+        if choice == TYPE_CHOICE {
+            return "Type another value…".to_owned();
+        }
+        if let Some(offer) = self.offer(def.path, choice) {
+            return match offer.action {
+                ChoiceAction::Download => format!("{} · download", offer.label),
+                _ => offer.label.clone(),
+            };
+        }
         match (def.kind_for(&self.effective), choice) {
             (Kind::AutoBool, "auto") => "Auto (let Dial decide)".to_owned(),
             (Kind::AutoBool, "true") => "On (enabled)".to_owned(),
@@ -2142,6 +2490,39 @@ impl SettingsOverlay {
             .map(|choice| self.choice_label(def, choice))
             .collect();
         pick_matches(&labels, choices, filter)
+    }
+
+    /// The open browser or structured editor on `path`, windowed to `height` rows.
+    fn structured_view(&self, path: &str, height: usize) -> Option<View> {
+        match &self.mode {
+            Mode::Path { def, browser } if def.path == path => Some(View {
+                rows: Vec::new(),
+                input: None,
+                browser: Some(browser.view(height)),
+                note: None,
+            }),
+            Mode::List { def, editor } if def.path == path => Some(editor.view(height)),
+            Mode::Entries { def, editor } if def.path == path => Some(editor.view(height)),
+            _ => None,
+        }
+    }
+
+    /// What the open browser or structured editor does, for the description area.
+    fn structured_help(&self) -> Option<String> {
+        Some(match &self.mode {
+            Mode::Path { .. } => "Enter opens a folder or chooses the entry; type to filter, or type a path and press Enter. Ctrl+E types the value instead.".to_owned(),
+            Mode::List { editor, .. } if editor.ordered() => "Space checks or unchecks; Shift+Up/Down reorders (earlier is preferred); the last row adds another value. Enter saves; Ctrl+E types the list.".to_owned(),
+            Mode::List { .. } => "Space checks or unchecks; the last row adds another value. Enter saves; Ctrl+E types the list.".to_owned(),
+            Mode::Entries { def, .. } => {
+                let layer = if matches!(def.kind, Kind::Toml) {
+                    format!(" Editing only the {} layer; inherited values are not copied.", scope_name(self.scope))
+                } else {
+                    String::new()
+                };
+                format!("Enter edits an entry; Delete removes it; choose Save to keep the changes.{layer} Ctrl+E edits it as TOML text.")
+            }
+            _ => return None,
+        })
     }
 
     // ---- drawing --------------------------------------------------------------------------
@@ -2295,6 +2676,41 @@ impl SettingsOverlay {
                         });
                     }
                 }
+                if i == self.cursor
+                    && let Some(view) =
+                        self.structured_view(def.path, body_rows.saturating_sub(4).max(PICK_ROWS))
+                {
+                    if let Some(browser) = view.browser {
+                        items.push(Item::Hint(format!("In {}", browser.title)));
+                        items.push(Item::Filter {
+                            editor: browser.filter,
+                            shown: browser.shown,
+                            total: browser.total,
+                        });
+                        for (name, on) in browser.rows {
+                            if on {
+                                cursor_item = items.len();
+                            }
+                            items.push(Item::Choice { name, on });
+                        }
+                        if let Some(note) = browser.note {
+                            items.push(Item::Hint(note));
+                        }
+                    }
+                    for (name, on) in view.rows {
+                        if on {
+                            cursor_item = items.len();
+                        }
+                        items.push(Item::Choice { name, on });
+                    }
+                    if let Some((prompt, editor)) = view.input {
+                        cursor_item = items.len();
+                        items.push(Item::Input { prompt, editor });
+                    }
+                    if let Some(note) = view.note {
+                        items.push(Item::Note(note));
+                    }
+                }
                 if let Some(note) = self.notes.get(def.path) {
                     items.push(Item::Note(note.clone()));
                 }
@@ -2320,13 +2736,16 @@ impl SettingsOverlay {
         let list_w = list_w_total.saturating_sub(usize::from(overflow));
         let mut top = cursor_item;
         let mut bottom = cursor_item;
-        if matches!(items.get(cursor_item), Some(Item::Choice { .. })) {
+        if matches!(
+            items.get(cursor_item),
+            Some(Item::Choice { .. } | Item::Input { .. })
+        ) {
             // Opening a picker near the bottom must reveal its alternatives, not just its
             // selected value. Keep the setting label with the choices when the block fits.
             while top > 0
                 && matches!(
                     items.get(top - 1),
-                    Some(Item::Choice { .. } | Item::Filter { .. })
+                    Some(Item::Choice { .. } | Item::Filter { .. } | Item::Hint(_))
                 )
             {
                 top -= 1;
@@ -2334,7 +2753,7 @@ impl SettingsOverlay {
             top = top.saturating_sub(1);
             while matches!(
                 items.get(bottom + 1),
-                Some(Item::Choice { .. } | Item::Filter { .. })
+                Some(Item::Choice { .. } | Item::Filter { .. } | Item::Input { .. })
             ) {
                 bottom += 1;
             }
@@ -2348,7 +2767,13 @@ impl SettingsOverlay {
         }
         while matches!(
             items.get(bottom + 1),
-            Some(Item::Note(_) | Item::Hint(_) | Item::Setup { .. } | Item::Filter { .. })
+            Some(
+                Item::Note(_)
+                    | Item::Hint(_)
+                    | Item::Setup { .. }
+                    | Item::Filter { .. }
+                    | Item::Input { .. }
+            )
         ) {
             bottom += 1;
         }
@@ -2468,6 +2893,15 @@ impl SettingsOverlay {
                     spans.push(Span::styled(format!("   {count}"), theme.fg(Tok::Muted)));
                     filled(spans, list_w, Style::default())
                 }
+                Some(Item::Input { prompt, editor }) => {
+                    let mut spans = vec![Span::styled(
+                        format!("      {prompt}: "),
+                        theme.fg(Tok::Muted),
+                    )];
+                    let room = list_w.saturating_sub(spans_width(&spans) + 1);
+                    spans.extend(editor_spans(theme, editor, room, false));
+                    filled(spans, list_w, Style::default())
+                }
                 Some(Item::Choice { name, on }) => {
                     let pointer = if *on {
                         theme.sym(Sym::RadioOn)
@@ -2534,6 +2968,8 @@ impl SettingsOverlay {
                             input_hint(def.kind_for(&self.effective))
                         };
                         head.push((hint, Tok::Muted));
+                    } else if let Some(help) = self.structured_help() {
+                        head.push((help, Tok::Muted));
                     } else {
                         if let Some(feedback) = &self.feedback {
                             head.push((feedback.clone(), Tok::Success));
@@ -2912,6 +3348,31 @@ impl SettingsOverlay {
                 ));
                 hints
             }
+            Mode::Path { .. } => vec![
+                hint(keys, Action::SelectConfirm, "open/choose"),
+                pair(Action::SelectUp, Action::SelectDown, "move"),
+                "Type filter or path".to_owned(),
+                "Ctrl+E type".to_owned(),
+                hint(keys, Action::SelectCancel, "cancel"),
+            ],
+            Mode::List { editor, .. } => {
+                let mut hints = vec![
+                    hint(keys, Action::SelectConfirm, "save"),
+                    "Space check".to_owned(),
+                ];
+                if editor.ordered() {
+                    hints.push("Shift+↑↓ reorder".to_owned());
+                }
+                hints.push("Ctrl+E type".to_owned());
+                hints.push(hint(keys, Action::SelectCancel, "cancel"));
+                hints
+            }
+            Mode::Entries { .. } => vec![
+                hint(keys, Action::SelectConfirm, "edit/save"),
+                "Del remove".to_owned(),
+                "Ctrl+E TOML text".to_owned(),
+                hint(keys, Action::SelectCancel, "cancel"),
+            ],
             Mode::Browse => {
                 let verb = match self.current_row() {
                     Some(Row::Link(_)) => "open",
@@ -2922,11 +3383,18 @@ impl SettingsOverlay {
                             "show"
                         }
                     }
-                    Some(Row::Setting(i)) => match crate::config::schema::registry()[i].kind {
-                        Kind::Bool => "toggle",
-                        Kind::AutoBool | Kind::Enum(_) | Kind::Choice(_) | Kind::Theme => "choose",
-                        _ => "edit",
-                    },
+                    Some(Row::Setting(i)) => {
+                        let def = &crate::config::schema::registry()[i];
+                        match (def.kind, def.source()) {
+                            (Kind::Bool, _) => "toggle",
+                            (_, Some(Source::Path(_))) => "browse",
+                            (_, Some(_))
+                            | (Kind::AutoBool | Kind::Enum(_) | Kind::Choice(_) | Kind::Theme, _) => {
+                                "choose"
+                            }
+                            _ => "edit",
+                        }
+                    }
                     None => "select",
                 };
                 let mut hints = vec![

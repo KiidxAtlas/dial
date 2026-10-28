@@ -160,6 +160,12 @@ impl Participant {
         }
         Ok(inbox)
     }
+
+    /// Whether letters are queued for this instance, without taking them.
+    pub fn has_mail(&self) -> Result<bool> {
+        let _transaction = transaction(&self.dir)?;
+        Ok(!load(&self.dir, &self.id)?.inbox.is_empty())
+    }
 }
 
 impl Drop for Participant {
@@ -383,6 +389,9 @@ fn collect(dir: &Path) -> Result<(Vec<Peer>, usize)> {
     }
     Ok((peers, live_count))
 }
+
+mod runs;
+pub use runs::{MAX_SUMMARY, RunEntry, RunResult, RunStatus, tail};
 
 #[cfg(test)]
 mod tests;

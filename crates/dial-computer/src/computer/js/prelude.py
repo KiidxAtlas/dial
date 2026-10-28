@@ -146,6 +146,9 @@ def _make_computer():
         async def zoom(self, region, *args, **kwargs):
             return await self._method("zoom", (region, *args), kwargs)
 
+        async def locate(self, description):
+            return await self._method("locate", (description,), {})
+
         async def click(self, *args, **kwargs):
             return await self._method("click", args, kwargs)
 

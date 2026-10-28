@@ -91,6 +91,19 @@ fn retention_and_opt_out_follow_auth_and_explicit_configuration() {
         };
         apply(&mut body, Some(&profile), oauth, Level::Full);
         assert_eq!(
+            tier(Some(&profile), oauth, Level::Full),
+            Some(if expected_long {
+                super::super::cache_warmer::Tier::Long
+            } else {
+                super::super::cache_warmer::Tier::Short
+            })
+        );
+        assert_eq!(
+            tier(Some(&profile), oauth, Level::WithoutTtl),
+            Some(super::super::cache_warmer::Tier::Short)
+        );
+        assert_eq!(tier(Some(&profile), oauth, Level::Off), None);
+        assert_eq!(
             body["system"][0]["cache_control"]["ttl"].as_str(),
             expected_long.then_some("1h")
         );
@@ -112,6 +125,17 @@ fn retention_and_opt_out_follow_auth_and_explicit_configuration() {
     );
     assert_eq!(count(&disabled), 0);
     assert!(disabled["messages"][2].get("dial_transient").is_none());
+    assert_eq!(
+        tier(
+            Some(&ModelProfile {
+                prompt_cache: Some(false),
+                ..Default::default()
+            }),
+            true,
+            Level::Full
+        ),
+        None
+    );
 }
 
 #[test]

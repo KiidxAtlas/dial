@@ -601,6 +601,17 @@ impl Accumulator {
             };
             ensure!(!block.closed, "duplicate Bedrock content stop");
             block.closed = true;
+            if let Content::Tool { id, name, input } = &block.content {
+                ensure!(
+                    on_event(&StreamEvent::ToolCallComplete {
+                        index,
+                        id: id.clone(),
+                        name: name.clone(),
+                        arguments: input.clone(),
+                    }),
+                    Interrupted
+                );
+            }
             return Ok(false);
         }
         let delta = &value["delta"];

@@ -78,6 +78,7 @@ pub(super) fn resolve_current(config: &Config) -> Result<Option<Target>> {
             key: String::new(),
             account_id: Some(account),
             headers,
+            settings: Default::default(),
         }));
     }
     let base = llm::provider::endpoint_url(&endpoint.base_url, endpoint.allow_insecure)?;
@@ -124,23 +125,37 @@ pub(super) fn resolve_current(config: &Config) -> Result<Option<Target>> {
         key,
         account_id: None,
         headers,
+        settings: Default::default(),
     }))
 }
 
 pub(super) fn body(target: &Target, request: &Request) -> Value {
     match target.wire {
-        Wire::Responses => json!({
-            "model": target.model,
-            "input": [{"role":"user", "content":[{"type":"input_text", "text":request.prompt}]}],
-            "instructions": "Generate exactly one image matching the user's request.",
-            "tools": [{"type":"image_generation", "size":request.size, "output_format":
-                match std::path::Path::new(request.output).extension().and_then(|s| s.to_str()).map(str::to_ascii_lowercase).as_deref() {
-                    Some("jpg" | "jpeg") => "jpeg", Some("webp") => "webp", _ => "png"
-                }}],
-            "tool_choice": {"type":"image_generation"},
-            "stream": true,
-            "store": false
-        }),
+        Wire::Responses => {
+            let mut tool = json!({"type":"image_generation", "size":request.size, "output_format":
+            match std::path::Path::new(request.output).extension().and_then(|s| s.to_str()).map(str::to_ascii_lowercase).as_deref() {
+                Some("jpg" | "jpeg") => "jpeg", Some("webp") => "webp", _ => "png"
+            }});
+            super::apply_settings(target, &mut tool, request.source.is_some());
+            let mut content = vec![json!({"type":"input_text", "text":request.prompt})];
+            if let Some(source) = &request.source {
+                content.push(json!({"type":"input_image", "image_url":source.data_url()}));
+            }
+            let instructions = if request.source.is_some() {
+                "Edit the provided image as the user requests and return exactly one image."
+            } else {
+                "Generate exactly one image matching the user's request."
+            };
+            json!({
+                "model": target.model,
+                "input": [{"role":"user", "content":content}],
+                "instructions": instructions,
+                "tools": [tool],
+                "tool_choice": {"type":"image_generation"},
+                "stream": true,
+                "store": false
+            })
+        }
         Wire::ChatCompletions => json!({
             "model": target.model,
             "messages": [{"role":"user", "content":request.prompt}],

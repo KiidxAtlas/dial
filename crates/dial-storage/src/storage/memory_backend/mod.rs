@@ -13,6 +13,8 @@ mod semantic_store;
 mod sharpshooter;
 pub use managed::discover as managed_skills;
 pub use managed::{directory_path as managed_directory, read_skill as read_managed_skill};
+/// OpenAI-compatible embedding wire helpers, shared with the `image_embedding` role.
+pub use semantic::{EmbeddingWire, embedding_url, parse_embeddings};
 pub fn managed_root(layout: &Layout) -> std::path::PathBuf {
     layout
         .user_dir

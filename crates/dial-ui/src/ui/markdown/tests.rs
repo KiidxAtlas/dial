@@ -489,7 +489,9 @@ fn diagram_fence_renders_a_titled_frame_of_equal_width_rows() {
     assert_eq!(text.len(), 6, "{text:?}");
     assert!(text[0].starts_with("╭─ Request flow ─"), "{text:?}");
     assert!(text[0].ends_with('╮') && text[5].starts_with('╰') && text[5].ends_with('╯'));
-    assert_eq!(text[1], "│ [User] --> [Agent] --> dial-app │");
+    assert_eq!(text[1], "│ [User] ──▶ [Agent] ──▶ dial-app │");
+    assert_eq!(text[2], "│    │                            │");
+    assert_eq!(text[3], "│    ▼                            │");
     assert_eq!(text[4], "│ [Tool]                          │");
     let widths: Vec<usize> = text.iter().map(|r| text::width(r)).collect();
     assert!(widths.iter().all(|&w| w == widths[0]), "{widths:?}");
@@ -501,7 +503,8 @@ fn diagram_fence_renders_a_titled_frame_of_equal_width_rows() {
 fn diagram_connectors_are_accented_and_labels_are_not() {
     let t = theme();
     let rows = md(DIAGRAM, 60);
-    assert_eq!(style_of(&rows, "-->").fg, t.fg(Tok::Accent).fg);
+    assert_eq!(style_of(&rows, "──▶").fg, t.fg(Tok::Accent).fg);
+    assert_eq!(style_of(&rows, "╭").bg, t.bg(Tok::MdCodeBlockBg).bg);
     assert_eq!(style_of(&rows, "Agent").fg, t.fg(Tok::MdCodeBlock).fg);
     // a hyphen inside a word is part of the label
     assert_eq!(style_of(&rows, "dial-app").fg, t.fg(Tok::MdCodeBlock).fg);
@@ -514,6 +517,36 @@ fn diagram_connectors_are_accented_and_labels_are_not() {
         style_of(&slopes, "snake_case").fg,
         t.fg(Tok::MdCodeBlock).fg
     );
+}
+
+#[test]
+fn ascii_line_art_is_drawn_cell_for_cell_and_labels_stay_text() {
+    let src = [
+        "+------+   +-----+",
+        "| app  |-->| ui  |",
+        "+--+---+   +-----+",
+        "   |  <== v1 dial-app a - b C++",
+        "   v",
+        "[core]",
+    ];
+    let drawn = draw_line_art(&src);
+    assert_eq!(
+        drawn,
+        [
+            "╭──────╮   ╭─────╮",
+            "│ app  │──▶│ ui  │",
+            "╰──┬───╯   ╰─────╯",
+            "   │  ◀══ v1 dial-app a - b C++",
+            "   ▼",
+            "[core]",
+        ]
+    );
+    for (before, after) in src.iter().zip(&drawn) {
+        assert_eq!(text::width(before), text::width(after), "{after}");
+    }
+    // the ASCII glyph set keeps the model's source characters
+    let ascii = plain(&render("```diagram\n+--+\n```", 40, &theme(), true));
+    assert!(ascii[1].starts_with("| +--+ "), "{ascii:?}");
 }
 
 #[test]

@@ -294,6 +294,10 @@ pub(in crate::agent) fn chat(
                         gate.tools_started = true;
                         gate.output(config, !delta.trim().is_empty())
                     }
+                    StreamEvent::ToolCallComplete { arguments, .. } => {
+                        gate.tools_started = true;
+                        gate.output(config, !arguments.trim().is_empty())
+                    }
                 }
             };
             if !allowed {

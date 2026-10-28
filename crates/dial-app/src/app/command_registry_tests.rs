@@ -130,6 +130,12 @@ fn model_aliases_and_subcommands_share_live_policy_and_panel_destinations() {
         }
         assert!(matches!(command_panel(name, ""), Some(Which::Models)));
         assert!(matches!(
+            command_panel("image", "settings"),
+            Some(Which::ImageSettings)
+        ));
+        assert!(command_panel("image", "generate a fox").is_none());
+        assert_eq!(during_turn("image", "settings"), DuringTurn::Now);
+        assert!(matches!(
             command_panel(name, "settings"),
             Some(Which::ModelSettings)
         ));
@@ -196,7 +202,7 @@ fn model_preparation_only_publishes_successful_uncancelled_results() {
             cancel: Arc::new(AtomicBool::new(cancelled)),
             model: Some(PreparedModel {
                 changes: selection_changes(&config, &selection, "main").unwrap(),
-                role: "main".into(),
+                role: Some("main".into()),
                 scope: Scope::Global,
             }),
         });

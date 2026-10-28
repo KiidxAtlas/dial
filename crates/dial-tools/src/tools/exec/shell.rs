@@ -764,10 +764,13 @@ fn run_bash(
                 } else {
                     format!("Output so far:\n{so_far}\n")
                 };
-                ToolOutput::ok(format!(
+                let mut output = ToolOutput::ok(format!(
                     "command is running as background job {id} (after {}s): {command}\n{so_far}Keep working; you are notified when it finishes. bg wait returns its output when it exits; stop it with bg kill. Do not poll it; continue independent work or use a bounded bg wait.",
                     started.elapsed().as_secs()
-                ))
+                ));
+                // Structured so the controller can follow the job without parsing this prose.
+                output.data = Some(serde_json::json!({"background_job": id}));
+                output
             });
         }
         if cancel_now {

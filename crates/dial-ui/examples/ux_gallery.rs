@@ -322,6 +322,28 @@ fn main() -> anyhow::Result<()> {
             &rows_buffer(view.rows, width, 6),
             light,
         );
+        for phase in [
+            dial_agent::agent::RequestPhase::Waiting,
+            dial_agent::agent::RequestPhase::Backoff,
+        ] {
+            let mut phase_status = status.clone();
+            phase_status.activity = phase.label().into();
+            let view = composer.view(
+                width,
+                &ComposerCtx {
+                    theme: &theme,
+                    keys: &keys,
+                    ui: &ui,
+                    status: &phase_status,
+                },
+            );
+            screen(
+                &mut out,
+                &format!("Inference {} / {name}", phase.label()),
+                &rows_buffer(view.rows, width, 6),
+                light,
+            );
+        }
         let working_ctx = ComposerCtx {
             theme: &theme,
             keys: &keys,
@@ -933,6 +955,30 @@ fn main() -> anyhow::Result<()> {
         screen(
             &mut out,
             &format!("Answer formatting / {name}"),
+            &rows_buffer(rows, width, 24),
+            light,
+        );
+        let mut diagram_transcript = Transcript::new();
+        diagram_transcript.push_user("How does one turn work?");
+        diagram_transcript.assistant_delta(
+            "```diagram One Dial turn\nuser -> prompt assembly -> model -> answer\nmodel -> tool call -> schema -> approval -> sandbox\nsandbox -> checkpoint -> result -> model\nanswer -> focused checks -> fail -> repair -> model\n```\n\n```diagram Crate layers\n[dial-app] --> [dial-ui] --> [dial-agent]\n                                 |\n                                 v\n[dial-llm] <-- [dial-storage] <-- [dial-tools]\n    |\n    v\n+-------------+\n| dial-core   |\n+-------------+\n```",
+        );
+        diagram_transcript.finish_turn();
+        let rows = diagram_transcript
+            .take_settled_with_images(
+                width,
+                &TranscriptCtx {
+                    theme: &theme,
+                    ui: &ui,
+                    tick: 0,
+                    tools_expanded: false,
+                    expand_key: &keys.label(dial_ui::ui::keys::Action::ToolsExpand),
+                },
+            )
+            .0;
+        screen(
+            &mut out,
+            &format!("Diagrams / {name}"),
             &rows_buffer(rows, width, 24),
             light,
         );

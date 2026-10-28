@@ -757,6 +757,68 @@ fn successful_background_warning_text_does_not_arm_a_failure_barrier() {
 }
 
 #[test]
+fn an_edit_refused_only_for_unread_lines_it_revealed_may_be_reissued() {
+    let mut edits = Edits::new();
+    let edit = edits.call(
+        "edit",
+        serde_json::json!({"input":"[a.rs#ABCD]\nPUT 3.=3:\n+x"}),
+    );
+    let refusal = format!(
+        "a.rs#ABCD: lines 3 have not been shown by a read, so nothing was written. {}; check them, then re-issue the edit against [a.rs#ABCD].",
+        crate::tools::edit::hashline::UNSEEN_LINES_NOW_READ
+    );
+    edits.settle(&edit, vec![], ToolOutput::err(refusal));
+    assert!(edits.engine.rejection_at(&edits.workspace, &edit).is_none());
+    // Any other failure of the same edit still arms the barrier.
+    edits.settle(&edit, vec![], ToolOutput::err("anchor mismatch"));
+    assert!(edits.engine.rejection_at(&edits.workspace, &edit).is_some());
+}
+
+#[test]
+fn a_failed_shell_command_may_rerun_after_another_session_changes_the_tree() {
+    let mut edits = Edits::new();
+    let root = edits.workspace.root().to_path_buf();
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&root)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    };
+    git(&["init", "-q"]);
+    std::fs::write(root.join("lib.rs"), "broken {\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "init"]);
+    let build = edits.call("bash", serde_json::json!({"command": "cargo check"}));
+    edits.settle(&build, vec![], ToolOutput::err("error: unclosed delimiter"));
+    assert!(
+        edits
+            .engine
+            .rejection_at(&edits.workspace, &build)
+            .is_some(),
+        "an unchanged tree keeps the barrier"
+    );
+    // Another session repairs the file; this session made no edit of its own.
+    std::fs::write(root.join("lib.rs"), "fn ok() {}\n").unwrap();
+    assert!(
+        edits
+            .engine
+            .rejection_at(&edits.workspace, &build)
+            .is_none()
+    );
+    // Non-shell failures keep the barrier regardless of the tree.
+    let read = edits.call("read", serde_json::json!({"path": "missing.rs"}));
+    edits.settle(&read, vec![], ToolOutput::err("missing file"));
+    std::fs::write(root.join("lib.rs"), "fn other() {}\n").unwrap();
+    assert!(edits.engine.rejection_at(&edits.workspace, &read).is_some());
+}
+
+#[test]
 fn a_post_commit_failure_does_not_release_the_failed_operation() {
     let mut edits = Edits::new();
     let check = edits.call("bash", serde_json::json!({"command":"cargo test"}));

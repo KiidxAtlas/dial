@@ -105,6 +105,18 @@ fn unknown_and_finished_recipients_fail_clearly() {
 }
 
 #[test]
+fn a_project_peer_id_is_pointed_at_the_peers_tool() {
+    let team = Team::open(8);
+    let why = team
+        .send(PARENT, "0f8ff1c13599ab16e96186a98ae2a128", "hi")
+        .unwrap_err();
+    assert!(why.contains("project peer id"), "{why}");
+    assert!(why.contains("`peers` tool"), "{why}");
+    let broadcast = team.send(PARENT, ALL, "hi").unwrap_err();
+    assert!(broadcast.contains("`peers` tool"), "{broadcast}");
+}
+
+#[test]
 fn a_worker_reaches_the_parent_and_the_parent_reaches_a_worker() {
     let team = Team::open(8);
     team.enlist("task-1", "scout", quiet()).unwrap();

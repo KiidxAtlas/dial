@@ -19,6 +19,9 @@ pub(in crate::agent) struct Engine {
     /// Failed normalized calls stay withheld across continuations and compaction, until a
     /// successful novel source mutation or new instruction changes the recovery context.
     failed: std::collections::BTreeSet<[u8; 32]>,
+    /// Tree a failed shell command ran against. Another session can repair the checkout, so a
+    /// later tree (different HEAD or uncommitted content) releases that command's barrier.
+    failed_trees: std::collections::HashMap<[u8; 32], String>,
     repeats: guard::RepeatGuard,
     investigation: investigation::InvestigationGuard,
     returned_reads: investigation::ReturnedReads,
@@ -213,7 +216,8 @@ impl Engine {
         }
     }
     pub fn rejection_at(&mut self, workspace: &Workspace, call: &ToolCall) -> Option<String> {
-        if self.failed.contains(&failed_identity(call)) {
+        let identity = failed_identity(call);
+        if self.failed.contains(&identity) && !self.tree_changed_since_failure(workspace, call) {
             return Some(format!(
                 "Failed-operation retry barrier: this unchanged `{}` call already failed and was not executed again. Inspect the retained diagnostic, use a different targeted observation, correct the arguments or repair the source before retrying. Todo updates and compaction do not release this barrier.",
                 call.name
@@ -226,6 +230,20 @@ impl Engine {
             ));
         }
         self.checkpoint.rejection_at(workspace, call)
+    }
+    /// A failed shell command whose tree has since changed (for example another session fixed the
+    /// file that broke the build) may run again; its barrier is released.
+    fn tree_changed_since_failure(&mut self, workspace: &Workspace, call: &ToolCall) -> bool {
+        let identity = failed_identity(call);
+        let Some(before) = self.failed_trees.get(&identity) else {
+            return false;
+        };
+        let changed = shell_tree(workspace, call).is_some_and(|now| &now != before);
+        if changed {
+            self.failed.remove(&identity);
+            self.failed_trees.remove(&identity);
+        }
+        changed
     }
     /// Snapshot admission restrictions before experimental early reads can start.
     pub fn failed_calls(&self) -> std::collections::BTreeSet<[u8; 32]> {
@@ -315,9 +333,20 @@ impl Engine {
         );
         if mutated && !output.is_error && !check_failed {
             self.failed.clear();
+            self.failed_trees.clear();
         }
-        if crate::runtime::execution::ToolStatus::from_output(output).failed() {
-            self.failed.insert(failed_identity(call));
+        // An edit refused only because its anchors were unread shows those lines and makes them
+        // witnesses, so the identical edit is now valid and must not be withheld.
+        let witnessed = call.name == "edit"
+            && output
+                .text
+                .contains(crate::tools::edit::hashline::UNSEEN_LINES_NOW_READ);
+        if crate::runtime::execution::ToolStatus::from_output(output).failed() && !witnessed {
+            let identity = failed_identity(call);
+            self.failed.insert(identity);
+            if let Some(tree) = shell_tree(workspace, call) {
+                self.failed_trees.insert(identity, tree);
+            }
             output.text.push_str("\nFailed-operation retry barrier: unchanged arguments are now withheld. Correct the arguments, inspect a different source, or repair the source before retrying; completed effects are retained.");
         }
         // Duplicate memory may only cite results the model still sees in full.
@@ -357,6 +386,16 @@ fn call_identity(call: &ToolCall) -> String {
 pub(in crate::agent) fn failed_identity(call: &ToolCall) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     Sha256::digest(call_identity(call).as_bytes()).into()
+}
+
+/// The tree a `bash` call runs against; `None` for other tools or outside git.
+fn shell_tree(workspace: &Workspace, call: &ToolCall) -> Option<String> {
+    (call.name == "bash").then_some(())?;
+    crate::agent::verify::shared_runs::tree_fingerprint(
+        workspace.root(),
+        call.arguments["command"].as_str().unwrap_or_default(),
+        call.arguments["cwd"].as_str().unwrap_or_default(),
+    )
 }
 
 #[cfg(test)]

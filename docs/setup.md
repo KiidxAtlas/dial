@@ -22,7 +22,11 @@ outside software. Dial sets it up on request, never at startup.
   `/setup <id> yes` explicitly runs it.
   `/setup embeddings` still prints the model catalog; `/setup embeddings:<model>` previews,
   and `/setup embeddings:<model> yes` pulls and assigns that model. Custom Ollama model names
-  remain supported through these direct commands. `/setup providers` opens Providers directly.
+  remain supported through these direct commands. `/setup grounding` and
+  `/setup image-embeddings` list the curated vision models; `/setup <id>:<repo>` previews and
+  `/setup grounding yes` / `/setup image-embeddings yes` download the default MLX checkpoint
+  and assign its role (see [model-vision.md](model-vision.md)). `/setup providers` opens
+  Providers directly.
 - **Shell**: `dial doctor` reports the same list (✓ installed with its path, · not installed with the
   `dial doctor --fix <id>` command), followed by a Memory section (the selected backend, what it
   still needs, and each backend's readiness). Select a backend without the TUI with

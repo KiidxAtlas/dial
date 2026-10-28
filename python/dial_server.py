@@ -546,9 +546,31 @@ def watch_parent():
         threading.Thread(target=watch_parent, daemon=True).start()
 
 
+def install_embedding_remapping(loader=None):
+    """Load VLM-architecture embedding checkpoints (Qwen3-VL-Embedding) as embedding models.
+
+    Their config.json names the chat architecture (`qwen3_vl`), so MLX-VLM's embedding loader would
+    build a generator that "does not produce embeddings". This server only ever loads embeddings.
+    """
+    if loader is None:
+        import importlib
+        loader = importlib.import_module("mlx_vlm.embedding_loader")
+    loader.EMBEDDING_MODEL_REMAPPING.setdefault("qwen3_vl", "qwen3_vl_embedding")
+
+
 def main():
     watch_parent()
     import os
+    if os.environ.get("DIAL_MODEL_ENGINE") == "mlx-vlm-embedding":
+        try:
+            from mlx_vlm import server
+        except ModuleNotFoundError as error:
+            if error.name == "mlx_vlm":
+                raise RuntimeError("Local image embeddings require MLX-VLM in Dial's Python runtime; run dial setup") from error
+            raise
+        install_embedding_remapping()
+        server.main()
+        return
     if os.environ.get("DIAL_MODEL_ENGINE") == "mlx-vlm":
         try:
             from mlx_vlm import server

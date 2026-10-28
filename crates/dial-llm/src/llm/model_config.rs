@@ -720,6 +720,14 @@ pub const ROLES: &[(&str, &str)] = &[
         "Image generation; unassigned follows the main model when it supports image output",
     ),
     (
+        "grounding",
+        "UI grounding vision model: finds an element in a screenshot for computer `win.locate` and browser `locate`; unassigned leaves locate off",
+    ),
+    (
+        "image_embedding",
+        "Multimodal image embedding model for the image_search tool (text-to-image, similar images, prompt match); unassigned leaves image_search off",
+    ),
+    (
         TURN_DRAFTER,
         "Turn optimizer (experimental): rewrites each user message into a structured prompt with diagrams; the main model sees only the draft; unassigned follows main",
     ),

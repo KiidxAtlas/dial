@@ -298,11 +298,17 @@ turn finishes. See [Session coordination](session-coordination.md) for delivery,
   `/permissions allow --persist bash cargo test` persists a project rule outside the workspace.
   Deny rules take precedence, including in automatic approval mode.
 - Idle terminal frames are not rewritten. Fenced code gets theme-aware lexical highlighting,
-  and a `diagram` fence (```` ```diagram Optional title ````) is drawn as a framed panel: an accent
-  border with the title in its top edge, connector glyphs (`-->`, `|`, box drawing, arrows) tinted
-  apart from the labels, and the theme's code background. Diagram rows are clipped with an ellipsis
-  rather than wrapped, so their columns stay aligned; the source text is unchanged in the transcript.
-  The agent is prompted to use these for structure and flow instead of long prose.
+  and a `diagram` fence (```` ```diagram Optional title ````) is drawn as a filled, framed panel: an
+  accent border with the title in its top edge, connector glyphs tinted apart from the labels, and the
+  theme's code background. Plain ASCII line art is redrawn cell for cell: `-`/`=` runs become `─`/`═`,
+  `|` becomes `│`, `->` and `<-` get `▶`/`◀` heads, a lone `v`/`^` under or over a line becomes
+  `▼`/`▲`, and each `+` becomes the matching rounded corner or junction. Hyphens and letters inside
+  words stay labels, and the ASCII glyph set shows the source unchanged. Diagram rows are clipped
+  with an ellipsis rather than wrapped, so their columns stay aligned; the source text is unchanged
+  in the transcript. The agent is advised, not required, to use a diagram only when the structure
+  branches, loops, layers or links several parts, and to write it as unboxed ASCII arrows: boxes and
+  long arrows cost tokens without adding meaning, box-drawing characters cost more than ASCII, and a
+  linear flow is shorter as one sentence or one arrow line.
   Completed Markdown prefixes are cached while streaming. Edit and write cards show the change as a
   numbered, coloured diff (separate hunks with two lines of context, per file); the anchored preview rows
   and removed-lines report the model gets are left out. Each todo call renders the list as it now stands,
@@ -364,6 +370,29 @@ While you search, the category tabs are not offered and `Tab` does nothing; `Esc
 Choice lists also accept typing to filter their labels and stored values. `Esc` clears that filter
 before returning to settings; `Enter` confirms only a visible match. Clearing an override restores
 its inherited value, rather than resetting unrelated settings.
+
+Settings that name something Dial can list offer it instead of a typing field; `Ctrl-E` in any of
+these choosers switches to typing the value, and every chooser still accepts values it does not list:
+
+- **Model rows** (draft model, architecture model, main model, decision-memory override, image
+  model) list discovered and downloaded models. A suggested local model that is not downloaded is
+  marked `· download`: the first `Enter` asks, the second downloads it in the background and saves
+  the setting only when the download succeeds. A failed or cancelled download (`Esc` closes the
+  panel and cancels it) keeps the previous value; opening a picker never starts a download. The
+  main model row assigns the model through the same path as `/models`.
+- **Name rows** (provider, model profile) list the configured names.
+- **Path rows** (Python, Node, worker, IDA, LSP programs) open a file browser starting in the
+  project. `Enter` opens a folder or chooses the entry; typing filters the listing, or type a path
+  (`~/`, absolute or relative) and press `Enter`. Hidden entries appear when the filter starts with `.`.
+- **Known-value lists** (status line segments, compaction order, integrations, foreign rule
+  sources, recall types, learn-from models) open a checklist: `Space` checks or unchecks,
+  `Shift-Up`/`Shift-Down` reorders preference lists, and the last row adds another value. Extra
+  writable folders add entries through the folder browser.
+- **Tables and arrays** (verification, model profiles and similar collections) open one
+  row per entry: `Enter` edits that entry as `name = value` (or one value for arrays), `Delete`
+  removes it, and **Save** writes the collection. Project scope edits only the project layer, as the
+  text editor does. Collections that can hold credentials (providers, MCP, hooks, tools, LSP and
+  similar) keep the masked text editor.
 
 The hub includes controls for all persisted configuration fields. `/settings` manages interactive/coding
 settings; `/improve settings` holds the learning and evaluation categories. Less common scalar fields

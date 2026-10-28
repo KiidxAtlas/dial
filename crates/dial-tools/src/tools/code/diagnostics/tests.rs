@@ -41,3 +41,24 @@ fn collector_joins_split_lines_and_respects_its_budget() {
     assert_eq!(kept, "error[E0308]: mismatched types\n  --> src/a.rs:1:1\n");
     assert_eq!((lines, overflow), (2, 1));
 }
+
+#[test]
+fn warning_locations_do_not_crowd_out_the_error() {
+    let mut noisy = String::new();
+    for n in 0..25 {
+        noisy.push_str(&format!(
+            "warning: unused import: `x{n}`\n  --> crates/w/src/lib.rs:{n}:5\n   |\n"
+        ));
+    }
+    noisy.push_str("error[E0004]: non-exhaustive patterns\n  --> crates/a/src/apply.rs:21:11\n");
+    noisy.push_str("warning: unused variable\n  --> crates/w/src/lib.rs:99:1\n");
+    let mut collector = Collector::new(200);
+    collector.feed(noisy.as_bytes());
+    collector.finish();
+    let (kept, lines, overflow) = collector.kept();
+    assert_eq!(
+        kept,
+        "error[E0004]: non-exhaustive patterns\n  --> crates/a/src/apply.rs:21:11\n"
+    );
+    assert_eq!((lines, overflow), (2, 0));
+}

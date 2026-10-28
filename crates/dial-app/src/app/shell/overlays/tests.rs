@@ -118,3 +118,49 @@ fn busy_drafter_command_returns_on_lock_contention_and_can_be_retried() {
     assert!(shell.startup.is_none());
     assert!(shell.deferred.is_empty());
 }
+
+#[test]
+fn image_settings_open_during_a_turn_and_save_a_per_model_entry() {
+    let (_home, _project, app, mut shell) = shell();
+    assert!(!shell.route_busy_command(&app, "/image settings".into()));
+    assert!(shell.startup.is_none() && shell.deferred.is_empty());
+    if let Some(state) = shell.busy_overlay.as_ref() {
+        assert!(matches!(state.overlay, ActiveOverlay::ImageSettings(_)));
+        shell.finish_busy_overlay(&app).unwrap();
+    }
+
+    // What the panel sends: the whole entry under a bare key derived from the model id.
+    let (key, mut entry) = app.config.image.entry_for("org/flux-turbo");
+    entry.steps = Some(4);
+    entry.loras = vec![crate::config::image::ImageLora {
+        path: "style.safetensors".into(),
+        scale: 1.25,
+    }];
+    let change = |entry: &crate::config::image::ImageModelSettings| Change::Set {
+        path: format!("image.models.{key}"),
+        value: toml::Value::try_from(entry).unwrap(),
+    };
+    shell
+        .save(&app, None, &[change(&entry)], Scope::Project)
+        .unwrap();
+    let saved = app.reload().unwrap();
+    assert_eq!(saved.image.settings_for("org/flux-turbo"), Some(&entry));
+    assert_eq!(saved.image.entry_for("org/flux-turbo").0, key);
+    assert_eq!(saved.model_profile, app.config.model_profile);
+
+    entry.steps = Some(0);
+    assert!(
+        shell
+            .save(&app, None, &[change(&entry)], Scope::Project)
+            .is_err()
+    );
+    assert_eq!(
+        app.reload()
+            .unwrap()
+            .image
+            .settings_for("org/flux-turbo")
+            .unwrap()
+            .steps,
+        Some(4)
+    );
+}

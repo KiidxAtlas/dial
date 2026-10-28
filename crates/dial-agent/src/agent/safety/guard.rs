@@ -772,7 +772,7 @@ impl PaceGuard {
         );
         let repeated = heads
             .iter()
-            .find(|(head, _)| self.current.contains(head))
+            .find(|(head, _)| !only_sets_shell_state(head) && self.current.contains(head))
             .map(|(head, _)| head.clone());
         // Only commands known not to write can leave earlier results current.
         if heads.is_empty()
@@ -825,6 +825,29 @@ impl PaceGuard {
             )
         })
     }
+}
+
+/// Heads that only change the shell's own state (`cd crates/x`, `export A=1`, `A=1`) print
+/// nothing worth reusing; repeating them as the prefix of a new command is not a rerun.
+fn only_sets_shell_state(head: &str) -> bool {
+    const STATE: &[&str] = &[
+        "cd", "pushd", "popd", "export", "unset", "set", "shopt", "alias", "umask", "true", ":",
+    ];
+    let mut words = head.split_whitespace();
+    let Some(first) = words.next() else {
+        return true;
+    };
+    if STATE.contains(&first) {
+        return true;
+    }
+    let assignment = |word: &str| {
+        word.split_once('=').is_some_and(|(name, _)| {
+            !name.is_empty()
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !name.starts_with(|c: char| c.is_ascii_digit())
+        })
+    };
+    assignment(first) && words.all(assignment)
 }
 
 /// What to do after a generation stopped because it hit the output token limit.

@@ -229,6 +229,12 @@ classification without changing the foreground instruction; failed admission pre
 as follow-up input rather than silently steering the foreground task. These choices do not grant
 worker permissions or bypass isolation, approval, or concurrency limits.
 
+Any routable queued message (not only Steer now) also stops the current wait early: `task wait`,
+`side_request wait`, `bg wait`, and a foreground `bash` command that has not yet moved to the
+background. The awaited work keeps running and its result still arrives at a later request
+boundary; the wait reports that it stopped for a new message, and the message is routed at the
+next step boundary. Input deferred until after the turn does not stop waits.
+
 Live-steering receipt settlement keeps its original acknowledgement deadlines but polls while
 servicing heartbeats, workers, aborts and newer steering. Replanning journals the accepted prefix
 and uncertain suffix once, in submission order, before later input. Cancellation is not rollback
@@ -807,14 +813,16 @@ two check-before-change aids, `fault_witness` (on) and `repro_first` (`advise`).
   mismatch between prediction and outcome is reported in the result text and in
   `data.prediction`; it does not change the check status. Sessions recorded with or without the
   property resume under either setting.
-- `experimental.streaming_dispatch` starts parallel-safe reads while the reply is still streaming.
-  A call counts as complete once the stream moves to a later tool call, so the last call of a
-  reply gains nothing. Reads start only under the parallel-read admission (no hooks for the tool,
-  no deny rule, valid offered form, at most `task.max_concurrency` per request). A result is used
-  only for the identical call in a multi-call reply, after the ordinary admission runs again, and
-  only while every earlier call in the reply was itself a grouped read; otherwise it is discarded
-  and the call runs as usual. Off in single-call mode and hermetic runs. Background work that
-  changes files during streaming can make an early read older than a serial read would be.
+- `experimental.streaming_dispatch` (default off) starts parallel-safe reads while the reply is
+  still streaming. Anthropic and Bedrock content-block stops and Responses finished output items
+  explicitly close a call, allowing even the last or only read to start before the reply ends.
+  Other streams retain the next-tool-index fallback; merely parseable partial JSON never starts
+  a call. Reads require the normal parallel-read admission (no hooks for the tool, no deny rule,
+  valid offered form, at most `task.max_concurrency` per request). Results are reused only for
+  identical calls after ordinary admission runs again, and only while preceding calls were grouped
+  reads; otherwise they are discarded. Forced single-call mode remains excluded: an invalid
+  multi-call reply must execute nothing. Hermetic runs are also excluded. Concurrent file changes
+  can make early results older than serial reads, so this remains an explicit experimental opt-in.
 
 ## Human questions and investigation checkpoints
 

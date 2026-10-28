@@ -15,6 +15,7 @@ pub(in crate::agent) mod repro_first;
 pub(in crate::agent) mod requirements;
 pub(in crate::agent) mod revert_edit;
 pub(in crate::agent) mod reviewworkflow;
+pub(in crate::agent) mod shared_runs;
 pub(in crate::agent) mod verification;
 pub(in crate::agent) mod verification_receipts;
 pub(in crate::agent) mod verified_examples;

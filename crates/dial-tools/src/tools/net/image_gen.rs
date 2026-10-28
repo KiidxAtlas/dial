@@ -1,15 +1,22 @@
-//! `image_gen`: one generated image from an OpenAI-compatible `images/generations` endpoint,
-//! written to a new workspace file.
+//! `image_gen`: one generated or edited image from the resolved image service, written to a new
+//! workspace file.
 //!
 //! Explicit image settings and roles win. Otherwise use main's image route, its provider's image
 //! default, configured image profiles, then keyed provider defaults. Tool availability is independent
 //! of main's vision capability. Automatic offering reads local state only; calls require approval.
 //!
+//! Per-model settings (`[image.models.*]`, edited by `/image settings`) apply to every request for
+//! the matching model; each image API receives only the settings it accepts (`supported`).
+//!
+//! Edits (`image`): MLX-Serve takes the source as base64 `image` on `images/generations`, OpenAI
+//! Images uses multipart `images/edits`, and the Responses hosted tool gets it as `input_image`.
+//! Other routes refuse before any request. The source file is only read.
+//!
 //! Request validation, path resolution, destination preflight and mutation authority run before
 //! generation. Provider errors or a later filesystem race can still fail a paid request. Returned
-//! images are decoded with resource limits; existing files are never overwritten.
+//! and source images are decoded with resource limits; existing files are never overwritten.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -17,7 +24,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use base64::Engine as _;
 use serde_json::{Value, json};
 
-use crate::config::image::ImageConfig;
+use crate::config::image::{ImageConfig, ImageModelSettings, SIZES};
 use crate::config::types::Config;
 use crate::storage::redact::redact_text;
 use crate::tools::integrations::ext::{Tool, ToolContext};
@@ -26,19 +33,21 @@ use crate::tools::{ToolOutput, tool_schema};
 mod selected;
 
 pub const TOOL: &str = "image_gen";
-const SIZES: &[&str] = &["auto", "1024x1024", "1536x1024", "1024x1536"];
 const DEFAULT_SIZE: &str = "1024x1024";
 const MAX_PROMPT_BYTES: usize = 4_000;
+/// Largest source image an edit uploads (OpenAI's gpt-image edit limit is 50 MB).
+const MAX_SOURCE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_ERROR_CHARS: usize = 300;
 const PNG_SIGNATURE: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
-const DESCRIPTION: &str = "Generate one image through the resolved image service, independently of \
-    the main chat model's image-output capability, and write it to a new workspace file. Explicit \
-    image settings/role win; otherwise available configured routes are selected automatically. \
-    ChatGPT hosted-image support may be unverified for the model/account; provider rejection is \
-    reported without retrying another billing route. Output must be PNG, JPEG, or WebP, and the \
-    extension must match. Existing files are never overwritten. The image is attached for \
-    vision-capable models to inspect and revise into a new file. Requires approval.";
+const DESCRIPTION: &str = "Generate one image, or edit an existing workspace image passed as \
+    `image`, through the resolved image service, independently of the main chat model's \
+    image-output capability, and write it to a new workspace file. Explicit image settings/role \
+    win; otherwise available configured routes are selected automatically. ChatGPT hosted-image \
+    support may be unverified for the model/account; provider rejection is reported without \
+    retrying another billing route. Output must be PNG, JPEG, or WebP, and the extension must \
+    match. Existing files are never overwritten and the source image is only read. The image is \
+    attached for vision-capable models to inspect and revise into a new file. Requires approval.";
 
 /// Hosted session providers whose `images/generations` route returns base64 images:
 /// (API host, default image model, request shape).
@@ -72,6 +81,114 @@ pub fn auto_tools(config: &Config) -> Result<Vec<Arc<dyn Tool>>> {
         }
         Err(_) => Ok(Vec::new()),
     }
+}
+
+/// The file extension a new output should use for the resolved route, read from local state only
+/// (no generation or network probe). xAI returns JPEG; every other route can deliver PNG.
+///
+/// # Errors
+/// Returns the same route failures generation would report.
+pub fn output_extension(config: &Config) -> Result<&'static str> {
+    Ok(match resolve(config)?.wire {
+        Wire::Xai => "jpg",
+        _ => "png",
+    })
+}
+
+/// The image model the next generation would use and the settings its API accepts, read from
+/// local state only (no generation or network probe). `/image settings` edits these.
+pub struct ImageRoute {
+    pub model: String,
+    /// Short name of the image API, for display.
+    pub api: &'static str,
+    /// `ImageModelSettings` fields this API receives; others are kept but not sent.
+    pub settings: &'static [&'static str],
+    /// Whether this route can edit an existing image.
+    pub edits: bool,
+}
+
+/// # Errors
+/// Returns the same route failures generation would report.
+pub fn current_route(config: &Config) -> Result<ImageRoute> {
+    let target = resolve(config)?;
+    Ok(ImageRoute {
+        api: match target.wire {
+            Wire::OpenAi => "OpenAI Images",
+            Wire::Xai => "xAI Images",
+            Wire::MlxServe => "MLX-Serve",
+            Wire::Responses => "Responses image tool",
+            Wire::ChatCompletions => "Chat image output",
+        },
+        settings: supported(target.wire, &target.model),
+        edits: edit_unsupported(&target).is_none(),
+        model: target.model,
+    })
+}
+
+/// Why `target` cannot edit an existing image, when it cannot.
+fn edit_unsupported(target: &Target) -> Option<String> {
+    match target.wire {
+        Wire::MlxServe | Wire::Responses => None,
+        Wire::OpenAi if target.model.starts_with("dall-e-3") => Some(format!(
+            "{} cannot edit images; use gpt-image-1 or dall-e-2",
+            target.model
+        )),
+        Wire::OpenAi => None,
+        Wire::Xai | Wire::ChatCompletions => Some(format!(
+            "image edits are not supported on {}'s image route; use an OpenAI Images, MLX-Serve or Responses image model",
+            target.model
+        )),
+    }
+}
+
+/// Per-model settings each image API accepts. `size` is the default for calls that omit it.
+fn supported(wire: Wire, model: &str) -> &'static [&'static str] {
+    match wire {
+        Wire::MlxServe => &["size", "steps", "seed", "strength", "loras"],
+        Wire::OpenAi if model.starts_with("dall-e") => &["size", "quality"],
+        Wire::OpenAi | Wire::Responses => &["size", "quality", "background", "moderation"],
+        Wire::Xai | Wire::ChatCompletions => &["size"],
+    }
+}
+
+/// Adds the target's per-model settings that its API accepts (except `size`, which the request
+/// carries) to a request object: the body, or the Responses image tool. `strength` applies only
+/// to edits.
+fn apply_settings(target: &Target, object: &mut Value, edit: bool) {
+    let settings = &target.settings;
+    for name in supported(target.wire, &target.model) {
+        let value = match *name {
+            "steps" => settings.steps.map(Value::from),
+            "seed" => settings.seed.map(Value::from),
+            "strength" => settings.strength.filter(|_| edit).map(Value::from),
+            "quality" => settings.quality.clone().map(Value::from),
+            "background" => settings.background.clone().map(Value::from),
+            "moderation" => settings.moderation.clone().map(Value::from),
+            "loras" if !settings.loras.is_empty() => {
+                object["lora_paths"] = settings
+                    .loras
+                    .iter()
+                    .map(|lora| {
+                        crate::config::image::lora_path(&lora.path)
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .collect();
+                object["lora_scales"] = settings.loras.iter().map(|lora| lora.scale).collect();
+                None
+            }
+            _ => None,
+        };
+        if let Some(value) = value {
+            object[*name] = value;
+        }
+    }
+}
+
+/// The configured default size, when the target's API accepts one from the settings.
+fn configured_size(target: &Target) -> Option<&'static str> {
+    let size = target.settings.size.as_deref()?;
+    SIZES.iter().copied().find(|known| *known == size)
 }
 
 /// Whether the user changed the image endpoint, model or key variable from the defaults.
@@ -118,10 +235,21 @@ struct Target {
     key: String,
     account_id: Option<String>,
     headers: Vec<crate::llm::model_config::RequestHeader>,
+    /// `[image.models.*]` settings for `model`; empty when none are configured.
+    settings: ImageModelSettings,
+}
+
+/// The resolved route with its per-model settings attached.
+fn resolve(config: &Config) -> Result<Target> {
+    let mut target = route(config)?;
+    if let Some(settings) = config.image.settings_for(&target.model) {
+        target.settings = settings.clone();
+    }
+    Ok(target)
 }
 
 /// Resolves the image endpoint and its key (see the module docs for the order).
-fn resolve(config: &Config) -> Result<Target> {
+fn route(config: &Config) -> Result<Target> {
     let image = &config.image;
     let customized = customized(image);
     let mut selected_error = None;
@@ -153,6 +281,7 @@ fn resolve(config: &Config) -> Result<Target> {
                 key,
                 account_id: None,
                 headers: Vec::new(),
+                settings: ImageModelSettings::default(),
             })
         });
     if let Some(target) = session {
@@ -183,6 +312,7 @@ fn resolve(config: &Config) -> Result<Target> {
                     key,
                     account_id: None,
                     headers: Vec::new(),
+                    settings: ImageModelSettings::default(),
                 });
             }
             if let Some(error) = selected_error {
@@ -201,6 +331,7 @@ fn resolve(config: &Config) -> Result<Target> {
         key,
         account_id: None,
         headers: Vec::new(),
+        settings: ImageModelSettings::default(),
     })
 }
 
@@ -276,11 +407,15 @@ impl Tool for ImageGen {
                 "size": {
                     "type": "string",
                     "enum": SIZES,
-                    "description": "Output size (sent as the matching aspect ratio to providers that take one). Defaults to 1024x1024."
+                    "description": "Output size (sent as the matching aspect ratio to providers that take one). Omit it to use the image model's configured size, else 1024x1024."
                 },
                 "output": {
                     "type": "string",
                     "description": "Workspace-relative file to create. Its extension must match the returned format: .png, .jpg/.jpeg, or .webp."
+                },
+                "image": {
+                    "type": "string",
+                    "description": "Optional workspace image (PNG, JPEG or WebP) to edit instead of generating from scratch. It is only read; the result goes to output."
                 }
             }),
             &["prompt", "output"],
@@ -293,14 +428,28 @@ impl Tool for ImageGen {
 
     fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
         match generate(ctx, args) {
-            Ok(written) => ToolOutput::ok(format!(
-                "Wrote {} image ({} bytes) from {} to {}.",
-                written.format.name(),
-                written.bytes,
-                written.model,
-                written.relative
-            ))
-            .with_changes([written.path]),
+            Ok(written) => {
+                let similarity = crate::tools::vision::search::prompt_similarity_line(
+                    ctx.config,
+                    args["prompt"].as_str().unwrap_or_default(),
+                    &written.path,
+                );
+                ToolOutput::ok(format!(
+                    "Wrote {} image ({} bytes) from {} to {}{}.{}",
+                    written.format.name(),
+                    written.bytes,
+                    written.model,
+                    written.relative,
+                    written
+                        .source
+                        .map(|source| format!(", edited from {source}"))
+                        .unwrap_or_default(),
+                    similarity
+                        .map(|line| format!("\n{line}"))
+                        .unwrap_or_default()
+                ))
+                .with_changes([written.path])
+            }
             Err(error) => ToolOutput::err(format!("{error:#}")),
         }
     }
@@ -311,6 +460,89 @@ struct Request<'a> {
     prompt: &'a str,
     size: &'static str,
     output: &'a str,
+    /// The image to edit; `None` generates from the prompt alone.
+    source: Option<Source>,
+}
+
+/// A workspace image an edit starts from.
+struct Source {
+    relative: String,
+    bytes: Vec<u8>,
+    format: Format,
+}
+
+impl std::fmt::Debug for Source {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Source")
+            .field("relative", &self.relative)
+            .field("format", &self.format)
+            .field("bytes", &self.bytes.len())
+            .finish()
+    }
+}
+
+impl Source {
+    fn base64(&self) -> String {
+        base64::engine::general_purpose::STANDARD.encode(&self.bytes)
+    }
+
+    fn data_url(&self) -> String {
+        format!("data:{};base64,{}", self.format.mime(), self.base64())
+    }
+}
+
+/// The `image` argument: the workspace path of the image to edit, if any.
+fn source_arg(args: &Value) -> Result<Option<&str>> {
+    match args.get("image").filter(|value| !value.is_null()) {
+        None => Ok(None),
+        Some(value) => value
+            .as_str()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(Some)
+            .ok_or_else(|| anyhow!("image_gen image must be a workspace image path")),
+    }
+}
+
+/// Reads and checks the source image without following a final symlink.
+fn read_source(ctx: &ToolContext, relative: &str) -> Result<Source> {
+    let path = ctx
+        .workspace
+        .resolve(relative)
+        .map_err(|error| anyhow!(error))?;
+    let file = crate::tools::edit::edit_transaction::open_read(ctx.workspace, &path)
+        .map_err(|error| anyhow!("reading source image {relative}: {error}"))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_SOURCE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading source image {relative}"))?;
+    ensure!(
+        bytes.len() as u64 <= MAX_SOURCE_BYTES,
+        "source image {relative} is larger than {} MiB",
+        MAX_SOURCE_BYTES / (1024 * 1024)
+    );
+    let format = Format::detect(&bytes)
+        .ok_or_else(|| anyhow!("source image {relative} is not a PNG, JPEG, or WebP file"))?;
+    decode_bounded(&bytes).with_context(|| format!("decoding source image {relative}"))?;
+    Ok(Source {
+        relative: relative.to_owned(),
+        bytes,
+        format,
+    })
+}
+
+/// Decodes an image fully under dimension and allocation limits.
+fn decode_bounded(bytes: &[u8]) -> Result<()> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .context("detecting image format")?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(16_384);
+    limits.max_image_height = Some(16_384);
+    limits.max_alloc = Some(512 * 1024 * 1024);
+    reader.limits(limits);
+    reader.decode()?;
+    Ok(())
 }
 
 fn parse_request(args: &Value) -> Result<Request<'_>> {
@@ -339,6 +571,7 @@ fn parse_request(args: &Value) -> Result<Request<'_>> {
         prompt,
         size,
         output,
+        source: None,
     })
 }
 
@@ -377,6 +610,14 @@ impl Format {
             Self::Webp => &["webp"],
         }
     }
+
+    fn mime(self) -> &'static str {
+        match self {
+            Self::Png => "image/png",
+            Self::Jpeg => "image/jpeg",
+            Self::Webp => "image/webp",
+        }
+    }
 }
 
 struct Written {
@@ -385,10 +626,11 @@ struct Written {
     format: Format,
     bytes: usize,
     model: String,
+    source: Option<String>,
 }
 
 fn generate(ctx: &ToolContext, args: &Value) -> Result<Written> {
-    let request = parse_request(args)?;
+    let mut request = parse_request(args)?;
     let path = ctx
         .workspace
         .resolve(request.output)
@@ -413,6 +655,21 @@ fn generate(ctx: &ToolContext, args: &Value) -> Result<Written> {
         "image_gen output extension must be .png, .jpg/.jpeg, or .webp"
     );
     let target = resolve(ctx.config)?;
+    if let Some(source) = source_arg(args)? {
+        if let Some(reason) = edit_unsupported(&target) {
+            bail!("{reason}");
+        }
+        request.source = Some(read_source(ctx, source)?);
+    }
+    // An explicit size wins; otherwise the model's configured default replaces the built-in one,
+    // and edits keep the source's shape.
+    if args.get("size").is_none_or(Value::is_null) {
+        if let Some(size) = configured_size(&target) {
+            request.size = size;
+        } else if request.source.is_some() {
+            request.size = "auto";
+        }
+    }
     ensure!(
         target.wire != Wire::MlxServe || extension == "png",
         "MLX-Serve returns PNG images; use a .png output path"
@@ -426,15 +683,7 @@ fn generate(ctx: &ToolContext, args: &Value) -> Result<Written> {
     let bytes = request_image(&target, ctx.config, &request)?;
     let format = Format::detect(&bytes)
         .ok_or_else(|| anyhow!("image API returned data that is not PNG, JPEG, or WebP"))?;
-    let mut reader = image::ImageReader::new(std::io::Cursor::new(&bytes))
-        .with_guessed_format()
-        .context("detecting generated image format")?;
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(16_384);
-    limits.max_image_height = Some(16_384);
-    limits.max_alloc = Some(512 * 1024 * 1024);
-    reader.limits(limits);
-    reader.decode().context("decoding generated image")?;
+    decode_bounded(&bytes).context("decoding generated image")?;
     ensure!(
         format.extensions().contains(&extension.as_str()),
         "{} is {} data; name the output with {}",
@@ -458,6 +707,7 @@ fn generate(ctx: &ToolContext, args: &Value) -> Result<Written> {
         format,
         bytes: bytes.len(),
         model: target.model,
+        source: request.source.map(|source| source.relative),
     })
 }
 
@@ -469,12 +719,24 @@ fn request_body(target: &Target, request: &Request) -> Value {
     });
     match target.wire {
         Wire::OpenAi | Wire::MlxServe => {
-            body["size"] = json!(request.size);
+            // MLX-Serve edits size the result from the source unless a size was chosen.
+            if !(target.wire == Wire::MlxServe
+                && request.source.is_some()
+                && request.size == "auto")
+            {
+                body["size"] = json!(request.size);
+            }
             // DALL·E models default to hosted URLs; gpt-image models always return base64 and
             // reject this field.
             if target.model.starts_with("dall-e") {
                 body["response_format"] = json!("b64_json");
             }
+            if target.wire == Wire::MlxServe
+                && let Some(source) = &request.source
+            {
+                body["image"] = json!(source.base64());
+            }
+            apply_settings(target, &mut body, request.source.is_some());
         }
         Wire::Xai => {
             body["aspect_ratio"] = json!(match request.size {
@@ -497,10 +759,14 @@ fn request_image(target: &Target, config: &Config, request: &Request) -> Result<
         return selected::responses(target, config, request);
     }
     let base = target.base_url.trim_end_matches('/');
-    let path = if target.wire == Wire::ChatCompletions {
-        "chat/completions"
-    } else {
-        "images/generations"
+    let edit = match (target.wire, &request.source) {
+        (Wire::OpenAi, Some(source)) => Some(source),
+        _ => None,
+    };
+    let path = match (target.wire, edit) {
+        (Wire::ChatCompletions, _) => "chat/completions",
+        (_, Some(_)) => "images/edits",
+        _ => "images/generations",
     };
     let headers = crate::llm::model_config::resolve_headers(&target.headers)?;
     let agent = crate::llm::agent_with(config.image.timeout_secs, true, None, None);
@@ -511,8 +777,20 @@ fn request_image(target: &Target, config: &Config, request: &Request) -> Result<
     for (name, value) in headers.pairs() {
         builder = builder.header(name, value);
     }
-    let mut response = builder
-        .send_json(request_body(target, request))
+    let body = request_body(target, request);
+    let sent = match edit {
+        Some(source) => {
+            let boundary = format!("dial-image-{:016x}", rand::random::<u64>());
+            builder
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .send(&multipart(&boundary, &body, source)[..])
+        }
+        None => builder.send_json(body),
+    };
+    let mut response = sent
         .map_err(|error| headers.redact(anyhow!(error).context("requesting image generation")))?;
     let status = response.status().as_u16();
     let raw = response
@@ -527,6 +805,33 @@ fn request_image(target: &Target, config: &Config, request: &Request) -> Result<
         );
     }
     parse_response(status, &raw).map_err(|error| headers.redact(error))
+}
+
+/// The `images/edits` form: every body field as text, then the source image as the `image` part.
+fn multipart(boundary: &str, body: &Value, source: &Source) -> Vec<u8> {
+    let mut out = Vec::with_capacity(source.bytes.len() + 1024);
+    for (name, value) in body.as_object().into_iter().flatten() {
+        let text = value
+            .as_str()
+            .map_or_else(|| value.to_string(), str::to_owned);
+        out.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{text}\r\n"
+            )
+            .as_bytes(),
+        );
+    }
+    out.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"source.{}\"\r\nContent-Type: {}\r\n\r\n",
+            source.format.extensions()[0],
+            source.format.mime()
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(&source.bytes);
+    out.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    out
 }
 
 fn parse_response(status: u16, raw: &[u8]) -> Result<Vec<u8>> {

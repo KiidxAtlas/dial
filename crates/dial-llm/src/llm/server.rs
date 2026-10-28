@@ -175,6 +175,8 @@ pub struct ModelServer {
     base_url: String,
     model: String,
     vision: bool,
+    /// Serves only `POST /v1/embeddings` (MLX-VLM embedding checkpoint), never chat.
+    embedding: bool,
     adapter: Option<PathBuf>,
     steering: Option<crate::llm::steering::Specification>,
     runtime: llm::local_runtime::LocalRuntime,
@@ -238,7 +240,7 @@ impl ModelServer {
         let mut last_race = None;
         for _ in 0..PORT_ATTEMPTS {
             let port = free_port()?;
-            match launch(profile, port, deadline, interrupt.clone()) {
+            match launch(profile, port, deadline, interrupt.clone(), false) {
                 Ok(server) => return Ok(server),
                 Err(Failure::PortTaken(error)) => last_race = Some(error),
                 Err(Failure::Fatal(error)) => return Err(error),
@@ -249,12 +251,48 @@ impl ModelServer {
         )
     }
 
+    /// Start an MLX-VLM server that serves `POST /v1/embeddings` for the multimodal embedding
+    /// checkpoint `model` (a resolved local directory), and wait until one embedding succeeds.
+    pub fn start_embedding(
+        python: &Path,
+        model: &str,
+        startup_timeout_secs: u64,
+        interrupt: Option<Arc<AtomicBool>>,
+        context: Option<&crate::config::types::Config>,
+    ) -> Result<ModelServer> {
+        ensure!(python.is_absolute(), "python path must be absolute");
+        ensure!(!model.is_empty(), "model must not be empty");
+        let deadline = (startup_timeout_secs != 0)
+            .then(|| Instant::now() + Duration::from_secs(startup_timeout_secs));
+        let runtime = llm::local_runtime::LocalRuntime::default();
+        let profile = ServerProfile {
+            python,
+            model,
+            adapter: None,
+            steering: None,
+            context,
+            runtime: &runtime,
+        };
+        let mut last_race = None;
+        for _ in 0..PORT_ATTEMPTS {
+            let port = free_port()?;
+            match launch(profile, port, deadline, interrupt.clone(), true) {
+                Ok(server) => return Ok(server),
+                Err(Failure::PortTaken(error)) => last_race = Some(error),
+                Err(Failure::Fatal(error)) => return Err(error),
+            }
+        }
+        Err(last_race.unwrap_or_else(|| anyhow!("no server start attempt was made"))).context(
+            format!("embedding server could not claim a port after {PORT_ATTEMPTS} attempts"),
+        )
+    }
+
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
 
     pub fn request_model(&self) -> &str {
-        if self.vision {
+        if self.vision || self.embedding {
             &self.model
         } else {
             SERVER_MODEL
@@ -717,6 +755,7 @@ fn launch(
     port: u16,
     deadline: Option<Instant>,
     interrupt: Option<Arc<AtomicBool>>,
+    embedding: bool,
 ) -> std::result::Result<ModelServer, Failure> {
     let ServerProfile {
         python,
@@ -737,8 +776,14 @@ fn launch(
     } else {
         None
     };
-    let vision =
-        gguf.is_none() && llm::catalog::local_model_metadata(Path::new(model)).vision == Some(true);
+    if embedding && gguf.is_some() {
+        return Err(Failure::Fatal(anyhow!(
+            "{model} is a GGUF file; local image embeddings need an MLX embedding checkpoint, or set an OpenAI-compatible embedding endpoint"
+        )));
+    }
+    let vision = !embedding
+        && gguf.is_none()
+        && llm::catalog::local_model_metadata(Path::new(model)).vision == Some(true);
     runtime.validate().map_err(Failure::Fatal)?;
     if gguf.is_none() && vision && !runtime.is_default() {
         return Err(Failure::Fatal(anyhow!(
@@ -780,11 +825,17 @@ fn launch(
         command
             .arg("-c")
             .arg(launch_script())
-            .arg(format!("--model={model}"))
+            .arg(if embedding {
+                format!("--embedding-model={model}")
+            } else {
+                format!("--model={model}")
+            })
             .arg("--host=127.0.0.1")
             .arg(format!("--port={port}"))
             .arg("--log-level=WARNING");
-        if vision {
+        if embedding {
+            command.arg("--max-num-seqs=1");
+        } else if vision {
             command.arg("--vision-cache-size=1").arg("--max-num-seqs=1");
             // Bounded, process-local reuse; Python disables APC if its compatibility check fails.
             command
@@ -817,7 +868,13 @@ fn launch(
         command
             .env(
                 "DIAL_MODEL_ENGINE",
-                if vision { "mlx-vlm" } else { "mlx-lm" },
+                if embedding {
+                    "mlx-vlm-embedding"
+                } else if vision {
+                    "mlx-vlm"
+                } else {
+                    "mlx-lm"
+                },
             )
             .env("DIAL_PARENT_PID", std::process::id().to_string())
             .env("DIAL_STEERING_SPEC", steering_spec)
@@ -866,7 +923,12 @@ fn launch(
         &tail,
         deadline,
         interrupt,
-        if vision { model } else { SERVER_MODEL },
+        if vision || embedding {
+            model
+        } else {
+            SERVER_MODEL
+        },
+        embedding,
     );
     match outcome {
         Ok(()) => {
@@ -878,6 +940,7 @@ fn launch(
                 base_url,
                 model: model.to_string(),
                 vision,
+                embedding,
                 adapter: adapter.map(Path::to_path_buf),
                 steering: steering.cloned(),
                 runtime: runtime.clone(),
@@ -908,6 +971,7 @@ fn wait_ready(
     deadline: Option<Instant>,
     interrupt: Option<Arc<AtomicBool>>,
     model: &str,
+    embedding: bool,
 ) -> Result<()> {
     let models_url = format!("{base_url}/v1/models");
     let mut last_probe = "no health response yet".to_string();
@@ -945,29 +1009,35 @@ fn wait_ready(
             .as_secs()
             .max(1)
     });
-    let warmup = Chat {
-        messages: vec![json!({"role": "user", "content": "ping"})],
-        tools: Vec::new(),
-        temperature: 0.0,
-        max_tokens: 1,
-        seed: None,
+    let warmed = if embedding {
+        warm_embedding(base_url, model, remaining)
+    } else {
+        let warmup = Chat {
+            messages: vec![json!({"role": "user", "content": "ping"})],
+            tools: Vec::new(),
+            temperature: 0.0,
+            max_tokens: 1,
+            seed: None,
+        };
+        llm::chat_at_controlled(
+            llm::Endpoint {
+                headers: &[],
+                url: &llm::completions_url(base_url),
+                auth: None,
+                model,
+            },
+            &warmup,
+            remaining,
+            llm::Control {
+                interrupt: interrupt.clone(),
+                profile: None,
+                reasoning_guard: None,
+                on_event: &mut |_| true,
+            },
+        )
+        .map(|_| ())
     };
-    if let Err(error) = llm::chat_at_controlled(
-        llm::Endpoint {
-            headers: &[],
-            url: &llm::completions_url(base_url),
-            auth: None,
-            model,
-        },
-        &warmup,
-        remaining,
-        llm::Control {
-            interrupt: interrupt.clone(),
-            profile: None,
-            reasoning_guard: None,
-            on_event: &mut |_| true,
-        },
-    ) {
+    if let Err(error) = warmed {
         if interrupt
             .as_ref()
             .is_some_and(|flag| flag.load(Ordering::SeqCst))
@@ -987,6 +1057,35 @@ fn wait_ready(
     ensure!(
         !process.exited().context("observing server exit")?,
         "model server exited right after becoming ready (is the port owned by another process?)"
+    );
+    Ok(())
+}
+
+/// One text embedding blocks until the embedding weights load and proves the route works.
+fn warm_embedding(base_url: &str, model: &str, timeout_secs: u64) -> Result<()> {
+    let body = json!({"model": model, "input": ["ping"]});
+    let mut response = llm::agent(timeout_secs)
+        .post(&format!("{base_url}/v1/embeddings"))
+        .header("Content-Type", "application/json")
+        .send(&serde_json::to_vec(&body)?)
+        .context("embedding warm-up request failed")?;
+    let status = response.status().as_u16();
+    let text = response
+        .body_mut()
+        .read_to_string()
+        .context("reading the embedding warm-up response")?;
+    ensure!(
+        (200..300).contains(&status),
+        "embedding warm-up returned HTTP {status}: {}",
+        text.chars().take(300).collect::<String>()
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(&text).context("embedding warm-up response is not JSON")?;
+    ensure!(
+        value["data"][0]["embedding"]
+            .as_array()
+            .is_some_and(|vector| !vector.is_empty()),
+        "embedding warm-up returned no vector"
     );
     Ok(())
 }

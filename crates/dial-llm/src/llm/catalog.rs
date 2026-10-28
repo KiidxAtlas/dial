@@ -268,6 +268,11 @@ pub fn image_generation_api(row: &Value) -> Option<super::profiles::ImageGenerat
     }) {
         return Some(ImageGenerationApi::Responses);
     }
+    // A meta-router (OpenRouter `openrouter/auto*`) advertises the union of its routing pool's
+    // modalities but serves no image-output endpoint itself, so its list declares nothing.
+    if row.pointer("/architecture/tokenizer") == Some(&Value::from("Router")) {
+        return None;
+    }
     row.pointer("/architecture/output_modalities")
         .or_else(|| row.get("output_modalities"))
         .and_then(Value::as_array)
@@ -1312,13 +1317,16 @@ fn wipe_token(token: &mut String) {
 }
 
 /// What LM Studio's native REST API knows that its OpenAI-compatible model list omits: whether a
-/// model is an embedder, and whether it is loaded and with how much context. A model that is not
-/// loaded gets loaded on first use, using whatever context LM Studio picks; that, not the model's
-/// maximum, is the budget Dial has to live within.
+/// model is an embedder, whether it declares native tool use, and whether it is loaded and with how
+/// much context. A model that is not loaded gets loaded on first use, using whatever context LM
+/// Studio picks; that, not the model's maximum, is the budget Dial has to live within.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LmStudioModel {
     pub id: String,
     pub kind: String,
+    /// `capabilities` lists `tool_use`. Absence is not a refusal: LM Studio still prompts tools to
+    /// models without native support.
+    pub tool_use: bool,
     pub loaded: bool,
     pub loaded_context: Option<u32>,
 }
@@ -1344,6 +1352,10 @@ fn parse_lmstudio(value: &Value) -> Vec<LmStudioModel> {
                             .and_then(Value::as_str)
                             .unwrap_or("llm")
                             .to_owned(),
+                        tool_use: row
+                            .get("capabilities")
+                            .and_then(Value::as_array)
+                            .is_some_and(|caps| caps.iter().any(|c| c == "tool_use")),
                         loaded,
                         loaded_context,
                     })
@@ -1762,6 +1774,14 @@ fn annotate_lmstudio(models: &mut [ModelEntry], info: &[LmStudioModel]) {
         };
         if entry.metadata.kind == ModelKind::Unknown {
             entry.metadata.kind = kind_from_declared(&known.kind);
+        }
+        // LM Studio's OpenAI-compatible list omits image input; its native `type` declares it:
+        // `vlm` models load a vision encoder, `llm` models do not. Other metadata wins.
+        if entry.metadata.vision.is_none() && matches!(known.kind.as_str(), "llm" | "vlm") {
+            entry.metadata.vision = Some(known.kind == "vlm");
+        }
+        if entry.metadata.tools.is_none() && known.tool_use {
+            entry.metadata.tools = Some(true);
         }
         if entry.metadata.kind == ModelKind::Embedding {
             entry.source = format!("{} · embedding model", entry.source);

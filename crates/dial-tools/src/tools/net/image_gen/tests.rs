@@ -7,7 +7,7 @@ use std::thread::JoinHandle;
 use base64::Engine as _;
 use serde_json::{Value, json};
 
-use super::{ImageGen, Request, TOOL, Wire, auto_tools, request_body, resolve};
+use super::{ImageGen, Request, TOOL, Wire, auto_tools, output_extension, request_body, resolve};
 use crate::config::types::{Config, EndpointConfig};
 use crate::tools::integrations::ext::{Registry, Tool, ToolContext};
 use crate::tools::testkit;
@@ -289,6 +289,22 @@ fn auto_offers_the_tool_only_when_its_endpoint_has_a_key() {
 }
 
 #[test]
+fn output_extension_follows_the_resolved_route_and_reports_missing_routes() {
+    let base = "http://127.0.0.1:9/v1";
+    let keyed = user_dir_with_key(base);
+    assert_eq!(
+        output_extension(&config_for(base, keyed.path())).unwrap(),
+        "png"
+    );
+
+    let xai = user_dir_with_key(XAI_BASE);
+    assert_eq!(output_extension(&xai_session(xai.path())).unwrap(), "jpg");
+
+    let empty = tempfile::tempdir().unwrap();
+    assert!(output_extension(&config_for(base, empty.path())).is_err());
+}
+
+#[test]
 fn registry_offers_image_gen_without_an_integrations_entry_when_keyed() {
     let base = "http://127.0.0.1:9/v1";
     let dir = tempfile::tempdir().unwrap();
@@ -326,6 +342,7 @@ fn image_capable_session_provider_supplies_endpoint_model_and_key() {
             prompt: "a fox",
             size: "1536x1024",
             output: "fox.png",
+            source: None,
         },
     );
     assert_eq!(body["aspect_ratio"], "3:2");
@@ -575,6 +592,7 @@ fn responses_body_selects_the_user_model_and_forces_image_generation() {
             prompt: "dog",
             size: "1024x1536",
             output: "dog.png",
+            source: None,
         },
     );
     assert_eq!(body["model"], "selected-image-model");
@@ -602,6 +620,7 @@ fn hosted_image_format_matches_destination_before_spending_quota() {
                 prompt: "dog",
                 output,
                 size: "auto",
+                source: None,
             },
         );
         assert_eq!(body["tools"][0]["output_format"], format);
@@ -1045,4 +1064,313 @@ fn automatic_chatgpt_profile_preserves_the_sessions_pinned_account() {
         super::configured_target(&config).is_none(),
         "must not switch to the globally active account"
     );
+}
+
+fn image_settings(model: &str) -> crate::config::image::ImageModelSettings {
+    use crate::config::image::{ImageLora, ImageModelSettings};
+    ImageModelSettings {
+        model: model.into(),
+        size: Some("1024x1536".into()),
+        steps: Some(8),
+        seed: Some(42),
+        loras: vec![
+            ImageLora {
+                path: "/loras/style.safetensors".into(),
+                scale: 1.5,
+            },
+            ImageLora {
+                path: "detail.safetensors".into(),
+                scale: 0.5,
+            },
+        ],
+        quality: Some("high".into()),
+        background: Some("transparent".into()),
+        moderation: Some("low".into()),
+        strength: Some(0.6),
+    }
+}
+
+fn sent_body(request: &str) -> Value {
+    let (_, payload) = request.split_once("\r\n\r\n").expect("request body");
+    serde_json::from_str(payload).unwrap()
+}
+
+#[test]
+fn mlx_serve_receives_its_model_settings_and_the_configured_default_size() {
+    use crate::llm::profiles::ImageGenerationApi;
+    let (_dir, ws) = testkit::workspace();
+    let png = image_bytes(image::ImageFormat::Png);
+    let (base, server) = serve_once(200, ok_body(&png));
+    let user = tempfile::tempdir().unwrap();
+    let mut config = selected_config(&base, user.path(), ImageGenerationApi::MlxServe);
+    config
+        .image
+        .models
+        .insert("flux".into(), image_settings("selected-image-model"));
+
+    let route = super::current_route(&config).unwrap();
+    assert_eq!(route.model, "selected-image-model");
+    assert_eq!(
+        route.settings,
+        ["size", "steps", "seed", "strength", "loras"]
+    );
+    assert!(route.edits);
+
+    let out = run(&ws, &config, json!({"prompt":"dog", "output":"dog.png"}));
+    assert!(!out.is_error, "{}", out.text);
+    let body = sent_body(&server.join().unwrap());
+    assert_eq!(body["size"], "1024x1536", "{body}");
+    assert_eq!(body["steps"], 8, "{body}");
+    assert_eq!(body["seed"], 42, "{body}");
+    assert_eq!(body["lora_scales"], json!([1.5, 0.5]), "{body}");
+    let paths = body["lora_paths"].as_array().unwrap();
+    assert_eq!(paths[0], "/loras/style.safetensors");
+    // Bare names resolve inside MLX-Serve's LoRA directory.
+    let detail = paths[1].as_str().unwrap();
+    assert!(
+        std::path::Path::new(detail).is_absolute() || crate::config::paths::home_dir().is_none(),
+        "{detail}"
+    );
+    assert!(detail.ends_with("detail.safetensors"), "{detail}");
+    // OpenAI-only settings are kept in config but never sent to MLX-Serve; strength is edit-only.
+    for absent in ["quality", "background", "moderation", "strength", "image"] {
+        assert!(body.get(absent).is_none(), "{absent} sent: {body}");
+    }
+}
+
+#[test]
+fn explicit_call_size_wins_and_openai_gets_only_its_settings() {
+    let (_dir, ws) = testkit::workspace();
+    let png = image_bytes(image::ImageFormat::Png);
+    let (base, server) = serve_once(200, ok_body(&png));
+    let user_dir = user_dir_with_key(&base);
+    let mut config = config_for(&base, user_dir.path());
+    config
+        .image
+        .models
+        .insert("gpt".into(), image_settings("gpt-image-1"));
+
+    let out = run(
+        &ws,
+        &config,
+        json!({"prompt":"fox", "output":"fox.png", "size":"1536x1024"}),
+    );
+    assert!(!out.is_error, "{}", out.text);
+    let body = sent_body(&server.join().unwrap());
+    assert_eq!(body["size"], "1536x1024", "{body}");
+    assert_eq!(body["quality"], "high", "{body}");
+    assert_eq!(body["background"], "transparent", "{body}");
+    assert_eq!(body["moderation"], "low", "{body}");
+    for absent in ["steps", "seed", "lora_paths", "lora_scales"] {
+        assert!(body.get(absent).is_none(), "{absent} sent: {body}");
+    }
+}
+
+#[test]
+fn settings_for_other_models_are_ignored_and_responses_tool_gets_quality() {
+    use crate::llm::profiles::ImageGenerationApi;
+    let user = user_dir_with_key(XAI_BASE);
+    let mut config = selected_config(XAI_BASE, user.path(), ImageGenerationApi::Responses);
+    config
+        .image
+        .models
+        .insert("other".into(), image_settings("another-model"));
+    let request = Request {
+        prompt: "dog",
+        size: "auto",
+        output: "dog.png",
+        source: None,
+    };
+    let body = request_body(&resolve(&config).unwrap(), &request);
+    assert!(body["tools"][0].get("quality").is_none(), "{body}");
+
+    config
+        .image
+        .models
+        .insert("mine".into(), image_settings("selected-image-model"));
+    let body = request_body(&resolve(&config).unwrap(), &request);
+    let tool = &body["tools"][0];
+    assert_eq!(tool["quality"], "high", "{body}");
+    assert_eq!(tool["background"], "transparent", "{body}");
+    assert!(tool.get("steps").is_none(), "{body}");
+    assert!(body.get("quality").is_none(), "{body}");
+}
+
+/// A 2×2 PNG written to `name` in the workspace, for edits to start from.
+fn source_png(ws: &crate::tools::Workspace, name: &str) -> Vec<u8> {
+    let png = image_bytes(image::ImageFormat::Png);
+    std::fs::write(ws.root().join(name), &png).unwrap();
+    png
+}
+
+#[test]
+fn mlx_serve_edit_sends_the_source_and_strength_to_generations() {
+    use crate::llm::profiles::ImageGenerationApi;
+    let (_dir, ws) = testkit::workspace();
+    let source = source_png(&ws, "fox.png");
+    let (base, server) = serve_once(200, ok_body(&image_bytes(image::ImageFormat::Png)));
+    let user = tempfile::tempdir().unwrap();
+    let mut config = selected_config(&base, user.path(), ImageGenerationApi::MlxServe);
+    let mut settings = image_settings("selected-image-model");
+    settings.size = None;
+    config.image.models.insert("flux".into(), settings);
+
+    let out = run(
+        &ws,
+        &config,
+        json!({"prompt":"make it snow", "output":"snow.png", "image":"fox.png"}),
+    );
+    assert!(!out.is_error, "{}", out.text);
+    assert!(out.text.contains("edited from fox.png"), "{}", out.text);
+    let request = server.join().unwrap();
+    assert!(
+        request.starts_with("POST /v1/images/generations "),
+        "{request}"
+    );
+    let body = sent_body(&request);
+    assert_eq!(
+        body["image"],
+        base64::engine::general_purpose::STANDARD.encode(&source),
+        "plain base64, no data URL"
+    );
+    assert_eq!(body["strength"], 0.6, "{body}");
+    assert_eq!(body["prompt"], "make it snow");
+    // Without a chosen size, the result follows the source's shape.
+    assert!(body.get("size").is_none(), "{body}");
+    // The source is only read.
+    assert_eq!(std::fs::read(ws.root().join("fox.png")).unwrap(), source);
+    assert!(ws.root().join("snow.png").exists());
+}
+
+#[test]
+fn openai_edit_uploads_the_source_as_multipart_to_images_edits() {
+    let (_dir, ws) = testkit::workspace();
+    let source = source_png(&ws, "fox.png");
+    let (base, server) = serve_once(200, ok_body(&image_bytes(image::ImageFormat::Png)));
+    let user_dir = user_dir_with_key(&base);
+    let mut config = config_for(&base, user_dir.path());
+    config
+        .image
+        .models
+        .insert("gpt".into(), image_settings("gpt-image-1"));
+
+    let out = run(
+        &ws,
+        &config,
+        json!({"prompt":"add a hat", "output":"hat.png", "image":"fox.png", "size":"1024x1024"}),
+    );
+    assert!(!out.is_error, "{}", out.text);
+    let request = server.join().unwrap();
+    assert!(request.starts_with("POST /v1/images/edits "), "{request}");
+    let lower = request.to_ascii_lowercase();
+    assert!(
+        lower.contains("content-type: multipart/form-data; boundary=dial-image-"),
+        "{request}"
+    );
+    assert!(lower.contains(&format!("authorization: bearer {KEY}").to_ascii_lowercase()));
+    for field in [
+        "name=\"model\"\r\n\r\ngpt-image-1\r\n",
+        "name=\"prompt\"\r\n\r\nadd a hat\r\n",
+        "name=\"size\"\r\n\r\n1024x1024\r\n",
+        "name=\"quality\"\r\n\r\nhigh\r\n",
+        "name=\"image\"; filename=\"source.png\"\r\nContent-Type: image/png\r\n\r\n",
+    ] {
+        assert!(request.contains(field), "missing {field:?} in {request}");
+    }
+    // MLX-only settings never reach OpenAI.
+    assert!(!request.contains("name=\"strength\""), "{request}");
+    assert!(!request.contains("name=\"steps\""), "{request}");
+    assert_eq!(std::fs::read(ws.root().join("fox.png")).unwrap(), source);
+}
+
+#[test]
+fn responses_edit_attaches_the_source_as_an_input_image() {
+    use crate::llm::profiles::ImageGenerationApi;
+    let user = user_dir_with_key(XAI_BASE);
+    let config = selected_config(XAI_BASE, user.path(), ImageGenerationApi::Responses);
+    let png = image_bytes(image::ImageFormat::Png);
+    let body = request_body(
+        &resolve(&config).unwrap(),
+        &Request {
+            prompt: "add a hat",
+            size: "auto",
+            output: "hat.png",
+            source: Some(super::Source {
+                relative: "fox.png".into(),
+                bytes: png.clone(),
+                format: super::Format::Png,
+            }),
+        },
+    );
+    let content = &body["input"][0]["content"];
+    assert_eq!(content[0]["text"], "add a hat");
+    assert_eq!(content[1]["type"], "input_image");
+    assert_eq!(
+        content[1]["image_url"],
+        format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&png)
+        )
+    );
+    assert!(body["instructions"].as_str().unwrap().starts_with("Edit"));
+}
+
+#[test]
+fn edits_refuse_unsupported_routes_and_bad_sources_before_any_request() {
+    let (_dir, ws) = testkit::workspace();
+    source_png(&ws, "fox.png");
+    std::fs::write(ws.root().join("notes.png"), b"not an image").unwrap();
+    // xAI's image route cannot edit; refusing must not contact it.
+    let user = user_dir_with_key(XAI_BASE);
+    let out = run(
+        &ws,
+        &xai_session(user.path()),
+        json!({"prompt":"hat", "output":"hat.jpg", "image":"fox.png"}),
+    );
+    assert!(out.is_error);
+    assert!(out.text.contains("not supported"), "{}", out.text);
+
+    // An unreachable endpoint proves no request is attempted for bad sources.
+    let base = "http://127.0.0.1:9/v1";
+    let user_dir = user_dir_with_key(base);
+    let config = config_for(base, user_dir.path());
+    for (image, expected) in [
+        ("missing.png", "missing.png"),
+        ("notes.png", "not a PNG, JPEG, or WebP"),
+        ("../outside.png", ""),
+    ] {
+        let out = run(
+            &ws,
+            &config,
+            json!({"prompt":"hat", "output":"hat.png", "image":image}),
+        );
+        assert!(out.is_error, "{image}: {}", out.text);
+        assert!(out.text.contains(expected), "{image}: {}", out.text);
+        assert!(!out.text.contains("requesting image"), "{}", out.text);
+    }
+    let out = run(
+        &ws,
+        &config,
+        json!({"prompt":"hat", "output":"hat.png", "image":7}),
+    );
+    assert!(
+        out.is_error && out.text.contains("workspace image path"),
+        "{}",
+        out.text
+    );
+
+    let mut dalle = config.clone();
+    dalle.image.model = "dall-e-3".into();
+    let out = run(
+        &ws,
+        &dalle,
+        json!({"prompt":"hat", "output":"hat.png", "image":"fox.png"}),
+    );
+    assert!(
+        out.is_error && out.text.contains("cannot edit"),
+        "{}",
+        out.text
+    );
+    assert!(!ws.root().join("hat.png").exists());
+    assert!(!ws.root().join("hat.jpg").exists());
 }

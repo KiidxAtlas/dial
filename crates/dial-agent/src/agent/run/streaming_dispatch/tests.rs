@@ -128,3 +128,95 @@ fn failed_reads_are_not_started_early_but_corrected_calls_remain_available() {
         .unwrap();
     assert!(!output.is_error, "{}", output.text);
 }
+
+#[test]
+fn provider_confirmed_single_read_finishes_while_response_is_pending() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
+    let mut stream = dispatch(dir.path());
+    let started = Instant::now();
+    stream.arguments(0, "c0", "read", r#"{"path":"a.txt"}"#);
+    assert_eq!(stream.started(), 0, "valid JSON alone never starts a read");
+    stream.completed(0, "c0", "read", r#"{"path":"a.txt"}"#);
+    stream.completed(0, "c0", "read", r#"{"path":"a.txt"}"#);
+    assert_eq!(
+        stream.started(),
+        1,
+        "duplicate completion cannot dispatch twice"
+    );
+    // No response-end or next-index event is delivered. Waiting on the worker channel
+    // proves overlap deterministically, without a scheduler-dependent sleep threshold.
+    let receiver = stream
+        .started
+        .get(&key(&call("read", json!({"path":"a.txt"}))))
+        .unwrap();
+    let (output, read_secs) = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(!output.is_error, "{}", output.text);
+    assert!(output.text.contains("alpha"));
+    eprintln!(
+        "single-read overlap: read={read_secs:.6}s, completed while response pending at {:.6}s",
+        started.elapsed().as_secs_f64()
+    );
+}
+
+#[test]
+fn explicit_completion_uses_authoritative_arguments_and_preserves_admission() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut stream = dispatch(dir.path());
+    stream.arguments(0, "c0", "read", r#"{"path":"old.txt"}"#);
+    stream.completed(0, "c0", "read", "{");
+    stream.completed(1, "c1", "edit", "{}");
+    stream.completed(2, "c2", "read", "{}");
+    assert_eq!(
+        stream.started(),
+        0,
+        "malformed, mutating and schema-invalid calls stay deferred"
+    );
+    stream.invalidate();
+    stream.completed(3, "c3", "read", r#"{"path":"a.txt"}"#);
+    assert_eq!(
+        stream.started(),
+        0,
+        "invalidation also blocks explicit completion"
+    );
+}
+
+#[test]
+fn explicit_completion_never_bypasses_hooks_denials_or_interrupts() {
+    let dir = tempfile::tempdir().unwrap();
+    for event in ["pre_tool_use", "post_tool_use"] {
+        let mut stream = dispatch(dir.path());
+        stream
+            .admission
+            .hooks
+            .push(crate::config::types::HookConfig {
+                event: event.into(),
+                matcher: Some("read".into()),
+                command: vec!["must-not-run".into()],
+                timeout_secs: 1,
+                fail_closed: None,
+            });
+        stream.completed(0, "c0", "read", r#"{"path":"a.txt"}"#);
+        assert_eq!(stream.started(), 0, "{event} requires ordinary dispatch");
+    }
+    let mut stream = dispatch(dir.path());
+    stream
+        .admission
+        .always
+        .push(crate::agent::safety::approval::PermissionRule {
+            effect: crate::agent::safety::approval::Effect::Deny,
+            tool: "read".into(),
+            command_prefix: Vec::new(),
+            paths: Vec::new(),
+        });
+    stream.completed(0, "c0", "read", r#"{"path":"a.txt"}"#);
+    assert_eq!(stream.started(), 0);
+    let mut stream = dispatch(dir.path());
+    stream.runner.interrupt.store(true, Ordering::SeqCst);
+    stream.completed(0, "c0", "read", r#"{"path":"a.txt"}"#);
+    let (output, _) = stream
+        .take(&call("read", json!({"path":"a.txt"})), &mut NullUi)
+        .unwrap();
+    assert!(output.is_error);
+    assert_eq!(output.text, interrupted_tool().text);
+}

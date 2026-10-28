@@ -372,7 +372,12 @@ mod management;
 mod memory;
 mod message_routing;
 mod model;
+mod sources;
 mod tools;
+pub use sources::{
+    COMPACTION_METHODS, FOREIGN_SOURCES, ModelUse, Names, PathKind, RECALL_TYPES, STATUS_SEGMENTS,
+    Source,
+};
 mod voice;
 static UI: &[SettingDef] = &[
     field!(
@@ -990,6 +995,7 @@ static REGISTRY: &[SettingDef] = &[
     experimental::DECLARATIONS[10],
     experimental::DECLARATIONS[11],
     coordination::DECLARATIONS[0],
+    coordination::DECLARATIONS[1],
     message_routing::DECLARATIONS[0],
     voice::DECLARATIONS[0],
     voice::DECLARATIONS[1],

@@ -1334,6 +1334,27 @@ async function emitScreenshot(context, frame, options) {
 	return result;
 }
 
+/**
+ * Ask the configured `grounding` model where `description` is. Takes a silent full screenshot of the
+ * target, which becomes the input frame, and returns a point in its pixels; nothing is clicked.
+ */
+async function locateTarget(session, getContext, target, description) {
+	if (typeof description !== "string" || !description.trim()) {
+		throw new ToolError("locate requires a description of the element, e.g. locate(\"the Save button\")");
+	}
+	const context = getContext();
+	const shot = await captureScreenshot(session, getContext, target, { silent: true });
+	throwIfAborted(context.signal);
+	const point = await context.callTool("grounding.locate", { path: shot.path, description });
+	throwIfAborted(context.signal);
+	const result = { x: point.x, y: point.y, width: shot.width, height: shot.height, target, model: point.model };
+	context.output.push({
+		type: "text",
+		text: `locate ${JSON.stringify(description)} → (${result.x}, ${result.y}) in the ${shot.width}×${shot.height} screenshot of ${target} [${point.model}]; this screenshot is now the input frame`,
+	});
+	return result;
+}
+
 class El {
 	#session;
 	#getContext;
@@ -1441,6 +1462,10 @@ class Win {
 			throw new ToolError("zoom requires a region { x, y, width, height } in the last full screenshot's pixels");
 		}
 		return captureScreenshot(this.#session, this.#getContext, this.id, options, region);
+	}
+
+	locate(description) {
+		return locateTarget(this.#session, this.#getContext, this.id, description);
 	}
 
 	async click(x, y, options) {
@@ -1678,6 +1703,7 @@ class ComputerWorkerCore {
 			output,
 			screenshots,
 			confirmControl: reason => this.#confirmControl(active, reason),
+			callTool: (name, args) => this.#callTool(active, name, args),
 		};
 		let returnValue;
 		let failure;
@@ -1886,6 +1912,7 @@ class ComputerWorkerCore {
 					id: selector,
 					screenshot: target.screenshot.bind(target),
 					zoom: target.zoom.bind(target),
+					locate: target.locate.bind(target),
 					click: target.click.bind(target),
 					doubleClick: target.doubleClick.bind(target),
 					move: target.move.bind(target),
@@ -1963,6 +1990,7 @@ class ComputerWorkerCore {
 			},
 			screenshot: options => captureScreenshot(session, getContext, "desktop", options),
 			zoom: desktopTarget.zoom.bind(desktopTarget),
+			locate: desktopTarget.locate.bind(desktopTarget),
 			click: desktopTarget.click.bind(desktopTarget),
 			doubleClick: desktopTarget.doubleClick.bind(desktopTarget),
 			move: desktopTarget.move.bind(desktopTarget),

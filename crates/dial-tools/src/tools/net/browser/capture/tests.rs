@@ -37,3 +37,29 @@ fn capture_actions_are_recognised() {
     assert!(!is_action("screenshot"));
     assert!(!is_action("click"));
 }
+
+#[test]
+fn locate_requires_a_bounded_description_on_the_viewport() {
+    assert!(validate("locate", &json!({ "description": "the Save button" })).is_ok());
+    for args in [
+        json!({}),
+        json!({ "description": "  " }),
+        json!({ "description": "x".repeat(501) }),
+        json!({ "description": "Save", "full_page": true }),
+    ] {
+        assert!(validate("locate", &args).is_err(), "{args}");
+    }
+}
+
+#[test]
+fn located_device_pixels_map_to_viewport_css_pixels() {
+    let located = crate::tools::vision::grounding::Located {
+        x: 1961,
+        y: 1251,
+        width: 2560,
+        height: 1600,
+        model: "mlx/m".into(),
+        reply: String::new(),
+    };
+    assert_eq!(css_point(&located, 1280.0, 800.0), (980.5, 625.5));
+}

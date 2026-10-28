@@ -147,6 +147,7 @@ impl Config {
         self.steering.validate()?;
         self.adaptive.validate()?;
         self.reliability.validate()?;
+        self.image.validate()?;
         ensure!(
             (1..=32).contains(&self.subagent_max_live_jobs),
             "subagent_max_live_jobs must be 1..32"

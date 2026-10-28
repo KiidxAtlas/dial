@@ -152,8 +152,8 @@ state, requests report `registry_default` routing.
   - `off`: no replays.
   - `streaming`: replays only while an agent run is streaming a reply, for up to 30 minutes from the last settled prefix.
   - `idle`: also replays between runs, for up to 60 minutes from the last settled prefix.
-- A replay is armed only when the economics favor it: the expected savings over the next replay must exceed $0.001 at catalog prices. Without catalog pricing for the model, warming does not start. Lifetimes are assumed to be the 5-minute default, so 1-hour cache writes are priced conservatively.
-- Warming stops when the mode changes to `off`, the model changes, the window ends, a replay wrote the cache instead of reading it, or the replay backend is unavailable. A round that settles a new prefix replaces the armed one. The reason is shown as a notice at the start of the next turn. Hermetic evaluation runs never replay.
+- A replay is armed only when the economics favor it: the expected savings over the next replay must exceed $0.001 at catalog prices. Without catalog pricing for the model, warming does not start. The successful native request supplies its effective cache lifetime, including cache-control refusal fallback: five-minute prefixes refresh after four minutes; one-hour prefixes after 59 minutes. Unknown or disabled retention disarms the previous prefix rather than guessing.
+- Warming stops when the mode changes to `off`, the model changes, the window ends, a replay wrote the cache instead of reading it, or the replay backend is unavailable. Accepted tool-call and text-only replies both replace the armed prefix with the request that produced them, not the newly generated reply. The reason is shown as a notice at the start of the next turn. Hermetic evaluation runs never replay.
 - Warming applies to native Anthropic routes only. Other providers and local servers have no equivalent cache control and never replay.
 
 ## Stable prompts and immutable media

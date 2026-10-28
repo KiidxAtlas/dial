@@ -5,9 +5,40 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 
 ## [Unreleased]
 
+### Added
+
+- Project peers can guide the next step of an existing task and wake an incomplete task in an open terminal. Wake-ups are deduplicated, limited to three per user turn with a 30-second cooldown, and disabled with `coordination.auto_wake = false`; completed, blocked, failed, cancelled and human-input-waiting tasks stay asleep (`docs/session-coordination.md`).
+- Inference latency reports now separate response wait, loading, prompt processing, generation, provider backoff and cancellation; local scheduling benchmarks measure batching and background overlap without paid model calls (`docs/configuration.md`).
+- `/image generate <prompt>` runs `image_gen` directly with the typed prompt, under the usual approval, writing a new image file named from the prompt in the workspace root (`docs/tools.md`).
+- `/image settings` sets per-model image generation settings, much like `/model settings` does for chat models. Every image API takes a default size. MLX-Serve adds steps, seed and LoRAs, chosen from `~/.mlx-serve/models/loras` with scales; OpenAI adds quality, background and moderation. Settings are saved under `[image.models.<key>]` and apply to every `image_gen` call for that model. The panel shows only the rows the model's image API accepts (`docs/configuration.md`).
+- `image_gen` can edit an existing workspace image through the optional `image` argument, and `/image edit <file> <prompt>` runs one edit directly. MLX-Serve receives the source on its generations route, with the new **Edit strength** setting from `/image settings`. OpenAI Images (gpt-image models and dall-e-2) gets a multipart `images/edits` upload, and the Responses image tool gets the source as an input image. xAI, inline chat-image output and dall-e-3 refuse an edit before any request is sent. The source file is only read, and the result is written to a new file (`docs/tools.md`).
+- Two new model roles, both with curated MLX defaults that one command downloads and assigns (`docs/model-vision.md`):
+  - **`grounding`** finds a described UI element in a screenshot. It powers the `computer` tool's `target.locate(description)`, which returns screenshot pixels and never clicks, and the browser's `action=locate`, which returns viewport CSS pixels for `click_at`. Set it up with `/setup grounding`: UI-Venus-1.5-2B by default, or UI-TARS-1.5-7B.
+  - **`image_embedding`** embeds text and images in one vector space. It powers the new read-only `image_search` tool (modes `text`, `similar` and `score`) and adds a prompt-similarity line to `image_gen` results. Set it up with `/setup image-embeddings`, which installs Qwen3-VL-Embedding-2B.
+
+  Both roles also run on any OpenAI-compatible endpoint. A finished setup reloads the session, so the role applies without a restart.
+- Settings rows that name something Dial can list now offer it instead of a typing field: model rows list discovered and downloaded models, and offer missing suggested local models as a confirmed background download that saves the setting only on success; provider and profile rows list configured names; program and folder paths open a file browser; known-value lists open a checklist; tables and arrays open a per-entry editor. `Ctrl-E` still types any value (`docs/terminal-interface.md`).
+- Sessions in one checkout share build and test results. A check command (`cargo test`, `npm run build`, …) that another session already ran on an identical tree (same HEAD and uncommitted content) returns that result once instead of compiling again. If the other session's run is still going, this session joins it and is notified when it finishes. Shared results are labelled and never count as this session's own verification (`docs/session-coordination.md`).
+
+### Changed
+
+- Provider retry backoff is distinguished from the initial response wait. Experimental streaming dispatch recognizes explicit Anthropic, Bedrock and Responses tool-call completion, so normal-mode last/single reads can overlap the rest of the response without guessing from partial JSON (`docs/agent-loop.md`).
+- `diagram` fences draw the model's plain ASCII line art (`->`, `|`, `v`, `+--+`) with box-drawing lines, arrowheads and rounded corners on a fully filled panel; the source stays ASCII, which tokenizes about a quarter cheaper than box-drawing characters. The advisory diagram rule now reaches the lean local prompt too, suggests a diagram only for branching, looping or layered structure, and prefers unboxed arrows, since boxes and long arrows cost tokens without adding meaning; a linear flow stays one sentence (`docs/terminal-interface.md`).
+
 ### Fixed
 
+- Idle cache warming now tracks accepted text-only/final requests as well as tool-call requests, and honors effective five-minute versus one-hour retention and provider refusal fallback (`docs/llm-transport.md`).
+- `task wait`, `side_request wait`, `bg wait` and a foreground `bash` command not yet moved to the background now stop as soon as the user queues a message, so the message is handled promptly instead of after a long wait. Nothing is cancelled: the awaited work keeps running (`docs/agent-loop.md`).
+- A shell command that repeats only a `cd`, `export` or `NAME=value` prefix of an earlier command (`cd crates/x && git status` after `cd crates/x && ls`) is no longer reported as an unchanged rerun.
+- `message` sent to a project peer id, or as a broadcast with no live workers, now says to use `peers` (action=send) for other Dial sessions.
+- An `edit` refused because its anchor lines had not been read shows those lines and says to re-issue it; the identical re-issue is no longer withheld by the failed-operation retry barrier.
+- A failed shell command is no longer withheld by the retry barrier once the checkout has changed since it failed (different HEAD or uncommitted content), so a build broken by another session's file can be rerun after that session fixes it.
+- Clipped build output keeps compiler errors and their locations ahead of warning locations, so 25 `--> file:line` lines under warnings no longer use the diagnostic budget before the `error[...]` line.
+- Slash-command Tab/Right completion no longer wraps extension suggestions or their arguments in shell quotes, which broke slash-command dispatch. Quotes and backslashes supplied by the suggestion are preserved (`docs/extensibility.md`).
+
 - Fixed a stdio MCP race where a fast server reply could arrive before local write completion was recorded, causing successful startup or tool calls to tear down a healthy connection. Cancellation and deadline teardown of genuinely blocked writes remain bounded.
+- LM Studio vision models (native type `vlm`) are now marked vision-capable in `/models` and accept image input; text-only `llm` models are marked as such. Models LM Studio reports as trained for tool use are marked tool-capable; the rest stay unknown, since LM Studio still prompts tools to them.
+- OpenRouter's Auto Router (`openrouter/auto`, `openrouter/auto-beta`) is no longer treated as an image-generation model. Its catalog row lists the output modalities of its whole routing pool, but image requests to it fail with HTTP 404 ("No endpoints found that support the requested output modalities"); assigning it to the image role now reports that it declares no image-generation capability before any request is sent.
 
 ## [0.2.2] - 2026-10-27
 

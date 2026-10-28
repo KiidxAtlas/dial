@@ -1795,6 +1795,11 @@ fn mismatch_error(
     )
 }
 
+/// Opens an unseen-lines refusal that displayed every missing anchor line. The refusal itself made
+/// those lines witnesses, so the unchanged edit may be re-issued; retry barriers recognise this.
+pub const UNSEEN_LINES_NOW_READ: &str =
+    "All unread anchor lines are shown below and now count as read";
+
 /// Show all unread anchor ranges together, without allowing the rejected patch to write.
 /// Only complete, displayed rows become witnesses; oversized previews require an explicit read.
 fn show_unseen(job: &mut Job, store: &mut EditStore, error: String) -> String {
@@ -1827,7 +1832,7 @@ fn show_unseen(job: &mut Job, store: &mut EditStore, error: String) -> String {
         .all(|&(a, b)| displayed.first_unseen(a, b).is_none());
     let next = if complete {
         format!(
-            "All unread anchor lines are shown below and now count as read; check them, then re-issue the edit against [{rel}#{tag}].",
+            "{UNSEEN_LINES_NOW_READ}; check them, then re-issue the edit against [{rel}#{tag}].",
             rel = job.rel,
             tag = job.tag
         )

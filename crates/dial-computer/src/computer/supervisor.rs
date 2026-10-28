@@ -64,6 +64,11 @@ impl AbortSignal {
     pub fn is_aborted(&self) -> bool {
         self.0.load(Ordering::SeqCst)
     }
+
+    /// The shared flag, for model requests that take a cancel flag instead of a signal.
+    pub fn flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.0)
+    }
 }
 
 pub trait ComputerHost: Send + Sync {

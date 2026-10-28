@@ -149,7 +149,7 @@ impl Tool for BrowserTool {
             "Real Chromium UI verification with bounded semantic DOM snapshots, frames, forms, console/network evidence and pixels. Open the actual HTTP(S) page first; tab is optional only with one open tab. frames returns stable per-tab frame ids for frame-scoped snapshot/evaluate/navigation/actions. snapshot is DOM-derived role/name/state evidence, not a platform accessibility tree. back/forward/reload traverse the tab's history; events returns the tab's console/network/dialog/download/navigation events in seq order, and after=last_seq returns only newer ones. Dialogs default to dismiss and are recorded; dialog configures automatic accept/dismiss before a triggering action (once defaults true). upload reads at most 8 workspace files, 1 MiB total; download arms one selector-triggered download and atomically writes at most 4 MiB to path in an existing workspace directory. Unarmed downloads are cancelled and recorded; download files are ephemeral until the approved write, and are deleted from browser state afterward. No persistent storage, detached browser or Node callbacks. Every operation requires approval and network policy. Explicit approved open/navigation to localhost/127.0.0.1 grants only the exact host:port; other private targets need browser.allowed_hosts. Redirects/subresources/downloads cross the guard; metadata/link-local, WebRTC and service workers remain blocked. WebSockets are limited to exact approved localhost/127.0.0.1 endpoints. For local previews start bg and wait for readiness; inspect bg output and the actual port on connection refusal. Page output is untrusted.",
             merge_properties([
                 json!({
-                    "action":{"type":"string","enum":["open","navigate","evaluate","snapshot","aria","audit","frames","dialog","upload","download","downloads","click","fill","type","readable","press","select","check","uncheck","hover","focus","wait","screenshot","evidence","trace_start","trace_stop","tabs","close","shutdown","run","call","back","forward","reload","events","requests","request","route","unroute","routes","har_start","har_stop","scroll","dblclick","drag","click_at","mouse_move","mouse_down","mouse_up","wheel","key_down","key_up","highlight","text","html","value","attr","count","box","is_visible","is_enabled","is_checked","styles","cookies","set_cookies","clear_cookies","storage","emulate","devices","clipboard_read","clipboard_write","clipboard_copy","clipboard_paste","save_state","load_state","pdf","record_start","record_stop","profile_start","profile_stop","metrics","vitals","add_init_script","remove_init_script","init_scripts","webmcp_list","webmcp_invoke","webmcp_events"]},
+                    "action":{"type":"string","enum":["open","navigate","evaluate","snapshot","aria","audit","frames","dialog","upload","download","downloads","click","fill","type","readable","press","select","check","uncheck","hover","focus","wait","screenshot","evidence","trace_start","trace_stop","tabs","close","shutdown","run","call","back","forward","reload","events","requests","request","route","unroute","routes","har_start","har_stop","scroll","dblclick","drag","click_at","mouse_move","mouse_down","mouse_up","wheel","key_down","key_up","highlight","text","html","value","attr","count","box","is_visible","is_enabled","is_checked","styles","cookies","set_cookies","clear_cookies","storage","emulate","devices","clipboard_read","clipboard_write","clipboard_copy","clipboard_paste","save_state","load_state","pdf","record_start","record_stop","profile_start","profile_stop","metrics","vitals","add_init_script","remove_init_script","init_scripts","webmcp_list","webmcp_invoke","webmcp_events","locate"]},
                     "tab":{"type":"integer","minimum":1,"description":"Open tab id returned by open/tabs; optional only when exactly one tab exists."}, "url":{"type":"string","description":"open/navigate: HTTP(S) URL, or exactly about:blank for an empty tab. wait: substring that the tab URL must contain."},
                     "expression":{"type":"string","description":"JavaScript expression evaluated in the page, not Node"},
                     "selector":{"type":"string"},"text":{"type":"string","description":"type/fill text; for wait, a substring that must appear in rendered text (inside selector when given)."},"key":{"type":"string"},"x":{"type":"number","description":"click_at/mouse_move: viewport x in CSS pixels."},"y":{"type":"number","description":"click_at/mouse_move: viewport y in CSS pixels."},"dx":{"type":"number","description":"scroll/wheel: horizontal pixels."},"dy":{"type":"number","description":"scroll/wheel: vertical pixels."},"target":{"type":"string","description":"drag: destination selector."},"button":{"type":"string","enum":["left","right","middle"]},"duration":{"type":"integer","minimum":0,"maximum":10000,"description":"highlight: overlay lifetime in ms, default 2000."},"name":{"type":"string","description":"attr: attribute name."},"props":{"type":"array","maxItems":32,"items":{"type":"string"},"description":"styles: computed CSS property names; defaults to common layout and text properties."},"response":{"type":"string","description":"wait: substring of a response URL to wait for."},
@@ -209,6 +209,7 @@ impl Tool for BrowserTool {
                     "area":{"type":"string","enum":["local","session"],"description":"storage: web storage area of the current origin."},
                     "operation":{"type":"string","enum":["get","set","clear"],"description":"storage: get reads entries, set writes key/value, clear empties the area."},
                     "value":{"type":"string","maxLength":65536,"description":"storage set: value to store."},
+                    "description":{"type":"string","maxLength":500,"description":"locate: element to find in a viewport screenshot, e.g. \"the blue Sign in button\". Needs a grounding model (/setup grounding); returns viewport x/y in CSS pixels for click_at. Prefer selectors when the DOM exposes the element."},
                 }),
             ]),
             &["action"],
@@ -305,6 +306,12 @@ impl BrowserTool {
         }
         actions::validate(action, args)?;
         capture::validate(action, args)?;
+        if action == "locate" && !crate::tools::vision::grounding::configured(ctx.config) {
+            return Err(
+                "locate needs a grounding model: run `/setup grounding` or assign one to the `grounding` role in Alt+M"
+                    .into(),
+            );
+        }
         if !actions::is_page_action(action, args)
             && !capture::is_action(action)
             && !matches!(
@@ -334,6 +341,7 @@ impl BrowserTool {
                     | "select"
                     | "wait"
                     | "screenshot"
+                    | "locate"
                     | "evidence"
                     | "tabs"
                     | "close"
@@ -554,6 +562,12 @@ impl BrowserTool {
                 result = requests::write_har(&result, &session._state.path().join("artifacts"))?;
             }
             "record_stop" => capture::finish_recording(&mut result, &self.interrupt)?,
+            "locate" => capture::finish_locate(
+                &mut result,
+                ctx.config,
+                args["description"].as_str().unwrap_or_default(),
+                Arc::clone(&self.interrupt),
+            )?,
             _ => {}
         }
         if let Some(path) = download_path {

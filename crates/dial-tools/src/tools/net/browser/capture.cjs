@@ -11,7 +11,7 @@ const MAX_ANNOTATIONS = 60;
 const MAX_METRICS = 200;
 const RECORD_QUALITY = 80;
 const RECORD_EVERY_NTH_FRAME = 2;
-const CAPTURE_ACTIONS = new Set(['screenshot', 'pdf', 'record_start', 'record_stop', 'profile_start', 'profile_stop', 'metrics', 'vitals']);
+const CAPTURE_ACTIONS = new Set(['screenshot', 'locate', 'pdf', 'record_start', 'record_stop', 'profile_start', 'profile_stop', 'metrics', 'vitals']);
 
 const fail = message => { throw new Error(message); };
 const requireCdp = tab => tab.cdp || fail('CDP session is unavailable for this tab');
@@ -24,6 +24,7 @@ async function run(request, ctx) {
   const base = { ...ctx, request, id: request.tab };
   switch (request.action) {
     case 'screenshot': return screenshot(base);
+    case 'locate': return locateCapture(base);
     case 'pdf': return pdf(base);
     case 'record_start': return recordStart(base);
     case 'record_stop': return recordStop(base);
@@ -76,6 +77,16 @@ async function screenshot(ctx) {
   }
   result.artifact = { media_type: format === 'jpeg' ? 'image/jpeg' : 'image/png', encoding: 'base64', data };
   return result;
+}
+
+// Viewport PNG for the host's grounding model, plus the CSS viewport size so device pixels can be
+// mapped back to click_at coordinates. It is not shown to the model and leaves if_changed state alone.
+async function locateCapture(ctx) {
+  const { request, page } = ctx;
+  const bytes = await page.screenshot({ type: 'png', timeout: request.timeout_ms });
+  if (bytes.length > MAX_SCREENSHOT_BYTES) fail('locate screenshot exceeds 5 MiB');
+  const viewport = await page.evaluate(() => ({ width: window.innerWidth, height: window.innerHeight }));
+  return { tab: ctx.id, url: clip(page.url()), viewport, image: bytes.toString('base64') };
 }
 
 // Self-contained: serialized into the page. Returns visible interactive elements addressed by a CSS

@@ -105,7 +105,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         EX,
         "Execution",
         "Streaming dispatch",
-        "Start admitted read-only calls as soon as their arguments finish streaming, before the reply ends; results are delivered in call order afterwards and discarded if the reply fails. Providers that mark each call's end only.",
+        "Start admitted read-only calls at explicit provider completion or the next call index, before the reply ends; results are delivered in call order afterwards and discarded if the reply fails. Disabled for forced single-call and hermetic turns.",
         Kind::Bool,
     ),
     field!(

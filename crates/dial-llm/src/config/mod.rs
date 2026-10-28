@@ -1290,7 +1290,9 @@ impl Config {
                         Some(small) => (Some(small.display_name()), RoleSource::FollowsSmall),
                         None => (Some(main.clone()), RoleSource::FollowsMain),
                     },
-                    ("embedding", None) => (None, RoleSource::NotSet),
+                    ("embedding" | "grounding" | "image_embedding", None) => {
+                        (None, RoleSource::NotSet)
+                    }
                     // The memory role never falls back to main: local and sharpshooter stay inactive
                     // and semantic pauses automatic fact saving until it is assigned.
                     ("memory", None) => (None, RoleSource::NotSet),

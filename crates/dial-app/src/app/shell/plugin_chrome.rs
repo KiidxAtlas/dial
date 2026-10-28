@@ -84,7 +84,7 @@ fn slots_from(slots: &[(String, UiSlot)]) -> PluginSlots {
 }
 
 /// Plugin suggestions as command-menu entries. A leading slash is dropped, since the menu adds it.
-/// Values containing whitespace are kept; the composer single-quotes them when one is inserted.
+/// Values containing whitespace are kept and inserted as command text, without added shell quoting.
 pub(in crate::app) fn suggestion_entries(items: Vec<Suggestion>) -> Vec<CommandEntry> {
     items
         .into_iter()

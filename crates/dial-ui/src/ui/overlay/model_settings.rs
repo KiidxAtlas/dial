@@ -1413,7 +1413,7 @@ fn is_local_provider(provider: &str) -> bool {
     matches!(provider, "mlx" | "lm-studio" | "ollama" | "llama-cpp")
 }
 
-fn as_number(value: &toml::Value) -> Option<f64> {
+pub(super) fn as_number(value: &toml::Value) -> Option<f64> {
     match value {
         toml::Value::Integer(i) => Some(*i as f64),
         toml::Value::Float(f) => Some(*f),
@@ -1422,7 +1422,7 @@ fn as_number(value: &toml::Value) -> Option<f64> {
 }
 
 /// Integers print bare; floats keep a decimal point so TOML reads them back as floats.
-fn number_text(value: f64, int: bool) -> String {
+pub(super) fn number_text(value: f64, int: bool) -> String {
     if int {
         return format!("{}", value.round() as i64);
     }

@@ -271,6 +271,7 @@ pub(in crate::agent) fn parallel_tools(
         let mut results: Vec<Option<(ToolOutput, f64)>> =
             (0..first_calls.len()).map(|_| None).collect();
         let mut outstanding = results.len();
+        let mut input_signalled = false;
         while outstanding > 0 {
             let steering = ui.take_steering();
             if !steering.is_empty() {
@@ -285,6 +286,11 @@ pub(in crate::agent) fn parallel_tools(
                         tool.cancel_operation();
                     }
                 }
+            } else if !input_signalled && ui.pending_input() {
+                // Queued input is routed at the step boundary; parallel waits end so it is prompt.
+                input_signalled = true;
+                signals.request_steering();
+                signals.interrupt_waits();
             }
             if interrupt.load(Ordering::SeqCst) {
                 signals.interrupt_waits();
@@ -898,8 +904,16 @@ impl<'a> Agent<'a> {
                 Err(error) => ToolOutput::err(format!("{error:#}")),
             };
         }
+        if name == "bash"
+            && let Some(shared) = self.shared_run_before(call)
+        {
+            // A peer's result is not this session's verification: no note_verification.
+            backend.release();
+            return shared;
+        }
         if let Some(out) = self.run_background_tool(name, args, ui, Some(backend)) {
             if name == "bash" {
+                self.shared_run_after(&out);
                 self.note_verification(call, &out, ui);
             }
             return out;
@@ -1202,7 +1216,7 @@ impl<'a> Agent<'a> {
                 },
             },
             "task" => self.run_task(backend, args, ui),
-            "side_request" => self.side_question(args),
+            "side_request" => self.side_question_with_input(args, &mut || ui.pending_input()),
             "message" => {
                 crate::agent::workers::live_tasks::output(self.live_tasks.message_call(args))
             }

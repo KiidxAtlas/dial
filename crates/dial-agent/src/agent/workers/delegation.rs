@@ -43,6 +43,7 @@ impl<'a> Agent<'a> {
                 "could not journal settled execution state: {error:#}"
             ));
         }
+        let mut finished_jobs = Vec::new();
         for name in self.ext.names() {
             if let Some(tool) = self.ext.get(name) {
                 for event in tool.drain_notifications() {
@@ -66,6 +67,11 @@ impl<'a> Agent<'a> {
                             .map(|uri| format!("\n[Complete output: {uri}]"))
                             .unwrap_or_default();
                         if event.kind == "complete" && name == "bg" {
+                            finished_jobs.push((
+                                event.name.clone(),
+                                event.text.clone(),
+                                event.artifact.clone(),
+                            ));
                             self.background_notices.push(format!(
                                 "[background job {} finished] {}{}",
                                 event.name, event.text, suffix
@@ -76,6 +82,10 @@ impl<'a> Agent<'a> {
                 }
             }
         }
+        for (job, label, artifact) in finished_jobs {
+            self.shared_run_job_finished(&job, &label, artifact.as_deref());
+        }
+        self.poll_joined_runs();
     }
     /// Persists finished worker results the model has not received as ordinary session messages, so
     /// they survive an overflow retry and stay in context on later steps. Each result is delivered once.
@@ -255,10 +265,20 @@ impl<'a> Agent<'a> {
                     &self.interrupt,
                     ui,
                 );
+                let (reply, stopped_for_input) = match reply {
+                    Ok((value, stopped)) => (Ok(value), stopped),
+                    Err(error) => (Err(error), false),
+                };
                 if let Ok(value) = &reply {
                     self.live_tasks.acknowledge(value);
                 }
-                return crate::agent::workers::live_tasks::output(reply);
+                let mut output = crate::agent::workers::live_tasks::output(reply);
+                if stopped_for_input {
+                    output
+                        .text
+                        .push_str(crate::agent::workers::live_tasks::STOPPED_FOR_INPUT);
+                }
+                return output;
             }
             "cancel" => {
                 let id = args["id"].as_str().unwrap_or("");

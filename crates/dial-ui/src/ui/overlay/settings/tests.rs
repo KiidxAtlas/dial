@@ -54,6 +54,22 @@ fn send_all(o: &mut SettingsOverlay, keys: &Keymap, events: Vec<Event>) -> Overl
     last
 }
 
+/// Enter on a setting, then Ctrl+E when Enter opened a chooser or structured editor, so the test
+/// ends in the plain text editor either way.
+fn open_text(o: &mut SettingsOverlay, keys: &Keymap) {
+    send(o, keys, key(KeyCode::Enter));
+    if !matches!(o.mode, Mode::Edit { .. }) {
+        assert!(
+            matches!(
+                o.mode,
+                Mode::List { .. } | Mode::Entries { .. } | Mode::Path { .. }
+            ),
+            "Enter opened neither a text nor a structured editor"
+        );
+        send(o, keys, ctrl('e'));
+    }
+}
+
 fn draw(o: &mut SettingsOverlay, rig: &Rig, w: u16, h: u16) -> String {
     let preview = |ui: &UiConfig, width: u16| status_preview(ui, width);
     let ctx = DrawCtx {
@@ -605,6 +621,11 @@ fn float_and_list_inputs_and_step_adjustment() {
 
     goto(&mut o, &rig.keys, "ui.status_left");
     send(&mut o, &rig.keys, key(KeyCode::Enter));
+    assert!(
+        matches!(o.mode, Mode::List { .. }),
+        "known-value lists open the checklist"
+    );
+    send(&mut o, &rig.keys, ctrl('e'));
     let Mode::Edit { editor, .. } = &o.mode else {
         panic!()
     };
@@ -1634,7 +1655,7 @@ fn structured_settings_roundtrip_nested_tables_and_arrays_without_stringifying()
         let rig = Rig::new();
         let mut o = overlay();
         goto(&mut o, &rig.keys, path);
-        send(&mut o, &rig.keys, key(KeyCode::Enter));
+        open_text(&mut o, &rig.keys);
         let Mode::Edit { editor, .. } = &mut o.mode else {
             panic!("{path} did not open an editor");
         };
@@ -1758,6 +1779,12 @@ fn project_structured_edits_do_not_copy_global_credentials_or_unrelated_fields()
             crate::config::schema::set(&mut o.effective, path, Value::Table(merged));
             goto(&mut o, &rig.keys, path);
             send(&mut o, &rig.keys, key(KeyCode::Enter));
+            if let Mode::Entries { editor, .. } = &o.mode {
+                let working = editor.value().to_string();
+                assert!(!working.contains("private-global-only"), "{path}");
+                assert!(!working.contains("unrelated"), "{path}");
+                send(&mut o, &rig.keys, ctrl('e'));
+            }
             let Mode::Edit { editor, def } = &o.mode else {
                 panic!("expected structured editor");
             };
@@ -1808,6 +1835,174 @@ fn structured_seeds_preserve_selected_scope_pending_values_and_empty_array_shape
             .insert(path.into(), Pending::Unset(Scope::Project));
         assert_eq!(o.edit_seed(def), empty);
     }
+}
+
+#[test]
+fn path_settings_open_a_browser_and_save_only_the_chosen_entry() {
+    let rig = Rig::new();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("venv")).unwrap();
+    let python = dir.path().join("python3");
+    std::fs::write(&python, "").unwrap();
+    let mut o = overlay();
+    o.set_base_dir(dir.path().to_path_buf());
+    goto(&mut o, &rig.keys, "python");
+    assert!(matches!(
+        send(&mut o, &rig.keys, key(KeyCode::Enter)),
+        OverlayEvent::None
+    ));
+    assert!(
+        matches!(o.mode, Mode::Path { .. }),
+        "Enter browses instead of typing"
+    );
+    let screen = draw(&mut o, &rig, 120, 40);
+    assert!(screen.contains("python3"), "{screen}");
+    assert!(matches!(
+        send(&mut o, &rig.keys, key(KeyCode::Esc)),
+        OverlayEvent::None
+    ));
+    assert!(matches!(o.mode, Mode::Browse), "Esc writes nothing");
+
+    send(&mut o, &rig.keys, key(KeyCode::Enter));
+    send_all(&mut o, &rig.keys, typed("python3"));
+    let (path, value, _) = expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
+    assert_eq!(path, "python");
+    assert_eq!(value, Value::String(python.display().to_string()));
+
+    send(&mut o, &rig.keys, key(KeyCode::Enter));
+    send(&mut o, &rig.keys, ctrl('e'));
+    assert!(
+        matches!(o.mode, Mode::Edit { .. }),
+        "Ctrl+E keeps typing available"
+    );
+}
+
+#[test]
+fn known_value_lists_check_values_instead_of_typing_them() {
+    let rig = Rig::new();
+    let mut o = overlay();
+    goto(&mut o, &rig.keys, "ui.status_right");
+    send(&mut o, &rig.keys, key(KeyCode::Enter));
+    let Mode::List { editor, .. } = &o.mode else {
+        panic!("expected the checklist");
+    };
+    let before = editor.value();
+    let screen = draw(&mut o, &rig, 120, 60);
+    assert!(
+        screen.contains("[ ] "),
+        "unchosen segments are offered: {screen}"
+    );
+    // Space on the first row flips it; Enter saves the whole list.
+    send(&mut o, &rig.keys, key(KeyCode::Char(' ')));
+    let (path, value, _) = expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
+    assert_eq!(path, "ui.status_right");
+    assert_ne!(value, before);
+    for segment in value.as_array().unwrap() {
+        let segment = segment.as_str().unwrap();
+        assert!(
+            crate::config::schema::STATUS_SEGMENTS.contains(&segment),
+            "{segment} is not a known status segment"
+        );
+    }
+}
+
+#[test]
+fn collections_open_a_per_entry_editor_that_saves_the_whole_value() {
+    let rig = Rig::new();
+    let mut o = overlay();
+    // Collections that can hold credentials (hooks, MCP, providers…) keep the masked text editor.
+    goto(&mut o, &rig.keys, "hooks");
+    send(&mut o, &rig.keys, key(KeyCode::Enter));
+    assert!(
+        matches!(o.mode, Mode::Edit { .. }),
+        "sensitive stays masked"
+    );
+    send(&mut o, &rig.keys, key(KeyCode::Esc));
+
+    goto(&mut o, &rig.keys, "verification");
+    send(&mut o, &rig.keys, key(KeyCode::Enter));
+    assert!(
+        matches!(o.mode, Mode::Entries { .. }),
+        "tables list entries"
+    );
+    // An empty table shows the add row first; Enter opens its input.
+    send(&mut o, &rig.keys, key(KeyCode::Enter));
+    send_all(
+        &mut o,
+        &rig.keys,
+        typed("commands = [{ name = \"check\", command = \"cargo check\" }]"),
+    );
+    send(&mut o, &rig.keys, key(KeyCode::Enter));
+    let screen = draw(&mut o, &rig, 120, 40);
+    assert!(screen.contains("cargo check"), "{screen}");
+    assert!(screen.contains("Save changes"), "{screen}");
+    // Down past the add row reaches Save.
+    send(&mut o, &rig.keys, key(KeyCode::Down));
+    send(&mut o, &rig.keys, key(KeyCode::Down));
+    let (path, value, _) = expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
+    assert_eq!(path, "verification");
+    assert_eq!(
+        value,
+        parse_input(
+            Kind::Toml,
+            "{ commands = [{ name = \"check\", command = \"cargo check\" }] }"
+        )
+        .unwrap()
+    );
+}
+
+#[test]
+fn model_offers_ask_before_downloading_and_esc_disarms() {
+    let rig = Rig::new();
+    let mut o = overlay();
+    o.set_value_choices(BTreeMap::from([(
+        "local_runtime.draft_model".to_owned(),
+        vec![
+            ValueChoice {
+                value: "org/ready".into(),
+                label: "Ready model".into(),
+                action: ChoiceAction::Set,
+            },
+            ValueChoice {
+                value: "org/remote".into(),
+                label: "Remote model".into(),
+                action: ChoiceAction::Download,
+            },
+        ],
+    )]));
+    goto(&mut o, &rig.keys, "local_runtime.draft_model");
+    send(&mut o, &rig.keys, key(KeyCode::Enter));
+    assert!(matches!(o.mode, Mode::Pick { .. }), "models are chosen");
+    send(&mut o, &rig.keys, key(KeyCode::Down));
+    assert!(
+        matches!(
+            send(&mut o, &rig.keys, key(KeyCode::Enter)),
+            OverlayEvent::None
+        ),
+        "the first Enter only asks"
+    );
+    assert!(matches!(o.mode, Mode::Pick { .. }));
+    assert!(o.feedback.as_deref().unwrap().contains("Enter again"));
+    send(&mut o, &rig.keys, key(KeyCode::Esc));
+    assert!(o.download_armed.is_none(), "Esc disarms");
+
+    send(&mut o, &rig.keys, key(KeyCode::Enter));
+    send(&mut o, &rig.keys, key(KeyCode::Down));
+    send(&mut o, &rig.keys, key(KeyCode::Enter));
+    assert!(matches!(
+        send(&mut o, &rig.keys, key(KeyCode::Enter)),
+        OverlayEvent::DownloadSetting { path, value, scope: Scope::Global }
+            if path == "local_runtime.draft_model" && value == "org/remote"
+    ));
+    assert!(matches!(o.mode, Mode::Browse));
+
+    send(&mut o, &rig.keys, key(KeyCode::Enter));
+    let (_, value, _) = expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
+    assert_eq!(
+        value,
+        Value::String("org/ready".into()),
+        "ready models save at once"
+    );
 }
 
 #[test]

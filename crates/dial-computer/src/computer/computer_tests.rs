@@ -171,7 +171,7 @@ fn computer_real_runtime_handles_sequential_and_concurrent_reads() {
             "code": "await wait(10); return (await desktop.control.state()).active;"}))
         .unwrap();
         let result = session
-            .execute(action, cwd, false, None, &AbortSignal::new())
+            .execute(action, cwd, false, None, None, &AbortSignal::new())
             .unwrap();
         assert_eq!(result["returnValue"], false, "{result}");
     };
@@ -206,6 +206,7 @@ fn computer_run_arguments_preserve_json_keys_without_changing_prototypes() {
             dir.path().to_str().unwrap(),
             false,
             None,
+            None,
             &AbortSignal::new(),
         )
         .unwrap();
@@ -235,6 +236,7 @@ fn computer_function_runs_use_async_bodies_and_keep_session_usable() {
                 action,
                 dir.path().to_str().unwrap(),
                 false,
+                None,
                 None,
                 &AbortSignal::new(),
             )
@@ -492,4 +494,40 @@ mod worker {
             "{result}"
         );
     }
+}
+
+#[test]
+fn locate_reads_only_this_runs_temporary_screenshots() {
+    let config = Config::default();
+    let signal = AbortSignal::new();
+    let refuse = |path: &std::path::Path| {
+        let error = locate_screenshot(
+            &config,
+            &json!({"path": path, "description": "the Save button"}),
+            &signal,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("only screenshots"), "{path:?}: {error}");
+    };
+    // A subdirectory of the temporary directory is not where the worker writes screenshots.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let outside = elsewhere.path().join("dial-computer-1.png");
+    std::fs::write(&outside, b"png").unwrap();
+    refuse(&outside);
+    let temp = std::env::temp_dir();
+    let wrong_name = temp.join(format!("not-dial-{}.png", std::process::id()));
+    std::fs::write(&wrong_name, b"png").unwrap();
+    refuse(&wrong_name);
+    std::fs::remove_file(&wrong_name).unwrap();
+    #[cfg(unix)]
+    {
+        let link = temp.join(format!("dial-computer-link-{}.png", std::process::id()));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        refuse(&link);
+        std::fs::remove_file(&link).unwrap();
+    }
+    let missing_description = locate_screenshot(&config, &json!({"path": outside}), &signal);
+    assert!(missing_description.is_err());
 }

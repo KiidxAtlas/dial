@@ -4,7 +4,9 @@ use crate::app::core::App;
 use crate::app::discovery::Catalog;
 use crate::app::overlay::auth::AuthJob;
 use crate::app::overlay::compute::ComputeMonitor;
-use crate::app::overlay::settings::{apply_settings_hints, setting_setup_offers};
+use crate::app::overlay::settings::{
+    apply_settings_hints, setting_setup_offers, settings_value_choices,
+};
 use crate::app::overlay::{ActiveOverlay, start_streaming_job};
 use crate::app::selection::change_path;
 use crate::config::settings_store::{self, Change, Scope};
@@ -156,7 +158,19 @@ impl OverlayEnv<'_> {
             }
             let result = if provider == "Model" {
                 result.and_then(|message| {
-                    self.reload_saved()?;
+                    let fresh = self.reload_saved()?;
+                    // A finished download saved a setting: show it, and offer the model as
+                    // downloaded from now on.
+                    if let ActiveOverlay::Settings(settings) = &mut *overlay
+                        && let Ok((values, global, project)) = settings_tables(self.app, &fresh)
+                    {
+                        settings.replace_values(values, project, global);
+                        settings.set_value_choices(settings_value_choices(
+                            &fresh,
+                            self.catalog.get().as_ref(),
+                            &self.app.layout.user_dir,
+                        ));
+                    }
                     Ok(message)
                 })
             } else {
@@ -274,6 +288,15 @@ impl OverlayEnv<'_> {
             });
             let result = self
                 .save(&updates, scope)
+                .map(|_| ())
+                .map_err(|e| format!("{e:#}"));
+            settings.settled(result);
+            return;
+        }
+        if let ActiveOverlay::ImageSettings(settings) = overlay {
+            // Image settings never switch the chat model's profile.
+            let result = self
+                .save(changes, scope)
                 .map(|_| ())
                 .map_err(|e| format!("{e:#}"));
             settings.settled(result);

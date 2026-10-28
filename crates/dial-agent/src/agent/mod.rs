@@ -316,6 +316,8 @@ pub struct Agent<'a> {
     /// notes in the next request (see `queue_hook_context`).
     hook_context: Vec<String>,
     peer_state: run::coordination::State,
+    /// Build/test results shared with peer sessions through the run ledger.
+    shared_runs: verify::shared_runs::State,
     todo: TodoList,
     memory: Option<Arc<ProvenanceMemory>>,
     memory_runtime: Option<Arc<crate::storage::memory_backend::MemoryRuntime>>,

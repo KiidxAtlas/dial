@@ -534,6 +534,9 @@ impl Ui for RpcUi {
             .map(|mut q| std::mem::take(&mut *q))
             .unwrap_or_default()
     }
+    fn pending_input(&mut self) -> bool {
+        self.steering.lock().is_ok_and(|queue| !queue.is_empty())
+    }
     fn policy_explanation(
         &mut self,
         call_id: &str,

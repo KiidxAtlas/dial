@@ -131,7 +131,7 @@ impl OverlayEnv<'_> {
                         );
                         self.auth_job.as_mut().unwrap().model = Some(PreparedModel {
                             changes,
-                            role,
+                            role: Some(role),
                             scope,
                         });
                         Ok("Preparing model in the background; settings save only on success. Esc closes this panel and cancels preparation.".into())
@@ -170,6 +170,55 @@ impl OverlayEnv<'_> {
                     settings.replace_values(values, project, global);
                     settings.roles_changed();
                 }
+            }
+            OverlayEvent::DownloadSetting { path, value, scope } => {
+                *self.scope = scope;
+                let config = self
+                    .latest
+                    .clone()
+                    .unwrap_or_else(|| self.app.config.clone());
+                let outcome = (|| -> Result<String> {
+                    let changes = vec![Change::Set {
+                        path: path.clone(),
+                        value: toml::Value::String(value.clone()),
+                    }];
+                    // Refuse an invalid value before spending a download on it.
+                    settings_store::preview_config(
+                        &self.app.layout,
+                        scope,
+                        &changes,
+                        &self.app.overlay,
+                    )?;
+                    let message = format!("{path} set to {value}");
+                    let model = value.clone();
+                    let python = config.python.clone();
+                    let started =
+                        start_streaming_job(self.auth_job, "Model", move |cancel, progress| {
+                            let progress = RefCell::new(progress);
+                            crate::llm::download::ensure_local_model_with(
+                                &python,
+                                &model,
+                                &crate::llm::download::Choice::Auto,
+                                &cancel,
+                                &|line| progress.borrow_mut()(line),
+                            )?;
+                            ensure!(!cancel.load(Ordering::SeqCst), "download cancelled");
+                            Ok(message)
+                        });
+                    ensure!(
+                        started,
+                        "Another background operation is still running; try again when it finishes."
+                    );
+                    self.auth_job.as_mut().unwrap().model = Some(PreparedModel {
+                        changes,
+                        role: None,
+                        scope,
+                    });
+                    Ok(format!(
+                        "Downloading {value} in the background; {path} saves only on success. Esc closes this panel and cancels the download."
+                    ))
+                })();
+                self.report(overlay, outcome);
             }
             OverlayEvent::ClearRole { role, scope } => {
                 *self.scope = scope;

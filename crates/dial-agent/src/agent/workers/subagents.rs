@@ -126,17 +126,32 @@ pub fn toolset(spec: &AgentSpec, enabled: &[String], ext: &Registry) -> Vec<Stri
     if spec.name == "seance" {
         return own.collect();
     }
-    // Read-only agents get recall extensions (codebase, memory, `find`, `dep_source`), not
-    // integrations such as browsers or archive inspection, even when those need no approval.
+    // Read-only agents get recall and code-intelligence extensions (codebase, memory, `find`,
+    // `dep_source`, `image_search`, `lsp`, read-only `git`, `ast_search`, `code_history`), not
+    // external side-effect integrations such as browsers, even when a probe needs no approval.
+    // Every actual call by a read-only child is still gated by `approval::needs_approval` in `child.rs`.
     let extra = ext
         .names()
         .filter(|name| {
+            let probe = if *name == "git" {
+                json!({"action": "status"})
+            } else {
+                json!({})
+            };
             enabled.iter().any(|n| n == *name)
                 && (spec.mutates
-                    || (approval::is_read_only(ext, name, &json!({}))
-                        && (matches!(*name, "find" | "dep_source")
-                            || !crate::config::tools::integrations::INTEGRATION_TOOLS
-                                .contains(name))))
+                    || (approval::is_read_only(ext, name, &probe)
+                        && (matches!(
+                            *name,
+                            "find"
+                                | "dep_source"
+                                | "image_search"
+                                | "lsp"
+                                | "git"
+                                | "ast_search"
+                                | "code_history"
+                        ) || !crate::config::tools::integrations::INTEGRATION_TOOLS
+                            .contains(name))))
         })
         .map(str::to_owned);
     own.chain(extra)
@@ -533,7 +548,11 @@ fn model_routes(
                     };
                     role = crate::llm::model_config::ROLES
                         .iter()
-                        .find_map(|(key, _)| (*key == named && *key != "decision").then_some(*key))
+                        .find_map(|(key, _)| {
+                            (!matches!(*key, "decision" | "grounding" | "image_embedding"))
+                                .then_some(*key)
+                                .filter(|key| *key == named)
+                        })
                         .ok_or_else(|| {
                             format!("subagent model role {named:?} is not a chat role")
                         })?;
@@ -655,9 +674,15 @@ impl Job<'_> {
             }
             _ => {}
         }
-        if !self.handoff.todos.is_empty() {
+        let uncovered_todos: Vec<&String> = self
+            .handoff
+            .todos
+            .iter()
+            .filter(|todo| !covered(todo))
+            .collect();
+        if !uncovered_todos.is_empty() {
             out.push_str("Parent open todos:\n");
-            for todo in &self.handoff.todos {
+            for todo in uncovered_todos {
                 out.push_str(&format!("- {todo}\n"));
             }
             out.push('\n');

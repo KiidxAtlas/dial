@@ -23,6 +23,7 @@ use std::{
 #[cfg(target_os = "macos")]
 mod idle_sleep;
 mod length_recovery;
+mod scheduling_measurements;
 mod turn_admission;
 
 fn system_text(request: &Value) -> String {

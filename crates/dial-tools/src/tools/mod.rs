@@ -38,6 +38,7 @@ pub mod net;
 pub mod surface;
 #[cfg(test)]
 mod testkit;
+pub mod vision;
 
 // External `dial::tools::*` paths used by src/main.rs, src/cmd and tests/integration.
 pub use edit::hashline;

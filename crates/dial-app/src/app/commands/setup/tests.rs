@@ -38,10 +38,17 @@ fn choices_only_dispatch_review_and_cover_every_capability() {
     assert_eq!(spec.command, "setup");
     assert_eq!(spec.verb, "choose");
     assert!(spec.remove.is_none());
-    assert_eq!(spec.items.len(), deps::RECIPES.len() + 4);
-    for id in ["presets", "providers", "memory", "embeddings"]
-        .into_iter()
-        .chain(deps::RECIPES.iter().map(|r| r.id))
+    assert_eq!(spec.items.len(), deps::RECIPES.len() + 6);
+    for id in [
+        "presets",
+        "providers",
+        "memory",
+        "embeddings",
+        "grounding",
+        "image-embeddings",
+    ]
+    .into_iter()
+    .chain(deps::RECIPES.iter().map(|r| r.id))
     {
         assert_eq!(spec.items.iter().filter(|item| item.value == id).count(), 1);
     }
@@ -64,6 +71,31 @@ fn embedding_choices_use_catalog_and_never_install_directly() {
         assert!(item.detail.contains(&format!("{} MB", model.size_mb)));
         assert!(item.detail.contains(model.description));
     }
+}
+
+#[test]
+fn vision_choices_list_each_curated_model_and_review_previews_them() {
+    let temp = tempfile::tempdir().unwrap();
+    let env = empty_env(temp.path());
+    for kind in Kind::ALL {
+        let spec = vision_choices(kind);
+        assert_eq!(spec.verb, "choose");
+        assert_eq!(spec.items.len(), kind.catalog().len());
+        for (item, model) in spec.items.iter().zip(kind.catalog()) {
+            assert_eq!(
+                vision_models::parse_id(&item.value),
+                Some((kind, model.repo))
+            );
+            assert!(item.detail.contains(&format!("{} MB", model.size_mb)));
+            assert!(review_plan(&item.value, &env).unwrap().contains(model.repo));
+        }
+        assert!(
+            review_plan(kind.id(), &env)
+                .unwrap()
+                .contains(kind.default_model())
+        );
+    }
+    assert!(!env.user_dir.exists());
 }
 
 #[test]

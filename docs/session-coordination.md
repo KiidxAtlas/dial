@@ -20,15 +20,49 @@ work or infer semantic dependencies between tasks.
   Claims communicate intended ownership; they are not locks, edit permissions or exclusive access.
   Claims last through the next turn and clear when that turn becomes idle; use `clear` to release
   them earlier. Normal same-session settings/model rebuilds retain the peer ID and queued mail.
-- `send` queues text for a live peer. Messages and inboxes are bounded; check the returned result
-  rather than assuming delivery. A queued message is delivered at the recipient's next foreground
-  model step. It does **not** start an idle session or trigger an unattended model call.
+- `send` queues guidance for a live peer. Messages and inboxes are bounded; check the returned result
+  rather than assuming delivery. During a turn, guidance reaches the next model-request boundary;
+  it does not interrupt an in-flight model response or tool call. In an open terminal, fresh mail
+  can also wake an eligible incomplete task (see below). Queuing is not acknowledgement.
 - `clear` clears this session's claimed scopes, not its conversation or another peer's state.
 
 These commands use ordinary transcript notices, not a separate panel. During a running turn they
 wait for the turn to finish. The model-facing `peers` tool exposes the same operations:
 `action="list"` (the default), `claim` with `scopes` and optional `summary`, `send` with `to` and
 `text`, and `clear`.
+
+## Task-scoped guidance and idle wake-ups
+
+Peer guidance can influence the next step **within the existing user-authorized task**. It cannot
+replace the user's request, expand permissions, answer a human approval, or supply a new task.
+The message stays labelled untrusted peer context rather than becoming a typed prompt, slash
+command, attachment reference, or turn-drafter input.
+
+With `coordination.auto_wake = true` (the default), an open terminal session checks for mail once
+per second while its last turn is **Incomplete**. At most two fresh messages are admitted for each
+wake-up, with at most **three automatic wake-ups per user turn**, separated by at least **30 seconds**.
+Repeated sender/text pairs in the most recent 32 delivered messages do not trigger another wake-up.
+These continuations can incur model charges; normal tool approvals, sandbox rules and compute
+admission still apply. No extra process or headless session is launched.
+
+Completed, blocked, failed, interrupted, and human-input-waiting tasks do not wake automatically.
+No task is armed on process restart or session resume; a real user turn must first end incomplete.
+Normal same-session settings/model rebuilds retain the bounded wake budget. A different task or
+session cannot inherit an armed wake-up. Queued human input, a nonempty composer, open panels,
+and scheduled loop turns take priority. Esc at the idle composer suspends wake-ups until the next
+user turn. Cancellation or failure during wake admission also suspends them, retaining reserved
+mail for a later normal request.
+
+To keep guidance delivery but disable automatic inference, set:
+
+```toml
+[coordination]
+auto_wake = false
+```
+
+This setting is also under Tools → Session coordination → Peer wake-ups in `/settings` and takes
+effect in a new session. RPC, ACP and one-shot CLI clients still receive mail only when they run a
+foreground request; they do not acquire a new idle event loop.
 
 ## Scope, privacy and safety
 
@@ -61,8 +95,31 @@ fresh-read, document-transaction and conflict checks remain the write authority.
 Verification evidence must still match the inputs checked. For checks with a declared complete input
 contract, Dial revalidates those inputs before reusing evidence after concurrent changes. Arbitrary
 commands do not acquire an inferred complete dependency contract: a successful command is not proof
-that unrelated or later changes were tested. Coordinate check ownership explicitly when two sessions
-would otherwise duplicate expensive verification.
+that unrelated or later changes were tested.
+
+## Shared build and test results
+
+Sessions in one checkout share the results of check commands (`cargo test`, `cargo check`,
+`npm run build`, `pytest` and similar), so two tabs do not compile the same tree twice. Before such
+a `bash` command runs, Dial fingerprints the tree from git: HEAD, the content of every uncommitted
+or untracked file (ignored build output excluded), the exact command text and its `cwd`. Then:
+
+- If another live session already **finished** that command on an identical tree, the call returns
+  that result (status, exit code, the output tail and the peer's complete-log artifact link),
+  labelled as not run here.
+- If another session is **still running** it, the call is not started; this session joins the run
+  and gets its result as a notice once it settles, so it can keep working meanwhile.
+- Otherwise the command runs normally and its run is announced. A run that moves to `bg` is
+  published when the job exits.
+
+Each shared answer is given once: running the same command again executes it in this session.
+A shared result is a peer's observation. It never counts as this session's own verification or
+check evidence. A result is published only when the tree fingerprint is the same at the end of the
+run as at the start; cancelled or timed-out runs, and runs whose tree changed meanwhile, withdraw
+their announcement. Runs of a session that exits are dropped. Outside a git repository with at
+least one commit, or when a changed file cannot be hashed, nothing is shared. The ledger lives
+next to the peer registry in private storage, and is bounded to 64 entries with a 2 KiB output
+tail each. Disabling coordination disables sharing too.
 
 ## Opt out or choose isolation
 

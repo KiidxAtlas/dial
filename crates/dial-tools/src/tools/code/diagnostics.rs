@@ -22,6 +22,14 @@ static DIAGNOSTIC: LazyLock<Regex> = LazyLock::new(|| {
     .expect("diagnostic pattern is valid")
 });
 
+/// A rustc-style `warning:` header. Locations under it (`--> file:line`) point at warnings, not at
+/// the failure, and a build with many warnings would otherwise spend the budget on them.
+static WARNING_HEADER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*warning(\[[A-Za-z_:]*\d*\])?:").expect("warning pattern"));
+
+static LOCATION: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*-->\s+\S+:\d+").expect("location pattern"));
+
 /// Whether one output line reports a failure worth keeping when its surroundings are clipped.
 pub fn is_diagnostic(line: &str) -> bool {
     DIAGNOSTIC.is_match(line)
@@ -44,6 +52,7 @@ pub struct Collector {
     budget: usize,
     lines: usize,
     overflow: usize,
+    under_warning: bool,
 }
 
 impl Collector {
@@ -54,6 +63,7 @@ impl Collector {
             budget,
             lines: 0,
             overflow: 0,
+            under_warning: false,
         }
     }
 
@@ -89,8 +99,19 @@ impl Collector {
 
     fn line(&mut self, raw: &[u8]) {
         let text = String::from_utf8_lossy(raw);
+        if WARNING_HEADER.is_match(&text) {
+            self.under_warning = true;
+            return;
+        }
         if !is_diagnostic(&text) {
             return;
+        }
+        if LOCATION.is_match(&text) {
+            if self.under_warning {
+                return;
+            }
+        } else {
+            self.under_warning = false;
         }
         let line = shorten(&text);
         if self.kept.len() + line.len() + 1 > self.budget {

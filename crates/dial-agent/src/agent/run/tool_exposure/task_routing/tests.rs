@@ -84,17 +84,27 @@ fn task_intents_select_native_specialists_without_discovery_calls() {
             vec!["ast_search", "ast_edit"],
         ),
         (
+            "Search for a syntax pattern across AST nodes",
+            vec!["ast_search"],
+        ),
+        (
             "Rename a function symbol and update its references",
             vec!["lsp"],
         ),
+        ("Find all callers of this trait method", vec!["lsp"]),
         (
             "Find our earlier conversation about authentication",
+            vec!["session_search"],
+        ),
+        (
+            "What did the prior session transcript say about caching?",
             vec!["session_search"],
         ),
         (
             "Which changes introduced this regression?",
             vec!["code_history"],
         ),
+        ("Which recent diff broke the parser?", vec!["code_history"]),
         ("Debug the runtime crash at a breakpoint", vec!["dap"]),
         (
             "Generate a logo image for the landing page",

@@ -1174,29 +1174,39 @@ fn fence_lang(info: &str) -> &str {
 }
 
 /// A diagram fence as a framed panel: an accent border with the title in its top edge, connector
-/// glyphs tinted and labels in the code color, all on the code background. Rows are clipped with
-/// an ellipsis, never wrapped, because a wrapped diagram no longer lines up. The full source stays
-/// in the transcript. Callers guarantee `avail >= MIN_CODE_GUTTER`.
+/// glyphs tinted and labels in the code color, all on the code background. Models write plain ASCII
+/// line art, which costs fewer tokens; outside the ASCII glyph set it is drawn with box-drawing
+/// glyphs (`draw_line_art`). Rows are clipped with an ellipsis, never wrapped, because a wrapped
+/// diagram no longer lines up. The full source stays in the transcript. Callers guarantee
+/// `avail >= MIN_CODE_GUTTER`.
 fn diagram_rows(theme: &Theme, title: &str, body: &str, avail: usize) -> Rows {
-    let border = theme.fg(Tok::BorderAccent);
     let fill = theme.bg(Tok::MdCodeBlockBg);
+    let border = theme.fg(Tok::BorderAccent).patch(fill);
     let h = theme.sym(Sym::BoxH);
     let v = theme.sym(Sym::BoxV);
     let ellipsis = theme.sym(Sym::Ellipsis);
     let body = body.strip_suffix('\n').unwrap_or(body);
-    let lines: Vec<&str> = if body.is_empty() {
+    let lines: Vec<String> = if body.is_empty() {
         Vec::new()
+    } else if theme.ascii() {
+        body.split('\n').map(str::to_owned).collect()
     } else {
-        body.split('\n').collect()
+        draw_line_art(&body.split('\n').collect::<Vec<_>>())
     };
     // A row is `│ ` + inner + ` │`; the top edge is `╭─ ` + label + ` ` + rule (at least one) + `╮`.
     let max_inner = avail - 4;
     let (label_text, label_style) = if title.is_empty() {
-        (DIAGRAM_LANG.to_uppercase(), theme.fg(Tok::Muted))
+        (
+            DIAGRAM_LANG.to_uppercase(),
+            theme.fg(Tok::Muted).patch(fill),
+        )
     } else {
         (
             title.to_owned(),
-            theme.fg(Tok::Accent).add_modifier(Modifier::BOLD),
+            theme
+                .fg(Tok::Accent)
+                .add_modifier(Modifier::BOLD)
+                .patch(fill),
         )
     };
     let content_w = lines.iter().map(|l| text::width(l)).max().unwrap_or(0);
@@ -1211,7 +1221,7 @@ fn diagram_rows(theme: &Theme, title: &str, body: &str, avail: usize) -> Rows {
             border,
         ),
     ])];
-    for line in lines {
+    for line in &lines {
         let mut content = diagram_spans(theme, line);
         if text::width(line) > inner {
             content = truncate_spans(content, inner, ellipsis);
@@ -1254,6 +1264,64 @@ fn diagram_spans(theme: &Theme, line: &str) -> Vec<Span<'static>> {
         push_merged(&mut spans, g, if connector { wire } else { label });
     }
     spans
+}
+
+/// Redraw ASCII line art with box-drawing glyphs, one cell for one cell so every column stays
+/// aligned: connector runs of `-`/`=` become `─`/`═`, `|` becomes `│`, `->`/`<-` heads become
+/// `▶`/`◀`, a lone `v`/`^` against a vertical line becomes `▼`/`▲`, and each `+` becomes the
+/// corner or junction its neighbours describe. Letters and hyphens inside words stay labels.
+fn draw_line_art(lines: &[&str]) -> Vec<String> {
+    let grid: Vec<Vec<char>> = lines.iter().map(|l| l.chars().collect()).collect();
+    let at = |r: usize, c: usize, dr: isize, dc: isize| -> Option<char> {
+        let row = grid.get(r.checked_add_signed(dr)?)?;
+        row.get(c.checked_add_signed(dc)?).copied()
+    };
+    let across = |n: Option<char>| matches!(n, Some('-' | '=' | '+'));
+    let up = |n: Option<char>| matches!(n, Some('|' | '+' | '^'));
+    let down = |n: Option<char>| matches!(n, Some('|' | '+' | 'v'));
+    let word = |n: Option<char>| n.is_some_and(char::is_alphanumeric);
+    let stem = |n: Option<char>| matches!(n, Some('|' | '+'));
+    grid.iter()
+        .enumerate()
+        .map(|(r, row)| {
+            row.iter()
+                .enumerate()
+                .map(|(c, &ch)| {
+                    let (prev, next) = (at(r, c, 0, -1), at(r, c, 0, 1));
+                    let lone = !word(prev) && !word(next);
+                    match ch {
+                        '-' if is_connector(prev, ch, next) => '─',
+                        '=' if is_connector(prev, ch, next) => '═',
+                        '|' => '│',
+                        '>' if matches!(prev, Some('-' | '=')) => '▶',
+                        '<' if matches!(next, Some('-' | '=')) => '◀',
+                        'v' if lone && stem(at(r, c, -1, 0)) => '▼',
+                        '^' if lone && stem(at(r, c, 1, 0)) => '▲',
+                        '+' => match (
+                            across(prev),
+                            across(next),
+                            up(at(r, c, -1, 0)),
+                            down(at(r, c, 1, 0)),
+                        ) {
+                            (false, true, false, true) => '╭',
+                            (true, false, false, true) => '╮',
+                            (false, true, true, false) => '╰',
+                            (true, false, true, false) => '╯',
+                            (true, true, false, true) => '┬',
+                            (true, true, true, false) => '┴',
+                            (false, true, true, true) => '├',
+                            (true, false, true, true) => '┤',
+                            (true, true, true, true) => '┼',
+                            (true, true, false, false) => '─',
+                            (false, false, true, true) => '│',
+                            _ => '+',
+                        },
+                        _ => ch,
+                    }
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// Whether `c`, between `prev` and `next`, draws part of a diagram rather than a label. Hyphens,

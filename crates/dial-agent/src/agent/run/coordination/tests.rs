@@ -1,6 +1,6 @@
 use super::*;
 
-fn with_agent(overlay: &str, f: impl FnOnce(&mut Agent<'_>)) {
+pub(super) fn with_agent(overlay: &str, f: impl FnOnce(&mut Agent<'_>)) {
     let temp = tempfile::tempdir().unwrap();
     let project = temp.path().join("project");
     std::fs::create_dir(&project).unwrap();

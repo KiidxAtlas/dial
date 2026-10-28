@@ -26,6 +26,7 @@ mod extension_commands;
 pub(crate) mod extensions;
 pub(crate) mod extensions_browser;
 mod graphify;
+mod image;
 pub(crate) mod maintenance;
 mod modes;
 mod peers;
@@ -51,6 +52,7 @@ pub(super) fn specs() -> impl Iterator<Item = &'static CommandSpec> {
         .chain(advanced::COMMANDS)
         .chain(extensions::COMMANDS)
         .chain(graphify::COMMANDS)
+        .chain(image::COMMANDS)
         .chain(config_cmds::COMMANDS)
         .chain(setup::COMMANDS)
         .chain(commit::COMMANDS)
@@ -100,6 +102,9 @@ pub(super) fn run(
         return Some(result);
     }
     if let Some(result) = session::run(shell, app, agent, name, args) {
+        return Some(result);
+    }
+    if let Some(result) = image::run(shell, app, agent, name, args) {
         return Some(result);
     }
     if let Some(result) = setup::run_command(shell, app, agent, name, args) {

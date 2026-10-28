@@ -62,6 +62,7 @@ fn wait_for(agent: &mut Agent<'_>, id: &str) {
         .query(
             &json!({"action":"wait","id":id,"timeout":2}),
             &AtomicBool::new(false),
+            &mut || false,
         )
         .unwrap();
 }

@@ -182,6 +182,7 @@ fn lmstudio_served_embedders_stay_available_for_embedding_roles() {
     let listed = |id: &str, kind: &str| LmStudioModel {
         id: id.into(),
         kind: kind.into(),
+        tool_use: false,
         loaded: false,
         loaded_context: None,
     };
@@ -1214,7 +1215,7 @@ pub(crate) fn routed(routes: Vec<(&'static str, String)>) -> String {
 fn lm_studio_routes() -> Vec<(&'static str, String)> {
     let native = serde_json::json!({"data":[
         {"id":"warm","type":"llm","state":"loaded","max_context_length":1_048_576,"loaded_context_length":8192},
-        {"id":"cold","type":"vlm","state":"not-loaded","max_context_length":262_144},
+        {"id":"cold","type":"vlm","state":"not-loaded","max_context_length":262_144,"capabilities":["tool_use"]},
         {"id":"embedder","type":"embeddings","state":"not-loaded","max_context_length":2048},
     ]});
     vec![
@@ -1254,6 +1255,30 @@ fn lm_studio_discovery_keeps_embedders_available_and_reports_only_loaded_context
             .all(|m| m.selection.context_window != Some(1_048_576)
                 && m.selection.context_window != Some(262_144))
     );
+}
+#[test]
+fn lm_studio_native_metadata_declares_image_input_and_tool_use() {
+    let url = routed(lm_studio_routes());
+    let (_, models) = probe_models(&test_probe(url, "lm-studio"));
+    let meta = |id: &str| {
+        let m = &models
+            .iter()
+            .find(|m| m.selection.model == id)
+            .unwrap()
+            .metadata;
+        (m.vision, m.tools)
+    };
+    assert_eq!(
+        meta("cold"),
+        (Some(true), Some(true)),
+        "vlm declaring tool_use"
+    );
+    assert_eq!(
+        meta("warm"),
+        (Some(false), None),
+        "text-only llm; no tool_use is not a refusal"
+    );
+    assert_eq!(meta("embedder"), (None, None), "embedders make no claim");
 }
 #[test]
 fn llama_server_is_recognised_by_props_on_local_hosts_only() {
@@ -1415,6 +1440,13 @@ fn image_generation_metadata_is_independent_of_image_input() {
             &serde_json::json!({"experimental_supported_tools":["image_generation"],"output_modalities":["text"]})
         ),
         Some(ImageGenerationApi::Responses)
+    );
+    // OpenRouter's auto router lists its pool's union of output modalities but has no image endpoint.
+    assert_eq!(
+        image_generation_api(&serde_json::json!({"architecture":{
+            "tokenizer":"Router","output_modalities":["text","image"]
+        }})),
+        None
     );
 }
 

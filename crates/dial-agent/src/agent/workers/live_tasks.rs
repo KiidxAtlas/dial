@@ -1544,6 +1544,8 @@ impl LiveTasks {
             let _ = self.pool_close(&id);
         }
     }
+    /// Waits for the selected workers. The flag is true when the wait ended early because the
+    /// user typed input; the workers keep running either way.
     pub fn wait(
         &mut self,
         id: Option<&str>,
@@ -1551,7 +1553,7 @@ impl LiveTasks {
         gate: ApprovalGate<'_>,
         interrupt: &AtomicBool,
         ui: &mut dyn Ui,
-    ) -> Result<Value, String> {
+    ) -> Result<(Value, bool), String> {
         let ApprovalGate {
             approval,
             read_only,
@@ -1585,7 +1587,10 @@ impl LiveTasks {
                 return Err("wait interrupted by the user".into());
             }
             if !pending || Instant::now() >= until {
-                return self.status(id);
+                return self.status(id).map(|status| (status, false));
+            }
+            if ui.pending_input() {
+                return self.status(id).map(|status| (status, true));
             }
             ui.heartbeat();
             thread::sleep(Duration::from_millis(40));
@@ -1614,6 +1619,9 @@ impl Drop for LiveTasks {
         }
     }
 }
+/// Appended to a pure wait that ended early because the user typed input.
+pub(in crate::agent) const STOPPED_FOR_INPUT: &str = "\n[Stopped waiting early: the user sent a new message. Nothing was cancelled; the awaited work keeps running and its results arrive at request boundaries.]";
+
 pub(in crate::agent) fn output(result: Result<Value, String>) -> ToolOutput {
     match result {
         Ok(value) => ToolOutput {

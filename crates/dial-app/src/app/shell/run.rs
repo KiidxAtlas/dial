@@ -127,7 +127,11 @@ impl Shell {
                 self.transcript.settle_job_notices();
             }
             if let Some((provider, result)) = AuthJob::collect(&mut self.auth_job, app) {
-                if provider == "Model" && result.is_ok() {
+                let vision_ready = provider == "Setup"
+                    && result.as_ref().is_ok_and(|message| {
+                        message.starts_with(crate::setup::vision_models::SUMMARY_PREFIX)
+                    });
+                if (provider == "Model" && result.is_ok()) || vision_ready {
                     self.pending_config = Some(app.reload()?);
                 }
                 let step = match result {
@@ -271,6 +275,33 @@ impl Shell {
                     other => return Ok(other),
                 }
             }
+            // Human input, open panels, and explicit loop scheduling take priority over peer mail.
+            if self.peer_turn_available()
+                && !crate::collab::room::with(|room| {
+                    matches!(room, Some(crate::collab::room::Room::Guest(_)))
+                })
+                && !poll(Duration::ZERO)?
+            {
+                match agent.peer_wake_pending() {
+                    Ok(true) => match self.run_peer_turn(app, agent)? {
+                        Step::Done => {
+                            dirty = true;
+                            continue;
+                        }
+                        other => return Ok(other),
+                    },
+                    Ok(false) => {}
+                    Err(error) => {
+                        agent.cancel_peer_wake();
+                        self.note(
+                            "Project peers",
+                            format!("Automatic wake-up suspended: {error:#}"),
+                        );
+                        dirty = true;
+                        continue;
+                    }
+                }
+            }
             let (left, right) = statusline::segments(&self.ui);
             let status_pending = self.git.cache.worker.is_some()
                 || self.learning.cache.worker.is_some()
@@ -291,6 +322,9 @@ impl Shell {
             let timeout = agent
                 .compaction_wakeup()
                 .map_or(timeout, |maintenance| timeout.min(maintenance));
+            let timeout = agent
+                .peer_wakeup_interval()
+                .map_or(timeout, |peer| timeout.min(peer));
             let timeout = self.loop_mode.next_due().map_or(timeout, |due| {
                 timeout.min(due.saturating_duration_since(Instant::now()))
             });
@@ -388,6 +422,7 @@ impl Shell {
                     let step = match event {
                         ComposerEvent::None => Step::Done,
                         ComposerEvent::Interrupt => {
+                            agent.cancel_peer_wake();
                             self.pause_loop();
                             self.stop_speech();
                             Step::Done
@@ -410,4 +445,21 @@ impl Shell {
             }
         }
     }
+
+    fn peer_turn_available(&self) -> bool {
+        self.startup.is_none()
+            && self.busy_overlay.is_none()
+            && self.held.is_empty()
+            && self.deferred.is_empty()
+            && self.pending_config.is_none()
+            && !self.pending_resource_rebuild
+            && !self.composer.has_queued_work()
+            && !self.composer.has_pending_input()
+            && self.composer.draft().is_empty()
+            && self.loop_mode.next_due().is_none()
+            && !self.loop_mode.is_awaiting_condition()
+    }
 }
+
+#[cfg(test)]
+mod tests;

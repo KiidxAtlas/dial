@@ -378,6 +378,13 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Name of an environment variable that holds the image endpoint's key, not the key itself. Unset uses the endpoint's standard variable or a key saved through /providers."
     ),
     structured!(
+        "image.models",
+        TO,
+        "Image generation",
+        "Per-model image settings",
+        "Generation settings per image model, keyed by any bare name and matched by each entry's exact model: size, steps, seed, loras (path and scale), quality, background, moderation. /image settings edits the current image model's entry."
+    ),
+    structured!(
         "retry.fallback_chains",
         MO,
         "Requests",

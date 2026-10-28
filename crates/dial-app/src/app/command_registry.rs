@@ -349,6 +349,7 @@ pub(super) const RUNS_NOW_ARGS: &[&str] = &[
     "understanding clear",
     "improve settings",
     "improve models",
+    "image settings",
 ];
 
 /// One scheduling decision for dispatch, help and palette annotations. Aliases are resolved before
@@ -403,6 +404,7 @@ pub(super) fn command_panel(name: &str, args: &str) -> Option<Which> {
     match (name, args) {
         ("model", "") => Some(Which::Models),
         ("model", "settings" | "setting") | ("model-settings", "") => Some(Which::ModelSettings),
+        ("image", "settings" | "setting") => Some(Which::ImageSettings),
         ("model", "defaults") => Some(Which::ContextDefaults),
         ("model", "local") => Some(Which::ModelDownloads),
         ("model", "memory") => Some(Which::ModelMemory),

@@ -591,6 +591,20 @@ impl Accumulator {
                     self.finished.insert(index, event["item"].clone()).is_none(),
                     "duplicate finished Responses output item"
                 );
+                let item = &event["item"];
+                if item["type"] == "function_call" {
+                    let arguments = item["arguments"]
+                        .as_str()
+                        .context("Responses finished call has invalid arguments")?;
+                    if !on_event(&StreamEvent::ToolCallComplete {
+                        index,
+                        id: item["call_id"].as_str().unwrap_or_default().to_owned(),
+                        name: tool_name(item)?,
+                        arguments: arguments.to_owned(),
+                    }) {
+                        return Err(Interrupted.into());
+                    }
+                }
             }
             Some("response.function_call_arguments.delta") => {
                 let index = event["output_index"]

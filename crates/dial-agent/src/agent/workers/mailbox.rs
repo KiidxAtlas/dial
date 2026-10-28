@@ -350,6 +350,17 @@ fn preview(text: &str) -> String {
     out
 }
 
+/// `message` only reaches workers of this session; independent sessions use `peers`.
+const PEERS_HINT: &str = "Other Dial sessions in this checkout are reached with the `peers` tool (action=send, to=<peer id from action=list>), not `message`.";
+
+/// Project peer instance ids are 32 lowercase hex digits; worker ids are `task-N`.
+fn is_peer_id(to: &str) -> bool {
+    to.len() == 32
+        && to
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// Maps a recipient name to its mailboxes. `all` is a broadcast, `parent` is the parent mailbox,
 /// and anything else is a worker id, or else a unique worker label.
 fn resolve(room: &Room, from: &str, to: &str) -> Result<Vec<(String, Arc<Inbox>)>, String> {
@@ -361,7 +372,9 @@ fn resolve(room: &Room, from: &str, to: &str) -> Result<Vec<(String, Arc<Inbox>)
             .map(|(id, member)| (id.clone(), member.inbox.clone()))
             .collect();
         if targets.is_empty() {
-            return Err("no other live worker to receive a broadcast".into());
+            return Err(format!(
+                "no other live worker to receive a broadcast. {PEERS_HINT}"
+            ));
         }
         return Ok(targets);
     }
@@ -382,9 +395,14 @@ fn resolve(room: &Room, from: &str, to: &str) -> Result<Vec<(String, Arc<Inbox>)
                 .collect();
             match matches.as_slice() {
                 [id] => (*id).clone(),
+                [] if is_peer_id(to) => {
+                    return Err(format!(
+                        "{to} is not a live worker; it looks like a project peer id. {PEERS_HINT}"
+                    ));
+                }
                 [] => {
                     return Err(format!(
-                        "no live recipient named {to} (unknown or finished); use parent, all, a live task id, or a live task label"
+                        "no live recipient named {to} (unknown or finished); use parent, all, a live task id, or a live task label. {PEERS_HINT}"
                     ));
                 }
                 _ => {

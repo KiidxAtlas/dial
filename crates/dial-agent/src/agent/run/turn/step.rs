@@ -766,6 +766,12 @@ impl Agent<'_> {
         self.observe_cost_warnings(&mut turn.turn_cost_warn, ui);
         // The projected request is not reused after inference: move its history instead of
         // deep-copying it each iteration. Recovery and training still see the exact bytes sent.
+        // Retain the effective request, including hook-rewritten sampling parameters, only
+        // when paid warming is enabled. Recovery may subsequently consume its messages.
+        let warm_request = self
+            .cache_warm
+            .as_ref()
+            .map(|_| rewritten.as_ref().unwrap_or(&request).clone());
         let (context_before, request_tools) = match rewritten {
             Some(rewritten) => (rewritten.messages, rewritten.tools),
             None => (std::mem::take(&mut request.messages), request.tools.clone()),
@@ -1464,6 +1470,9 @@ impl Agent<'_> {
         turn.stall_continues = 0;
         ui.message_settled();
         if reply.tool_calls.is_empty() {
+            if let (Some(warm), Some(sent)) = (&self.cache_warm, &warm_request) {
+                warm.settled(sent, &reply, &self.usage_scope);
+            }
             self.push(json!({"role":"assistant","content":reply.text}))?;
             self.observe_assistant_message(&reply.text, step, ui);
             let accepted_live = self.flush_accepted_live_steering(ui)?;
@@ -1700,6 +1709,9 @@ impl Agent<'_> {
                 ui,
             );
         }
+        if let (Some(warm), Some(sent)) = (&self.cache_warm, &warm_request) {
+            warm.settled(sent, &reply, &self.usage_scope);
+        }
         if turn.final_step {
             // The wrap-up step answers; tools it still asks for would outlive the step limit.
             self.record(
@@ -1728,17 +1740,6 @@ impl Agent<'_> {
             let mut control = self.session.control_state();
             turn.rule_state.save(&mut control);
             self.session.set_control_state(control)?;
-        }
-        if let Some(warm) = &self.cache_warm {
-            // The settled prefix is the exact bytes sent: the warmer replays it near expiry.
-            let settled = llm::Chat {
-                messages: context_before.clone(),
-                tools: request_tools.clone(),
-                temperature: request.temperature,
-                max_tokens: request.max_tokens,
-                seed: request.seed,
-            };
-            warm.settled(&settled, reply.prompt_tokens, &self.usage_scope);
         }
         self.execute_round(
             turn,
