@@ -43,7 +43,7 @@ def check_target_format(executable, target):
                 or int.from_bytes(data[pe + 4:pe + 6], "little") != PE_MACHINES[arch]:
             raise RuntimeError(f"{executable.name} is not a PE {arch} binary")
     elif "linux" in target:
-        if data[:5] != b"\x7fELF\x02\x01" or arch not in ELF_MACHINES \
+        if data[:6] != b"\x7fELF\x02\x01" or arch not in ELF_MACHINES \
                 or int.from_bytes(data[18:20], "little") != ELF_MACHINES[arch]:
             raise RuntimeError(f"{executable.name} is not a 64-bit little-endian ELF {arch} binary")
         interpreter = elf_interpreter(data)

@@ -90,7 +90,7 @@ impl Shell {
         let peer = matches!(input, TurnInput::Peer);
         let text = match input {
             TurnInput::User(text) => text,
-            TurnInput::Peer => "Continuing the unfinished task for peer context",
+            TurnInput::Peer => "Continuing the current conversation for peer context",
         };
         // A joined guest's prompts belong to the host agent: send them there or refuse. The local
         // agent never runs them.
@@ -118,7 +118,8 @@ impl Shell {
         if peer {
             self.note("Project peers", text);
         } else {
-            self.transcript.push_user(text);
+            self.transcript
+                .push_user_at(text, &crate::storage::session::timestamp_now());
         }
         self.composer.set_busy(true);
         self.status.phase = Phase::Working;

@@ -102,6 +102,76 @@ pub enum PointerEvent {
     },
 }
 
+impl PointerEvent {
+    /// Map screenshot points while preserving gesture options and scroll deltas.
+    pub(super) fn map_points(
+        self,
+        mut map: impl FnMut(f64, f64) -> CoreResult<(f64, f64)>,
+    ) -> CoreResult<Self> {
+        Ok(match self {
+            Self::Click {
+                x,
+                y,
+                button,
+                count,
+                modifiers,
+            } => {
+                let (x, y) = map(x, y)?;
+                Self::Click {
+                    x,
+                    y,
+                    button,
+                    count,
+                    modifiers,
+                }
+            }
+            Self::Move { x, y } => {
+                let (x, y) = map(x, y)?;
+                Self::Move { x, y }
+            }
+            Self::Drag {
+                mut path,
+                button,
+                modifiers,
+                keys,
+            } => {
+                for point in &mut path {
+                    *point = map(point.0, point.1)?;
+                }
+                Self::Drag {
+                    path,
+                    button,
+                    modifiers,
+                    keys,
+                }
+            }
+            Self::Hold {
+                x,
+                y,
+                button,
+                keys,
+                duration,
+            } => {
+                let (x, y) = map(x, y)?;
+                Self::Hold {
+                    x,
+                    y,
+                    button,
+                    keys,
+                    duration,
+                }
+            }
+            Self::Scroll { x, y, dx, dy } => {
+                let (x, y) = map(x, y)?;
+                Self::Scroll { x, y, dx, dy }
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests;
+
 pub trait Backend: Send {
     fn capabilities(&mut self) -> DesktopCapabilities;
     fn displays(&mut self) -> CoreResult<Vec<DesktopDisplay>>;

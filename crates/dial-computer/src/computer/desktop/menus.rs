@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+#[cfg(any(test, dial_desktop_macos, dial_desktop_windows, dial_desktop_linux))]
 use super::error::{CoreResult, DesktopError};
 
 /// One immediate child of a native application menu. Paths contain the actual
@@ -22,6 +23,7 @@ pub struct MenuSelectOptions {
     pub takeover: Option<bool>,
 }
 
+#[cfg(any(test, dial_desktop_macos, dial_desktop_windows, dial_desktop_linux))]
 pub(crate) fn validate_path(path: &[String], allow_empty: bool) -> CoreResult<()> {
     if (!allow_empty && path.is_empty()) || path.len() > 32 {
         return Err(DesktopError::invalid_target(
@@ -39,6 +41,7 @@ pub(crate) fn validate_path(path: &[String], allow_empty: bool) -> CoreResult<()
     Ok(())
 }
 
+#[cfg(any(test, dial_desktop_macos, dial_desktop_windows, dial_desktop_linux))]
 fn normalized(label: &str) -> &str {
     let label = label.trim();
     label
@@ -50,6 +53,7 @@ fn normalized(label: &str) -> &str {
 
 /// Exact case-insensitive labels win over ellipsis-normalized matches. Every
 /// tier must have exactly one match: order and enabled state never break ties.
+#[cfg(any(test, dial_desktop_macos, dial_desktop_windows, dial_desktop_linux))]
 pub(crate) fn match_index(items: &[DesktopMenuItem], label: &str) -> CoreResult<usize> {
     let folded = label.trim().to_lowercase();
     let mut exact = items
@@ -81,6 +85,7 @@ pub(crate) fn match_index(items: &[DesktopMenuItem], label: &str) -> CoreResult<
     }
 }
 
+#[cfg(any(test, dial_desktop_macos, dial_desktop_windows, dial_desktop_linux))]
 pub(crate) fn require_enabled(item: &DesktopMenuItem) -> CoreResult<()> {
     if item.enabled {
         Ok(())
@@ -92,6 +97,7 @@ pub(crate) fn require_enabled(item: &DesktopMenuItem) -> CoreResult<()> {
     }
 }
 
+#[cfg(any(test, dial_desktop_macos, dial_desktop_windows, dial_desktop_linux))]
 pub(crate) fn require_command(item: &DesktopMenuItem) -> CoreResult<()> {
     require_enabled(item)?;
     if item.has_submenu || item.title.trim().is_empty() {

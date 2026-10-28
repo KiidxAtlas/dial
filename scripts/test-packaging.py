@@ -17,6 +17,15 @@ def load_checker():
     return module
 
 
+def load_artifact_checker():
+    path = Path(__file__).resolve().with_name("check-artifact.py")
+    spec = importlib.util.spec_from_file_location("check_artifact", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+artifact = load_artifact_checker()
 packaging = load_checker()
 
 
@@ -145,6 +154,50 @@ class FormulaUpdateTests(unittest.TestCase):
         del sums["dial-v0.2.0-aarch64-unknown-linux-gnu.tar.gz"]
         with self.assertRaises(SystemExit):
             updater.update_formula(REAL_FORMULA(), "0.2.0", sums)
+
+
+class ArtifactFormatTests(unittest.TestCase):
+    @staticmethod
+    def elf(machine=0x3E, elf_class=2, endian=1, interpreter=b"/lib64/ld-linux-x86-64.so.2\0"):
+        header = bytearray(64)
+        header[0:6] = bytes([0x7F, ord("E"), ord("L"), ord("F"), elf_class, endian])
+        header[18:20] = machine.to_bytes(2, "little")
+        header[32:40] = (64).to_bytes(8, "little")      # e_phoff
+        header[54:56] = (56).to_bytes(2, "little")      # e_phentsize
+        header[56:58] = (1).to_bytes(2, "little")       # e_phnum
+        string_offset = 64 + 56
+        phdr = bytearray(56)
+        phdr[0:4] = artifact.PT_INTERP.to_bytes(4, "little")
+        phdr[8:16] = string_offset.to_bytes(8, "little")
+        phdr[32:40] = len(interpreter).to_bytes(8, "little")
+        return bytes(header + phdr + interpreter)
+
+    def check(self, data, target):
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "dial"
+            executable.write_bytes(data)
+            artifact.check_target_format(executable, target)
+
+    def test_64_bit_little_endian_glibc_elf_is_accepted(self):
+        self.check(self.elf(), "x86_64-unknown-linux-gnu")
+        self.check(self.elf(machine=0xB7), "aarch64-unknown-linux-gnu")
+
+    def test_musl_elf_with_musl_loader_is_accepted(self):
+        self.check(self.elf(interpreter=b"/lib/ld-musl-x86_64.so.1\0"), "x86_64-unknown-linux-musl")
+
+    def test_big_endian_or_32_bit_elf_is_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, "64-bit little-endian ELF"):
+            self.check(self.elf(endian=2), "x86_64-unknown-linux-gnu")
+        with self.assertRaisesRegex(RuntimeError, "64-bit little-endian ELF"):
+            self.check(self.elf(elf_class=1), "x86_64-unknown-linux-gnu")
+
+    def test_wrong_machine_is_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, "64-bit little-endian ELF"):
+            self.check(self.elf(machine=0xB7), "x86_64-unknown-linux-gnu")
+
+    def test_glibc_target_must_link_ld_linux(self):
+        with self.assertRaisesRegex(RuntimeError, "does not link ld-linux"):
+            self.check(self.elf(interpreter=b"/lib/ld-musl-x86_64.so.1\0"), "x86_64-unknown-linux-gnu")
 
 
 if __name__ == "__main__":

@@ -23,7 +23,7 @@ work or infer semantic dependencies between tasks.
 - `send` queues guidance for a live peer. Messages and inboxes are bounded; check the returned result
   rather than assuming delivery. During a turn, guidance reaches the next model-request boundary;
   it does not interrupt an in-flight model response or tool call. In an open terminal, fresh mail
-  can also wake an eligible incomplete task (see below). Queuing is not acknowledgement.
+  can also wake an eligible idle conversation (see below). Queuing is not acknowledgement.
 - `clear` clears this session's claimed scopes, not its conversation or another peer's state.
 
 These commands use ordinary transcript notices, not a separate panel. During a running turn they
@@ -39,14 +39,19 @@ The message stays labelled untrusted peer context rather than becoming a typed p
 command, attachment reference, or turn-drafter input.
 
 With `coordination.auto_wake = true` (the default), an open terminal session checks for mail once
-per second while its last turn is **Incomplete**. At most two fresh messages are admitted for each
-wake-up, with at most **three automatic wake-ups per user turn**, separated by at least **30 seconds**.
+per second while its last turn is **Completed** or **Incomplete**. At most two fresh messages are
+admitted for each wake-up, with at most **three automatic wake-ups per user turn**, separated by
+at least **30 seconds**.
 Repeated sender/text pairs in the most recent 32 delivered messages do not trigger another wake-up.
 These continuations can incur model charges; normal tool approvals, sandbox rules and compute
 admission still apply. No extra process or headless session is launched.
+Relevance is assessed by the model after waking, not by a pre-inference filter: even unrelated
+fresh mail can consume a request. Disable automatic wake-ups below to avoid that cost.
 
-Completed, blocked, failed, interrupted, and human-input-waiting tasks do not wake automatically.
-No task is armed on process restart or session resume; a real user turn must first end incomplete.
+Blocked, failed, interrupted, and human-input-waiting tasks do not wake automatically. A completed
+reply can wake for relevant peer follow-up within the existing task or conversation; completion
+does not authorize new work or permission changes. Without fresh mail, no inference starts.
+No task is armed on process restart or session resume; a real user turn must first end successfully.
 Normal same-session settings/model rebuilds retain the bounded wake budget. A different task or
 session cannot inherit an armed wake-up. Queued human input, a nonempty composer, open panels,
 and scheduled loop turns take priority. Esc at the idle composer suspends wake-ups until the next

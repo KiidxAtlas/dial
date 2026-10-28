@@ -427,15 +427,14 @@ impl Worker {
         Ok((frame, current))
     }
 
-    fn map_point(
+    fn map_pointer(
         &mut self,
         target: &Target,
-        x: f64,
-        y: f64,
-    ) -> CoreResult<(f64, f64, FrameGeometry)> {
+        event: PointerEvent,
+    ) -> CoreResult<(PointerEvent, FrameGeometry)> {
         let (frame, current) = self.validated_frame(target)?;
-        let (x, y) = frame.map_point(x, y, current.as_ref())?;
-        Ok((x, y, frame))
+        let event = event.map_points(|x, y| frame.map_point(x, y, current.as_ref()))?;
+        Ok((event, frame))
     }
 
     fn explicit_window(&mut self, target: &Target) -> CoreResult<DesktopWindow> {
@@ -723,16 +722,19 @@ impl Worker {
                 if !keys.is_empty() {
                     self.validate_keyboard_target(target)?;
                 }
-                let (x, y, frame) = self.map_point(target, *x, *y)?;
-                self.backend()?.pointer(
+                let (event, frame) = self.map_pointer(
                     target,
                     PointerEvent::Hold {
-                        x,
-                        y,
+                        x: *x,
+                        y: *y,
                         button: *button,
                         keys: keys.clone(),
                         duration: *duration,
                     },
+                )?;
+                self.backend()?.pointer(
+                    target,
+                    event,
                     &frame,
                     delivery_mode(*takeover, token),
                     token,
@@ -794,20 +796,18 @@ impl Worker {
                 if options.modifiers != Modifiers::default() {
                     self.validate_keyboard_target(target)?;
                 }
-                let (x, y, frame) = self.map_point(target, *x, *y)?;
-                self.backend()?.pointer(
+                let (event, frame) = self.map_pointer(
                     target,
                     PointerEvent::Click {
-                        x,
-                        y,
+                        x: *x,
+                        y: *y,
                         button: options.button,
                         count: options.count,
                         modifiers: options.modifiers,
                     },
-                    &frame,
-                    options.mode(token),
-                    token,
                 )?;
+                self.backend()?
+                    .pointer(target, event, &frame, options.mode(token), token)?;
                 Ok(Response::Unit)
             }
             Request::MoveMouse {
@@ -817,10 +817,11 @@ impl Worker {
                 takeover,
                 ..
             } => {
-                let (x, y, frame) = self.map_point(target, *x, *y)?;
+                let (event, frame) =
+                    self.map_pointer(target, PointerEvent::Move { x: *x, y: *y })?;
                 self.backend()?.pointer(
                     target,
-                    PointerEvent::Move { x, y },
+                    event,
                     &frame,
                     delivery_mode(*takeover, token),
                     token,
@@ -836,23 +837,17 @@ impl Worker {
                 if !options.keys.is_empty() || options.modifiers != Modifiers::default() {
                     self.validate_keyboard_target(target)?;
                 }
-                let (frame, current) = self.validated_frame(target)?;
-                let mapped = path
-                    .iter()
-                    .map(|(x, y)| frame.map_point(*x, *y, current.as_ref()))
-                    .collect::<CoreResult<Vec<_>>>()?;
-                self.backend()?.pointer(
+                let (event, frame) = self.map_pointer(
                     target,
                     PointerEvent::Drag {
-                        path: mapped,
+                        path: path.clone(),
                         button: options.button,
                         modifiers: options.modifiers,
                         keys: options.keys.clone(),
                     },
-                    &frame,
-                    options.mode(token),
-                    token,
                 )?;
+                self.backend()?
+                    .pointer(target, event, &frame, options.mode(token), token)?;
                 Ok(Response::Unit)
             }
             Request::Scroll {
@@ -864,15 +859,18 @@ impl Worker {
                 takeover,
                 ..
             } => {
-                let (x, y, frame) = self.map_point(target, *x, *y)?;
-                self.backend()?.pointer(
+                let (event, frame) = self.map_pointer(
                     target,
                     PointerEvent::Scroll {
-                        x,
-                        y,
+                        x: *x,
+                        y: *y,
                         dx: *dx,
                         dy: *dy,
                     },
+                )?;
+                self.backend()?.pointer(
+                    target,
+                    event,
                     &frame,
                     delivery_mode(*takeover, token),
                     token,

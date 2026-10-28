@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 #[serde(default, deny_unknown_fields)]
 pub struct CoordinationConfig {
     pub enabled: bool,
-    /// Let open interactive sessions resume unfinished tasks when fresh peer mail arrives.
+    /// Let open interactive sessions resume the current conversation when fresh peer mail arrives.
     pub auto_wake: bool,
 }
 

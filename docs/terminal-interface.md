@@ -12,6 +12,12 @@ turn finishes. See [Session coordination](session-coordination.md) for delivery,
 - Inline, scrollback-native transcript with a live composer; finished turns remain in normal terminal
   scrollback. Model, provider and settings panels use a full-screen overlay and restore the terminal
   when closed. Approval prompts and settings adapt to narrow terminal widths.
+- User and assistant messages have muted UTC timestamp headers. Live timestamps mark submission
+  or the start of an answer; resumed messages use their recorded journal time (assistant journal
+  times mark persistence). Older imported messages without a recorded time remain unstamped.
+- Finished-turn footers show measured output speed as `tok/s` when available, alongside elapsed
+  time and token counts. Unknown or invalid rates are omitted; `ui.show_turn_stats = false` hides
+  the footer. Historical rates are not reconstructed from message timestamps.
 - New conversations open on a centered launch screen: a braille knob and wordmark (the needle turns
   into place at start-up when `ui.motion` allows) above a compact input card near the window
   midpoint. One line beneath shows the model, current directory and Git branch, then a quiet

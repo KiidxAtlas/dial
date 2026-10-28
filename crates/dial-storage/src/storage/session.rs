@@ -427,6 +427,11 @@ fn iso_now() -> String {
     iso(now_ms())
 }
 
+/// Current wall-clock time in the same UTC format as session entry timestamps.
+pub fn timestamp_now() -> String {
+    iso_now()
+}
+
 pub(super) fn random_hex(bytes: usize) -> String {
     (0..bytes)
         .map(|_| format!("{:02x}", rand::random::<u8>()))
@@ -3204,6 +3209,19 @@ impl Session {
         let mut out = Vec::new();
         self.extend_messages(&mut out);
         out
+    }
+
+    /// Conversation projection with journal timestamps for presentation, not provider fields.
+    /// Synthetic compaction messages keep no timestamp unless one was explicitly retained.
+    pub fn timestamped_messages(&self) -> Vec<Value> {
+        let mut messages = self.messages();
+        let offset = messages.len() - self.active.messages.len();
+        for (message, &index) in messages[offset..].iter_mut().zip(&self.active.messages) {
+            if let Some(object) = message.as_object_mut() {
+                object.insert("dial_timestamp".into(), json!(self.entries[index].ts));
+            }
+        }
+        messages
     }
 
     /// Canonical compaction replay framing, shared with atomic request previews.

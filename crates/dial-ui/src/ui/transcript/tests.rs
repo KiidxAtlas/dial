@@ -806,6 +806,7 @@ fn stats_row_is_dim_and_gated_by_setting() {
         line.contains("26.8s") && line.contains("11K in") && line.contains("59 out"),
         "{line}"
     );
+    assert!(line.contains("2.2 tok/s"), "measured rate shows: {line}");
     assert!(
         !line.contains("2026-10-01"),
         "the compact footer omits redundant clock/rate accounting"
@@ -2120,4 +2121,77 @@ fn live_tail_renders_only_the_blocks_it_shows_on_a_long_backlog() {
         t.blocks[0].rendered.borrow().is_none(),
         "the historical head is never rendered"
     );
+}
+
+#[test]
+fn message_timestamps_replay_only_recorded_times_and_live_deltas_keep_start_time() {
+    let env = Env::new();
+    let mut transcript = Transcript::new();
+    let mut replay = Replay::default();
+    replay.push(&mut transcript, &serde_json::json!({"role":"user","content":"earlier", "dial_timestamp":"2026-10-01T10:00:00.123Z"}));
+    replay.push(
+        &mut transcript,
+        &serde_json::json!({"role":"assistant","content":"old reply"}),
+    );
+    transcript.assistant_delta_at("new", "2026-10-01T10:01:00.000Z");
+    transcript.assistant_delta_at(" reply", "2026-10-01T10:02:00.000Z");
+    transcript.finish_turn();
+    let rows = plain(&transcript.all_rows(80, &env.ctx()));
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("You · 2026-10-01 10:00:00 UTC")),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("Assistant · 2026-10-01 10:01:00 UTC")),
+        "{rows:?}"
+    );
+    assert_eq!(
+        rows.iter().filter(|row| row.contains(" UTC")).count(),
+        2,
+        "unknown history must not acquire a time: {rows:?}"
+    );
+    assert!(!rows.iter().any(|row| row.contains("10:02:00")));
+}
+
+#[test]
+fn timestamped_stream_spills_without_repeating_header_or_text() {
+    let env = Env::new();
+    let mut transcript = Transcript::new();
+    let text = "first paragraph\n\nsecond paragraph\n\nlast paragraph";
+    transcript.assistant_delta_at(text, "2026-10-01T10:01:00.000Z");
+    let expected = plain(&transcript.all_rows(40, &env.ctx()));
+    let mut delivered = transcript.take_settled(40, &env.ctx());
+    transcript.finish_turn();
+    delivered.extend(transcript.take_settled(40, &env.ctx()));
+    assert_eq!(plain(&delivered), expected);
+}
+
+#[test]
+fn invalid_timestamps_and_nonfinite_token_rates_are_not_displayed() {
+    let env = Env::new();
+    let mut transcript = Transcript::new();
+    transcript.push_user_at("hello", "not a timestamp");
+    assert!(
+        !plain(&transcript.all_rows(40, &env.ctx()))
+            .iter()
+            .any(|row| row.contains(" UTC"))
+    );
+    for rate in [f64::NAN, f64::INFINITY, 0.0, -1.0] {
+        let mut transcript = Transcript::new();
+        transcript.turn_stats(TurnStats {
+            clock: String::new(),
+            elapsed_secs: 1.0,
+            prompt_tokens: None,
+            output_tokens: Some(4),
+            tokens_per_second: Some(rate),
+            outcome: None,
+        });
+        assert!(
+            !plain(&transcript.all_rows(80, &env.ctx()))
+                .iter()
+                .any(|row| row.contains("tok/s"))
+        );
+    }
 }

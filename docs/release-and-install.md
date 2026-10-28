@@ -215,6 +215,8 @@ desktop operations require `FEATURES=desktop`; the `voice` and `embedded-shell` 
 can also be restored individually. Use a quoted, comma-separated list for several,
 for example `FEATURES='aws,desktop'`. Missing optional capabilities report an explicit
 error rather than silently succeeding. Select the same flags on subsequent updates.
+Native-only desktop helpers are compiled only with a supported desktop backend (or
+their unit tests), so slim builds do not produce unused-native-code warnings.
 
 Builds automatically write Cargo's timing report to
 `target/cargo-timings/cargo-timing.html`. Keep `target` between builds: the first build

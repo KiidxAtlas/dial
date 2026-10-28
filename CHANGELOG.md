@@ -5,6 +5,14 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 
 ## [Unreleased]
 
+### Fixed
+
+- Desktop-disabled builds no longer compile unused native-only helpers; shared pointer coordinate mapping preserves gesture options without dead-code warnings.
+- Linux atomic no-replace moves invoke the kernel syscall directly, avoiding a missing `renameat2` libc wrapper when linking musl release binaries while preserving no-clobber behavior.
+- Fresh peer messages can wake completed replies as well as incomplete turns, so idle conversations can receive follow-ups. Wake-ups remain bounded, task-scoped and disabled for blocked, failed, interrupted or human-input-waiting turns (`docs/session-coordination.md`).
+- Chat messages show UTC timestamps in live and resumed terminal transcripts. Turn footers display measured token speed when available (`docs/terminal-interface.md`).
+- Release artifact validation checks the ELF identification bytes correctly for Linux x86-64 and arm64, with regression coverage for incorrect formats and architectures.
+
 ## [0.2.3] - 2026-10-28
 
 ### Added

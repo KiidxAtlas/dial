@@ -9,10 +9,14 @@ use std::{
     marker::PhantomData,
     rc::Rc,
     sync::{
-        Arc, Weak,
+        Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
+};
+#[cfg(any(test, dial_desktop_macos, dial_desktop_windows, dial_desktop_linux))]
+use std::{
+    sync::Weak,
     time::{Duration, Instant},
 };
 
@@ -50,6 +54,7 @@ pub(crate) enum CancelReason {
     /// Explicit task control was relinquished.
     ControlReleased,
     /// The user's emergency stop key was pressed.
+    #[cfg(any(test, dial_desktop_macos, dial_desktop_windows, dial_desktop_linux))]
     EmergencyStop,
     /// The caller gave up waiting for the native worker.
     OperationTimeout,
@@ -68,6 +73,7 @@ impl CancelReason {
             Self::SessionClosed => "the desktop session was closed",
             Self::SessionDropped => "the desktop session was dropped",
             Self::ControlReleased => "desktop control was released",
+            #[cfg(any(test, dial_desktop_macos, dial_desktop_windows, dial_desktop_linux))]
             Self::EmergencyStop => "the emergency stop key was pressed",
             Self::OperationTimeout => "a native desktop operation timed out",
             Self::Unknown => "the cancellation source was not recorded",
@@ -174,9 +180,11 @@ impl CancellationSource {
 }
 
 /// Weak callback ownership avoids a lease -> monitor -> source -> lease cycle.
+#[cfg(any(test, dial_desktop_macos, dial_desktop_windows, dial_desktop_linux))]
 #[derive(Clone)]
 pub(super) struct EmergencyStop(Weak<CancellationState>);
 
+#[cfg(any(test, dial_desktop_macos, dial_desktop_windows, dial_desktop_linux))]
 impl EmergencyStop {
     fn cancel(&self) {
         if let Some(source) = self.0.upgrade() {
@@ -253,6 +261,7 @@ impl OperationToken {
         }
     }
 
+    #[cfg(any(test, dial_desktop_macos, dial_desktop_windows, dial_desktop_linux))]
     pub(crate) fn wait(&self, duration: Duration) -> CoreResult<()> {
         let deadline = Instant::now() + duration;
         let mut state = self.source.0.state.lock();
@@ -297,6 +306,7 @@ pub(crate) fn current_token() -> Option<OperationToken> {
     }
 }
 
+#[cfg(any(test, dial_desktop_macos, dial_desktop_windows, dial_desktop_linux))]
 pub(crate) fn check() -> CoreResult<()> {
     if CLEANUP.get() {
         return Ok(());
@@ -304,6 +314,7 @@ pub(crate) fn check() -> CoreResult<()> {
     CURRENT.with_borrow(|token| token.as_ref().map_or(Ok(()), OperationToken::check))
 }
 
+#[cfg(any(test, dial_desktop_macos, dial_desktop_windows, dial_desktop_linux))]
 pub(crate) fn wait(duration: Duration) -> CoreResult<()> {
     if CLEANUP.get() {
         thread::sleep(duration);
@@ -321,6 +332,7 @@ pub(crate) fn wait(duration: Duration) -> CoreResult<()> {
 
 /// Cleanup must release already-held input even after cancellation. This does
 /// not clear a token or authorize any later operation. Nested cleanup is safe.
+#[cfg(any(test, dial_desktop_macos, dial_desktop_windows, dial_desktop_linux))]
 pub(crate) fn cleanup<T>(action: impl FnOnce() -> T) -> T {
     struct Restore(bool);
     impl Drop for Restore {
@@ -334,6 +346,7 @@ pub(crate) fn cleanup<T>(action: impl FnOnce() -> T) -> T {
 
 /// Owns one bounded button hold. An attempted press can be partially delivered,
 /// so release is mandatory even when that press reports an error.
+#[cfg(any(test, dial_desktop_macos, dial_desktop_windows, dial_desktop_linux))]
 pub(crate) fn bounded_hold(
     duration: Duration,
     mut transition: impl FnMut(bool) -> CoreResult<()>,
@@ -352,6 +365,7 @@ pub(crate) fn bounded_hold(
     }
 }
 
+#[cfg(any(dial_desktop_macos, dial_desktop_windows, dial_desktop_linux))]
 pub(crate) fn key_modifiers(keys: &[super::keys::KeyName]) -> super::backend::Modifiers {
     use super::keys::KeyName;
     super::backend::Modifiers {

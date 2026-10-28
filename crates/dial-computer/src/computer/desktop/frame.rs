@@ -1,6 +1,8 @@
 use std::io::Cursor;
 
-use image::{DynamicImage, ImageFormat, Rgba, RgbaImage, imageops::FilterType};
+#[cfg(any(test, dial_desktop_macos, dial_desktop_windows, dial_desktop_linux))]
+use image::Rgba;
+use image::{DynamicImage, ImageFormat, RgbaImage, imageops::FilterType};
 
 use super::{
     error::{CoreResult, DesktopError},
@@ -51,6 +53,7 @@ impl DisplayGeometry {
 #[derive(Debug, Clone, PartialEq)]
 enum FrameKind {
     Desktop,
+    #[cfg(any(test, dial_desktop_macos, dial_desktop_windows, dial_desktop_linux))]
     Window {
         captured_width: u32,
         captured_height: u32,
@@ -68,6 +71,7 @@ pub struct FrameGeometry {
 }
 
 impl FrameGeometry {
+    #[cfg(any(test, dial_desktop_macos, dial_desktop_windows, dial_desktop_linux))]
     pub(crate) fn for_displays(displays: &[DesktopDisplay]) -> Self {
         let width = displays
             .iter()
@@ -103,6 +107,7 @@ impl FrameGeometry {
         }
     }
 
+    #[cfg(any(test, dial_desktop_macos, dial_desktop_windows, dial_desktop_linux))]
     pub(crate) fn for_window(window: &DesktopWindow, px_width: u32, px_height: u32) -> Self {
         Self {
             width: px_width,
@@ -189,13 +194,14 @@ impl FrameGeometry {
         Ok(())
     }
 
-    pub(crate) fn validate_window(&self, window: Option<&DesktopWindow>) -> CoreResult<()> {
+    pub(crate) fn validate_window(&self, _window: Option<&DesktopWindow>) -> CoreResult<()> {
+        #[cfg(any(test, dial_desktop_macos, dial_desktop_windows, dial_desktop_linux))]
         if let FrameKind::Window {
             captured_width,
             captured_height,
         } = self.kind
         {
-            let current = window.ok_or_else(|| {
+            let current = _window.ok_or_else(|| {
                 DesktopError::window_not_found("target window is no longer available")
             })?;
             if current.width != captured_width || current.height != captured_height {
@@ -367,6 +373,7 @@ impl FrameGeometry {
         let local_x = (x - region.pixel_x) * region.width / region.pixel_width;
         let local_y = (y - region.pixel_y) * region.height / region.pixel_height;
         match self.kind {
+            #[cfg(any(test, dial_desktop_macos, dial_desktop_windows, dial_desktop_linux))]
             FrameKind::Window { .. } => {
                 let current = current_window.ok_or_else(|| {
                     DesktopError::window_not_found("target window is no longer available")
@@ -426,6 +433,7 @@ impl FrameGeometry {
 /// common single-display capture skips a second full-frame allocation and copy.
 /// Tiles are pulled one at a time so multi-display captures hold at most one
 /// display image beside the canvas.
+#[cfg(any(test, dial_desktop_macos, dial_desktop_windows, dial_desktop_linux))]
 pub fn compose<I>(width: u32, height: u32, background: Rgba<u8>, tiles: I) -> CoreResult<RgbaImage>
 where
     I: IntoIterator<Item = CoreResult<(RgbaImage, u32, u32)>>,

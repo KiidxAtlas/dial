@@ -46,25 +46,27 @@ fn send(agent: &mut Agent<'_>, text: &str) -> Participant {
 }
 
 #[test]
-fn only_uninterrupted_incomplete_user_tasks_arm_wakes() {
+fn only_successful_user_tasks_arm_wakes() {
     with_agent("", |agent| {
         assert!(agent.peer_wakeup_interval().is_none());
         assert!(!agent.peer_wake_pending().unwrap());
         assert!(agent.resume_from_peer(&mut NullUi).is_err());
         for outcome in [
-            TurnOutcome::Completed,
             TurnOutcome::Blocked,
             TurnOutcome::NeedsInput,
             TurnOutcome::Failed,
+            TurnOutcome::Interrupted,
         ] {
             arm(agent);
             agent.coordination_turn_settled(TurnOrigin::User, &report(outcome, false));
             assert!(agent.peer_wakeup_interval().is_none());
             assert!(agent.resume_from_peer(&mut NullUi).is_err());
         }
-        arm(agent);
-        agent.coordination_turn_settled(TurnOrigin::User, &report(TurnOutcome::Incomplete, true));
-        assert!(agent.peer_wakeup_interval().is_none());
+        for outcome in [TurnOutcome::Incomplete, TurnOutcome::Completed] {
+            arm(agent);
+            agent.coordination_turn_settled(TurnOrigin::User, &report(outcome, true));
+            assert!(agent.peer_wakeup_interval().is_none());
+        }
         arm(agent);
         agent
             .coordination_turn_settled(TurnOrigin::User, &Err(anyhow::anyhow!("execution failed")));
@@ -224,6 +226,8 @@ fn peer_resume_calls_provider_without_drafting_expanding_files_or_replacing_user
     ))]);
     with_agent("[experimental]\nturn_optimizer=true", |agent| {
         arm(agent);
+        // Ordinary final replies are Completed, not Incomplete. Fresh peer context must still wake.
+        agent.coordination_turn_settled(TurnOrigin::User, &report(TurnOutcome::Completed, false));
         agent.modes.skillful = Some(false);
         std::fs::write(
             agent.workspace.root().join("peer-only.txt"),
@@ -274,4 +278,36 @@ fn peer_resume_calls_provider_without_drafting_expanding_files_or_replacing_user
         body["messages"][0]["content"],
         crate::agent::prompts::turn_drafter::SYSTEM
     );
+}
+
+#[test]
+fn completed_peer_replies_rearm_without_resetting_budget_or_cooldown() {
+    with_agent("", |agent| {
+        arm(agent);
+        agent.coordination_turn_settled(TurnOrigin::User, &report(TurnOutcome::Completed, false));
+        let peer = send(agent, "continue the existing discussion");
+        let now = Instant::now();
+        assert!(agent.peer_wake_pending_at(now).unwrap());
+        // Exercise settlement and clock gates without another provider call; the provider path
+        // is covered by peer_resume_calls_provider_without_drafting_expanding_files_or_replacing_user_authority.
+        agent.peer_state.wake.remaining -= 1;
+        agent.peer_state.wake.last_wake = Some(now);
+        agent.poll_coordination(&mut NullUi);
+        agent.coordination_turn_started(TurnOrigin::Peer);
+        agent.coordination_turn_settled(TurnOrigin::Peer, &report(TurnOutcome::Completed, false));
+        assert_eq!(agent.peer_state.wake.remaining, 2);
+        assert!(!agent.peer_wake_pending_at(now + COOLDOWN).unwrap());
+        let id = agent.peer_state.participant.as_ref().unwrap().id();
+        peer.send(id, "a new follow-up").unwrap();
+        assert!(
+            !agent
+                .peer_wake_pending_at(now + COOLDOWN - Duration::from_nanos(1))
+                .unwrap()
+        );
+        assert!(
+            agent
+                .peer_wake_pending_at(now + COOLDOWN + POLL_INTERVAL)
+                .unwrap()
+        );
+    });
 }

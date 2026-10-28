@@ -2,6 +2,7 @@ use super::*;
 use serde_json::json;
 mod relocation_artifacts;
 mod schema;
+mod timing;
 mod tree;
 #[test]
 fn streamed_observations_survive_reopen_before_any_final_reply() {

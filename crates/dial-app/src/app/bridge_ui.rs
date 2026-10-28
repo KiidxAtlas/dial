@@ -53,7 +53,9 @@ impl Ui for Bridge<'_> {
         if tool {
             self.shell.pending_result = running.then(|| body.clone());
         } else if prose {
-            self.shell.transcript.bind_prose(body);
+            self.shell
+                .transcript
+                .bind_prose_at(body, &crate::storage::session::timestamp_now());
             self.shell.shared_prose = running;
         }
     }
@@ -117,14 +119,18 @@ impl Ui for Bridge<'_> {
     fn steering_applied(&mut self, text: &str) {
         // Automatically routed input is shown by `pending_message_accepted`; only explicit here.
         if self.shell.composer.mark_explicit(text, SteerStage::Applied) {
-            self.shell.transcript.push_user(text);
+            self.shell
+                .transcript
+                .push_user_at(text, &crate::storage::session::timestamp_now());
             self.repaint(true);
         }
     }
 
     fn pending_message_accepted(&mut self, text: &str) {
         self.shell.composer.mark_explicit(text, SteerStage::Applied);
-        self.shell.transcript.push_user(text);
+        self.shell
+            .transcript
+            .push_user_at(text, &crate::storage::session::timestamp_now());
         self.repaint(true);
     }
 
@@ -213,7 +219,9 @@ impl Ui for Bridge<'_> {
 
     fn extension_panel(&mut self, title: &str, markdown: &str) {
         self.shell.transcript.notice(title, "");
-        self.shell.transcript.assistant_delta(markdown);
+        self.shell
+            .transcript
+            .assistant_delta_at(markdown, &crate::storage::session::timestamp_now());
         self.shell.transcript.finish_turn();
         self.repaint(true);
     }
@@ -250,7 +258,9 @@ impl Ui for Bridge<'_> {
 
     fn text_delta(&mut self, text: &str) {
         if !std::mem::take(&mut self.shell.shared_prose) {
-            self.shell.transcript.assistant_delta(text);
+            self.shell
+                .transcript
+                .assistant_delta_at(text, &crate::storage::session::timestamp_now());
         }
         self.shell.transcript.advance_reveal(&self.shell.ui);
         self.set_activity("writing");

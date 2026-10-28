@@ -8,7 +8,7 @@ use serde_json::Value;
 /// Show an earlier session's conversation as transcript blocks (for `dial -c`).
 pub(super) fn replay_session(transcript: &mut Transcript, session: &Session) {
     let records = session.custom_records(PLUGIN_ENTRY_TYPE);
-    replay(transcript, &session.messages(), &records);
+    replay(transcript, &session.timestamped_messages(), &records);
     for body in session.runtime().bodies("tool") {
         if let Some(id) = body.read(|node| node.call_id.clone()) {
             transcript.bind_tool(&id, body);

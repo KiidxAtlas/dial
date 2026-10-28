@@ -14,7 +14,10 @@ pub fn rename_noreplace(source: &Path, target: &Path) -> io::Result<()> {
         let target = CString::new(target.as_os_str().as_bytes())?;
         #[cfg(target_os = "linux")]
         let result = unsafe {
-            libc::renameat2(
+            // musl does not export the renameat2 wrapper on every supported toolchain.
+            // Invoke the kernel operation directly; never fall back to a clobbering rename.
+            libc::syscall(
+                libc::SYS_renameat2,
                 libc::AT_FDCWD,
                 source.as_ptr(),
                 libc::AT_FDCWD,

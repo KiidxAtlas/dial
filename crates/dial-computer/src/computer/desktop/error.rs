@@ -63,6 +63,7 @@ impl DesktopError {
         }
     }
 
+    #[cfg(any(dial_desktop_macos, dial_desktop_windows, dial_desktop_linux))]
     pub(crate) fn permission_denied(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::PermissionDenied, message)
     }
@@ -83,6 +84,7 @@ impl DesktopError {
         Self::new(ErrorCode::Cancelled, message)
     }
 
+    #[cfg(any(dial_desktop_macos, dial_desktop_windows, dial_desktop_linux))]
     pub(crate) fn background_unavailable(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::BackgroundUnavailable, message)
     }

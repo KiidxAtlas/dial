@@ -18,7 +18,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         TO,
         "Session coordination",
         "Peer wake-ups",
-        "Let fresh peer messages resume an incomplete task in an open terminal session, at most three times per user turn and at least 30 seconds apart. Never resumes completed, blocked, failed, cancelled or human-input-waiting tasks. May use paid model requests; normal approvals still apply. Takes effect in a new session.",
+        "Let fresh peer messages resume completed or incomplete turns in the current task or conversation in an open terminal session, at most three times per user turn and at least 30 seconds apart. Never resumes blocked, failed, cancelled or human-input-waiting tasks. May use paid model requests; normal approvals still apply. Takes effect in a new session.",
         Kind::Bool,
         true,
     ),

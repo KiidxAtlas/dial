@@ -149,6 +149,7 @@ struct Spill {
 
 struct Block {
     kind: Kind,
+    timestamp: Option<String>,
     active: bool,
     spill: Spill,
     markdown: std::cell::RefCell<StreamingRows>,
@@ -181,6 +182,7 @@ impl Block {
     fn new(kind: Kind, active: bool) -> Self {
         Block {
             kind,
+            timestamp: None,
             active,
             spill: Spill::default(),
             markdown: std::cell::RefCell::new(StreamingRows::default()),
@@ -304,7 +306,7 @@ impl Block {
                 return std::sync::Arc::clone(rows);
             }
         }
-        let rows = match &self.kind {
+        let mut rows = match &self.kind {
             Kind::User(t) => Arc::new(user_rows(t, w, ctx)),
             Kind::Assistant(t) => match &self.shared {
                 Some(b) => b.read(|n| {
@@ -332,8 +334,30 @@ impl Block {
             Kind::Image(image) => Arc::new(image.rows(w, ctx.theme)),
             Kind::Stats(s) => Arc::new(stats_rows(s, w, ctx)),
         };
+        if self.timestamp.is_some() {
+            self.timestamp_rows(Arc::make_mut(&mut rows), w, ctx);
+        }
         *self.rendered.borrow_mut() = Some((key, ctx.tick, Arc::clone(&rows)));
         rows
+    }
+
+    fn timestamp_rows(&self, rows: &mut Rows, width: u16, ctx: &TranscriptCtx) {
+        let Some(timestamp) = &self.timestamp else {
+            return;
+        };
+        let label = match self.kind {
+            Kind::User(_) => "You",
+            Kind::Assistant(_) => "Assistant",
+            _ => return,
+        };
+        let header = format!("{label} · {} UTC", timestamp.replace('T', " "));
+        rows.insert(
+            0,
+            Line::from(Span::styled(
+                text::clip(&header, width as usize),
+                ctx.theme.fg(Tok::Muted),
+            )),
+        );
     }
 
     /// Rows of this block already in scrollback because of a spill (re-measured on width change).
@@ -356,7 +380,9 @@ impl Block {
             while !text.is_char_boundary(end) {
                 end -= 1;
             }
-            prose_rows(kind, &text[..end], w, ctx).len()
+            let mut rows = prose_rows(kind, &text[..end], w, ctx);
+            self.timestamp_rows(&mut rows, w, ctx);
+            rows.len()
         })
     }
 
@@ -374,7 +400,8 @@ impl Block {
             return None;
         }
         for &cut in stable_cuts(&text, self.spill.src).iter().rev().take(4) {
-            let prefix = prose_rows(kind, &text[..cut], w, ctx);
+            let mut prefix = prose_rows(kind, &text[..cut], w, ctx);
+            self.timestamp_rows(&mut prefix, w, ctx);
             let p = prefix.len();
             if p > skip && p <= full.len() && full[..p] == prefix[..] {
                 return Some((cut, p));
@@ -806,6 +833,9 @@ fn stats_rows(s: &TurnStats, w: u16, ctx: &TranscriptCtx) -> Rows {
                 theme.fg(Tok::Muted),
             );
         }
+        if let Some(rate) = s.tokens_per_second.filter(|r| r.is_finite() && *r > 0.0) {
+            push(&mut left, format!("{rate:.1} tok/s"), theme.fg(Tok::Muted));
+        }
     }
     let right: Vec<Span<'static>> = if changed > 0 {
         vec![
@@ -1052,6 +1082,45 @@ impl Transcript {
     pub fn push_user(&mut self, text: &str) {
         self.close_streaming_text();
         self.push(Kind::User(text.to_owned()), false);
+    }
+
+    /// Append live user text with its observed UTC submission time.
+    pub fn push_user_at(&mut self, text: &str, timestamp: &str) {
+        let first = self.blocks.len();
+        self.push_user(text);
+        self.stamp_blocks(first, timestamp);
+    }
+
+    /// Append live assistant text, timestamping only a newly created answer block.
+    pub fn assistant_delta_at(&mut self, text: &str, timestamp: &str) {
+        let first = self.blocks.len();
+        self.assistant_delta(text);
+        self.stamp_blocks(first, timestamp);
+    }
+
+    /// Bind a live answer body without changing its timestamp on subsequent updates.
+    pub fn bind_prose_at(&mut self, body: &crate::runtime::Body, timestamp: &str) {
+        let first = self.blocks.len();
+        self.bind_prose(body);
+        self.stamp_blocks(first, timestamp);
+    }
+
+    fn stamp_blocks(&mut self, first: usize, timestamp: &str) {
+        let Some(time) = timestamp
+            .get(..19)
+            .filter(|time| crate::platform::time::parse_utc(time).is_some())
+        else {
+            return;
+        };
+        if !timestamp.ends_with('Z') {
+            return;
+        }
+        for block in &mut self.blocks[first..] {
+            if matches!(block.kind, Kind::User(_) | Kind::Assistant(_)) {
+                block.timestamp = Some(time.to_owned());
+                block.revision.set(block.revision.get().saturating_add(1));
+            }
+        }
     }
 
     pub fn assistant_delta(&mut self, text: &str) {
@@ -2159,6 +2228,9 @@ impl Replay {
                 }
             }
             _ => {}
+        }
+        if let Some(timestamp) = message["dial_timestamp"].as_str() {
+            transcript.stamp_blocks(first, timestamp);
         }
         first
     }
