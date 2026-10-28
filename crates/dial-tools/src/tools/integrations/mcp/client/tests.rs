@@ -549,3 +549,97 @@ fn progress_callback_panic_settles_blocked_stdio_work() {
         );
     }
 }
+
+/// Make the reader win deterministically: publish a reply from flush(), then hold the
+/// writer there until the request loop has observed that reply without cancelling it.
+#[cfg(unix)]
+#[test]
+fn terminal_stdio_replies_wait_for_writer_bookkeeping_without_closing_the_server() {
+    struct EarlyReply {
+        shared: Arc<Shared>,
+        release: mpsc::Receiver<()>,
+        published: Arc<AtomicBool>,
+        reply: Value,
+    }
+    impl Write for EarlyReply {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.shared.handle(&self.reply);
+            self.published.store(true, Ordering::SeqCst);
+            self.release.recv_timeout(Duration::from_secs(3)).unwrap();
+            Ok(())
+        }
+    }
+
+    for rpc_error in [false, true] {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exec sleep 60"]);
+        let child = crate::platform::process::spawn_group(&mut command).unwrap();
+        let shared = Arc::new(Shared::new(Vec::new(), None));
+        let (outgoing, queue) = mpsc::sync_channel(2);
+        let (release, released) = mpsc::channel();
+        let (observed, observation) = mpsc::channel();
+        let published = Arc::new(AtomicBool::new(false));
+        let writer = EarlyReply {
+            shared: shared.clone(),
+            release: released,
+            published: published.clone(),
+            reply: if rpc_error {
+                json!({"id":1,"error":{"code":-1,"message":"expected failure"}})
+            } else {
+                json!({"id":1,"result":{"done":true}})
+            },
+        };
+        let writer_state = shared.clone();
+        let worker = thread::spawn(move || write_loop(writer, queue, &writer_state));
+        let client = Client::new(
+            "early-reply",
+            Transport::Stdio {
+                child: Mutex::new(child),
+                outgoing,
+                workers: Mutex::new(vec![worker]),
+            },
+            shared.clone(),
+        );
+        thread::scope(|scope| {
+            let request = scope.spawn(|| {
+                client.request_with(
+                    "tools/call",
+                    json!({}),
+                    Duration::from_secs(5),
+                    &|| {
+                        if published.load(Ordering::SeqCst) {
+                            let _ = observed.send(());
+                        }
+                        false
+                    },
+                    None,
+                )
+            });
+            let deferred = observation.recv_timeout(Duration::from_secs(1));
+            let closed_before_release = shared.is_closed();
+            release.send(()).unwrap();
+            let result = request.join().unwrap();
+            assert!(deferred.is_ok(), "reply must await local write settlement");
+            assert!(
+                !closed_before_release,
+                "a terminal reply is not a blocked write"
+            );
+            if rpc_error {
+                assert_eq!(
+                    result
+                        .unwrap_err()
+                        .downcast_ref::<RequestFailure>()
+                        .unwrap()
+                        .settlement,
+                    Settlement::Reply
+                );
+            } else {
+                assert_eq!(result.unwrap(), json!({"done":true}));
+            }
+            assert!(!client.is_closed(), "the connection remains usable");
+        });
+    }
+}

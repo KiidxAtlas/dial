@@ -306,6 +306,7 @@ fn server_noise_is_ignored_and_server_pings_are_answered() {
 #[test]
 fn a_call_that_never_returns_times_out_and_the_server_stays_usable() {
     let loaded = load(&config_with(vec![("fake", fake_config("", 1))]));
+    assert!(loaded.notices.is_empty(), "{:?}", loaded.notices);
     let started = Instant::now();
     let slow = call(&loaded, "mcp__fake__slow", json!({}));
     assert!(slow.is_error);

@@ -255,6 +255,8 @@ Settled native edit calls remain readable when switching among Dial's five suppo
 
 Execution results carry typed terminal status, effect certainty and committed paths separately from tool-owned payloads. MCP requests rejected before transport admission have no effects; timeouts, cancellation or transport loss after admission leave effects unknown. A terminal protocol reply settles the request. Unknown effects stop the shared lifecycle for inspection and never trigger automatic replay.
 
+For stdio MCP, a terminal reply also waits for local writer bookkeeping before the request returns, so a fast server reply cannot be mistaken for a blocked pipe and close a healthy connection. The existing cancellation and request deadlines still bound that wait; an actually blocked write is torn down and reaped rather than left running.
+
 ## Discover, import and toggle skills
 
 Browse compatible skills from Claude, Codex, Agents (`.agents`/`.agent`) and pi

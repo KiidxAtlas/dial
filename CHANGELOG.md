@@ -5,6 +5,10 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed a stdio MCP race where a fast server reply could arrive before local write completion was recorded, causing successful startup or tool calls to tear down a healthy connection. Cancellation and deadline teardown of genuinely blocked writes remain bounded.
+
 ## [0.2.2] - 2026-10-27
 
 ### Added

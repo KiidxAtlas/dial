@@ -27,7 +27,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -636,11 +636,32 @@ impl Client {
         };
         let _owned = owned;
         let mut deadline = (!timeout.is_zero()).then(|| Instant::now() + timeout);
+        let mut terminal_reply = None;
         loop {
             let wait = deadline.map_or(POLL, |end| {
                 end.saturating_duration_since(Instant::now()).min(POLL)
             });
-            match reply_rx.recv_timeout(wait) {
+            let received = if let Some(reply) = terminal_reply.take() {
+                operation.wait_for_delivery(wait);
+                Ok(reply)
+            } else {
+                reply_rx.recv_timeout(wait)
+            };
+            // A server can consume the complete line and answer before the writer thread
+            // records delivery. Returning now would make Pending mistake that healthy write
+            // for a blocked one and kill the connection. Keep the reply while waiting for
+            // local delivery settlement, under the same cancellation/deadline checks.
+            let received = match received {
+                Ok(reply @ Event::Reply(Ok(_) | Err(Failure::Rpc(_))))
+                    if matches!(&self.transport, Transport::Stdio { .. })
+                        && operation.phase() == Phase::Dispatching =>
+                {
+                    terminal_reply = Some(reply);
+                    Err(RecvTimeoutError::Timeout)
+                }
+                received => received,
+            };
+            match received {
                 Ok(Event::Reply(Ok(value))) => return Ok(value),
                 Ok(Event::Reply(Err(Failure::Rpc(message)))) => {
                     return Err(anyhow!(
@@ -996,7 +1017,7 @@ pub(super) fn server_env(
     env.into_iter().collect()
 }
 
-fn write_loop(mut stdin: ChildStdin, queue: mpsc::Receiver<Outgoing>, shared: &Shared) {
+fn write_loop(mut stdin: impl Write, queue: mpsc::Receiver<Outgoing>, shared: &Shared) {
     while !shared.is_closed() {
         let outgoing = match queue.recv_timeout(POLL) {
             Ok(outgoing) => outgoing,

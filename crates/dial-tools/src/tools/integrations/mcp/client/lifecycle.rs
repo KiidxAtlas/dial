@@ -15,6 +15,7 @@ pub(super) enum Phase {
 pub(in super::super) struct Operation {
     pub cancel: Arc<AtomicBool>,
     phase: Mutex<Phase>,
+    delivery: std::sync::Condvar,
     pub deadline: Instant,
 }
 
@@ -27,6 +28,7 @@ impl Operation {
         Arc::new(Self {
             cancel,
             phase: Mutex::new(Phase::Queued),
+            delivery: std::sync::Condvar::new(),
             deadline: Instant::now() + lifetime,
         })
     }
@@ -43,6 +45,17 @@ impl Operation {
 
     pub fn delivered(&self) {
         *lock(&self.phase) = Phase::Delivered;
+        self.delivery.notify_all();
+    }
+
+    /// A protocol reply can beat the writer's post-write bookkeeping. Wait without spinning,
+    /// but wake at the caller's polling interval so cancellation and deadlines still apply.
+    pub(super) fn wait_for_delivery(&self, timeout: Duration) {
+        let phase = lock(&self.phase);
+        let _ = self
+            .delivery
+            .wait_timeout_while(phase, timeout, |phase| *phase == Phase::Dispatching)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
     }
 
     pub fn stopped(&self) -> bool {
