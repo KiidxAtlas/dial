@@ -80,12 +80,9 @@ impl Participant {
     /// result, or a run still going under a live owner.
     pub fn shared_run(&self, command: &str, fingerprint: &str) -> Result<Option<RunEntry>> {
         let _transaction = transaction(&self.dir)?;
-        Ok(live_entries(&self.dir)?
-            .into_iter()
-            .rev()
-            .find(|entry| {
-                entry.owner != self.id && entry.command == command && entry.fingerprint == fingerprint
-            }))
+        Ok(live_entries(&self.dir)?.into_iter().rev().find(|entry| {
+            entry.owner != self.id && entry.command == command && entry.fingerprint == fingerprint
+        }))
     }
 
     /// Runs other sessions currently have going, for the peers listing.
@@ -104,7 +101,9 @@ impl Participant {
         let _transaction = transaction(&self.dir)?;
         let mut entries = live_entries(&self.dir)?;
         entries.retain(|entry| {
-            !(entry.owner == self.id && entry.command == command && entry.fingerprint == fingerprint)
+            !(entry.owner == self.id
+                && entry.command == command
+                && entry.fingerprint == fingerprint)
         });
         entries.push(RunEntry {
             owner: self.id.clone(),

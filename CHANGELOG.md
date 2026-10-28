@@ -27,6 +27,7 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 
 ### Fixed
 
+- Release checks now accept the intentionally read-only `code_history` and `dep_source` tools for read-only subagents; coordination code and tests match the pinned Rust formatter.
 - Idle cache warming now tracks accepted text-only/final requests as well as tool-call requests, and honors effective five-minute versus one-hour retention and provider refusal fallback (`docs/llm-transport.md`).
 - `task wait`, `side_request wait`, `bg wait` and a foreground `bash` command not yet moved to the background now stop as soon as the user queues a message, so the message is handled promptly instead of after a long wait. Nothing is cancelled: the awaited work keeps running (`docs/agent-loop.md`).
 - A shell command that repeats only a `cd`, `export` or `NAME=value` prefix of an earlier command (`cd crates/x && git status` after `cd crates/x && ls`) is no longer reported as an unchanged rerun.

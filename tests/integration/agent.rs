@@ -5015,10 +5015,12 @@ fn each_agent_type_gets_its_own_prompt_and_tool_allowlist() {
                         extra.as_str(),
                         "codebase_memory"
                             | "find"
+                            | "dep_source"
                             | "recall"
                             | "memory_history"
                             | "artifact_read"
                             | "archive"
+                            | "code_history"
                             | "ask"
                     ),
                     "{agent_type} got non-read-only tool {extra}"

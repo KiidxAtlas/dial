@@ -310,12 +310,22 @@ fn run_ledger_shares_finished_results_and_live_runs_only_for_the_same_tree() {
             }),
         )
         .unwrap();
-    assert!(reader.shared_run("cargo check", "tree-a").unwrap().is_none());
+    assert!(
+        reader
+            .shared_run("cargo check", "tree-a")
+            .unwrap()
+            .is_none()
+    );
 
     // A run whose owner exits without finishing is no longer advertised; results stay.
     owner.begin_run("owner", "cargo build", "tree-a").unwrap();
     drop(owner);
-    assert!(reader.shared_run("cargo build", "tree-a").unwrap().is_none());
+    assert!(
+        reader
+            .shared_run("cargo build", "tree-a")
+            .unwrap()
+            .is_none()
+    );
     assert!(reader.shared_run("cargo test", "tree-a").unwrap().is_some());
     // The ledger file does not count as a peer.
     assert!(reader.peers().unwrap().is_empty());
