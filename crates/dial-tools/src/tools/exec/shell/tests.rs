@@ -5,6 +5,7 @@ use crate::tools::testkit::*;
 use serde_json::json;
 #[cfg(target_os = "macos")]
 use std::path::PathBuf;
+#[cfg(target_os = "macos")]
 fn sandboxed() -> bool {
     super::super::sandbox::require_for_test()
 }

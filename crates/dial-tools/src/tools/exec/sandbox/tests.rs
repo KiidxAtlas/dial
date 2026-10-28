@@ -139,6 +139,7 @@ impl Fixture {
         fx
     }
 
+    #[cfg(target_os = "macos")]
     fn policy(&self, allow_network: bool) -> Policy {
         Policy::Dev {
             deny_read: vec![self.denied.clone()],
@@ -148,10 +149,12 @@ impl Fixture {
     }
 
     /// Run `script` in bash under the Dev policy; returns (exit code, stdout+stderr).
+    #[cfg(target_os = "macos")]
     fn run(&self, policy: &Policy, script: &str) -> (Option<i32>, String) {
         self.run_with_env(policy, script, std::env::vars_os())
     }
 
+    #[cfg(target_os = "macos")]
     fn run_with_env(
         &self,
         policy: &Policy,

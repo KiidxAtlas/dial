@@ -115,7 +115,7 @@ pub(super) fn terminal(rows: u16, cols: u16) -> Result<(File, File), String> {
             &mut slave,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut size,
+            &raw mut size,
         )
     } == -1
     {

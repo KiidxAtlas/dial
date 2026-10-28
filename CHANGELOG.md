@@ -62,6 +62,7 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 - Prompt data framing is stricter. A project instruction file containing `</context>` can no longer end its `<context>` wrapper early, and context paths and MCP server names are attribute-escaped the same way as `@file` blocks. MCP servers that send blank instructions no longer add an empty block. Single-line previews (`truncate_chars`) now fold `\r` and `\r\n` as well as `\n`.
 
 ### Fixed
+- Linux installer detection respects the active libc even when musl development loaders are also installed. Cross-platform release checks compile Unix-only fixtures only on supported hosts and keep platform-specific Clippy clean.
 - Replace the abandoned 7z decoder with maintained `sevenz-rust2`, removing the vulnerable dependency while retaining read-only archive admission and expansion limits.
 - Release CI installs the signature-test dependency before running installer contracts. Named shell sessions retain published state after ordinary nonzero background exits, and histories recorded before the optional `bash.session` property remain resumable.
 - Parallel tool results and timings now appear as each call finishes, remain correlated by call ID, and retain original-order provider conversation settlement (`docs/agent-loop.md`).

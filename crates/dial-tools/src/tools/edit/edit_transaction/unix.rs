@@ -101,7 +101,11 @@ impl Drop for ParentCleanup {
             } == 0
             {
                 let metadata = unsafe { metadata.assume_init() };
-                if metadata.st_dev as u64 == entry.dev
+                #[cfg(target_os = "macos")]
+                let dev = metadata.st_dev as u64;
+                #[cfg(not(target_os = "macos"))]
+                let dev = metadata.st_dev;
+                if dev == entry.dev
                     && metadata.st_ino == entry.ino
                     && metadata.st_mode & libc::S_IFMT == libc::S_IFDIR
                 {

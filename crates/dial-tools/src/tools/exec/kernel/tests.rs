@@ -1,4 +1,3 @@
-use crate::config::tools::kernel::KernelConfig;
 use crate::config::types::Config;
 
 use super::*;

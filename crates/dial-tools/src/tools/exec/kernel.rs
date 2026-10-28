@@ -30,8 +30,6 @@ pub(crate) use crate::runtime::json_transport::{INTERRUPT_GRACE, execution_deadl
 // No descendant can detach: even with the operator's filesystem sandbox opt-out, fork/spawn is denied.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(super) const FORK_FENCE: &str = "(version 1)(allow default)(deny process-fork)";
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-const BWRAP: &str = "/usr/bin/bwrap";
 const PYTHON_PREFLIGHT: &str = "import sys,json\nr=json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'result':{'executable':sys.executable,'version':list(sys.version_info[:2])}}),flush=True)";
 
 pub(crate) struct ActiveGuard<'a>(&'a AtomicUsize);

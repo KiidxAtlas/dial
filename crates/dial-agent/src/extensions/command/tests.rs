@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use super::*;
 use crate::agent::Ui;
 use crate::extensions::panel::{Panel, Value as PanelValue};

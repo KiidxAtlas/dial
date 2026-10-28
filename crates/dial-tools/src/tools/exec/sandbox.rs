@@ -75,6 +75,7 @@ use std::process::{Command, Stdio};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
+#[cfg(not(target_os = "linux"))]
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
 /// System locations a command may read (never write) to start up and run.
@@ -954,6 +955,7 @@ fn probe() -> Sandbox {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn self_test() -> Result<(), String> {
     let scratch = tempfile::tempdir().map_err(|e| format!("creating scratch dir: {e}"))?;
     let base = scratch
@@ -991,6 +993,7 @@ fn self_test() -> Result<(), String> {
 
 /// Run `/bin/bash -c script _ args…` under `profile` in `cwd` with a minimal
 /// environment, bounded to 15 seconds. Returns the exit code and stdout.
+#[cfg(not(target_os = "linux"))]
 fn run_probe(
     profile: &str,
     cwd: &Path,

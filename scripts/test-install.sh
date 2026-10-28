@@ -4,7 +4,19 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 mkdir -p "$root/.tmp"
 test_root=$(mktemp -d "$root/.tmp/install-test.XXXXXX")
-trap 'rm -rf "$test_root"' EXIT
+cleanup() {
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        echo "Installer fixture failed (exit $status); captured command output:" >&2
+        for log in "$test_root"/*.log; do
+            [ -f "$log" ] || continue
+            printf '\n--- %s ---\n' "${log##*/}" >&2
+            cat "$log" >&2
+        done
+    fi
+    rm -rf "$test_root"
+}
+trap cleanup EXIT
 mkdir -p "$test_root/bin" "$test_root/releases" "$test_root/temp"
 
 # Fixture signing needs OpenSSL 3+; macOS's LibreSSL `openssl` cannot sign Ed25519.
@@ -134,6 +146,16 @@ bash "$root/scripts/install.sh" latest > "$test_root/intel.log" 2>&1
 export FAKE_OS=Linux FAKE_ARCH=x86_64 FAKE_LIBC=glibc DIAL_INSTALL_DIR="$test_root/linux/bin"
 bash "$root/scripts/install.sh" latest > "$test_root/linux.log" 2>&1
 [ "$("$DIAL_INSTALL_DIR/dial" --version)" = 'dial 0.1.0 x86_64-unknown-linux-gnu' ]
+# Installing musl-tools on a glibc host leaves a musl loader behind. Its presence
+# must not override ldd's active glibc result; emulate it without writing to /lib.
+compgen() {
+    if [ "${1:-}" = -G ] && [ "${2:-}" = '/lib/ld-musl-*.so.1' ]; then return 0; fi
+    builtin compgen "$@"
+}
+export -f compgen
+DIAL_INSTALL_DIR="$test_root/glibc-with-musl/bin" bash "$root/scripts/install.sh" v0.1.0 > "$test_root/glibc-with-musl.log" 2>&1
+[ "$("$test_root/glibc-with-musl/bin/dial" --version)" = 'dial 0.1.0 x86_64-unknown-linux-gnu' ]
+unset -f compgen
 export FAKE_OS=Linux FAKE_ARCH=aarch64 FAKE_LIBC=glibc DIAL_INSTALL_DIR="$test_root/linux-arm/bin"
 bash "$root/scripts/install.sh" v0.1.0 > "$test_root/linux-arm.log" 2>&1
 [ "$("$DIAL_INSTALL_DIR/dial" --version)" = 'dial 0.1.0 aarch64-unknown-linux-gnu' ]

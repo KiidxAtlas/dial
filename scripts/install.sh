@@ -23,8 +23,10 @@ case "$(uname -s):$(uname -m)" in
             x86_64 | amd64) linux_arch=x86_64 ;;
             *) linux_arch=aarch64 ;;
         esac
-        # Musl hosts (Alpine and similar) need the static musl build; glibc hosts keep the gnu build.
-        if compgen -G '/lib/ld-musl-*.so.1' >/dev/null || { ldd --version 2>&1 || true; } | grep -qi musl; then
+        # Prefer the active libc reported by ldd: glibc development hosts can also have
+        # musl loaders installed. Only use loader presence when ldd is unavailable.
+        if { command -v ldd >/dev/null && { ldd --version 2>&1 || true; } | grep -qi musl; } \
+            || { ! command -v ldd >/dev/null && compgen -G '/lib/ld-musl-*.so.1' >/dev/null; }; then
             target=$linux_arch-unknown-linux-musl
         else
             target=$linux_arch-unknown-linux-gnu

@@ -10,7 +10,23 @@ curl -fsSL https://github.com/KiidxAtlas/dial/releases/latest/download/install.s
 
 Published targets are `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-musl`, `x86_64-pc-windows-msvc`, and `aarch64-pc-windows-msvc`. The Windows archives are `dial-<tag>-<target>.zip` containing `dial.exe`; install with the release's `install.ps1` in Windows PowerShell 5.1 or PowerShell 7 (one-line commands in [windows.md](windows.md)).
 
-The published installers (`install.sh` and `install.ps1`) embed the release's Ed25519 public key, select the host target, and check the archive digest against `SHA256SUMS` before extraction. `install.ps1` always verifies the detached signature over `SHA256SUMS`. `install.sh` verifies it whenever OpenSSL 3 is available (on `PATH`, Homebrew's `openssl@3`, or `DIAL_OPENSSL`); stock macOS ships LibreSSL, which cannot verify Ed25519, so without OpenSSL 3 the script prints a notice and relies on the HTTPS-fetched checksum alone. Set `DIAL_REQUIRE_SIGNATURE=1` to refuse installation instead. `install.sh` installs into `~/.local/bin` (override with `DIAL_INSTALL_DIR`), validates the binary version before and after activation, and restores the previous executable if activation fails. When the directory is not on `PATH`, it appends one `export PATH=…` line (`fish_add_path` for fish) to the login shell's profile (`~/.zshrc`, `~/.bash_profile` on macOS bash, `~/.bashrc` on Linux bash, otherwise `~/.profile`), once; `DIAL_NO_MODIFY_PATH=1` prints the line instead. For a pinned version, download `install.sh` and pass a tag such as `v0.1.1` to it. Release archives include `LICENSE`, `THIRD_PARTY_NOTICES`, and the Silver/Unscii font notices.
+On Linux, target selection prefers the active libc reported by `ldd`; installing musl development
+tools on a glibc host does not switch that host to the musl build. Loader presence is a fallback
+only when `ldd` is unavailable.
+
+The published installers (`install.sh` and `install.ps1`) embed the release's Ed25519 public key,
+select the host target, and check the archive digest against `SHA256SUMS` before extraction.
+Both verify the signed manifest. `install.sh` tries OpenSSL 3 (on `PATH`, Homebrew's `openssl@3`,
+or `DIAL_OPENSSL`), Python with `cryptography` (`DIAL_PYTHON`), then OpenSSH `ssh-keygen`
+(`DIAL_SSH_KEYGEN`). If none is available, it refuses installation unless
+`DIAL_ALLOW_UNSIGNED_INSTALL=1` explicitly opts into checksum-only verification.
+`install.sh` installs into `~/.local/bin` (override with `DIAL_INSTALL_DIR`), validates the binary
+version before and after activation, and restores the previous executable if activation fails.
+When the directory is not on `PATH`, it appends one `export PATH=…` line (`fish_add_path` for fish)
+to the login shell's profile (`~/.zshrc`, `~/.bash_profile` on macOS bash, `~/.bashrc` on Linux bash,
+otherwise `~/.profile`), once; `DIAL_NO_MODIFY_PATH=1` prints the line instead. For a pinned
+version, download `install.sh` and pass a tag such as `v0.2.2` to it. Release archives include
+`LICENSE`, `THIRD_PARTY_NOTICES`, and the Silver/Unscii font notices.
 
 `dial update` checks the GitHub latest release (or `dial update --version 0.1.1`), verifies the same signed manifest and asset digest, stages the candidate on the install filesystem, and checks its `--version`. On Unix it holds a lock file (`.dial-update.lock`) in the install directory so concurrent updates cannot interleave, preserves a digest-verified copy of the current binary as the rollback point, renames the candidate over the active name (never removing that name first, so an interruption leaves a complete old or new executable), fsyncs the directory, and re-checks `--version`. If the post-install check fails, the rollback copy is renamed back; if that also fails, the error reports both failures and the rollback copy is kept at `<name>.dial.bak` for manual recovery. Windows uses a deferred PowerShell swap after the running process exits, with its own rollback. Homebrew, Cargo, and Nix-managed installations are left to their package managers; the command prints the matching update instruction.
 
