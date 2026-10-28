@@ -19,10 +19,10 @@ fn piped(program: &str, args: &[&str]) -> Command {
 /// otherwise the short child's stderr reaches EOF only when the sibling exits, which is how an
 /// MCP client's stderr drain blocked its `Drop` forever.
 #[test]
-fn concurrent_group_spawns_do_not_share_stdio_pipes() {
+fn concurrent_group_and_ordinary_spawns_do_not_share_stdio_pipes() {
     const PAIRS: usize = 4;
     const ROUNDS: usize = 40;
-    for _ in 0..ROUNDS {
+    for round in 0..ROUNDS {
         let start = Arc::new(Barrier::new(PAIRS * 2));
         let spawners: Vec<_> = (0..PAIRS * 2)
             .map(|index| {
@@ -34,7 +34,13 @@ fn concurrent_group_spawns_do_not_share_stdio_pipes() {
                         piped("/bin/sleep", &["30"])
                     };
                     start.wait();
-                    (index % 2 == 0, spawn_group(&mut command).unwrap())
+                    let child = if (index + round) % 3 == 0 {
+                        spawn(&mut command)
+                    } else {
+                        spawn_group(&mut command)
+                    }
+                    .unwrap();
+                    (index % 2 == 0, child)
                 })
             })
             .collect();
@@ -57,6 +63,7 @@ fn concurrent_group_spawns_do_not_share_stdio_pipes() {
         let all_closed = (0..PAIRS).all(|_| finished.recv_timeout(Duration::from_secs(5)).is_ok());
         for mut child in lingering {
             let _ = kill_group(child.id());
+            let _ = child.kill();
             let _ = child.wait();
         }
         assert!(

@@ -17,18 +17,20 @@ fn check(result: libc::c_int) -> io::Result<()> {
     }
 }
 
-/// Serializes group spawns. Where std has no `pipe2` (macOS among them) it creates a child's
-/// stdio pipes with `pipe()` and only then sets `FD_CLOEXEC`, so a concurrent spawn on another
-/// thread can fork in between and its child inherits those pipes. A long-lived child holding
-/// another child's stderr write end keeps that reader from ever seeing EOF. Spawning is brief,
-/// and the guard covers pipe creation and fork together.
+/// Serialize pipe creation and fork together on platforms without atomic close-on-exec pipes.
+/// All core spawn paths share this guard, including detached and ordinary children: an unrelated
+/// child inheriting a writer can otherwise prevent EOF after the owning process group is killed.
 static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-pub(in crate::platform) fn spawn_group(command: &mut Command) -> io::Result<Child> {
+pub(in crate::platform) fn spawn(command: &mut Command) -> io::Result<Child> {
     let _spawning = SPAWN
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    command.process_group(0).spawn()
+    command.spawn()
+}
+
+pub(in crate::platform) fn spawn_group(command: &mut Command) -> io::Result<Child> {
+    spawn(command.process_group(0))
 }
 
 pub(in crate::platform) fn kill_group(leader: u32) -> io::Result<()> {
@@ -180,3 +182,6 @@ pub(in crate::platform) fn exit_signal(status: &ExitStatus) -> Option<i32> {
 }
 
 pub(in crate::platform) fn forget_group(_leader: u32) {}
+
+#[cfg(test)]
+mod tests;

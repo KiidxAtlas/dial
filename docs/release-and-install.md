@@ -60,6 +60,11 @@ so the container binary retains its source identity and trusted update key.
 
 Install the pinned Rust toolchain from `rust-toolchain.toml` and run `cargo build --release --locked -p dial` for shipping optimization. `make build` and `make update` default to the optimized `local` profile (incremental compilation, no LTO); pass `PROFILE=release` for shipping-equivalent builds (thin LTO). `make update` rebuilds from the checkout, backs up existing binaries, and retains only the three newest backups at each managed location. `make check`, `make test-lib`, and `make test-module MOD=module::path` provide narrower development checks; `make test` retains the full Rust suite. CI builds and tests with the `ci` profile (unoptimized, no debug info) and caches Rust dependencies separately for test, lint, and release jobs. Release builds start as soon as a tag is pushed and run alongside CI; the publish job waits for CI to pass on the tagged commit before signing and publishing anything. Python tests run under pytest in CI; optional model/runtime dependencies are separate from the Rust executable.
 
+Unix subprocess creation shares one pipe/fork guard for ordinary, detached and process-group
+children. This prevents concurrent core spawns from retaining unrelated output-pipe writers on
+macOS, where close-on-exec pipe creation is not atomic. Cancellation still kills the owned process
+group and bounds output draining; output is marked incomplete if EOF cannot be observed.
+
 ## Platform installation details
 
 Release targets are **macOS 13+ on Apple Silicon (arm64) or Intel (x86-64)**, **Linux x86-64 (Ubuntu

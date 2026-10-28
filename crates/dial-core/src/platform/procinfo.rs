@@ -112,11 +112,17 @@ fn probe(pid: i32) -> Option<(u64, bool)> {
 
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
 fn probe(pid: i32) -> Option<(u64, bool)> {
-    let output = std::process::Command::new("ps")
-        .env("LC_ALL", "C")
-        .args(["-o", "lstart=,stat=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
+    let output = super::process::spawn(
+        std::process::Command::new("ps")
+            .env("LC_ALL", "C")
+            .args(["-o", "lstart=,stat=", "-p", &pid.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped()),
+    )
+    .ok()?
+    .wait_with_output()
+    .ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
     let line = text.trim();
     if !output.status.success() || line.is_empty() {

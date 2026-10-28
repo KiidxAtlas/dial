@@ -222,13 +222,15 @@ fn ignored_bin_output(root: &Path, relative: &Path) -> bool {
     }
     // A tracked descendant keeps the directory visible; individual ignored outputs below it
     // can still be excluded. This local query runs no hooks and reads no file contents.
-    let tracked = std::process::Command::new("git")
-        .args(["ls-files", "--error-unmatch", "--"])
-        .arg(format!(":(literal){}", relative.display()))
-        .current_dir(root)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    let tracked = crate::platform::process::spawn(
+        std::process::Command::new("git")
+            .args(["ls-files", "--error-unmatch", "--"])
+            .arg(format!(":(literal){}", relative.display()))
+            .current_dir(root)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    )
+    .and_then(|mut child| child.wait());
     !tracked.is_ok_and(|status| status.success())
 }
 

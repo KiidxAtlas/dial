@@ -1,6 +1,19 @@
 use std::io;
 use std::process::{Child, Command, ExitStatus};
 
+/// Spawn an ordinary child without changing its process group. Shares Unix pipe/fork
+/// serialization with [`spawn_group`], including commands configured to detach with `setsid`.
+pub fn spawn(command: &mut Command) -> io::Result<Child> {
+    #[cfg(unix)]
+    {
+        super::imp::process::spawn(command)
+    }
+    #[cfg(windows)]
+    {
+        command.spawn()
+    }
+}
+
 /// Spawn `command` as the leader of a new process group (Unix: `process_group(0)`; Windows: a
 /// new console process group inside a Job Object assigned before the child runs any code).
 /// On Windows this sets the command's creation flags; do not set them separately.

@@ -376,7 +376,7 @@ pub fn run_with_control(
     }
     #[cfg(unix)]
     let child = if policy.detached {
-        command.spawn()
+        crate::platform::process::spawn(&mut command)
     } else {
         crate::platform::process::spawn_group(&mut command)
     };

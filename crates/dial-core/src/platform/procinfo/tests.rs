@@ -3,10 +3,9 @@ use super::*;
 #[cfg(unix)]
 #[test]
 fn identity_tracks_exit_and_reaping() {
-    let mut child = std::process::Command::new("/bin/sleep")
-        .arg("30")
-        .spawn()
-        .unwrap();
+    let mut child =
+        crate::platform::process::spawn(std::process::Command::new("/bin/sleep").arg("30"))
+            .unwrap();
     let id = ProcId::of(child.id() as i32).expect("live child identity");
     assert!(id.alive());
     assert!(
