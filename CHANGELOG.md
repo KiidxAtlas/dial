@@ -5,6 +5,8 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-27
+
 ### Added
 
 - Streamed `/btw` conversations run independently of the main turn, retain private history and interrupted prefixes, and can become full sibling conversations without changing the main branch (`docs/terminal-interface.md`).

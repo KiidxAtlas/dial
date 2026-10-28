@@ -1818,7 +1818,7 @@ checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 
 [[package]]
 name = "dial"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -1852,7 +1852,7 @@ dependencies = [
 
 [[package]]
 name = "dial-agent"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "ast-grep-language",
@@ -1894,7 +1894,7 @@ dependencies = [
 
 [[package]]
 name = "dial-app"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -1933,14 +1933,14 @@ dependencies = [
 
 [[package]]
 name = "dial-build-info"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "dial-computer"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -1984,7 +1984,7 @@ dependencies = [
 
 [[package]]
 name = "dial-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "ast-grep-core",
@@ -2005,7 +2005,7 @@ dependencies = [
 
 [[package]]
 name = "dial-llm"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -2040,7 +2040,7 @@ dependencies = [
 
 [[package]]
 name = "dial-storage"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2067,7 +2067,7 @@ dependencies = [
 
 [[package]]
 name = "dial-tools"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "ast-grep-core",
@@ -2127,7 +2127,7 @@ dependencies = [
 
 [[package]]
 name = "dial-ui"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
