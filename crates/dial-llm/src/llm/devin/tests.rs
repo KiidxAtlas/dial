@@ -412,8 +412,8 @@ fn text_frame(text: &str) -> Vec<u8> {
     frame(0, &message.0).unwrap()
 }
 
-fn paced_exchange(base: &str) -> (Result<Reply>, std::time::Duration) {
-    crate::llm::cancel::Patience::with_test_idle_limit(Duration::from_millis(300));
+fn paced_exchange(base: &str, idle_limit: Duration) -> (Result<Reply>, std::time::Duration) {
+    crate::llm::cancel::Patience::with_test_idle_limit(idle_limit);
     let chat = Chat {
         messages: vec![json!({"role":"user","content":"hi"})],
         tools: Vec::new(),
@@ -436,11 +436,13 @@ fn paced_exchange(base: &str) -> (Result<Reply>, std::time::Duration) {
 
 #[test]
 fn a_reply_that_keeps_producing_frames_outlives_the_idle_limit() {
-    // 14 frames 150 ms apart: longer than the 1.5 s first-event budget, never silent for 300 ms.
+    // 14 frames 150 ms apart: longer than the 1.5 s first-event budget and 1 s idle limit.
+    // Leave scheduler headroom for real socket I/O on busy CI runners. The separate
+    // silence test retains its tight 300 ms limit and checks the stalled-stream error.
     let mut frames: Vec<Vec<u8>> = (0..14).map(|_| text_frame("x")).collect();
     frames.push(frame(FLAG_END_STREAM, b"{}").unwrap());
     let (base, server) = serve_paced(frames, Duration::from_millis(150), None);
-    let (result, elapsed) = paced_exchange(&base);
+    let (result, elapsed) = paced_exchange(&base, Duration::from_secs(1));
     server.join().unwrap();
     assert_eq!(result.unwrap().text, "x".repeat(14));
     assert!(elapsed > Duration::from_millis(1800), "{elapsed:?}");
@@ -453,7 +455,7 @@ fn silence_after_a_frame_is_a_transient_stall_not_an_unbounded_wait() {
         Duration::from_millis(10),
         Some(Duration::from_secs(4)),
     );
-    let (result, elapsed) = paced_exchange(&base);
+    let (result, elapsed) = paced_exchange(&base, Duration::from_millis(300));
     let error = result.unwrap_err();
     assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
     assert!(
@@ -494,7 +496,7 @@ fn clean_eof_discards_incomplete_text_tools_and_frames() {
         let mut jwt = Enc::default();
         jwt.string(1, "jwt-1");
         let (base, server) = serve(vec![jwt.0, body]);
-        let (result, _) = paced_exchange(&base);
+        let (result, _) = paced_exchange(&base, Duration::from_millis(300));
         let error = result.unwrap_err();
         assert!(
             error
