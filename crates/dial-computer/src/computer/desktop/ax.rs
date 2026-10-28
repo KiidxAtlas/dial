@@ -456,18 +456,26 @@ pub fn node_to_ax_node(reference: String, props: AxProps) -> AxNode {
     }
 }
 
-fn format_tree(
-    node: WalkNode,
-    depth: usize,
-    window: &DesktopWindow,
-    backend: &mut dyn AxBackend,
-    registry: &mut AxRegistry,
-    target: &str,
+/// Accumulates the accessibility tree text for one snapshot.
+struct TreeWriter<'a> {
+    window: &'a DesktopWindow,
+    backend: &'a mut dyn AxBackend,
+    registry: &'a mut AxRegistry,
+    target: &'a str,
     generation: u64,
-    text: &mut String,
-    nodes: &mut u32,
-) {
-    let reference = registry.register(backend, target, generation, node.handle, &node.props);
+    text: String,
+    nodes: u32,
+}
+
+fn format_tree(writer: &mut TreeWriter<'_>, node: WalkNode, depth: usize) {
+    let window = writer.window;
+    let target = writer.target;
+    let generation = writer.generation;
+    let reference =
+        writer
+            .registry
+            .register(writer.backend, target, generation, node.handle, &node.props);
+    let text = &mut writer.text;
     if !text.is_empty() {
         text.push('\n');
     }
@@ -524,19 +532,9 @@ fn format_tree(
     if focused {
         text.push_str(" (focused)");
     }
-    *nodes += 1;
+    writer.nodes += 1;
     for child in node.children {
-        format_tree(
-            child,
-            depth + 1,
-            window,
-            backend,
-            registry,
-            target,
-            generation,
-            text,
-            nodes,
-        );
+        format_tree(writer, child, depth + 1);
     }
 }
 
@@ -558,22 +556,24 @@ pub fn snapshot(
     };
     let root = walk_raw(backend, root, 0, &mut state)?
         .and_then(|node| filter_node(node, options.all.unwrap_or(false)));
-    let mut text = String::new();
-    let mut node_count = 0;
+    let mut writer = TreeWriter {
+        window,
+        backend,
+        registry,
+        target,
+        generation,
+        text: String::new(),
+        nodes: 0,
+    };
     if let Some(root) = root {
-        format_tree(
-            root,
-            0,
-            window,
-            backend,
-            registry,
-            target,
-            generation,
-            &mut text,
-            &mut node_count,
-        );
+        format_tree(&mut writer, root, 0);
     }
-    registry.end_snapshot(target, generation);
+    writer.registry.end_snapshot(target, generation);
+    let TreeWriter {
+        mut text,
+        nodes: node_count,
+        ..
+    } = writer;
     if state.truncated {
         if !text.is_empty() {
             text.push('\n');

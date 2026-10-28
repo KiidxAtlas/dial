@@ -144,7 +144,7 @@ fn start(shell: &mut Shell, app: &App, agent: &Agent<'_>, read_only: bool) -> Re
             if slot.is_some() {
                 return Err(Box::new(host));
             }
-            *slot = Some(Room::Host(host));
+            *slot = Some(Room::Host(Box::new(host)));
             Ok(())
         });
         if let Err(host) = claimed {

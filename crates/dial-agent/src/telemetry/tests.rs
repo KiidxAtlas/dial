@@ -99,7 +99,7 @@ fn env_headers_and_resource_attributes_are_parsed() {
 fn otlp_json_payloads_have_the_protocol_shape() {
     let mut exporter = Exporter::new(settings("http://127.0.0.1:4318"));
     exporter.observe(&request_event("s1", false));
-    exporter.observe(&Event::Tool(Tool {
+    exporter.observe(&Event::Tool(Box::new(Tool {
         facts: ExecutionFacts::default(),
         status: crate::tools::ToolStatus::Error,
         effects: crate::tools::surface::outcome::Effects::Known,
@@ -109,7 +109,7 @@ fn otlp_json_payloads_have_the_protocol_shape() {
         duration: Duration::from_millis(12),
         error: true,
         end: SystemTime::now(),
-    }));
+    })));
     exporter.observe(&Event::Turn(Turn {
         session: "s1".into(),
         project: "proj-1234abcd".into(),
@@ -290,7 +290,7 @@ fn flush_posts_json_to_the_signal_path() {
 }
 
 fn execution_event(execution: &crate::runtime::execution::Execution) -> Event {
-    Event::Tool(Tool {
+    Event::Tool(Box::new(Tool {
         facts: ExecutionFacts::from(execution),
         status: crate::tools::ToolStatus::Ok,
         effects: execution.effects,
@@ -300,7 +300,7 @@ fn execution_event(execution: &crate::runtime::execution::Execution) -> Event {
         duration: Duration::ZERO,
         error: false,
         end: SystemTime::now(),
-    })
+    }))
 }
 
 #[test]
@@ -411,7 +411,7 @@ fn full_or_disconnected_ingress_drops_without_blocking_and_counts_loss() {
         &tx,
         Msg::Event(Box::new(route.clone()), request_event("overflow", false)),
     );
-    assert!(loss_counters().ingress >= before + 1);
+    assert!(loss_counters().ingress > before);
     drop(rx);
     enqueue(
         &tx,

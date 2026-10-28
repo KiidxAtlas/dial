@@ -311,8 +311,7 @@ fn window_snapshot(target: Option<u32>) -> CoreResult<DesktopWindowSnapshot> {
         .frontmostApplication()
         .and_then(|app| u32::try_from(app.processIdentifier()).ok());
     // SAFETY: This copy-rule snapshot remains alive and is never mutated.
-    let metadata =
-        unsafe { snapshot.iter_unchecked() }.filter_map(|dictionary| window_metadata(dictionary));
+    let metadata = unsafe { snapshot.iter_unchecked() }.filter_map(window_metadata);
     let (mut listing, active) = collect_windows(metadata, target, active_pid);
     let focused = active_pid
         .and_then(|pid| libc::pid_t::try_from(pid).ok())

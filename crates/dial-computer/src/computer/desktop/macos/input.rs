@@ -61,7 +61,15 @@ impl MacInput {
                     DeliveryMode::Background => {
                         background_guard(&window, pid, &event)?;
                         skylight::with_background_guard(pid, || {
-                            background_pointer(&self.source, pid, wid, &window, event)
+                            background_pointer(
+                                BackgroundRoute {
+                                    source: &self.source,
+                                    pid,
+                                    wid,
+                                    window: &window,
+                                },
+                                event,
+                            )
                         })
                     }
                     DeliveryMode::Foreground => {
@@ -516,13 +524,16 @@ const fn button_types(
     }
 }
 
-fn background_pointer(
-    source: &CGEventSource,
+/// The window a background pointer or keyboard event is routed to.
+#[derive(Clone, Copy)]
+struct BackgroundRoute<'a> {
+    source: &'a CGEventSource,
     pid: libc::pid_t,
     wid: u32,
-    window: &DesktopWindow,
-    event: PointerEvent,
-) -> CoreResult<()> {
+    window: &'a DesktopWindow,
+}
+
+fn background_pointer(route: BackgroundRoute<'_>, event: PointerEvent) -> CoreResult<()> {
     match event {
         PointerEvent::Click {
             x,
@@ -530,8 +541,8 @@ fn background_pointer(
             button: MouseButton::Left,
             count,
             ..
-        } => skylight::with_focus_without_raise(pid, wid, || {
-            background_left_click(source, pid, wid, window, x, y, count)
+        } => skylight::with_focus_without_raise(route.pid, route.wid, || {
+            background_left_click(route, x, y, count)
         }),
         PointerEvent::Click {
             x,
@@ -539,15 +550,14 @@ fn background_pointer(
             button,
             count,
             ..
-        } => background_button_click(source, pid, wid, window, x, y, button, count),
-        PointerEvent::Move { x, y } => post_hover(source, pid, wid, window, x, y, click_group_id()),
-        PointerEvent::Scroll { x, y, dx, dy } => {
-            background_scroll(source, pid, wid, window, x, y, dx, dy)
-        }
+        } => background_button_click(route, x, y, button, count),
+        PointerEvent::Move { x, y } => post_hover(route, x, y, click_group_id()),
+        PointerEvent::Scroll { x, y, dx, dy } => background_scroll(route, x, y, dx, dy),
         PointerEvent::Drag { .. } | PointerEvent::Hold { .. } => {
             Err(DesktopError::background_unavailable(format!(
-                "window {wid} cannot receive a background drag on macOS; retry with takeover:true or \
+                "window {} cannot receive a background drag on macOS; retry with takeover:true or \
 				 use ax actions",
+                route.wid
             )))
         }
     }
@@ -560,15 +570,13 @@ fn background_pointer(
 /// Quartz event locations are global; the separate window-location field is
 /// relative to the window's top-left, including its title bar. Chromium uses
 /// that field for hit-testing even on the `SkyLight`-only route.
-fn background_left_click(
-    source: &CGEventSource,
-    pid: libc::pid_t,
-    wid: u32,
-    window: &DesktopWindow,
-    x: f64,
-    y: f64,
-    count: u32,
-) -> CoreResult<()> {
+fn background_left_click(route: BackgroundRoute<'_>, x: f64, y: f64, count: u32) -> CoreResult<()> {
+    let BackgroundRoute {
+        source,
+        pid,
+        wid,
+        window,
+    } = route;
     let group = click_group_id();
     let target = CGPoint::new(x, y);
     let local = window_local(window, x, y);
@@ -635,47 +643,26 @@ fn background_left_click(
 /// their button number (a right press stamped as button 0 is handled as a left
 /// press) and the window-routing fields that reach a non-key window.
 fn background_button_click(
-    source: &CGEventSource,
-    pid: libc::pid_t,
-    wid: u32,
-    window: &DesktopWindow,
+    route: BackgroundRoute<'_>,
     x: f64,
     y: f64,
     button: MouseButton,
     count: u32,
 ) -> CoreResult<()> {
+    let BackgroundRoute { source, .. } = route;
     let group = click_group_id();
     let (cg_button, down, up, _, number) = button_types(button);
-    post_hover(source, pid, wid, window, x, y, group)?;
+    post_hover(route, x, y, group)?;
     control::wait(Duration::from_millis(12))?;
     let count = count.max(1);
     for click_state in 1..=count {
         let press = mouse_event(source, down, CGPoint::new(x, y), cg_button)?;
         let release = mouse_event(source, up, CGPoint::new(x, y), cg_button)?;
-        let result = post_window_pointer(
-            pid,
-            wid,
-            window,
-            &press,
-            x,
-            y,
-            i64::from(click_state),
-            number,
-            group,
-        )
-        .and_then(|()| control::wait(PRESS_GAP));
+        let result =
+            post_window_pointer(route, &press, x, y, i64::from(click_state), number, group)
+                .and_then(|()| control::wait(PRESS_GAP));
         let cleanup = control::cleanup(|| {
-            post_window_pointer(
-                pid,
-                wid,
-                window,
-                &release,
-                x,
-                y,
-                i64::from(click_state),
-                number,
-                group,
-            )
+            post_window_pointer(route, &release, x, y, i64::from(click_state), number, group)
         });
         skylight::after_cleanup(result, cleanup)?;
         if click_state < count {
@@ -687,31 +674,22 @@ fn background_button_click(
 
 /// Moves the target window's notion of the pointer to `(x, y)`, so hover
 /// state and the next press hit-test at the right view.
-fn post_hover(
-    source: &CGEventSource,
-    pid: libc::pid_t,
-    wid: u32,
-    window: &DesktopWindow,
-    x: f64,
-    y: f64,
-    group: i64,
-) -> CoreResult<()> {
+fn post_hover(route: BackgroundRoute<'_>, x: f64, y: f64, group: i64) -> CoreResult<()> {
+    let source = route.source;
     let event = mouse_event(
         source,
         CGEventType::MouseMoved,
         CGPoint::new(x, y),
         CGMouseButton::Left,
     )?;
-    post_window_pointer(pid, wid, window, &event, x, y, 0, 0, group)
+    post_window_pointer(route, &event, x, y, 0, 0, group)
 }
 
 /// Stamps the window-routing fields on a background pointer event and posts it
 /// with `skylight::post_dual`. The window location is window-local, as the
 /// public route expects.
 fn post_window_pointer(
-    pid: libc::pid_t,
-    wid: u32,
-    window: &DesktopWindow,
+    route: BackgroundRoute<'_>,
     event: &CGEvent,
     x: f64,
     y: f64,
@@ -719,6 +697,9 @@ fn post_window_pointer(
     button_number: i64,
     group: i64,
 ) -> CoreResult<()> {
+    let BackgroundRoute {
+        pid, wid, window, ..
+    } = route;
     skylight::set_fields(
         event,
         &[
@@ -737,20 +718,23 @@ fn post_window_pointer(
 }
 
 fn background_scroll(
-    source: &CGEventSource,
-    pid: libc::pid_t,
-    wid: u32,
-    window: &DesktopWindow,
+    route: BackgroundRoute<'_>,
     x: f64,
     y: f64,
     dx: f64,
     dy: f64,
 ) -> CoreResult<()> {
+    let BackgroundRoute {
+        source,
+        pid,
+        wid,
+        window,
+    } = route;
     let wheel_x = finite_i32(dx, "horizontal scroll delta")?;
     let wheel_y = finite_i32(dy, "vertical scroll delta")?;
     // A stale hover location makes a nested scroller miss the wheel even though
     // the event reaches the process.
-    post_hover(source, pid, wid, window, x, y, click_group_id())?;
+    post_hover(route, x, y, click_group_id())?;
     control::wait(Duration::from_millis(12))?;
     let event = CGEvent::new_scroll_event(
         source.clone(),

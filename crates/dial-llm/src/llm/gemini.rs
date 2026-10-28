@@ -779,12 +779,16 @@ pub(super) fn exchange(
     }
     let url = request_url(endpoint.url, endpoint.model)?;
     exchange_at(
-        endpoint,
-        &url,
+        Endpoint {
+            url: &url,
+            ..endpoint
+        },
         req,
-        timeout_secs,
+        super::Limits {
+            timeout_secs,
+            interrupt,
+        },
         on_text,
-        interrupt,
         profile,
         on_event,
     )
@@ -831,14 +835,17 @@ pub(super) fn throttle_error(
 /// GenerateContent stream against an explicit provider URL and headers (e.g. Vertex ADC).
 pub(super) fn exchange_at(
     endpoint: Endpoint<'_>,
-    url: &str,
     req: &Chat,
-    timeout_secs: u64,
+    limits: super::Limits,
     on_text: &mut Option<&mut dyn FnMut(&str) -> bool>,
-    interrupt: Arc<AtomicBool>,
     profile: Option<&ModelProfile>,
     on_event: &mut dyn FnMut(&StreamEvent) -> bool,
 ) -> Result<Reply> {
+    let super::Limits {
+        timeout_secs,
+        interrupt,
+    } = limits;
+    let url = endpoint.url;
     if interrupt.load(Ordering::SeqCst) {
         return Err(Interrupted.into());
     }

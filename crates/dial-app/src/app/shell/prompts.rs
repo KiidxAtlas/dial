@@ -5,7 +5,8 @@
 //! anything. A non-empty draft starts with focus, and Tab hands focus between the two.
 
 use crate::app::panel::{
-    RECOVERY_PANEL, panel_body_limit, panel_has_room, panel_inner, panel_rows_window, panel_scroll,
+    PanelView, RECOVERY_PANEL, panel_body_limit, panel_has_room, panel_inner, panel_rows_window,
+    panel_scroll,
 };
 use crate::app::shell::{Shell, TICK};
 use crate::ui::composer::ComposerEvent;
@@ -153,12 +154,14 @@ impl Shell {
             let rows = panel_rows_window(
                 self.themes.current(),
                 cols,
-                title,
-                &shown,
-                options,
-                selected,
-                body_offset,
                 height.saturating_sub(6) as usize,
+                PanelView {
+                    title,
+                    body: &shown,
+                    options,
+                    selected,
+                    offset: body_offset,
+                },
             );
             if self.paint(Some(rows)).is_err() {
                 return None;

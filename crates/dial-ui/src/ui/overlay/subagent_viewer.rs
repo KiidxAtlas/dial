@@ -192,17 +192,14 @@ impl Conversation {
         let Ok(value) = serde_json::from_slice::<Value>(line) else {
             return;
         };
-        match value["type"].as_str() {
-            // Older archives may contain delta records. Do not display their raw
-            // fragments: only authoritative messages and cumulative safe snapshots.
-            Some("message") => {
-                if value["message"]["role"] == "assistant" {
-                    self.streaming = Transcript::new();
-                }
-                let first = self.replay.push(&mut self.transcript, &value["message"]);
-                self.entries.push(first);
+        // Older archives may contain delta records. Do not display their raw
+        // fragments: only authoritative messages and cumulative safe snapshots.
+        if let Some("message") = value["type"].as_str() {
+            if value["message"]["role"] == "assistant" {
+                self.streaming = Transcript::new();
             }
-            _ => {}
+            let first = self.replay.push(&mut self.transcript, &value["message"]);
+            self.entries.push(first);
         }
     }
 

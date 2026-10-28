@@ -2,6 +2,15 @@
 
 use crate::agent::*;
 
+/// One auxiliary role request: the role, its usage purpose, the prepared chat, and its budget.
+#[derive(Clone, Copy)]
+pub(in crate::agent) struct RoleChatCall<'a> {
+    role: &'a str,
+    purpose: llm::usage::Purpose,
+    request: &'a Chat,
+    timeout_secs: u64,
+}
+
 impl<'a> Agent<'a> {
     pub(in crate::agent) fn run_semantic_find(
         &mut self,
@@ -248,11 +257,13 @@ impl<'a> Agent<'a> {
     ) -> Result<String> {
         self.role_chat_with_control(
             main,
-            role,
-            purpose,
-            request,
+            RoleChatCall {
+                role,
+                purpose,
+                request,
+                timeout_secs,
+            },
             ui,
-            timeout_secs,
             self.interrupt.clone(),
         )
     }
@@ -270,20 +281,29 @@ impl<'a> Agent<'a> {
     ) -> Result<String> {
         let parent = self.interrupt.clone();
         with_request_deadline(parent, Duration::from_secs(timeout_secs), |cancel| {
-            self.role_chat_with_control(main, role, purpose, request, ui, timeout_secs, cancel)
+            self.role_chat_with_control(
+                main,
+                RoleChatCall {
+                    role,
+                    purpose,
+                    request,
+                    timeout_secs,
+                },
+                ui,
+                cancel,
+            )
         })
     }
 
     fn role_chat_with_control(
         &mut self,
         main: &mut Backend,
-        role: &str,
-        purpose: llm::usage::Purpose,
-        request: &Chat,
+        call: RoleChatCall<'_>,
         ui: &mut dyn Ui,
-        timeout_secs: u64,
         cancel: Arc<AtomicBool>,
     ) -> Result<String> {
+        let role = call.role;
+        let purpose = call.purpose;
         ensure!(
             !self.interrupt.load(Ordering::SeqCst),
             "{role} request cancelled"
@@ -301,13 +321,10 @@ impl<'a> Agent<'a> {
         let previous_profile = main.swap_request_profile(None);
         let result = self.role_chat_scoped(
             main,
-            role,
-            purpose,
-            request,
+            call,
             ui,
             &namespace,
             previous_profile.as_ref(),
-            timeout_secs,
             cancel,
         );
         main.restore_cache_namespace(previous_cache);
@@ -318,15 +335,18 @@ impl<'a> Agent<'a> {
     pub(in crate::agent) fn role_chat_scoped(
         &mut self,
         main: &mut Backend,
-        role: &str,
-        purpose: llm::usage::Purpose,
-        request: &Chat,
+        call: RoleChatCall<'_>,
         ui: &mut dyn Ui,
         namespace: &str,
         main_profile: Option<&llm::profiles::ModelProfile>,
-        timeout_secs: u64,
         cancel: Arc<AtomicBool>,
     ) -> Result<String> {
+        let RoleChatCall {
+            role,
+            purpose,
+            request,
+            timeout_secs,
+        } = call;
         let selection = self.role_selection(role).cloned();
         let Some(selection) = selection else {
             if (request.max_tokens > 0 || main_profile.is_some())

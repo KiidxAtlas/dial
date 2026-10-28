@@ -115,6 +115,14 @@ impl ModelEntry {
     pub fn supports_chat(&self) -> bool {
         self.metadata.kind.supports_chat()
     }
+    /// Image generation, independent of image input/vision capability.
+    pub fn supports_images(&self) -> bool {
+        self.metadata.kind == ModelKind::Image
+            || self
+                .metadata
+                .image_generation
+                .is_some_and(|api| api != super::profiles::ImageGenerationApi::Disabled)
+    }
     /// The provider shown before the label. Dial's own local route keeps the id `mlx` (configs
     /// select it as `provider = "mlx"`) but serves GGUF files on llama.cpp, so those read `gguf`.
     pub fn display_provider(&self) -> &str {
@@ -241,21 +249,34 @@ impl CacheWriteSplit {
 /// Image output declared by provider metadata, never inferred from a model name or vision.
 pub fn image_generation_api(row: &Value) -> Option<super::profiles::ImageGenerationApi> {
     use super::profiles::ImageGenerationApi;
-    let hosted = row.get("experimental_supported_tools")
+    // MLX-Serve explicitly advertises native image generation, not vision input.
+    if row["owned_by"] == "mlx-serve"
+        && row["capabilities"]
+            .as_array()
+            .is_some_and(|caps| caps.iter().any(|cap| cap == "image"))
+    {
+        return Some(ImageGenerationApi::MlxServe);
+    }
+    let hosted = row
+        .get("experimental_supported_tools")
         .or_else(|| row.get("supported_tools"))
         .and_then(Value::as_array);
-    if hosted.is_some_and(|tools| tools.iter().any(|tool| {
-        tool == "image_generation" || tool["type"] == "image_generation"
-    })) {
+    if hosted.is_some_and(|tools| {
+        tools
+            .iter()
+            .any(|tool| tool == "image_generation" || tool["type"] == "image_generation")
+    }) {
         return Some(ImageGenerationApi::Responses);
     }
     row.pointer("/architecture/output_modalities")
         .or_else(|| row.get("output_modalities"))
         .and_then(Value::as_array)
-        .map(|items| if items.iter().any(|item| item == "image") {
-            ImageGenerationApi::ChatCompletions
-        } else {
-            ImageGenerationApi::Disabled
+        .map(|items| {
+            if items.iter().any(|item| item == "image") {
+                ImageGenerationApi::ChatCompletions
+            } else {
+                ImageGenerationApi::Disabled
+            }
         })
 }
 
@@ -360,6 +381,13 @@ pub fn local_lora_support(user_dir: &Path, model: &Path) -> Option<bool> {
 /// Read local capabilities without importing Python or loading model weights. GGUF models are read
 /// from their header (chat template) and a sibling `mmproj` projector, which `llama-server` loads.
 pub fn local_model_metadata(model: &Path) -> ModelMetadata {
+    if is_image_checkpoint(model) {
+        return ModelMetadata {
+            kind: ModelKind::Image,
+            vision: Some(false),
+            ..Default::default()
+        };
+    }
     if !model.join("config.json").is_file()
         && let Some(info) = crate::llm::local_format::gguf_info(model)
     {
@@ -449,7 +477,9 @@ pub fn model_metadata(layout: &Layout, selection: &ModelSelection) -> ModelMetad
             &layout.user_dir,
             selection.account_id.as_deref(),
             &selection.model,
-        ).ok().flatten();
+        )
+        .ok()
+        .flatten();
         return ModelMetadata {
             vision: profile.as_ref().and_then(|p| p.capabilities.vision),
             image_generation: profile.and_then(|p| p.capabilities.image_generation),
@@ -1613,6 +1643,22 @@ fn kind_from_declared(token: &str) -> ModelKind {
 
 /// The purpose a row declares through an explicit field; see [`kind_from_declared`].
 fn declared_kind(row: &Value) -> ModelKind {
+    if row["owned_by"] == "mlx-serve"
+        && let Some(caps) = row["capabilities"].as_array()
+    {
+        if caps.iter().any(|cap| cap == "image") {
+            return ModelKind::Image;
+        }
+        if caps.iter().any(|cap| cap == "embeddings") {
+            return ModelKind::Embedding;
+        }
+        if caps.iter().any(|cap| cap == "chat") {
+            return ModelKind::Chat;
+        }
+        if caps.iter().any(|cap| cap == "audio") {
+            return ModelKind::Audio;
+        }
+    }
     ["type", "pipeline_tag", "task"]
         .iter()
         .filter_map(|key| row.get(*key).and_then(Value::as_str))
@@ -1830,9 +1876,43 @@ pub(crate) fn read_json(path: &Path) -> Option<Value> {
     }
     serde_json::from_slice(&bytes).ok()
 }
+/// A diffusion component layout is evidence of image weights, not of a serving transport.
+/// Krea stores its transformer at the root; FLUX conversions can omit a root config entirely.
+fn is_image_checkpoint(path: &Path) -> bool {
+    path.join("vae").is_dir()
+        && path.join("text_encoder").is_dir()
+        && (path.join("transformer").is_dir()
+            || path.join("unet").is_dir()
+            || read_json(&path.join("config.json"))
+                .is_some_and(|v| v["model_type"] == "krea2_turbo"))
+}
+
 fn snapshot(path: &Path) -> Option<Option<u32>> {
+    if is_image_checkpoint(path) {
+        let transformer = if path.join("transformer").is_dir() {
+            path.join("transformer")
+        } else if path.join("unet").is_dir() {
+            path.join("unet")
+        } else {
+            path.to_owned()
+        };
+        for component in [transformer, path.join("vae"), path.join("text_encoder")] {
+            complete_safetensors(&component)?;
+        }
+        for component in ["text_encoder_2", "text_encoder_3"] {
+            if path.join(component).is_dir() {
+                complete_safetensors(&path.join(component))?;
+            }
+        }
+        return Some(None);
+    }
     let config = read_json(&path.join("config.json"))?;
     config.as_object()?;
+    complete_safetensors(path)?;
+    Some(context(&config))
+}
+
+fn complete_safetensors(path: &Path) -> Option<()> {
     if path.join("model.safetensors.index.json").exists() {
         let index = read_json(&path.join("model.safetensors.index.json"))?;
         let weights = index.get("weight_map")?.as_object()?;
@@ -1860,7 +1940,7 @@ fn snapshot(path: &Path) -> Option<Option<u32>> {
     {
         return None;
     }
-    Some(context(&config))
+    Some(())
 }
 fn local_models(cache: &Path, trainable: Option<&Path>) -> Vec<ModelEntry> {
     let mut models = Vec::new();
@@ -2367,6 +2447,31 @@ pub(crate) fn local_model_entries(trainable: Option<&Path>) -> Vec<ModelEntry> {
             }
         }
     }
+    // Native MLX-Serve uses the same publisher/repository store layout. Keep offline weights
+    // visible, but never claim that Dial's chat worker can serve a diffusion checkpoint.
+    if let Some(home) = crate::config::paths::home_dir() {
+        for mut entry in lmstudio_mlx_models(&home.join(".mlx-serve/models"), None)
+            .into_iter()
+            .filter(ModelEntry::supports_images)
+        {
+            entry.source =
+                "MLX-Serve download · start MLX-Serve and F5 rescan to select its endpoint".into();
+            entry.available = false;
+            if models.len() < MAX_MODELS && !models.iter().any(|known| known.label == entry.label) {
+                models.push(entry);
+            }
+        }
+    }
+    for entry in &mut models {
+        if entry.metadata.kind == ModelKind::Image && entry.selection.base_url.is_none() {
+            entry.available = false;
+            if !entry.source.starts_with("MLX-Serve download") {
+                entry.source.push_str(
+                    " · image checkpoint, not served: import/serve in MLX-Serve, then F5 rescan",
+                );
+            }
+        }
+    }
     models
 }
 
@@ -2463,6 +2568,12 @@ pub fn discover(
             "Ollama",
             "OLLAMA_BASE_URL",
             super::ollama::BASE_URL,
+        ),
+        (
+            "mlx-serve",
+            "MLX-Serve",
+            "MLX_SERVE_BASE_URL",
+            "http://127.0.0.1:11234/v1",
         ),
         (
             "llama-cpp",

@@ -100,7 +100,7 @@ fn empty_and_oversized_payloads_are_rejected_before_decoding() {
 #[test]
 fn macos_selects_pasteboard_then_finder_files() {
     let env = Environment {
-        os: Os::MacOs,
+        os: Os::Mac,
         wsl: false,
         termux: false,
         wayland: false,

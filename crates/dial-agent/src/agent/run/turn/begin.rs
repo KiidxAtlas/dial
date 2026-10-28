@@ -210,11 +210,21 @@ impl Agent<'_> {
         )
     }
 
-    /// Applies MCP tool-list changes at a request boundary: the offered schemas and the system
-    /// prompt follow the registry, and queued MCP notices and events reach the UI and
-    /// `mcp_notification` subscribers.
+    /// Applies dynamic tool-list changes at a request boundary: the offered schemas and system
+    /// prompt follow MCP lists and selected-model image availability; queued MCP notices and
+    /// events reach the UI and `mcp_notification` subscribers.
     fn sync_mcp_tools(&mut self, schemas: &mut Vec<Value>, ui: &mut dyn Ui) -> Result<()> {
-        if self.ext.sync_mcp() {
+        let images_changed = match self.ext.sync_image_generation(&self.auth_config) {
+            Ok(changed) => changed,
+            Err(error) => {
+                ui.notice(&format!(
+                    "image_gen availability: {}",
+                    crate::storage::redact::redact_text(&format!("{error:#}"))
+                ));
+                false
+            }
+        };
+        if self.ext.sync_mcp() || images_changed {
             let names = self.offered();
             *schemas = self.schemas(&names)?;
             self.rebuild_system();

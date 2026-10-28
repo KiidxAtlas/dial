@@ -129,7 +129,7 @@ impl Tool for GlabMr {
         _on_event: &(dyn Fn(ToolEvent) + Sync),
         cancel: &AtomicBool,
     ) -> ToolOutput {
-        execute(&ctx.workspace, args, cancel)
+        execute(ctx.workspace, args, cancel)
     }
 }
 

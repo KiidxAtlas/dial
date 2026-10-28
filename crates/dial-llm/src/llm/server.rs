@@ -213,47 +213,32 @@ impl ModelServer {
         interrupt: Option<Arc<AtomicBool>>,
     ) -> Result<ModelServer> {
         Self::start_profile(
-            python,
-            model,
-            adapter,
+            ServerProfile {
+                python,
+                model,
+                adapter,
+                steering: None,
+                context: None,
+                runtime: &llm::local_runtime::LocalRuntime::default(),
+            },
             startup_timeout_secs,
             interrupt,
-            None,
-            &llm::local_runtime::LocalRuntime::default(),
-            None,
         )
     }
 
     fn start_profile(
-        python: &Path,
-        model: &str,
-        adapter: Option<&Path>,
+        profile: ServerProfile<'_>,
         startup_timeout_secs: u64,
         interrupt: Option<Arc<AtomicBool>>,
-        steering: Option<&crate::llm::steering::Specification>,
-        runtime: &llm::local_runtime::LocalRuntime,
-        context: Option<&crate::config::types::Config>,
     ) -> Result<ModelServer> {
-        ensure!(python.is_absolute(), "python path must be absolute");
-        ensure!(!model.is_empty(), "model must not be empty");
+        ensure!(profile.python.is_absolute(), "python path must be absolute");
+        ensure!(!profile.model.is_empty(), "model must not be empty");
         let deadline = (startup_timeout_secs != 0)
             .then(|| Instant::now() + Duration::from_secs(startup_timeout_secs));
         let mut last_race = None;
         for _ in 0..PORT_ATTEMPTS {
             let port = free_port()?;
-            match launch(
-                ServerProfile {
-                    python,
-                    model,
-                    adapter,
-                    steering,
-                    context,
-                    runtime,
-                },
-                port,
-                deadline,
-                interrupt.clone(),
-            ) {
+            match launch(profile, port, deadline, interrupt.clone()) {
                 Ok(server) => return Ok(server),
                 Err(Failure::PortTaken(error)) => last_race = Some(error),
                 Err(Failure::Fatal(error)) => return Err(error),
@@ -430,28 +415,21 @@ pub fn ensure_profile_tracked<'a>(
     startup_timeout_secs: u64,
     interrupt: Option<Arc<AtomicBool>>,
 ) -> Result<&'a mut ModelServer> {
-    let ServerProfile {
-        python,
-        model,
-        adapter,
-        steering,
-        context,
-        runtime,
-    } = profile;
-    let reusable = slot
-        .as_ref()
-        .is_some_and(|server| server.ready_for(model, adapter, steering, runtime, context));
+    let reusable = slot.as_ref().is_some_and(|server| {
+        server.ready_for(
+            profile.model,
+            profile.adapter,
+            profile.steering,
+            profile.runtime,
+            profile.context,
+        )
+    });
     if !reusable {
         drop(slot.take());
         *slot = Some(ModelServer::start_profile(
-            python,
-            model,
-            adapter,
+            profile,
             startup_timeout_secs,
             interrupt,
-            steering,
-            runtime,
-            context,
         )?);
     }
     slot.as_mut().context("model server slot is empty")

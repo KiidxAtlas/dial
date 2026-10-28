@@ -3,7 +3,7 @@ use crate::agent::{Agent, Ui};
 use crate::{
     llm::{ToolCall, provider::Backend},
     runtime::tool_output::ToolOutput,
-    storage::session::Session,
+    storage::session::{ExplorationRewind, Session},
 };
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -450,7 +450,17 @@ impl Agent<'_> {
                 if let Some(memory) = &self.memory_runtime {
                     memory.cancel();
                 }
-                let commit = self.session.rewind_exploration(&owner, &expected_leaf, &checkpoint.entry_id, report_message, siblings, state, digest)
+                let commit = self
+                    .session
+                    .rewind_exploration(ExplorationRewind {
+                        owner_id: &owner,
+                        expected_leaf: &expected_leaf,
+                        anchor: &checkpoint.entry_id,
+                        report: report_message,
+                        siblings,
+                        control: state,
+                        digest,
+                    })
                     .map_err(|error| {
                         if !self.session.owns_journal() {
                             backend.remember_session_error(anyhow::anyhow!("investigation journal append is uncertain; reopen the owning session before another request: {error:#}"));

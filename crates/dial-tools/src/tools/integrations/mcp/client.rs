@@ -90,10 +90,13 @@ enum Event {
     Reply(Result<Value, Failure>),
 }
 
+/// The newest progress update for one request, stamped with its arrival time.
+type ProgressSlot = Arc<Mutex<Option<(Instant, String)>>>;
+
 struct Waiter {
     reply: Sender<Event>,
     /// Progress is lossy: retain only the newest update, independently of the terminal reply.
-    progress: Option<Arc<Mutex<Option<(Instant, String)>>>>,
+    progress: Option<ProgressSlot>,
 }
 
 #[derive(Default)]
@@ -899,17 +902,17 @@ impl Client {
         let previous = operation.cancel();
         // A blocked stdio write cannot be independently interrupted. Tear down this connection
         // rather than leave a writer capable of dispatching after cancellation returns.
-        if previous == Phase::Dispatching {
-            if let Transport::Stdio { child, .. } = &self.transport {
-                let mut child = lock(child);
-                self.shared
-                    .close("cancelled during a blocked stdio write".into());
-                let _ = crate::platform::process::kill_group(child.id());
-                let _ = child.kill();
-                let _ = child.wait();
-                while operation.phase() == Phase::Dispatching {
-                    thread::sleep(Duration::from_millis(1));
-                }
+        if previous == Phase::Dispatching
+            && let Transport::Stdio { child, .. } = &self.transport
+        {
+            let mut child = lock(child);
+            self.shared
+                .close("cancelled during a blocked stdio write".into());
+            let _ = crate::platform::process::kill_group(child.id());
+            let _ = child.kill();
+            let _ = child.wait();
+            while operation.phase() == Phase::Dispatching {
+                thread::sleep(Duration::from_millis(1));
             }
         }
         previous
@@ -1053,18 +1056,16 @@ fn read_loop(stdout: impl Read, shared: &Shared, replies: &mpsc::SyncSender<Outg
                 if !skipping
                     && let Ok(message) = serde_json::from_slice::<Value>(&line)
                     && let Some(answer) = shared.handle(&message)
-                {
-                    if replies
+                    && replies
                         .try_send(Outgoing {
                             message: answer,
                             operation: Operation::new(NOTIFY_TIMEOUT),
                             delivered: None,
                         })
                         .is_err()
-                    {
-                        shared.close("outgoing server-answer queue is full".into());
-                        return;
-                    }
+                {
+                    shared.close("outgoing server-answer queue is full".into());
+                    return;
                 }
                 skipping = false;
                 line.clear();

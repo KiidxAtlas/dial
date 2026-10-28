@@ -33,13 +33,15 @@ const BACKLOG_LIMIT: usize = 256 * 1024;
 
 /// Where the terminal's bytes go.
 pub(super) enum Sink {
-    /// Synchronous writer (tests and any non-TTY sink).
+    /// Synchronous writer for fake terminals (tests and `test-support` only).
+    #[cfg(any(test, feature = "test-support"))]
     Direct(Box<dyn Write>),
     /// Real TTY: a dedicated writer thread drains the bounded queue in order.
     Queued(Queued),
 }
 
 impl Sink {
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn direct(out: Box<dyn Write>) -> Self {
         Self::Direct(out)
     }
@@ -58,6 +60,7 @@ impl Sink {
     /// Whether the reader has fallen far enough behind that intermediate frames should be skipped.
     pub(super) fn backlogged(&self) -> bool {
         match self {
+            #[cfg(any(test, feature = "test-support"))]
             Self::Direct(_) => false,
             Self::Queued(queued) => queued.queue.backlog.load(Ordering::SeqCst) > BACKLOG_LIMIT,
         }
@@ -67,6 +70,7 @@ impl Sink {
     /// and when the reader stalls past `timeout`.
     pub(super) fn drain(&mut self, timeout: Duration) -> io::Result<()> {
         match self {
+            #[cfg(any(test, feature = "test-support"))]
             Self::Direct(out) => out.flush(),
             Self::Queued(queued) => queued.queue.drain(timeout),
         }
@@ -76,6 +80,7 @@ impl Sink {
     /// means the queue is full and nothing was queued.
     pub(super) fn try_write(&mut self, data: &[u8]) -> io::Result<bool> {
         match self {
+            #[cfg(any(test, feature = "test-support"))]
             Self::Direct(out) => out.write_all(data).map(|()| true),
             Self::Queued(queued) => queued.queue.try_push_with(data.len(), || data.to_vec()),
         }
@@ -85,6 +90,7 @@ impl Sink {
     /// queue. `Ok(false)` means the queue is full; the frame is dropped and must be rendered again.
     pub(super) fn try_write_frame(&mut self, frame: Vec<u8>) -> io::Result<bool> {
         match self {
+            #[cfg(any(test, feature = "test-support"))]
             Self::Direct(out) => out.write_all(&frame).map(|()| true),
             Self::Queued(queued) => {
                 let len = frame.len();
@@ -97,6 +103,7 @@ impl Sink {
 impl Write for Sink {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         match self {
+            #[cfg(any(test, feature = "test-support"))]
             Self::Direct(out) => out.write(data),
             Self::Queued(_) => {
                 if self.try_write(data)? {
@@ -114,6 +121,7 @@ impl Write for Sink {
     /// The queue is ordered by itself; a real barrier is [`Sink::drain`].
     fn flush(&mut self) -> io::Result<()> {
         match self {
+            #[cfg(any(test, feature = "test-support"))]
             Self::Direct(out) => out.flush(),
             Self::Queued(_) => Ok(()),
         }

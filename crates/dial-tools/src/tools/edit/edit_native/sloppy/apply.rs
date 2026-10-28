@@ -1883,16 +1883,29 @@ fn positional_rewrite_segments(
     None
 }
 
+/// One inline replacement within a candidate: its selection, rewrite text, surrounding gaps,
+/// operation number and whether whitespace matched leniently.
+struct InlineRewrite<'a> {
+    selection: &'a SelectionPair,
+    rewrite: &'a str,
+    edges: EdgeGaps,
+    operation_number: usize,
+    lenient: bool,
+}
+
 fn prepare_inline(
     content: &str,
     located: &Candidate,
     span: (usize, usize),
-    selection: &SelectionPair,
-    rewrite: &str,
-    edges: EdgeGaps,
-    operation_number: usize,
-    lenient: bool,
+    inline: InlineRewrite<'_>,
 ) -> Result<(Candidate, String, Option<String>), EditError> {
+    let InlineRewrite {
+        selection,
+        rewrite,
+        edges,
+        operation_number,
+        lenient,
+    } = inline;
     let (mut start, mut end) = span;
     if selection.gap_only {
         if let Some(newline) = content[start..].find('\n').map(|at| start + at)
@@ -2540,11 +2553,13 @@ fn apply_operations(
                             content,
                             candidate,
                             span,
-                            pair,
-                            &replacements[selection_index],
-                            selection_edges(&pattern, candidate, pair),
-                            number,
-                            operation.whitespace_matched,
+                            InlineRewrite {
+                                selection: pair,
+                                rewrite: &replacements[selection_index],
+                                edges: selection_edges(&pattern, candidate, pair),
+                                operation_number: number,
+                                lenient: operation.whitespace_matched,
+                            },
                         )?;
                         if content[prepared.start..prepared.end] == replacement {
                             continue;

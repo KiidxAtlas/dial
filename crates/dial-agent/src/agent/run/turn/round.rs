@@ -390,13 +390,15 @@ impl Agent<'_> {
                             Vec::new()
                         } else {
                             parallel_tools(
-                                &self.workspace,
-                                self.effective_config(),
-                                &self.ext,
+                                ParallelToolContext {
+                                    workspace: &self.workspace,
+                                    config: self.effective_config(),
+                                    ext: &self.ext,
+                                    interrupt: &self.interrupt,
+                                    ui,
+                                    pending_steering: &mut steering,
+                                },
                                 &rest,
-                                &self.interrupt,
-                                ui,
-                                &mut steering,
                                 Some(&call.id),
                             )
                         }

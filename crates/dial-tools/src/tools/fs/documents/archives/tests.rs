@@ -177,6 +177,73 @@ fn seven_zip_reads_member_content() {
     );
 }
 
+fn seven_zip_with(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    use sevenz_rust2::{ArchiveEntry, ArchiveWriter};
+    let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+    for (name, data) in entries {
+        writer
+            .push_archive_entry(ArchiveEntry::new_file(name), Some(Cursor::new(*data)))
+            .unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
+#[test]
+fn seven_zip_lists_and_reports_missing_members() {
+    let bytes = include_bytes!("tests/fixtures/single_file.7z");
+    assert_eq!(
+        read_bytes("7z", "single_file.7z", bytes, None).unwrap(),
+        "file.txt\t15 bytes\n"
+    );
+    assert!(
+        read_bytes("7z", "single_file.7z", bytes, Some("absent.txt"))
+            .unwrap_err()
+            .contains("not found")
+    );
+}
+
+#[test]
+fn seven_zip_validates_unselected_names_after_selected_content() {
+    for name in [
+        "../escape.txt",
+        "/absolute.txt",
+        "dir\\escape.txt",
+        "C:/drive.txt",
+        "ok.txt",
+    ] {
+        let bytes = seven_zip_with(&[("ok.txt", b"safe"), (name, b"unsafe")]);
+        for member in [None, Some("ok.txt")] {
+            let error = read_bytes("7z", "unsafe.7z", &bytes, member).unwrap_err();
+            assert!(error.contains("unsafe or duplicate"), "{name}: {error}");
+        }
+    }
+}
+
+#[test]
+fn seven_zip_rejects_member_over_content_limit() {
+    let data = vec![b'a'; (super::super::MAX_CONTENT + 1) as usize];
+    let bytes = seven_zip_with(&[("large.txt", &data)]);
+    // Listing does not impose the selected-text cap.
+    assert!(read_bytes("7z", "large.7z", &bytes, None).is_ok());
+    assert!(
+        read_bytes("7z", "large.7z", &bytes, Some("large.txt"))
+            .unwrap_err()
+            .contains("exceeds 8 MiB")
+    );
+}
+
+#[test]
+fn seven_zip_rejects_entry_count_over_limit() {
+    let names: Vec<_> = (0..=MAX_ENTRIES).map(|n| format!("{n}.txt")).collect();
+    let entries: Vec<_> = names.iter().map(|name| (name.as_str(), &b""[..])).collect();
+    let bytes = seven_zip_with(&entries);
+    assert!(
+        read_bytes("7z", "many.7z", &bytes, Some("0.txt"))
+            .unwrap_err()
+            .contains("10000 member limit")
+    );
+}
+
 #[test]
 fn cab_reads_member_content() {
     let bytes = cab_archive("notes.txt", HELLO.as_bytes());

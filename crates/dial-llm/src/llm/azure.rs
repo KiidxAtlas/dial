@@ -65,13 +65,17 @@ pub(super) fn exchange(
         headers: &headers,
     };
     super::transports::exchange_wire(
-        Wire::Responses,
-        endpoint,
-        req,
-        timeout_secs,
+        super::transports::WireRequest {
+            wire: Wire::Responses,
+            endpoint,
+            req,
+            limits: super::Limits {
+                timeout_secs,
+                interrupt,
+            },
+            profile,
+        },
         on_text,
-        interrupt,
-        profile,
         on_event,
         None,
     )

@@ -39,7 +39,7 @@ outline even when fills are disabled. Schema discovery keeps its quiet context r
 Native calls are told apart by kind (`tool_cards.rs`):
 
 - **Framed cards.** Shell commands and background jobs, code cells and code intelligence (`eval`,
-  `kernel`, `lsp`, debuggers), file changes, and network calls draw a frame once they have a body
+  `lsp`, debuggers), file changes, and network calls draw a frame once they have a body
   (`tool_cards/frame.rs`). The top edge carries the status glyph and the call, `$ cmd` for shell. The
   bottom edge carries facts (`exit 101 · 2.40s`, `+3 −1`, `new · 4 lines`). Each family has its own
   border color, and a failed call's border is red. Below `frame::MIN_W` cells, or with no body, the

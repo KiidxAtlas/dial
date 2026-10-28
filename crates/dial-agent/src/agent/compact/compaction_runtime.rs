@@ -22,19 +22,32 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Session state a portable summary request needs to rebuild its guidance loop.
+pub struct PortableSummaryContext {
+    pub config: crate::config::types::Config,
+    pub layout: Option<crate::config::paths::Layout>,
+    pub root: std::path::PathBuf,
+    pub control_state: serde_json::Value,
+    pub session_id: String,
+    pub hermetic: bool,
+}
+
 /// An owned form of the ordinary child-request portable-guidance loop. It deliberately has no
 /// access to the live Session or normal-turn interrupt; interceptions can only regenerate this
 /// summary request. Native provider replay remains on WorkerBackends::main.
 pub fn portable_summary_completion(
-    config: crate::config::types::Config,
-    layout: Option<crate::config::paths::Layout>,
-    root: std::path::PathBuf,
-    control_state: serde_json::Value,
+    context: PortableSummaryContext,
     hooks_config: Vec<crate::config::types::HookConfig>,
     hook_plugins: Option<Arc<crate::tools::integrations::plugin::Host>>,
-    session_id: String,
-    hermetic: bool,
 ) -> impl FnMut(&mut Backend, &Chat, &mut dyn Ui, Arc<AtomicBool>, u64) -> Result<String> + Send {
+    let PortableSummaryContext {
+        config,
+        layout,
+        root,
+        control_state,
+        session_id,
+        hermetic,
+    } = context;
     let telemetry_config = config.clone();
     let selection = config.selection();
     let service_tier = config.effective_service_tier().to_owned();
@@ -108,11 +121,13 @@ pub fn portable_summary_completion(
                     recovery: Some(&recovery),
                 },
                 generation_cancel.clone(),
-                ui,
-                &mut |_| {
-                    if cancel.load(Ordering::SeqCst) {
-                        generation_cancel.store(true, Ordering::SeqCst);
-                    }
+                crate::agent::ChatSinks {
+                    ui,
+                    on_idle: &mut |_| {
+                        if cancel.load(Ordering::SeqCst) {
+                            generation_cancel.store(true, Ordering::SeqCst);
+                        }
+                    },
                 },
                 Some(&mut monitor),
             );
@@ -286,6 +301,25 @@ pub fn settle_into_runtime(body: crate::runtime::Body) -> impl FnOnce(WorkerSett
             "usage_coverage": "cumulative original-agent ledger; not an additional billable delta",
         })), phase);
     }
+}
+
+/// The per-launch inputs of a background compaction: the source template, the work kind and
+/// method, the context size that triggered it, and the native profile for provider replay.
+pub struct BackgroundCompactionRequest<'a> {
+    pub template: Option<&'a Chat>,
+    pub kind: WorkKind,
+    pub method: Option<CompactionMethod>,
+    pub context_tokens: u64,
+    pub native_profile: Option<&'a crate::llm::profiles::ModelProfile>,
+}
+
+/// The work identity of one background compaction: its kind, the context size that triggered it,
+/// the invocation options, and the usage scope its model requests are charged to.
+pub struct CompactionWork {
+    pub kind: WorkKind,
+    pub context_tokens: u64,
+    pub options: CompactionOptions,
+    pub usage_scope: Scope,
 }
 
 /// Native compaction always uses `main`; only portable summaries use the optional role backend.
@@ -847,10 +881,7 @@ impl CompactionRuntime {
         &mut self,
         mut backends: WorkerBackends,
         mut snapshot: CompactionSnapshot,
-        kind: WorkKind,
-        context_tokens: u64,
-        mut options: CompactionOptions,
-        usage_scope: Scope,
+        work: CompactionWork,
         mut complete: C,
         settled: L,
     ) -> Result<Launch>
@@ -860,6 +891,12 @@ impl CompactionRuntime {
             + 'static,
         L: FnOnce(WorkerSettlement) + Send + 'static,
     {
+        let CompactionWork {
+            kind,
+            context_tokens,
+            mut options,
+            usage_scope,
+        } = work;
         self.reap_retiring();
         if self.closed
             || !snapshot.policy.enabled
@@ -955,10 +992,12 @@ impl CompactionRuntime {
                     };
                     compaction::compact_history(
                         &mut backends.main,
-                        &worker_snapshot.source,
-                        &worker_snapshot.policy,
-                        worker_snapshot.context(),
-                        &worker_options,
+                        compaction::HistoryCompaction {
+                            request: &worker_snapshot.source,
+                            policy: &worker_snapshot.policy,
+                            context: worker_snapshot.context(),
+                            options: &worker_options,
+                        },
                         worker_cancel.clone(),
                         &mut ui,
                         &mut callback,
@@ -1220,13 +1259,16 @@ impl crate::agent::Agent<'_> {
     pub(in crate::agent) fn start_background_compaction(
         &mut self,
         ui: &mut dyn Ui,
-        template: Option<&Chat>,
-        kind: WorkKind,
-        method: Option<CompactionMethod>,
-        context_tokens: u64,
-        native_profile: Option<&crate::llm::profiles::ModelProfile>,
+        request: BackgroundCompactionRequest<'_>,
         live_backend: Option<&mut Backend>,
     ) -> Result<Launch> {
+        let BackgroundCompactionRequest {
+            template,
+            kind,
+            method,
+            context_tokens,
+            native_profile,
+        } = request;
         let policy = &self.config.compaction;
         if self.hermetic
             || !policy.enabled
@@ -1282,14 +1324,16 @@ impl crate::agent::Agent<'_> {
             .clone()
             .unwrap_or_else(|| snapshot.main_config.clone());
         let complete = portable_summary_completion(
-            completion_config,
-            self.layout.clone(),
-            self.workspace.root().to_path_buf(),
-            self.session.control_state(),
+            PortableSummaryContext {
+                config: completion_config,
+                layout: self.layout.clone(),
+                root: self.workspace.root().to_path_buf(),
+                control_state: self.session.control_state(),
+                session_id: snapshot.session_id.clone(),
+                hermetic: self.hermetic,
+            },
             self.tool_hooks().to_vec(),
             self.hook_plugins(),
-            snapshot.session_id.clone(),
-            self.hermetic,
         );
         let scope = if kind == WorkKind::Idle {
             self.usage_scope.next_turn(0)?
@@ -1307,14 +1351,16 @@ impl crate::agent::Agent<'_> {
         let result = self.compaction_runtime.start(
             WorkerBackends { main, summary },
             snapshot,
-            kind,
-            context_tokens,
-            CompactionOptions {
-                method,
-                require_method: method.is_some(),
-                ..Default::default()
+            CompactionWork {
+                kind,
+                context_tokens,
+                options: CompactionOptions {
+                    method,
+                    require_method: method.is_some(),
+                    ..Default::default()
+                },
+                usage_scope: scope,
             },
-            scope,
             complete,
             settle_into_runtime(body.clone()),
         );
@@ -1453,11 +1499,13 @@ impl crate::agent::Agent<'_> {
         }
         match self.start_background_compaction(
             ui,
-            None,
-            WorkKind::Idle,
-            None,
-            tokens,
-            None,
+            BackgroundCompactionRequest {
+                template: None,
+                kind: WorkKind::Idle,
+                method: None,
+                context_tokens: tokens,
+                native_profile: None,
+            },
             None,
         )? {
             Launch::UnsupportedLocal => self.compact_foreground_idle(ui).map(Some),

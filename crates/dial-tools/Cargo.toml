@@ -55,7 +55,7 @@ bzip2-rs.workspace = true
 cab.workspace = true
 lzma-rs.workspace = true
 ruzstd.workspace = true
-sevenz-rust.workspace = true
+sevenz-rust2.workspace = true
 rars.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -69,6 +69,7 @@ windows-sys.workspace = true
 dial-core = { workspace = true, features = ["test-support"] }
 dial-llm = { workspace = true, features = ["test-support"] }
 rars = { workspace = true, features = ["write"] }
+sevenz-rust2 = { workspace = true, features = ["compress"] }
 
 [features]
 default = ["voice", "embedded-shell"]

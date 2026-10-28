@@ -212,7 +212,7 @@ fn missing_deferred_blocked_and_remote_metadata_never_implies_no_key() {
         for install in [
             Install::Blocked("remote requires unsupported headers".into()),
             Install::Deferred("package manifest".into()),
-            Install::Server(Box::new(McpServerConfig::default())),
+            Install::Server(Box::default()),
             Install::Server(Box::new(McpServerConfig {
                 url: Some("https://example.com/mcp".into()),
                 ..Default::default()

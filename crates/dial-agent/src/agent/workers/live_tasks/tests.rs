@@ -65,10 +65,12 @@ fn rebinding_cancels_old_workers_without_projecting_them_into_the_new_session() 
     let mut view = View::default();
     tasks.pump(
         Approval::Ask,
-        false,
-        &mut Vec::new(),
-        std::path::Path::new("."),
-        &[],
+        PumpPolicy {
+            read_only: false,
+            rules: &mut Vec::new(),
+            root: std::path::Path::new("."),
+            extra_roots: &[],
+        },
         None,
         &mut None,
         &mut view,
@@ -157,10 +159,12 @@ fn completion_is_visible_before_pumping_and_an_early_ack_is_not_redelivered() {
     impl Ui for View {}
     tasks.pump(
         Approval::Ask,
-        false,
-        &mut Vec::new(),
-        std::path::Path::new("."),
-        &[],
+        PumpPolicy {
+            read_only: false,
+            rules: &mut Vec::new(),
+            root: std::path::Path::new("."),
+            extra_roots: &[],
+        },
         None,
         &mut None,
         &mut View,
@@ -480,10 +484,12 @@ fn worker_policy_provenance_keeps_deny_before_readonly_and_cancel_before_deny() 
         let mut view = View::default();
         tasks.pump(
             Approval::Auto,
-            true,
-            &mut rules,
-            std::path::Path::new("."),
-            &[],
+            PumpPolicy {
+                read_only: true,
+                rules: &mut rules,
+                root: std::path::Path::new("."),
+                extra_roots: &[],
+            },
             None,
             &mut None,
             &mut view,

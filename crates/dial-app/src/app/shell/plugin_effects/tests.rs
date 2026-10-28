@@ -44,7 +44,7 @@ fn provider_prompt_hides_header_values_and_names_only_the_key_variable() {
         "label": "Loop",
         "base_url": "http://127.0.0.1:9/v1",
         "api_key_env": "LOOP_KEY",
-        "headers": [{"name": "Authorization", "value": {"literal": "Bearer sk-SECRET"}}]
+        "headers": [{"name": "X-Team", "value": {"literal": "team-SECRET"}}]
     });
     let action = Action::RegisterProvider {
         name: "loop".into(),
@@ -54,8 +54,8 @@ fn provider_prompt_hides_header_values_and_names_only_the_key_variable() {
     assert!(title.contains("register a provider"));
     assert!(detail.contains("Base URL: http://127.0.0.1:9/v1"));
     assert!(detail.contains("API key variable: LOOP_KEY"));
-    assert!(detail.contains("Authorization"));
-    assert!(!detail.contains("sk-SECRET"));
+    assert!(detail.contains("X-Team"));
+    assert!(!detail.contains("team-SECRET"));
 }
 
 #[test]

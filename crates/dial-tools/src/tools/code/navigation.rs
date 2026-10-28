@@ -323,18 +323,31 @@ impl Ord for Ranked {
         rank(&self.evidence, &other.evidence).then(self.sequence.cmp(&other.sequence))
     }
 }
-fn retain(
-    heap: &mut BinaryHeap<Ranked>,
-    sequence: &mut usize,
-    path: &str,
+/// One span offered to `retain`: its location, rank score and provenance.
+struct Span<'a> {
+    path: &'a str,
     start: usize,
     end: usize,
     score: usize,
-    kind: &str,
-    source_sha256: &str,
-    revision: &Arc<Revision>,
+    kind: &'a str,
+    source_sha256: &'a str,
+    revision: &'a Arc<Revision>,
+}
+fn retain(
+    heap: &mut BinaryHeap<Ranked>,
+    sequence: &mut usize,
+    span: Span<'_>,
     materialize: impl FnOnce() -> (String, String),
 ) {
+    let Span {
+        path,
+        start,
+        end,
+        score,
+        kind,
+        source_sha256,
+        revision,
+    } = span;
     let order = *sequence;
     *sequence += 1;
     if heap.len() == 1000
@@ -523,13 +536,15 @@ fn retrieve(ws: &Workspace, args: &Value, semantic: bool) -> Result<Retrieval, S
                 retain(
                     &mut heap,
                     &mut sequence,
-                    &rel,
-                    line,
-                    end,
-                    1,
-                    "exact-text",
-                    &source_sha256,
-                    &revision,
+                    Span {
+                        path: &rel,
+                        start: line,
+                        end,
+                        score: 1,
+                        kind: "exact-text",
+                        source_sha256: &source_sha256,
+                        revision: &revision,
+                    },
                     || (snippet(&lines, line, end), String::new()),
                 );
             }
@@ -592,13 +607,15 @@ fn retrieve(ws: &Workspace, args: &Value, semantic: bool) -> Result<Retrieval, S
                 retain(
                     target,
                     &mut sequence,
-                    &rel,
-                    start,
-                    end,
-                    score,
-                    kind,
-                    &source_sha256,
-                    &revision,
+                    Span {
+                        path: &rel,
+                        start,
+                        end,
+                        score,
+                        kind,
+                        source_sha256: &source_sha256,
+                        revision: &revision,
+                    },
                     || {
                         let snippet = body
                             .split('\n')

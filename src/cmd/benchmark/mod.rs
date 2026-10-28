@@ -39,17 +39,27 @@ struct Profiles {
     machine: MachineBenchmarkPolicy,
 }
 
-pub fn run(
-    layout: &Layout,
-    config: &Config,
-    manifest: &Path,
-    baseline: Option<&Path>,
-    report_path: Option<&Path>,
-    profiles_path: Option<&Path>,
-    checkpoint_path: Option<&Path>,
-    resume: bool,
-    share_auth: bool,
-) -> Result<()> {
+/// Options for `run` that name paths and flags, grouped to keep the call site readable.
+pub struct RunOptions<'a> {
+    pub manifest: &'a Path,
+    pub baseline: Option<&'a Path>,
+    pub report_path: Option<&'a Path>,
+    pub profiles_path: Option<&'a Path>,
+    pub checkpoint_path: Option<&'a Path>,
+    pub resume: bool,
+    pub share_auth: bool,
+}
+
+pub fn run(layout: &Layout, config: &Config, options: RunOptions<'_>) -> Result<()> {
+    let RunOptions {
+        manifest,
+        baseline,
+        report_path,
+        profiles_path,
+        checkpoint_path,
+        resume,
+        share_auth,
+    } = options;
     ensure!(
         checkpoint_path.is_none() || profiles_path.is_none(),
         "--checkpoint currently records one configured run; select a model profile through config"
@@ -102,17 +112,19 @@ pub fn run(
         );
         if !profiles.configurations.is_empty() {
             let report = run_machine(
-                layout,
-                config,
-                &suite,
-                &source,
+                MachineRunEnv {
+                    layout,
+                    base: config,
+                    suite: &suite,
+                    source: &source,
+                    executable: &executable,
+                    share_auth,
+                    report_path: report_path
+                        .map(|path| resolve_output(layout, path))
+                        .as_deref(),
+                },
                 profiles.configurations,
                 profiles.machine,
-                &executable,
-                share_auth,
-                report_path
-                    .map(|path| resolve_output(layout, path))
-                    .as_deref(),
             )?;
             regressed = report.recommended_configuration.is_none();
             invalid.extend(report.invalid_runs.iter().cloned());
@@ -448,8 +460,10 @@ fn assist_configurations(
         }
         configurations.push(variant);
     }
+    type ExperimentSwitch = fn(&mut ExperimentalOverrides);
+
     // One row per experimental workflow switch, each a single change from `dial`.
-    let experiments: [(&str, fn(&mut ExperimentalOverrides)); 7] = [
+    let experiments: [(&str, ExperimentSwitch); 7] = [
         ("enable-fault_witness", |e| e.fault_witness = Some(true)),
         ("enable-repro_first_advise", |e| {
             e.repro_first = Some(ReproFirst::Advise)
@@ -504,17 +518,19 @@ pub fn run_assist(
     };
     let executable = std::env::current_exe().context("locating dial executable")?;
     let report = run_machine(
-        layout,
-        &isolated_config(config),
-        &suite,
-        &source,
+        MachineRunEnv {
+            layout,
+            base: &isolated_config(config),
+            suite: &suite,
+            source: &source,
+            executable: &executable,
+            share_auth,
+            report_path: report_path
+                .map(|path| resolve_output(layout, path))
+                .as_deref(),
+        },
         configurations,
         policy,
-        &executable,
-        share_auth,
-        report_path
-            .map(|path| resolve_output(layout, path))
-            .as_deref(),
     )?;
     print_assist_table(&report);
     let bytes = serde_json::to_vec_pretty(&json!({"assistance_ablation": report}))?;
@@ -1142,17 +1158,31 @@ fn select_configuration(
     Ok((selected, settings))
 }
 
+/// Everything a machine benchmark run reads besides its configurations and policy.
+struct MachineRunEnv<'a> {
+    layout: &'a Layout,
+    base: &'a Config,
+    suite: &'a BenchmarkSuite,
+    source: &'a str,
+    executable: &'a Path,
+    share_auth: bool,
+    report_path: Option<&'a Path>,
+}
+
 fn run_machine(
-    layout: &Layout,
-    base: &Config,
-    suite: &BenchmarkSuite,
-    source: &str,
+    env: MachineRunEnv<'_>,
     mut configurations: Vec<MachineConfiguration>,
     policy: MachineBenchmarkPolicy,
-    executable: &Path,
-    share_auth: bool,
-    report_path: Option<&Path>,
 ) -> Result<MachineBenchmarkReport> {
+    let MachineRunEnv {
+        layout,
+        base,
+        suite,
+        source,
+        executable,
+        share_auth,
+        report_path,
+    } = env;
     policy.validate(suite, &configurations)?;
     // Preflight every entry before inference. Misspellings must not become failed task scores.
     let selected = configurations

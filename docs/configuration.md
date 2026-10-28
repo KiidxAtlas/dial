@@ -134,9 +134,27 @@ boundary. The fallback's first successful reply and each return to the primary a
 
 ## Image generation (`[image]`)
 
-The `image_gen` tool calls an OpenAI-compatible `images/generations` endpoint. `base_url` (default `https://api.openai.com/v1`), `model` (default `gpt-image-1`) and `timeout_secs` (default `180`, `0` disables) are settings in the schema. `api_key_env` names the environment variable holding the key; when unset, Dial uses the provider's standard variable or a key saved through `/providers`.
+`image_gen` is a shared tool: any tool-calling main model can use an available image route, even when that chat model cannot output images. An assigned **image role** wins; otherwise Dial first tries main, then configured image-capable model profiles (stable profile-name order), before the dedicated provider defaults. Image input (`vision`) is independent and never implies image generation. MLX-Serve's native `image` capability enables its PNG Images API. Catalog `experimental_supported_tools` / `supported_tools` containing `image_generation` enables the Responses hosted tool; `output_modalities` containing `image` enables compatible inline-image chat completions.
 
-When `base_url` and `model` are left at their defaults, `api_key_env` is unset, and the session's provider serves image generation (OpenAI at `api.openai.com`, xAI at `api.x.ai` with `grok-imagine-image-2.0`), `image_gen` uses that provider's endpoint and key; it falls back to the `[image]` defaults when the session provider has no key. Changing `base_url` or `model`, or setting `api_key_env`, always uses the `[image]` settings as written. With `auto = true` (the default), the tool is offered whenever that resolution finds a key, without an `integrations` entry; only local credentials are read, nothing is sent until a call. If automatic registration fails, a redacted startup notice explains why the tool is unavailable. `auto = false` restores the explicit `integrations = ["image_gen"]` opt-in. Calls always require approval.
+An operator can declare the transport for an exact model using its existing model profile:
+
+```toml
+[model_profiles.my-image-model]
+provider = "chatgpt"
+model = "exact-model-id"
+[model_profiles.my-image-model.capabilities]
+image_generation = "responses"
+```
+
+Supported declarations are `responses` (the selected model calls the hosted `image_generation` tool), `chat-completions` (inline base64 image data URLs), `images` (the selected model itself serves `images/generations`), and `disabled` (do not use this model for generation). Declaring support does not grant provider access. ChatGPT's official Codex Responses endpoint can offer the approval-gated hosted image tool even when catalog capability metadata is missing; this is **unverified model/account support**, not a claim that the chat model outputs images. An explicit `disabled` declaration prevents that attempt. ChatGPT uses the selected account's OAuth credentials, with no separate API key and no automatic fallback to API billing after a failure. Account access remains subject to private account restrictions and provider plan/model permissions.
+
+`mlx-serve` declares the native MLX-Serve PNG-only Images API. Local endpoints can operate without an API key; remote endpoints still require credentials. MLX-Serve discovery defaults to `http://127.0.0.1:11234/v1`; use `MLX_SERVE_BASE_URL` or a configured provider for a different address. Servers on the LM Studio default port 1234 are also identified by their structured MLX-Serve metadata. After a successful rescan, cached rows remain visible as unverified while the server is stopped; start it again before generation.
+
+Explicit `[image]` overrides take precedence over all automatic routing. `base_url` (default `https://api.openai.com/v1`), `model` (default `gpt-image-1`) and `timeout_secs` (default `180`, `0` disables) configure the dedicated Images API. `api_key_env` names its credential variable; when unset, Dial uses the provider's standard variable or a saved `/providers` key. Changing `base_url` or `model`, or setting `api_key_env`, always uses these settings as written. An assigned image role never falls back to another model on a configuration error.
+
+Without overrides or an assigned role, automatic routing uses main's supported route (including ChatGPT's unverified hosted-tool attempt), then the active OpenAI/xAI provider's image model, then configured image-capable profiles in name order. Capability declarations can come from each profile or its cached catalog; ChatGPT profiles with unknown hosted-tool support are considered after the other profiles. Unavailable automatic candidates and disabled providers are skipped. The default OpenAI Images API is next, then xAI's image default if keyed. This lets local and other chat models use separately configured image services without changing main. Assign the image role to pin a model instead of relying on automatic selection.
+
+With `auto = true` (default), the tool is exposed when a route resolves with the required credentials (including ChatGPT sign-in), or a local no-key endpoint. Discovery reads local state only: no generation, network probing or OAuth refresh occurs. `auto = false` restores the explicit `integrations = ["image_gen"]` opt-in. Calls always require approval. Customized routes and assigned-role errors are reported rather than silently hidden. A provider rejection never triggers another generation route. Output files are validated, never overwritten, and only published after successful completion; previews, incomplete responses and remote image URLs are not accepted as a completed image.
 
 ## Context files (`[context_files]`)
 

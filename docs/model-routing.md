@@ -75,6 +75,7 @@ In the picker, `Tab` switches between the sidebar and the list; `Enter` or `Righ
 | `memory` | Memory extraction and consolidation (`local`) and sharpshooter model calls, including sharpshooter decision memory (`memory.sharpshooter.model_role`). Required when a model-calling memory backend is enabled | No chat fallback for model-calling memory; backend stays inactive until assigned |
 | `decision` | Laya decision engine: the assigned value is the Laya checkpoint (local path or HF repo id), passed to the managed service as `DIAL_LAYA_CHECKPOINT`. Set with `dial laya install --checkpoint` or /roles | Installed Laya checkpoint (shown as “Laya · <checkpoint>”), else not set |
 | `embedding` | Semantic memory recall through an embedding-capable endpoint | Lexical recall |
+| `image` | Image generation through `image_gen`, including image models served by MLX-Serve | Try `main`, then shared configured image profiles and keyed provider defaults. ChatGPT may offer an unverified hosted-image attempt when metadata is absent. Explicit `[image]` overrides still win. |
 | `turn_drafter` | Experimental turn optimizer: rewrites each user message into a structured prompt before the main model sees it. Listed in /roles only while `experimental.turn_optimizer` is on (see [agent-loop](agent-loop.md#turn-optimizer-experimental)) | `main` (a separate request with the drafter's own system prompt) |
 
 ### Task-tool routing and deliberate overrides

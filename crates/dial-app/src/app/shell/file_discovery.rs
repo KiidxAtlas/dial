@@ -96,11 +96,11 @@ impl Files {
     }
     pub fn poll(&mut self) -> Option<Listing> {
         let result = self.result.lock().unwrap().take();
-        if let Some((generation, listing)) = result {
-            if generation == self.shared.generation.load(Ordering::Acquire) {
-                self.running = false;
-                return Some(listing);
-            }
+        if let Some((generation, listing)) = result
+            && generation == self.shared.generation.load(Ordering::Acquire)
+        {
+            self.running = false;
+            return Some(listing);
         }
         None
     }

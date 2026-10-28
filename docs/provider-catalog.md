@@ -8,7 +8,7 @@ The bundled model catalog exposes `known_context_window` and `model_capabilities
 
 ## Model purpose and selection
 
-`/models` separates **chat**, **embedding**, and **other** models using structured provider
+`/models` separates **chat**, **embedding**, **image**, and **other** models using structured provider
 metadata and exact catalog records, not words in a model's name or status. Unknown types remain
 visible and chat-selectable for compatibility with custom endpoints; their details say **kind unknown**.
 The CLI shows a **KIND** column; `dial models --kind embedding` filters by an exact declared type,
@@ -16,10 +16,11 @@ and `dial models --json` includes `metadata.kind`.
 
 Enter on a chat model selects the main model. Enter on an embedding model assigns **embedding**,
 not main; `/roles` and Ctrl+A expose compatible assignments. Model cycling and scoped chat-model
-lists exclude known non-chat models. Reranking, image-generation and audio-only models can appear
-under **other**, but are not chat models and do not have a general-purpose Dial role. Vision-capable
-chat models remain chat models. The request layer rejects known non-chat types before making a
-chat request, including selections loaded from configuration.
+lists exclude known non-chat models. Enter on an image-generation model assigns the **image** role,
+which follows the main model when unassigned. The **Images** group lists image generators; **Get models**
+has an image-model shelf. Reranking and audio-only models remain under **other** and do not have a
+general-purpose Dial role. Vision-capable chat models remain chat models. The request layer rejects
+known non-chat types before making a chat request, including selections loaded from configuration.
 
 LM Studio embeddings can be assigned to the embedding role without being marked unavailable merely
 because they cannot chat. Downloaded embedding checkpoints are shown separately; Dial's supervised

@@ -15,8 +15,8 @@ pub struct ImageConfig {
     pub api_key_env: Option<String>,
     /// Per request timeout in seconds. Zero disables the timeout.
     pub timeout_secs: u64,
-    /// Offer `image_gen` without an `integrations` entry whenever the endpoint it would call has
-    /// a usable API key.
+    /// Offer `image_gen` without an `integrations` entry whenever a shared image route resolves
+    /// with its required credentials, independently of the main chat model's vision capability.
     pub auto: bool,
 }
 

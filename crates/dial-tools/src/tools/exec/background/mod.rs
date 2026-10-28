@@ -40,7 +40,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 pub use table::CellJob;
-use table::{Ring, Snapshot, State, Table, kill_all_entries, kill_entry, lock};
+use table::{Attachment, Ring, Snapshot, State, Table, kill_all_entries, kill_entry, lock};
 
 /// A foreground job transferred to the managed background owner: a shell command that outlived its
 /// wait, or a native eval cell moved off its controller.
@@ -229,10 +229,12 @@ impl Background {
             opt_str(args, "name")?,
             command,
             &cwd,
-            pty,
-            stdin,
-            rows,
-            cols,
+            Attachment {
+                terminal: pty,
+                stdin,
+                rows,
+                cols,
+            },
         )?;
         let started = format!("started {name} (pid {pid}) in {}: {command}", ws.rel(&cwd));
         if ready.is_some() {

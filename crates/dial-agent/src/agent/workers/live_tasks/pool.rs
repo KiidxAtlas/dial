@@ -237,7 +237,7 @@ impl LiveTasks {
     pub fn pool_create(&mut self, ctx: StartContext<'_>, args: &Value) -> Result<Value, String> {
         let launch = Arc::new(PoolLaunch::capture(&ctx));
         let concurrency = match args.get("concurrency") {
-            None | Some(Value::Null) => launch.config.task.max_concurrency.clamp(1, 4) as usize,
+            None | Some(Value::Null) => launch.config.task.max_concurrency.clamp(1, 4),
             Some(value) => value
                 .as_u64()
                 .filter(|n| (1..=32).contains(n))
@@ -447,10 +447,7 @@ impl LiveTasks {
             .map(|(id, _)| id.clone())
             .collect();
         for id in ids {
-            loop {
-                let Some(pool) = self.pools.get(&id) else {
-                    break;
-                };
+            while let Some(pool) = self.pools.get(&id) {
                 let (Some(seq), Some(slot)) = (pool.next_queued(), pool.free_slot()) else {
                     break;
                 };

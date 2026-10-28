@@ -160,7 +160,18 @@ fn call_with(agent: &str, tool: &str, arguments: Value, allow: bool) -> (ToolOut
         asked: Vec::new(),
     };
     (
-        call_tool(env, job, &schemas, &names, &call, &mut reviewer, None, None),
+        call_tool(
+            env,
+            job,
+            ToolSurface {
+                schemas: &schemas,
+                names: &names,
+            },
+            &call,
+            &mut reviewer,
+            None,
+            None,
+        ),
         reviewer.asked,
     )
 }
@@ -358,7 +369,18 @@ fn rewritten_child_reads_recheck_schema_and_path_authority() {
             malformed_arguments: false,
         };
         let mut reviewer = PathReviewer(Vec::new(), Vec::new());
-        let output = call_tool(env, job, &schemas, &names, &call, &mut reviewer, None, None);
+        let output = call_tool(
+            env,
+            job,
+            ToolSurface {
+                schemas: &schemas,
+                names: &names,
+            },
+            &call,
+            &mut reviewer,
+            None,
+            None,
+        );
         assert!(output.text.contains(expected), "{}", output.text);
         assert_eq!(output.is_error, expected != "allowed evidence");
         assert!(!output.text.contains("secret evidence"));
@@ -841,8 +863,10 @@ fn cancelled_child_exits_while_workspace_serial_lock_is_still_held() {
             let result = call_tool(
                 env,
                 &request.jobs[0],
-                &[schema],
-                &["serial_fixture".into()],
+                ToolSurface {
+                    schemas: &[schema],
+                    names: &["serial_fixture".into()],
+                },
                 &call,
                 &mut Approved(approved_tx),
                 None,

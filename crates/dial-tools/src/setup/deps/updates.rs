@@ -319,10 +319,9 @@ fn inspect(recipe: &Recipe, path: &Path, env: &Env, query: &mut QueryFn<'_>) -> 
             } else {
                 None
             }
-        }) {
-            if dir.join("node_modules").is_dir() {
-                return npm(recipe, path, env, packages, query);
-            }
+        }) && dir.join("node_modules").is_dir()
+        {
+            return npm(recipe, path, env, packages, query);
         }
         if recipe
             .methods

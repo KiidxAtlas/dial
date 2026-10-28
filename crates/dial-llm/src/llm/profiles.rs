@@ -107,6 +107,8 @@ pub enum ImageGenerationApi {
     Disabled,
     /// OpenAI-compatible images/generations.
     Images,
+    /// MLX-Serve native Images API; PNG output only.
+    MlxServe,
     /// Responses hosted image_generation tool.
     Responses,
     /// Chat completions returning inline image data URLs (for example OpenRouter).

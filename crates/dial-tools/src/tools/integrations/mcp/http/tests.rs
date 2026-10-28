@@ -286,10 +286,10 @@ fn drain_request(socket: &mut std::net::TcpStream) {
         if line == "\r\n" || line.is_empty() {
             break;
         }
-        if let Some((name, value)) = line.split_once(':') {
-            if name.eq_ignore_ascii_case("content-length") {
-                length = value.trim().parse::<usize>().unwrap();
-            }
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            length = value.trim().parse::<usize>().unwrap();
         }
     }
     let mut body = vec![0; length];

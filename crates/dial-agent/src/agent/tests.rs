@@ -115,13 +115,15 @@ fn shared_wait_receives_steering_without_losing_the_queued_instruction() {
     };
     let mut queued = Vec::new();
     let results = parallel_tools(
-        &workspace,
-        &Config::default(),
-        &registry,
+        ParallelToolContext {
+            workspace: &workspace,
+            config: &Config::default(),
+            ext: &registry,
+            interrupt: &AtomicBool::new(false),
+            ui: &mut Steering(true),
+            pending_steering: &mut queued,
+        },
         &[call],
-        &AtomicBool::new(false),
-        &mut Steering(true),
-        &mut queued,
         None,
     );
     assert!(!results[0].0.is_error);
@@ -147,13 +149,15 @@ fn parallel_hooks_run_per_call_and_block_before_file_reads() {
         malformed_arguments: false,
     });
     let outputs = parallel_tools(
-        &workspace,
-        &config,
-        &Registry::new(),
+        ParallelToolContext {
+            workspace: &workspace,
+            config: &config,
+            ext: &Registry::new(),
+            interrupt: &AtomicBool::new(false),
+            ui: &mut NullUi,
+            pending_steering: &mut Vec::new(),
+        },
         &calls,
-        &AtomicBool::new(false),
-        &mut NullUi,
-        &mut Vec::new(),
         None,
     );
     assert_eq!(
@@ -227,13 +231,15 @@ fn independent_slow_reads_overlap_and_results_stay_ordered() {
         &calls[0].arguments
     ));
     let outputs = parallel_tools(
-        &workspace,
-        &Config::default(),
-        &ext,
+        ParallelToolContext {
+            workspace: &workspace,
+            config: &Config::default(),
+            ext: &ext,
+            interrupt: &AtomicBool::new(false),
+            ui: &mut NullUi,
+            pending_steering: &mut Vec::new(),
+        },
         &calls,
-        &AtomicBool::new(false),
-        &mut NullUi,
-        &mut Vec::new(),
         None,
     );
     assert_eq!(
@@ -282,13 +288,15 @@ fn batched_read_only_bash_runs_through_parallel_tools_in_call_order() {
             ))
     );
     let outputs = parallel_tools(
-        &workspace,
-        &Config::default(),
-        &Registry::new(),
+        ParallelToolContext {
+            workspace: &workspace,
+            config: &Config::default(),
+            ext: &Registry::new(),
+            interrupt: &AtomicBool::new(false),
+            ui: &mut NullUi,
+            pending_steering: &mut Vec::new(),
+        },
         &calls,
-        &AtomicBool::new(false),
-        &mut NullUi,
-        &mut Vec::new(),
         None,
     );
     assert_eq!(
@@ -348,13 +356,15 @@ fn parallel_hook_refusals_report_policy_for_each_call_without_execution() {
             .collect();
         let mut ui = View::default();
         let outputs = parallel_tools(
-            &workspace,
-            &config,
-            &Registry::new(),
+            ParallelToolContext {
+                workspace: &workspace,
+                config: &config,
+                ext: &Registry::new(),
+                interrupt: &AtomicBool::new(false),
+                ui: &mut ui,
+                pending_steering: &mut Vec::new(),
+            },
             &calls,
-            &AtomicBool::new(false),
-            &mut ui,
-            &mut Vec::new(),
             None,
         );
         assert!(outputs.iter().all(|(output, _)| output.is_error

@@ -361,13 +361,12 @@ fn command(
 ) -> Option<Danger> {
     let mut words = words;
     loop {
-        let Some(first) = words.first() else {
-            return None;
-        };
+        let first = words.first()?;
         let name = first.text.as_str();
-        if KEYWORDS.contains(&name) || (is_assignment(name) && !name.starts_with('=')) {
-            words = &words[1..];
-        } else if matches!(name, "command" | "exec" | "nohup" | "builtin") {
+        if KEYWORDS.contains(&name)
+            || matches!(name, "command" | "exec" | "nohup" | "builtin")
+            || (is_assignment(name) && !name.starts_with('='))
+        {
             words = &words[1..];
         } else if name == "env" {
             // Options and VAR=value pairs; `-u NAME` and `-C DIR` take a value.

@@ -70,6 +70,13 @@ pub fn segments(cfg: &UiConfig) -> (Vec<String>, Vec<String>) {
     }
 }
 
+/// The rule and corner glyphs of a composer border.
+pub struct BorderGlyphs<'a> {
+    pub bar: &'a str,
+    pub left_corner: &'a str,
+    pub right_corner: &'a str,
+}
+
 /// The composer's top border with the status segments embedded: `╭─ left ──── right ─╮`, exactly
 /// `width` cells. `border` styles the rule; segments use their own tokens.
 #[cfg(test)]
@@ -88,9 +95,11 @@ pub fn border_line(
         theme,
         width,
         border,
-        theme.sym(Sym::BoxH),
-        left_corner,
-        right_corner,
+        BorderGlyphs {
+            bar: theme.sym(Sym::BoxH),
+            left_corner,
+            right_corner,
+        },
     )
 }
 
@@ -101,20 +110,9 @@ pub fn border_line_with(
     theme: &Theme,
     width: u16,
     border: Style,
-    bar: &str,
-    left_corner: &str,
-    right_corner: &str,
+    glyphs: BorderGlyphs<'_>,
 ) -> Line<'static> {
-    compose(
-        cfg,
-        data,
-        theme,
-        width as usize,
-        border,
-        bar,
-        left_corner,
-        right_corner,
-    )
+    compose(cfg, data, theme, width as usize, border, glyphs)
 }
 
 /// The same line without corners, for the settings preview.
@@ -125,9 +123,11 @@ pub fn preview_row(cfg: &UiConfig, data: &StatusData, theme: &Theme, width: u16)
         theme,
         width as usize,
         theme.fg(Tok::Border),
-        theme.sym(Sym::BoxH),
-        "",
-        "",
+        BorderGlyphs {
+            bar: theme.sym(Sym::BoxH),
+            left_corner: "",
+            right_corner: "",
+        },
     )
 }
 
@@ -1009,10 +1009,13 @@ fn compose(
     theme: &Theme,
     width: usize,
     border: Style,
-    bar: &str,
-    left_corner: &str,
-    right_corner: &str,
+    glyphs: BorderGlyphs<'_>,
 ) -> Line<'static> {
+    let BorderGlyphs {
+        bar,
+        left_corner,
+        right_corner,
+    } = glyphs;
     let frame = text::width(left_corner) + text::width(right_corner) + 2 * text::width(bar);
     if width < frame {
         return rule(width, left_corner, right_corner, bar, border);

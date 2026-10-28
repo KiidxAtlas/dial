@@ -345,9 +345,9 @@ fn lean_local_routes_relevant_mcp_with_a_small_bounded_offer() {
 }
 #[test]
 fn restrictions_and_schema_budgets_are_enforced_before_selection() {
-    for overlay in
-        ["[harness]\ntools=['read','tool_search','tool_load']\n[assistance]\nlean_local=false"]
     {
+        let overlay =
+            "[harness]\ntools=['read','tool_search','tool_load']\n[assistance]\nlean_local=false";
         with_agent(overlay, |agent| {
             nuxt(agent);
             agent.begin_tool_routing("Nuxt routing");

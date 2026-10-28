@@ -1,6 +1,6 @@
 //! Responses protocol adapter for API endpoints and ChatGPT plan usage. Full history and native
 //! replay are retained; only a terminal completed response authorizes local tool execution.
-use super::{Chat, Interrupted, Patience, Reply, StreamEvent, ToolCall};
+use super::{Chat, Interrupted, Limits, Patience, Reply, StreamEvent, ToolCall};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -214,9 +214,8 @@ fn cacheable_block(block: &Value) -> bool {
 pub(super) fn exchange_api(
     endpoint: super::Endpoint<'_>,
     chat: &Chat,
-    timeout: u64,
+    limits: Limits,
     on_text: &mut OnText<'_>,
-    interrupt: Arc<AtomicBool>,
     profile: Option<&super::profiles::ModelProfile>,
     cache_key: Option<&str>,
     on_event: &mut dyn FnMut(&StreamEvent) -> bool,
@@ -230,13 +229,14 @@ pub(super) fn exchange_api(
             model: endpoint.model,
         },
         chat,
-        timeout,
+        limits,
         on_text,
-        interrupt,
         profile,
         on_event,
-        cache_key,
-        None,
+        CacheKeys {
+            prompt_cache_key: cache_key,
+            session_key: None,
+        },
     )
 }
 
@@ -495,15 +495,28 @@ fn reply_from_output(response: &Value, partial: bool) -> Result<Reply> {
 /// An image turn accepts exactly one completed hosted image, never a partial preview.
 fn completed_image(response: &Value) -> Result<Reply> {
     let mut response = response.clone();
-    let output = response["output"].as_array_mut().context("Responses completion has no output array")?;
-    let images: Vec<_> = output.iter().filter(|item| item["type"] == "image_generation_call").cloned().collect();
-    ensure!(images.len() == 1, "Responses image generation must return exactly one image");
+    let output = response["output"]
+        .as_array_mut()
+        .context("Responses completion has no output array")?;
+    let images: Vec<_> = output
+        .iter()
+        .filter(|item| item["type"] == "image_generation_call")
+        .cloned()
+        .collect();
+    ensure!(
+        images.len() == 1,
+        "Responses image generation must return exactly one image"
+    );
     let image = &images[0];
-    ensure!(image["status"] == "completed" && image["result"].as_str().is_some_and(|s| !s.is_empty()),
-        "Responses image generation is unfinished or has no image data");
+    ensure!(
+        image["status"] == "completed" && image["result"].as_str().is_some_and(|s| !s.is_empty()),
+        "Responses image generation is unfinished or has no image data"
+    );
     output.retain(|item| item["type"] != "image_generation_call");
     let mut reply = completed(&response)?;
-    reply.provider_content.push(json!({"type":"dial_response_item", "item":image}));
+    reply
+        .provider_content
+        .push(json!({"type":"dial_response_item", "item":image}));
     Ok(reply)
 }
 
@@ -713,6 +726,20 @@ pub struct Endpoint<'a> {
     pub headers: &'a [(&'a str, &'a str)],
 }
 
+/// Prompt-cache and session identifiers for one Responses exchange.
+#[derive(Clone, Copy, Default)]
+pub(super) struct CacheKeys<'a> {
+    pub prompt_cache_key: Option<&'a str>,
+    pub session_key: Option<&'a str>,
+}
+
+/// Instructions and retained-history budget for one native Responses compaction.
+pub(super) struct CompactOptions<'a> {
+    pub instructions: &'a str,
+    pub v2: bool,
+    pub retained_budget: u32,
+}
+
 /// Native replay is account/endpoint-owned, including encrypted compaction state.
 pub(super) fn has_native_history(chat: &Chat) -> bool {
     chat.messages.iter().any(|message| {
@@ -782,31 +809,28 @@ pub(super) fn exchange(
     on_event: &mut dyn FnMut(&StreamEvent) -> bool,
 ) -> Result<Reply> {
     exchange_inner(
-        endpoint, chat, timeout, on_text, interrupt, profile, on_event, None, None,
+        endpoint,
+        chat,
+        Limits {
+            timeout_secs: timeout,
+            interrupt,
+        },
+        on_text,
+        profile,
+        on_event,
+        CacheKeys::default(),
     )
 }
 pub(super) fn exchange_codex(
     endpoint: Endpoint<'_>,
     chat: &Chat,
-    timeout: u64,
+    limits: Limits,
     on_text: &mut OnText<'_>,
-    interrupt: Arc<AtomicBool>,
     profile: Option<&super::profiles::ModelProfile>,
-    cache_key: Option<&str>,
     on_event: &mut dyn FnMut(&StreamEvent) -> bool,
-    session_key: Option<&str>,
+    keys: CacheKeys<'_>,
 ) -> Result<Reply> {
-    exchange_inner(
-        endpoint,
-        chat,
-        timeout,
-        on_text,
-        interrupt,
-        profile,
-        on_event,
-        cache_key,
-        session_key,
-    )
+    exchange_inner(endpoint, chat, limits, on_text, profile, on_event, keys)
 }
 
 /// Grounded search turns the caller built; the stream is read by the same parser as chat turns.
@@ -829,14 +853,20 @@ pub(super) fn exchange_codex_body(
 fn exchange_inner(
     endpoint: Endpoint<'_>,
     chat: &Chat,
-    timeout: u64,
+    limits: Limits,
     on_text: &mut OnText<'_>,
-    interrupt: Arc<AtomicBool>,
     profile: Option<&super::profiles::ModelProfile>,
     on_event: &mut dyn FnMut(&StreamEvent) -> bool,
-    cache_key: Option<&str>,
-    session_key: Option<&str>,
+    keys: CacheKeys<'_>,
 ) -> Result<Reply> {
+    let Limits {
+        timeout_secs: timeout,
+        interrupt,
+    } = limits;
+    let CacheKeys {
+        prompt_cache_key: cache_key,
+        session_key,
+    } = keys;
     let Endpoint {
         url,
         account_id: codex_account_id,
@@ -880,7 +910,15 @@ fn stream_body(
     on_event: &mut dyn FnMut(&StreamEvent) -> bool,
     session_key: Option<&str>,
 ) -> Result<Reply> {
-    stream_body_inner(endpoint, body, timeout, on_text, interrupt, on_event, session_key, false)
+    stream_body_inner(
+        endpoint,
+        body,
+        timeout,
+        on_text,
+        interrupt,
+        on_event,
+        StreamPurpose::Chat(session_key),
+    )
 }
 
 /// Execute an approved image-only turn through the ordinary Responses transport.
@@ -889,13 +927,27 @@ fn stream_body(
 /// # Errors
 /// Fails on transport errors, unfinished responses, missing or multiple images.
 pub fn generate_image(endpoint: Endpoint<'_>, body: &Value, timeout: u64) -> Result<String> {
-    let reply = stream_body_inner(endpoint, body, timeout, &mut None,
-        Arc::new(AtomicBool::new(false)), &mut |_| true, None, true)?;
-    reply.provider_content.iter()
+    let reply = stream_body_inner(
+        endpoint,
+        body,
+        timeout,
+        &mut None,
+        Arc::new(AtomicBool::new(false)),
+        &mut |_| true,
+        StreamPurpose::Image,
+    )?;
+    reply
+        .provider_content
+        .iter()
         .find(|part| part["item"]["type"] == "image_generation_call")
         .and_then(|part| part["item"]["result"].as_str())
         .map(str::to_owned)
         .context("Responses returned no completed image")
+}
+
+enum StreamPurpose<'a> {
+    Chat(Option<&'a str>),
+    Image,
 }
 
 fn stream_body_inner(
@@ -905,9 +957,12 @@ fn stream_body_inner(
     on_text: &mut OnText<'_>,
     interrupt: Arc<AtomicBool>,
     on_event: &mut dyn FnMut(&StreamEvent) -> bool,
-    session_key: Option<&str>,
-    image_generation: bool,
+    purpose: StreamPurpose<'_>,
 ) -> Result<Reply> {
+    let (session_key, image_generation) = match purpose {
+        StreamPurpose::Chat(session) => (session, false),
+        StreamPurpose::Image => (None, true),
+    };
     let Endpoint {
         url,
         token,
@@ -944,7 +999,7 @@ fn stream_body_inner(
     let mut response = super::send_with_headers(
         url,
         (!token.is_empty()).then_some(token),
-        &body,
+        body,
         timeout,
         Some(patience.clone()),
         Some(interrupt),
@@ -1021,7 +1076,10 @@ fn stream_body_inner(
                 .eq_ignore_ascii_case("text/event-stream"))),
         "ChatGPT Responses requires an SSE stream"
     );
-    let mut accumulator = Accumulator { image_generation, ..Default::default() };
+    let mut accumulator = Accumulator {
+        image_generation,
+        ..Default::default()
+    };
     super::stream::read_events_with_progress(
         response.body_mut().as_reader(),
         super::MAX_STREAM_BYTES,
@@ -1078,14 +1136,17 @@ fn authored_user_content(content: &Value) -> bool {
 pub(super) fn compact(
     endpoint: Endpoint<'_>,
     chat: &Chat,
-    instructions: &str,
-    v2: bool,
-    retained_budget: u32,
+    options: CompactOptions<'_>,
     timeout: u64,
     interrupt: Arc<AtomicBool>,
     profile: Option<&super::profiles::ModelProfile>,
     cache_key: Option<&str>,
 ) -> Result<super::provider::NativeCompactionReply> {
+    let CompactOptions {
+        instructions,
+        v2,
+        retained_budget,
+    } = options;
     use std::sync::atomic::Ordering;
     let scope = super::model_config::native_replay_scope(
         "responses",

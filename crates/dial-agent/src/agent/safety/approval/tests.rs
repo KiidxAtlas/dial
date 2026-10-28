@@ -399,10 +399,12 @@ fn mutation_paths_accept_attached_roots_and_refuse_others() {
     let extra = [attached.clone()];
     assert!(
         authorize_mutation_paths(
-            &[],
-            &primary,
-            &extra,
-            false,
+            MutationPolicy {
+                rules: &[],
+                root: &primary,
+                extra_roots: &extra,
+                read_only: false,
+            },
             &call,
             "write",
             &[attached.join("note.txt")],
@@ -412,10 +414,12 @@ fn mutation_paths_accept_attached_roots_and_refuse_others() {
     );
     assert!(
         authorize_mutation_paths(
-            &[],
-            &primary,
-            &extra,
-            false,
+            MutationPolicy {
+                rules: &[],
+                root: &primary,
+                extra_roots: &extra,
+                read_only: false,
+            },
             &call,
             "write",
             &[outside.join("note.txt")],

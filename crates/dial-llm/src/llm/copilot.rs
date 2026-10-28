@@ -35,13 +35,17 @@ pub(super) fn exchange(
         headers: &headers,
     };
     transports::exchange_wire(
-        Wire::ChatCompletions,
-        endpoint,
-        req,
-        timeout_secs,
+        transports::WireRequest {
+            wire: Wire::ChatCompletions,
+            endpoint,
+            req,
+            limits: super::Limits {
+                timeout_secs,
+                interrupt,
+            },
+            profile,
+        },
         on_text,
-        interrupt,
-        profile,
         on_event,
         None,
     )

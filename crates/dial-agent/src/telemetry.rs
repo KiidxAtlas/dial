@@ -73,7 +73,7 @@ pub struct Turn {
 #[derive(Debug, Clone)]
 pub enum Event {
     Request(Box<Request>),
-    Tool(Tool),
+    Tool(Box<Tool>),
     Turn(Turn),
 }
 
@@ -200,7 +200,7 @@ pub fn tool_with_effects(
     }
     emit(
         config,
-        Event::Tool(Tool {
+        Event::Tool(Box::new(Tool {
             facts: ExecutionFacts::default(),
             status,
             effects,
@@ -210,7 +210,7 @@ pub fn tool_with_effects(
             duration: Duration::try_from_secs_f64(seconds).unwrap_or_default(),
             error: status.failed() || effects == crate::tools::surface::outcome::Effects::Unknown,
             end: SystemTime::now(),
-        }),
+        })),
     );
 }
 
@@ -230,7 +230,7 @@ pub fn tool_output(
     }
     emit(
         config,
-        Event::Tool(Tool {
+        Event::Tool(Box::new(Tool {
             facts: ExecutionFacts::from(execution),
             status,
             effects: execution.effects,
@@ -241,7 +241,7 @@ pub fn tool_output(
             error: status.failed()
                 || execution.effects == crate::runtime::execution::Effects::Unknown,
             end: SystemTime::now(),
-        }),
+        })),
     );
 }
 
@@ -410,10 +410,10 @@ fn run(rx: mpsc::Receiver<Msg>) {
                             }
                         }
                     }
-                    if let Some((_, db)) = &mut stats {
-                        if record_stats(db, &event).is_err() {
-                            STATS_LOSS.fetch_add(1, Ordering::Relaxed);
-                        }
+                    if let Some((_, db)) = &mut stats
+                        && record_stats(db, &event).is_err()
+                    {
+                        STATS_LOSS.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 if exporter.as_ref().map(|e| &e.settings) != route.otlp.as_ref() {

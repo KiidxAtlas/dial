@@ -72,14 +72,14 @@ where
 /// Maps plugin slot contributions onto the composer's placements. Editor-mode and other slots are
 /// not chrome and are skipped.
 fn slots_from(slots: &[(String, UiSlot)]) -> PluginSlots {
-    PluginSlots::collect(slots.iter().filter_map(|(_, slot)| {
+    PluginSlots::collect(slots.iter().map(|(_, slot)| {
         let placement = match slot.slot {
             Slot::Header => Placement::Header,
             Slot::Footer => Placement::Footer,
             Slot::Status => Placement::Status,
             Slot::Title => Placement::Title,
         };
-        Some((placement, slot.lines.as_slice()))
+        (placement, slot.lines.as_slice())
     }))
 }
 

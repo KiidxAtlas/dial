@@ -130,13 +130,17 @@ fn sse_codex_requests_carry_session_affinity_headers() {
                 model: "account-model",
             },
             &chat(),
-            5,
+            Limits {
+                timeout_secs: 5,
+                interrupt: Arc::new(AtomicBool::new(false)),
+            },
             &mut None,
-            Arc::new(AtomicBool::new(false)),
             None,
-            Some("cache-key"),
             &mut |_| true,
-            session,
+            CacheKeys {
+                prompt_cache_key: Some("cache-key"),
+                session_key: session,
+            },
         )
         .unwrap();
     }
@@ -797,4 +801,85 @@ fn long_retention_is_rejected_on_subscription_and_without_declared_caching() {
 
 fn persisted(message: &Value) -> Value {
     serde_json::from_str(&message.to_string()).unwrap()
+}
+
+#[test]
+fn image_turn_releases_only_a_completed_image_after_terminal_success() {
+    let item = json!({"type":"image_generation_call", "id":"img", "status":"completed", "result":"aW1hZ2U="});
+    let response = response(vec![item.clone()]);
+    assert!(
+        completed(&response).is_err(),
+        "ordinary chat must not accept unrequested image output"
+    );
+    let mut collector = Accumulator {
+        image_generation: true,
+        ..Default::default()
+    };
+    for event in [
+        json!({"type":"response.output_item.added", "output_index":0, "item":{"type":"image_generation_call", "id":"img"}}),
+        json!({"type":"response.output_item.done", "output_index":0, "item":item}),
+    ] {
+        assert!(
+            !collector
+                .feed(&event.to_string(), &mut |_| true, &mut |_| true)
+                .unwrap()
+        );
+    }
+    assert!(collector.result.is_none());
+    assert!(collector.feed(&json!({"type":"response.completed", "response":{"status":"completed","output":[]}}).to_string(), &mut |_| true, &mut |_| true).unwrap());
+    assert_eq!(
+        collector.finish().unwrap().provider_content.last().unwrap()["item"]["result"],
+        "aW1hZ2U="
+    );
+    for response in [
+        json!({"status":"completed", "output":[]}),
+        json!({"status":"incomplete", "output":[{"type":"image_generation_call","status":"completed","result":"abc"}]}),
+        json!({"status":"completed", "output":[{"type":"image_generation_call","status":"in_progress","result":"abc"}]}),
+    ] {
+        assert!(completed_image(&response).is_err(), "{response}");
+    }
+}
+
+#[test]
+fn image_stream_accepts_large_inline_images_but_never_partial_or_failed_turns() {
+    let encoded = "a".repeat(1024 * 1024 + 100);
+    let image = json!({"type":"image_generation_call","status":"completed","result":encoded});
+    let terminal = json!({"type":"response.completed","response":response(vec![image.clone()])});
+    let server = fake::serve(vec![Script::Sse(sse(vec![terminal]))]);
+    let output = generate_image(
+        Endpoint {
+            url: &server.url,
+            token: "fixture-token",
+            account_id: None,
+            model: "selected",
+            headers: &[],
+        },
+        &json!({"model":"selected","stream":true}),
+        5,
+    )
+    .unwrap();
+    assert_eq!(output, encoded);
+    server.requests();
+    for terminal in [
+        json!({"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[image.clone()]}}),
+        json!({"type":"response.failed","response":{"status":"failed","error":{"message":"failed"}}}),
+        json!({"type":"response.completed","response":response(vec![image.clone(),image.clone()])}),
+    ] {
+        let server = fake::serve(vec![Script::Sse(sse(vec![terminal]))]);
+        assert!(
+            generate_image(
+                Endpoint {
+                    url: &server.url,
+                    token: "fixture-token",
+                    account_id: None,
+                    model: "selected",
+                    headers: &[]
+                },
+                &json!({"model":"selected","stream":true}),
+                5
+            )
+            .is_err()
+        );
+        server.requests();
+    }
 }

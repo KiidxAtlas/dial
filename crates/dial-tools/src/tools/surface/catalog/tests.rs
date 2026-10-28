@@ -48,7 +48,8 @@ fn integration_defaults_and_legacy_registration_share_metadata() {
 
 #[test]
 fn execution_platform_reason_matches_launch_gate() {
-    for name in ["eval"] {
+    {
+        let name = "eval";
         let platform = execution_platform(name);
         assert_eq!(platform.available, platform.reason.is_none());
         assert_eq!(

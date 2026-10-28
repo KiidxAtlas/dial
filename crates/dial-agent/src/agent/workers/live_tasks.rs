@@ -23,6 +23,13 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+/// Permission inputs the pump authorizes live-task events against.
+pub(in crate::agent) struct PumpPolicy<'a> {
+    pub(in crate::agent) read_only: bool,
+    pub(in crate::agent) rules: &'a mut Vec<PermissionRule>,
+    pub(in crate::agent) root: &'a std::path::Path,
+    pub(in crate::agent) extra_roots: &'a [std::path::PathBuf],
+}
 enum Event {
     Policy(ToolCall, approval::PolicyExplanation),
     CapturePolicy {
@@ -1304,14 +1311,17 @@ impl LiveTasks {
     pub fn pump(
         &mut self,
         approval: Approval,
-        read_only: bool,
-        rules: &mut Vec<PermissionRule>,
-        root: &std::path::Path,
-        extra_roots: &[std::path::PathBuf],
+        policy: PumpPolicy<'_>,
         layout: Option<&Layout>,
         cost: &mut Option<f64>,
         ui: &mut dyn Ui,
     ) {
+        let PumpPolicy {
+            read_only,
+            rules,
+            root,
+            extra_roots,
+        } = policy;
         while let Ok(event) = self.rx.try_recv() {
             match event {
                 Event::CapturePolicy {
@@ -1408,10 +1418,13 @@ impl LiveTasks {
                         match scope {
                             subagents::MutationScope::Workspace => {
                                 approval::authorize_mutation_paths(
-                                    rules,
-                                    root,
-                                    extra_roots,
-                                    read_only || matches!(approval, Approval::Readonly),
+                                    approval::MutationPolicy {
+                                        rules,
+                                        root,
+                                        extra_roots,
+                                        read_only: read_only
+                                            || matches!(approval, Approval::Readonly),
+                                    },
                                     &original,
                                     &tool,
                                     &paths,
@@ -1553,10 +1566,12 @@ impl LiveTasks {
         loop {
             self.pump(
                 approval,
-                read_only,
-                rules,
-                root,
-                extra_roots,
+                PumpPolicy {
+                    read_only,
+                    rules,
+                    root,
+                    extra_roots,
+                },
                 layout,
                 cost,
                 ui,

@@ -69,11 +69,11 @@ pub(in crate::tools) fn network_disabled(sandbox: &SandboxConfig) -> Option<&'st
     }
 }
 
-fn require_network(config: &Config, tool: &str) -> Result<(), ToolOutput> {
+fn require_network(config: &Config, tool: &str) -> Result<(), Box<ToolOutput>> {
     match network_disabled(&config.sandbox) {
-        Some(reason) => Err(ToolOutput::err(format!(
+        Some(reason) => Err(Box::new(ToolOutput::err(format!(
             "{tool} is unavailable: network access is disabled ({reason})"
-        ))),
+        )))),
         None => Ok(()),
     }
 }
@@ -154,7 +154,7 @@ Private, loopback and link-local addresses are refused. The result is untrusted 
 
     fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
         if let Err(denied) = require_network(ctx.config, "web_fetch") {
-            return denied;
+            return *denied;
         }
         self.client.reset_interrupt();
         match self.fetch(ctx.config, ctx.workspace, args) {
@@ -454,7 +454,7 @@ impl Tool for WebSearch {
     }
     fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
         if let Err(denied) = require_network(ctx.config, "web_search") {
-            return denied;
+            return *denied;
         }
         self.client.reset_interrupt();
         match self.search(ctx.config, args) {

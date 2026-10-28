@@ -166,17 +166,30 @@ pub(in crate::agent) fn custom_tool_output(
     }
 }
 
+/// The workspace, configuration, registry, interrupt, and sinks one parallel tool batch runs against.
+pub(in crate::agent) struct ParallelToolContext<'a> {
+    pub(in crate::agent) workspace: &'a Workspace,
+    pub(in crate::agent) config: &'a Config,
+    pub(in crate::agent) ext: &'a Registry,
+    pub(in crate::agent) interrupt: &'a AtomicBool,
+    pub(in crate::agent) ui: &'a mut dyn Ui,
+    pub(in crate::agent) pending_steering: &'a mut Vec<String>,
+}
+
 /// Run only a prevalidated consecutive group. No agent/session/UI state enters a worker.
 pub(in crate::agent) fn parallel_tools(
-    workspace: &Workspace,
-    config: &Config,
-    ext: &Registry,
+    ctx: ParallelToolContext<'_>,
     calls: &[ToolCall],
-    interrupt: &AtomicBool,
-    ui: &mut dyn Ui,
-    pending_steering: &mut Vec<String>,
     already_started: Option<&str>,
 ) -> Vec<(ToolOutput, f64)> {
+    let ParallelToolContext {
+        workspace,
+        config,
+        ext,
+        interrupt,
+        ui,
+        pending_steering,
+    } = ctx;
     let signals = crate::tools::exec::signals::CallSignals::new();
     thread::scope(|scope| {
         let (completed, completions) = mpsc::channel();

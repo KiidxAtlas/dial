@@ -164,6 +164,7 @@ enum Group {
     Favorites,
     /// Chat models for the `memory` role, with the memory backend's status.
     Memory,
+    Images,
     Download,
     Provider(String),
 }
@@ -257,6 +258,7 @@ fn role_accepts(role: &str, entry: &ModelEntry) -> bool {
     match role {
         "decision" => false,
         "embedding" => is_embedding(entry),
+        "image" => entry.supports_images(),
         _ => entry.supports_chat(),
     }
 }
@@ -416,6 +418,9 @@ fn capability_badges(theme: &Theme, entry: &ModelEntry) -> String {
 }
 
 fn capability_detail(theme: &Theme, entry: &ModelEntry) -> String {
+    if entry.supports_images() {
+        return "image generation · image role".to_owned();
+    }
     if !entry.supports_chat() && !entry.is_embedding() {
         return format!("{} · no compatible Dial role", entry.metadata.kind.label());
     }
@@ -1180,6 +1185,10 @@ impl ModelOverlay {
                 .all_entries()
                 .filter(|entry| self.in_memory_group(entry))
                 .count(),
+            Group::Images => self
+                .all_entries()
+                .filter(|entry| entry.supports_images())
+                .count(),
             Group::Download => self.downloads.installed_count(),
             Group::Provider(id) => self
                 .all_entries()
@@ -1210,6 +1219,9 @@ impl ModelOverlay {
                 continue;
             }
             if self.group == Group::Memory && !self.in_memory_group(entry) {
+                continue;
+            }
+            if self.group == Group::Images && !entry.supports_images() {
                 continue;
             }
             if !self.kind.accepts(entry) || !self.shows(entry) {
@@ -1275,10 +1287,10 @@ impl ModelOverlay {
 
     /// The role the list marks and leads with: memory in the Memory group, otherwise main.
     fn lead_role(&self) -> &'static str {
-        if self.group == Group::Memory {
-            "memory"
-        } else {
-            "main"
+        match self.group {
+            Group::Memory => "memory",
+            Group::Images => "image",
+            _ => "main",
         }
     }
 
@@ -1315,6 +1327,7 @@ impl ModelOverlay {
             Group::All,
             Group::Favorites,
             Group::Memory,
+            Group::Images,
             Group::Download,
         ];
         groups.extend(self.providers().map(|p| Group::Provider(p.id.clone())));
@@ -1441,6 +1454,13 @@ impl ModelOverlay {
                     return OverlayEvent::AssignModel {
                         role: "memory".into(),
                         selection: ModelSelection::new("mlx", &path),
+                        scope: self.scope,
+                    };
+                }
+                Step::UseImage(selection) => {
+                    return OverlayEvent::AssignModel {
+                        role: "image".into(),
+                        selection,
                         scope: self.scope,
                     };
                 }
@@ -1744,6 +1764,8 @@ impl ModelOverlay {
             // The memory role is picked in its own group, which shows the memory backend's status.
             self.group = if role == "memory" {
                 Group::Memory
+            } else if role == "image" {
+                Group::Images
             } else {
                 Group::All
             };
@@ -1772,6 +1794,8 @@ impl ModelOverlay {
                 "memory"
             } else if entry.is_embedding() {
                 "embedding"
+            } else if entry.metadata.kind == ModelKind::Image || self.group == Group::Images {
+                "image"
             } else {
                 "main"
             });
@@ -2164,6 +2188,7 @@ impl ModelOverlay {
             Group::All => "All models".to_owned(),
             Group::Favorites => "Favorites".to_owned(),
             Group::Memory => "Memory models".to_owned(),
+            Group::Images => "Images".to_owned(),
             Group::Download => "Get models".to_owned(),
             Group::Provider(id) => self
                 .providers()
@@ -2199,6 +2224,19 @@ impl ModelOverlay {
                 .unwrap_or_default();
             spans.push(Span::styled(
                 format!("  {} {backend}memory role: {value}", theme.sym(Sym::Dot)),
+                theme.fg(tok),
+            ));
+        }
+        if self.group == Group::Images {
+            let (value, tok) = self.role_value("image");
+            let source = self
+                .roles
+                .iter()
+                .find(|status| status.role == "image")
+                .map(|status| source_label(status.source))
+                .unwrap_or("follows main");
+            spans.push(Span::styled(
+                format!("  {} image role: {value} · {source}", theme.sym(Sym::Dot)),
                 theme.fg(tok),
             ));
         }
@@ -2367,6 +2405,16 @@ impl ModelOverlay {
                 &Group::Memory,
                 "Memory".to_owned(),
                 nonzero(self.count_in(&Group::Memory)),
+                None,
+                self,
+            ),
+        ));
+        entries.push((
+            Some(Group::Images),
+            line(
+                &Group::Images,
+                "Images".to_owned(),
+                nonzero(self.count_in(&Group::Images)),
                 None,
                 self,
             ),
@@ -2982,6 +3030,12 @@ impl ModelOverlay {
                         "set memory"
                     } else if self.highlighted().is_some_and(ModelEntry::is_embedding) {
                         "set embedding"
+                    } else if self.group == Group::Images
+                        || self
+                            .highlighted()
+                            .is_some_and(|entry| entry.metadata.kind == ModelKind::Image)
+                    {
+                        "set image"
                     } else {
                         "set main"
                     },

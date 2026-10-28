@@ -8,7 +8,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         TO,
         "Image generation",
         "Offer automatically",
-        "Offer the image_gen tool whenever its endpoint (the [image] settings, or an image-capable session provider) has an API key, without listing it in integrations. Takes effect in a new session.",
+        "Offer image_gen automatically when a shared image route resolves: image settings/role, main's provider, configured image profiles or keyed provider defaults. ChatGPT hosted-tool support may be unverified. Refreshes at request boundaries; calls still require approval.",
         Kind::Bool,
         true,
     ),

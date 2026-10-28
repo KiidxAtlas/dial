@@ -70,11 +70,11 @@ impl Shell {
         plugin: &str,
         action: Action,
     ) -> Result<Option<Step>> {
-        if let Some((title, detail)) = approval_prompt(plugin, &action)? {
-            if !self.approve(&title, &detail) {
-                self.note("Plugin action", format!("{plugin}: declined."));
-                return Ok(None);
-            }
+        if let Some((title, detail)) = approval_prompt(plugin, &action)?
+            && !self.approve(&title, &detail)
+        {
+            self.note("Plugin action", format!("{plugin}: declined."));
+            return Ok(None);
         }
         match action {
             Action::Ui(_) => Ok(None),
@@ -181,7 +181,7 @@ fn approval_prompt(plugin: &str, action: &Action) -> Result<Option<(String, Stri
         ),
         Action::RegisterProvider { name, config } => {
             let spec = parse_provider(name, config)?;
-            ("register a provider", provider_detail(name, config, &spec))
+            ("register a provider", provider_detail(name, &spec))
         }
         Action::UnregisterProvider { name } => {
             ensure_provider_name(name)?;
@@ -212,7 +212,7 @@ fn parse_provider(name: &str, config: &Value) -> Result<ProviderSpec> {
 }
 
 /// Provider summary for the prompt. Header values are hidden; only their names are shown.
-fn provider_detail(name: &str, config: &Value, spec: &ProviderSpec) -> String {
+fn provider_detail(name: &str, spec: &ProviderSpec) -> String {
     let mut lines = vec![
         format!("Provider: {name}"),
         format!("Base URL: {}", sanitize_line(&spec.base_url)),
@@ -220,8 +220,8 @@ fn provider_detail(name: &str, config: &Value, spec: &ProviderSpec) -> String {
     if let Some(env) = &spec.api_key_env {
         lines.push(format!("API key variable: {env}"));
     }
-    if let Some(headers) = config.get("headers").and_then(Value::as_object) {
-        let names: Vec<String> = headers.keys().map(|key| sanitize_line(key)).collect();
+    if let Some(headers) = spec.headers.as_ref().filter(|headers| !headers.is_empty()) {
+        let names: Vec<String> = headers.iter().map(|row| sanitize_line(&row.name)).collect();
         lines.push(format!("Headers: {} (values hidden)", names.join(", ")));
     }
     lines.join("\n")

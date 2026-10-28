@@ -24,6 +24,7 @@ use std::thread;
 const USAGE: &str = "usage: /btw <question> | /btw new <question> | /btw threads | /btw open <id> | /btw copy | /btw promote <id> | /btw cancel";
 
 /// Side threads of the bound session plus at most one streaming request.
+#[derive(Default)]
 pub(in crate::app) struct SideThreadState {
     session: Option<String>,
     path: Option<PathBuf>,
@@ -52,19 +53,6 @@ enum Event {
 pub(in crate::app) struct Note {
     pub title: String,
     pub text: String,
-}
-
-impl Default for SideThreadState {
-    fn default() -> Self {
-        Self {
-            session: None,
-            path: None,
-            threads: SideThreads::default(),
-            open: None,
-            job: None,
-            snapshot: None,
-        }
-    }
 }
 
 impl Drop for SideThreadState {

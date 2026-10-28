@@ -248,13 +248,14 @@ fn websocket_history_survives_http_fallback_and_token_refresh() {
         let error = super::super::responses::exchange_codex(
             route,
             history,
-            5,
+            crate::llm::Limits {
+                timeout_secs: 5,
+                interrupt: Arc::new(AtomicBool::new(false)),
+            },
             &mut None,
-            Arc::new(AtomicBool::new(false)),
-            None,
             None,
             &mut |_| panic!("invalid history must not emit callbacks"),
-            None,
+            super::super::responses::CacheKeys::default(),
         )
         .unwrap_err();
         assert!(error.to_string().contains("native history belongs"));
@@ -266,13 +267,14 @@ fn websocket_history_survives_http_fallback_and_token_refresh() {
             ..endpoint
         },
         &chat,
-        5,
+        crate::llm::Limits {
+            timeout_secs: 5,
+            interrupt: Arc::new(AtomicBool::new(false)),
+        },
         &mut None,
-        Arc::new(AtomicBool::new(false)),
-        None,
         None,
         &mut |_| true,
-        None,
+        super::super::responses::CacheKeys::default(),
     )
     .unwrap();
     assert_eq!(reply.text, "second");

@@ -517,6 +517,13 @@ struct CachedAction {
     command_executed: bool,
 }
 
+/// The file, server language and operation a cached code action must still match.
+struct ActionTarget<'a> {
+    abs: &'a Path,
+    language: &'a str,
+    operation: Action,
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
@@ -964,7 +971,12 @@ impl LspTool {
             action,
             Action::CodeActionResolve | Action::CodeActionApply | Action::ExecuteCommand
         ) {
-            return self.run_cached(ctx, args, &abs, language, action, cancel, effects);
+            let target = ActionTarget {
+                abs: &abs,
+                language,
+                operation: action,
+            };
+            return self.run_cached(ctx, args, target, cancel, effects);
         }
         // Startup/reload can execute project code too, so own the workspace barrier before it.
         let _workspace = workspace_lock(ws, cancel)?;
@@ -1188,12 +1200,15 @@ impl LspTool {
         &self,
         ctx: &ToolContext,
         args: &Value,
-        abs: &Path,
-        language: &str,
-        operation: Action,
+        target: ActionTarget<'_>,
         cancel: &AtomicBool,
         effects: &mut Effects,
     ) -> Result<String, String> {
+        let ActionTarget {
+            abs,
+            language,
+            operation,
+        } = target;
         let ws = ctx.workspace;
         let id = req_str(args, "action_id")?;
         let mut cached = lock(&self.actions)

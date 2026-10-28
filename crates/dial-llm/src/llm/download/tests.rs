@@ -576,3 +576,18 @@ fn subprocess_plans_gguf_files_and_validates_them_before_caching() {
     );
     assert!(!marker.exists());
 }
+
+#[test]
+fn image_search_filters_declared_mlx_text_to_image_capabilities() {
+    let params = image_search_query("  flux  ");
+    assert!(params.contains(&("filter", "mlx")));
+    assert!(params.contains(&("pipeline_tag", "text-to-image")));
+    assert!(params.contains(&("search", "flux")));
+    assert!(
+        !image_search_query("")
+            .iter()
+            .any(|(key, _)| *key == "search")
+    );
+    let hits = parse_search(Family::Mlx, r#"[{"id":"org/generator"}]"#).unwrap();
+    assert_eq!(hits[0].family, Family::Mlx);
+}

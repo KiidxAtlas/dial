@@ -187,6 +187,7 @@ const MODEL_ROLES: EnumValues = &[
     ("planner", "Planner"),
     ("memory", "Memory"),
     ("decision", "Decision"),
+    ("image", "Image"),
 ];
 const SERVICE_TIER: EnumValues = &[
     ("none", "None"),

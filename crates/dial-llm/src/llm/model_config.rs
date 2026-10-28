@@ -716,6 +716,10 @@ pub const ROLES: &[(&str, &str)] = &[
         "Embedding model for semantic memory recall; use an OpenAI-compatible, Ollama or Gemini embedding endpoint; unassigned uses lexical recall",
     ),
     (
+        "image",
+        "Image generation; unassigned follows the main model when it supports image output",
+    ),
+    (
         TURN_DRAFTER,
         "Turn optimizer (experimental): rewrites each user message into a structured prompt with diagrams; the main model sees only the draft; unassigned follows main",
     ),

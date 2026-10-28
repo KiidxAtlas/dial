@@ -185,6 +185,32 @@ fn history_recorded_before_an_additive_builtin_property_stays_valid() {
     );
 }
 
+#[test]
+fn bash_history_before_named_sessions_stays_valid_without_rewriting_calls() {
+    let registry = Registry::new();
+    let current = crate::tools::schema("bash", crate::config::types::EditMode::Replace).unwrap();
+    let mut before = current.clone();
+    assert!(
+        before["function"]["parameters"]["properties"]
+            .as_object_mut()
+            .unwrap()
+            .remove("session")
+            .is_some()
+    );
+    let old = identities(&[before], &registry)["bash"].clone();
+    let history = vec![
+        json!({"role":"assistant","tool_calls":[{"id":"call","type":"function","function":{"name":"bash","arguments":"{\"command\":\"pwd\"}"}}],"dial_tool_contracts":{"call":old}}),
+        json!({"role":"tool","tool_call_id":"call","content":"recorded output"}),
+    ];
+    let original = history.clone();
+    assert!(
+        project_history(&history, &[current], &registry)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(history, original);
+}
+
 /// `edit` gained the optional `allow_syntax_errors`; sessions recorded before it resume in every
 /// edit grammar.
 #[test]
@@ -461,7 +487,6 @@ fn recorded_kernel_calls_with_an_explicit_language_are_refused() {
 /// `eval` gained `language:"py"`; sessions recorded when only JavaScript existed stay valid.
 #[test]
 fn eval_history_recorded_before_python_language_stays_valid() {
-    use crate::tools::integrations::ext::Tool;
     let tool = crate::tools::exec::eval::tools(&crate::config::types::Config::default())
         .pop()
         .unwrap();

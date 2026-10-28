@@ -690,14 +690,17 @@ fn serial_operation<'a>(
 /// before returning. The driver stays paused until the reply is sent.
 fn dispatch_guarded<'a>(
     serial: &mut Option<std::sync::MutexGuard<'a, ()>>,
-    workspace: &'a Workspace,
-    end: &Deadline,
-    interrupt: &AtomicBool,
-    cancel: &AtomicBool,
-    callback_wait: &AtomicBool,
+    scope: &CellScope<'a>,
     dispatch: &mut dyn FnMut(ToolCallback) -> ToolOutput,
     callback: ToolCallback,
 ) -> Result<ToolOutput, String> {
+    let &CellScope {
+        workspace,
+        end,
+        interrupt,
+        cancel,
+        callback_wait,
+    } = scope;
     struct CallbackWait<'a>(&'a AtomicBool);
     impl Drop for CallbackWait<'_> {
         fn drop(&mut self) {
@@ -835,30 +838,15 @@ fn native_cell_once(
     yield_now: &dyn Fn() -> bool,
 ) -> Result<Option<Value>, String> {
     let end: &Deadline = scope.end;
-    let (workspace, interrupt, cancel, callback_wait) = (
-        scope.workspace,
-        scope.interrupt,
-        scope.cancel,
-        scope.callback_wait,
-    );
+    let (workspace, interrupt, cancel) = (scope.workspace, scope.interrupt, scope.cancel);
     // Native code may write directly. Never run it concurrently with another workspace transaction.
     // The outer agent MUST NOT hold its own serial guard for supports_tool_dispatch() tools.
     let mut serial = Some(serial_operation(workspace, end, interrupt, cancel)?);
     let check = || check_operation(end, interrupt, cancel);
     let callback = |request: &Value| {
         check_operation(end, interrupt, cancel)?;
-        let mut call = |callback: ToolCallback| {
-            dispatch_guarded(
-                &mut serial,
-                workspace,
-                end,
-                interrupt,
-                cancel,
-                callback_wait,
-                dispatch,
-                callback,
-            )
-        };
+        let mut call =
+            |callback: ToolCallback| dispatch_guarded(&mut serial, scope, dispatch, callback);
         if let Some(reply) = preludes::bridge_reply(request, display, &mut call) {
             return reply;
         }
@@ -882,16 +870,7 @@ fn native_cell_once(
             _ => return Err("unsupported code-mode callback".into()),
         };
         // Controller callbacks execute their own Workspace transaction, approvals and observers.
-        let output = dispatch_guarded(
-            &mut serial,
-            workspace,
-            end,
-            interrupt,
-            cancel,
-            callback_wait,
-            dispatch,
-            callback,
-        )?;
+        let output = dispatch_guarded(&mut serial, scope, dispatch, callback)?;
         Ok(json!({"text":output.text,"data":output.data,"is_error":output.is_error}))
     };
     match code {

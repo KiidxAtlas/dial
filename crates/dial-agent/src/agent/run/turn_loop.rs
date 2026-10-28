@@ -57,7 +57,7 @@ impl<'a> Agent<'a> {
         let stops = if self.hermetic {
             Vec::new()
         } else {
-            model::cache_warm::CacheWarm::sync(&mut self.cache_warm, &self.config)?
+            model::cache_warm::CacheWarm::sync(&mut self.cache_warm, self.config)?
         };
         for stop in stops {
             ui.notice(&format!(

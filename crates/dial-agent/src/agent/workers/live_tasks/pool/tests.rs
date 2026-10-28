@@ -2,8 +2,10 @@ use super::*;
 
 fn test_launch(model: &str) -> Arc<PoolLaunch> {
     let workspace = Workspace::new(std::env::temp_dir().as_path()).expect("workspace");
-    let mut config = Config::default();
-    config.model = model.into();
+    let config = Config {
+        model: model.into(),
+        ..Config::default()
+    };
     let ext = Registry::new();
     let harness = Harness::default();
     Arc::new(PoolLaunch::capture(&StartContext {

@@ -14,7 +14,7 @@ fn sensitive_grant_is_exact_native_only_and_revoked_on_remove() {
     let storage = storage.canonicalize().unwrap();
     let mut ws = Workspace::new(&root)
         .unwrap()
-        .with_protected_paths(&[storage.clone()]);
+        .with_protected_paths(std::slice::from_ref(&storage));
     ws.add_root(&allowed).unwrap();
     assert!(ws.resolve(allowed.join("new").to_str().unwrap()).is_err());
     let target = allowed.join("note.txt");
@@ -69,7 +69,7 @@ fn sensitive_request_cannot_unlock_home_or_credentials() {
     std::fs::create_dir_all(&credentials).unwrap();
     let mut ws = Workspace::new(tmp.path())
         .unwrap()
-        .with_protected_paths(&[protected.clone()]);
+        .with_protected_paths(std::slice::from_ref(&protected));
     ws.credential_paths = vec![credentials.canonicalize().unwrap()];
     assert!(ws.directory_request(tmp.path(), true).is_err());
     assert!(ws.directory_request(&protected, true).is_err());

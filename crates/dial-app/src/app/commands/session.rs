@@ -45,7 +45,7 @@ pub(super) const COMMANDS: &[super::CommandSpec] = &[
     },
     super::CommandSpec {
         name: "pack",
-        description: "Write this session as a portable archive (journal, side history, streams, subagent transcripts, artifacts)",
+        description: "Write this session as a portable archive with its side history, workers and artifacts",
         args_hint: "[path]",
         subcommands: &[],
     },

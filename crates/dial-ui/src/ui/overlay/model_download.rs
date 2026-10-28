@@ -45,6 +45,8 @@ pub enum Step {
     UseModel(String),
     /// Assign the installed model at this path to the memory role (the Memory shelf).
     UseMemory(String),
+    /// Assign a discovered image endpoint, preserving its route and never using chat preparation.
+    UseImage(ModelSelection),
     /// Set up this curated embedding model, as `/setup embeddings:<model> yes` does.
     SetupEmbedding(String),
     /// Assign this discovered, served embedding model to the embedding role.
@@ -69,6 +71,8 @@ enum Shelf {
     /// suggestions (a query searches Hugging Face) and every installed local model. Enter on an
     /// installed model assigns it to the memory role instead of the main one.
     Memory,
+    /// MLX text-to-image models, searched by declared Hugging Face pipeline tag.
+    Images,
     /// Browse Hugging Face for embedding models (pipeline tag `feature-extraction`); downloads are
     /// GGUF embedders, which Dial then serves through `llama-server` and assigns to the embedding
     /// role. Reuses the Hub download flow but searches embeddings instead of weight formats.
@@ -76,10 +80,11 @@ enum Shelf {
     Embedding,
 }
 
-const SHELVES: [Shelf; 5] = [
+const SHELVES: [Shelf; 6] = [
     Shelf::Hub(Family::Mlx),
     Shelf::Hub(Family::Gguf),
     Shelf::Memory,
+    Shelf::Images,
     Shelf::EmbeddingHub,
     Shelf::Embedding,
 ];
@@ -89,6 +94,7 @@ impl Shelf {
         match self {
             Shelf::Hub(family) => family.label(),
             Shelf::Memory => "Memory",
+            Shelf::Images => "Images",
             Shelf::EmbeddingHub => "Embeddings",
             Shelf::Embedding => "Curated",
         }
@@ -108,6 +114,7 @@ impl Shelf {
         match self {
             Shelf::Hub(family) => Some(family),
             Shelf::Memory => Some(download::default_family()),
+            Shelf::Images => Some(Family::Mlx),
             Shelf::EmbeddingHub => Some(Family::Gguf),
             Shelf::Embedding => None,
         }
@@ -198,6 +205,12 @@ pub struct ModelDownloads {
     pulled_rx: Option<Receiver<Result<Vec<String>, String>>>,
     /// Embedding models discovery found on any provider, listed before the curated catalog.
     discovered: Vec<ModelEntry>,
+    /// Catalog facts used to keep non-chat checkpoints out of chat and memory shelves.
+    known_models: Vec<ModelEntry>,
+    /// Image downloads remain classified while the controller's catalog rescan is pending.
+    downloaded_images: BTreeSet<String>,
+    /// Repositories explicitly selected from Images; survives switching shelves during a download.
+    image_repos: BTreeSet<String>,
     /// Set after a download finishes; the panel takes it and asks the controller to rescan.
     rescan: bool,
 }
@@ -257,6 +270,9 @@ impl ModelDownloads {
             task: None,
             message: String::new(),
             pulled: None,
+            known_models: Vec::new(),
+            downloaded_images: BTreeSet::new(),
+            image_repos: BTreeSet::new(),
             pulled_rx: None,
             discovered: Vec::new(),
             rescan: false,
@@ -288,6 +304,7 @@ impl ModelDownloads {
     /// The embedding models discovery found (Ollama, LM Studio, other servers and local checkpoints).
     /// The Embedding shelf lists them before the curated catalog; Enter assigns a served one.
     pub fn set_embedding_models(&mut self, models: &[ModelEntry]) {
+        self.known_models = models.to_vec();
         self.discovered = models
             .iter()
             .filter(|entry| entry.is_embedding())
@@ -428,11 +445,13 @@ impl ModelDownloads {
         let enter = if self.focus == Focus::Query {
             match self.shelf {
                 Shelf::Hub(_) | Shelf::Memory | Shelf::EmbeddingHub => "search",
+                Shelf::Images => "search images",
                 Shelf::Embedding => "list",
             }
         } else {
             match self.current() {
                 Some(Pick::Installed(_)) if self.shelf == Shelf::Memory => "use for memory",
+                Some(Pick::Installed(_)) if self.shelf == Shelf::Images => "use for images",
                 Some(Pick::Installed(_)) => "use as main",
                 Some(Pick::Hit(_)) => "list files",
                 Some(Pick::Embedding(_)) => "set up",
@@ -541,6 +560,7 @@ impl ModelDownloads {
                     " Enter searches Hugging Face; an empty query browses suggested models."
                         .to_owned()
                 }
+                Shelf::Images => " Enter searches MLX text-to-image models on Hugging Face; Enter on a result downloads it.".to_owned(),
                 Shelf::Memory => {
                     " Enter searches Hugging Face; an empty query shows small models suited to memory extraction."
                         .to_owned()
@@ -653,10 +673,34 @@ impl ModelDownloads {
             .iter()
             .enumerate()
             .filter(|(_, row)| {
-                (any_format || row.format == Some(family.label())) && self.query_matches(&row.label)
+                let image = self.is_image_path(&row.path);
+                let compatible = if self.shelf == Shelf::Images {
+                    image
+                        || self.known_models.iter().any(|entry| {
+                            entry.supports_images() && same_model(&entry.selection.model, &row.path)
+                        })
+                } else {
+                    !image
+                        && !self.known_models.iter().any(|entry| {
+                            same_model(&entry.selection.model, &row.path) && !entry.supports_chat()
+                        })
+                };
+                compatible
+                    && (any_format || row.format == Some(family.label()))
+                    && self.query_matches(&row.label)
             })
             .map(|(index, _)| index)
             .collect()
+    }
+
+    fn is_image_path(&self, path: &str) -> bool {
+        self.downloaded_images
+            .iter()
+            .any(|known| same_model(known, path))
+            || self.known_models.iter().any(|entry| {
+                entry.metadata.kind == crate::llm::catalog::ModelKind::Image
+                    && same_model(&entry.selection.model, path)
+            })
     }
 
     /// Discovered embedding models matching the query, as indexes into `discovered`.
@@ -711,6 +755,11 @@ impl ModelDownloads {
             // Browse popular embedders (or re-run the query) rather than chat-model suggestions.
             self.run_embedding_search();
         } else if self.shelf.family().is_some() && self.query.trim().is_empty() {
+            if self.shelf == Shelf::Images {
+                self.hits.clear();
+                self.curated = false;
+                return;
+            }
             self.show_curated();
         }
     }
@@ -739,7 +788,7 @@ impl ModelDownloads {
     /// Every selectable row, in display order: available downloads, then installed models.
     fn picks(&self) -> Vec<Pick> {
         match self.shelf {
-            Shelf::Hub(_) | Shelf::Memory | Shelf::EmbeddingHub => self
+            Shelf::Hub(_) | Shelf::Memory | Shelf::EmbeddingHub | Shelf::Images => self
                 .available_hits()
                 .into_iter()
                 .map(Pick::Hit)
@@ -784,7 +833,7 @@ impl ModelDownloads {
     fn confirm(&mut self) -> Step {
         if self.focus == Focus::Query {
             match self.shelf {
-                Shelf::Hub(_) | Shelf::Memory => {
+                Shelf::Hub(_) | Shelf::Memory | Shelf::Images => {
                     self.run_search();
                     if self.query.trim().is_empty() {
                         self.focus = Focus::Results;
@@ -802,6 +851,19 @@ impl ModelDownloads {
         }
         match self.current() {
             Some(Pick::Installed(index)) => match self.dashboard.models.get(index) {
+                Some(row) if self.shelf == Shelf::Images || self.is_image_path(&row.path) => {
+                    if let Some(entry) = self.known_models.iter().find(|entry| {
+                        entry.available
+                            && entry.supports_images()
+                            && entry.selection.base_url.is_some()
+                            && same_model(&entry.selection.model, &row.path)
+                    }) {
+                        Step::UseImage(entry.selection.clone())
+                    } else {
+                        self.message = "Image weights are in the Hugging Face cache. Import/serve them in MLX-Serve, then F5 rescan and choose the endpoint in Images.".into();
+                        Step::Handled
+                    }
+                }
                 Some(row) if self.shelf == Shelf::Memory => Step::UseMemory(row.path.clone()),
                 Some(row) => Step::UseModel(row.path.clone()),
                 None => Step::Handled,
@@ -889,6 +951,13 @@ impl ModelDownloads {
         self.cursor = 0;
         self.status.clear();
         match shelf {
+            Shelf::Images => {
+                self.hits.clear();
+                self.curated = false;
+                self.search = None;
+                self.focus = Focus::Results;
+                self.start_search();
+            }
             Shelf::Hub(_) | Shelf::Memory if self.query.trim().is_empty() => {
                 self.show_curated();
                 self.focus = Focus::Results;
@@ -934,6 +1003,13 @@ impl ModelDownloads {
 
     /// Empty searches retain offline suggestions while refreshing the live catalog.
     fn run_search(&mut self) {
+        if self.shelf == Shelf::Images {
+            self.hits.clear();
+            self.curated = false;
+            self.cursor = 0;
+            self.start_search();
+            return;
+        }
         if self.query.trim().is_empty() {
             self.show_curated();
             if self.source.is_none() || self.shelf == Shelf::Memory {
@@ -948,6 +1024,9 @@ impl ModelDownloads {
     }
 
     fn start_search(&mut self) {
+        if self.shelf == Shelf::Images && self.source.is_none() {
+            return;
+        }
         let Some(family) = self.shelf.family() else {
             return;
         };
@@ -956,8 +1035,14 @@ impl ModelDownloads {
         self.metadata = None;
         self.metadata_attempted.clear();
         let (tx, rx) = mpsc::channel();
+        let images = self.shelf == Shelf::Images;
         std::thread::spawn(move || {
-            let _ = tx.send(download::search(family, &query).map_err(|error| format!("{error:#}")));
+            let result = if images {
+                download::search_images(&query)
+            } else {
+                download::search(family, &query)
+            };
+            let _ = tx.send(result.map_err(|error| format!("{error:#}")));
         });
         self.search = Some(rx);
         self.status = format!("loading {} catalog from Hugging Face…", family.label());
@@ -1008,6 +1093,9 @@ impl ModelDownloads {
         let Some(hit) = self.hits.get(index).cloned() else {
             return;
         };
+        if self.shelf == Shelf::Images {
+            self.image_repos.insert(hit.repo.clone());
+        }
         let (tx, rx) = mpsc::channel();
         let listed = hit.repo.clone();
         std::thread::spawn(move || {
@@ -1270,7 +1358,12 @@ impl ModelDownloads {
         }
         self.rescan = true;
         let memory = self.shelf == Shelf::Memory;
-        if !memory {
+        let image = self.image_repos.contains(repo);
+        if image {
+            self.downloaded_images.insert(path.to_owned());
+            self.shelf = Shelf::Images;
+        }
+        if !memory && !image {
             self.shelf = Shelf::Hub(family);
         }
         self.picker = None;
@@ -1287,7 +1380,11 @@ impl ModelDownloads {
                 _ => false,
             })
             .unwrap_or(0);
-        self.message = if memory {
+        self.message = if image {
+            format!(
+                "Downloaded {repo} to the Hugging Face cache. Serve/import it in MLX-Serve, then F5 rescan and choose Images. Compatibility depends on the server's supported packs."
+            )
+        } else if memory {
             format!("Downloaded {repo}. Enter assigns it to the memory role.")
         } else {
             format!("Downloaded {repo}. Enter makes it the main model.")
@@ -1338,6 +1435,7 @@ impl ModelDownloads {
 
     fn facts_line(&self, width: usize, theme: &Theme) -> Line<'static> {
         let facts = match self.shelf {
+            Shelf::Images => " MLX text-to-image weights · Enter downloads to HF cache · requires a compatible image server, not Dial's chat runner".to_owned(),
             Shelf::Memory => {
                 let installed = self.dashboard.models.len();
                 let memory = match self.dashboard.memory_bytes {
@@ -1389,6 +1487,7 @@ impl ModelDownloads {
         if focused && self.query.is_empty() {
             let placeholder = match self.shelf {
                 Shelf::Hub(_) => "  type a name, Enter searches Hugging Face",
+                Shelf::Images => "  search MLX text-to-image models on Hugging Face",
                 Shelf::Memory => "  type a name, Enter searches Hugging Face for small models",
                 Shelf::EmbeddingHub => "  type to search embedders, Enter searches Hugging Face",
                 Shelf::Embedding => "  type to filter the catalog",
@@ -1425,7 +1524,7 @@ impl ModelDownloads {
         };
         let mut rows = Vec::new();
         match self.shelf {
-            Shelf::Hub(_) | Shelf::Memory | Shelf::EmbeddingHub => {
+            Shelf::Hub(_) | Shelf::Memory | Shelf::EmbeddingHub | Shelf::Images => {
                 let memory = self.shelf == Shelf::Memory;
                 let family = self.shelf.family().unwrap_or(Family::Gguf);
                 let available = self.available_hits();

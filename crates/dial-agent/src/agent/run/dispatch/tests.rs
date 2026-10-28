@@ -101,13 +101,15 @@ fn parallel_completion_reaches_the_view_before_a_slow_sibling_and_keeps_call_ord
         finished: Vec::new(),
     };
     let results = parallel_tools(
-        &workspace,
-        &Config::default(),
-        &registry,
+        ParallelToolContext {
+            workspace: &workspace,
+            config: &Config::default(),
+            ext: &registry,
+            interrupt: &AtomicBool::new(false),
+            ui: &mut view,
+            pending_steering: &mut Vec::new(),
+        },
         &calls,
-        &AtomicBool::new(false),
-        &mut view,
-        &mut Vec::new(),
         None,
     );
     assert_eq!(view.finished, ["fast", "slow"]);

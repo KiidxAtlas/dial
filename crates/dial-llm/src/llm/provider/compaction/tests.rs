@@ -82,12 +82,14 @@ fn v2_compaction_retains_rejected_usage_without_duplicating_success_or_inventing
             seed: None,
         };
         let result = backend.compact_native(
-            &request,
-            Some(NativeCompactionCapability::ResponsesV2),
-            true,
-            128,
-            0,
-            "compact",
+            NativeCompactionRequest {
+                request: &request,
+                capability: Some(NativeCompactionCapability::ResponsesV2),
+                streaming_v2: true,
+                retained_user_budget: 128,
+                first_kept: 0,
+                instructions: "compact",
+            },
             5,
             Arc::new(AtomicBool::new(false)),
         );

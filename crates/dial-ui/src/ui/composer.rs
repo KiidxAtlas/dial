@@ -1095,7 +1095,9 @@ impl Composer {
                 return ComposerEvent::None;
             }
             // Command completion adds a space for further typing, not execution.
-            self.editor.set(&self.editor.text.trim_end().to_owned());
+            // `set` needs `&mut` on the editor, so the trimmed text must be an owned copy.
+            let trimmed = self.editor.text.trim_end().to_owned();
+            self.editor.set(&trimmed);
         }
         // A second Enter explicitly sends the oldest queued message now. Do not
         // add it to history again: queuing already recorded the original draft.
@@ -1866,7 +1868,16 @@ impl Composer {
             rows.push(band(vec![edge()]));
         } else {
             rows.push(statusline::border_line_with(
-                header_ui, ctx.status, theme, w as u16, border, bar, top_l, top_r,
+                header_ui,
+                ctx.status,
+                theme,
+                w as u16,
+                border,
+                statusline::BorderGlyphs {
+                    bar,
+                    left_corner: top_l,
+                    right_corner: top_r,
+                },
             ));
         }
         for row in laid.rows.iter().skip(start).take(MAX_INPUT_ROWS) {
@@ -1945,9 +1956,11 @@ impl Composer {
                     theme,
                     w as u16,
                     theme.fg(Tok::Dim),
-                    " ",
-                    " ",
-                    " ",
+                    statusline::BorderGlyphs {
+                        bar: " ",
+                        left_corner: " ",
+                        right_corner: " ",
+                    },
                 ));
             }
             if !landing || self.recording.is_some() {

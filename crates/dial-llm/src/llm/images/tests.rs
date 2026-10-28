@@ -193,7 +193,10 @@ fn oversized_images_are_downscaled_under_the_model_cap() {
     let (bytes, mime) = resize_for_model(&png, "image/png").unwrap();
     assert!(bytes.len() as u64 <= MAX_IMAGE_BYTES);
     // Incompressible pixels cannot fit the cap as PNG; the encoder falls back to JPEG.
-    assert!(matches!(mime.as_str(), "image/png" | "image/jpeg"), "{mime}");
+    assert!(
+        matches!(mime.as_str(), "image/png" | "image/jpeg"),
+        "{mime}"
+    );
     let decoded = image::load_from_memory(&bytes).unwrap();
     assert!(decoded.width() <= width && decoded.width() > 0);
 }

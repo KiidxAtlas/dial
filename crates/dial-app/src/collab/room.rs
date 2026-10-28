@@ -7,7 +7,7 @@ use crate::storage::session::Session;
 use std::sync::Mutex;
 
 pub enum Room {
-    Host(Host),
+    Host(Box<Host>),
     Guest(Guest),
 }
 

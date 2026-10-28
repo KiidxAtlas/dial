@@ -297,7 +297,7 @@ fn write_members(
     for source in sources {
         zip.start_file(source.name.as_str(), options)?;
         let mut input =
-            platform_fs::open_nofollow_nonblocking(&OpenOptions::new().read(true), &source.path)
+            platform_fs::open_nofollow_nonblocking(OpenOptions::new().read(true), &source.path)
                 .with_context(|| format!("reading {}", source.path.display()))?;
         let (sha256, bytes) = copy_hashed(&mut input, &mut zip, member_limit)
             .with_context(|| format!("archiving {}", source.name))?;

@@ -15,10 +15,12 @@ impl<'a> Agent<'a> {
         self.side_questions.pump();
         self.live_tasks.pump(
             self.approval,
-            self.plan_mode,
-            &mut self.always,
-            self.workspace.root(),
-            self.workspace.additional_roots(),
+            super::live_tasks::PumpPolicy {
+                read_only: self.plan_mode,
+                rules: &mut self.always,
+                root: self.workspace.root(),
+                extra_roots: self.workspace.additional_roots(),
+            },
             self.layout.as_ref(),
             &mut self.session_cost,
             ui,

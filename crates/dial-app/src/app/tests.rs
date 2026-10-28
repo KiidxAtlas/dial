@@ -13,7 +13,9 @@ use crate::app::learning::{Learning, lora_state};
 use crate::app::notices::{memory_age, memory_status_text};
 use crate::app::overlay::compute::{compute_starts, overlay_compute_release};
 use crate::app::overlay::{Which, overlay_destination, work_panel};
-use crate::app::panel::{panel_body_limit, panel_inner, panel_rows_window, panel_scroll};
+use crate::app::panel::{
+    PanelView, panel_body_limit, panel_inner, panel_rows_window, panel_scroll,
+};
 use crate::app::selection::{
     PendingFavorite, clear_role_changes, model_settings_profile, next_favorite, reasoning_changes,
     reasoning_profile, thinking_label,
@@ -1872,12 +1874,14 @@ fn policy_reason_renders_in_normal_and_narrow_approval_panels() {
         let rows = panel_rows_window(
             &Theme::dark(),
             width,
-            "Allow bash?",
-            &summary,
-            &options,
-            0,
-            0,
             64,
+            PanelView {
+                title: "Allow bash?",
+                body: &summary,
+                options: &options,
+                selected: 0,
+                offset: 0,
+            },
         );
         assert!(
             rows.iter()
@@ -1933,12 +1937,14 @@ fn policy_approval_visual_fixture() {
         for line in panel_rows_window(
             &Theme::dark(),
             width,
-            "Allow bash?",
-            &summary,
-            &options,
-            0,
-            0,
             64,
+            PanelView {
+                title: "Allow bash?",
+                body: &summary,
+                options: &options,
+                selected: 0,
+                offset: 0,
+            },
         ) {
             for span in line.spans {
                 let style = line.style.patch(span.style);
@@ -1978,19 +1984,32 @@ fn the_approval_panel_fits_any_width_and_shows_the_choice() {
         let rows = panel_rows_window(
             &theme,
             width,
-            "Allow bash?",
-            "rm -rf build && cargo build 日本語",
-            &options,
-            1,
-            0,
             64,
+            PanelView {
+                title: "Allow bash?",
+                body: "rm -rf build && cargo build 日本語",
+                options: &options,
+                selected: 1,
+                offset: 0,
+            },
         );
         assert!(
             rows.iter().all(|r| text::line_width(r) <= width as usize),
             "width {width}"
         );
     }
-    let rows = panel_rows_window(&theme, 60, "Allow bash?", "cargo test", &options, 1, 0, 64);
+    let rows = panel_rows_window(
+        &theme,
+        60,
+        64,
+        PanelView {
+            title: "Allow bash?",
+            body: "cargo test",
+            options: &options,
+            selected: 1,
+            offset: 0,
+        },
+    );
     assert_eq!(
         rows.len(),
         1 + 1 + 3 + 1 + 1,
@@ -2018,7 +2037,18 @@ fn modal_details_scroll_and_selection_stays_visible_at_small_sizes() {
         .map(|index| format!("detail-{index}\n"))
         .collect::<String>();
     for width in [6, 12, 40] {
-        let rows = panel_rows_window(&theme, width, "Details", &body, &options, 31, 20, 12);
+        let rows = panel_rows_window(
+            &theme,
+            width,
+            12,
+            PanelView {
+                title: "Details",
+                body: &body,
+                options: &options,
+                selected: 31,
+                offset: 20,
+            },
+        );
         assert!(
             rows.iter()
                 .all(|row| text::line_width(row) <= width as usize)
@@ -2028,8 +2058,30 @@ fn modal_details_scroll_and_selection_stays_visible_at_small_sizes() {
             assert!(rows.iter().any(|row| row.to_string().contains("choice-31")));
         }
     }
-    let first = panel_rows_window(&theme, 40, "Details", &body, &options, 0, 0, 20);
-    let later = panel_rows_window(&theme, 40, "Details", &body, &options, 0, 20, 20);
+    let first = panel_rows_window(
+        &theme,
+        40,
+        20,
+        PanelView {
+            title: "Details",
+            body: &body,
+            options: &options,
+            selected: 0,
+            offset: 0,
+        },
+    );
+    let later = panel_rows_window(
+        &theme,
+        40,
+        20,
+        PanelView {
+            title: "Details",
+            body: &body,
+            options: &options,
+            selected: 0,
+            offset: 20,
+        },
+    );
     assert_ne!(
         first.iter().map(ToString::to_string).collect::<Vec<_>>(),
         later.iter().map(ToString::to_string).collect::<Vec<_>>()
@@ -2064,12 +2116,14 @@ fn paging_long_approval_details_reaches_every_line_at_any_height() {
             for row in panel_rows_window(
                 &theme,
                 cols,
-                "Allow bash?",
-                &body,
-                &options,
-                0,
-                offset,
                 height,
+                PanelView {
+                    title: "Allow bash?",
+                    body: &body,
+                    options: &options,
+                    selected: 0,
+                    offset,
+                },
             ) {
                 let row = row.to_string();
                 if let Some(at) = row.find("line-") {
@@ -2107,12 +2161,14 @@ fn tiny_approval_panels_pause_confirmation_and_stay_within_the_viewport() {
             let rows = panel_rows_window(
                 &Theme::dark(),
                 width,
-                "Allow bash?",
-                "cargo test",
-                &options,
-                1,
-                0,
                 height,
+                PanelView {
+                    title: "Allow bash?",
+                    body: "cargo test",
+                    options: &options,
+                    selected: 1,
+                    offset: 0,
+                },
             );
             assert!(rows.len() <= height, "{width}x{height}");
             assert!(

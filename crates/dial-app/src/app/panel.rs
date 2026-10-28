@@ -18,16 +18,28 @@ pub(super) fn panel_has_room(width: u16, height: usize) -> bool {
     width >= 36 && height >= 5
 }
 
+/// What the recovery panel shows: its title, body text, choices, and the scroll state of both.
+pub(super) struct PanelView<'a> {
+    pub(super) title: &'a str,
+    pub(super) body: &'a str,
+    pub(super) options: &'a [(&'a str, char)],
+    pub(super) selected: usize,
+    pub(super) offset: usize,
+}
+
 pub(super) fn panel_rows_window(
     theme: &crate::ui::theme::Theme,
     width: u16,
-    title: &str,
-    body: &str,
-    options: &[(&str, char)],
-    selected: usize,
-    offset: usize,
     height: usize,
+    view: PanelView<'_>,
 ) -> Rows {
+    let PanelView {
+        title,
+        body,
+        options,
+        selected,
+        offset,
+    } = view;
     if width == 0 || height == 0 {
         return Vec::new();
     }

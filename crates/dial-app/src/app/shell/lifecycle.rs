@@ -181,11 +181,10 @@ impl Shell {
         // Optional update checks never block startup or input, and never run in network-off mode.
         if app.config.sandbox.mode != crate::config::types::SandboxMode::Strict
             && app.config.sandbox.allow_network
+            && let Some(message) = self.runtime_updates.poll(&app.layout.user_dir)
         {
-            if let Some(message) = self.runtime_updates.poll(&app.layout.user_dir) {
-                self.runtime_updates.retain_report(message);
-                files_changed = true;
-            }
+            self.runtime_updates.retain_report(message);
+            files_changed = true;
         }
         self.files.request(&app.layout.project_root);
         if let Some(listing) = self.files.poll() {

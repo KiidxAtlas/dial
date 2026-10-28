@@ -1709,8 +1709,7 @@ fn grep_with_workers(ws: &Workspace, args: &Value, workers: usize) -> Result<Str
             break;
         }
     }
-    if batched && state.next.is_some() {
-        let stop = &state.next.as_ref().expect("overrun has a continuation").0;
+    if let Some((stop, _)) = state.next.as_ref().filter(|_| batched) {
         walk = SearchWalk::new(
             ws,
             hidden,

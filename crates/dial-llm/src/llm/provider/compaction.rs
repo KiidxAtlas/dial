@@ -21,6 +21,17 @@ pub struct NativeCompactionReply {
     pub retained_messages: usize,
     pub notices: Vec<String>,
 }
+
+/// One native compaction request: the chat snapshot and how its summary is shaped.
+#[derive(Clone, Copy)]
+pub struct NativeCompactionRequest<'a> {
+    pub request: &'a Chat,
+    pub capability: Option<NativeCompactionCapability>,
+    pub streaming_v2: bool,
+    pub retained_user_budget: u32,
+    pub first_kept: usize,
+    pub instructions: &'a str,
+}
 impl Backend {
     /// Preserve the controls selected for the actual projected request during native maintenance.
     pub fn compaction_profile(&self) -> Option<&llm::profiles::ModelProfile> {
@@ -250,18 +261,13 @@ impl Backend {
     }
     pub fn compact_native(
         &mut self,
-        request: &Chat,
-        capability: Option<NativeCompactionCapability>,
-        streaming_v2: bool,
-        retained_user_budget: u32,
-        first_kept: usize,
-        instructions: &str,
+        native: NativeCompactionRequest<'_>,
         timeout_secs: u64,
         interrupt: Arc<AtomicBool>,
     ) -> Result<NativeCompactionReply> {
         self.require_session_identity()?;
         ensure!(
-            self.supports_native_compaction(capability, streaming_v2),
+            self.supports_native_compaction(native.capability, native.streaming_v2),
             "the active model/route has no declared native compaction support"
         );
         let billing = if matches!(
@@ -282,20 +288,15 @@ impl Backend {
         let transport = llm::usage::Transport::enter(scope.clone());
         let (masked, restorer) = match self.secrets.clone() {
             Some(masker) => {
-                let (masked, restorer) = masker.mask_chat(request);
+                let (masked, restorer) = masker.mask_chat(native.request);
                 (Some(masked), Some(restorer))
             }
             None => (None, None),
         };
-        let request = masked.as_ref().unwrap_or(request);
+        let request = masked.as_ref().unwrap_or(native.request);
         let result = self
             .compact_native_inner(
-                request,
-                capability,
-                streaming_v2,
-                retained_user_budget,
-                first_kept,
-                instructions,
+                NativeCompactionRequest { request, ..native },
                 timeout_secs,
                 interrupt,
             )
@@ -329,15 +330,18 @@ impl Backend {
     }
     fn compact_native_inner(
         &mut self,
-        request: &Chat,
-        capability: Option<NativeCompactionCapability>,
-        streaming_v2: bool,
-        retained_user_budget: u32,
-        first_kept: usize,
-        instructions: &str,
+        native: NativeCompactionRequest<'_>,
         timeout_secs: u64,
         interrupt: Arc<AtomicBool>,
     ) -> Result<NativeCompactionReply> {
+        let NativeCompactionRequest {
+            request,
+            capability,
+            streaming_v2,
+            retained_user_budget,
+            first_kept,
+            instructions,
+        } = native;
         use NativeCompactionCapability::*;
         let timeout = self.response_timeout(timeout_secs);
         let timeout = if timeout == 0 { 300 } else { timeout.min(300) };
@@ -444,9 +448,11 @@ impl Backend {
             match llm::responses::compact(
                 endpoint,
                 request,
-                instructions,
-                true,
-                retained_user_budget,
+                llm::responses::CompactOptions {
+                    instructions,
+                    v2: true,
+                    retained_budget: retained_user_budget,
+                },
                 timeout,
                 interrupt.clone(),
                 self.compaction_profile(),
@@ -467,9 +473,11 @@ impl Backend {
         let mut reply = llm::responses::compact(
             endpoint,
             request,
-            instructions,
-            false,
-            retained_user_budget,
+            llm::responses::CompactOptions {
+                instructions,
+                v2: false,
+                retained_budget: retained_user_budget,
+            },
             timeout,
             interrupt,
             self.compaction_profile(),

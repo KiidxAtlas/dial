@@ -231,8 +231,8 @@ fn provider_browsing_keeps_role_assignment_and_cancel_destination() {
         send(&mut o, &rig, key(KeyCode::Down));
         send(&mut o, &rig, key(KeyCode::Enter));
         send(&mut o, &rig, key(KeyCode::Tab));
-        // All -> Favorites -> Memory -> Get models -> LM Studio.
-        for _ in 0..4 {
+        // All -> Favorites -> Memory -> Images -> Get models -> LM Studio.
+        for _ in 0..5 {
             send(&mut o, &rig, key(KeyCode::Down));
         }
         assert_eq!(o.group, Group::Provider("lm-studio".into()));
@@ -363,7 +363,10 @@ fn non_chat_models_are_visible_but_cannot_be_assigned_to_chat_roles() {
         model.metadata.kind = kind;
         assert!(!KindFilter::Chat.accepts(&model));
         assert!(KindFilter::Other.accepts(&model));
-        assert!(!ROLES.iter().any(|(role, _)| role_accepts(role, &model)));
+        for &(role, _) in ROLES.iter().filter(|(role, _)| *role != "image") {
+            assert!(!role_accepts(role, &model), "{kind:?} accepted for {role}");
+        }
+        assert_eq!(role_accepts("image", &model), kind == ModelKind::Image);
         let mut o = ModelOverlay::new(
             Some(Discovery {
                 models: vec![model],
@@ -373,11 +376,17 @@ fn non_chat_models_are_visible_but_cannot_be_assigned_to_chat_roles() {
             Scope::Global,
         );
         assert_eq!(names(&o), ["specialized"]);
-        assert!(matches!(
-            send(&mut o, &rig, key(KeyCode::Enter)),
-            OverlayEvent::None
-        ));
-        assert!(o.message.is_some());
+        let event = send(&mut o, &rig, key(KeyCode::Enter));
+        if kind == ModelKind::Image {
+            assert!(
+                matches!(event, OverlayEvent::AssignModel { role, selection, .. }
+                if role == "image" && selection.model == "specialized")
+            );
+            assert!(o.message.is_none());
+        } else {
+            assert!(matches!(event, OverlayEvent::None));
+            assert!(o.message.is_some());
+        }
     }
 }
 
@@ -1166,6 +1175,8 @@ fn provider_group_filters_and_groups_are_walked_with_the_keymap() {
     send(&mut o, &rig, key(KeyCode::Down));
     assert_eq!(o.group, Group::Memory);
     send(&mut o, &rig, key(KeyCode::Down));
+    assert_eq!(o.group, Group::Images);
+    send(&mut o, &rig, key(KeyCode::Down));
     assert_eq!(o.group, Group::Download);
     assert!(draw(&mut o, &rig, 120, 30).contains("Get models"));
     send(&mut o, &rig, key(KeyCode::Down));
@@ -1176,6 +1187,8 @@ fn provider_group_filters_and_groups_are_walked_with_the_keymap() {
     send(&mut o, &rig, key(KeyCode::Up));
     send(&mut o, &rig, key(KeyCode::Up));
     assert_eq!(o.group, Group::Download);
+    send(&mut o, &rig, key(KeyCode::Up));
+    assert_eq!(o.group, Group::Images);
     send(&mut o, &rig, key(KeyCode::Up));
     assert_eq!(o.group, Group::Memory);
     send(&mut o, &rig, key(KeyCode::Up));
@@ -1405,7 +1418,7 @@ fn discovery_arriving_later_keeps_search_cursor_and_group() {
     // A group that disappears falls back to All.
     send(&mut o, &rig, key(KeyCode::Esc));
     send(&mut o, &rig, key(KeyCode::Tab));
-    for _ in 0..6 {
+    for _ in 0..7 {
         send(&mut o, &rig, key(KeyCode::Down));
     }
     assert_eq!(o.group, Group::Provider("openai".into()));
@@ -1452,7 +1465,7 @@ fn empty_states_explain_themselves() {
     send(&mut o, &rig, key(KeyCode::Right));
     send(&mut o, &rig, key(KeyCode::Right));
     send(&mut o, &rig, key(KeyCode::Tab));
-    for _ in 0..5 {
+    for _ in 0..6 {
         send(&mut o, &rig, key(KeyCode::Down));
     }
     send(&mut o, &rig, key(KeyCode::Tab));
@@ -1579,10 +1592,10 @@ fn get_models_is_reachable_from_the_groups_column_by_keyboard() {
     let rig = Rig::new();
     let mut o = overlay();
     assert_eq!(o.group, Group::All);
-    // Left moves focus to the groups column; Down walks All -> Favorites -> Memory -> Get models.
+    // Left moves focus to groups; Down walks All -> Favorites -> Memory -> Images -> Get models.
     send(&mut o, &rig, key(KeyCode::Left));
     assert_eq!(o.focus, Focus::Groups);
-    for _ in 0..3 {
+    for _ in 0..4 {
         send(&mut o, &rig, key(KeyCode::Down));
     }
     assert_eq!(o.group, Group::Download);
@@ -1693,6 +1706,8 @@ fn switching_groups_keeps_a_running_download() {
     ));
     assert_eq!(o.focus, Focus::Groups);
     send(&mut o, &rig, key(KeyCode::Up));
+    assert_eq!(o.group, Group::Images);
+    send(&mut o, &rig, key(KeyCode::Up));
     assert_eq!(o.group, Group::Memory);
     send(&mut o, &rig, key(KeyCode::Up));
     assert_eq!(o.group, Group::Favorites);
@@ -1722,7 +1737,7 @@ fn model_tabs_use_right_and_tab_while_left_returns_to_groups() {
         send(&mut o, &rig, key(KeyCode::Up)),
         OverlayEvent::None
     ));
-    assert_eq!(o.group, Group::Memory);
+    assert_eq!(o.group, Group::Images);
     assert!(matches!(
         send(&mut o, &rig, key(KeyCode::Down)),
         OverlayEvent::None
@@ -1757,7 +1772,7 @@ fn get_models_escape_returns_to_groups_then_closes() {
         send(&mut o, &rig, key(KeyCode::Up)),
         OverlayEvent::None
     ));
-    assert_eq!(o.group, Group::Memory);
+    assert_eq!(o.group, Group::Images);
     assert!(matches!(
         send(&mut o, &rig, key(KeyCode::Down)),
         OverlayEvent::None
@@ -2079,4 +2094,54 @@ fn footer_advertises_only_keys_that_do_something() {
     let shown = draw(&mut o, &rig, 120, 30);
     let footer = shown.lines().rev().find(|l| l.contains("Esc")).unwrap();
     assert!(!footer.contains("set main"), "{footer}");
+}
+
+fn image_entry() -> ModelEntry {
+    let mut image = entry("mlx", "local-image", "downloaded", true, None);
+    image.metadata.kind = ModelKind::Image;
+    image
+}
+
+#[test]
+fn images_group_lists_generators_and_enter_assigns_image_not_main() {
+    let rig = Rig::new();
+    let mut d = discovery();
+    d.models.push(image_entry());
+    let mut o = ModelOverlay::new(Some(d), roles_with_main(), Scope::Global);
+    o.group = Group::Images;
+    assert_eq!(names(&o), ["local-image"]);
+    assert_eq!(o.count_in(&Group::Images), 1);
+    let shown = draw(&mut o, &rig, 140, 35);
+    assert!(shown.contains("Images"), "{shown}");
+    assert!(shown.contains("image generation"), "{shown}");
+    assert!(matches!(o.confirm(), OverlayEvent::AssignModel { role, .. } if role == "image"));
+    o.group = Group::All;
+    o.search = "local-image".into();
+    assert!(matches!(o.confirm(), OverlayEvent::AssignModel { role, .. } if role == "image"));
+}
+
+#[test]
+fn image_role_picker_and_chooser_share_capability_policy_and_inheritance() {
+    let rig = Rig::new();
+    let image = image_entry();
+    assert!(role_accepts("image", &image));
+    for role in ["main", "small", "memory", "embedding"] {
+        assert!(!role_accepts(role, &image), "{role}");
+    }
+    let mut d = discovery();
+    d.models.push(image);
+    let mut o = ModelOverlay::new(Some(d), roles_with_main(), Scope::Global);
+    o.show_roles();
+    o.cursor = o
+        .visible_roles()
+        .iter()
+        .position(|(role, _)| *role == "image")
+        .unwrap();
+    let shown = draw(&mut o, &rig, 140, 40);
+    assert!(shown.contains("follows main"), "{shown}");
+    o.confirm();
+    assert_eq!(o.group, Group::Images);
+    assert_eq!(names(&o), ["local-image"]);
+    o.open_chooser();
+    assert_eq!(o.chooser.as_ref().unwrap().roles, ["image"]);
 }

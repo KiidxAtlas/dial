@@ -109,7 +109,15 @@ pub(super) fn exchange_gemini(
         headers: &headers,
     };
     super::gemini::exchange_at(
-        endpoint, &url, req, timeout, on_text, interrupt, profile, on_event,
+        endpoint,
+        req,
+        super::Limits {
+            timeout_secs: timeout,
+            interrupt,
+        },
+        on_text,
+        profile,
+        on_event,
     )
 }
 pub(super) fn exchange_anthropic(
@@ -145,13 +153,17 @@ pub(super) fn exchange_anthropic(
         Ok(())
     };
     super::transports::exchange_wire(
-        Wire::Anthropic,
-        endpoint,
-        req,
-        timeout,
+        super::transports::WireRequest {
+            wire: Wire::Anthropic,
+            endpoint,
+            req,
+            limits: super::Limits {
+                timeout_secs: timeout,
+                interrupt,
+            },
+            profile,
+        },
         on_text,
-        interrupt,
-        profile,
         on_event,
         Some(shape),
     )

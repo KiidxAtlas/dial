@@ -894,7 +894,7 @@ fn retrieval_measurement_matrix() {
                 let mut samples = Vec::new();
                 for _ in 0..SAMPLES {
                     // Fresh path/invocation, NOT an OS cache purge: writes can warm page cache.
-                    let fresh = (cache == "fresh-workspace").then(&make_fixture);
+                    let fresh = (cache == "fresh-workspace").then(make_fixture);
                     let target = fresh.as_ref().map_or(&ws, |(_, ws, _)| ws);
                     let started = Instant::now();
                     let observed = grep_with_workers(target, &args, workers).unwrap();

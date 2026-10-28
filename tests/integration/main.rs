@@ -13,4 +13,5 @@ mod hashline;
 mod isolation;
 mod proposals;
 mod review;
+mod shell_sessions;
 mod ui_configuration;

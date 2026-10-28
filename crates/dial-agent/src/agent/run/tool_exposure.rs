@@ -435,10 +435,8 @@ impl<'a> Agent<'a> {
             names.sort();
         }
         // Side reasoning must be callable while a long command runs, without a discovery
-        // round. Under the compact-tool budget it stays loadable through `tool_load` instead.
-        // Mode/profile restrictions and the minimal-context budget still apply below.
-        if !discovery
-            && catalog.iter().any(|name| name == "side_request")
+        // round. Mode/profile restrictions and the minimal-context budget still apply below.
+        if catalog.iter().any(|name| name == "side_request")
             && !names.iter().any(|name| name == "side_request")
         {
             names.push("side_request".into());

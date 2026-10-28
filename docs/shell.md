@@ -55,13 +55,14 @@ Differences and limits:
 
 ## Named embedded sessions
 
-With `shell.backend = "embedded"`, a foreground `bash` call may supply `session` to retain its
+With `shell.backend = "embedded"`, a `bash` call may supply `session` to retain its
 working directory and exported string variables for later calls in this Dial workspace. Named
-sessions reject overlapping commands and explicit background execution. Ordinary shell calls
-retain their existing background-transfer behavior. Named calls wait for completion or the
-configured deadline; cancellation, timeout or an incomplete state exchange invalidates the saved
-state. Functions, unexported variables and process-restart persistence are not retained. Protected
-host variables and credentials are excluded, and each command keeps the ordinary sandbox policy.
+sessions reject overlapping commands, including while a command is owned by a background job.
+Explicit and automatic background handoff retain the session claim until the job settles.
+Normal completion publishes state even for a nonzero exit code; cancellation, timeout, a signal
+or an incomplete state exchange invalidates it. Functions, unexported variables and process-restart
+persistence are not retained. Protected host variables and credentials are excluded, and each
+command keeps the ordinary sandbox policy.
 
 ## Output minimizer
 

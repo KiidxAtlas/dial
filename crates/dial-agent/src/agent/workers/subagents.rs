@@ -1486,10 +1486,12 @@ impl Approver for Direct<'_> {
         }
         let result = match scope {
             MutationScope::Workspace => approval::authorize_mutation_paths(
-                self.always,
-                self.root,
-                self.extra_roots,
-                matches!(self.approval, Approval::Readonly),
+                approval::MutationPolicy {
+                    rules: self.always,
+                    root: self.root,
+                    extra_roots: self.extra_roots,
+                    read_only: matches!(self.approval, Approval::Readonly),
+                },
                 original,
                 tool,
                 paths,

@@ -267,13 +267,15 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
         return cmd::benchmark::run(
             &layout,
             &config,
-            manifest,
-            baseline.as_deref(),
-            report.as_deref(),
-            profiles.as_deref(),
-            checkpoint.as_deref(),
-            *resume,
-            *share_auth,
+            cmd::benchmark::RunOptions {
+                manifest,
+                baseline: baseline.as_deref(),
+                report_path: report.as_deref(),
+                profiles_path: profiles.as_deref(),
+                checkpoint_path: checkpoint.as_deref(),
+                resume: *resume,
+                share_auth: *share_auth,
+            },
         );
     }
     if let Some(Command::Improve(cmd)) = cli.command {

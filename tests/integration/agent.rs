@@ -1109,8 +1109,9 @@ fn cloud_tool_economy_preserves_core_and_requires_loading_specialists() {
             .collect::<Vec<_>>()
     };
     let initial = names(0);
-    // Core tools are always offered, including `task`, `skill`, `message`, `check` and the memory tools, so the initial set is the core, not `initial_tool_limit`.
-    assert!(initial.len() <= 20, "{initial:?}");
+    // Core tools are always offered, including `task`, `skill`, `message`, `check`, `side_request`
+    // and the memory tools, so the initial set is the core, not `initial_tool_limit`.
+    assert!(initial.len() <= 21, "{initial:?}");
     for core in [
         "read",
         "edit",
@@ -1126,6 +1127,7 @@ fn cloud_tool_economy_preserves_core_and_requires_loading_specialists() {
         "tool_search",
         "artifact_read",
         "working_state",
+        "side_request",
     ] {
         assert!(initial.contains(&core), "{core}");
     }

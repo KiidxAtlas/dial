@@ -183,20 +183,34 @@ pub(super) enum Wire {
 /// Body hook for Anthropic-shaped proxies (applied after Dial builds the Messages body).
 pub(super) type AnthropicShape<'a> = &'a dyn Fn(&mut Value) -> Result<()>;
 
+/// One request over a standard wire protocol, with its endpoint and call-scoped limits.
+pub(super) struct WireRequest<'a> {
+    pub wire: Wire,
+    pub endpoint: Endpoint<'a>,
+    pub req: &'a Chat,
+    pub limits: super::Limits,
+    pub profile: Option<&'a ModelProfile>,
+}
+
 /// Run one request over a standard wire protocol. Credentials in `endpoint.auth` follow that
 /// protocol's convention (Bearer for OpenAI shapes, `x-api-key` for Anthropic, `x-goog-api-key`
 /// for Gemini); proxies that need a different scheme pass `auth: None` and an explicit header.
 pub(super) fn exchange_wire(
-    wire: Wire,
-    endpoint: Endpoint<'_>,
-    req: &Chat,
-    timeout_secs: u64,
+    request: WireRequest<'_>,
     on_text: OnText<'_, '_>,
-    interrupt: Arc<AtomicBool>,
-    profile: Option<&ModelProfile>,
     on_event: &mut dyn FnMut(&StreamEvent) -> bool,
     anthropic_shape: Option<AnthropicShape<'_>>,
 ) -> Result<Reply> {
+    let WireRequest {
+        wire,
+        endpoint,
+        req,
+        limits: super::Limits {
+            timeout_secs,
+            interrupt,
+        },
+        profile,
+    } = request;
     match wire {
         Wire::ChatCompletions => super::provider::exchange(
             endpoint,
@@ -213,9 +227,11 @@ pub(super) fn exchange_wire(
         Wire::Responses => super::responses::exchange_api(
             endpoint,
             req,
-            timeout_secs,
+            super::Limits {
+                timeout_secs,
+                interrupt,
+            },
             on_text,
-            interrupt,
             profile,
             None,
             on_event,

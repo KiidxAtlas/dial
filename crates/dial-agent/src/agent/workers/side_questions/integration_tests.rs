@@ -19,19 +19,20 @@ fn sse_text(text: &str) -> String {
 
 /// Config whose endpoint is the loopback fake server, so `make_backend` resolves a plain endpoint.
 fn side_config(url: &str, user_dir: &Path) -> Config {
-    let mut config = Config::default();
-    config.provider = Some("endpoint".into());
-    config.model = "test".into();
-    config.user_dir = user_dir.to_path_buf();
-    config.endpoint = Some(EndpointConfig {
-        headers: None,
-        base_url: format!("{url}/v1"),
-        api_key_env: None,
-        allow_insecure: true,
-        protocol: None,
-        account_id: None,
-    });
-    config
+    Config {
+        provider: Some("endpoint".into()),
+        model: "test".into(),
+        user_dir: user_dir.to_path_buf(),
+        endpoint: Some(EndpointConfig {
+            headers: None,
+            base_url: format!("{url}/v1"),
+            api_key_env: None,
+            allow_insecure: true,
+            protocol: None,
+            account_id: None,
+        }),
+        ..Config::default()
+    }
 }
 
 fn hermetic_agent<'a>(config: &'a Config, workspace: &Path) -> Agent<'a> {

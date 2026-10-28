@@ -378,8 +378,17 @@ impl Agent<'_> {
                         self.compaction_runtime.cancel();
                     }
                     let native_profile = backend.compaction_profile().cloned();
-                    match self.start_background_compaction(ui, Some(&request), crate::agent::compact::compaction_runtime::WorkKind::Speculative,
-                            Some(method), request_context, native_profile.as_ref(), Some(backend)) {
+                    match self.start_background_compaction(
+                        ui,
+                        crate::agent::compact::compaction_runtime::BackgroundCompactionRequest {
+                            template: Some(&request),
+                            kind: crate::agent::compact::compaction_runtime::WorkKind::Speculative,
+                            method: Some(method),
+                            context_tokens: request_context,
+                            native_profile: native_profile.as_ref(),
+                        },
+                        Some(backend),
+                    ) {
                             Ok(crate::agent::compact::compaction_runtime::Launch::Started) => deferred_compaction = true,
                             Ok(_) => {}
                             Err(error) => ui.diagnostic(&format!("Background compaction was not started ({error:#}); considering blocking maintenance.")),
@@ -699,35 +708,39 @@ impl Agent<'_> {
                     recovery: Some(&self.config.request_recovery),
                 },
                 generation_cancel.clone(),
-                ui,
-                &mut |ui| {
-                    self.pump_subagents(ui);
-                    if self.modes.launch.expired() {
-                        deadline_cancelled = true;
-                        generation_cancel.store(true, Ordering::SeqCst);
-                    }
-                    generation_scope.sync();
-                    let result = self.steer_during_generation(
-                        ui,
-                        live_steering_key.as_deref(),
-                        &mut live_steering,
-                    );
-                    match result {
-                        Ok(true) => {
-                            steered_during_generation = true;
+                crate::agent::ChatSinks {
+                    ui,
+                    on_idle: &mut |ui| {
+                        self.pump_subagents(ui);
+                        if self.modes.launch.expired() {
+                            deadline_cancelled = true;
                             generation_cancel.store(true, Ordering::SeqCst);
                         }
-                        Ok(false) => {}
-                        Err(error) => {
-                            steering_error = Some(error);
-                            generation_cancel.store(true, Ordering::SeqCst);
+                        generation_scope.sync();
+                        let result = self.steer_during_generation(
+                            ui,
+                            live_steering_key.as_deref(),
+                            &mut live_steering,
+                        );
+                        match result {
+                            Ok(true) => {
+                                steered_during_generation = true;
+                                generation_cancel.store(true, Ordering::SeqCst);
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                steering_error = Some(error);
+                                generation_cancel.store(true, Ordering::SeqCst);
+                            }
                         }
-                    }
+                    },
                 },
-                Some(&mut rule_monitor),
-                streamed.as_mut().map(|stream| {
-                    stream as &mut dyn crate::agent::run::streaming_dispatch::ToolStream
-                }),
+                crate::agent::ChatMonitors {
+                    rules: Some(&mut rule_monitor),
+                    stream: streamed.as_mut().map(|stream| {
+                        stream as &mut dyn crate::agent::run::streaming_dispatch::ToolStream
+                    }),
+                },
             )
         };
         if let Some(previous) = previous_usage {

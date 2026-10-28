@@ -776,18 +776,29 @@ impl PermissionRule {
         }
     }
 }
+/// The permission state a native mutation is authorized against.
+pub(crate) struct MutationPolicy<'a> {
+    pub(crate) rules: &'a [PermissionRule],
+    pub(crate) root: &'a Path,
+    pub(crate) extra_roots: &'a [PathBuf],
+    pub(crate) read_only: bool,
+}
+
 /// Checks native targets after the server has computed them but before any effects.
 /// The original operation was already approved; this gate cannot widen its grant.
 pub(crate) fn authorize_mutation_paths(
-    rules: &[PermissionRule],
-    root: &Path,
-    extra_roots: &[PathBuf],
-    read_only: bool,
+    policy: MutationPolicy<'_>,
     original: &ToolCall,
     requested_name: &str,
     paths: &[PathBuf],
     unbounded_effects: bool,
 ) -> std::result::Result<(), String> {
+    let MutationPolicy {
+        rules,
+        root,
+        extra_roots,
+        read_only,
+    } = policy;
     if requested_name != original.name {
         return Err("native mutation authority does not match the executing tool".into());
     }
@@ -926,10 +937,12 @@ pub(crate) fn authorize_managed_memory_paths(
         );
     }
     authorize_mutation_paths(
-        rules,
-        &root,
-        &[],
-        read_only,
+        MutationPolicy {
+            rules,
+            root: &root,
+            extra_roots: &[],
+            read_only,
+        },
         original,
         &original.name,
         paths,

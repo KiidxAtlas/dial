@@ -251,14 +251,14 @@ pub(in crate::agent) fn curate(messages: &mut Vec<Value>, emissions: &mut Emissi
     let mut seen_now: Vec<String> = Vec::new();
     let mut remove = Vec::new();
     // Forward, so the first assembled note of a duplicate pair is the one kept.
-    for index in tail..messages.len() {
-        let Some(priority) = Priority::of(&messages[index]) else {
+    for (index, message) in messages.iter().enumerate().skip(tail) {
+        let Some(priority) = Priority::of(message) else {
             continue;
         };
         if Emissions::exempt(priority) {
             continue;
         }
-        let text = messages[index]["content"].as_str().unwrap_or_default();
+        let text = message["content"].as_str().unwrap_or_default();
         let key = normalize(text);
         if is_content_free(text) || emissions.repeated(&key) || seen_now.contains(&key) {
             remove.push(index);

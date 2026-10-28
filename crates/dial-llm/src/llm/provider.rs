@@ -15,7 +15,7 @@
 //! Neither prompts nor the API key appear in any error produced here.
 
 pub(super) mod compaction;
-pub use compaction::{NativeCompactionFailure, NativeCompactionReply};
+pub use compaction::{NativeCompactionFailure, NativeCompactionReply, NativeCompactionRequest};
 
 use super::model_config::ApiProtocol;
 use super::server::{self, ModelServer};
@@ -1873,13 +1873,17 @@ impl Backend {
                         Ok(None) => llm::responses::exchange_codex(
                             endpoint,
                             req,
-                            timeout_secs,
+                            llm::Limits {
+                                timeout_secs,
+                                interrupt: Arc::clone(&interrupt),
+                            },
                             &mut on_text,
-                            Arc::clone(&interrupt),
                             profile.as_ref(),
-                            self.prompt_cache_key.as_deref(),
                             on_event,
-                            self.session_id.as_deref(),
+                            llm::responses::CacheKeys {
+                                prompt_cache_key: self.prompt_cache_key.as_deref(),
+                                session_key: self.session_id.as_deref(),
+                            },
                         ),
                         Err(error) => Err(error),
                     }
@@ -1906,9 +1910,11 @@ impl Backend {
                         model,
                     },
                     req,
-                    timeout_secs,
+                    llm::Limits {
+                        timeout_secs,
+                        interrupt: Arc::clone(&interrupt),
+                    },
                     &mut on_text,
-                    Arc::clone(&interrupt),
                     profile.as_ref(),
                     self.prompt_cache_key.as_deref(),
                     on_event,

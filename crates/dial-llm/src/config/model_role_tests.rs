@@ -346,6 +346,37 @@ fn task_status_shows_assigned_model_or_main_without_changing_small_fallback() {
 }
 
 #[test]
+fn image_role_follows_main_until_assigned_and_can_be_cleared() {
+    use crate::llm::model_config::{ModelSelection, RoleSource};
+    let mut config = Config {
+        model: "main-model".into(),
+        ..Default::default()
+    };
+    let status = config
+        .role_statuses()
+        .into_iter()
+        .find(|row| row.role == "image")
+        .unwrap();
+    assert_eq!(status.source, RoleSource::FollowsMain);
+    assert_eq!(config.for_role("image").selection(), config.selection());
+    let mut image = ModelSelection::new("mlx-serve", "downloaded/image-model");
+    image.base_url = Some("http://127.0.0.1:1234/v1".into());
+    image.context_window = Some(4096);
+    image.protocol = Some(crate::llm::model_config::ApiProtocol::ChatCompletions);
+    config.model_roles.insert("image".into(), image.clone());
+    config.validate().unwrap();
+    assert_eq!(config.for_role("image").selection(), image);
+    assert_eq!(config.model, "main-model");
+    let table = toml::Value::try_from(&config).unwrap();
+    assert_eq!(
+        table["model_roles"]["image"]["model"].as_str(),
+        Some("downloaded/image-model")
+    );
+    config.model_roles.remove("image");
+    assert_eq!(config.for_role("image").selection(), config.selection());
+}
+
+#[test]
 fn turn_drafter_row_is_listed_only_while_the_turn_optimizer_is_on() {
     use crate::llm::model_config::{ROLES, RoleSource, TURN_DRAFTER};
     assert_eq!(ROLES.last().map(|(role, _)| *role), Some(TURN_DRAFTER));

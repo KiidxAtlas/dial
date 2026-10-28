@@ -56,10 +56,21 @@ fn claim_writer(file: &File) -> io::Result<()> {
     }
 }
 
+/// One validated exploration rewind: the checkpoint it anchors to and the report branch it appends.
+pub struct ExplorationRewind<'a> {
+    pub owner_id: &'a str,
+    pub expected_leaf: &'a str,
+    pub anchor: &'a str,
+    pub report: Value,
+    pub siblings: Vec<Value>,
+    pub control: Value,
+    pub digest: String,
+}
+
 /// Writer-claim outcome. Contention is a value so `open_or_fork` can fall back to a fork; every
 /// other claim failure stays an error.
 enum Claimed {
-    Owned(Session),
+    Owned(Box<Session>),
     Contended(io::Error),
 }
 
@@ -993,7 +1004,7 @@ impl Session {
     /// refused before loading or repairing history; read-only inspection is separate.
     pub fn open(path: &Path) -> Result<Session> {
         match Self::claim_open(path)? {
-            Claimed::Owned(session) => Ok(session),
+            Claimed::Owned(session) => Ok(*session),
             Claimed::Contended(error) => Err(busy_session_error(path, error)),
         }
     }
@@ -1014,7 +1025,7 @@ impl Session {
             }
         }
         match Self::claim_open(path)? {
-            Claimed::Owned(session) => Ok(Resumed::Owned(session)),
+            Claimed::Owned(session) => Ok(Resumed::Owned(*session)),
             Claimed::Contended(error) => {
                 let snapshot = Self::read(path)?;
                 Self::fork_snapshot(
@@ -1086,7 +1097,7 @@ impl Session {
         s.runtime
             .journal(crate::runtime::stream_journal::Journal::open(path)?);
         s.repair_incomplete_tools()?;
-        Ok(Claimed::Owned(s))
+        Ok(Claimed::Owned(Box::new(s)))
     }
 
     /// Inspect a persisted journal without claiming writer ownership or repairing it.
@@ -3793,16 +3804,16 @@ impl Session {
     /// Append a new report branch under the checkpoint; the discarded exploration remains
     /// immutable and searchable. Current same-owner notebook, controls and real runtime
     /// outcomes are carried, not rolled back to obsolete approvals/tasks at the checkpoint.
-    pub fn rewind_exploration(
-        &mut self,
-        owner_id: &str,
-        expected_leaf: &str,
-        anchor: &str,
-        report: Value,
-        siblings: Vec<Value>,
-        control: Value,
-        digest: String,
-    ) -> Result<JournalCommit> {
+    pub fn rewind_exploration(&mut self, rewind: ExplorationRewind<'_>) -> Result<JournalCommit> {
+        let ExplorationRewind {
+            owner_id,
+            expected_leaf,
+            anchor,
+            report,
+            siblings,
+            control,
+            digest,
+        } = rewind;
         ensure!(
             self.owns_journal() && self.id == owner_id && self.branch_leaf() == Some(expected_leaf),
             "rewind owner or branch changed; no report branch committed"

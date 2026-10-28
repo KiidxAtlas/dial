@@ -131,6 +131,7 @@ fn every_path_is_a_real_key_with_the_real_default() {
                     | "snowflake_account"
                     | "cloudflare_account_id"
                     | "cloudflare_gateway_id"
+                    | "image.api_key_env"
             );
             let unset = default == Value::String(String::new())
                 || default == Value::String("auto".into())
@@ -448,18 +449,18 @@ fn every_serialized_setting_has_a_management_route() {
         if registry().iter().any(|def| def.path == path) {
             return;
         }
-        if let serde_json::Value::Object(table) = value {
-            if !table.is_empty() {
-                for (key, value) in table {
-                    let child = if path.is_empty() {
-                        key.clone()
-                    } else {
-                        format!("{path}.{key}")
-                    };
-                    visit(value, &child, missing);
-                }
-                return;
+        if let serde_json::Value::Object(table) = value
+            && !table.is_empty()
+        {
+            for (key, value) in table {
+                let child = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                visit(value, &child, missing);
             }
+            return;
         }
         missing.push(path.to_owned());
     }

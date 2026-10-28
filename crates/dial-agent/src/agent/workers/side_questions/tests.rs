@@ -7,7 +7,7 @@ fn start_returns_while_work_is_blocked_and_delivers_once_acknowledged() {
     let id = questions
         .start(move |_| receive.recv().map_err(|e| e.to_string()))
         .unwrap();
-    assert_eq!(questions.running_ids(), [id.clone()]);
+    assert_eq!(questions.running_ids(), std::slice::from_ref(&id));
     assert!(questions.undelivered().is_empty());
     send.send("answer".into()).unwrap();
     let result = questions

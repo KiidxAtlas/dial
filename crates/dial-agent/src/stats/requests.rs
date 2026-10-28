@@ -1,7 +1,7 @@
 //! Request-level views of the ledger: the newest requests, one request's full row, and the live
 //! session (the most recently active transcript).
 
-use super::{Db, Totals, Trace, TraceRequest, TraceTool, session_file_in_tree};
+use super::{Db, Totals, TraceRequest, TraceTool, session_file_in_tree};
 use anyhow::Result;
 use rusqlite::{OptionalExtension, Row, params};
 use serde::Serialize;

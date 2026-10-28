@@ -695,3 +695,33 @@ fn stored_chatgpt_file_keeps_its_shape_through_the_shared_store() {
     assert_eq!(keys(&file), vec!["accounts", "active"]);
     assert!(accounts(dir.path()).unwrap()[0].active);
 }
+
+#[test]
+fn hosted_image_capability_survives_account_catalog_roundtrip() {
+    use super::super::profiles::ImageGenerationApi;
+    let dir = tempfile::tempdir().unwrap();
+    test_account(dir.path(), false);
+    test_catalog(
+        dir.path(),
+        &serde_json::json!({"models":[
+            {"slug":"image-capable", "experimental_supported_tools":["image_generation"]},
+            {"slug":"vision-only", "input_modalities":["text","image"]}
+        ]}),
+    );
+    assert_eq!(
+        scoped_model_profile(dir.path(), Some("oaiapp_test"), "image-capable")
+            .unwrap()
+            .unwrap()
+            .capabilities
+            .image_generation,
+        Some(ImageGenerationApi::Responses)
+    );
+    assert_eq!(
+        scoped_model_profile(dir.path(), Some("oaiapp_test"), "vision-only")
+            .unwrap()
+            .unwrap()
+            .capabilities
+            .image_generation,
+        None
+    );
+}

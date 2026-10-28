@@ -1551,16 +1551,28 @@ pub fn create_operation(
     }
 }
 
-fn finish_operation(
-    lines: &[String],
+/// Where one parsed operation block sits in the patch: the full line list, the index that ends
+/// the block, its path, and whether it applies to every match.
+struct Section<'a> {
+    lines: &'a [String],
     end_index: usize,
-    path: &str,
+    path: &'a str,
+    all: bool,
+}
+
+fn finish_operation(
+    section: &Section<'_>,
     pattern_lines: &[String],
     rewrite_lines: &[String],
     reference_separator: Option<&str>,
-    all: bool,
     operations: &mut Vec<Operation>,
 ) -> Result<(), EditError> {
+    let &Section {
+        lines,
+        end_index,
+        path,
+        all,
+    } = section;
     let source = normalize_block(pattern_lines, false);
     let rewrite = normalize_block(rewrite_lines, true);
     if let Some(reference) = reference_separator.filter(|_| rewrite.trim().is_empty()) {
@@ -1645,16 +1657,19 @@ fn finish_operation(
 }
 
 fn finish_pattern(
-    lines: &[String],
-    end_index: usize,
+    section: &Section<'_>,
     content: &str,
-    path: &str,
     pattern_lines: &[String],
-    all: bool,
     streaming: bool,
     operations: &mut Vec<Operation>,
     pending: &mut Vec<(usize, String)>,
 ) -> Result<(), EditError> {
+    let &Section {
+        lines,
+        end_index,
+        path,
+        all,
+    } = section;
     let source = normalize_block(pattern_lines, false);
     let number = operations.len() + 1;
     if has_inline_selection(&source) || has_marker_lines(&source) || has_bare_desired(&source) {
@@ -1981,12 +1996,14 @@ pub(super) fn parse_section(
             } else if let Some(opener) = parsed_opener {
                 if pattern.has_content {
                     finish_pattern(
-                        &lines,
-                        index,
+                        &Section {
+                            lines: &lines,
+                            end_index: index,
+                            path,
+                            all,
+                        },
                         content,
-                        path,
                         &pattern.lines,
-                        all,
                         false,
                         &mut operations,
                         &mut pending,
@@ -2003,13 +2020,15 @@ pub(super) fn parse_section(
         }
         if let Some(opener) = parsed_opener {
             finish_operation(
-                &lines,
-                index,
-                path,
+                &Section {
+                    lines: &lines,
+                    end_index: index,
+                    path,
+                    all,
+                },
                 &pattern.lines,
                 &rewrite.lines,
                 reference_separator.as_deref(),
-                all,
                 &mut operations,
             )?;
             all = opener == OpenerKind::All;
@@ -2035,22 +2054,26 @@ pub(super) fn parse_section(
     }
     match state {
         State::Rewrite => finish_operation(
-            &lines,
-            lines.len(),
-            path,
+            &Section {
+                lines: &lines,
+                end_index: lines.len(),
+                path,
+                all,
+            },
             &pattern.lines,
             &rewrite.lines,
             reference_separator.as_deref(),
-            all,
             &mut operations,
         )?,
         State::Pattern => finish_pattern(
-            &lines,
-            lines.len(),
+            &Section {
+                lines: &lines,
+                end_index: lines.len(),
+                path,
+                all,
+            },
             content,
-            path,
             &pattern.lines,
-            all,
             streaming,
             &mut operations,
             &mut pending,

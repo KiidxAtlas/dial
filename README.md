@@ -32,7 +32,7 @@ Ollama) or hosted providers, with approvals, sandboxing and checkpoints included
 - **Keyboard-driven terminal UI.** Steer or queue messages while the agent works, browse its work
   plan, open the action palette with `Ctrl-P`, and change settings without leaving the session.
 - **Delegation and integrations.** Subagents with typed roles, MCP servers, skills, hooks, SSH,
-  browser and kernel tools, an RPC/ACP interface for editors, and a one-shot print mode for scripts.
+  browser and `eval` (JavaScript/Python) tools, an RPC/ACP interface for editors, and a one-shot print mode for scripts.
 - **Optional learning.** `dial improve` runs verified practice, harness proposals and local LoRA
   training behind an external evaluation gate. This stays off unless you turn on **Teach this model**
   for a local model (`/settings` → Model → Learning). Ordinary sessions never open a learning store
@@ -204,7 +204,7 @@ This README is an overview. Detailed documentation lives in [`docs/`](docs/), an
 - Local MLX inference and training require Apple Silicon. Intel Macs and Linux/WSL2 use hosted or OpenAI-compatible providers, or GGUF through llama.cpp.
 - By default, local compute is serialized across projects. Turning off **Compute locks** in Settings → Model → Local worker (`compute_locks = false`) allows concurrent model work, but this can exhaust RAM or GPU memory. Laya roles never require the compute lock. With locks enabled, a session that queues improvement releases compute once it is idle and its child agents have finished; a later turn waits if the cycle holds compute. Dial makes no claim of zero-downtime training.
   While a turn waits for compute, the elapsed timer keeps running and commands follow the same live/deferred/interrupting policy as during inference. Turn duration includes the wait; once compute is acquired, the status returns to Working.
-- The TUI is keyboard-driven, and not every terminal supports modified Enter keys. `dial schedule` handles scheduling but does not install a daemon. Voice (text-to-speech, push-to-talk dictation and protocol live sessions) is described in [docs/voice.md](docs/voice.md). The browser and kernel tools require OS containment; they fail closed rather than falling back to unrestricted execution.
+- The TUI is keyboard-driven, and not every terminal supports modified Enter keys. `dial schedule` handles scheduling but does not install a daemon. Voice (text-to-speech, push-to-talk dictation and protocol live sessions) is described in [docs/voice.md](docs/voice.md). The browser and `eval` tools require OS containment; they fail closed rather than falling back to unrestricted execution.
 - Live memory and skill edits are your working state and are not gated; only the admitted harness is.
 - Operator tools are trusted programs and are not sandboxed during live work; they are excluded from automatic evaluation. Outside macOS, `bash` is unavailable for live use unless `sandbox.mode = "off"`, while generated evaluations still require the strict sandbox.
 

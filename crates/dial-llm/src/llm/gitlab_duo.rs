@@ -85,13 +85,17 @@ pub(super) fn exchange(
         headers: &borrowed,
     };
     transports::exchange_wire(
-        Wire::Anthropic,
-        endpoint,
-        req,
-        timeout_secs,
+        transports::WireRequest {
+            wire: Wire::Anthropic,
+            endpoint,
+            req,
+            limits: super::Limits {
+                timeout_secs,
+                interrupt,
+            },
+            profile,
+        },
         on_text,
-        interrupt,
-        profile,
         on_event,
         None,
     )

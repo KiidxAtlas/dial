@@ -12,6 +12,7 @@ use crate::config::compaction::CompactionOptions;
 use crate::config::compaction::CompactionReason;
 use crate::config::compaction::CompactionStrategy;
 use crate::config::compaction::NativeCompactionCapability;
+use crate::llm::provider::NativeCompactionRequest;
 use crate::llm::wire::estimate;
 
 use crate::storage::transcript::{complete_boundary, is_history};
@@ -188,6 +189,14 @@ pub struct CompactionContext<'a> {
     pub native_request: Option<&'a Chat>,
 }
 
+/// The immutable source of one history compaction and the invocation settings applied to it.
+pub struct HistoryCompaction<'a> {
+    pub request: &'a Chat,
+    pub policy: &'a CompactionConfig,
+    pub context: CompactionContext<'a>,
+    pub options: &'a CompactionOptions,
+}
+
 #[derive(Clone)]
 pub struct CompactionSnapshot {
     pub source: Chat,
@@ -315,15 +324,18 @@ pub fn replacement_request(source: &Chat, history: &[Value]) -> Chat {
 /// Prepare only. Callers validate their exact final projection and current snapshot before committing.
 pub fn compact_history(
     backend: &mut Backend,
-    request: &Chat,
-    policy: &CompactionConfig,
-    context: CompactionContext<'_>,
-    options: &CompactionOptions,
+    input: HistoryCompaction<'_>,
     interrupt: Arc<AtomicBool>,
     ui: &mut dyn Ui,
     complete: &mut dyn FnMut(&mut Backend, &Chat, &mut dyn Ui) -> Result<String>,
     mut remote_observer: Option<&mut RemoteCompactionObserver<'_>>,
 ) -> Result<PreparedCompaction> {
+    let HistoryCompaction {
+        request,
+        policy,
+        context,
+        options,
+    } = input;
     policy.validate()?;
     interrupted(&interrupt)?;
     let before = request_tokens_with_policy(
@@ -458,12 +470,14 @@ pub fn compact_history(
                     }
                     let response = with_ui(ui, interrupt.clone(), || {
                         backend.compact_native(
-                            &native_request,
-                            capability,
-                            policy.remote_streaming_v2_enabled,
-                            policy.v2_retained_message_budget,
-                            native_cut,
-                            &instructions,
+                            NativeCompactionRequest {
+                                request: &native_request,
+                                capability,
+                                streaming_v2: policy.remote_streaming_v2_enabled,
+                                retained_user_budget: policy.v2_retained_message_budget,
+                                first_kept: native_cut,
+                                instructions: &instructions,
+                            },
                             context.timeout_secs,
                             interrupt.clone(),
                         )

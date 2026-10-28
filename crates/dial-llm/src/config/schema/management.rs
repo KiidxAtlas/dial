@@ -371,6 +371,13 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Maximum turn and session cost in USD (hard caps; zero disables each), plus warn_session_cost_usd and warn_turn_cost_usd notices shown once per crossing without stopping work."
     ),
     structured!(
+        "image.api_key_env",
+        TO,
+        "Image generation",
+        "API key variable",
+        "Name of an environment variable that holds the image endpoint's key, not the key itself. Unset uses the endpoint's standard variable or a key saved through /providers."
+    ),
+    structured!(
         "retry.fallback_chains",
         MO,
         "Requests",

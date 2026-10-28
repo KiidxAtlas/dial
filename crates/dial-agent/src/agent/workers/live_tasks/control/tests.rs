@@ -94,9 +94,11 @@ fn late_acknowledgement_never_marks_a_newer_queued_revision_applied() {
 
 #[test]
 fn failed_take_keeps_previous_backend_and_leaves_later_queue_intact() {
-    let mut slot = SettingsSlot::default();
-    slot.revision = 1;
-    slot.queued = true;
+    let mut slot = SettingsSlot {
+        revision: 1,
+        queued: true,
+        ..SettingsSlot::default()
+    };
     assert!(slot.take().is_some());
     slot.fail("journal write failed");
     assert_eq!(slot.applied_revision, 0);

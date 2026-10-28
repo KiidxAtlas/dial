@@ -31,10 +31,12 @@ impl Agent<'_> {
         };
         // Edit-family deny rules and scoped grants judge the resolved target, as for native edits.
         if let Err(why) = crate::agent::safety::approval::authorize_mutation_paths(
-            &self.always,
-            self.workspace.root(),
-            self.workspace.additional_roots(),
-            false,
+            crate::agent::safety::approval::MutationPolicy {
+                rules: &self.always,
+                root: self.workspace.root(),
+                extra_roots: self.workspace.additional_roots(),
+                read_only: false,
+            },
             call,
             NAME,
             std::slice::from_ref(&target),

@@ -143,12 +143,20 @@ fn a_deadline_passing_during_a_tool_round_skips_the_unstarted_calls_and_stops() 
     );
 }
 
-/// Interrupts the turn as soon as the first tool result is shown.
-struct InterruptAfterFirstResult(std::sync::Arc<std::sync::atomic::AtomicBool>);
+/// Interrupts only once both parallel reads have visibly completed, before the write can run.
+struct InterruptAfterParallelReads {
+    interrupt: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    finished_reads: usize,
+}
 
-impl Ui for InterruptAfterFirstResult {
-    fn tool_result_with_id(&mut self, _call_id: &str, _name: &str, _output: &ToolOutput) {
-        self.0.store(true, Ordering::SeqCst);
+impl Ui for InterruptAfterParallelReads {
+    fn tool_result_with_id(&mut self, _call_id: &str, name: &str, _output: &ToolOutput) {
+        if name == "read" {
+            self.finished_reads += 1;
+            if self.finished_reads == 2 {
+                self.interrupt.store(true, Ordering::SeqCst);
+            }
+        }
     }
 }
 
@@ -167,7 +175,12 @@ fn an_interrupt_keeps_finished_parallel_reads_and_marks_the_rest_not_run() {
         for (name, text) in [("a.txt", "alpha\n"), ("b.txt", "bravo\n")] {
             std::fs::write(agent.workspace.root().join(name), text).unwrap();
         }
-        let mut ui = InterruptAfterFirstResult(agent.interrupt.clone());
+        // A first result does not imply the sibling has started, even for tiny files.
+        // Wait for observable completion of both reads rather than racing their workers.
+        let mut ui = InterruptAfterParallelReads {
+            interrupt: agent.interrupt.clone(),
+            finished_reads: 0,
+        };
         let report = agent.turn("Read both, then write", &mut ui).unwrap();
         let results: Vec<Value> = agent
             .session

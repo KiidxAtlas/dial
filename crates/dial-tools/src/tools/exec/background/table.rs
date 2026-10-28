@@ -401,17 +401,30 @@ pub(super) struct Proc {
     session: Option<SessionClaim>,
 }
 
+/// How a job's process is attached: a `rows` x `cols` terminal when `terminal`, and whether its
+/// stdin stays open for `stdin`.
+#[derive(Clone, Copy)]
+pub(super) struct Attachment {
+    pub(super) terminal: bool,
+    pub(super) stdin: bool,
+    pub(super) rows: u16,
+    pub(super) cols: u16,
+}
+
 impl Proc {
     fn spawn(
         ws: &Workspace,
         name: String,
         command: &str,
         cwd: &Path,
-        terminal: bool,
-        stdin: bool,
-        rows: u16,
-        cols: u16,
+        attachment: Attachment,
     ) -> Result<Proc, String> {
+        let Attachment {
+            terminal,
+            stdin,
+            rows,
+            cols,
+        } = attachment;
         let spool = ws
             .artifacts()
             .map(|store| store.spool())
@@ -618,7 +631,11 @@ impl Proc {
         self.stop.store(true, Ordering::Release);
         self.input.take();
         let status = self.group.wait().ok();
-        let clean = failure.is_none() && status.as_ref().is_some_and(ExitStatus::success);
+        // A normal nonzero exit still publishes session state; signals and unavailable status do not.
+        let clean = failure.is_none()
+            && status
+                .as_ref()
+                .is_some_and(|status| status.code().is_some());
         if let Some(claim) = self.session.take() {
             claim.settle(clean);
         }
@@ -889,10 +906,7 @@ impl Table {
         name: Option<&str>,
         command: &str,
         cwd: &Path,
-        terminal: bool,
-        stdin: bool,
-        rows: u16,
-        cols: u16,
+        attachment: Attachment,
     ) -> Result<(String, u32), String> {
         self.refresh();
         let name = match name {
@@ -915,7 +929,7 @@ impl Table {
                 "{MAX_PROCESSES} background processes are already running; kill one first"
             ));
         }
-        let proc = Proc::spawn(ws, name.clone(), command, cwd, terminal, stdin, rows, cols)?;
+        let proc = Proc::spawn(ws, name.clone(), command, cwd, attachment)?;
         // Only now that the spawn worked is a finished entry of the same name replaced.
         if let Some(i) = self.position(&name) {
             self.discard(i);

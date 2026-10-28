@@ -415,10 +415,10 @@ fn inline(ws: &Workspace, text: String) -> String {
     }
     let mut out = text[..end].to_owned();
     out.push_str("\n…[output truncated");
-    if let Some(store) = ws.artifacts() {
-        if let Ok(uri) = store.retain(&text) {
-            out.push_str(&format!("; full text: {uri}"));
-        }
+    if let Some(store) = ws.artifacts()
+        && let Ok(uri) = store.retain(&text)
+    {
+        out.push_str(&format!("; full text: {uri}"));
     }
     out.push(']');
     out

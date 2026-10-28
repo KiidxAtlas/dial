@@ -179,6 +179,14 @@ fn resolve_run_source(
     }
 }
 
+/// Per-run settings for `ComputerSession::run_source` besides the code itself.
+struct RunSettings<'a> {
+    cwd: &'a str,
+    coordinate_safe: bool,
+    read_only: bool,
+    timeout: Option<f64>,
+}
+
 /// Confirmation request forwarded from a worker control thread to the tool thread.
 struct ConfirmRequest {
     summary: String,
@@ -286,11 +294,13 @@ impl ComputerSession {
                 let read_only = read_only == Some(true);
                 self.run_source(
                     source,
-                    cwd,
-                    coordinate_safe,
+                    RunSettings {
+                        cwd,
+                        coordinate_safe,
+                        read_only,
+                        timeout,
+                    },
                     confirm,
-                    read_only,
-                    timeout,
                     signal,
                 )
             }
@@ -302,11 +312,13 @@ impl ComputerSession {
                 let read_only = is_read_only_computer_call(&chain).map_err(ComputerError::tool)?;
                 self.run_source(
                     source,
-                    cwd,
-                    coordinate_safe,
+                    RunSettings {
+                        cwd,
+                        coordinate_safe,
+                        read_only,
+                        timeout,
+                    },
                     confirm,
-                    read_only,
-                    timeout,
                     signal,
                 )
             }
@@ -318,13 +330,16 @@ impl ComputerSession {
     fn run_source(
         &self,
         code: String,
-        cwd: &str,
-        coordinate_safe: bool,
+        settings: RunSettings<'_>,
         confirm: Option<&dyn Fn(&str) -> bool>,
-        read_only: bool,
-        timeout: Option<f64>,
         signal: &AbortSignal,
     ) -> ComputerResult<Value> {
+        let RunSettings {
+            cwd,
+            coordinate_safe,
+            read_only,
+            timeout,
+        } = settings;
         let timeout = clamp_timeout(timeout);
         let request = RunRequest {
             code,

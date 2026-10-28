@@ -222,10 +222,12 @@ impl<'a> Agent<'a> {
         let previous_namespace = self.active_side_namespace.replace(namespace);
         let prepared = crate::agent::compact::compaction::compact_history(
             backend,
-            &snapshot.source,
-            &snapshot.policy,
-            snapshot.context(),
-            options,
+            crate::agent::compact::compaction::HistoryCompaction {
+                request: &snapshot.source,
+                policy: &snapshot.policy,
+                context: snapshot.context(),
+                options,
+            },
             cancel,
             ui,
             &mut |backend, request, ui| {

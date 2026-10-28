@@ -531,6 +531,41 @@ impl Registry {
     pub fn origin(&self, name: &str) -> Option<crate::tools::surface::catalog::Origin> {
         self.origins.get(name).copied()
     }
+    /// Refresh native image availability after a model/account switch, without replacing extensions.
+    /// Explicit integration opt-in remains available even without automatic credentials.
+    ///
+    /// # Errors
+    /// Returns invalid explicit image configuration or credential lookup failures.
+    pub fn sync_image_generation(
+        &mut self,
+        config: &crate::config::types::Config,
+    ) -> anyhow::Result<bool> {
+        use crate::tools::{
+            net::image_gen,
+            surface::catalog::{Origin, integration_enabled},
+        };
+        let name = image_gen::TOOL;
+        if self.contains(name) && self.origin(name) != Some(Origin::Native) {
+            return Ok(false);
+        }
+        let tools = if integration_enabled(name, &config.integrations) {
+            image_gen::tools(config)
+        } else {
+            image_gen::auto_tools(config)?
+        };
+        let available = !tools.is_empty();
+        if self.contains(name) == available {
+            return Ok(false);
+        }
+        if available {
+            for tool in tools {
+                self.register_native(tool);
+            }
+        } else {
+            self.remove(name);
+        }
+        Ok(true)
+    }
     /// Applies the MCP servers' current tool lists. Returns whether any registered tool changed,
     /// so the caller rebuilds the offered schemas. Removed tools leave the registry; redefined
     /// tools replace theirs.

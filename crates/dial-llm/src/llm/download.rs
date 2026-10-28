@@ -263,6 +263,19 @@ pub fn search_embedding(query: &str) -> Result<Vec<Hit>> {
     parse_search(Family::Gguf, &text)
 }
 
+fn image_search_query(query: &str) -> Vec<(&str, &str)> {
+    let mut params = search_query(Family::Mlx, query);
+    params.push(("pipeline_tag", "text-to-image"));
+    params
+}
+
+/// MLX text-to-image repositories, using declared Hub tags rather than repository names.
+/// Network metadata only; weights are fetched only after an explicit model selection.
+pub fn search_images(query: &str) -> Result<Vec<Hit>> {
+    let text = get_text(API, &image_search_query(query))?;
+    parse_search(Family::Mlx, &text)
+}
+
 /// Metadata for one repository, including its whole-repository storage when reported.
 /// Network only; no file listing or weights are fetched.
 pub fn metadata(family: Family, repo: &str) -> Result<Hit> {

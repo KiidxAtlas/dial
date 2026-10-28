@@ -1,4 +1,3 @@
-use super::super::Recency;
 use super::super::domains::UNFILTERED;
 use super::*;
 

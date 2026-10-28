@@ -1,9 +1,9 @@
 //! `image_gen`: one generated image from an OpenAI-compatible `images/generations` endpoint,
 //! written to a new workspace file.
 //!
-//! Explicit `[image]` overrides win. Otherwise a declared image-capable selected model is used
-//! with its own connection and credentials, before the provider image-model fallback.
-//! Image-input support alone never enables generation. Automatic offering reads only local state.
+//! Explicit image settings and roles win. Otherwise use main's image route, its provider's image
+//! default, configured image profiles, then keyed provider defaults. Tool availability is independent
+//! of main's vision capability. Automatic offering reads local state only; calls require approval.
 //!
 //! Request validation, path resolution, destination preflight and mutation authority run before
 //! generation. Provider errors or a later filesystem race can still fail a paid request. Returned
@@ -32,12 +32,13 @@ const MAX_PROMPT_BYTES: usize = 4_000;
 const MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_ERROR_CHARS: usize = 300;
 const PNG_SIGNATURE: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
-const DESCRIPTION: &str = "Generate one image using the selected model when it declares image output, \
-    otherwise the configured image endpoint or provider image model, and write it to a new workspace \
-    file. Output must be PNG, JPEG, or WebP, and the file extension must match the format. \
-    Existing files are never overwritten. The written image is attached to the result for \
-    vision-capable models: inspect it and generate a revised file when it misses the request. \
-    Requires approval.";
+const DESCRIPTION: &str = "Generate one image through the resolved image service, independently of \
+    the main chat model's image-output capability, and write it to a new workspace file. Explicit \
+    image settings/role win; otherwise available configured routes are selected automatically. \
+    ChatGPT hosted-image support may be unverified for the model/account; provider rejection is \
+    reported without retrying another billing route. Output must be PNG, JPEG, or WebP, and the \
+    extension must match. Existing files are never overwritten. The image is attached for \
+    vision-capable models to inspect and revise into a new file. Requires approval.";
 
 /// Hosted session providers whose `images/generations` route returns base64 images:
 /// (API host, default image model, request shape).
@@ -51,20 +52,24 @@ pub fn tools(_config: &Config) -> Vec<Arc<dyn Tool>> {
     vec![Arc::new(ImageGen)]
 }
 
-/// The tool when `image.auto` is on and the resolved image endpoint has an API key. Reads only
-/// local credentials (environment, saved keys); never contacts the provider. With default `[image]`
-/// settings, a missing key simply means the tool is not offered.
+/// Offer a shared image route using local configuration and credentials, never network probes.
+/// Missing default credentials leave the tool unavailable; explicit route failures are reported.
 ///
 /// # Errors
-/// Returns credential/configuration failures for customized `[image]` settings, so the registry
-/// can explain why the configured endpoint is unavailable.
+/// Returns failures for customized image settings, assigned roles and selected image routes.
 pub fn auto_tools(config: &Config) -> Result<Vec<Arc<dyn Tool>>> {
     if !config.image.auto {
         return Ok(Vec::new());
     }
     match resolve(config) {
         Ok(_) => Ok(tools(config)),
-        Err(error) if customized(&config.image) => Err(error),
+        Err(error)
+            if customized(&config.image)
+                || config.role_selection("image").is_some()
+                || config.provider.as_deref() == Some(crate::llm::chatgpt::PROVIDER) =>
+        {
+            Err(error)
+        }
         Err(_) => Ok(Vec::new()),
     }
 }
@@ -84,6 +89,8 @@ enum Wire {
     OpenAi,
     /// xAI: `aspect_ratio` instead of `size`, and `response_format` for base64 data.
     Xai,
+    /// Native MLX-Serve Images API, returning PNG only.
+    MlxServe,
     Responses,
     ChatCompletions,
 }
@@ -117,13 +124,24 @@ struct Target {
 fn resolve(config: &Config) -> Result<Target> {
     let image = &config.image;
     let customized = customized(image);
-    if !customized && let Some(target) = selected::resolve(config)? {
-        return Ok(target);
+    let mut selected_error = None;
+    if !customized {
+        match selected::resolve(config) {
+            Ok(Some(target)) => return Ok(target),
+            Err(error) if config.role_selection("image").is_some() => return Err(error),
+            Err(error) => selected_error = Some(error),
+            Ok(None) => {}
+        }
+        ensure!(
+            config.role_selection("image").is_none(),
+            "the assigned image model is unavailable"
+        );
     }
     let session = config
         .endpoint
         .as_ref()
         .filter(|_| !customized)
+        .filter(|_| provider_enabled(config, config.provider.as_deref().unwrap_or_default()))
         .and_then(|endpoint| {
             let host = host(&endpoint.base_url)?;
             let (_, model, wire) = PROVIDERS.iter().find(|(known, _, _)| *known == host)?;
@@ -140,16 +158,42 @@ fn resolve(config: &Config) -> Result<Target> {
     if let Some(target) = session {
         return Ok(target);
     }
-    let key = crate::llm::catalog::resolve_credential(
-        &config.user_dir,
-        image.base_url.trim_end_matches('/'),
-        image.api_key_env.as_deref(),
-    )?
-    .ok_or_else(|| {
-        anyhow!(
-            "no API key for image generation; save one through /providers or set image.api_key_env"
+    if !customized && let Some(target) = configured_target(config) {
+        return Ok(target);
+    }
+    let key = if customized || provider_enabled(config, "openai") {
+        crate::llm::catalog::resolve_credential(
+            &config.user_dir,
+            image.base_url.trim_end_matches('/'),
+            image.api_key_env.as_deref(),
         )
-    })?;
+    } else {
+        Ok(None)
+    };
+    let key = match key {
+        Ok(Some(key)) => key,
+        missing if !customized => {
+            if provider_enabled(config, "xai")
+                && let Some(key) = credential(config, "https://api.x.ai/v1", None)
+            {
+                return Ok(Target {
+                    base_url: "https://api.x.ai/v1".into(),
+                    model: "grok-imagine-image-2.0".into(),
+                    wire: Wire::Xai,
+                    key,
+                    account_id: None,
+                    headers: Vec::new(),
+                });
+            }
+            if let Some(error) = selected_error {
+                return Err(error);
+            }
+            missing?.context("no image generation route; assign an image role in /models or configure an image provider")?
+        }
+        missing => missing?.context(
+            "no API key for image generation; save one through /providers or set image.api_key_env",
+        )?,
+    };
     Ok(Target {
         base_url: image.base_url.clone(),
         model: image.model.clone(),
@@ -158,6 +202,53 @@ fn resolve(config: &Config) -> Result<Target> {
         account_id: None,
         headers: Vec::new(),
     })
+}
+
+/// Respect provider opt-outs before inspecting any credentials for automatic routes.
+fn provider_enabled(config: &Config, provider: &str) -> bool {
+    use crate::llm::{chatgpt, model_config::AuthMethod};
+    config.providers.get(provider).is_none_or(|spec| {
+        spec.enabled
+            && if provider == chatgpt::PROVIDER {
+                spec.auth != AuthMethod::ApiKey
+            } else {
+                spec.auth != AuthMethod::OAuth
+            }
+    })
+}
+
+/// Configured routes are shared by all chat models. Prefer declared image support over unknown
+/// ChatGPT hosted-tool support, then use stable profile-name order. Never retry after generation.
+fn configured_target(config: &Config) -> Option<Target> {
+    use crate::llm::{chatgpt, profiles::ImageGenerationApi};
+    for declared in [true, false] {
+        for (name, profile) in &config.model_profiles {
+            let api = profile.capabilities.image_generation;
+            let eligible = if declared {
+                api != Some(ImageGenerationApi::Disabled)
+                    && (api.is_some() || profile.provider != chatgpt::PROVIDER)
+            } else {
+                api.is_none() && profile.provider == chatgpt::PROVIDER
+            };
+            if !eligible || !provider_enabled(config, &profile.provider) {
+                continue;
+            }
+            let Ok(mut candidate) = config.with_named_model_profile(name) else {
+                continue;
+            };
+            // A model fallback must not silently switch a session's pinned subscription account.
+            if profile.provider == chatgpt::PROVIDER
+                && config.provider.as_deref() == Some(chatgpt::PROVIDER)
+                && let Some(endpoint) = &mut candidate.endpoint
+            {
+                endpoint.account_id = config.endpoint.as_ref().and_then(|e| e.account_id.clone());
+            }
+            if let Ok(Some(target)) = selected::resolve_current(&candidate) {
+                return Some(target);
+            }
+        }
+    }
+    None
 }
 
 fn credential(config: &Config, base_url: &str, variable: Option<&str>) -> Option<String> {
@@ -322,6 +413,10 @@ fn generate(ctx: &ToolContext, args: &Value) -> Result<Written> {
         "image_gen output extension must be .png, .jpg/.jpeg, or .webp"
     );
     let target = resolve(ctx.config)?;
+    ensure!(
+        target.wire != Wire::MlxServe || extension == "png",
+        "MLX-Serve returns PNG images; use a .png output path"
+    );
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("output has no parent directory"))?;
@@ -373,7 +468,7 @@ fn request_body(target: &Target, request: &Request) -> Value {
         "n": 1,
     });
     match target.wire {
-        Wire::OpenAi => {
+        Wire::OpenAi | Wire::MlxServe => {
             body["size"] = json!(request.size);
             // DALL·E models default to hosted URLs; gpt-image models always return base64 and
             // reject this field.
@@ -402,16 +497,23 @@ fn request_image(target: &Target, config: &Config, request: &Request) -> Result<
         return selected::responses(target, config, request);
     }
     let base = target.base_url.trim_end_matches('/');
-    let path = if target.wire == Wire::ChatCompletions { "chat/completions" } else { "images/generations" };
+    let path = if target.wire == Wire::ChatCompletions {
+        "chat/completions"
+    } else {
+        "images/generations"
+    };
     let headers = crate::llm::model_config::resolve_headers(&target.headers)?;
     let agent = crate::llm::agent_with(config.image.timeout_secs, true, None, None);
-    let mut builder = agent.post(&format!("{base}/{path}"))
-        .header("authorization", format!("Bearer {}", target.key));
+    let mut builder = agent.post(&format!("{base}/{path}"));
+    if !target.key.is_empty() {
+        builder = builder.header("authorization", format!("Bearer {}", target.key));
+    }
     for (name, value) in headers.pairs() {
         builder = builder.header(name, value);
     }
-    let mut response = builder.send_json(request_body(target, request))
-        .map_err(|error| headers.redact_error(anyhow!(error).context("requesting image generation")))?;
+    let mut response = builder
+        .send_json(request_body(target, request))
+        .map_err(|error| headers.redact(anyhow!(error).context("requesting image generation")))?;
     let status = response.status().as_u16();
     let raw = response
         .body_mut()
@@ -420,9 +522,11 @@ fn request_image(target: &Target, config: &Config, request: &Request) -> Result<
         .read_to_vec()
         .context("reading image generation response")?;
     if target.wire == Wire::ChatCompletions && (200..300).contains(&status) {
-        return selected::chat_image(&serde_json::from_slice(&raw).context("invalid image chat response")?);
+        return selected::chat_image(
+            &serde_json::from_slice(&raw).context("invalid image chat response")?,
+        );
     }
-    parse_response(status, &raw)
+    parse_response(status, &raw).map_err(|error| headers.redact(error))
 }
 
 fn parse_response(status: u16, raw: &[u8]) -> Result<Vec<u8>> {

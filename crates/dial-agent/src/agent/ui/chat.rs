@@ -125,6 +125,17 @@ pub(in crate::agent) struct ChatOptions<'a> {
     pub(in crate::agent) recovery: Option<&'a crate::config::types::RequestRecoveryConfig>,
 }
 
+pub(in crate::agent) struct ChatSinks<'a> {
+    pub(in crate::agent) ui: &'a mut dyn Ui,
+    pub(in crate::agent) on_idle: &'a mut dyn FnMut(&mut dyn Ui),
+}
+
+pub(in crate::agent) struct ChatMonitors<'a, 'm> {
+    pub(in crate::agent) rules: Option<&'a mut crate::agent::safety::rules::Monitor<'m>>,
+    pub(in crate::agent) stream:
+        Option<&'a mut dyn crate::agent::run::streaming_dispatch::ToolStream>,
+}
+
 pub(in crate::agent) fn chat_with_ui(
     backend: &mut Backend,
     adapter: Option<&Path>,
@@ -135,7 +146,13 @@ pub(in crate::agent) fn chat_with_ui(
     on_idle: &mut dyn FnMut(&mut dyn Ui),
 ) -> Result<llm::Reply> {
     chat_with_ui_inner(
-        backend, adapter, request, options, interrupt, ui, on_idle, None,
+        backend,
+        adapter,
+        request,
+        options,
+        interrupt,
+        ChatSinks { ui, on_idle },
+        None,
     )
 }
 
@@ -145,12 +162,20 @@ pub(in crate::agent) fn chat_with_ui_inner(
     request: &Chat,
     options: ChatOptions<'_>,
     interrupt: Arc<AtomicBool>,
-    ui: &mut dyn Ui,
-    on_idle: &mut dyn FnMut(&mut dyn Ui),
+    sinks: ChatSinks<'_>,
     rules: Option<&mut crate::agent::safety::rules::Monitor<'_>>,
 ) -> Result<llm::Reply> {
     chat_with_ui_streaming(
-        backend, adapter, request, options, interrupt, ui, on_idle, rules, None,
+        backend,
+        adapter,
+        request,
+        options,
+        interrupt,
+        sinks,
+        ChatMonitors {
+            rules,
+            stream: None,
+        },
     )
 }
 
@@ -161,11 +186,14 @@ pub(in crate::agent) fn chat_with_ui_streaming(
     request: &Chat,
     options: ChatOptions<'_>,
     interrupt: Arc<AtomicBool>,
-    ui: &mut dyn Ui,
-    on_idle: &mut dyn FnMut(&mut dyn Ui),
-    mut rules: Option<&mut crate::agent::safety::rules::Monitor<'_>>,
-    mut stream: Option<&mut dyn crate::agent::run::streaming_dispatch::ToolStream>,
+    sinks: ChatSinks<'_>,
+    monitors: ChatMonitors<'_, '_>,
 ) -> Result<llm::Reply> {
+    let ChatSinks { ui, on_idle } = sinks;
+    let ChatMonitors {
+        mut rules,
+        mut stream,
+    } = monitors;
     let mut automatically_retried = false;
     let mut loop_attempts = 1;
     let mut redirected: Option<Chat> = None;
@@ -177,12 +205,16 @@ pub(in crate::agent) fn chat_with_ui_streaming(
             redirected.as_ref().unwrap_or(request),
             options,
             interrupt.clone(),
-            ui,
-            on_idle,
-            rules.as_deref_mut(),
-            stream.as_mut().map(|stream| {
-                &mut **stream as &mut dyn crate::agent::run::streaming_dispatch::ToolStream
-            }),
+            ChatSinks {
+                ui: &mut *ui,
+                on_idle: &mut *on_idle,
+            },
+            ChatMonitors {
+                rules: rules.as_deref_mut(),
+                stream: stream.as_mut().map(|stream| {
+                    &mut **stream as &mut dyn crate::agent::run::streaming_dispatch::ToolStream
+                }),
+            },
         );
         if result
             .as_ref()
@@ -274,11 +306,14 @@ pub(in crate::agent) fn chat_attempt_with_ui(
     request: &Chat,
     options: ChatOptions<'_>,
     interrupt: Arc<AtomicBool>,
-    ui: &mut dyn Ui,
-    on_idle: &mut dyn FnMut(&mut dyn Ui),
-    mut rules: Option<&mut crate::agent::safety::rules::Monitor<'_>>,
-    mut stream: Option<&mut dyn crate::agent::run::streaming_dispatch::ToolStream>,
+    sinks: ChatSinks<'_>,
+    monitors: ChatMonitors<'_, '_>,
 ) -> Result<llm::Reply> {
+    let ChatSinks { ui, on_idle } = sinks;
+    let ChatMonitors {
+        mut rules,
+        mut stream,
+    } = monitors;
     if let Some(monitor) = rules.as_deref_mut() {
         monitor.restart();
     }

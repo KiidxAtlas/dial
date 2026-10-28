@@ -122,7 +122,6 @@ fn a_session_switch_unregisters_schemes_so_later_reads_are_refused() {
     // With the scheme unserved, `read` falls through to the built-in resource schemes, which
     // refuse it as unregistered.
     let error = dial_tools::tools::integrations::resources::scheme("jira://PROJ-1")
-        .err()
-        .expect("an unregistered scheme must be refused");
+        .expect_err("an unregistered scheme must be refused");
     assert!(error.contains("unsupported resource scheme"));
 }

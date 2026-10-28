@@ -37,12 +37,11 @@ pub fn load_or_create_token(user_dir: &Path) -> io::Result<String> {
         .map_err(private_io_error)?;
     if let Some(existing) =
         crate::platform::atomic::read_private(&path).map_err(private_io_error)?
+        && let Ok(existing) = std::str::from_utf8(&existing)
     {
-        if let Ok(existing) = std::str::from_utf8(&existing) {
-            let token = existing.trim();
-            if is_valid_token(token) {
-                return Ok(token.to_owned());
-            }
+        let token = existing.trim();
+        if is_valid_token(token) {
+            return Ok(token.to_owned());
         }
     }
     let random: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();

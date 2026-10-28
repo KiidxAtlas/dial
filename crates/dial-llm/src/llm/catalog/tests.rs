@@ -1393,3 +1393,103 @@ fn llama_cpp_and_ollama_report_the_context_they_actually_serve() {
         "a server with none of the native APIs"
     );
 }
+
+#[test]
+fn image_generation_metadata_is_independent_of_image_input() {
+    use crate::llm::profiles::ImageGenerationApi;
+    assert_eq!(
+        image_generation_api(&serde_json::json!({"input_modalities":["text","image"]})),
+        None
+    );
+    assert_eq!(
+        metadata(&serde_json::json!({"architecture":{"output_modalities":["text","image"]}}))
+            .image_generation,
+        Some(ImageGenerationApi::ChatCompletions)
+    );
+    assert_eq!(
+        image_generation_api(&serde_json::json!({"output_modalities":["text"]})),
+        Some(ImageGenerationApi::Disabled)
+    );
+    assert_eq!(
+        image_generation_api(
+            &serde_json::json!({"experimental_supported_tools":["image_generation"],"output_modalities":["text"]})
+        ),
+        Some(ImageGenerationApi::Responses)
+    );
+}
+
+#[test]
+fn native_mlx_serve_image_metadata_works_under_any_endpoint_provider() {
+    use crate::llm::profiles::ImageGenerationApi;
+    for id in [
+        "ddalcu/Krea-2-Turbo-MLX-Serve-mixed-4-8",
+        "mlx-community/flux2-klein-9b-4bit",
+    ] {
+        let row = serde_json::json!({"id": id, "owned_by":"mlx-serve", "loaded":false, "capabilities":["image"]});
+        assert_eq!(declared_kind(&row), ModelKind::Image);
+        assert_eq!(
+            image_generation_api(&row),
+            Some(ImageGenerationApi::MlxServe)
+        );
+    }
+    let vision = serde_json::json!({"owned_by":"mlx-serve", "capabilities":["chat","vision"]});
+    assert_eq!(declared_kind(&vision), ModelKind::Chat);
+    assert_eq!(image_generation_api(&vision), None);
+    assert_eq!(
+        declared_kind(&serde_json::json!({"owned_by":"mlx-serve", "capabilities":["audio"]})),
+        ModelKind::Audio
+    );
+}
+
+#[test]
+fn nested_diffusion_snapshots_resolve_without_root_config_and_reject_missing_shards() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    for part in ["transformer", "vae", "text_encoder"] {
+        fs::create_dir_all(path.join(part)).unwrap();
+        fs::write(path.join(part).join("0.safetensors"), b"weights").unwrap();
+        fs::write(
+            path.join(part).join("model.safetensors.index.json"),
+            r#"{"weight_map":{"w":"0.safetensors"}}"#,
+        )
+        .unwrap();
+    }
+    assert_eq!(snapshot(path), Some(None));
+    assert_eq!(local_model_metadata(path).kind, ModelKind::Image);
+    assert_eq!(
+        Path::new(&resolve_local_model_in(path.to_str().unwrap(), None, None).unwrap()),
+        fs::canonicalize(path).unwrap()
+    );
+    fs::remove_file(path.join("vae/0.safetensors")).unwrap();
+    assert!(snapshot(path).is_none());
+    fs::write(
+        path.join("vae/model.safetensors.index.json"),
+        r#"{"weight_map":{"w":"../transformer/0.safetensors"}}"#,
+    )
+    .unwrap();
+    assert!(
+        snapshot(path).is_none(),
+        "index cannot escape its component"
+    );
+}
+
+#[test]
+fn krea_root_transformer_layout_is_an_image_not_chat() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("config.json"),
+        r#"{"model_type":"krea2_turbo"}"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("transformer_mixed_4_8.safetensors"),
+        b"weights",
+    )
+    .unwrap();
+    for part in ["vae", "text_encoder"] {
+        fs::create_dir_all(dir.path().join(part)).unwrap();
+        fs::write(dir.path().join(part).join("model.safetensors"), b"weights").unwrap();
+    }
+    assert_eq!(snapshot(dir.path()), Some(None));
+    assert_eq!(local_model_metadata(dir.path()).kind, ModelKind::Image);
+}

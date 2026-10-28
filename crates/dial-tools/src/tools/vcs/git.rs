@@ -131,18 +131,31 @@ fn combine(out: String, err: String) -> String {
     }
 }
 
-/// Run `program` with a bounded time. Returns (success, stdout, stderr), each complete up to
-/// `MAX_CAPTURE`; callers clip for display.
-fn run_streams(
-    program: &str,
-    args: &[String],
-    root: &Path,
+/// One bounded external command: program, arguments, working root, time limit and guards.
+struct Invocation<'a> {
+    program: &'a str,
+    args: &'a [String],
+    root: &'a Path,
     timeout: Duration,
     hooks: Hooks,
-    envs: &[(&str, &std::ffi::OsStr)],
-    cancel: &AtomicBool,
+    envs: &'a [(&'a str, &'a std::ffi::OsStr)],
+    cancel: &'a AtomicBool,
     may_mutate: bool,
-) -> Result<(bool, String, String), String> {
+}
+
+/// Run `program` with a bounded time. Returns (success, stdout, stderr), each complete up to
+/// `MAX_CAPTURE`; callers clip for display.
+fn run_streams(inv: Invocation<'_>) -> Result<(bool, String, String), String> {
+    let Invocation {
+        program,
+        args,
+        root,
+        timeout,
+        hooks,
+        envs,
+        cancel,
+        may_mutate,
+    } = inv;
     let mut command = Command::new(program);
     if program == "git" {
         // Repository config is untrusted: no fsmonitor, pager, external diff or textconv.
@@ -191,19 +204,8 @@ fn run_streams(
 
 /// Run `program` with a bounded time. Returns (success, stdout+stderr combined), complete up to
 /// `MAX_CAPTURE`; callers clip for display.
-fn run(
-    program: &str,
-    args: &[String],
-    root: &Path,
-    timeout: Duration,
-    hooks: Hooks,
-    envs: &[(&str, &std::ffi::OsStr)],
-    cancel: &AtomicBool,
-    may_mutate: bool,
-) -> Result<(bool, String), String> {
-    let (ok, out, err) = run_streams(
-        program, args, root, timeout, hooks, envs, cancel, may_mutate,
-    )?;
+fn run(inv: Invocation<'_>) -> Result<(bool, String), String> {
+    let (ok, out, err) = run_streams(inv)?;
     Ok((ok, combine(out, err)))
 }
 
@@ -226,16 +228,16 @@ fn git_streams(
     } else {
         Hooks::Off
     };
-    run_streams(
-        "git",
+    run_streams(Invocation {
+        program: "git",
         args,
         root,
-        LOCAL_TIMEOUT,
+        timeout: LOCAL_TIMEOUT,
         hooks,
         envs,
         cancel,
-        mutating,
-    )
+        may_mutate: mutating,
+    })
 }
 
 /// One entry of `git worktree list --porcelain`.
@@ -530,16 +532,16 @@ fn jj_dispatch(
 ) -> Result<(bool, String), String> {
     let root = ws.root();
     let jj = |a: Vec<String>| {
-        run(
-            "jj",
-            &a,
+        run(Invocation {
+            program: "jj",
+            args: &a,
             root,
-            LOCAL_TIMEOUT,
-            Hooks::Off,
-            &[],
+            timeout: LOCAL_TIMEOUT,
+            hooks: Hooks::Off,
+            envs: &[],
             cancel,
-            !READS.contains(&action),
-        )
+            may_mutate: !READS.contains(&action),
+        })
     };
     match action {
         "status" => jj(strings(&["status"])),
@@ -619,16 +621,16 @@ fn dispatch(
     let action = req_str(args, "action")?;
     let root = ws.root();
     let git = |a: Vec<String>, t: Duration| {
-        run(
-            "git",
-            &a,
+        run(Invocation {
+            program: "git",
+            args: &a,
             root,
-            t,
-            Hooks::Off,
-            &[],
+            timeout: t,
+            hooks: Hooks::Off,
+            envs: &[],
             cancel,
-            !READS.contains(&action),
-        )
+            may_mutate: !READS.contains(&action),
+        })
     };
     // Approved repository changes honour hooks/signing unless the operator bypasses them.
     let hooked = if bypass_hooks {
@@ -637,28 +639,28 @@ fn dispatch(
         Hooks::Repository
     };
     let git_hooked = |a: Vec<String>, t: Duration| {
-        run(
-            "git",
-            &a,
+        run(Invocation {
+            program: "git",
+            args: &a,
             root,
-            t,
-            hooked,
-            &[],
+            timeout: t,
+            hooks: hooked,
+            envs: &[],
             cancel,
-            !READS.contains(&action),
-        )
+            may_mutate: !READS.contains(&action),
+        })
     };
     let gh = |a: Vec<String>| {
-        run(
-            "gh",
-            &a,
+        run(Invocation {
+            program: "gh",
+            args: &a,
             root,
-            NETWORK_TIMEOUT,
-            Hooks::Off,
-            &[],
+            timeout: NETWORK_TIMEOUT,
+            hooks: Hooks::Off,
+            envs: &[],
             cancel,
-            !READS.contains(&action),
-        )
+            may_mutate: !READS.contains(&action),
+        })
     };
     let mut note = None;
     let (ok, text) = if use_jj(ws, args, action)? {

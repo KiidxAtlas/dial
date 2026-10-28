@@ -45,14 +45,16 @@ fn compaction_summary_request_gets_before_provider_request() {
     };
     let dir = tempfile::tempdir().unwrap();
     let mut complete = portable_summary_completion(
-        Config::default(),
-        None,
-        dir.path().to_path_buf(),
-        json!({}),
+        PortableSummaryContext {
+            config: Config::default(),
+            layout: None,
+            root: dir.path().to_path_buf(),
+            control_state: json!({}),
+            session_id: String::new(),
+            hermetic: false,
+        },
         vec![rewrite],
         None,
-        String::new(),
-        false,
     );
     let source = Chat {
         messages: vec![json!({"role":"user","content":"original"})],
@@ -108,14 +110,16 @@ fn compaction_summary_chatgpt_completes_without_injected_overrides() {
     });
     backend.chatgpt_url = Some(format!("{}/codex/responses", server.url));
     let mut complete = crate::agent::compact::compaction_runtime::portable_summary_completion(
-        crate::config::types::Config::default(),
-        None,
-        dir.path().to_path_buf(),
-        json!({}),
+        PortableSummaryContext {
+            config: crate::config::types::Config::default(),
+            layout: None,
+            root: dir.path().to_path_buf(),
+            control_state: json!({}),
+            session_id: String::new(),
+            hermetic: false,
+        },
         vec![],
         None,
-        String::new(),
-        false,
     );
     let request = Chat {
         messages: vec![json!({"role":"user","content":"Summarize this conversation."})],

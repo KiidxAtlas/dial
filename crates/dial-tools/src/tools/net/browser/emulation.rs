@@ -226,7 +226,7 @@ pub(super) fn parse_open(args: &Value) -> Result<OpenOptions, String> {
         None => None,
     };
     Ok(OpenOptions {
-        tab: (!tab.is_empty()).then(|| Value::Object(tab)),
+        tab: (!tab.is_empty()).then_some(Value::Object(tab)),
         ignore_https_errors,
     })
 }

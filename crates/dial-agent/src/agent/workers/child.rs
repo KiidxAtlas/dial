@@ -643,23 +643,60 @@ fn child_provider_request(
     Ok(rewritten.or(projected))
 }
 
+/// Inputs of one side inference request made through `child_role_chat`.
+struct ChildRoleCall<'a> {
+    role: &'a str,
+    purpose: llm::usage::Purpose,
+    request: &'a Chat,
+    steps: &'a mut u32,
+    budget: u32,
+    model_override: Option<&'a str>,
+    timeout: Option<u64>,
+    operation: Option<&'a crate::storage::memory_backend::Operation>,
+}
+
+/// The model backend, step budget, and approver a child's compaction and rollover run against.
+struct ChildRequestCtx<'a> {
+    backend: &'a mut Backend,
+    adapter: Option<&'a Path>,
+    steps: &'a mut u32,
+    budget: u32,
+    approver: &'a mut dyn Approver,
+}
+
+/// The tool schemas and names a child may call.
+#[derive(Clone, Copy)]
+struct ToolSurface<'a> {
+    schemas: &'a [Value],
+    names: &'a [String],
+}
+
+/// A `find` call routed to semantic search, with its parsed request.
+struct SemanticCall<'a> {
+    call: &'a llm::ToolCall,
+    request: crate::tools::code::navigation::SemanticRequest,
+}
+
 /// Side inference remains a worker request, with its own role cap, account and
 /// cancellation. A borrowed observer never enters the Send + Sync tool registry.
 fn child_role_chat(
     env: Env,
     main: &mut Backend,
     adapter: Option<&Path>,
-    role: &str,
-    purpose: llm::usage::Purpose,
-    request: &Chat,
-    steps: &mut u32,
-    budget: u32,
+    call: ChildRoleCall<'_>,
     observer: &std::cell::RefCell<&mut (dyn Approver + '_)>,
     children: &ChildBackends,
-    model_override: Option<&str>,
-    timeout: Option<u64>,
-    operation: Option<&crate::storage::memory_backend::Operation>,
 ) -> Result<String> {
+    let ChildRoleCall {
+        role,
+        purpose,
+        request,
+        steps,
+        budget,
+        model_override,
+        timeout,
+        operation,
+    } = call;
     with_child_role_backend(
         env,
         main,
@@ -1000,16 +1037,18 @@ impl crate::storage::memory_backend::MemoryModelRunner for ChildMemoryRunner<'_,
             self.env,
             self.backend,
             self.adapter,
-            &request.role,
-            llm::usage::Purpose::Memory,
-            &chat,
-            self.steps,
-            self.budget,
+            ChildRoleCall {
+                role: &request.role,
+                purpose: llm::usage::Purpose::Memory,
+                request: &chat,
+                steps: self.steps,
+                budget: self.budget,
+                model_override: request.model_override.as_deref(),
+                timeout: Some(request.operation.timeout_secs(request.timeout_secs)),
+                operation: Some(&request.operation),
+            },
             self.observer,
             self.children,
-            request.model_override.as_deref(),
-            Some(request.operation.timeout_secs(request.timeout_secs)),
-            Some(&request.operation),
         )?;
         self.check(&request.operation)?;
         Ok(answer)
@@ -1140,14 +1179,17 @@ impl crate::storage::memory_backend::MemoryModelRunner for ChildMemoryRunner<'_,
 fn child_compaction_memory(
     env: Env,
     job: &Job,
-    backend: &mut Backend,
-    adapter: Option<&Path>,
+    ctx: ChildRequestCtx<'_>,
     request: &mut Chat,
-    steps: &mut u32,
-    budget: u32,
-    approver: &mut dyn Approver,
     children: &ChildBackends,
 ) -> Result<()> {
+    let ChildRequestCtx {
+        backend,
+        adapter,
+        steps,
+        budget,
+        approver,
+    } = ctx;
     request
         .messages
         .retain(|message| message["dial_child_compaction_memory"] != true);
@@ -1190,16 +1232,19 @@ fn child_compaction_memory(
 fn rollover_child(
     env: Env,
     job: &Job,
-    backend: &mut Backend,
+    ctx: ChildRequestCtx<'_>,
     request: &mut Chat,
     rules: &crate::agent::safety::rules::State,
     children: &ChildBackends,
     signal: Option<crate::agent::window::context_notes::NewContextRequest>,
-    approver: &mut dyn Approver,
-    adapter: Option<&Path>,
-    steps: &mut u32,
-    request_budget: u32,
 ) -> Result<bool> {
+    let ChildRequestCtx {
+        backend,
+        adapter,
+        steps,
+        budget: request_budget,
+        approver,
+    } = ctx;
     use crate::agent::{compact::compaction, window::context_notes};
     let automatic = signal.is_none();
     children.archive(&request.messages)?;
@@ -1210,12 +1255,14 @@ fn rollover_child(
     child_compaction_memory(
         env,
         job,
-        backend,
-        adapter,
+        ChildRequestCtx {
+            backend,
+            adapter,
+            steps,
+            budget: request_budget,
+            approver,
+        },
         request,
-        steps,
-        request_budget,
-        approver,
         children,
     )?;
     let journal = children.journal.borrow();
@@ -1473,15 +1520,18 @@ fn settle_child_exploration(
             if env.interrupt.load(Ordering::SeqCst) {
                 return Err(llm::Interrupted.into());
             }
-            let commit = journal.session.rewind_exploration(
-                &owner,
-                &leaf,
-                &checkpoint.entry_id,
-                message,
-                siblings,
-                state,
-                digest,
-            )?;
+            let commit =
+                journal
+                    .session
+                    .rewind_exploration(crate::storage::session::ExplorationRewind {
+                        owner_id: &owner,
+                        expected_leaf: &leaf,
+                        anchor: &checkpoint.entry_id,
+                        report: message,
+                        siblings,
+                        control: state,
+                        digest,
+                    })?;
             journal.exploration.active = None;
             journal.exploration.completed = true;
             journal.cursor = history_len(&journal.session.messages());
@@ -1498,15 +1548,18 @@ fn settle_child_exploration(
 fn compact_child(
     env: Env,
     job: &Job,
-    backend: &mut Backend,
-    adapter: Option<&Path>,
+    ctx: ChildRequestCtx<'_>,
     request: &mut Chat,
-    steps: &mut u32,
-    budget: u32,
-    approver: &mut dyn Approver,
     reason: crate::config::compaction::CompactionReason,
     children: &ChildBackends,
 ) -> Result<bool> {
+    let ChildRequestCtx {
+        backend,
+        adapter,
+        steps,
+        budget,
+        approver,
+    } = ctx;
     use crate::agent::compact::compaction;
     anyhow::ensure!(
         crate::storage::transcript::complete_boundary(&request.messages, request.messages.len()),
@@ -1518,7 +1571,17 @@ fn compact_child(
         "active investigation checkpoints cannot be compacted"
     );
     child_compaction_memory(
-        env, job, backend, adapter, request, steps, budget, approver, children,
+        env,
+        job,
+        ChildRequestCtx {
+            backend,
+            adapter,
+            steps,
+            budget,
+            approver,
+        },
+        request,
+        children,
     )?;
     let migration = request
         .messages
@@ -1588,10 +1651,12 @@ fn compact_child(
     };
     let prepared = compaction::compact_history(
         backend,
-        &source,
-        &env.config.compaction,
-        context,
-        &options,
+        compaction::HistoryCompaction {
+            request: &source,
+            policy: &env.config.compaction,
+            context,
+            options: &options,
+        },
         env.interrupt.clone(),
         &mut ui,
         &mut |backend, chat, _| {
@@ -1599,16 +1664,18 @@ fn compact_child(
                 env,
                 backend,
                 adapter,
-                "small",
-                llm::usage::Purpose::Compaction,
-                chat,
-                &mut steps.borrow_mut(),
-                budget,
+                ChildRoleCall {
+                    role: "small",
+                    purpose: llm::usage::Purpose::Compaction,
+                    request: chat,
+                    steps: &mut steps.borrow_mut(),
+                    budget,
+                    model_override: None,
+                    timeout: None,
+                    operation: None,
+                },
                 &observer,
                 children,
-                None,
-                None,
-                None,
             )
         },
         Some(&mut remote_observer),
@@ -2194,12 +2261,8 @@ fn run_inner(
             match compact_child(
                 env,
                 job,
-                backend,
-                adapter,
+                ChildRequestCtx { backend, adapter, steps: &mut steps, budget, approver },
                 &mut request,
-                &mut steps,
-                budget,
-                approver,
                 reason,
                 children,
             ) {
@@ -2231,7 +2294,7 @@ fn run_inner(
         }
 
         if should_compact && experimental && !children.journal.borrow().exploration.busy() {
-            match rollover_child(env, job, backend, &mut request, rule_state, children, None, approver, adapter, &mut steps, budget) {
+            match rollover_child(env, job, ChildRequestCtx { backend, adapter, steps: &mut steps, budget, approver }, &mut request, rule_state, children, None) {
                 Ok(true) => approver.notice("Private child notes-backed context window committed; original records remain searchable until this task ends."),
                 Ok(false) => return Ok(crate::agent::run::engine::Tick::Finished(Outcome::failed(steps, "Private child context reset committed; continuation paused by compaction policy or the retained protected context exceeds its continuation band."))),
                 Err(_) if env.interrupt.load(Ordering::SeqCst) => return Ok(crate::agent::run::engine::Tick::Finished(Outcome::interrupted(steps))),
@@ -2336,13 +2399,15 @@ fn run_inner(
                 recovery: None,
             },
             generation_cancel.clone(),
-            &mut stream_ui,
-            &mut |_| {
-                generation_scope.sync();
-                pending_coordination.borrow_mut().extend(observer.borrow_mut().take_messages());
-                if !pending_coordination.borrow().is_empty() {
-                    generation_cancel.store(true, Ordering::SeqCst);
-                }
+            crate::agent::ChatSinks {
+                ui: &mut stream_ui,
+                on_idle: &mut |_| {
+                    generation_scope.sync();
+                    pending_coordination.borrow_mut().extend(observer.borrow_mut().take_messages());
+                    if !pending_coordination.borrow().is_empty() {
+                        generation_cancel.store(true, Ordering::SeqCst);
+                    }
+                },
             },
             Some(&mut rule_monitor),
         );
@@ -2490,8 +2555,13 @@ fn run_inner(
                         )));
                     }
                     match rollover_child(
-                        env, job, backend, &mut retry, rule_state, children, None, approver,
-                        adapter, &mut steps, budget,
+                        env,
+                        job,
+                        ChildRequestCtx { backend, adapter, steps: &mut steps, budget, approver },
+                        &mut retry,
+                        rule_state,
+                        children,
+                        None,
                     ) {
                         Ok(true) => {
                             messages = retry.messages;
@@ -2513,12 +2583,8 @@ fn run_inner(
                 match compact_child(
                     env,
                     job,
-                    backend,
-                    adapter,
+                    ChildRequestCtx { backend, adapter, steps: &mut steps, budget, approver },
                     &mut retry,
-                    &mut steps,
-                    budget,
-                    approver,
                     crate::config::compaction::CompactionReason::Overflow,
                     children,
                 ) {
@@ -2992,19 +3058,21 @@ fn run_inner(
                     // and names them like any other call.
                     let observer = std::cell::RefCell::new(&mut *approver);
                     parallel = crate::agent::parallel_tools(
-                        env.workspace,
-                        env.config,
-                        env.ext,
-                        &reply.tool_calls[index..index + count],
-                        env.interrupt,
-                        &mut RuleUi {
-                            observer: &observer,
-                            steps,
-                            stream: children.transcript.clone(),
-                            stream_error: None,
-                            registry: env.ext,
+                        crate::agent::ParallelToolContext {
+                            workspace: env.workspace,
+                            config: env.config,
+                            ext: env.ext,
+                            interrupt: env.interrupt,
+                            ui: &mut RuleUi {
+                                observer: &observer,
+                                steps,
+                                stream: children.transcript.clone(),
+                                stream_error: None,
+                                registry: env.ext,
+                            },
+                            pending_steering: &mut round_messages,
                         },
-                        &mut round_messages,
+                        &reply.tool_calls[index..index + count],
                         None,
                     )
                     .into();
@@ -3041,8 +3109,7 @@ fn run_inner(
                     let output = call_tool(
                         env,
                         job,
-                        &schemas,
-                        &names,
+                        ToolSurface { schemas: &schemas, names: &names },
                         call,
                         approver,
                         Some(RerankContext {
@@ -3305,15 +3372,11 @@ fn run_inner(
             if let Err(error) = rollover_child(
                 env,
                 job,
-                backend,
+                ChildRequestCtx { backend, adapter, steps: &mut steps, budget, approver },
                 &mut next,
                 rule_state,
                 children,
                 Some(signal),
-                approver,
-                adapter,
-                &mut steps,
-                budget,
             ) {
                 return Ok(crate::agent::run::engine::Tick::Finished(Outcome::failed(steps, format!("{error:#}"))));
             }
@@ -3665,8 +3728,10 @@ fn capture_child_memory(
             call_tool(
                 env,
                 job,
-                &request.tools,
-                &names,
+                ToolSurface {
+                    schemas: &request.tools,
+                    names: &names,
+                },
                 call,
                 approver,
                 Some(RerankContext {
@@ -3772,8 +3837,7 @@ fn preview_reads_authorized(
 fn call_tool(
     env: Env,
     job: &Job,
-    schemas: &[Value],
-    names: &[String],
+    surface: ToolSurface<'_>,
     call: &llm::ToolCall,
     approver: &mut dyn Approver,
     rerank: Option<RerankContext<'_>>,
@@ -3789,28 +3853,10 @@ fn call_tool(
         crate::tools::exec::execution::mutation_scope(&mutation, || {
             if let Some(signals) = approver.tool_signals(call, env.ext) {
                 crate::tools::exec::signals::scope(&signals, || {
-                    call_tool_inner(
-                        env,
-                        job,
-                        schemas,
-                        names,
-                        call,
-                        approver,
-                        rerank,
-                        callback_gate,
-                    )
+                    call_tool_inner(env, job, surface, call, approver, rerank, callback_gate)
                 })
             } else {
-                call_tool_inner(
-                    env,
-                    job,
-                    schemas,
-                    names,
-                    call,
-                    approver,
-                    rerank,
-                    callback_gate,
-                )
+                call_tool_inner(env, job, surface, call, approver, rerank, callback_gate)
             }
         })
     })
@@ -3829,13 +3875,13 @@ fn read_only_refusal(tool: &str) -> String {
 fn call_tool_inner(
     env: Env,
     job: &Job,
-    schemas: &[Value],
-    names: &[String],
+    surface: ToolSurface<'_>,
     call: &llm::ToolCall,
     approver: &mut dyn Approver,
     mut rerank: Option<RerankContext<'_>>,
     callback_gate: Option<&std::sync::Mutex<crate::agent::safety::rules::CallbackGate<'_>>>,
 ) -> ToolOutput {
+    let ToolSurface { schemas, names } = surface;
     let refuse = |text: String| {
         ToolOutput {
             execution: Default::default(),
@@ -4034,10 +4080,8 @@ fn call_tool_inner(
                 let mut output = semantic_find(
                     env,
                     job,
-                    schemas,
-                    names,
-                    call,
-                    request,
+                    surface,
+                    SemanticCall { call, request },
                     rerank,
                     &approver,
                     callback_gate,
@@ -4231,8 +4275,7 @@ fn call_tool_inner(
                     let mut output = call_tool(
                         env,
                         job,
-                        schemas,
-                        names,
+                        surface,
                         &nested,
                         &mut **approver.borrow_mut(),
                         context,
@@ -4312,16 +4355,18 @@ fn call_tool_inner(
                 env,
                 context.backend,
                 context.adapter,
-                "coach",
-                llm::usage::Purpose::Repair,
-                &chat,
-                context.steps,
-                context.budget,
+                ChildRoleCall {
+                    role: "coach",
+                    purpose: llm::usage::Purpose::Repair,
+                    request: &chat,
+                    steps: context.steps,
+                    budget: context.budget,
+                    model_override: None,
+                    timeout: None,
+                    operation: None,
+                },
                 &approver,
                 context.children,
-                None,
-                None,
-                None,
             )
             .map_err(|error| format!("{error:#}"))?;
             let response = crate::agent::run::edit_runtime::repair_response(&text);
@@ -4525,14 +4570,13 @@ fn call_tool_inner(
 fn semantic_find(
     env: Env,
     job: &Job,
-    schemas: &[Value],
-    names: &[String],
-    call: &llm::ToolCall,
-    request: crate::tools::code::navigation::SemanticRequest,
+    surface: ToolSurface<'_>,
+    semantic: SemanticCall<'_>,
     rerank: Option<RerankContext<'_>>,
     approver: &std::cell::RefCell<&mut dyn Approver>,
     callback_gate: Option<&std::sync::Mutex<crate::agent::safety::rules::CallbackGate<'_>>>,
 ) -> ToolOutput {
+    let SemanticCall { call, request } = semantic;
     let result = (|| -> Result<ToolOutput> {
         let supplementary = crate::tools::code::navigation::lsp_args(&call.arguments)
             .map_err(anyhow::Error::msg)?;
@@ -4605,8 +4649,7 @@ fn semantic_find(
             let metadata = call_tool(
                 env,
                 job,
-                schemas,
-                names,
+                surface,
                 &metadata_call,
                 &mut **approver.borrow_mut(),
                 None,

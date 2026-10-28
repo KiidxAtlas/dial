@@ -7,7 +7,7 @@ use std::thread::JoinHandle;
 use base64::Engine as _;
 use serde_json::{Value, json};
 
-use super::{ImageGen, Request, Wire, auto_tools, request_body, resolve};
+use super::{ImageGen, Request, TOOL, Wire, auto_tools, request_body, resolve};
 use crate::config::types::{Config, EndpointConfig};
 use crate::tools::integrations::ext::{Registry, Tool, ToolContext};
 use crate::tools::testkit;
@@ -461,4 +461,588 @@ fn rejects_images_exceeding_decode_limits() {
     assert!(out.is_error, "{}", out.text);
     assert!(out.text.contains("decoding"), "{}", out.text);
     assert_eq!(std::fs::read_dir(ws.root()).unwrap().count(), 0);
+}
+
+fn selected_config(
+    base: &str,
+    dir: &std::path::Path,
+    api: crate::llm::profiles::ImageGenerationApi,
+) -> Config {
+    let mut config = xai_session(dir);
+    config.endpoint.as_mut().unwrap().base_url = base.into();
+    config.endpoint.as_mut().unwrap().protocol =
+        Some(crate::llm::model_config::ApiProtocol::ChatCompletions);
+    config.model = "selected-image-model".into();
+    let selection = config.selection();
+    let mut profile =
+        crate::llm::profiles::ModelProfile::minimal(&selection.provider, &selection.model);
+    profile.capabilities.image_generation = Some(api);
+    config.model_profiles.insert("selected".into(), profile);
+    config.model_profile = Some("selected".into());
+    config
+}
+
+#[test]
+fn selected_image_model_uses_its_own_model_and_endpoint() {
+    use crate::llm::profiles::ImageGenerationApi;
+    let (_dir, ws) = testkit::workspace();
+    let png = image_bytes(image::ImageFormat::Png);
+    let (base, server) = serve_once(200, ok_body(&png));
+    let user = user_dir_with_key(&base);
+    let config = selected_config(&base, user.path(), ImageGenerationApi::Images);
+    assert_eq!(auto_tools(&config).unwrap().len(), 1);
+    let out = run(&ws, &config, json!({"prompt":"dog", "output":"dog.png"}));
+    assert!(!out.is_error, "{}", out.text);
+    assert_eq!(std::fs::read(ws.root().join("dog.png")).unwrap(), png);
+    let request = server.join().unwrap();
+    let body: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(body["model"], "selected-image-model");
+}
+
+#[test]
+fn selected_chat_model_writes_inline_image_without_fetching_urls() {
+    use crate::llm::profiles::ImageGenerationApi;
+    let (_dir, ws) = testkit::workspace();
+    let png = image_bytes(image::ImageFormat::Png);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
+    let body = json!({"choices":[{"finish_reason":"stop", "message":{"images":[{"image_url":{"url":format!("data:image/png;base64,{encoded}")}}]}}]}).to_string();
+    let (base, server) = serve_once(200, body);
+    let user = user_dir_with_key(&base);
+    let config = selected_config(&base, user.path(), ImageGenerationApi::ChatCompletions);
+    let out = run(&ws, &config, json!({"prompt":"dog", "output":"dog.png"}));
+    assert!(!out.is_error, "{}", out.text);
+    assert_eq!(std::fs::read(ws.root().join("dog.png")).unwrap(), png);
+    let request = server.join().unwrap();
+    assert!(
+        request.starts_with("POST /v1/chat/completions "),
+        "{request}"
+    );
+    let body: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(body["model"], "selected-image-model");
+    assert_eq!(body["modalities"], json!(["image", "text"]));
+    assert!(super::selected::chat_image(&json!({"choices":[{"finish_reason":"stop", "message":{"images":[{"image_url":{"url":"https://example.com/dog.png"}}]}}]})).is_err());
+}
+
+#[test]
+fn image_overrides_win_and_vision_alone_does_not_select_the_chat_model() {
+    use crate::llm::profiles::ImageGenerationApi;
+    let user = user_dir_with_key(XAI_BASE);
+    let mut config = selected_config(XAI_BASE, user.path(), ImageGenerationApi::Responses);
+    assert_eq!(resolve(&config).unwrap().model, "selected-image-model");
+    config
+        .model_profiles
+        .get_mut("selected")
+        .unwrap()
+        .capabilities
+        .image_generation = None;
+    config
+        .model_profiles
+        .get_mut("selected")
+        .unwrap()
+        .capabilities
+        .vision = Some(true);
+    assert_eq!(resolve(&config).unwrap().model, "grok-imagine-image-2.0");
+    config
+        .model_profiles
+        .get_mut("selected")
+        .unwrap()
+        .capabilities
+        .image_generation = Some(ImageGenerationApi::Responses);
+    config.image.model = "explicit-image-model".into();
+    config.image.base_url = XAI_BASE.into();
+    assert_eq!(resolve(&config).unwrap().model, "explicit-image-model");
+}
+
+#[test]
+fn selected_model_switch_is_resolved_for_each_generation() {
+    use crate::llm::profiles::ImageGenerationApi;
+    let user = user_dir_with_key(XAI_BASE);
+    let mut config = selected_config(XAI_BASE, user.path(), ImageGenerationApi::Responses);
+    assert_eq!(resolve(&config).unwrap().model, "selected-image-model");
+    config.model = "different-model".into();
+    assert_eq!(resolve(&config).unwrap().model, "grok-imagine-image-2.0");
+}
+
+#[test]
+fn responses_body_selects_the_user_model_and_forces_image_generation() {
+    use crate::llm::profiles::ImageGenerationApi;
+    let user = user_dir_with_key(XAI_BASE);
+    let config = selected_config(XAI_BASE, user.path(), ImageGenerationApi::Responses);
+    let target = resolve(&config).unwrap();
+    let body = request_body(
+        &target,
+        &Request {
+            prompt: "dog",
+            size: "1024x1536",
+            output: "dog.png",
+        },
+    );
+    assert_eq!(body["model"], "selected-image-model");
+    assert_eq!(body["tools"][0]["type"], "image_generation");
+    assert_eq!(body["tools"][0]["size"], "1024x1536");
+    assert_eq!(body["tool_choice"]["type"], "image_generation");
+    assert_eq!(body["store"], false);
+}
+
+#[test]
+fn hosted_image_format_matches_destination_before_spending_quota() {
+    use crate::llm::profiles::ImageGenerationApi;
+    let user = user_dir_with_key(XAI_BASE);
+    let config = selected_config(XAI_BASE, user.path(), ImageGenerationApi::Responses);
+    let target = resolve(&config).unwrap();
+    for (output, format) in [
+        ("dog.png", "png"),
+        ("dog.jpg", "jpeg"),
+        ("dog.jpeg", "jpeg"),
+        ("dog.webp", "webp"),
+    ] {
+        let body = request_body(
+            &target,
+            &Request {
+                prompt: "dog",
+                output,
+                size: "auto",
+            },
+        );
+        assert_eq!(body["tools"][0]["output_format"], format);
+    }
+}
+
+#[test]
+fn registry_refreshes_image_availability_after_model_switches() {
+    use crate::llm::profiles::ImageGenerationApi;
+    let user = user_dir_with_key("http://127.0.0.1:9/v1");
+    let mut config = selected_config(
+        "http://127.0.0.1:9/v1",
+        user.path(),
+        ImageGenerationApi::Responses,
+    );
+    let mut registry = crate::tools::integrations::ext::Registry::default();
+    assert!(registry.sync_image_generation(&config).unwrap());
+    assert!(registry.contains(TOOL));
+    assert!(!registry.sync_image_generation(&config).unwrap());
+    config.model = "vision-only".into();
+    config.image.api_key_env = Some("DIAL_IMAGE_GEN_TEST_UNSET_KEY_7F3A".into());
+    config.image.auto = false;
+    assert!(registry.sync_image_generation(&config).unwrap());
+    assert!(!registry.contains(TOOL));
+    config.integrations.push(TOOL.into());
+    assert!(registry.sync_image_generation(&config).unwrap());
+    assert!(registry.contains(TOOL));
+}
+
+#[test]
+fn selected_responses_transport_publishes_only_terminal_success() {
+    use crate::llm::{
+        fake::{self, Script},
+        profiles::ImageGenerationApi,
+    };
+    let png = image_bytes(image::ImageFormat::Png);
+    let image = json!({"type":"image_generation_call", "status":"completed", "result":base64::engine::general_purpose::STANDARD.encode(&png)});
+    for success in [true, false] {
+        let (_dir, ws) = testkit::workspace();
+        let terminal = if success {
+            json!({"type":"response.completed","response":{"status":"completed","output":[image.clone()]}})
+        } else {
+            json!({"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[image.clone()]}})
+        };
+        let server = fake::serve(vec![Script::Sse(format!("data: {terminal}\n\n"))]);
+        let user = user_dir_with_key(&server.url);
+        let config = selected_config(&server.url, user.path(), ImageGenerationApi::Responses);
+        let out = run(&ws, &config, json!({"prompt":"dog", "output":"dog.png"}));
+        assert_eq!(!out.is_error, success, "{}", out.text);
+        if success {
+            assert_eq!(std::fs::read(ws.root().join("dog.png")).unwrap(), png);
+        } else {
+            assert_eq!(std::fs::read_dir(ws.root()).unwrap().count(), 0);
+        }
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1, "no retry or billing fallback");
+        let request = String::from_utf8(requests[0].clone()).unwrap();
+        assert!(request.starts_with("POST /v1/responses "), "{request}");
+        let body: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(body["model"], "selected-image-model");
+    }
+}
+
+#[test]
+fn selected_image_header_values_are_not_exposed_by_provider_errors() {
+    use crate::llm::{
+        model_config::{HeaderValue, RequestHeader},
+        profiles::ImageGenerationApi,
+    };
+    let (_dir, ws) = testkit::workspace();
+    let (base, server) = serve_once(
+        400,
+        json!({"error":{"message":"echoed-custom-header-value"}}).to_string(),
+    );
+    let user = user_dir_with_key(&base);
+    let mut config = selected_config(&base, user.path(), ImageGenerationApi::Images);
+    config.endpoint.as_mut().unwrap().headers = Some(vec![RequestHeader {
+        name: "x-image-routing".into(),
+        value: HeaderValue::Literal("echoed-custom-header-value".into()),
+    }]);
+    let out = run(&ws, &config, json!({"prompt":"dog", "output":"dog.png"}));
+    assert!(out.is_error);
+    assert!(
+        !out.text.contains("echoed-custom-header-value"),
+        "{}",
+        out.text
+    );
+    assert!(
+        server
+            .join()
+            .unwrap()
+            .contains("echoed-custom-header-value")
+    );
+    assert_eq!(std::fs::read_dir(ws.root()).unwrap().count(), 0);
+}
+
+#[test]
+fn assigned_image_role_uses_its_model_not_main() {
+    use crate::llm::{
+        model_config::ModelSelection,
+        profiles::{ImageGenerationApi, ModelCapabilities, ModelProfile},
+    };
+    let base = "https://images.example/v1";
+    let user = user_dir_with_key(base);
+    let mut config = Config {
+        user_dir: user.path().into(),
+        model: "main-chat".into(),
+        ..Default::default()
+    };
+    config.model_roles.insert(
+        "image".into(),
+        ModelSelection {
+            provider: "image-provider".into(),
+            model: "image-model".into(),
+            base_url: Some(base.into()),
+            ..Default::default()
+        },
+    );
+    config.model_profiles.insert(
+        "images".into(),
+        ModelProfile {
+            provider: "image-provider".into(),
+            model: "image-model".into(),
+            capabilities: ModelCapabilities {
+                image_generation: Some(ImageGenerationApi::Images),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    let target = resolve(&config).unwrap();
+    assert_eq!(target.model, "image-model");
+    assert_eq!(target.base_url, base);
+    assert_eq!(config.model, "main-chat");
+}
+
+#[test]
+fn assigned_unsupported_image_model_never_falls_back_to_billed_provider() {
+    let user = user_dir_with_key("https://api.openai.com/v1");
+    let mut config = Config {
+        user_dir: user.path().into(),
+        ..Default::default()
+    };
+    config.model_roles.insert(
+        "image".into(),
+        crate::llm::model_config::ModelSelection::new("mlx", "not-an-image"),
+    );
+    let error = resolve(&config).err().unwrap().to_string();
+    assert!(error.contains("assigned image model"), "{error}");
+}
+
+#[test]
+fn native_mlx_serve_generates_png_without_a_key() {
+    use crate::llm::profiles::ImageGenerationApi;
+    let (_dir, ws) = testkit::workspace();
+    let png = image_bytes(image::ImageFormat::Png);
+    let (base, server) = serve_once(200, ok_body(&png));
+    let user = tempfile::tempdir().unwrap();
+    let config = selected_config(&base, user.path(), ImageGenerationApi::MlxServe);
+    let out = run(&ws, &config, json!({"prompt":"dog", "output":"dog.png"}));
+    let request = server.join().unwrap();
+    assert!(!out.is_error, "{}", out.text);
+    assert!(!request.to_ascii_lowercase().contains("authorization:"));
+    assert!(request.starts_with("POST /v1/images/generations "));
+    assert_eq!(std::fs::read(ws.root().join("dog.png")).unwrap(), png);
+}
+
+#[test]
+fn native_mlx_serve_rejects_non_png_before_request() {
+    use crate::llm::profiles::ImageGenerationApi;
+    let (_dir, ws) = testkit::workspace();
+    let user = tempfile::tempdir().unwrap();
+    let config = selected_config(
+        "http://127.0.0.1:9/v1",
+        user.path(),
+        ImageGenerationApi::MlxServe,
+    );
+    let out = run(&ws, &config, json!({"prompt":"dog", "output":"dog.webp"}));
+    assert!(out.is_error);
+    assert!(out.text.contains("PNG"), "{}", out.text);
+    assert_eq!(std::fs::read_dir(ws.root()).unwrap().count(), 0);
+}
+
+fn chatgpt_session(user_dir: &std::path::Path) -> Config {
+    use crate::llm::{chatgpt, model_config::ModelSelection};
+    let config = Config {
+        user_dir: user_dir.into(),
+        ..Default::default()
+    };
+    config.with_selection(&ModelSelection::new(chatgpt::PROVIDER, "chat-model"))
+}
+
+#[test]
+fn chatgpt_unknown_metadata_offers_hosted_images_without_an_api_key() {
+    use crate::llm::{chatgpt, profiles::ImageGenerationApi};
+    let user = tempfile::tempdir().unwrap();
+    chatgpt::test_account(user.path(), false);
+    let mut config = chatgpt_session(user.path());
+    assert_eq!(auto_tools(&config).unwrap().len(), 1);
+    let target = resolve(&config).unwrap();
+    assert_eq!(target.model, "chat-model");
+    assert_eq!(target.base_url, chatgpt::BASE_URL);
+    assert_eq!(target.wire, Wire::Responses);
+    assert_eq!(target.account_id.as_deref(), Some("oaiapp_test"));
+    assert!(target.key.is_empty());
+
+    let mut profile = crate::llm::profiles::ModelProfile::minimal(chatgpt::PROVIDER, "chat-model");
+    profile.capabilities.image_generation = Some(ImageGenerationApi::Disabled);
+    config.model_profiles.insert("disabled".into(), profile);
+    config
+        .model_roles
+        .insert("image".into(), config.selection());
+    assert!(
+        auto_tools(&config).is_err(),
+        "explicitly disabled image roles must not fall back"
+    );
+}
+
+#[test]
+fn any_chat_model_can_automatically_use_a_configured_image_profile() {
+    use crate::llm::profiles::{ImageGenerationApi, ModelProfile};
+    let user = tempfile::tempdir().unwrap();
+    let mut config = Config {
+        user_dir: user.path().into(),
+        model: "text-only".into(),
+        ..Default::default()
+    };
+    let base = "http://127.0.0.1:9/v1";
+    config.providers.insert(
+        "pictures".into(),
+        crate::llm::model_config::ProviderSpec {
+            base_url: base.into(),
+            ..Default::default()
+        },
+    );
+    let mut profile = ModelProfile::minimal("pictures", "image-model");
+    profile.capabilities.image_generation = Some(ImageGenerationApi::Images);
+    config.model_profiles.insert("pictures".into(), profile);
+    assert_eq!(auto_tools(&config).unwrap().len(), 1);
+    let target = resolve(&config).unwrap();
+    assert_eq!(target.model, "image-model");
+    assert_eq!(target.base_url, base);
+    assert_eq!(config.model, "text-only");
+
+    config.providers.get_mut("pictures").unwrap().enabled = false;
+    assert!(
+        resolve(&config).is_err(),
+        "disabled providers are not image candidates"
+    );
+}
+
+#[test]
+fn assigned_image_errors_are_reported_even_with_default_image_settings() {
+    let user = tempfile::tempdir().unwrap();
+    let mut config = Config {
+        user_dir: user.path().into(),
+        ..Default::default()
+    };
+    config.model_roles.insert(
+        "image".into(),
+        crate::llm::model_config::ModelSelection::new("mlx", "unsupported"),
+    );
+    assert!(auto_tools(&config).is_err());
+}
+
+#[test]
+fn shared_image_profile_generates_without_changing_main() {
+    use crate::llm::{
+        model_config::ProviderSpec,
+        profiles::{ImageGenerationApi, ModelProfile},
+    };
+    let (_dir, ws) = testkit::workspace();
+    let png = image_bytes(image::ImageFormat::Png);
+    let (base, server) = serve_once(200, ok_body(&png));
+    let user = user_dir_with_key(&base);
+    let mut config = Config {
+        user_dir: user.path().into(),
+        model: "text-only".into(),
+        ..Default::default()
+    };
+    config.providers.insert(
+        "pictures".into(),
+        ProviderSpec {
+            base_url: base,
+            ..Default::default()
+        },
+    );
+    let mut profile = ModelProfile::minimal("pictures", "image-model");
+    profile.capabilities.image_generation = Some(ImageGenerationApi::Images);
+    config.model_profiles.insert("pictures".into(), profile);
+    let out = run(&ws, &config, json!({"prompt":"dog", "output":"dog.png"}));
+    assert!(!out.is_error, "{}", out.text);
+    assert_eq!(std::fs::read(ws.root().join("dog.png")).unwrap(), png);
+    let request = server.join().unwrap();
+    let body: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(body["model"], "image-model");
+    assert_eq!(config.model, "text-only");
+}
+
+#[test]
+fn chatgpt_hosted_images_enforce_account_endpoint_and_auth_policy() {
+    use crate::llm::{
+        chatgpt,
+        model_config::{AuthMethod, ProviderSpec},
+    };
+    let user = tempfile::tempdir().unwrap();
+    let mut config = chatgpt_session(user.path());
+    assert!(
+        super::selected::resolve(&config).is_err(),
+        "sign-in required"
+    );
+    chatgpt::test_account(user.path(), false);
+    config.chatgpt_allowed_accounts = Some(["other-account".into()].into());
+    assert!(
+        super::selected::resolve(&config).is_err(),
+        "private account policy enforced"
+    );
+    config.chatgpt_allowed_accounts = None;
+    config.endpoint.as_mut().unwrap().base_url = "https://untrusted.example".into();
+    assert!(
+        super::selected::resolve(&config).is_err(),
+        "OAuth route requires official endpoint"
+    );
+    config.endpoint.as_mut().unwrap().base_url = chatgpt::BASE_URL.into();
+    config.providers.insert(
+        chatgpt::PROVIDER.into(),
+        ProviderSpec {
+            auth: AuthMethod::ApiKey,
+            ..Default::default()
+        },
+    );
+    assert!(
+        super::selected::resolve(&config).unwrap().is_none(),
+        "API-key selection forbids OAuth"
+    );
+}
+
+#[test]
+fn configured_chatgpt_route_is_shared_with_local_main() {
+    use crate::llm::{chatgpt, profiles::ModelProfile};
+    let user = tempfile::tempdir().unwrap();
+    chatgpt::test_account(user.path(), false);
+    let mut config = Config {
+        user_dir: user.path().into(),
+        model: "local-text".into(),
+        ..Default::default()
+    };
+    config.model_profiles.insert(
+        "chatgpt".into(),
+        ModelProfile::minimal(chatgpt::PROVIDER, "chat-model"),
+    );
+    let target = resolve(&config).unwrap();
+    assert_eq!(target.model, "chat-model");
+    assert_eq!(target.wire, Wire::Responses);
+    assert_eq!(target.account_id.as_deref(), Some("oaiapp_test"));
+    let mut registry = Registry::default();
+    assert!(registry.sync_image_generation(&config).unwrap());
+    assert!(registry.contains(TOOL));
+    config.model = "another-text-model".into();
+    assert!(!registry.sync_image_generation(&config).unwrap());
+    assert!(registry.contains(TOOL));
+}
+
+#[test]
+fn keyed_xai_image_default_is_shared_with_other_chat_providers() {
+    use crate::llm::model_config::{AuthMethod, ProviderSpec};
+    let user = user_dir_with_key(XAI_BASE);
+    let mut config = Config {
+        user_dir: user.path().into(),
+        model: "text-only".into(),
+        ..Default::default()
+    };
+    config.providers.insert(
+        "openai".into(),
+        ProviderSpec {
+            enabled: false,
+            ..Default::default()
+        },
+    );
+    let target = resolve(&config).unwrap();
+    assert_eq!(target.base_url, XAI_BASE);
+    assert_eq!(target.model, "grok-imagine-image-2.0");
+    config.providers.insert(
+        "xai".into(),
+        ProviderSpec {
+            auth: AuthMethod::OAuth,
+            ..Default::default()
+        },
+    );
+    assert!(
+        resolve(&config).is_err(),
+        "do not bypass explicit authentication selection"
+    );
+}
+
+#[test]
+fn unavailable_automatic_main_does_not_block_a_shared_route_but_assigned_role_does() {
+    use crate::llm::{
+        model_config::ProviderSpec,
+        profiles::{ImageGenerationApi, ModelProfile},
+    };
+    let user = tempfile::tempdir().unwrap();
+    // No signed-in ChatGPT account: the automatic main candidate is unavailable.
+    let mut config = chatgpt_session(user.path());
+    config.providers.insert(
+        "pictures".into(),
+        ProviderSpec {
+            base_url: "http://127.0.0.1:9/v1".into(),
+            ..Default::default()
+        },
+    );
+    let mut profile = ModelProfile::minimal("pictures", "image-model");
+    profile.capabilities.image_generation = Some(ImageGenerationApi::Images);
+    config.model_profiles.insert("pictures".into(), profile);
+    assert_eq!(resolve(&config).unwrap().model, "image-model");
+    config
+        .model_roles
+        .insert("image".into(), config.selection());
+    assert!(
+        resolve(&config).is_err(),
+        "assigned route must not switch provider"
+    );
+    assert!(
+        auto_tools(&config).is_err(),
+        "assigned route errors remain visible"
+    );
+}
+
+#[test]
+fn automatic_chatgpt_profile_preserves_the_sessions_pinned_account() {
+    use crate::llm::{chatgpt, profiles::ModelProfile};
+    let user = tempfile::tempdir().unwrap();
+    chatgpt::test_account(user.path(), false);
+    let mut config = chatgpt_session(user.path());
+    config.endpoint.as_mut().unwrap().account_id = Some("missing-pinned-account".into());
+    config.model_profiles.insert(
+        "chatgpt".into(),
+        ModelProfile::minimal(chatgpt::PROVIDER, "other-model"),
+    );
+    assert!(
+        super::configured_target(&config).is_none(),
+        "must not switch to the globally active account"
+    );
 }

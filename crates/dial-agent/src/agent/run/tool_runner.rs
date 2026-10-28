@@ -426,11 +426,13 @@ impl Agent<'_> {
                             );
                         }
                         crate::agent::safety::approval::authorize_mutation_paths(
-                            &self.always,
-                            self.workspace.root(),
-                            self.workspace.additional_roots(),
-                            self.plan_mode
-                                || self.approval == crate::config::types::Approval::Readonly,
+                            crate::agent::safety::approval::MutationPolicy {
+                                rules: &self.always,
+                                root: self.workspace.root(),
+                                extra_roots: self.workspace.additional_roots(),
+                                read_only: self.plan_mode
+                                    || self.approval == crate::config::types::Approval::Readonly,
+                            },
                             original,
                             &tool,
                             &paths,

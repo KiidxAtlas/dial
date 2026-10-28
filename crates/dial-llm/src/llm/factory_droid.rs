@@ -94,23 +94,28 @@ pub(super) fn exchange(
     if factory_wire == FactoryWire::Gemini {
         return super::gemini::exchange_at(
             endpoint,
-            &url,
             &request,
-            timeout_secs,
+            super::Limits {
+                timeout_secs,
+                interrupt,
+            },
             on_text,
-            interrupt,
             profile,
             on_event,
         );
     }
     transports::exchange_wire(
-        wire,
-        endpoint,
-        &request,
-        timeout_secs,
+        transports::WireRequest {
+            wire,
+            endpoint,
+            req: &request,
+            limits: super::Limits {
+                timeout_secs,
+                interrupt,
+            },
+            profile,
+        },
         on_text,
-        interrupt,
-        profile,
         on_event,
         None,
     )

@@ -56,7 +56,7 @@ pub(crate) fn read_image() -> Result<Vec<u8>> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Os {
-    MacOs,
+    Mac,
     Windows,
     Linux,
     Other,
@@ -76,7 +76,7 @@ impl Environment {
     fn detect() -> Self {
         let set = |key: &str| std::env::var_os(key).is_some_and(|value| !value.is_empty());
         let os = if cfg!(target_os = "macos") {
-            Os::MacOs
+            Os::Mac
         } else if cfg!(windows) {
             Os::Windows
         } else if cfg!(any(target_os = "linux", target_os = "android")) {
@@ -126,7 +126,7 @@ impl Reader {
 /// Readers to try, in order, for `env`. The first reader with an image wins.
 fn readers(env: Environment) -> Vec<Reader> {
     match env.os {
-        Os::MacOs => vec![Reader::MacPasteboard, Reader::MacFileUrls],
+        Os::Mac => vec![Reader::MacPasteboard, Reader::MacFileUrls],
         Os::Windows => vec![Reader::PowerShell],
         Os::Linux => linux_readers(env),
         Os::Other => Vec::new(),

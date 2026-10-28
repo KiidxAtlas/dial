@@ -477,12 +477,14 @@ fn window_and_size_helpers_keep_the_cursor_visible_and_read_plainly() {
 fn shelves_cycle_through_mlx_gguf_memory_embeddings_and_curated_both_ways() {
     assert_eq!(Shelf::Hub(Family::Mlx).next(), Shelf::Hub(Family::Gguf));
     assert_eq!(Shelf::Hub(Family::Gguf).next(), Shelf::Memory);
-    assert_eq!(Shelf::Memory.next(), Shelf::EmbeddingHub);
+    assert_eq!(Shelf::Memory.next(), Shelf::Images);
+    assert_eq!(Shelf::Images.next(), Shelf::EmbeddingHub);
     assert_eq!(Shelf::EmbeddingHub.next(), Shelf::Embedding);
     assert_eq!(Shelf::Embedding.next(), Shelf::Hub(Family::Mlx));
     assert_eq!(Shelf::Hub(Family::Mlx).prev(), Shelf::Embedding);
     assert_eq!(Shelf::Embedding.prev(), Shelf::EmbeddingHub);
-    assert_eq!(Shelf::EmbeddingHub.prev(), Shelf::Memory);
+    assert_eq!(Shelf::EmbeddingHub.prev(), Shelf::Images);
+    assert_eq!(Shelf::Images.prev(), Shelf::Memory);
     assert_eq!(Shelf::Memory.prev(), Shelf::Hub(Family::Gguf));
 }
 
@@ -493,6 +495,7 @@ fn arrows_cycle_shelves_and_preserve_navigation_focus() {
     for shelf in [
         Shelf::Hub(Family::Gguf),
         Shelf::Memory,
+        Shelf::Images,
         Shelf::EmbeddingHub,
         Shelf::Embedding,
         Shelf::Hub(Family::Mlx),
@@ -645,4 +648,47 @@ fn publication_age_uses_valid_utc_dates_and_never_guesses_missing_values() {
     let shown = hit_metadata(hit, now);
     assert!(shown.contains("repo unknown"));
     assert!(shown.contains("published unknown"));
+}
+
+#[test]
+fn image_shelf_uses_metadata_and_never_assigns_downloaded_images_to_chat() {
+    let mut group = selection_pane(vec![row("chat"), row("image")]);
+    let mut image = ModelEntry {
+        selection: ModelSelection::new("mlx", "/models/image"),
+        label: "image".into(),
+        source: "downloaded".into(),
+        available: true,
+        metadata: Default::default(),
+    };
+    image.metadata.kind = crate::llm::catalog::ModelKind::Image;
+    image.selection.base_url = Some("http://127.0.0.1:11234/v1".into());
+    let image_selection = image.selection.clone();
+    group.set_embedding_models(&[image]);
+    assert_eq!(group.installed_rows(), [0]);
+    group.shelf = Shelf::Memory;
+    assert_eq!(group.installed_rows(), [0]);
+    group.shelf = Shelf::Images;
+    group.hits.clear();
+    group.curated = false;
+    assert_eq!(group.installed_rows(), [1]);
+    assert_eq!(group.confirm(), Step::UseImage(image_selection));
+    let shown = text_of(&group.body(140, 20, &Theme::dark()));
+    assert!(shown.contains("image"), "{shown}");
+    assert!(!shown.contains("/models/chat"), "{shown}");
+    assert!(group.task.is_none(), "browsing/assigning never downloads");
+}
+
+#[test]
+fn image_download_stays_image_after_switching_shelves_before_completion() {
+    let mut group = selection_pane(vec![row("image")]);
+    group.image_repos.insert("org/image".into());
+    group.shelf = Shelf::Memory;
+    group.finish_download("org/image", Family::Mlx, "/models/image");
+    assert_eq!(group.shelf, Shelf::Images);
+    assert_eq!(group.confirm(), Step::Handled);
+    assert!(group.message.contains("MLX-Serve"));
+    group.shelf = Shelf::Hub(Family::Mlx);
+    assert!(group.installed_rows().is_empty());
+    group.shelf = Shelf::Memory;
+    assert!(group.installed_rows().is_empty());
 }

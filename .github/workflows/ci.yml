@@ -48,6 +48,8 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: test-${{ matrix.os }}
+      - name: Install installer test dependencies
+        run: python3 -m pip install --disable-pip-version-check cryptography
       - name: Test terminal installer
         run: bash scripts/test-install.sh
       - name: Test local build and update commands

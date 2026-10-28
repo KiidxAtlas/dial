@@ -28,10 +28,11 @@ access, with a message saying it is neither a local path nor a repository id.
 ## Finding and downloading in `/models`
 
 Open `/models` and choose **Get models** in the left column (`/models local` opens it directly). It has
-four shelves, **MLX**, **GGUF**, **Memory** and **Embedding**, switched with Right/Tab (Shift+Tab goes back).
-The Memory shelf suggests small 1-2B instruct models (in this machine's default weight format) for the
-`memory` role and lists every installed model whatever its format; Enter on an installed model assigns
-it to `memory`. In the Memory group of `/models`, `Ctrl+G` opens this shelf.
+six shelves, **MLX**, **GGUF**, **Memory**, **Images**, **Embeddings** and **Curated**, switched with
+Right/Tab (Shift+Tab goes back). The Memory shelf suggests small 1-2B instruct models (in this
+machine's default weight format) for the `memory` role and lists installed chat models whatever
+their format; Enter on an installed model assigns it to `memory`. In the Memory group of
+`/models`, `Ctrl+G` opens this shelf.
 Suggested models that are not already installed appear **first**, with a selected row visible even
 in short panels. Offline starting points appear immediately; a background Hugging Face catalog
 request adds popular models without requiring a search. Network failures leave the starting points
@@ -48,13 +49,24 @@ Typing moves to the query, and Enter searches Hugging Face. Results receive list
 selects rather than repeating the search. Clearing the query restores offline suggestions while
 refreshing the live catalog. F5 refreshes installed models and retries catalog metadata.
 
+The **Images** shelf searches Hugging Face for repositories tagged **MLX** and **text-to-image**,
+not models guessed from names or vision-input capabilities. Browsing and searching only read
+metadata. Enter on a result explicitly starts the existing snapshot download flow to the **Hugging
+Face cache**; Esc cancels it. These weights require a compatible image server such as MLX-Serve:
+Dial's Python chat runner does not run them, and a Hub tag does not guarantee that the server supports
+that particular pack. Import/serve the checkpoint, then F5 rescan and select its endpoint in the
+separate **Images** group. This group also lists models already downloaded for MLX-Serve. Enter
+assigns the `image` role; Roles / `Ctrl+A` offer the same assignment. Image-only checkpoints are not
+assigned to `main`, `memory` or `embedding`. An unassigned `image` role follows the main model;
+this does not turn a chat-only model into an image-generation endpoint.
+
 | Key | Action |
 |---|---|
 | Type, Backspace | Edit the query. Typing never searches or downloads |
 | Enter (query) | Search and focus results; an empty query restores suggestions and refreshes the catalog |
 | Right / Tab, Shift+Tab | Next / previous shelf (MLX is the default on Apple Silicon, GGUF elsewhere) |
 | Up / Down | Move through rows; Up from the first row edits the query, Down returns to the rows |
-| Enter (installed model) | Make it the main model, through the same selection as `/models` |
+| Enter (installed model) | Assign chat to main or memory; image weights require a compatible served endpoint |
 | Enter (result) | List the repository's files. MLX starts downloading; GGUF opens the quantization picker |
 | Enter (picker) | Download the chosen quantization (with its projector, when the repository has one) |
 | Enter (discovered embedding model) | Assign it to the `embedding` role |
@@ -66,7 +78,8 @@ A download runs in the background. The status line shows the repository, the byt
 against the expected total, the elapsed time and the latest step. Downloads keep running while you
 browse other groups in `/models`. Closing `/models` cancels a running download. When a download
 finishes, Dial rescans the models (F5 does the same), and the new model is selected on its shelf. Enter
-then makes it the main model.
+then assigns chat to main or memory. Image downloads require serving/importing before selecting
+the endpoint in Images. Downloading alone never assigns a model.
 
 Selecting a GGUF quantization sends exactly its files to the download (`hf_hub_download`), so the
 other quantizations in the repository are neither listed for choice nor fetched. Check the file sizes

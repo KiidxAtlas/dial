@@ -1221,8 +1221,10 @@ fn chatgpt_failover_preserves_account_allowlist() {
         &json!({"error":{"message":"rejected"}}),
     )]);
     let mut remote = rotation_backend(dir.path(), &server.url);
-    let mut config = crate::config::types::Config::default();
-    config.chatgpt_allowed_accounts = Some(["oaiapp_test".to_owned()].into());
+    let config = crate::config::types::Config {
+        chatgpt_allowed_accounts: Some(["oaiapp_test".to_owned()].into()),
+        ..Default::default()
+    };
     remote = remote.with_steering(&config);
     assert!(remote.chat(None, &request(), 5, None).is_err());
     assert_eq!(remote.account_id(), Some("oaiapp_test"));

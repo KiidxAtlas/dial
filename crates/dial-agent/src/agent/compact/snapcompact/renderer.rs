@@ -643,6 +643,32 @@ fn ttf_glyph_top(cell_top: usize, ascent: f32, metrics: &Metrics) -> i32 {
     (cell_top as f32 + ascent - metrics.height as f32 - metrics.ymin as f32).round() as i32
 }
 
+/// One page to rasterize: its text, pixel size, cell grid, and layout flags.
+struct PageSpec<'a> {
+    text: &'a str,
+    width: usize,
+    height: usize,
+    grid: &'a Grid,
+    doc: bool,
+    black_ink: bool,
+}
+
+/// A palette-indexed source canvas, `width` x `height`, row-major.
+struct IndexedSource<'a> {
+    pixels: &'a [u8],
+    width: usize,
+    height: usize,
+}
+
+/// The RGB8 destination frame: `pixels` has row stride `stride`, and the content occupies its
+/// top-left `width` x `height` corner.
+struct RgbTarget<'a> {
+    pixels: &'a mut [u8],
+    stride: usize,
+    width: usize,
+    height: usize,
+}
+
 /// Rasterize `text` onto a `width` x `height` palette-indexed bitmap on the
 /// grid's cell box, laid out by [`Layout`] (grid, or two doc columns when
 /// `doc`). Glyphs keep their natural size with the baseline at the font's
@@ -652,16 +678,15 @@ fn ttf_glyph_top(cell_top: usize, ascent: f32, metrics: &Metrics) -> i32 {
 /// its whole cell with pitch-black ink, ignoring hue and dim state. Code
 /// points missing from the bitmap font draw through the embedded Silver
 /// TrueType fallback when it has a glyph.
-fn render_bitmap(
-    text: &str,
-    width: usize,
-    height: usize,
-    font: &Font,
-    grid: &Grid,
-    doc: bool,
-    black_ink: bool,
-    cancel: &AtomicBool,
-) -> Result<Vec<u8>> {
+fn render_bitmap(spec: PageSpec<'_>, font: &Font, cancel: &AtomicBool) -> Result<Vec<u8>> {
+    let PageSpec {
+        text,
+        width,
+        height,
+        grid,
+        doc,
+        black_ink,
+    } = spec;
     let mut pixels = vec![0u8; width * height]; // 0 = white background
     let layout = Layout::new(text, grid, doc, true, black_ink);
     if layout.is_empty() {
@@ -728,16 +753,15 @@ fn render_bitmap(
 
 /// RGB counterpart of [`render_bitmap`] for the TrueType font: same layout,
 /// glyphs alpha-blended from grayscale coverage, one cell per code point.
-fn render_ttf_rgb(
-    text: &str,
-    width: usize,
-    height: usize,
-    font: &TtfFont,
-    grid: &Grid,
-    doc: bool,
-    black_ink: bool,
-    cancel: &AtomicBool,
-) -> Result<Vec<u8>> {
+fn render_ttf_rgb(spec: PageSpec<'_>, font: &TtfFont, cancel: &AtomicBool) -> Result<Vec<u8>> {
+    let PageSpec {
+        text,
+        width,
+        height,
+        grid,
+        doc,
+        black_ink,
+    } = spec;
     let mut pixels = vec![255u8; width * height * 3];
     let layout = Layout::new(text, grid, doc, false, black_ink);
     if layout.is_empty() {
@@ -852,16 +876,18 @@ fn madd(a: f32, b: f32, c: f32) -> f32 {
 /// indices and the vertical pass accumulates one output row at a time, so the
 /// only full-size f32 buffer is the `dw * sh` horizontal intermediate (no f32
 /// copy of the source, no f32 copy of the output).
-fn stretch_indexed(
-    src: &[u8],
-    sw: usize,
-    sh: usize,
-    dw: usize,
-    dh: usize,
-    frame: &mut [u8],
-    frame_w: usize,
-    cancel: &AtomicBool,
-) -> Result<()> {
+fn stretch_indexed(src: IndexedSource<'_>, dst: RgbTarget<'_>, cancel: &AtomicBool) -> Result<()> {
+    let IndexedSource {
+        pixels: src,
+        width: sw,
+        height: sh,
+    } = src;
+    let RgbTarget {
+        pixels: frame,
+        stride: frame_w,
+        width: dw,
+        height: dh,
+    } = dst;
     let horiz = contributions(sw, dw);
     let mut tmp = vec![0f32; dw * sh * 3];
     for y in 0..sh {
@@ -1160,15 +1186,35 @@ pub(super) fn render(text: &str, shape: &super::Shape, cancel: &AtomicBool) -> R
     }
     let png = match font {
         RenderFont::Ttf(font) => {
-            let mut pixels =
-                render_ttf_rgb(text, size, height, font, &grid, doc, shape.black, cancel)?;
+            let mut pixels = render_ttf_rgb(
+                PageSpec {
+                    text,
+                    width: size,
+                    height,
+                    grid: &grid,
+                    doc,
+                    black_ink: shape.black,
+                },
+                font,
+                cancel,
+            )?;
             pixels[content_height * size * 3..].fill(255);
             encode_rgb_png(&pixels, size, height, png::Compression::Balanced)?
         }
         RenderFont::Bitmap(font) => {
             if !shape.stretch || (grid.cell_w, grid.cell_h) == (font.cell_w, font.cell_h) {
-                let mut pixels =
-                    render_bitmap(text, size, height, font, &grid, doc, shape.black, cancel)?;
+                let mut pixels = render_bitmap(
+                    PageSpec {
+                        text,
+                        width: size,
+                        height,
+                        grid: &grid,
+                        doc,
+                        black_ink: shape.black,
+                    },
+                    font,
+                    cancel,
+                )?;
                 pixels[content_height * size..].fill(0);
                 encode_indexed_png(&pixels, size, height, png::Compression::Balanced)?
             } else {
@@ -1179,16 +1225,31 @@ pub(super) fn render(text: &str, shape: &super::Shape, cancel: &AtomicBool) -> R
                 };
                 let sw = grid.cols * font.cell_w;
                 let sh = used * grid.repeat * font.cell_h;
-                let indexed = render_bitmap(text, sw, sh, font, &native, doc, shape.black, cancel)?;
+                let indexed = render_bitmap(
+                    PageSpec {
+                        text,
+                        width: sw,
+                        height: sh,
+                        grid: &native,
+                        doc,
+                        black_ink: shape.black,
+                    },
+                    font,
+                    cancel,
+                )?;
                 let mut frame = vec![255u8; size * height * 3];
                 stretch_indexed(
-                    &indexed,
-                    sw,
-                    sh,
-                    grid.cols * grid.cell_w,
-                    content_height,
-                    &mut frame,
-                    size,
+                    IndexedSource {
+                        pixels: &indexed,
+                        width: sw,
+                        height: sh,
+                    },
+                    RgbTarget {
+                        pixels: &mut frame,
+                        stride: size,
+                        width: grid.cols * grid.cell_w,
+                        height: content_height,
+                    },
                     cancel,
                 )?;
                 encode_rgb_png(&frame, size, height, png::Compression::Balanced)?

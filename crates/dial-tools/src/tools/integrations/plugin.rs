@@ -117,12 +117,15 @@ fn push_notice(notices: &parking_lot::Mutex<Vec<String>>, notice: String) {
     }
 }
 
+/// UI contributions per `(plugin, slot)`; an empty list means the slot is cleared.
+type SlotMap = BTreeMap<(String, Slot), Vec<String>>;
+
 /// Applies one reply. UI contributions replace their slot (an empty list clears it); other
 /// actions queue as effects. Only protocol 2 plugins may act; refusals become notices.
 fn absorb_reply(
     notices: &parking_lot::Mutex<Vec<String>>,
     effects: &parking_lot::Mutex<Vec<PluginEffect>>,
-    slots: &parking_lot::Mutex<BTreeMap<(String, Slot), Vec<String>>>,
+    slots: &parking_lot::Mutex<SlotMap>,
     plugin: &str,
     negotiated: &Negotiated,
     reply: &Value,
@@ -160,7 +163,7 @@ pub struct Host {
     generation: Arc<AtomicU64>,
     closed: Arc<AtomicBool>,
     effects: Arc<parking_lot::Mutex<Vec<PluginEffect>>>,
-    slots: Arc<parking_lot::Mutex<BTreeMap<(String, Slot), Vec<String>>>>,
+    slots: Arc<parking_lot::Mutex<SlotMap>>,
     observer: OnceLock<Option<SyncSender<EventJob>>>,
 }
 impl Host {
