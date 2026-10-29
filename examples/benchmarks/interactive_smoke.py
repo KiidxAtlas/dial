@@ -38,12 +38,23 @@ def unsupported_probe(handler):
     return True
 
 
+class DiscoveryGate:
+    def __init__(self):
+        self.armed = threading.Event()
+        self.requested = threading.Event()
+        self.release = threading.Event()
+
+    def open(self):
+        self.release.set()
+        self.armed.set()
+
+
 class Provider(http.server.ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self):
         super().__init__(("127.0.0.1", 0), Handler)
-        self.discovery = threading.Event()
+        self.discovery = DiscoveryGate()
         self.chat_requests = 0
         self.lock = threading.Lock()
         self.stream_requests = 0
@@ -87,7 +98,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.rstrip("/") == "/v1/models":
-            if not self.server.discovery.wait(15):
+            # Snapshot this scenario's gate: startup can request discovery before
+            # the terminal is ready, and later scenarios must not reuse its deadline.
+            gate = self.server.discovery
+            gate.requested.set()
+            gate.armed.wait()
+            if not gate.release.wait(15):
                 self.respond({"error": "fixture discovery deadline"}, 503)
                 return
             self.respond({"data": [{"id": "mock-main"}, {"id": "mock-next"}]})
@@ -346,7 +362,9 @@ class Terminal:
 
     def command(self, command, key="Enter"):
         self.run("send-keys", "-t", "smoke", "-l", "\x1b[200~" + command + "\x1b[201~")
-        # A human presses Enter separately from a paste; preserve Dial's paste guard.
+        # Observe paste consumption before starting the existing guard-settle period.
+        # Waiting from send-keys alone can batch paste and Enter on a busy UI loop.
+        self.wait(command, history=False)
         time.sleep(0.5)
         self.run("send-keys", "-t", "smoke", key)
 
@@ -616,11 +634,13 @@ def main():
             project, home = fixture(root, server.server_port)
             terminal = Terminal(binary, project, home, args.captures)
             terminal.wait("mock-main")
+            server.discovery.armed.set()
             terminal.capture("baseline")
             terminal.command("/model next")
             terminal.wait("Discovering available models")
             assert model(home) == "mock-main"
-            server.discovery.set()
+            assert server.discovery.requested.wait(5), "discovery request never reached fixture"
+            server.discovery.open()
             try:
                 wait_model(home, "mock-next")
             except AssertionError:
@@ -733,15 +753,22 @@ def main():
         side_thread_case(server, binary, args.captures)
         with tempfile.TemporaryDirectory(prefix="dial-pty-cancel-") as directory:
             project, home = fixture(pathlib.Path(directory), server.server_port)
-            server.discovery.clear()
+            server.discovery = DiscoveryGate()
             terminal = Terminal(binary, project, home, args.captures)
             terminal.wait("mock-main")
+            server.discovery.armed.set()
             terminal.command("/model next")
             terminal.wait("Discovering available models")
             terminal.key("Escape")
             terminal.wait("Pending switch cancelled")
-            server.discovery.set()
-            time.sleep(1)
+            assert server.discovery.requested.wait(5), "discovery request never reached fixture"
+            server.discovery.open()
+            # A populated real picker acknowledges that Dial consumed discovery;
+            # do not infer completion from an elapsed sleep or HTTP response alone.
+            terminal.key("M-m")
+            terminal.wait("scope: global")
+            terminal.wait("mock-next", history=False)
+            terminal.key("Escape")
             assert model(home) == "mock-main", "cancelled switch must not apply after discovery"
             terminal.capture("favorite-cancelled")
             terminal.close()
@@ -766,7 +793,7 @@ def main():
             "model_quality_evidence": False,
         }))
     finally:
-        server.discovery.set()
+        server.discovery.open()
         server.crash_release.set()
         server.worker_release.set()
         server.draft_release.set()

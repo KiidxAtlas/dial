@@ -5,6 +5,10 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 
 ## [Unreleased]
 
+### Fixed
+
+- Terminal lifecycle checks wait for pasted input to render before submitting and use per-scenario model-discovery gates, avoiding lost Enter presses and premature discovery timeouts on busy runners.
+
 ## [0.2.7] - 2026-10-28
 
 ### Fixed
