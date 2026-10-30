@@ -15,6 +15,7 @@ mod clipboard;
 pub mod command_surface;
 pub mod composer;
 pub mod editor;
+pub mod extension_views;
 pub mod fx;
 pub mod images;
 pub mod input;

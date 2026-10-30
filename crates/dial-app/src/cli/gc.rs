@@ -449,6 +449,22 @@ pub fn collect_references(layout: &Layout) -> Result<ReferenceScan> {
         let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
         scan(&bytes, &mut refs, &mut pending);
     }
+    if artifacts.is_dir() && !refs.is_empty() {
+        let store = crate::storage::artifact::ArtifactStore::new(&artifacts)?;
+        let mut uris = refs
+            .iter()
+            .map(|hash| format!("artifact://{hash}"))
+            .collect();
+        store.expand_evidence_references(&mut uris)?;
+        for uri in uris {
+            let hash = uri
+                .strip_prefix("artifact://")
+                .context("invalid expanded artifact reference")?;
+            if refs.insert(hash.to_owned()) {
+                pending.push(hash.to_owned());
+            }
+        }
+    }
     // Bodies of referenced artifacts may themselves reference other artifacts.
     let mut missing = Vec::new();
     while let Some(hash) = pending.pop() {

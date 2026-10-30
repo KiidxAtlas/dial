@@ -8,8 +8,8 @@
 //! Per-model settings (`[image.models.*]`, edited by `/image settings`) apply to every request for
 //! the matching model; each image API receives only the settings it accepts (`supported`).
 //!
-//! Edits (`image`): MLX-Serve takes the source as base64 `image` on `images/generations`, OpenAI
-//! Images uses multipart `images/edits`, and the Responses hosted tool gets it as `input_image`.
+//! Edits (`image`): MLX-Serve accepts base64 input on `images/generations`, OpenAI Images uses
+//! multipart `images/edits`, Responses gets `input_image`, and Gemini gets `inlineData`.
 //! Other routes refuse before any request. The source file is only read.
 //!
 //! Request validation, path resolution, destination preflight and mutation authority run before
@@ -30,6 +30,10 @@ use crate::storage::redact::redact_text;
 use crate::tools::integrations::ext::{Tool, ToolContext};
 use crate::tools::{ToolOutput, tool_schema};
 
+mod comfyui;
+mod google;
+mod native;
+mod queued;
 mod selected;
 
 pub const TOOL: &str = "image_gen";
@@ -52,7 +56,7 @@ const DESCRIPTION: &str = "Generate one image, or edit an existing workspace ima
 /// Hosted session providers whose `images/generations` route returns base64 images:
 /// (API host, default image model, request shape).
 const PROVIDERS: &[(&str, &str, Wire)] = &[
-    ("api.openai.com", "gpt-image-1", Wire::OpenAi),
+    ("api.openai.com", "gpt-image-1.5", Wire::OpenAi),
     ("api.x.ai", "grok-imagine-image-2.0", Wire::Xai),
 ];
 
@@ -61,8 +65,8 @@ pub fn tools(_config: &Config) -> Vec<Arc<dyn Tool>> {
     vec![Arc::new(ImageGen)]
 }
 
-/// Offer a shared image route using local configuration and credentials, never network probes.
-/// Missing default credentials leave the tool unavailable; explicit route failures are reported.
+/// Offer image generation independently of the chat model, without network probes.
+/// Missing automatic routes stay callable so generation can report the setup requirement.
 ///
 /// # Errors
 /// Returns failures for customized image settings, assigned roles and selected image routes.
@@ -79,7 +83,7 @@ pub fn auto_tools(config: &Config) -> Result<Vec<Arc<dyn Tool>>> {
         {
             Err(error)
         }
-        Err(_) => Ok(Vec::new()),
+        Err(_) => Ok(tools(config)),
     }
 }
 
@@ -118,6 +122,12 @@ pub fn current_route(config: &Config) -> Result<ImageRoute> {
             Wire::MlxServe => "MLX-Serve",
             Wire::Responses => "Responses image tool",
             Wire::ChatCompletions => "Chat image output",
+            Wire::Gemini => "Gemini native image",
+            Wire::Imagen => "Imagen prediction",
+            Wire::BlackForestLabs => "Black Forest Labs",
+            Wire::ComfyUi => "ComfyUI workflow",
+            Wire::Fal => "fal queue",
+            Wire::Replicate => "Replicate prediction",
         },
         settings: supported(target.wire, &target.model),
         edits: edit_unsupported(&target).is_none(),
@@ -128,14 +138,20 @@ pub fn current_route(config: &Config) -> Result<ImageRoute> {
 /// Why `target` cannot edit an existing image, when it cannot.
 fn edit_unsupported(target: &Target) -> Option<String> {
     match target.wire {
-        Wire::MlxServe | Wire::Responses => None,
+        Wire::MlxServe | Wire::Responses | Wire::Gemini => None,
         Wire::OpenAi if target.model.starts_with("dall-e-3") => Some(format!(
             "{} cannot edit images; use gpt-image-1 or dall-e-2",
             target.model
         )),
         Wire::OpenAi => None,
-        Wire::Xai | Wire::ChatCompletions => Some(format!(
-            "image edits are not supported on {}'s image route; use an OpenAI Images, MLX-Serve or Responses image model",
+        Wire::Xai
+        | Wire::ChatCompletions
+        | Wire::Imagen
+        | Wire::BlackForestLabs
+        | Wire::ComfyUi
+        | Wire::Fal
+        | Wire::Replicate => Some(format!(
+            "image edits are not supported on {}'s image route; use an OpenAI Images, MLX-Serve, Gemini or Responses image model",
             target.model
         )),
     }
@@ -148,6 +164,11 @@ fn supported(wire: Wire, model: &str) -> &'static [&'static str] {
         Wire::OpenAi if model.starts_with("dall-e") => &["size", "quality"],
         Wire::OpenAi | Wire::Responses => &["size", "quality", "background", "moderation"],
         Wire::Xai | Wire::ChatCompletions => &["size"],
+        Wire::Gemini | Wire::Imagen => &["size"],
+        Wire::BlackForestLabs if model.starts_with("flux-2-") => &["size", "seed"],
+        Wire::BlackForestLabs => &["seed"],
+        Wire::Fal | Wire::Replicate => &["seed", "input"],
+        Wire::ComfyUi => &["comfyui"],
     }
 }
 
@@ -187,6 +208,9 @@ fn apply_settings(target: &Target, object: &mut Value, edit: bool) {
 
 /// The configured default size, when the target's API accepts one from the settings.
 fn configured_size(target: &Target) -> Option<&'static str> {
+    if !supported(target.wire, &target.model).contains(&"size") {
+        return None;
+    }
     let size = target.settings.size.as_deref()?;
     SIZES.iter().copied().find(|known| *known == size)
 }
@@ -196,6 +220,7 @@ fn customized(image: &ImageConfig) -> bool {
     let defaults = ImageConfig::default();
     image.base_url != defaults.base_url
         || image.model != defaults.model
+        || image.api.is_some()
         || image.api_key_env.is_some()
 }
 
@@ -210,6 +235,12 @@ enum Wire {
     MlxServe,
     Responses,
     ChatCompletions,
+    Gemini,
+    Imagen,
+    BlackForestLabs,
+    ComfyUi,
+    Fal,
+    Replicate,
 }
 
 impl Wire {
@@ -217,6 +248,23 @@ impl Wire {
         host(base_url)
             .and_then(|host| PROVIDERS.iter().find(|(known, _, _)| *known == host))
             .map_or(Self::OpenAi, |(_, _, wire)| *wire)
+    }
+
+    fn configured(api: crate::llm::profiles::ImageGenerationApi, base_url: &str) -> Result<Self> {
+        use crate::llm::profiles::ImageGenerationApi as Api;
+        Ok(match api {
+            Api::Images => Self::of(base_url),
+            Api::MlxServe => Self::MlxServe,
+            Api::Responses => Self::Responses,
+            Api::ChatCompletions => Self::ChatCompletions,
+            Api::Gemini => Self::Gemini,
+            Api::Imagen => Self::Imagen,
+            Api::BlackForestLabs => Self::BlackForestLabs,
+            Api::ComfyUi => Self::ComfyUi,
+            Api::Fal => Self::Fal,
+            Api::Replicate => Self::Replicate,
+            Api::Disabled => bail!("image generation is explicitly disabled"),
+        })
     }
 }
 
@@ -242,8 +290,12 @@ struct Target {
 /// The resolved route with its per-model settings attached.
 fn resolve(config: &Config) -> Result<Target> {
     let mut target = route(config)?;
+    native::validate_base(&target.base_url)?;
     if let Some(settings) = config.image.settings_for(&target.model) {
         target.settings = settings.clone();
+    }
+    if target.settings != ImageModelSettings::default() {
+        target.settings.validate()?;
     }
     Ok(target)
 }
@@ -252,6 +304,31 @@ fn resolve(config: &Config) -> Result<Target> {
 fn route(config: &Config) -> Result<Target> {
     let image = &config.image;
     let customized = customized(image);
+    if customized && image.api.is_some() {
+        // Native services need not expose a chat endpoint. The explicit API is authoritative.
+        let wire = image.api.map_or_else(
+            || Ok(Wire::of(&image.base_url)),
+            |api| Wire::configured(api, &image.base_url),
+        )?;
+        let key = crate::llm::catalog::resolve_credential(
+            &config.user_dir,
+            &image.base_url,
+            image.api_key_env.as_deref(),
+        )?;
+        ensure!(
+            key.is_some() || crate::llm::is_local_url(&image.base_url),
+            "no API key for image generation; save one through /providers or set image.api_key_env"
+        );
+        return Ok(Target {
+            base_url: image.base_url.clone(),
+            model: image.model.clone(),
+            wire,
+            key: key.unwrap_or_default(),
+            account_id: None,
+            headers: Vec::new(),
+            settings: ImageModelSettings::default(),
+        });
+    }
     let mut selected_error = None;
     if !customized {
         match selected::resolve(config) {
@@ -427,7 +504,32 @@ impl Tool for ImageGen {
     }
 
     fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
-        match generate(ctx, args) {
+        self.execute(
+            ctx,
+            args,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+    }
+
+    fn call_streaming(
+        &self,
+        ctx: &ToolContext,
+        args: &Value,
+        _on_event: &(dyn Fn(crate::tools::integrations::ext::ToolEvent) + Sync),
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> ToolOutput {
+        native::with_cancel(cancel, |cancel| self.execute(ctx, args, cancel))
+    }
+}
+
+impl ImageGen {
+    fn execute(
+        &self,
+        ctx: &ToolContext,
+        args: &Value,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> ToolOutput {
+        match generate(ctx, args, cancel) {
             Ok(written) => {
                 let similarity = crate::tools::vision::search::prompt_similarity_line(
                     ctx.config,
@@ -629,7 +731,15 @@ struct Written {
     source: Option<String>,
 }
 
-fn generate(ctx: &ToolContext, args: &Value) -> Result<Written> {
+fn generate(
+    ctx: &ToolContext,
+    args: &Value,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<Written> {
+    ensure!(
+        !cancel.load(std::sync::atomic::Ordering::SeqCst),
+        "image generation interrupted"
+    );
     let mut request = parse_request(args)?;
     let path = ctx
         .workspace
@@ -666,7 +776,9 @@ fn generate(ctx: &ToolContext, args: &Value) -> Result<Written> {
     if args.get("size").is_none_or(Value::is_null) {
         if let Some(size) = configured_size(&target) {
             request.size = size;
-        } else if request.source.is_some() {
+        } else if request.source.is_some()
+            || !supported(target.wire, &target.model).contains(&"size")
+        {
             request.size = "auto";
         }
     }
@@ -680,7 +792,10 @@ fn generate(ctx: &ToolContext, args: &Value) -> Result<Written> {
     // Stage in the destination directory before spending quota; RAII removes it on every error.
     let mut file = tempfile::NamedTempFile::new_in(parent)
         .with_context(|| format!("preparing image destination {}", request.output))?;
-    let bytes = request_image(&target, ctx.config, &request)?;
+    let client = native::Client::new(&target, ctx.config, cancel);
+    client.check()?;
+    let bytes = request_image(&target, ctx.config, &request, &client)
+        .map_err(|error| client.redact(error))?;
     let format = Format::detect(&bytes)
         .ok_or_else(|| anyhow!("image API returned data that is not PNG, JPEG, or WebP"))?;
     decode_bounded(&bytes).context("decoding generated image")?;
@@ -699,6 +814,8 @@ fn generate(ctx: &ToolContext, args: &Value) -> Result<Written> {
 
     file.write_all(&bytes)
         .with_context(|| format!("writing {}", request.output))?;
+    client.check()?;
+    crate::tools::exec::execution::before_commit().map_err(|error| anyhow!(error))?;
     file.persist_noclobber(&path)
         .with_context(|| format!("publishing {} without overwriting", request.output))?;
     Ok(Written {
@@ -750,11 +867,30 @@ fn request_body(target: &Target, request: &Request) -> Value {
         Wire::Responses | Wire::ChatCompletions => {
             return selected::body(target, request);
         }
+        Wire::Gemini
+        | Wire::Imagen
+        | Wire::BlackForestLabs
+        | Wire::ComfyUi
+        | Wire::Fal
+        | Wire::Replicate => unreachable!("native image services own their request bodies"),
     }
     body
 }
 
-fn request_image(target: &Target, config: &Config, request: &Request) -> Result<Vec<u8>> {
+fn request_image(
+    target: &Target,
+    config: &Config,
+    request: &Request,
+    client: &native::Client<'_>,
+) -> Result<Vec<u8>> {
+    match target.wire {
+        Wire::Gemini | Wire::Imagen => return google::request(client, target, request),
+        Wire::BlackForestLabs | Wire::Fal | Wire::Replicate => {
+            return queued::request(client, target, request);
+        }
+        Wire::ComfyUi => return comfyui::request(client, target, request),
+        _ => {}
+    }
     if target.wire == Wire::Responses {
         return selected::responses(target, config, request);
     }
@@ -769,7 +905,7 @@ fn request_image(target: &Target, config: &Config, request: &Request) -> Result<
         _ => "images/generations",
     };
     let headers = crate::llm::model_config::resolve_headers(&target.headers)?;
-    let agent = crate::llm::agent_with(config.image.timeout_secs, true, None, None);
+    let agent = client.agent()?;
     let mut builder = agent.post(&format!("{base}/{path}"));
     if !target.key.is_empty() {
         builder = builder.header("authorization", format!("Bearer {}", target.key));

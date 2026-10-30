@@ -81,11 +81,21 @@ pub(super) fn resolve_current(config: &Config) -> Result<Option<Target>> {
             settings: Default::default(),
         }));
     }
-    let base = llm::provider::endpoint_url(&endpoint.base_url, endpoint.allow_insecure)?;
-    let base_url = base
-        .strip_suffix("/chat/completions")
-        .context("invalid selected image endpoint")?
-        .to_owned();
+    let base_url = if matches!(
+        api,
+        ImageGenerationApi::Images
+            | ImageGenerationApi::MlxServe
+            | ImageGenerationApi::Responses
+            | ImageGenerationApi::ChatCompletions
+    ) {
+        let base = llm::provider::endpoint_url(&endpoint.base_url, endpoint.allow_insecure)?;
+        base.strip_suffix("/chat/completions")
+            .context("invalid selected image endpoint")?
+            .to_owned()
+    } else {
+        super::native::validate_base(&endpoint.base_url)?;
+        endpoint.base_url.trim_end_matches('/').to_owned()
+    };
     let key = llm::catalog::resolve_credential(
         &config.user_dir,
         &endpoint.base_url,
@@ -116,6 +126,12 @@ pub(super) fn resolve_current(config: &Config) -> Result<Option<Target>> {
             );
             Wire::ChatCompletions
         }
+        ImageGenerationApi::Gemini
+        | ImageGenerationApi::Imagen
+        | ImageGenerationApi::BlackForestLabs
+        | ImageGenerationApi::ComfyUi
+        | ImageGenerationApi::Fal
+        | ImageGenerationApi::Replicate => Wire::configured(api, &base_url)?,
         ImageGenerationApi::Disabled => unreachable!("disabled capability was filtered"),
     };
     Ok(Some(Target {

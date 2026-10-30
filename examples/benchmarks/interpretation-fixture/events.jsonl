@@ -1,0 +1,3 @@
+{"event_id":"E1","payload":{"duration":{"value":250,"unit":"ms"}}}
+{"event_id":"E2","payload":{"duration":{"value":2,"unit":"s"}}}
+{"event_id":"E3","payload":{"duration":null}}

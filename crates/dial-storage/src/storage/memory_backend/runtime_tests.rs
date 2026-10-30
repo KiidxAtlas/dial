@@ -516,3 +516,87 @@ fn rewind_rebinds_the_history_generation_and_reattaches_removed_facts() {
             .is_err()
     );
 }
+
+#[test]
+fn automatic_recall_filters_incidental_words_and_old_assistant_subjects() {
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, auth) = semantic_runtime(dir.path(), true);
+    let mut runner = FakeRunner::new("{}");
+    runtime
+        .command(
+            &auth,
+            "save Image generation context is scoped to a session.",
+            &mut runner,
+        )
+        .unwrap();
+    runtime
+        .observe_owned(
+            &auth,
+            vec![
+                turn("user", "image generation"),
+                turn("assistant", "Image generation uses session context."),
+            ],
+        )
+        .unwrap();
+    for query in [
+        "from your current session did you see or put anything in your context that would be better if collapsed",
+        "fix the router deadline",
+    ] {
+        let recalled = runtime
+            .prepare_prompt(&auth, query, &mut runner)
+            .unwrap()
+            .unwrap();
+        assert!(
+            recalled.context.is_none(),
+            "{query}: {:?}",
+            recalled.context
+        );
+        assert!(recalled.commit(&auth));
+    }
+    // Provider-compatible role=user reports must not replace the human subject, including during
+    // compaction recall and glue-only continuations.
+    let mut history = vec![turn("user", "fix the router deadline")];
+    for key in [
+        "dial_worker_result",
+        "dial_side_result",
+        "dial_compaction_summary",
+    ] {
+        let mut report = turn("user", "Image generation uses session context.");
+        report[key] = if key == "dial_compaction_summary" {
+            json!(true)
+        } else {
+            json!("task-1")
+        };
+        history.push(report);
+    }
+    runtime.observe_owned(&auth, history.clone()).unwrap();
+    let continuation = runtime
+        .prepare_prompt(&auth, "continue", &mut runner)
+        .unwrap()
+        .unwrap();
+    assert!(continuation.context.is_none());
+    assert!(continuation.commit(&auth));
+    assert!(
+        runtime
+            .compaction_context(&auth, &history, &mut runner)
+            .unwrap()
+            .is_none()
+    );
+    let explicit = runtime
+        .execute_tool(
+            &auth,
+            "recall",
+            &json!({"query":"image generation"}),
+            &mut runner,
+        )
+        .unwrap();
+    assert!(!explicit["items"].as_array().unwrap().is_empty());
+    let matching = runtime
+        .prepare_prompt(&auth, "image generation", &mut runner)
+        .unwrap()
+        .unwrap();
+    assert!(
+        matching.context.unwrap().contains("Image generation"),
+        "filtered facts must not become shown"
+    );
+}

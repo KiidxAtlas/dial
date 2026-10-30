@@ -96,6 +96,50 @@ fn started_job_requires_a_running_entry() {
 }
 
 #[test]
+fn pool_polling_tracks_delivery_per_item_without_hiding_new_results() {
+    let mut tasks = LiveTasks::default();
+    let mut pool = WorkerPool::new("batch".into(), 1, json!({}));
+    for index in 1..=2 {
+        let id = format!("task-{index}");
+        let body = tasks.tree.start("worker", &id, None);
+        let record = json!({"id":id,"status":"done","result":format!("narrative {index}"),
+            "artifact":format!("artifact://report-{index}")});
+        body.settle(
+            String::new(),
+            Some(record.clone()),
+            crate::runtime::Phase::from_status("done"),
+        );
+        tasks.jobs.insert(
+            id,
+            JobState {
+                body,
+                interrupt: Arc::new(AtomicBool::new(false)),
+                worker: None,
+                active_tool: Arc::default(),
+                delivered: false,
+            },
+        );
+        pool.items.push(item(ItemState::Settled(record)));
+    }
+    tasks.pools.insert("pool-1".into(), pool);
+    // Canonical automatic delivery covers only the first item in this batch.
+    let mut first_batch = tasks.report_from("pool-1", false, 0).unwrap();
+    first_batch["items"].as_array_mut().unwrap().truncate(1);
+    tasks.completed.push(aggregate(first_batch));
+    tasks.deliver("pool-1");
+    let report = tasks.pool_report("pool-1", false).unwrap();
+    let polled = tasks.polling_output(Ok(report.clone()));
+    assert!(!polled.text.contains("narrative 1"));
+    assert!(polled.text.contains("artifact://report-1"));
+    assert!(polled.text.contains("narrative 2"));
+    let repeated = tasks.polling_output(Ok(report.clone()));
+    assert!(!repeated.text.contains("narrative 1") && !repeated.text.contains("narrative 2"));
+    assert_eq!(repeated.data, Some(report.clone()));
+    let recovered = output(Ok(report));
+    assert!(recovered.text.contains("narrative 1") && recovered.text.contains("narrative 2"));
+}
+
+#[test]
 fn queued_items_keep_the_launch_they_were_pushed_with() {
     let alpha = test_launch("alpha");
     let beta = test_launch("beta");

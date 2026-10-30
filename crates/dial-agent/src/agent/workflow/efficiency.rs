@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
 
+mod commands;
+pub(in crate::agent) use commands::compact_command;
+
 /// Bounded controller-observed call identities, not evidence freshness or model comprehension.
 #[derive(Default, Serialize, Deserialize)]
 pub(in crate::agent) struct Inspections {
@@ -147,28 +150,128 @@ pub(in crate::agent) fn append_ambient(context: &mut String, block: &str, histor
     if block.trim().is_empty() || context.contains(block) {
         return;
     }
-    let contains = |message: &Value| {
-        message["dial_recall"]
-            .as_str()
-            .is_some_and(|text| text.contains(block))
-            || message["content"]
-                .as_str()
-                .is_some_and(|text| text.contains(block))
-            || message["content"].as_array().is_some_and(|parts| {
-                parts.iter().any(|part| {
-                    part["text"]
+    let contains = |needle: &str| {
+        ambient_contains(context, needle)
+            || history.iter().any(|message| {
+                message["dial_recall"]
+                    .as_str()
+                    .is_some_and(|text| ambient_contains(text, needle))
+                    || message["content"]
                         .as_str()
-                        .is_some_and(|text| text.contains(block))
-                })
+                        .is_some_and(|text| ambient_contains(text, needle))
+                    || message["content"].as_array().is_some_and(|parts| {
+                        parts.iter().any(|part| {
+                            part["text"]
+                                .as_str()
+                                .is_some_and(|text| ambient_contains(text, needle))
+                        })
+                    })
             })
     };
-    if history.iter().any(contains) {
+    if contains(block) {
+        return;
+    }
+    let block = novel_ambient(block, &contains);
+    if block.is_empty() {
         return;
     }
     if !context.is_empty() {
         context.push_str("\n\n");
     }
-    context.push_str(block);
+    context.push_str(&block);
+}
+
+fn ambient_contains(text: &str, needle: &str) -> bool {
+    if text.contains(needle) {
+        return true;
+    }
+    // JSON maps may have different key order after transcript persistence. Compare whole note
+    // records, never IDs alone, so corrected content/provenance is admitted again.
+    let Ok(record) = serde_json::from_str::<Value>(needle) else {
+        return false;
+    };
+    text.lines().any(|line| {
+        serde_json::from_str::<Value>(line)
+            .ok()
+            .is_some_and(|value| {
+                value["entries"]
+                    .as_array()
+                    .is_some_and(|entries| entries.contains(&record))
+            })
+    })
+}
+
+/// Only shorten built-in edits when the complete raw result was retained. The producer's validated
+/// projection keeps fresh anchors; UI/raw evidence still contain the diff representation.
+pub(in crate::agent) fn edit_result(
+    tool: &str,
+    output: &crate::runtime::tool_output::ToolOutput,
+    retained: bool,
+) -> Option<String> {
+    if tool != "edit" || !retained {
+        return None;
+    }
+    let message = crate::tools::surface::outcome::message_for(tool, "", output);
+    let text = message["content"].as_str()?;
+    (text != output.text).then(|| text.to_owned())
+}
+
+/// Deduplicate exact records rather than entire changing bundles. Full record bytes (including
+/// revisions and source digests) must match; a summary or an ID alone is never sufficient.
+fn novel_ambient(block: &str, contains: &dyn Fn(&str) -> bool) -> String {
+    if block.starts_with("Task architecture context ")
+        && let Some(at) = block.find("Saved codebase understanding ")
+    {
+        let (architecture, sources) = block.split_at(at);
+        let sources = novel_ambient(sources, contains);
+        return if contains(architecture.trim_end()) {
+            sources
+        } else {
+            format!("{architecture}{sources}")
+        };
+    }
+    if block.starts_with("Relevant persistent notes ")
+        && let Some((header, body)) = block.split_once('\n')
+        && let Ok(mut value) = serde_json::from_str::<Value>(body)
+        && let Some(entries) = value.get_mut("entries").and_then(Value::as_array_mut)
+    {
+        entries.retain(|entry| !contains(&entry.to_string()));
+        return if entries.is_empty() {
+            String::new()
+        } else {
+            format!("{header}\n{value}")
+        };
+    }
+    if !block.starts_with("Saved codebase understanding ") {
+        return block.to_owned();
+    }
+    let mut removed = false;
+    let mut kept_data = false;
+    let mut lines = Vec::new();
+    for line in block.lines() {
+        let record = ["Finding ", "Source ", "Architecture source "]
+            .iter()
+            .any(|prefix| {
+                line.strip_prefix(prefix).is_some_and(|json| {
+                    serde_json::from_str::<Value>(json).is_ok_and(|value| value.is_object())
+                })
+            });
+        if record && contains(line) {
+            removed = true;
+            continue;
+        }
+        kept_data |= !line.is_empty()
+            && !line.starts_with("Saved codebase understanding ")
+            && !line.starts_with("Ambient brief:");
+        lines.push(line);
+    }
+    if removed && !kept_data {
+        String::new()
+    } else if removed {
+        format!("{}\n", lines.join("\n"))
+    } else {
+        block.to_owned()
+    }
 }
 
 /// Normalize an optional byte cap for composition: zero means no cap.

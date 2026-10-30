@@ -56,3 +56,6 @@ pub mod time;
 
 /// Host facts and process-wide signal handling.
 pub mod sys;
+
+#[cfg(unix)]
+pub mod terminal;

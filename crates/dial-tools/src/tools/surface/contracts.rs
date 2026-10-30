@@ -24,14 +24,42 @@ pub struct HistoricalCall {
 /// history recorded before them stays valid. Removing a pinned property recovers that identity.
 const ADDITIVE_PROPERTIES: &[(&str, &[&str])] = &[
     ("bash", &["session"]),
+    ("bg", &["persist", "lifetime"]),
+    ("monitor", &["run"]),
     ("grep", &["output"]),
     ("edit", &["allow_syntax_errors"]),
-    ("task", &["source_session", "model"]),
+    ("task", &["source_session", "model", "isolation_backend"]),
     ("find", &["related"]),
     ("lsp", &["payload"]),
     ("eval", &["background", "title"]),
     ("web_search", &["domains", "exclude_domains"]),
     ("image_gen", &["image"]),
+    (
+        "data",
+        &[
+            "row_ids",
+            "brush",
+            "calculation_reference",
+            "bins",
+            "order_by",
+            "whole_source",
+            "json_pointers",
+            "decimal_columns",
+            "conversions",
+            "dates",
+            "dictionary",
+            "join",
+        ],
+    ),
+    (
+        "audio",
+        &[
+            "window_ms",
+            "silence_dbfs",
+            "clip_threshold",
+            "transient_db",
+        ],
+    ),
     (
         "browser",
         &[
@@ -93,6 +121,14 @@ const ADDITIVE_PROPERTIES: &[(&str, &[&str])] = &[
 const ADDITIVE_ENUM_VALUES: &[(&str, &str, &[&str])] = &[
     ("eval", "language", &["py"]),
     ("lsp", "action", &["request"]),
+    (
+        "data",
+        "action",
+        &["histogram", "trend", "correlation", "inspect"],
+    ),
+    ("data", "format", &["jsonl"]),
+    ("audio", "action", &["analyze"]),
+    ("document", "action", &["inspect"]),
     (
         "browser",
         "action",
@@ -389,6 +425,13 @@ fn controller_compatible(
                 .any(|variant| identities(&[variant], &Registry::new()).get(&old.name) == Some(old))
         });
     }
+    if old.name == "task" {
+        return task_variants(schema).is_some_and(|variants| {
+            variants
+                .into_iter()
+                .any(|variant| identities(&[variant], &Registry::new()).get(&old.name) == Some(old))
+        });
+    }
     let mut before = schema.clone();
     let Some(properties) = before
         .pointer_mut("/function/parameters/properties")
@@ -406,38 +449,58 @@ fn controller_compatible(
             }
             properties["action"]["enum"] = json!(["view", "update"]);
         }
-        "task" => {
-            // Pool actions, `concurrency`, and the seance source/model are the only change since the
-            // prior release.
-            if properties.remove("concurrency").is_none()
-                || properties["action"]["enum"]
-                    != json!([
-                        "run", "start", "resume", "status", "wait", "cancel", "create", "push",
-                        "peek", "close"
-                    ])
-            {
-                return false;
-            }
-            properties["action"]["enum"] =
-                json!(["run", "start", "resume", "status", "wait", "cancel"]);
-            // Additive seance properties: strip when present; the identity comparison below still
-            // rejects any other change.
-            for property in ["source_session", "model"] {
-                properties.remove(property);
-            }
-            if let Some(items) = properties
-                .get_mut("tasks")
-                .and_then(|tasks| tasks.pointer_mut("/items/properties"))
-                .and_then(Value::as_object_mut)
-            {
-                for property in ["source_session", "model"] {
-                    items.remove(property);
-                }
-            }
-        }
         _ => return false,
     }
     identities(&[before], &Registry::new()).get(&old.name) == Some(old)
+}
+
+/// Optional `task` properties added since the prior release, each present at the top level and in
+/// `tasks[]` items. Their absence keeps the old meaning.
+const TASK_ADDITIVE: &[&[&str]] = &[&["source_session", "model"], &["isolation_backend"]];
+
+/// Every prior shape of the current `task` schema: with or without the pool actions and
+/// `concurrency`, and with or without each group in [`TASK_ADDITIVE`]. `None` unless the current
+/// schema has the pool actions, the only shape these variants are derived from.
+fn task_variants(schema: &Value) -> Option<Vec<Value>> {
+    let properties = schema.pointer("/function/parameters/properties")?;
+    if properties.get("concurrency").is_none()
+        || properties["action"]["enum"]
+            != json!([
+                "run", "start", "resume", "status", "wait", "cancel", "create", "push", "peek",
+                "close"
+            ])
+    {
+        return None;
+    }
+    let mut variants = Vec::new();
+    for mask in 0..(1u32 << (TASK_ADDITIVE.len() + 1)) {
+        let mut variant = schema.clone();
+        let properties = variant
+            .pointer_mut("/function/parameters/properties")
+            .and_then(Value::as_object_mut)?;
+        if mask & 1 != 0 {
+            properties.remove("concurrency");
+            properties["action"]["enum"] =
+                json!(["run", "start", "resume", "status", "wait", "cancel"]);
+        }
+        for (bit, group) in TASK_ADDITIVE.iter().enumerate() {
+            if mask & (2 << bit) == 0 {
+                continue;
+            }
+            for property in *group {
+                properties.remove(*property);
+                if let Some(items) = properties
+                    .get_mut("tasks")
+                    .and_then(|tasks| tasks.pointer_mut("/items/properties"))
+                    .and_then(Value::as_object_mut)
+                {
+                    items.remove(*property);
+                }
+            }
+        }
+        variants.push(variant);
+    }
+    Some(variants)
 }
 
 /// Project settled history onto the current contracts. `None` means no historical call needed a

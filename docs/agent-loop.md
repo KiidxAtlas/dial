@@ -69,11 +69,14 @@ their optional descriptions; discovery still supplies those on demand. If immuta
 and pinned schemas still cannot fit, the request fails before inference without silently unloading
 explicit tools or discarding the session's unfinished work.
 
-Ambient provenance recall and saved-codebase blocks are appended only when their exact text is
-absent from the current visible branch (with efficiency enabled). Earlier messages and their
-cacheable prefixes are not rewritten. Changed blocks still reach the model, and compaction or
-branching that removes a block permits retrieval again. This is exact-block deduplication, not
-semantic merging of partially overlapping recall results or a combined ambient byte budget.
+Ambient provenance recall and saved-codebase records are appended only when absent from the current
+visible branch, even with optional efficiency settings disabled. Exact note records and source/finding
+rows are deduplicated individually, so a changing neighbour does not repeat unchanged evidence.
+Revisions, content, source digests and provenance must still match; changed records reach the model.
+Earlier messages and cacheable prefixes are not rewritten. Compaction or branching that removes a
+record permits retrieval again. This is exact-record admission, not semantic merging or a combined
+ambient byte budget. Automatic semantic/Hindsight recall also admits facts against the latest user
+subject, not arbitrary words from prior assistant discussion; explicit recall remains broad.
 
 Ordinary coding tasks no longer carry unrelated `web_search`/`web_fetch` schemas. Explicit web
 research or URL intent routes the relevant tools locally before inference; missing matches remain
@@ -95,7 +98,7 @@ filled from prompt estimates. Model, purpose, worker and turn attribution remain
 
 Overflow recovery uses a fit-only compaction target: the request only needs to fit the model's context window and output reserve, even when the normal auto-continue threshold would pause the turn. Compaction preserves complete assistant/tool groups while tolerating orphan or duplicated tool-call records in irregular imported history.
 
-Portable summaries update the previous committed summary with newly summarized history instead of summarizing the summary as transcript. A cut within a user turn gets a distinct turn-prefix summary, while the recent suffix remains verbatim. Every subsequent turn-prefix or branch window explicitly integrates the prior output using the original format. Update instructions prioritize active goals, constraints, unresolved work, material decisions and evidence provenance while allowing duplicate or obsolete details to be consolidated. File-operation lists carry forward as attempted targets from call arguments, explicitly not proof of successful reads or modifications; legacy list tags remain readable. Summarizer input is divided at message boundaries, conservatively discounted against the selected summarizer window, and a rejected window is halved and replanned. Single messages too large for a window are clamped with an explicit omission marker.
+Portable summaries update the previous committed summary with newly summarized history instead of summarizing the summary as transcript. A cut within a user turn gets a distinct turn-prefix summary, while the recent suffix remains verbatim. Every subsequent turn-prefix or branch window explicitly integrates the prior output using the original format. Update instructions prioritize active requests, approval boundaries, unrelated work, unresolved failures, running tasks, current edit-witness distinctions and verification gaps; resolved incidents retain their supported resolution and retrieval pointer rather than repeated diagnostic transcripts. File-operation inventories prioritize recent mutation targets, with at most 16 targets per list and 4,096 combined path bytes; older read inventories do not accumulate across summaries. These lists are attempted targets from call arguments, not edit witnesses or evidence of successful reads or modifications; legacy tags remain readable, and full calls/results remain in session history. Summarizer input is divided at message boundaries, conservatively discounted against the selected summarizer window, and a rejected window is halved and replanned. Single messages too large for a window are clamped with an explicit omission marker.
 
 Parent and child conversations share reply recovery in `agent/turn_recovery.rs`. Empty answers and action-only stops get at most three continuation attempts, and malformed or mixed stalled replies share an eight-attempt bound. Productive work remains unlimited when `max_steps = 0`. Exhausted recovery leaves work incomplete, preserves completed effects, and never records completion. Quotes, code examples and optional future work do not restart a finished report; no classifier request is required. A completed `finish` must contain a report rather than a promise to act.
 Action-only replies include dangling transitions such as “Now the full Stats page:” and
@@ -720,11 +723,32 @@ limits, reasoning budgets, approvals or verification requirements:
   selects task-relevant sources/findings whose cited sources still match their saved hashes, clips
   finding summaries (at most four, with source links), keeps only task-matching outline lines, omits
   the directory inventory, bounds stale notices to topic names, and states that the user's
-  instructions take precedence and that the brief is not an edit grant.
+  instructions take precedence and that the brief is not an edit grant. Automatic codebase and
+  persistent-note lookup abstain on conversational follow-ups; longer queries require more than
+  incidental word overlap. Architecture sections do not expand automatically just because they
+  cite the same source. Explicit recall/navigation keeps its broader scope.
+  Relevance is enforced for parent and child automatic codebase context even with efficiency disabled.
+  Long prompts need several distinct matching terms unless they name a file explicitly; a single
+  incidental path component is not sufficient to admit an entire subsystem.
 - Tool results are shown whole up to the per-model limit (48 KiB for large windows, about an eighth
   of the window for small ones), with the complete output retained in artifacts.
   `efficiency.tool_preview_bytes` can reduce successful inspection results further; errors, read/edit
   snapshots, explicit artifact retrieval and unretained output are never reduced.
+  Settled background pipe output and completion notifications also use the shell output minimizer
+  when the full, previously unread capture fits the retained ring and has a complete artifact.
+  Recognized Cargo progress and passing Rust test lines are omitted on success or failure while
+  diagnostics, failing tests, totals and raw artifacts remain. Partial/delta, tail-selected and PTY
+  results remain unfiltered; `shell.minimize_output` controls it.
+  Homogeneous sequences of recognized Cargo checks can share the same filter; mixed arbitrary
+  stdout, pipelines, and executable `cargo run`/`cargo bench` output remain unfiltered.
+  Successful retained hashline edits show one fresh anchored representation to the model rather
+  than repeating an equivalent diff. UI/raw evidence keep the diff; absent, stale, truncated,
+  empty or otherwise non-equivalent projections fall back to the complete representation.
+  Large Git status inventories show exact status counts and bounded path samples with the complete
+  raw listing in an artifact; `git status` accepts the existing `path` filter for focused inspection.
+  Skills can use author-maintained compact entrypoints and on-demand bundled references. Arbitrary
+  instruction bodies are never silently summarized or truncated; oversized/invalid bodies refuse
+  loading rather than supplying partial policy.
 - Brief, non-complex tasks omit redundant tool-argument examples for the first few requests. An
   explicit plan, a tool error, debugging work or exhausting that allowance restores full guidance;
   todo enforcement and finish/verification gates do not change.
@@ -735,7 +759,23 @@ limits, reasoning budgets, approvals or verification requirements:
   `compaction.supersede_reads` permits additional supersession and `compaction.drop_useless` permits
   broader old-observation pruning. Both pressure and tail protection use the effective capped
   planning window. Once projected, placeholders stay stable; archived evidence is never mutated.
+  Exact successful read-only duplicates (same call arguments and text, with retained originals)
+  consolidate under pressure even below the pruning batch size; the newest copy remains in full.
+  Short observation text and harness notices stay verbatim when a pointer would be larger.
+  Observations are results of search/read tools (`read`, `grep`, `glob`, `find`, read-only `lsp`,
+  `ast_search`, `dep_source`, web search/fetch) and the bounded read-only investigation tools
+  (`data`, `database`, `document`, `network_inspect`, `runtime_inspect`, `timeline`,
+  `evidence_search`, `audio`, `visual`, `video`); tools that also record state keep their results.
   Compaction still uses configured token/percentage/model/agent policy with output/reserve headroom.
+  With `compaction.drop_useless`, an old artifact-backed read-only failure can condense only after
+  a later exact tool-and-arguments retry has explicit successful metadata and known effects.
+  The placeholder retains the failed attempt ID, matching success ID and diagnostic artifact.
+  Recent or unresolved failures, mutations and uncertain effects remain intact; no shell/build
+  resolution is inferred from prose or an unrelated later pass.
+- Side-request answers and failures have one canonical persisted conversation message. Poll, wait
+  and cancel results contain lifecycle/delivery references rather than repeating answer bodies.
+  Reporting guidance answers the active question without repeating a delivered completion report;
+  this is model guidance, not runtime censorship or a guarantee of concise prose.
 - Very large windows are planned against `efficiency.history_token_cap` (default 262144) rather
   than their full size, because every step resends the whole history. With `threshold_*` on `auto`,
   the trigger is the planning window minus its reserve (15%, at least 16k): about 223k on a

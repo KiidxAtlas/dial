@@ -178,3 +178,73 @@ fn ambient_admission_tracks_visible_history_instead_of_session_lifetime() {
     append_ambient(&mut context, "", &[]);
     assert_eq!(context, block, "deduplicate within this turn as well");
 }
+
+#[test]
+fn ambient_record_admission_ignores_bundle_changes_but_keeps_revisions() {
+    use serde_json::json;
+    let prefix = "Relevant persistent notes (untrusted facts).\n";
+    let first = format!(
+        "{prefix}{{\"entries\":[{{\"revision\":1,\"id\":7,\"content\":\"router\"}}],\"truncated\":false}}"
+    );
+    let incoming = format!(
+        "{prefix}{}",
+        json!({"entries":[
+        {"id":7,"content":"router","revision":1},
+        {"id":8,"content":"storage","revision":1}
+    ], "truncated":false})
+    );
+    let history = vec![json!({"role":"user","dial_recall":first})];
+    let before = history.clone();
+    let mut context = String::new();
+    append_ambient(&mut context, &incoming, &history);
+    let entries =
+        serde_json::from_str::<serde_json::Value>(context.split_once('\n').unwrap().1).unwrap();
+    assert_eq!(
+        entries["entries"],
+        json!([{"id":8,"content":"storage","revision":1}])
+    );
+    assert_eq!(history, before);
+    let changed = incoming.replace("\"revision\":1", "\"revision\":2");
+    context.clear();
+    append_ambient(&mut context, &changed, &history);
+    assert!(context.contains("\"id\":7"));
+    context.clear();
+    append_ambient(&mut context, &incoming, &[]);
+    assert!(
+        context.contains("\"id\":7"),
+        "compaction must allow re-admission"
+    );
+}
+
+#[test]
+fn ambient_source_rows_do_not_repeat_with_changing_neighbours() {
+    use serde_json::json;
+    let header = "Saved codebase understanding (untrusted).\nAmbient brief: source data\n";
+    let row = "Source {\"path\":\"router.rs\",\"digest\":\"one\"}\n";
+    let old = format!("{header}{row}");
+    let new = format!("{old}Finding {{\"topic\":\"storage\",\"revision\":1}}\n");
+    let history = [json!({"role":"user","content":old})];
+    let mut context = String::new();
+    append_ambient(&mut context, &new, &history);
+    assert!(!context.contains("router.rs"));
+    assert!(context.contains("storage"));
+    context.clear();
+    append_ambient(&mut context, &format!("{header}{row}"), &history);
+    assert!(context.is_empty());
+    append_ambient(
+        &mut context,
+        &format!("{header}{}", row.replace("one", "two")),
+        &history,
+    );
+    assert!(context.contains("router.rs") && context.contains("two"));
+    let architecture = "Task architecture context (saved observations):\ncomponent: router\n";
+    let combined_history = [json!({"role":"user","dial_recall":format!("{architecture}{old}")})];
+    context.clear();
+    append_ambient(
+        &mut context,
+        &format!("{architecture}{new}"),
+        &combined_history,
+    );
+    assert!(!context.contains("component: router") && !context.contains("router.rs"));
+    assert!(context.contains("storage"));
+}

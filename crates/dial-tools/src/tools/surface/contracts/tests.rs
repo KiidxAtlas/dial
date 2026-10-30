@@ -326,6 +326,49 @@ fn task_history_before_pool_actions_resumes_but_other_task_changes_are_rejected(
     );
 }
 
+#[test]
+fn task_history_before_isolation_backend_resumes() {
+    let registry = Registry::new();
+    let pooled = [
+        "run", "start", "resume", "status", "wait", "cancel", "create", "push", "peek", "close",
+    ];
+    let mut before = task_schema(&pooled, true);
+    before["function"]["parameters"]["properties"]["tasks"] = json!({"type": "array",
+        "items": {"type": "object", "properties": {"task": {"type": "string"}}}});
+    let backend = json!({"type": "string", "enum": ["auto", "clone", "worktree", "copy"]});
+    let mut current = before.clone();
+    let properties = &mut current["function"]["parameters"]["properties"];
+    properties["isolation_backend"] = backend.clone();
+    properties["tasks"]["items"]["properties"]["isolation_backend"] = backend;
+    // Recorded before `isolation_backend`, both with and without the pool actions.
+    let mut before_pool = before.clone();
+    before_pool["function"]["parameters"]["properties"]
+        .as_object_mut()
+        .unwrap()
+        .remove("concurrency");
+    before_pool["function"]["parameters"]["properties"]["action"]["enum"] =
+        json!(["run", "start", "resume", "status", "wait", "cancel"]);
+    for recorded in [before.clone(), before_pool] {
+        let old = identities(&[recorded], &registry)["task"].clone();
+        let history = vec![
+            json!({"role":"assistant","tool_calls":[{"id":"call","type":"function","function":{"name":"task","arguments":"{\"action\":\"status\"}"}}],"dial_tool_contracts":{"call":old}}),
+            json!({"role":"tool","tool_call_id":"call","content":"recorded status"}),
+        ];
+        assert!(
+            project_history(&history, std::slice::from_ref(&current), &registry)
+                .unwrap()
+                .is_none(),
+            "isolation_backend is additive for prior task history"
+        );
+    }
+    // Any other item change is still refused.
+    before["function"]["parameters"]["properties"]["tasks"]["items"]["properties"]["isolation_backend"] =
+        json!({"type": "integer"});
+    let old = identities(&[before], &registry)["task"].clone();
+    let history = vec![json!({"role":"assistant","dial_tool_contracts":{"call":old}})];
+    assert!(project_history(&history, &[current], &registry).is_err());
+}
+
 /// `check.expect` comes and goes with `experimental.check_predictions`; history recorded on
 /// either side of the flag stays valid, while other changes are still refused.
 #[test]
@@ -508,4 +551,58 @@ fn eval_history_recorded_before_python_language_stays_valid() {
     let other = vec![json!({"role":"assistant","dial_tool_contracts":{"c1":
         identities(&[changed], &Registry::new())["eval"]}})];
     assert!(validate_history(&other, &[current], &registry).is_err());
+}
+
+#[test]
+fn document_inspection_enum_preserves_prior_layout_history() {
+    let config = crate::config::types::Config::default();
+    let tools = crate::tools::fs::documents::analysis_tools(&config);
+    let current = tools[0].schema();
+    let mut before = current.clone();
+    before["function"]["parameters"]["properties"]["action"]["enum"] = json!(["layout", "compare"]);
+    let mut registry = Registry::new();
+    registry.register(std::sync::Arc::clone(&tools[0]));
+    let old = identities(&[before], &registry)["document"].clone();
+    let history = vec![json!({"role":"assistant", "dial_tool_contracts":{"id":old}})];
+    validate_history(&history, std::slice::from_ref(&current), &registry).unwrap();
+    let mut incompatible = current;
+    incompatible["function"]["parameters"]["properties"]["path"]["type"] = json!("integer");
+    assert!(validate_history(&history, &[incompatible], &registry).is_err());
+}
+
+#[test]
+fn data_interpretation_additions_preserve_prior_table_history() {
+    let tools = crate::tools::knowledge::data::tools(&crate::config::types::Config::default());
+    let current = tools[0].schema();
+    let mut before = current.clone();
+    let properties = before["function"]["parameters"]["properties"]
+        .as_object_mut()
+        .unwrap();
+    for property in [
+        "row_ids",
+        "brush",
+        "calculation_reference",
+        "bins",
+        "order_by",
+        "whole_source",
+        "json_pointers",
+        "decimal_columns",
+        "conversions",
+        "dates",
+        "dictionary",
+        "join",
+    ] {
+        properties.remove(property);
+    }
+    properties.get_mut("format").unwrap()["enum"] = json!(["json", "csv", "xlsx"]);
+    properties.get_mut("action").unwrap()["enum"] =
+        json!(["profile", "select", "aggregate", "chart"]);
+    let mut registry = Registry::new();
+    registry.register(std::sync::Arc::clone(&tools[0]));
+    let old = identities(&[before], &registry)["data"].clone();
+    let history = vec![json!({"role":"assistant", "dial_tool_contracts":{"id":old}})];
+    validate_history(&history, std::slice::from_ref(&current), &registry).unwrap();
+    let mut incompatible = current;
+    incompatible["function"]["parameters"]["properties"]["path"]["type"] = json!("integer");
+    assert!(validate_history(&history, &[incompatible], &registry).is_err());
 }

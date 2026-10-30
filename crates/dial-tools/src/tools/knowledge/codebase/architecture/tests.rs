@@ -911,3 +911,35 @@ fn impact_context_omits_stale_findings_and_generic_filename_noise() {
             .is_empty()
     );
 }
+
+#[test]
+fn ambient_architecture_abstains_without_relevant_terms_and_shared_source_expansion() {
+    let (_home, _project, cache, _ws) = fixture();
+    let packet = cache.architecture_synthesis(16000, true).unwrap().unwrap();
+    let mut draft = answer();
+    draft["sections"].as_array_mut().unwrap().push(json!({
+        "id":"unrelated", "kind":"component", "title":"Archive format",
+        "summary":"Archive exports use compressed snapshots.", "sources":["routing.rs"]
+    }));
+    cache
+        .save_architecture(&packet, &draft.to_string(), "model")
+        .unwrap();
+    assert!(
+        cache
+            .task_architecture_context("can you fix all of these", 8000)
+            .unwrap()
+            .is_empty()
+    );
+    let brief = cache.task_architecture_context("routing", 8000).unwrap();
+    assert!(brief.contains("Routing is implemented"), "{brief}");
+    assert!(
+        !brief.contains("Archive exports"),
+        "shared source alone is not relevance: {brief}"
+    );
+    assert!(
+        cache
+            .architecture_context("routing", 8000)
+            .unwrap()
+            .contains("Archive exports")
+    );
+}

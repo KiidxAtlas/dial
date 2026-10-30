@@ -1,5 +1,6 @@
 use super::test_support::{commit_plugin, git, write_plugin};
 use super::*;
+use serde_json::json;
 
 #[test]
 fn git_install_records_commit_sha_and_refuses_duplicates() {
@@ -223,4 +224,39 @@ fn remove_deletes_plugin() {
     store.remove("gone").unwrap();
     assert!(store.list().unwrap().is_empty());
     assert!(store.get("gone").is_err());
+}
+
+#[test]
+fn compatibility_and_explicit_purge_boundaries() {
+    for api in [json!(1), json!({"min":1,"max":1}), json!({"min":0,"max":2})] {
+        assert!(validate_compatibility(json!({"apiVersion":api}).as_object().unwrap()).is_ok());
+    }
+    for api in [
+        json!(2),
+        json!("1"),
+        json!({"min":2,"max":3}),
+        json!({"min":1}),
+        json!({"min":1,"max":1,"unknown":true}),
+    ] {
+        assert!(validate_compatibility(json!({"apiVersion":api}).as_object().unwrap()).is_err());
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("src");
+    write_plugin(&source, r#"{"name":"gone"}"#);
+    let store = PluginStore::new(temp.path().join("store"));
+    store
+        .install(&format!("file:{}", source.display()))
+        .unwrap();
+    for name in ["gone", "keep"] {
+        fs::create_dir_all(store.root.join(".state").join(name)).unwrap();
+    }
+    fs::create_dir_all(store.root.join(".settings")).unwrap();
+    fs::write(store.root.join(".settings/gone.json"), "{}").unwrap();
+    store.remove("gone").unwrap();
+    assert!(store.root.join(".state/gone").exists());
+    store.purge_state("gone").unwrap();
+    assert!(!store.root.join(".state/gone").exists());
+    assert!(store.root.join(".state/keep").exists());
+    assert!(!store.root.join(".settings/gone.json").exists());
+    assert!(store.purge_state("../keep").is_err());
 }

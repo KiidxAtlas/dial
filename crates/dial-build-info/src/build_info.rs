@@ -10,6 +10,11 @@ pub const VERSION: &str = concat!(
     ")"
 );
 
+/// The commit this executable was built from (a Git hash prefix), or `unknown`.
+pub const REVISION: &str = env!("DIAL_BUILD_REVISION");
+/// Whether the build inputs differed from [`REVISION`]: `true`, `false` or `unknown`.
+pub const DIRTY: &str = env!("DIAL_BUILD_DIRTY");
+
 pub fn report() -> Value {
     json!({
         "version": env!("CARGO_PKG_VERSION"),

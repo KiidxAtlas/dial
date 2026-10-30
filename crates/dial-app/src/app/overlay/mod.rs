@@ -54,6 +54,8 @@ pub(super) enum Which {
     ModelRoles,
     Providers,
     Shortcuts,
+    /// `/peers`: the board, built from the agent before the panel opens.
+    Peers(Box<crate::app::commands::peers::PeersPanel>),
     Git {
         root: std::path::PathBuf,
         revision: String,
@@ -132,6 +134,7 @@ pub(super) enum ActiveOverlay {
     Subagents(Box<crate::ui::subagent_hub::SubagentHub>),
     SubagentViewer(Box<crate::ui::overlay::subagent_viewer::SubagentViewer>),
     Jobs(Box<crate::ui::overlay::jobs::JobsOverlay>),
+    Peers(Box<crate::ui::overlay::peers::PeersOverlay>),
 }
 
 impl ActiveOverlay {
@@ -151,6 +154,7 @@ impl ActiveOverlay {
             Self::Subagents(o) => o.draw(frame, ctx),
             Self::SubagentViewer(o) => o.draw(frame, ctx),
             Self::Jobs(o) => o.draw(frame, ctx),
+            Self::Peers(o) => o.draw(frame, ctx),
         }
     }
 
@@ -183,6 +187,7 @@ impl ActiveOverlay {
             Self::Git(o) => o.handle(event, keys),
             Self::SubagentViewer(o) => o.handle(event, keys, std::time::Instant::now()),
             Self::Jobs(o) => o.handle(event, keys),
+            Self::Peers(o) => o.handle(event, keys),
         }
     }
 
@@ -231,6 +236,7 @@ impl ActiveOverlay {
             Self::Subagents(o) => o.banner(message, is_error),
             Self::SubagentViewer(o) => o.set_notice(message),
             Self::Jobs(o) => o.banner(message, is_error),
+            Self::Peers(o) => o.banner(message, is_error),
             Self::Settings(o) => o.banner(message, is_error),
             Self::Palette(_) | Self::Shortcuts(_) | Self::Git(_) => {}
         }

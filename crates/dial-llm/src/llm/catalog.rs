@@ -3,6 +3,7 @@
 //! not an OS keychain. They are URL-scoped and written only on explicit user action.
 use super::local_format::LocalFormat;
 use super::model_config::{ApiProtocol, ModelSelection, ProviderSpec};
+use super::profiles::ImageGenerationApi;
 use crate::config::paths::Layout;
 use crate::config::settings_store::{locked, write_private};
 use anyhow::{Result, ensure};
@@ -117,11 +118,20 @@ impl ModelEntry {
     }
     /// Image generation, independent of image input/vision capability.
     pub fn supports_images(&self) -> bool {
-        self.metadata.kind == ModelKind::Image
-            || self
-                .metadata
-                .image_generation
-                .is_some_and(|api| api != super::profiles::ImageGenerationApi::Disabled)
+        match self.metadata.image_generation {
+            Some(super::profiles::ImageGenerationApi::Disabled) => false,
+            Some(_) => true,
+            None => self.metadata.kind == ModelKind::Image,
+        }
+    }
+    /// Whether the image role may select this model. Besides declared image output, ChatGPT plan
+    /// models qualify through the hosted Responses image tool, which their catalogs can omit; the
+    /// approved generation itself verifies account access. An explicit `Disabled` still refuses.
+    pub fn accepts_image_role(&self) -> bool {
+        self.supports_images()
+            || (self.selection.provider == super::chatgpt::PROVIDER
+                && self.metadata.image_generation.is_none()
+                && self.supports_chat())
     }
     /// The provider shown before the label. Dial's own local route keeps the id `mlx` (configs
     /// select it as `provider = "mlx"`) but serves GGUF files on llama.cpp, so those read `gguf`.
@@ -285,6 +295,50 @@ pub fn image_generation_api(row: &Value) -> Option<super::profiles::ImageGenerat
         })
 }
 
+/// Image-generation model ids a provider documents for its direct API, used only when the row
+/// declares no image output. Exact ids on the built-in endpoint only: no name, family or vision
+/// inference, and an explicit row value (including `Disabled`) always wins.
+fn documented_image_generation(
+    provider: &str,
+    base_url: &str,
+    model: &str,
+) -> Option<super::profiles::ImageGenerationApi> {
+    use super::profiles::ImageGenerationApi;
+    let builtin = bundled::builtin_provider(provider)?;
+    if builtin.base_url.trim_end_matches('/') != base_url.trim_end_matches('/') {
+        return None;
+    }
+    match (provider, model) {
+        // OpenAI Images API (`/v1/images/generations`) for the GPT Image models.
+        (
+            "openai",
+            "gpt-image-1"
+            | "gpt-image-1-mini"
+            | "gpt-image-1.5"
+            | "gpt-image-2"
+            | "gpt-image-2.5-flare"
+            | "gpt-image-2.5-sunburst",
+        ) => Some(ImageGenerationApi::Images),
+        // xAI Grok Imagine on `/v1/images/generations` (OpenAI-compatible request shape).
+        ("xai", "grok-imagine-image-2.0") => Some(ImageGenerationApi::Images),
+        // Gemini native `generateContent` with image output (the "Nano Banana" family). These are
+        // the ids whose OpenRouter rows (`google/<id>`) declare image output, plus Google's
+        // `nano-banana-pro-preview` alias of `gemini-3-pro-image-preview`.
+        (
+            "gemini",
+            "gemini-2.5-flash-image"
+            | "gemini-3-pro-image"
+            | "gemini-3-pro-image-preview"
+            | "nano-banana-pro-preview"
+            | "gemini-3.1-flash-image"
+            | "gemini-3.1-flash-image-preview"
+            | "gemini-3.1-flash-lite-image"
+            | "gemini-nano-banana-2.1",
+        ) => Some(ImageGenerationApi::Gemini),
+        _ => None,
+    }
+}
+
 fn metadata(row: &Value) -> ModelMetadata {
     let modalities = row
         .pointer("/architecture/input_modalities")
@@ -303,6 +357,11 @@ fn metadata(row: &Value) -> ModelMetadata {
             row.get("vision_config")
                 .filter(|config| config.is_object())
                 .map(|_| true)
+        })
+        // Anthropic `/v1/models`: `capabilities` is an object of `{ "supported": bool }` records.
+        .or_else(|| {
+            row.pointer("/capabilities/image_input/supported")
+                .and_then(Value::as_bool)
         });
     let capability = |name: &str, parameters: &[&str]| {
         row.pointer(&format!("/capabilities/{name}"))
@@ -332,11 +391,18 @@ fn metadata(row: &Value) -> ModelMetadata {
             .as_bool()
             .filter(|supported| *supported)
     });
-    let reasoning = capability("reasoning", &["reasoning", "reasoning_effort"]).or_else(|| {
-        row.get("supported_reasoning_levels")
-            .and_then(Value::as_array)
-            .map(|items| !items.is_empty())
-    });
+    let reasoning = capability("reasoning", &["reasoning", "reasoning_effort"])
+        // Anthropic `capabilities.thinking.supported`; Gemini's top-level `thinking` boolean.
+        .or_else(|| {
+            row.pointer("/capabilities/thinking/supported")
+                .and_then(Value::as_bool)
+        })
+        .or_else(|| row.get("thinking").and_then(Value::as_bool))
+        .or_else(|| {
+            row.get("supported_reasoning_levels")
+                .and_then(Value::as_array)
+                .map(|items| !items.is_empty())
+        });
     let price = |key| {
         row.pointer(key)
             .and_then(|v| {
@@ -969,16 +1035,27 @@ fn parse_models(value: &Value, probe: &Probe) -> Result<Vec<ModelEntry>> {
             } else {
                 declared
             };
-            let kind = bundled::known_kind(&selection, reported);
+            let mut kind = bundled::known_kind(&selection, reported);
+            // Capabilities the live row left open come from the same bundled record the runtime
+            // uses (`model_metadata`), so the picker shows what requests will actually assume.
+            let mut live = metadata(row);
+            live.image_generation = live
+                .image_generation
+                .or_else(|| documented_image_generation(&probe.id, &probe.spec.base_url, model));
+            // A documented direct image transport with no declared purpose is an image model, not chat.
+            if kind == ModelKind::Unknown
+                && live.image_generation == Some(ImageGenerationApi::Images)
+            {
+                kind = ModelKind::Image;
+            }
+            let metadata =
+                bundled::complete_capabilities(&selection, ModelMetadata { kind, ..live });
             Some(ModelEntry {
                 selection,
                 label: model.into(),
                 source: probe.spec.label.clone(),
                 available: true,
-                metadata: ModelMetadata {
-                    kind,
-                    ..metadata(row)
-                },
+                metadata,
             })
         })
         .take(MAX_MODELS)
@@ -1680,8 +1757,9 @@ fn declared_kind(row: &Value) -> ModelKind {
 }
 
 /// Ollama's `/api/tags` states no purpose; its `/api/show` reports `capabilities` (`embedding`,
-/// `completion`, ...). Asked only for rows still `Unknown`, at most `CONCURRENCY` at a time, through
-/// the probe's agent, headers and key. A failed request leaves the row `Unknown` (still listed).
+/// `completion`, `tools`, `vision`, `thinking`, ...). Asked only for rows still `Unknown`, at most
+/// `CONCURRENCY` at a time, through the probe's agent, headers and key. A failed request leaves the
+/// row `Unknown` (still listed) with unknown capabilities.
 fn annotate_ollama(
     models: &mut [ModelEntry],
     agent: &ureq::Agent,
@@ -1696,45 +1774,46 @@ fn annotate_ollama(
         .map(|(index, entry)| (index, entry.selection.model.clone()))
         .collect();
     for chunk in pending.chunks(CONCURRENCY) {
-        let kinds: Vec<(usize, ModelKind)> = std::thread::scope(|scope| {
+        let shown: Vec<(usize, Value)> = std::thread::scope(|scope| {
             let jobs: Vec<_> = chunk
                 .iter()
                 .map(|(index, model)| {
-                    scope.spawn(move || (*index, ollama_kind(agent, base, model, token, headers)))
+                    scope.spawn(move || (*index, ollama_show(agent, base, model, token, headers)))
                 })
                 .collect();
-            jobs.into_iter().filter_map(|job| job.join().ok()).collect()
+            jobs.into_iter()
+                .filter_map(|job| job.join().ok())
+                .filter_map(|(index, shown)| Some((index, shown?)))
+                .collect()
         });
-        for (index, kind) in kinds {
-            models[index].metadata.kind = kind;
+        for (index, shown) in shown {
+            apply_ollama_capabilities(&mut models[index].metadata, &shown);
         }
     }
 }
 
-fn ollama_kind(
+fn ollama_show(
     agent: &ureq::Agent,
     base: &str,
     model: &str,
     token: Option<&str>,
     headers: &super::model_config::ResolvedHeaders<'_>,
-) -> ModelKind {
+) -> Option<Value> {
     let mut request = agent
         .post(format!("{base}/api/show"))
         .header("Accept", "application/json");
     for (name, value) in headers.pairs() {
-        let Ok(field) = super::model_config::private_header_value(value) else {
-            return ModelKind::Unknown;
-        };
+        let field = super::model_config::private_header_value(value).ok()?;
         request = request.header(name, field);
     }
     if let Some(token) = token {
         request = request.header("Authorization", format!("Bearer {token}"));
     }
-    let Ok(mut response) = request.send_json(serde_json::json!({ "model": model })) else {
-        return ModelKind::Unknown;
-    };
+    let mut response = request
+        .send_json(serde_json::json!({ "model": model }))
+        .ok()?;
     if !response.status().is_success() {
-        return ModelKind::Unknown;
+        return None;
     }
     let mut bytes = Vec::new();
     if response
@@ -1745,11 +1824,23 @@ fn ollama_kind(
         .is_err()
         || bytes.len() as u64 > MAX_RESPONSE
     {
-        return ModelKind::Unknown;
+        return None;
     }
-    serde_json::from_slice::<Value>(&bytes)
-        .map(|shown| ollama_capability_kind(&shown))
-        .unwrap_or_default()
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Purpose and capabilities from Ollama's `/api/show`. Its `capabilities` list is the server's own
+/// declaration (Ollama refuses tools or images for a model that lacks them), so a listed name is
+/// `Some(true)` and an absent one `Some(false)`; without a list everything stays unknown.
+fn apply_ollama_capabilities(metadata: &mut ModelMetadata, shown: &Value) {
+    metadata.kind = ollama_capability_kind(shown);
+    let Some(capabilities) = shown["capabilities"].as_array() else {
+        return;
+    };
+    let has = |name: &str| Some(capabilities.iter().any(|c| c == name));
+    metadata.vision = metadata.vision.or(has("vision"));
+    metadata.tools = metadata.tools.or(has("tools"));
+    metadata.reasoning = metadata.reasoning.or(has("thinking"));
 }
 
 /// An `embedding` capability without `completion` is an embedder; `completion` is chat.
@@ -2259,11 +2350,21 @@ fn cached(user_dir: &Path) -> BTreeMap<String, Vec<ModelEntry>> {
             .flatten()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default();
-    // Repair missing windows in older cached Claude rows without a network request or a rewrite.
+    // Repair rows saved before a model was documented, without a network request or a rewrite:
+    // missing windows in older Claude rows, and image output an older catalog did not know.
     for entries in cache.values_mut() {
         for entry in entries {
             if entry.selection.context_window.is_none() {
                 entry.selection.context_window = documented_context_window(&entry.selection);
+            }
+            if entry.metadata.image_generation.is_none()
+                && let Some(base_url) = entry.selection.base_url.as_deref()
+            {
+                entry.metadata.image_generation = documented_image_generation(
+                    &entry.selection.provider,
+                    base_url,
+                    &entry.selection.model,
+                );
             }
         }
     }
@@ -2371,21 +2472,22 @@ fn anthropic_subscription_catalog(
     if models.is_empty() {
         models = ANTHROPIC_SUBSCRIPTION_SEEDS
             .iter()
-            .map(|(id, label)| ModelEntry {
-                selection: ModelSelection {
+            .map(|(id, label)| {
+                let selection = ModelSelection {
                     provider: "anthropic".into(),
                     model: (*id).into(),
                     base_url: Some(super::anthropic::BASE_URL.into()),
                     context_window: Some(1_000_000),
                     ..Default::default()
-                },
-                label: (*label).into(),
-                source: "Claude subscription catalog (inference verifies model access)".into(),
-                available: true,
-                metadata: ModelMetadata {
-                    vision: Some(true),
-                    ..Default::default()
-                },
+                };
+                ModelEntry {
+                    // The seeds carry no metadata of their own; their bundled records do.
+                    metadata: bundled::complete_capabilities(&selection, ModelMetadata::default()),
+                    selection,
+                    label: (*label).into(),
+                    source: "Claude subscription catalog (inference verifies model access)".into(),
+                    available: true,
+                }
             })
             .collect();
     }

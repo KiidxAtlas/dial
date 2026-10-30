@@ -89,3 +89,59 @@ fn model_rows_offer_downloads_only_for_missing_suggestions_and_assign_chat_model
         "downloads name a repository"
     );
 }
+
+#[test]
+fn voice_choices_distinguish_missing_models_ready_custom_programs_and_credentials() {
+    let home = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config.user_dir = home.path().into();
+    // Readiness probes only executable availability; the fixture never runs this program.
+    config.voice.tts.piper_program = std::env::current_exe().unwrap();
+    config.voice.tts.espeak_program = std::env::current_exe().unwrap();
+    config.voice.stt.whisper_cpp_program = std::env::current_exe().unwrap();
+    config.voice.openai.base_url = "https://voice-setup-test.invalid/v1".into();
+    config.voice.openai.api_key_env = Some("DIAL_TEST_VOICE_SETUP_MISSING_KEY".into());
+    let model = home.path().join("voice.onnx");
+    std::fs::write(&model, b"fixture model").unwrap();
+    config.voice.tts.piper_model = Some(model.clone());
+    let choices = settings_value_choices(&config, None, home.path());
+    assert!(
+        matches!(
+            find(&choices["voice.tts.backend"], "piper").action,
+            ChoiceAction::Install { .. }
+        ),
+        "Piper needs the sidecar too"
+    );
+    assert_eq!(
+        find(&choices["voice.tts.backend"], "espeak").action,
+        ChoiceAction::Set
+    );
+    assert!(
+        matches!(
+            find(&choices["voice.stt.backend"], "whisper-cpp").action,
+            ChoiceAction::Install { .. }
+        ),
+        "Whisper needs a model, not only a program"
+    );
+    assert!(matches!(
+        find(&choices["voice.tts.backend"], "openai").action,
+        ChoiceAction::Unavailable { .. }
+    ));
+    std::fs::write(
+        model.with_added_extension("json"),
+        br#"{"audio":{"sample_rate":22050},"phoneme_id_map":{}}"#,
+    )
+    .unwrap();
+    config.voice.stt.whisper_cpp_model = Some(model);
+    let choices = settings_value_choices(&config, None, home.path());
+    for (path, value) in [
+        ("voice.tts.backend", "piper"),
+        ("voice.stt.backend", "whisper-cpp"),
+    ] {
+        assert_eq!(
+            find(&choices[path], value).action,
+            ChoiceAction::Set,
+            "{value} reuses its custom executable and model"
+        );
+    }
+}

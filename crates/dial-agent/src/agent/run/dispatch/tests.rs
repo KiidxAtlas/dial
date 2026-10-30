@@ -122,3 +122,49 @@ fn parallel_completion_reaches_the_view_before_a_slow_sibling_and_keeps_call_ord
     );
     assert!(results.iter().all(|(output, _)| !output.is_error));
 }
+
+#[test]
+fn rendered_pixels_from_any_tool_become_an_attachment_and_keep_the_description() {
+    let root = tempfile::tempdir().unwrap();
+    let store = crate::storage::artifact::ArtifactStore::new(&root.path().join(".art")).unwrap();
+    let workspace = Workspace::new(root.path()).unwrap().with_artifacts(store);
+    // 1x1 PNG.
+    let encoded = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aY4cAAAAASUVORK5CYII=";
+    let output = |text: &str| ToolOutput {
+        execution: Default::default(),
+        data: Some(
+            json!({"frames":1,"artifact":{"media_type":"image/png","encoding":"base64","data":encoded}}),
+        ),
+        text: text.into(),
+        is_error: false,
+    };
+    let call = |name: &str| ToolCall {
+        id: name.into(),
+        name: name.into(),
+        arguments: json!({"action":"inspect","path":"clip.mp4"}),
+        malformed_arguments: false,
+    };
+    for tool in ["visual", "video", "evidence", "read"] {
+        let mut out = output("frame 0 at 0.0s; first frame attached");
+        let image = capture_output_image(&workspace, &call(tool), &mut out)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{tool} pixels must reach the model"));
+        assert!(image.is_object(), "{tool}: {image}");
+        assert_eq!(out.text, "frame 0 at 0.0s; first frame attached", "{tool}");
+        let data = out.data.as_ref().unwrap();
+        assert!(data["artifact"]["uri"].is_string() && data["artifact"]["data"].is_null());
+    }
+    let mut failed = output("boom");
+    failed.is_error = true;
+    assert!(
+        capture_output_image(&workspace, &call("visual"), &mut failed)
+            .unwrap()
+            .is_none()
+    );
+    let mut plain = ToolOutput::ok("no pixels".into());
+    assert!(
+        capture_output_image(&workspace, &call("data"), &mut plain)
+            .unwrap()
+            .is_none()
+    );
+}

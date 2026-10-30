@@ -158,6 +158,27 @@ pub trait Ui {
             None => self.approve(tool, summary),
         }
     }
+    /// Approve only these exact calls, once. No response can create a reusable grant.
+    /// Adapters may return per-call choices; missing choices deny. The default presents
+    /// one all-or-nothing prompt on the real approval surface.
+    fn approve_batch(&mut self, calls: &[ToolCall], cancel: &AtomicBool) -> Vec<bool> {
+        if calls.is_empty() || cancel.load(Ordering::Acquire) {
+            return vec![false; calls.len()];
+        }
+        let mut summary = String::from(
+            "Approve these exact calls once? This is not an atomic transaction; calls can partially succeed. No reusable permission is granted.\n",
+        );
+        for call in calls {
+            summary.push_str(&format!(
+                "\n{} · {}\n{}\n",
+                call.id, call.name, call.arguments
+            ));
+        }
+        let allowed = self.approve_call("finite-batch", "batch", &summary, Some(cancel))
+            == Decision::Allow
+            && !cancel.load(Ordering::Acquire);
+        vec![allowed; calls.len()]
+    }
     /// Wait for an answer while the current agent turn remains active.
     fn ask_user(&mut self, _title: &str, _question: &str, _options: &[String]) -> Option<String> {
         None

@@ -509,6 +509,10 @@ pub enum ChoiceAction {
     Set,
     /// Download the local model the value names (a second Enter confirms), then save it.
     Download,
+    /// Install and prepare a voice backend after explicit confirmation, then select it.
+    Install { preview: String },
+    /// A backend requiring manual credentials or platform support, not an installable package.
+    Unavailable { reason: String },
     /// Assign the model to a role through the canonical selection writer.
     Assign {
         role: String,
@@ -1999,6 +2003,10 @@ impl SettingsOverlay {
     /// Open the chooser a setting's value source offers (see `SettingDef::source`); `None` keeps
     /// the kind's own editor.
     fn open_source(&mut self, def: &'static SettingDef, current: &Value) -> Option<OverlayEvent> {
+        if matches!(def.path, "voice.tts.backend" | "voice.stt.backend") {
+            self.download_armed = None;
+            return self.open_offers(def, current);
+        }
         let source = def.source()?;
         self.download_armed = None;
         let mode = match (source, def.kind_for(&self.effective)) {
@@ -2089,7 +2097,9 @@ impl SettingsOverlay {
         if choices.is_empty() {
             return None;
         }
-        choices.push(TYPE_CHOICE.to_owned());
+        if !matches!(def.kind, Kind::Enum(_)) {
+            choices.push(TYPE_CHOICE.to_owned());
+        }
         self.notes.remove(def.path);
         self.mode = Mode::Pick {
             def,
@@ -2115,6 +2125,31 @@ impl SettingsOverlay {
     /// first Enter on a model that is not downloaded only asks; the picker stays open.
     fn pick_offer(&mut self, def: &'static SettingDef, offer: ValueChoice) -> OverlayEvent {
         match offer.action {
+            ChoiceAction::Unavailable { reason } => {
+                self.download_armed = None;
+                self.feedback = Some(reason);
+                OverlayEvent::None
+            }
+            ChoiceAction::Install { .. }
+                if self.download_armed.as_deref() != Some(offer.value.as_str()) =>
+            {
+                self.feedback = Some(format!(
+                    "Install {}? Enter again: yes; Esc: cancel. Selection saves only after setup succeeds.",
+                    offer.label
+                ));
+                self.download_armed = Some(offer.value);
+                OverlayEvent::None
+            }
+            ChoiceAction::Install { .. } => {
+                self.download_armed = None;
+                self.mode = Mode::Browse;
+                self.feedback = None;
+                OverlayEvent::InstallVoice {
+                    path: def.path.to_owned(),
+                    value: offer.value,
+                    scope: self.scope,
+                }
+            }
             ChoiceAction::Download
                 if self.download_armed.as_deref() != Some(offer.value.as_str()) =>
             {
@@ -2311,15 +2346,15 @@ impl SettingsOverlay {
         let at = *cursor;
         let visible = pick_matches(&labels, choices, &filter.text);
         if keys.matches(Action::SelectCancel, key) {
+            if self.download_armed.take().is_some() {
+                self.feedback = None;
+            }
             // Esc first clears the filter; only a bare Esc leaves the picker.
             if !filter.text.is_empty() {
                 filter.set("");
                 return OverlayEvent::None;
             }
             self.mode = Mode::Browse;
-            if self.download_armed.take().is_some() {
-                self.feedback = None;
-            }
             if def.path == "memory.backend" {
                 self.memory_intent = None;
             }
@@ -2413,6 +2448,8 @@ impl SettingsOverlay {
                 return OverlayEvent::None;
             };
             *cursor = n;
+            self.download_armed = None;
+            self.feedback = None;
             return if is_theme {
                 OverlayEvent::PreviewTheme(Some(choices[n].clone()))
             } else {
@@ -2424,6 +2461,8 @@ impl SettingsOverlay {
         if !filter.key_with(*key, keys) || filter.text == before {
             return OverlayEvent::None;
         }
+        self.download_armed = None;
+        self.feedback = None;
         self.refit_pick()
     }
 
@@ -2471,6 +2510,8 @@ impl SettingsOverlay {
         if let Some(offer) = self.offer(def.path, choice) {
             return match offer.action {
                 ChoiceAction::Download => format!("{} · download", offer.label),
+                ChoiceAction::Install { .. } => format!("{} · install", offer.label),
+                ChoiceAction::Unavailable { .. } => format!("{} · setup required", offer.label),
                 _ => offer.label.clone(),
             };
         }
@@ -2646,6 +2687,29 @@ impl SettingsOverlay {
                         .map(|choice| self.choice_label(def, choice))
                         .collect();
                     let visible = pick_matches(&labels, choices, &filter.text);
+                    let install_plan = self.download_armed.as_deref().and_then(|armed| {
+                        self.value_choices.get(def.path)?.iter().find_map(|offer| {
+                            match &offer.action {
+                                ChoiceAction::Install { preview } if offer.value == armed => {
+                                    Some(preview)
+                                }
+                                _ => None,
+                            }
+                        })
+                    });
+                    if let Some(plan) = install_plan {
+                        cursor_item = items.len();
+                        items.push(Item::Hint(
+                            "Install this backend? Enter: yes; Esc: cancel.".into(),
+                        ));
+                        for line in plan.lines() {
+                            for wrapped in
+                                text::wrap_words(line, list_w_total.saturating_sub(8).max(1))
+                            {
+                                items.push(Item::Hint(wrapped));
+                            }
+                        }
+                    }
                     // Show every match the panel has room for (beside the setting row, its
                     // section header and the filter line); short panels keep the usual window.
                     let pick_rows = body_rows.saturating_sub(3).max(PICK_ROWS);
@@ -2667,7 +2731,7 @@ impl SettingsOverlay {
                         .saturating_sub(pick_rows / 2)
                         .min(visible.len().saturating_sub(pick_rows));
                     for &n in visible.iter().skip(first).take(pick_rows) {
-                        if n == *cursor {
+                        if n == *cursor && install_plan.is_none() {
                             cursor_item = items.len();
                         }
                         items.push(Item::Choice {

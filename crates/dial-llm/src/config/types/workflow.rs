@@ -35,6 +35,8 @@ impl Default for CommitConfig {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ExperimentalConfig {
+    /// Offer bounded, approved video frame investigations; image tokens can be expensive.
+    pub video_analysis: bool,
     pub work_packet_contracts: bool,
     pub verification_receipts: bool,
     pub context_overlap_dedup: bool,
@@ -58,6 +60,12 @@ pub struct ExperimentalConfig {
     /// Start admitted read-only calls as soon as their arguments finish streaming, before the
     /// assistant reply ends. Results are delivered in call order after the reply completes.
     pub streaming_dispatch: bool,
+    /// Present exact native edit calls as a finite one-shot approval batch.
+    pub batch_approvals: bool,
+    /// Schedule only operations with trusted resource contracts across independent calls.
+    pub dependency_dispatch: bool,
+    /// Start configured focused verification after committed edits, overlapping safe reads only.
+    pub background_checks: bool,
     /// Offer `check.expect` (pass/fail prediction); a mismatch is reported as a fact and the next
     /// request asks the model to account for it before editing again.
     pub check_predictions: bool,
@@ -66,6 +74,7 @@ pub struct ExperimentalConfig {
 impl Default for ExperimentalConfig {
     fn default() -> Self {
         Self {
+            video_analysis: false,
             work_packet_contracts: false,
             verification_receipts: false,
             context_overlap_dedup: false,
@@ -77,6 +86,9 @@ impl Default for ExperimentalConfig {
             edit_bisection_runs: 0,
             outcome_gradient_rounds: 0,
             streaming_dispatch: false,
+            batch_approvals: false,
+            dependency_dispatch: false,
+            background_checks: false,
             check_predictions: false,
         }
     }

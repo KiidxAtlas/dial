@@ -317,6 +317,11 @@ impl<'a> Agent<'a> {
     pub fn usage(&self) -> (llm::usage::Groups, llm::usage::Groups) {
         self.usage_scope.snapshot()
     }
+    /// The shared usage ledger (cloned handle, same counters). A UI reads live spend from it while
+    /// a turn holds the agent; its totals include workers and requests settled after this call.
+    pub fn usage_ledger(&self) -> llm::usage::Scope {
+        self.usage_scope.clone()
+    }
     /// Most recent `thinking = "auto"` judgment this session, as the judged choice name.
     pub fn last_auto_thinking(&self) -> Option<&str> {
         self.last_auto_thinking.as_deref()
@@ -413,6 +418,14 @@ impl<'a> Agent<'a> {
     }
     pub(in crate::agent) fn restore_control(&mut self) -> Result<()> {
         let mut state = self.session.control_state();
+        self.workspace.reset_file_handles();
+        if let Some(snapshot) = state.get("file_handles") {
+            let snapshot = serde_json::from_value(snapshot.clone())
+                .context("decoding session file handles")?;
+            self.workspace
+                .restore_file_handles(&snapshot)
+                .map_err(anyhow::Error::msg)?;
+        }
         self.exploration =
             crate::agent::workflow::exploration::Lifecycle::restore(&state, self.session.id());
         if !self.config.checkpoint.enabled && self.exploration.busy() {

@@ -1,7 +1,9 @@
 use super::*;
 use crate::agent::Agent;
 use crate::agent::window::context;
-use crate::app::command_registry::{BUILTIN_COMMANDS, command_entries, palette_entries};
+use crate::app::command_registry::{
+    BUILTIN_COMMANDS, command_entries, palette_entries, turn_count,
+};
 use crate::app::completions::command_argument_completions;
 use crate::app::core::App;
 use crate::app::discovery::{Catalog, ProbeLease};
@@ -389,6 +391,21 @@ fn action_palette_uses_registered_commands_and_real_turn_policies() {
         matches!(palette.handle(&Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), &keys),
         OverlayEvent::Action(action) if action == "command:/review-project")
     );
+}
+
+#[test]
+fn undo_and_rollback_take_an_optional_positive_turn_count() {
+    assert_eq!(turn_count(""), Some(1), "bare /undo keeps undoing one turn");
+    assert_eq!(turn_count(" 3 "), Some(3));
+    for bad in ["0", "-1", "two", "1 2"] {
+        assert_eq!(turn_count(bad), None, "{bad}");
+    }
+    let undo = BUILTIN_COMMANDS
+        .iter()
+        .find(|(name, _, _)| *name == "undo")
+        .unwrap();
+    assert_eq!(undo.1, "[n]");
+    assert!(Shell::stops_turn("/undo 3"));
 }
 
 #[test]

@@ -104,6 +104,10 @@ pub(in crate::app) fn settings_value_choices(
     };
     let mut choices = BTreeMap::new();
     for def in crate::config::schema::registry() {
+        if matches!(def.path, "voice.tts.backend" | "voice.stt.backend") {
+            choices.insert(def.path.to_owned(), voice_choices(def, config, user_dir));
+            continue;
+        }
         let offered = match def.source() {
             Some(Source::Model(use_)) => model_choices(def, use_, config, &models),
             Some(Source::Names(names)) => name_choices(names, config, discovery),
@@ -114,6 +118,45 @@ pub(in crate::app) fn settings_value_choices(
         }
     }
     choices
+}
+
+fn voice_choices(
+    def: &crate::config::schema::SettingDef,
+    config: &Config,
+    user_dir: &std::path::Path,
+) -> Vec<ValueChoice> {
+    let crate::config::schema::Kind::Enum(options) = def.kind else {
+        return Vec::new();
+    };
+    let env = crate::setup::deps::Env::current(user_dir);
+    options
+        .iter()
+        .map(|(value, label)| {
+            let ready = crate::setup::voice::ready(config, def.path, value);
+            let action = match ready {
+                Ok(()) => ChoiceAction::Set,
+                // Auto is a policy, not a particular program to install.
+                Err(_) if *value == "auto" => ChoiceAction::Set,
+                Err(error) => match crate::setup::voice::recipe_for(def.path, value) {
+                    Some(id) => ChoiceAction::Install {
+                        preview: format!("{}\n{}", crate::setup::deps::run::preview_text(id, &env), match id {
+                            "piper" => "Also prepares the en_US-lessac-medium voice model and matching JSON when no complete voice model is configured.",
+                            "mlx-whisper" => "Also prepares the configured MLX Whisper model in the Hugging Face cache when needed.",
+                            _ => "Keeps existing configured models when usable.",
+                        }),
+                    },
+                    None => ChoiceAction::Unavailable {
+                        reason: format!("{error:#}"),
+                    },
+                },
+            };
+            ValueChoice {
+                value: (*value).to_owned(),
+                label: (*label).to_owned(),
+                action,
+            }
+        })
+        .collect()
 }
 
 /// A downloaded MLX checkpoint's value: its Hugging Face repository id when it came from that

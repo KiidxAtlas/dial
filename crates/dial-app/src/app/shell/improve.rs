@@ -107,7 +107,7 @@ impl Shell {
             "cycle" | "train" | "session" | "enable" | "disable" | "versions" | "tasks"
             | "rollback" => {
                 let text = self
-                    .improve_action(app, sub, rest)
+                    .improve_action(app, agent, sub, rest)
                     .unwrap_or_else(|error| format!("{error:#}"));
                 self.note("Improvement", text);
             }
@@ -131,8 +131,20 @@ impl Shell {
 
     /// The `/improve` actions that start work, change the switch or read the learning store. Returns
     /// the note text. Starting work needs Enabled on; the Enabled switch is never changed here.
-    fn improve_action(&mut self, app: &App, sub: &str, rest: &str) -> Result<String> {
-        let learning = app.reload()?;
+    fn improve_action(
+        &mut self,
+        app: &App,
+        agent: &Agent<'_>,
+        sub: &str,
+        rest: &str,
+    ) -> Result<String> {
+        let saved = app.reload()?;
+        let selection = if sub == "session" && !rest.is_empty() {
+            crate::agent::modes::switch::resolve(&saved, rest)?
+        } else {
+            agent.effective_config().selection()
+        };
+        let learning = crate::learn::session::target_config(&app.layout, &saved, &selection)?;
         let store = App::open_store(&learning)?;
         let off = format!(
             "Automatic improvement is off for this model, so nothing starts. Turn on Enabled in {} first.",
@@ -140,19 +152,16 @@ impl Shell {
         );
         match sub {
             "session" => {
-                let approval = store.approve_session(&self.session_id)?;
+                let approval = crate::learn::session::approve(&learning, &store, agent.session())?;
                 let mut text = format!(
-                    "This session: {} turn(s) approved for training, {} already verified, {} kept with an existing lower score, {} not usable (failed or no saved request).",
-                    approval.approved, approval.already, approval.judged, approval.unusable
+                    "Target {}/{}: {} source turn(s) approved for training, {} already approved, {} kept with an existing lower score, {} not usable (failed or no saved request). Source work is not counted as this model's measured performance.",
+                    selection.provider,
+                    selection.model,
+                    approval.approved,
+                    approval.already,
+                    approval.judged,
+                    approval.unusable
                 );
-                let verified = store.verified_live_turns()?;
-                let needed = crate::learn::improve::min_examples(&learning);
-                if verified < needed {
-                    text.push_str(&format!(
-                        "\n{verified}/{needed} verified turns recorded for this model; training starts once there are {needed}. Run /improve session again after more turns."
-                    ));
-                    return Ok(text);
-                }
                 if !learning.improve.enabled {
                     text.push_str(&format!("\nTraining not started. {off}"));
                     return Ok(text);

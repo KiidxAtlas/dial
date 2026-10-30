@@ -80,6 +80,7 @@ fn a_rejected_window_lowers_the_budget_for_every_remaining_sibling() {
         timeout_secs: 5,
         user_dir: &user_dir,
         native_request: None,
+        supplemental_context: None,
     };
     // 24 parts of ~10k tokens: four ~60k-token windows under the planned budget, while the
     // provider actually accepts only ~40k tokens of conversation.
@@ -134,7 +135,8 @@ fn previous_summary_drops_harness_notes_and_file_lists() {
     let message = Session::compaction_message(&stored);
     let (text, carried) = previous_summary(&message).expect("a committed summary");
     assert_eq!(text, "## Goal\nship it");
-    assert_eq!(carried, ops);
+    assert_eq!(carried.read, ops.read);
+    assert_eq!(carried.modified, ops.modified);
 }
 
 #[test]
@@ -153,6 +155,30 @@ fn file_ops_track_reads_writes_edits_and_skip_urls() {
     let rendered = ops.upsert("summary");
     assert!(rendered.contains("<read-files>\nsrc/lib.rs\n</read-files>"));
     assert!(rendered.contains("<modified-files>\nsrc/new.rs\n</modified-files>"));
+}
+
+#[test]
+fn file_inventory_is_bounded_recent_and_roundtrips_without_growing() {
+    let mut ops = FileOps::default();
+    for i in 0..40 {
+        ops.add(false, Some(&format!("src/{i:02}.rs")));
+    }
+    ops.add(true, Some("src/changed.rs"));
+    ops.add(false, Some(&"z".repeat(5_000)));
+    let rendered = ops.upsert("active request and unresolved work");
+    assert!(rendered.contains("src/39.rs"));
+    assert!(!rendered.contains("src/00.rs"));
+    assert!(rendered.contains("src/changed.rs"));
+    assert!(rendered.contains("full calls remain in session history"));
+    assert!(rendered.len() < 5_000);
+    let (text, carried) = FileOps::take_from(&rendered);
+    let next = carried.upsert(text);
+    assert!(next.contains("src/39.rs"));
+    assert!(!next.contains("src/00.rs"));
+    assert!(
+        !next.contains("[..."),
+        "omission notices are not file targets"
+    );
 }
 
 #[test]
@@ -284,6 +310,7 @@ fn summary_context(user_dir: &std::path::Path) -> CompactionContext<'_> {
         timeout_secs: 5,
         user_dir,
         native_request: None,
+        supplemental_context: None,
     }
 }
 
@@ -425,10 +452,110 @@ fn failed_and_denied_operations_remain_attempted_targets_not_success_evidence() 
     let legacy = "old summary\n\n<read-files>\nmissing.rs\n</read-files>\n\n<modified-files>\nprotected.rs\n</modified-files>";
     let (text, carried) = FileOps::take_from(legacy);
     assert_eq!(text, "old summary");
-    assert_eq!(carried, ops);
+    assert_eq!(carried.read, ops.read);
+    assert_eq!(carried.modified, ops.modified);
     assert!(carried.upsert(text).contains(FILE_TARGETS_NOTE));
     assert_eq!(
         previous_summary(&Session::compaction_message(&summary)).unwrap(),
         (facts, ops)
     );
+}
+
+#[test]
+fn updated_summary_drops_historical_read_inventory_but_keeps_mutation_targets() {
+    let mut prior = FileOps::default();
+    prior.add(false, Some("old-navigation.rs"));
+    prior.add(true, Some("unfinished-change.rs"));
+    let messages = [
+        Session::compaction_message(
+            &prior.upsert("Active request; approval needed; check still failing"),
+        ),
+        user("continue"),
+        assistant_call("new", "read", json!({"path":"current.rs"})),
+        tool("new"),
+    ];
+    let user_dir = std::env::temp_dir();
+    let summary = summarize_prefix(
+        &mut summary_backend(),
+        &messages,
+        messages.len(),
+        &CompactionConfig::default(),
+        &summary_context(&user_dir),
+        CompactionMethod::Handoff,
+        "",
+        &Arc::new(AtomicBool::new(false)),
+        &mut crate::agent::NullUi,
+        &mut |_, request, _| {
+            let input = request.messages[1]["content"].as_str().unwrap();
+            assert!(input.contains("Active request; approval needed; check still failing"));
+            assert!(!input.contains("old-navigation.rs"));
+            Ok("Active request; approval needed; check still failing".to_owned())
+        },
+        &mut None,
+    )
+    .unwrap();
+    assert!(!summary.contains("old-navigation.rs"));
+    assert!(summary.contains("unfinished-change.rs"));
+    assert!(summary.contains("current.rs"));
+}
+
+#[test]
+fn supplemental_compaction_data_is_transient_user_input_and_budgeted_before_dispatch() {
+    let user_dir = std::env::temp_dir();
+    let note = "[extension example; untrusted data] Preserve open questions";
+    let mut context = summary_context(&user_dir);
+    context.supplemental_context = Some(note);
+    let original = vec![user("conversation source")];
+    let messages = original.clone();
+    let mut calls = 0;
+    let summary = summarize_prefix(
+        &mut summary_backend(),
+        &messages,
+        messages.len(),
+        &CompactionConfig::default(),
+        &context,
+        CompactionMethod::Soft,
+        "",
+        &Arc::new(AtomicBool::new(false)),
+        &mut crate::agent::NullUi,
+        &mut |_, request, _| {
+            calls += 1;
+            assert_eq!(
+                request.messages[0],
+                json!({"role":"system","content":SYSTEM_PROMPT})
+            );
+            let supplemental = &request.messages[1];
+            assert_eq!(supplemental["role"], "user");
+            assert_eq!(supplemental["dial_transient"], true);
+            assert!(supplemental["content"].as_str().unwrap().contains(note));
+            assert!(
+                request_estimate(request) + u64::from(request.max_tokens)
+                    <= u64::from(context.summary_window)
+            );
+            Ok("summary".into())
+        },
+        &mut None,
+    )
+    .unwrap();
+    assert_eq!(calls, 1);
+    assert_eq!(summary, "summary");
+    assert_eq!(messages, original);
+    let large = "x".repeat(8 * 1024);
+    context.supplemental_context = Some(&large);
+    context.summary_window = 1200;
+    let denied = fold(
+        &mut summary_backend(),
+        &["small".into()],
+        None,
+        Prompt::Main,
+        &CompactionConfig::default(),
+        &context,
+        CompactionMethod::Soft,
+        "",
+        &Arc::new(AtomicBool::new(false)),
+        &mut crate::agent::NullUi,
+        &mut |_, _, _| panic!("over-budget request must not reach the provider"),
+        &mut None,
+    );
+    assert!(denied.unwrap_err().to_string().contains("cannot fit"));
 }

@@ -54,3 +54,34 @@ fn model_history_keeps_controller_execution_and_integrity_facts() {
     assert_eq!(history["dial_execution"]["output"]["retention"], "partial");
     assert_eq!(history["dial_execution_status"], "ok");
 }
+
+#[test]
+fn edit_projection_is_named_digest_bound_and_never_applied_to_errors() {
+    let model = "[a.txt#ABCD]\nupdated (+1 -1 lines)\n1:new\n";
+    let raw = format!("{model}\nchange preview (+1 -1 lines)\n-old\n+new\n");
+    let output = edit_projection(raw.clone(), model.into());
+    assert_eq!(message_for("edit", "id", &output)["content"], model);
+    assert_eq!(message("id", &output)["content"], raw);
+    for name in ["bash", "extension_edit", "write"] {
+        assert_eq!(message_for(name, "id", &output)["content"], raw);
+    }
+    for case in 0..5 {
+        let mut changed = output.clone();
+        match case {
+            0 => changed.is_error = true,
+            1 => changed.text.push_str("\nwarning: hook annotation"),
+            2 => changed.execution.status = Some(ToolStatus::Blocked),
+            3 => changed.data.as_mut().unwrap()[EDIT_PROJECTION]["producer"] = "extension".into(),
+            4 => {
+                changed.data.as_mut().unwrap()[EDIT_PROJECTION]["anchored_text"] =
+                    "unobserved".into()
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            message_for("edit", "id", &changed)["content"],
+            changed.text,
+            "case {case}"
+        );
+    }
+}

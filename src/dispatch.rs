@@ -30,6 +30,9 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
     };
     let layout = Layout::discover(&cwd)?;
     match &cli.command {
+        Some(Command::ProviderBatch(args)) => {
+            return dial::cli::provider_batches::run(&layout, args);
+        }
         Some(Command::Stats {
             json,
             serve,
@@ -144,6 +147,9 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
         }
         Some(Command::Watch(args)) => {
             return exit_with(dial::cli::watch::run(&layout, args.clone())?);
+        }
+        Some(Command::Run(args)) => {
+            return exit_with(dial::cli::run::run(&layout, args)?);
         }
         Some(Command::Gc(args)) => {
             return exit_with(dial::cli::gc::run(&layout, args.clone())?);

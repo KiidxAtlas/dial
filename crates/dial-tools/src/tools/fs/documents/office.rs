@@ -201,7 +201,7 @@ pub(super) fn attr<'a>(attrs: &'a [(String, String)], name: &str) -> Option<&'a 
         .find(|(key, _)| key == name)
         .map(|(_, value)| value.as_str())
 }
-fn relationship_id(attrs: &[(String, String)]) -> Result<&str, String> {
+pub(super) fn relationship_id(attrs: &[(String, String)]) -> Result<&str, String> {
     let mut ids = attrs
         .iter()
         .filter(|(key, _)| key.split_once(':').is_some_and(|(_, local)| local == "id"));
@@ -253,7 +253,7 @@ fn paragraphs(input: &str, root: &str) -> Result<String, String> {
     })?;
     Ok(out)
 }
-fn relationships(input: &str, base: &str) -> Result<HashMap<String, String>, String> {
+pub(super) fn relationships(input: &str, base: &str) -> Result<HashMap<String, String>, String> {
     let mut out = HashMap::new();
     xml(input, "Relationships", |event| {
         if let Xml::Start(name, attrs) = event
@@ -280,7 +280,7 @@ fn relationships(input: &str, base: &str) -> Result<HashMap<String, String>, Str
     })?;
     Ok(out)
 }
-fn shared_strings(input: &str) -> Result<Vec<String>, String> {
+pub(super) fn shared_strings(input: &str) -> Result<Vec<String>, String> {
     let mut strings = Vec::new();
     let mut current = String::new();
     let mut in_text = false;

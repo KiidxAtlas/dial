@@ -106,7 +106,7 @@ fn writes_decoded_png_and_sends_model_prompt_and_key() {
     );
 
     assert!(!out.is_error, "{}", out.text);
-    assert!(out.text.contains("from gpt-image-1"), "{}", out.text);
+    assert!(out.text.contains("from gpt-image-1.5"), "{}", out.text);
     assert_eq!(std::fs::read(ws.root().join("fox.png")).unwrap(), png);
     let request = server.join().unwrap();
     let lower = request.to_ascii_lowercase();
@@ -122,7 +122,7 @@ fn writes_decoded_png_and_sends_model_prompt_and_key() {
     let body: Value = serde_json::from_str(payload).unwrap();
     assert_eq!(body["prompt"], "a red fox", "{request}");
     assert_eq!(body["size"], "1536x1024", "{request}");
-    assert_eq!(body["model"], "gpt-image-1", "{request}");
+    assert_eq!(body["model"], "gpt-image-1.5", "{request}");
     assert!(body.get("response_format").is_none(), "{request}");
 }
 
@@ -274,7 +274,7 @@ fn xai_session(user_dir: &std::path::Path) -> Config {
 }
 
 #[test]
-fn auto_offers_the_tool_only_when_its_endpoint_has_a_key() {
+fn auto_reports_missing_credentials_for_a_customized_endpoint() {
     let base = "http://127.0.0.1:9/v1";
     let keyed = user_dir_with_key(base);
     let mut config = config_for(base, keyed.path());
@@ -325,6 +325,76 @@ fn registry_offers_image_gen_without_an_integrations_entry_when_keyed() {
 }
 
 #[test]
+fn opus_without_an_image_role_keeps_the_automatic_tool_available() {
+    use crate::llm::model_config::{ModelSelection, ProviderSpec};
+    let (_dir, ws) = testkit::workspace();
+    let user = tempfile::tempdir().unwrap();
+    let mut config = Config {
+        project_root: ws.root().into(),
+        state_dir: ws.root().join("state"),
+        user_dir: user.path().into(),
+        integrations: Vec::new(),
+        ..Default::default()
+    }
+    .with_selection(&ModelSelection::new("anthropic", "claude-opus-4-6"));
+    config.extensions.enabled = false;
+    // Make this independent of developer/CI provider credentials.
+    for provider in ["openai", "xai"] {
+        config.providers.insert(
+            provider.into(),
+            ProviderSpec {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+    }
+    assert!(config.role_selection("image").is_none());
+    assert!(config.model_profiles.is_empty());
+    assert!(resolve(&config).is_err());
+    let offered = auto_tools(&config).unwrap();
+    assert_eq!(offered.len(), 1, "route setup must not hide image_gen");
+    assert!(offered[0].needs_approval(&json!({"prompt":"dog", "output":"dog.png"})));
+    let mut registry = Registry::standard(&config, Vec::new());
+    assert!(registry.contains(TOOL));
+    assert!(!registry.sync_image_generation(&config).unwrap());
+
+    let out = run(&ws, &config, json!({"prompt":"dog", "output":"dog.png"}));
+    assert!(
+        out.is_error,
+        "offering a tool must not invent an image service"
+    );
+    assert!(!ws.root().join("dog.png").exists());
+
+    config.image.auto = false;
+    assert!(registry.sync_image_generation(&config).unwrap());
+    assert!(!registry.contains(TOOL), "explicit opt-out still wins");
+}
+
+#[test]
+fn opus_without_an_image_role_reuses_the_saved_openai_image_key() {
+    use crate::llm::model_config::ModelSelection;
+    let user = user_dir_with_key("https://api.openai.com/v1");
+    let config = Config {
+        user_dir: user.path().into(),
+        integrations: Vec::new(),
+        ..Default::default()
+    }
+    .with_selection(&ModelSelection::new("anthropic", "claude-opus-4-6"));
+    assert!(config.role_selection("image").is_none());
+    assert!(config.model_profiles.is_empty());
+    assert_eq!(auto_tools(&config).unwrap().len(), 1);
+    let target = resolve(&config).unwrap();
+    assert_eq!(target.base_url, "https://api.openai.com/v1");
+    assert_eq!(
+        target.model,
+        crate::config::image::ImageConfig::default().model
+    );
+    assert_eq!(target.key, KEY);
+    assert_eq!(config.provider.as_deref(), Some("anthropic"));
+    assert_eq!(config.model, "claude-opus-4-6");
+}
+
+#[test]
 fn image_capable_session_provider_supplies_endpoint_model_and_key() {
     let user_dir = user_dir_with_key(XAI_BASE);
     let config = xai_session(user_dir.path());
@@ -370,7 +440,7 @@ fn customized_image_settings_win_over_the_session_provider() {
 
     let target = resolve(&config).unwrap();
     assert_eq!(target.base_url, base);
-    assert_eq!(target.model, "gpt-image-1");
+    assert_eq!(target.model, "gpt-image-1.5");
     assert_eq!(target.wire, Wire::OpenAi);
     assert_eq!(target.key, KEY);
 }
@@ -840,6 +910,31 @@ fn chatgpt_unknown_metadata_offers_hosted_images_without_an_api_key() {
 }
 
 #[test]
+fn chatgpt_image_role_generates_through_the_subscription_while_main_uses_another_provider() {
+    use crate::llm::{chatgpt, model_config::ModelSelection};
+    let user = tempfile::tempdir().unwrap();
+    chatgpt::test_account(user.path(), false);
+    let mut config = Config {
+        user_dir: user.path().into(),
+        model: "text-only".into(),
+        ..Default::default()
+    };
+    assert_ne!(config.selection().provider, chatgpt::PROVIDER);
+    config.model_roles.insert(
+        "image".into(),
+        ModelSelection::new(chatgpt::PROVIDER, "chat-model"),
+    );
+    assert_eq!(auto_tools(&config).unwrap().len(), 1);
+    let target = resolve(&config).unwrap();
+    assert_eq!(target.model, "chat-model");
+    assert_eq!(target.base_url, chatgpt::BASE_URL);
+    assert_eq!(target.wire, Wire::Responses);
+    assert_eq!(target.account_id.as_deref(), Some("oaiapp_test"));
+    assert!(target.key.is_empty());
+    assert_eq!(config.model, "text-only");
+}
+
+#[test]
 fn any_chat_model_can_automatically_use_a_configured_image_profile() {
     use crate::llm::profiles::{ImageGenerationApi, ModelProfile};
     let user = tempfile::tempdir().unwrap();
@@ -1087,6 +1182,7 @@ fn image_settings(model: &str) -> crate::config::image::ImageModelSettings {
         background: Some("transparent".into()),
         moderation: Some("low".into()),
         strength: Some(0.6),
+        ..Default::default()
     }
 }
 
@@ -1148,7 +1244,7 @@ fn explicit_call_size_wins_and_openai_gets_only_its_settings() {
     config
         .image
         .models
-        .insert("gpt".into(), image_settings("gpt-image-1"));
+        .insert("gpt".into(), image_settings("gpt-image-1.5"));
 
     let out = run(
         &ws,
@@ -1252,7 +1348,7 @@ fn openai_edit_uploads_the_source_as_multipart_to_images_edits() {
     config
         .image
         .models
-        .insert("gpt".into(), image_settings("gpt-image-1"));
+        .insert("gpt".into(), image_settings("gpt-image-1.5"));
 
     let out = run(
         &ws,
@@ -1269,7 +1365,7 @@ fn openai_edit_uploads_the_source_as_multipart_to_images_edits() {
     );
     assert!(lower.contains(&format!("authorization: bearer {KEY}").to_ascii_lowercase()));
     for field in [
-        "name=\"model\"\r\n\r\ngpt-image-1\r\n",
+        "name=\"model\"\r\n\r\ngpt-image-1.5\r\n",
         "name=\"prompt\"\r\n\r\nadd a hat\r\n",
         "name=\"size\"\r\n\r\n1024x1024\r\n",
         "name=\"quality\"\r\n\r\nhigh\r\n",
@@ -1373,4 +1469,157 @@ fn edits_refuse_unsupported_routes_and_bad_sources_before_any_request() {
     );
     assert!(!ws.root().join("hat.png").exists());
     assert!(!ws.root().join("hat.jpg").exists());
+}
+
+#[test]
+fn native_profile_routes_preserve_their_base_paths() {
+    use crate::llm::profiles::ImageGenerationApi as Api;
+    let user = tempfile::tempdir().unwrap();
+    for (api, wire, base) in [
+        (Api::Gemini, Wire::Gemini, "http://127.0.0.1:9/v1beta"),
+        (
+            Api::Imagen,
+            Wire::Imagen,
+            "http://127.0.0.1:9/publishers/google",
+        ),
+        (
+            Api::BlackForestLabs,
+            Wire::BlackForestLabs,
+            "http://127.0.0.1:9/v1",
+        ),
+        (Api::Fal, Wire::Fal, "http://127.0.0.1:9"),
+        (Api::Replicate, Wire::Replicate, "http://127.0.0.1:9/v1"),
+        (Api::ComfyUi, Wire::ComfyUi, "http://127.0.0.1:9"),
+    ] {
+        let config = selected_config(base, user.path(), api);
+        let target = resolve(&config).unwrap();
+        assert_eq!(target.base_url, base, "{api:?}");
+        assert_eq!(target.wire, wire);
+        assert_eq!(auto_tools(&config).unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn dedicated_native_endpoint_overrides_selected_model_and_rejects_unsafe_urls() {
+    use crate::llm::profiles::ImageGenerationApi as Api;
+    let user = tempfile::tempdir().unwrap();
+    let mut config = selected_config("http://127.0.0.1:9/v1", user.path(), Api::Images);
+    config.image.api = Some(Api::ComfyUi);
+    config.image.base_url = "http://127.0.0.1:8188".into();
+    config.image.model = "my-workflow".into();
+    let target = resolve(&config).unwrap();
+    assert_eq!(target.wire, Wire::ComfyUi);
+    assert_eq!(target.model, "my-workflow");
+    for base in [
+        "http://remote.invalid",
+        "http://user:secret@localhost:8188",
+        "http://localhost:8188/#fragment",
+    ] {
+        config.image.base_url = base.into();
+        assert!(resolve(&config).is_err(), "accepted {base}");
+    }
+}
+
+#[test]
+fn gemini_generation_and_edit_use_native_auth_and_inline_image_data() {
+    use crate::llm::profiles::ImageGenerationApi as Api;
+    let (_dir, ws) = testkit::workspace();
+    let png = image_bytes(image::ImageFormat::Png);
+    for edit in [false, true] {
+        let (base, server) = serve_once(200, json!({"candidates":[{"finishReason":"STOP","content":{"parts":[{"inlineData":{"mimeType":"image/png","data":base64::engine::general_purpose::STANDARD.encode(&png)}}]}}]}).to_string());
+        let user = user_dir_with_key(&base);
+        let mut config = config_for(&base, user.path());
+        config.image.api = Some(Api::Gemini);
+        config.image.model = "gemini-2.5-flash-image".into();
+        let mut args =
+            json!({"prompt":"a red fox", "output":if edit {"edit.png"} else {"generated.png"}});
+        if edit {
+            source_png(&ws, "source.png");
+            args["image"] = json!("source.png");
+        }
+        let out = run(&ws, &config, args);
+        assert!(!out.is_error, "{}", out.text);
+        let sent = server.join().unwrap();
+        assert!(
+            sent.starts_with("POST /v1/models/gemini-2.5-flash-image:generateContent "),
+            "{sent}"
+        );
+        let lower = sent.to_ascii_lowercase();
+        assert!(lower.contains(&format!("x-goog-api-key: {KEY}")), "{sent}");
+        assert!(!lower.contains("authorization:"), "{sent}");
+        let body = sent_body(&sent);
+        assert_eq!(
+            body["generationConfig"]["responseModalities"],
+            json!(["TEXT", "IMAGE"])
+        );
+        assert_eq!(
+            body["contents"][0]["parts"].as_array().unwrap().len(),
+            if edit { 2 } else { 1 }
+        );
+        if edit {
+            assert_eq!(std::fs::read(ws.root().join("source.png")).unwrap(), png);
+        }
+    }
+}
+
+#[test]
+fn imagen_uses_bearer_predict_and_refuses_unsupported_output_before_submission() {
+    use crate::llm::profiles::ImageGenerationApi as Api;
+    let (_dir, ws) = testkit::workspace();
+    let png = image_bytes(image::ImageFormat::Png);
+    let (base, server) = serve_once(200, json!({"predictions":[{"bytesBase64Encoded":base64::engine::general_purpose::STANDARD.encode(&png)}]}).to_string());
+    let user = user_dir_with_key(&base);
+    let mut config = config_for(&base, user.path());
+    config.image.api = Some(Api::Imagen);
+    config.image.model = "imagen-4.0-generate-001".into();
+    let out = run(&ws, &config, json!({"prompt":"a fox","output":"out.png"}));
+    assert!(!out.is_error, "{}", out.text);
+    let sent = server.join().unwrap();
+    assert!(
+        sent.starts_with("POST /v1/models/imagen-4.0-generate-001:predict "),
+        "{sent}"
+    );
+    assert!(
+        sent.to_ascii_lowercase()
+            .contains(&format!("authorization: bearer {KEY}")),
+        "{sent}"
+    );
+    assert_eq!(sent_body(&sent)["parameters"]["sampleCount"], 1);
+    config.image.base_url = "http://127.0.0.1:9/v1".into();
+    let out = run(
+        &ws,
+        &config,
+        json!({"prompt":"a fox","output":"unsupported.webp"}),
+    );
+    assert!(
+        out.is_error && out.text.contains("WebP is not supported"),
+        "{}",
+        out.text
+    );
+    assert!(!ws.root().join("unsupported.webp").exists());
+}
+
+#[test]
+fn interrupted_generation_never_submits_or_publishes() {
+    let (_dir, ws) = testkit::workspace();
+    let user = tempfile::tempdir().unwrap();
+    let config = config_for("http://127.0.0.1:9/v1", user.path());
+    let authorize = testkit::authorize_in_workspace(&ws, TOOL);
+    let out = ImageGen.call_streaming(
+        &ToolContext {
+            workspace: &ws,
+            config: &config,
+            mutation_authorizer: Some(&authorize),
+            confirm: None,
+        },
+        &json!({"prompt":"a fox", "output":"interrupted.png"}),
+        &|_| {},
+        &std::sync::atomic::AtomicBool::new(true),
+    );
+    assert!(
+        out.is_error && out.text.contains("interrupted"),
+        "{}",
+        out.text
+    );
+    assert_eq!(std::fs::read_dir(ws.root()).unwrap().count(), 0);
 }

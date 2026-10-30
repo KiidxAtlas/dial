@@ -3,7 +3,6 @@
 //! `crate::extensions::command`, which drives panels via the interactive `Ui` bridge.
 use crate::agent::Agent;
 use crate::app::{App, Bridge, PAINT_EVERY, Shell, Step};
-use crate::extensions::command;
 use anyhow::Result;
 use std::time::Instant;
 
@@ -17,7 +16,6 @@ pub(super) fn run(
 ) -> Option<Result<Step>> {
     let host = agent.extension_host()?;
     let plugin = host.command_owner(name)?;
-    let cancel = app.interrupt.clone();
     let result = {
         let mut bridge = Bridge {
             app,
@@ -30,7 +28,7 @@ pub(super) fn run(
             next_id: 0,
         };
         bridge.repaint(true);
-        command::run(&mut bridge, &host, &plugin, name, args.trim(), &cancel)
+        agent.run_extension_command(&mut bridge, &host, &plugin, name, args.trim())
     };
     Some(result.map(|text| {
         if !text.is_empty() {

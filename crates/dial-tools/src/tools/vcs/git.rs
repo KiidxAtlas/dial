@@ -28,7 +28,8 @@ const NETWORK_TIMEOUT: Duration = Duration::from_secs(120);
 const HOOKS_SKIPPED: &str =
     "[repository hooks and commit signing were skipped because git.bypass_hooks = true]";
 
-const DESCRIPTION: &str = "Git, jj (jujutsu) and GitHub operations without shell quoting. Read actions: `status`, `diff` \
+const DESCRIPTION: &str = "Git, jj (jujutsu) and GitHub operations without shell quoting. Read actions: `status` \
+(optional `path`; large git status returns counts and samples, complete output via artifact_read), `diff` \
 (optional `staged`, `base` ref, `path`), `log` (`limit` ≤ 50, optional `path`), `show` (`rev`), `blame` (`path`, optional \
 `start`/`end` lines, `rev`), `branches`, `pr_view`/`pr_checks`/`issue_view` (`number`; need the `gh` CLI). Changing actions \
 (ask approval): `add` (`paths`), `unstage` (`paths`), `commit` (`message`; commits what is staged, or every tracked change \
@@ -194,6 +195,13 @@ fn run_streams(inv: Invocation<'_>) -> Result<(bool, String, String), String> {
         crate::runtime::process::run_with_policy(command, None, policy, cancel, &mut |_, _| {})?;
     if output.cancelled || output.timed_out || output.io_error.is_some() {
         return Err(output.failure(program, timeout));
+    }
+    if args.first().is_some_and(|arg| arg == "status")
+        && (output.stdout_total > output.stdout.len()
+            || output.stderr_total > output.stderr.len()
+            || output.output_incomplete)
+    {
+        return Err("status output exceeded the capture limit or was incomplete; exact counts and full retention are unavailable. Retry with `path` to narrow the scope.".into());
     }
     Ok((
         output.success(),
@@ -544,7 +552,13 @@ fn jj_dispatch(
         })
     };
     match action {
-        "status" => jj(strings(&["status"])),
+        "status" => {
+            let mut a = strings(&["status"]);
+            if let Some(path) = opt_str(args, "path")? {
+                a.push(jj_path(ws, path)?);
+            }
+            jj(a)
+        }
         "diff" => {
             if opt_bool(args, "staged")? {
                 return Err("jj has no staging area; diff shows the working-copy change (omit `staged`, or pass vcs \"git\")".into());
@@ -612,6 +626,89 @@ fn commit_message(args: &Value) -> Result<&str, String> {
     Ok(message)
 }
 
+/// Keep the exact porcelain output retrievable, but do not flood context with a file inventory.
+fn status_output(ws: &Workspace, text: &str) -> String {
+    const SAMPLE_PATHS: usize = 20;
+    const SAMPLE_CHARS: usize = 240;
+    let is_entry = |line: &str| {
+        let bytes = line.as_bytes();
+        bytes.get(2) == Some(&b' ') && bytes[..2].iter().all(|code| b" MTADRCU?!".contains(code))
+    };
+    let entries: Vec<_> = text.lines().filter(|line| is_entry(line)).collect();
+    if entries.len() <= SAMPLE_PATHS && text.len() <= 4096 {
+        return text.to_owned();
+    }
+    let uri = match ws
+        .artifacts()
+        .map(|store| store.retain_with_integrity(text))
+    {
+        Some(Ok((uri, integrity)))
+            if matches!(
+                integrity.retention,
+                crate::runtime::execution::Completeness::Complete
+            ) =>
+        {
+            uri
+        }
+        Some(Ok(_)) => {
+            return format!(
+                "{text}\n[status summary bypassed: artifact retention was incomplete; complete status returned inline]"
+            );
+        }
+        Some(Err(error)) => {
+            return format!(
+                "{text}\n[status summary bypassed: complete status could not be retained: {error:#}; complete status returned inline]"
+            );
+        }
+        None => {
+            return format!(
+                "{text}\n[status summary bypassed: no artifact store; complete status returned inline]"
+            );
+        }
+    };
+    let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+    for line in &entries {
+        if let Some(code) = line.get(..2) {
+            *counts.entry(code).or_default() += 1;
+        }
+    }
+    let mut out = String::new();
+    for header in text.lines().filter(|line| line.starts_with("## ")) {
+        out.extend(header.chars().take(SAMPLE_CHARS));
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "Status: {} entries (paths; renames count once).\nXY status counts (index/worktree; ??=untracked):",
+        entries.len()
+    ));
+    for (code, count) in counts {
+        out.push_str(&format!(" {code:?}={count}"));
+    }
+    out.push_str(&format!(
+        "\nSample paths (first {}):\n",
+        entries.len().min(SAMPLE_PATHS)
+    ));
+    for line in entries.iter().take(SAMPLE_PATHS) {
+        out.extend(line.chars().take(SAMPLE_CHARS));
+        if line.chars().count() > SAMPLE_CHARS {
+            out.push_str("… [path shortened]");
+        }
+        out.push('\n');
+    }
+    if text
+        .lines()
+        .any(|line| !line.starts_with("## ") && !is_entry(line))
+    {
+        out.push_str("Additional diagnostics are included in complete output.\n");
+    }
+    out.push_str(&format!(
+        "Complete status ({} bytes): {uri}; retrieve with artifact_read.",
+        text.len()
+    ));
+    out.push_str("\nSample only; use git status with `path` to inspect a scope.");
+    out
+}
+
 fn dispatch(
     ws: &Workspace,
     args: &Value,
@@ -663,11 +760,24 @@ fn dispatch(
         })
     };
     let mut note = None;
-    let (ok, text) = if use_jj(ws, args, action)? {
+    let jj = use_jj(ws, args, action)?;
+    let (ok, text) = if jj {
         jj_dispatch(ws, args, action, cancel)?
     } else {
         match action {
-            "status" => git(strings(&["status", "--short", "--branch"]), LOCAL_TIMEOUT)?,
+            "status" => {
+                let mut a = strings(&[
+                    "status",
+                    "--porcelain=v1",
+                    "--branch",
+                    "--untracked-files=all",
+                ]);
+                if let Some(path) = opt_str(args, "path")? {
+                    a.push("--".into());
+                    a.push(one_path(ws, path)?);
+                }
+                git(a, LOCAL_TIMEOUT)?
+            }
             "diff" => {
                 let mut a = strings(&["diff", "--no-color", "--no-ext-diff", "--no-textconv"]);
                 if opt_bool(args, "staged")? {
@@ -805,11 +915,15 @@ fn dispatch(
             other => return Err(format!("unknown git action {other:?}")),
         }
     };
-    let mut text = clip_with_hint(
-        ws,
-        text.trim_end().to_owned(),
-        "narrow the request with `path`, `limit` or a smaller range",
-    );
+    let mut text = if ok && action == "status" && !jj {
+        status_output(ws, text.trim_end())
+    } else {
+        clip_with_hint(
+            ws,
+            text.trim_end().to_owned(),
+            "narrow the request with `path`, `limit` or a smaller range",
+        )
+    };
     if text.is_empty() {
         text = "(no output)".to_owned();
     }
@@ -839,7 +953,7 @@ impl Tool for Git {
                 "start": {"type": "integer", "minimum": 1, "description": "blame: first line"},
                 "end": {"type": "integer", "minimum": 1, "description": "blame: last line"},
                 "paths": {"type": "array", "items": {"type": "string"}, "description": "add/unstage: workspace paths"},
-                "path": {"type": "string", "description": "diff/log: limit to this path; blame: file (required)"},
+                "path": {"type": "string", "description": "status/diff/log: limit to this path; blame: file (required)"},
                 "staged": {"type": "boolean", "description": "diff: staged changes"},
                 "base": {"type": "string", "description": "diff: compare the working tree to this ref; pr_create: base branch"},
                 "rev": {"type": "string", "description": "show: commit, tag or ref; blame: blame as of this revision"},

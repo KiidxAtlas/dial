@@ -195,6 +195,16 @@ pub trait Tool: Send + Sync {
     fn drain_notifications(&self) -> Vec<ToolEvent> {
         Vec::new()
     }
+    /// Whether this tool owns approved, unexpired application watches.
+    fn has_monitors(&self) -> bool {
+        false
+    }
+    /// Poll bounded incremental output; returned diagnostics are untrusted source data.
+    fn poll_monitors(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// Revoke watches when the user replaces the task; never stop the observed application.
+    fn stop_monitors(&self) {}
     /// Session-owned asynchronous work which is still running between controller turns.
     /// Stateless tools have no pending wake; process owners report their actual live state.
     fn has_live_work(&self) -> bool {
@@ -232,6 +242,11 @@ pub trait Tool: Send + Sync {
     /// Tools without background jobs return `None`.
     fn jobs_view(&self, _attached: Option<&str>) -> Option<JobsView> {
         None
+    }
+    /// Stop a background job this tool owns, at the user's explicit request (the `/watch` pane).
+    /// Returns what was stopped. Tools without background jobs refuse.
+    fn kill_job(&self, _name: &str) -> Result<String, String> {
+        Err("this tool does not own background jobs".into())
     }
     /// Transfer a foreground shell command or native cell to a managed background owner.
     #[doc(hidden)]
@@ -289,6 +304,7 @@ pub struct Registry {
     notices: Vec<String>,
     mcp_instructions: Vec<(String, String)>,
     plugins: Option<Arc<super::plugin::Host>>,
+    plugin_tools: std::collections::BTreeSet<String>,
     origins: BTreeMap<String, crate::tools::surface::catalog::Origin>,
     /// MCP tools mirrored from the connected servers; [`Registry::sync_mcp`] applies their changes.
     mcp: super::mcp::Live,
@@ -333,6 +349,23 @@ impl Registry {
         self.tools.values().any(|tool| tool.has_live_work())
     }
 
+    pub fn has_monitors(&self) -> bool {
+        self.tools.values().any(|tool| tool.has_monitors())
+    }
+
+    pub fn poll_monitors(&self) -> Vec<String> {
+        self.tools
+            .values()
+            .flat_map(|tool| tool.poll_monitors())
+            .collect()
+    }
+
+    pub fn stop_monitors(&self) {
+        for tool in self.tools.values() {
+            tool.stop_monitors();
+        }
+    }
+
     /// `(server, text)` instructions that connected MCP servers sent at initialize.
     pub fn mcp_instructions(&self) -> &[(String, String)] {
         &self.mcp_instructions
@@ -341,25 +374,40 @@ impl Registry {
     /// Share immutable definitions and multiplexed services (including MCP), but
     /// give every execution owner fresh workspace/process/native-tool state.
     pub fn fork_session(&self) -> Self {
+        let plugins = self
+            .plugins
+            .as_ref()
+            .map(|host| Arc::new(host.fork_session()));
+        let mut tools: BTreeMap<_, _> = self
+            .tools
+            .iter()
+            .map(|(name, tool)| {
+                (
+                    name.clone(),
+                    tool.fork_session().unwrap_or_else(|| Arc::clone(tool)),
+                )
+            })
+            .collect();
+        // Adapters must use the fork's host: closing the parent must not revoke child tools.
+        if let Some(host) = &plugins {
+            for tool in host.tools() {
+                if tools.get(tool.name()).is_some_and(|old| {
+                    self.plugin_tools.contains(tool.name())
+                        && old.schema() == tool.schema()
+                        && old.contract_revision() == tool.contract_revision()
+                }) {
+                    tools.insert(tool.name().to_owned(), tool);
+                }
+            }
+        }
         Self {
-            tools: self
-                .tools
-                .iter()
-                .map(|(name, tool)| {
-                    (
-                        name.clone(),
-                        tool.fork_session().unwrap_or_else(|| Arc::clone(tool)),
-                    )
-                })
-                .collect(),
+            tools,
             notices: Vec::new(),
             mcp_instructions: self.mcp_instructions.clone(),
             origins: self.origins.clone(),
             mcp: self.mcp.clone(),
-            plugins: self
-                .plugins
-                .as_ref()
-                .map(|host| Arc::new(host.fork_session())),
+            plugins,
+            plugin_tools: self.plugin_tools.clone(),
         }
     }
 
@@ -388,6 +436,22 @@ impl Registry {
             crate::tools::code::navigation::tools(config),
             crate::tools::code::ida::tools(config),
             crate::tools::knowledge::autoresearch::tools(config),
+            crate::tools::knowledge::evidence::tools(config),
+            crate::tools::knowledge::retrieval::tools(config),
+            crate::tools::knowledge::investigate::tools(config),
+            crate::tools::knowledge::workbench::tools(config),
+            crate::tools::knowledge::data::tools(config),
+            crate::tools::fs::documents::analysis_tools(config),
+            crate::tools::fs::audio::tools(config),
+            crate::tools::fs::video::tools(config),
+            crate::tools::fs::visual::tools(config),
+            crate::tools::knowledge::timeline::tools(config),
+            crate::tools::knowledge::notebook::tools(config),
+            crate::tools::knowledge::reality::tools(config),
+            crate::tools::knowledge::perception::tools(config),
+            crate::tools::knowledge::runtime_inspect::tools(config),
+            crate::tools::knowledge::network_inspect::tools(config),
+            crate::tools::knowledge::database::tools(config),
             crate::tools::fs::archive::tools(config),
             crate::tools::knowledge::deps::tools(config),
             crate::tools::vision::search::tools(config),
@@ -409,7 +473,7 @@ impl Registry {
                 registry.register_native(tool);
             }
         }
-        // Offered without an `integrations` entry when its endpoint has a key (`image.auto`).
+        // Offered without an `integrations` entry in automatic mode (`image.auto`).
         match crate::tools::net::image_gen::auto_tools(config) {
             Ok(tools) => {
                 for tool in tools {
@@ -434,6 +498,14 @@ impl Registry {
         host.load_configured(config);
         registry.notices.extend(host.take_notices());
         if config.extensions.enabled {
+            for owner in host.tool_owners() {
+                if let Err(error) = registry.attach_plugin_tools(&host, &owner) {
+                    host.unregister(&owner);
+                    registry
+                        .notices
+                        .push(format!("plugin {owner} tools refused: {error:#}"));
+                }
+            }
             registry.plugins = Some(host);
         }
         registry.notices = registry.notices.into_iter().chain(mcp.notices).collect();
@@ -446,10 +518,40 @@ impl Registry {
         &mut self,
         plugin: Arc<dyn super::plugin::Plugin>,
     ) -> anyhow::Result<()> {
-        let host = self
-            .plugins
-            .get_or_insert_with(|| Arc::new(super::plugin::Host::default()));
-        host.register(plugin)
+        let host = Arc::clone(
+            self.plugins
+                .get_or_insert_with(|| Arc::new(super::plugin::Host::default())),
+        );
+        let name = plugin.name().to_owned();
+        host.register(plugin)?;
+        if let Err(error) = self.attach_plugin_tools(&host, &name) {
+            host.unregister(&name);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn attach_plugin_tools(
+        &mut self,
+        host: &Arc<super::plugin::Host>,
+        owner: &str,
+    ) -> anyhow::Result<()> {
+        let tools = host.tools_for(Some(owner));
+        let mut names = std::collections::BTreeSet::new();
+        for tool in &tools {
+            crate::tools::surface::catalog::validate_tool(tool.as_ref())?;
+            anyhow::ensure!(
+                !self.contains(tool.name()) && names.insert(tool.name().to_owned()),
+                "duplicate tool name {}",
+                tool.name()
+            );
+        }
+        for tool in tools {
+            let name = tool.name().to_owned();
+            self.try_register(tool)?;
+            self.plugin_tools.insert(name);
+        }
+        Ok(())
     }
 
     /// Shared plugin dispatcher used by parent and child agent hooks.
@@ -475,6 +577,7 @@ impl Registry {
     /// Removes a tool and its origin; returns whether it was registered.
     pub fn remove(&mut self, name: &str) -> bool {
         self.origins.remove(name);
+        self.plugin_tools.remove(name);
         self.tools.remove(name).is_some()
     }
     pub fn try_register(&mut self, tool: Arc<dyn Tool>) -> anyhow::Result<()> {
@@ -504,6 +607,7 @@ impl Registry {
             tool.name().to_owned(),
             crate::tools::surface::catalog::Origin::Extension,
         );
+        self.plugin_tools.remove(tool.name());
         self.tools.insert(tool.name().to_owned(), tool);
         Ok(())
     }

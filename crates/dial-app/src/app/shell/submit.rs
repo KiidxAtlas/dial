@@ -73,6 +73,7 @@ impl Shell {
         if trimmed.is_empty() {
             return Ok(Step::Done);
         }
+        self.mark_home_input();
         self.save_history(app);
         if let Err(error) = crate::storage::archive::record_prompt(
             &app.layout.user_dir,
@@ -85,7 +86,7 @@ impl Shell {
                 format!("could not record prompt history: {error:#}"),
             );
         }
-        if trimmed.starts_with('/') {
+        if crate::ui::composer::is_slash_command(&trimmed) {
             return self.command(app, agent, &trimmed);
         }
         let (shell, include) = if let Some(command) = trimmed.strip_prefix("!!") {

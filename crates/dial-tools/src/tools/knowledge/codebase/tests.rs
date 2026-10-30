@@ -1039,3 +1039,108 @@ fn ambient_findings_are_ranked_before_the_count_cap() {
             .contains("cancellation ownership")
     );
 }
+
+#[test]
+fn ambient_context_can_abstain_on_conversational_followups() {
+    let (_home, project, layout, ws) = fixture();
+    fs::write(
+        project.path().join("README.md"),
+        "# Current project\nYou can fix all of these checks.\n",
+    )
+    .unwrap();
+    let cache = Codebase::open(&layout).unwrap();
+    cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+    cache
+        .remember_investigation(
+            "current checks",
+            "You can fix all of these checks.",
+            &["src/router.rs".into()],
+            "session",
+        )
+        .unwrap();
+    for query in [
+        "can you fix all of these",
+        "yes please",
+        "what was it",
+        "look at ur current session",
+    ] {
+        assert!(
+            cache.task_context(query, 8000).unwrap().is_empty(),
+            "{query}"
+        );
+    }
+    assert!(
+        !cache
+            .task_context("src/router.rs", 8000)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !cache.context("checks", 8000).unwrap().is_empty(),
+        "explicit retrieval stays available"
+    );
+}
+
+#[test]
+fn ambient_design_documents_and_findings_need_more_than_incidental_overlap() {
+    let (_home, project, layout, ws) = fixture();
+    fs::write(
+        project.path().join("README.md"),
+        "# Session archives\nCurrent session exports are stored as zip files.\n",
+    )
+    .unwrap();
+    let cache = Codebase::open(&layout).unwrap();
+    cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+    cache
+        .remember_investigation(
+            "archives",
+            "The session export uses zip files.",
+            &["src/router.rs".into()],
+            "session",
+        )
+        .unwrap();
+    let query =
+        "look at ur current session check if anything specific flooded your context or transcript";
+    let brief = cache.task_context(query, 8000).unwrap();
+    assert!(
+        !brief.contains("README.md") && !brief.contains("Finding "),
+        "{brief}"
+    );
+    assert!(
+        cache
+            .task_context("README.md", 8000)
+            .unwrap()
+            .contains("README.md")
+    );
+}
+
+#[test]
+fn ambient_long_prompts_do_not_admit_an_incidental_path_component() {
+    let (_home, project, layout, ws) = fixture();
+    fs::write(
+        project.path().join("src/session.rs"),
+        "//! Session context archives.\npub fn export_context() {}\n",
+    )
+    .unwrap();
+    let cache = Codebase::open(&layout).unwrap();
+    cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+    let query = "from your current session did you see or put anything in your context that would be better if collapsed";
+    assert!(
+        !cache
+            .task_context(query, 8000)
+            .unwrap()
+            .contains("src/session.rs")
+    );
+    assert!(
+        cache
+            .task_context("session context", 8000)
+            .unwrap()
+            .contains("src/session.rs")
+    );
+    assert!(
+        cache
+            .task_context(&format!("{query} src/session.rs"), 8000)
+            .unwrap()
+            .contains("src/session.rs")
+    );
+}

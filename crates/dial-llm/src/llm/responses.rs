@@ -1193,10 +1193,17 @@ pub(super) fn compact(
             );
         }
     }
-    let mut snapshot = chat.clone();
-    snapshot
+    let supplemental: Vec<_> = chat
         .messages
-        .retain(|m| m["dial_transient"] != true && m["dial_portable_rules"] != true);
+        .iter()
+        .filter_map(super::provider::compaction::supplemental_context)
+        .collect();
+    let mut snapshot = chat.clone();
+    snapshot.messages.retain(|m| {
+        (m["dial_transient"] != true
+            || super::provider::compaction::supplemental_context(m).is_some())
+            && m["dial_portable_rules"] != true
+    });
     let chat = &snapshot;
     let mut body = if endpoint.account_id.is_some() {
         request_codex(endpoint.model, chat, profile)?
@@ -1256,7 +1263,13 @@ pub(super) fn compact(
                         .as_array()
                         .into_iter()
                         .flatten()
-                        .cloned(),
+                        .cloned()
+                        .map(|mut item| {
+                            // Request shorthand omits type; retained native replay needs the
+                            // explicit message tag for accounting and later compaction passes.
+                            item["type"] = json!("message");
+                            item
+                        }),
                 );
             }
         }
@@ -1483,6 +1496,14 @@ pub(super) fn compact(
                     matches!(item["role"].as_str(), Some("user" | "assistant")),
                     "V1 compaction returned an invalid message role"
                 );
+                // V1 may echo source users. Strip the exact transient note even if the
+                // provider normalizes input_text to output_text/text blocks or adds ids.
+                if item["role"] == "user"
+                    && compact_user_text(&item["content"])
+                        .is_some_and(|text| supplemental.iter().any(|note| *note == text))
+                {
+                    continue;
+                }
             }
             _ => bail!("Responses compaction returned unsupported output; no tools were executed"),
         }
@@ -1529,6 +1550,24 @@ pub(super) fn compact(
         retained_messages,
         notices: Vec::new(),
     })
+}
+
+fn compact_user_text(content: &Value) -> Option<String> {
+    if let Some(text) = content.as_str() {
+        return Some(text.to_owned());
+    }
+    let parts = content.as_array()?;
+    let mut text = String::new();
+    for part in parts {
+        if !matches!(
+            part["type"].as_str(),
+            Some("input_text" | "output_text" | "text")
+        ) {
+            return None;
+        }
+        text.push_str(part["text"].as_str()?);
+    }
+    Some(text)
 }
 
 #[cfg(test)]

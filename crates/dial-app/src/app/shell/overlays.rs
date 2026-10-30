@@ -87,6 +87,23 @@ impl Shell {
                 };
                 continue;
             }
+            // `/peers` panel requests run against the agent, then the panel reopens fresh.
+            if let Some((action, selected)) = outcome
+                .next
+                .as_deref()
+                .and_then(crate::ui::overlay::peers::PeerAction::parse)
+            {
+                match crate::app::commands::peers::act(agent, action, selected) {
+                    Ok(panel) => {
+                        which = panel;
+                        continue;
+                    }
+                    Err(error) => {
+                        self.note("Project peers", error);
+                        return Ok(carried);
+                    }
+                }
+            }
             if let Some(id) = outcome
                 .next
                 .as_deref()
@@ -218,6 +235,17 @@ impl Shell {
                 ),
             )),
             Which::Shortcuts => ActiveOverlay::Shortcuts(ShortcutOverlay::new()),
+            Which::Peers(panel) => {
+                let panel = *panel;
+                let mut overlay = crate::ui::overlay::peers::PeersOverlay::new(panel.view);
+                if let Some(id) = &panel.selected {
+                    overlay.select(id);
+                }
+                if let Some((message, is_error)) = panel.banner {
+                    overlay.banner(message, is_error);
+                }
+                ActiveOverlay::Peers(Box::new(overlay))
+            }
             Which::Jobs => {
                 ActiveOverlay::Jobs(Box::new(crate::ui::overlay::jobs::JobsOverlay::new()))
             }

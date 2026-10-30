@@ -15,7 +15,9 @@
 //! Terminal limits (not Dial's): without the kitty keyboard protocol a terminal cannot report
 //! `Shift+Enter`, `Ctrl+,` or `Ctrl+Shift+<key>`; the defaults therefore include fallbacks
 //! (`Alt+Enter`, `Ctrl+4`). Labels use Option on macOS and Alt elsewhere; either spelling parses.
-//! On macOS Terminal.app, Option chords need "Use Option as Meta key".
+//! macOS terminals type symbols for Option chords unless Option is set to send Meta/Esc+, and
+//! Windows Terminal claims `Alt+Enter` (fullscreen), so every default Option/Alt application chord
+//! also has a Ctrl or function-key alternative (`Ctrl+Q`, `Ctrl+L`, `F2`–`F9`).
 //! Model selection uses Ctrl+K on macOS so it works without changing terminal Option settings.
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::{collections::HashSet, fs, path::Path};
@@ -344,7 +346,8 @@ impl Action {
     pub fn defaults(self) -> &'static [&'static str] {
         match self {
             Action::Submit => &["Enter"],
-            Action::FollowUp => &["Alt+Enter"],
+            // Windows Terminal takes Alt+Enter for fullscreen; Ctrl+Q ("queue") always arrives.
+            Action::FollowUp => &["Ctrl+Q", "Alt+Enter"],
             Action::Newline => &["Shift+Enter", "Ctrl+J"],
             Action::Complete => &["Tab", "Right"],
             Action::Dismiss => &["Esc"],
@@ -353,20 +356,21 @@ impl Action {
             Action::Exit => &["Ctrl+D"],
             Action::HistorySearch => &["Ctrl+R"],
             Action::EditExternal => &["Ctrl+G"],
-            Action::DisplayReset => &["Alt+L"],
+            Action::DisplayReset => &["Ctrl+L", "Alt+L"],
             Action::CommandPalette => &["Ctrl+P", "Alt+K"],
-            Action::ModelSelect if cfg!(target_os = "macos") => &["Ctrl+K", "Alt+M"],
-            Action::ModelSelect => &["Alt+M"],
-            Action::ModelRoles => &["Alt+R"],
-            Action::ModelFavoriteNext => &["Alt+]"],
-            Action::ProviderSetup => &["Alt+P"],
+            // Function keys back up Option chords, which macOS terminals often turn into symbols.
+            Action::ModelSelect if cfg!(target_os = "macos") => &["Ctrl+K", "Alt+M", "F2"],
+            Action::ModelSelect => &["Alt+M", "F2"],
+            Action::ModelRoles => &["Alt+R", "F3"],
+            Action::ModelFavoriteNext => &["Alt+]", "F8"],
+            Action::ProviderSetup => &["Alt+P", "F4"],
             Action::Settings => &["Ctrl+,", "Ctrl+4"],
             Action::ToolsExpand => &["Ctrl+O"],
-            Action::ToolsToggle => &["Alt+O"],
+            Action::ToolsToggle => &["Alt+O", "F5"],
             Action::ThinkingToggle => &["Ctrl+T"],
             Action::ApprovalCycle => &["Shift+Tab"],
-            Action::SubagentsHub => &["Alt+A"],
-            Action::SubagentsRecent => &["Alt+Shift+A"],
+            Action::SubagentsHub => &["Alt+A", "F6"],
+            Action::SubagentsRecent => &["Alt+Shift+A", "F7"],
             Action::RateGood => &["Alt+Up"],
             Action::RateBad => &["Alt+Down"],
             Action::SelectUp => &["Up", "Ctrl+P"],
@@ -379,8 +383,12 @@ impl Action {
             Action::TabPrev => &["Left"],
             Action::SectionNext => &["Tab"],
             Action::SectionPrev => &["Shift+Tab"],
+            // Windows Terminal binds Ctrl+V to its own text paste, which drops an image-only
+            // clipboard; Alt+V attaches the image there, and voice keeps F9.
+            Action::PasteImage if cfg!(windows) => &["Alt+V", "Ctrl+V"],
             Action::PasteImage => &["Ctrl+V"],
-            Action::VoiceInput => &["Alt+V"],
+            Action::VoiceInput if cfg!(windows) => &["F9"],
+            Action::VoiceInput => &["Alt+V", "F9"],
             Action::EditorLeft => &["Left", "Ctrl+B"],
             Action::EditorRight => &["Right", "Ctrl+F"],
             Action::EditorWordLeft => &["Alt+Left", "Ctrl+Left", "Alt+B"],
@@ -399,7 +407,8 @@ impl Action {
             Action::EditorYank => &["Ctrl+Y"],
             Action::EditorYankPop => &["Alt+Y"],
             Action::EditorUndo => &["Ctrl+-", "Ctrl+_", "Ctrl+7"],
-            Action::EditorRedo => &["Alt+-", "Ctrl+Alt+-"],
+            // Ctrl+6 (Ctrl+^) sits next to undo's Ctrl+7 and needs no Option key.
+            Action::EditorRedo => &["Alt+-", "Ctrl+Alt+-", "Ctrl+6"],
         }
     }
 
@@ -901,12 +910,45 @@ impl Keymap {
             .unwrap_or(&[])
     }
     pub fn matches(&self, action: Action, key: &KeyEvent) -> bool {
-        self.chords(action).iter().any(|c| c.matches(key))
+        let key = self.voice_key(action, *key);
+        self.chords(action).iter().any(|c| c.matches(&key))
+    }
+
+    /// Like [`Keymap::matches`] for a shortcut checked ahead of other contexts (the composer
+    /// consults application shortcuts before editing keys): a default chord gives way when the
+    /// user bound the same key to an action in another context, so their binding is not shadowed.
+    pub fn triggers(&self, action: Action, key: &KeyEvent) -> bool {
+        self.matches(action, key)
+            && (self.customized.contains(&action)
+                || !self
+                    .customized
+                    .iter()
+                    .any(|other| other.context() != action.context() && self.matches(*other, key)))
     }
 
     /// True when `key` releases one of `action`'s bound keys (see [`Chord::matches_release`]).
     pub fn release_matches(&self, action: Action, key: &KeyEvent) -> bool {
-        self.chords(action).iter().any(|c| c.matches_release(key))
+        let key = self.voice_key(action, *key);
+        self.chords(action).iter().any(|c| c.matches_release(&key))
+    }
+
+    // Legacy macOS terminals send the layout's Option+V character, not an Alt modifier.
+    // Keep this alias scoped to voice and its active Alt+V binding. Bracketed paste
+    // bypasses key matching, so literal square roots can still be pasted into the draft.
+    fn voice_key(&self, action: Action, mut key: KeyEvent) -> KeyEvent {
+        if cfg!(target_os = "macos")
+            && action == Action::VoiceInput
+            && key.code == KeyCode::Char('√')
+            && (key.modifiers - KeyModifiers::ALT).is_empty()
+            && self
+                .chords(action)
+                .iter()
+                .any(|chord| chord.code == KeyCode::Char('v') && chord.mods == KeyModifiers::ALT)
+        {
+            key.code = KeyCode::Char('v');
+            key.modifiers = KeyModifiers::ALT;
+        }
+        key
     }
 
     /// Every action bound to this key (a chord may legitimately serve several, e.g. Esc).

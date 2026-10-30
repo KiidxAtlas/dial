@@ -1,7 +1,8 @@
 //! `/image generate <prompt>` and `/image edit <file> <prompt>`: run `image_gen` with the typed
 //! prompt directly, without a model turn. Approval, plan mode and mutation authority are the
-//! agent's (`Agent::generate_image`); the output is a new workspace-root file named from the
-//! prompt, never an existing one, and an edited source is only read.
+//! agent's (`Agent::generate_image`); the output is a new file named from the prompt (in the
+//! workspace root, or beside the edited source), never an existing one, and an edited source is
+//! only read.
 use super::CommandSpec;
 use crate::agent::Agent;
 use crate::app::{App, Bridge, PAINT_EVERY, Shell, Step};
@@ -9,7 +10,7 @@ use crate::storage::redact::redact_text;
 use crate::tools::net::image_gen;
 use anyhow::Result;
 use serde_json::json;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
@@ -86,7 +87,7 @@ fn generate(
             return Ok(Step::Done);
         }
     };
-    let output = output_name(agent.workspace().root(), prompt, extension);
+    let output = output_name(agent.workspace().root(), prompt, extension, source);
     let typed = match source {
         Some(source) => format!("/image edit {source} {prompt}"),
         None => format!("/image generate {prompt}"),
@@ -130,8 +131,10 @@ fn generate(
     Ok(Step::Done)
 }
 
-/// `image-<first prompt words>.<extension>` in the workspace root, numbered past existing files.
-fn output_name(root: &Path, prompt: &str, extension: &str) -> String {
+/// The new image's workspace-relative path. `generate` writes `image-<first prompt words>.<ext>`
+/// in the workspace root; `edit` writes `<source stem>-<first prompt words>.<ext>` beside the
+/// source. A taken name is numbered (`-2`, `-3`, ...), so no existing file is ever the target.
+fn output_name(root: &Path, prompt: &str, extension: &str, source: Option<&str>) -> String {
     let slug = prompt
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|word| !word.is_empty())
@@ -141,18 +144,32 @@ fn output_name(root: &Path, prompt: &str, extension: &str) -> String {
         .join("-");
     let slug: String = slug.chars().take(SLUG_CHARS).collect();
     let slug = slug.trim_end_matches('-');
+    let (dir, base) = match source.map(Path::new) {
+        Some(path) => (
+            path.parent().map(Path::to_path_buf).unwrap_or_default(),
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .filter(|stem| !stem.is_empty())
+                .unwrap_or("image"),
+        ),
+        None => (PathBuf::new(), "image"),
+    };
     let stem = if slug.is_empty() {
-        "image".to_owned()
+        base.to_owned()
     } else {
-        format!("image-{slug}")
+        format!("{base}-{slug}")
     };
     (1usize..)
-        .map(|n| match n {
-            1 => format!("{stem}.{extension}"),
-            n => format!("{stem}-{n}.{extension}"),
+        .map(|n| {
+            dir.join(match n {
+                1 => format!("{stem}.{extension}"),
+                n => format!("{stem}-{n}.{extension}"),
+            })
         })
         .find(|name| !root.join(name).exists())
         .expect("an unused numbered name exists")
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[cfg(test)]

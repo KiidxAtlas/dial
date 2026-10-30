@@ -1604,6 +1604,7 @@ impl Session {
             }
             if !references.is_empty() {
                 let source = crate::storage::artifact::ArtifactStore::new(&source_root)?;
+                source.expand_evidence_references(&mut references)?;
                 let destination =
                     crate::storage::artifact::ArtifactStore::new(&artifact_root(&dst)?)?;
                 for uri in references {

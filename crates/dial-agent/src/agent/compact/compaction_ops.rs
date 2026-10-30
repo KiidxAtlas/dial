@@ -180,7 +180,7 @@ impl<'a> Agent<'a> {
         let root = self.workspace.root().to_path_buf();
         let payload = json!({"session_id":self.session.id(),"reason":options.reason});
         let mut notices = Vec::new();
-        let gate = crate::agent::safety::hooks::gate(
+        let gate = crate::agent::safety::hooks::gate_noted(
             self.tool_hooks(),
             plugins.as_deref(),
             &root,
@@ -195,9 +195,9 @@ impl<'a> Agent<'a> {
                 notice,
             ))
         });
-        if let Err(reason) = gate {
-            bail!("compaction refused by before_compact hook: {reason}");
-        }
+        let supplemental_context = gate.map_err(|reason| {
+            anyhow::anyhow!("compaction refused by before_compact hook: {reason}")
+        })?;
         if self.config.compaction.experimental_context_management
             && options.method.is_none()
             && options.strategy.is_none()
@@ -220,12 +220,14 @@ impl<'a> Agent<'a> {
             crate::agent::compact::compaction_runtime::side_request_namespace(self.session.id())?;
         let previous_cache = backend.swap_cache_namespace(&namespace, &self.auth_config)?;
         let previous_namespace = self.active_side_namespace.replace(namespace);
+        let mut context = snapshot.context();
+        context.supplemental_context = supplemental_context.as_deref();
         let prepared = crate::agent::compact::compaction::compact_history(
             backend,
             crate::agent::compact::compaction::HistoryCompaction {
                 request: &snapshot.source,
                 policy: &snapshot.policy,
-                context: snapshot.context(),
+                context,
                 options,
             },
             cancel,

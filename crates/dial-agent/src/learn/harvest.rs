@@ -82,6 +82,8 @@ struct Candidate {
     repair: bool,
     /// Sibling model database this record was learned from; `None` for this model's own runs.
     origin: Option<String>,
+    /// Selected by explicit session approval, rather than automatic cross-model sampling.
+    explicit: bool,
     preference_pairs: Vec<Value>,
 }
 
@@ -151,6 +153,7 @@ pub fn harvest(config: &Config, store: &Store, held_out: &HashSet<String>) -> Re
             repair: true,
             preference_pairs,
             origin: None,
+            explicit: false,
         };
         match candidates.entry(digest) {
             std::collections::btree_map::Entry::Vacant(entry) => {
@@ -189,6 +192,41 @@ pub fn harvest(config: &Config, store: &Store, held_out: &HashSet<String>) -> Re
                 &mut links,
                 &candidate.group,
                 &trajectory_key(None, trajectory),
+            );
+            candidates
+                .entry(candidate.digest.clone())
+                .or_insert(candidate);
+        }
+    }
+    // Explicit session teaching is independent of automatic sibling-model discovery.
+    // Imports retain source provenance and never masquerade as measured runs of this model.
+    for (id, example) in store.session_training_examples()? {
+        let origin = format!("session-{}", &digest(&json!(example.source_model))[..16]);
+        // Keep split lineage even after a source verdict changes: previously exported data
+        // remains immutable and must not become validation context for a later source turn.
+        link_group(
+            &mut links,
+            &trajectory_key(Some(&origin), id),
+            &format!("source-session:{}", digest(&json!(example.source_session))),
+        );
+        if !super::session::source_approved(config, &example)? {
+            continue;
+        }
+        for mut candidate in success_candidates(
+            id,
+            "session-teaching",
+            "user:session",
+            &example.payload,
+            held_out,
+            max_tokens,
+            &mut report,
+            Some(&origin),
+        ) {
+            candidate.explicit = true;
+            link_group(
+                &mut links,
+                &candidate.group,
+                &trajectory_key(Some(&origin), id),
             );
             candidates
                 .entry(candidate.digest.clone())
@@ -603,6 +641,7 @@ fn sibling_candidates(
             repair: true,
             preference_pairs: Vec::new(),
             origin: Some(origin.to_owned()),
+            explicit: false,
         });
     }
     for (trajectory, _version, domain, _score, source, payload) in
@@ -655,6 +694,8 @@ fn cap_learned(
     minimum: usize,
     report: &mut Report,
 ) -> Vec<Candidate> {
+    // Explicitly approved sessions are operator-selected data, not automatic sibling sampling.
+    let automatic = |c: &&Candidate| c.origin.is_some() && !c.explicit;
     let local = candidates.iter().filter(|c| c.origin.is_none()).count();
     let percent = percent.min(50) as usize;
     let allowed = minimum
@@ -662,7 +703,7 @@ fn cap_learned(
         .max(local * percent / (100 - percent));
     let mut foreign: Vec<String> = candidates
         .iter()
-        .filter(|c| c.origin.is_some())
+        .filter(automatic)
         .map(|c| c.digest.clone())
         .collect();
     foreign.sort();
@@ -1024,6 +1065,7 @@ fn success_candidates(
                 repair: false,
                 preference_pairs: Vec::new(),
                 origin: origin.map(str::to_owned),
+                explicit: false,
             });
         }
         let keep = sample(&(0..candidates.len()).collect::<Vec<_>>(), PER_TRAJECTORY);
@@ -1076,6 +1118,7 @@ fn success_candidates(
                 repair: false,
                 preference_pairs: Vec::new(),
                 origin: origin.map(str::to_owned),
+                explicit: false,
             })
         })
         .collect()

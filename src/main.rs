@@ -21,6 +21,12 @@ fn exit_with(code: i32) -> Result<()> {
 
 fn main() {
     dial::install_tls_provider();
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == dial::tools::exec::background::durable::OWNER_ARG)
+    {
+        std::process::exit(dial::tools::exec::background::durable::owner_main());
+    }
     // Re-exec target for isolated document parsing; never reaches the CLI parser.
     if std::env::args_os()
         .nth(1)

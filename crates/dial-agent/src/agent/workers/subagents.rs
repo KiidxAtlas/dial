@@ -57,6 +57,8 @@ const MAX_CONTEXT: usize = 16 * 1024;
 /// Most skills one item may preload.
 const MAX_SKILLS: usize = 8;
 const MAX_NAME: usize = 40;
+/// `isolation_backend` values: the `[isolation] backend` names, for one task.
+const ISOLATION_BACKENDS: [&str; 6] = ["auto", "clone", "overlay", "worktree", "copy", "projfs"];
 /// Budget for all answers in one `task` result; the parent clips tool output beyond this anyway.
 const RESULT_BUDGET: usize = 14_000;
 
@@ -240,7 +242,8 @@ pub fn schema(config: &Config) -> Value {
         "max_steps":{"type":"integer","minimum":0,"description":"Model step limit; default 0 means unlimited."},
         "name":{"type":"string","description":"Optional label shown to the user."},
         "output_schema":{"type":"object","description":"JSON Schema the final answer must satisfy."},
-        "isolation":{"type":"string","enum":["copy"],"description":"Workers only: use a private copy and native-tool session. Successful changed files merge unless the parent changed them. Failed/interrupted edits remain in a recovery copy. The result's separate isolation metadata reports applied files, conflicts, I/O errors and recovery_location; output_schema data is never altered."}
+        "isolation":{"type":"string","enum":["copy"],"description":"Workers only: use a private copy and native-tool session. Successful changed files merge unless the parent changed them. Failed/interrupted edits remain in a recovery copy. The result's separate isolation metadata reports the backend used, applied files, conflicts, I/O errors and recovery_location; output_schema data is never altered."},
+        "isolation_backend":{"type":"string","enum":ISOLATION_BACKENDS,"description":"Workers only: how this task's private copy is made, overriding the configured [isolation] backend for this task: clone (copy-on-write clone), worktree (git worktree of HEAD plus uncommitted files), overlay (Linux), projfs (Windows), copy (plain file copy), auto (first available). Implies isolation copy. An unavailable backend fails the call before any worker starts; omit to use the configured backend."}
     });
     entry_properties.as_object_mut().unwrap().insert("source_session".into(), json!({"type":"string","minLength":1,"description":"agent seance only: a session id prefix or a worker id from this session whose record the consultant reads."}));
     entry_properties.as_object_mut().unwrap().insert("model".into(), json!({"type":"string","description":"agent seance only: model to answer on; default is the source session's saved model, else the main model."}));
@@ -315,6 +318,10 @@ pub fn schema(config: &Config) -> Value {
         (
             "isolation".into(),
             json!({"type":"string","enum":["copy"],"description":"Single worker task: run in an isolated project copy and merge back (see tasks[].isolation)."}),
+        ),
+        (
+            "isolation_backend".into(),
+            json!({"type":"string","enum":ISOLATION_BACKENDS,"description":"Single worker task: backend for its isolated copy, overriding the configured [isolation] backend (see tasks[].isolation_backend). Implies isolation copy."}),
         ),
         (
             "tasks".into(),
@@ -487,6 +494,8 @@ pub(in crate::agent) struct Job<'c> {
     pub schema: Option<Value>,
     /// Runs against a private project copy that is merged back afterwards.
     pub isolated: bool,
+    /// Backend this task asked for with `isolation_backend`; `None` uses `[isolation] backend`.
+    pub isolation_backend: Option<crate::config::isolation::Preference>,
     /// Largest answer (bytes) this task may return.
     pub limit: usize,
     pub(in crate::agent) work_packet: Option<WorkPacket>,
@@ -959,16 +968,20 @@ fn parse_job<'c>(
         crate::agent::window::output_schema::check_schema(schema)
             .map_err(|why| format!("invalid `output_schema`: {why}"))?;
     }
-    let isolated =
-        match optional_str(entry, "isolation")? {
-            None => false,
-            Some("copy") if spec.mutates => true,
-            Some("copy") => return Err(
-                "`isolation` applies only to workers; read-only agents never change the project"
+    let isolation_backend = optional_str(entry, "isolation_backend")?
+        .map(parse_isolation_backend)
+        .transpose()?;
+    let isolated = match optional_str(entry, "isolation")? {
+        None if isolation_backend.is_none() => false,
+        None | Some("copy") if spec.mutates => true,
+        None | Some("copy") => {
+            return Err(
+                "`isolation` and `isolation_backend` apply only to workers; read-only agents never change the project"
                     .into(),
-            ),
-            Some(other) => return Err(format!("unknown isolation {other:?}; use \"copy\"")),
-        };
+            );
+        }
+        Some(other) => return Err(format!("unknown isolation {other:?}; use \"copy\"")),
+    };
     let work_packet = match entry.get("work_packet") {
         None | Some(Value::Null) => None,
         Some(_) if !config.experimental.work_packet_contracts => {
@@ -1024,6 +1037,7 @@ fn parse_job<'c>(
         max_steps,
         schema,
         isolated,
+        isolation_backend,
         limit,
         work_packet,
         autoload_skills,
@@ -1106,6 +1120,43 @@ fn parse_work_packet(value: &Value) -> Result<WorkPacket, String> {
         interface: text("interface", 2048)?,
         acceptance,
     })
+}
+
+/// Per-task `isolation_backend`: one of the `[isolation] backend` names.
+fn parse_isolation_backend(name: &str) -> Result<crate::config::isolation::Preference, String> {
+    serde_json::from_value(json!(name)).map_err(|_| {
+        format!(
+            "unknown isolation_backend {name:?}; use one of {}",
+            ISOLATION_BACKENDS.join(", ")
+        )
+    })
+}
+
+/// Refuse the whole call before any worker starts when a task names an isolation backend that
+/// cannot run for this project. Tasks without `isolation_backend` keep the configured backend,
+/// which is still checked when the worker's copy is made.
+pub(in crate::agent) fn check_isolation_backends(
+    jobs: &[Job],
+    workspace: &Workspace,
+    config: &Config,
+) -> Result<(), String> {
+    for job in jobs {
+        let Some(preference) = job.isolation_backend else {
+            continue;
+        };
+        crate::agent::workers::isolation::backend::check_requested(
+            preference,
+            workspace.root(),
+            config.task.isolation_source_files,
+        )
+        .map_err(|why| {
+            format!(
+                "{}: {why}; no worker was started. Choose another isolation_backend, or omit it to use the configured [isolation] backend",
+                job.label
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn optional_str<'a>(entry: &'a Value, key: &str) -> Result<Option<&'a str>, String> {
@@ -1859,7 +1910,9 @@ pub(in crate::agent) fn run(
         return ToolOutput::err("task spawning is disabled by task.max_recursion_depth");
     }
     let config = with_file_agents(env.config);
-    let mut request = match parse(args, &config) {
+    let mut request = match parse(args, &config).and_then(|request| {
+        check_isolation_backends(&request.jobs, env.workspace, &config).map(|()| request)
+    }) {
         Ok(request) => request,
         Err(why) => {
             return ToolOutput {
@@ -2057,7 +2110,9 @@ pub(in crate::agent) fn nested(
         return ToolOutput::err(reason).with_status(crate::tools::ToolStatus::Blocked);
     }
     let config = with_file_agents(env.config);
-    let mut request = match parse(args, &config) {
+    let mut request = match parse(args, &config).and_then(|request| {
+        check_isolation_backends(&request.jobs, env.workspace, &config).map(|()| request)
+    }) {
         Ok(request) => request,
         Err(error) => return ToolOutput::err(error),
     };
@@ -2571,7 +2626,8 @@ pub(in crate::agent) fn run_job(
     let isolated = match crate::agent::workers::isolation::Isolated::with_config(
         env.workspace,
         &env.config.task,
-        env.config.isolation.backend,
+        job.isolation_backend
+            .unwrap_or(env.config.isolation.backend),
     ) {
         Ok(isolated) => isolated,
         Err(error) => {
@@ -2647,6 +2703,59 @@ fn run_isolated(env: Env, role: &Config, job: &Job, approver: &mut dyn Approver)
     attempt.unwrap_or_else(|_| Outcome::failed(0, "subagent crashed unexpectedly"))
 }
 
+/// Generate patches in caller-owned copies without automatic worker merge. The caller owns
+/// scope checks, verification and promotion. Local inference keeps the ordinary serial lane.
+pub(in crate::agent) fn run_copies(
+    parent: &mut Parent<'_>,
+    env: Env<'_>,
+    workspaces: &[Workspace],
+    prompts: &[String],
+    limit: usize,
+    ui: &mut dyn Ui,
+) -> Result<Vec<ToolOutput>, String> {
+    let tasks: Vec<Value> = prompts.iter().map(|prompt| json!({"agent":"worker","task":prompt,"solution_space":"one implementation slice: the spec is given","max_steps":env.config.solve.max_steps})).collect();
+    let request = parse(&json!({"tasks":tasks}), env.config)?;
+    if request.jobs.len() != workspaces.len() {
+        return Err("candidate workspace count mismatch".into());
+    }
+    let jobs: Vec<(&Job, Env)> = request
+        .jobs
+        .iter()
+        .zip(workspaces)
+        .map(|(job, workspace)| (job, Env { workspace, ..env }))
+        .collect();
+    let mut outcomes: Vec<Option<Outcome>> = request.jobs.iter().map(|_| None).collect();
+    run_concurrent(
+        parent.env,
+        &jobs,
+        limit.min(env.config.task.max_concurrency.max(1)),
+        Direct {
+            approval: parent.approval,
+            always: &mut *parent.always,
+            root: parent.env.workspace.root(),
+            extra_roots: parent.env.workspace.additional_roots(),
+            layout: parent.env.layout,
+            plan_mode: parent.env.plan_mode,
+            cost: &mut *parent.cost,
+            ui,
+        },
+        jobs.len(),
+        &mut outcomes,
+    );
+    Ok(outcomes
+        .into_iter()
+        .map(|outcome| {
+            let outcome = outcome.unwrap_or_else(|| Outcome::failed(0, "candidate did not report"));
+            ToolOutput {
+                text: outcome.status.text,
+                is_error: outcome.status.phase != crate::runtime::Phase::Completed,
+                data: None,
+                execution: Default::default(),
+            }
+        })
+        .collect())
+}
+
 /// Run the concurrent jobs on at most `limit` threads, refilling each freed thread with the next job
 /// as it finishes. The calling thread stays here to answer their approval requests and report
 /// progress, because only it may use the UI.
@@ -2675,20 +2784,27 @@ fn run_concurrent(
         })
         .collect();
     drop(tx);
+    let controller_root = env.workspace.root();
     rolling(
         items,
         limit,
         |(job, env, body, report)| {
+            let mut remote = Remote(
+                report.tx.clone(),
+                body.clone(),
+                job.index,
+                env.interrupt.clone(),
+            );
             let outcome = run_isolated(
                 env,
                 env.config,
                 job,
-                &mut Remote(
-                    report.tx.clone(),
-                    body.clone(),
-                    job.index,
-                    env.interrupt.clone(),
-                ),
+                &mut Rebase {
+                    descendant: None,
+                    inner: &mut remote,
+                    from: env.workspace.root(),
+                    to: controller_root,
+                },
             );
             finish_worker(&body, &outcome);
             report.finish(outcome);
@@ -2739,7 +2855,12 @@ impl Drop for Report {
 /// as soon as it finishes one, so a slow item never idles the other slots. `pump` runs on the calling
 /// thread while the workers are alive. A panic in `work` is contained so the queue keeps draining and
 /// `pump` is released; the first such panic is resumed on the calling thread once everything has ended.
-fn rolling<T: Send>(items: Vec<T>, limit: usize, work: impl Fn(T) + Sync, pump: impl FnOnce()) {
+pub(in crate::agent) fn rolling<T: Send>(
+    items: Vec<T>,
+    limit: usize,
+    work: impl Fn(T) + Sync,
+    pump: impl FnOnce(),
+) {
     let workers = limit.max(1).min(items.len());
     let queue = std::sync::Mutex::new(items.into_iter());
     let panicked: std::sync::Mutex<Option<Box<dyn std::any::Any + Send>>> =

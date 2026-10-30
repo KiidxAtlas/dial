@@ -13,14 +13,75 @@ impl Agent<'_> {
         mut round: Round,
     ) -> Result<crate::agent::run::engine::Tick<TurnReport>> {
         // Unconsumed speculative reads are dropped when this round ends, on every exit path.
+        self.pending_batch_approvals.clear();
         let _speculative_batch = self.workspace.speculation.batch();
-        if let ControlFlow::Break(tick) =
-            self.dispatch_calls(turn, engine, backend, schemas, ui, &mut round)?
-        {
+        let dispatched = self.dispatch_calls(turn, engine, backend, schemas, ui, &mut round);
+        // Tickets belong to this exact reply, including when dispatch exits with an error.
+        self.pending_batch_approvals.clear();
+        if let ControlFlow::Break(tick) = dispatched? {
             return Ok(tick);
         }
         engine.research_round();
         self.settle_round(turn, engine, backend, schemas, ui, round)
+    }
+
+    fn native_edit_preflight(
+        &mut self,
+        turn: &mut TurnState<'_>,
+        call: &ToolCall,
+        ui: &mut dyn Ui,
+    ) -> Option<ToolOutput> {
+        let mut preflight = None;
+        if !self.hermetic
+            && matches!(call.name.as_str(), "write" | "edit" | "ast_edit")
+            && let (Some(cache), Some(path)) =
+                (self.codebase.clone(), call.arguments["path"].as_str())
+        {
+            if turn.prechecked_paths.insert(path.to_owned()) {
+                let path = path.to_owned();
+                let check = thread::scope(|scope| -> Result<_> {
+                    let (tx, rx) = mpsc::sync_channel(1);
+                    scope.spawn(move || {
+                        let _ = tx.send(cache.pre_edit_context(&path));
+                    });
+                    receive_with_heartbeat(&rx, ui)?
+                });
+                match check {
+                    Ok(Some(text)) => {
+                        preflight = Some(ToolOutput {
+                            execution: Default::default(),
+                            data: None,
+                            text,
+                            is_error: true,
+                        });
+                    }
+                    Ok(None) => {
+                        turn.revalidated_paths
+                            .insert(call.arguments["path"].as_str().unwrap().to_owned());
+                    }
+                    Err(error) => {
+                        preflight = Some(ToolOutput {
+                            execution: Default::default(),
+                            data: None,
+                            text: format!(
+                                "Could not check saved assumptions: {error}. Read the current target before retrying."
+                            ),
+                            is_error: true,
+                        });
+                    }
+                }
+            } else if !turn.revalidated_paths.contains(path) {
+                preflight = Some(ToolOutput {
+                    execution: Default::default(),
+                    data: None,
+                    text: format!(
+                        "Read current {path} before retrying this edit; its saved assumptions required review."
+                    ),
+                    is_error: true,
+                });
+            }
+        }
+        preflight
     }
 
     /// Runs the reply's calls in order and records what they produced in `round.outcome`.
@@ -45,9 +106,10 @@ impl Agent<'_> {
         let streamed = &mut round.streamed;
         let narration_warning = engine.narration.observe(reply);
         self.edit_preview_intercepted = false;
-        self.push(crate::tools::surface::contracts::assistant_message(
-            reply, schemas, &self.ext,
-        ))?;
+        let mut assistant =
+            crate::tools::surface::contracts::assistant_message(reply, schemas, &self.ext);
+        crate::agent::window::file_handles::capture_calls(&self.workspace, &mut assistant);
+        self.push(assistant)?;
         let (mut form_kinds, mut rejected_calls, mut execution_failed) =
             (Vec::new(), Vec::new(), false);
         let mut observed_check_failure = false;
@@ -81,10 +143,77 @@ impl Agent<'_> {
                 repeat.count > crate::agent::safety::stream_guards::TOOL_CALL_LOOP_THRESHOLD
             })
             .and_then(|repeat| repeat.short_circuit(&reply.tool_calls));
+        self.drain_background_check(ui, false);
         if duplicates.is_some() {
             ui.event(&crate::agent::ui::ui_event::UiEvent::new(crate::agent::ui::ui_event::EventKind::Recovery, "Repeated tool call not executed; the earlier identical result is already in context"));
         }
+        if self.config.experimental.batch_approvals
+            && !self.hermetic
+            && !self.plan_mode
+            && !single_call
+            && duplicates.is_none()
+            && engine.pending_refusal().is_none()
+            && self.approval == crate::config::types::Approval::Ask
+        {
+            let prepared: Vec<_> = reply
+                .tool_calls
+                .iter()
+                .take(32)
+                .filter_map(|call| {
+                    if !matches!(call.name.as_str(), "edit" | "write" | "ast_edit")
+                        || call_form_error(call, schemas, &turn.names).is_some()
+                        || engine.rejection_at(&self.workspace, call).is_some()
+                        || crate::agent::safety::hooks::wanted_for_tool(
+                            self.tool_hooks(),
+                            self.hook_plugins().as_deref(),
+                            "pre_tool_use",
+                            &call.name,
+                        )
+                    {
+                        return None;
+                    }
+                    let mut effective = call.clone();
+                    crate::agent::window::file_handles::expand(&self.workspace, &mut effective)
+                        .ok()?;
+                    if self
+                        .always
+                        .iter()
+                        .any(|rule| rule.matches(&effective, self.workspace.root()))
+                    {
+                        return None;
+                    }
+                    Some(effective)
+                })
+                .collect();
+            if prepared.len() > 1 {
+                let choices = ui.approve_batch(&prepared, self.interrupt.as_ref());
+                self.pending_batch_approvals = prepared
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, call)| (call, choices.get(index) == Some(&true)))
+                    .collect();
+            }
+        }
         for (index, call) in reply.tool_calls.iter().enumerate() {
+            let read_overlap = call.name != "bash"
+                && crate::agent::safety::approval::parallel_read(
+                    &self.ext,
+                    &call.name,
+                    &call.arguments,
+                )
+                && !crate::agent::safety::hooks::wanted_for_tool(
+                    self.tool_hooks(),
+                    self.hook_plugins().as_deref(),
+                    "pre_tool_use",
+                    &call.name,
+                )
+                && !crate::agent::safety::hooks::wanted_for_tool(
+                    self.tool_hooks(),
+                    self.hook_plugins().as_deref(),
+                    "post_tool_use",
+                    &call.name,
+                );
+            self.drain_background_check(ui, !read_overlap);
             if parallel.is_empty()
                 && let Some(reason) = engine.pending_refusal()
             {
@@ -232,55 +361,8 @@ impl Agent<'_> {
             let contract_failed = form.is_some();
             let mut image = None;
             let mut preflight = None;
-            if form.is_none()
-                && !self.hermetic
-                && matches!(call.name.as_str(), "write" | "edit" | "ast_edit")
-                && let (Some(cache), Some(path)) =
-                    (self.codebase.clone(), call.arguments["path"].as_str())
-            {
-                if turn.prechecked_paths.insert(path.to_owned()) {
-                    let path = path.to_owned();
-                    let check = thread::scope(|scope| -> Result<_> {
-                        let (tx, rx) = mpsc::sync_channel(1);
-                        scope.spawn(move || {
-                            let _ = tx.send(cache.pre_edit_context(&path));
-                        });
-                        receive_with_heartbeat(&rx, ui)?
-                    });
-                    match check {
-                        Ok(Some(text)) => {
-                            preflight = Some(ToolOutput {
-                                execution: Default::default(),
-                                data: None,
-                                text,
-                                is_error: true,
-                            });
-                        }
-                        Ok(None) => {
-                            turn.revalidated_paths
-                                .insert(call.arguments["path"].as_str().unwrap().to_owned());
-                        }
-                        Err(error) => {
-                            preflight = Some(ToolOutput {
-                                execution: Default::default(),
-                                data: None,
-                                text: format!(
-                                    "Could not check saved assumptions: {error}. Read the current target before retrying."
-                                ),
-                                is_error: true,
-                            });
-                        }
-                    }
-                } else if !turn.revalidated_paths.contains(path) {
-                    preflight = Some(ToolOutput {
-                        execution: Default::default(),
-                        data: None,
-                        text: format!(
-                            "Read current {path} before retrying this edit; its saved assumptions required review."
-                        ),
-                        is_error: true,
-                    });
-                }
+            if form.is_none() && parallel.is_empty() {
+                preflight = self.native_edit_preflight(turn, call, ui);
             }
             let controller_blocked = preflight.is_some() || form.is_some();
             let mut tool_seconds = 0.0;
@@ -324,6 +406,45 @@ impl Agent<'_> {
                 {
                     self.metrics.dynamic_tools_used += 1;
                 }
+                if self.config.experimental.dependency_dispatch
+                    && !self.hermetic
+                    && !single_call
+                    && parallel.is_empty()
+                {
+                    let mut group = self.dependency_wave(&reply.tool_calls[index..]);
+                    let mut admitted = 0;
+                    for candidate in &group {
+                        if call_form_error(candidate, schemas, &turn.names).is_some()
+                            || engine.rejection_at(&self.workspace, candidate).is_some()
+                            || (admitted > 0
+                                && self.native_edit_preflight(turn, candidate, ui).is_some())
+                        {
+                            break;
+                        }
+                        admitted += 1;
+                    }
+                    group.truncate(admitted);
+                    if group.len() > 1 {
+                        self.drain_background_check(ui, true);
+                        if let Some(streamed) = streamed.as_mut() {
+                            streamed.invalidate();
+                        }
+                        for candidate in group.iter().skip(1) {
+                            ui.tool_call_with_args(
+                                &candidate.id,
+                                &candidate.name,
+                                &summarize(candidate),
+                                &candidate.arguments,
+                            );
+                        }
+                        let outputs = self.dispatch_dependency_wave(backend, &group, ui);
+                        for (candidate, (output, seconds)) in group.iter().zip(&outputs) {
+                            ui.tool_timing(&candidate.id, &candidate.name, *seconds);
+                            ui.tool_result_with_id(&candidate.id, &candidate.name, output);
+                        }
+                        parallel = outputs.into();
+                    }
+                }
                 if !single_call
                         && parallel.is_empty()
                         // Rewrites must pass the serial controller's schema and approval checks.
@@ -345,15 +466,18 @@ impl Agent<'_> {
                                 self.hook_plugins().as_deref(),
                                 "pre_tool_use",
                                 &c.name,
-                            ) && crate::agent::safety::approval::parallel_read(
-                                &self.ext,
-                                &c.name,
-                                &c.arguments,
-                            ) && !crate::agent::safety::approval::denied_by_rule(
-                                &self.always,
-                                c,
-                                self.workspace.root(),
-                            ) && call_form_error(c, schemas, &turn.names).is_none()
+                            ) && (self.pending_check.is_none() || c.name != "bash")
+                                && crate::agent::safety::approval::parallel_read(
+                                    &self.ext,
+                                    &c.name,
+                                    &c.arguments,
+                                )
+                                && !crate::agent::safety::approval::denied_by_rule(
+                                    &self.always,
+                                    c,
+                                    self.workspace.root(),
+                                )
+                                && call_form_error(c, schemas, &turn.names).is_none()
                                 && !self.speculative_pending(c)
                                 && engine.rejection_at(&self.workspace, c).is_none()
                         })
@@ -448,13 +572,14 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                         self.workflow_started.elapsed(),
                     );
                 }
-                if (call.name == "browser" || call.name == "computer") && !out.is_error {
-                    match crate::storage::artifact::capture_image(
-                        self.workspace.artifacts(),
+                if !out.is_error {
+                    match crate::agent::run::dispatch::capture_output_image(
+                        &self.workspace,
+                        call,
                         &mut out,
                     ) {
                         Ok(attachment) => image = attachment,
-                        Err(e) => {
+                        Err(e) if call.name == "browser" || call.name == "computer" => {
                             out = ToolOutput {
                                 execution: Default::default(),
                                 data: None,
@@ -462,6 +587,10 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                                 is_error: true,
                             }
                         }
+                        // The text result stands on its own; only the attachment is lost.
+                        Err(e) => out
+                            .text
+                            .push_str(&format!("\n[Image attachment unavailable: {e:#}]")),
                     }
                 }
                 if !result_presented {
@@ -669,6 +798,9 @@ text: "finish completed cannot follow a failed call in the same batch; address i
             self.step_checks
                 .evidence
                 .settle_call(&call.id, self.step_checks.revision());
+            if committed && parallel.is_empty() {
+                self.start_background_check(ui);
+            }
             // Bound after this call's own shell effect, like the ledger's observations.
             if shell_check_passed {
                 self.step_checks.shell_check_passed = Some(self.step_checks.revision());
@@ -818,18 +950,23 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                 output.is_error,
                 artifact.is_some(),
             );
-            let (mut body, dropped) =
-                crate::agent::workflow::efficiency::visible_result(&output.text, limit, duplicate);
+            let edit = crate::agent::workflow::efficiency::edit_result(
+                &call.name,
+                &output,
+                artifact.is_some(),
+            );
+            let (mut body, dropped) = crate::agent::workflow::efficiency::visible_result(
+                edit.as_deref().unwrap_or(&output.text),
+                limit,
+                duplicate,
+            );
+            let dropped = dropped || edit.is_some();
             let mut presentation_changed = body != output.text;
-            if call.name == "bash"
-                && !output.is_error
-                && call.arguments["command"]
-                    .as_str()
-                    .is_some_and(is_check_command)
-                && let Some(uri) = &artifact
-                && let Some(compact) =
-                    crate::agent::verify::verification::compact_success(&output.text, uri)
-            {
+            if let Some(compact) = crate::agent::workflow::efficiency::compact_command(
+                call,
+                &output,
+                artifact.as_deref(),
+            ) {
                 body = compact;
                 presentation_changed = true;
             }
@@ -975,6 +1112,24 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                 && !output.is_error
             {
                 message["dial_exploration_result"] = json!(true);
+            }
+            if !self.hermetic && !output.is_error {
+                let model = crate::agent::window::file_handles::model_result(
+                    &self.workspace,
+                    call,
+                    message["content"].as_str().unwrap_or(""),
+                );
+                if message["content"].as_str() != Some(model.as_str()) {
+                    message["dial_model_content"] = json!(model);
+                }
+                // Journal the registry only when it grew; an unchanged snapshot would still
+                // append a state entry after every tool result.
+                let snapshot = serde_json::to_value(self.workspace.file_handle_snapshot())?;
+                let mut control = self.session.control_state();
+                if control["file_handles"] != snapshot {
+                    control["file_handles"] = snapshot;
+                    self.session.set_control_state(control)?;
+                }
             }
             self.push(message)?;
             // A changed history snapshot may make a previously dead-ended compaction fit.

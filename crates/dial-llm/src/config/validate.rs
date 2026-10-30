@@ -202,6 +202,7 @@ impl Config {
                 }),
             "verification.python_command must be an argv list (or [] for autodetection), without control characters"
         );
+        self.preparation.validate()?;
         self.solve.validate()?;
         self.escalation.validate()?;
         Ok(())

@@ -170,6 +170,22 @@ fn f9_inherits_and_tab_only_switches_fields() {
 }
 
 #[test]
+fn ctrl_s_saves_where_f10_is_taken_by_the_terminal() {
+    let keymap = Keymap::defaults();
+    let mut editor = HeaderEditor::new(&headers(1));
+    assert!(matches!(
+        editor.key(&key(KeyCode::Char('s'), KeyModifiers::CONTROL), &keymap),
+        Outcome::Save(Some(rows)) if rows.len() == 1
+    ));
+    assert!(
+        text(&editor.lines(&Theme::dark(), 100, 6))
+            .iter()
+            .any(|row| row.contains("^S save")),
+        "the compact hint names the portable save key"
+    );
+}
+
+#[test]
 fn title_names_the_model_and_role_being_edited() {
     let theme = Theme::dark();
     let editor = HeaderEditor::new(&None).titled("qwen → role main".into());

@@ -39,7 +39,8 @@ fn pending_user_input_ends_a_wait_without_cancelling_the_question() {
         &AtomicBool::new(false),
     )
     .unwrap();
-    assert_eq!(result[0]["answer"], "answer");
+    assert_eq!(result[0]["delivery"], "pending");
+    assert!(result[0].get("answer").is_none());
 }
 
 #[test]
@@ -58,7 +59,8 @@ fn pending_input_is_not_checked_once_the_wait_is_already_satisfied() {
         !stopped,
         "a finished answer is reported as a normal completion"
     );
-    assert_eq!(result[0]["answer"], "done");
+    assert_eq!(result[0]["status"], "completed");
+    assert_eq!(result[0]["delivery"], "pending");
 }
 
 #[test]
@@ -77,7 +79,8 @@ fn start_returns_while_work_is_blocked_and_delivers_once_acknowledged() {
         &AtomicBool::new(false),
     )
     .unwrap();
-    assert_eq!(result[0]["answer"], "answer");
+    assert!(result[0].get("answer").is_none());
+    assert_eq!(questions.undelivered()[0].1["answer"], "answer");
     assert_eq!(questions.undelivered().len(), 1);
     questions.deliver(&id);
     assert!(questions.undelivered().is_empty());
@@ -107,7 +110,11 @@ fn concurrency_limit_cancel_and_failure_are_visible() {
         )
         .unwrap();
         assert_eq!(result[0]["status"], "failed");
-        assert_eq!(result[0]["error"], "side question cancelled");
+        assert!(result[0].get("error").is_none());
+        assert_eq!(
+            questions.undelivered().last().unwrap().1["error"],
+            "side question cancelled"
+        );
     }
 }
 
@@ -137,7 +144,11 @@ fn undelivered_results_are_not_evicted_and_delivered_results_are_bounded() {
             &AtomicBool::new(false),
         )
         .unwrap();
-        assert_eq!(result[0]["error"], "provider failure");
+        assert_eq!(result[0]["status"], "failed");
+        assert_eq!(
+            questions.undelivered().last().unwrap().1["error"],
+            "provider failure"
+        );
     }
     assert!(questions.start(|_| Ok("overflow".into())).is_err());
     let first = questions.jobs.front().unwrap().id.clone();

@@ -9,8 +9,6 @@ use std::io;
 use std::io::Write;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
-#[cfg(unix)]
-use std::os::fd::FromRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -101,39 +99,7 @@ impl AsRawFd for Handle {
 
 #[cfg(unix)]
 pub(super) fn terminal(rows: u16, cols: u16) -> Result<(File, File), String> {
-    let mut master = -1;
-    let mut slave = -1;
-    let mut size = libc::winsize {
-        ws_row: rows,
-        ws_col: cols,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    if unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &raw mut size,
-        )
-    } == -1
-    {
-        return Err(format!("opening PTY: {}", io::Error::last_os_error()));
-    }
-    let master = unsafe { File::from_raw_fd(master) };
-    let slave = unsafe { File::from_raw_fd(slave) };
-    for file in [&master, &slave] {
-        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
-        if flags == -1
-            || unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) }
-                == -1
-        {
-            return Err(format!("configuring PTY: {}", io::Error::last_os_error()));
-        }
-    }
-    crate::platform::io::set_nonblocking(&master).map_err(|e| format!("configuring PTY: {e}"))?;
-    Ok((master, slave))
+    crate::platform::terminal::open(rows, cols).map_err(|e| format!("opening PTY: {e}"))
 }
 
 pub(super) struct Input {

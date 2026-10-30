@@ -3,17 +3,35 @@
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SolveConfig {
     pub enabled: bool,
     pub max_candidates: usize,
     pub max_steps: u32,
     pub max_snapshot_bytes: usize,
+    /// Independent candidate slots; local inference still obeys its serial owner.
+    pub concurrency: usize,
+}
+
+impl Default for SolveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_candidates: 0,
+            max_steps: 0,
+            max_snapshot_bytes: 0,
+            concurrency: 1,
+        }
+    }
 }
 
 impl SolveConfig {
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            (1..=64).contains(&self.concurrency),
+            "solve.concurrency must be 1..=64"
+        );
         Ok(())
     }
 }

@@ -40,6 +40,15 @@ Auto-retain sends the text of each queued turn to the model assigned to the `mem
 
 Automatic recall runs on user messages for the semantic and Hindsight backends. Shown-fact dedupe is scoped to the selected runtime's session/history generation. Every committed change to the provider-visible history advances that generation: compaction, a context reset, an investigation rewind, and a real `rewind` (one that removes at least one visible message). Facts removed from the visible transcript therefore attach again on the next matching prompt. Identical raw prompts are deduped by the effective recall query, including the selected history; a changed query gets a new search, while a redundant call does not cancel an in-flight one. Compaction also consults the selected backend's recall. A no-op rewind (no user message in view) commits nothing and keeps shown-fact suppression.
 
+Automatic recall is optional task context, not a reason to attach the nearest fact regardless of
+relevance. Semantic/Hindsight automatic recall and compaction memory require lexical support in the
+current user subject; a conversational continuation may inherit the most recent substantive user
+subject, not arbitrary prior assistant discussion. Longer prompts need several distinct matches.
+This conservative admission can omit synonym-only matches; explicit `recall` keeps the backend's
+full lexical/embedding search. Rejected facts are not marked shown and can attach to a later relevant
+request. Provenance/codebase automatic context similarly abstains on incidental overlap and admits
+unchanged individual records only once while they remain in the visible branch.
+
 Semantic recall ranks each bank with reciprocal rank fusion over up to three voices: lexical (FTS5 BM25), embedding similarity when an embedding is available, and recency. The recency voice runs only for temporal queries (for example "yesterday", "recent", "this week", "ago") and orders the facts updated in the last seven days, newest first. Recall results are cached per bank, keyed by query, limit, token budget and query vector, for at most 300 seconds and 32 entries. Any write to the memory database (retain, update, forget, consolidation, or a write from another connection) invalidates the bank's cache. Temporal recalls and recalls that degraded because embedding failed are not cached. Relation or graph ranking is not part of this backend: Dial's semantic store has no entity or triple storage.
 
 `/debug memory` reports the active backend, fact counts, embedding and auto-retain state, each bank's recall cache hits, misses and entries, the most recent recall (mode, item count, and whether each bank was a cache hit, miss, bypass, or skipped), and the backend's read-only diagnose report.

@@ -11,21 +11,73 @@ pub(in crate::agent) struct RoleChatCall<'a> {
     timeout_secs: u64,
 }
 
+/// Source-specific candidates share model routing, budgeting and index-only response validation.
+pub(in crate::agent) enum RetrievalRequest {
+    Source(Box<crate::tools::code::navigation::SemanticRequest>),
+    Evidence(crate::tools::knowledge::retrieval::SemanticRequest),
+}
+
+impl RetrievalRequest {
+    pub(in crate::agent) fn has_candidates(&self) -> bool {
+        match self {
+            Self::Source(request) => request.has_candidates(),
+            Self::Evidence(request) => request.has_candidates(),
+        }
+    }
+
+    pub(in crate::agent) fn render_response(&self, response: &str) -> Result<String, String> {
+        match self {
+            Self::Source(request) => request.render_response(response),
+            Self::Evidence(request) => request.render_response(response),
+        }
+    }
+
+    pub(in crate::agent) fn supplementary(&self, args: &Value) -> Result<Option<Value>, String> {
+        match self {
+            Self::Source(_) => crate::tools::code::navigation::lsp_args(args),
+            Self::Evidence(_) => Ok(None),
+        }
+    }
+
+    pub(in crate::agent) fn chat(&self, max_tokens: u32) -> Chat {
+        match self {
+            Self::Source(request) => semantic_chat(request, max_tokens),
+            Self::Evidence(request) => index_chat(&request.system, &request.prompt, max_tokens),
+        }
+    }
+}
+
+pub(in crate::agent) fn retrieval_request(
+    workspace: &Workspace,
+    name: &str,
+    args: &Value,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Option<RetrievalRequest>, String> {
+    match name {
+        "find" => crate::tools::code::navigation::semantic_request(workspace, args)
+            .map(|request| request.map(|request| RetrievalRequest::Source(Box::new(request)))),
+        "evidence_search" => crate::tools::knowledge::retrieval::semantic_request_with_cancel(
+            workspace, args, cancel,
+        )
+        .map(|request| request.map(RetrievalRequest::Evidence)),
+        _ => Ok(None),
+    }
+}
+
 impl<'a> Agent<'a> {
     pub(in crate::agent) fn run_semantic_find(
         &mut self,
         main: &mut Backend,
         args: &Value,
-        request: crate::tools::code::navigation::SemanticRequest,
+        request: RetrievalRequest,
         ui: &mut dyn Ui,
     ) -> ToolOutput {
         let result = (|| -> Result<ToolOutput> {
-            let supplementary =
-                crate::tools::code::navigation::lsp_args(args).map_err(anyhow::Error::msg)?;
+            let supplementary = request.supplementary(args).map_err(anyhow::Error::msg)?;
             let response = if request.has_candidates() {
-                let chat = semantic_chat(&request, self.version.harness.max_tokens);
+                let chat = request.chat(self.version.harness.max_tokens);
                 self.role_chat(main, "small", llm::usage::Purpose::Retrieval, &chat, ui)
-                    .context("semantic find ranking failed")?
+                    .context("semantic retrieval ranking failed")?
             } else {
                 "{\"indices\":[]}".to_owned()
             };
@@ -540,10 +592,14 @@ pub(in crate::agent) fn semantic_chat(
     request: &crate::tools::code::navigation::SemanticRequest,
     max_tokens: u32,
 ) -> Chat {
+    index_chat(&request.system, &request.prompt, max_tokens)
+}
+
+fn index_chat(system: &str, prompt: &str, max_tokens: u32) -> Chat {
     Chat {
         messages: vec![
-            json!({"role":"system","content":request.system.as_str()}),
-            json!({"role":"user","content":request.prompt.as_str()}),
+            json!({"role":"system","content":system}),
+            json!({"role":"user","content":prompt}),
         ],
         tools: vec![],
         temperature: 0.0,

@@ -1,4 +1,5 @@
-//! A private, session-scoped live feed and its append-only side-pane follower.
+//! A private, session-scoped live feed and the side pane that follows it. In a terminal the pane is
+//! the tabbed dashboard in [`pane`]; with `--once` or redirected output it prints the feed.
 use crate::config::paths::Layout;
 use crate::platform::{atomic, fs as platform_fs, procinfo::ProcId};
 use crate::ui::{
@@ -11,10 +12,12 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs::OpenOptions,
     io::{BufRead, BufReader, IsTerminal, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
+mod pane;
+pub(crate) mod state;
 const MAX_EVENT: usize = 128 * 1024;
 const MAX_FEED: u64 = 16 * 1024 * 1024;
 
@@ -194,6 +197,18 @@ pub(crate) fn image(layout: &Layout, session: &str, reference: &serde_json::Valu
     )
 }
 
+/// A feed image after its name and content hash are checked against the file on disk.
+fn load_image(dir: &Path, file: &str, label: &str, native: bool) -> Result<Thumbnail> {
+    ensure!(image_name(file), "invalid live image path");
+    let bytes = atomic::read_private(&dir.join(file))?.context("live image is missing")?;
+    use sha2::{Digest, Sha256};
+    ensure!(
+        file == format!("{:x}.image", Sha256::digest(&bytes)),
+        "live image identity mismatch"
+    );
+    Thumbnail::from_bytes(label, &bytes, native)
+}
+
 /// Called on the existing image worker so file publication never blocks terminal input.
 pub(crate) fn preview_image(
     layout: &Layout,
@@ -233,6 +248,9 @@ pub fn run(layout: &Layout, args: WatchArgs) -> Result<i32> {
     }
     let protocol = terminal.then(ImageProtocol::detect).flatten();
     let mut reader = BufReader::new(file);
+    if !args.once && terminal {
+        return pane::run(layout, &args.session, &dir, &mut reader);
+    }
     let mut pending = Vec::new();
     let mut out = std::io::stdout().lock();
     loop {
@@ -263,15 +281,7 @@ pub fn run(layout: &Layout, args: WatchArgs) -> Result<i32> {
                 }
             }
             Event::Image { label, file } => {
-                ensure!(image_name(&file), "invalid live image path");
-                let bytes =
-                    atomic::read_private(&dir.join(&file))?.context("live image is missing")?;
-                use sha2::{Digest, Sha256};
-                ensure!(
-                    file == format!("{:x}.image", Sha256::digest(&bytes)),
-                    "live image identity mismatch"
-                );
-                let thumbnail = Thumbnail::from_bytes(&label, &bytes, protocol.is_some())?;
+                let thumbnail = load_image(&dir, &file, &label, protocol.is_some())?;
                 writeln!(out, "\n{}", text::one_line(&label))?;
                 let height = crossterm::terminal::size()
                     .map_or(24, |(_, h)| h)

@@ -1,12 +1,91 @@
 # Changelog
 
-All notable changes to Dial are recorded here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-Entries are taken from the git history (commit subjects, shown by short hash) and tags `v0.1.0` through `v0.1.7`.
+Notable changes to Dial, grouped by version, following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`; dates use the tag's calendar date. Tags establish source contents, not successful publication or live-provider compatibility. Older untagged notes are explicitly marked below. Unreleased describes the current checkout, not an installed release. Later entries supersede earlier defaults and behavior; optional integrations still require their documented prerequisites and approvals.
+
+**Capability guide — current checkout, not first-release attribution.** The entries below track changes rather than repeat every unchanged feature. These guides cover Dial's main capability areas, including features inherited by the earliest available release tag:
+
+- **Models and inference:** hosted and local providers, API-key/subscription authentication, model discovery/downloads, role routing, thinking, fallback and cache controls ([providers](docs/provider-catalog.md), [downloads](docs/model-downloads.md), [routing](docs/model-routing.md), [transport](docs/llm-transport.md)).
+- **Coding and verification:** bounded file/search/AST tools, editing grammars and notebooks, Git/jj/GitHub/GitLab workflows, LSP, debugger adapters, checkpoints/undo, focused checks and requirement evidence ([tools](docs/tools.md), [verification](docs/requirement-verification.md)).
+- **Execution and access:** foreground/background shell jobs, persistent JavaScript/Python evaluation, web search/fetch, Chromium and native desktop control, approved SSH and added-directory access; platform and sandbox limits apply ([execution/web](docs/execution-and-web.md), [shell](docs/shell.md), [SSH](docs/ssh.md), [directory access](docs/directory-access.md)).
+- **Sessions and terminal UI:** streaming conversations, command palette, settings/keymaps/themes, branches/resume/export/portable archives, side conversations, live work dashboard and voice ([terminal](docs/terminal-interface.md), [composer](docs/composer.md), [voice](docs/voice.md)).
+- **Delegation and collaboration:** role-scoped workers, isolated copies/pools, peer coordination and encrypted host/guest collaboration ([subagents](docs/subagents.md), [peers](docs/session-coordination.md), [collaboration](docs/collab.md)).
+- **Extensibility and clients:** MCP discovery/OAuth/tools/prompts/resources, lifecycle hooks, skill packages, trusted plugins/Python extensions, print mode, RPC and ACP ([extensions](docs/extensibility.md), [skills](docs/skills.md), [Python](docs/python-extensions.md), [protocols](docs/rpc-and-acp.md)).
+- **Memory and improvement:** persistent project/user memory, saved source understanding and change history, explicit local learning, evaluation gates, benchmarks and autoresearch experiments ([memory](docs/memory-and-learning.md), [improvement](docs/improvement.md), [benchmarks](docs/benchmarks.md), [autoresearch/archive](docs/autoresearch-and-archive.md)).
+- **Media and investigations:** image generation/editing/search/grounding, documents/audio/data/video, retained citations, research/timelines, offline runtime/HAR/SQLite investigations and approved monitoring ([images](docs/image-generation.md), [vision](docs/model-vision.md), [evidence](docs/evidence-investigation.md), [system investigation](docs/system-investigation.md), [monitoring](docs/application-monitoring.md)).
+- **Operations and distribution:** setup/doctor, runtime maintenance, schedules/background services, redacted encrypted sharing, local statistics/optional telemetry, signed release installers and updates ([setup](docs/setup.md), [services](docs/background-services.md), [sharing/statistics](docs/share-stats-telemetry.md), [releases](docs/release-and-install.md)).
 
 ## [Unreleased]
 
+### Added
+
+- Opt-in idle session preparation: local one-token prefix warming, explicitly approved language-server source preparation and offline locked Cargo checks. All activity defaults off; no hosted fallback, model download or final-verification credit (`docs/session-preparation.md`).
+- Explicit native paid OpenAI/Anthropic provider batches with private restart-safe submit/status/results/cancel records and review-only archive summary snapshots. No scheduler, subscription-token routing, automatic submission or application of generated text (`docs/provider-batches.md`).
+- Explicit finite-lifetime restart-surviving Unix pipe jobs, owned by a private helper instead of the calling session. Ordinary background jobs remain session-owned; reconnect never replays commands, installs services or grants additional permissions (`docs/background-services.md`).
+- Opt-in bounded parallel isolated candidate generation/evaluation through `solve.concurrency` (default 1), and byte-validated single-file native read/grep preparation under the existing disabled speculation flag (`docs/async-candidates-and-reads.md`).
+- Opt-in finite exact batch approvals, conservative dependency scheduling for disjoint native operations, and controller-owned background focused checks with freshness barriers. No saved permissions or experimental settings are enabled automatically (`docs/async-execution.md`).
+- First-class trusted Python extensions: bundled SDK for Python 3.11+ commands, hooks, panels, autocomplete, custom tools and protocol-2 actions; `dial plugin new`/`check` authoring commands; explicit install/update prepares a per-extension virtual environment and declared dependencies. Python must already be installed. Model-callable plugin tools retain approvals, versioned contracts and session ownership; state is explicit and Python plugins are not sandboxed (`docs/python-extensions.md`).
+- Expanded Python extension API: controller-mediated tools, owned tasks, bounded active-model requests and selected conversation context; session workers with polled subscriptions and progress; revisioned declarative workspace views; typed user/workspace settings, credentials, shortcuts, public presets, scoped profiles and approval workflows. Added temporary `dial plugin dev` reload previews, compatibility/dependency-lock checks, diagnostics and three dependency-free example packages. Explicit trust and all existing approvals still apply (`docs/python-extensions.md`).
+- Explicit cross-model session teaching: retain bounded successful request/target observations from local or hosted model A, switch to local model B and run `/improve session` (or name a target selector). Approved source examples keep their identities, use the existing curation and sealed evaluation gates, and never count as B's measured live performance. No automatic training or activation (`docs/improvement.md`).
+
+- Experimental evidence foundation: immutable artifact-backed citations, parent attribution, optional original-source snapshots and freshness checks, explicit coverage and uncertain clock alignment. The `evidence` tool captures/reopens/compares/refines retained data; media reads and approved monitor matches emit citations. Session export/relocation and GC follow bounded manifest dependencies without granting access or verification credit (`docs/evidence.md`).
+- Source investigation tools: document structure and content/layout revision observations, timestamped whisper.cpp file audio with retained clips, reproducible CSV/JSON/XLSX calculations and linked charts, attributed comparison findings and hypothesis/experiment records, and the `/evidence` terminal workbench. Bounded video frame investigations require `experimental.video_analysis = true` (off by default because image-token cost varies). All outputs retain existing evidence trust and authorization boundaries (`docs/evidence-investigation.md`).
+- Extended source investigations: region-cited image/diagram annotations and coordinate OCR, explicit scanned-PDF pages, clock-aware event timelines, row-linked distribution/trend/correlation charts, expectation-versus-observation checks, persistent research notebooks, channel-preserving audio signal measurements, and human-approved live inspection budgets. Video remains opt-in; measurements, interpretations and verification remain distinct (`docs/evidence-investigation.md`).
+- Agent guidance now asks models to inspect schema, units and coverage before conclusions and to make targeted rechecks for ambiguous audio, OCR and conflicting revisions; guidance is not proof of compliance or accuracy. Document inspection exposes workbook sheets and unevaluated formulas; citation-scoped `evidence_search` combines local lexical retrieval with optional configured-model reranking while preserving source locations and limitations (`docs/evidence-investigation.md`).
+- Structured data now supports attributed dictionaries and identifier checks, explicit whole-source selection, nested JSON Pointer/JSONL rows, bounded relational joins, dimension-checked unit conversions, strict date/offset parsing and exact decimal-string sums. Added reproducible adversarial interpretation fixtures and offline grader tests; these are not a measured live-model accuracy claim.
+- Experimental system investigations: bounded local runtime trace/CPU profile analysis, redacted HAR/API conversation observations with OpenAPI response-status comparisons, and read-only SQLite schema, query and query-plan inspection. Sources and results retain evidence identities; no live capture, remote database access, application execution or causality/verification credit (`docs/system-investigation.md`).
+- Approved application monitoring: expiring one-shot watches on Dial-owned background output or existing workspace log files can wake an idle terminal agent to diagnose and repair within the current task and permissions. Every start/rearm requires explicit approval; no external process takeover or automatic restart (`docs/application-monitoring.md`).
+- Foreground application monitoring on Unix: `dial run --name web -- pnpm start` preserves interactive PTY input, resize and Ctrl-C while capturing bounded private output for explicitly approved, future-only `monitor` watches in another session of the same project. Watches never own or stop the app; restart, capture loss and wrapper death disarm observation. Windows currently refuses the wrapper (`docs/application-monitoring.md`).
+- Images picker discovery for direct OpenAI, xAI and MLX-Serve image models, plus native Gemini, explicit Vertex/Imagen, Black Forest Labs, ComfyUI workflows, fal queues and Replicate predictions. Per-model provider inputs and workflows are editable in image settings; generation stays approval-gated with bounded polling, no submission retries and credential-free output downloads (`docs/image-generation.md`).
+- Automatic OpenAI image routing now defaults to `gpt-image-1.5` instead of `gpt-image-1`; explicitly selected models remain unchanged. Catalog discovery does not establish account access or a successful generation.
+- Collaborative hashline edits coordinate writers before reading current text, preserving explicit anchor checks during races. Atomic batch conflicts return fresh local context across files and mappings for unchanged anchors; preserved read witnesses and range-selective change notices reduce unnecessary rereads without granting unseen-source access (`docs/tools.md`).
+- Compact model-only file handles are issued automatically for native file/search result paths and expanded before normal policy checks; user tool views retain actual paths, and session resume preserves handle identities. Successful complete Cargo/Rust test output omits recognized progress while preserving diagnostics/counts and a full-evidence link. Exact redundant read-only results share cache-aware context filtering without deleting history (`docs/tools.md`).
+- The interactive terminal checks for newer Dial releases in the background at most once a day, caches the answer and offers `/update` when an executable update plan is available. Strict/network-off sandboxes skip the check, and print/protocol modes show no notice. `dial update` and `/update` can install verified release binaries, run Homebrew/Cargo updates, or fast-forward and rebuild an available source checkout with `make update`; dirty tracked source files are refused and an already-current version skips reinstalling. Cargo uses the Git install route, not crates.io, and `/update VERSION` passes `--version`. Nix and unsigned builds whose original checkout is unavailable retain manual instructions rather than attempting an unverifiable binary update (`docs/release-and-install.md`).
+- `/watch` now opens the live side pane automatically in tmux, Zellij, WezTerm and kitty (with socket remote control) as well as iTerm2. When no supported terminal is detected, or the split fails, it prints the exact `dial … watch SESSION_ID` command to run in another terminal. GNU screen is detected and refused with a reason (`docs/terminal-interface.md`).
+- The `/watch` side pane is now a tabbed dashboard for session activity and ongoing work: **Feed** (edits, advisories, reviews, turn outcomes, screenshots), **Plan**, **Jobs** (`bg` processes and slash-command jobs such as `/update`, with output), **Workers**, **Threads** (`/btw`) and **Peers**. From the pane you can stop a job, cancel a worker or a streaming side answer (each confirmed with `y`) and message a peer; approvals stay in the main window. While it is attached, slash-command output and the pinned worker block move to the pane, and the conversation keeps one-line status. `--once` and redirected output still print the feed. The feed's turn entries now read `completed`/`failed` instead of internal names (`docs/terminal-interface.md`).
+- New `art-to-ui` example skill (`dial skills import ./examples/skills/art-to-ui`): generate art with `/image` or `image_gen`, then build and screenshot-check the page around it (`docs/image-generation.md`).
+- The `task` tool accepts an optional `isolation_backend` (`auto`, `clone`, `overlay`, `worktree`, `copy`, `projfs`) per task or batch item. It overrides `[isolation] backend` for that worker only and implies `isolation: "copy"`. A backend that can't run here refuses the whole call before any worker starts, never falling back. Sessions recorded before the property still resume (`docs/subagents.md`).
+- New `cost` status-line segment, for example `$0.0412 turn · $1.20 session`. It updates live during a turn, settles to the exact per-turn ledger figure at the end, and stays hidden when the cost is unknown or zero (local and subscription models). It is on in the default, `nerd`, `ascii`, `compact` and `full` presets (`docs/terminal-interface.md`).
+- Bare `/peers` now opens a peers panel. It shows this session and every live peer with phase, summary, claims (overlaps marked ⚠) and unread mail. `Enter`/`m` messages the selected peer, `r` refreshes and `c` clears your claims. `/peers list` prints the old text listing, and the other subcommands are unchanged (`docs/session-coordination.md`).
+- `/undo N` undoes the last N turns and restores their file changes; bare `/undo` still undoes one. `/rollback 0` is now refused up front (`docs/tools.md`).
+- The browser tool installs bun when it needs to and finds none (`DIAL_BUN`, then Dial's own install, then `PATH`), after approval, using the existing `bun` setup recipe. If you refuse, the error names `/setup bun yes` (`docs/execution-and-web.md`).
+- The palette's "Manage ongoing work" goal now includes `/watch`.
+
 ### Fixed
 
+- After a stream-journal append fails (for example because the disk is full), the next turn retries the writer instead of retaining the old error forever. Recovery preserves committed frames, discards only the failed append's partial row and refuses removed or replaced journals; it does not replay tools or recover unpublished output (`docs/terminal-interface.md`).
+- Voice settings now ask before installing a missing local backend, prepare its runtime and required model, and select it only after successful setup. Cancellation or failure preserves the previous backend (`docs/voice.md`).
+- Silent-inference recovery now defaults to 30 seconds instead of 120. Anthropic lifecycle and signed-thinking activity reaches the agent watchdog, so that hidden activity renews the silence timer instead of producing a false stall; keepalives and usage-only updates still cannot hide a stall. Explicit configured silence limits remain unchanged (`docs/tools.md`).
+
+- Automatic language-server provisioning now uses normal npm global, uv tool, Go, rustup and Homebrew destinations rather than redirecting new servers into Dial storage. Approved first use detects existing package-manager bins outside `PATH`; custom and existing local installations remain unchanged (`docs/setup.md`).
+
+- Ingestion paths now expand compact handles before format detection and share authorized bounded source capture, including added workspace roots. Rich document workers consume captured bytes and extraction caches detect same-size rewrites even with restored timestamps. Legacy HEIC/video/PDF-image reads require explicit converter authorization; PDF rendering applies pixel and output bounds during conversion (`docs/tools.md`).
+
+- On macOS, Option+V starts/stops dictation even when the terminal sends `√` instead of an Alt key event. The fallback follows the active voice binding; bracketed paste remains literal (`docs/voice.md`).
+- Every Option/Alt application shortcut now has a default that needs no Option key, since macOS terminals type symbols for Option+letter: `Ctrl+Q` queues a follow-up, `Ctrl+L` repaints, and `F2` model selector, `F3` roles, `F4` providers, `F5` show/hide tools, `F6` worker hub, `F7` latest worker, `F8` next favorite, `F9` dictation. Editor redo adds `Ctrl+6`. A key you bind to an editing or list action is no longer shadowed by an application default in the composer (`docs/terminal-interface.md`).
+- Windows: `Ctrl+G` falls back to Windows PowerShell when PowerShell 7 (`pwsh`) is not installed. `Alt+V` attaches clipboard images, because Windows Terminal handles `Ctrl+V` itself and drops image-only clipboards. Dictation moves to `F9`. `Ctrl+Q` replaces `Alt+Enter`, which Windows Terminal uses for fullscreen. The HTTP header editor saves with `Ctrl+S` as well as `F10`, which GNOME Terminal takes for its menu (`docs/terminal-interface.md`).
+
+- `/models` → **Images** now lists the direct Gemini API's image models (`gemini-3-pro-image`, `gemini-3.1-flash-image`, `gemini-3.1-flash-lite-image`, `nano-banana-pro-preview`, `gemini-nano-banana-2.1` and the `-preview` ids), not only `gemini-2.5-flash-image`; they generate through the native Gemini transport with your Gemini key. A saved model catalog from an earlier version picks them up when loaded, without a manual rescan (`docs/image-generation.md`).
+- Command results on the launch screen are visible: the first command that prints something (for example `/add-dir`) restores the normal conversation instead of leaving its answer in scrollback behind the full-height home. Text that starts with `/` but is not a command, such as a pasted path `/Users/me/notes.md`, is now sent as a message instead of failing with "unknown command"; paths no longer open the command menu or get completed into a command on `Enter` (`docs/terminal-interface.md`).
+- Test-writing guidance now favors compact, risk-driven suites: extend existing coverage, group equivalent cases, test distinct behavior and important boundaries, and isolate deterministic test state. Main/lean prompts, implementation/tester roles and the test-runner skill discourage redundant one-off cases, brittle prose/source assertions and test-count quotas without removing useful coverage (`docs/subagents.md`).
+- Context filtering consolidates exact successful read-only duplicates under pressure without waiting for a large pruning batch. Short observations and repeated harness notices no longer expand into larger placeholders; full artifacts, failures, mutations and the newest result remain intact (`docs/agent-loop.md`).
+- Images rendered by `visual`, `video`, `evidence` and derived-media `read` (SVG, HEIC, PDF pages) now reach vision models in normal parent and worker turns. One shared capture rule replaces the tool-name list that only covered `browser` and `computer`; the tool's description text is kept as the result, and a failed attachment no longer discards it (`docs/tools.md`).
+- `monitor` watches on a busy `bg` job no longer disarm with a spurious "output overrun" after more than 32 KiB arrives between idle polls. Output is scanned forward from the cursor; only bytes the bounded ring really discarded count as loss (`docs/application-monitoring.md`).
+- Under context pressure, old large results from the bounded read-only investigation tools (`data`, `database`, `document`, `network_inspect`, `runtime_inspect`, `timeline`, `evidence_search`, `audio`, `visual`, `video`) are replaced by artifact pointers like `read` and `grep` results. Tools that also record state keep their results verbatim (`docs/agent-loop.md`).
+- The file-handle registry is journaled to the session only when it changes, instead of after every tool result.
+- Tool routing no longer loads `investigate`, `research`, `monitor`, `timeline`, `reality`, `perception`, `video` or `workbench` schemas just because the request uses those everyday words; name them in backticks or with "tool". `monitor` routes for real runtime intent ("check the app logs for errors") and no longer for coding tasks that mention a server or watch mode.
+- Complete retained background pipe output and completion notifications now reuse shell minimization on success or failure. Recognized Cargo progress and passing Rust test noise are removed without losing diagnostics, failures, totals or raw artifacts; partial/delta and terminal output stay unfiltered (`docs/agent-loop.md`).
+- Automatic codebase and persistent-note context abstain on conversational follow-ups and incidental overlap, without narrowing explicit recall. Side-request polls return delivery references instead of duplicating canonical answer messages; reporting guidance discourages repeated completion reports (`docs/agent-loop.md`).
+- Automatic context relevance is now enforced for parent/child codebase context even with efficiency disabled, and for semantic/Hindsight automatic recall using the current human subject rather than prior assistant or synthetic worker reports. Changing bundles no longer repeat unchanged revision-sensitive note/source records; explicit recall keeps its broader scope (`docs/memory-and-learning.md`).
+- Model-facing coordination and output avoid redundant noise: delivered successful worker/pool reports keep recovery pointers instead of repeating narratives, automatic peer rosters are bounded and overlap-prioritized, homogeneous Cargo-check sequences share conservative filtering, and retained successful hashline edits omit equivalent diff duplication. Handoffs bound recent file inventories; historical read-only diagnostics condense only after an exact retry with explicit success/effects metadata. Raw evidence, failures, warnings, approvals and verification distinctions remain available (`docs/agent-loop.md`, `docs/subagents.md`, `docs/session-coordination.md`).
+- Large Git status inventories return exact counts and bounded path samples with full artifact recovery; status accepts the existing path filter. Skills support authored compact entrypoints with bundled references and reject partial instruction bodies rather than silently truncating policy (`docs/agent-loop.md`).
+
+- Automatic image generation no longer silently hides `image_gen` from Opus and other chat models when no image role or automatic service is available. Calls report missing provider setup instead; explicit image-route errors, automatic opt-out, credentials and approval requirements remain unchanged (`docs/image-generation.md`).
+- `/models` → **Images**, the image role picker and `Ctrl+A` now offer ChatGPT plan models even though their catalog omits the hosted image tool, so a ChatGPT subscription can generate images while main uses another provider. Generation still uses the approval-gated Responses hosted tool on the official endpoint, account access is verified only by the request, and an explicit `disabled` image-generation declaration still refuses the model (`docs/image-generation.md`).
+- `/image edit SRC PROMPT` now writes `<source stem>-<prompt slug>.<ext>` next to the source, for example `kite-add-a-sun.png`, instead of a generic name in the project root (`docs/tools.md`).
+- Plain-language questions about local runtime captures, HAR files and SQLite snapshots now offer eligible system-investigation tools without requiring tool names or inspection jargon. Coding/conceptual questions, tool allowlists and schema budgets retain their existing boundaries (`docs/system-investigation.md`).
+
+- `/models` capabilities now match what requests assume. Anthropic's `capabilities` object (image input, thinking) and Gemini's `thinking` flag are read. Ollama's `/api/show` list sets tools, vision and reasoning. Hosted rows with no live capability fields (OpenAI, Anthropic, Gemini) fall back to the same bundled record the runtime uses, instead of showing unknown. A chat model that declares no tool calls is flagged in the detail line, because Dial's tools cannot run on it (`docs/provider-catalog.md`).
 - Local-server shutdown tests distinguish exited Linux zombies from running processes, avoiding false failures while still checking that the failed server and its helper stop before retry.
 
 ## [0.2.6] - 2026-10-28
@@ -51,11 +130,12 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 ### Changed
 
 - Provider retry backoff is distinguished from the initial response wait. Experimental streaming dispatch recognizes explicit Anthropic, Bedrock and Responses tool-call completion, so normal-mode last/single reads can overlap the rest of the response without guessing from partial JSON (`docs/agent-loop.md`).
-- `diagram` fences draw the model's plain ASCII line art (`->`, `|`, `v`, `+--+`) with box-drawing lines, arrowheads and rounded corners on a fully filled panel; the source stays ASCII, which tokenizes about a quarter cheaper than box-drawing characters. The advisory diagram rule now reaches the lean local prompt too, suggests a diagram only for branching, looping or layered structure, and prefers unboxed arrows, since boxes and long arrows cost tokens without adding meaning; a linear flow stays one sentence (`docs/terminal-interface.md`).
+- `diagram` fences render plain ASCII line art (`->`, `|`, `v`, `+--+`) with box-drawing lines, arrowheads and rounded corners on a filled panel while keeping the source in ASCII. The advisory rule reaches the lean local prompt too and suggests unboxed diagrams for branching, looping or layered structure; a linear flow stays one sentence. No model-independent token-savings percentage is established (`docs/terminal-interface.md`).
 
 ### Fixed
 
 - Release checks now accept the intentionally read-only `code_history` and `dep_source` tools for read-only subagents; coordination code and tests match the pinned Rust formatter.
+- Linux installer detection respects the active libc even when musl development loaders are also installed. Cross-platform release checks compile Unix-only fixtures only on supported hosts and keep platform-specific Clippy clean.
 - Idle cache warming now tracks accepted text-only/final requests as well as tool-call requests, and honors effective five-minute versus one-hour retention and provider refusal fallback (`docs/llm-transport.md`).
 - `task wait`, `side_request wait`, `bg wait` and a foreground `bash` command not yet moved to the background now stop as soon as the user queues a message, so the message is handled promptly instead of after a long wait. Nothing is cancelled: the awaited work keeps running (`docs/agent-loop.md`).
 - A shell command that repeats only a `cd`, `export` or `NAME=value` prefix of an earlier command (`cd crates/x && git status` after `cd crates/x && ls`) is no longer reported as an unchanged rerun.
@@ -126,7 +206,6 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 - Prompt data framing is stricter. A project instruction file containing `</context>` can no longer end its `<context>` wrapper early, and context paths and MCP server names are attribute-escaped the same way as `@file` blocks. MCP servers that send blank instructions no longer add an empty block. Single-line previews (`truncate_chars`) now fold `\r` and `\r\n` as well as `\n`.
 
 ### Fixed
-- Linux installer detection respects the active libc even when musl development loaders are also installed. Cross-platform release checks compile Unix-only fixtures only on supported hosts and keep platform-specific Clippy clean.
 - Replace the abandoned 7z decoder with maintained `sevenz-rust2`, removing the vulnerable dependency while retaining read-only archive admission and expansion limits.
 - Release CI installs the signature-test dependency before running installer contracts. Named shell sessions retain published state after ordinary nonzero background exits, and histories recorded before the optional `bash.session` property remain resumable.
 - Parallel tool results and timings now appear as each call finishes, remain correlated by call ID, and retain original-order provider conversation settlement (`docs/agent-loop.md`).
@@ -137,8 +216,7 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 - Settings and prompt-history lock contention now returns a bounded, retryable error instead of blocking command dispatch indefinitely. Settings-driven agent rebuilds (including `/drafter`) keep the composer active during MCP reconnection; queued Enter/shortcut input no longer drops into a synchronous startup wait (`docs/configuration.md`).
 - Avoid repeated exact ambient provenance/codebase blocks while retaining cacheable history; defer unrelated web schemas with local task-intent routing; and skip auto-thinking judgments until a request profile supports selectable effort, retaining one judgment across fallbacks and repair rounds. Automatic-compaction defaults and opt-in advisor/drafter behavior are unchanged. No release-wide live token-savings percentage is established (`docs/agent-loop.md`).
 - Computer AX role queries no longer confuse tabs with tables or tab groups, and trees expose non-press action hints. Native menu selection accepts explicit foreground recovery while retaining exact-key-window safeguards; unavailable-window diagnostics and multi-window keyboard/AX recovery guidance now distinguish macOS limits from closed windows (`docs/tools.md`).
-- Browser navigation accommodates large unbundled module graphs with a larger count- and byte-bounded request queue and total admission ceiling, longer deadline-bounded navigation settlement, and retained blocked-request causes that survive asset-event bursts. Completed non-navigation actions retain their short settlement budget; exact-endpoint network safeguards remain unchanged (`docs/execution-and-web.md`).
-- Browser pages can queue bounded bursts of HTTP requests instead of dropping everything beyond 16 concurrent jobs; the existing network guard and active-job limit remain in force (`docs/execution-and-web.md`).
+- Browser navigation accommodates large unbundled module graphs with a count- and byte-bounded burst request queue instead of dropping requests above 16 concurrent jobs, a total admission ceiling, longer deadline-bounded navigation settlement and retained blocked-request causes. Completed non-navigation actions keep their short settlement budget; the active-job limit and exact-endpoint network safeguards remain unchanged (`docs/execution-and-web.md`).
 - `web_fetch` preserves the download-size cutoff warning even when the displayed text is also truncated.
 - `ast_search` and `ast_edit` report errors for explicitly selected files they cannot scan, and distinguish unreadable files from content and size skips in tree coverage (`docs/tools.md`).
 - MCP discovery now gives lean prompts bounded capability hints, uses dependency names from complete Cargo and Python project manifest reads, recognizes distinctive inspection capabilities without a server name, and allows one bounded follow-up after discovery. Eligibility, approval and schema-byte limits remain unchanged (`docs/agent-loop.md`).
@@ -150,20 +228,29 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 
 ## [0.2.1] - 2026-10-26
 
-### Fixed
-
-- Read-only subagents (`scout`, `planner`, `reviewer` and read-only custom agents) are told their limits before their first call instead of discovering them through a refused call: the system prompt marks them read-only and, when `bash` is offered, lists the inspection commands that run without approval and says to use `cwd` instead of `cd`. A refused call now repeats that rule (`docs/subagents.md`).
-- The ambient codebase brief no longer pulls in test, benchmark and fixture sources, files that match a long task prompt by a single outline word, or files that match only by a near-universal path word (`crates`, the project name, `mod.rs`/`tests.rs` file names). Such sources need to be named or, for tests and benchmarks, asked for (`docs/tools.md`).
-- Core-loop reliability: deadlines, cost caps, overflow and compaction failures, guidance-regeneration limits and uncertain-effect refusals now stop a turn with a report instead of failing it; one turn state spans repair and stop-hook rounds; one-shot notes survive discarded requests; a no-reply watchdog and a shared no-progress ledger bound recovery; the last step of a finite budget asks for a report without tools; interrupts keep finished parallel results; timed-out checks count as failed; unverified edits get one reminder then a disclosure when automatic checks are off; ready fallbacks take over after two attempts instead of every retry; a primary that cannot be rebuilt keeps the fallback (`docs/agent-loop.md`).
-
-## [0.2.0] - 2026-10-25
-
 ### Added
 
 - Automatically prevent idle system sleep during active agent turns and delegated workers, releasing each request when its work ends. Uses native macOS/Windows power requests and a Linux logind idle inhibitor without changing saved settings or inhibiting screen locking; unavailable protection is reported rather than failing the turn (`docs/agent-loop.md`).
 - Graphify is a curated MCP server in `/extensions` and `mcp_servers`: `graphify` runs the local `graphify-mcp` stdio server from the `graphifyy[mcp]` PyPI package through `uvx`, in the project root, so it serves that project's `graphify-out/graph.json` with no account or key (`docs/extensibility.md`). Curated servers can now run in the project root instead of receiving it as an argument, and PyPI installs that differ only in extras (`graphifyy[mcp]` and `graphifyy==<version>`) fold into one catalog row.
 - A relative `[mcp.<name>] cwd` now resolves against the project root instead of Dial's process directory, so a user-level entry with `cwd = "."` runs in whichever project Dial opened, including under `-C`.
 - `/graphify [tree|html|callflow]` opens the project's Graphify knowledge graph in the browser. It runs Graphify's own tree, interactive-graph or call-flow exporter on `graphify-out/graph.json` (or `$GRAPHIFY_OUT`) through `uvx` as a background job, and names the build command when no graph exists (`docs/tools.md`).
+
+### Fixed
+
+- Read-only subagents (`scout`, `planner`, `reviewer` and read-only custom agents) are told their limits before their first call instead of discovering them through a refused call: the system prompt marks them read-only and, when `bash` is offered, lists the inspection commands that run without approval and says to use `cwd` instead of `cd`. A refused call now repeats that rule (`docs/subagents.md`).
+- The ambient codebase brief no longer pulls in test, benchmark and fixture sources, files that match a long task prompt by a single outline word, or files that match only by a near-universal path word (`crates`, the project name, `mod.rs`/`tests.rs` file names). Such sources need to be named or, for tests and benchmarks, asked for (`docs/tools.md`).
+- Core-loop reliability: deadlines, cost caps, overflow and compaction failures, guidance-regeneration limits and uncertain-effect refusals now stop a turn with a report instead of failing it; one turn state spans repair and stop-hook rounds; one-shot notes survive discarded requests; a no-reply watchdog and a shared no-progress ledger bound recovery; the last step of a finite budget asks for a report without tools; interrupts keep finished parallel results; timed-out checks count as failed; unverified edits get one reminder then a disclosure when automatic checks are off; ready fallbacks take over after two attempts instead of every retry; a primary that cannot be rebuilt keeps the fallback (`docs/agent-loop.md`).
+- Installing a remote MCP server that requires an OAuth sign-in (HTTP 401 with a `WWW-Authenticate: Bearer` challenge, for example Graphify) no longer fails with "health check failed, nothing saved" and a `/mcp login` hint that could not work without a config entry. `/extensions` (install, import and Smithery) and the agent's `mcp_servers install` now save the `[mcp.<name>]` entry and direct the user to `/mcp login <name>`; the agent tool reports `needs_sign_in`. Other failures, including a 401 without an OAuth challenge, a 403 or refused static credentials, still save nothing.
+- Cancelling a request now interrupts a large request body on Windows too, without resending or skipping bytes. Request bodies are sent in bounded non-blocking chunks with a readiness wait between them instead of a socket send timeout, because Windows accepts a send of any size while its buffer has room and leaves the socket state indeterminate when a send timeout expires.
+- Listing desktop displays on macOS no longer fails with "native desktop worker panicked" when AppKit reports no localized name for a screen (headless or virtual displays); the display keeps its model-number name.
+- Closing Dial or reloading MCP servers no longer hangs on macOS when several stdio servers started together. Process-group spawns are serialized, because std on macOS sets close-on-exec on new pipes only after creating them, so a server started concurrently could inherit another server's stderr pipe and keep it from ever closing.
+- Homebrew update checks match the installed keg through the same canonical paths as the ownership check, so a Cellar reached through a symlink is no longer reported as "active binary does not match an installed formula keg".
+- Cross-platform CI: tool tests create workspaces under the canonical temp directory (macOS `/var` is a symlink), the budget-expiry worker test bounds the stop after the budget is spent rather than Python start-up, and the real-terminal smoke expects the current queued-message row, uses `/help text` now that bare `/help` opens the command palette, sends Esc as soon as the pending-switch note renders, and stamps its fixture home so the daily runtime update check (Homebrew queries) does not run beside the session under test.
+
+## [0.2.0] - 2026-10-25
+
+### Added
+
 - Bounded retrieval work: parallel grep reserves read budgets before dispatch, reuses matched source snapshots, and rebuilds capped-page coverage without rerunning content search. Codebase context reuses its current bounded freshness snapshot instead of hashing selected sources twice; missing observations remain unchecked. Added resource-budget, paging, stale-witness and freshness regressions.
 - Completed retrieval and contract follow-up: bounded pre-sort directory admission shared by legacy/index and paged walkers with distinct ignore policies; reproducible offline search and graph-ranking experiments; typed observational policy reasons across foreground, workers, TUI and RPC; schema-backed client contract examples and portable review/pack skills with roundtrip tests. Graph experiments did not justify changing lexical defaults.
 - Retrieval timing reports distinguish first-use workspaces from warm runs. Genuine OS-cold-cache latency remains unmeasured pending an operator-controlled cold-cache environment.
@@ -201,12 +288,7 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 - Contributor and release tooling: `AGENTS.md`, `CONTRIBUTING.md`, `SECURITY.md`, a PR template, `.config/nextest.toml` with `make test-nextest`, `scripts/release.sh`, SHA-pinned CI actions, a docs-only `paths-ignore` for CI, and a `[workspace.lints]` ratchet (`dbg_macro`, `todo`, `unimplemented`, `rc_mutex` denied) inherited by every crate.
 
 ### Fixed
-- Installing a remote MCP server that requires an OAuth sign-in (HTTP 401 with a `WWW-Authenticate: Bearer` challenge, for example Graphify) no longer fails with "health check failed, nothing saved" and a `/mcp login` hint that could not work without a config entry. `/extensions` (install, import and Smithery) and the agent's `mcp_servers install` now save the `[mcp.<name>]` entry and direct the user to `/mcp login <name>`; the agent tool reports `needs_sign_in`. Other failures, including a 401 without an OAuth challenge, a 403 or refused static credentials, still save nothing.
-- Cancelling a request now interrupts a large request body on Windows too, without resending or skipping bytes. Request bodies are sent in bounded non-blocking chunks with a readiness wait between them instead of a socket send timeout, because Windows accepts a send of any size while its buffer has room and leaves the socket state indeterminate when a send timeout expires.
-- Listing desktop displays on macOS no longer fails with "native desktop worker panicked" when AppKit reports no localized name for a screen (headless or virtual displays); the display keeps its model-number name.
-- Closing Dial or reloading MCP servers no longer hangs on macOS when several stdio servers started together. Process-group spawns are serialized, because std on macOS sets close-on-exec on new pipes only after creating them, so a server started concurrently could inherit another server's stderr pipe and keep it from ever closing.
-- Homebrew update checks match the installed keg through the same canonical paths as the ownership check, so a Cellar reached through a symlink is no longer reported as "active binary does not match an installed formula keg".
-- Cross-platform CI: tool tests create workspaces under the canonical temp directory (macOS `/var` is a symlink), the budget-expiry worker test bounds the stop after the budget is spent rather than Python start-up, and the real-terminal smoke expects the current queued-message row, uses `/help text` now that bare `/help` opens the command palette, sends Esc as soon as the pending-switch note renders, and stamps its fixture home so the daily runtime update check (Homebrew queries) does not run beside the session under test.
+- Automatic Python verification executes fresh checks when the installed runtime cannot provide a supported input snapshot; explicit input contracts and stale-snapshot checks remain enforced.
 - Isolated scripted integration projects from enclosing repository instructions when `TMPDIR` is inside a checkout. Aligned compaction and unlimited-step fixtures with current defaults and synthesis contracts, and stripped `dial_execution` bookkeeping from canonical model/training messages without relaxing unknown-field validation.
 - Core-loop correctness and responsiveness: subset verification retains unrelated failed-check obligations; semantic check classification uses complete retained bytes rather than clipped output. Rejected plain finals receive bounded corrective feedback. Worker coordination cancels obsolete inference during admission/streaming, automatic post-edit hints run outside edit settlement, and live-steering receipt waits service aborts and newer input without losing ordered journal entries.
 - Interactive responsiveness and navigation: `/hotkeys` and `/help` open the same panels during turns; provider tests return to the live provider list; saved display preferences apply on closing a busy panel. Compute/model preparation preserves contextual Escape dismissal and supports provider, tool, reasoning, repaint and dictation shortcuts. Screen reset no longer waits for inference, malformed worker commands report usage immediately, and palette mouse actions reject borders and undrawn rows.
@@ -225,6 +307,23 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 - Reset current-turn change and verification evidence before fallible admission, preventing rejected prompts from republishing the preceding turn's provenance.
 - Worker workspace-lock waits observe cancellation; partial batch launch failures preserve started-worker results, and worker persistence errors are visible separately from candidate answers.
 - Benchmark recommendations require outcome-verified successes, report comparisons enforce recorded fixture-source identity, and zero-token transport failures remain visible in offline reliability analysis.
+
+### Changed
+- Terminal UX pass. `dial --help` groups options into task sections (running a prompt, sessions, model, permissions, context, work modes, extensions, protocols), lists everyday commands first and ends with examples and exit codes; subcommand help shows its own options before the grouped global flags. A lone near-miss of a subcommand (`dial sesions`) now exits with a did-you-mean error instead of starting a model turn; `dial -- <word>` and `-p` still send the word. `dial sessions` on a terminal prints a table with a header, relative activity, fitted titles, `~/`-relative projects (`--all`) and the commands that act on an id; piped output is unchanged. `dial doctor` marks ✓ installed and · missing capabilities with the `dial doctor --fix <id>` command (the TUI list keeps `/setup <id>`), a preview ends with the exact `--yes` command, and an unknown id points back to the list. Unmatched or ambiguous `-r`/session ids name the matches and the next command. In the TUI, the steer/queue strip above the composer is indented with a stage glyph, bold label and the quoted message; pinned sessions lead the resume picker as soon as it opens; and work-plan rows show a step's reason or finding before its phase.
+
+## [0.1.22] - 2026-10-23
+
+### Fixed
+- Updated Tokio from 1.53.2 to 1.53.3 and stabilized cancellation, artifact-relocation and background-heartbeat regression fixtures without changing their behavioral contracts.
+
+## [0.1.21] - 2026-10-23
+
+### Fixed
+- Secret-named environment values containing spaces or newlines are redacted as complete literal values; whitespace-only values remain excluded. Updated ctutils from 0.4.3 to 0.4.4.
+
+## [0.1.20] - 2026-10-23
+
+### Fixed
 - Delegation avoids duplicate automatic parent-goal text while preserving explicit assignments and constraints; resumed workers retain developer-role operator instructions. Built-in guidance emphasizes evidence reuse, compact handoffs and shared-check ownership without changing permissions.
 - Reliability audit: reject checkpoint restores whose recorded path now resolves elsewhere; bound MCP progress retention; preserve cancellation in automatic-thinking judgments and foreground compute admission; deliver subprocess stdin EOF before waiting for exit on Windows.
 - Model transports reject incomplete Devin streams, cap expanded Connect gzip responses, refresh endpoint credentials between retries, and keep Codex WebSocket streaming cancellation and idle limits active inside frame reads.
@@ -268,7 +367,6 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 - Devin and Cursor model streams that go silent after their first frame now fail as a retryable stall after the idle limit instead of waiting indefinitely, and a long, steadily streaming reply is no longer cut off by the first-event limit.
 
 ### Changed
-- Terminal UX pass. `dial --help` groups options into task sections (running a prompt, sessions, model, permissions, context, work modes, extensions, protocols), lists everyday commands first and ends with examples and exit codes; subcommand help shows its own options before the grouped global flags. A lone near-miss of a subcommand (`dial sesions`) now exits with a did-you-mean error instead of starting a model turn; `dial -- <word>` and `-p` still send the word. `dial sessions` on a terminal prints a table with a header, relative activity, fitted titles, `~/`-relative projects (`--all`) and the commands that act on an id; piped output is unchanged. `dial doctor` marks ✓ installed and · missing capabilities with the `dial doctor --fix <id>` command (the TUI list keeps `/setup <id>`), a preview ends with the exact `--yes` command, and an unknown id points back to the list. Unmatched or ambiguous `-r`/session ids name the matches and the next command. In the TUI, the steer/queue strip above the composer is indented with a stage glyph, bold label and the quoted message; pinned sessions lead the resume picker as soon as it opens; and work-plan rows show a step's reason or finding before its phase.
 - Isolated-worker startup uses metadata-only preflight before hashing the worker baseline. Worker text journals store bounded-tail deltas, collaboration/RPC history projections consume incremental messages, semantic recall streams exact top-k ranking with bounded memory, and scheduler watch sets share filesystem traversal.
 - Bounded worker-tail journal deltas use schema version 2; current readers retain version-1 compatibility, while older binaries refuse the newer frames instead of silently reconstructing incorrect text. Materialized checkpoints remain version 1.
 - A failed turn saves its cause and error class in the turn summary (`turn_summary.error`, `turn_summary.error_class`), so the failure can still be diagnosed from the session after the transcript is gone. The turn report names the class, for example `Outcome: failed (rate limited)`.
@@ -287,7 +385,7 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 
 ### Changed
 - `/review` splits the diff into chunks of at most 20,000 bytes, runs them as one reviewer batch (concurrent for remote endpoints), merges and dedupes findings, and prints a P0–P3 report with a verdict (`do not ship`, `inconclusive`, `ship with fixes`, `ship`) followed by machine-readable JSON. The output format changed: it is no longer a bare JSON array.
-- Skill guidance is narrower: the system prompt and skill catalog ask for `skill` only on substantial multi-step work, so small or single-file edits no longer get a skill nudge (`SKILL_RULE`, `skills::catalog_block`). On the efficiency suite (gpt-6-astra, 3 reps, HEAD vs HEAD+patch) `skill` calls fell from 6 to 0 and tool calls from 39 to 33, prompt tokens per verified result fell 1.2%, and pass count was unchanged at 12/15 (`continued-session` fails on both: its history is too short to compact).
+- Skill guidance now requests `skill` only on substantial multi-step work, so small or single-file edits no longer get a skill nudge (`SKILL_RULE`, `skills::catalog_block`). This changes model guidance, not a guarantee of fewer calls or better task success.
 - The model settings overlay labels its runtime field "Local runtime" (it covers llama.cpp as well as MLX), and the Intel Mac/Linux setup message says GGUF models run on llama.cpp without the Python MLX runtime.
 
 ## [0.1.18] - 2026-10-22
@@ -311,14 +409,22 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 
 ## [0.1.17] - 2026-10-21
 
+### Fixed
+- Release validation handles inherited session-lease timing in the steering promotion regression. The adjacent tagged source changes otherwise consist of version metadata; the features previously grouped here shipped in 0.1.14–0.1.16.
+
+## [0.1.16] - 2026-10-21
+
+### Fixed
+- Updated TLS certificate verification and bundled roots to `rustls-webpki` 0.103.16 and `webpki-roots` 1.0.10. Native Windows keepalive tests use the getters available on that platform.
+
+## [0.1.15] - 2026-10-21
+
 ### Added
 - Task-driven tool routing selects bounded native and MCP specialists from the request and dependency manifests already read, without requiring server names. Successful MCP discovery exposes relevant same-server consumers. Small MCP servers are no longer loaded wholesale; automatic additions share a six-tool/24 KiB budget and explicit unloads stay suppressed for the turn. Tool search also indexes parameter help and enum choices.
 - Verification causality: unchanged bounded nonbehavioral baseline failures remain disclosed without unrelated automatic repair; explicit runner metadata recognizes missing prerequisites conservatively. Rust compilation targets owning packages, including non-default workspace members, and broadens for shared manifest/lock changes.
 - Revision-checked `working_state` patches and addressable unverified claims; compaction carries exact designated critical state outside summaries. Worker handoffs pack priority fields and expose separate acceptance/blocker envelopes without changing custom-schema JSON results.
 - Opt-in strict declared-requirement settlement and selective bounded independent coach review, using existing approvals and evidence. Neither reviewer claims nor model-recorded state become verification proof.
 - Browser runtime provisioning can be disabled with `browser.allow_install = false` for cache-only execution and isolated integration evaluations.
-- Live local-model request settings in the status bar (`inference` in custom layouts), with deduplicated Model settings notices when controls change and full details in `/policy`. Server-controlled values are explicitly unknown rather than guessed.
-- Busy messages default to agent-selected routing: changes of approach steer the current task, while clearly independent requests start isolated background workers. Explicit after-turn queueing remains available.
 - The `browser` tool's `back`, `forward`, `reload` and `events` actions run in Dial's own Chromium driver. Previously they worked only inside an external Tern pane. `events` returns the tab's console, network, dialog, download and navigation events in `seq` order; pass `after` set to the returned `last_seq` to get only newer events. `evidence` also includes the tab's navigation history.
 - `check` tool: runs the focused checks the completion gate would select for the current changes and records results in the same evidence ledger, so the agent and the gate agree on what passes. Offered by default and on the small/lean local tiers when verification is enabled.
 - Loadable `revert_edit` tool: restores one file to before Dial's last change this turn (or the turn start), refusing files changed outside Dial's journal; the revert is itself checkpointed.
@@ -348,14 +454,28 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 
 ### Fixed
 - Windows startup resolves the user directory from `USERPROFILE` when `HOME` is missing; model discovery uses the same fallback. First-run setup follows panel navigation and connection tests instead of treating them as cancellation, and local-server setup explains rescanning and preserves real connection errors.
-- TLS certificate verification and bundled roots use patched `rustls-webpki` 0.103.16 and `webpki-roots` 1.0.10, addressing RUSTSEC-2026-0382 and RUSTSEC-2026-0381. Native Windows keepalive tests use the getters available on that platform.
 - Remote model requests whose connection died while the model was silent (sleep/wake, a Wi-Fi or VPN switch, an expired NAT mapping) no longer wait out the full 300 s idle limit before retrying: TCP keepalive probes detect the dead path within about a minute. A real header timeout now reads "no response before the silence limit" instead of "timeout: receive response", and retry notices say how long the failed attempt ran.
-- Changing models on the welcome screen updates its model label and the status bar together as soon as the new configuration is adopted, without resetting recent-session navigation.
-- Local models that ship `do_sample: false` now request greedy decoding (temperature zero) instead of falling back to the harness temperature. Explicit sampling overrides retain precedence.
-- Local thinking now defaults to `assistance.local.thinking = "model"`, preserving model/server settings instead of automatically switching thinking by request phase. Phase-based switching remains an explicit opt-in.
 - A llama-server started without `--jinja` that rejects `tools` is now a fatal error naming the fix, instead of being retried as transient.
 - `codebase_memory refresh` drops index entries for deleted files even when a scan stops at a limit.
 - Dial-launched llama-server passes each option and its value as separate arguments; current llama.cpp rejects the `--host=127.0.0.1` form, so the launch failed.
+
+## [0.1.14] - 2026-10-20
+
+### Added
+- Live local-model request settings in the status bar (`inference` in custom layouts), with deduplicated Model settings notices when controls change and full details in `/policy`. Server-controlled values are explicitly unknown rather than guessed.
+- Busy messages default to agent-selected routing: changes of approach steer the current task, while clearly independent requests start isolated background workers. Explicit after-turn queueing remains available.
+- Local lean assistance now defaults on for local routes regardless of context size; `"auto"` retains the small-context heuristic and `false` opts out. Hosted routes and hermetic runs are unchanged.
+- Model settings expose chat-template arguments and MLX server draft-model/KV-cache controls as individual rows, plus Ollama keep-alive settings.
+
+### Changed
+- Active-turn settings commands save immediately and defer agent adoption until turn completion; background command reports can arrive while the turn runs.
+
+### Fixed
+- Changing models on the welcome screen updates its model label and the status bar together as soon as the new configuration is adopted, without resetting recent-session navigation.
+- Local models that ship `do_sample: false` now request greedy decoding (temperature zero) instead of falling back to the harness temperature. Explicit sampling overrides retain precedence.
+- Local thinking now defaults to `assistance.local.thinking = "model"`, preserving model/server settings instead of automatically switching thinking by request phase. Phase-based switching remains an explicit opt-in.
+- First tool failures receive diagnose-first recovery guidance, including uncertain effects, without granting permission to replay them. Edit guidance reuses current returned evidence and asks only for missing source.
+- Hashline edits preflight all unread operation ranges together before staging; only complete current rows shown in the refusal become read witnesses.
 
 ## [0.1.13] - 2026-10-19
 
@@ -371,9 +491,23 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 ## [0.1.12] - 2026-10-19
 
 ### Fixed
+- The lean-tool fallback integration test derives its context limit from the actual full request instead of assuming a platform-specific prompt size, retaining coverage on Linux and macOS.
+
+## [0.1.11] - 2026-10-19
+
+### Added
+- Memory-model selection and richer model browsing: a dedicated Memory group and download shelf assign small instruction models to `memory`; model lists add filtering/sorting and recorded speed, price and usage details.
+- Goal-first action palette, explicit busy-message send intent and a read-only `/todo` work-plan inspector. Empty Enter with queued work defaults to keeping the current turn running rather than stopping it.
+- Structured completion evidence and opt-in requirement contracts distinguish execution outcome from open obligations, current/stale checks and required rendered pixels. Operator-declared checks and visual evidence do not establish complete request correctness (`docs/requirement-verification.md`).
+
+### Changed
+- Automatic improvement guard suites require statistical non-regression evidence; infrastructure exclusions stay distinct from model failures, and unknown measurement costs cannot pass cost/latency admission. Live monitoring records matched-prompt signals instead of rolling back automatically. Default-sized generated guards may be insufficient to establish the default tolerance; these gates do not guarantee improved models (`docs/improvement.md`).
+- Terminal panels gain type-to-filter choices, visible selected rows in short layouts, clearer empty/search states and resize-gated confirmation when approval details cannot fit.
+
+### Fixed
 - Release container builds receive the tagged source revision explicitly, so excluding Git metadata from the Docker context no longer causes release compilation to fail. Containers also embed the release's trusted update public key.
 - The terminal lifecycle regression follows the interactive work-plan inspector, including paging through long blocked-step details and returning to the plan.
-- The lean-tool fallback integration test derives its context limit from the actual full request instead of assuming a platform-specific prompt size, retaining coverage on Linux and macOS.
+- Focused Rust verification derives owning packages and registered targets from manifests, selects target/module checks and discloses coverage gaps; zero-test runs remain unverified (`docs/rust-focused-tests.md`).
 
 ## [0.1.10] - 2026-10-19
 
@@ -432,20 +566,48 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 - The `browser` tool failed with "Chromium is not installed" when `browser.playwright_module` pointed at a Playwright whose own Chromium revision was never downloaded, even though other Chromium builds were installed. It now falls back to the newest complete Playwright build (dial's private runtime, `PLAYWRIGHT_BROWSERS_PATH`, or Playwright's per-user cache such as `~/Library/Caches/ms-playwright`) and then to an installed Chrome, Chromium or Edge. The built-in runtime also uses this fallback when its Chromium download fails, for example offline. When no browser is found, the error gives the exact `node …/cli.js install chromium` command for the configured Playwright.
 - Scouts and other read-only subagents no longer get the `retain` and `learn` tools.
 - Windows: private-file verification accepts files owned by `BUILTIN\Administrators`, which an elevated token creates; the DACL still grants only the current user.
+- Requested synchronization access when opening Windows files and directories for deletion, fixing native deletion failures.
+
+## [0.1.8] - 2026-10-15
+
+### Added
+- `/model defaults` and the model-settings shortcut open shared local/cloud context defaults in global scope.
+- Multi-turn benchmark journeys cover forced compaction and corrected requirements.
+
+### Changed
+- Kept `message` available whenever `task` is offered, avoiding schema changes as workers start and stop.
+- Stateless read-only shell calls can join parallel observation groups; named sessions and background calls remain serial barriers.
+- Enter dispatches the slash command exactly as typed; Tab/Right accepts completion suggestions. Queued-message editing preserves routing and order, and Enter on an empty draft can stop the current turn and send the oldest queued message.
+- Approvals preserve full tool descriptions while transcript summaries remain bounded.
+
+### Fixed
+- A smaller provider-accepted summary budget applies to remaining compaction windows after an overflow, avoiding repeated oversized sibling requests.
+- Repeated-failure stops include the last concrete tool error, and automatic focused checks disclose changed file types they did not cover.
 
 ## [0.1.7] - 2026-10-15
 
-Includes the changes prepared for v0.1.5 and v0.1.6, whose publication was blocked by an outdated integration test and a Windows compile error. The test now verifies that unseen-line errors provide read evidence for a direct retry; sandbox cache setup is correctly limited to non-Windows platforms.
+### Fixed
+- Limited sandbox toolchain-cache setup to non-Windows platforms, fixing Windows compilation.
+
+## [0.1.6] - 2026-10-15
+
+### Fixed
+- Updated the hashline integration regression to verify that an unseen-line refusal supplies read evidence for a direct retry.
+
+## [0.1.5] - 2026-10-15
 
 ### Added
 - The stats ledger records each request's transport and cache-invalidation fingerprint (`transport`, `invalidation`, `common_prompt_bytes`, `prompt_bytes` in `requests`), so a prompt-cache miss can be attributed to a prompt change or to the provider.
 - **Teach this model** (`/settings` → Model → Learning, `improve.teach`): an opt-in switch that lets a local model (MLX, Ollama, LM Studio) learn from your coding sessions. Turns are recorded, and the latest version admitted by the evaluation gate serves the session, LoRA adapter included. Turns are approved without typing scores: committing a turn's exact changes, Alt+Up, or passing behavioral checks counts as good; Alt+Down or `/undo` as bad. Hosted models are never recorded.
+- Checkpoints record and restore journaled file changes under `/add-dir` workspace roots as well as the primary project, refusing restores into detached or redirected roots.
 
 ### Changed
-- Faster releases and CI. Release binaries use thin LTO instead of fat LTO with one codegen unit, which had taken 14-43 minutes per target. Release builds start when the tag is pushed and run alongside CI; publishing still waits for CI to pass on the tagged commit. CI builds and tests with the `ci` profile (no debug info), which lowers memory use and link time on the macOS runners.
+- Release binaries use thin LTO instead of fat LTO with one codegen unit. Release builds start when the tag is pushed and run alongside CI; publishing still waits for CI on the tagged commit. CI builds and tests use the `ci` profile without debug information.
 - On models with very large context windows, the history used for compaction and pruning is now capped at 262,144 tokens by default (`efficiency.history_token_cap`; 0 restores the full window). On a 1M-token window, automatic compaction now starts at about 178k tokens instead of 680k. Windows of 262k tokens or less are unaffected.
 - The bash interceptor (`[bash_interceptor]`) is now wired into the agent's `bash` tool and on by default in a new `hint` mode. A command that only duplicates a dedicated tool (`cat`, `sed -n 'A,Bp'`, `grep`/`rg`, `find -name`, `sed -i`, `echo >`, `nohup`, dev servers) still runs, and its result gains one line naming `read`, `grep`, `glob`, `edit`, `write` or `bg`. Batched compound commands are left alone, because one batched call saves model round trips. `gh run view|list` and `gh pr checks` results that still show an unfinished run get a hint to wait once (`github` op `run_watch`, or `gh run watch` with `bg` `wait`) instead of polling. `mode = "block"` keeps the old refusal behavior. Before this change the setting was accepted but never applied.
 - Interceptor rules: `cat >file` and `cat <<EOF >file` count as writes, not reads; `tail -f` points to `bg`, not `read`; `find` with `-exec`, `-delete`, time, size or permission predicates is no longer flagged; `perl` counts as an in-place edit only when `-i` is one of its leading switches; and the service, background and watch rules name `bg`.
+- Session pickers prioritize pinned sessions and recent activity, hide unpinned empty sessions by default, support word-order-independent search and show prompt/answer previews.
+- Private Dial storage remains excluded from native tools and sandboxed commands even when it sits within a workspace such as the home directory; starting a workspace inside private storage is refused. Sandbox `off` remains an explicit isolation opt-out.
 
 ### Fixed
 - GPT background compaction requests now send an empty tools array instead of null, avoiding HTTP 400 errors from endpoints that require an array.
@@ -454,15 +616,16 @@ Includes the changes prepared for v0.1.5 and v0.1.6, whose publication was block
 - An edit that touched lines no read had shown failed with "read them first", which cost a read call plus a retry. The error now shows those lines and counts them as read, so the same edit can be re-issued directly. Nothing is written until then, and lines whose snapshot is stale still need a fresh read.
 - ChatGPT/Codex sessions lost nearly all prompt caching after an idle gap (a background wait, a long tool, a pause before the next message). The reused websocket had been dropped by the server, its first write failed, and the session was moved to SSE for the rest of the process. SSE requests carried no session affinity headers, so they reached arbitrary servers. Idle sockets are now replaced before use, a dead reused socket is reconnected and the request replayed instead of switching to SSE, and SSE requests send `session_id`/`conversation_id`.
 - `/outcome` and `/undo` feedback had nowhere to go in coding sessions, and `/improve` told you to use them anyway; both now record when Teach this model is on and say how to turn it on otherwise.
+- `/add-dir` expands `~` and attached directories participate in native file access.
 
-## [0.1.4] - 2026-10-14
+## [0.1.4] - 2026-10-15
 
 ### Added
 - Native Cursor provider: `/providers` sign-in, model catalog, usage report and streaming chat with tool-call handoff over Cursor's Connect/protobuf agent protocol, with no Node or Bun runtime. Cursor's protocol is private, so this path is verified against local fake servers only.
 - `semantic` memory backend: per-project and user-level SQLite banks with keyword (FTS5) recall out of the box, hybrid keyword + embedding recall when the `embedding` model role is assigned (Alt+M lists only embedding-capable models for it), automatic fact extraction after substantive turns with the `memory` role (`memory.semantic.auto_retain`), periodic duplicate consolidation (`consolidate_interval_minutes`), a token budget, and `/memory rebuild|history|update|forget`. Saved settings that selected the earlier sidecar memory backend migrate to `semantic`.
 - Skill packages: `/skills install|update|remove|installed|search` and `dial skills …` install skills from Git URLs (`url@ref#path`) or user-configured registries (`skills.registries`), with a lock file recording the resolved commit and integrity, a Skills tab in `/extensions`, and precedence project > user > packages > other tools' skill folders. Install scripts never run.
 - Browser relay: `dial browser-relay install|serve|status` and a bundled Dial Chrome extension let the `browser` tool drive your logged-in Chrome tabs over a token-authenticated loopback relay, with no remote-debugging flag (`browser.relay`, `browser.allow_attach`, `DIAL_BROWSER_RELAY`).
-- Built-in shell: `shell.backend = auto | system | embedded | powershell`. `auto` uses a system bash (Git for Windows bash on Windows), otherwise a built-in bash-compatible shell with common coreutils, so the `bash` tool works without a system bash. About 3.3 MiB of binary; it can be compiled out with the `embedded-shell` feature.
+- Built-in shell: `shell.backend = auto | system | embedded | powershell`. `auto` uses a system bash (Git for Windows bash on Windows), otherwise a built-in bash-compatible shell with common coreutils. The built-in shell can be compiled out with the `embedded-shell` feature.
 - Isolation backends for workers (`isolation.backend`): `auto` picks overlayfs (kernel, then fuse-overlayfs) on Linux, `clonefile` on macOS and ProjFS on Windows, then a git worktree, then a copy, and says in the status line which one ran and why. Overlay hides secret files with pre-created whiteouts; dependency directories stay visible and are never merged back. ProjFS is compile-checked only.
 - `message` tool: the parent and live workers exchange short messages (`to`: a worker id or label, `parent`, or `all`), delivered at the recipient's next step with bounded mailboxes. The Workers panel shows recent traffic; replaces the `task` action `message`.
 - Word completion in the composer: a dim ghost finishes the word you are typing from your past prompts and this project's identifiers and file names; Tab or Right accepts (`ui.word_completion`). Prompts that look like secrets are never learned.
@@ -470,7 +633,7 @@ Includes the changes prepared for v0.1.5 and v0.1.6, whose publication was block
 - `read` opens `.epub` books in reading order, with `[chapter N: title]` markers and a `:chapter=N` selector.
 - Benchmark reports record each failed case's redacted reason (`evidence.agent_error_detail`) and flag runs in which no case reached the model (`invalid_run`); such runs exit non-zero, cannot serve as baselines and are never recommended by machine ranking.
 - Directory reads list directories first, then files, by name, and name ignored/generated directories without expanding them; complete `glob`/`grep` walks report a one-line coverage footer.
-- `memory_update` and `ast_search` are loadable on demand instead of offered on every request (about 2 KB less schema per request).
+- `memory_update` and `ast_search` are loadable on demand instead of offered on every request.
 - Interface pass: brand gradient tokens (`brand.start`, `brand.mid`, `brand.end`; themes without them derive one from their palette); a welcome banner with a gradient wordmark, a readiness card (model, project and branch, approval and sandbox) and numbered starters; a working shimmer and pulsing spinner; outcome marks and timing on every turn's closing rule (`ui.show_turn_stats` now defaults on); reasoning shown by default; rounded frames and `◆ Title` panel titles everywhere; `/help` and the action palette share ten command categories, with Maintenance and Learning folded until `/help all`.
 - Workers panel and live worker card: a roles line that groups roles following the main model, a running/total count, and one row per worker with its task, steps and elapsed time. The transcript view shows a name and model rule and marks successes and failures; internal IDs and raw tool-argument JSON are gone, and a worker with no current tool reads "thinking".
 - Command results read as finished panels: background commands (`/usage`, `/images`, `/update`, `/setup` installs and others) fill one panel in place instead of printing "Started" and each line separately; `/setup` groups installed and missing capabilities in aligned columns; `/computer` and `/session` print labeled rows; `/debug` separates what runs from what Dial lacks; `/policy` and `/experience` say on and off instead of true and false.
@@ -494,7 +657,7 @@ Includes the changes prepared for v0.1.5 and v0.1.6, whose publication was block
 - MLX tool-call grammar covers the gemma4, function_gemma, glm47 and mistral tool formats in addition to JSON `<tool_call>` templates.
 - Opt-in learning from other models' verified work into local LoRA data (`training.learn_from`, `learn_from_all_verified`, `learn_from_max_percent`).
 - `[local_runtime]` MLX speculative decoding (`draft_model`, `num_draft_tokens`) and KV-cache quantization (`kv_bits`, `kv_group_size`, `quantized_kv_start`), per model profile and per benchmark configuration.
-- Automatic escalation to the `stronger` role after repeated failed rounds, under the escalate tool's approval decision (`escalation.auto_after_failed_rounds`, `max_auto_per_turn`).
+- Automatic escalation to the `coach` role (formerly `stronger`) after repeated failed rounds, under the escalate tool's approval decision (`escalation.auto_after_failed_rounds`, `max_auto_per_turn`).
 - `dial models recommend`: RAM-aware fit and context estimates for downloaded MLX models.
 - Portable adapter and steering packs: `dial improve export|import|evaluate`, `dial steering export|import|promote`; imports never activate without local evaluation.
 - Harder gate-only task families and adaptive primary-suite tiers so strong baselines are not at the ceiling.
@@ -523,9 +686,9 @@ Includes the changes prepared for v0.1.5 and v0.1.6, whose publication was block
 - Reasoning text is shown by default (`ui.show_thinking`); Ctrl-T style toggle unchanged.
 - Settings under the Improvement tab and the Laya, Project understanding, Adaptive policy and Decision memory sections are hidden behind "Show advanced"; the harness commands (`/reliability`, `/policy`, `/steering`, `/experience`, `/understanding`, `/laya`, `/improve`, `/outcome`, `/autoresearch`, `/compute`) list after the coding commands.
 - The welcome screen points to `/providers` for a hosted model first; `/setup` is named as the local MLX installer.
-- The default tool offer is the core roster plus the essential integrations when configured (`find`, `lsp`, `bg`, `git`, `web_fetch`, `web_search`, `ast_search`). Every other catalog tool (browser, debug adapters, kernels, archives, MCP servers) is listed in the system prompt with a one-line description, so the model loads it with `tool_load` in one round instead of searching. Offering the whole catalog was measured at 55 schemas and 94 KB per request, 15 of them per-adapter `dap_*` copies. `assistance.compact_tools=true` remains the bounded discovery mode for small local models.
+- The default tool offer is the core roster plus essential integrations when configured (`find`, `lsp`, `bg`, `git`, `web_fetch`, `web_search`, `ast_search`). Other catalog tools are listed with a one-line description and loaded with `tool_load` instead of sending every schema each request. `assistance.compact_tools=true` retains bounded discovery for small local models.
 - Tool results are shown whole up to the per-model limit, now 48 KiB (was 24 KiB, with successful inspections cut to 8 KiB and `efficiency.tool_preview_bytes` 4096 on top). `read` and `grep` pages grew to 48 KiB. `efficiency.tool_preview_bytes` defaults to 0 (no extra cap).
-- The system prompt uses short MUST/NEVER rules about engineering, tools, workflow, verification and delivery, with the harness-mechanics paragraph (tool search, tool loading, artifact paging) removed. About 15% shorter.
+- The system prompt uses short MUST/NEVER rules about engineering, tools, workflow, verification and delivery, removing the separate harness-mechanics paragraph.
 - Per-turn ambient context is opt-in: `codebase.ambient_context` (saved architecture notes and outlines, default off; `codebase_memory` remains callable), `assistance.repair_hints` (verified repair patterns and matching past repairs, default off) and `efficiency.task_packet` (the transient task evidence packet, default off). Laya advice was already opt-in.
 - Harness-initiated verification is opt-in: `verification.automatic_checks` (default off) controls the behavioral baseline before edits, focused checks at `finish` and after the turn, and the automatic repair rounds. `verification.enabled` still records checks the model runs and gates `finish` on failed, unrepaired checks; the prompt requires a smoke run before yielding.
 - History stays byte-stable until compaction: `compaction.supersede_reads` and `compaction.drop_useless` default to off, so older tool results are not rewritten under context pressure.
@@ -546,7 +709,7 @@ Includes the changes prepared for v0.1.5 and v0.1.6, whose publication was block
 - Token-efficiency work (`fe17c89`).
 - Guards and prompts updated (`c339c09`, `f6a7ac1`, `64ced40`).
 - Documentation describes verification, recovery, favorites, and runtime controls (`01a1d0f`).
-- Model roles: `main`, `small`, `coach`, `tester`, `planner`, `memory`, `decision` and `embedding`. Unassigned roles use `main`; `decision` falls back to `memory` first, and `embedding` has no chat fallback. The former `stronger` escalation role is now `coach`. Legacy `[model_roles]` keys migrate automatically on load (legacy `memory` now maps to `memory`, not `small`; the old `escalation.role` setting is removed); `--smol` now sets `small` and `--slow` sets `coach`.
+- Role assignments distinguish chat helpers (`main`, `small`, `judge`, `coach`, `tester`, `planner`, `memory`) from the Laya `decision` checkpoint and the `embedding` model. `judge` falls back to `small`, then main; an unset `decision` uses an installed Laya checkpoint, if available, not a chat-model fallback. Embeddings have no chat fallback, and model-calling memory requires its own explicit assignment. Legacy role keys migrate on load; `stronger` becomes `coach`, `--smol` sets `small` and `--slow` sets `coach`.
 - Model-calling memory (`local` or `sharpshooter`) requires an explicit model role. Missing assignments now leave memory inactive with a setup error instead of preventing startup, so Alt+M → Roles remains reachable. Restart after assigning the roles to activate memory; no backend or chat-model fallback is silently selected.
 - Codex WebSocket write disconnections (including broken pipes on cached sockets) now follow incomplete-stream recovery: the failed attempt is discarded and subsequent retries use SSE, without executing partial tool calls or replaying inline after callbacks.
 - Delegation is on by default: `task` and `skill` are offered without a complexity gate (explicit profile allowlists still win) and survive tool compaction. The system prompt is rebuilt when the offered tools or policy change.
@@ -591,7 +754,7 @@ Includes the changes prepared for v0.1.5 and v0.1.6, whose publication was block
 - Setup and distribution: Hindsight no longer reports ready just because Docker is installed; cancelled or timed-out setup steps stop their whole process group (npm/uv/brew children); `dial update` accepts release archives over ureq's 10 MB body cap and bounds its network requests with timeouts; the release smoke checks, the Homebrew formula checksum updater (each archive now updates its own digest) and both installer version checks match the version token of `dial --version`.
 - Sessions: `dial -c` skips empty sessions; `/new`, `/clear`, `/resume`, `/fork`, `/delete` and `/move` reset plan mode, stop `/loop`, use the live project and model, and swap per-session modes, `/switch` selection and cost; `/delete` and `/move` no longer leave partial state; torn session tails no longer block move/fork/import; the picker and RPC prefix lookups no longer parse every session.
 - Approvals: bash permission rules match through absolute paths, `env`/assignments, wrappers, `sh -c` bodies and git global options; "always allow" never stores a grant broader than the approved command; `/memory clear` requires approval; `post_tool_use` no longer fires for denied calls.
-- Providers and transports: unknown stream events/deltas no longer abort replies; in-stream rate-limit and overload errors retry; Anthropic `end_turn` maps to `stop` and tool errors are sent as errors; `max_output_tokens` truncation returns the partial answer; streamed bodies use the 64 MiB stream cap; Codex websocket falls back to SSE only for unsupported upgrades; OAuth-only providers (Copilot, Cursor, GitLab Duo, Gemini CLI, Antigravity, xAI) are listed and selectable after sign-in; ChatGPT sign-in works off macOS and keeps rotated refresh tokens.
+- Providers and transports: unknown stream events/deltas no longer abort replies; in-stream rate-limit and overload errors retry; Anthropic `end_turn` maps to `stop` and tool errors are sent as errors; `max_output_tokens` truncation returns the partial answer; streamed bodies use the 64 MiB stream cap. Codex unsupported upgrades and interrupted WebSocket streams can select SSE recovery without executing partial calls. OAuth-only providers (Copilot, Cursor, GitLab Duo, Gemini CLI, Antigravity, xAI) are listed and selectable after sign-in; ChatGPT sign-in works off macOS and keeps rotated refresh tokens.
 - Tools: legacy MCP `sse` transport works and server instructions reach the prompt; installed plugins actually run; `session_start`/`session_end` hooks no longer fire on settings rebuilds; LSP `start_on_write`, diagnostics for unopened files and format-on-write work; LSP file renames are checkpointed; mixed-line-ending files keep untouched lines' endings; web pages in legacy and UTF-16 charsets decode correctly; browser `aria`/`audit`/`trace_*` actions and attach-only mode work; `/bg` jobs keep output printed before adoption; `dial commit --dry-run` leaves the index unchanged and `[git] bypass_hooks` applies to `/git` and `dial commit`.
 - Other: `[compaction] supersede_reads`/`drop_useless` take effect; `ui.history_limit` applies live; `dial config set` validates values; scheduled watches fire across `dial schedule run --once`; `dial -p` no longer spawns background workers or blocks on `ask`; the collab web viewer joins rooms; live voice RPC methods work and stopping speech is not an error.
 - Strict tool schemas: optional arguments sent as `null` are treated as absent by every tool (finish, ask, task, todo, edit, kernel/eval, gh, artifact_read and others); `working_state` updates are validated.
@@ -603,10 +766,14 @@ Includes the changes prepared for v0.1.5 and v0.1.6, whose publication was block
 
 ## [0.1.3] - 2026-10-07
 
+Historical source-version milestone: no matching local release tag is available. The date and changes below follow source history, not a verified published archive.
+
 ### Fixed
 - Native calibration respects the opt-out; solve verification fails closed (`38171cb`).
 
 ## [0.1.2] - 2026-10-07
+
+Historical source-version milestone: no matching local release tag is available. The date and changes below follow source history, not a verified published archive.
 
 ### Added
 - Windows installer and release packaging with native runtime checks (`647f3dc`).
@@ -621,12 +788,16 @@ Includes the changes prepared for v0.1.5 and v0.1.6, whose publication was block
 
 ## [0.1.1] - 2026-10-07
 
+Historical source-version milestone: no matching local release tag is available. The date and changes below follow source history, not a verified published archive.
+
 ### Fixed
 - Intel Homebrew command lookup (`4afa9af`).
 - Reset sockets recognized in the cancellation closure test (`d94df84`).
 - Release installer filename corrected in the usage example (`f01f616`).
 
 ## [0.1.0] - 2026-10-07
+
+Historical source-version milestone: no matching local release tag is available. This groups initial development through October 7, including October 5 commits; it is not evidence of a published archive.
 
 ### Added
 - Steering, adaptive scheduling, git and syntax tools, and compute controls (`198734a`).
@@ -637,3 +808,35 @@ Includes the changes prepared for v0.1.5 and v0.1.6, whose publication was block
 ### Changed
 - Live steering prioritized and repeated agent work guarded (`ac4fb95`).
 - Clippy autofixes applied (`21c514c`).
+
+[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.2.6...HEAD
+[0.2.6]: https://github.com/KiidxAtlas/dial/tree/v0.2.6
+[0.2.5]: https://github.com/KiidxAtlas/dial/tree/v0.2.5
+[0.2.4]: https://github.com/KiidxAtlas/dial/tree/v0.2.4
+[0.2.3]: https://github.com/KiidxAtlas/dial/tree/v0.2.3
+[0.2.2]: https://github.com/KiidxAtlas/dial/tree/v0.2.2
+[0.2.1]: https://github.com/KiidxAtlas/dial/tree/v0.2.1
+[0.2.0]: https://github.com/KiidxAtlas/dial/tree/v0.2.0
+[0.1.22]: https://github.com/KiidxAtlas/dial/tree/v0.1.22
+[0.1.21]: https://github.com/KiidxAtlas/dial/tree/v0.1.21
+[0.1.20]: https://github.com/KiidxAtlas/dial/tree/v0.1.20
+[0.1.19]: https://github.com/KiidxAtlas/dial/tree/v0.1.19
+[0.1.18]: https://github.com/KiidxAtlas/dial/tree/v0.1.18
+[0.1.17]: https://github.com/KiidxAtlas/dial/tree/v0.1.17
+[0.1.16]: https://github.com/KiidxAtlas/dial/tree/v0.1.16
+[0.1.15]: https://github.com/KiidxAtlas/dial/tree/v0.1.15
+[0.1.14]: https://github.com/KiidxAtlas/dial/tree/v0.1.14
+[0.1.13]: https://github.com/KiidxAtlas/dial/tree/v0.1.13
+[0.1.12]: https://github.com/KiidxAtlas/dial/tree/v0.1.12
+[0.1.11]: https://github.com/KiidxAtlas/dial/tree/v0.1.11
+[0.1.10]: https://github.com/KiidxAtlas/dial/tree/v0.1.10
+[0.1.9]: https://github.com/KiidxAtlas/dial/tree/v0.1.9
+[0.1.8]: https://github.com/KiidxAtlas/dial/tree/v0.1.8
+[0.1.7]: https://github.com/KiidxAtlas/dial/tree/v0.1.7
+[0.1.6]: https://github.com/KiidxAtlas/dial/tree/v0.1.6
+[0.1.5]: https://github.com/KiidxAtlas/dial/tree/v0.1.5
+[0.1.4]: https://github.com/KiidxAtlas/dial/tree/v0.1.4
+[0.1.3]: https://github.com/KiidxAtlas/dial/commit/38171cb
+[0.1.2]: https://github.com/KiidxAtlas/dial/commit/647f3dc
+[0.1.1]: https://github.com/KiidxAtlas/dial/commit/4afa9af
+[0.1.0]: https://github.com/KiidxAtlas/dial/commit/198734a

@@ -20,6 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod application_monitoring;
 #[cfg(target_os = "macos")]
 mod idle_sleep;
 mod length_recovery;

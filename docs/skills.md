@@ -59,11 +59,13 @@ not a new parser requirement; compatible third-party skills are not rejected for
 5. **Report:** useful output, evidence, uncertainty and stop criteria. Do not require a particular
    persona, invented client history, fabricated scores or a structured API that does not exist.
 
-Keep catalog descriptions specific. Keep bodies short enough to read in one load; put genuinely
-optional references, scripts and templates in bundled files. Read those only when needed. Review
-scripts before execution; a bundle is data, not authorization. Reuse the tool's actual schema and
-project checks instead of copying them into every skill. Do not store secrets, private payloads,
-bidi/zero-width controls or session progress in reusable procedures.
+Keep catalog descriptions specific. Use a complete, author-maintained compact core entrypoint
+with mandatory safeguards and a clear index saying which task-specific chapters to load through
+`skill`'s `file` parameter. Large handbooks belong in bundled references, not every initial load.
+Dial never automatically summarizes policy or silently drops instructions. Read scripts before
+execution; a bundle is data, not authorization. Reuse the tool's actual schema and project checks
+instead of copying them into every skill. Do not store secrets, private payloads, bidi/zero-width
+controls or session progress in reusable procedures.
 
 ### Complete example
 
@@ -113,9 +115,10 @@ working skills merely to make an import succeed. Import metadata records provena
 quality. Locally edited imports intentionally retain their original hashes, so later updates detect
 and protect those changes.
 
-Bodies returned by `skill` are capped at 64 KiB; oversized externally supplied bodies report
-truncation at a UTF-8 boundary. A full root `SKILL.md` can use another 16 KiB for metadata (which must
-fit in discovery's first 16 KiB), so a body created at the supported limit remains loadable and
+Bodies returned by `skill` are capped at 64 KiB; oversized or invalid instruction bodies are refused
+rather than returned as partial policy. Split them into a complete compact entrypoint and bundled
+references. A full root `SKILL.md` can use another 16 KiB for metadata (which must fit in discovery's
+first 16 KiB), so a body created at the supported limit remains loadable and
 importable. Bundled-file reads, including explicit `file: "SKILL.md"` reads, remain limited to
 64 KiB. Local imports allow 200 files, 8 MiB per skill and five nested directories; package-copy
 limits differ as documented in [extensibility](extensibility.md#context-and-skills). These are ceilings,

@@ -31,6 +31,7 @@ macro_rules! notebook_edit_description {($description:literal)=>{concat!($descri
 pub mod code;
 pub mod edit;
 pub mod exec;
+pub mod file_handles;
 pub mod fs;
 pub mod integrations;
 pub mod knowledge;
@@ -180,6 +181,7 @@ pub struct Workspace {
     observer: ObserverSlot,
     /// Session snapshots / seen lines / registers for hashline; shared by clones.
     edits: Arc<Mutex<edit::hashline::EditStore>>,
+    file_handles: Arc<Mutex<file_handles::Registry>>,
     /// `ast_edit` dry-run previews awaiting an `apply_token`; shared by clones.
     staged_rewrites: Arc<edit::ast::StagedPreviews>,
     artifacts: Option<artifact::ArtifactStore>,
@@ -234,6 +236,7 @@ impl Workspace {
             native_edits: Arc::default(),
             observer: ObserverSlot::default(),
             edits: Arc::default(),
+            file_handles: Arc::default(),
             staged_rewrites: Arc::default(),
             artifacts: None,
             cargo_session: None,
@@ -574,6 +577,12 @@ impl Workspace {
         let fresh = Workspace::new(root)?;
         let mut next = self.clone();
         next.root = fresh.root;
+        next.file_handles = Arc::new(Mutex::new(
+            self.file_handles
+                .lock()
+                .expect("file handle registry poisoned")
+                .retired(),
+        ));
         next.additional_roots.clear();
         next.sensitive_roots.clear();
         Ok(next)
@@ -792,6 +801,14 @@ impl Workspace {
     /// primary root; absolute paths must fall under some root. The target need not
     /// exist; existing components are resolved through symlinks and re-checked.
     pub fn resolve(&self, input: &str) -> Result<PathBuf, String> {
+        let expanded = self.expand_file_handle(input)?;
+        if file_handles::is_handle_with_selector(input) {
+            return Err("read selectors are not accepted by path resolution".into());
+        }
+        self.resolve_literal(&expanded)
+    }
+
+    fn resolve_literal(&self, input: &str) -> Result<PathBuf, String> {
         if input.contains('\0') {
             return Err("path contains a NUL byte".to_string());
         }
@@ -801,7 +818,7 @@ impl Workspace {
         if !path.is_absolute() {
             let absolute = Self::canonical_prefix(&self.root.join(path));
             if self.sensitive_access(&absolute) {
-                return self.resolve(&absolute.to_string_lossy());
+                return self.resolve_literal(&absolute.to_string_lossy());
             }
         }
         let (root, relative): (&Path, PathBuf) = if path.is_absolute() {
@@ -1184,11 +1201,36 @@ pub fn read_tool_streaming(
     cancel: &std::sync::atomic::AtomicBool,
     budget: usize,
 ) -> ToolOutput {
+    read_streaming(ws, args, cancel, budget, None)
+}
+
+/// Whether a legacy media target requires explicit external-process approval.
+pub fn media_read_needs_approval(path: &str) -> bool {
+    fs::media::needs_approval(path)
+}
+
+/// Controller-owned read entry point; external media processes require explicit authorization.
+pub fn read_with_context(
+    context: &integrations::ext::ToolContext<'_>,
+    args: &Value,
+    cancel: &std::sync::atomic::AtomicBool,
+    budget: usize,
+) -> ToolOutput {
+    read_streaming(context.workspace, args, cancel, budget, Some(context))
+}
+
+fn read_streaming(
+    ws: &Workspace,
+    args: &Value,
+    cancel: &std::sync::atomic::AtomicBool,
+    budget: usize,
+    context: Option<&integrations::ext::ToolContext<'_>>,
+) -> ToolOutput {
     if !args.is_object() {
         return ToolOutput::err("tool arguments must be a JSON object");
     }
     exec::execution::run(cancel, || {
-        if let Some(result) = fs::media::read(ws, args, cancel) {
+        if let Some(result) = fs::media::read(ws, args, cancel, context) {
             return result.unwrap_or_else(ToolOutput::err);
         }
         match fs::files::read_tool_streaming(ws, args, cancel, budget) {
@@ -1394,13 +1436,15 @@ fn edit_for_workspace(
         preview_no_change: None,
         refuse_syntax_errors,
     };
-    let result = if workspace.edit_mode == EditMode::Hashline {
-        edit::hashline::input_arg(args)
-            .and_then(|input| edit::hashline::edit_with(workspace, input, true, &execution))
-    } else {
-        edit::editing::prepare(workspace, args)
-            .and_then(|changes| edit::editing::finish_with(workspace, changes, true, &execution))
-    };
+    if workspace.edit_mode == EditMode::Hashline {
+        return edit::hashline::input_arg(args)
+            .and_then(|input| edit::hashline::edit_output_with(workspace, input, true, &execution))
+            .unwrap_or_else(|error| {
+                ToolOutput::err(fs::suggest::annotate_edit(workspace, args, error))
+            });
+    }
+    let result = edit::editing::prepare(workspace, args)
+        .and_then(|changes| edit::editing::finish_with(workspace, changes, true, &execution));
     match result {
         Ok(text) => ToolOutput::ok(text),
         Err(error) => ToolOutput::err(fs::suggest::annotate_edit(workspace, args, error)),
@@ -1485,13 +1529,13 @@ fn dispatch(
         return Err("tool arguments must be a JSON object".to_string());
     }
     match name {
-        "read" => match fs::media::read(ws, args, &std::sync::atomic::AtomicBool::new(false)) {
+        "read" => match fs::media::read(ws, args, &std::sync::atomic::AtomicBool::new(false), None)
+        {
             Some(result) => result,
             None => fs::files::read_tool(ws, args).map(ToolOutput::ok),
         },
         "write" => fs::files::write_tool(ws, args).map(ToolOutput::ok),
-        "edit" => edit::editing::edit(ws, args)
-            .map(ToolOutput::ok)
+        "edit" => edit::editing::edit_output(ws, args)
             .map_err(|error| fs::suggest::annotate_edit(ws, args, error)),
         "glob" => fs::search::glob_tool(ws, args).map(ToolOutput::ok),
         "grep" => fs::search::grep_tool(ws, args).map(ToolOutput::ok),

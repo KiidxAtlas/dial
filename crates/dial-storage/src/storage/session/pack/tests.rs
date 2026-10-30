@@ -47,6 +47,70 @@ fn session_with_artifact(e: &Env) -> (Session, String) {
     (session, uri)
 }
 
+fn evidence_chain(store: &ArtifactStore) -> (String, Vec<String>) {
+    use sha2::{Digest, Sha256};
+    let mut parents = Vec::new();
+    let mut dependencies = Vec::new();
+    for bytes in [b"parent bytes".as_slice(), b"child bytes".as_slice()] {
+        let evidence = serde_json::from_value(json!({
+            "source":"file:///not-fetched", "location":{"kind":"whole"},
+            "method":"read", "producer":"pack-test", "kind":"observation",
+            "summary":"retained", "representation":{"media_type":"text/plain",
+            "sha256":format!("{:x}", Sha256::digest(bytes))}, "limitations":[],
+            "context":{"parents":parents}
+        }))
+        .unwrap();
+        let citation = store.retain_evidence(&evidence, bytes).unwrap();
+        dependencies.push(store.evidence_record(&citation).unwrap().representation_uri);
+        dependencies.push(citation.clone());
+        parents = vec![citation];
+    }
+    (parents.remove(0), dependencies)
+}
+
+#[test]
+fn manifest_only_journal_packs_and_resumes_transitive_evidence() {
+    let src = env();
+    let mut session = Session::create(&src.layout, SessionMeta { model: "m".into() }).unwrap();
+    let path = session.path().unwrap().to_owned();
+    let store = ArtifactStore::new(&artifact_root(&path).unwrap()).unwrap();
+    let (citation, dependencies) = evidence_chain(&store);
+    session
+        .append(json!({"role":"user", "content":citation}))
+        .unwrap();
+    let archive = src.project.path().join("evidence.zip");
+    assert_eq!(
+        pack_session(&src.layout, &path, &archive)
+            .unwrap()
+            .artifacts,
+        4
+    );
+    let dst = env();
+    let unpacked = unpack_session(&dst.layout, &archive).unwrap();
+    let imported = ArtifactStore::new(&artifact_root(&unpacked.session_path).unwrap()).unwrap();
+    for uri in dependencies {
+        assert_eq!(
+            fs::read(imported.blob_path(&uri).unwrap()).unwrap(),
+            fs::read(store.blob_path(&uri).unwrap()).unwrap()
+        );
+    }
+    assert!(Session::open(&unpacked.session_path).is_ok());
+}
+
+#[test]
+fn missing_transitive_representation_refuses_pack() {
+    let src = env();
+    let mut session = Session::create(&src.layout, SessionMeta { model: "m".into() }).unwrap();
+    let path = session.path().unwrap().to_owned();
+    let store = ArtifactStore::new(&artifact_root(&path).unwrap()).unwrap();
+    let (citation, dependencies) = evidence_chain(&store);
+    fs::remove_file(store.blob_path(&dependencies[0]).unwrap()).unwrap();
+    session
+        .append(json!({"role":"user", "content":citation}))
+        .unwrap();
+    assert!(pack_session(&src.layout, &path, &src.project.path().join("missing.zip")).is_err());
+}
+
 fn write_zip(path: &Path, entries: &[(String, Vec<u8>, Option<u32>)]) {
     let mut zip = zip::ZipWriter::new(File::create(path).unwrap());
     for (name, bytes, mode) in entries {

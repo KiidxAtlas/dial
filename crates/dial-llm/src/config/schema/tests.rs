@@ -7,6 +7,27 @@ fn default_table() -> Table {
 }
 
 #[test]
+fn video_analysis_is_opt_in_and_typed() {
+    for source in [
+        "",
+        "[experimental]\n",
+        "[experimental]\nvideo_analysis = false",
+    ] {
+        let config: Config = toml::from_str(source).unwrap();
+        assert!(!config.experimental.video_analysis);
+    }
+    let config: Config = toml::from_str("[experimental]\nvideo_analysis = true").unwrap();
+    assert!(config.experimental.video_analysis);
+    assert!(toml::from_str::<Config>("[experimental]\nvideo_analysis = 1").is_err());
+    let setting = registry()
+        .iter()
+        .find(|s| s.path == "experimental.video_analysis")
+        .unwrap();
+    assert_eq!(setting.kind, Kind::Bool);
+    assert_eq!(setting.default_value(), Some(Value::Boolean(false)));
+}
+
+#[test]
 fn prefer_subagents_defaults_off_for_new_and_existing_configs() {
     assert!(!Config::default().task.prefer_subagents);
     for source in [
@@ -131,6 +152,7 @@ fn every_path_is_a_real_key_with_the_real_default() {
                     | "snowflake_account"
                     | "cloudflare_account_id"
                     | "cloudflare_gateway_id"
+                    | "image.api"
                     | "image.api_key_env"
             );
             let unset = default == Value::String(String::new())

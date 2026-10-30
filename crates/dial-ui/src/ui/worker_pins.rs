@@ -141,6 +141,11 @@ impl WorkerBoard {
         &self.snapshot.agents
     }
 
+    /// Recent worker activity as of the last refresh, oldest first.
+    pub fn activity(&self) -> &[super::subagent_model::ActivityEvent] {
+        &self.snapshot.activity
+    }
+
     /// A board showing `snapshot` without touching disk, for renderer tests.
     #[cfg(test)]
     pub fn from_snapshot(snapshot: HubSnapshot) -> Self {

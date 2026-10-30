@@ -31,6 +31,9 @@ use std::time::{Duration, Instant};
 pub(in crate::app) mod busy;
 mod checkpoint_review;
 pub(in crate::app) mod command;
+pub(in crate::app) mod extension_keys;
+pub(in crate::app) mod extension_settings;
+pub(in crate::app) mod extension_views;
 mod file_discovery;
 pub(in crate::app) mod frame_pacing;
 pub(in crate::app) mod help;
@@ -38,6 +41,7 @@ pub(in crate::app) mod improve;
 pub(in crate::app) mod input;
 pub(in crate::app) mod lifecycle;
 mod live;
+pub(in crate::app) mod live_pane;
 pub(in crate::app) mod notes;
 pub(in crate::app) mod overlays;
 pub(in crate::app) mod paint;
@@ -45,6 +49,7 @@ pub(in crate::app) mod pickers;
 pub(in crate::app) mod plugin_chrome;
 pub(in crate::app) mod plugin_effects;
 pub(in crate::app) mod prompts;
+mod release_notice;
 pub(in crate::app) mod run;
 mod runtime_updates;
 pub(in crate::app) mod sessions;
@@ -72,7 +77,10 @@ pub(super) const PAINT_EVERY: Duration = Duration::from_millis(40);
 pub(super) struct Shell {
     files: file_discovery::Files,
     runtime_updates: runtime_updates::RuntimeUpdates,
+    release_notice: release_notice::ReleaseNotice,
     pub(in crate::app) side: crate::app::side::SideThreadState,
+    /// Publisher and request handler for the `/watch` side pane.
+    pub(in crate::app) live_pane: live_pane::LivePane,
     pub(super) loop_mode: crate::agent::modes::loop_runner::LoopMode,
     pub(super) runtime: crate::runtime::Tree,
     pub(super) pending_result: Option<crate::runtime::Body>,
@@ -83,7 +91,9 @@ pub(super) struct Shell {
     /// The running `/extensions` install, if any.
     pub(crate) extensions_job: Option<crate::app::commands::extensions_browser::InstallJob>,
     pub(super) extension_commands: Vec<(String, String)>,
+    pub(in crate::app) extension_views: extension_views::ExtensionViews,
     /// Set by `/restart`; `run_interactive` relaunches the binary once the terminal is restored.
+    pub(in crate::app) extension_keys: extension_keys::ExtensionKeys,
     pub(super) restart_requested: bool,
     /// A provider retry was already explained in this turn; later attempts update nothing new.
     pub(super) retry_noted: bool,
@@ -111,6 +121,10 @@ pub(super) struct Shell {
     pub(super) tools_expanded: bool,
     /// The live home screen, shown above the composer until the conversation starts.
     pub(super) home: Option<welcome::Home>,
+    /// The transcript's block count when the user first submitted input on the home screen. Output
+    /// added after it (a command's report) ends the home so the report is visible, not hidden in
+    /// scrollback behind the full-height launch screen.
+    pub(super) home_mark: Option<usize>,
     pub(super) started: Instant,
     pub(super) request_phase: agent::RequestPhase,
     last_trajectory: Option<i64>,
@@ -137,6 +151,8 @@ pub(super) struct Shell {
     /// Draft-review consent for this shell only; never persisted or shared with tool approvals.
     accept_all_turn_drafts: bool,
     pub(super) turn_output_tokens: u64,
+    /// Ledger baseline for the `cost` segment while a turn holds the agent; `None` between turns.
+    pub(in crate::app) live_cost: Option<paint::LiveCost>,
     /// The agent's task list as last reported; drawn above the composer while any task is open.
     pub(super) todo: TodoList,
     /// Skills found at the last command refresh, so `/help` and `/skills` work while a turn runs.

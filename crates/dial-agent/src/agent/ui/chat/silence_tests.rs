@@ -294,3 +294,70 @@ fn popup_retry_after_watchdog_uses_http_instead_of_another_silent_upgrade() {
 fn user_cancellation_does_not_retry_or_disable_codex_websocket() {
     codex_watchdog_retry(true);
 }
+
+#[test]
+fn anthropic_signed_thinking_activity_prevents_false_silence_retries() {
+    struct QuietUi;
+    impl Ui for QuietUi {}
+    let events = [
+        json!({"type":"message_start","message":{"usage":{"input_tokens":4,"output_tokens":1}}}),
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"planning","signature":""}}),
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"signed-part-1"}}),
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"signed-part-2"}}),
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"signed-part-3"}}),
+        json!({"type":"content_block_stop","index":0}),
+        json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":"done"}}),
+        json!({"type":"content_block_stop","index":1}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":8}}),
+        json!({"type":"message_stop"}),
+    ];
+    let server = llm::fake::serve(vec![llm::fake::Script::SseSlow {
+        pieces: events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect(),
+        pause: Duration::from_millis(300),
+    }]);
+    let mut backend = Backend::new(
+        ProviderKind::AnthropicEndpoint {
+            base_url: server.url.clone(),
+            model: "claude-opus-5-5".into(),
+            api_key: None,
+        },
+        PathBuf::new(),
+        5,
+    );
+    let request = Chat {
+        messages: vec![json!({"role":"user","content":"finish this task"})],
+        tools: vec![],
+        temperature: 0.0,
+        max_tokens: 64,
+        seed: None,
+    };
+    let recovery = crate::config::types::RequestRecoveryConfig {
+        silence_secs: 1,
+        retry_once: false,
+    };
+    let reply = chat_with_ui(
+        &mut backend,
+        None,
+        &request,
+        ChatOptions {
+            timeout: 5,
+            render_text: false,
+            context_tokens: None,
+            policy: None,
+            recovery: Some(&recovery),
+        },
+        Arc::new(AtomicBool::new(false)),
+        &mut QuietUi,
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(reply.text, "done");
+    assert_eq!(
+        server.requests().len(),
+        1,
+        "active inference must not be replayed"
+    );
+}

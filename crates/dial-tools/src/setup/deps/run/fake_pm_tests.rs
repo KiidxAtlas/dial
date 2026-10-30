@@ -64,3 +64,92 @@ fn cancel_stops_a_running_step() {
     let error = run_step(&step, &AtomicBool::new(true), &mut |_| {}).unwrap_err();
     assert!(error.to_string().contains("cancelled"), "{error}");
 }
+
+#[test]
+fn language_server_install_uses_and_rediscovers_standard_manager_bins() {
+    for (id, manager, query, install_args, suffix) in [
+        (
+            "pyright-langserver",
+            "npm",
+            "prefix --global",
+            "install --global --no-audit --no-fund pyright",
+            "bin",
+        ),
+        (
+            "pylsp",
+            "uv",
+            "tool dir --bin",
+            "tool install python-lsp-server",
+            "",
+        ),
+        (
+            "gopls",
+            "go",
+            "env GOBIN",
+            "install golang.org/x/tools/gopls@latest",
+            "",
+        ),
+        (
+            "gopls",
+            "go",
+            "env GOPATH",
+            "install golang.org/x/tools/gopls@latest",
+            "bin",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = fake_tools(tmp.path(), &[manager]);
+        let destination = tmp.path().join("standard location");
+        let bin = destination.join(suffix);
+        let target = recipe(id).unwrap();
+        let script = format!(
+            "#!/bin/sh\nset -eu\ncase \"$*\" in\n'{query}') printf '%s\\n' '{}' ;;\n'env GOBIN') printf '\\n' ;;\n'{install_args}') /bin/mkdir -p '{}'; printf '#!/bin/sh\\necho 1.0.0\\n' > '{}'; /bin/chmod +x '{}' ;;\n*) echo unexpected-arguments >&2; exit 1 ;;\nesac\n",
+            destination.display(),
+            bin.display(),
+            bin.join(id).display(),
+            bin.join(id).display()
+        );
+        let executable = env.path[0].join(manager);
+        std::fs::write(&executable, script).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            standard_location(target, &env).unwrap(),
+            None,
+            "{manager}: {query}"
+        );
+        let location =
+            install_with_requirements(id, &env, &AtomicBool::new(false), &mut |_| {}).unwrap();
+        assert_eq!(location, bin.join(id), "{manager}: {query}");
+        assert_eq!(
+            standard_location(target, &env).unwrap(),
+            Some(location),
+            "{manager}: {query}"
+        );
+        assert!(
+            !env.user_dir.exists(),
+            "no Dial installation directory for {id}"
+        );
+    }
+}
+
+#[test]
+fn standard_manager_discovery_rejects_relative_destination_and_query_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = fake_tools(tmp.path(), &["uv"]);
+    let uv = env.path[0].join("uv");
+    for (script, message) in [
+        (
+            "#!/bin/sh\necho relative/bin\n",
+            "non-absolute bin directory",
+        ),
+        (
+            "#!/bin/sh\necho broken-manager >&2\nexit 1\n",
+            "broken-manager",
+        ),
+    ] {
+        std::fs::write(&uv, script).unwrap();
+        let error = standard_location(recipe("pylsp").unwrap(), &env).unwrap_err();
+        assert!(error.to_string().contains(message), "{error:#}");
+    }
+    assert!(!env.user_dir.exists());
+}

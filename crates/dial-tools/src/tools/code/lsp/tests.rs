@@ -708,6 +708,44 @@ fn approval_is_needed_only_to_start_a_server() {
 }
 
 #[test]
+fn discovered_bin_is_used_for_start_reload_and_fork() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::new(dir.path()).unwrap();
+    let bins = tempfile::tempdir().unwrap();
+    let program = "dial-test-standard-lsp";
+    let executable = bins.path().join(program);
+    std::fs::write(&executable, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut config = fake_config(false);
+    config.servers.get_mut("fake").unwrap().program = program.into();
+    let logs = Arc::default();
+    let tool = owner_tool(&config, &logs);
+    // Model a bin discovered by the authorized package-manager query without mutating PATH.
+    tool.discovered_bins
+        .lock()
+        .unwrap()
+        .push(bins.path().to_owned());
+    std::fs::write(ws.root().join("a.fk"), "x\n").unwrap();
+    for action in ["hover", "reload", "hover"] {
+        let output = run_as(
+            &*tool,
+            &ws,
+            json!({"action": action, "path": "a.fk", "line": 1, "column": 1}),
+        );
+        assert!(!output.is_error, "{action}: {}", output.text);
+    }
+    let child = tool.fork_session().unwrap();
+    let child_ws = Workspace::new(dir.path()).unwrap();
+    let output = run_as(
+        &*child,
+        &child_ws,
+        json!({"action": "hover", "path": "a.fk", "line": 1, "column": 1}),
+    );
+    assert!(!output.is_error, "{}", output.text);
+}
+
+#[test]
 fn servers_start_lazily_once_and_restart_after_dying() {
     let h = Harness::new();
     h.write("a.fk", "x\n");

@@ -60,6 +60,27 @@ fn model_change_updates_status_and_home_without_resetting_navigation() {
 }
 
 #[test]
+fn a_command_report_on_the_home_screen_ends_the_home_so_it_is_visible() {
+    let (_home, _project, _app, mut shell) = super::super::testkit::shell();
+    shell.home = Some(Home::new(WelcomeInfo::default(), Vec::new(), false));
+    // Background notices at launch keep the home: the user has not asked for anything yet.
+    shell.note("Workers", "restored");
+    shell.paint(None).unwrap();
+    assert!(shell.home.is_some());
+
+    // A submitted command that only opens a panel reports nothing, so the home stays.
+    shell.mark_home_input();
+    shell.paint(None).unwrap();
+    assert!(shell.home.is_some());
+
+    // Its report (here `/add-dir`) would land in scrollback behind the full-height home.
+    shell.note("Add dir", "Added /tmp/project.");
+    shell.paint(None).unwrap();
+    assert!(shell.home.is_none(), "the report is shown, not hidden");
+    assert_eq!(shell.home_mark, None);
+}
+
+#[test]
 fn terminal_signals_follow_the_session_state() {
     use crate::ui::status::Phase;
     use crate::ui::term_state::{Activity, Progress};

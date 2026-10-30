@@ -1071,4 +1071,55 @@ fn rpc_initialization_preserves_the_actor_failure_cause() {
     );
 }
 
+#[test]
+fn provider_batch_preparation_is_local_and_submission_requires_consent() {
+    let env = Env::new();
+    let config = std::fs::read(env.home.path().join("config.toml")).unwrap();
+    let plan = json!({"provider":"openai", "model":"offline-fixture", "max_tokens":8,
+        "items":[{"custom_id":"one", "prompt":"Summarize approved fixture text"}]});
+    std::fs::write(env.project.path().join("plan.json"), plan.to_string()).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_dial"))
+            .env("DIAL_HOME", env.home.path())
+            .current_dir(env.project.path())
+            .args(["provider-batch"])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let prepared = run(&["prepare", "plan.json"]);
+    assert!(
+        prepared.status.success(),
+        "{}",
+        String::from_utf8_lossy(&prepared.stderr)
+    );
+    let id = String::from_utf8(prepared.stdout).unwrap();
+    let id = id.trim();
+    let inspect = || {
+        let output = run(&["inspect", id]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let before = inspect();
+    assert_eq!(before["plan"], plan);
+    let refused = run(&["submit", id]);
+    assert!(
+        !refused.status.success(),
+        "paid submission must require explicit consent"
+    );
+    assert_eq!(
+        inspect(),
+        before,
+        "refused submission must not advance the ledger"
+    );
+    assert_eq!(
+        std::fs::read(env.home.path().join("config.toml")).unwrap(),
+        config
+    );
+}
+
 mod rpc_lifecycle;

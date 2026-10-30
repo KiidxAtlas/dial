@@ -159,6 +159,85 @@ fn each_settled_side_result_is_delivered_exactly_once_into_the_conversation() {
 }
 
 #[test]
+fn wait_then_delivery_then_poll_never_repeats_success_failure_or_cancellation_bodies() {
+    with_agent("", |agent| {
+        for outcome in ["answer", "failure", "cancelled"] {
+            let id = match outcome {
+                "answer" => agent
+                    .side_questions
+                    .start(|_| Ok("unique answer body".into())),
+                "failure" => agent
+                    .side_questions
+                    .start(|_| Err("unique failure body".into())),
+                _ => agent.side_questions.start(|cancel| {
+                    while !cancel.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Ok("must not survive cancellation".into())
+                }),
+            }
+            .unwrap();
+            if outcome == "cancelled" {
+                let cancel = agent.side_question(&json!({"action":"cancel","id":id}));
+                assert!(!cancel.is_error);
+                assert!(!cancel.text.contains("must not survive cancellation"));
+            }
+            let expected = if outcome == "answer" {
+                "completed"
+            } else {
+                "failed"
+            };
+            for action in ["wait", "status", "wait"] {
+                let result = agent.side_question(&json!({"action":action,"id":id,"timeout":2}));
+                let data = result.data.unwrap();
+                assert_eq!(data[0]["status"], expected);
+                assert_eq!(data[0]["delivery"], "pending");
+                assert!(data[0].get("answer").is_none());
+                assert!(data[0].get("error").is_none());
+            }
+            assert_eq!(delivered_count(agent, &id), 0);
+            assert!(agent.side_questions.has_undelivered());
+            agent.deliver_worker_results().unwrap();
+            assert_eq!(delivered_count(agent, &id), 1);
+            let original = agent
+                .session
+                .messages()
+                .iter()
+                .find(|message| message["dial_side_result"] == id)
+                .unwrap()
+                .clone();
+            let body = original["content"].as_str().unwrap();
+            assert!(body.contains(match outcome {
+                "answer" => "unique answer body",
+                "failure" => "unique failure body",
+                _ => "side question cancelled",
+            }));
+            assert!(!body.contains("must not survive cancellation"));
+            for action in ["status", "wait", "cancel"] {
+                let result = agent.side_question(&json!({"action":action,"id":id,"timeout":2}));
+                let data = result.data.unwrap();
+                assert_eq!(data[0]["status"], expected);
+                assert_eq!(data[0]["delivery"], "delivered");
+                assert_eq!(data[0]["result_message"]["dial_side_result"], id);
+                assert!(data[0].get("answer").is_none());
+                assert!(data[0].get("error").is_none());
+                agent.deliver_worker_results().unwrap();
+                assert_eq!(delivered_count(agent, &id), 1);
+            }
+            assert_eq!(
+                agent
+                    .session
+                    .messages()
+                    .iter()
+                    .find(|message| message["dial_side_result"] == id)
+                    .unwrap(),
+                &original
+            );
+        }
+    });
+}
+
+#[test]
 fn side_request_is_offered_to_the_parent_but_never_to_children() {
     with_agent("", |agent| {
         assert!(
@@ -201,7 +280,21 @@ fn side_answer_is_built_from_a_tool_free_snapshot_taken_at_start() {
     assert!(!done.is_error, "{}", done.text);
     let data = done.data.unwrap();
     assert_eq!(data[0]["status"], "completed", "{data}");
-    assert_eq!(data[0]["answer"], "snapshot answer");
+    assert_eq!(data[0]["delivery"], "pending");
+    assert!(data[0].get("answer").is_none());
+    agent.deliver_worker_results().unwrap();
+    let delivered = agent
+        .session
+        .messages()
+        .into_iter()
+        .find(|m| m["dial_side_result"] == id)
+        .unwrap();
+    assert!(
+        delivered["content"]
+            .as_str()
+            .unwrap()
+            .contains("snapshot answer")
+    );
 
     let requests = server.requests();
     assert_eq!(requests.len(), 1, "one side request, no extra model calls");
@@ -281,7 +374,15 @@ fn side_question_respects_the_shared_worker_cap_without_sending_a_request() {
     let done = agent.side_question(&json!({"action":"wait","id":id,"timeout":5}));
     let data = done.data.unwrap();
     assert_eq!(data[0]["status"], "failed", "{data}");
-    let error = data[0]["error"].as_str().unwrap_or_default();
+    assert!(data[0].get("error").is_none());
+    agent.deliver_worker_results().unwrap();
+    let delivered = agent
+        .session
+        .messages()
+        .into_iter()
+        .find(|m| m["dial_side_result"] == id)
+        .unwrap();
+    let error = delivered["content"].as_str().unwrap();
     assert!(error.contains("worker request budget exhausted"), "{error}");
     assert!(
         server.requests().is_empty(),

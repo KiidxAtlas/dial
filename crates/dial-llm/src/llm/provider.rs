@@ -1192,6 +1192,14 @@ impl Backend {
             | ProviderKind::AnthropicEndpoint { model, .. } => model,
         }
     }
+    /// Whether prefix warming can use this local route without downloading model files.
+    /// This inspects only the selected route and filesystem; it never starts inference.
+    pub fn local_prefix_available(&self) -> bool {
+        match &self.kind {
+            ProviderKind::Local { model_dir } => Path::new(model_dir).is_dir(),
+            _ => self.local_inference(),
+        }
+    }
 
     /// Stop the local server (if any) to free its memory. A later `chat`
     /// starts a new one.

@@ -54,7 +54,9 @@ impl Shell {
         let mut shell = Shell {
             files: super::file_discovery::Files::new(),
             runtime_updates: Default::default(),
+            release_notice: Default::default(),
             side: Default::default(),
+            live_pane: Default::default(),
             loop_mode: Default::default(),
             runtime: Default::default(),
             pending_result: None,
@@ -63,6 +65,8 @@ impl Shell {
             extensions_pending: None,
             extensions_job: None,
             extension_commands: Vec::new(),
+            extension_views: Default::default(),
+            extension_keys: Default::default(),
             restart_requested: false,
             retry_noted: false,
             smithery_resume: None,
@@ -96,6 +100,7 @@ impl Shell {
             scope: Scope::Global,
             tools_expanded: false,
             home: None,
+            home_mark: None,
             started: Instant::now(),
             request_phase: agent::RequestPhase::Waiting,
             last_trajectory: None,
@@ -120,6 +125,7 @@ impl Shell {
             awaiting_user: false,
             accept_all_turn_drafts: false,
             turn_output_tokens: 0,
+            live_cost: None,
             todo: TodoList::new(),
             skills: Vec::new(),
             deferred: Default::default(),
@@ -181,10 +187,12 @@ impl Shell {
         // Optional update checks never block startup or input, and never run in network-off mode.
         if app.config.sandbox.mode != crate::config::types::SandboxMode::Strict
             && app.config.sandbox.allow_network
-            && let Some(message) = self.runtime_updates.poll(&app.layout.user_dir)
         {
-            self.runtime_updates.retain_report(message);
-            files_changed = true;
+            if let Some(message) = self.runtime_updates.poll(&app.layout.user_dir) {
+                self.runtime_updates.retain_report(message);
+                files_changed = true;
+            }
+            files_changed |= self.release_notice.poll(&app.layout.user_dir);
         }
         self.files.request(&app.layout.project_root);
         if let Some(listing) = self.files.poll() {
@@ -444,6 +452,7 @@ impl Shell {
             };
             let motion = crate::ui::fx::motion(self.ui.motion, self.themes.current());
             self.home = Some(welcome::Home::new(info, sessions, motion));
+            self.home_mark = None;
         }
         super::paint::update_model_status(&mut self.status, &mut self.home, &app.config);
         if resumed {
@@ -476,6 +485,7 @@ impl Shell {
                 .to_string_lossy()
         );
         self.home = None;
+        self.home_mark = None;
         self.refresh_commands(app);
     }
 

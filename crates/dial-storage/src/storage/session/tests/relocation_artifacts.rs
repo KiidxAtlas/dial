@@ -21,6 +21,40 @@ fn feedback(store: &Path, uri: &str, text: &str) {
 }
 
 #[test]
+fn manifest_only_reference_relocates_parent_chain_and_missing_child_refuses_move() {
+    let e = env();
+    let mut session = new_session(&e);
+    let store = ArtifactStore::new(&artifact_root(session.path().unwrap()).unwrap()).unwrap();
+    let mut parents = Vec::new();
+    for bytes in [b"parent".as_slice(), b"child".as_slice()] {
+        let evidence = serde_json::from_value(json!({
+            "source":"file:///not-fetched", "location":{"kind":"whole"},
+            "method":"read", "producer":"move-test", "kind":"observation",
+            "summary":"retained", "representation":{"media_type":"text/plain",
+            "sha256":format!("{:x}", Sha256::digest(bytes))}, "limitations":[],
+            "context":{"parents":parents}
+        }))
+        .unwrap();
+        parents = vec![store.retain_evidence(&evidence, bytes).unwrap()];
+    }
+    let citation = &parents[0];
+    session.append(user(citation)).unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let moved = session.relocate_to(&target(&e, project.path())).unwrap();
+    let destination = ArtifactStore::new(&artifact_root(moved.path().unwrap()).unwrap()).unwrap();
+    let record = destination.evidence_record(citation).unwrap();
+    let parent = destination
+        .evidence_record(&record.evidence.context.parents[0])
+        .unwrap();
+    assert_eq!(destination.evidence_bytes(&parent, 64).unwrap(), b"parent");
+    assert_eq!(destination.evidence_bytes(&record, 64).unwrap(), b"child");
+    fs::remove_file(store.blob_path(&parent.representation_uri).unwrap()).unwrap();
+    let another = tempfile::tempdir().unwrap();
+    assert!(session.relocate_to(&target(&e, another.path())).is_err());
+    assert!(session.path().unwrap().exists());
+}
+
+#[test]
 fn moved_text_artifacts_and_feedback_survive_source_retirement_and_reopen() {
     let e = env();
     let mut session = new_session(&e);

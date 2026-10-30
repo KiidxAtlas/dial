@@ -358,26 +358,6 @@ pub(in crate::agent) fn zero_tests(output: &str) -> bool {
     counts.peek().is_some() && counts.all(|n| n == 0)
 }
 
-/// Only compact retained successful checks; preserve test counts and diagnostics
-/// in the visible tail, and leave empty suites/failures untouched.
-pub(in crate::agent) fn compact_success(output: &str, artifact: &str) -> Option<String> {
-    if output.len() < 4096 || exit_code(output) != Some(0) || zero_tests(output) {
-        return None;
-    }
-    let mut tail = output.len().saturating_sub(2048);
-    while !output.is_char_boundary(tail) {
-        tail += 1;
-    }
-    Some(format!(
-        "[Successful check; {} bytes retained at {artifact}; retrieve with artifact_read]\n{}",
-        output.len(),
-        &output[tail..]
-    ))
-}
-
-#[cfg(test)]
-mod compact_tests;
-
 /// Select a project runner without installing packages or falling back to a different
 /// interpreter when that runner fails. Commands still pass normal shell approval.
 fn python_runner(root: &Path, fallback: &Path) -> String {

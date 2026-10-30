@@ -190,6 +190,10 @@ fn pack_session_with(
         });
     }
 
+    if !refs.is_empty() {
+        ArtifactStore::new(&source_root)?.expand_evidence_references(&mut refs)?;
+    }
+
     let mut uris: Vec<String> = refs.into_iter().collect();
     uris.sort();
     if !uris.is_empty() {

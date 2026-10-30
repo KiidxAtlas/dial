@@ -66,6 +66,7 @@ pub const STATUS_SEGMENTS: &[&str] = &[
     "session",
     "time",
     "workers",
+    "cost",
 ];
 /// Serialized names of `CompactionMethod`, in the default preference order.
 pub const COMPACTION_METHODS: &[&str] = &["remote", "soft", "shake", "snapcompact", "handoff"];

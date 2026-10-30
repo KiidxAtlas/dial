@@ -113,6 +113,19 @@ pub enum ImageGenerationApi {
     Responses,
     /// Chat completions returning inline image data URLs (for example OpenRouter).
     ChatCompletions,
+    /// Google Gemini native `generateContent` with image output (Google provider).
+    Gemini,
+    /// Google Imagen `:predict` (legacy; no bundled model row, see docs/provider-catalog.md).
+    Imagen,
+    /// Black Forest Labs native API (`https://api.bfl.ai/v1`, async polling).
+    BlackForestLabs,
+    /// ComfyUI `/prompt` workflow graph supplied inline in the image model settings.
+    #[serde(rename = "comfyui")]
+    ComfyUi,
+    /// fal queue API (`https://queue.fal.run`).
+    Fal,
+    /// Replicate predictions API (`https://api.replicate.com/v1`).
+    Replicate,
 }
 
 /// Structured-output mechanism an endpoint enforces. Never inferred from model names.

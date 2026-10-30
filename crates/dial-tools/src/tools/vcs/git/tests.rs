@@ -320,3 +320,116 @@ fn jj_file_escapes_as_a_jj_string_literal() {
     );
     assert_eq!(jj_file("a\tb\n\u{1b}\u{1}"), r#"file:"a\tb\n\e\x01""#);
 }
+
+#[test]
+fn large_status_reports_counts_samples_and_retains_every_path() {
+    let (dir, ws) = repo();
+    let state = tempfile::tempdir().unwrap();
+    let ws = ws.with_artifacts(crate::storage::artifact::ArtifactStore::new(state.path()).unwrap());
+    std::fs::write(dir.path().join("a.txt"), "changed\n").unwrap();
+    std::fs::create_dir(dir.path().join("new")).unwrap();
+    for i in 0..120 {
+        std::fs::write(dir.path().join(format!("new/{i:03}.txt")), "new\n").unwrap();
+    }
+    let output = call(&ws, json!({"action":"status"}));
+    assert!(!output.is_error, "{}", output.text);
+    assert!(
+        output.text.contains("Status: 121 entries"),
+        "{}",
+        output.text
+    );
+    assert!(output.text.contains("\" M\"=1"), "{}", output.text);
+    assert!(output.text.contains("\"??\"=120"), "{}", output.text);
+    assert!(output.text.contains("Sample paths (first 20)"));
+    assert!(!output.text.contains("new/119.txt"));
+    assert!(output.text.len() < 4096);
+    let uris = crate::storage::artifact::uris(&output.text);
+    assert_eq!(uris.len(), 1);
+    let retained = ws.artifacts().unwrap().retrieve(uris[0], 1, 500).unwrap();
+    assert!(retained.contains("new/119.txt"), "{retained}");
+    for i in 0..120 {
+        assert!(
+            retained.contains(&format!("?? new/{i:03}.txt")),
+            "missing retained path {i}: {retained}"
+        );
+    }
+    let scoped = call(&ws, json!({"action":"status", "path":"new/119.txt"}));
+    assert!(!scoped.is_error, "{}", scoped.text);
+    assert!(scoped.text.contains("?? new/119.txt"));
+    assert!(!scoped.text.contains("a.txt"));
+    assert!(!scoped.text.contains("new/000.txt"));
+    assert!(call(&ws, json!({"action":"status", "path":"../outside"})).is_error);
+}
+
+#[test]
+fn status_without_artifacts_keeps_complete_evidence_inline() {
+    let (_dir, ws) = repo();
+    let text = format!(
+        "## main\n{}",
+        (0..500)
+            .map(|i| format!("?? path-{i:03}.txt\n"))
+            .collect::<String>()
+    );
+    let output = status_output(&ws, &text);
+    assert!(output.contains(&text));
+    assert!(output.contains("no artifact store"));
+    assert!(output.contains("complete status returned inline"));
+    assert!(!output.contains("Sample only"));
+}
+
+#[test]
+fn status_sample_bounds_individual_paths_without_splitting_utf8() {
+    let (_dir, ws) = repo();
+    let state = tempfile::tempdir().unwrap();
+    let ws = ws.with_artifacts(crate::storage::artifact::ArtifactStore::new(state.path()).unwrap());
+    let text = format!("## main\n?? {}\n", "界".repeat(5000));
+    let output = status_output(&ws, &text);
+    assert!(output.contains("Status: 1 entries"));
+    assert!(output.contains("[path shortened]"));
+    assert!(!output.contains('\u{fffd}'));
+    assert!(output.len() < 2048);
+}
+
+#[test]
+fn failed_status_retention_keeps_complete_evidence_inline() {
+    let (_dir, ws) = repo();
+    let state = tempfile::tempdir().unwrap();
+    let root = state.path().join("artifacts");
+    let store = crate::storage::artifact::ArtifactStore::new(&root).unwrap();
+    std::fs::remove_dir(&root).unwrap();
+    std::fs::write(&root, "blocked").unwrap();
+    let ws = ws.with_artifacts(store);
+    let text = format!(
+        "## main\n{}",
+        (0..500)
+            .map(|i| format!("?? path-{i:03}.txt\n"))
+            .collect::<String>()
+    );
+    let output = status_output(&ws, &text);
+    assert!(output.contains(&text));
+    assert!(output.contains("could not be retained"));
+    assert!(!output.contains("Sample only"));
+}
+
+#[test]
+fn capped_status_artifact_keeps_complete_evidence_inline() {
+    let (_dir, ws) = repo();
+    let state = tempfile::tempdir().unwrap();
+    let store = crate::storage::artifact::ArtifactStore::new(state.path())
+        .unwrap()
+        .with_limits(&crate::storage::artifact::ArtifactConfig {
+            max_bytes: 1024,
+            head_bytes: 512,
+        });
+    let ws = ws.with_artifacts(store);
+    let text = format!(
+        "## main\n{}",
+        (0..500)
+            .map(|i| format!("?? path-{i:03}.txt\n"))
+            .collect::<String>()
+    );
+    let output = status_output(&ws, &text);
+    assert!(output.contains(&text));
+    assert!(output.contains("artifact retention was incomplete"));
+    assert!(!output.contains("Sample only"));
+}

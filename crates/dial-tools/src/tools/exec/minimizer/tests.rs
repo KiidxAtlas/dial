@@ -75,13 +75,8 @@ fn only_a_single_simple_command_is_filtered() {
         "cargo",
         "cargo --version",
     ] {
-        // `cargo run` is a cargo command, but its program output is the program's own.
-        let out = minimize(command, &text);
-        if command == "cargo run -- --verbose" {
-            assert!(out.is_some());
-        } else {
-            assert!(out.is_none(), "{command}");
-        }
+        // Executed applications have arbitrary stdout, even if it resembles Cargo progress.
+        assert!(minimize(command, &text).is_none(), "{command}");
     }
     for command in [
         "cargo build",
@@ -217,4 +212,53 @@ fn filtering_never_removes_a_diagnostic_line() {
     }
     let out = minimize("cargo test", &text).unwrap();
     assert_eq!(diagnostic_lines(&out.text), diagnostic_lines(&text));
+}
+
+#[test]
+fn clippy_checking_progress_drops_but_failure_diagnostic_and_status_stay() {
+    let mut text =
+        big((0..80).map(|i| format!("    Checking dependency{i} v0.1.{i} (/workspace/crate{i})")));
+    text.push_str("error: this expression creates a reference which is immediately dereferenced\n --> src/lib.rs:4:5\n  |\n4 |     &value\n  |     ^^^^^^ help: change this to: `value`\n  = note: `-D clippy::needless-borrow` implied by `-D warnings`\nerror: could not compile `app` (lib) due to 1 previous error\n");
+    let out = minimize("cargo clippy --workspace -- -D warnings", &text).unwrap();
+    assert!(!out.text.contains("Checking dependency"));
+    assert_eq!(out.text, &text[text.find("error:").unwrap()..]);
+}
+
+#[test]
+fn homogeneous_cargo_sequences_compact_without_losing_summary_or_coverage() {
+    let mut text = big((0..60).map(|i| format!("    Checking dependency{i} v1.0.0")));
+    text.push_str(&big(
+        (0..80).map(|i| format!("test module::case_{i} ... ok"))
+    ));
+    text.push_str("warning: keep this warning\n    Finished `test` profile in 1s\nrunning 80 tests\ntest result: ok. 80 passed; 0 failed; 2 ignored; 3 filtered out\n");
+    for command in [
+        "cargo fmt --check && cargo check && cargo test",
+        "cd workspace && cargo check; cargo test",
+        "cargo check\ncargo test",
+    ] {
+        let out = minimize(command, &text).expect(command);
+        assert_eq!(out.filter, "cargo");
+        assert!(!out.text.contains("Checking dependency"), "{command}");
+        assert!(out.text.contains("[80 passing lines omitted"));
+        for kept in [
+            "warning: keep",
+            "Finished",
+            "running 80 tests",
+            "80 passed; 0 failed; 2 ignored; 3 filtered out",
+        ] {
+            assert!(out.text.contains(kept), "{command}: {kept}");
+        }
+    }
+    for command in [
+        "cargo check && cat output.txt",
+        "cargo check && cargo run",
+        "cargo check && cargo bench",
+        "cargo check | cargo test",
+        "cargo check & cargo test",
+        "(cargo check; cargo test)",
+        "echo 'cargo check && cargo test'",
+        "cargo check && printf 'test example ... ok'",
+    ] {
+        assert!(minimize(command, &text).is_none(), "{command}");
+    }
 }

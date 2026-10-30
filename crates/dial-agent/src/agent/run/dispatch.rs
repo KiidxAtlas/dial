@@ -24,6 +24,33 @@ pub(in crate::agent) fn projected_request(
     })
 }
 
+/// Turn a successful tool's PNG `data.artifact` envelope into a compact image reference, so
+/// every tool that renders pixels (browser, computer, github, derived-media `read`, `visual`,
+/// `video`, `evidence`, ...) reaches a vision model through one rule instead of a name list.
+/// Browser, computer and github results are replaced by the compact pointer object; for every
+/// other tool the description text is the model-facing result and survives capture.
+pub(in crate::agent) fn capture_output_image(
+    workspace: &Workspace,
+    call: &ToolCall,
+    output: &mut ToolOutput,
+) -> Result<Option<Value>> {
+    if output.is_error
+        || !output
+            .data
+            .as_ref()
+            .is_some_and(|data| data["artifact"]["data"].is_string())
+    {
+        return Ok(None);
+    }
+    if matches!(call.name.as_str(), "browser" | "computer" | "github") {
+        return crate::storage::artifact::capture_image(workspace.artifacts(), output);
+    }
+    let text = output.text.clone();
+    let reference = crate::storage::artifact::capture_image(workspace.artifacts(), output)?;
+    output.text = text;
+    Ok(reference)
+}
+
 pub(in crate::agent) fn callback_image(
     workspace: &Workspace,
     call: &ToolCall,
@@ -33,21 +60,8 @@ pub(in crate::agent) fn callback_image(
     if output.is_error {
         return Ok(None);
     }
-    // `github` file_read attaches PNG bytes as `data.artifact`, the same shape browser screenshots use.
-    let reference = if call.name == "browser" || call.name == "computer" || call.name == "github" {
-        crate::storage::artifact::capture_image(workspace.artifacts(), output)?
-    } else if call.name == "read"
-        && output
-            .data
-            .as_ref()
-            .is_some_and(|data| data["artifact"]["data"].is_string())
-    {
-        // Derived media (SVG, HEIC, PDF pages, video) carries PNG pixels; the description text is
-        // the model-facing result and must survive capture.
-        let text = output.text.clone();
-        let reference = crate::storage::artifact::capture_image(workspace.artifacts(), output)?;
-        output.text = text;
-        reference
+    let reference = if let Some(reference) = capture_output_image(workspace, call, output)? {
+        Some(reference)
     } else if call.name == "read"
         && let Some(path) = call.arguments["path"]
             .as_str()
@@ -379,6 +393,16 @@ impl<'a> Agent<'a> {
         call: &ToolCall,
         ui: &mut dyn Ui,
     ) -> std::result::Result<(), crate::agent::safety::approval::Denial> {
+        let once = self
+            .pending_batch_approvals
+            .iter()
+            .position(|(prepared, _)| {
+                prepared.id == call.id
+                    && prepared.name == call.name
+                    && prepared.arguments == call.arguments
+                    && prepared.malformed_arguments == call.malformed_arguments
+            })
+            .map(|index| self.pending_batch_approvals.remove(index).1);
         let local_memory_write = call.name == "learn"
             && self.memory_runtime.as_ref().is_some_and(|memory| {
                 memory.id() == crate::config::memory_backend::MemoryBackendId::Local
@@ -410,6 +434,17 @@ impl<'a> Agent<'a> {
                 crate::agent::safety::approval::PolicyReason::PlanMode,
             );
             Err(crate::agent::safety::approval::Denial::ReadOnly)
+        } else if let Some(allowed) = once {
+            crate::agent::safety::approval::authorize_once(
+                self.approval,
+                &mut self.always,
+                self.workspace.root(),
+                call,
+                ui,
+                self.interrupt.as_ref(),
+                allowed,
+            )
+            .map(|_| ())
         } else if local_memory_write
             || crate::agent::safety::approval::needs_approval(&self.ext, call)
         {
@@ -575,6 +610,14 @@ impl<'a> Agent<'a> {
         call: &ToolCall,
         ui: &mut dyn Ui,
     ) -> ToolOutput {
+        let mut expanded = call.clone();
+        if let Err(error) =
+            crate::agent::window::file_handles::expand(&self.workspace, &mut expanded)
+        {
+            return ToolOutput::err(format!("File reference refused: {error}"))
+                .with_effects(crate::tools::surface::outcome::Effects::None);
+        }
+        let call = &expanded;
         if self
             .ext
             .get(&call.name)
@@ -698,6 +741,15 @@ impl<'a> Agent<'a> {
         approval_denied: &mut bool,
         arguments_changed: bool,
     ) -> ToolOutput {
+        let mut expanded = call.clone();
+        if let Err(error) =
+            crate::agent::window::file_handles::expand(&self.workspace, &mut expanded)
+        {
+            return ToolOutput::err(format!("File reference refused: {error}"))
+                .with_effects(crate::tools::surface::outcome::Effects::None);
+        }
+        let arguments_changed = arguments_changed || expanded.arguments != call.arguments;
+        let call = &expanded;
         let denied = |why: &str| {
             ToolOutput {
                 execution: Default::default(),
@@ -874,8 +926,13 @@ impl<'a> Agent<'a> {
         if name == "edit_preview" {
             return self.preview_tool(args, ui);
         }
-        if name == "find" {
-            match crate::tools::code::navigation::semantic_request(&self.workspace, args) {
+        if matches!(name, "find" | "evidence_search") {
+            match crate::agent::model::roles::retrieval_request(
+                &self.workspace,
+                name,
+                args,
+                &self.interrupt,
+            ) {
                 Ok(Some(request)) => return self.run_semantic_find(backend, args, request, ui),
                 Ok(None) => {}
                 Err(text) => {
@@ -1342,19 +1399,38 @@ impl<'a> Agent<'a> {
         if let Some((_, why)) = call_form_error(&call, &schemas, &names) {
             return ToolOutput::err(format!("invalid code-mode tool call: {why}"));
         }
-        if let Err(reason) = self.intercept_native_effect(gate, &call, ui) {
+        self.execute_callback(backend, ui, &call, &schemas, owner, gate)
+    }
+
+    /// Executes an admitted native callback through the durable evidence and effect boundary.
+    pub(in crate::agent) fn execute_callback(
+        &mut self,
+        backend: &mut Backend,
+        ui: &mut dyn Ui,
+        call: &ToolCall,
+        schemas: &[Value],
+        owner: &str,
+        gate: &mut crate::agent::safety::rules::CallbackGate<'_>,
+    ) -> ToolOutput {
+        if self.interrupt.load(Ordering::SeqCst) {
+            return interrupted_tool();
+        }
+        if let Some(reason) = gate.blocked() {
+            return ToolOutput::err(reason);
+        }
+        if let Err(reason) = self.intercept_native_effect(gate, call, ui) {
             return ToolOutput::err(reason);
         }
         if let Err(error) = self.record(
             self.cur_step,
             "code_tool_call",
-            json!({"parent":owner,"name":call.name,"input":call.arguments,"contract":tools::surface::contracts::identities(&schemas,&self.ext).get(&call.name)}),
+            json!({"parent":owner,"name":call.name,"input":call.arguments,"contract":tools::surface::contracts::identities(schemas,&self.ext).get(&call.name)}),
         ) {
             return ToolOutput::err(format!(
                 "recording code-mode call before execution: {error:#}"
             ));
         }
-        ui.tool_call_with_args(&call.id, &call.name, &summarize(&call), &call.arguments);
+        ui.tool_call_with_args(&call.id, &call.name, &summarize(call), &call.arguments);
         if let Err(error) = self.session.flush_runtime() {
             let output = ToolOutput::err(format!(
                 "journaling code-mode call before execution: {error:#}"
@@ -1363,7 +1439,7 @@ impl<'a> Agent<'a> {
             return output;
         }
         let started = Instant::now();
-        let mut output = self.dispatch(backend, &call, ui);
+        let mut output = self.dispatch(backend, call, ui);
         let supplied = if call.name == "read" {
             call.arguments["path"].as_str().and_then(|path| {
                 llm::images::authorized_user_reference(&self.session.messages(), Path::new(path))
@@ -1371,7 +1447,7 @@ impl<'a> Agent<'a> {
         } else {
             None
         };
-        let image = match callback_image(&self.workspace, &call, &mut output, supplied) {
+        let image = match callback_image(&self.workspace, call, &mut output, supplied) {
             Ok(image) => image,
             Err(error) => {
                 output.is_error = true;
@@ -1397,7 +1473,7 @@ impl<'a> Agent<'a> {
             self.record(
                 self.cur_step,
                 "code_tool_result",
-                json!({"parent":owner,"name":call.name,"is_error":output.is_error,"output":output.text,"data":output.data}),
+                json!({"parent":owner,"name":call.name,"is_error":output.is_error,"output":output.text,"data":output.data,"execution":output.execution}),
             )
         }) {
             output.execution.effects = crate::tools::surface::outcome::Effects::Unknown;

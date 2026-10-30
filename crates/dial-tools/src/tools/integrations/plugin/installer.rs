@@ -1,7 +1,9 @@
 //! Plugin installer. Stages a plugin tree from a git repository, an npm tarball, or a local
 //! directory, verifies its integrity, and atomically moves it into `<root>/<name>/`. Install
 //! metadata (`source`, `integrity`, `version`, `enabled`) is stored in the plugin's
-//! `dial-plugin.json`, next to the optional runtime fields `program`, `args`, and `env`.
+//! `dial-plugin.json`, next to the optional runtime fields `program`, `args`, `env`, and `python`.
+pub(crate) mod python;
+
 use crate::hex;
 use crate::runtime::process;
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -104,9 +106,19 @@ impl PluginStore {
             "plugin {} is already installed; use update to replace it",
             staged.name
         );
+        let environment = python::prepare(&staged.manifest, &staged.tree, &self.root)?;
+        let _lease = super::lease::exclusive(&self.root, &staged.name)?;
+        ensure!(
+            !self.root.join(&staged.name).exists(),
+            "plugin {} was installed concurrently; use update",
+            staged.name
+        );
         let installed = self.finalize(&staged, true)?;
         fs::rename(&staged.tree, &installed.path)
             .with_context(|| format!("installing plugin {}", staged.name))?;
+        if let Some(environment) = environment {
+            let _path = environment.keep();
+        }
         Ok(installed)
     }
 
@@ -174,11 +186,45 @@ impl PluginStore {
     }
 
     pub fn remove(&self, name: &str) -> Result<()> {
+        validate_name(name)?;
+        let _lease = super::lease::exclusive(&self.root, name)?;
         let plugin = self.get(name)?;
-        fs::remove_dir_all(&plugin.path).with_context(|| format!("removing plugin {name}"))
+        let environment = python::environment(&plugin.path, &self.root)?;
+        fs::remove_dir_all(&plugin.path).with_context(|| format!("removing plugin {name}"))?;
+        python::cleanup(environment)
+    }
+
+    /// Explicit purge only; ordinary removal intentionally preserves extension state.
+    pub fn purge_state(&self, name: &str) -> Result<()> {
+        validate_name(name)?;
+        for root in [".state", ".settings", ".cache"] {
+            let parent = self.root.join(root);
+            if parent.exists() {
+                ensure!(
+                    !fs::symlink_metadata(&parent)?.file_type().is_symlink(),
+                    "extension state root must not be a symlink"
+                );
+            }
+            let path = if root == ".settings" {
+                parent.join(format!("{name}.json"))
+            } else {
+                parent.join(name)
+            };
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                    fs::remove_dir_all(&path)?
+                }
+                Ok(_) => fs::remove_file(&path)?,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
     }
 
     pub fn set_enabled(&self, name: &str, enabled: bool) -> Result<()> {
+        validate_name(name)?;
+        let _lease = super::lease::exclusive(&self.root, name)?;
         let plugin = self.get(name)?;
         let manifest_path = plugin.path.join(MANIFEST_FILE);
         let mut map = read_manifest(&manifest_path)?;
@@ -266,7 +312,11 @@ impl PluginStore {
             staged.name
         );
         let from = Some(display_version(&old.version, &old.integrity));
-        if staged.source == old.source && staged.integrity == old.integrity {
+        let runtime_healthy = !staged.manifest.contains_key("python")
+            || read_manifest(&old.path.join(MANIFEST_FILE))
+                .and_then(|map| python::runtime(&map, &old.path))
+                .is_ok();
+        if staged.source == old.source && staged.integrity == old.integrity && runtime_healthy {
             return Ok(PluginUpdate {
                 name: old.name.clone(),
                 from: from.clone(),
@@ -275,8 +325,21 @@ impl PluginStore {
             });
         }
         validate_staged_runtime(&staged)?;
-        let installed = self.finalize(&staged, old.enabled)?;
+        let environment = python::prepare(&staged.manifest, &staged.tree, &self.root)?;
+        let _lease = super::lease::exclusive(&self.root, &old.name)?;
+        let current = self.get(&old.name)?;
+        ensure!(
+            current.integrity == old.integrity && current.source == old.source,
+            "plugin {} changed concurrently; retry update",
+            old.name
+        );
+        let previous_environment = python::environment(&current.path, &self.root)?;
+        let installed = self.finalize(&staged, current.enabled)?;
         swap_into_place(staged.dir, &staged.tree, &installed.path)?;
+        if let Some(environment) = environment {
+            let _path = environment.keep();
+        }
+        python::cleanup(previous_environment)?;
         Ok(PluginUpdate {
             name: old.name.clone(),
             from,
@@ -365,17 +428,22 @@ pub type PluginRuntime = (
 );
 
 /// Resolves a plugin's runtime executable. Returns `None` when the plugin is disabled or declares
-/// no `program`. The program must be a file inside the plugin directory, after symlink resolution.
+/// no runtime. Legacy programs must be files inside the plugin directory; Python runtimes use a
+/// managed interpreter installed explicitly during install/update, never during discovery.
 pub fn runtime_spec(plugin: &InstalledPlugin) -> Result<Option<RuntimeSpec>> {
     if !plugin.enabled {
         return Ok(None);
     }
     let map = read_manifest(&plugin.path.join(MANIFEST_FILE))?;
+    validate_compatibility(&map)?;
     runtime_from_manifest(&map, &plugin.path)
 }
 
 /// Parses the runtime fields of a manifest whose plugin tree is at `base`.
 fn runtime_from_manifest(map: &Map<String, Value>, base: &Path) -> Result<Option<RuntimeSpec>> {
+    if map.contains_key("python") {
+        return python::runtime(map, base).map(Some);
+    }
     let Some(program) = map.get("program") else {
         return Ok(None);
     };
@@ -395,6 +463,11 @@ fn runtime_from_manifest(map: &Map<String, Value>, base: &Path) -> Result<Option
             .collect::<Result<Vec<_>>>()?,
         Some(_) => bail!("{MANIFEST_FILE} field \"args\" must be an array"),
     };
+    let env = manifest_env(map)?;
+    Ok(Some((program, args, env)))
+}
+
+fn manifest_env(map: &Map<String, Value>) -> Result<BTreeMap<String, String>> {
     let env = match map.get("env") {
         None | Some(Value::Null) => BTreeMap::new(),
         Some(Value::Object(entries)) => entries
@@ -408,15 +481,59 @@ fn runtime_from_manifest(map: &Map<String, Value>, base: &Path) -> Result<Option
             .collect::<Result<BTreeMap<_, _>>>()?,
         Some(_) => bail!("{MANIFEST_FILE} field \"env\" must be an object"),
     };
-    Ok(Some((program, args, env)))
+    Ok(env)
 }
 
 /// Checks a staged plugin's runtime declaration before it can be enabled, so a broken declaration
 /// never becomes an installed, enabled record.
 fn validate_staged_runtime(staged: &Staged) -> Result<()> {
-    runtime_from_manifest(&staged.manifest, &staged.tree)
-        .with_context(|| format!("plugin {} has an invalid runtime declaration", staged.name))
-        .map(|_| ())
+    let validate = || -> Result<()> {
+        validate_compatibility(&staged.manifest)?;
+        if let Some(value) = staged.manifest.get("contributions") {
+            super::contributions::validate(&super::contributions::Contributions::parse(
+                value.clone(),
+            )?)?;
+        }
+        if staged.manifest.contains_key("python") {
+            python::validate(&staged.manifest, &staged.tree)?;
+        } else {
+            runtime_from_manifest(&staged.manifest, &staged.tree)?;
+        }
+        Ok(())
+    };
+    validate().with_context(|| format!("plugin {} has an invalid runtime declaration", staged.name))
+}
+
+/// Manifest API compatibility is independent of transport protocol negotiation.
+pub fn validate_compatibility(map: &Map<String, Value>) -> Result<()> {
+    if let Some(version) = map.get("apiVersion") {
+        match version {
+            Value::Number(number) => ensure!(
+                number.as_u64() == Some(1),
+                "extension requires an unsupported host API version (host is 1)"
+            ),
+            Value::Object(range) => {
+                ensure!(
+                    range.keys().all(|k| matches!(k.as_str(), "min" | "max")),
+                    "unknown API compatibility field"
+                );
+                let min = range
+                    .get("min")
+                    .and_then(Value::as_u64)
+                    .context("apiVersion.min must be an integer")?;
+                let max = range
+                    .get("max")
+                    .and_then(Value::as_u64)
+                    .context("apiVersion.max must be an integer")?;
+                ensure!(
+                    min <= 1 && max >= 1 && min <= max,
+                    "extension is incompatible with host API 1"
+                );
+            }
+            _ => bail!("apiVersion must be 1 or {{min,max}}"),
+        }
+    }
+    Ok(())
 }
 
 /// Validates a plugin or marketplace name: `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`.
@@ -700,7 +817,9 @@ fn extract_tarball(bytes: &[u8], dest: &Path) -> Result<()> {
 fn stage_file(path: &Path, tree: &Path) -> Result<Fetched> {
     let source = fs::canonicalize(path).with_context(|| format!("resolving {}", path.display()))?;
     ensure!(source.is_dir(), "{} is not a directory", source.display());
-    copy_tree(&source, tree)?;
+    let manifest_path = source.join(MANIFEST_FILE);
+    let python = manifest_path.is_file() && read_manifest(&manifest_path)?.contains_key("python");
+    copy_tree(&source, tree, python)?;
     Ok(Fetched {
         integrity: tree_digest(tree)?,
         version: None,
@@ -711,15 +830,24 @@ fn stage_file(path: &Path, tree: &Path) -> Result<Fetched> {
     })
 }
 
-fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
+fn copy_tree(src: &Path, dst: &Path, python: bool) -> Result<()> {
     fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
+        // Development environments are recreated locally, never copied into the managed store.
+        if python
+            && matches!(
+                entry.file_name().to_str(),
+                Some(".venv" | "venv" | "__pycache__")
+            )
+        {
+            continue;
+        }
         let from = entry.path();
         let to = dst.join(entry.file_name());
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            copy_tree(&from, &to)?;
+            copy_tree(&from, &to, python)?;
         } else if file_type.is_file() {
             fs::copy(&from, &to)?;
         } else {

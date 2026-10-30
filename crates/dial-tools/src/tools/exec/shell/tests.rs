@@ -985,6 +985,31 @@ fn compound_commands_are_not_minimized() {
 }
 
 #[test]
+fn minimization_requires_a_complete_unclipped_capture() {
+    let (_dir, ws, _artifacts) = with_artifacts(true);
+    let body = "    Checking dependency v1.0.0\n".repeat(80);
+    let mut text = format!("{body}[exit code: 101]\n[complete output: artifact://raw]\n");
+    let original = text.clone();
+    assert!(!minimize_body(
+        &ws,
+        "cargo clippy",
+        body.len(),
+        &mut text,
+        false
+    ));
+    assert_eq!(text, original);
+    assert!(minimize_body(
+        &ws,
+        "cargo clippy",
+        body.len(),
+        &mut text,
+        true
+    ));
+    assert!(text.contains("[exit code: 101]"));
+    assert!(!text.contains("Checking"));
+}
+
+#[test]
 fn the_git_guard_refuses_before_anything_runs() {
     let (dir, ws) = workspace();
     let ws = ws.without_sandbox().with_shared_checkout(true);

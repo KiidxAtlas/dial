@@ -142,6 +142,7 @@ impl Agent<'_> {
         // Lifecycle hooks' `additional_context` is delivered once, like background notices.
         turn.pending_nudges.extend(self.take_hook_context());
         turn.pending_nudges.extend(self.poll_coordination(ui));
+        turn.pending_nudges.extend(self.take_monitor_context());
         messages.extend(turn.pending_nudges.iter().cloned());
         // The redirect is stated once; if the identical repeat continues, the stronger
         // guidance replaces it. Neither stage ends the turn.
@@ -1606,7 +1607,7 @@ impl Agent<'_> {
                 ui.text_delta(&note);
             }
             self.disclose_turn_changes(ui);
-            if self.logging {
+            if self.capture_training_requests() {
                 self.training_capture.record(
                     &context_before,
                     &request_tools,
@@ -1670,6 +1671,16 @@ impl Agent<'_> {
                     crate::agent::ui::ui_event::EventKind::Tools,
                     format!("Enabled {} for the next round", loaded.join(", ")),
                 ));
+            }
+        }
+        if !self.hermetic {
+            for call in &mut reply.tool_calls {
+                if let Err(error) =
+                    crate::agent::window::file_handles::expand(&self.workspace, call)
+                {
+                    call.malformed_arguments = true;
+                    ui.notice(&format!("File reference refused: {error}"));
+                }
             }
         }
         // Hermetic turns disable repair; its live endpoint probe is not evaluated either.

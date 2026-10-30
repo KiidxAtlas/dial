@@ -35,6 +35,8 @@ struct Writer {
     file: File,
     path: PathBuf,
     error: Option<String>,
+    /// Start of the failed append; only I/O write failures may be retried explicitly.
+    retry_from: Option<u64>,
     /// Stream size below which reclamation is not retried after a deferred attempt.
     reclaim_after: u64,
 }
@@ -60,10 +62,9 @@ pub fn remove(session: &Path) -> std::io::Result<()> {
             .remove(&canonical)
             .and_then(|writer| writer.upgrade())
         {
-            writer
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .error =
+            let mut writer = writer.lock().unwrap_or_else(|poison| poison.into_inner());
+            writer.retry_from = None;
+            writer.error =
                 Some("stream journal removed by its owner; stale publication refused".into());
         }
     }
@@ -226,6 +227,7 @@ impl Journal {
             file,
             path: path.clone(),
             error: None,
+            retry_from: None,
             reclaim_after: 0,
         }));
         writers.insert(path, Arc::downgrade(&writer));
@@ -245,7 +247,10 @@ impl Journal {
                     "stream frame exceeds the replay row limit",
                 ));
             }
-            writer.file.write_all(&bytes)
+            let offset = writer.file.metadata()?.len();
+            writer.file.write_all(&bytes).inspect_err(|_| {
+                writer.retry_from = Some(offset);
+            })
         })();
         if let Err(error) = result {
             writer.error = Some(format!("stream journal failed: {error}"));
@@ -284,6 +289,44 @@ impl Journal {
             .error
             .clone()
             .map_or(Ok(()), Err)
+    }
+    /// Retry a failed append at a new turn boundary, never during the failing operation.
+    /// Discard its possibly torn row before enabling publication again. Other failures remain
+    /// terminal, and a removed or replaced journal is never recreated or adopted.
+    pub fn retry_failed_write(&self) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let mut writer = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
+        let Some(error) = writer.error.clone() else {
+            return Ok(());
+        };
+        let offset = writer.retry_from.context(error.clone())?;
+        let result = (|| -> anyhow::Result<File> {
+            let mut file = crate::platform::fs::open_owner_only(
+                std::fs::OpenOptions::new().append(true).read(true),
+                &writer.path,
+            )?;
+            anyhow::ensure!(
+                file.metadata()?.is_file()
+                    && crate::platform::fs::owned_by_current_user(&file)?
+                    && crate::platform::fs::link_count(&file)? == 1
+                    && crate::platform::fs::identity(&file)?
+                        == crate::platform::fs::identity(&writer.file)?,
+                "stream journal was replaced or is no longer safe to write"
+            );
+            anyhow::ensure!(
+                file.metadata()?.len() >= offset,
+                "stream journal was truncated outside its writer"
+            );
+            file.set_len(offset)?;
+            // Probe actual publication, not merely opening a descriptor after ENOSPC.
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            Ok(file)
+        })();
+        writer.file = result.with_context(|| format!("{error}; retrying stream journal write"))?;
+        writer.retry_from = None;
+        writer.error = None;
+        Ok(())
     }
     /// Makes the frames written so far durable. Relocation syncs before it retires the source.
     pub fn sync(&self) -> std::io::Result<()> {

@@ -49,3 +49,57 @@ fn bounded_capture_keeps_the_final_target_and_its_schema() {
     assert_eq!(capture.examples.len(), MAX_EXAMPLES);
     assert!(capture.bytes <= MAX_BYTES);
 }
+
+#[test]
+fn session_retention_excludes_nonordinary_unfinished_and_empty_captures() {
+    use crate::agent::run::tool_exposure::default_offer_tests::with_agent;
+    use crate::agent::{NullUi, TurnOutcome, TurnReport};
+
+    for case in [
+        "hermetic",
+        "domain",
+        "ephemeral",
+        "failed",
+        "interrupted",
+        "empty",
+    ] {
+        with_agent("", |agent| {
+            agent
+                .session
+                .append(json!({"role":"user","content":"task"}))
+                .unwrap();
+            agent
+                .training_capture
+                .set_source_turn(agent.session.branch_leaf());
+            if case != "empty" {
+                agent.training_capture.record(
+                    &[json!({"role":"user","content":"task"})],
+                    &[],
+                    json!({"role":"assistant","content":"answer"}),
+                );
+            }
+            match case {
+                "hermetic" => agent.hermetic = true,
+                "domain" => agent.domain_override = Some("selfplay".into()),
+                "ephemeral" => agent.session = crate::storage::session::Session::ephemeral(),
+                _ => {}
+            }
+            let report = TurnReport {
+                text: "answer".into(),
+                outcome: if case == "failed" {
+                    TurnOutcome::Failed
+                } else {
+                    TurnOutcome::Completed
+                },
+                interrupted: case == "interrupted",
+                steps: 1,
+                trajectory: None,
+            };
+            agent.retain_training_turn(&report, "task", &mut NullUi);
+            assert!(
+                agent.session.custom_records("training_turn").is_empty(),
+                "case={case}"
+            );
+        });
+    }
+}

@@ -12,6 +12,105 @@ fn consistent_ux_worker_projection_keeps_findings_and_typed_state_without_assign
     );
     assert!(!result.text.contains("assignment") && !result.text.contains("portable_rules"));
 }
+
+#[test]
+fn running_status_keeps_lifecycle_without_an_empty_result_projection() {
+    let value = json!({"id":"task-1","status":"running","phase":"tool: read","steps":2});
+    let rendered = output(Ok(value.clone()));
+    assert_eq!(rendered.data, Some(value));
+    assert_eq!(
+        rendered.text,
+        "Worker task-1: running (2 requests); tool: read"
+    );
+}
+
+#[test]
+fn polling_reports_are_compact_only_after_delivery_and_remain_recoverable() {
+    let mut tasks = LiveTasks::default();
+    let body = tasks.tree.start("worker", "report", None);
+    let report = "distinct narrative\nBLOCKER: confirm migration approval";
+    let value = json!({"id":"task-1","status":"done","result":report,"artifact":"artifact://full",
+        "isolation":{"conflicts":["src/changed.rs"]},"steps":3});
+    body.settle(
+        report.into(),
+        Some(value.clone()),
+        crate::runtime::Phase::from_status("done"),
+    );
+    tasks.jobs.insert(
+        "task-1".into(),
+        JobState {
+            body: body.clone(),
+            interrupt: Arc::new(AtomicBool::new(false)),
+            worker: None,
+            active_tool: Arc::default(),
+            delivered: false,
+        },
+    );
+    let first = tasks.polling_output(tasks.status(None));
+    assert!(first.text.contains("distinct narrative"));
+    let repeated = tasks.polling_output(tasks.status(None));
+    assert_eq!(repeated.data, first.data, "typed reports are never reduced");
+    assert!(!repeated.text.contains("distinct narrative"));
+    for required in [
+        "already delivered",
+        "task-1: done",
+        "confirm migration approval",
+        "src/changed.rs",
+        "artifact://full",
+    ] {
+        assert!(
+            repeated.text.contains(required),
+            "missing {required}: {}",
+            repeated.text
+        );
+    }
+    let recovered = output(tasks.status(Some("task-1")));
+    assert!(recovered.text.contains("distinct narrative"));
+    assert_eq!(body_status(&body), value);
+    // A different report with the same identity is not mistaken for the delivered result.
+    let mut changed = value.clone();
+    changed["result"] = json!("new narrative");
+    assert!(
+        tasks
+            .polling_output(Ok(changed))
+            .text
+            .contains("new narrative")
+    );
+}
+
+#[test]
+fn polling_never_elides_failures_or_unretained_reports() {
+    for (status, artifact) in [("failed", Some("artifact://full")), ("done", None)] {
+        let mut tasks = LiveTasks::default();
+        let body = tasks.tree.start("worker", "report", None);
+        let mut value = json!({"id":"task-1","status":status,"result":"important narrative"});
+        if let Some(artifact) = artifact {
+            value["artifact"] = json!(artifact);
+        }
+        body.settle(
+            "important narrative".into(),
+            Some(value.clone()),
+            crate::runtime::Phase::from_status(status),
+        );
+        tasks.jobs.insert(
+            "task-1".into(),
+            JobState {
+                body,
+                interrupt: Arc::new(AtomicBool::new(false)),
+                worker: None,
+                active_tool: Arc::default(),
+                delivered: true,
+            },
+        );
+        assert!(
+            tasks
+                .polling_output(Ok(value))
+                .text
+                .contains("important narrative"),
+            "{status}"
+        );
+    }
+}
 #[test]
 fn rebinding_cancels_old_workers_without_projecting_them_into_the_new_session() {
     #[derive(Default)]

@@ -400,8 +400,15 @@ fn append_output_notes(
 /// when `shell.minimize_output` is on and the complete output is saved as an artifact, which the
 /// `[complete output: ...]` line that follows the note names. Without that line the raw output
 /// would be unrecoverable, so the text is left alone.
-fn minimize_body(ws: &Workspace, command: &str, body_len: usize, text: &mut String) -> bool {
-    if !ws.minimizing_output()
+fn minimize_body(
+    ws: &Workspace,
+    command: &str,
+    body_len: usize,
+    text: &mut String,
+    capture_complete: bool,
+) -> bool {
+    if !capture_complete
+        || !ws.minimizing_output()
         || !text[body_len..].contains("[complete output: artifact://")
         || text.contains("[output capture error:")
         || text.contains("[output artifact error:")
@@ -856,7 +863,13 @@ fn run_bash(
         text.push_str("[sandbox: /tmp is outside the project and not writable; use $TMPDIR, a scratch directory inside the project]\n");
     }
     let artifact = append_output_notes(&mut text, spool, &capture_error, &mut artifact_error);
-    let minimized = minimize_body(ws, &command, body_len, &mut text);
+    let minimized = minimize_body(
+        ws,
+        &command,
+        body_len,
+        &mut text,
+        eof && capture_error.is_none() && original == inline_retained,
+    );
     let integrity = output_integrity(
         original,
         inline_retained,

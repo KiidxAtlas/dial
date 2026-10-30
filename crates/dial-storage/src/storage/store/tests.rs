@@ -844,3 +844,59 @@ fn matched_live_scores_pair_only_explicit_same_source_scores_per_prompt() {
         vec![(60.0, 20.0), (80.0, 40.0)]
     );
 }
+
+#[test]
+fn approved_snapshot_identity_conflicts_and_invalid_batches_are_atomic() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), "target-b", "case", &harness()).unwrap();
+    let original = SessionTrainingExample {
+        version: 1,
+        source_session: "source-session-a".into(),
+        source_turn: "turn-1".into(),
+        source_model: "source-model-a".into(),
+        source_state: None,
+        source_trajectory: None,
+        prompt: "task".into(),
+        payload: json!({"examples":[{"messages":[{"role":"user","content":"task"},{"role":"assistant","content":"answer"}],"tools":[]}]}),
+    };
+    assert_eq!(
+        store
+            .approve_session_examples(std::slice::from_ref(&original))
+            .unwrap(),
+        (1, 0)
+    );
+    let before = store.session_training_examples().unwrap();
+    for boundary in [
+        "changed-identity",
+        "version",
+        "empty-prompt",
+        "incomplete-source",
+        "empty-examples",
+        "oversize",
+    ] {
+        let mut fresh = original.clone();
+        fresh.source_turn = "fresh-turn".into();
+        let mut bad = original.clone();
+        match boundary {
+            "changed-identity" => {
+                bad.payload["examples"][0]["messages"][1]["content"] = json!("replacement")
+            }
+            "version" => bad.version = 2,
+            "empty-prompt" => bad.prompt = " ".into(),
+            "incomplete-source" => bad.source_trajectory = Some(1),
+            "empty-examples" => bad.payload = json!({"examples":[]}),
+            "oversize" => bad.payload["padding"] = json!("x".repeat(2 * 1024 * 1024)),
+            _ => unreachable!(),
+        }
+        assert!(
+            store.approve_session_examples(&[fresh, bad]).is_err(),
+            "boundary {boundary}"
+        );
+        assert_eq!(
+            store.session_training_examples().unwrap(),
+            before,
+            "boundary {boundary} must roll back the preceding insert"
+        );
+    }
+    assert_eq!(store.approve_session_examples(&[original]).unwrap(), (0, 1));
+}

@@ -163,8 +163,13 @@ impl Participant {
 
     /// Whether letters are queued for this instance, without taking them.
     pub fn has_mail(&self) -> Result<bool> {
+        Ok(self.mail_count()? > 0)
+    }
+
+    /// How many letters are queued for this instance, without taking them.
+    pub fn mail_count(&self) -> Result<usize> {
         let _transaction = transaction(&self.dir)?;
-        Ok(!load(&self.dir, &self.id)?.inbox.is_empty())
+        Ok(load(&self.dir, &self.id)?.inbox.len())
     }
 }
 

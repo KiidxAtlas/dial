@@ -1,6 +1,6 @@
 //! Applying overlay events as semantic configuration changes.
 
-use crate::app::overlay::auth::PreparedModel;
+use crate::app::overlay::auth::{PreparedModel, PreparedVoice};
 use crate::app::overlay::compute::compute_starts;
 use crate::app::overlay::env::{OverlayEnv, favorite_routes, settings_tables};
 use crate::app::overlay::{ActiveOverlay, start_streaming_job};
@@ -133,6 +133,7 @@ impl OverlayEnv<'_> {
                             changes,
                             role: Some(role),
                             scope,
+                            voice: None,
                         });
                         Ok("Preparing model in the background; settings save only on success. Esc closes this panel and cancels preparation.".into())
                     } else {
@@ -213,9 +214,70 @@ impl OverlayEnv<'_> {
                         changes,
                         role: None,
                         scope,
+                        voice: None,
                     });
                     Ok(format!(
                         "Downloading {value} in the background; {path} saves only on success. Esc closes this panel and cancels the download."
+                    ))
+                })();
+                self.report(overlay, outcome);
+            }
+            OverlayEvent::InstallVoice { path, value, scope } => {
+                *self.scope = scope;
+                let config = self
+                    .latest
+                    .clone()
+                    .unwrap_or_else(|| self.app.config.clone());
+                let layout = self.app.layout.clone();
+                let outcome = (|| -> Result<String> {
+                    ensure!(
+                        crate::setup::voice::recipe_for(&path, &value).is_some(),
+                        "unsupported voice setup choice"
+                    );
+                    let changes = vec![Change::Set {
+                        path: path.clone(),
+                        value: toml::Value::String(value.clone()),
+                    }];
+                    settings_store::preview_config(&layout, scope, &changes, &self.app.overlay)?;
+                    let message = format!("{path} set to {value}; voice backend is ready");
+                    let setup_path = path.clone();
+                    let setup_value = value.clone();
+                    let (prepared_tx, prepared_rx) = std::sync::mpsc::channel();
+                    let original_voice = config.voice.clone();
+                    let started =
+                        start_streaming_job(self.auth_job, "Voice", move |cancel, progress| {
+                            let prepared = crate::setup::voice::prepare(
+                                &layout,
+                                &config,
+                                &setup_path,
+                                &setup_value,
+                                &cancel,
+                                progress,
+                            )?;
+                            ensure!(!cancel.load(Ordering::SeqCst), "voice setup cancelled");
+                            prepared_tx
+                                .send(prepared)
+                                .map_err(|_| anyhow::anyhow!("voice setup cancelled"))?;
+                            Ok(message)
+                        });
+                    ensure!(
+                        started,
+                        "Another background operation is still running; try again when it finishes."
+                    );
+                    self.auth_job.as_mut().unwrap().model = Some(PreparedModel {
+                        changes,
+                        role: None,
+                        scope,
+                        voice: Some(PreparedVoice {
+                            original: original_voice,
+                            changes: prepared_rx,
+                        }),
+                    });
+                    if let ActiveOverlay::Settings(settings) = &mut *overlay {
+                        settings.set_setup_pending(true);
+                    }
+                    Ok(format!(
+                        "Setting up {value} in the background; {path} saves only on success. Esc closes this panel and cancels setup."
                     ))
                 })();
                 self.report(overlay, outcome);
@@ -530,6 +592,7 @@ impl OverlayEnv<'_> {
                 if action.starts_with("open:")
                     || action.starts_with("command:")
                     || action.starts_with("test:")
+                    || action.starts_with("peers:")
                 {
                     self.next = Some(action);
                     return true;

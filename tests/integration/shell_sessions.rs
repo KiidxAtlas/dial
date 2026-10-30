@@ -104,3 +104,70 @@ fn named_session_restores_cwd_and_env_after_a_job_and_refuses_while_busy() {
         restored.text
     );
 }
+
+/// Unit fixtures re-execute a test helper; this checks the shipping binary's private entry point.
+#[cfg(unix)]
+#[test]
+fn durable_owner_entry_point_runs_once_and_publishes_a_terminal_observation() {
+    use std::{
+        io::Write,
+        os::unix::fs::PermissionsExt,
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+    let temp = tempfile::Builder::new()
+        .prefix("dial-owner-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let directory = root.join("owner");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let launch = json!({
+        "directory":directory, "root":root, "roots":[], "strict":false, "deny":[],
+        "writes":[], "network":false, "unsandboxed":true, "backend":ShellBackend::System,
+        "cargo_session":null, "artifacts":null, "lifetime":3,
+        "args":{"name":"job","command":"printf x >> once; printf ready; printf done"}
+    });
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dial"))
+        .arg(dial::tools::exec::background::durable::OWNER_ARG)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&serde_json::to_vec(&launch).unwrap())
+        .unwrap();
+    let end = Instant::now() + Duration::from_secs(8);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= end {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("production durable owner did not terminate within the fixture deadline");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        status.success(),
+        "production durable owner failed: {status}"
+    );
+    let observation: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.join("finished.json")).unwrap()).unwrap();
+    assert_eq!(observation["is_error"], false, "{observation}");
+    assert_eq!(
+        observation["execution"]["process"]["exit_code"], 0,
+        "{observation}"
+    );
+    assert!(
+        observation["text"].as_str().unwrap().contains("readydone"),
+        "{observation}"
+    );
+    assert_eq!(std::fs::read(root.join("once")).unwrap(), b"x");
+}

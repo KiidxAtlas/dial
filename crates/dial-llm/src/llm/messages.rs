@@ -14,6 +14,9 @@ pub fn canonicalize(message: &mut Value) {
     if let Some(object) = message.as_object_mut() {
         object.remove("dial_evidence");
         object.remove("dial_recall");
+        object.remove("dial_model_content");
+        object.remove("dial_model_tool_calls");
+        object.remove("dial_file_handles");
         object.remove("dial_transient");
         object.remove("dial_generated_user");
         object.remove("dial_context_request");

@@ -19,6 +19,7 @@ use std::time::Instant;
 enum TurnInput<'a> {
     User(&'a str),
     Peer,
+    Monitor,
 }
 
 impl Shell {
@@ -81,20 +82,25 @@ impl Shell {
         self.run_turn_input(app, agent, TurnInput::Peer)
     }
 
+    pub(super) fn run_monitor_turn(&mut self, app: &App, agent: &mut Agent<'_>) -> Result<Step> {
+        self.run_turn_input(app, agent, TurnInput::Monitor)
+    }
+
     fn run_turn_input(
         &mut self,
         app: &App,
         agent: &mut Agent<'_>,
         input: TurnInput<'_>,
     ) -> Result<Step> {
-        let peer = matches!(input, TurnInput::Peer);
+        let automatic = !matches!(input, TurnInput::User(_));
         let text = match input {
             TurnInput::User(text) => text,
             TurnInput::Peer => "Continuing the current conversation for peer context",
+            TurnInput::Monitor => "Continuing the current task for an approved application watch",
         };
         // A joined guest's prompts belong to the host agent: send them there or refuse. The local
         // agent never runs them.
-        if !peer && let Some(routed) = crate::collab::room::route_guest_prompt(text) {
+        if !automatic && let Some(routed) = crate::collab::room::route_guest_prompt(text) {
             let message = match routed {
                 Ok(()) => "Sent to the host agent; its replies arrive as collab entries.",
                 Err(message) => message,
@@ -102,9 +108,10 @@ impl Shell {
             self.note("Collab", message);
             return Ok(Step::Done);
         }
-        if !peer {
+        if !automatic {
             // A new user submission supersedes an older wake even if preflight never reaches Agent::turn.
             agent.cancel_peer_wake();
+            agent.cancel_monitor_wake();
             self.loop_mode.turn_started(text);
             platform::interrupt::clear_interrupt();
             app.interrupt.store(false, Ordering::SeqCst);
@@ -115,8 +122,8 @@ impl Shell {
         self.background_control = agent.background_control();
         let started = Instant::now();
         self.status.elapsed_secs = 0.0;
-        if peer {
-            self.note("Project peers", text);
+        if automatic {
+            self.note("Automatic continuation", text);
         } else {
             self.transcript
                 .push_user_at(text, &crate::storage::session::timestamp_now());
@@ -133,16 +140,18 @@ impl Shell {
         match ready {
             Ok(true) => {}
             Ok(false) => {
-                if peer {
+                if automatic {
                     agent.cancel_peer_wake();
+                    agent.cancel_monitor_wake();
                 }
                 self.composer.set_busy(false);
                 self.loop_mode.pause();
                 return Ok(Step::Done);
             }
             Err(error) => {
-                if peer {
+                if automatic {
                     agent.cancel_peer_wake();
+                    agent.cancel_monitor_wake();
                 }
                 self.transcript.error(&format!("{error:#}"));
                 self.composer.set_busy(false);
@@ -154,9 +163,11 @@ impl Shell {
         self.turn_output_tokens = 0;
         self.status.output_tokens = 0;
         self.status.tokens_per_second = None;
+        self.status.turn_cost = None;
+        self.live_cost = Some(super::paint::LiveCost::start(agent));
         self.status.activity = "thinking".into();
         let teach = self.teach_turn_start(app, agent);
-        if !peer && let Err(error) = self.side.prepare_turn(agent, text) {
+        if !automatic && let Err(error) = self.side.prepare_turn(agent, text) {
             self.note("BTW", format!("error: {error:#}"));
         }
         let (result, failed, streamed_tokens) = {
@@ -171,10 +182,10 @@ impl Shell {
                 next_id: 0,
             };
             bridge.repaint(true);
-            let result = if peer {
-                agent.resume_from_peer(&mut bridge)
-            } else {
-                agent.turn(text, &mut bridge)
+            let result = match input {
+                TurnInput::Peer => agent.resume_from_peer(&mut bridge),
+                TurnInput::Monitor => agent.resume_from_monitor(&mut bridge),
+                TurnInput::User(_) => agent.turn(text, &mut bridge),
             };
             (result, bridge.failed, bridge.shell.turn_output_tokens)
         };
@@ -187,6 +198,7 @@ impl Shell {
         self.status.model_progress = None;
         self.status.model_silence_secs = 0;
         let elapsed = started.elapsed().as_secs_f64();
+        self.live_cost = None;
         self.refresh_status(app, agent);
         match &result {
             Ok(report) => {
@@ -215,7 +227,7 @@ impl Shell {
                 &self.session_id,
                 crate::cli::watch::Event::Text {
                     title: "Turn finished".into(),
-                    body: format!("{outcome:?}"),
+                    body: outcome.label().to_owned(),
                 },
             )
         {
@@ -252,7 +264,7 @@ impl Shell {
         let halted = result
             .as_ref()
             .map_or(true, |report| report.halts_automation());
-        if !peer {
+        if !automatic {
             self.loop_mode.turn_settled(Instant::now(), halted);
         }
         if failed {

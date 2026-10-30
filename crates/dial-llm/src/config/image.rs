@@ -1,11 +1,14 @@
-//! `[image]` settings: the OpenAI-compatible endpoint used by the `image_gen` tool, and per-model
-//! generation settings (`[image.models.<key>]`) applied to every request for that image model.
+//! `[image]` route and per-model generation settings (`[image.models.<key>]`). Native protocols
+//! are explicit; an unset protocol preserves OpenAI-compatible endpoint inference.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::llm::profiles::ImageGenerationApi;
 
 /// Output sizes `image_gen` accepts, per call or as a model's default.
 pub const SIZES: &[&str] = &["auto", "1024x1024", "1536x1024", "1024x1536"];
@@ -15,6 +18,9 @@ pub const BACKGROUNDS: &[&str] = &["auto", "transparent", "opaque"];
 pub const MODERATIONS: &[&str] = &["auto", "low"];
 pub const MAX_STEPS: u32 = 200;
 pub const MAX_LORAS: usize = 8;
+/// Bounds on an inline ComfyUI graph: real exported workflows are far below both.
+pub const MAX_COMFY_NODES: usize = 512;
+pub const MAX_COMFY_WORKFLOW_BYTES: usize = 1024 * 1024;
 /// LoRA scales outside this range are refused; real adapters use roughly 0..2.
 pub const LORA_SCALE_LIMIT: f64 = 8.0;
 
@@ -22,10 +28,17 @@ pub const LORA_SCALE_LIMIT: f64 = 8.0;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ImageConfig {
-    /// Base URL of an OpenAI-compatible API (`/images/generations`).
+    /// Service base URL; the configured image protocol determines its API paths.
     pub base_url: String,
     /// Image model identifier sent with each generation request.
     pub model: String,
+    /// Native image protocol for `model`. Unset keeps the legacy inference from `base_url`.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_api",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub api: Option<ImageGenerationApi>,
     /// Environment variable holding the API key. Unset uses the provider's standard variable
     /// (`OPENAI_API_KEY` for api.openai.com) or a key saved through `/providers`.
     pub api_key_env: Option<String>,
@@ -43,7 +56,8 @@ impl Default for ImageConfig {
     fn default() -> Self {
         Self {
             base_url: "https://api.openai.com/v1".into(),
-            model: "gpt-image-1".into(),
+            model: "gpt-image-1.5".into(),
+            api: None,
             api_key_env: None,
             timeout_secs: 180,
             auto: true,
@@ -92,6 +106,28 @@ impl ImageConfig {
     }
 }
 
+/// Blank means "infer from the endpoint", the same as an absent key.
+fn deserialize_api<'de, D>(deserializer: D) -> Result<Option<ImageGenerationApi>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let raw: Option<String> = Option::deserialize(deserializer)?;
+    match raw.as_deref() {
+        None | Some("") => Ok(None),
+        Some(name) => serde_json::from_value(Value::String(name.to_owned()))
+            .map(Some)
+            .map_err(D::Error::custom),
+    }
+}
+
+/// The settings-file name of `api` (`""` when unset), for schema accessors.
+pub fn api_name(api: Option<ImageGenerationApi>) -> String {
+    api.and_then(|api| serde_json::to_value(api).ok())
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
 /// Settings for one image model. Unset values leave the endpoint's own default. Each image API
 /// receives only the settings it accepts (see `image_gen`); the rest are kept but not sent.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -123,6 +159,70 @@ pub struct ImageModelSettings {
     /// How far an edit may move from its source image, 0–1 (MLX-Serve; used only for edits).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strength: Option<f64>,
+    /// Model-specific request fields for fal and Replicate (e.g. `aspect_ratio`). Adapter-owned
+    /// prompt, size, output count and format fields cannot be overridden by these inputs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub input: BTreeMap<String, Value>,
+    /// ComfyUI API-format workflow (ComfyUI only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comfyui: Option<ComfyWorkflow>,
+}
+
+/// An inline ComfyUI API-format graph. Inline (not a workspace path) so reads stay within settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ComfyWorkflow {
+    /// Node id → `{ "class_type": ..., "inputs": { ... } }`, as exported by ComfyUI's API format.
+    pub workflow: Value,
+    /// Node id whose `inputs.text` receives the prompt.
+    pub prompt_node: String,
+    /// Node id whose outputs hold the generated images.
+    pub output_node: String,
+}
+
+impl ComfyWorkflow {
+    /// # Errors
+    /// Returns an error unless the graph is an object, both node ids are set, the prompt node has
+    /// a string `inputs.text`, and the output node exists.
+    pub fn validate(&self) -> Result<()> {
+        let graph = self
+            .workflow
+            .as_object()
+            .context("comfyui.workflow must be an object of API-format nodes")?;
+        ensure!(
+            graph.len() <= MAX_COMFY_NODES,
+            "comfyui.workflow has more than {MAX_COMFY_NODES} nodes"
+        );
+        ensure!(
+            serde_json::to_vec(&self.workflow)?.len() <= MAX_COMFY_WORKFLOW_BYTES,
+            "comfyui.workflow is larger than {MAX_COMFY_WORKFLOW_BYTES} bytes"
+        );
+        ensure!(
+            !self.prompt_node.trim().is_empty(),
+            "comfyui.prompt_node must name a node id"
+        );
+        ensure!(
+            !self.output_node.trim().is_empty(),
+            "comfyui.output_node must name a node id"
+        );
+        let prompt = graph.get(&self.prompt_node).with_context(|| {
+            format!(
+                "comfyui.prompt_node {:?} is not in the workflow",
+                self.prompt_node
+            )
+        })?;
+        ensure!(
+            prompt["inputs"]["text"].is_string(),
+            "comfyui prompt node {:?} needs a string inputs.text",
+            self.prompt_node
+        );
+        ensure!(
+            graph.contains_key(&self.output_node),
+            "comfyui.output_node {:?} is not in the workflow",
+            self.output_node
+        );
+        Ok(())
+    }
 }
 
 /// One LoRA adapter: a `.safetensors` file and its strength.
@@ -180,6 +280,9 @@ impl ImageModelSettings {
             self.loras.len() <= MAX_LORAS,
             "at most {MAX_LORAS} LoRAs are allowed"
         );
+        if let Some(workflow) = &self.comfyui {
+            workflow.validate()?;
+        }
         for lora in &self.loras {
             let path = lora.path.trim();
             ensure!(

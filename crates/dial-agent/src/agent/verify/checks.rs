@@ -9,6 +9,25 @@ pub(in crate::agent) struct CheckRun {
     pub(in crate::agent) actionable: Vec<String>,
 }
 
+/// One bounded verification process, owned until its actual result is settled.
+pub(in crate::agent) struct PendingCheck {
+    check: verify::verification::FocusedCheck,
+    inputs: Result<Option<verify::inputs::Snapshot>, ()>,
+    revision: verify::evidence::Revision,
+    started: Instant,
+    cancel: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<ToolOutput>>,
+}
+
+impl Drop for PendingCheck {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::SeqCst);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 impl<'a> Agent<'a> {
     /// Capture a complete contract separately from whether a usable witness is available.
     /// `Err` means a contract exists but could not be captured; `Ok(None)` is undeclared.
@@ -309,6 +328,7 @@ impl<'a> Agent<'a> {
         check: &crate::agent::verify::verification::FocusedCheck,
         ui: &mut dyn Ui,
     ) -> ToolOutput {
+        self.drain_background_check(ui, true);
         let args = json!({"command":check.command,"timeout":check.timeout_secs});
         let inputs_before = self.capture_check_inputs(check);
         let revision_before = self.step_checks.revision();
@@ -353,7 +373,7 @@ impl<'a> Agent<'a> {
             Some(self.interrupt.as_ref()),
         );
         let started = Instant::now();
-        let mut output = match gate {
+        let output = match gate {
             Ok(persist) => {
                 if persist && let Err(error) = self.persist_permissions() {
                     ui.notice(&format!(
@@ -385,6 +405,20 @@ impl<'a> Agent<'a> {
                 crate::agent::safety::approval::denied_check_output(&check.name, &denial)
             }
         };
+        self.settle_focused_check(check, inputs_before, revision_before, started, output, ui)
+    }
+
+    fn settle_focused_check(
+        &mut self,
+        check: &verify::verification::FocusedCheck,
+        inputs_before: Result<Option<verify::inputs::Snapshot>, ()>,
+        revision_before: verify::evidence::Revision,
+        started: Instant,
+        mut output: ToolOutput,
+        ui: &mut dyn Ui,
+    ) -> ToolOutput {
+        let args = json!({"command":check.command,"timeout":check.timeout_secs});
+        let call_id = format!("focused-check:{}", check.name);
         let inputs_after = self.capture_check_inputs(check);
         let inputs_stale = inputs_before.is_err()
             || inputs_after.is_err()
@@ -433,6 +467,176 @@ impl<'a> Agent<'a> {
             output.text.push_str(&line);
         }
         output
+    }
+
+    /// Settle on the controller; never convert an unfinished process into evidence.
+    pub(in crate::agent) fn drain_background_check(&mut self, ui: &mut dyn Ui, wait: bool) {
+        let Some(pending) = self.pending_check.as_ref() else {
+            return;
+        };
+        if !wait
+            && !pending
+                .worker
+                .as_ref()
+                .is_some_and(|worker| worker.is_finished())
+        {
+            return;
+        }
+        let mut pending = self
+            .pending_check
+            .take()
+            .expect("pending check inspected above");
+        while pending
+            .worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+        {
+            if self.interrupt.load(Ordering::SeqCst) {
+                pending.cancel.store(true, Ordering::SeqCst);
+            }
+            self.pump_subagents(ui);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let output = pending
+            .worker
+            .take()
+            .expect("pending check owns worker")
+            .join()
+            .unwrap_or_else(|_| {
+                ToolOutput::err("focused verification worker panicked; no completion observed")
+            });
+        self.settle_focused_check(
+            &pending.check,
+            pending.inputs.clone(),
+            pending.revision,
+            pending.started,
+            output,
+            ui,
+        );
+    }
+
+    /// Start only operator-configured checks with complete input contracts. They remain
+    /// ordinary shell authority, not permission grants, and one process is owned at a time.
+    pub(in crate::agent) fn start_background_check(&mut self, ui: &mut dyn Ui) {
+        if !self.config.experimental.background_checks
+            || !self.config.verification.automatic_checks
+            || self.hermetic
+            || self.plan_mode
+            || self.pending_check.is_some()
+            || self.interrupt.load(Ordering::SeqCst)
+        {
+            return;
+        }
+        let checks = self.current_focused_checks();
+        let Some((check, inputs)) = checks.into_iter().find_map(|check| {
+            if !self
+                .config
+                .verification
+                .commands
+                .iter()
+                .any(|custom| custom.name == check.name && custom.command == check.command)
+            {
+                return None;
+            }
+            let inputs = self.capture_check_inputs(&check).ok().flatten()?;
+            Some((check, inputs))
+        }) else {
+            return;
+        };
+        if self.reuse_check(&check) {
+            return;
+        }
+        let call_id = format!("focused-check:{}", check.name);
+        let args = json!({"command":check.command,"timeout":check.timeout_secs});
+        ui.tool_call_with_args(
+            &call_id,
+            "bash",
+            &format!("Verify {} (background)", check.name),
+            &args,
+        );
+        let gate = crate::agent::safety::approval::authorize_automatic_check(
+            self.approval,
+            &mut self.always,
+            self.workspace.root(),
+            &crate::agent::safety::approval::AutomaticCheck {
+                name: &check.name,
+                command: &check.command,
+                configured: true,
+            },
+            ui,
+            Some(self.interrupt.as_ref()),
+        );
+        let started = Instant::now();
+        let revision = self.step_checks.revision();
+        match gate {
+            Err(denial) => {
+                let output =
+                    crate::agent::safety::approval::denied_check_output(&check.name, &denial);
+                self.settle_focused_check(&check, Ok(Some(inputs)), revision, started, output, ui);
+                return;
+            }
+            Ok(persist) => {
+                if persist && let Err(error) = self.persist_permissions() {
+                    ui.notice(&format!(
+                        "The rule applies to this session but could not be saved: {error:#}"
+                    ));
+                }
+            }
+        }
+        let workspace = self.workspace.clone();
+        let mut config = self.effective_config().clone();
+        // Verification owns the actual process to completion, not a detached shell ticket.
+        // This is an execution-local clone; operator settings and ordinary bash are unchanged.
+        config.shell.auto_background_secs = 0;
+        let registry = self.ext.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let worker = std::thread::Builder::new()
+            .name("dial-focused-check".into())
+            .spawn(move || {
+                crate::tools::exec::execution::run(&worker_cancel, || {
+                    let _serial = workspace.serial_operation();
+                    if worker_cancel.load(Ordering::SeqCst) {
+                        return ToolOutput::err("focused verification cancelled before execution");
+                    }
+                    crate::tools::exec::execution::native(
+                        &crate::tools::integrations::ext::ToolContext {
+                            workspace: &workspace,
+                            config: &config,
+                            mutation_authorizer: None,
+                            confirm: None,
+                        },
+                        &registry,
+                        "bash",
+                        &args,
+                        &|_| {},
+                        &worker_cancel,
+                    )
+                    .expect("bash is a native tool")
+                })
+            });
+        match worker {
+            Ok(worker) => {
+                self.pending_check = Some(PendingCheck {
+                    check,
+                    inputs: Ok(Some(inputs)),
+                    revision,
+                    started,
+                    cancel,
+                    worker: Some(worker),
+                })
+            }
+            Err(error) => {
+                self.settle_focused_check(
+                    &check,
+                    Ok(Some(inputs)),
+                    revision,
+                    started,
+                    ToolOutput::err(format!("starting focused verification: {error}")),
+                    ui,
+                );
+            }
+        }
     }
 
     /// Focused checks for the files this turn changed: built-in syntax/type checks plus the configured
@@ -599,6 +803,7 @@ impl<'a> Agent<'a> {
         checks: &[crate::agent::verify::verification::FocusedCheck],
         ui: &mut dyn Ui,
     ) -> CheckRun {
+        self.drain_background_check(ui, true);
         let mut failures = Vec::new();
         let mut actionable = Vec::new();
         let mut results = Vec::new();

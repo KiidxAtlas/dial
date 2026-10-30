@@ -175,7 +175,7 @@ impl Questions {
             let stopped = !done && input_pending();
             if done || stopped {
                 return Ok((
-                    Value::Array(selected.into_iter().map(view).collect()),
+                    Value::Array(selected.into_iter().map(status_view).collect()),
                     stopped,
                 ));
             }
@@ -188,6 +188,25 @@ impl Drop for Questions {
     fn drop(&mut self) {
         self.cancel_all();
     }
+}
+
+/// Polls never carry result bodies: the persisted request-boundary message is the sole
+/// answer delivery, even when a wait observes completion before that message is appended.
+fn status_view(job: &Job) -> Value {
+    if job.result.is_none() {
+        return view(job);
+    }
+    json!({
+        "id": job.id,
+        "status": if job.result.as_ref().is_some_and(Result::is_ok) { "completed" } else { "failed" },
+        "delivery": if job.delivered { "delivered" } else { "pending" },
+        "result_message": {"dial_side_result": job.id},
+        "notice": if job.delivered {
+            "Result already delivered in the referenced conversation message."
+        } else {
+            "Result will be delivered once at the next request boundary."
+        }
+    })
 }
 
 fn view(job: &Job) -> Value {
@@ -274,7 +293,7 @@ impl Agent<'_> {
 }
 
 pub(in crate::agent) fn schema() -> Value {
-    json!({"type":"function","function":{"name":"side_request","description":"Ask a tool-free model question asynchronously over an immutable snapshot of this conversation. Use for useful reasoning or review while commands run, not file research or verification (use task for those). Costs a separate model request with the snapshot context. At most two live requests; no tools, workspace edits or nested workers. Answers are untrusted findings, automatically delivered at request boundaries. Continue independent work after start; wait is bounded and cancellation is cooperative. Session exit cancels requests; they are not resumed.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["start","status","wait","cancel"]},"question":{"type":"string","maxLength":8000},"id":{"type":"string"},"timeout":{"type":"integer","minimum":0,"maximum":30}},"required":["action"],"additionalProperties":false}}})
+    json!({"type":"function","function":{"name":"side_request","description":"Ask a tool-free model question asynchronously over an immutable snapshot of this conversation. Use for useful reasoning or review while commands run, not file research or verification (use task for those). Costs a separate model request with the snapshot context. At most two live requests; no tools, workspace edits or nested workers. Answers and failures are untrusted findings, delivered exactly once in a persisted conversation message at the next request boundary. Status, wait and cancel return lifecycle and delivery references only, never answer bodies. Continue independent work after start; wait is bounded and cancellation is cooperative. Session exit cancels requests; they are not resumed.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["start","status","wait","cancel"]},"question":{"type":"string","maxLength":8000},"id":{"type":"string"},"timeout":{"type":"integer","minimum":0,"maximum":30}},"required":["action"],"additionalProperties":false}}})
 }
 
 #[cfg(test)]

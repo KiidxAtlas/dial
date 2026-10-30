@@ -1060,6 +1060,14 @@ impl Codebase {
         scoped: bool,
         fresh_only: bool,
     ) -> Result<String> {
+        let terms = if scoped {
+            super::ambient_terms(query)
+        } else {
+            navigation::tokens(query)
+        };
+        if scoped && terms.is_empty() {
+            return Ok(String::new());
+        }
         let max_bytes = if max_bytes == 0 {
             usize::MAX
         } else {
@@ -1069,8 +1077,20 @@ impl Codebase {
             return Ok(String::new());
         };
         let statuses = self.section_statuses(&saved.sections)?;
-        let terms = navigation::tokens(query);
         let score = |s: &Section| {
+            if scoped {
+                let overlap = navigation::tokens(&format!("{} {}", s.title, s.summary))
+                    .intersection(&terms)
+                    .count();
+                return if super::ambient_overlap(query, overlap)
+                    || s.sources.iter().any(|source| {
+                        super::names_file(&query.to_lowercase(), &source.path.to_lowercase())
+                    }) {
+                    overlap.max(1)
+                } else {
+                    0
+                };
+            }
             navigation::tokens(&format!(
                 "{} {} {}",
                 s.title,
@@ -1096,7 +1116,7 @@ impl Codebase {
             .filter(|s| {
                 (!scoped && (s.kind == "purpose" || s.sources.is_empty()))
                     || score(s) > 0
-                    || s.sources.iter().any(|s| relevant.contains(&s.path))
+                    || (!scoped && s.sources.iter().any(|s| relevant.contains(&s.path)))
             })
             .collect::<Vec<_>>();
         ranked.sort_by_key(|s| {

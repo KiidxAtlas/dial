@@ -8,10 +8,12 @@ fn setup() -> (
 ) {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("a.rs"), "fn main() { old(x); }\n").unwrap();
-    let workspace = Workspace::new(root.path()).unwrap();
+    let workspace = Workspace::new(root.path())
+        .unwrap()
+        .with_edit_mode(crate::tools::EditMode::Hashline);
     let mut config = crate::config::types::Config::default();
     config.extensions.enabled = false;
-    config.integrations = vec!["ast_search".into()];
+    config.integrations = vec!["ast_search".into(), "read".into(), "grep".into()];
     let registry = Registry::standard(&config, Vec::new());
     (root, workspace, config, registry)
 }
@@ -185,4 +187,134 @@ fn only_local_native_ast_search_files_are_prepared() {
     }
     assert_eq!(pool.stats().started, 0);
     assert!(!stop.load(Ordering::SeqCst));
+}
+
+#[test]
+fn native_read_and_grep_reuse_exact_rows_only_after_delivery() {
+    for (name, args) in [
+        ("read", json!({"path":"a.rs","limit":10})),
+        (
+            "grep",
+            json!({"path":"a.rs","pattern":"old","fixed_string":true}),
+        ),
+    ] {
+        let (_root, workspace, config, registry) = setup();
+        let pool = Pool::default();
+        let session = crate::runtime::cancellation::SessionCancellation::default();
+        assert!(pool.start_named(
+            &workspace,
+            config,
+            &registry,
+            &crate::llm::ToolCall {
+                id: String::new(),
+                name: name.into(),
+                arguments: args.clone(),
+                malformed_arguments: false,
+            },
+            name.into(),
+            session.turn(Arc::new(std::sync::atomic::AtomicBool::new(false)))
+        ));
+        ready(&pool);
+        let path = workspace.root().join("a.rs");
+        assert!(
+            workspace
+                .store()
+                .check_ranges(&path, "fn main() { old(x); }\n", &[(1, 1)])
+                .is_err(),
+            "preparation issued witnesses for {name}"
+        );
+        let output = pool
+            .take_named(&workspace, name, &args, name)
+            .expect("native result was prepared");
+        assert!(!output.is_error, "{name}: {}", output.text);
+        assert!(output.text.contains("old(x)"));
+        assert!(
+            workspace
+                .store()
+                .check_ranges(&path, "fn main() { old(x); }\n", &[(1, 1)])
+                .is_ok(),
+            "delivery missing witnesses for {name}"
+        );
+        assert_eq!(pool.stats().reused, 1);
+    }
+}
+
+#[test]
+fn bounded_native_reads_discard_stale_and_cancelled_results() {
+    for cancel in [false, true] {
+        let (_root, workspace, config, registry) = setup();
+        let pool = Pool::default();
+        let session = crate::runtime::cancellation::SessionCancellation::default();
+        let args = json!({"path":"a.rs","limit":10});
+        assert!(pool.start_named(
+            &workspace,
+            config,
+            &registry,
+            &crate::llm::ToolCall {
+                id: String::new(),
+                name: "read".into(),
+                arguments: args.clone(),
+                malformed_arguments: false,
+            },
+            "owner".into(),
+            session.turn(Arc::new(std::sync::atomic::AtomicBool::new(false)))
+        ));
+        ready(&pool);
+        if cancel {
+            session.cancel();
+        } else {
+            std::fs::write(workspace.root().join("a.rs"), "fn main() { new(x); }\n").unwrap();
+        }
+        assert!(
+            pool.take_named(&workspace, "read", &args, "owner")
+                .is_none()
+        );
+        assert!(
+            workspace
+                .store()
+                .check_ranges(
+                    &workspace.root().join("a.rs"),
+                    "fn main() { old(x); }\n",
+                    &[(1, 1)]
+                )
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn native_preparation_excludes_special_sources_and_large_files() {
+    let (root, workspace, config, registry) = setup();
+    std::fs::write(root.path().join("note.ipynb"), "{}").unwrap();
+    std::fs::write(root.path().join("pic.svg"), "<svg/>").unwrap();
+    let file = std::fs::File::create(root.path().join("large.txt")).unwrap();
+    file.set_len(MAX_SOURCE + 1).unwrap();
+    for path in [
+        "note.ipynb",
+        "pic.svg",
+        "large.txt",
+        ".",
+        "https://example.com/file",
+    ] {
+        for name in ["read", "grep"] {
+            let pool = Pool::default();
+            let session = crate::runtime::cancellation::SessionCancellation::default();
+            assert!(
+                !pool.start_named(
+                    &workspace,
+                    config.clone(),
+                    &registry,
+                    &crate::llm::ToolCall {
+                        id: String::new(),
+                        name: name.into(),
+                        arguments: json!({"path":path,"pattern":"old"}),
+                        malformed_arguments: false,
+                    },
+                    "owner".into(),
+                    session.turn(Arc::new(std::sync::atomic::AtomicBool::new(false)))
+                ),
+                "{name} admitted {path}"
+            );
+        }
+    }
 }

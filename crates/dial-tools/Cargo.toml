@@ -14,8 +14,11 @@ anyhow.workspace = true
 ast-grep-core.workspace = true
 ast-grep-language.workspace = true
 base64.workspace = true
+bigdecimal.workspace = true
+time.workspace = true
 brush-builtins = { workspace = true, optional = true }
 brush-core = { workspace = true, optional = true }
+csv.workspace = true
 encoding_rs.workspace = true
 fancy-regex.workspace = true
 flate2.workspace = true

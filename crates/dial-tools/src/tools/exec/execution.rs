@@ -241,8 +241,8 @@ fn native_with(
             )
             .unwrap_or_else(ToolOutput::err)
         }
-        "read" => crate::tools::read_tool_streaming(
-            context.workspace,
+        "read" => crate::tools::read_with_context(
+            context,
             args,
             cancel,
             crate::tools::model_output_limit(context.config.context_window),

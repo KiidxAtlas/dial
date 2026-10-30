@@ -92,7 +92,7 @@ fn tool_completion_precedes_message_end_and_honors_cancellation() {
         );
         assert_eq!(result.is_err(), cancel);
         assert!(
-            matches!(seen.last().unwrap(), StreamEvent::ToolCallComplete { index:0, name, arguments, .. }
+            matches!(seen.iter().rev().find(|e| !matches!(e, StreamEvent::Activity)).unwrap(), StreamEvent::ToolCallComplete { index:0, name, arguments, .. }
             if name == "read" && arguments == r#"{"path":"a.txt"}"#)
         );
         assert!(
@@ -100,4 +100,56 @@ fn tool_completion_precedes_message_end_and_honors_cancellation() {
             "call completion is not response completion"
         );
     }
+}
+
+#[test]
+fn invisible_stream_activity_excludes_keepalives_and_honors_cancellation() {
+    let mut acc = Accumulator::default();
+    let mut seen = Vec::new();
+    for (event, active) in [
+        (START, true),
+        (
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+            true,
+        ),
+        (r#"{"type":"ping"}"#, false),
+        (
+            r#"{"type":"message_delta","delta":{},"usage":{"output_tokens":2}}"#,
+            false,
+        ),
+        (
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":""}}"#,
+            false,
+        ),
+        (
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"signed"}}"#,
+            true,
+        ),
+    ] {
+        seen.clear();
+        acc.feed(
+            event,
+            &mut |_| panic!("signature is not visible text"),
+            &mut |event| {
+                seen.push(event.clone());
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            seen,
+            if active {
+                vec![StreamEvent::Activity]
+            } else {
+                vec![]
+            },
+            "{event}"
+        );
+    }
+    let error = acc.feed(
+        r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"next"}}"#,
+        &mut |_| true,
+        &mut |_| false,
+    ).unwrap_err();
+    assert!(error.downcast_ref::<Interrupted>().is_some());
 }

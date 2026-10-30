@@ -1,7 +1,7 @@
 # Architecture
 
 Dial is a Rust control plane (agent loop, tools, UI, storage, learning loop) with a small Python
-worker used only for MLX inference and LoRA training.
+worker for MLX inference and LoRA training, plus optional operator-installed Python extensions.
 
 ## Workspace layout
 
@@ -67,7 +67,7 @@ The root `build.rs` only declares rerun inputs; per-crate build scripts own thei
 | `net` | web fetch and the browser tool |
 | `vcs` | git and GitHub (`gh_*`) tools |
 | `integrations` | external tool extensions (`ext`), MCP, plugins, SSH and resources |
-| `knowledge` | codebase index, provenance, history and autoresearch |
+| `knowledge` | codebase index, provenance, immutable evidence operations, history and autoresearch |
 | `surface` | tool catalog, contracts, outcomes and presentation |
 
 The `tools` root keeps the `Workspace` confinement type, schema plumbing and the registry; the
@@ -222,6 +222,7 @@ Lib tests report timings with `RUSTC_BOOTSTRAP=1 target/debug/deps/<crate>-<hash
 - `crates/dial-agent/src/agent/run/engine.rs` drives foreground and worker iterations. Role adapters own preparation, permissions and persistence; shared execution/recovery policy has one owner.
 - `crates/dial-agent/src/agent/modes/lifecycle.rs` defines mode hooks for request preparation, dispatch, settlement and yielding. The parent implements goal/prewalk behavior through these hooks; workers keep their assignment policy in the worker adapter.
 - `crates/dial-core/src/runtime/execution.rs` defines terminal status, effect certainty and committed paths. Tool payload and display text never authorize or reconstruct those facts. The shared tool boundary retains uncertainty through nested error handling, including a transaction whose rollback could not settle every path.
+- `crates/dial-core/src/runtime/evidence.rs` owns bounded versioned evidence, source snapshots, coverage and explicit uncertain clock metadata. `dial-storage::storage::artifact` retains authenticated manifests/representations under the existing lifecycle; pack, relocation and GC expand bounded manifest dependencies. `dial-tools::tools::knowledge::evidence` owns authorized capture/freshness and retained inspection/comparison/refinement. Media readers and approved monitor matches retain citations. These payloads never change execution authority, approvals, wake eligibility or verification credit.
 - `crates/dial-core/src/runtime/cancellation.rs` separates session termination, turn interruption, inference/read/background scopes and mutation commitment. Atomic commits settle before interruption is reported; uncertain effects never imply rollback.
 - `crates/dial-core/src/runtime/stream_journal.rs` appends incremental runtime observations before publication. A body updates its observable state only after the journal accepts the change; write failure stops both callback publication and polling-visible changes. Session recovery overlays newer frames only on their active branch, marks open bodies interrupted, and never projects partial tool arguments as executable calls. Final snapshots live in the main journal. Session relocation, deletion and archiving handle both files.
 - `crates/dial-agent/src/agent/run/dispatch.rs` publishes shared-call completion and timing by call ID as each worker finishes; role adapters retain original-order provider conversation settlement.
@@ -265,6 +266,7 @@ of each feature. The reviewed areas and resulting decisions are:
 | Background execution | Long `eval` cells and named shells hand off through the existing bash adopter into the `bg` table; handed-off cells refuse host callbacks and busy names/runtimes refuse new work. |
 | Media and remote reads | `read` keeps one dispatch path: hooks and approval run before vision questions; URL reads reuse the guarded web fetch client; archive formats share one admission walk with entry, size and decode limits. |
 | Plugin protocol 2 | `dial-tools` validates capabilities and queues effects; the app drains them at safe boundaries behind user approval; the UI renders sanitized slots. Observed events are asynchronous and never block the turn. |
+| Python extensions | The bundled stdlib SDK supports legacy EOF and managed framed request/session-worker transport. Explicit install/update prepares isolated dependencies; loading never installs packages. Neutral bounded contributions live in `dial-core::runtime::extensions`; `dial-tools` owns registration, worker leases and settings, `dial-agent::run::extension_api` admits host tool/task/model/context requests, and the app/UI own rendering and input. Plugin tools retain approvals, versioned contracts and registration ownership. Python is trusted user code, not sandboxed workspace content. |
 | Portable sessions | Packing is versioned and hash-verified; unpack never overwrites and refuses traversal, links and newer schemas. A global transfer ledger makes a moved-away source fork. |
 | Provider resilience | Cache-field refusals narrow a per-endpoint latch; cache warming runs on its own client and folds replay cost into session usage; OAuth accounts share one store and rotate like the API-key pool. |
 | Consultation and host integration | `seance` is a read-only worker over stored transcripts; RPC host tools and URI schemes are ordinary tools subject to approval and reset on session switch. |

@@ -2614,6 +2614,32 @@ fn enter_runs_matching_commands_and_preserves_unknown_names() {
 }
 
 #[test]
+fn a_pasted_path_is_a_message_not_a_command() {
+    assert!(super::is_slash_command("/help"));
+    assert!(super::is_slash_command("  /add-dir ~/src/app"));
+    assert!(super::is_slash_command("/"));
+    assert!(!super::is_slash_command("/Users/me/notes.md"));
+    assert!(!super::is_slash_command("/tmp/x explain this file"));
+    assert!(!super::is_slash_command("plain text"));
+
+    let env = Env::new();
+    let mut c = with_commands();
+    typed(&mut c, &env, "/Users/me/settings.md");
+    assert!(!c.menu_open(), "a path opens no command menu");
+    assert_eq!(
+        press(&mut c, &env, KeyCode::Enter),
+        ComposerEvent::Submit("/Users/me/settings.md".into()),
+        "Enter sends the path as typed, never a fuzzy command match"
+    );
+
+    // While busy a path is routed like any message (the chooser), not run as a command.
+    c.set_busy(true);
+    typed(&mut c, &env, "/Users/me/notes.md");
+    assert_eq!(press(&mut c, &env, KeyCode::Enter), ComposerEvent::None);
+    assert!(c.choice_open());
+}
+
+#[test]
 fn typed_settings_command_with_menu_open_submits_settings_not_a_neighbour() {
     // `/settings` + Enter with the menu open must run `settings`, never another command.
     let env = Env::new();
@@ -2952,6 +2978,34 @@ fn recording_hint_says_release_when_held_and_busy_paste_lands_in_draft() {
     c.handle_paste("spoken words");
     assert_eq!(c.draft(), "spoken words");
     assert!(c.busy);
+}
+
+#[test]
+fn option_v_character_dispatches_voice_but_paste_stays_literal() {
+    let mut env = Env::new();
+    let mut c = Composer::new(vec![], 10);
+    for busy in [false, true] {
+        c.set_busy(busy);
+        c.set_draft("keep draft");
+        let event = c.handle_key(
+            KeyEvent::new(KeyCode::Char('√'), KeyModifiers::NONE),
+            &env.ctx(),
+        );
+        if cfg!(target_os = "macos") {
+            assert_eq!(event, ComposerEvent::Action(Action::VoiceInput));
+            assert_eq!(c.draft(), "keep draft");
+        } else {
+            assert_eq!(event, ComposerEvent::None);
+            assert_eq!(c.draft(), "keep draft√");
+        }
+    }
+    c.clear();
+    c.handle_paste("√");
+    assert_eq!(c.draft(), "√");
+    env.keys.rebind(Action::VoiceInput, &["F9"]).unwrap();
+    c.clear();
+    assert_eq!(press(&mut c, &env, KeyCode::Char('√')), ComposerEvent::None);
+    assert_eq!(c.draft(), "√");
 }
 
 #[test]

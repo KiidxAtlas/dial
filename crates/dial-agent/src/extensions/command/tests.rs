@@ -114,3 +114,54 @@ fn unloading_the_extension_while_the_panel_is_open_fails_the_close() {
     let err = run(&mut ui, &host, "fixture", "demo", "", &idle).unwrap_err();
     assert!(err.to_string().contains("is not loaded"), "{err}");
 }
+
+#[test]
+fn registered_command_schema_is_admitted_before_the_extension_runs() {
+    use crate::runtime::extensions::Contributions;
+    use crate::tools::integrations::plugin::Plugin;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    struct Structured(Arc<AtomicUsize>);
+    impl Plugin for Structured {
+        fn name(&self) -> &str {
+            "fixture"
+        }
+        fn events(&self) -> &[String] {
+            &[]
+        }
+        fn contributions(&self) -> Contributions {
+            serde_json::from_value(json!({"commands":[{"name":"typed","description":"Typed input","parameters":{"type":"object","properties":{"count":{"type":"integer","minimum":1}},"required":["count"],"additionalProperties":false},"keybinding":null}]})).unwrap()
+        }
+        fn on_event(&self, _: &str, params: &Value, _: &AtomicBool) -> Result<Option<Value>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(params["args"], "{\"count\":2}");
+            assert_eq!(params["arguments"], json!({"count":2}));
+            Ok(Some(json!({"text":"accepted"})))
+        }
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let host = Host::default();
+    host.register(Arc::new(Structured(calls.clone()))).unwrap();
+    let mut ui = FakeUi {
+        host: None,
+        outcome: Outcome::Cancelled,
+        shown: None,
+    };
+    let cancel = AtomicBool::new(false);
+    for args in [
+        "free text",
+        "{}",
+        "{\"count\":0}",
+        "{\"count\":2,\"extra\":true}",
+    ] {
+        assert!(run(&mut ui, &host, "fixture", "typed", args, &cancel).is_err());
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        run(&mut ui, &host, "fixture", "typed", "{\"count\":2}", &cancel).unwrap(),
+        "accepted"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}

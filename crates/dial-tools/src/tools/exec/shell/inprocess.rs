@@ -146,7 +146,13 @@ pub(super) fn run(
         text.push_str("[in-process shell did not stop (a builtin that never yields cannot be interrupted); it was abandoned and may keep using CPU until Dial exits]\n");
     }
     let artifact = append_output_notes(&mut text, spool, &capture_error, &mut artifact_error);
-    let minimized = minimize_body(ws, command, body_len, &mut text);
+    let minimized = minimize_body(
+        ws,
+        command,
+        body_len,
+        &mut text,
+        eof && capture_error.is_none() && original == inline_retained,
+    );
     let integrity = output_integrity(
         original,
         inline_retained,

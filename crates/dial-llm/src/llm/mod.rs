@@ -17,6 +17,7 @@ pub mod apple;
 pub mod auth;
 mod aws_credentials;
 mod azure;
+pub mod batch;
 mod bedrock;
 pub mod cache_warmer;
 mod cancel;
@@ -380,6 +381,9 @@ pub enum StreamEvent {
         waiting: bool,
     },
     Progress(ModelProgress),
+    /// Validated provider activity without displayable content (e.g. signed thinking or block
+    /// transitions). Not a keepalive, token estimate, or evidence that generation has started.
+    Activity,
     Reasoning(String),
     ToolArguments {
         index: u64,

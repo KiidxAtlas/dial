@@ -2,18 +2,11 @@
 //! (`Walk`), so name safety, duplicate, entry-count, and declared-expansion limits apply the same way
 //! whatever the format. Each format is read from a seekable source, either a file or an in-memory
 //! download, so URL reads and local reads share one implementation.
-use super::{
-    MAX_CONTENT, Workspace, bounded,
-    cache::{Identity, Opened},
-    text,
-};
-use parking_lot::Mutex;
+use super::{MAX_CONTENT, bounded, text};
 use std::{
-    collections::{HashSet, VecDeque},
-    fs::File,
+    collections::HashSet,
     io::{self, BufReader, Cursor, Read, Seek, SeekFrom, Write},
-    path::{Component, Path, PathBuf},
-    sync::LazyLock,
+    path::{Component, Path},
 };
 
 mod cab;
@@ -26,17 +19,6 @@ mod tests;
 pub(super) const MAX_ENTRIES: usize = 10_000;
 pub(super) const MAX_DECODED: u64 = 128 * 1024 * 1024;
 const EXPANSION_MESSAGE: &str = "archive decoded stream exceeds 128 MiB";
-const MAX_READERS: usize = 4;
-const MAX_INDEX_ENTRIES: usize = 200_000;
-
-struct CachedZip {
-    path: PathBuf,
-    identity: Identity,
-    archive: zip::ZipArchive<File>,
-}
-
-static READERS: LazyLock<Mutex<VecDeque<CachedZip>>> =
-    LazyLock::new(|| Mutex::new(VecDeque::new()));
 
 pub(super) fn safe(name: &str) -> bool {
     !name.is_empty()
@@ -50,25 +32,8 @@ pub(super) fn safe(name: &str) -> bool {
             .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
 }
 
-/// Reads a local archive or compressed stream. `format` is the name `documents::kind` reports.
-pub(super) fn read(
-    opened: &Opened,
-    ws: &Workspace,
-    format: &str,
-    member: Option<&str>,
-) -> Result<String, String> {
-    check_member(member)?;
-    if format == "zip" {
-        return zip(opened, ws, member);
-    }
-    let file = opened.file.try_clone().map_err(|e| e.to_string())?;
-    let text = read_source(format, &opened.path.to_string_lossy(), file, member)?;
-    opened.validate(ws)?;
-    Ok(text)
-}
-
-/// Reads an archive already held in memory (URL downloads). `name` supplies the file name, whose
-/// compression suffix decides how a tar container is decoded.
+/// Reads an authorized captured archive or download. `name` supplies the file name,
+/// whose compression suffix decides how a tar container is decoded.
 pub(super) fn read_bytes(
     format: &str,
     name: &str,
@@ -306,45 +271,6 @@ fn validate_zip<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> Result<(), 
         }
     }
     Ok(())
-}
-
-fn zip(opened: &Opened, ws: &Workspace, member: Option<&str>) -> Result<String, String> {
-    let mut readers = READERS.lock();
-    readers.retain(|r| r.path != opened.path || r.identity == opened.identity);
-    let cached_index = readers
-        .iter()
-        .position(|r| r.path == opened.path && r.identity == opened.identity);
-    let mut cached = if let Some(cached) = cached_index.and_then(|i| readers.remove(i)) {
-        cached
-    } else {
-        // Evict before opening a fifth retained reader, including the reader in use.
-        while readers.len() >= MAX_READERS {
-            readers.pop_front();
-        }
-        let mut archive = zip::ZipArchive::new(opened.file.try_clone().map_err(|e| e.to_string())?)
-            .map_err(|e| format!("invalid ZIP archive: {e}"))?;
-        validate_zip(&mut archive)?;
-        CachedZip {
-            path: opened.path.clone(),
-            identity: opened.identity,
-            archive,
-        }
-    };
-    // The retained FD pins its inode; matching the freshly opened dev/ino and
-    // full revision cannot accidentally reuse an unlinked/replaced inode.
-    opened.validate(ws)?;
-    let result = zip_text(&mut cached.archive, member)?;
-    opened.validate(ws)?;
-    let count = cached.archive.len();
-    while readers.len() >= MAX_READERS
-        || readers.iter().map(|r| r.archive.len()).sum::<usize>() + count > MAX_INDEX_ENTRIES
-    {
-        if readers.pop_front().is_none() {
-            break;
-        }
-    }
-    readers.push_back(cached);
-    Ok(result)
 }
 
 fn zip_text<R: Read + Seek>(

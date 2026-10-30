@@ -25,27 +25,18 @@ fn signature_verification_accepts_only_the_signed_manifest() {
 }
 
 #[test]
-fn installation_detection_preserves_package_manager_ownership() {
-    assert_eq!(
-        installation_kind(Path::new("/opt/homebrew/Cellar/dial/bin/dial")),
-        "Homebrew"
+fn a_source_build_is_current_only_when_clean_and_built_from_head() {
+    let head = "0123456789abcdef0123456789abcdef01234567";
+    assert!(built_from(head, "0123456789ab", "false"));
+    assert!(built_from(head, head, "false"));
+    assert!(
+        !built_from(head, "0123456789ab", "true"),
+        "dirty builds rebuild"
     );
-    assert_eq!(
-        installation_kind(Path::new("/home/user/.cargo/bin/dial")),
-        "Cargo"
-    );
-    assert_eq!(
-        installation_kind(Path::new("/nix/store/hash-dial/bin/dial")),
-        "Nix"
-    );
-    assert_eq!(
-        installation_kind(Path::new("/home/user/.local/bin/dial")),
-        "script"
-    );
-    assert_eq!(
-        installation_kind(Path::new(r"C:\Users\user\.cargo\bin\dial.exe")),
-        "Cargo"
-    );
+    assert!(!built_from(head, "0123456789ab", "unknown"));
+    assert!(!built_from(head, "fedcba987654", "false"), "older commit");
+    assert!(!built_from(head, "unknown", "false"));
+    assert!(!built_from(head, "", "false"));
 }
 
 #[cfg(unix)]

@@ -176,11 +176,11 @@ impl<'a> Agent<'a> {
         let cache = self.codebase.as_ref()?.clone();
         let workspace = self.workspace.clone();
         let cancel = self.interrupt.clone();
-        // Initial context is an index; explicit retrieval retains its own budget.
-        let scoped = self.config.efficiency.enabled;
+        // Relevance is a correctness boundary, not an optional efficiency setting.
+        // Explicit recall retains its broader index view and separate budget.
         let max_bytes =
             crate::agent::workflow::efficiency::byte_limit(self.config.codebase.context_max_bytes)
-                .min(if scoped {
+                .min(if self.config.efficiency.enabled {
                     crate::agent::workflow::efficiency::byte_limit(
                         self.config.efficiency.ambient_context_bytes,
                     )
@@ -191,16 +191,12 @@ impl<'a> Agent<'a> {
             let (tx, rx) = mpsc::sync_channel(1);
             let worker = scope.spawn(move || {
                 let result = cache.refresh(&workspace, &cancel).and_then(|stats| {
-                    let architecture = if scoped {
-                        cache.task_architecture_context(query, max_bytes / 2)?
+                    let architecture = cache.task_architecture_context(query, max_bytes / 2)?;
+                    let remaining = max_bytes.saturating_sub(architecture.len());
+                    let context = if remaining == 0 {
+                        String::new()
                     } else {
-                        cache.architecture_context(query, max_bytes / 2)?
-                    };
-                    let remaining = max_bytes.saturating_sub(architecture.len()).max(1024);
-                    let context = if scoped {
                         cache.task_context(query, remaining)?
-                    } else {
-                        cache.context(query, remaining)?
                     };
                     Ok((stats, format!("{architecture}{context}")))
                 });

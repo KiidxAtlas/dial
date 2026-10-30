@@ -16,6 +16,31 @@ Supported lifecycle points include user prompt submission, session start/end, be
 
 Runtime plugins are operator-installed stdio programs: those declared under `[extensions.plugins.<name>]` and those installed with `dial plugin install` (started from the user `plugins` directory). Dial does not scan `~/.dial/extensions` or the project for plugin executables, so no project-local extension runs without an explicit configuration entry. Plugins communicate using JSON-RPC messages over stdio and may register tools, commands, shortcuts and flags, update active tools, and observe lifecycle events. They run with the privileges of the Dial process; only install code you trust. The Rust SDK is for embedding trusted native integrations and does not bypass tool approvals or workspace controls. Plugins and skills offered by marketplaces are found and installed in `/extensions`; see Marketplaces below.
 
+### Python extensions
+
+Python 3.11+ extensions use the same installed-plugin runtime, with a bundled standard-library-only
+SDK and an isolated virtual environment prepared during explicit installation or update. Start with
+`dial plugin new ./my-extension`, validate without executing it with
+`dial plugin check ./my-extension`, then review and install with
+`dial plugin install ./my-extension`. Managed extensions can use framed approved host APIs,
+session-owned persistent workers, declarative workspaces, typed settings/credentials, task profiles,
+workflows, context sources and public presets. `dial plugin dev DIR` explicitly runs a temporary
+reloadable development preview. See [Python extension authoring](python-extensions.md) for
+contracts, examples, dependency locks and trust limitations. The SDK is bundled in Dial;
+extension authors do not need a separately published PyPI package.
+
+An initialization reply may also declare up to 64 `tools`, each with `name`, `description`,
+`parameters` (JSON Schema) and positive `revision` (default 1). Tool names are plugin-local ASCII
+letters, digits, `_` and `-`, at most 48 bytes. The model sees
+`ext__<extension namespace>__<tool name>`; the namespace escapes `_` as `_u` and `.` as `_d`.
+Generated names must fit Dial's 128-byte tool-name bound. Registration refuses collisions instead of
+shadowing another tool. Tool invocation sends `tool.call` with `{name, arguments, workspace}` and
+expects `{text, is_error}`. All plugin tools require normal host approval, are treated as potentially
+workspace-mutating, and participate in durable schema/revision identities. Unload revokes adapters;
+a new registration under the same name does not inherit an old adapter's contract.
+Process failures, cancellation after dispatch and malformed results leave effects unknown rather
+than imply rollback. Tools cannot declare themselves approval-free through their manifests.
+
 ### Commands and declarative panels
 
 A stdio plugin advertises slash-command names in its `initialize` result, for example
@@ -291,7 +316,7 @@ default, including for same-name shadowed skills. Disabling never deletes a skil
 removes it from completion, the model catalog and skill-tool loading. Imports and toggles
 refresh chat completion immediately and the model catalog on the next turn. While a turn runs,
 submitting a draft opens a choice between adding direction now and queuing for after the turn;
-Option/Alt+Enter still queues a follow-up directly. Empty Enter with queued work opens a
+Ctrl+Q or Option/Alt+Enter still queues a follow-up directly. Empty Enter with queued work opens a
 keep-working/stop-and-send choice, defaulting to keeping the current work running. Sending the
 oldest queued message requires explicitly choosing stop and confirming. Other queued messages
 are preserved. Slash commands run immediately or are deferred. Previously loaded skill text
@@ -338,6 +363,7 @@ sealed evaluations, and disable parallel read batching so every call passes `pre
 - `after_provider_response` is observe-only and fires after each main-session model response with `{"model","stop_reason","latency_ms","tool_calls","usage":{prompt_tokens,completion_tokens,reasoning_tokens,cache_read_tokens,cache_write_tokens}}`. Exit 2 or a block changes nothing.
 - `session_before_branch` (`/branch`, `/undo`, `/retry` rewinds, `/fork`, ACP `fork_session`) and `session_before_switch` (`/new`, `/resume`, `/sessions`, RPC `new_session` and `resume`) are cancelable. The payload has `reason` and the target ids; exit 2 or `{"block":reason}` refuses the change and leaves the session as it is, showing the reason. Use `fail_closed = true` to make a crashing hook refuse too.
 - `additional_context` (also `additionalContext`) is a result field on `pre_tool_use`, `post_tool_use`, `user_prompt_submit`, `assistant_message` and `context`. The text (clipped to 4 KiB per answer, repeats dropped, discarded when the same event blocks) becomes a transient harness note on the next model request. It is delivered once, is never written to session history, and never changes a tool result.
+- `before_compact` can return `additional_context` for an explicit summary operation. Notes are attributed untrusted data, bounded to 4 KiB each and 8 KiB aggregate, budgeted as transient user input in portable and native summary requests, and discarded if a hook refuses. They do not become system instructions or stored conversation. Background compaction does not run this hook.
 
 ```toml
 [[hooks]]

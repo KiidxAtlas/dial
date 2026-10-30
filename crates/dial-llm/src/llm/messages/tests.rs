@@ -7,6 +7,7 @@ fn removes_only_bookkeeping_and_preserves_evidence_text() {
         "dial_evidence":{"artifact":"artifact://proof"},"dial_recall":"notes",
         "dial_transient":true,"unknown":"reject me","dial_turn_draft":{"original":"typed"},
         "dial_execution":{"changed_paths":[],"effects":"known","status":null},
+        "dial_model_content":"compact","dial_model_tool_calls":[],"dial_file_handles":{"root":"/private","paths":["long/path"]},
         "dial_images":[{"url":"artifact://image"}],
         "dial_provider_content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]});
     let projected = canonical(&original);
@@ -15,6 +16,9 @@ fn removes_only_bookkeeping_and_preserves_evidence_text() {
     assert!(projected.get("dial_recall").is_none());
     assert!(projected.get("dial_turn_draft").is_none());
     assert!(projected.get("dial_execution").is_none());
+    assert!(projected.get("dial_model_content").is_none());
+    assert!(projected.get("dial_model_tool_calls").is_none());
+    assert!(projected.get("dial_file_handles").is_none());
     assert_eq!(projected["content"], original["content"]);
     assert_eq!(projected["unknown"], "reject me");
     assert_eq!(projected["dial_images"], original["dial_images"]);

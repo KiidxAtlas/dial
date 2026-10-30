@@ -252,6 +252,11 @@ pub fn health(id: &str, location: &Path, model: Option<&Path>) -> Result<String>
             }
             Ok(format!("Node.js {}.{}.{}", version.0, version.1, version.2))
         }
+        // These Python CLIs expose --help, not --version. A version probe rejects a healthy
+        // installation before the settings picker can prepare its voice/model files.
+        "piper" | "mlx-whisper" => {
+            probe(location, &["--help"]).map(|_| format!("{id} CLI available"))
+        }
         "mlx-runtime" => probe(location, &["-c", "import mlx"]).map(|_| "MLX imports".into()),
         "whisper-cpp" => {
             let model = model.context("whisper.cpp needs its model; run setup again")?;
@@ -283,6 +288,65 @@ pub fn health(id: &str, location: &Path, model: Option<&Path>) -> Result<String>
     }
 }
 
+/// Resolve standard package-manager bins absent from PATH. Executes package managers, so callers
+/// must obtain installation/start authorization first.
+pub(crate) fn standard_location(target: &Recipe, env: &Env) -> Result<Option<PathBuf>> {
+    for method in target.methods {
+        let bin = match method {
+            super::Method::NpmGlobal(_) => {
+                let Some(npm) = env.find("npm") else { continue };
+                let prefix = PathBuf::from(probe(&npm, &["prefix", "--global"])?);
+                if cfg!(windows) {
+                    prefix
+                } else {
+                    prefix.join("bin")
+                }
+            }
+            super::Method::UvTool(_) => {
+                let Some(uv) = env.find("uv") else { continue };
+                PathBuf::from(probe(&uv, &["tool", "dir", "--bin"])?)
+            }
+            super::Method::Go(_) => {
+                let Some(go) = env.find("go") else { continue };
+                let gobin = probe(&go, &["env", "GOBIN"])?;
+                if gobin.is_empty() {
+                    let gopath = probe(&go, &["env", "GOPATH"])?;
+                    std::env::split_paths(&gopath)
+                        .next()
+                        .context("go returned no GOPATH")?
+                        .join("bin")
+                } else {
+                    PathBuf::from(gobin)
+                }
+            }
+            _ => continue,
+        };
+        anyhow::ensure!(
+            bin.is_absolute(),
+            "package manager returned a non-absolute bin directory: {}",
+            bin.display()
+        );
+        let program = if cfg!(windows) {
+            format!(
+                "{}{}",
+                target.program,
+                if matches!(method, super::Method::NpmGlobal(_)) {
+                    ".cmd"
+                } else {
+                    ".exe"
+                }
+            )
+        } else {
+            target.program.to_owned()
+        };
+        let path = bin.join(program);
+        if super::is_executable(&path) {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
 /// Plans and runs one install, then health-checks it. Returns the healthy location.
 ///
 /// `progress` receives every output line so a background job can show it. The caller saves
@@ -297,7 +361,7 @@ pub fn install(
     let planned = plan(target, env).map_err(|blocked| anyhow::anyhow!("{blocked}"))?;
     run_plan(&planned, cancel, progress)?;
     let location = if planned.expected.as_os_str().is_empty() {
-        locate(target, env)
+        standard_location(target, env)?.or_else(|| locate(target, env))
     } else {
         planned.expected.is_file().then(|| planned.expected.clone())
     }
@@ -311,8 +375,8 @@ pub fn install(
     Ok(location)
 }
 
-/// Installs `id` after whatever it requires (Node.js for npm servers, uv for Python tools) is
-/// ready. Settings are not saved: callers find the result in Dial's install directory.
+/// Installs `id` after its declared prerequisites. Language servers require an existing package
+/// manager and use its normal installation directories; the returned path is authoritative.
 pub fn install_with_requirements(
     id: &str,
     env: &Env,

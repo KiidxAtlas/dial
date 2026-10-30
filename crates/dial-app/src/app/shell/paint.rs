@@ -18,6 +18,41 @@ use anyhow::Result;
 use std::path::Path;
 use std::time::Instant;
 
+/// Live inputs of the `cost` segment while a turn holds the agent: the shared ledger and its
+/// observed totals when the turn began. Spend observed since then is this turn's running cost
+/// (it can include background work that settles meanwhile); the exact per-turn figure replaces
+/// it when the turn ends.
+pub(in crate::app) struct LiveCost {
+    ledger: crate::llm::usage::Scope,
+    ledger_start: f64,
+    session_start: Option<f64>,
+}
+
+impl LiveCost {
+    pub(in crate::app) fn start(agent: &Agent<'_>) -> Self {
+        let ledger = agent.usage_ledger();
+        Self {
+            ledger_start: ledger.observed_cost().unwrap_or(0.0),
+            ledger,
+            session_start: agent.session_cost(),
+        }
+    }
+
+    /// `(turn, session)` observed USD so far; `None` when nothing priced was observed.
+    pub(in crate::app) fn observe(&self) -> (Option<f64>, Option<f64>) {
+        let turn = self
+            .ledger
+            .observed_cost()
+            .map(|total| total - self.ledger_start)
+            .filter(|spent| spent.is_finite() && *spent > 0.0);
+        let session = match (self.session_start, turn) {
+            (start, Some(spent)) => Some(start.unwrap_or(0.0) + spent),
+            (start, None) => start,
+        };
+        (turn, session)
+    }
+}
+
 /// Keep the launch screen and status bar on the same selection, even before an agent exists.
 pub(super) fn update_model_status(
     status: &mut crate::ui::status::StatusData,
@@ -125,6 +160,14 @@ fn side_rows(
 impl Shell {
     // ----- painting -------------------------------------------------------------------------
 
+    /// The user submitted input on the home screen: whatever it reports from now on ends the home
+    /// at the next paint, so a command's answer is never hidden behind the launch screen.
+    pub(super) fn mark_home_input(&mut self) {
+        if self.home.is_some() && self.home_mark.is_none() {
+            self.home_mark = Some(self.transcript.block_count());
+        }
+    }
+
     pub(in crate::app) fn paint(&mut self, panel: Option<Rows>) -> Result<()> {
         if self.term.output_backlogged() {
             self.term.defer_paint();
@@ -156,10 +199,15 @@ impl Shell {
         self.status.mode = self.composer.mode();
         self.status.usage = self.usage_status.poll();
         let (cols, rows) = self.term.size();
-        // The conversation has started (a message, a resumed or switched session): the home
+        // The conversation has started (a message, a resumed or switched session, or a command
+        // whose report would otherwise land in scrollback behind the full-height home): the home
         // steps aside for its one-line summary, which leads the conversation in scrollback.
-        if self.home.is_some() && self.transcript.has_user() {
+        let reported = self
+            .home_mark
+            .is_some_and(|mark| self.transcript.block_count() > mark);
+        if self.home.is_some() && (self.transcript.has_user() || reported) {
             let home = self.home.take().expect("checked");
+            self.home_mark = None;
             self.term.commit(home.summary(cols, self.themes.current()));
         }
         let Shell {
@@ -237,7 +285,10 @@ impl Shell {
                     _ => (rows as usize / 5).clamp(2, 6),
                 }
                 .min(available.saturating_sub(bottom.len()));
-                if rows as usize >= crate::ui::worker_pins::MIN_TERMINAL_ROWS {
+                // An attached `/watch` pane shows workers in full; the block would repeat it.
+                if rows as usize >= crate::ui::worker_pins::MIN_TERMINAL_ROWS
+                    && !self.live_pane.attached()
+                {
                     bottom.extend(crate::ui::worker_pins::rows(
                         &self.workers,
                         cols as usize,
@@ -248,9 +299,11 @@ impl Shell {
                         theme,
                     ));
                 }
-                if available > bottom.len()
-                    && let Some(notice) = self.runtime_updates.notice()
-                {
+                let notices = [self.release_notice.notice(), self.runtime_updates.notice()];
+                for notice in notices.into_iter().flatten() {
+                    if available <= bottom.len() {
+                        break;
+                    }
                     bottom.push(ratatui::text::Line::from(ratatui::text::Span::styled(
                         crate::ui::text::ellipsize(notice, cols as usize, theme.ascii()),
                         theme.fg(crate::ui::theme::Tok::Muted),
@@ -266,6 +319,11 @@ impl Shell {
                     theme,
                     spinner,
                     cap.min(available.saturating_sub(bottom.len())),
+                ));
+                bottom.extend(self.extension_views.rows(
+                    cols as usize,
+                    available.saturating_sub(bottom.len()),
+                    theme,
                 ));
                 if let Some(home) = home {
                     let frame = home.frame(cols, rows.saturating_sub(1), theme, view, bottom);
@@ -354,6 +412,9 @@ impl Shell {
             agent.approval()
         };
         status.sandbox = format!("{:?}", app.config.sandbox.mode).to_lowercase();
+        // Between turns the segment shows the last turn's exact ledger figure.
+        status.turn_cost = agent.usage_ledger().observed_turn_cost();
+        status.session_cost = agent.session_cost();
         status.version = None;
         status.learning.clear();
         status.lora = Lora::Unknown;

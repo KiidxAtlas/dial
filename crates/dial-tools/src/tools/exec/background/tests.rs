@@ -434,6 +434,16 @@ fn ring_keeps_newest_bytes_and_tracks_what_was_lost() {
 }
 
 #[test]
+fn ring_oldest_since_reads_forward_and_reports_only_discarded_bytes() {
+    let mut ring = Ring::new(8);
+    ring.push(b"0123456789");
+    assert_eq!(ring.oldest_since(0, 3), (b"234".to_vec(), 2));
+    assert_eq!(ring.oldest_since(4, 3), (b"456".to_vec(), 0));
+    assert_eq!(ring.oldest_since(7, 100), (b"789".to_vec(), 0));
+    assert_eq!(ring.oldest_since(ring.total, 4), (Vec::new(), 0));
+}
+
+#[test]
 fn terminal_ring_renders_the_current_screen_not_the_byte_stream() {
     let mut ring = Ring::terminal(64, 3, 20);
     ring.push(b"\x1b[31mhi\x1b[0m\r\nthere");
@@ -1154,4 +1164,246 @@ fn capped_artifact_is_not_labeled_complete() {
     assert_eq!(integrity.original_bytes, Some(16));
     assert_eq!(integrity.retained_bytes, Some(8));
     assert_eq!(integrity.omitted_bytes, Some(8));
+}
+
+fn minimizer_snapshot() -> Snapshot {
+    use std::os::unix::process::ExitStatusExt;
+    let mut ring = Ring::new(MAX_BUFFER);
+    ring.push("   Compiling dependency v1.0.0\n".repeat(1500).as_bytes());
+    ring.push(b"warning: keep this diagnostic\n    Finished dev profile\n");
+    ring.closed = true;
+    ring.reached_eof = true;
+    ring.artifact = Some("artifact://test-output".into());
+    Snapshot {
+        name: "build".into(),
+        command: "cargo build".into(),
+        pid: 1,
+        ring: Arc::new(Mutex::new(ring)),
+        state: State::Exited {
+            at: Instant::now(),
+            detail: "exit code 0".into(),
+            status: Some(std::process::ExitStatus::from_raw(0)),
+        },
+        network: false,
+        terminal: false,
+    }
+}
+
+#[test]
+fn settled_background_minimizer_preserves_diagnostics_facts_and_cursor() {
+    let (_dir, ws) = open_workspace();
+    let ws = ws.with_shell_config(&crate::config::types::ShellConfig {
+        minimize_output: true,
+        ..Default::default()
+    });
+    let mut snap = minimizer_snapshot();
+    snap.command = "cargo fmt --check && cargo check && cargo test".into();
+    let original = lock(&snap.ring).total;
+    assert!(original > MAX_OUTPUT as u64);
+    let (body, lost, integrity) = take_presented(&ws, &snap, None);
+    assert!(body.contains("[output filtered (cargo)"), "{body}");
+    assert!(body.contains("warning: keep this diagnostic"));
+    assert!(!body.contains("Compiling"));
+    assert_eq!(lost, 0);
+    assert_eq!(integrity.capture, Completeness::Complete);
+    assert_eq!(integrity.retention, Completeness::Complete);
+    assert_eq!(integrity.presentation, Completeness::Partial);
+    assert_eq!(integrity.original_bytes, Some(original));
+    assert_eq!(integrity.retained_bytes, Some(original));
+    assert_eq!(integrity.omitted_bytes, Some(0));
+    assert_eq!(process_outcome(&snap).exit_code, Some(0));
+    assert!(process_outcome(&snap).output_complete);
+    assert!(render_body(&snap, body, lost, None).contains("[complete output: artifact://"));
+    let (again, lost, _) = take_presented(&ws, &snap, None);
+    assert!(again.is_empty());
+    assert_eq!(lost, 0);
+}
+
+#[test]
+fn background_minimizer_refuses_partial_delta_pty_unknown_and_disabled_results() {
+    let (_dir, ws) = open_workspace();
+    let ws = ws.with_shell_config(&crate::config::types::ShellConfig {
+        minimize_output: true,
+        ..Default::default()
+    });
+    for case in 0..11 {
+        let mut snap = minimizer_snapshot();
+        let mut tail = None;
+        let mut ws = ws.clone();
+        match case {
+            0 => lock(&snap.ring).artifact = None,
+            1 => lock(&snap.ring).reached_eof = false,
+            2 => lock(&snap.ring).closed = false,
+            3 => lock(&snap.ring).error = Some("capture failed".into()),
+            4 => lock(&snap.ring).elided_bytes = 1,
+            5 => lock(&snap.ring).cursor = 1,
+            6 => snap.terminal = true,
+            7 => snap.state = State::Running,
+            8 => {
+                snap.state = State::Exited {
+                    at: Instant::now(),
+                    detail: "exit status unavailable".into(),
+                    status: None,
+                }
+            }
+            9 => tail = Some(2),
+            10 => {
+                ws = ws.with_shell_config(&crate::config::types::ShellConfig {
+                    minimize_output: false,
+                    ..Default::default()
+                })
+            }
+            _ => unreachable!(),
+        }
+        let (body, _, _) = take_presented(&ws, &snap, tail);
+        assert!(!body.contains("[output filtered"), "case {case}: {body}");
+        assert!(body.contains("Compiling"), "case {case}: {body}");
+    }
+    let mut snap = minimizer_snapshot();
+    snap.command = "cargo build && cat important.txt".into();
+    let (body, _, _) = take_presented(&ws, &snap, None);
+    assert!(body.contains("Compiling"));
+    assert!(!body.contains("[output filtered"));
+}
+
+#[test]
+fn background_wait_and_output_minimize_complete_saved_builds() {
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, ws) = open_workspace();
+    let storage = tempfile::tempdir().unwrap();
+    let store = crate::storage::artifact::ArtifactStore::new(storage.path()).unwrap();
+    let ws = ws
+        .with_artifacts(store)
+        .with_shell_config(&crate::config::types::ShellConfig {
+            minimize_output: true,
+            ..Default::default()
+        });
+    let script = dir.path().join("cargo");
+    fs::write(&script, "#!/bin/sh\ni=0\nwhile [ $i -lt 1500 ]; do echo '    Checking dependency v1.0.0'; i=$((i+1)); done\necho 'test module::working ... ok'\necho 'test module::working2 ... ok'\necho 'test module::working3 ... ok'\necho 'warning: keep this diagnostic'\nif [ \"$2\" = 101 ]; then echo 'test module::broken ... FAILED'; echo 'test result: FAILED. 3 passed; 1 failed'; fi\nexit \"$2\"\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    let tool = tool();
+    for (action, code) in [("wait", 0), ("output", 0), ("wait", 101), ("output", 101)] {
+        assert!(
+            !start(
+                &tool,
+                &ws,
+                action,
+                &format!("{} test {code}", script.display())
+            )
+            .is_error
+        );
+        if action == "output" {
+            let end = Instant::now() + Duration::from_secs(5);
+            loop {
+                let snap = tool.table().snapshot(action).unwrap();
+                if matches!(snap.state, State::Exited { .. }) {
+                    snap.settle();
+                    break;
+                }
+                assert!(Instant::now() < end, "build did not finish");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let out = bg(
+            &tool,
+            &ws,
+            json!({"action": action, "name": action, "timeout":5}),
+        );
+        assert!(!out.is_error, "{}", out.text);
+        assert!(
+            out.text.contains("[output filtered (cargo)"),
+            "{}",
+            out.text
+        );
+        assert!(out.text.contains("warning: keep this diagnostic"));
+        assert!(!out.text.contains("Checking"));
+        assert_eq!(
+            out.execution.process.as_ref().unwrap().exit_code,
+            Some(code)
+        );
+        if code != 0 {
+            assert!(out.text.contains("module::broken ... FAILED"));
+            assert!(out.text.contains("test result: FAILED"));
+        }
+        let uri = out
+            .execution
+            .output
+            .as_ref()
+            .unwrap()
+            .artifact
+            .as_ref()
+            .unwrap();
+        let raw = fs::read_to_string(
+            storage
+                .path()
+                .join(uri.strip_prefix("artifact://").unwrap()),
+        )
+        .unwrap();
+        assert_eq!(raw.matches("Checking").count(), 1500);
+        let notices = tool.drain_notifications();
+        let replay = notices
+            .iter()
+            .find(|event| event.kind == "background_output")
+            .unwrap();
+        assert!(
+            replay.text.contains("[output filtered (cargo)"),
+            "{}",
+            replay.text
+        );
+        assert!(replay.text.contains("warning: keep this diagnostic"));
+        assert!(!replay.text.contains("Checking"));
+        if code != 0 {
+            assert!(replay.text.contains("module::broken ... FAILED"));
+        }
+        assert!(notices.iter().any(|event| event.kind == "complete"));
+        assert!(tool.drain_notifications().is_empty());
+        let again = bg(&tool, &ws, json!({"action":"output", "name":action}));
+        assert!(again.text.contains("(no new output)"), "{}", again.text);
+    }
+}
+
+#[test]
+fn failed_background_minimizer_preserves_failure_and_capture_without_replay() {
+    use std::os::unix::process::ExitStatusExt;
+    let (_dir, ws) = open_workspace();
+    let ws = ws.with_shell_config(&crate::config::types::ShellConfig {
+        minimize_output: true,
+        ..Default::default()
+    });
+    let mut snap = minimizer_snapshot();
+    snap.command = "cargo test".into();
+    snap.state = State::Exited {
+        at: Instant::now(),
+        detail: "exit code 101".into(),
+        status: Some(std::process::ExitStatus::from_raw(101 << 8)),
+    };
+    let raw = {
+        let mut ring = lock(&snap.ring);
+        ring.push("test module::working ... ok\n".repeat(80).as_bytes());
+        ring.push(b"test module::broken ... FAILED\nthread 'broken' panicked at src/lib.rs:3\nassertion left: 1 right: 2\ntest result: FAILED. 80 passed; 1 failed\n");
+        ring.text()
+    };
+    let (body, lost, integrity) = take_presented(&ws, &snap, None);
+    assert!(body.contains("[output filtered (cargo)"), "{body}");
+    assert!(!body.contains("Compiling") && !body.contains("working ... ok"));
+    for kept in [
+        "broken ... FAILED",
+        "panicked at src/lib.rs:3",
+        "assertion left: 1 right: 2",
+        "test result: FAILED",
+    ] {
+        assert!(body.contains(kept), "{kept}: {body}");
+    }
+    assert_eq!(lost, 0);
+    assert_eq!(integrity.capture, Completeness::Complete);
+    assert_eq!(integrity.retention, Completeness::Complete);
+    assert_eq!(integrity.presentation, Completeness::Partial);
+    assert_eq!(integrity.omitted_bytes, Some(0));
+    assert_eq!(integrity.original_bytes, Some(raw.len() as u64));
+    assert_eq!(lock(&snap.ring).text(), raw);
+    assert_eq!(process_outcome(&snap).exit_code, Some(101));
+    assert!(process_outcome(&snap).output_complete);
+    let (again, lost, _) = take_presented(&ws, &snap, None);
+    assert!(again.is_empty());
+    assert_eq!(lost, 0);
 }

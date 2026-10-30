@@ -90,7 +90,10 @@ impl HeaderEditor {
         if keys.matches(Action::SelectCancel, key) {
             return Outcome::Cancel;
         }
+        // F10 opens the menu bar in GNOME Terminal and Ctrl+Enter needs the kitty protocol, so
+        // Ctrl+S saves everywhere.
         if key.code == KeyCode::F(10)
+            || is_ctrl(key, 's')
             || (key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::CONTROL))
         {
             if self.inherit {
@@ -210,14 +213,14 @@ impl HeaderEditor {
             |text: &str| Line::from(fit(vec![Span::styled(format!(" {text}"), muted)], width));
         if compact {
             lines.push(hint(
-                "^N add · ^D delete · Tab field · F2 env/literal · F10 save · Esc cancel",
+                "^N add · ^D delete · Tab field · F2 env/literal · ^S save · Esc cancel",
             ));
         } else {
             let arrows = arrows(theme, Axis::Vertical);
             lines.push(hint(&format!(
                 "^N add · ^D delete · Tab field · {arrows} row · F2 env/literal"
             )));
-            lines.push(hint("F9 inherit · ^E clear all · F10 save · Esc cancel"));
+            lines.push(hint("F9 inherit · ^E clear all · ^S/F10 save · Esc cancel"));
         }
 
         let name_w = (width.saturating_sub(FIXED_COLUMNS) / 3).clamp(6, 28);

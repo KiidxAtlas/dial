@@ -17,7 +17,7 @@ impl std::fmt::Display for IncompleteStream {
 }
 impl std::error::Error for IncompleteStream {}
 
-/// Only events that advance the generated reply renew the idle deadline.
+/// Shared progress policy for transport idle handling and the agent silence watchdog.
 /// Usage updates, keepalives, unknown extensions and empty deltas are not output.
 /// Lifecycle events are bounded by the accumulator's duplicate/block checks.
 pub(super) fn advances_reply(data: &str) -> bool {
@@ -380,6 +380,11 @@ impl Accumulator {
             }
             // Unknown event types are future extensions; they must not abort the reply.
             _ => {}
+        }
+        // The transport's idle clock and the agent's silence watchdog must see the same real
+        // progress. Signatures and lifecycle transitions have no text callback of their own.
+        if advances_reply(data) && !on_event(&StreamEvent::Activity) {
+            return Err(Interrupted.into());
         }
         Ok(false)
     }

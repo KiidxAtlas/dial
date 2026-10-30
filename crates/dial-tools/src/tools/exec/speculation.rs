@@ -1,5 +1,5 @@
-//! Optional preparation of admitted native AST observations. Never runs processes, callbacks,
-//! edits, directory scans or hinted third-party tools. A cache is not an execution grant.
+//! Optional preparation of admitted native single-file observations. Never runs processes,
+//! callbacks, edits or directory scans. A cache is not an execution grant.
 use crate::runtime::cancellation::{Scope, TurnCancellation};
 use crate::tools::{
     ToolOutput, Workspace,
@@ -48,12 +48,18 @@ impl Counters {
         }
     }
 }
+struct Prepared {
+    digest: String,
+    output: ToolOutput,
+    witness: Option<(String, Vec<(usize, usize)>)>,
+}
 struct Pending {
+    name: String,
     _owner: TurnCancellation,
     source: PathBuf,
     scope: Scope,
     started: Instant,
-    result: Receiver<Option<(String, ToolOutput)>>,
+    result: Receiver<Option<Prepared>>,
 }
 #[derive(Default)]
 pub struct Pool {
@@ -110,16 +116,49 @@ impl Pool {
         owner_key: String,
         owner: TurnCancellation,
     ) -> bool {
-        if registry.origin("ast_search") != Some(crate::tools::surface::catalog::Origin::Native) {
+        self.start_named(
+            workspace,
+            config,
+            registry,
+            &crate::llm::ToolCall {
+                id: String::new(),
+                name: "ast_search".into(),
+                arguments: args,
+                malformed_arguments: false,
+            },
+            owner_key,
+            owner,
+        )
+    }
+    /// Prepare one native bounded source; ordinary delivery must admit the call again
+    /// before publishing its exact source witnesses.
+    pub fn start_named(
+        &self,
+        workspace: &Workspace,
+        config: crate::config::types::Config,
+        registry: &Registry,
+        call: &crate::llm::ToolCall,
+        owner_key: String,
+        owner: TurnCancellation,
+    ) -> bool {
+        if call.malformed_arguments {
             return false;
         }
-        let Some(tool) = registry.get("ast_search").cloned() else {
-            return false;
-        };
-        if tool.needs_approval(&args)
-            || tool.may_modify_workspace(&args)
-            || tool.supports_tool_dispatch()
+        let name = call.name.as_str();
+        let args = call.arguments.clone();
+        let native_builtin = matches!(name, "read" | "grep") && registry.get(name).is_none();
+        if !matches!(name, "ast_search" | "read" | "grep")
+            || (!native_builtin
+                && registry.origin(name) != Some(crate::tools::surface::catalog::Origin::Native))
         {
+            return false;
+        }
+        let tool = registry.get(name).cloned();
+        if tool.as_ref().is_some_and(|tool| {
+            tool.needs_approval(&args)
+                || tool.may_modify_workspace(&args)
+                || tool.supports_tool_dispatch()
+        }) {
             return false;
         }
         let scope = owner.read();
@@ -142,6 +181,8 @@ impl Pool {
         let counters = self.counters.clone();
         let worker_scope = scope.clone();
         let worker_source = source.clone();
+        let name = name.to_owned();
+        let worker_name = name.clone();
         let workspace = workspace.speculative_workspace();
         let worker = std::thread::Builder::new()
             .name("dial-read-preparation".into())
@@ -151,39 +192,64 @@ impl Pool {
                     if worker_scope.is_cancelled() {
                         return None;
                     }
+                    if worker_name == "read"
+                        && workspace.edit_mode() != crate::tools::EditMode::Hashline
+                    {
+                        return None;
+                    }
                     let output = super::execution::run(&worker_scope.flag(), || {
-                        tool.call(
-                            &ToolContext {
-                                workspace: &workspace,
-                                config: &config,
-                                mutation_authorizer: None,
-                                confirm: None,
-                            },
-                            &args,
-                        )
+                        if let Some(tool) = tool {
+                            tool.call(
+                                &ToolContext {
+                                    workspace: &workspace,
+                                    config: &config,
+                                    mutation_authorizer: None,
+                                    confirm: None,
+                                },
+                                &args,
+                            )
+                        } else {
+                            crate::tools::dispatch(&workspace, &worker_name, &args, 0)
+                                .unwrap_or_else(ToolOutput::err)
+                        }
                     });
                     if output.is_error || worker_scope.is_cancelled() {
                         return None;
                     }
-                    let observations: Vec<crate::runtime::fingerprint::Observation> =
-                        serde_json::from_value(
-                            output.data.as_ref()?.get("source_observations")?.clone(),
+                    let (captured, witness) = if worker_name == "ast_search" {
+                        let observations: Vec<crate::runtime::fingerprint::Observation> =
+                            serde_json::from_value(
+                                output.data.as_ref()?.get("source_observations")?.clone(),
+                            )
+                            .ok()?;
+                        if observations.len() != 1
+                            || observations[0].path != worker_source
+                            || observations[0].bytes as u64 > MAX_SOURCE
+                        {
+                            return None;
+                        }
+                        (observations[0].sha256.clone(), None)
+                    } else {
+                        // Native owners record the exact immutable source used for rendered rows.
+                        // Reject normalized CRLF (not raw-byte identity) and sources without complete rows.
+                        let witness = workspace.store().prepared_witness(&worker_source)?;
+                        if witness.0.contains('\r')
+                            || witness.0.len() as u64 > MAX_SOURCE
+                            || witness.1.is_empty()
+                        {
+                            return None;
+                        }
+                        (
+                            format!("{:x}", Sha256::digest(witness.0.as_bytes())),
+                            Some(witness),
                         )
-                        .ok()?;
-                    if observations.len() != 1
-                        || observations[0].path != worker_source
-                        || observations[0].bytes as u64 > MAX_SOURCE
-                    {
-                        return None;
-                    }
-                    let captured = &observations[0].sha256;
+                    };
                     (fingerprint(&worker_source, &worker_scope).as_deref()
                         == Some(captured.as_str()))
-                    .then(|| {
-                        (
-                            captured.clone(),
-                            output.with_effects(crate::tools::surface::outcome::Effects::None),
-                        )
+                    .then(|| Prepared {
+                        digest: captured,
+                        output: output.with_effects(crate::tools::surface::outcome::Effects::None),
+                        witness,
                     })
                 })();
                 counters.preparation_ms.fetch_add(
@@ -200,6 +266,7 @@ impl Pool {
         pending.insert(
             key,
             Pending {
+                name,
                 _owner: pending_owner,
                 source,
                 scope,
@@ -212,6 +279,16 @@ impl Pool {
     /// Ordinary owner admission runs again before this call. An unfinished/stale cache never waits
     /// or substitutes a different query: cancel it and run the ordinary tool instead.
     pub fn take(&self, workspace: &Workspace, args: &Value, owner_key: &str) -> Option<ToolOutput> {
+        self.take_named(workspace, "ast_search", args, owner_key)
+    }
+    /// Consume only a preparation for this exact native tool name and owner.
+    pub fn take_named(
+        &self,
+        workspace: &Workspace,
+        name: &str,
+        args: &Value,
+        owner_key: &str,
+    ) -> Option<ToolOutput> {
         let key = key(owner_key, args)?;
         let entry = self
             .pending
@@ -219,22 +296,28 @@ impl Pool {
             .unwrap_or_else(|poison| poison.into_inner())
             .remove(&key)?;
         let result = if !entry.scope.is_cancelled()
+            && entry.name == name
             && entry.started.elapsed() <= Duration::from_secs(5)
             && single_source(workspace, args).as_ref() == Some(&entry.source)
         {
-            entry
-                .result
-                .try_recv()
-                .ok()
-                .flatten()
-                .and_then(|(digest, output)| {
-                    (fingerprint(&entry.source, &entry.scope).as_deref() == Some(digest.as_str()))
-                        .then_some(output)
-                })
+            entry.result.try_recv().ok().flatten().and_then(|prepared| {
+                if fingerprint(&entry.source, &entry.scope).as_deref()
+                    != Some(prepared.digest.as_str())
+                {
+                    return None;
+                }
+                if let Some((source, ranges)) = prepared.witness {
+                    workspace
+                        .record_edit_witnesses(&entry.source, &source, &ranges)
+                        .ok()?;
+                }
+                Some(prepared.output)
+            })
         } else {
             None
         };
         entry.scope.cancel();
+        // Preparation witnesses become visible only here, after ordinary owner admission.
         if result.is_some() {
             self.counters.reused.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -286,6 +369,35 @@ fn single_source(workspace: &Workspace, args: &Value) -> Option<PathBuf> {
         cursor = path.parent();
     }
     let metadata = std::fs::symlink_metadata(&path).ok()?;
+    // Keep structured/visual readers and non-UTF8 content out of byte preparation. Selectors,
+    // multi-path calls and archive members do not resolve to this exact regular file.
+    let extension = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if matches!(
+        extension.as_str(),
+        "ipynb"
+            | "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "webp"
+            | "svg"
+            | "pdf"
+            | "zip"
+            | "tar"
+            | "gz"
+            | "docx"
+            | "xlsx"
+            | "pptx"
+    ) {
+        return None;
+    }
+    if args.get("paths").is_some() || args.get("info").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
     (metadata.is_file() && metadata.len() <= MAX_SOURCE).then_some(path)
 }
 fn fingerprint(path: &Path, scope: &Scope) -> Option<String> {

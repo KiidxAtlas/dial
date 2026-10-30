@@ -90,6 +90,9 @@ impl Bridge<'_> {
             .frame_pacing
             .record(Phase::Refresh, refresh.elapsed());
         self.shell.status.elapsed_secs = self.started.elapsed().as_secs_f64();
+        if let Some(live) = &self.shell.live_cost {
+            (self.shell.status.turn_cost, self.shell.status.session_cost) = live.observe();
+        }
         if let Some(monitor) = &self.shell.adapter_monitor {
             self.shell.status.lora = self
                 .shell

@@ -40,6 +40,7 @@ impl Shell {
             dirty |= self.composer.poll_autocomplete();
             // Plugin header, status, footer and title, plus autocomplete answers, once per pass.
             dirty |= self.refresh_plugin_chrome(agent);
+            dirty |= self.drain_extension_view_events(app, agent);
             if let Some(notice) = self.composer.take_word_notice() {
                 self.note("Word completion", notice);
             }
@@ -119,7 +120,7 @@ impl Shell {
                 dirty = true;
             }
             for (label, line) in AuthJob::drain_lines(&mut self.auth_job) {
-                self.transcript.notice_merge(label, &line);
+                self.job_line(app, label, &line);
                 dirty = true;
             }
             // A job cancelled elsewhere (Esc, sign-out, overlay) must not leave its panel pending.
@@ -127,6 +128,7 @@ impl Shell {
                 self.transcript.settle_job_notices();
             }
             if let Some((provider, result)) = AuthJob::collect(&mut self.auth_job, app) {
+                self.job_ended(provider, &result);
                 let vision_ready = provider == "Setup"
                     && result.as_ref().is_ok_and(|message| {
                         message.starts_with(crate::setup::vision_models::SUMMARY_PREFIX)
@@ -238,6 +240,7 @@ impl Shell {
                 self.note("Compute", "Local models unloaded for queued work. This chat stays open; the next turn reloads the model.");
                 dirty = true;
             }
+            self.sync_live_pane(app, Some(&mut *agent));
             self.refresh_status(app, agent);
             self.status.phase = Phase::Idle;
             self.status.model_progress = None;
@@ -282,6 +285,15 @@ impl Shell {
                 })
                 && !poll(Duration::ZERO)?
             {
+                if agent.monitor_wake_pending() {
+                    match self.run_monitor_turn(app, agent)? {
+                        Step::Done => {
+                            dirty = true;
+                            continue;
+                        }
+                        other => return Ok(other),
+                    }
+                }
                 match agent.peer_wake_pending() {
                     Ok(true) => match self.run_peer_turn(app, agent)? {
                         Step::Done => {
@@ -325,6 +337,9 @@ impl Shell {
             let timeout = agent
                 .peer_wakeup_interval()
                 .map_or(timeout, |peer| timeout.min(peer));
+            let timeout = agent
+                .monitor_wakeup_interval()
+                .map_or(timeout, |monitor| timeout.min(monitor));
             let timeout = self.loop_mode.next_due().map_or(timeout, |due| {
                 timeout.min(due.saturating_duration_since(Instant::now()))
             });
@@ -340,6 +355,20 @@ impl Shell {
             };
             let timeout = if self.voice_input.is_some() {
                 timeout.min(Duration::from_millis(100))
+            } else {
+                timeout
+            };
+            // An attached side pane sees requests and fresh state within half a second.
+            let timeout = if self.live_pane.attached() {
+                timeout.min(Duration::from_millis(500))
+            } else {
+                timeout
+            };
+            let timeout = if agent
+                .extension_host()
+                .is_some_and(|host| !host.persistent_names().is_empty())
+            {
+                timeout.min(Duration::from_millis(500))
             } else {
                 timeout
             };
@@ -423,6 +452,7 @@ impl Shell {
                         ComposerEvent::None => Step::Done,
                         ComposerEvent::Interrupt => {
                             agent.cancel_peer_wake();
+                            agent.cancel_monitor_wake();
                             self.pause_loop();
                             self.stop_speech();
                             Step::Done

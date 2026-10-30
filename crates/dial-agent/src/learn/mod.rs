@@ -14,6 +14,7 @@ pub mod mutate;
 pub mod probe;
 pub mod processes;
 pub mod resources;
+pub mod session;
 pub mod signals;
 pub mod verify;
 pub mod worker;

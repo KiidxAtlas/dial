@@ -33,9 +33,11 @@ const MIN_SUMMARY_INPUT_TOKENS: u64 = 16_384;
 /// `Agent::compaction_evidence_notes` appends harness notes after this marker; they are regenerated
 /// on every commit, so an update summary must not fold them back in.
 const EVIDENCE_NOTES_MARKER: &str = "\n\nOriginal user goal: ";
-const FILE_LIST_LIMIT: usize = 50;
+const FILE_LIST_LIMIT: usize = 16;
+const FILE_LIST_BYTES: usize = 4_096;
 // Keep legacy tag names for stored-summary and branch consumers; the lists are not result evidence.
 const READ_FILES: &str = "read-files";
+const LEGACY_FILE_TARGETS_NOTE: &str = "File-operation lists below are attempted targets observed in tool-call arguments, not evidence of successful reads or modifications. Calls may have failed, been denied, or never executed; consult retained results for outcomes.";
 const MODIFIED_FILES: &str = "modified-files";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -201,7 +203,13 @@ fn prompt_text(prompt: Prompt, method: CompactionMethod, focus: &str, updating: 
     }
 }
 
-fn summary_request(conversation: &str, previous: Option<&str>, prompt: &str, output: u32) -> Chat {
+fn summary_request(
+    conversation: &str,
+    previous: Option<&str>,
+    prompt: &str,
+    output: u32,
+    context: &CompactionContext<'_>,
+) -> Chat {
     let mut text = format!(
         "<conversation>\n{}\n</conversation>\n\n",
         escape_boundaries(conversation)
@@ -213,7 +221,7 @@ fn summary_request(conversation: &str, previous: Option<&str>, prompt: &str, out
         ));
     }
     text.push_str(prompt);
-    Chat {
+    let mut request = Chat {
         messages: vec![
             json!({"role":"system","content":SYSTEM_PROMPT}),
             json!({"role":"user","content":text}),
@@ -222,7 +230,11 @@ fn summary_request(conversation: &str, previous: Option<&str>, prompt: &str, out
         temperature: 0.2,
         max_tokens: output,
         seed: None,
+    };
+    if let Some(note) = context.supplemental_message() {
+        request.messages.insert(1, note);
     }
+    request
 }
 
 fn request_estimate(request: &Chat) -> u64 {
@@ -239,6 +251,8 @@ fn request_estimate(request: &Chat) -> u64 {
 struct FileOps {
     read: BTreeSet<String>,
     modified: BTreeSet<String>,
+    /// Oldest to newest, so bounded inventories favor recent targets rather than lexical order.
+    recent: Vec<String>,
 }
 
 /// `read` `paths` entries may carry a line selector (`src/a.rs:1-80`); observe the file itself.
@@ -321,25 +335,33 @@ impl FileOps {
         } else {
             self.read.insert(path.to_owned());
         }
+        self.recent.retain(|old| old != path);
+        self.recent.push(path.to_owned());
     }
 
     fn merge(&mut self, other: FileOps) {
-        self.read.extend(other.read);
-        self.modified.extend(other.modified);
+        for path in other.recent {
+            self.add(other.modified.contains(&path), Some(&path));
+        }
     }
 
     /// Split a summary into its text and the file lists this module appended to it.
     fn take_from(summary: &str) -> (&str, FileOps) {
-        let start = [READ_FILES, MODIFIED_FILES, FILE_TARGETS_NOTE]
-            .iter()
-            .filter_map(|tag| {
-                if *tag == FILE_TARGETS_NOTE {
-                    summary.find(&format!("\n\n{FILE_TARGETS_NOTE}"))
-                } else {
-                    summary.find(&format!("\n<{tag}>\n"))
-                }
-            })
-            .min();
+        let start = [
+            READ_FILES,
+            MODIFIED_FILES,
+            FILE_TARGETS_NOTE,
+            LEGACY_FILE_TARGETS_NOTE,
+        ]
+        .iter()
+        .filter_map(|tag| {
+            if matches!(*tag, FILE_TARGETS_NOTE | LEGACY_FILE_TARGETS_NOTE) {
+                summary.find(&format!("\n\n{tag}"))
+            } else {
+                summary.find(&format!("\n<{tag}>\n"))
+            }
+        })
+        .min();
         let Some(start) = start else {
             return (summary.trim(), FileOps::default());
         };
@@ -355,7 +377,7 @@ impl FileOps {
             else {
                 continue;
             };
-            for line in body.lines() {
+            for line in body.lines().rev() {
                 ops.add(modified, Some(line));
             }
         }
@@ -365,27 +387,40 @@ impl FileOps {
     fn upsert(&self, summary: &str) -> String {
         let mut out = FileOps::take_from(summary).0.to_owned();
         let read: Vec<&String> = self
-            .read
+            .recent
             .iter()
-            .filter(|path| !self.modified.contains(*path))
+            .rev()
+            .filter(|path| self.read.contains(*path) && !self.modified.contains(*path))
             .collect();
-        let modified: Vec<&String> = self.modified.iter().collect();
+        let modified: Vec<&String> = self
+            .recent
+            .iter()
+            .rev()
+            .filter(|path| self.modified.contains(*path))
+            .collect();
         if !read.is_empty() || !modified.is_empty() {
             out.push_str(&format!("\n\n{FILE_TARGETS_NOTE}"));
         }
-        for (tag, list) in [(READ_FILES, read), (MODIFIED_FILES, modified)] {
+        let mut remaining = FILE_LIST_BYTES;
+        for (tag, list) in [(MODIFIED_FILES, modified), (READ_FILES, read)] {
             if list.is_empty() {
                 continue;
             }
             out.push_str(&format!("\n\n<{tag}>\n"));
-            for path in list.iter().take(FILE_LIST_LIMIT) {
+            let mut shown = 0;
+            for path in &list {
+                if shown == FILE_LIST_LIMIT || path.len() + 1 > remaining {
+                    continue;
+                }
+                remaining -= path.len() + 1;
+                shown += 1;
                 out.push_str(path);
                 out.push('\n');
             }
-            if list.len() > FILE_LIST_LIMIT {
+            if list.len() > shown {
                 out.push_str(&format!(
-                    "[... {} more files elided]\n",
-                    list.len() - FILE_LIST_LIMIT
+                    "[... {} older or oversized targets omitted; full calls remain in session history]\n",
+                    list.len() - shown
                 ));
             }
             out.push_str(&format!("</{tag}>"));
@@ -434,6 +469,10 @@ pub(super) fn summarize_prefix(
         {
             seen_history = true;
             ops.merge(carried);
+            // Historical read inventories are navigation noise, not current edit witnesses.
+            // Keep mutation targets across folds; new reads repopulate the bounded recent inventory.
+            ops.read.clear();
+            ops.recent.retain(|path| ops.modified.contains(path));
             previous = Some(text).filter(|text| !text.is_empty());
             continue;
         }
@@ -659,7 +698,7 @@ fn fold(
         let halved = window_budget.min(tokens) / 2;
         let text = clamp(&joined, window_budget, tokens);
         let instructions = prompt_text(prompt, method, focus, carried.is_some());
-        let request = summary_request(&text, carried.as_deref(), &instructions, output);
+        let request = summary_request(&text, carried.as_deref(), &instructions, output, context);
         if request_estimate(&request).saturating_add(u64::from(output)) > window {
             ensure!(
                 halved >= floor && halved < window_budget,

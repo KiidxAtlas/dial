@@ -14,6 +14,7 @@ pub mod model_settings;
 pub mod models;
 pub mod palette;
 pub mod path_browser;
+pub mod peers;
 pub mod providers;
 pub mod settings;
 pub mod shortcuts;
@@ -56,6 +57,12 @@ pub enum OverlayEvent {
     /// Download the local model `value` names, then save it to `path` in `scope`. Nothing is
     /// saved when the download fails or is cancelled.
     DownloadSetting {
+        path: String,
+        value: String,
+        scope: Scope,
+    },
+    /// Install a confirmed voice choice; save its selector only after successful preparation.
+    InstallVoice {
         path: String,
         value: String,
         scope: Scope,
@@ -164,6 +171,12 @@ impl fmt::Debug for OverlayEvent {
                 .finish(),
             Self::DownloadSetting { path, value, scope } => f
                 .debug_struct("DownloadSetting")
+                .field("path", path)
+                .field("value", value)
+                .field("scope", scope)
+                .finish(),
+            Self::InstallVoice { path, value, scope } => f
+                .debug_struct("InstallVoice")
                 .field("path", path)
                 .field("value", value)
                 .field("scope", scope)

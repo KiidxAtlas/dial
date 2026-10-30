@@ -168,6 +168,22 @@ fn fields(installed_loras: &[String]) -> Vec<Field> {
             kind: Kind::Toml,
             help: "Every adapter in order, for stacking several: [{ path = \"a.safetensors\", scale = 1.0 }, …].",
         },
+        Field {
+            path: "input",
+            setting: "input",
+            label: "Model input",
+            section: "Provider",
+            kind: Kind::Toml,
+            help: "Model-specific fal or Replicate input as a TOML inline table. Prompt and single-image output fields are controlled by Dial. Use the model's documented input schema.",
+        },
+        Field {
+            path: "comfyui",
+            setting: "comfyui",
+            label: "Workflow",
+            section: "Provider",
+            kind: Kind::Toml,
+            help: "An inline table with workflow (the full API-format node graph), prompt_node and output_node. The prompt replaces inputs.text; dimensions and sampling remain in the workflow. See docs/image-generation.md.",
+        },
     ]
 }
 

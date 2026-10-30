@@ -534,6 +534,23 @@ impl Ui for StateUi<'_> {
         });
         decision
     }
+    fn approve_batch(&mut self, calls: &[crate::llm::ToolCall], cancel: &AtomicBool) -> Vec<bool> {
+        for call in calls {
+            self.emit_observed(
+                "tool_approval_requested",
+                || json!({"call_id":call.id,"name":call.name,"batch":true}),
+            );
+        }
+        let choices = self.inner.approve_batch(calls, cancel);
+        for (index, call) in calls.iter().enumerate() {
+            let allowed = choices.get(index) == Some(&true)
+                && !cancel.load(std::sync::atomic::Ordering::Acquire);
+            self.emit_observed("tool_approval_resolved", || {
+                json!({"call_id":call.id,"name":call.name,"decision":if allowed {"allow"} else {"deny"},"source":"finite_batch"})
+            });
+        }
+        choices
+    }
     fn ask_user(&mut self, title: &str, question: &str, options: &[String]) -> Option<String> {
         self.inner.ask_user(title, question, options)
     }

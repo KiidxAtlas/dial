@@ -639,11 +639,44 @@ fn ollama_models_take_their_purpose_from_api_show_capabilities() {
     ]);
     let (_, models) = probe_models(&test_probe(url, "ollama"));
     assert_eq!(models[0].metadata.kind, ModelKind::Chat);
+    // The `/api/show` list is Ollama's own declaration: listed is supported, absent is not.
+    assert_eq!(
+        (
+            models[0].metadata.tools,
+            models[0].metadata.vision,
+            models[0].metadata.reasoning
+        ),
+        (Some(true), Some(false), Some(false))
+    );
+    let url = routed(vec![
+        ("/api/tags", r#"{"models":[{"name":"gemma3:4b"}]}"#.into()),
+        (
+            "/api/show",
+            r#"{"capabilities":["completion","vision","thinking"]}"#.into(),
+        ),
+    ]);
+    let (_, models) = probe_models(&test_probe(url, "ollama"));
+    assert_eq!(
+        (
+            models[0].metadata.tools,
+            models[0].metadata.vision,
+            models[0].metadata.reasoning
+        ),
+        (Some(false), Some(true), Some(true))
+    );
     // No /api/show (404): the model is still listed, with an unknown purpose.
     let url = routed(vec![("/api/tags", r#"{"models":[{"name":"m"}]}"#.into())]);
     let (_, models) = probe_models(&test_probe(url, "ollama"));
     assert_eq!(models.len(), 1);
     assert_eq!(models[0].metadata.kind, ModelKind::Unknown);
+    assert_eq!(
+        (
+            models[0].metadata.tools,
+            models[0].metadata.vision,
+            models[0].metadata.reasoning
+        ),
+        (None, None, None)
+    );
 }
 #[test]
 fn auth_redirect_invalid_and_oversized_responses_are_explicit_failures() {
@@ -1103,6 +1136,57 @@ fn anthropic_catalog_reads_input_context_without_confusing_output_limits() {
 }
 
 #[test]
+fn hosted_catalog_capabilities_match_what_requests_assume() {
+    // Anthropic: `capabilities` is an object of `{ "supported": bool }` records; live values win.
+    let probe = test_probe(super::super::anthropic::BASE_URL.into(), "anthropic");
+    let entries = parse_models(
+        &serde_json::json!({"data":[
+            {"id":"claude-custom","capabilities":{
+                "image_input":{"supported":false},
+                "thinking":{"supported":true,"types":{}}
+            }},
+            {"id":"claude-opus-5-5"},
+            {"id":"claude-unlisted"}
+        ]}),
+        &probe,
+    )
+    .unwrap();
+    assert_eq!(
+        (entries[0].metadata.vision, entries[0].metadata.reasoning),
+        (Some(false), Some(true))
+    );
+    // Without live fields the picker shows the bundled record the runtime also resolves.
+    let selection = &entries[1].selection;
+    let runtime = bundled::complete_metadata(selection, ModelMetadata::default());
+    assert_eq!(entries[1].metadata.vision, Some(true));
+    assert_eq!(entries[1].metadata.reasoning, Some(true));
+    assert_eq!(
+        (entries[1].metadata.vision, entries[1].metadata.reasoning),
+        (runtime.vision, runtime.reasoning)
+    );
+    // Discovery does not attach a list price as if the provider had reported one.
+    assert!(entries[1].metadata.pricing.is_none());
+    // A model no source describes stays unknown rather than guessed from its name.
+    assert_eq!(
+        (
+            entries[2].metadata.vision,
+            entries[2].metadata.tools,
+            entries[2].metadata.reasoning
+        ),
+        (None, None, None)
+    );
+    // Gemini reports `thinking` as a top-level boolean.
+    assert_eq!(
+        metadata(&serde_json::json!({"name":"models/x","thinking":false})).reasoning,
+        Some(false)
+    );
+    assert_eq!(
+        metadata(&serde_json::json!({"name":"models/x","thinking":true})).reasoning,
+        Some(true)
+    );
+}
+
+#[test]
 fn old_claude_cache_recovers_context_without_network_or_rewriting_saved_metadata() {
     let home = tempfile::tempdir().unwrap();
     let selection = ModelSelection {
@@ -1156,6 +1240,69 @@ fn old_claude_cache_recovers_context_without_network_or_rewriting_saved_metadata
     selected.base_url = selection.base_url;
     selected.model = "claude-future-99".into();
     assert_eq!(model_context_window(home.path(), &selected), None);
+}
+
+/// A catalog saved before a Gemini image model was documented lists it as an image model on the
+/// next load, without a rescan; an explicit saved value and custom endpoints are left alone.
+#[test]
+fn old_gemini_cache_recovers_documented_image_output_without_rewriting_it() {
+    use crate::llm::profiles::ImageGenerationApi;
+    let home = tempfile::tempdir().unwrap();
+    let base_url = bundled::builtin_provider("gemini")
+        .unwrap()
+        .base_url
+        .clone();
+    let row = |model: &str, base_url: &str, image_generation| ModelEntry {
+        selection: ModelSelection {
+            provider: "gemini".into(),
+            model: model.into(),
+            base_url: Some(base_url.into()),
+            ..Default::default()
+        },
+        label: model.into(),
+        source: "gemini".into(),
+        available: true,
+        metadata: ModelMetadata {
+            image_generation,
+            ..Default::default()
+        },
+    };
+    let rows = vec![
+        row("gemini-3.1-flash-image", &base_url, None),
+        row(
+            "gemini-3-pro-image",
+            &base_url,
+            Some(ImageGenerationApi::Disabled),
+        ),
+        row("gemini-2.5-flash", &base_url, None),
+        row("gemini-3.1-flash-image", "https://proxy.example/v1", None),
+    ];
+    let path = home.path().join("model-catalog.json");
+    let bytes = serde_json::to_vec(&BTreeMap::from([("saved", rows.clone())])).unwrap();
+    write_private(&path, &bytes).unwrap();
+    let loaded: Vec<_> = cached(home.path()).into_values().flatten().collect();
+    let image = |model: &str, url: &str| {
+        loaded
+            .iter()
+            .find(|e| e.selection.model == model && e.selection.base_url.as_deref() == Some(url))
+            .unwrap()
+            .metadata
+            .image_generation
+    };
+    assert_eq!(
+        image("gemini-3.1-flash-image", &base_url),
+        Some(ImageGenerationApi::Gemini)
+    );
+    assert_eq!(
+        image("gemini-3-pro-image", &base_url),
+        Some(ImageGenerationApi::Disabled)
+    );
+    assert_eq!(image("gemini-2.5-flash", &base_url), None);
+    assert_eq!(
+        image("gemini-3.1-flash-image", "https://proxy.example/v1"),
+        None
+    );
+    assert_eq!(fs::read(&path).unwrap(), bytes);
 }
 #[test]
 fn malformed_credentials_fail_closed_without_echoing_content() {
@@ -1524,4 +1671,154 @@ fn krea_root_transformer_layout_is_an_image_not_chat() {
     }
     assert_eq!(snapshot(dir.path()), Some(None));
     assert_eq!(local_model_metadata(dir.path()).kind, ModelKind::Image);
+}
+
+/// Direct provider discovery: an exact documented id is annotated only when the live row declares
+/// no image output, and the row's own value (including `Disabled`) always wins.
+#[test]
+fn direct_image_providers_are_annotated_by_exact_documented_ids() {
+    use crate::llm::profiles::ImageGenerationApi;
+    let openai = test_probe("https://api.openai.com/v1".into(), "openai");
+    let entries = parse_models(
+        &serde_json::json!({"data":[
+            {"id":"gpt-image-1"},
+            {"id":"gpt-image-2.5-flare"},
+            {"id":"gpt-4o"},
+            {"id":"gpt-image-1-custom"}
+        ]}),
+        &openai,
+    )
+    .unwrap();
+    let api = |i: usize| entries[i].metadata.image_generation;
+    assert_eq!(api(0), Some(ImageGenerationApi::Images));
+    assert_eq!(api(1), Some(ImageGenerationApi::Images));
+    assert_eq!(api(2), None);
+    assert_eq!(api(3), None);
+    assert_eq!(entries[0].metadata.kind, ModelKind::Image);
+    assert!(!entries[0].supports_chat());
+    assert!(entries[0].supports_images());
+
+    let xai = test_probe("https://api.x.ai/v1".into(), "xai");
+    let entries = parse_models(
+        &serde_json::json!({"data":[{"id":"grok-imagine-image-2.0"},{"id":"grok-4"}]}),
+        &xai,
+    )
+    .unwrap();
+    assert_eq!(
+        entries[0].metadata.image_generation,
+        Some(ImageGenerationApi::Images)
+    );
+    assert_eq!(entries[1].metadata.image_generation, None);
+    assert_eq!(entries[0].metadata.kind, ModelKind::Image);
+    assert!(!entries[0].supports_chat());
+    assert!(entries[0].supports_images());
+
+    // Gemini lists purpose only through generation methods; the native image transport is exact.
+    let gemini = test_probe(
+        "https://generativelanguage.googleapis.com/v1beta".into(),
+        "gemini",
+    );
+    let entries = parse_models(
+        &serde_json::json!({"models":[
+            {"name":"models/gemini-2.5-flash-image","supportedGenerationMethods":["generateContent"]},
+            {"name":"models/gemini-3-pro-image-preview","supportedGenerationMethods":["generateContent"]},
+            {"name":"models/gemini-3.1-flash-image","supportedGenerationMethods":["generateContent"]},
+            {"name":"models/gemini-2.5-flash","supportedGenerationMethods":["generateContent"]}
+        ]}),
+        &gemini,
+    )
+    .unwrap();
+    assert_eq!(entries[0].selection.model, "gemini-2.5-flash-image");
+    for entry in &entries[..3] {
+        assert_eq!(
+            entry.metadata.image_generation,
+            Some(ImageGenerationApi::Gemini),
+            "{}",
+            entry.selection.model
+        );
+        assert!(entry.accepts_image_role(), "{}", entry.selection.model);
+    }
+    assert_eq!(entries[3].metadata.image_generation, None);
+    assert!(!entries[3].accepts_image_role());
+}
+
+/// Documented ids never apply on a custom or local endpoint, and a row that declares text-only
+/// output stays disabled. Vision input never implies image output.
+#[test]
+fn image_annotation_ignores_custom_endpoints_disabled_rows_and_vision() {
+    use crate::llm::profiles::ImageGenerationApi;
+    let custom = test_probe("http://127.0.0.1:1234/v1".into(), "openai");
+    let entries =
+        parse_models(&serde_json::json!({"data":[{"id":"gpt-image-1"}]}), &custom).unwrap();
+    assert_eq!(entries[0].metadata.image_generation, None);
+
+    let openai = test_probe("https://api.openai.com/v1".into(), "openai");
+    let entries = parse_models(
+        &serde_json::json!({"data":[
+            {"id":"gpt-image-1","output_modalities":["text"]},
+            {"id":"gpt-4o","input_modalities":["text","image"]}
+        ]}),
+        &openai,
+    )
+    .unwrap();
+    assert_eq!(
+        entries[0].metadata.image_generation,
+        Some(ImageGenerationApi::Disabled)
+    );
+    assert_eq!(entries[1].metadata.image_generation, None);
+    assert_eq!(entries[1].metadata.vision, Some(true));
+}
+
+/// MLX-Serve rows keep their native declaration; the documented-id fallback never touches them.
+#[test]
+fn mlx_serve_image_annotation_is_unchanged_by_direct_discovery() {
+    use crate::llm::profiles::ImageGenerationApi;
+    let probe = test_probe("http://127.0.0.1:8080/v1".into(), "mlx");
+    let entries = parse_models(
+        &serde_json::json!({"data":[
+            {"id":"mlx-community/flux2-klein-9b-4bit","owned_by":"mlx-serve","capabilities":["image"]},
+            {"id":"gpt-image-1","owned_by":"mlx-serve","capabilities":["chat","vision"]}
+        ]}),
+        &probe,
+    )
+    .unwrap();
+    assert_eq!(
+        entries[0].metadata.image_generation,
+        Some(ImageGenerationApi::MlxServe)
+    );
+    assert_eq!(entries[0].metadata.kind, ModelKind::Image);
+    assert_eq!(entries[1].metadata.image_generation, None);
+}
+
+/// `supports_images` follows the explicit declaration: `Disabled` vetoes even an image-kind row,
+/// any declared transport enables it, and only an undeclared row falls back to its purpose.
+#[test]
+fn supports_images_lets_explicit_disabled_veto_image_kind() {
+    use crate::llm::profiles::ImageGenerationApi;
+    let openai = test_probe("https://api.openai.com/v1".into(), "openai");
+    let entries = parse_models(
+        &serde_json::json!({"data":[
+            {"id":"gpt-image-1","type":"image","output_modalities":["text"]},
+            {"id":"gpt-image-1-mini","type":"image"},
+            {"id":"custom-image-model","type":"image"},
+            {"id":"gpt-4o","type":"chat"}
+        ]}),
+        &openai,
+    )
+    .unwrap();
+    assert_eq!(entries[0].metadata.kind, ModelKind::Image);
+    assert_eq!(
+        entries[0].metadata.image_generation,
+        Some(ImageGenerationApi::Disabled)
+    );
+    assert!(!entries[0].supports_images());
+    assert_eq!(
+        entries[1].metadata.image_generation,
+        Some(ImageGenerationApi::Images)
+    );
+    assert!(entries[1].supports_images());
+    assert_eq!(entries[2].metadata.image_generation, None);
+    assert!(entries[2].supports_images());
+    assert!(!entries[3].supports_images());
+    assert!(entries[3].supports_chat());
 }

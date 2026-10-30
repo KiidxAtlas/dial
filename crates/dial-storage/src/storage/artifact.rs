@@ -3,6 +3,9 @@
 //! Spools are capped (default 16 MiB): the first `head_bytes` are kept verbatim, later bytes
 //! feed a rolling tail window in a private ring file, and `finish` writes head, one
 //! `[ARTIFACT TRUNCATED: …]` marker and the tail. The content hash covers the stored bytes.
+mod evidence;
+pub use evidence::StoredEvidence;
+
 use crate::runtime::tool_output::ToolOutput;
 use anyhow::{Context, Result, ensure};
 use fs2::FileExt;
@@ -80,6 +83,10 @@ impl ArtifactStore {
             root: root.canonicalize()?,
             limits: ArtifactConfig::default(),
         })
+    }
+    /// Private storage root, for transferring an already-authorized output sink to a child owner.
+    pub fn root(&self) -> &Path {
+        &self.root
     }
     /// Apply the given bounds to spools created from now on (tests override the default cap).
     pub fn with_limits(mut self, limits: &ArtifactConfig) -> Self {

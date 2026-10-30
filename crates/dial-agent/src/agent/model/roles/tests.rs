@@ -154,6 +154,63 @@ fn semantic_index_budget_is_bounded_without_raising_configured_caps() {
 }
 
 #[test]
+fn retained_evidence_ranking_uses_index_only_chat_and_no_lsp_supplement() {
+    use crate::runtime::evidence::{
+        Evidence, EvidenceContext, EvidenceKind, Location, Method, Representation,
+    };
+    use crate::storage::artifact::ArtifactStore;
+    let dir = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(dir.path())
+        .unwrap()
+        .with_artifacts(ArtifactStore::new(state.path()).unwrap());
+    let bytes = b"The timeout is five seconds.";
+    let evidence = Evidence {
+        source: "requirements.txt".into(),
+        location: Location::Whole,
+        method: Method::Read,
+        producer: "test/source".into(),
+        kind: EvidenceKind::Observation,
+        summary: "Captured requirements".into(),
+        representation: Representation::of_bytes("text/plain", bytes),
+        limitations: vec![],
+        context: EvidenceContext::default(),
+    };
+    let reference = workspace
+        .artifacts()
+        .unwrap()
+        .retain_evidence(&evidence, bytes)
+        .unwrap();
+    let args = json!({"query":"timeout", "references":[reference], "ranking":"semantic"});
+    let request = retrieval_request(
+        &workspace,
+        "evidence_search",
+        &args,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(request.has_candidates());
+    assert!(request.supplementary(&args).unwrap().is_none());
+    let chat = request.chat(32);
+    assert_eq!(chat.max_tokens, 32);
+    assert!(chat.tools.is_empty());
+    assert!(request.render_response("{\"indices\":[9999]}").is_err());
+    let response = request.render_response("{\"indices\":[0]}").unwrap();
+    assert!(response.contains("five seconds"), "{response}");
+    assert!(
+        retrieval_request(
+            &workspace,
+            "evidence_search",
+            &json!({"query":"timeout","references":[reference]}),
+            &std::sync::atomic::AtomicBool::new(false)
+        )
+        .unwrap()
+        .is_none()
+    );
+}
+
+#[test]
 fn cancelled_role_request_never_initializes_a_backend_or_sends_a_request() {
     use crate::agent::run::tool_exposure::default_offer_tests::with_agent;
     let server = llm::fake::serve(vec![]);

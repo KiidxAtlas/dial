@@ -4,6 +4,7 @@ pub mod benchmark;
 pub mod changelog;
 pub mod cli;
 pub mod collab;
+pub mod release;
 pub mod repl;
 pub mod rpc;
 pub mod schedule;

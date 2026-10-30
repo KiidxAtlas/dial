@@ -397,9 +397,9 @@ impl CompactionControl {
 }
 
 /// Foreground local idle preparation uses the actor's compute lease, but not its normal-turn flag.
-struct ForegroundIdle {
+pub(in crate::agent) struct ForegroundIdle {
     control: CompactionControl,
-    cancel: Arc<AtomicBool>,
+    pub(in crate::agent) cancel: Arc<AtomicBool>,
     deadline: Deadline,
 }
 impl Drop for ForegroundIdle {
@@ -718,7 +718,10 @@ impl CompactionRuntime {
         self.failed_native = None;
         self.idle.activity(Instant::now());
     }
-    fn foreground_idle(&mut self, timeout_secs: u64) -> Result<ForegroundIdle> {
+    pub(in crate::agent) fn foreground_idle(
+        &mut self,
+        timeout_secs: u64,
+    ) -> Result<ForegroundIdle> {
         self.reap_retiring();
         ensure!(
             !self.closed && self.slot.is_none() && self.retiring.is_none(),
@@ -1403,6 +1406,9 @@ impl crate::agent::Agent<'_> {
     /// Actors acquire their existing foreground lease only for a due local pass. Constructing the
     /// role Backend here inspects the real route; it never loads a model or borrows a resident server.
     pub fn foreground_idle_pending(&self, busy: bool) -> Result<bool> {
+        if self.preparation_local_pending(busy) {
+            return Ok(true);
+        }
         if self.memory_foreground_pending(busy)? {
             return Ok(true);
         }
@@ -1472,6 +1478,9 @@ impl crate::agent::Agent<'_> {
         if activity.busy() {
             self.compaction_runtime
                 .idle_due(&self.config.compaction, now, tokens, activity);
+            return Ok(None);
+        }
+        if self.prepare_session_idle(ui)? {
             return Ok(None);
         }
         if self.compaction_runtime.kind() == Some(WorkKind::Idle)

@@ -151,6 +151,9 @@ fn scoped_guidance(offer: &Offer<'_>, concise: bool, prefer_subagents: bool) -> 
             out.push_str(PREVIEW_SERVER_RULES);
         }
     }
+    if has("monitor") {
+        out.push_str(MONITOR_RULES);
+    }
     if has("task") {
         out.push_str(if prefer_subagents {
             TESTER_DELEGATION_RULES
@@ -311,6 +314,8 @@ fn environment_prompt(i: &Inputs<'_>, rendered: Option<&str>, notes: TurnNotes) 
         std::env::consts::OS,
         i.tools.join(", ")
     ));
+    out.push_str(crate::agent::window::file_handles::GUIDANCE);
+    out.push('\n');
     if !i.discoverable.is_empty() {
         out.push_str("- Loadable tools, not in the schema yet: call `tool_load` with the exact name and use the tool next round. NEVER call one before loading it.\n");
         if i.lean || i.one_call {

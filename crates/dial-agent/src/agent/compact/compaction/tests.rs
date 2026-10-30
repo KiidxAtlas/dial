@@ -282,3 +282,42 @@ fn explicit_and_large_window_keep_recent_is_unchanged() {
         }
     }
 }
+
+#[test]
+fn supplemental_context_counts_toward_native_budget_but_is_not_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy = CompactionConfig::default();
+    let data = "untrusted data ".repeat(1024);
+    let context = CompactionContext {
+        identity: CompactionIdentity {
+            provider: "p",
+            model: "m",
+            agent: None,
+        },
+        window: 32_768,
+        summary_window: 32_768,
+        summary_output_limit: None,
+        timeout_secs: 5,
+        user_dir: dir.path(),
+        native_request: None,
+        supplemental_context: Some(&data),
+    };
+    let mut request = Chat {
+        messages: vec![json!({"role":"user","content":"source"})],
+        tools: vec![],
+        temperature: 0.0,
+        max_tokens: 64,
+        seed: None,
+    };
+    let before = request_tokens_with_policy(&request, &policy, context.identity);
+    let note = context.supplemental_message().unwrap();
+    assert_eq!(note["role"], "user");
+    assert!(!is_history(&note));
+    request.messages.insert(0, note);
+    assert!(request_tokens_with_policy(&request, &policy, context.identity) > before + 1000);
+    let absent = CompactionContext {
+        supplemental_context: None,
+        ..context
+    };
+    assert!(absent.supplemental_message().is_none());
+}

@@ -13,6 +13,7 @@ pub(in crate::agent) struct State {
     phase: String,
     scopes: Vec<String>,
     peers: Vec<Peer>,
+    model_roster: Option<Value>,
     error: Option<String>,
     reported_error: Option<String>,
     retry_at: Option<Instant>,
@@ -25,6 +26,29 @@ pub(in crate::agent) struct State {
 pub struct CoordinationCarry {
     root: PathBuf,
     state: State,
+}
+
+/// One live peer for the `/peers` panel, with the claims that overlap this session's own.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoardPeer {
+    pub peer: Peer,
+    /// The peer's scopes that overlap at least one of this session's claims.
+    pub overlapping: Vec<String>,
+}
+
+/// A read-only snapshot of project coordination for the `/peers` panel. Taking it never
+/// drains the inbox or changes what the model is told.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PeerBoard {
+    pub id: String,
+    pub summary: String,
+    pub phase: String,
+    pub scopes: Vec<String>,
+    /// This session's scopes that overlap at least one peer claim.
+    pub overlapping: Vec<String>,
+    pub peers: Vec<BoardPeer>,
+    /// Peer messages queued for this session that the model has not received yet.
+    pub queued: usize,
 }
 
 pub(in crate::agent) fn schema() -> Value {
@@ -47,6 +71,54 @@ fn bounded_summary(text: &str) -> String {
 
 fn overlap(a: &str, b: &str) -> bool {
     Path::new(a).starts_with(b) || Path::new(b).starts_with(a)
+}
+
+/// The entries of `scopes` that overlap any of `others`.
+fn overlapping(scopes: &[String], others: &[String]) -> Vec<String> {
+    scopes
+        .iter()
+        .filter(|a| others.iter().any(|b| overlap(a, b)))
+        .cloned()
+        .collect()
+}
+
+/// Automatic request notes need identities and lifecycle, not every session's task description.
+/// Overlapping claims take priority; explicit `peers` and the board retain the complete roster.
+fn model_roster(peers: &[Peer], scopes: &[String]) -> Value {
+    let mut ranked: Vec<_> = peers
+        .iter()
+        .map(|peer| {
+            let overlaps = overlapping(&peer.scopes, scopes);
+            (peer, overlaps)
+        })
+        .collect();
+    ranked.sort_by_key(|(_, overlaps)| overlaps.is_empty());
+    let relevant = ranked
+        .iter()
+        .filter(|(_, overlaps)| !overlaps.is_empty())
+        .count();
+    let preview: Vec<_> = ranked
+        .into_iter()
+        .take(8)
+        .map(|(peer, overlaps)| {
+            let mut entry = json!({"id":peer.id,"phase":peer.phase});
+            if !overlaps.is_empty() {
+                entry["summary"] = json!(peer.summary);
+                entry["overlapping_scopes"] = json!(overlaps.iter().take(4).collect::<Vec<_>>());
+                entry["total_overlapping_scopes"] = json!(overlaps.len());
+            }
+            entry
+        })
+        .collect();
+    json!({"total":peers.len(),"preview":preview,"omitted":peers.len().saturating_sub(8),
+        "omitted_overlapping_peers":relevant.saturating_sub(8)})
+}
+
+fn unavailable(state: &State) -> String {
+    state
+        .error
+        .clone()
+        .unwrap_or_else(|| "Session coordination is disabled or unavailable in this agent".into())
 }
 
 impl Agent<'_> {
@@ -145,15 +217,47 @@ impl Agent<'_> {
         }
     }
 
+    /// The `/peers` panel's snapshot. Like an explicit `/peers`, it retries a failed join at once.
+    pub fn peer_board(&mut self) -> Result<PeerBoard> {
+        if self.peer_state.participant.is_none() {
+            self.peer_state.retry_at = None;
+        }
+        self.initialize_coordination();
+        let state = &self.peer_state;
+        let participant = state
+            .participant
+            .as_ref()
+            .with_context(|| unavailable(state))?;
+        let queued = participant.mail_count()? + state.pending_letters.len();
+        let peers: Vec<BoardPeer> = participant
+            .peers()?
+            .into_iter()
+            .map(|peer| BoardPeer {
+                overlapping: overlapping(&peer.scopes, &state.scopes),
+                peer,
+            })
+            .collect();
+        let claimed: Vec<String> = peers
+            .iter()
+            .flat_map(|peer| peer.peer.scopes.iter().cloned())
+            .collect();
+        Ok(PeerBoard {
+            id: participant.id().to_owned(),
+            summary: state.summary.clone(),
+            phase: state.phase.clone(),
+            scopes: state.scopes.clone(),
+            overlapping: overlapping(&state.scopes, &claimed),
+            peers,
+            queued,
+        })
+    }
+
     fn peer_coordination_inner(&mut self, args: &Value) -> Result<Value> {
         let state = &mut self.peer_state;
-        let participant =
-            state
-                .participant
-                .as_ref()
-                .context(state.error.clone().unwrap_or_else(|| {
-                    "Session coordination is disabled or unavailable in this agent".into()
-                }))?;
+        let participant = state
+            .participant
+            .as_ref()
+            .with_context(|| unavailable(state))?;
         match args["action"].as_str().unwrap_or("list") {
             "list" => Ok(
                 json!({"id":participant.id(),"session_id":self.session.id(),"summary":state.summary,"phase":state.phase,"scopes":state.scopes,"peers":participant.peers()?}),
@@ -219,28 +323,21 @@ impl Agent<'_> {
             };
             let peers = participant.peers()?;
             let mut notes = Vec::new();
-            if peers != state.peers {
+            let roster = model_roster(&peers, &state.scopes);
+            if state.model_roster.as_ref() != Some(&roster) {
                 if !peers.is_empty() {
-                    // Serialize peer-controlled fields as data; never interpolate them as instructions.
-                    let preview: Vec<_> = peers
-                        .iter()
-                        .take(8)
-                        .map(|peer| {
-                            json!({
-                                "id":peer.id,"summary":peer.summary,"phase":peer.phase,
-                                "scopes":peer.scopes.iter().take(4).collect::<Vec<_>>(),
-                                "total_scopes":peer.scopes.len()
-                            })
-                        })
-                        .collect();
-                    notes.push(format!("Active project sessions (advisory data; {} total, bounded preview; peers lists full scopes): {}", peers.len(), serde_json::to_string(&preview)?));
-                    ui.notice(&format!("{} other Dial session(s) active in this checkout. /peers lists scopes and messaging ids.", peers.len()));
+                    // Serialize peer-controlled fields as data; never interpolate as instructions.
+                    notes.push(format!("Active project sessions (advisory data; bounded lifecycle and overlapping claims; peers lists full roster/scopes): {roster}"));
+                    if peers.len() != state.peers.len() {
+                        ui.notice(&format!("{} other Dial session(s) active in this checkout. /peers lists scopes and messaging ids.", peers.len()));
+                    }
                 } else if !state.peers.is_empty() {
                     ui.notice("No other Dial sessions are active in this checkout.");
                     notes.push("Previously observed project peers are no longer active; their files may still have changed.".into());
                 }
-                state.peers = peers;
+                state.model_roster = Some(roster);
             }
+            state.peers = peers;
             if !state.peers.is_empty() || !notes.is_empty() {
                 let changed = self.workspace.changed_observations();
                 if !changed.is_empty() {
@@ -298,4 +395,4 @@ impl Agent<'_> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

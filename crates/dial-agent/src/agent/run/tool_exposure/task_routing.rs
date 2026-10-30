@@ -76,10 +76,174 @@ fn coding(terms: &BTreeSet<String>) -> bool {
     )
 }
 
+/// Source formats in filenames are useful signals; incidental module names (`audio.rs`) are not.
+fn source_tools(query: &str) -> Vec<&'static str> {
+    let mut source_file = false;
+    let text = query
+        .split_whitespace()
+        .filter_map(|token| {
+            let token = token.trim_matches([
+                '`', '"', '\'', '“', '”', '‘', '’', ',', ';', ':', '?', '!', '(', ')', '.',
+            ]);
+            if let Some((_, extension)) = token.rsplit_once('.') {
+                let format = match extension.to_ascii_lowercase().as_str() {
+                    "pdf" => Some("pdf"),
+                    "docx" => Some("docx"),
+                    "pptx" => Some("pptx"),
+                    "xlsx" => Some("xlsx"),
+                    "csv" => Some("csv"),
+                    "json" | "jsonl" => Some("json"),
+                    "wav" | "mp3" | "m4a" | "flac" | "ogg" => Some("audio"),
+                    "png" | "jpg" | "jpeg" | "webp" | "tiff" => Some("image"),
+                    "har" => Some("har"),
+                    "sqlite" | "sqlite3" | "db" => Some("sqlite"),
+                    "folded" => Some("profile"),
+                    _ => None,
+                };
+                source_file |= format.is_some();
+                return format;
+            }
+            (!token.contains(['/', '\\'])).then_some(token)
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let terms = words(&text);
+    let inspect = any(
+        &terms,
+        &[
+            "inspect",
+            "read",
+            "analyze",
+            "analyse",
+            "summarize",
+            "summarise",
+            "extract",
+            "compare",
+            "verify",
+            "check",
+            "audit",
+            "investigate",
+            "search",
+            "find",
+            "locate",
+            "calculate",
+            "compute",
+            "count",
+            "plot",
+            "measure",
+            "explain",
+            "answer",
+            "query",
+        ],
+    );
+    // Questions about supplied captures should not require tool names or inspection jargon.
+    // Keep conceptual questions and requests to implement a parser out of this fallback.
+    let system_inspect = inspect
+        || (!coding(&terms)
+            && (any(&terms, &["show", "list"])
+                || (source_file && any(&terms, &["what", "which", "where", "why", "how"]))));
+    let mut names = Vec::new();
+    if system_inspect
+        && (any(
+            &terms,
+            &[
+                "trace",
+                "traces",
+                "otlp",
+                "profile",
+                "profiles",
+                "flamegraph",
+            ],
+        ) || (source_file && terms.contains("json") && any(&terms, &["span", "spans"])))
+    {
+        names.push("runtime_inspect");
+    }
+    if system_inspect && any(&terms, &["har", "openapi"]) {
+        names.push("network_inspect");
+    }
+    if system_inspect
+        && (any(&terms, &["sqlite", "database"])
+            || (terms.contains("query") && terms.contains("plan")))
+    {
+        names.push("database");
+    }
+    if inspect
+        && any(
+            &terms,
+            &[
+                "document",
+                "documents",
+                "pdf",
+                "docx",
+                "pptx",
+                "slides",
+                "report",
+            ],
+        )
+    {
+        names.push("document");
+    }
+    if inspect
+        && any(
+            &terms,
+            &[
+                "data",
+                "dataset",
+                "datasets",
+                "csv",
+                "json",
+                "xlsx",
+                "spreadsheet",
+                "workbook",
+                "table",
+            ],
+        )
+    {
+        names.push("data");
+    }
+    if any(&terms, &["transcribe", "transcription"])
+        || (inspect
+            && any(
+                &terms,
+                &["audio", "recording", "recordings", "speech", "podcast"],
+            ))
+    {
+        names.push("audio");
+    }
+    if (inspect || any(&terms, &["ocr", "annotate"]))
+        && any(
+            &terms,
+            &[
+                "image",
+                "images",
+                "diagram",
+                "diagrams",
+                "chart",
+                "screenshot",
+                "scan",
+                "scanned",
+                "ocr",
+            ],
+        )
+    {
+        names.push("visual");
+    }
+    if !names.is_empty()
+        || (inspect
+            && any(
+                &terms,
+                &["evidence", "citations", "citation", "sources", "quotes"],
+            ))
+    {
+        names.extend(["evidence", "evidence_search"]);
+    }
+    names
+}
+
 /// Workflow-specific native tools. A task needs an actual intent, not just an incidental word in
 /// a filename. The eligible catalog still decides which of these capabilities exists.
-fn native(terms: &BTreeSet<String>) -> Vec<&'static str> {
-    let mut names = Vec::new();
+fn native(query: &str, terms: &BTreeSet<String>) -> Vec<&'static str> {
+    let mut names = source_tools(query);
     // Web schemas are not a coding core. Offer them directly for web intent rather than
     // making research pay for a discovery round, or every unrelated coding step pay for them.
     if any(terms, &["web", "online", "internet", "research", "browse"]) {
@@ -181,6 +345,28 @@ fn native(terms: &BTreeSet<String>) -> Vec<&'static str> {
     {
         names.push("dap");
     }
+    // Runtime watching, not code that merely mentions servers, logs or watch modes.
+    let runtime = any(
+        terms,
+        &[
+            "running",
+            "crash",
+            "crashes",
+            "crashed",
+            "errors",
+            "exception",
+            "exceptions",
+            "live",
+            "alert",
+            "alerts",
+            "tail",
+        ],
+    );
+    if any(terms, &["monitor", "monitoring", "traceback"])
+        || (any(terms, &["log", "server", "watch"]) && runtime)
+    {
+        names.push("monitor");
+    }
     // Creating pictures, not containers or image-processing code.
     if any(
         terms,
@@ -209,14 +395,37 @@ fn select(query: &str, context: &BTreeSet<String>, candidates: &[(String, String
         candidates
             .iter()
             .filter(|(name, _)| {
-                query
-                    .split_whitespace()
-                    .any(|word| word.trim_matches(['`', ',', '.', '"']) == name)
+                query.split_whitespace().any(|word| {
+                    let matches = word.trim_matches(['`', ',', '.', '"']) == name;
+                    // Tool names that are ordinary English words route only when explicit.
+                    let common_source_name = [
+                        "document",
+                        "data",
+                        "audio",
+                        "visual",
+                        "evidence",
+                        "database",
+                        "investigate",
+                        "research",
+                        "monitor",
+                        "timeline",
+                        "reality",
+                        "perception",
+                        "video",
+                        "workbench",
+                    ]
+                    .contains(&name.as_str());
+                    matches
+                        && (!common_source_name
+                            || query.trim() == name
+                            || word.starts_with('`')
+                            || terms.contains("tool"))
+                })
             })
             .map(|entry| entry.0.clone()),
     );
     selected.extend(
-        native(&terms)
+        native(query, &terms)
             .into_iter()
             .filter(|name| candidates.iter().any(|entry| entry.0 == *name))
             .map(str::to_owned),

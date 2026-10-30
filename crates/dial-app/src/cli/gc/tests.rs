@@ -37,6 +37,41 @@ fn set_age(path: &Path, age: Duration) {
         .unwrap();
 }
 
+#[test]
+fn manifest_only_reference_keeps_parent_representations_and_reports_missing() {
+    use crate::storage::artifact::ArtifactStore;
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let l = layout(dir.path());
+    let root = l.state_dir.join(ARTIFACTS_DIR);
+    let store = ArtifactStore::new(&root).unwrap();
+    let mut parents = Vec::new();
+    let mut representations = Vec::new();
+    for bytes in [b"parent".as_slice(), b"child".as_slice()] {
+        let evidence = serde_json::from_value(serde_json::json!({
+            "source":"file:///not-fetched", "location":{"kind":"whole"},
+            "method":"read", "producer":"gc-test", "kind":"observation",
+            "summary":"retained", "representation":{"media_type":"text/plain",
+            "sha256":format!("{:x}", Sha256::digest(bytes))}, "limitations":[],
+            "context":{"parents":parents}
+        }))
+        .unwrap();
+        let citation = store.retain_evidence(&evidence, bytes).unwrap();
+        representations.push(store.evidence_record(&citation).unwrap().representation_uri);
+        parents = vec![citation];
+    }
+    fs::create_dir_all(l.sessions_dir()).unwrap();
+    fs::write(l.sessions_dir().join("evidence.jsonl"), &parents[0]).unwrap();
+    let scan = collect_references(&l).unwrap();
+    assert_eq!(scan.refs.len(), 4);
+    assert!(scan.missing.is_empty());
+    let missing = representations[0].strip_prefix("artifact://").unwrap();
+    fs::remove_file(root.join(missing)).unwrap();
+    let scan = collect_references(&l).unwrap();
+    assert_eq!(scan.missing, vec![missing.to_owned()]);
+    assert_eq!(scan.refs.len(), 4);
+}
+
 fn write_session(layout: &Layout, file: &str, cwd: &str, age: Duration) -> PathBuf {
     let dir = layout.sessions_dir();
     fs::create_dir_all(&dir).unwrap();

@@ -93,6 +93,8 @@ impl crate::agent::Ui for RuleUi<'_, '_, '_> {
 /// Operator instructions and explicit task/skill/schema inputs are never deduplicated.
 fn initial_messages(env: Env, job: &Job<'_>, names: &[String]) -> Vec<Value> {
     let mut system = job.system(env.workspace.root(), names);
+    system.push('\n');
+    system.push_str(crate::agent::window::file_handles::GUIDANCE);
     if names.iter().any(|name| {
         matches!(
             name.as_str(),
@@ -685,10 +687,10 @@ struct ToolSurface<'a> {
     names: &'a [String],
 }
 
-/// A `find` call routed to semantic search, with its parsed request.
+/// A source or retained-evidence call routed to bounded semantic ranking.
 struct SemanticCall<'a> {
     call: &'a llm::ToolCall,
-    request: crate::tools::code::navigation::SemanticRequest,
+    request: crate::agent::model::roles::RetrievalRequest,
 }
 
 /// Side inference remains a worker request, with its own role cap, account and
@@ -1628,6 +1630,7 @@ fn compact_child(
         timeout_secs: env.config.worker_timeout_secs,
         user_dir: &env.config.user_dir,
         native_request: Some(request),
+        supplemental_context: None,
     };
     let observer = std::cell::RefCell::new(approver);
     let mut ui = RuleUi {
@@ -2009,6 +2012,16 @@ fn run_inner(
         return Outcome::failed(0, format!("{error:#}"));
     }
     let mut messages = initial_messages(env, job, &names);
+    for message in &job.resume_messages {
+        if let Some(snapshot) = message.get("dial_file_handles") {
+            let restored = serde_json::from_value(snapshot.clone())
+                .map_err(|error| error.to_string())
+                .and_then(|snapshot| env.workspace.restore_file_handles(&snapshot));
+            if let Err(error) = restored {
+                return Outcome::failed(0, format!("restoring worker file handles: {error}"));
+            }
+        }
+    }
     // Independent child conversations reuse the same project cache without rebuilding the map.
     // Automatic retrieval follows the parent's ambient-context policy; explicit lookups stay available.
     if env.config.codebase.enabled
@@ -2016,19 +2029,19 @@ fn run_inner(
         && let Some(layout) = env.layout
     {
         match crate::tools::knowledge::codebase::Codebase::open(layout).and_then(|cache| {
-            if env.config.efficiency.enabled {
-                cache.task_context(
-                    &job.prompt,
-                    crate::agent::workflow::efficiency::byte_limit(
-                        env.config.codebase.context_max_bytes,
-                    )
-                    .min(crate::agent::workflow::efficiency::byte_limit(
-                        env.config.efficiency.ambient_context_bytes,
-                    )),
+            cache.task_context(
+                &job.prompt,
+                crate::agent::workflow::efficiency::byte_limit(
+                    env.config.codebase.context_max_bytes,
                 )
-            } else {
-                cache.context(&job.prompt, env.config.codebase.context_max_bytes)
-            }
+                .min(if env.config.efficiency.enabled {
+                    crate::agent::workflow::efficiency::byte_limit(
+                        env.config.efficiency.ambient_context_bytes,
+                    )
+                } else {
+                    usize::MAX
+                }),
+            )
         }) {
             Ok(context)
                 if !context.is_empty()
@@ -2054,6 +2067,7 @@ fn run_inner(
     let turn_cancel = children.cancellation.turn(env.interrupt.clone());
     let mut reasoning_recovery = reasoning::Recovery::default();
     let mut request_prefix = crate::agent::window::request_prefix::Tracker::default();
+    let mut superseded = crate::agent::workflow::evidence::Supersession::default();
     // Messages taken while waiting or generating remain owned until the next request
     // accepts them. In particular, cancellation must not consume coordination.
     let pending_coordination = std::cell::RefCell::new(Vec::new());
@@ -2387,7 +2401,21 @@ fn run_inner(
         };
         // Request hooks are synchronous and can themselves wait. Revalidate after
         // that boundary, before spending a request or dispatching stale context.
-        let provider_rewrite = match child_provider_request(&env, &request, &observer) {
+        // Project a request copy: the child's retained history and immutable archive keep full
+        // paths, original observations and handle metadata across later requests/maintenance.
+        let mut model_request = request.clone();
+        crate::agent::window::file_handles::project(env.workspace, &mut model_request.messages);
+        let estimate_before = crate::llm::wire::estimate_parts(&model_request.messages, &model_request.tools);
+        let window = child_window(env, backend);
+        let policy = crate::agent::workflow::evidence::Policy {
+            warm_tokens: if env.config.efficiency.enabled || env.config.compaction.preserve_prefix { 0 } else { 10_000 },
+            pressure: estimate_before > u64::from(window) * u64::from(env.config.efficiency.cache_pressure_percent) / 100,
+            protect_tokens: (window as usize / 5).max(4_000),
+            supersede_reads: env.config.compaction.supersede_reads,
+            drop_useless: env.config.compaction.drop_useless,
+        };
+        crate::agent::workflow::evidence::project(&mut model_request.messages, &mut superseded, &policy);
+        let provider_rewrite = match child_provider_request(&env, &model_request, &observer) {
             Ok(rewrite) => rewrite,
             Err(error) => return Ok(crate::agent::run::engine::Tick::Finished(Outcome::failed(steps, format!("{error:#}")))),
         };
@@ -2409,7 +2437,7 @@ fn run_inner(
         let generation_scope = turn_cancel.inference();
         let generation_cancel = generation_scope.flag();
         let mut rule_monitor = rule_catalog.monitor(rule_root, rule_state, &rule_agent);
-        let provider_request = provider_rewrite.as_ref().unwrap_or(&request);
+        let provider_request = provider_rewrite.as_ref().unwrap_or(&model_request);
         let prefix =
             request_prefix.observe(&env.config.selection().display_name(), provider_request);
         if prefix.invalidation != crate::agent::window::request_prefix::Invalidation::None {
@@ -2941,6 +2969,10 @@ fn run_inner(
                 .and_then(|s| s.pointer("/function/parameters"))
             {
                 crate::agent::run::tool_compat::normalize(&call.name, parameters, &mut call.arguments);
+                if let Err(error) = crate::agent::window::file_handles::expand(env.workspace, call) {
+                    call.malformed_arguments = true;
+                    approver.notice(&format!("File reference refused: {error}"));
+                }
             }
         }
         let mut normalized_rules = rule_catalog.monitor(rule_root, rule_state, &rule_agent);
@@ -2991,7 +3023,8 @@ fn run_inner(
             }
         }
         let narration_warning = engine.narration.observe(&reply);
-        let assistant = crate::tools::surface::contracts::assistant_message(&reply, &schemas, env.ext);
+        let mut assistant = crate::tools::surface::contracts::assistant_message(&reply, &schemas, env.ext);
+        crate::agent::window::file_handles::capture_calls(env.workspace, &mut assistant);
         if let Err(error) = children.archive_assistant(&messages, &assistant, recovered_original) {
             return Ok(crate::agent::run::engine::Tick::Finished(Outcome::failed(
                 steps,
@@ -2999,6 +3032,7 @@ fn run_inner(
             )));
         }
         messages.push(assistant);
+        let _speculative_batch = env.workspace.speculation.batch();
         let mut parallel = std::collections::VecDeque::new();
         let mut investigation_stop = None;
         let mut round_messages = Vec::new();
@@ -3077,7 +3111,23 @@ fn run_inner(
                 );
                 continue;
             }
+            if env.config.experimental.tool_speculation {
+                for later in reply.tool_calls.iter().skip(index + 1).take(2) {
+                    if call_form_error(later, &schemas, &names).is_some()
+                        || engine.rejection_at(env.workspace, later).is_some() {
+                        continue;
+                    }
+                    let Some(key) = child_speculation_key(env, job, later, &children.namespace) else { continue; };
+                    if approver.authorize_with_cancel(later, &summarize(later), false, env.interrupt).is_ok() {
+                        env.workspace.speculation.start_named(env.workspace, env.config.clone(), env.ext,
+                            later, key,
+                            children.cancellation.turn(env.interrupt.clone()));
+                    }
+                }
+            }
             if parallel.is_empty()
+                && !child_speculation_key(env, job, call, &children.namespace)
+                    .is_some_and(|key| env.workspace.speculation.pending(&key, &call.arguments))
                 && !crate::agent::safety::hooks::wanted(
                     &env.config.hooks,
                     env.ext.plugins().as_deref(),
@@ -3186,7 +3236,7 @@ fn run_inner(
             portable_batch_intercepted |= rule_state.callback_pending();
             let (duplicate, repeat_advice, stop) =
                 engine.settle(env.workspace, call, &mut output, false, false, |id| {
-                    messages
+                    superseded.holds_full(id) && messages
                         .iter()
                         .any(|message| message["tool_call_id"].as_str() == Some(id))
                 });
@@ -3204,15 +3254,20 @@ fn run_inner(
                 output.text.push_str("\n\n");
                 output.text.push_str(&advice);
             }
-            let image = if (call.name == "browser" || call.name == "computer") && !output.is_error {
-                match crate::storage::artifact::capture_image(env.workspace.artifacts(), &mut output) {
+            let image = if output.is_error {
+                None
+            } else {
+                match crate::agent::run::dispatch::capture_output_image(env.workspace, call, &mut output) {
                     Ok(image) => image,
-                    Err(e) => {
+                    Err(e) if call.name == "browser" || call.name == "computer" => {
                         return Ok(crate::agent::run::engine::Tick::Finished(Outcome::failed(steps, format!("retaining screenshot: {e:#}"))));
                     }
+                    // The text result stands on its own; only the attachment is lost.
+                    Err(e) => {
+                        output.text.push_str(&format!("\n[Image attachment unavailable: {e:#}]"));
+                        None
+                    }
                 }
-            } else {
-                None
             };
             // Shaped by the same helpers as the parent's results: this child's own window sets the
             // clip, and complete evidence is linked only when the visible body dropped content.
@@ -3236,8 +3291,17 @@ fn run_inner(
                 output.is_error,
                 artifact.is_some(),
             );
-            let (mut body, dropped) =
-                crate::agent::workflow::efficiency::visible_result(&output.text, limit, duplicate);
+            let original_observation = duplicate.is_none();
+            let edit = crate::agent::workflow::efficiency::edit_result(&call.name, &output, artifact.is_some());
+            let (mut body, dropped) = crate::agent::workflow::efficiency::visible_result(
+                edit.as_deref().unwrap_or(&output.text), limit, duplicate,
+            );
+            let dropped = dropped || edit.is_some();
+            if let Some(compact) = crate::agent::workflow::efficiency::compact_command(
+                call, &output, artifact.as_deref(),
+            ) {
+                body = compact;
+            }
             if body != output.text {
                 let integrity = output.execution.output.get_or_insert_with(Default::default);
                 integrity.mark_presentation_partial();
@@ -3264,6 +3328,12 @@ fn run_inner(
             let mut message = llm::tool_message(&call.id, &body);
             crate::tools::surface::outcome::annotate(&mut message, &output);
             message["is_error"] = json!(output.is_error);
+            message["dial_evidence"] = json!({"artifact":artifact,"is_error":output.is_error});
+            if call.name == "read" && !output.is_error && original_observation {
+                let mut observation = call.arguments.clone();
+                if let Some(args) = observation.as_object_mut() { args.remove("i"); }
+                message["dial_evidence"]["observation"] = json!(observation.to_string());
+            }
             if let Some(image) = image {
                 message["dial_images"] = json!([image]);
             }
@@ -3326,6 +3396,15 @@ fn run_inner(
                 }
                 if crate::agent::workflow::exploration::TOOL_NAMES.contains(&call.name.as_str()) {
                     message["dial_exploration_result"] = json!(true);
+                }
+            }
+            if !output.is_error {
+                let model = crate::agent::window::file_handles::model_result(
+                    env.workspace, call, message["content"].as_str().unwrap_or(""),
+                );
+                if message["content"].as_str() != Some(model.as_str()) {
+                    message["dial_model_content"] = json!(model);
+                    message["dial_file_handles"] = json!(env.workspace.file_handle_snapshot());
                 }
             }
             crate::storage::media::retain_message(&mut message, &children.image_store);
@@ -3884,6 +3963,44 @@ fn preview_reads_authorized(
     !env.interrupt.load(Ordering::SeqCst)
 }
 
+/// Child preparation has its own immutable namespace; current authorization is repeated
+/// at delivery by call_tool_inner, never inferred from this cache identity.
+fn child_speculation_key(
+    env: Env,
+    job: &Job,
+    call: &llm::ToolCall,
+    namespace: &str,
+) -> Option<String> {
+    if !env.config.experimental.tool_speculation
+        || !matches!(call.name.as_str(), "ast_search" | "read" | "grep")
+        || (!matches!(call.name.as_str(), "read" | "grep")
+            && env.ext.origin(&call.name) != Some(tools::surface::catalog::Origin::Native))
+        || (matches!(call.name.as_str(), "read" | "grep") && env.ext.get(&call.name).is_some())
+        || crate::agent::safety::hooks::wanted(
+            &env.config.hooks,
+            env.ext.plugins().as_deref(),
+            "pre_tool_use",
+        )
+    {
+        return None;
+    }
+    let tool = env.ext.get(&call.name);
+    if tool.is_some_and(|tool| {
+        tool.needs_approval(&call.arguments)
+            || tool.may_modify_workspace(&call.arguments)
+            || tool.supports_tool_dispatch()
+    }) {
+        return None;
+    }
+    use sha2::Digest as _;
+    let authority = json!({"child":namespace,"job":job.index,"name":call.name,"root":env.workspace.root(),
+        "config":env.config,"schema":tool.map(|tool| tool.schema()),"revision":tool.map(|tool| tool.contract_revision()),"builtin_schema":tools::schemas(&[&call.name], env.workspace.edit_mode()).ok()});
+    Some(format!(
+        "{:x}",
+        sha2::Sha256::digest(serde_json::to_vec(&authority).ok()?)
+    ))
+}
+
 fn call_tool(
     env: Env,
     job: &Job,
@@ -3942,6 +4059,11 @@ fn call_tool_inner(
         .with_status(tools::ToolStatus::Blocked)
         .with_effects(crate::tools::surface::outcome::Effects::None)
     };
+    let mut expanded = call.clone();
+    if let Err(error) = crate::agent::window::file_handles::expand(env.workspace, &mut expanded) {
+        return refuse(format!("File reference refused: {error}"));
+    }
+    let call = &expanded;
     let preview_abort = rerank.as_ref().map(|context| context.preview_abort);
     let children = rerank.as_ref().map(|context| context.children);
     if preview_abort.is_some_and(std::cell::Cell::get) {
@@ -4124,8 +4246,13 @@ fn call_tool_inner(
         }
         authorized
     };
-    if call.name == "find" {
-        match crate::tools::code::navigation::semantic_request(env.workspace, &call.arguments) {
+    if matches!(call.name.as_str(), "find" | "evidence_search") {
+        match crate::agent::model::roles::retrieval_request(
+            env.workspace,
+            &call.name,
+            &call.arguments,
+            env.interrupt,
+        ) {
             Ok(Some(request)) => {
                 let mut output = semantic_find(
                     env,
@@ -4193,7 +4320,7 @@ fn call_tool_inner(
     let plugin_host = env.ext.plugins();
     let plugins = plugin_host.as_deref().filter(|_| env.layout.is_some());
     let root = env.workspace.root().to_path_buf();
-    let rewritten;
+    let mut rewritten;
     let call = match crate::agent::safety::hooks::pre_tool_with(
         &env.config.hooks,
         plugins,
@@ -4221,6 +4348,11 @@ fn call_tool_inner(
                 arguments,
                 ..call.clone()
             };
+            if let Err(error) =
+                crate::agent::window::file_handles::expand(env.workspace, &mut rewritten)
+            {
+                return refuse(format!("File reference refused: {error}"));
+            }
             if approval::needs_approval(env.ext, &rewritten)
                 || call_form_error(&rewritten, schemas, names).is_some()
             {
@@ -4250,7 +4382,16 @@ fn call_tool_inner(
         approver.borrow_mut().tool_finished(&call.id);
         return crate::agent::interrupted_tool();
     }
-    let mut output = if let Some(tool) = code_tool {
+    let prepared = children
+        .and_then(|children| child_speculation_key(env, job, call, &children.namespace))
+        .and_then(|key| {
+            env.workspace
+                .speculation
+                .take_named(env.workspace, &call.name, &call.arguments, &key)
+        });
+    let mut output = if let Some(output) = prepared {
+        output
+    } else if let Some(tool) = code_tool {
         let mut callbacks = 0usize;
         let mut questions = Vec::new();
         let mut dispatch = |request| {
@@ -4628,48 +4769,72 @@ fn semantic_find(
 ) -> ToolOutput {
     let SemanticCall { call, request } = semantic;
     let result = (|| -> Result<ToolOutput> {
-        let supplementary = crate::tools::code::navigation::lsp_args(&call.arguments)
+        let supplementary = request
+            .supplementary(&call.arguments)
             .map_err(anyhow::Error::msg)?;
         let response = if request.has_candidates() {
             let context = rerank
-                .context("semantic find requires the child run's configured model backend")?;
-            if context.budget != 0 && *context.steps >= context.budget {
-                bail!("semantic find cannot exceed the subagent model-request budget");
+                .context("semantic retrieval requires the child run's configured model backend")?;
+            let chat = request.chat(env.harness.max_tokens);
+            if matches!(
+                request,
+                crate::agent::model::roles::RetrievalRequest::Evidence(_)
+            ) {
+                child_role_chat(
+                    env,
+                    context.backend,
+                    context.adapter,
+                    ChildRoleCall {
+                        role: "small",
+                        purpose: llm::usage::Purpose::Retrieval,
+                        request: &chat,
+                        steps: context.steps,
+                        budget: context.budget,
+                        model_override: None,
+                        timeout: None,
+                        operation: None,
+                    },
+                    approver,
+                    context.children,
+                )?
+            } else {
+                if context.budget != 0 && *context.steps >= context.budget {
+                    bail!("semantic find cannot exceed the subagent model-request budget");
+                }
+                *context.steps += 1;
+                let mut keep_going = |_: &str| !env.interrupt.load(Ordering::SeqCst);
+                let Some(_provider_slot) =
+                    crate::agent::model::provider_slots::acquire(env.config, env.interrupt)
+                else {
+                    return Err(llm::Interrupted.into());
+                };
+                let started = std::time::Instant::now();
+                let previous_scope = context.backend.set_usage_scope(
+                    env.usage
+                        .map(|scope| scope.worker().for_purpose(llm::usage::Purpose::Retrieval)),
+                );
+                let result = context.backend.chat_with_control(
+                    context.adapter,
+                    &chat,
+                    env.config.worker_timeout_secs,
+                    Some(&mut keep_going),
+                    &mut |notice| approver.borrow_mut().notice(notice),
+                    std::sync::Arc::clone(env.interrupt),
+                );
+                context.backend.set_usage_scope(previous_scope);
+                record_child_request(
+                    env,
+                    &context.children.namespace,
+                    context.backend,
+                    &result,
+                    started,
+                );
+                let reply = result.context("semantic find ranking failed")?;
+                if let Some(cost) = context.backend.reply_cost(&reply) {
+                    approver.borrow_mut().add_cost(cost);
+                }
+                reply.text
             }
-            *context.steps += 1;
-            let chat = crate::agent::semantic_chat(&request, env.harness.max_tokens);
-            let mut keep_going = |_: &str| !env.interrupt.load(Ordering::SeqCst);
-            let Some(_provider_slot) =
-                crate::agent::model::provider_slots::acquire(env.config, env.interrupt)
-            else {
-                return Err(llm::Interrupted.into());
-            };
-            let started = std::time::Instant::now();
-            let previous_scope = context.backend.set_usage_scope(
-                env.usage
-                    .map(|scope| scope.worker().for_purpose(llm::usage::Purpose::Retrieval)),
-            );
-            let result = context.backend.chat_with_control(
-                context.adapter,
-                &chat,
-                env.config.worker_timeout_secs,
-                Some(&mut keep_going),
-                &mut |notice| approver.borrow_mut().notice(notice),
-                std::sync::Arc::clone(env.interrupt),
-            );
-            context.backend.set_usage_scope(previous_scope);
-            record_child_request(
-                env,
-                &context.children.namespace,
-                context.backend,
-                &result,
-                started,
-            );
-            let reply = result.context("semantic find ranking failed")?;
-            if let Some(cost) = context.backend.reply_cost(&reply) {
-                approver.borrow_mut().add_cost(cost);
-            }
-            reply.text
         } else {
             "{\"indices\":[]}".to_owned()
         };

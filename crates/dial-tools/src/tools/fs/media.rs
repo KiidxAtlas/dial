@@ -3,14 +3,21 @@
 //! `data.artifact` channel (captured like screenshots); the text stays a short description.
 //! External tools are detected at runtime and missing ones fail with an actionable error.
 use crate::llm::{images, policy};
+use crate::runtime::evidence::{
+    Coverage, CoverageExtent, Evidence, EvidenceBundle, EvidenceContext, EvidenceKind, Location,
+    Method, Representation,
+};
 use crate::runtime::tool_output::ToolOutput;
 use crate::tools::Workspace;
+use crate::tools::integrations::ext::ToolContext;
+use crate::tools::knowledge::evidence::source;
 use crate::voice::process::{CommandSpec, run, which};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use resvg::{tiny_skia, usvg};
 use serde_json::{Value, json};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -23,14 +30,33 @@ const FFMPEG_HINT: &str =
 const MIN_SVG_EDGE: f32 = 1024.0;
 const PREVIEW_FRAMES: u32 = 9;
 
+/// Conservative approval classifier; execution expands handles before media detection.
+pub(in crate::tools) fn needs_approval(path: &str) -> bool {
+    let (file, selector) = split(path);
+    let ext = Path::new(file)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("");
+    let ext = ext.to_ascii_lowercase();
+    VIDEO_EXTENSIONS.contains(&ext.as_str())
+        || matches!(ext.as_str(), "heic" | "heif")
+        || (ext == "pdf" && pdf_page(selector).is_some())
+}
+
 /// Intercepts media targets before the generic file reader. `None` means the target is not a
 /// media request and ordinary text or image handling applies.
 pub(crate) fn read(
     ws: &Workspace,
     args: &Value,
     cancel: &AtomicBool,
+    context: Option<&ToolContext<'_>>,
 ) -> Option<Result<ToolOutput, String>> {
-    let path_text = args.get("path")?.as_str()?;
+    let raw = args.get("path")?.as_str()?;
+    let expanded = match ws.expand_file_handle(raw) {
+        Ok(path) => path,
+        Err(error) => return Some(Err(error)),
+    };
+    let path_text = expanded.as_str();
     if crate::tools::net::web::read::is_url(path_text) {
         return None;
     }
@@ -41,15 +67,95 @@ pub(crate) fn read(
         split(path_text)
     };
     let ext = Path::new(file).extension()?.to_str()?.to_ascii_lowercase();
-    let result = match ext.as_str() {
-        "svg" if selector == "img" => svg(ws, file),
-        "pdf" => render_pdf_page(ws, file, pdf_page(selector)?, cancel),
-        "heic" | "heif" if selector.is_empty() => heic(ws, file, cancel),
-        "heic" | "heif" => Err(anyhow!("HEIC images take no selector")),
-        ext if VIDEO_EXTENSIONS.contains(&ext) => video(ws, file, selector, cancel),
+    let external = match ext.as_str() {
+        "pdf" => {
+            pdf_page(selector)?;
+            true
+        }
+        "heic" | "heif" => true,
+        ext if VIDEO_EXTENSIONS.contains(&ext) => true,
+        "svg" if selector == "img" => false,
         _ => return None,
     };
-    Some(result.map_err(|error| format!("{error:#}")))
+    let result = (|| {
+        if !external {
+            return svg(ws, file);
+        }
+        let context = context.context("external media reads require explicit confirmation and execution-controller authorization")?;
+        super::audio::authorize(
+            context,
+            "read",
+            "Run installed local media converters outside the shell sandbox on a copied, bounded authorized source? No installation or network requested.",
+        )?;
+        ensure!(
+            !cancel.load(std::sync::atomic::Ordering::Acquire),
+            "media read cancelled"
+        );
+        if ext == "pdf" {
+            return render_pdf_page(
+                ws,
+                file,
+                pdf_page(selector).context("invalid PDF page")?,
+                cancel,
+            );
+        }
+        let bytes = source::read(ws, file)?;
+        let snapshot = source::snapshot(&bytes)?;
+        let dir = tempfile::tempdir().context("creating copied media source")?;
+        let input = dir.path().join(format!("source.{ext}"));
+        fs::write(&input, bytes)?;
+        let output = match ext.as_str() {
+            "heic" | "heif" if selector.is_empty() => heic(&input, file, cancel),
+            "heic" | "heif" => Err(anyhow!("HEIC images take no selector")),
+            _ => video(&input, file, selector, cancel),
+        }?;
+        with_snapshot(output, snapshot)
+    })();
+    Some(
+        result
+            .and_then(|output| retain(ws, output))
+            .map_err(|error| format!("{error:#}")),
+    )
+}
+
+fn with_snapshot(
+    mut output: ToolOutput,
+    snapshot: crate::runtime::evidence::SourceSnapshot,
+) -> Result<ToolOutput> {
+    let mut bundle = output.evidence()?.context("media evidence is missing")?;
+    for item in &mut bundle.items {
+        item.context.snapshot = Some(snapshot.clone());
+    }
+    bundle.validate()?;
+    let data = output.data.as_mut().context("media data is missing")?;
+    data["evidence"] = serde_json::to_value(bundle)?;
+    Ok(output)
+}
+
+/// Retain the exact fitted representation; never reread or silently retain the original source.
+fn retain(ws: &Workspace, mut output: ToolOutput) -> Result<ToolOutput> {
+    let Some(store) = ws.artifacts() else {
+        return Ok(output);
+    };
+    let bundle = output.evidence()?.context("media evidence is missing")?;
+    let encoded = output
+        .data
+        .as_ref()
+        .and_then(|data| data.pointer("/artifact/data"))
+        .and_then(Value::as_str)
+        .context("media PNG is missing")?;
+    let png = STANDARD.decode(encoded)?;
+    let citations = bundle
+        .items
+        .iter()
+        .map(|item| store.retain_evidence(item, &png))
+        .collect::<Result<Vec<_>>>()?;
+    output.text.push_str(&format!(
+        "\nEvidence citation: {} (retention-limited; not verification).",
+        citations.join(", ")
+    ));
+    output.data.as_mut().unwrap()["evidence_references"] = json!(citations);
+    Ok(output)
 }
 
 /// Splits `file.ext:selector` at the first colon after the last dot, so clock selectors such as
@@ -71,7 +177,7 @@ fn pdf_page(selector: &str) -> Option<u32> {
         .strip_suffix(":img")?
         .parse::<u32>()
         .ok()
-        .filter(|page| *page >= 1)
+        .filter(|page| (1..=10_000).contains(page))
 }
 
 fn resolve(ws: &Workspace, file: &str) -> Result<PathBuf> {
@@ -93,9 +199,76 @@ fn tool(name: &str, hint: &str) -> Result<PathBuf> {
     which(Path::new(name)).with_context(|| format!("{name} is not installed; {hint}"))
 }
 
-/// Wraps a derived PNG as the structured artifact the agent captures and attaches.
-fn derived(text: String, png: &[u8]) -> Result<ToolOutput> {
+fn bounded_output(path: &Path) -> Result<Vec<u8>> {
+    let file = fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file(),
+        "converter output must be a regular file"
+    );
+    ensure!(
+        metadata.len() <= images::MAX_IMAGE_SOURCE_BYTES,
+        "converter output exceeds 64 MiB"
+    );
+    let mut bytes = Vec::new();
+    file.take(images::MAX_IMAGE_SOURCE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 <= images::MAX_IMAGE_SOURCE_BYTES,
+        "converter output exceeds 64 MiB"
+    );
+    Ok(bytes)
+}
+
+struct Origin<'a> {
+    source: &'a str,
+    location: Location,
+    method: Method,
+    producer: &'static str,
+    limitations: &'static [&'static str],
+}
+
+/// Keep provenance beside the existing artifact, hashing the fitted PNG actually returned.
+fn derived(mut text: String, png: &[u8], origin: Origin<'_>) -> Result<ToolOutput> {
+    ensure!(
+        png.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "media converter did not return a PNG"
+    );
+    images::dimensions(png).context("invalid or oversized derived PNG header")?;
     let png = images::fit_png(png)?;
+    let mut limitations = vec![
+        "Returned PNG digest identifies the derived representation; source snapshot, when present, identifies captured input bytes.".into(),
+        "Extraction is not visual interpretation or verification of the depicted behavior.".into(),
+    ];
+    limitations.extend(origin.limitations.iter().map(|value| (*value).to_owned()));
+    text.push_str("\n[Evidence limitations: ");
+    text.push_str(&limitations.join(" "));
+    text.push(']');
+    let evidence = EvidenceBundle::new(vec![Evidence {
+        source: origin.source.into(),
+        location: origin.location.clone(),
+        method: origin.method,
+        producer: origin.producer.into(),
+        kind: EvidenceKind::Observation,
+        summary: text.clone(),
+        representation: Representation::of_bytes("image/png", &png),
+        limitations,
+        context: EvidenceContext {
+            coverage: Some(Coverage {
+                extent: CoverageExtent::Partial,
+                inspected: if origin.method == Method::Sample && origin.location == Location::Whole
+                {
+                    vec![]
+                } else {
+                    vec![origin.location]
+                },
+                omitted: vec![],
+                truncated: false,
+                failures: vec![],
+            }),
+            ..Default::default()
+        },
+    }])?;
     let mut output = ToolOutput::ok(text);
     output.data = Some(json!({
         "artifact": {
@@ -104,7 +277,7 @@ fn derived(text: String, png: &[u8]) -> Result<ToolOutput> {
             "data": STANDARD.encode(&png),
         }
     }));
-    Ok(output)
+    output.with_evidence(evidence)
 }
 
 fn svg(ws: &Workspace, file: &str) -> Result<ToolOutput> {
@@ -115,6 +288,13 @@ fn svg(ws: &Workspace, file: &str) -> Result<ToolOutput> {
             "Image: {file} rasterized from SVG; attached to the next model request when vision is available"
         ),
         &png,
+        Origin {
+            source: file,
+            location: Location::Whole,
+            method: Method::Render,
+            producer: "resvg",
+            limitations: &[],
+        },
     )
 }
 
@@ -144,8 +324,7 @@ fn rasterize_svg(bytes: &[u8]) -> Result<Vec<u8>> {
         .map_err(|error| anyhow!("encoding SVG raster: {error}"))
 }
 
-fn heic(ws: &Workspace, file: &str, cancel: &AtomicBool) -> Result<ToolOutput> {
-    let path = resolve(ws, file)?;
+fn heic(path: &Path, file: &str, cancel: &AtomicBool) -> Result<ToolOutput> {
     let sips = tool(
         "sips",
         "HEIC reads use macOS sips; convert the file to PNG or JPEG first",
@@ -156,16 +335,25 @@ fn heic(ws: &Workspace, file: &str, cancel: &AtomicBool) -> Result<ToolOutput> {
         .arg("-s")
         .arg("format")
         .arg("png")
+        .arg("-Z")
+        .arg("2048")
         .arg(path.as_os_str())
         .arg("--out")
         .arg(out.as_os_str());
     run(&spec, None, cancel, COMMAND_TIMEOUT).context("converting HEIC image")?;
-    let png = fs::read(&out).context("HEIC conversion produced no image")?;
+    let png = bounded_output(&out).context("HEIC conversion produced no bounded image")?;
     derived(
         format!(
             "Image: {file} converted from HEIC; attached to the next model request when vision is available"
         ),
         &png,
+        Origin {
+            source: file,
+            location: Location::Whole,
+            method: Method::Render,
+            producer: "sips",
+            limitations: &[],
+        },
     )
 }
 
@@ -175,33 +363,24 @@ fn render_pdf_page(
     page: u32,
     cancel: &AtomicBool,
 ) -> Result<ToolOutput> {
-    let path = resolve(ws, file)?;
-    let pdftoppm = tool(
-        "pdftoppm",
-        "PDF page images use poppler's pdftoppm (install with `brew install poppler`)",
-    )?;
-    let dir = tempfile::tempdir().context("creating render directory")?;
-    let prefix = dir.path().join("page");
-    let spec = CommandSpec::new(pdftoppm)
-        .arg("-png")
-        .arg("-r")
-        .arg("150")
-        .arg("-f")
-        .arg(page.to_string())
-        .arg("-l")
-        .arg(page.to_string())
-        .arg("-singlefile")
-        .arg(path.as_os_str())
-        .arg(prefix.as_os_str());
-    run(&spec, None, cancel, COMMAND_TIMEOUT).context("rendering PDF page")?;
-    let png = fs::read(dir.path().join("page.png"))
-        .context("pdftoppm produced no page image; the page may be out of range")?;
-    derived(
+    let bytes = source::read(ws, file)?;
+    let (png, snapshot) = super::visual::render_pdf_page(file, &bytes, page, cancel)?;
+    let output = derived(
         format!(
             "Image: {file} page {page} rendered from PDF; attached to the next model request when vision is available"
         ),
         &png,
-    )
+        Origin {
+            source: file,
+            location: Location::Page { number: page },
+            method: Method::Render,
+            producer: "pdftoppm",
+            limitations: &[
+                "Only the selected page was rendered; no text or layout interpretation was performed.",
+            ],
+        },
+    )?;
+    with_snapshot(output, snapshot)
 }
 
 struct Probe {
@@ -213,22 +392,50 @@ struct Probe {
     audio_codec: Option<String>,
 }
 
-fn video(ws: &Workspace, file: &str, selector: &str, cancel: &AtomicBool) -> Result<ToolOutput> {
-    let path = resolve(ws, file)?;
-    let probe = probe(&path, cancel)?;
+fn video(path: &Path, file: &str, selector: &str, cancel: &AtomicBool) -> Result<ToolOutput> {
+    let probe = probe(path, cancel)?;
     if selector.is_empty() {
         let text = describe_video(file, &probe);
-        let grid = preview_grid(&path, &probe, cancel)?;
-        return derived(text, &grid);
+        let grid = preview_grid(path, &probe, cancel)?;
+        return derived(
+            text,
+            &grid,
+            Origin {
+                source: file,
+                location: Location::Whole,
+                method: Method::Sample,
+                producer: "ffmpeg",
+                limitations: &[
+                    "Preview grid is sparse sampling, not continuous video coverage. Cell timestamps are not established. Audio was not interpreted.",
+                ],
+            },
+        );
     }
     let at = locate(selector, &probe)?;
-    let png = frame(&path, at, cancel)?;
+    ensure!(
+        at * 1000.0 < u64::MAX as f64,
+        "video position exceeds evidence timestamp range"
+    );
+    let requested_ms = (at * 1000.0).round() as u64;
+    let png = frame(path, at, cancel)?;
     derived(
         format!(
-            "Frame at {at:.3} s of {file} ({}x{}); attached to the next model request when vision is available",
+            "Frame requested at {at:.3} s of {file} ({}x{}); attached to the next model request when vision is available",
             probe.width, probe.height
         ),
         &png,
+        Origin {
+            source: file,
+            location: Location::Time {
+                start_ms: requested_ms,
+                end_ms: requested_ms,
+            },
+            method: Method::Sample,
+            producer: "ffmpeg",
+            limitations: &[
+                "Timestamp is the requested seek position, not a measured presentation timestamp. A single frame cannot establish a sequence of actions. Audio was not interpreted.",
+            ],
+        },
     )
 }
 
@@ -316,7 +523,9 @@ fn preview_grid(path: &Path, probe: &Probe, cancel: &AtomicBool) -> Result<Vec<u
         .arg("-i")
         .arg(path.as_os_str())
         .arg("-vf")
-        .arg(format!("fps={rate:.9},scale=320:-2,tile=3x3"))
+        .arg(format!(
+            "fps={rate:.9},scale=320:320:force_original_aspect_ratio=decrease,tile=3x3"
+        ))
         .arg("-frames:v")
         .arg("1")
         .arg("-f")
@@ -339,6 +548,8 @@ fn frame(path: &Path, at: f64, cancel: &AtomicBool) -> Result<Vec<u8>> {
         .arg(format!("{at:.3}"))
         .arg("-i")
         .arg(path.as_os_str())
+        .arg("-vf")
+        .arg("scale=2048:2048:force_original_aspect_ratio=decrease")
         .arg("-frames:v")
         .arg("1")
         .arg("-f")

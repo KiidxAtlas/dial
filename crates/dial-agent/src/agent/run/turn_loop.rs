@@ -38,7 +38,14 @@ impl<'a> Agent<'a> {
         prepared: Option<Value>,
         origin: TurnOrigin,
     ) -> Result<TurnReport> {
+        // A previous turn may have stopped on a full disk. Retry only its journal writer,
+        // before admitting new work; never replay the failed model request or tool effects.
+        if let Some(journal) = self.session.runtime().stream_writer() {
+            journal.retry_failed_write()?;
+        }
+        self.training_capture.clear();
         self.coordination_turn_started(origin);
+        self.monitor_turn_started(origin);
         // The turn owns the assertion, not the session: idle prompts must allow sleep.
         // Hermetic evaluation must not change host power state.
         let _idle_sleep = if self.hermetic {
@@ -70,6 +77,7 @@ impl<'a> Agent<'a> {
         let _cache_warm_run = self.cache_warm.as_ref().map(|warm| warm.run_guard());
         // Reset current-turn evidence before any admission step can fail. Historical receipts
         // remain separately labelled and must still pass freshness checks before reuse.
+        self.drain_background_check(ui, true);
         self.step_checks = StepChecks::default();
         self.verifications.clear();
         self.behavioral_checks.clear();
@@ -227,6 +235,9 @@ impl<'a> Agent<'a> {
             (result, Ok(())) => result,
             (Ok(_), Err(journal)) => Err(journal),
         };
+        if let Ok(report) = &result {
+            self.retain_training_turn(report, user_text, &mut observed);
+        }
         if result
             .as_ref()
             .is_ok_and(|report| report.outcome == TurnOutcome::Completed && !report.interrupted)
@@ -239,6 +250,7 @@ impl<'a> Agent<'a> {
             }),
         );
         self.coordination_turn_settled(origin, &result);
+        self.monitor_turn_settled(origin, &result);
         result
     }
     pub(in crate::agent) fn turn_inner(
@@ -265,7 +277,7 @@ impl<'a> Agent<'a> {
             json!({"session_id": self.session.id(), "prompt": crate::agent::window::prompt::truncate_chars(user_text, 8000)})
         });
         let plugins = self.hook_plugins();
-        if origin != TurnOrigin::Peer
+        if !matches!(origin, TurnOrigin::Peer | TurnOrigin::Monitor)
             && crate::agent::safety::hooks::wanted(
                 self.tool_hooks(),
                 plugins.as_deref(),
@@ -327,7 +339,7 @@ impl<'a> Agent<'a> {
             self.draft_leftover_steering(ui)?;
             match origin {
                 TurnOrigin::User => Some(self.draft_turn_text(typed_text, ui)?),
-                TurnOrigin::Harness | TurnOrigin::Peer => None,
+                TurnOrigin::Harness | TurnOrigin::Peer | TurnOrigin::Monitor => None,
             }
         } else {
             None
@@ -465,7 +477,6 @@ impl<'a> Agent<'a> {
             _ => None,
         };
         self.assistance.begin(user_text);
-        self.training_capture.clear();
         self.reasoning_recovery = crate::agent::workflow::reasoning::Recovery::default();
         self.logging = self.store.is_some();
         if let (Some(hint), Some(content)) = (
@@ -537,12 +548,8 @@ impl<'a> Agent<'a> {
             }))?);
             context.push_str("\nRun the named configured checks against the final result; required visuals need delivered browser pixels. Missing, stale, failed or unavailable evidence remains uncovered. Do not weaken checks or edit code to hide environment failures.");
         }
-        // Only inspect the current branch/tail: archived pre-compaction context is not visible.
-        let ambient_history = if self.config.efficiency.enabled {
-            self.session.messages()
-        } else {
-            Vec::new()
-        };
+        // Admission tracks the model-visible branch even when optional economy is disabled.
+        let ambient_history = self.session.messages();
         if let Some(memory) = &self.memory {
             // The lookup is a search query, not the prompt: a pasted file or log must not fail the turn.
             let query = crate::agent::window::prompt::truncate_chars(user_text, RECALL_QUERY_CHARS);
@@ -650,6 +657,8 @@ impl<'a> Agent<'a> {
         }
         message["dial_context_request"] = json!(true);
         self.session.append(message)?;
+        self.training_capture
+            .set_source_turn(self.session.branch_leaf());
         let recovery = self.session.take_recovery_diagnostics();
         if !recovery.is_empty() {
             let count = recovery.len();
@@ -683,7 +692,7 @@ impl<'a> Agent<'a> {
             memory.bind(memory_authority(&self.session, 0));
         }
         let mut state = self.session.control_state();
-        if origin != TurnOrigin::Peer {
+        if !matches!(origin, TurnOrigin::Peer | TurnOrigin::Monitor) {
             state["current_instruction_entry_id"] = json!(self.session.branch_leaf());
             if state["original_goal"].is_null() {
                 state["original_goal"] = json!(crate::agent::window::prompt::truncate_chars(

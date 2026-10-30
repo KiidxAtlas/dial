@@ -324,7 +324,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Tools",
         "Configuration",
         "Isolated solve configuration",
-        "Enable bounded patch search and set candidate, step and snapshot limits."
+        "Enable bounded patch search and set candidate, concurrency (default 1), step and snapshot limits."
     ),
     structured!(
         "escalation",

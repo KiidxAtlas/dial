@@ -1,5 +1,10 @@
 //! Read-only rich documents. Parsers never extract archive members to disk or execute notebook cells.
+mod analysis;
 mod archives;
+mod layout;
+mod table;
+mod workbook;
+pub use analysis::analysis_tools;
 mod cache;
 mod epub;
 mod isolate;
@@ -94,6 +99,11 @@ pub(in crate::tools) fn read_streaming(
         Ok(s) => s,
         Err(e) => return Some(Err(e)),
     };
+    let expanded = match ws.expand_file_handle(input) {
+        Ok(path) => path,
+        Err(error) => return Some(Err(error)),
+    };
+    let input = expanded.as_str();
     let resolved = ws.resolve(input);
     if resolved.as_ref().is_ok_and(|p| p.is_dir()) {
         return None;
@@ -122,15 +132,20 @@ pub(in crate::tools) fn read_streaming(
                     return Err("JSON queries use zero-based ?offset=N and ?limit=N; do not combine them with source-line offset/limit arguments".into());
                 }
                 let path = ws.resolve(&input[..i])?;
-                parse_isolated(
-                    &input[..i],
-                    Job::Json {
-                        path,
-                        label: input[..i].to_owned(),
-                        query: input[i + 1..].to_owned(),
+                let opened = cache::Opened::open(ws, &path)?;
+                let text = isolate::run(
+                    "JSON query",
+                    &Job::Read {
+                        format: "json".into(),
+                        name: input[..i].to_owned(),
+                        member: Some(input[i + 1..].to_owned()),
                     },
+                    &opened.bytes,
+                    PARSE_DEADLINE,
                     cancel,
-                )
+                )?;
+                opened.validate(ws)?;
+                Ok(text)
             })());
         }
     }
@@ -188,46 +203,21 @@ pub(in crate::tools) fn read_streaming(
             opened.validate(ws)?;
             Arc::new(text)
         } else {
-            cache::extracted(&opened, ws, format, member, || match format {
-                "notebook" => parse_isolated(
-                    "notebook",
-                    Job::Notebook {
-                        path: path.clone(),
-                        member: member.map(str::to_owned),
-                    },
-                    cancel,
-                ),
-                "zip" | "tar" | "gzip" | "xz" | "bz2" | "zst" | "7z" | "rar" | "cab" | "iso" => {
-                    parse_isolated(
-                        "archive",
-                        Job::Archive {
-                            root: ws.root().to_owned(),
-                            path: path.clone(),
-                            format: format.to_owned(),
-                            member: member.map(str::to_owned),
-                        },
-                        cancel,
-                    )
+            cache::extracted(&opened, ws, format, member, || {
+                if format == "pdf" {
+                    return pdf::read(ws, &opened.file()?, member, cancel);
                 }
-                "pdf" => pdf::read(ws, &opened.file, member, cancel),
-                "docx" | "xlsx" | "pptx" => parse_isolated(
+                isolate::run(
                     "document",
-                    Job::Office {
-                        path: path.clone(),
+                    &Job::Read {
                         format: format.to_owned(),
+                        name: base.to_owned(),
                         member: member.map(str::to_owned),
                     },
+                    &opened.bytes,
+                    PARSE_DEADLINE,
                     cancel,
-                ),
-                "epub" => parse_isolated(
-                    "epub",
-                    Job::Epub {
-                        path: path.clone(),
-                        member: member.map(str::to_owned),
-                    },
-                    cancel,
-                ),
-                _ => unreachable!(),
+                )
             })?
         };
         render(
@@ -449,6 +439,70 @@ pub fn convert_bytes(ws: &Workspace, bytes: &[u8], filename: &str) -> Result<Str
         ),
         _ => Err(format!("unsupported in-memory document type: {format}")),
     }
+}
+
+/// Read structured worksheet cells from authorized bytes in the bounded document worker.
+pub(crate) fn table_bytes(
+    bytes: &[u8],
+    sheet: Option<&str>,
+    cancel: &AtomicBool,
+) -> Result<serde_json::Value, String> {
+    if bytes.len() as u64 > MAX_INPUT {
+        return Err("workbook exceeds 64 MiB".into());
+    }
+    let text = isolate::run(
+        "worksheet",
+        &Job::Table {
+            sheet: sheet.map(str::to_owned),
+        },
+        bytes,
+        PARSE_DEADLINE,
+        cancel,
+    )?;
+    serde_json::from_str(&text).map_err(|e| format!("invalid worksheet worker output: {e}"))
+}
+
+/// Inspect worksheet metadata and formula text without evaluating formulas or trusting caches.
+pub(crate) fn inspect_workbook_bytes(
+    bytes: &[u8],
+    cancel: &AtomicBool,
+) -> Result<serde_json::Value, String> {
+    if bytes.len() as u64 > MAX_INPUT {
+        return Err("workbook exceeds 64 MiB".into());
+    }
+    let text = isolate::run(
+        "workbook inspection",
+        &Job::Workbook,
+        bytes,
+        PARSE_DEADLINE,
+        cancel,
+    )?;
+    serde_json::from_str(&text).map_err(|e| format!("invalid workbook inspection output: {e}"))
+}
+
+/// Investigate authorized SQLite bytes in a disposable, resource-bounded parser process.
+pub(crate) fn inspect_database_bytes(
+    bytes: &[u8],
+    action: &str,
+    sql: Option<&str>,
+    limit: usize,
+    cancel: &AtomicBool,
+) -> Result<serde_json::Value, String> {
+    if bytes.len() > 16 * 1024 * 1024 {
+        return Err("database snapshot exceeds 16 MiB".into());
+    }
+    let text = isolate::run(
+        "database inspection",
+        &Job::Database {
+            action: action.to_owned(),
+            sql: sql.map(str::to_owned),
+            limit,
+        },
+        bytes,
+        std::time::Duration::from_secs(10),
+        cancel,
+    )?;
+    serde_json::from_str(&text).map_err(|e| format!("invalid database worker output: {e}"))
 }
 
 /// Worker side of `convert_bytes`: converts the worker-owned copy of the document. Runs only

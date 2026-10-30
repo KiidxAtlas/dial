@@ -63,7 +63,7 @@ worker idle timeout, `harness.max_steps`, `harness.max_tokens`, reasoning guard 
 solve/escalation budgets, background daily compute, recalled context, history retention, and benchmark
 case deadlines. A positive value restores a cap. Other deadlines and previews have finite defaults:
 `shell.bash_timeout_secs` 300, hook `timeout_secs` 30, MCP `timeout_secs` 120 and `connect_timeout_secs`
-30, extension `timeout_secs` 30, `request_recovery.silence_secs` 120, `efficiency.ambient_context_bytes`
+30, extension `timeout_secs` 30, `request_recovery.silence_secs` 30, `efficiency.ambient_context_bytes`
 8192, `efficiency.lightweight_requests` 4, `efficiency.cache_pressure_percent` 75 and
 `efficiency.history_token_cap` 262144 (see below). The exception is
 `verification.repair_attempts`: `0` selects the default of 3 automatic repair rounds (when

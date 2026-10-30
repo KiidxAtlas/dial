@@ -36,3 +36,11 @@ fn identical_tagged_notices_shrink_but_user_text_is_untouched() {
     assert!(messages[1]["content"].as_str().unwrap().len() < 100);
     assert_eq!(messages[2], notice);
 }
+
+#[test]
+fn short_tagged_notices_are_not_expanded() {
+    let notice = json!({"role":"user","content":"retry","dial_reminder":"reasoning"});
+    let mut messages = vec![notice.clone(), notice.clone()];
+    project(&mut messages, &mut Supersession::default(), &Policy::calm());
+    assert_eq!(messages, vec![notice.clone(), notice]);
+}

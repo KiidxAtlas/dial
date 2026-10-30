@@ -137,6 +137,11 @@ pub struct StatusData {
     pub usage: Option<String>,
     /// Running and total workers for the `workers` segment; `None` hides it. Filled by the app from the worker snapshot cache.
     pub workers: Option<super::worker_pins::WorkerTally>,
+    /// Observed API cost of the current (or last finished) turn in USD; `None` when no priced
+    /// request was seen (local, subscription or unpriced). Hides the turn part of `cost`.
+    pub turn_cost: Option<f64>,
+    /// Observed API cost of the session so far in USD, including workers; `None` when unknown.
+    pub session_cost: Option<f64>,
 }
 
 impl StatusData {

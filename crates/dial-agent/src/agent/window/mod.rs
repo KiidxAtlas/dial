@@ -4,6 +4,7 @@ pub mod context;
 pub mod context_breakdown;
 pub(in crate::agent) mod context_meter;
 pub(in crate::agent) mod context_notes;
+pub(in crate::agent) mod file_handles;
 pub mod output_schema;
 pub(in crate::agent) mod projection;
 pub mod prompt;

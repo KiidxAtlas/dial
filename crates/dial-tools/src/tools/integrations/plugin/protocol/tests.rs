@@ -28,6 +28,27 @@ fn version_two_keeps_only_known_capabilities() {
 }
 
 #[test]
+fn host_callback_capabilities_are_explicit_and_never_granted_to_legacy() {
+    let caps = [
+        "host.context",
+        "host.conversation",
+        "host.tools",
+        "host.tasks",
+        "host.models",
+        "host.workflows",
+        "host.secrets",
+        "views",
+    ];
+    let modern = negotiate(&json!({"protocolVersion":"2", "capabilities":caps})).unwrap();
+    let legacy = negotiate(&json!({"capabilities":caps})).unwrap();
+    for cap in caps {
+        assert!(modern.has(cap));
+        assert!(!legacy.has(cap));
+    }
+    assert!(!modern.has("host.settings"));
+}
+
+#[test]
 fn unsupported_or_malformed_version_is_refused() {
     assert!(negotiate(&json!({"protocolVersion": "9"})).is_err());
     assert!(negotiate(&json!({"protocolVersion": 2})).is_err());

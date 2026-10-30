@@ -8,6 +8,12 @@ Delegation briefs avoid repeating automatic parent goals when the exact text alr
 
 For efficient handoffs, supply the outcome, owned files or subsystem, shared interfaces, relevant evidence references, and checks with an owner. Keep shared builds with one integration owner and wait for relevant edits to settle. Worker findings are evidence to use, not a reason to repeat the investigation; failed checks still need diagnosis, repair and rechecking.
 
+Untargeted task status/wait and pool polling retain lifecycle state and report artifacts but do not
+repeat a successful narrative already delivered for that exact execution. New results, failures,
+blockers, acceptance/audit details and isolation/merge warnings remain visible. Targeted
+`task status` with an `id` recovers the full existing preview; `artifact_read` retrieves the complete
+canonical report. Polling never labels a running worker complete or counts a report as verification.
+
 ### Tool-free side questions
 
 `side_request` lets the main agent ask a reasoning question while a command or independent task
@@ -63,12 +69,24 @@ criteria, owned test files, interfaces, focused commands and a readiness boundar
 authored against stable interfaces in parallel; runs wait until the inputs have settled. Do not
 edit the same files concurrently.
 
-The tester should reuse existing coverage and add only meaningful behavior/failure-boundary
-regressions, not a quota of tests or assertions that pin prose or restate implementation. Start
-with the changed package/module (for example,
+Built-in test-writing guidance applies to the main agent (including lean/one-call prompts),
+implementation workers and test-runners. Prefer compact, risk-driven suites: inspect and extend
+the existing owner and fixtures; add a test only for a distinct plausible regression not already
+covered. Use table-driven cases for equivalent input classes, not a separate test/file for every
+use case or exhaustive permutations. Keep genuinely different contracts separate and choose the
+lowest layer that proves them; integration/end-to-end tests cover risks lower layers cannot.
+Tests should be deterministic and independent, with isolated state, controlled time/randomness
+and resource cleanup; live services/credentials belong in explicit optional integration tiers.
+Avoid assertions that pin prose, inspect source or mirror implementation, unless the exact
+representation is itself a required contract. Stop when distinct risks are covered, not at a
+test-count or coverage-percentage quota. Do not remove meaningful existing coverage to shrink
+the suite. The versioned `examples/skills/test-runner` skill expands these design rules.
+
+Start with the changed package/module (for example,
 `cargo test --locked -p dial-agent --lib agent::workflow::research`), not overlapping whole-workspace
 suites. Broaden for affected cross-cutting behavior, unresolved risk or an explicit project/user
 gate. `make test-module` filters test execution but still selects every workspace library crate.
+This is advisory prompt guidance, not a hard test-count limit or a measured live-model guarantee.
 
 The tester owns check execution and returns exact commands, source state, observed results,
 failure locations, actionable fixes and unverified gaps. It may repair tests within its assignment;
@@ -130,6 +148,19 @@ backend = "auto" # auto | clone | overlay | worktree | projfs | copy
 - `projfs` (Windows, opt-in) mounts a Windows Projected File System view of the project. It needs the optional Windows feature `Client-ProjFS` (`Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS`); without it the named backend reports that reason. Sources are never written. Git initialization is skipped because it would hydrate every file, and dependency copies are not made. This backend is compile-checked for Windows only and has not been runtime-verified.
 
 A named backend that is unavailable is an error that names the reason; Dial never falls back from a named backend silently.
+
+### Choosing the backend per task
+
+A single worker task, or any `tasks[]` item, may set `isolation_backend` to override `[isolation] backend` for that task only. It accepts the same names (`auto`, `clone`, `overlay`, `worktree`, `copy`, `projfs`) and implies `isolation: "copy"`, so batch siblings can run one worker in a `clone` and another in a `worktree`:
+
+```json
+{"tasks": [
+  {"agent": "worker", "task": "...", "solution_space": "...", "isolation_backend": "clone"},
+  {"agent": "worker", "task": "...", "solution_space": "...", "isolation_backend": "worktree"}
+]}
+```
+
+Without `isolation_backend`, `isolation: "copy"` uses the configured backend exactly as before. Read-only agents reject both fields. Each named backend is checked before any worker in the call starts. For `start`, `create` and `push` the check runs before anything is queued. A backend that cannot run here, such as `worktree` outside the top of a git repository or `clone` off macOS, fails the whole call with the task's label and the reason, for example ``wt: isolation backend `worktree` is unavailable: ...; no worker was started``. Dial never falls back to another backend or to the live checkout. The chosen backend is recorded in a started worker's assignment and reported in the isolation metadata (`backend`) and the status line.
 
 Copy and clone materialize in-root source symlinks. Directory cycle detection is path-local: both
 a real directory and its aliases retain their contents, regardless of enumeration order. Cycles
@@ -249,7 +280,7 @@ The `task` tool runs typed subagents (`scout`, `reviewer`, `planner`, `worker`, 
 
 `task` and `skill` are offered in ordinary sessions. A user message that shares words with a skill's name or description gets a one-line hint to load that skill.
 
-Open the worker hub with Alt+A (`app.subagents.hub`), Left twice on an empty composer, or `/workers` (`/agents` opens it too; `/jobs` and `/hub` are hidden aliases). `/bg` and `/processes` open the background process panel instead. The `subagent-hub:activity` action opens the hub directly on its Activity tab. Each child's conversation is saved as JSONL under the state directory (`subagents/<session>/<job>-<millis>.jsonl`), outside the workspace.
+Open the worker hub with Alt+A or F6 (`app.subagents.hub`), Left twice on an empty composer, or `/workers` (`/agents` opens it too; `/jobs` and `/hub` are hidden aliases). `/bg` and `/processes` open the background process panel instead. The `subagent-hub:activity` action opens the hub directly on its Activity tab. Each child's conversation is saved as JSONL under the state directory (`subagents/<session>/<job>-<millis>.jsonl`), outside the workspace.
 
 Agents tab: Up/Down or `j`/`k` select a worker; Enter opens its transcript at the selected entry; `t` toggles flat and tree views; `/` filters by name, task or id; `m` messages a worker (steers a running one, resumes a finished one); `x` pressed twice within 2 seconds cancels a running worker; `r` opens model roles; PageUp/PageDown scroll the inspector. Existing roster positions stay stable while the hub is open; workers waiting for input or reporting failure can rise for attention rather than continuously reordering by recent activity.
 

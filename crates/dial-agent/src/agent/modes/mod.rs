@@ -83,11 +83,14 @@ impl Agent<'_> {
     }
 
     pub fn workspace_mut(&mut self) -> &mut crate::tools::Workspace {
+        // Mutable access may revoke roots or sandbox authority held by a file watch.
+        self.cancel_monitor_wake();
         &mut self.workspace
     }
 
     /// Applies CLI `--add-dir` roots to the session workspace. Callers invoke this once after construction.
     pub fn add_workspace_roots(&mut self, dirs: &[std::path::PathBuf]) -> Result<()> {
+        self.cancel_monitor_wake();
         self.workspace = self.workspace.clone().with_additional_roots(dirs)?;
         Ok(())
     }
@@ -106,6 +109,7 @@ impl Agent<'_> {
     /// from the workspace root, so only the system prompt, which embeds the cwd, needs a rebuild.
     /// Checkpoints are rebound to the target project so later edits snapshot the new root.
     pub fn reroot_workspace(&mut self, target: &crate::config::paths::Layout) -> Result<()> {
+        self.cancel_monitor_wake();
         let mut workspace = self.workspace.reroot(&target.project_root)?;
         let checkpoints = if self.checkpoints.is_some() {
             let checkpoints = std::sync::Arc::new(crate::storage::checkpoint::Checkpoints::new(
@@ -125,6 +129,9 @@ impl Agent<'_> {
         }
         // All fallible setup and the durable root write precede live publication.
         self.session.set_additional_dirs(&dirs)?;
+        let mut control = self.session.control_state();
+        control["file_handles"] = serde_json::to_value(workspace.file_handle_snapshot())?;
+        self.session.set_control_state(control)?;
         self.workspace = workspace;
         self.layout = Some(target.clone());
         self.checkpoints = checkpoints;

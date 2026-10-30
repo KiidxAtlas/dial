@@ -22,6 +22,8 @@ fn notebook_cells_ranges_and_text_output_are_not_executed() {
         all.contains("Heading") && all.contains("retained output") && all.contains("plain display")
     );
     assert!(!all.contains("binary payload"));
+    let handle = ws.file_handle("sample.ipynb").unwrap();
+    assert!(read_path(&ws, &handle).unwrap().contains("safe prose"));
     let cell = read_path(&ws, "sample.ipynb:cell=2:2-2").unwrap();
     assert!(cell.contains("raise RuntimeError") && !cell.contains("Heading"));
     assert!(read_path(&ws, "sample.ipynb:cell=0").is_err());
@@ -154,7 +156,7 @@ fn rich_dispatch_preserves_plain_reads_and_confines_symlinks() {
 }
 fn pdf_fixture() -> Vec<u8> {
     let stream = "BT /F1 12 Tf 20 80 Td (PDF evidence fixture) Tj ET";
-    let objects = ["<< /Type /Catalog /Pages 2 0 R >>".to_string(), "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(), "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".into(), "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(), format!("<< /Length {} >>\nstream\n{stream}\nendstream", stream.len())];
+    let objects = ["<< /Type /Catalog /Pages 2 0 R >>".to_string(), "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(), "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 2000 1000] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".into(), "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(), format!("<< /Length {} >>\nstream\n{stream}\nendstream", stream.len())];
     let mut pdf = String::from("%PDF-1.4\n");
     let mut offsets = vec![0];
     for (i, object) in objects.iter().enumerate() {
@@ -184,14 +186,47 @@ fn pdf_selectors_reject_invalid_pages_before_starting_parser() {
     assert!(read_path(&ws, "sample.pdf:page=2-1").is_err());
 }
 #[test]
-#[ignore = "requires operator-installed Poppler pdftotext; external smoke enables this test"]
+#[ignore = "requires operator-installed Poppler pdftotext and pdftoppm; external smoke enables this test"]
 fn pdf_real_poppler_fixture() {
     let (dir, ws) = crate::tools::testkit::workspace();
     fs::write(dir.path().join("sample.pdf"), pdf_fixture()).unwrap();
     assert!(
-        read_path(&ws.without_sandbox(), "sample.pdf:page=1")
+        read_path(&ws.clone().without_sandbox(), "sample.pdf:page=1")
             .unwrap()
             .contains("PDF evidence fixture")
+    );
+    use base64::Engine as _;
+    let config = crate::config::types::Config::default();
+    let context = crate::tools::integrations::ext::ToolContext {
+        workspace: &ws,
+        config: &config,
+        confirm: Some(&|_| true),
+        mutation_authorizer: Some(&|_, _, outside_shell| {
+            assert!(outside_shell);
+            Ok(())
+        }),
+    };
+    let output = crate::tools::read_with_context(
+        &context,
+        &json!({"path":"sample.pdf:page=1:img"}),
+        &AtomicBool::new(false),
+        4096,
+    );
+    assert!(!output.is_error, "{}", output.text);
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(
+            output.data.as_ref().unwrap()["artifact"]["data"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(crate::llm::images::dimensions(&png).unwrap(), (2048, 1024));
+    let evidence = output.evidence().unwrap().unwrap();
+    assert_eq!(
+        evidence.items[0].context.snapshot.as_ref().unwrap().sha256,
+        crate::tools::knowledge::evidence::source::snapshot(&pdf_fixture())
+            .unwrap()
+            .sha256
     );
 }
 #[test]
@@ -227,24 +262,26 @@ fn isolated_archive_parse_matches_in_process_parser() {
     zip.finish().unwrap();
     let path = ws.resolve("iso.zip").unwrap();
     let opened = cache::Opened::open(&ws, &path).unwrap();
-    let direct = archives::read(&opened, &ws, "zip", None).unwrap();
+    let direct = archives::read_bytes("zip", "iso.zip", &opened.bytes, None).unwrap();
     let cancel = std::sync::atomic::AtomicBool::new(false);
-    let job = isolate::Job::Archive {
-        root: ws.root().to_owned(),
-        path,
+    let job = isolate::Job::Read {
+        name: "iso.zip".into(),
         format: "zip".into(),
         member: None,
     };
+    // Changing the original path after capture must not change the worker input.
+    fs::write(&path, b"not a ZIP anymore").unwrap();
     let isolated = isolate::run(
         "archive",
         &job,
-        &[],
+        &opened.bytes,
         std::time::Duration::from_secs(60),
         &cancel,
     )
     .unwrap();
     assert_eq!(isolated, direct);
     assert!(direct.contains("a.txt"));
+    assert!(opened.validate(&ws).is_err());
 }
 
 #[test]
@@ -339,18 +376,110 @@ fn isolated_epub_parse_matches_in_process_parser() {
     let path = ws.resolve("iso.epub").unwrap();
     let direct = epub::read(fs::File::open(&path).unwrap(), Some("chapter=1")).unwrap();
     let cancel = std::sync::atomic::AtomicBool::new(false);
-    let job = isolate::Job::Epub {
-        path,
+    let job = isolate::Job::Read {
+        format: "epub".into(),
+        name: "iso.epub".into(),
         member: Some("chapter=1".into()),
     };
     let isolated = isolate::run(
         "epub",
         &job,
-        &[],
+        &fs::read(&path).unwrap(),
         std::time::Duration::from_secs(60),
         &cancel,
     )
     .unwrap();
     assert_eq!(isolated, direct);
     assert!(direct.starts_with("[chapter 1: First & Last]"), "{direct}");
+}
+
+#[test]
+fn source_snapshot_reads_documents_and_archives_from_added_roots() {
+    let (_dir, ws) = crate::tools::testkit::workspace();
+    let extra = tempfile::tempdir().unwrap();
+    let ws = ws
+        .with_additional_roots(&[extra.path().to_owned()])
+        .unwrap();
+    let notebook = extra.path().join("extra.ipynb");
+    fs::write(
+        &notebook,
+        r#"{"nbformat":4,"cells":[{"cell_type":"markdown","source":"added root text"}]}"#,
+    )
+    .unwrap();
+    assert!(
+        read_path(&ws, notebook.to_str().unwrap())
+            .unwrap()
+            .contains("added root text")
+    );
+    let archive = extra.path().join("extra.zip");
+    let mut zip = zip::ZipWriter::new(fs::File::create(&archive).unwrap());
+    zip.start_file("note.txt", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    zip.write_all(b"added root archive").unwrap();
+    zip.finish().unwrap();
+    assert!(
+        read_path(&ws, &format!("{}:note.txt", archive.display()))
+            .unwrap()
+            .contains("added root archive")
+    );
+}
+
+#[test]
+fn source_snapshot_cache_detects_same_size_rewrites_with_restored_mtime() {
+    let (dir, ws) = crate::tools::testkit::workspace();
+    let path = dir.path().join("revision.ipynb");
+    let before = r#"{"nbformat":4,"cells":[{"cell_type":"markdown","source":"first revision"}]}"#;
+    let after = before.replace("first", "other");
+    fs::write(&path, before).unwrap();
+    let modified = fs::metadata(&path).unwrap().modified().unwrap();
+    assert!(
+        read_path(&ws, "revision.ipynb")
+            .unwrap()
+            .contains("first revision")
+    );
+    fs::write(&path, after).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    let result = read_path(&ws, "revision.ipynb").unwrap();
+    assert!(
+        result.contains("other revision") && !result.contains("first revision"),
+        "{result}"
+    );
+}
+
+#[test]
+fn source_snapshot_cache_never_bypasses_current_read_denials() {
+    use crate::tools::exec::sandbox::Policy;
+    let (dir, mut ws) = crate::tools::testkit::workspace();
+    let path = dir.path().join("denied.ipynb");
+    fs::write(
+        &path,
+        r#"{"nbformat":4,"cells":[{"cell_type":"markdown","source":"cached text"}]}"#,
+    )
+    .unwrap();
+    assert!(
+        read_path(&ws, "denied.ipynb")
+            .unwrap()
+            .contains("cached text")
+    );
+    for policy in [
+        Policy::Dev {
+            deny_read: vec![path.clone()],
+            allow_network: false,
+            extra_write: vec![],
+        },
+        Policy::Strict {
+            deny_read: vec![path],
+            allow_network: false,
+            extra_write: vec![],
+        },
+    ] {
+        ws.policy = Some(policy);
+        let error = read_path(&ws, "denied.ipynb").unwrap_err();
+        assert!(error.contains("denied by workspace read policy"), "{error}");
+    }
 }

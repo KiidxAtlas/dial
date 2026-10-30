@@ -188,3 +188,34 @@ fn page_names_the_model_api_and_values_and_survives_tiny_terminals() {
         OverlayEvent::Close
     ));
 }
+
+#[test]
+fn native_provider_settings_are_editable_and_validated() {
+    let mut queued = overlay(&["size", "seed", "input"]);
+    assert_eq!(
+        queued.fields.iter().map(|f| f.path).collect::<Vec<_>>(),
+        ["size", "seed", "input"]
+    );
+    go(&mut queued, "input");
+    let OverlayEvent::Set { value, .. } = queued.apply("{ guidance_scale = 3.5, custom = true }")
+    else {
+        panic!("valid model input must be saved");
+    };
+    let saved: ImageModelSettings = value.try_into().unwrap();
+    assert_eq!(saved.input["guidance_scale"], serde_json::json!(3.5));
+    queued.settled(Ok(()));
+    assert_eq!(queued.settings, saved);
+    assert!(matches!(queued.apply("42"), OverlayEvent::None));
+
+    let mut comfy = overlay(&["comfyui"]);
+    assert_eq!(comfy.fields.len(), 1);
+    assert_eq!(comfy.fields[0].path, "comfyui");
+    assert!(matches!(
+        comfy.apply("{ workflow = {}, prompt_node = \"6\", output_node = \"9\" }"),
+        OverlayEvent::None
+    ));
+    let event = comfy.apply(r#"{ workflow = { "6" = { class_type = "CLIPTextEncode", inputs = { text = "old" } }, "9" = { class_type = "SaveImage", inputs = {} } }, prompt_node = "6", output_node = "9" }"#);
+    assert!(matches!(event, OverlayEvent::Set { .. }));
+    comfy.settled(Ok(()));
+    assert!(comfy.settings.comfyui.is_some());
+}

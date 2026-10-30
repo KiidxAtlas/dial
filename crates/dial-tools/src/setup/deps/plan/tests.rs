@@ -78,14 +78,9 @@ fn go_and_rustup_recipes_plan_into_the_expected_places() {
     let env = fake_tools(tmp.path(), &["go", "rustup"]);
     let gopls = plan(recipe("gopls").unwrap(), &env).unwrap();
     assert_eq!(gopls.steps[0].args[0], "install");
-    assert_eq!(
-        gopls.steps[0].env,
-        vec![(
-            "GOBIN".to_owned(),
-            env.user_dir.join("tools/gopls/bin").display().to_string()
-        )]
-    );
-    assert_eq!(gopls.expected, env.user_dir.join("tools/gopls/bin/gopls"));
+    assert!(gopls.steps[0].env.is_empty());
+    assert!(gopls.expected.as_os_str().is_empty());
+    assert!(!gopls.destination.starts_with(&env.user_dir));
     let ra = plan(recipe("rust-analyzer").unwrap(), &env).unwrap();
     assert_eq!(ra.steps[0].args, vec!["component", "add", "rust-analyzer"]);
     assert!(ra.expected.as_os_str().is_empty());
@@ -132,9 +127,40 @@ fn npm_recipes_use_the_npm_of_a_dial_installed_node() {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
     }
-    let plan = plan(recipe("pyright-langserver").unwrap(), &env).unwrap();
-    let step = &plan.steps[0];
-    assert_eq!(step.program, bin.join("npm").display().to_string());
-    let path = step.env.iter().find(|(key, _)| key == "PATH").unwrap();
+    let bun = plan(recipe("bun").unwrap(), &env).unwrap();
+    assert_eq!(bun.steps[0].program, bin.join("npm").display().to_string());
+    let path = bun.steps[0]
+        .env
+        .iter()
+        .find(|(key, _)| key == "PATH")
+        .unwrap();
     assert!(path.1.starts_with(&bin.display().to_string()));
+    // Language servers must not acquire an implicit prefix under Dial's downloaded Node.
+    assert_eq!(
+        plan(recipe("pyright-langserver").unwrap(), &env),
+        Err(Blocked::NoPackageManager(vec!["npm"]))
+    );
+}
+
+#[test]
+fn language_servers_leave_package_manager_destinations_unchanged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = fake_tools(tmp.path(), &["npm", "uv"]);
+    for (id, args) in [
+        (
+            "pyright-langserver",
+            vec!["install", "--global", "--no-audit", "--no-fund", "pyright"],
+        ),
+        ("pylsp", vec!["tool", "install", "python-lsp-server"]),
+    ] {
+        let planned = plan(recipe(id).unwrap(), &env).unwrap();
+        assert_eq!(planned.steps[0].args, args, "{id}");
+        assert!(
+            planned.steps[0].env.iter().all(|(key, _)| key == "PATH"),
+            "{id}"
+        );
+        assert!(planned.fetch.is_none(), "{id}");
+        assert!(!planned.destination.starts_with(&env.user_dir), "{id}");
+        assert!(planned.expected.as_os_str().is_empty(), "{id}");
+    }
 }

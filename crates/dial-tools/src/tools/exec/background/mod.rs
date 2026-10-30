@@ -19,7 +19,9 @@
 //! keeping output open; raw PTYs have no half-close. Port readiness is network-approved and
 //! requires lsof-proven owned listeners; Linux sandbox namespace ownership fails closed.
 
+pub mod durable;
 mod input;
+mod monitor;
 mod readiness;
 mod table;
 mod wake;
@@ -72,7 +74,9 @@ tail), `wait` (until regex, \
 or exit), `kill` (name or all=true). `ready` on named start or wait: log regex and/or numeric host/port, \
 both required if supplied; port readiness needs network permission and approval, and requires lsof-proven \
 owned listeners on POSIX (unsupported on Windows). Waits default to 5s; explicit 0 is unlimited, positive waits max 300s. \
-At most 8 live jobs, 8 retained finished entries. No persist/detach. Drop/session exit kills owned \
+At most 8 live session jobs, 8 retained finished entries. Explicit persist=true selects Unix-only, named, \
+finite-lifetime pipe jobs in a separate restart-surviving namespace (no PTY/stdin/ready); use persist=true \
+on every durable call. Ordinary drop/session exit kills owned \
 process groups or Windows Job Objects; POSIX descendants that escape with setsid/job control may not \
 be cleaned up.";
 
@@ -87,11 +91,15 @@ pub struct Background {
 
 /// The tools this module contributes, for `Registry::standard`.
 pub fn tools(config: &Config) -> Vec<Arc<dyn Tool>> {
-    vec![Arc::new(Background {
+    let background = Arc::new(Background {
         table: Mutex::new(Table::default()),
         interrupt: AtomicBool::new(false),
         pty_allowed: !config.shell.no_pty,
-    })]
+    });
+    vec![
+        background.clone(),
+        Arc::new(monitor::Monitor::new(Some(background))),
+    ]
 }
 
 impl Background {
@@ -163,10 +171,16 @@ impl Background {
         on_event: Option<&(dyn Fn(ToolEvent) + Sync)>,
         cancel: &AtomicBool,
     ) -> Result<ToolOutput, String> {
+        if opt_bool(args, "persist")? {
+            return durable::dispatch(ws, args, cancel, &self.interrupt);
+        }
+        if present(args, "lifetime") {
+            return Err("lifetime requires explicit persist=true".into());
+        }
         match req_str(args, "action")? {
             "start" => self.start(ws, args, on_event, cancel),
             "list" => Ok(self.list()),
-            "output" => self.output(args),
+            "output" => self.output(ws, args),
             "wait" => self.wait(ws, args, on_event, cancel, Ready::parse(args)?),
             "input" | "close_stdin" | "resize" => self.input(args, cancel),
             "kill" => self.kill(args),
@@ -311,7 +325,7 @@ impl Background {
         ToolOutput::ok(text)
     }
 
-    fn output(&self, args: &Value) -> Result<ToolOutput, String> {
+    fn output(&self, ws: &Workspace, args: &Value) -> Result<ToolOutput, String> {
         let name = req_str(args, "name")?;
         let tail = match opt_u64(args, "tail")? {
             Some(0) => return Err("tail must be at least 1 line".to_string()),
@@ -320,9 +334,8 @@ impl Background {
         };
         let snap = self.table().snapshot(name)?;
         snap.settle();
-        let (body, lost) = take_unread(&snap);
+        let (body, lost, integrity) = take_presented(ws, &snap, tail);
         let is_error = lock(&snap.ring).error.is_some();
-        let integrity = output_integrity(&snap, &body, lost, tail);
         Ok(ToolOutput {
             execution: Default::default(),
             data: None,
@@ -463,8 +476,7 @@ impl Background {
                 let state = snap.state.label();
                 // The exit result carries the unread output, so a finished build or test needs no
                 // separate `output` round trip. Shares the model-visible cursor with `output`.
-                let (body, lost) = take_unread(&snap);
-                let integrity = output_integrity(&snap, &body, lost, None);
+                let (body, lost, integrity) = take_presented(ws, &snap, None);
                 let output = render_body(&snap, body, lost, None);
                 let observation_satisfied = !conditions && lock(&snap.ring).error.is_none();
                 return Ok(if conditions {
@@ -659,6 +671,72 @@ fn last_lines(text: &str, n: usize) -> &str {
     &text[start + 1..]
 }
 
+/// Filter only a complete, previously unread exited pipe result, including failed commands.
+/// A delta must never be interpreted by a filter as the whole build/test output. Stay within the
+/// bounded ring; larger captures still use the existing capped delta plus artifact reference.
+fn take_presented(
+    ws: &Workspace,
+    snap: &Snapshot,
+    tail: Option<usize>,
+) -> (String, u64, OutputIntegrity) {
+    let minimized = if ws.minimizing_output()
+        && !snap.terminal
+        && tail.is_none()
+        && matches!(
+            snap.state,
+            State::Exited {
+                status: Some(_),
+                ..
+            }
+        ) {
+        let mut ring = lock(&snap.ring);
+        let minimized = if ring.cursor == 0 {
+            minimize_complete(&snap.command, &ring)
+        } else {
+            None
+        };
+        if minimized.is_some() {
+            ring.cursor = ring.total;
+        }
+        minimized
+    } else {
+        None
+    };
+    if let Some(minimized) = minimized {
+        let mut integrity = output_integrity(snap, &minimized.text, 0, None);
+        integrity.presentation = Completeness::Partial;
+        let mut body = minimized.text;
+        if !body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push_str(&format!(
+            "[output filtered ({}): {} -> {} bytes; the complete output is at the artifact below]\n",
+            minimized.filter, minimized.before, minimized.after
+        ));
+        return (body, 0, integrity);
+    }
+    let (body, lost) = take_unread(snap);
+    let integrity = output_integrity(snap, &body, lost, tail);
+    (body, lost, integrity)
+}
+
+/// Shared by explicit reads and completion notices. Never classify a delta or reread an artifact;
+/// the bounded ring must still contain the complete, valid UTF-8 capture backed by an artifact.
+fn minimize_complete(command: &str, ring: &Ring) -> Option<super::minimizer::Minimized> {
+    if !ring.closed
+        || !ring.reached_eof
+        || ring.error.is_some()
+        || ring.elided_bytes != 0
+        || ring.artifact.is_none()
+        || ring.retained_bytes() != ring.total
+    {
+        return None;
+    }
+    let (bytes, _) = ring.since(0);
+    let body = String::from_utf8(bytes).ok()?;
+    super::minimizer::minimize(command, &body)
+}
+
 /// Model-visible output not yet returned by `output` or `wait`, advancing their shared cursor.
 /// A terminal's model-facing output is its rendered screen, a snapshot not a delta.
 fn take_unread(snap: &Snapshot) -> (String, u64) {
@@ -809,6 +887,10 @@ impl Tool for Background {
     fn jobs_view(&self, attached: Option<&str>) -> Option<JobsView> {
         Some(Background::jobs_view(self, attached))
     }
+    fn kill_job(&self, name: &str) -> Result<String, String> {
+        let state = kill_entry(&self.table, name)?;
+        Ok(format!("killed {name} (was {})", state.label()))
+    }
 
     fn schema(&self) -> Value {
         tool_schema(
@@ -819,6 +901,8 @@ impl Tool for Background {
                 "command": {"type": "string", "description": "start: shell command to run"},
                 "name": {"type": "string", "description": "start: optional unique name (letters, digits, - _ .); output/wait/kill: which process"},
                 "cwd": {"type": "string", "description": "start: working directory relative to the primary workspace root, or absolute inside it or an added workspace root (default: primary root)"},
+                "persist": {"type": "boolean", "description": "Explicit opt-in: Unix pipe-only job owned beyond controller exit; use true on every start/list/output/wait/kill call. Named start required; no PTY/stdin/ready. Default false, ordinary session lifecycle unchanged."},
+                "lifetime": {"type": "integer", "minimum": 1, "maximum": 86400, "description": "persist start only: maximum lifetime in seconds (default 3600); owner stops process at deadline"},
                 "pty": {"type": "boolean", "description": "start: allocate a private controlling terminal (default false); also enables input"},
                 "stdin": {"type": "boolean", "description": "start without PTY: keep a stdin pipe open (default false)"},
                 "rows": {"type": "integer", "minimum": 1, "maximum": 65535, "description": "PTY start/resize rows (default 24)"},

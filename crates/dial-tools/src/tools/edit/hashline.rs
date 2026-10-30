@@ -286,6 +286,12 @@ impl EditStore {
         self.evict();
         tag
     }
+    /// Exact source and complete rows issued by an isolated native read/search owner.
+    /// The caller must validate disk bytes again before publishing these witnesses.
+    pub(crate) fn prepared_witness(&self, path: &Path) -> Option<(String, Vec<(usize, usize)>)> {
+        let snapshot = self.files.get(path)?.last()?;
+        Some((snapshot.text.to_string(), snapshot.seen.0.clone()))
+    }
 
     /// Record `lf` with every line marked seen (the model authored or was shown it all).
     pub fn record_all(&mut self, path: &Path, lf: &str) -> String {
@@ -1761,6 +1767,7 @@ fn mismatch_error(
     store: &mut EditStore,
     blocked: &[(usize, usize)],
     map: &[Option<usize>],
+    authored: &[Edit],
 ) -> String {
     let all = hunks(map, job.cur.len());
     let touching: Vec<_> = all
@@ -1775,7 +1782,38 @@ fn mismatch_error(
     };
     let regions: Vec<(usize, usize)> = chosen.iter().map(|&(_, _, cs, ce)| (cs + 1, ce)).collect();
     let (rows, shown) = preview_rows(&job.cur, &regions, MISMATCH_CONTEXT, MISMATCH_MAX_ROWS);
-    let fresh = store.record(&job.abs, &job.cur_lf, &shown);
+    // Preserve only old witnesses whose exact rows survived, plus the complete rows displayed
+    // below. A fresh tag must not force a reread of unrelated, already-observed targets.
+    let prior = job.seen.flags(job.base.len());
+    let mut flags = vec![false; job.cur.len()];
+    for (base, current) in map.iter().enumerate() {
+        if let Some(current) = current {
+            flags[*current] = prior[base];
+        }
+    }
+    let mut witnessed = Seen::from_ranges(&ranges_from_flags(&flags));
+    for (first, last) in shown {
+        witnessed.add(first, last);
+    }
+    let fresh = store.record(&job.abs, &job.cur_lf, &witnessed.0);
+    let mut anchors = String::new();
+    for edit in authored {
+        let mut translated = [edit.clone()];
+        if translate(&mut translated, map, job.cur.len()).is_ok() {
+            let current = &translated[0];
+            if edit.insert {
+                anchors.push_str(&format!("gap {} -> {}\n", edit.lo, current.lo));
+            } else {
+                anchors.push_str(&format!(
+                    "range {}-{} -> {}-{}\n",
+                    edit.lo, edit.hi, current.lo, current.hi
+                ));
+            }
+        }
+    }
+    if !anchors.is_empty() {
+        anchors.insert_str(0, "Unchanged anchors (snapshot -> current):\n");
+    }
     let spans: Vec<String> = blocked
         .iter()
         .map(|&(a, b)| {
@@ -1788,7 +1826,7 @@ fn mismatch_error(
         .collect();
     format!(
         "{rel}#{tag}: the file changed since that snapshot and the edit touches changed lines (snapshot lines {spans}), so it cannot be re-anchored safely.\n\
-         Current content near the change (fresh tag):\n[{rel}#{fresh}]\n{rows}Re-issue the edit against [{rel}#{fresh}] using these line numbers.",
+         Current content near the change (fresh tag):\n[{rel}#{fresh}]\n{rows}{anchors}Re-issue the complete batch against [{rel}#{fresh}] using current line numbers. Nothing was written.",
         rel = job.rel,
         tag = job.tag,
         spans = spans.join(", "),
@@ -1910,7 +1948,7 @@ fn finalize(job: &mut Job, store: &mut EditStore) -> Result<Prepared, String> {
         })?;
         let authored = edits.clone();
         if let Err(blocked) = translate(&mut edits, &map, job.cur.len()) {
-            return Err(mismatch_error(job, store, &blocked, &map));
+            return Err(mismatch_error(job, store, &blocked, &map, &authored));
         }
         if let Err(reason) = recovery::check(&job.abs, &job.base, &job.cur, &authored, &edits) {
             return Err(format!(
@@ -1929,9 +1967,8 @@ fn finalize(job: &mut Job, store: &mut EditStore) -> Result<Prepared, String> {
         }
         cur_seen = flags;
         job.warnings.push(format!(
-            "snapshot #{} was stale; the file changed elsewhere ({} changed region(s)) and the edit was re-anchored onto the current content",
+            "stale snapshot #{} rebased; unrelated concurrent changes preserved",
             job.tag,
-            hunks(&map, job.cur.len()).len()
         ));
     } else {
         cur_seen = job.seen.flags(job.cur.len());
@@ -2038,6 +2075,16 @@ pub(crate) fn edit_with(
     commit: bool,
     execution: &super::editing::Execution<'_>,
 ) -> Result<String, String> {
+    edit_output_with(ws, input, commit, execution).map(|output| output.text)
+}
+
+/// Preserve the complete transcript result while projecting only anchored lines to the model.
+pub(crate) fn edit_output_with(
+    ws: &Workspace,
+    input: &str,
+    commit: bool,
+    execution: &super::editing::Execution<'_>,
+) -> Result<crate::tools::ToolOutput, String> {
     ws.edit_settings.validate()?;
     let sections = parse_patch(input)?;
     let multi = sections.len() > 1;
@@ -2057,6 +2104,20 @@ pub(crate) fn edit_with(
         }
         resolved.push((abs, sec));
     }
+    // Acquire before reading current text, not after staging it. Cooperating writers then use
+    // the same explicit-anchor recovery (and compact conflict preview) even when they race.
+    // Models hold no lease while reading or thinking; only this tool call is serialized.
+    let _lease = if commit {
+        let mut paths: Vec<_> = resolved.iter().map(|(path, _)| path.clone()).collect();
+        for (_, section) in &resolved {
+            if let Some(destination) = &section.mv {
+                paths.push(ws.resolve(destination)?);
+            }
+        }
+        Some(super::document_transaction::Lease::acquire(paths)?)
+    } else {
+        None
+    };
     let mut store = ws.store();
     let mut regs = Registers {
         named: store.named.clone(),
@@ -2195,8 +2256,18 @@ pub(crate) fn edit_with(
     }
 
     let mut prepared = Vec::with_capacity(jobs.len());
+    let mut conflicts = Vec::new();
     for job in jobs.iter_mut() {
-        prepared.push(finalize(job, &mut store)?);
+        match finalize(job, &mut store) {
+            Ok(proposal) => prepared.push(proposal),
+            Err(error) => conflicts.push(error),
+        }
+    }
+    if !conflicts.is_empty() {
+        return Err(format!(
+            "Nothing was written; repair the rejected batch.\n{}",
+            conflicts.join("\n\n")
+        ));
     }
 
     // No-op handling.
@@ -2219,10 +2290,10 @@ pub(crate) fn edit_with(
     }
     if !multi && !noops.is_empty() {
         if !commit {
-            return Ok(format!(
+            return Ok(crate::tools::ToolOutput::ok(format!(
                 "Preview only; no changes would be made to {}",
                 noops[0].rel
-            ));
+            )));
         }
         let key = hash_of(input);
         let count = match store.noop {
@@ -2236,9 +2307,9 @@ pub(crate) fn edit_with(
                 "{rel}: this identical edit has now produced no change {count} times in a row; the file already has the requested content. Re-read it and move on or change approach"
             ));
         }
-        return Ok(format!(
+        return Ok(crate::tools::ToolOutput::ok(format!(
             "No changes: the edit leaves {rel} identical. Nothing was written."
-        ));
+        )));
     }
 
     // Destination / size checks before any mutation.
@@ -2267,41 +2338,10 @@ pub(crate) fn edit_with(
         targets.push(target);
     }
     drop(store); // Never hold edit state while awaiting current-owner model repair/approval.
-    let _lease = if commit {
-        Some(super::document_transaction::Lease::acquire(
-            prepared.iter().flat_map(|proposal| {
-                std::iter::once(proposal.abs.clone())
-                    .chain(proposal.mv.as_ref().map(|(path, _)| path.clone()))
-            }),
-        )?)
-    } else {
-        None
-    };
     let mut warnings = Vec::new();
     let mut records = Vec::new();
     let mut changes = Vec::new();
     for p in &mut prepared {
-        if commit && !p.rem && p.mv.is_none() && !p.projected && !p.carrier_changed {
-            let mut proposal = super::edit_transaction::Change::existing(
-                p.abs.clone(),
-                p.original.clone(),
-                Some(p.new_text.clone()),
-            );
-            let notes =
-                super::document_transaction::rebase(ws, std::slice::from_mut(&mut proposal))?;
-            if !notes.is_empty() {
-                let after = proposal.after.take().expect("text proposal");
-                let flags = Seen::from_ranges(&p.seen_after).flags(split_lines(&p.new_lf).len());
-                let new_lf = normalize_body(&after).into_owned();
-                p.seen_after = ranges_from_flags(&transition_flags(&p.new_lf, &new_lf, &flags));
-                p.original = proposal.before.take().expect("existing text");
-                p.diff = super::diff::preview(&p.original.text, &after);
-                p.new_text = after;
-                p.new_lf = new_lf;
-                p.preview.clear();
-                warnings.extend(notes);
-            }
-        }
         execution.check_cancel()?;
         let target =
             p.mv.as_ref()
@@ -2431,23 +2471,34 @@ pub(crate) fn edit_with(
             }
         }
     }
-    let mut out = prepared.iter().map(describe).collect::<Vec<_>>().join("\n");
-    if !commit {
-        out.insert_str(0, "Preview only; no files modified.\n");
-    }
+    let mut out = prepared
+        .iter()
+        .map(|p| describe(p, true))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut model = prepared
+        .iter()
+        .map(|p| describe(p, false))
+        .collect::<Vec<_>>()
+        .join("\n");
     for p in &prepared {
         warnings.extend(p.warnings.iter().map(|w| format!("{}: {w}", p.rel)));
     }
-    if !warnings.is_empty() {
-        out.push_str("\nWarnings:\n");
-        for warning in warnings {
-            out.push_str(&format!("- {warning}\n"));
+    for text in [&mut out, &mut model] {
+        if !commit {
+            text.insert_str(0, "Preview only; no files modified.\n");
+        }
+        if !warnings.is_empty() {
+            text.push_str("\nWarnings:\n");
+            for warning in &warnings {
+                text.push_str(&format!("- {warning}\n"));
+            }
         }
     }
-    Ok(out)
+    Ok(crate::tools::surface::outcome::edit_projection(out, model))
 }
 
-fn describe(p: &Prepared) -> String {
+fn describe(p: &Prepared, include_diff: bool) -> String {
     if p.rem {
         return format!("deleted {}{}", p.rel, p.diff);
     }
@@ -2477,7 +2528,14 @@ fn describe(p: &Prepared) -> String {
     }
     out.push_str(&p.dropped);
     out.push_str(&p.preview);
-    out.push_str(&p.diff);
+    if include_diff
+        || p.preview.is_empty()
+        || p.preview.contains("[preview truncated;")
+        || p.preview.contains("[line truncated]")
+        || p.diff.contains("[final newline ")
+    {
+        out.push_str(&p.diff);
+    }
     out
 }
 
@@ -2799,6 +2857,27 @@ enum DiskObservation {
     Unavailable(std::io::ErrorKind),
 }
 
+/// Only invalidate context whose witnessed ranges no longer survive as contiguous text.
+/// Shifts outside those ranges are handled by edit's snapshot-coordinate translation.
+fn invalidates_seen(before: &str, after: &str, seen: &Seen) -> bool {
+    let base: Vec<String> = split_lines(before).into_iter().map(str::to_owned).collect();
+    let current: Vec<String> = split_lines(after).into_iter().map(str::to_owned).collect();
+    let Some(map) = line_map(&base, &current) else {
+        return true;
+    };
+    let mut anchors: Vec<_> = seen
+        .0
+        .iter()
+        .map(|&(lo, hi)| Edit {
+            lo,
+            hi,
+            insert: false,
+            lines: Vec::new(),
+        })
+        .collect();
+    translate(&mut anchors, &map, current.len()).is_err()
+}
+
 pub(crate) fn changed_observations(ws: &Workspace) -> Vec<String> {
     use std::io::Read;
     use std::time::{Duration, Instant};
@@ -2822,16 +2901,23 @@ pub(crate) fn changed_observations(ws: &Workspace) -> Vec<String> {
             if snapshot.raw_revision.is_some()
                 || ext_of(path) == "ipynb"
                 || snapshot.text.len() > OBSERVATION_FILE_BYTES
+                || snapshot.seen.0.is_empty()
             {
                 continue;
             }
-            candidates.push((path.clone(), snapshot.digest, snapshot.observation_id));
+            candidates.push((
+                path.clone(),
+                snapshot.digest,
+                snapshot.observation_id,
+                snapshot.text.clone(),
+                snapshot.seen.clone(),
+            ));
         }
         candidates
     };
     let mut remaining = OBSERVATION_BYTES;
     let mut notices = Vec::new();
-    for (path, expected, id) in candidates {
+    for (path, expected, id, before, seen) in candidates {
         if notices.len() >= OBSERVATION_NOTICES
             || remaining == 0
             || started.elapsed() >= Duration::from_millis(50)
@@ -2871,8 +2957,14 @@ pub(crate) fn changed_observations(ws: &Workspace) -> Vec<String> {
             }
             let text = std::str::from_utf8(&bytes)
                 .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+            let normalized = normalize(text);
+            let digest = Sha256::digest(normalized.as_bytes()).into();
             Ok(Some(DiskObservation::Content(
-                Sha256::digest(normalize(text).as_bytes()).into(),
+                if digest == expected || invalidates_seen(&before, &normalized, &seen) {
+                    digest
+                } else {
+                    expected
+                },
             )))
         })();
         let observed = match observed {
@@ -2906,3 +2998,6 @@ mod observation_tests;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod collaboration_tests;

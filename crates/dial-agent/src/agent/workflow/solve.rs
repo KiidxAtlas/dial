@@ -289,84 +289,111 @@ fn search(parent: &mut subagents::Parent<'_>, args: &Value, ui: &mut dyn Ui) -> 
         harness.tools.iter().any(|n| n == "write" || n == "edit"),
         "candidate model profile must permit write or edit"
     );
-    // Freeze the selected route: subagents::run must not select the old endpoint a second time.
+    // Freeze the already privacy-checked route for every worker/fallback role. Candidate
+    // generation must not silently resolve an unrelated configured task/coach endpoint.
     let mut child_config = child_config;
-    if child_config.model_roles.contains_key("small") {
-        child_config
-            .model_roles
-            .insert("small".into(), child_config.selection());
-    }
+    child_config.model_roles.clear();
+    let limit = env
+        .config
+        .solve
+        .concurrency
+        .min(env.config.task.max_concurrency.max(1));
+    let candidate_env = subagents::Env {
+        config: &child_config,
+        workspace: env.workspace,
+        ext: &ext,
+        layout: None,
+        harness: &harness,
+        interrupt: env.interrupt,
+        usage: env.usage,
+        context_cap: env.context_cap,
+        memory: None,
+        agents_messages: &[],
+        plan_mode: env.plan_mode,
+    };
     let mut best: Option<BestCandidate> = None;
     let mut attempts = Vec::new();
-    for (index, approach) in request.candidates.iter().enumerate() {
-        ensure!(
-            !env.interrupt.load(Ordering::SeqCst),
-            "solve interrupted; source unchanged"
-        );
-        let candidate = crate::workspace_copy::clone_project(baseline.path())?;
-        let workspace = Workspace::new(candidate.path())?.with_edit_mode(env.workspace.edit_mode());
-        let candidate_env = subagents::Env {
-            config: &child_config,
-            workspace: &workspace,
-            ext: &ext,
-            layout: None,
-            harness: &harness,
-            interrupt: env.interrupt,
-            usage: env.usage,
-            context_cap: env.context_cap,
-            memory: None,
-            agents_messages: &[],
-            plan_mode: env.plan_mode,
-        };
-        let prompt = format!(
+    candidate_waves(
+        baseline.path(),
+        &request.candidates,
+        limit,
+        |offset, approaches, candidates| {
+            ensure!(
+                !env.interrupt.load(Ordering::SeqCst),
+                "solve interrupted; source unchanged"
+            );
+            let workspaces: Vec<_> = candidates
+                .iter()
+                .map(|candidate| {
+                    Workspace::new(candidate.path())
+                        .map(|ws| ws.with_edit_mode(env.workspace.edit_mode()))
+                })
+                .collect::<Result<_>>()?;
+            let prompts: Vec<_> = approaches.iter().map(|approach| format!(
             "Goal: {}\nCandidate approach: {}\nOnly change these exact relative files: {:?}. Preserve unrelated work. Do not run verification; the caller runs identical checks in a separate copy. Implement the patch, then summarize. Never use network.\n",
             request.goal, approach, request.allowed_paths
-        );
-        let child = subagents::run(
-            subagents::Parent {
-                env: candidate_env,
-                approval: parent.approval,
-                always: &mut *parent.always,
-                cost: &mut *parent.cost,
-                main: &mut *parent.main,
-                side: &mut *parent.side,
-                adapter: parent.adapter,
-                handoff: Default::default(),
-            },
-            None,
-            &json!({"agent":"worker","task":prompt,"solution_space":"one implementation slice: the spec is given","max_steps":env.config.solve.max_steps}),
-            ui,
-        );
-        let assessed = (|| -> Result<(Tree, Vec<PathBuf>, Vec<Value>)> {
-            ensure!(
-                !child.is_error,
-                "candidate agent failed: {}",
-                subagents::clip(&child.text, 1200)
-            );
-            let after = tree(candidate.path(), env.config.solve.max_snapshot_bytes)?;
-            let paths = scoped_patch(&before, &after, &request.allowed_paths)?;
-            let evidence = verify(
-                candidate.path(),
-                &after,
-                &request.checks,
-                env.config.solve.max_snapshot_bytes,
-                env.interrupt,
-                ui,
-            )?;
-            Ok((after, paths, evidence))
-        })();
-        match assessed {
-            Ok((after, paths, evidence)) => {
-                let size = patch_size(&before, &after, &paths);
-                attempts.push(json!({"candidate":index + 1,"passed":true,"changed_bytes":size.0,"paths":paths,"checks":evidence}));
-                if best.as_ref().is_none_or(|(_, _, _, old)| size < *old) {
-                    best = Some((index, after, paths, size));
+        )).collect();
+            let children = if limit > 1 && child_config.endpoint.is_some() {
+                // The existing queue retains provider jobs, approvals and global slot admission.
+                subagents::run_copies(parent, candidate_env, &workspaces, &prompts, limit, ui)
+                    .map_err(anyhow::Error::msg)?
+            } else {
+                let mut children = Vec::new();
+                for (workspace, prompt) in workspaces.iter().zip(&prompts) {
+                    ensure!(
+                        !env.interrupt.load(Ordering::SeqCst),
+                        "solve interrupted; source unchanged"
+                    );
+                    children.push(subagents::run(subagents::Parent {
+                    env: subagents::Env { workspace, ..candidate_env }, approval: parent.approval,
+                    always: &mut *parent.always, cost: &mut *parent.cost, main: &mut *parent.main,
+                    side: &mut *parent.side, adapter: parent.adapter, handoff: Default::default(),
+                }, None, &json!({"agent":"worker","task":prompt,"solution_space":"one implementation slice: the spec is given","max_steps":env.config.solve.max_steps}), ui));
+                }
+                children
+            };
+            let assessed = assess_parallel(children, limit, ui, |index, child| {
+                ensure!(
+                    !env.interrupt.load(Ordering::SeqCst),
+                    "solve interrupted; source unchanged"
+                );
+                ensure!(
+                    !child.is_error,
+                    "candidate agent failed: {}",
+                    subagents::clip(&child.text, 1200)
+                );
+                let candidate = &candidates[index];
+                let after = tree(candidate.path(), env.config.solve.max_snapshot_bytes)?;
+                let paths = scoped_patch(&before, &after, &request.allowed_paths)?;
+                let evidence = verify(
+                    candidate.path(),
+                    &after,
+                    &request.checks,
+                    env.config.solve.max_snapshot_bytes,
+                    env.interrupt,
+                    &mut crate::agent::NullUi,
+                )?;
+                Ok((after, paths, evidence))
+            });
+            // Each wave is reduced in original order before all its copies are released.
+            for (index, assessed) in assessed.into_iter().enumerate() {
+                let index = offset + index;
+                match assessed {
+                    Ok((after, paths, evidence)) => {
+                        let size = patch_size(&before, &after, &paths);
+                        attempts.push(json!({"candidate":index + 1,"passed":true,"changed_bytes":size.0,"paths":paths,"checks":evidence}));
+                        if best.as_ref().is_none_or(|(_, _, _, old)| size < *old) {
+                            best = Some((index, after, paths, size));
+                        }
+                    }
+                    Err(error) => attempts.push(
+                        json!({"candidate":index + 1,"passed":false,"reason":format!("{error:#}")}),
+                    ),
                 }
             }
-            Err(error) => attempts
-                .push(json!({"candidate":index + 1,"passed":false,"reason":format!("{error:#}")})),
-        }
-    }
+            Ok(())
+        },
+    )?;
     let Some((index, after, paths, _)) = best else {
         bail!(
             "no candidate passed all explicit checks; source unchanged: {}",
@@ -387,6 +414,66 @@ fn search(parent: &mut subagents::Parent<'_>, args: &Value, ui: &mut dyn Ui) -> 
     Ok(
         json!({"winner":index + 1,"applied":paths,"verified_against":"only the explicit checks listed","attempts":attempts,"training_evidence":false}),
     )
+}
+
+/// Own one wave's copies until generation, verification and ordered reduction finish.
+/// Only the reduced best tree may escape; even unlimited searches retain bounded copies.
+fn candidate_waves<T>(
+    baseline: &Path,
+    approaches: &[T],
+    limit: usize,
+    mut run: impl FnMut(usize, &[T], &[tempfile::TempDir]) -> Result<()>,
+) -> Result<()> {
+    let limit = limit.clamp(1, subagents::MAX_BATCH);
+    for (wave, approaches) in approaches.chunks(limit).enumerate() {
+        let copies = approaches
+            .iter()
+            .map(|_| crate::workspace_copy::clone_project(baseline))
+            .collect::<Result<Vec<_>>>()?;
+        run(wave * limit, approaches, &copies)?;
+    }
+    Ok(())
+}
+
+/// Reuse the worker queue for bounded isolated evaluation, with UI ownership on the caller.
+/// Panics become failed attempts; every item reports and no result can promote itself.
+fn assess_parallel<T: Send>(
+    children: Vec<ToolOutput>,
+    limit: usize,
+    ui: &mut dyn Ui,
+    assess: impl Fn(usize, ToolOutput) -> Result<T> + Sync,
+) -> Vec<Result<T>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut results: Vec<Option<Result<T>>> = children.iter().map(|_| None).collect();
+    let items: Vec<_> = children
+        .into_iter()
+        .enumerate()
+        .map(|(index, child)| (index, child, tx.clone()))
+        .collect();
+    drop(tx);
+    subagents::rolling(
+        items,
+        limit,
+        |(index, child, tx)| {
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| assess(index, child)))
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("candidate evaluation panicked")));
+            let _ = tx.send((index, result));
+        },
+        || loop {
+            match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok((index, result)) => results[index] = Some(result),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => ui.heartbeat(),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        },
+    );
+    results
+        .into_iter()
+        .map(|result| {
+            result.unwrap_or_else(|| Err(anyhow::anyhow!("candidate evaluation disconnected")))
+        })
+        .collect()
 }
 
 fn scoped_patch(before: &Tree, after: &Tree, allowed: &[PathBuf]) -> Result<Vec<PathBuf>> {

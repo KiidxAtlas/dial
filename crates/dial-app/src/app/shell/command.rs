@@ -3,7 +3,7 @@
 use crate::agent::window::context;
 use crate::agent::{Agent, Ui};
 use crate::app::bridge::Bridge;
-use crate::app::command_registry::{canonical_command, command_panel};
+use crate::app::command_registry::{canonical_command, command_panel, turn_count};
 use crate::app::core::App;
 use crate::app::display::{group_digits, short};
 use crate::app::drive::Step;
@@ -579,6 +579,10 @@ impl Shell {
                 }
             }
             "undo" => {
+                let Some(turns) = turn_count(args) else {
+                    self.note("Undo", "Usage: /undo [n] with a whole number of turns (default 1).");
+                    return Ok(Step::Done);
+                };
                 let mut lines = Vec::new();
                 if let (Some(trajectory), Some(store)) = (self.last_trajectory, app.store.as_ref())
                 {
@@ -594,7 +598,7 @@ impl Shell {
                     }
                 }
                 if let Some(checkpoints) = agent.checkpoints() {
-                    match checkpoints.rollback(1) {
+                    match checkpoints.rollback(turns) {
                         Ok(report) => lines.push(format!(
                             "restored {} file(s), removed {}",
                             report.restored.len(),
@@ -604,7 +608,7 @@ impl Shell {
                     }
                 }
                 agent.cancel_background_compaction();
-                match crate::app::commands::branch::rewind(app, agent, 1) {
+                match crate::app::commands::branch::rewind(app, agent, turns) {
                     Ok(rewound) => {
                         lines.push(format!("dropped {} message(s)", rewound.dropped));
                         lines.extend(rewound.note);
@@ -614,8 +618,7 @@ impl Shell {
                 self.note("Undo", lines.join("\n"));
             }
             "rollback" => {
-                let turns = if args.is_empty() { Ok(1) } else { args.parse::<usize>() };
-                let Ok(turns) = turns else {
+                let Some(turns) = turn_count(args) else {
                     self.note("Rollback", "Usage: /rollback [n] with a whole number of turns.");
                     return Ok(Step::Done);
                 };
@@ -941,10 +944,9 @@ impl Shell {
                     let prompt = context::expand_command(def, args);
                     return self.run_turn(app, agent, &prompt);
                 }
-                None => self.note(
-                    "Command",
-                    format!("unknown command /{name}; /help lists commands"),
-                ),
+                // Not a command (a pasted path such as `/Users/me/notes.md`, or other text that
+                // happens to start with a slash): send the line as an ordinary message.
+                None => return self.run_turn(app, agent, line),
             },
         }
         Ok(Step::Done)

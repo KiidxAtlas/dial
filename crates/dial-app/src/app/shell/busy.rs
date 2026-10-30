@@ -18,7 +18,7 @@ impl Shell {
         // Plain Submit while busy is the explicit empty-Enter queue flush.
         // Stop at the next safe point and dispatch it in this same chat, ahead
         // of deferred commands and the remaining queued messages.
-        if !text.trim_start().starts_with('/') {
+        if !crate::ui::composer::is_slash_command(&text) {
             self.startup = Some(text);
             return true;
         }
@@ -282,8 +282,9 @@ impl Shell {
     /// Jobs whose result continues an agent-bound flow wait for the idle loop.
     pub(in crate::app) fn pump_jobs_during_turn(&mut self, app: &App) {
         for (label, line) in AuthJob::drain_lines(&mut self.auth_job) {
-            self.transcript.notice_merge(label, &line);
+            self.job_line(app, label, &line);
         }
+        self.sync_live_pane(app, None);
         if self
             .auth_job
             .as_ref()
@@ -292,6 +293,7 @@ impl Shell {
             return;
         }
         if let Some((label, result)) = AuthJob::collect(&mut self.auth_job, app) {
+            self.job_ended(label, &result);
             self.report_job_result(label, result);
             self.transcript.settle_job_notices();
             self.catalog.refresh(app);

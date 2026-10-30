@@ -7,6 +7,7 @@ pub(in crate::agent) enum ChatEvent {
         waiting: bool,
     },
     Progress(llm::ModelProgress),
+    Activity,
     Text(String),
     Reasoning(String),
     ToolArguments {
@@ -373,6 +374,9 @@ pub(in crate::agent) fn chat_attempt_with_ui(
                         llm::StreamEvent::Progress(value) => {
                             let _ = tx.send(ChatEvent::Progress(value.clone()));
                         }
+                        llm::StreamEvent::Activity => {
+                            let _ = tx.send(ChatEvent::Activity);
+                        }
                         llm::StreamEvent::Reasoning(text) => {
                             let _ = tx.send(ChatEvent::Reasoning(text.clone()));
                         }
@@ -542,6 +546,9 @@ pub(in crate::agent) fn chat_attempt_with_ui(
                         progress.observe(value, last_progress);
                         ui.model_progress(&progress.value);
                     }
+                }
+                Ok(ChatEvent::Activity) => {
+                    last_progress = Instant::now();
                 }
                 Ok(ChatEvent::Text(text) | ChatEvent::Reasoning(text)) if text.is_empty() => {}
                 Ok(ChatEvent::Text(text)) => {

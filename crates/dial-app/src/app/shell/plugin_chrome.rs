@@ -37,6 +37,17 @@ impl Shell {
             .map(|host| slots_from(&host.ui_slots()))
             .unwrap_or_default();
         let mut changed = self.composer.set_plugin_slots(slots);
+        changed |= self
+            .extension_views
+            .sync(host.as_ref().map(|h| h.views()).unwrap_or_default());
+        if let Some(layout) = agent.layout() {
+            changed |= self.extension_keys.refresh(
+                host.as_deref(),
+                &self.keys,
+                &layout.user_dir,
+                &layout.project_dir,
+            );
+        }
 
         let query = self.composer.plugin_query().map(str::to_owned);
         if query != self.plugin_chrome.sent {

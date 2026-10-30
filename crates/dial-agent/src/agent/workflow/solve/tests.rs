@@ -299,3 +299,107 @@ fn exact_route_privacy_is_local_by_default() {
     };
     assert!(local_route(local, false).is_ok());
 }
+
+#[test]
+fn candidate_evaluation_overlaps_but_returns_attempt_order_and_contains_panics() {
+    use std::sync::{Barrier, atomic::AtomicUsize};
+    let active = AtomicUsize::new(0);
+    let peak = AtomicUsize::new(0);
+    let barrier = Barrier::new(2);
+    let results = assess_parallel(
+        (0..4).map(|_| ToolOutput::ok("candidate".into())).collect(),
+        2,
+        &mut crate::agent::NullUi,
+        |index, _| {
+            let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(count, Ordering::SeqCst);
+            if index < 2 {
+                barrier.wait();
+            }
+            active.fetch_sub(1, Ordering::SeqCst);
+            if index == 2 {
+                panic!("injected candidate failure");
+            }
+            Ok(index)
+        },
+    );
+    assert_eq!(peak.load(Ordering::SeqCst), 2);
+    assert_eq!(*results[0].as_ref().unwrap(), 0);
+    assert_eq!(*results[1].as_ref().unwrap(), 1);
+    assert!(results[2].is_err());
+    assert_eq!(*results[3].as_ref().unwrap(), 3);
+}
+
+#[test]
+fn solve_parallelism_is_explicit_and_bounded() {
+    assert_eq!(SolveConfig::default().concurrency, 1);
+    assert!(!SolveConfig::default().enabled);
+    for concurrency in [0, 65, usize::MAX] {
+        assert!(
+            SolveConfig {
+                concurrency,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+    for concurrency in [1, 2, 64] {
+        assert!(
+            SolveConfig {
+                concurrency,
+                ..Default::default()
+            }
+            .validate()
+            .is_ok()
+        );
+    }
+}
+
+#[test]
+fn candidate_waves_release_real_copies_before_next_wave_and_on_failure() {
+    let baseline = tempfile::tempdir().unwrap();
+    fs::write(baseline.path().join("dirty"), "uncommitted source").unwrap();
+    for limit in [1, 2, 64] {
+        for fail in [false, true] {
+            let mut previous = Vec::<PathBuf>::new();
+            let mut visited = Vec::new();
+            let result = candidate_waves(
+                baseline.path(),
+                &[0, 1, 2, 3, 4],
+                limit,
+                |offset, approaches, copies| {
+                    assert!(
+                        previous.iter().all(|path| !path.exists()),
+                        "previous wave still occupies disk"
+                    );
+                    assert!(copies.len() <= limit);
+                    assert_eq!(copies.len(), approaches.len());
+                    previous = copies.iter().map(|copy| copy.path().to_owned()).collect();
+                    for (index, copy) in copies.iter().enumerate() {
+                        assert_eq!(
+                            fs::read_to_string(copy.path().join("dirty")).unwrap(),
+                            "uncommitted source"
+                        );
+                        fs::write(copy.path().join("dirty"), "candidate modification").unwrap();
+                        visited.push(offset + index);
+                    }
+                    ensure!(!fail, "injected generation failure");
+                    Ok(())
+                },
+            );
+            assert_eq!(result.is_err(), fail);
+            assert!(
+                previous.iter().all(|path| !path.exists()),
+                "final wave leaked copies"
+            );
+            if !fail {
+                assert_eq!(visited, [0, 1, 2, 3, 4]);
+            }
+            assert_eq!(
+                fs::read_to_string(baseline.path().join("dirty")).unwrap(),
+                "uncommitted source"
+            );
+        }
+    }
+}

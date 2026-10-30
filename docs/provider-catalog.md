@@ -33,6 +33,28 @@ can be incomplete: an unknown capability is not proof of support. Operator profi
 vision/tool support, context/output limits and supported request options; they do not install a new
 runtime or turn an embedding checkpoint into a chat model.
 
+The vision, tools and reasoning badges in `/models` come from structured metadata, never model names:
+live provider fields first (Anthropic `capabilities`, Gemini `thinking`, OpenRouter modalities and
+supported parameters, Ollama `/api/show`, LM Studio `type`/`capabilities`, local checkpoint configs and
+chat templates), then the exact bundled catalog record. That is the same order the request layer uses.
+`?` means no source declared the capability. A model that declares no tool calls is flagged: Dial refuses
+requests that offer it tools, so either pick a tool-capable model or set `capabilities.tools = false` in
+`/model settings` to use it for chat only. Images sent to a model without vision become text notes.
+
+### Image generation
+
+The **Images** group uses explicit image-output metadata, exact documented model IDs on direct
+provider endpoints, or a model profile's `capabilities.image_generation`. OpenAI/xAI image-only
+models are not chat models; Gemini image-capable chat models can serve both roles. MLX-Serve must
+advertise its native image capability. Vision alone never enables generation, and an explicit
+`disabled` capability vetoes image use.
+
+Native Gemini, explicit Vertex/Imagen, BFL, ComfyUI workflows, fal and Replicate use distinct
+transports rather than an assumed OpenAI image endpoint. Services without a compatible model-list
+API use explicitly configured profiles or `[image]` settings; Dial does not guess installed workflows
+or enumerate access by attempting billed generations. See [image providers](image-generation.md)
+for endpoints, credential variables, model inputs, workflows and cancellation limits.
+
 ## Independent authentication methods
 
 In `/providers`, select a provider and choose **Use API key** or **Use sign-in or subscription**

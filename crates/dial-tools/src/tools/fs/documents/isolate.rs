@@ -9,10 +9,9 @@
 //! thread at fork time (allocator, SQLite, std) leaves the forked child blocked forever.
 
 use std::{
-    fs,
     io::{self, Read, Seek, Write},
     panic::{self, AssertUnwindSafe},
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -25,9 +24,6 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::platform;
-use crate::tools::Workspace;
-
-use super::cache::Opened;
 
 /// Frame markers on stdout. The payload is compact JSON with `<` escaped, so a marker can never
 /// occur inside it.
@@ -53,34 +49,29 @@ pub(super) enum Job {
         path: PathBuf,
         member: Option<String>,
     },
-    Notebook {
-        path: PathBuf,
-        member: Option<String>,
-    },
-    /// `root` is the workspace root the parent authorized `path` under.
-    Archive {
-        root: PathBuf,
-        path: PathBuf,
+    /// Immutable authorized bytes supplied by the parent; `name` is a label, not a path to open.
+    Read {
         format: String,
+        name: String,
         member: Option<String>,
-    },
-    Office {
-        path: PathBuf,
-        format: String,
-        member: Option<String>,
-    },
-    /// EPUB package; `member` is an optional `chapter=N` spine selector.
-    Epub {
-        path: PathBuf,
-        member: Option<String>,
-    },
-    Json {
-        path: PathBuf,
-        label: String,
-        query: String,
     },
     /// In-memory document; the bytes travel as the payload after the JSON header.
-    Convert { format: String },
+    Convert {
+        format: String,
+    },
+    Layout {
+        format: String,
+    },
+    Table {
+        sheet: Option<String>,
+    },
+    Workbook,
+    /// Read-only investigation of already authorized SQLite bytes.
+    Database {
+        action: String,
+        sql: Option<String>,
+        limit: usize,
+    },
     /// Archive held in memory (URL downloads); bytes travel as the payload, `name` picks the tar codec.
     ArchiveBytes {
         format: String,
@@ -88,7 +79,9 @@ pub(super) enum Job {
         member: Option<String>,
     },
     #[cfg(test)]
-    Probe { action: String },
+    Probe {
+        action: String,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -282,7 +275,7 @@ fn limit(_command: &mut Command, _deadline: Duration) {
 #[cfg(target_os = "linux")]
 fn address_space_limit() -> Option<u64> {
     const PARSER_ADDRESS_SPACE: u64 = 4 << 30;
-    let statm = fs::read_to_string("/proc/self/statm").ok()?;
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
     let pages: u64 = statm.split_whitespace().next()?.parse().ok()?;
     let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
         .ok()
@@ -352,24 +345,60 @@ fn read_job() -> Result<(Job, Vec<u8>), String> {
 fn execute(job: &Job, payload: &[u8]) -> Result<String, String> {
     match job {
         Job::Sqlite { path, member } => super::sqlite::read(path, member.as_deref()),
-        Job::Notebook { path, member } => super::notebook(open(path)?, member.as_deref()),
-        Job::Archive {
-            root,
-            path,
+        Job::Read {
             format,
+            name,
             member,
         } => {
-            let ws = Workspace::new(root).map_err(|e| format!("{e:#}"))?;
-            let opened = Opened::open(&ws, path)?;
-            super::archives::read(&opened, &ws, format, member.as_deref())
+            if super::is_archive(format) {
+                return super::archives::read_bytes(format, name, payload, member.as_deref());
+            }
+            let mut file = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
+            file.write_all(payload).map_err(|e| e.to_string())?;
+            file.rewind().map_err(|e| e.to_string())?;
+            match format.as_str() {
+                "notebook" => {
+                    super::notebook(file.reopen().map_err(|e| e.to_string())?, member.as_deref())
+                }
+                "docx" | "xlsx" | "pptx" => super::office::read(
+                    file.reopen().map_err(|e| e.to_string())?,
+                    format,
+                    member.as_deref(),
+                ),
+                "epub" => {
+                    super::epub::read(file.reopen().map_err(|e| e.to_string())?, member.as_deref())
+                }
+                "json" => super::json::read(
+                    file.path(),
+                    name,
+                    member.as_deref().ok_or("JSON query missing")?,
+                ),
+                _ => Err(format!("unsupported snapshot document format {format:?}")),
+            }
         }
-        Job::Office {
-            path,
-            format,
-            member,
-        } => super::office::read(open(path)?, format, member.as_deref()),
-        Job::Epub { path, member } => super::epub::read(open(path)?, member.as_deref()),
-        Job::Json { path, label, query } => super::json::read(path, label, query),
+        Job::Layout { format } => super::layout::read(payload, format),
+        Job::Table { sheet } => {
+            let mut file = tempfile::tempfile().map_err(|e| e.to_string())?;
+            file.write_all(payload).map_err(|e| e.to_string())?;
+            file.rewind().map_err(|e| e.to_string())?;
+            super::table::read(file, sheet.as_deref())
+        }
+        Job::Workbook => {
+            let mut file = tempfile::tempfile().map_err(|e| e.to_string())?;
+            file.write_all(payload).map_err(|e| e.to_string())?;
+            file.rewind().map_err(|e| e.to_string())?;
+            super::workbook::inspect(file)
+        }
+        Job::Database { action, sql, limit } => {
+            let result = crate::tools::knowledge::database::inspect_snapshot(
+                payload,
+                action,
+                sql.as_deref(),
+                *limit,
+            )
+            .map_err(|e| format!("{e:#}"))?;
+            serde_json::to_string(&result).map_err(|e| e.to_string())
+        }
         Job::Convert { format } => {
             let mut file =
                 tempfile::tempfile().map_err(|e| format!("creating parser input: {e}"))?;
@@ -387,10 +416,6 @@ fn execute(job: &Job, payload: &[u8]) -> Result<String, String> {
         #[cfg(test)]
         Job::Probe { action } => probe(action),
     }
-}
-
-fn open(path: &Path) -> Result<fs::File, String> {
-    fs::File::open(path).map_err(|e| format!("opening document: {e}"))
 }
 
 #[cfg(test)]

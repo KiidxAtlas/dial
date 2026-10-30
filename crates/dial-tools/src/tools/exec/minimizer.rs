@@ -1,9 +1,9 @@
 //! Output minimizer: shrinks the progress noise of recognised commands before the model reads it.
 //!
-//! The filter is chosen from the command alone ([`bash_interceptor::sole_command`]): only a single
-//! simple command qualifies, so a compound command, a pipeline or anything the flat scanner declines
-//! is never filtered. Filters are deterministic line classifiers (drop, keep, or "passing result" that
-//! collapses in runs). Three rules hold for every filter and are enforced here, not in the filters:
+//! The filter is chosen from the command alone. Simple recognized commands qualify; compound
+//! commands qualify only when every output-producing segment is a recognized Cargo check command.
+//! Arbitrary program stdout and pipelines never select a Cargo filter. Filters are deterministic
+//! line classifiers (drop, keep, or passing results that collapse in runs). Three rules hold:
 //!
 //! - a line that mentions an error, warning, panic, failure, traceback, exception or fatal condition
 //!   is always kept ([`is_diagnostic`]);
@@ -209,7 +209,27 @@ fn strip_escapes(text: &str) -> String {
 // ------------------------------------------------------------------------------------- detection
 
 fn filter_for(command: &str) -> Option<&'static Filter> {
-    let sole = bash_interceptor::sole_command(command)?;
+    let Some(sole) = bash_interceptor::sole_command(command) else {
+        let commands = bash_interceptor::output_commands(command)?;
+        if commands.len() < 2 {
+            return None;
+        }
+        let mut cargo = false;
+        for segment in commands {
+            if segment.starts_with("cd ") || segment.starts_with("cd\t") {
+                // `cd` can print directory names (CDPATH); it cannot emit Cargo progress.
+                if segment.contains(['<', '>', '`', '$']) {
+                    return None;
+                }
+                continue;
+            }
+            if filter_for(&segment).is_none_or(|filter| !std::ptr::eq(filter, &CARGO)) {
+                return None;
+            }
+            cargo = true;
+        }
+        return cargo.then_some(&CARGO);
+    };
     if sole.contains(['<', '>', '`']) || sole.contains("$(") {
         return None;
     }
@@ -224,8 +244,8 @@ fn filter_for(command: &str) -> Option<&'static Filter> {
                 _ => &args[..],
             };
             match *args.iter().find(|arg| !arg.starts_with('-'))? {
-                "build" | "b" | "check" | "c" | "clippy" | "test" | "t" | "run" | "r" | "bench"
-                | "doc" | "nextest" | "install" | "fetch" => Some(&CARGO),
+                "build" | "b" | "check" | "c" | "clippy" | "test" | "t" | "doc" | "nextest"
+                | "install" | "fetch" | "fmt" => Some(&CARGO),
                 _ => None,
             }
         }

@@ -186,6 +186,8 @@ pub struct Config {
     pub context_files: ContextFilesConfig,
     pub web: WebConfig,
     pub verification: VerificationConfig,
+    /// Optional session-start work, run only at an idle maintenance boundary.
+    pub preparation: crate::config::preparation::PreparationConfig,
     /// Bounded isolated patch search. Requires explicit paths and executable checks.
     pub solve: crate::config::solve::SolveConfig,
     /// Narrow stronger-model advice; remote providers require explicit operator opt-in.
@@ -302,6 +304,7 @@ impl Default for Config {
             context_files: ContextFilesConfig::default(),
             web: WebConfig::default(),
             verification: VerificationConfig::default(),
+            preparation: Default::default(),
             solve: Default::default(),
             escalation: Default::default(),
             browser: Default::default(),

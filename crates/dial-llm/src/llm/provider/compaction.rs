@@ -32,6 +32,15 @@ pub struct NativeCompactionRequest<'a> {
     pub first_kept: usize,
     pub instructions: &'a str,
 }
+
+/// A one-request, untrusted user note. Never eligible for native retained conversation.
+pub(in crate::llm) fn supplemental_context(message: &Value) -> Option<&str> {
+    (message["dial_compaction_context"] == true
+        && message["dial_transient"] == true
+        && message["role"] == "user")
+        .then(|| message["content"].as_str())
+        .flatten()
+}
 impl Backend {
     /// Preserve the controls selected for the actual projected request during native maintenance.
     pub fn compaction_profile(&self) -> Option<&llm::profiles::ModelProfile> {
@@ -709,6 +718,31 @@ fn anthropic_compact(
     );
     let tail = wire[prefix_len..].to_vec();
     body["messages"] = json!(&wire[..prefix_len]);
+    // Derive the retained wire tail without transient data, then add hook data only to the
+    // summarized prefix. Consecutive user content stays one Anthropic wire message.
+    let notes: Vec<_> = request
+        .messages
+        .iter()
+        .filter_map(supplemental_context)
+        .map(|text| json!({"type":"text","text":text}))
+        .collect();
+    if !notes.is_empty() {
+        let messages = body["messages"].as_array_mut().unwrap();
+        if messages
+            .first()
+            .is_some_and(|message| message["role"] == "user")
+        {
+            let mut content = notes;
+            match &messages[0]["content"] {
+                Value::String(text) => content.push(json!({"type":"text","text":text})),
+                Value::Array(parts) => content.extend(parts.iter().cloned()),
+                _ => bail!("Anthropic user content is not text or an array"),
+            }
+            messages[0]["content"] = json!(content);
+        } else {
+            messages.insert(0, json!({"role":"user","content":notes}));
+        }
+    }
     let retained_messages = tail.len();
     body["compaction"] = json!({"type":"summarize","instructions":instructions});
     body["stream"] = json!(false);

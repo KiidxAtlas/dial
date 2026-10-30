@@ -658,7 +658,7 @@ fn managed_body_limit_round_trips_without_truncation() {
 }
 
 #[test]
-fn body_truncation_is_bounded_and_preserves_utf8() {
+fn oversized_instructions_are_refused_instead_of_partially_returned() {
     let text = format!(
         "---\ndescription: Large external skill\n---\n{}end",
         "界".repeat(MAX_BODY_BYTES)
@@ -670,9 +670,13 @@ fn body_truncation_is_bounded_and_preserves_utf8() {
     let e = env();
     put(&e.layout.skills_dirs()[0], "large", SKILL_FILE, &text);
     let loaded = skill_tool::call(&e.layout, &json!({"name": "large"}));
-    assert!(!loaded.is_error);
-    assert!(loaded.text.contains(body));
-    assert!(loaded.text.contains("[truncated"));
+    assert!(loaded.is_error);
+    assert!(
+        loaded
+            .text
+            .contains("incomplete instructions were not returned")
+    );
+    assert!(!loaded.text.contains(body));
     assert!(!loaded.text.contains('\u{fffd}'));
 }
 
@@ -710,6 +714,7 @@ fn versioned_skill_examples_import_discover_and_load() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/skills");
     let reports = import::run(&e.layout, &root, Scope::Project, false, false).unwrap();
     let names = [
+        "art-to-ui",
         "code-cleanup",
         "debugging",
         "file-structure-cleanup",
@@ -738,4 +743,70 @@ fn versioned_skill_examples_import_discover_and_load() {
         assert!(catalog.contains(&format!("- {name}:")));
     }
     assert!(!catalog.contains("more skills"));
+}
+
+#[test]
+fn compact_entrypoint_returns_complete_core_and_references_only_on_request() {
+    let e = env();
+    let [project, _] = e.layout.skills_dirs();
+    let core = "# Core\nNever skip safety checks. Before async changes, read references/async.md with skill file.\n";
+    let handbook = format!(
+        "# Async\n{}\nMandatory async policy at the end.\n",
+        "Detail.\n".repeat(4000)
+    );
+    put(
+        &project,
+        "compact",
+        SKILL_FILE,
+        &format!("---\nname: compact\ndescription: Explicit progressive disclosure\n---\n{core}"),
+    );
+    put(&project, "compact", "references/async.md", &handbook);
+    let loaded = skill_tool::call(&e.layout, &json!({"name":"compact"}));
+    assert!(!loaded.is_error, "{}", loaded.text);
+    assert!(loaded.text.contains(core.trim()));
+    assert!(loaded.text.contains("references/async.md"));
+    assert!(!loaded.text.contains("Mandatory async policy at the end."));
+    let reference = skill_tool::call(
+        &e.layout,
+        &json!({"name":"compact", "file":"references/async.md"}),
+    );
+    assert!(!reference.is_error, "{}", reference.text);
+    assert!(reference.text.contains(&handbook));
+}
+
+#[test]
+fn arbitrary_skill_policy_is_not_automatically_summarized() {
+    let e = env();
+    let [project, _] = e.layout.skills_dirs();
+    let body = format!(
+        "# Policy\n{}\nMANDATORY final safeguard.\n",
+        "Do not discard this policy.\n".repeat(1200)
+    );
+    put(
+        &project,
+        "policy",
+        SKILL_FILE,
+        &format!("---\nname: policy\ndescription: Complete instructions\n---\n{body}"),
+    );
+    let loaded = skill_tool::call(&e.layout, &json!({"name":"policy"}));
+    assert!(!loaded.is_error, "{}", loaded.text);
+    assert!(loaded.text.contains(body.trim()));
+}
+
+#[test]
+fn malformed_utf8_skill_policy_is_not_silently_replaced() {
+    let e = env();
+    let [project, _] = e.layout.skills_dirs();
+    put(
+        &project,
+        "policy",
+        SKILL_FILE,
+        &skill_md("policy", "Complete instructions"),
+    );
+    let mut bytes = fs::read(project.join("policy").join(SKILL_FILE)).unwrap();
+    bytes.push(0xff);
+    fs::write(project.join("policy").join(SKILL_FILE), bytes).unwrap();
+    let loaded = skill_tool::call(&e.layout, &json!({"name":"policy"}));
+    assert!(loaded.is_error);
+    assert!(loaded.text.contains("not UTF-8"), "{}", loaded.text);
 }

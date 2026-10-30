@@ -228,7 +228,9 @@ impl Agent<'_> {
         // Step indices keep counting across rounds so journal records stay distinct; reports
         // count this round's attempts, which the caller adds to the turn total.
         let first = turn.iteration;
-        let report = self.drive_round(turn, engine, backend, schemas, max_steps, ui)?;
+        let result = self.drive_round(turn, engine, backend, schemas, max_steps, ui);
+        self.drain_background_check(ui, true);
+        let report = result?;
         Ok((
             TurnReport {
                 steps: report.steps.saturating_sub(first),

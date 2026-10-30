@@ -53,6 +53,14 @@ const KNOWN_CAPABILITIES: &[&str] = &[
     CAP_SET_THINKING,
     CAP_REGISTER_PROVIDER,
     CAP_UNREGISTER_PROVIDER,
+    "host.context",
+    "host.conversation",
+    "host.tools",
+    "host.tasks",
+    "host.models",
+    "host.workflows",
+    "host.secrets",
+    "views",
 ];
 
 /// Caps on untrusted plugin text. Every string is bounded before it reaches the UI or the agent.

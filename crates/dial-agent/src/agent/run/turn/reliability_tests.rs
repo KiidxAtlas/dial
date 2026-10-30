@@ -26,6 +26,42 @@ fn fallback_to(url: &str) -> String {
 }
 
 #[test]
+fn a_new_turn_recovers_a_failed_stream_writer_without_replaying_the_failed_turn() {
+    let server = llm::fake::serve(vec![
+        response("This reply cannot be published.", None),
+        response("Recovered.", None),
+    ]);
+    with_agent("[compaction]\nenabled=false\n", |agent| {
+        connect(agent, &server.url);
+        let journal = agent.session.runtime().stream_writer().unwrap();
+        let path = crate::runtime::stream_journal::path(agent.session.path().unwrap());
+        journal.fail_writes_for_test(std::fs::File::open(path).unwrap());
+
+        let error = agent
+            .turn("Do not replay this request", &mut NullUi)
+            .err()
+            .expect("the first turn must stop on the failed journal write");
+        assert!(
+            error.to_string().contains("stream journal failed"),
+            "{error:#}"
+        );
+        assert!(journal.check().is_err(), "the write failure must be sticky");
+
+        let report = agent.turn("Answer the new request", &mut NullUi).unwrap();
+        assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+        assert_eq!(report.text, "Recovered.");
+        assert!(journal.check().is_ok(), "admission repairs the same writer");
+    });
+    let requests = completion_requests(&server);
+    assert_eq!(
+        requests.len(),
+        2,
+        "one failed request and one explicitly started new turn"
+    );
+    assert!(mentions(&requests[1], "Answer the new request"));
+}
+
+#[test]
 fn one_shot_notes_survive_a_request_discarded_before_any_reply() {
     let server = llm::fake::serve(vec![
         unavailable(),
@@ -182,6 +218,7 @@ fn an_interrupt_keeps_finished_parallel_reads_and_marks_the_rest_not_run() {
             finished_reads: 0,
         };
         let report = agent.turn("Read both, then write", &mut ui).unwrap();
+        assert!(agent.session.custom_records("training_turn").is_empty());
         let results: Vec<Value> = agent
             .session
             .messages()
@@ -629,4 +666,114 @@ fn a_failed_tool_cannot_execute_an_unchanged_retry_but_can_use_corrected_argumen
     };
     assert_eq!(tool_error(&requests[2]), Some(true));
     assert_eq!(tool_error(&requests[3]), Some(false));
+}
+
+#[test]
+fn file_handles_are_projected_for_the_model_but_expanded_for_approval_and_ui() {
+    #[derive(Default)]
+    struct View {
+        calls: Vec<(String, Value)>,
+        approvals: Vec<(String, String)>,
+    }
+    impl Ui for View {
+        fn tool_call_with_args(&mut self, _: &str, name: &str, _: &str, args: &Value) {
+            self.calls.push((name.to_owned(), args.clone()));
+        }
+        fn approve(&mut self, name: &str, summary: &str) -> Decision {
+            self.approvals.push((name.to_owned(), summary.to_owned()));
+            Decision::Allow
+        }
+    }
+    let path = "deep/project/module/note.txt";
+    let initial = "before\nunchanged\n";
+    let tag = crate::tools::hashline::tag_of(initial);
+    let tool = |id: &str, name: &str, args: Value| {
+        let event = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":id,"type":"function","function":{"name":name,"arguments":args.to_string()}}]},"finish_reason":"tool_calls"}]});
+        llm::fake::Script::Sse(format!("data: {event}\n\ndata: [DONE]\n\n"))
+    };
+    let server = llm::fake::serve(vec![
+        tool("read-file", "read", json!({"path":path})),
+        slots(),
+        tool(
+            "edit-file",
+            "edit",
+            json!({"input":format!("[@f1#{tag}]\nPUT 1.=1:\n+after\n")}),
+        ),
+        response("Done.", None),
+    ]);
+    with_agent(
+        "approval='ask'\n[compaction]\nenabled=false\n[verification]\nenabled=false\n[checkpoint]\nenabled=false\n[harness]\nedit_mode='hashline'\n",
+        |agent| {
+            connect(agent, &server.url);
+            std::fs::create_dir_all(agent.workspace.root().join("deep/project/module")).unwrap();
+            std::fs::write(agent.workspace.root().join(path), initial).unwrap();
+            let mut ui = View::default();
+            let report = agent
+                .turn("Change before to after in the note", &mut ui)
+                .unwrap();
+            assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+            assert_eq!(
+                std::fs::read(agent.workspace.root().join(path)).unwrap(),
+                b"after\nunchanged\n",
+                "requests: {:?}; tool evidence: {:?}",
+                server
+                    .requests()
+                    .iter()
+                    .map(|r| String::from_utf8_lossy(r)
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_owned())
+                    .collect::<Vec<_>>(),
+                agent
+                    .session
+                    .messages()
+                    .iter()
+                    .filter(|m| m["role"] == "tool")
+                    .map(|m| &m["content"])
+                    .collect::<Vec<_>>()
+            );
+            assert!(ui.calls.iter().any(|(name, args)| {
+                name == "edit"
+                    && args["input"]
+                        .as_str()
+                        .is_some_and(|input| input.contains(path) && !input.contains("@f1"))
+            }));
+            assert!(
+                ui.approvals
+                    .iter()
+                    .any(|(name, summary)| name == "edit" && summary.contains(path)),
+                "approval must expose the real target: {:?}",
+                ui.approvals
+            );
+            let history = agent.session.messages();
+            assert!(
+                history
+                    .iter()
+                    .filter(|m| m["role"] == "tool")
+                    .any(|m| m["content"]
+                        .as_str()
+                        .is_some_and(|body| body.contains(path))),
+                "stored evidence retains real paths"
+            );
+        },
+    );
+    let requests = completion_requests(&server);
+    assert_eq!(requests.len(), 3);
+    assert!(
+        requests[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["role"] == "tool"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|body| body.contains(&format!("[@f1#{tag}]"))))
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request["messages"].to_string().contains("dial_model_")),
+        "private projections are not wire fields"
+    );
 }

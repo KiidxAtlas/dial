@@ -29,6 +29,8 @@ pub(in crate::agent) enum TurnOrigin {
     Harness,
     /// Resume the existing task for peer context, without recording a new user instruction.
     Peer,
+    /// Resume for an approved application watch, without promoting logs into instructions.
+    Monitor,
 }
 
 /// The drafter request. The user's message and its context travel as JSON data, never as

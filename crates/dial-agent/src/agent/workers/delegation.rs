@@ -244,6 +244,9 @@ impl<'a> Agent<'a> {
             }
             "status" => {
                 let reply = self.live_tasks.status(args["id"].as_str());
+                if args["id"].as_str().is_none() {
+                    return self.live_tasks.polling_output(reply);
+                }
                 if let Ok(value) = &reply {
                     self.live_tasks.acknowledge(value);
                 }
@@ -269,10 +272,7 @@ impl<'a> Agent<'a> {
                     Ok((value, stopped)) => (Ok(value), stopped),
                     Err(error) => (Err(error), false),
                 };
-                if let Ok(value) = &reply {
-                    self.live_tasks.acknowledge(value);
-                }
-                let mut output = crate::agent::workers::live_tasks::output(reply);
+                let mut output = self.live_tasks.polling_output(reply);
                 if stopped_for_input {
                     output
                         .text

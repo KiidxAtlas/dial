@@ -42,7 +42,7 @@ pub fn segments(cfg: &UiConfig) -> (Vec<String>, Vec<String>) {
                 "path",
                 "git",
             ]),
-            names(&["workers", "context"]),
+            names(&["workers", "cost", "context"]),
         ),
         StatusPreset::Minimal => (
             names(&["model", "thinking", "inference"]),
@@ -50,7 +50,7 @@ pub fn segments(cfg: &UiConfig) -> (Vec<String>, Vec<String>) {
         ),
         StatusPreset::Compact => (
             names(&["spinner", "model", "thinking", "inference", "git"]),
-            names(&["workers", "context", "tokens"]),
+            names(&["workers", "cost", "context", "tokens"]),
         ),
         StatusPreset::Full => (
             names(&[
@@ -64,7 +64,7 @@ pub fn segments(cfg: &UiConfig) -> (Vec<String>, Vec<String>) {
                 "approval",
                 "sandbox",
             ]),
-            names(&["workers", "tokens", "rate", "learning", "context"]),
+            names(&["workers", "tokens", "rate", "cost", "learning", "context"]),
         ),
         StatusPreset::Custom => (cfg.status_left.clone(), cfg.status_right.clone()),
     }
@@ -286,6 +286,7 @@ fn canonical(name: &str) -> Option<(&'static str, u8)> {
         "approval" => ("approval", 45),
         "sandbox" => ("sandbox", 44),
         "tokens" => ("tokens", 40),
+        "cost" => ("cost", 42),
         "rate" => ("rate", 35),
         "learning" => ("learning", 30),
         "usage" => ("usage", 25),
@@ -677,6 +678,25 @@ impl Env<'_> {
                     vec![Some(self.part(tally.label(), Tok::StatusTokens))],
                 )
             }
+            "cost" => {
+                let turn = data.turn_cost.filter(|c| c.is_finite() && *c > 0.0)?;
+                let mut label = format!("{} turn", usd(turn));
+                if let Some(session) = data
+                    .session_cost
+                    .filter(|c| c.is_finite() && *c > turn && usd(*c) != usd(turn))
+                {
+                    label.push_str(&format!(
+                        " {} {} session",
+                        self.theme.sym(Sym::Dot),
+                        usd(session)
+                    ));
+                }
+                self.seg(
+                    name,
+                    importance,
+                    vec![Some(self.part(label, Tok::StatusTokens))],
+                )
+            }
             "time" => {
                 let clock = text::one_line(&data.clock);
                 if clock.trim().is_empty() {
@@ -761,6 +781,19 @@ pub(super) fn elapsed(secs: f64) -> String {
         0..=59 => format!("{total}s"),
         60..=3599 => format!("{}m{:02}s", total / 60, total % 60),
         _ => format!("{}h{:02}m", total / 3600, total % 3600 / 60),
+    }
+}
+
+/// Observed USD in the `$` form of `/cost` and the cost notices, short enough for the line:
+/// four decimals below a dollar (`$0.0412`), cents above (`$1.20`); a positive amount that
+/// rounds to nothing is `<$0.0001`, never a misleading zero.
+pub(super) fn usd(amount: f64) -> String {
+    if amount >= 1.0 {
+        format!("${amount:.2}")
+    } else if amount < 0.000_05 {
+        "<$0.0001".to_owned()
+    } else {
+        format!("${amount:.4}")
     }
 }
 

@@ -134,6 +134,307 @@ fn task_intents_select_native_specialists_without_discovery_calls() {
 }
 
 #[test]
+fn source_investigations_offer_eligible_native_tools_for_formats_and_task_verbs() {
+    let candidates = [
+        "document",
+        "data",
+        "audio",
+        "visual",
+        "evidence",
+        "evidence_search",
+    ]
+    .map(|name| (name.to_owned(), "Capability".to_owned()));
+    for (query, specialist) in [
+        ("Inspect the PDF structure before summarizing", "document"),
+        (
+            "Compare /reports/quarterly.DOCX with the slides",
+            "document",
+        ),
+        ("Summarize deck.pptx", "document"),
+        ("Calculate totals from sales.csv", "data"),
+        ("Inspect the workbook units and coverage", "data"),
+        ("Analyze sample.xlsx", "data"),
+        ("Count rows in readings.json", "data"),
+        ("Count rows in readings.jsonl", "data"),
+        ("Transcribe the unclear part of meeting.wav", "audio"),
+        ("Compare the audio recording with its transcript", "audio"),
+        ("Read labels in diagram.png", "visual"),
+        ("OCR the scanned pages", "visual"),
+    ] {
+        assert_eq!(
+            select(query, &BTreeSet::new(), &candidates),
+            [specialist, "evidence", "evidence_search"],
+            "{query}"
+        );
+    }
+    assert_eq!(
+        select(
+            "Find conflicting evidence quotes",
+            &BTreeSet::new(),
+            &candidates
+        ),
+        ["evidence", "evidence_search"]
+    );
+    // Routing selects schemas from the eligible catalog, never invents unavailable capabilities.
+    assert_eq!(
+        select("Inspect the PDF", &BTreeSet::new(), &candidates[..1]),
+        ["document"]
+    );
+    assert!(select("Inspect the PDF", &BTreeSet::new(), &[]).is_empty());
+    assert_eq!(
+        select("Use the `audio` tool", &BTreeSet::new(), &candidates),
+        ["audio"]
+    );
+    assert_eq!(select("audio", &BTreeSet::new(), &candidates), ["audio"]);
+}
+
+#[test]
+fn source_routing_ignores_incidental_module_names_and_format_mentions_without_intent() {
+    let candidates = [
+        "document",
+        "data",
+        "audio",
+        "visual",
+        "evidence",
+        "evidence_search",
+    ]
+    .map(|name| (name.to_owned(), "Capability".to_owned()));
+    for query in [
+        "Inspect src/audio.rs and visual.rs",
+        "Read crates/document/mod.rs and knowledge/data.rs",
+        "Fix the CSV parser implementation",
+        "Add an audio recording button",
+        "Generate a diagram image",
+        "report.pdf",
+        "hello",
+    ] {
+        assert!(
+            select(query, &BTreeSet::new(), &candidates).is_empty(),
+            "{query}"
+        );
+    }
+}
+
+#[test]
+fn ordinary_words_and_coding_tasks_do_not_route_runtime_or_evidence_specialists() {
+    let candidates = [
+        "monitor",
+        "investigate",
+        "research",
+        "timeline",
+        "workbench",
+    ]
+    .map(|name| (name.to_owned(), "Capability".to_owned()));
+    for query in [
+        "investigate why the parser test fails",
+        "research how tokio schedules tasks",
+        "Fix the language server config",
+        "Add a server endpoint",
+        "enable watch mode in the build",
+        "add a timeline component",
+    ] {
+        assert!(
+            select(query, &BTreeSet::new(), &candidates).is_empty(),
+            "{query}"
+        );
+    }
+    for query in [
+        "check the app logs for errors",
+        "watch the running dev server for crashes",
+        "monitor the build",
+        "why does this traceback keep appearing",
+    ] {
+        assert_eq!(
+            select(query, &BTreeSet::new(), &candidates),
+            ["monitor"],
+            "{query}"
+        );
+    }
+    assert_eq!(
+        select("Use the `investigate` tool", &BTreeSet::new(), &candidates),
+        ["investigate"]
+    );
+}
+
+#[test]
+fn system_sources_route_to_eligible_read_only_specialists_not_incidental_code_names() {
+    let candidates = [
+        "runtime_inspect",
+        "network_inspect",
+        "database",
+        "evidence",
+        "evidence_search",
+    ]
+    .map(|name| (name.to_owned(), "Capability".to_owned()));
+    for (query, specialist) in [
+        ("Analyze Chrome traces and slow spans", "runtime_inspect"),
+        ("Inspect OTLP service spans", "runtime_inspect"),
+        ("Analyze cpu.folded", "runtime_inspect"),
+        ("Inspect capture.har", "network_inspect"),
+        ("Compare HAR responses with OpenAPI", "network_inspect"),
+        ("Inspect app.sqlite schema", "database"),
+        ("Query the database read only", "database"),
+        ("Explain the query plan", "database"),
+    ] {
+        assert_eq!(
+            select(query, &BTreeSet::new(), &candidates),
+            [specialist, "evidence", "evidence_search"],
+            "{query}"
+        );
+    }
+    for query in [
+        "Inspect src/database.rs",
+        "Fix the HAR parser implementation",
+        "Add database migrations",
+        "cpu.folded",
+    ] {
+        assert!(
+            select(query, &BTreeSet::new(), &candidates).is_empty(),
+            "{query}"
+        );
+    }
+    assert_eq!(
+        select("Inspect capture.har", &BTreeSet::new(), &candidates[..1]),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        select("Use the `database` tool", &BTreeSet::new(), &candidates),
+        ["database"]
+    );
+}
+
+#[test]
+fn system_sources_accept_plain_questions_without_tool_names_or_inspection_jargon() {
+    let candidates = [
+        "runtime_inspect",
+        "network_inspect",
+        "database",
+        "evidence",
+        "evidence_search",
+    ]
+    .map(|name| (name.to_owned(), "Capability".to_owned()));
+    for (query, specialist) in [
+        ("What tables are in exports/app.sqlite?", "database"),
+        ("“What tables are in `exports/app.sqlite`?”", "database"),
+        (
+            "Which requests failed in captures/session.har?",
+            "network_inspect",
+        ),
+        (
+            "Where is time spent in captures/cpu.folded?",
+            "runtime_inspect",
+        ),
+        (
+            "What are the slowest spans in captures/trace.json?",
+            "runtime_inspect",
+        ),
+        (
+            "Show the slowest OTLP spans in captures/trace.json",
+            "runtime_inspect",
+        ),
+        ("List tables in my SQLite database", "database"),
+    ] {
+        assert!(
+            select(query, &BTreeSet::new(), &candidates).contains(&specialist.to_owned()),
+            "{query}"
+        );
+    }
+    for query in [
+        "What is a CPU profile?",
+        "How do I implement a HAR parser?",
+        "How do I add migrations for exports/app.sqlite?",
+        "Show src/database.rs",
+        "Which spans are in the Rust implementation?",
+        "captures/session.har",
+    ] {
+        assert!(
+            select(query, &BTreeSet::new(), &candidates).is_empty(),
+            "{query}"
+        );
+    }
+}
+
+#[test]
+fn plain_system_questions_preserve_real_registry_policy_and_schema_budgets() {
+    with_agent("[assistance]\nlean_local=false", |agent| {
+        for (query, specialist) in [
+            ("What tables are in exports/app.sqlite?", "database"),
+            (
+                "Which requests failed in captures/session.har?",
+                "network_inspect",
+            ),
+            (
+                "Where is time spent in captures/cpu.folded?",
+                "runtime_inspect",
+            ),
+        ] {
+            assert!(agent.ext.get(specialist).unwrap().read_only_hint());
+            agent.begin_tool_routing(query);
+            assert!(
+                agent.offered().iter().any(|name| name == specialist),
+                "{query}"
+            );
+            assert!(agent.tool_routing.selected.len() <= TOOL_LIMIT);
+            assert!(
+                agent
+                    .schemas(&agent.tool_routing.selected)
+                    .unwrap()
+                    .iter()
+                    .map(|schema| schema.to_string().len())
+                    .sum::<usize>()
+                    <= SCHEMA_BYTES
+            );
+        }
+        agent.modes.launch.tools = Some(["read".into()].into());
+        agent.begin_tool_routing("Which requests failed in captures/session.har?");
+        assert!(agent.tool_routing.selected.is_empty());
+    });
+    with_agent("[assistance]\nlean_local=true", |agent| {
+        agent.begin_tool_routing("What tables are in exports/app.sqlite?");
+        assert!(!selected(agent, "database"));
+    });
+}
+
+#[test]
+fn source_specialists_preserve_task_schema_caps_and_lean_routing() {
+    with_agent("[assistance]\nlean_local=false", |agent| {
+        for name in [
+            "document",
+            "data",
+            "audio",
+            "visual",
+            "evidence",
+            "evidence_search",
+        ] {
+            register(agent, name, "Source capability");
+        }
+        agent.begin_tool_routing("Inspect PDF CSV audio and diagram sources online");
+        assert!(selected(agent, "document"));
+        assert!(selected(agent, "data"));
+        assert!(selected(agent, "audio"));
+        assert!(selected(agent, "visual"));
+        assert!(agent.tool_routing.selected.len() <= TOOL_LIMIT);
+        assert!(
+            agent
+                .schemas(&agent.tool_routing.selected)
+                .unwrap()
+                .iter()
+                .map(|schema| schema.to_string().len())
+                .sum::<usize>()
+                <= SCHEMA_BYTES
+        );
+        agent.modes.launch.tools = Some(["read".into()].into());
+        agent.begin_tool_routing("Inspect the PDF");
+        assert!(agent.tool_routing.selected.is_empty());
+    });
+    with_agent("[assistance]\nlean_local=true", |agent| {
+        register(agent, "document", "Source capability");
+        agent.begin_tool_routing("Inspect the PDF");
+        assert!(!selected(agent, "document"));
+    });
+}
+
+#[test]
 fn library_task_finds_documentation_service_without_knowing_its_server_name() {
     with_agent("[assistance]\nlean_local=false", |agent| {
         library_docs(agent);

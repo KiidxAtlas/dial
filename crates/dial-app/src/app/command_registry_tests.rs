@@ -204,6 +204,7 @@ fn model_preparation_only_publishes_successful_uncancelled_results() {
                 changes: selection_changes(&config, &selection, "main").unwrap(),
                 role: Some("main".into()),
                 scope: Scope::Global,
+                voice: None,
             }),
         });
         assert!(AuthJob::collect(&mut job, &app).is_none());

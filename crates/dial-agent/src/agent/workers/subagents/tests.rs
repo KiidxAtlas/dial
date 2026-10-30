@@ -1067,3 +1067,117 @@ fn batch_controller_cancellation_reports_final_reason_and_rolls_back_grant() {
         }
     }
 }
+
+#[test]
+fn isolation_backend_is_chosen_per_task_and_absent_keeps_the_configured_backend() {
+    use crate::config::isolation::Preference;
+    let config = config(&[]);
+    let single = parse(
+        &json!({"agent":"worker","task":"edit","solution_space":"s","isolation_backend":"worktree"}),
+        &config,
+    )
+    .unwrap();
+    assert!(
+        single.jobs[0].isolated,
+        "a backend implies an isolated copy"
+    );
+    assert_eq!(single.jobs[0].isolation_backend, Some(Preference::Worktree));
+
+    let batch = parse(
+        &json!({"tasks":[
+            {"agent":"worker","task":"a","solution_space":"s","isolation":"copy","isolation_backend":"clone"},
+            {"agent":"worker","task":"b","solution_space":"s","isolation":"copy"},
+            {"agent":"worker","task":"c","solution_space":"s"},
+            {"task":"d","solution_space":"s"}
+        ]}),
+        &config,
+    )
+    .unwrap();
+    let chosen: Vec<_> = batch
+        .jobs
+        .iter()
+        .map(|job| (job.isolated, job.isolation_backend))
+        .collect();
+    assert_eq!(
+        chosen,
+        [
+            (true, Some(Preference::Clone)),
+            (true, None),
+            (false, None),
+            (false, None)
+        ],
+        "`copy` alone and an absent isolation keep their old meaning"
+    );
+
+    for (args, expected) in [
+        (
+            json!({"task":"t","solution_space":"s","isolation_backend":"worktree"}),
+            "apply only to workers",
+        ),
+        (
+            json!({"agent":"worker","task":"t","solution_space":"s","isolation_backend":"zfs"}),
+            "unknown isolation_backend \"zfs\"",
+        ),
+        (
+            json!({"agent":"worker","task":"t","solution_space":"s","isolation_backend":7}),
+            "`isolation_backend` must be a string",
+        ),
+        (
+            json!({"agent":"worker","task":"t","solution_space":"s","isolation":"clone"}),
+            "unknown isolation \"clone\"",
+        ),
+    ] {
+        let error = parse(&args, &config).err().unwrap();
+        assert!(error.contains(expected), "{error}");
+    }
+}
+
+#[test]
+fn unavailable_isolation_backend_is_refused_before_any_worker_starts() {
+    let config = config(&[]);
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("a.txt"), "a").unwrap();
+    let workspace = Workspace::new(project.path()).unwrap();
+    let request = parse(
+        &json!({"tasks":[
+            {"agent":"worker","task":"a","solution_space":"s","isolation_backend":"copy"},
+            {"agent":"worker","task":"b","solution_space":"s","isolation_backend":"worktree","name":"wt"}
+        ]}),
+        &config,
+    )
+    .unwrap();
+    let error = check_isolation_backends(&request.jobs, &workspace, &config).unwrap_err();
+    assert!(
+        error.starts_with("wt: isolation backend `worktree` is unavailable:"),
+        "{error}"
+    );
+    assert!(error.contains("no worker was started"), "{error}");
+
+    // Tasks without a backend, and backends that can run here, pass the check.
+    let fine = parse(
+        &json!({"tasks":[
+            {"agent":"worker","task":"a","solution_space":"s","isolation":"copy"},
+            {"agent":"worker","task":"b","solution_space":"s","isolation_backend":"auto"},
+            {"agent":"worker","task":"c","solution_space":"s","isolation_backend":"copy"}
+        ]}),
+        &config,
+    )
+    .unwrap();
+    check_isolation_backends(&fine.jobs, &workspace, &config).unwrap();
+}
+
+#[test]
+fn task_schema_offers_isolation_backend_for_single_tasks_and_batch_items() {
+    let schema = schema(&config(&[]));
+    let properties = &schema["function"]["parameters"]["properties"];
+    for property in [
+        &properties["isolation_backend"],
+        &properties["tasks"]["items"]["properties"]["isolation_backend"],
+    ] {
+        assert_eq!(
+            property["enum"],
+            json!(["auto", "clone", "overlay", "worktree", "copy", "projfs"])
+        );
+    }
+    assert_eq!(properties["isolation"]["enum"], json!(["copy"]));
+}

@@ -165,7 +165,8 @@ impl WorkerPool {
         let mut queued = Vec::with_capacity(tasks.len());
         for task in tasks {
             let args = merged(&self.shared, task)?;
-            subagents::parse(&args, &config).map_err(|error| error.to_string())?;
+            let request = subagents::parse(&args, &config).map_err(|error| error.to_string())?;
+            subagents::check_isolation_backends(&request.jobs, &launch.workspace, &config)?;
             queued.push(args);
         }
         self.items.extend(queued.into_iter().map(|args| PoolItem {
@@ -319,6 +320,17 @@ impl LiveTasks {
         self.pools.contains_key(id)
     }
 
+    /// Pool items are announced through their aggregate, not as duplicate per-job results.
+    pub(super) fn pool_owns_job(&self, id: &str) -> bool {
+        self.pools.values().any(|pool| {
+            pool.items.iter().any(|item| match &item.state {
+                ItemState::Running { job, .. } => job == id,
+                ItemState::Settled(record) => record["id"].as_str() == Some(id),
+                ItemState::Queued => false,
+            })
+        })
+    }
+
     /// The pool's state and item outcomes. `settled_only` omits items that are still queued or running.
     pub fn pool_report(&self, id: &str, settled_only: bool) -> Result<Value, String> {
         self.report_from(id, settled_only, 0)
@@ -470,10 +482,6 @@ impl LiveTasks {
                 let args = pool.items[seq].args.clone();
                 match self.launch_item(&launch, &args, store, prev.is_some()) {
                     Ok(job) => {
-                        if let Some(state) = self.jobs.get_mut(&job) {
-                            // Item outcomes reach the model through the pool aggregate, not per job.
-                            state.delivered = true;
-                        }
                         if let Some(pool) = self.pools.get_mut(&id) {
                             pool.slots[slot].last = Some(job.clone());
                             pool.items[seq].state = ItemState::Running { job, slot };

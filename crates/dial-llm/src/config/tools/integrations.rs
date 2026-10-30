@@ -25,6 +25,7 @@ macro_rules! integrations {
 }
 integrations! {
     ("bg", true, false),
+    ("monitor", true, true),
     ("web_fetch", true, false),
     ("web_search", true, false),
     ("lsp", true, false),
@@ -37,6 +38,23 @@ integrations! {
     ("eval", true, true),
     ("find", true, true),
     ("autoresearch", true, true),
+    ("evidence", true, true),
+    ("evidence_search", true, true),
+    ("investigate", true, true),
+    ("workbench", true, true),
+    ("data", true, true),
+    ("document", true, true),
+    ("audio", true, true),
+    ("visual", true, true),
+    ("timeline", true, true),
+    ("research", true, true),
+    ("reality", true, true),
+    ("perception", true, true),
+    ("runtime_inspect", true, true),
+    ("network_inspect", true, true),
+    ("database", true, true),
+    // Availability is additionally gated by experimental.video_analysis (off by default).
+    ("video", true, false),
     ("archive", true, true),
     ("dep_source", true, true),
     // Registered only while the `image_embedding` role is assigned.

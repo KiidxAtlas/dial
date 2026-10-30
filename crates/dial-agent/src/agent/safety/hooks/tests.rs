@@ -821,3 +821,68 @@ fn user_prompt_submit_prompt_rewrite_reaches_later_hooks_and_the_outcome() {
     assert!(matches!(outcome.verdict, Verdict::Continue { .. }));
     assert_eq!(outcome.prompt.as_deref(), Some("rewritten"));
 }
+
+#[cfg(unix)]
+#[test]
+fn before_compact_notes_are_attributed_bounded_and_discarded_on_refusal() {
+    let root = tempfile::tempdir().unwrap();
+    let interrupt = AtomicBool::new(false);
+    let mut hooks = (0..4)
+        .map(|i| {
+            hook(
+                "before_compact",
+                None,
+                &format!(
+                    "printf '%s' '{}'",
+                    json!({"additional_context":format!("{i}{}", "é".repeat(2300))})
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut notices = Vec::new();
+    let note = gate_noted(
+        &hooks,
+        None,
+        root.path(),
+        "before_compact",
+        json!({}),
+        &interrupt,
+        &mut |text| notices.push(text.to_owned()),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(note.contains("operator hook") && note.contains("untrusted data"));
+    assert!(note.len() <= MAX_OUTPUT);
+    assert!(note.contains("[cut]"));
+    assert!(notices.iter().any(|text| text.contains("aggregate limit")));
+    hooks.push(hook("before_compact", None, "echo refused >&2; exit 2"));
+    assert_eq!(
+        gate_noted(
+            &hooks,
+            None,
+            root.path(),
+            "before_compact",
+            json!({}),
+            &interrupt,
+            &mut |_| {}
+        ),
+        Err("refused".into())
+    );
+    hooks.pop();
+    let mut closed = hook("before_compact", None, "exit 1");
+    closed.fail_closed = Some(true);
+    hooks.push(closed);
+    assert!(
+        gate_noted(
+            &hooks,
+            None,
+            root.path(),
+            "before_compact",
+            json!({}),
+            &interrupt,
+            &mut |_| {}
+        )
+        .unwrap_err()
+        .contains("fail-closed")
+    );
+}

@@ -372,6 +372,7 @@ mod management;
 mod memory;
 mod message_routing;
 mod model;
+mod preparation;
 mod sources;
 mod tools;
 pub use sources::{
@@ -485,7 +486,7 @@ static UI: &[SettingDef] = &[
         AP,
         "Status Line",
         "Left segments",
-        "Segments for the custom preset: spinner, model, thinking, inference (last local request settings), role, path, git, context, tokens, rate, approval, sandbox, learning, session, time.",
+        "Segments for the custom preset: spinner, model, mode, thinking, inference (last local request settings), role, path, git, context, tokens, rate, cost (observed API cost of the turn and session; hidden when unknown or zero), approval, sandbox, learning, usage, session, time, workers.",
         Kind::StringList,
     ),
     field!(
@@ -994,6 +995,14 @@ static REGISTRY: &[SettingDef] = &[
     experimental::DECLARATIONS[9],
     experimental::DECLARATIONS[10],
     experimental::DECLARATIONS[11],
+    experimental::DECLARATIONS[12],
+    experimental::DECLARATIONS[13],
+    experimental::DECLARATIONS[14],
+    experimental::DECLARATIONS[15],
+    preparation::DECLARATIONS[0],
+    preparation::DECLARATIONS[1],
+    preparation::DECLARATIONS[2],
+    preparation::DECLARATIONS[3],
     coordination::DECLARATIONS[0],
     coordination::DECLARATIONS[1],
     message_routing::DECLARATIONS[0],
@@ -1008,6 +1017,7 @@ static REGISTRY: &[SettingDef] = &[
     image::DECLARATIONS[1],
     image::DECLARATIONS[2],
     image::DECLARATIONS[3],
+    image::DECLARATIONS[4],
     tools::DECLARATIONS[35],
     tools::DECLARATIONS[36],
     tools::DECLARATIONS[37],
@@ -1035,6 +1045,7 @@ const _: () = assert!(
             + tools::DECLARATIONS.len()
             + compaction::DECLARATIONS.len()
             + experimental::DECLARATIONS.len()
+            + preparation::DECLARATIONS.len()
             + coordination::DECLARATIONS.len()
             + message_routing::DECLARATIONS.len()
             + voice::DECLARATIONS.len()

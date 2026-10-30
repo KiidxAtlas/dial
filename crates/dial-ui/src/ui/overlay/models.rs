@@ -258,7 +258,7 @@ fn role_accepts(role: &str, entry: &ModelEntry) -> bool {
     match role {
         "decision" => false,
         "embedding" => is_embedding(entry),
-        "image" => entry.supports_images(),
+        "image" => entry.accepts_image_role(),
         // Grounding reads screenshots: a chat model that does not declare itself text-only.
         "grounding" => entry.supports_chat() && entry.metadata.vision != Some(false),
         // Multimodal embedders are VLM checkpoints (Qwen3-VL-Embedding) that catalogs list as
@@ -502,6 +502,14 @@ fn state_of(entry: &ModelEntry) -> &'static str {
     } else {
         "available"
     }
+}
+
+/// A chat model that declares tool calls unsupported cannot run Dial's tools: requests that offer
+/// tools are refused (`Backend` checks the resolved capability) unless its profile disables tools.
+fn tool_warning(entry: &ModelEntry) -> Option<&'static str> {
+    (entry.supports_chat() && entry.metadata.tools == Some(false)).then_some(
+        "no tool calls: Dial's tools cannot run on it (declare capabilities.tools = false in /model settings for chat only)",
+    )
 }
 
 /// Why a model cannot be selected.
@@ -1210,7 +1218,7 @@ impl ModelOverlay {
                 .count(),
             Group::Images => self
                 .all_entries()
-                .filter(|entry| entry.supports_images())
+                .filter(|entry| entry.accepts_image_role())
                 .count(),
             Group::Download => self.downloads.installed_count(),
             Group::Provider(id) => self
@@ -1244,7 +1252,7 @@ impl ModelOverlay {
             if self.group == Group::Memory && !self.in_memory_group(entry) {
                 continue;
             }
-            if self.group == Group::Images && !entry.supports_images() {
+            if self.group == Group::Images && !entry.accepts_image_role() {
                 continue;
             }
             if !self.kind.accepts(entry) || !self.shows(entry) {
@@ -2851,6 +2859,8 @@ impl ModelOverlay {
                 format!("  {}", refusal(entry)),
                 theme.fg(Tok::Warning),
             ));
+        } else if let Some(warning) = tool_warning(entry) {
+            first.push(Span::styled(format!("  {warning}"), theme.fg(Tok::Warning)));
         }
         let used = self.roles_using(&entry.selection);
         let used_text = if used.is_empty() {

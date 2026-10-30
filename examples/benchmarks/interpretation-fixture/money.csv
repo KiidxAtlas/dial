@@ -1,0 +1,5 @@
+id,amount,currency
+M1,0.10,USD
+M2,0.20,USD
+M3,9007199254740993.01,USD
+M4,-0.01,USD

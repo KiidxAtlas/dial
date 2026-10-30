@@ -122,13 +122,13 @@ pub(super) const BUILTIN_COMMANDS: &[(&str, &str, &str)] = &[
     ),
     (
         "undo",
-        "",
-        "drop the last turn and restore its file changes",
+        "[n]",
+        "drop the last n turns (default 1) and restore their file changes",
     ),
     (
         "rollback",
         "[n]",
-        "restore files changed in the last n turns",
+        "restore files from the last n turns, keeping the conversation",
     ),
     (
         "clear",
@@ -233,6 +233,16 @@ pub(super) fn canonical_command(name: &str) -> &str {
         .iter()
         .find(|(alias, _)| *alias == name)
         .map_or(name, |(_, target)| target)
+}
+
+/// The turn count for `/undo [n]` and `/rollback [n]`: 1 when omitted, otherwise a whole number
+/// of at least 1. `None` for anything else.
+pub(super) fn turn_count(args: &str) -> Option<usize> {
+    let args = args.trim();
+    if args.is_empty() {
+        return Some(1);
+    }
+    args.parse::<usize>().ok().filter(|turns| *turns > 0)
 }
 
 /// Commands that end or replace the running turn, so typing one stops the turn first. `stops_turn`,

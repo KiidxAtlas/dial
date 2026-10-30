@@ -363,6 +363,8 @@ pub(crate) enum Command {
     },
     /// Create the Python/MLX environment, save the model chosen with -m as your default, verify it loads.
     Setup,
+    /// Explicit paid native API batches (never runs automatically).
+    ProviderBatch(dial::cli::provider_batches::Args),
     /// List and inspect models; `recommend` checks which local models fit in memory.
     Models(dial::cli::config_models::ModelsArgs),
     /// Show, read, or change Dial configuration.
@@ -407,6 +409,8 @@ pub(crate) enum Command {
     Search(dial::cli::search::SearchArgs),
     /// Follow live edits, diagnostics and screenshots in another pane.
     Watch(dial::cli::watch::WatchArgs),
+    /// Run a foreground command and expose bounded output to approved monitors by name.
+    Run(dial::cli::run::RunArgs),
     /// Recurring or file-triggered prompt runs for this project.
     Schedule {
         #[command(subcommand)]

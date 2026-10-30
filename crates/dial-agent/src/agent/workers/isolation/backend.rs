@@ -115,6 +115,25 @@ fn select_from(
     Err("no isolation backend is available on this platform".into())
 }
 
+/// Whether the backend a single task requested can run for `project`, checked before the worker
+/// starts. `auto` always can, because it ends with the universal `copy`. A named backend that
+/// cannot run is an error with the reason; it never falls back to another backend.
+pub fn check_requested(
+    preference: Preference,
+    project: &Path,
+    max_entries: usize,
+) -> Result<(), String> {
+    let Some(backend) = named_backend(preference) else {
+        return Ok(());
+    };
+    probe(backend, project, max_entries).map_err(|reason| {
+        format!(
+            "isolation backend `{}` is unavailable: {reason}",
+            backend.name()
+        )
+    })
+}
+
 /// Process-wide probe results, keyed by backend, project root, and entry budget. Probing worktree
 /// runs git and overlay scans the project, so each answer is computed once per project and budget
 /// for the life of the process.

@@ -709,3 +709,108 @@ fn strict_required_subset_cannot_discharge_an_unrelated_failed_check() {
     assert_eq!(agent.step_checks.failed_checks, vec![unrelated]);
     assert!(agent.step_checks.failed);
 }
+
+#[test]
+fn finite_approval_choices_are_exact_consumed_and_never_reusable() {
+    let root = tempfile::tempdir().unwrap();
+    let config = Config::default();
+    let mut agent = hermetic_agent(&config, root.path());
+    agent.approval = crate::config::types::Approval::Ask;
+    let call = ToolCall {
+        id: "edit-1".into(),
+        name: "write".into(),
+        arguments: json!({"path":"new.txt", "content":"first"}),
+        malformed_arguments: false,
+    };
+    agent.pending_batch_approvals.push((call.clone(), true));
+    let mut changed = call.clone();
+    changed.arguments["content"] = json!("different");
+    assert!(
+        agent.authorize_call(&changed, &mut NullUi).is_err(),
+        "changed arguments must prompt, not consume the ticket"
+    );
+    assert!(agent.authorize_call(&call, &mut NullUi).is_ok());
+    assert!(
+        agent.authorize_call(&call, &mut NullUi).is_err(),
+        "one-shot choice cannot authorize a second execution"
+    );
+    assert!(
+        agent.always.is_empty(),
+        "batch approval must not create rules"
+    );
+    agent.pending_batch_approvals.push((call.clone(), false));
+    agent.approval = crate::config::types::Approval::Auto;
+    assert!(
+        agent.authorize_call(&call, &mut NullUi).is_err(),
+        "a declined exact call remains declined even if policy changes"
+    );
+}
+
+#[test]
+fn background_check_overlaps_reads_and_settles_stale_inputs_without_credit() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("input"), "before").unwrap();
+    let command = "touch started; while test ! -f release; do sleep 0.01; done; exit 0";
+    let (mut config, check) = input_contract_config(command);
+    config.experimental.background_checks = true;
+    config.verification.automatic_checks = true;
+    config.experimental.fault_witness = false;
+    let mut agent = hermetic_agent(&config, root.path());
+    agent.hermetic = false;
+    agent.approval = crate::config::types::Approval::Auto;
+    agent.start_background_check(&mut NullUi);
+    assert!(
+        agent.pending_check.is_some(),
+        "configured check should have a controller-owned process"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !root.path().join("started").exists() {
+        assert!(Instant::now() < deadline, "background check never started");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let read = tools::execute(&agent.workspace, "read", &json!({"path":"input"}), 5);
+    assert!(
+        !read.is_error,
+        "independent read must progress while check waits: {}",
+        read.text
+    );
+    agent.drain_background_check(&mut NullUi, false);
+    assert!(
+        agent.pending_check.is_some(),
+        "nonblocking settlement must not wait"
+    );
+    std::fs::write(root.path().join("input"), "external change").unwrap();
+    std::fs::write(root.path().join("release"), "ready").unwrap();
+    agent.drain_background_check(&mut NullUi, true);
+    assert!(agent.pending_check.is_none());
+    assert_eq!(
+        agent.step_checks.evidence.latest_status(command),
+        Some(verify::verification::CheckStatus::Unverified)
+    );
+    assert!(
+        !agent.reuse_check(&check),
+        "stale run must not satisfy completion"
+    );
+}
+
+#[test]
+fn background_check_denial_never_starts_a_process() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("input"), "before").unwrap();
+    let (mut config, _) = input_contract_config("touch unauthorized");
+    config.experimental.background_checks = true;
+    config.verification.automatic_checks = true;
+    let mut agent = hermetic_agent(&config, root.path());
+    agent.hermetic = false;
+    agent.approval = crate::config::types::Approval::Ask;
+    agent.start_background_check(&mut NullUi);
+    assert!(agent.pending_check.is_none());
+    assert!(!root.path().join("unauthorized").exists());
+    assert_eq!(
+        agent
+            .step_checks
+            .evidence
+            .latest_status("touch unauthorized"),
+        Some(verify::verification::CheckStatus::PermissionDenied)
+    );
+}

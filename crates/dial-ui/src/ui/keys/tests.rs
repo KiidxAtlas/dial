@@ -97,6 +97,75 @@ fn model_shortcut_is_platform_specific_and_keeps_alt_compatibility() {
 }
 
 #[test]
+fn every_option_letter_shortcut_has_a_non_option_default() {
+    // macOS terminals type a symbol for Option+letter (Option+R is ®) unless Option sends Meta,
+    // and Windows Terminal claims Alt+Enter, so application shortcuts never rely on them alone.
+    let map = Keymap::defaults();
+    for action in Action::ALL.iter().filter(|a| a.context() == 0) {
+        let chords = map.chords(*action);
+        let option_only = |c: &Chord| {
+            c.mods.contains(KeyModifiers::ALT)
+                && matches!(c.code, KeyCode::Char(_) | KeyCode::Enter)
+        };
+        if chords.iter().any(option_only) {
+            assert!(
+                chords.iter().any(|c| !c.mods.contains(KeyModifiers::ALT)),
+                "{} has only Option chords: {}",
+                action.id(),
+                map.labels(*action)
+            );
+        }
+    }
+    let mut seen = HashSet::new();
+    for action in Action::ALL
+        .iter()
+        .filter(|a| a.context() == 0 && !a.overlap_exempt())
+    {
+        for chord in map.chords(*action) {
+            assert!(
+                seen.insert(*chord),
+                "{} is a default of two application actions",
+                chord.display()
+            );
+        }
+    }
+    assert!(map.matches(
+        Action::DisplayReset,
+        &key(KeyCode::Char('l'), KeyModifiers::CONTROL)
+    ));
+    assert!(map.matches(
+        Action::FollowUp,
+        &key(KeyCode::Char('q'), KeyModifiers::CONTROL)
+    ));
+    assert!(map.matches(
+        Action::EditorRedo,
+        &key(KeyCode::Char('6'), KeyModifiers::CONTROL)
+    ));
+}
+
+#[test]
+fn a_users_binding_in_another_context_is_not_shadowed_by_a_default() {
+    let f7 = key(KeyCode::F(7), KeyModifiers::NONE);
+    let defaults = Keymap::defaults();
+    assert!(defaults.triggers(Action::SubagentsRecent, &f7));
+    let mut map = Keymap::defaults();
+    map.rebind(Action::EditorWordLeft, &["F7"]).unwrap();
+    assert!(
+        map.matches(Action::SubagentsRecent, &f7),
+        "the default stays bound for other contexts"
+    );
+    assert!(
+        !map.triggers(Action::SubagentsRecent, &f7),
+        "the composer leaves F7 to the user's editing binding"
+    );
+    map.rebind(Action::SubagentsRecent, &["F7"]).unwrap();
+    assert!(
+        map.triggers(Action::SubagentsRecent, &f7),
+        "an application key the user chose also triggers"
+    );
+}
+
+#[test]
 fn chords_match_modifiers_exactly_and_backtab_is_shift_tab() {
     let alt_m = Chord::parse("Alt+M").unwrap();
     assert!(alt_m.matches(&key(KeyCode::Char('m'), KeyModifiers::ALT)));
@@ -481,4 +550,55 @@ fn voice_release_matches_bound_key_even_when_alt_is_already_up() {
         Action::VoiceInput,
         &release(KeyCode::Char('x'), KeyModifiers::NONE)
     ));
+}
+
+#[test]
+fn mac_option_v_text_fallback_respects_platform_modifiers_and_remaps() {
+    let mut map = Keymap::defaults();
+    for mods in [KeyModifiers::NONE, KeyModifiers::ALT] {
+        for kind in [
+            KeyEventKind::Press,
+            KeyEventKind::Repeat,
+            KeyEventKind::Release,
+        ] {
+            let mut event = key(KeyCode::Char('√'), mods);
+            event.kind = kind;
+            assert_eq!(
+                map.matches(Action::VoiceInput, &event),
+                cfg!(target_os = "macos") && kind != KeyEventKind::Release,
+                "{event:?}"
+            );
+            assert_eq!(
+                map.release_matches(Action::VoiceInput, &event),
+                cfg!(target_os = "macos") && kind == KeyEventKind::Release,
+                "{event:?}"
+            );
+        }
+    }
+    for mods in [
+        KeyModifiers::CONTROL,
+        KeyModifiers::SUPER,
+        KeyModifiers::SHIFT,
+    ] {
+        assert!(!map.matches(Action::VoiceInput, &key(KeyCode::Char('√'), mods)));
+    }
+    assert!(map.matches(
+        Action::VoiceInput,
+        &key(KeyCode::Char('v'), KeyModifiers::ALT)
+    ));
+    assert!(!map.matches(
+        Action::VoiceInput,
+        &key(KeyCode::Char('v'), KeyModifiers::NONE)
+    ));
+    for binding in [vec!["F9"], vec![]] {
+        map.rebind(Action::VoiceInput, &binding).unwrap();
+        assert!(!map.matches(
+            Action::VoiceInput,
+            &key(KeyCode::Char('√'), KeyModifiers::NONE)
+        ));
+        assert!(!map.release_matches(
+            Action::VoiceInput,
+            &release(KeyCode::Char('√'), KeyModifiers::NONE)
+        ));
+    }
 }

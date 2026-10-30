@@ -1,13 +1,13 @@
 # Optional learning and harness improvement
 
-Coding and learning have separate lifecycles. Normal terminal, print, RPC and ACP launches use configured model/harness settings and do not record training trajectories, apply learned versions, start Laya/automatic learned-skill capture, generate project-learning summaries, run startup model evaluations, monitor learning adapters, or queue improvement at startup/exit. Legacy automatic-learning preferences remain on disk and cannot opt a coding session back into this work. The one opt-in is **Teach this model**, below.
+Coding and learning have separate lifecycles. Normal terminal, print, RPC and ACP launches use configured model/harness settings and do not approve training examples, apply learned versions, start Laya/automatic learned-skill capture, generate project-learning summaries, run startup model evaluations, monitor learning adapters, or queue improvement at startup/exit. Durable ordinary sessions retain bounded request/target observations for later explicit session teaching, including hosted source models; retention alone never starts training. Legacy automatic-learning preferences remain on disk and cannot opt a coding session back into this work. **Teach this model**, below, additionally records local live trajectories and serves admitted versions.
 
 ## Teach this model
 
 Turn on `/settings` → Model → Learning → **Teach this model** (`[improve] teach = true`) to let a local
 model learn from the work you do with it. It applies to Dial's MLX runtime and to OpenAI-compatible
-servers on this machine or your network (Ollama, LM Studio); hosted models are never recorded, even
-with the switch on. While it is on, coding sessions with that model:
+servers on this machine or your network (Ollama, LM Studio); hosted models are not training targets.
+Hosted sessions can still supply source examples through explicit session teaching below. While it is on, coding sessions with that local model:
 
 - record each turn in the model's learning database, and
 - run on the model's latest admitted version: its harness changes and, for MLX models, its LoRA adapter.
@@ -34,12 +34,17 @@ passes the evaluation gate. `/improve` shows how many approved turns are recorde
 turn, Dial posts a short note at three quarters of the threshold and again when it is reached, at
 most twice per session.
 
-`/improve session` approves the current session for training, including a session reopened with
-`/resume` or `/sessions`. Every completed turn of that session that has a saved request and no
-existing verdict is recorded as approved (`user:session`, score 100). Failed or interrupted turns
-are skipped, and a turn you or a check scored lower keeps that score. Once the model has
-threshold of verified turns, the command queues training and evaluation right away; until then it
-reports how many are still missing. It needs Enabled on (see below). Running it again approves only turns added since.
+### Teach B from a successful session with A
+
+1. Do useful work with model A, local or hosted. The transcript stays in the same session when you switch models.
+2. Select your trainable local model B with `/switch`, then run `/improve session` to approve the active session branch for B. Alternatively, `/improve session <model-selector>` names B without changing your coding model. Selectors use the same provider/model or configured-profile resolution as `/switch`.
+3. Dial retains source session, turn and provider/model identities, and imports approved source snapshots into B's learning store—not into B's measured performance history. Reopening with `/resume` or `/sessions`, or approving an inherited fork again, does not duplicate those source turns. Existing lower source scores are preserved; an unavailable referenced source store is reported rather than silently treated as approval.
+4. The existing curator selects bounded successful assistant targets with their recorded request context and tool schemas. It deduplicates, strips foreign-model reasoning, rejects malformed/oversize records and sealed-evaluation prompts, and keeps related prompts/trajectories together in train or validation. Explicit session approvals do not require `training.learn_from`, and are not limited by the automatic sibling-model mixing percentage.
+5. With Enabled and training on, the command queues background curation, training and evaluation for **B**; it no longer uses turn count as a proxy for training-record readiness. B's model-default dataset paths and adapter history are isolated from A's; explicitly configured shared dataset paths remain shared. The LoRA still requires supported local MLX weights, sufficient curated training data, a separate validation split, available compute/budget and a passing evaluation gate before activation. The background job reports insufficient data without training. A source session stays entirely on one side of the split, so one session alone cannot supply both training and validation. Merely completing a training run does not establish improved quality.
+
+Retention is bounded to the latest eight eligible request/target snapshots and 1 MiB per turn, in the private session journal. Failed, incomplete, interrupted, ephemeral and hermetic turns do not supply these ordinary-session records. Observations stay out of provider conversation history and do not authorize training until you approve the session. They can contain the same private code and text as the conversation; do not approve material you are not allowed to use for training. Source attribution is not a claim that Dial can predict which example will improve B most.
+
+Older sessions without retained snapshots can still approve saved local trajectories in the selected model's own store. A transcript alone cannot reconstruct the exact historical requests/tool schemas for cross-model teaching; missing snapshots are not fabricated. Running the command again imports only newly retained source turns. Like existing harvested data, exported datasets and admitted training snapshots are not automatically retracted by later ratings.
 
 Run `dial improve status` to inspect learning, `dial improve cycle` for an explicit gated cycle, or `dial improve train` for explicit training. Inside the terminal, bare `/improve` opens a panel with Status, Jobs, Versions and Setup tabs: Tab and Shift+Tab switch tabs, Up and Down select, Enter acts and Esc closes. Stopping a job and rolling back a version ask for Enter first. `/improve status` prints the same facts as text. `/improve settings` and `/improve models` open the learning controls.
 
@@ -47,7 +52,7 @@ Run `dial improve status` to inspect learning, `dial improve cycle` for an expli
 
 **Enabled is the switch that gates starting work.** `/improve cycle`, `/improve train`, `/improve session` (when it would train) and the panel's start action refuse while Enabled (`[improve] enabled`, in `/improve settings`) is off, and say so. `/improve enable` and `/improve disable` pause or resume a model's scheduling but do not change Enabled.
 
-Existing verified trajectories remain available to the explicit learning pipeline. New ordinary coding chats stay in the session journal for resume, review and undo, without becoming training examples. To evaluate task/model performance, run the explicit benchmark and improvement tools.
+Existing verified trajectories remain available to the explicit learning pipeline. New ordinary coding chats and their bounded request observations stay in the session journal for resume, review and explicit cross-model session teaching, without becoming approved training examples. To evaluate task/model performance, run the explicit benchmark and improvement tools.
 
 ## What a cycle does
 

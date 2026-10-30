@@ -156,7 +156,7 @@ impl OverlayEnv<'_> {
                     &self.app.layout.user_dir,
                 ));
             }
-            let result = if provider == "Model" {
+            let result = if matches!(provider, "Model" | "Voice") {
                 result.and_then(|message| {
                     let fresh = self.reload_saved()?;
                     // A finished download saved a setting: show it, and offer the model as
@@ -169,6 +169,11 @@ impl OverlayEnv<'_> {
                             &fresh,
                             self.catalog.get().as_ref(),
                             &self.app.layout.user_dir,
+                        ));
+                        apply_settings_hints(settings, &fresh);
+                        settings.set_setup_offers(setting_setup_offers(
+                            &self.app.layout.user_dir,
+                            &fresh,
                         ));
                     }
                     Ok(message)
@@ -305,6 +310,19 @@ impl OverlayEnv<'_> {
         let ActiveOverlay::Settings(settings) = overlay else {
             return;
         };
+        // Do not let a pending setup overwrite a newer selection made in this panel.
+        if self.auth_job.as_ref().is_some_and(|job| {
+            job.label == "Voice"
+                && job.model.as_ref().is_some_and(|prepared| {
+                    prepared
+                        .changes
+                        .iter()
+                        .any(|change| change_path(change) == path)
+                })
+        }) {
+            settings.settled(path, Err("Voice setup is still running; wait for it to finish or close the panel to cancel.".into()));
+            return;
+        }
         match self
             .save(changes, scope)
             .and_then(|fresh| settings_tables(self.app, &fresh).map(|tables| (fresh, tables)))
@@ -320,6 +338,13 @@ impl OverlayEnv<'_> {
                 }
                 settings.settled(path, Ok(Self::effective_value(&fresh, path)));
                 settings.replace_values(values, project, global);
+                apply_settings_hints(settings, &fresh);
+                settings.set_setup_offers(setting_setup_offers(&self.app.layout.user_dir, &fresh));
+                settings.set_value_choices(settings_value_choices(
+                    &fresh,
+                    self.catalog.get().as_ref(),
+                    &self.app.layout.user_dir,
+                ));
             }
             Err(error) => {
                 for other in changes
@@ -358,6 +383,12 @@ impl OverlayEnv<'_> {
         settings.replace_values(values, project, global);
         apply_settings_hints(settings, &config);
         settings.set_setup_offers(setting_setup_offers(&self.app.layout.user_dir, &config));
+        settings.set_value_choices(settings_value_choices(
+            &config,
+            self.catalog.get().as_ref(),
+            &self.app.layout.user_dir,
+        ));
+        self.latest = Some(config);
     }
 
     pub(in crate::app) fn report(&mut self, overlay: &mut ActiveOverlay, outcome: Result<String>) {

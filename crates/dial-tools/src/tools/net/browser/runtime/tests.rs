@@ -40,14 +40,23 @@ fn provision_cached_dependencies_offline_without_private_chromium() {
     }
     assert!(!runtime.browsers.exists());
     // Configured Chromium and CDP startup both provision these same dependencies only.
-    let provisioned = provision_at(dir.path(), &AtomicBool::new(false), || {
-        panic!("cached dependencies must not probe the network")
-    })
+    let provisioned = provision_at(
+        dir.path(),
+        &AtomicBool::new(false),
+        || panic!("cached dependencies must not probe the network"),
+        || panic!("cached dependencies must not need Bun"),
+    )
     .unwrap();
     assert_eq!(provisioned.entry, runtime.entry);
     assert!(!runtime.browsers.exists());
     std::fs::remove_file(&runtime.readability).unwrap();
-    let error = provision_at(dir.path(), &AtomicBool::new(false), || false).unwrap_err();
+    let error = provision_at(
+        dir.path(),
+        &AtomicBool::new(false),
+        || false,
+        || panic!("an offline runtime must not install Bun"),
+    )
+    .unwrap_err();
     assert!(
         error.contains("JavaScript dependencies are not cached"),
         "{error}"
@@ -96,4 +105,52 @@ fn cache_only_prerequisites_never_create_missing_dependencies() {
     assert_eq!(cached_at(dir.path()).unwrap().entry, runtime.entry);
     assert!(!dir.path().join("package.json").exists());
     assert!(!runtime.browsers.exists());
+}
+
+#[test]
+fn missing_bun_stops_provisioning_with_the_setup_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let error = provision_at(
+        dir.path(),
+        &AtomicBool::new(false),
+        || true,
+        || Err(bun_unavailable("declined")),
+    )
+    .unwrap_err();
+    assert!(error.contains("/setup bun yes"), "{error}");
+    assert!(error.contains("declined"), "{error}");
+    assert!(!layout(dir.path()).entry.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn bun_source_prefers_override_then_dial_install_then_path_else_installs() {
+    use crate::setup::deps::{Env, install_dir};
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let user = dir.path().join("user");
+    let path_dir = dir.path().join("path");
+    let fake = |path: &Path| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    let env = Env {
+        path: vec![path_dir.clone()],
+        user_dir: user.clone(),
+    };
+    assert_eq!(bun_source(None, &env), BunSource::Install);
+    assert_eq!(bun_source(Some("".into()), &env), BunSource::Install);
+    assert_eq!(
+        bun_source(Some("/opt/bun".into()), &env),
+        BunSource::Ready("/opt/bun".into())
+    );
+    fake(&path_dir.join("bun"));
+    assert_eq!(
+        bun_source(None, &env),
+        BunSource::Ready(path_dir.join("bun"))
+    );
+    let private = install_dir(&user, "bun").join("node_modules/.bin/bun");
+    fake(&private);
+    assert_eq!(bun_source(None, &env), BunSource::Ready(private));
 }

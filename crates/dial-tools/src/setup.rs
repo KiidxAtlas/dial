@@ -3,6 +3,7 @@ pub mod deps;
 pub mod embeddings;
 pub mod memory;
 pub mod vision_models;
+pub mod voice;
 use crate::config::paths::Layout;
 use crate::config::settings_store::{self, Scope};
 use crate::config::types::Config;

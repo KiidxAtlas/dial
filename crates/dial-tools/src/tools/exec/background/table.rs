@@ -161,6 +161,17 @@ impl Ring {
         (self.data.range(skip as usize..).copied().collect(), lost)
     }
 
+    /// Up to `cap` retained bytes starting at absolute offset `from`, oldest first, and how many
+    /// bytes after `from` the ring already discarded. Readers that must see every byte in order
+    /// advance by `lost + bytes.len()` and keep up with the ring instead of skipping to its tail.
+    pub(super) fn oldest_since(&self, from: u64, cap: usize) -> (Vec<u8>, u64) {
+        let retained = self.start();
+        let lost = retained.saturating_sub(from);
+        let skip = (from.max(retained) - retained) as usize;
+        let end = self.data.len().min(skip.saturating_add(cap));
+        (self.data.range(skip.min(end)..end).copied().collect(), lost)
+    }
+
     pub(super) fn retained_bytes(&self) -> u64 {
         self.data.len() as u64
     }
@@ -392,6 +403,7 @@ pub(super) struct Proc {
     pub(super) input: Option<Arc<Input>>,
     pub(super) terminal: bool,
     network: bool,
+    minimize_output: bool,
     notice_cursor: u64,
     completion_notified: bool,
     /// Started by a `bash` call that moved to the background (not an explicit `bg start`).
@@ -588,6 +600,7 @@ impl Proc {
             input,
             terminal,
             network: super::network_allowed(ws),
+            minimize_output: ws.minimizing_output(),
             notice_cursor: 0,
             completion_notified: false,
             adopted: false,
@@ -675,9 +688,42 @@ impl Proc {
                     artifact: None,
                 });
             } else {
-                let (bytes, omitted) = ring.recent_since(proc.notice_cursor, 16 * 1024);
-                let mut text = String::from_utf8(bytes)
-                    .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned());
+                // Completion can replay a whole build through this independent UI cursor. Apply
+                // the same filter as explicit reads only when the entire capture is available;
+                // running output and previously delivered deltas remain untouched.
+                let minimized = (proc.minimize_output
+                    && proc.notice_cursor == 0
+                    && matches!(
+                        proc.state,
+                        State::Exited {
+                            status: Some(_),
+                            ..
+                        }
+                    ))
+                .then(|| super::minimize_complete(&proc.command, &ring))
+                .flatten()
+                .filter(|minimized| minimized.text.len() <= 16 * 1024);
+                let (mut text, omitted) = if let Some(minimized) = minimized {
+                    (
+                        format!(
+                            "{}\n[output filtered ({}): {} -> {} bytes; complete output: {}]\n",
+                            minimized.text,
+                            minimized.filter,
+                            minimized.before,
+                            minimized.after,
+                            ring.artifact.as_deref().expect("filter requires artifact")
+                        ),
+                        0,
+                    )
+                } else {
+                    let (bytes, omitted) = ring.recent_since(proc.notice_cursor, 16 * 1024);
+                    (
+                        String::from_utf8(bytes).unwrap_or_else(|error| {
+                            String::from_utf8_lossy(error.as_bytes()).into_owned()
+                        }),
+                        omitted,
+                    )
+                };
                 if omitted > 0 {
                     text.insert_str(
                         0,
@@ -794,6 +840,7 @@ impl Killed {
 /// What a caller needs from an entry without holding the table lock.
 pub(super) struct Snapshot {
     pub(super) name: String,
+    pub(super) command: String,
     pub(super) pid: u32,
     pub(super) ring: Arc<Mutex<Ring>>,
     pub(super) state: State,
@@ -819,7 +866,7 @@ impl Snapshot {
     }
 }
 
-fn validate_name(name: &str) -> Result<(), String> {
+pub(super) fn validate_name(name: &str) -> Result<(), String> {
     let valid = !name.is_empty()
         && name.len() <= MAX_NAME
         && name
@@ -997,6 +1044,7 @@ impl Table {
             input: None,
             terminal: false,
             network: super::network_allowed(&workspace),
+            minimize_output: workspace.minimizing_output(),
             notice_cursor: 0,
             completion_notified: false,
             adopted: true,
@@ -1054,6 +1102,7 @@ impl Table {
             input: None,
             terminal: false,
             network: job.network,
+            minimize_output: false,
             notice_cursor: 0,
             completion_notified: false,
             adopted: true,
@@ -1087,6 +1136,7 @@ impl Table {
         let proc = &self.procs[i];
         Ok(Snapshot {
             name: proc.name.clone(),
+            command: proc.command.clone(),
             pid: proc.pid,
             ring: proc.ring.clone(),
             state: proc.state.clone(),

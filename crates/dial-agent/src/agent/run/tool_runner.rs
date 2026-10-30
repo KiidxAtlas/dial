@@ -8,8 +8,10 @@ impl Agent<'_> {
     pub(in crate::agent) fn speculation_key(&self, name: &str, args: &Value) -> Option<String> {
         if self.hermetic
             || !self.effective_config().experimental.tool_speculation
-            || name != "ast_search"
-            || self.ext.origin(name) != Some(crate::tools::surface::catalog::Origin::Native)
+            || !matches!(name, "ast_search" | "read" | "grep")
+            || (!matches!(name, "read" | "grep")
+                && self.ext.origin(name) != Some(crate::tools::surface::catalog::Origin::Native))
+            || (matches!(name, "read" | "grep") && self.ext.get(name).is_some())
             || crate::agent::safety::approval::denied_by_rule(
                 &self.always,
                 &ToolCall {
@@ -31,17 +33,18 @@ impl Agent<'_> {
         ) {
             return None;
         }
-        let tool = self.ext.get(name)?;
-        if tool.needs_approval(args)
-            || tool.supports_tool_dispatch()
-            || tool.may_modify_workspace(args)
-        {
+        let tool = self.ext.get(name);
+        if tool.is_some_and(|tool| {
+            tool.needs_approval(args)
+                || tool.supports_tool_dispatch()
+                || tool.may_modify_workspace(args)
+        }) {
             return None;
         }
         use sha2::Digest as _;
-        let authority = json!({"session":self.session.id(),"step":self.cur_step,"root":self.workspace.root(),
+        let authority = json!({"name":name,"session":self.session.id(),"step":self.cur_step,"root":self.workspace.root(),
             "approval":self.approval,"plan":self.plan_mode,"rules":self.always,
-            "sandbox":format!("{:?}",self.workspace.sandbox_policy()),"revision":tool.contract_revision(),"schema":tool.schema()});
+            "sandbox":format!("{:?}",self.workspace.sandbox_policy()),"revision":tool.map(|tool| tool.contract_revision()),"schema":tool.map(|tool| tool.schema()),"builtin_schema":crate::tools::schemas(&[name], self.workspace.edit_mode()).ok()});
         Some(format!(
             "{:x}",
             sha2::Sha256::digest(serde_json::to_vec(&authority).ok()?)
@@ -59,11 +62,11 @@ impl Agent<'_> {
             return false;
         }
         let owner = self.cancellation.turn(self.interrupt.clone());
-        self.workspace.speculation.start(
+        self.workspace.speculation.start_named(
             &self.workspace,
             self.effective_config().clone(),
             &self.ext,
-            call.arguments.clone(),
+            call,
             key,
             owner,
         )
@@ -119,64 +122,88 @@ impl Agent<'_> {
         name: &str,
         args: &Value,
         ui: &mut dyn Ui,
-        mut backend: Option<&mut Backend>,
+        backend: Option<&mut Backend>,
     ) -> Option<ToolOutput> {
+        let call = ToolCall {
+            id: String::new(),
+            name: name.to_owned(),
+            arguments: args.clone(),
+            malformed_arguments: false,
+        };
+        self.run_background_tools(std::slice::from_ref(&call), ui, backend)
+            .map(|outputs| {
+                outputs
+                    .into_iter()
+                    .next()
+                    .expect("one result for one call")
+                    .0
+            })
+    }
+
+    /// Shared native worker/event owner. Multi-call admission belongs to dependency dispatch;
+    /// each callback still returns to this live controller before its native effect.
+    pub(in crate::agent) fn run_background_tools(
+        &mut self,
+        calls: &[ToolCall],
+        ui: &mut dyn Ui,
+        mut backend: Option<&mut Backend>,
+    ) -> Option<Vec<(ToolOutput, f64)>> {
         self.portable_callback_intercepted = false;
         if self.hermetic {
             return None;
         }
-        let builtin = config::tools::BUILTIN.contains(&name);
-        let extension = self.ext.get(name).cloned();
-        let registry = self.ext.clone();
-        let cancellation = extension.clone();
-        let external = self.config.tools.get(name).cloned();
-        if !builtin && extension.is_none() && external.is_none() {
+        if calls.iter().any(|call| {
+            !config::tools::BUILTIN.contains(&call.name.as_str())
+                && !self.ext.contains(&call.name)
+                && !self.config.tools.contains_key(&call.name)
+        }) {
             return None;
         }
-        if let Some(key) = self.speculation_key(name, args)
-            && let Some(mut output) = self.workspace.speculation.take(&self.workspace, args, &key)
-        {
-            let data = output.data.get_or_insert_with(|| json!({}));
-            if let Some(data) = data.as_object_mut() {
-                data.insert(
-                    "speculation".into(),
-                    json!({"reused":true,"stats":self.workspace.speculation.stats()}),
-                );
+        if calls.len() == 1 {
+            let call = &calls[0];
+            if let Some(key) = self.speculation_key(&call.name, &call.arguments)
+                && let Some(mut output) = self.workspace.speculation.take_named(
+                    &self.workspace,
+                    &call.name,
+                    &call.arguments,
+                    &key,
+                )
+            {
+                let data = output.data.get_or_insert_with(|| json!({}));
+                if let Some(data) = data.as_object_mut() {
+                    data.insert(
+                        "speculation".into(),
+                        json!({"reused":true,"stats":self.workspace.speculation.stats()}),
+                    );
+                }
+                return Some(vec![(output, 0.0)]);
             }
-            return Some(output);
         }
-        let workspace = self.workspace.clone();
-        let config = self.effective_config().clone();
-        let arguments = args.clone();
-        let name = name.to_owned();
-        let callback_owner = name.clone();
-        let guarded_edit = matches!(name.as_str(), "edit" | "write");
-        let original_call = (cancellation.is_some() || guarded_edit).then(|| ToolCall {
-            id: String::new(),
-            name: callback_owner.clone(),
-            arguments: args.clone(),
-            malformed_arguments: false,
-        });
+        let resource_bounds = if calls.len() > 1 {
+            let bounds = calls
+                .iter()
+                .map(|call| {
+                    crate::agent::run::dependency_dispatch::footprint(
+                        &self.workspace,
+                        self.edit_mode(),
+                        call,
+                    )
+                })
+                .collect::<Option<Vec<_>>>();
+            let Some(bounds) = bounds else {
+                return Some(calls.iter().map(|_| (ToolOutput::err("Native dependency resources changed before execution; retry serially.")
+                    .with_status(tools::ToolStatus::Blocked).with_effects(tools::surface::outcome::Effects::None), 0.0)).collect());
+            };
+            Some(bounds)
+        } else {
+            None
+        };
         let turn_cancel = self.cancellation.turn(self.interrupt.clone());
-        let mutation_cancel = turn_cancel.mutation();
-        let cancel = mutation_cancel.interrupt.flag();
-        let worker_cancel = mutation_cancel;
-        let signals = crate::tools::exec::signals::CallSignals::new();
-        let worker_signals = signals.clone();
-        let interruptible = extension
-            .as_ref()
-            .is_some_and(|tool| tool.interruptible(args));
         let mut steering = Vec::new();
-        // Ordinary queued input is not taken here (routing happens at the step boundary), but it
-        // must not sit behind a pure wait or a foreground command that could step aside.
         let mut input_signalled = false;
-        let active = Arc::new(AtomicBool::new(false));
-        let started = active.clone();
-        let serial = !matches!(name.as_str(), "edit" | "write")
-            && !extension.as_ref().is_some_and(|tool| {
-                tool.supports_tool_dispatch() || tool.manages_workspace_serialization()
-            })
-            && !crate::agent::safety::approval::parallel_read(&self.ext, &name, &arguments);
+        let mut signals = Vec::new();
+        let mut active_calls = Vec::new();
+        let mut workers = Vec::new();
         enum Event {
             Output(crate::tools::integrations::ext::ToolEvent),
             Callback(
@@ -194,12 +221,51 @@ impl Agent<'_> {
                 tools::EditRepairRequest,
                 mpsc::SyncSender<std::result::Result<String, String>>,
             ),
-            Done(ToolOutput),
+            Done(ToolOutput, f64),
         }
         let (tx, rx) = mpsc::sync_channel(64);
-        let worker = match thread::Builder::new()
+        struct IndexedSender<T> {
+            index: usize,
+            sender: mpsc::SyncSender<(usize, T)>,
+        }
+        impl<T> IndexedSender<T> {
+            fn send(&self, event: T) -> std::result::Result<(), mpsc::SendError<(usize, T)>> {
+                self.sender.send((self.index, event))
+            }
+        }
+        let failed_start = tx.clone();
+        for (index, call) in calls.iter().enumerate() {
+            let name = call.name.clone();
+            let arguments = call.arguments.clone();
+            let builtin = config::tools::BUILTIN.contains(&name.as_str());
+            let extension = self.ext.get(&name).cloned();
+            let external = self.config.tools.get(&name).cloned();
+            #[cfg(test)]
+            let effect_probe = super::dependency_dispatch::tests::effect_probe();
+            let workspace = self.workspace.clone();
+            let config = self.effective_config().clone();
+            let registry = self.ext.clone();
+            let mutation_cancel = turn_cancel.mutation();
+            let cancel = mutation_cancel.interrupt.flag();
+            let worker_cancel = mutation_cancel;
+            let worker_signals = crate::tools::exec::signals::CallSignals::new();
+            signals.push(worker_signals.clone());
+            let active = Arc::new(AtomicBool::new(false));
+            active_calls.push(active.clone());
+            let started = active;
+            let serial = !matches!(name.as_str(), "edit" | "write")
+                && !extension.as_ref().is_some_and(|tool| {
+                    tool.supports_tool_dispatch() || tool.manages_workspace_serialization()
+                })
+                && !crate::agent::safety::approval::parallel_read(&self.ext, &name, &arguments);
+            let tx = IndexedSender {
+                index,
+                sender: tx.clone(),
+            };
+            match thread::Builder::new()
             .name("dial-tool".to_owned())
             .spawn(move || {
+                let began = Instant::now();
                 let output = crate::tools::exec::execution::run(&cancel, || crate::tools::exec::execution::mutation_scope(&worker_cancel, || crate::tools::exec::signals::scope(&worker_signals, || {
                     let _serial = if serial {
                         Some(workspace.serial_operation())
@@ -221,6 +287,8 @@ impl Agent<'_> {
                     }
                         let authorize_mutation = |requested: &str, paths: &[PathBuf], unbounded: bool| {
                             if cancel.load(Ordering::SeqCst) { return Err("native effect cancelled before authorization".into()); }
+                            #[cfg(test)]
+                            if let Some(probe) = &effect_probe { probe(paths)?; }
                             let (reply, result) = mpsc::sync_channel(1);
                             tx.send(Event::Mutation(requested.into(), paths.to_vec(), unbounded, reply))
                                 .map_err(|_| "native mutation controller disconnected".to_owned())?;
@@ -320,22 +388,20 @@ impl Agent<'_> {
                     custom_tool_output(&tool, &arguments, &cancel)
                 })));
                 started.store(false, Ordering::SeqCst);
-                let _ = tx.send(Event::Done(output));
+                let _ = tx.send(Event::Done(output, began.elapsed().as_secs_f64()));
             }) {
-            Ok(worker) => worker,
-            Err(e) => {
-                return Some(ToolOutput { execution: Default::default(),
-                    data: None,
-                    text: format!("starting tool: {e}"),
-                    is_error: true,
-                });
+            Ok(worker) => workers.push(worker),
+            Err(error) => {
+                let _ = failed_start.send((index, Event::Done(ToolOutput::err(format!("starting tool: {error}")), 0.0)));
             }
         };
-        let mut callback_count = 0usize;
-        let supports_callbacks = cancellation
-            .as_ref()
-            .is_some_and(|tool| tool.supports_tool_dispatch());
-        let native_authority = cancellation.is_some() || guarded_edit;
+        }
+        drop(tx);
+        drop(failed_start);
+        let mut callback_counts = vec![0usize; calls.len()];
+        let native_authority = calls.iter().any(|call| {
+            self.ext.contains(&call.name) || matches!(call.name.as_str(), "edit" | "write")
+        });
         let callback_catalog = if native_authority && self.config.portable_rules.enabled {
             self.layout
                 .as_ref()
@@ -366,109 +432,137 @@ impl Agent<'_> {
                 },
             )
         });
-        let output = loop {
+        let mut outputs = vec![None; calls.len()];
+        while outputs.iter().any(Option::is_none) {
             turn_cancel.sync();
             let queued = ui.take_steering();
             if !queued.is_empty() {
-                signals.request_steering();
-                signals.interrupt_waits();
+                for signal in &signals {
+                    signal.request_steering();
+                    signal.interrupt_waits();
+                }
                 steering.extend(queued);
-                if interruptible && let Some(tool) = &cancellation {
-                    tool.cancel_operation();
+                for call in calls {
+                    if let Some(tool) = self.ext.get(&call.name)
+                        && tool.interruptible(&call.arguments)
+                    {
+                        tool.cancel_operation();
+                    }
                 }
             } else if !input_signalled && ui.pending_input() {
                 // Cooperative only: waits end and long commands move to bg; nothing is killed.
                 input_signalled = true;
-                signals.request_steering();
-                signals.interrupt_waits();
+                for signal in &signals {
+                    signal.request_steering();
+                    signal.interrupt_waits();
+                }
             }
 
             match rx.recv_timeout(Duration::from_millis(80)) {
-                Ok(Event::Output(event)) => {
-                    if matches!(
-                        event.kind.as_str(),
-                        "background_output" | "background_progress"
-                    ) {
-                        ui.background_output(
-                            &event.name,
-                            &event.text,
-                            event.kind == "background_progress",
-                        );
-                    } else if event.kind == "output" {
-                        ui.tool_output(&event.name, &event.text);
-                    } else if event.kind == "progress" {
-                        ui.tool_progress(&event.name, &event.text);
-                    } else {
-                        ui.background_notice(&format!(
-                            "{}: {}{}",
-                            event.name,
-                            event.text,
-                            event
-                                .artifact
-                                .map(|uri| format!("\n[Complete output: {uri}]"))
-                                .unwrap_or_default()
-                        ));
-                    }
-                }
-                Ok(Event::Callback(request, reply)) => {
-                    callback_count += 1;
-                    let output = if !supports_callbacks {
-                        ToolOutput::err("this native tool has no code-mode callback capability")
-                    } else if callback_count > 128 {
-                        ToolOutput::err("code-mode callback limit exceeded (128 per cell)")
-                    } else if let (Some(backend), Some(gate)) =
-                        (backend.as_deref_mut(), callback_gate.as_mut())
-                    {
-                        self.code_callback(backend, request, &callback_owner, ui, gate)
-                    } else {
-                        ToolOutput::err(
-                            "code-mode callbacks require the agent execution controller",
-                        )
-                    };
-                    self.portable_callback_intercepted |= callback_gate
-                        .as_ref()
-                        .is_some_and(|gate| gate.blocked().is_some());
-                    let _ = reply.send(output);
-                }
-                Ok(Event::Repair(request, reply)) => {
-                    let result = if self.interrupt.load(Ordering::SeqCst) {
-                        Err("edit repair cancelled".into())
-                    } else if !guarded_edit || !self.config.edit.auto_repair.enabled {
-                        Err("edit repair is not enabled for this execution owner".into())
-                    } else if let Some(main) = backend.as_deref_mut() {
-                        self.repair_edit(main, &request, ui)
-                            .map_err(|error| format!("{error:#}"))
-                    } else {
-                        Err("edit repair requires the live model owner".into())
-                    };
-                    let _ = reply.send(result);
-                }
-                Ok(Event::Mutation(tool, paths, unbounded, reply)) => {
-                    let result = (|| -> std::result::Result<(), String> {
-                        if self.interrupt.load(Ordering::SeqCst) {
-                            return Err("native effect cancelled before authorization".into());
+                Ok((position, event)) => {
+                    let original_call = Some(calls[position].clone());
+                    let callback_owner = calls[position].name.clone();
+                    let guarded_edit = matches!(callback_owner.as_str(), "edit" | "write");
+                    let supports_callbacks = self
+                        .ext
+                        .get(&callback_owner)
+                        .is_some_and(|tool| tool.supports_tool_dispatch());
+                    match event {
+                        Event::Output(event) => {
+                            if matches!(
+                                event.kind.as_str(),
+                                "background_output" | "background_progress"
+                            ) {
+                                ui.background_output(
+                                    &event.name,
+                                    &event.text,
+                                    event.kind == "background_progress",
+                                );
+                            } else if event.kind == "output" {
+                                ui.tool_output(&event.name, &event.text);
+                            } else if event.kind == "progress" {
+                                ui.tool_progress(&event.name, &event.text);
+                            } else {
+                                ui.background_notice(&format!(
+                                    "{}: {}{}",
+                                    event.name,
+                                    event.text,
+                                    event
+                                        .artifact
+                                        .map(|uri| format!("\n[Complete output: {uri}]"))
+                                        .unwrap_or_default()
+                                ));
+                            }
                         }
-                        if self.edit_preview_intercepted {
-                            return Err("native effect refused after a completed edit preview failed in this assistant batch".into());
+                        Event::Callback(request, reply) => {
+                            callback_counts[position] += 1;
+                            let output = if !supports_callbacks {
+                                ToolOutput::err(
+                                    "this native tool has no code-mode callback capability",
+                                )
+                            } else if callback_counts[position] > 128 {
+                                ToolOutput::err("code-mode callback limit exceeded (128 per cell)")
+                            } else if let (Some(backend), Some(gate)) =
+                                (backend.as_deref_mut(), callback_gate.as_mut())
+                            {
+                                self.code_callback(backend, request, &callback_owner, ui, gate)
+                            } else {
+                                ToolOutput::err(
+                                    "code-mode callbacks require the agent execution controller",
+                                )
+                            };
+                            self.portable_callback_intercepted |= callback_gate
+                                .as_ref()
+                                .is_some_and(|gate| gate.blocked().is_some());
+                            let _ = reply.send(output);
                         }
-                        let source_read = guarded_edit && tool == "read";
-                        if tool != callback_owner && !source_read {
-                            return Err(
-                                "native mutation authority does not match the active tool".into()
-                            );
+                        Event::Repair(request, reply) => {
+                            let result = if self.interrupt.load(Ordering::SeqCst) {
+                                Err("edit repair cancelled".into())
+                            } else if !guarded_edit || !self.config.edit.auto_repair.enabled {
+                                Err("edit repair is not enabled for this execution owner".into())
+                            } else if let Some(main) = backend.as_deref_mut() {
+                                self.repair_edit(main, &request, ui)
+                                    .map_err(|error| format!("{error:#}"))
+                            } else {
+                                Err("edit repair requires the live model owner".into())
+                            };
+                            let _ = reply.send(result);
                         }
-                        let gate = callback_gate
-                            .as_mut()
-                            .ok_or("native effect requires the owner rule controller")?;
-                        if let Some(reason) = gate.blocked() {
-                            return Err(reason.into());
-                        }
-                        let original = original_call
-                            .as_ref()
-                            .ok_or("native effect has no authorized original call")?;
-                        if source_read {
-                            // Source bytes are read-deny policy only; the owner edit's own target authorization and interception cover the write.
-                            return crate::agent::safety::approval::authorize_source_read_paths(
+                        Event::Mutation(tool, paths, unbounded, reply) => {
+                            let result = (|| -> std::result::Result<(), String> {
+                                if self.interrupt.load(Ordering::SeqCst) {
+                                    return Err(
+                                        "native effect cancelled before authorization".into()
+                                    );
+                                }
+                                if let Some(bounds) = &resource_bounds
+                                    && !bounds[position].permits(&paths, unbounded)
+                                {
+                                    return Err("native effect exceeded its admitted dependency footprint; retry serially".into());
+                                }
+                                if self.edit_preview_intercepted {
+                                    return Err("native effect refused after a completed edit preview failed in this assistant batch".into());
+                                }
+                                let source_read = guarded_edit && tool == "read";
+                                if tool != callback_owner && !source_read {
+                                    return Err(
+                                        "native mutation authority does not match the active tool"
+                                            .into(),
+                                    );
+                                }
+                                let gate = callback_gate
+                                    .as_mut()
+                                    .ok_or("native effect requires the owner rule controller")?;
+                                if let Some(reason) = gate.blocked() {
+                                    return Err(reason.into());
+                                }
+                                let original = original_call
+                                    .as_ref()
+                                    .ok_or("native effect has no authorized original call")?;
+                                if source_read {
+                                    // Source bytes are read-deny policy only; the owner edit's own target authorization and interception cover the write.
+                                    return crate::agent::safety::approval::authorize_source_read_paths(
                                 &self.always,
                                 self.workspace.root(),
                                 self.workspace.additional_roots(),
@@ -477,81 +571,101 @@ impl Agent<'_> {
                                 &paths,
                                 unbounded,
                             );
+                                }
+                                crate::agent::safety::approval::authorize_mutation_paths(
+                                    crate::agent::safety::approval::MutationPolicy {
+                                        rules: &self.always,
+                                        root: self.workspace.root(),
+                                        extra_roots: self.workspace.additional_roots(),
+                                        read_only: self.plan_mode
+                                            || self.approval
+                                                == crate::config::types::Approval::Readonly,
+                                    },
+                                    original,
+                                    &tool,
+                                    &paths,
+                                    unbounded,
+                                )?;
+                                let observed = crate::agent::safety::rules::mutation_call(
+                                    self.workspace.root(),
+                                    self.workspace.additional_roots(),
+                                    original,
+                                    &paths,
+                                    unbounded,
+                                )?;
+                                self.intercept_native_effect(gate, &observed, ui)
+                            })();
+                            let _ = reply.send(result);
                         }
-                        crate::agent::safety::approval::authorize_mutation_paths(
-                            crate::agent::safety::approval::MutationPolicy {
-                                rules: &self.always,
-                                root: self.workspace.root(),
-                                extra_roots: self.workspace.additional_roots(),
-                                read_only: self.plan_mode
-                                    || self.approval == crate::config::types::Approval::Readonly,
-                            },
-                            original,
-                            &tool,
-                            &paths,
-                            unbounded,
-                        )?;
-                        let observed = crate::agent::safety::rules::mutation_call(
-                            self.workspace.root(),
-                            self.workspace.additional_roots(),
-                            original,
-                            &paths,
-                            unbounded,
-                        )?;
-                        self.intercept_native_effect(gate, &observed, ui)
-                    })();
-                    let _ = reply.send(result);
-                }
-                Ok(Event::Confirm(summary, reply)) => {
-                    let allowed = match original_call.as_ref() {
-                        Some(original) => crate::agent::safety::approval::authorize_with_cancel(
-                            self.approval,
-                            &mut self.always,
-                            self.workspace.root(),
-                            original,
-                            &summary,
-                            ui,
-                            self.interrupt.as_ref(),
-                        )
-                        .is_ok(),
-                        None => false,
-                    };
-                    let _ = reply.send(allowed);
-                }
-                Ok(Event::Done(mut output)) => {
-                    if self.edit_preview_intercepted {
-                        output.is_error = true;
-                        output.text.push_str("\n[An authorized edit preview failed; remaining native callbacks/effects were refused. Earlier completed results are retained.]");
+                        Event::Confirm(summary, reply) => {
+                            let allowed = match original_call.as_ref() {
+                                Some(original) => {
+                                    crate::agent::safety::approval::authorize_with_cancel(
+                                        self.approval,
+                                        &mut self.always,
+                                        self.workspace.root(),
+                                        original,
+                                        &summary,
+                                        ui,
+                                        self.interrupt.as_ref(),
+                                    )
+                                    .is_ok()
+                                }
+                                None => false,
+                            };
+                            let _ = reply.send(allowed);
+                        }
+                        Event::Done(mut output, seconds) => {
+                            if self.edit_preview_intercepted {
+                                output.is_error = true;
+                                output.text.push_str("\n[An authorized edit preview failed; remaining native callbacks/effects were refused. Earlier completed results are retained.]");
+                            }
+                            if let Some(reason) =
+                                callback_gate.as_ref().and_then(|gate| gate.blocked())
+                            {
+                                output.is_error = true;
+                                output.text.push_str(&format!("\n[{reason}]"));
+                                self.portable_callback_intercepted = true;
+                            }
+                            outputs[position] = Some((output, seconds));
+                        }
                     }
-                    if let Some(reason) = callback_gate.as_ref().and_then(|gate| gate.blocked()) {
-                        output.is_error = true;
-                        output.text.push_str(&format!("\n[{reason}]"));
-                        self.portable_callback_intercepted = true;
-                    }
-                    break output;
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     ui.heartbeat();
-                    if self.interrupt.load(Ordering::SeqCst)
-                        && active.load(Ordering::SeqCst)
-                        && let Some(tool) = &cancellation
-                    {
-                        tool.cancel_operation();
+                    if self.interrupt.load(Ordering::SeqCst) {
+                        for (call, active) in calls.iter().zip(&active_calls) {
+                            if active.load(Ordering::SeqCst)
+                                && let Some(tool) = self.ext.get(&call.name)
+                            {
+                                tool.cancel_operation();
+                            }
+                        }
                     }
                     self.pump_subagents(ui);
                 }
                 Err(_) => {
-                    break ToolOutput {
-                        execution: Default::default(),
-                        data: None,
-                        text: "tool worker ended without output".into(),
-                        is_error: true,
-                    };
+                    for output in &mut outputs {
+                        if output.is_none() {
+                            *output = Some((
+                                ToolOutput::err("tool worker ended without output")
+                                    .with_effects(crate::tools::surface::outcome::Effects::Unknown),
+                                0.0,
+                            ));
+                        }
+                    }
                 }
             }
-        };
-        let _ = worker.join();
+        }
+        for worker in workers {
+            let _ = worker.join();
+        }
         self.pending_tool_steering.extend(steering);
-        Some(output)
+        Some(
+            outputs
+                .into_iter()
+                .map(|output| output.expect("each owned call settled"))
+                .collect(),
+        )
     }
 }

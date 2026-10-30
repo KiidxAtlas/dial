@@ -210,3 +210,33 @@ fn torn_final_row_recovers_the_complete_prefix() {
     assert_eq!(nodes.len(), 1);
     assert_eq!(nodes[0].result.text, "kept");
 }
+
+#[test]
+fn retry_never_adopts_replaced_truncated_or_owner_removed_journals() {
+    for case in ["replaced", "truncated", "removed"] {
+        let root = tempfile::tempdir().unwrap();
+        let session = root.path().join("session.jsonl");
+        let stream = path(&session);
+        let journal = Journal::open(&session).unwrap();
+        let tree = crate::runtime::Tree::default();
+        tree.journal(journal.clone());
+        let body = tree.start("assistant", "live", None);
+        body.append("prefix");
+        journal.fail_writes_for_test(File::open(&stream).unwrap());
+        body.append("failed");
+        assert!(journal.check().is_err());
+        match case {
+            "replaced" => {
+                std::fs::rename(&stream, root.path().join("original.streams")).unwrap();
+                std::fs::write(&stream, b"unrelated").unwrap();
+            }
+            "truncated" => std::fs::write(&stream, b"short").unwrap(),
+            "removed" => remove(&session).unwrap(),
+            _ => unreachable!(),
+        }
+        let before = std::fs::read(&stream).ok();
+        assert!(journal.retry_failed_write().is_err(), "{case}");
+        assert!(journal.check().is_err(), "{case}");
+        assert_eq!(std::fs::read(&stream).ok(), before, "{case}");
+    }
+}

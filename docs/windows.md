@@ -1,6 +1,6 @@
 # Windows
 
-Dial's Windows release is `x86_64-pc-windows-msvc`. ARM64 Windows runs that binary through built-in x64 emulation. Hosted providers are supported; MLX is macOS-only.
+Dial ships native Windows releases for `x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc`; the installer picks the one matching your machine. Hosted providers, Ollama, LM Studio and GGUF through llama.cpp are supported; MLX is macOS-only.
 
 ## Install
 

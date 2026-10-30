@@ -52,6 +52,7 @@ const CONTEXT_EVENTS: &[&str] = &[
     "user_prompt_submit",
     "assistant_message",
     "context",
+    "before_compact",
 ];
 
 #[derive(Debug, PartialEq, Eq)]
@@ -442,10 +443,24 @@ pub fn gate(
     interrupt: &AtomicBool,
     notice: &mut dyn FnMut(&str),
 ) -> Result<(), String> {
+    gate_noted(hooks, plugins, root, event, payload, interrupt, notice).map(|_| ())
+}
+
+/// Admit a lifecycle action and return bounded supplemental data, discarded on refusal.
+pub fn gate_noted(
+    hooks: &[HookConfig],
+    plugins: Option<&crate::tools::integrations::plugin::Host>,
+    root: &Path,
+    event: &str,
+    payload: Value,
+    interrupt: &AtomicBool,
+    notice: &mut dyn FnMut(&str),
+) -> Result<Option<String>, String> {
     if !wanted(hooks, plugins, event) {
-        return Ok(());
+        return Ok(None);
     }
     let outcome = fire_with(hooks, plugins, root, event, None, payload, interrupt);
+    let note = outcome.context_note();
     outcome.notices.iter().for_each(|n| notice(n));
     match outcome.verdict {
         Verdict::Block { reason } => Err(reason),
@@ -453,8 +468,23 @@ pub fn gate(
             if !output.is_empty() {
                 notice(&format!("hook: {output}"));
             }
-            Ok(())
+            Ok(note)
         }
+    }
+}
+
+fn compact_attribution(event: &str, reply: &mut Reply, source: &str) {
+    if event == "before_compact"
+        && let Some(note) = reply.additional_context.take()
+    {
+        if note.trim().is_empty() {
+            return;
+        }
+        let bounded = clip_to(note, MAX_CONTEXT.saturating_sub(256));
+        reply.additional_context = Some(format!(
+            "[{}; untrusted data]\n{bounded}",
+            clip_to(source.to_owned(), 128)
+        ));
     }
 }
 
@@ -600,6 +630,15 @@ fn apply(
         let note = clip_to(note, MAX_CONTEXT);
         // Repeats are compared ignoring surrounding whitespace, like the note itself.
         if !note.is_empty() && !outcome.context.contains(&note) {
+            if event == "before_compact"
+                && outcome.context.iter().map(String::len).sum::<usize>() + note.len()
+                    > MAX_OUTPUT.saturating_sub(256)
+            {
+                outcome
+                    .notices
+                    .push("before_compact additional context truncated at aggregate limit".into());
+                return None;
+            }
             outcome.context.push(note);
         }
     }
@@ -691,7 +730,12 @@ pub fn fire_with(
         .filter(|h| canonical(&h.event) == event && matches(h, tool))
     {
         match run_one(hook, root, &payload, interrupt) {
-            Ok(reply) => {
+            Ok(mut reply) => {
+                compact_attribution(
+                    event,
+                    &mut reply,
+                    &format!("operator hook {:?}", hook.command.first()),
+                );
                 if let Some(reason) = apply(event, reply, &mut payload, &mut outcome, &mut output) {
                     block(&mut outcome, reason, "hook");
                     return outcome;
@@ -718,9 +762,10 @@ pub fn fire_with(
         for answer in host.dispatch(event, &payload, interrupt) {
             match answer.result {
                 Ok(value) => {
-                    let Some(reply) = Reply::from_json(&value) else {
+                    let Some(mut reply) = Reply::from_json(&value) else {
                         continue;
                     };
+                    compact_attribution(event, &mut reply, &format!("extension {}", answer.plugin));
                     if let Some(reason) =
                         apply(event, reply, &mut payload, &mut outcome, &mut output)
                     {

@@ -7,6 +7,17 @@ For independent Dial sessions in the same checkout, `/peers` lists live peers an
 manage advisory path claims through ordinary transcript notices. Commands wait until an active
 turn finishes. See [Session coordination](session-coordination.md) for delivery, safety and opt-out details.
 
+## Recovering from a full disk
+
+If a turn stops with `stream journal failed: … No space left on device`, free space on
+the volume holding Dial's session data, then send `continue`. On the next turn Dial
+retries the failed stream writer without restarting. It removes only the failed append's
+possibly incomplete row; previously committed observations remain intact. The failed
+operation's unpublished output is not recovered, and tools are not automatically replayed.
+If storage still cannot be written, the turn stops again with the write error. Removed,
+replaced or externally truncated journals are refused rather than recreated; non-write
+failures (including checkpoint failures) are not reset by this recovery.
+
 ## Interface overview and shortcuts
 
 - Inline, scrollback-native transcript with a live composer; finished turns remain in normal terminal
@@ -24,9 +35,25 @@ turn finishes. See [Session coordination](session-coordination.md) for delivery,
   shortcut hint; setup and unsafe-mode warnings appear only when relevant. `Down` reveals suggested
   requests or recent sessions; `Enter` opens a request for editing or resumes a session. Small
   windows shed artwork before warnings and selected actions. Sending a message restores the
-  normal conversation.
+  normal conversation, and so does a command that prints a result (for example `/add-dir`), so
+  its answer is shown rather than left in scrollback behind the launch screen. Commands that
+  only open a panel keep it.
+- Text that starts with `/` but is not a command is sent as an ordinary message. A first word
+  containing another `/` (a pasted path such as `/Users/me/notes.md`) never opens the command
+  menu, so `Enter` sends it as typed, and while busy it queues like any other message.
 - A configurable status line shows model, role, path, Git state, context, token usage/rate, approval,
   sandbox and session state. Settings let you choose presets or define left/right segments. Learning diagnostics are available in the explicit improvement views.
+- The `cost` segment shows the observed API cost of the running turn and the session, such as
+  `$0.0412 turn · $1.20 session`. Amounts use the `$` form of `/cost` (four decimals below a
+  dollar, cents above). While a turn runs, the segment counts spend observed since the turn
+  started, including workers and background work that settles meanwhile. When the turn ends it
+  shows that turn's exact ledger figure until the next turn starts. The session total includes
+  workers and is omitted when it equals the turn. The segment is hidden when the cost is unknown
+  or zero: local and subscription models, unpriced requests, and a turn with no priced reply. It
+  is part of the default, `nerd`, `ascii`, `compact` and `full` presets; custom layouts add
+  `cost` to `ui.status_left` or `ui.status_right`. It is the first segment to drop on a narrow
+  line after the token, rate, learning, usage, session and time segments. `/cost` keeps the full
+  breakdown.
 - Local inference shows **loading model**, **processing prompt**, then a live **generating tokens**
   counter and tokens/second in the composer. Dial's MLX runners report engine counts, including
   reasoning and tool tokens; the text runner also reports prompt processing progress. Other local
@@ -111,7 +138,7 @@ turn finishes. See [Session coordination](session-coordination.md) for delivery,
   (the agent took it and is cancelling the stale reply) and *applied* (recorded as the current
   instruction, or the worker started). If the turn ends before a message was applied it is queued
   to send next rather than lost. They are not part of `/queue`.
-  `Option+Enter` on macOS (`Alt+Enter` elsewhere) still queues a follow-up directly.
+  `Ctrl+Q`, or `Option+Enter` on macOS (`Alt+Enter` elsewhere), still queues a follow-up directly.
   The queue above the composer previews up to three messages (`Queued  send after turn  “message”`)
   and counts the rest.
   Empty Enter with queued work opens a separate choice, defaulting to **Keep working**;
@@ -148,7 +175,7 @@ turn finishes. See [Session coordination](session-coordination.md) for delivery,
   The **Favorites** view lists saved favorites; `*` marks favorites that are not the current main model.
   Favorites use the picker's global/project scope (`Ctrl-S`) and persist across restarts.
   In All models, favorites are pinned below the current main model and above other models.
-  Press `Option+]` on macOS or `Alt+]` elsewhere (remappable as `app.model.favoriteNext`), or use `/model next` to cycle through
+  Press `F8`, `Option+]` on macOS or `Alt+]` elsewhere (remappable as `app.model.favoriteNext`), or use `/model next` to cycle through
   available chat favorites without opening the picker. Unavailable/embedding models are skipped;
   a switch requested during a turn saves immediately and is adopted when the turn finishes rather than interrupting it.
   On the first press, if discovery is needed, the switch is retained and applies when ready.
@@ -323,25 +350,36 @@ turn finishes. See [Session coordination](session-coordination.md) for delivery,
 | Action | Shortcut / command |
 |---|---|
 | Search slash commands | `Ctrl-P` / `Alt-K`, `/palette` |
-| Model selector / roles | `Ctrl-K` on macOS (`Alt-M` elsewhere) / `Alt-R`, `/model` |
-| Provider setup | `Alt-P`, `/providers` |
+| Model selector / roles | `Ctrl-K` on macOS (`Alt-M` elsewhere) or `F2` / `Alt-R` or `F3`, `/model` |
+| Provider setup | `Alt-P` or `F4`, `/providers` |
 | Settings | `Ctrl-,` (`Ctrl-4` fallback), `/settings` |
 | Edit keyboard shortcuts | `/hotkeys`, or `/settings` → Setup → Keyboard shortcuts |
 | Previous/next prompt | `Up` / `Down`; preserves the unsent draft |
 | Search prompt history | `Ctrl-R` |
 | Command list / completion | `/`, then `Up` / `Down`, `Tab` or `Right` to complete, `Esc` to dismiss |
 | Accept inline suggestion | `Tab` or `Right` at the end of the draft |
-| Multiline input | `Option+Enter` on macOS / `Alt+Enter` elsewhere; `Shift-Enter` when supported by the terminal |
-| Expand/collapse tool results | `Ctrl-O` |
+| Multiline input | `Shift-Enter` when supported by the terminal, or `Ctrl-J` |
+| Queue a follow-up while busy | `Ctrl-Q`, or `Option+Enter` on macOS / `Alt+Enter` elsewhere (Windows Terminal keeps `Alt+Enter` for fullscreen) |
+| Expand/collapse tool results / show or hide tools | `Ctrl-O` / `Alt-O` or `F5` |
+| Worker hub / latest worker | `Alt-A` or `F6` / `Alt-Shift-A` or `F7` |
+| Next favorite model | `Alt-]` or `F8` |
+| Repaint the screen | `Ctrl-L` or `Alt-L` |
+| Attach the clipboard image / dictate | `Ctrl-V` / `Alt-V` or `F9`; on Windows `Alt-V` attaches the image and `F9` dictates |
 | Scroll transcript | `PageUp` / `PageDown` |
 | Cancel a panel / stop at next callback | `Esc` / `Ctrl-C` |
 | Quit from an empty composer | `Ctrl-D`, `/exit` |
 
-Dial detects the OS for the model shortcut: on macOS, **Control+K** works without terminal
-configuration (not Command+K). Option+M remains available as a fallback. Other Option shortcuts on
-macOS require Option to send Meta/Esc; in Terminal.app enable **Use Option as Meta key**.
-Without that setting, Option+M may type `µ` instead. `/model` works on every platform, and
-the footer and `/hotkeys` show your active bindings, including custom overrides.
+Every Option/Alt shortcut also has a Control or function-key default, because macOS terminals type a
+symbol for Option+letter (Option+M types `µ`) unless Option sends Meta/Esc (iTerm2: Profiles → Keys →
+Left Option key → Esc+; Terminal.app: **Use Option as Meta key**). On macOS, **Control+K** opens the
+model selector (not Command+K) and Option+M remains available. Function keys on Mac keyboards may need
+`Fn` unless "Use F1, F2, etc. keys as standard function keys" is on. On Windows, Windows Terminal
+keeps `Alt+Enter` (fullscreen), `Ctrl+V` (its text paste) and `Ctrl+,` (its settings), so use `Ctrl+Q`,
+`Alt+V` and `Ctrl+4` there; `Ctrl+G` opens the draft through `pwsh`, falling back to Windows PowerShell.
+Panel keys (`F2`–`F8` in `/models`) are panel-local; in the HTTP header editor `Ctrl+S` saves, since
+GNOME Terminal takes `F10`. A key you bind to an editing action is not shadowed by an application
+default on the same key. `/model` works on every platform, and the footer and `/hotkeys` show your
+active bindings, including custom overrides.
 Shortcut labels use **Option** on macOS and **Alt** elsewhere. **Ctrl** always means Control,
 not Command. Both `Alt` and `Option` are accepted in keybinding configuration on every platform;
 saved bindings retain the portable `Alt` spelling. `/hotkeys` shows the effective native labels.
@@ -510,33 +548,72 @@ these. Dial restores tab color, progress and variables when it exits, suspends o
 ### Live side pane
 
 `/watch` enables a private live feed for the current session and runs immediately, even during a
-turn. In a direct macOS iTerm2 session it opens a vertical split targeted to that exact session.
-macOS may ask for Automation permission. If unavailable, or under a multiplexer, Dial prints a
-shell-quoted command to run in another pane:
+turn. It then tries to open the follower in a split to the right of Dial, keeping focus on Dial.
+The innermost layer wins, because a multiplexer inherits the outer terminal's variables:
+
+| Detected by | Split command |
+| --- | --- |
+| `$TMUX` (targets `$TMUX_PANE`) | `tmux split-window -h -d -t PANE -- dial …` (tmux 3.0 or newer) |
+| `$ZELLIJ` or `$ZELLIJ_SESSION_NAME` | `zellij run --direction right -- dial …` |
+| macOS, `TERM_PROGRAM=iTerm.app` | iTerm2 vertical split of that exact session (Automation permission) |
+| `$WEZTERM_PANE` | `wezterm cli split-pane --right --pane-id PANE -- dial …` |
+| `$KITTY_WINDOW_ID` and `$KITTY_LISTEN_ON` | `kitty @ --to SOCKET launch --location=vsplit --keep-focus -- dial …` |
+
+The watcher's executable and arguments are passed as separate arguments, never through a shell.
+GNU screen is refused because its split commands act on whichever region is focused and cannot be
+pinned to Dial's window. kitty needs remote control on a socket (`allow_remote_control
+socket-only` and `listen_on unix:/tmp/kitty` in `kitty.conf`); Dial does not send remote-control
+escapes through the terminal it is drawing. When no supported terminal is detected, or the split
+command fails or exceeds five seconds, Dial prints the exact command, using the running
+executable's path, to run in another terminal:
 
 ```sh
-dial -C /path/to/project watch SESSION_ID
+/path/to/dial -C /path/to/project watch SESSION_ID
 ```
 
-The pane follows new edit-result previews, changed paths, language-server advisories, turn outcomes
-and `/review` results in its own scrollback. Preview diff lines are coloured; this is a display of
-tool output, not a new verification result. LSP advisories require a running server under the usual
-LSP settings and remain explicitly **not verification**. `/review` keeps its existing execution and
-queuing behaviour; opening a watcher does not start a review or model request.
+In a terminal the pane is a tabbed dashboard of everything running for the session. Switch tabs with
+`←`/`→`, `Tab`/`Shift-Tab` or `1`–`6`; `↑`/`↓` select, `PgUp`/`PgDn` scroll the details, `Home`/`End`
+jump, and `q` or `Ctrl-C` closes the pane. The header shows counts and whether a turn is running;
+it warns when the session has not published for five seconds (closed, or busy in a step that does
+not repaint).
 
-When the pane is attached, screenshots are copied only from verified attachments and shown there,
-with a one-line marker in the conversation instead of an inline thumbnail. Native images fit the
-viewer's available width and height; unsupported terminals use coloured cells. If publishing fails
-or no viewer is attached, Dial keeps the inline preview. Closing the watcher restores inline images
-on the next capture. `Ctrl-C` stops the viewer; `dial watch SESSION_ID --once` prints the recorded
-feed and exits. Redirected output contains no colour or graphics escape sequences.
+| Tab | Shows | Action |
+| --- | --- | --- |
+| **Feed** | Edit previews and changed paths, language-server advisories, turn outcomes, `/review` results and screenshots | — |
+| **Plan** | The agent's task list with blocked/dropped reasons, findings and evidence | — |
+| **Jobs** | Background (`bg`) processes and slash-command jobs such as `/update`, `/gc` or `/benchmark`, with their recent output | `x` stops the selected job |
+| **Workers** | Subagents with status, current step, usage and recent activity | `x` cancels the selected worker |
+| **Threads** | `/btw` side threads, including the answer streaming now | `x` stops the streaming answer |
+| **Peers** | Other Dial sessions in this checkout, their claims and overlaps with yours | `m` writes a message to the selected peer |
+
+Every stop asks `y`/`n` first. Requests go through the same controls the main window uses; each
+outcome is noted in the conversation under **Side pane** and shown in the pane's footer. A peer
+message written during a turn is sent when the turn ends. Approvals, questions and anything else
+that needs a decision stay in the main window; the pane cannot approve, answer or start work.
+
+While the pane is attached, slash-command job output goes only to its **Jobs** tab (the conversation
+keeps the job's one-line status and result), and the pinned worker block above the composer is
+hidden because the **Workers** tab shows it in full. Closing the pane restores both. Preview diff
+lines are coloured; this is a display of tool output, not a new verification result. LSP advisories
+require a running server under the usual LSP settings and remain explicitly **not verification**.
+`/review` keeps its existing execution and queuing behaviour; opening a watcher does not start a
+review or model request.
+
+When the pane is attached, screenshots are copied only from verified attachments and shown in its
+**Feed**, with a one-line marker in the conversation instead of an inline thumbnail. If publishing
+fails or no viewer is attached, Dial keeps the inline preview. Closing the watcher restores inline
+images on the next capture. `dial watch SESSION_ID --once`, or a watcher whose output is redirected,
+prints the recorded feed as text instead of the dashboard; redirected output contains no colour or
+graphics escape sequences.
 
 Feeds are opt-in per session and stored outside the checkout under the project's private state
-directory, `live/SESSION_ID/`. Switching or forking sessions does not redirect an existing viewer;
-run `/watch` in the new session. Text previews are bounded and the append-only text feed stops at
-16 MiB rather than silently deleting earlier entries; screenshot copies stop at 64 MiB per session.
-These files may contain source and screenshots; they are local private state, not published or sent
-to an additional service.
+directory, `live/SESSION_ID/`: the feed, the dashboard state (`state.json`, rewritten only while a
+pane is attached) and the pane's pending requests (`inbox/`, removed as the session reads them).
+Switching or forking sessions does not redirect an existing viewer; run `/watch` in the new session.
+Text previews are bounded and the append-only text feed stops at 16 MiB rather than silently
+deleting earlier entries; screenshot copies stop at 64 MiB per session. These files may contain
+source and screenshots; they are local private state, not published or sent to an additional
+service.
 
 ## Workspace rail and live worker cards
 

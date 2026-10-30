@@ -1,0 +1,1 @@
+{"batches":[{"id":"B1","orders":[{"id":"O1","lines":[{"sku":"X","quantity":2},{"sku":"Y","quantity":1}]}]},{"id":"B2","orders":[{"id":"O2","lines":[{"sku":"X","quantity":3}]}]}]}

@@ -2,7 +2,7 @@
 
 use crate::app::core::App;
 use crate::config::settings_store::{Change, Scope};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -12,6 +12,13 @@ pub(in crate::app) struct PreparedModel {
     /// The model role the changes assign; `None` for a plain setting such as a draft model.
     pub(in crate::app) role: Option<String>,
     pub(in crate::app) scope: Scope,
+    /// Runtime/model paths discovered by voice preparation, committed together with the selector.
+    pub(in crate::app) voice: Option<PreparedVoice>,
+}
+
+pub(in crate::app) struct PreparedVoice {
+    pub(in crate::app) original: crate::config::voice::VoiceConfig,
+    pub(in crate::app) changes: std::sync::mpsc::Receiver<Vec<Change>>,
 }
 
 pub(crate) struct AuthJob {
@@ -63,7 +70,35 @@ impl AuthJob {
             let result = result.and_then(|message| {
                 ensure!(!job.cancel.load(Ordering::SeqCst), "operation cancelled");
                 if let Some(model) = &job.model {
-                    app.save_settings(model.scope, &model.changes, model.role.as_deref())?;
+                    let mut changes = model.changes.clone();
+                    if let Some(prepared) = &model.voice {
+                        ensure!(app.reload()?.voice == prepared.original,
+                            "Voice settings changed during setup; select the backend again to use the prepared installation");
+                        changes.extend(
+                            prepared
+                                .changes
+                                .try_recv()
+                                .context("setup did not provide prepared settings")?,
+                        );
+                    }
+                    if label == "Voice" {
+                        let proposed = crate::config::settings_store::preview_config(
+                            &app.layout,
+                            model.scope,
+                            &changes,
+                            &app.overlay,
+                        )?;
+                        for change in &model.changes {
+                            if let Change::Set {
+                                path,
+                                value: toml::Value::String(value),
+                            } = change
+                            {
+                                crate::setup::voice::ready(&proposed, path, value)?;
+                            }
+                        }
+                    }
+                    app.save_settings(model.scope, &changes, model.role.as_deref())?;
                 }
                 Ok(message)
             });

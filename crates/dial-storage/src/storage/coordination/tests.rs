@@ -236,9 +236,15 @@ fn full_inbox_rejects_without_eviction_and_drain_is_exact() {
     }
     assert!(recipient.drain().unwrap().is_empty());
     assert!(!recipient.has_mail().unwrap());
+    assert_eq!(recipient.mail_count().unwrap(), 0);
     sender.send(recipient.id(), "peek").unwrap();
     assert!(recipient.has_mail().unwrap());
     assert!(recipient.has_mail().unwrap(), "peeking must not consume");
+    assert_eq!(
+        recipient.mail_count().unwrap(),
+        1,
+        "counting must not consume"
+    );
     assert_eq!(recipient.drain().unwrap()[0].text, "peek");
     let large = "x".repeat(MAX_TEXT);
     let mut accepted = 0;

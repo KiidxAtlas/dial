@@ -169,7 +169,13 @@ partial. A protocol-result artifact is labelled complete only if its retention w
 
 The browser tool provisions its own pinned Playwright-core, Readability, and Chromium into a private
 owner-only cache on first use (`bun install --frozen-lockfile --ignore-scripts`, then Chromium install);
-no operator setup is required. Cached JavaScript dependencies can be used offline with an installed
+no operator setup is required. Bun comes from `DIAL_BUN`, Dial's own install (`~/.dial/tools/bun`) or
+`PATH`. If none has it, the first browser use that needs to install dependencies installs Bun through
+the same recipe as `/setup bun yes` (npm into Dial's tools directory, Homebrew, or the pinned
+checksummed release; never sudo). That install is authorized like the browser call's other native
+effects, so plan mode, `readonly` approval and path-scoped browser rules refuse it. A refusal or
+failed install reports the reason and names `/setup bun yes`. With `browser.allow_install = false`,
+Dial neither installs Bun nor fetches dependencies. Cached JavaScript dependencies can be used offline with an installed
 `[browser] chromium_executable` or CDP attach; those modes do not download private Chromium.
 Missing JavaScript dependencies still require registry access, even when attaching to a browser.
 Set `[browser] playwright_module` only to override with an operator-owned Playwright entry

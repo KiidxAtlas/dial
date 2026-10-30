@@ -19,6 +19,12 @@ impl Shell {
     /// Keys for the live home while the input is empty: Down enters its list, Up walks back to the
     /// input, Enter picks, Esc leaves. `None` passes the key on; `Some(Some(command))` asks to run it.
     pub(super) fn home_key(&mut self, key: &crossterm::event::KeyEvent) -> Option<Option<String>> {
+        if let Some(command) = self.extension_keys.key(*key, &self.keys) {
+            return Some(Some(command));
+        }
+        if self.extension_views.key(*key, &self.keys) {
+            return Some(None);
+        }
         let home = self.home.as_mut()?;
         if !key.modifiers.is_empty()
             || !self.composer.draft().is_empty()
@@ -314,29 +320,7 @@ impl Shell {
             return;
         }
         drop(draft_file);
-        let ran = self.term.suspend(|| {
-            // The editor setting may carry arguments (`code --wait`), so it goes through the shell.
-            #[cfg(unix)]
-            let mut command = {
-                let mut command = Command::new("/bin/sh");
-                command
-                    .arg("-c")
-                    .arg(format!("{editor} \"$1\""))
-                    .arg("dial-editor")
-                    .arg(&path);
-                command
-            };
-            #[cfg(windows)]
-            let mut command = {
-                let mut command = Command::new("pwsh");
-                command
-                    .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
-                    .arg(format!("& {editor} $env:DIAL_EDITOR_FILE"))
-                    .env("DIAL_EDITOR_FILE", &path);
-                command
-            };
-            command.status()
-        });
+        let ran = self.term.suspend(|| run_editor(&editor, &path));
         match ran {
             Ok(Ok(status)) if status.success() => {
                 if let Ok(text) = std::fs::read_to_string(&path) {
@@ -351,6 +335,34 @@ impl Shell {
             Err(error) => self.note("Editor", format!("terminal error: {error:#}")),
         }
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// The editor setting may carry arguments (`code --wait`), so it goes through the shell.
+#[cfg(unix)]
+fn run_editor(editor: &str, path: &std::path::Path) -> std::io::Result<std::process::ExitStatus> {
+    Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$1\""))
+        .arg("dial-editor")
+        .arg(path)
+        .status()
+}
+
+/// The editor setting may carry arguments (`code --wait`), so it goes through PowerShell.
+/// PowerShell 7 (`pwsh`) is an optional install; Windows PowerShell ships with every Windows.
+#[cfg(windows)]
+fn run_editor(editor: &str, path: &std::path::Path) -> std::io::Result<std::process::ExitStatus> {
+    let run = |shell: &str| {
+        Command::new(shell)
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+            .arg(format!("& {editor} $env:DIAL_EDITOR_FILE"))
+            .env("DIAL_EDITOR_FILE", path)
+            .status()
+    };
+    match run("pwsh") {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => run("powershell.exe"),
+        other => other,
     }
 }
 

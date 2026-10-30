@@ -308,7 +308,7 @@ fn start_for_changes(
     paths: &[(PathBuf, u8)],
     output: &mut String,
 ) {
-    let dirs = servers::path_dirs();
+    let dirs = tool.path_dirs();
     for (path, kind) in paths {
         if *kind == 3 || tool.servers.language_for(&path.to_string_lossy()).is_err() {
             continue;
@@ -491,6 +491,8 @@ type Launcher =
 
 pub struct LspTool {
     servers: Servers,
+    /// Standard package-manager bin directories discovered after approval in this session.
+    discovered_bins: Mutex<Vec<PathBuf>>,
     launch: Launcher,
     /// One live client per language, started on first use.
     running: Mutex<HashMap<String, Arc<Client>>>,
@@ -569,8 +571,14 @@ fn workspace_lock<'a>(
 
 /// Installs a missing built-in language server for `abs` the first time it is needed.
 impl LspTool {
+    fn path_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs = servers::path_dirs();
+        dirs.extend(lock(&self.discovered_bins).iter().cloned());
+        dirs
+    }
+
     /// `select_all`, and when no server for the file is installed, installs the first built-in one
-    /// that has a Dial recipe (into Dial's tools directory, never with sudo) and selects again.
+    /// that has a recipe, using its package manager's normal install location (never sudo).
     /// The install is gated like a server start; failures are folded into the original error.
     fn select_all_installing(
         &self,
@@ -579,11 +587,12 @@ impl LspTool {
         cancel: &AtomicBool,
     ) -> Result<Vec<Resolved>, String> {
         let root = ctx.workspace.root();
-        let error = match self.servers.select_all(root, abs, &servers::path_dirs()) {
+        let dirs = self.path_dirs();
+        let error = match self.servers.select_all(root, abs, &dirs) {
             Ok(found) => return Ok(found),
             Err(error) => error,
         };
-        let wanted = self.servers.installable(root, abs, &servers::path_dirs());
+        let wanted = self.servers.installable(root, abs, &dirs);
         if wanted.is_empty() {
             return Err(error);
         }
@@ -592,14 +601,29 @@ impl LspTool {
         let mut failures = Vec::new();
         for program in &wanted {
             check_cancel(cancel)?;
-            match crate::setup::deps::run::install_with_requirements(
-                program,
-                &env,
-                cancel,
-                &mut |_| {},
-            ) {
-                Ok(_) => {
-                    return self.servers.select_all(root, abs, &servers::path_dirs());
+            let target = crate::setup::deps::recipe(program)
+                .ok_or_else(|| format!("no install recipe for {program}"))?;
+            let installed =
+                crate::setup::deps::run::standard_location(target, &env).and_then(|existing| {
+                    match existing {
+                        Some(path) => Ok(path),
+                        None => crate::setup::deps::run::install_with_requirements(
+                            program,
+                            &env,
+                            cancel,
+                            &mut |_| {},
+                        ),
+                    }
+                });
+            match installed {
+                Ok(location) => {
+                    if let Some(bin) = location.parent() {
+                        let mut discovered = lock(&self.discovered_bins);
+                        if !discovered.iter().any(|known| known == bin) {
+                            discovered.push(bin.to_owned());
+                        }
+                    }
+                    return self.servers.select_all(root, abs, &self.path_dirs());
                 }
                 Err(failure) => failures.push(format!("{program}: {failure:#}")),
             }
@@ -638,6 +662,7 @@ impl LspTool {
     fn with_launcher(config: &LspConfig, launch: BoxedLauncher) -> Self {
         Self {
             servers: Servers::new(config),
+            discovered_bins: Mutex::new(Vec::new()),
             launch: Arc::from(launch),
             running: Mutex::new(HashMap::new()),
             starting: Mutex::new(None),
@@ -746,10 +771,7 @@ impl LspTool {
             if self.servers.names_for(&source.to_string_lossy()).is_err() {
                 continue;
             }
-            for server in self
-                .servers
-                .select_all(ws.root(), source, &servers::path_dirs())?
-            {
+            for server in self.select_all_installing(ctx, source, cancel)? {
                 match resolved.iter().position(|known| *known == server) {
                     Some(slot) => routed[slot].push(index),
                     None => {
@@ -980,9 +1002,7 @@ impl LspTool {
         }
         // Startup/reload can execute project code too, so own the workspace barrier before it.
         let _workspace = workspace_lock(ws, cancel)?;
-        let server = self
-            .servers
-            .select(ws.root(), &abs, &servers::path_dirs())?;
+        let server = selected.first().ok_or("no language server selected")?;
         if action == Action::Reload {
             ctx.authorize_mutation("lsp", &[], true)?;
         }
@@ -1000,7 +1020,7 @@ impl LspTool {
             }
         }
         check_cancel(cancel)?;
-        let client = self.client(ctx, &server, cancel)?;
+        let client = self.client(ctx, server, cancel)?;
         check_cancel(cancel)?;
         if action == Action::Reload {
             return Ok(
@@ -1665,6 +1685,7 @@ impl Tool for LspTool {
     fn fork_session(&self) -> Option<Arc<dyn Tool>> {
         Some(Arc::new_cyclic(|owner| Self {
             servers: self.servers.clone(),
+            discovered_bins: Mutex::new(lock(&self.discovered_bins).clone()),
             launch: Arc::clone(&self.launch),
             running: Mutex::new(HashMap::new()),
             starting: Mutex::new(None),

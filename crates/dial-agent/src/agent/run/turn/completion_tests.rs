@@ -176,6 +176,7 @@ fn exhausted_step_budget_retains_rejected_candidate_and_missing_prerequisite() {
             .turn("Report the rendered result", &mut NullUi)
             .unwrap();
         assert_eq!(report.outcome, TurnOutcome::Incomplete, "{}", report.text);
+        assert!(agent.session.custom_records("training_turn").is_empty());
         assert!(
             report
                 .text
@@ -186,4 +187,72 @@ fn exhausted_step_budget_retains_rejected_candidate_and_missing_prerequisite() {
         assert!(report.text.contains("rendered"), "{}", report.text);
     });
     assert_eq!(completion_requests(&server).len(), 1);
+}
+
+#[test]
+fn hosted_turn_without_store_retains_exact_requests_and_original_identity() {
+    let server = llm::fake::serve(vec![
+        response("", Some(("read", json!({"path":"input.txt"})))),
+        llm::fake::json(200, &json!({"total_slots":1})),
+        response("The input says ready.", None),
+    ]);
+    with_agent("[compaction]\nenabled=false", |agent| {
+        std::fs::write(agent.workspace.root().join("input.txt"), "ready\n").unwrap();
+        connect(agent, &server.url);
+        assert!(agent.store.is_none());
+        let report = agent.turn("Read input.txt", &mut NullUi).unwrap();
+        assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+        assert!(!agent.logging, "retention must not enable event logging");
+        let records = agent.session.custom_records("training_turn");
+        assert_eq!(records.len(), 1);
+        let record = &records[0].1;
+        assert_eq!(record["version"], 1);
+        assert_eq!(record["source_session"], agent.session.id());
+        let user_entry = agent
+            .session
+            .branchable_user_messages()
+            .into_iter()
+            .find(|(_, text)| text == "Read input.txt")
+            .unwrap()
+            .0;
+        assert_eq!(record["source_turn"], user_entry);
+        let selection = agent.effective_config().selection();
+        assert_eq!(
+            record["source_model"],
+            format!("{}/{}", selection.provider, selection.model)
+        );
+        assert!(record.get("source_state").is_none());
+        assert!(record.get("source_trajectory").is_none());
+        assert_eq!(record["prompt"], "Read input.txt");
+        let requests = completion_requests(&server);
+        let examples = record["payload"]["examples"].as_array().unwrap();
+        assert_eq!(examples.len(), 2);
+        assert_eq!(requests.len(), examples.len());
+        for (example, request) in examples.iter().zip(&requests) {
+            let messages = example["messages"].as_array().unwrap();
+            let context: Vec<_> = request["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(llm::messages::canonical)
+                .collect();
+            assert_eq!(&messages[..messages.len() - 1], context.as_slice());
+            assert_eq!(example["tools"], request["tools"]);
+        }
+        assert_eq!(
+            examples[0]["messages"].as_array().unwrap().last().unwrap()["tool_calls"][0]["function"]
+                ["name"],
+            "read"
+        );
+        assert_eq!(
+            examples[1]["messages"].as_array().unwrap().last().unwrap()["content"],
+            "The input says ready."
+        );
+        let reopened =
+            crate::storage::session::Session::read(agent.session.path().unwrap()).unwrap();
+        assert_eq!(reopened.custom_records("training_turn"), records);
+        let fork = agent.session.fork(agent.layout.as_ref().unwrap()).unwrap();
+        assert_ne!(fork.id(), agent.session.id());
+        assert_eq!(fork.custom_records("training_turn"), records);
+    });
 }

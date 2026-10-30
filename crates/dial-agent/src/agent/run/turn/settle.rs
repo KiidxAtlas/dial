@@ -456,7 +456,7 @@ impl Agent<'_> {
                     .step_checks
                     .visual
                     .summary(finish.text, self.step_checks.revision());
-                if self.logging {
+                if self.capture_training_requests() {
                     self.training_capture.record(
                         &context_before,
                         &request_tools,
@@ -486,7 +486,7 @@ impl Agent<'_> {
         if self.take_steering(ui)? {
             turn.steering_pending = true;
         }
-        if form_kinds.is_empty() && !execution_failed && self.logging {
+        if form_kinds.is_empty() && !execution_failed && self.capture_training_requests() {
             self.training_capture.record(
                 &context_before,
                 &request_tools,

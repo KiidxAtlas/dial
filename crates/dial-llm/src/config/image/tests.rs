@@ -141,3 +141,72 @@ fn panel_entry_reuses_the_existing_key_or_derives_a_stable_bare_one() {
     config.models.insert("mine".into(), mine.clone());
     assert_eq!(config.entry_for("org/model"), ("mine".into(), mine));
 }
+
+#[test]
+fn native_protocols_and_provider_inputs_round_trip_without_changing_legacy_defaults() {
+    assert_eq!(ImageConfig::default().api, None);
+    for api in [
+        "images",
+        "mlx-serve",
+        "gemini",
+        "imagen",
+        "black-forest-labs",
+        "comfyui",
+        "fal",
+        "replicate",
+        "disabled",
+    ] {
+        let text = format!(
+            "api = {api:?}\n[models.native]\nmodel = 'owner/model'\ninput = {{ guidance_scale = 3.5, nested = {{ enabled = true }} }}\n"
+        );
+        let config: ImageConfig = toml::from_str(&text).unwrap();
+        config.validate().unwrap();
+        assert_eq!(api_name(config.api), api);
+        let saved = toml::to_string(&config).unwrap();
+        assert_eq!(toml::from_str::<ImageConfig>(&saved).unwrap(), config);
+    }
+    assert_eq!(toml::from_str::<ImageConfig>("api = ''").unwrap().api, None);
+    assert!(toml::from_str::<ImageConfig>("api = 'imaginary'").is_err());
+    assert!(toml::from_str::<ImageConfig>("[models.a]\nmodel='m'\nunknown=true").is_err());
+}
+
+#[test]
+fn comfy_workflow_validates_both_nodes_and_round_trips() {
+    let graph = serde_json::json!({
+        "6": {"class_type":"CLIPTextEncode", "inputs":{"text":"old prompt"}},
+        "9": {"class_type":"SaveImage", "inputs":{"images":["8",0]}}
+    });
+    let workflow = ComfyWorkflow {
+        workflow: graph,
+        prompt_node: "6".into(),
+        output_node: "9".into(),
+    };
+    workflow.validate().unwrap();
+    let mut model = settings("my-workflow");
+    model.comfyui = Some(workflow.clone());
+    let encoded = toml::to_string(&model).unwrap();
+    assert_eq!(
+        toml::from_str::<ImageModelSettings>(&encoded).unwrap(),
+        model
+    );
+    for invalid in [
+        ComfyWorkflow {
+            prompt_node: "missing".into(),
+            ..workflow.clone()
+        },
+        ComfyWorkflow {
+            output_node: "missing".into(),
+            ..workflow.clone()
+        },
+        ComfyWorkflow {
+            workflow: serde_json::json!([]),
+            ..workflow.clone()
+        },
+        ComfyWorkflow {
+            workflow: serde_json::json!({"6":{"inputs":{"text":42}}, "9":{}}),
+            ..workflow
+        },
+    ] {
+        assert!(invalid.validate().is_err(), "accepted {invalid:?}");
+    }
+}

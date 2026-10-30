@@ -1,80 +1,52 @@
-//! Immutable extraction reuse. Identity comes from an opened no-follow regular file,
-//! never from a pathname stat alone. Nothing is published after a revision change.
-use super::{MAX_INPUT, Workspace};
+//! Immutable extraction reuse keyed by the exact authorized source bytes.
+//! Parsers consume a private snapshot, never reopen an independently mutable source path.
+use super::Workspace;
+use crate::tools::knowledge::evidence::source;
 use parking_lot::Mutex;
+use sha2::{Digest, Sha256};
 use std::{
     collections::VecDeque,
-    fs::{File, Metadata},
+    fs::File,
+    io::{Seek, Write},
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Identity {
-    file: crate::platform::FileIdentity,
-    size: u64,
-    modified: std::time::SystemTime,
-}
+pub(super) struct Identity([u8; 32]);
 impl Identity {
-    fn of(file: &File, meta: &Metadata) -> Result<Self, String> {
-        if !meta.is_file() || meta.len() > MAX_INPUT {
-            return Err("rich document must be a regular file no larger than 64 MiB".into());
-        }
-        Ok(Self {
-            file: crate::platform::fs::identity(file).map_err(|e| e.to_string())?,
-            size: meta.len(),
-            modified: meta.modified().map_err(|e| e.to_string())?,
-        })
+    fn of(bytes: &[u8]) -> Self {
+        Self(Sha256::digest(bytes).into())
     }
 }
 pub(super) struct Opened {
-    pub file: File,
     pub path: PathBuf,
     pub identity: Identity,
-}
-fn open_file(ws: &Workspace, path: &Path) -> Result<File, String> {
-    let relative = path
-        .strip_prefix(ws.root())
-        .map_err(|_| "document is outside the workspace")?;
-    if relative.as_os_str().is_empty() {
-        return Err("document path must name a file".into());
-    }
-    crate::platform::fs::open_beneath(ws.root(), relative, false)
-        .map_err(|e| format!("opening rich document: {e}"))
+    pub bytes: Vec<u8>,
 }
 impl Opened {
     pub fn open(ws: &Workspace, path: &Path) -> Result<Self, String> {
-        // Authorization precedes even a global cache hit.
-        let authorized = ws.resolve(path.to_str().ok_or("document path must be UTF-8")?)?;
-        if authorized != path {
-            return Err("document path changed during resolution".into());
-        }
-        if let Some(crate::tools::exec::sandbox::Policy::Dev { deny_read, .. }) =
-            ws.policy.as_ref().filter(|_| !ws.unsandboxed)
-        {
-            for denied in deny_read {
-                let denied = crate::tools::exec::sandbox::resolve(denied)?;
-                if path.starts_with(denied) {
-                    return Err("document access denied by workspace policy".into());
-                }
-            }
-        }
-        let file = open_file(ws, path)?;
-        let metadata = file.metadata().map_err(|e| e.to_string())?;
-        let identity = Identity::of(&file, &metadata)?;
+        let input = path.to_str().ok_or("document path must be UTF-8")?;
+        let bytes = source::read(ws, input).map_err(|e| format!("{e:#}"))?;
         Ok(Self {
-            file,
+            identity: Identity::of(&bytes),
+            bytes,
             path: path.to_owned(),
-            identity,
         })
     }
+
+    /// A seekable private copy for parsers that require a file descriptor.
+    pub fn file(&self) -> Result<File, String> {
+        let mut file = tempfile::tempfile().map_err(|e| e.to_string())?;
+        file.write_all(&self.bytes).map_err(|e| e.to_string())?;
+        file.rewind().map_err(|e| e.to_string())?;
+        Ok(file)
+    }
+
     pub fn validate(&self, ws: &Workspace) -> Result<(), String> {
-        if Identity::of(
-            &self.file,
-            &self.file.metadata().map_err(|e| e.to_string())?,
-        )? != self.identity
-            || Self::open(ws, &self.path)?.identity != self.identity
-        {
+        let input = self.path.to_str().ok_or("document path must be UTF-8")?;
+        let bytes = source::read(ws, input).map_err(|e| format!("{e:#}"))?;
+        if Identity::of(&bytes) != self.identity {
             return Err("rich document changed while reading; retry the read".into());
         }
         Ok(())

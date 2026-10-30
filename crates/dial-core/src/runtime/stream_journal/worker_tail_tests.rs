@@ -91,7 +91,31 @@ fn worker_failed_append_is_not_visible_and_latches_later_updates() {
     worker.settle("not published either".into(), None, Phase::Completed);
     assert!(tree.check_persistence().is_err());
     assert_eq!(worker.snapshot(), before);
-    assert_eq!(recover(&session).unwrap(), vec![before]);
+    assert_eq!(recover(&session).unwrap(), vec![before.clone()]);
+
+    // A retry that still cannot access storage must leave publication latched.
+    let stream = path(&session);
+    let saved = root.path().join("saved.streams");
+    std::fs::rename(&stream, &saved).unwrap();
+    assert!(journal.retry_failed_write().is_err());
+    assert!(tree.check_persistence().is_err());
+    std::fs::rename(&saved, &stream).unwrap();
+    // Model a short write: the failed row must not swallow the next complete frame.
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&stream)
+        .unwrap()
+        .write_all(b"{\"kind\":\"append\",\"id\":\"torn")
+        .unwrap();
+    let alias = Journal::open(&session).unwrap();
+    alias.retry_failed_write().unwrap();
+    journal.check().unwrap();
+    assert_eq!(worker.snapshot(), before);
+    worker.append(" resumed");
+    worker.settle("finished after recovery".into(), None, Phase::Completed);
+    assert_eq!(recover(&session).unwrap(), vec![worker.snapshot()]);
+    assert_eq!(worker.snapshot().result.text, "finished after recovery");
+    alias.retry_failed_write().unwrap();
 }
 
 #[test]

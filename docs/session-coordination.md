@@ -9,13 +9,15 @@ work or infer semantic dependencies between tasks.
 
 ```text
 /peers
+/peers list
 /peers claim crates/example/src 'docs/a page.md'
 /peers send <id> I am changing the parser; please leave its public interface stable.
 /peers clear
 ```
 
-- Bare `/peers` lists live peers and this session's own peer ID. Independent sessions are not
-  delegated workers: use `/peers`, not the worker messaging controls, to reach another tab.
+- Bare `/peers` opens the peers panel (see below). `/peers list` prints the same roster to the
+  transcript as text, with every live peer's full ID and this session's own. Independent sessions
+  are not delegated workers: use `/peers`, not the worker messaging controls, to reach another tab.
 - `claim` replaces this session's advisory relative-path scopes. Quote paths containing spaces.
   Claims communicate intended ownership; they are not locks, edit permissions or exclusive access.
   Claims last through the next turn and clear when that turn becomes idle; use `clear` to release
@@ -26,10 +28,35 @@ work or infer semantic dependencies between tasks.
   can also wake an eligible idle conversation (see below). Queuing is not acknowledgement.
 - `clear` clears this session's claimed scopes, not its conversation or another peer's state.
 
-These commands use ordinary transcript notices, not a separate panel. During a running turn they
-wait for the turn to finish. The model-facing `peers` tool exposes the same operations:
+The subcommands write ordinary transcript notices. During a running turn, `/peers` and its
+subcommands wait for the turn to finish. The model-facing `peers` tool exposes the same operations:
 `action="list"` (the default), `claim` with `scopes` and optional `summary`, `send` with `to` and
 `text`, and `clear`.
+
+Automatic model-facing roster notes are a bounded coordination preview, not a repeated full peer
+inventory: at most eight identities/lifecycle states, overlapping peers first, with at most four
+overlapping scopes per previewed peer and explicit omitted counts. Unrelated peers' changing task
+summaries do not regenerate that note. Explicit `peers list`, slash-command rosters and the panel
+retain the full view; fresh peer messages are delivered independently and are never hidden by roster
+deduplication.
+
+### The peers panel
+
+Bare `/peers` opens a board of the sessions in this checkout:
+
+- **This session**: its short peer ID, phase (`working` or `idle`), task summary and claims, plus
+  the inbox: how many peer messages are queued for this session that its model has not received
+  yet. Opening the panel only counts them; they are still delivered at the next model request.
+- **Other sessions**: every live peer with its short ID, phase, task summary and claims.
+- Claims that overlap a claim on the other side (one path contains the other, compared by path
+  component) are marked with a warning sign and the warning color. The title shows the peer
+  count, how many peers overlap this session's claims, and the unread count.
+
+Keys: `↑`/`↓` (or `Home`/`End`) select a peer; `Enter` or `m` writes a one-line message to the
+selected peer (`Enter` sends, `Esc` cancels the message); `r` refreshes; `c` clears this
+session's own claims; `Esc` closes. The panel is a snapshot taken when it opens and after each
+action: it does not poll, so press `r` to see newer peer state. Each send or clear reports its
+outcome in the panel. The panel never changes another session's claims.
 
 ## Task-scoped guidance and idle wake-ups
 

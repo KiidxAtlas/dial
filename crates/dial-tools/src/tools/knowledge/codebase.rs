@@ -471,9 +471,27 @@ const GENERIC_PATH_TOKENS: [&str; 12] = [
 ];
 /// Below this many indexed files every path token stays distinctive.
 const COMMON_PATH_MIN_FILES: usize = 20;
-/// Queries with at most this many terms are short and deliberate: one shared word can locate a
-/// file. Longer task prompts share some word with almost every outline by chance.
+/// Short queries deliberately name a subject. Longer prompts need several independent matches;
+/// a path component such as `session` alone must not admit a whole subsystem.
 const SHORT_QUERY_TERMS: usize = 6;
+
+/// Ambient context is optional: conversational glue must not select repository evidence.
+/// Explicit recall and navigation keep their broader token vocabulary.
+pub(super) fn ambient_terms(query: &str) -> BTreeSet<String> {
+    navigation::tokens(query)
+        .into_iter()
+        .filter(|term| crate::storage::memory_backend::ambient_term(term))
+        .collect()
+}
+
+pub(super) fn ambient_overlap(query: &str, overlap: usize) -> bool {
+    let required = if navigation::tokens(query).len() > SHORT_QUERY_TERMS {
+        ambient_terms(query).len().clamp(2, 3)
+    } else {
+        1
+    };
+    overlap >= required
+}
 
 fn auxiliary(path: &str) -> bool {
     navigation::tokens(path)
@@ -555,14 +573,13 @@ fn path_relevance(
     rank
 }
 
-/// Ambient admission for one indexed file. In a long task prompt one shared outline word is
-/// incidental: a file needs a distinctive path match or two shared outline words. Test, benchmark
-/// and fixture sources need to be named, or a task about tests and a distinctive path match.
+/// A literal file name is deliberate. Otherwise long prompts need distinct matching vocabulary
+/// across the path and outline, not the same incidental word counted twice.
 fn ambient_file(
     query: &str,
     path: &str,
     terms: &BTreeSet<String>,
-    outline_overlap: usize,
+    evidence_overlap: usize,
     path_rank: usize,
 ) -> bool {
     if auxiliary(path) {
@@ -570,12 +587,9 @@ fn ambient_file(
         return names_file(&query.to_lowercase(), &path.to_lowercase())
             || (wants_auxiliary && path_rank > 0);
     }
-    let min_overlap = if terms.len() > SHORT_QUERY_TERMS {
-        2
-    } else {
-        1
-    };
-    path_rank > 0 || outline_overlap >= min_overlap
+    names_file(&query.to_lowercase(), &path.to_lowercase())
+        || (navigation::tokens(query).len() <= SHORT_QUERY_TERMS && path_rank > 0)
+        || ambient_overlap(query, evidence_overlap)
 }
 
 fn document(path: &Path) -> bool {
@@ -991,7 +1005,12 @@ impl Codebase {
     }
 
     fn context_inner(&self, query: &str, max_bytes: usize, scoped: bool) -> Result<String> {
-        if scoped && navigation::tokens(query).is_empty() {
+        let terms = if scoped {
+            ambient_terms(query)
+        } else {
+            navigation::tokens(query)
+        };
+        if scoped && terms.is_empty() {
             return Ok(String::new());
         }
         let snapshot = self.freshness_snapshot()?;
@@ -1001,7 +1020,6 @@ impl Codebase {
             max_bytes
         };
         let conn = self.conn.lock();
-        let terms = navigation::tokens(query);
         let score = |text: &str| navigation::tokens(text).intersection(&terms).count();
         let mut checked = BTreeMap::<String, Option<String>>::new();
         let mut fresh = |sources: &[Source]| {
@@ -1047,6 +1065,14 @@ impl Codebase {
             }
             let sources: Vec<Source> = serde_json::from_str(&raw_sources)?;
             let rank = score(&format!("{topic} {content} {raw_sources}"));
+            if scoped
+                && !ambient_overlap(query, rank)
+                && !sources
+                    .iter()
+                    .any(|source| names_file(&query.to_lowercase(), &source.path.to_lowercase()))
+            {
+                continue;
+            }
             if !terms.is_empty() && rank == 0 {
                 continue;
             }
@@ -1106,15 +1132,21 @@ impl Codebase {
             // text, and prefer files the query names outright ("approval.rs", "src/agent").
             let path_rank = path_relevance(query, &path, &terms, &common);
             let rank = score(&format!("{path} {outline}")) + path_rank;
-            if architecture_document(Path::new(&path)) && (!scoped || rank > 0) {
+            let admitted = if scoped {
+                ambient_file(
+                    query,
+                    &path,
+                    &terms,
+                    score(&format!("{path} {outline}")),
+                    path_rank,
+                )
+            } else {
+                terms.is_empty() || rank > 0 || (!path.contains('/') && document(Path::new(&path)))
+            };
+            if architecture_document(Path::new(&path)) && (!scoped || admitted) {
                 architecture_files.push((rank, path.clone(), digest.clone(), outline.clone()));
             }
             let root_doc = !path.contains('/') && document(Path::new(&path));
-            let admitted = if scoped {
-                ambient_file(query, &path, &terms, score(&outline), path_rank)
-            } else {
-                terms.is_empty() || rank > 0 || root_doc
-            };
             if admitted {
                 ranked_files.push((rank * 10 + usize::from(root_doc) * 5, path, digest, outline));
             }
@@ -1133,6 +1165,20 @@ impl Codebase {
             }]) {
                 continue;
             }
+            let outline = if scoped {
+                let matched = matching_outline(&outline, &terms, AMBIENT_OUTLINE_LINES);
+                if matched.is_empty() {
+                    outline
+                        .lines()
+                        .take(AMBIENT_OUTLINE_LINES)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    matched
+                }
+            } else {
+                outline
+            };
             let row = format!(
                 "Architecture source {}\n",
                 json!({"path":path,"digest":digest,"outline":outline})

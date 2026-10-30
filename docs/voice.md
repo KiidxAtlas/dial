@@ -2,6 +2,14 @@
 
 Voice is off by default. Settings are under the Voice tab in `/settings`, or in `[voice.tts]` and `[voice.stt]` of the config.
 
+Selecting a missing local speech or recognition program in the Voice settings asks whether to
+install and configure it. Press Enter again to confirm, or Esc to cancel. Setup runs in the
+background and selects the backend only after it succeeds; failures and cancellation preserve
+the previous selection. Required local voice/model files are prepared too. Already configured
+backends are selected immediately. OpenAI needs an API key through `/providers`, rather than a
+package install; macOS `say` is supplied by the operating system. Read-aloud and dictation remain
+separate toggles, so installing a backend does not turn on the microphone or automatic speech.
+
 ## Read answers aloud
 
 - `voice.tts.auto_speak = true` reads each final answer aloud when a turn finishes. Answers longer than `voice.tts.auto_speak_max_chars` are cut short.
@@ -13,6 +21,7 @@ Voice is off by default. Settings are under the Voice tab in `/settings`, or in 
 ## Dictation (push-to-talk)
 
 - Turn on `voice.stt.enabled`. The default push-to-talk key is `Option+V` on macOS and `Alt+V` elsewhere. `/hotkeys` shows the active binding, including remaps.
+- On macOS, terminals that send `√` instead of an Alt key event are supported too: Dial treats that key as Option+V while `Alt+V` is bound to dictation. This reserves typed `√` for the shortcut (even when speech recognition is off); bracketed paste still inserts it literally. Remapping dictation away from `Alt+V` disables this fallback. This fallback covers layouts where Option+V produces `√`; other layouts can use `F9` or remap in `/hotkeys`.
 - The transcript is inserted into the draft. It is never sent on its own; review it and press Enter.
 - `voice.stt.backend` picks the program: `auto`, `openai`, `whisper-cpp` (whisper-cli), or `mlx-whisper`.
 

@@ -571,6 +571,19 @@ fn extract_flat_shell_command_segments(command: &str) -> Vec<FlatSegment> {
     segments
 }
 
+/// Flat sequential commands for output classification. Reject pipes and asynchronous jobs: their
+/// interleaved output cannot be attributed to a recognized producer.
+pub(super) fn output_commands(command: &str) -> Option<Vec<String>> {
+    if command.replace("&&", "").contains('&') {
+        return None;
+    }
+    let segments = extract_flat_shell_command_segments(command);
+    if segments.is_empty() || segments.iter().any(|segment| segment.piped_stdin) {
+        return None;
+    }
+    Some(segments.into_iter().map(|segment| segment.text).collect())
+}
+
 /// Finds the end of a shell word, respecting quotes and escapes. `None` for incomplete syntax.
 /// Returns the index of the terminating space/tab, or the length when the word runs to the end.
 fn skip_shell_word(chars: &[char], start: usize) -> Option<usize> {

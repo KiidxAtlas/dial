@@ -77,10 +77,11 @@ const GOALS: &[Goal] = &[
     },
     Goal {
         title: "Manage ongoing work",
-        blurb: "background agents, processes, queued messages and todos",
+        blurb: "background agents, processes, live watch, queued messages and todos",
         commands: &[
             "workers",
             "processes",
+            "watch",
             "todo",
             "queue",
             "goal",

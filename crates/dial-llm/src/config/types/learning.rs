@@ -63,8 +63,10 @@ impl Default for TrainingConfig {
     }
 }
 
-/// Automatic self-improvement. On by default: dial records turns, runs verified self-play on
-/// procedurally generated tasks, and proposes harness and LoRA changes that only a sealed gate can admit.
+/// Explicit self-improvement. Coding sessions never schedule it: cycles run from `/improve cycle`
+/// or `dial improve cycle`, and a background cycle is attempted only when `/improve enable` resumes
+/// the loop for a project. A cycle runs verified self-play on procedurally generated tasks and
+/// proposes harness and LoRA changes that only a sealed gate can admit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ImproveConfig {
@@ -96,7 +98,10 @@ pub struct ImproveConfig {
     pub monitor_drop: f64,
     /// Minimum distinct task-matched prompts before computing a live diagnostic.
     pub monitor_min_turns: u32,
-    /// Run the background cycle at session start/exit, subject to idle, AC-power, budget and /compute pause gates. When false, only `dial improve cycle` runs it.
+    /// Permit an unforced background cycle (the one `/improve enable` tries to start), subject to
+    /// interval, idle, AC-power, budget and /compute pause gates. Session start and exit never
+    /// schedule one, and coding sessions force this off. Explicit `/improve cycle` and
+    /// `dial improve cycle` runs ignore it.
     pub background: bool,
     /// Start a background cycle only after this many minutes without a coding turn (0 = any time).
     pub idle_minutes: u32,

@@ -10,6 +10,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
+mod session_training;
+pub use session_training::SessionTrainingExample;
+
 /// The immutable dataset manifest and incremental cursor associated with an adapter version.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -313,7 +316,11 @@ impl Store {
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
             CREATE INDEX IF NOT EXISTS executable_repairs_project ON executable_repairs(project_root,id);
             CREATE TABLE IF NOT EXISTS trajectory_messages(
-                trajectory INTEGER PRIMARY KEY REFERENCES trajectories(id),payload TEXT NOT NULL);")?;
+                trajectory INTEGER PRIMARY KEY REFERENCES trajectories(id),payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS session_examples(
+                id INTEGER PRIMARY KEY,source_session TEXT NOT NULL,source_turn TEXT NOT NULL,
+                source_model TEXT NOT NULL,payload TEXT NOT NULL,
+                UNIQUE(source_session,source_turn));")?;
         let store = Self { conn };
         let tx = store.transaction()?;
         let binding: Option<String> = tx

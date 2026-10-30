@@ -4,6 +4,8 @@
 //! Chromium live in an owner-only cache directory keyed by a digest of the embedded
 //! manifest. Dependencies are installed with `bun install --frozen-lockfile
 //! --ignore-scripts`, so nothing is fetched into the workspace and no install scripts run.
+//! Bun itself comes from `DIAL_BUN`, Dial's own install or `PATH`; when none has it, the caller
+//! installs it through the `bun` setup recipe (see [`bun_source`]).
 
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -34,15 +36,52 @@ pub(super) struct Runtime {
 }
 
 /// Provision (or reuse) the pinned runtime. Install and download are bounded by their
-/// caps and abort promptly when `interrupt` is set.
-pub(super) fn provision(interrupt: &AtomicBool, allow_install: bool) -> Result<Runtime, String> {
+/// caps and abort promptly when `interrupt` is set. `bun` yields the Bun executable and is
+/// called only when the JavaScript dependencies actually need installing.
+pub(super) fn provision(
+    interrupt: &AtomicBool,
+    allow_install: bool,
+    bun: impl FnOnce() -> Result<PathBuf, String>,
+) -> Result<Runtime, String> {
     let root = cache_root()?.join(digest_dir());
     if !allow_install {
         return cached();
     }
-    provision_at(&root, interrupt, || {
-        hosts_reachable(&["registry.npmjs.org:443"])
-    })
+    provision_at(
+        &root,
+        interrupt,
+        || hosts_reachable(&["registry.npmjs.org:443"]),
+        bun,
+    )
+}
+
+/// Where Bun for dependency installation comes from.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum BunSource {
+    /// An executable to run: `DIAL_BUN`, then Dial's own install, then `PATH`.
+    Ready(PathBuf),
+    /// No Bun anywhere: install it with the `bun` setup recipe (after authorization).
+    Install,
+}
+
+/// Pure decision over the `DIAL_BUN` override and the dependency environment.
+pub(super) fn bun_source(
+    override_path: Option<std::ffi::OsString>,
+    env: &crate::setup::deps::Env,
+) -> BunSource {
+    if let Some(path) = override_path.filter(|path| !path.is_empty()) {
+        return BunSource::Ready(PathBuf::from(path));
+    }
+    crate::setup::deps::recipe("bun")
+        .and_then(|recipe| crate::setup::deps::locate(recipe, env))
+        .map_or(BunSource::Install, BunSource::Ready)
+}
+
+/// The error for a missing Bun that could not be installed automatically.
+pub(super) fn bun_unavailable(reason: &str) -> String {
+    format!(
+        "browser runtime needs Bun to install its pinned dependencies, and Bun is not installed ({reason}); run `/setup bun yes` (or `dial setup`), or set DIAL_BUN to a Bun executable"
+    )
 }
 
 /// Inspect existing files only: never contact a service, require JS, install or launch Chromium.
@@ -63,6 +102,7 @@ fn provision_at(
     root: &Path,
     interrupt: &AtomicBool,
     reachable: impl FnOnce() -> bool,
+    bun: impl FnOnce() -> Result<PathBuf, String>,
 ) -> Result<Runtime, String> {
     let runtime = layout(root);
     ensure_fetchable(dependencies_cached(&runtime), reachable)?;
@@ -79,7 +119,7 @@ fn provision_at(
             .map_err(|e| format!("restricting private browser runtime file: {e}"))?;
     }
     if !dependencies_cached(&runtime) {
-        let mut command = Command::new(bun());
+        let mut command = Command::new(bun()?);
         command
             .current_dir(root)
             .args(["install", "--frozen-lockfile", "--ignore-scripts"]);
@@ -197,12 +237,6 @@ fn cache_root() -> Result<PathBuf, String> {
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
         .ok_or("cannot determine private browser runtime cache directory")?;
     Ok(base.join("dial").join("browser-runtime"))
-}
-
-fn bun() -> PathBuf {
-    std::env::var_os("DIAL_BUN")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(if cfg!(windows) { "bun.exe" } else { "bun" }))
 }
 
 /// Run a provisioning command in its own process group, bounded by `cap` and `interrupt`.

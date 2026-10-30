@@ -20,6 +20,28 @@ fn ssh_url_file_reads_require_approval() {
         &json!({"path":"src/main.rs"})
     ));
 }
+
+#[test]
+fn external_media_reads_are_not_plan_safe_or_parallel_reads() {
+    let registry = Registry::new();
+    for path in [
+        "clip.mp4",
+        "clip.MOV:01:23",
+        "photo.heic",
+        "a.pdf:page=2:img",
+    ] {
+        for args in [json!({"path":path}), json!({"paths":["a.rs",path]})] {
+            assert!(!is_read_only(&registry, "read", &args), "{args}");
+            assert!(!parallel_read(&registry, "read", &args), "{args}");
+        }
+    }
+    for path in ["photo.png", "drawing.svg:img", "a.rs:1-20"] {
+        assert!(
+            is_read_only(&registry, "read", &json!({"path":path})),
+            "{path}"
+        );
+    }
+}
 #[test]
 fn shell_inspection_is_conservative() {
     for text in [
@@ -237,6 +259,77 @@ fn always_allow_is_scoped_and_deny_wins_even_in_auto_mode() {
         ),
         Err(Denial::ReadOnly)
     ));
+}
+
+#[test]
+fn monitor_start_requires_fresh_confirmation_even_with_auto_or_reusable_grants() {
+    struct Confirm {
+        calls: usize,
+        decision: Decision,
+    }
+    impl Ui for Confirm {
+        fn approve(&mut self, _: &str, _: &str) -> Decision {
+            self.calls += 1;
+            self.decision
+        }
+    }
+    let call = file_call(
+        "monitor",
+        json!({"action":"start", "name":"site", "path":"site.log"}),
+    );
+    for mode in [Approval::Auto, Approval::Write, Approval::Ask] {
+        let mut rules = vec![rule(Effect::Allow, "monitor", &[])];
+        let mut ui = Confirm {
+            calls: 0,
+            decision: Decision::AllowAlways,
+        };
+        for _ in 0..2 {
+            assert!(matches!(
+                authorize(mode, &mut rules, Path::new("/p"), &call, "", &mut ui),
+                Ok(false)
+            ));
+        }
+        assert_eq!(ui.calls, 2);
+        assert_eq!(
+            rules.len(),
+            1,
+            "watch approval must not create reusable grants"
+        );
+        ui.decision = Decision::Deny;
+        assert!(matches!(
+            authorize(mode, &mut rules, Path::new("/p"), &call, "", &mut ui),
+            Err(Denial::User)
+        ));
+    }
+    let mut rules = vec![rule(Effect::Deny, "monitor", &[])];
+    let mut ui = Confirm {
+        calls: 0,
+        decision: Decision::Allow,
+    };
+    assert!(matches!(
+        authorize(
+            Approval::Auto,
+            &mut rules,
+            Path::new("/p"),
+            &call,
+            "",
+            &mut ui
+        ),
+        Err(Denial::Rule)
+    ));
+    rules.clear();
+    assert!(matches!(
+        authorize(
+            Approval::Readonly,
+            &mut rules,
+            Path::new("/p"),
+            &call,
+            "",
+            &mut ui
+        ),
+        Err(Denial::ReadOnly)
+    ));
+    assert_eq!(ui.calls, 0);
 }
 
 #[test]
@@ -537,4 +630,34 @@ fn policy_prompt_and_cancelled_reusable_response_do_not_create_grants() {
         ui.1,
         [PolicyReason::PromptRequired, PolicyReason::Cancelled]
     );
+}
+
+#[test]
+fn finite_batch_surface_never_converts_persistent_choices_into_grants() {
+    struct Prompt(Decision, usize);
+    impl Ui for Prompt {
+        fn approve(&mut self, _: &str, _: &str) -> Decision {
+            self.1 += 1;
+            self.0
+        }
+    }
+    let calls = vec![bash("first"), bash("second")];
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    for (decision, allowed) in [
+        (Decision::Allow, true),
+        (Decision::AllowAlways, false),
+        (Decision::AllowProject, false),
+        (Decision::Deny, false),
+    ] {
+        let mut ui = Prompt(decision, 0);
+        assert_eq!(ui.approve_batch(&calls, &cancel), vec![allowed; 2]);
+        assert_eq!(
+            ui.1, 1,
+            "one real approval surface call for the finite batch"
+        );
+    }
+    cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut ui = Prompt(Decision::Allow, 0);
+    assert_eq!(ui.approve_batch(&calls, &cancel), vec![false; 2]);
+    assert_eq!(ui.1, 0, "cancelled batch must not prompt");
 }

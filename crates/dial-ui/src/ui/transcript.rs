@@ -1042,6 +1042,11 @@ impl Transcript {
         self.blocks.iter().any(|b| matches!(b.kind, Kind::User(_)))
     }
 
+    /// How many blocks the conversation holds; it grows whenever something new is shown.
+    pub fn block_count(&self) -> usize {
+        self.blocks.len()
+    }
+
     /// A new model request begins: whatever prose streamed so far is a finished message, so the next
     /// reply starts its own block instead of continuing the previous sentence.
     pub fn end_text(&mut self) {

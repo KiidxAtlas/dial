@@ -30,6 +30,9 @@ dial-agent = { path = "crates/dial-agent" }
 dial-ui = { path = "crates/dial-ui", default-features = false }
 dial-app = { path = "crates/dial-app" }
 anyhow = "1"
+csv = "1"
+bigdecimal = "0.4"
+time = { version = "0.3", features = ["parsing", "formatting"] }
 vt100 = "0.15"
 thiserror = "2"
 unicode-normalization = "0.1"
@@ -39,7 +42,7 @@ fs2 = "0.4"
 rand = "0.9"
 libc = "0.2"
 socket2 = { version = "0.6", features = ["all"] }
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled", "hooks", "limits"] }
 serde = { version = "1", features = ["derive"] }
 ureq = { version = "3", features = ["json"] }
 url = "2"

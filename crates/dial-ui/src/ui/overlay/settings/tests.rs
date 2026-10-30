@@ -2017,3 +2017,100 @@ fn scalar_override_still_starts_from_inherited_effective_value() {
     crate::config::schema::set(&mut o.effective, def.path, value.clone());
     assert_eq!(o.edit_seed(def), value);
 }
+
+#[test]
+fn voice_choices_confirm_install_without_changing_selection() {
+    let rig = Rig::new();
+    for path in ["voice.tts.backend", "voice.stt.backend"] {
+        let mut o = overlay();
+        o.scope = Scope::Project;
+        let value = if path == "voice.tts.backend" {
+            "piper"
+        } else {
+            "whisper-cpp"
+        };
+        o.set_value_choices(BTreeMap::from([(
+            path.into(),
+            vec![ValueChoice {
+                value: value.into(),
+                label: "Missing backend".into(),
+                action: ChoiceAction::Install {
+                    preview: "Install runtime and voice model".into(),
+                },
+            }],
+        )]));
+        goto(&mut o, &rig.keys, path);
+        let previous = o.current_path(path);
+        send(&mut o, &rig.keys, key(KeyCode::Enter));
+        // The current Auto choice follows the missing choice supplied by the controller.
+        send(&mut o, &rig.keys, key(KeyCode::Home));
+        send(&mut o, &rig.keys, key(KeyCode::Char('M')));
+        assert!(matches!(
+            send(&mut o, &rig.keys, key(KeyCode::Enter)),
+            OverlayEvent::None
+        ));
+        assert_eq!(o.current_path(path), previous);
+        assert!(matches!(o.mode, Mode::Pick { .. }));
+        assert!(draw(&mut o, &rig, 120, 32).contains("Enter again"));
+        send(&mut o, &rig.keys, key(KeyCode::Esc));
+        assert!(o.download_armed.is_none());
+        assert_eq!(o.current_path(path), previous);
+        send(&mut o, &rig.keys, key(KeyCode::Enter));
+        send(&mut o, &rig.keys, key(KeyCode::Home));
+        assert!(matches!(
+            send(&mut o, &rig.keys, key(KeyCode::Enter)),
+            OverlayEvent::None
+        ));
+        assert!(matches!(send(&mut o, &rig.keys, key(KeyCode::Enter)),
+            OverlayEvent::InstallVoice { path: picked, value: backend, scope: Scope::Project }
+                if picked == path && backend == value));
+        assert_eq!(
+            o.current_path(path),
+            previous,
+            "controller saves only after success"
+        );
+    }
+}
+
+#[test]
+fn voice_choices_reuse_ready_backends_and_explain_manual_setup() {
+    let rig = Rig::new();
+    let mut o = overlay();
+    o.set_value_choices(BTreeMap::from([(
+        "voice.tts.backend".into(),
+        vec![
+            ValueChoice {
+                value: "espeak".into(),
+                label: "Ready".into(),
+                action: ChoiceAction::Set,
+            },
+            ValueChoice {
+                value: "openai".into(),
+                label: "OpenAI".into(),
+                action: ChoiceAction::Unavailable {
+                    reason: "Configure an API key in Providers".into(),
+                },
+            },
+        ],
+    )]));
+    goto(&mut o, &rig.keys, "voice.tts.backend");
+    send(&mut o, &rig.keys, key(KeyCode::Enter));
+    send(&mut o, &rig.keys, key(KeyCode::Home));
+    send(&mut o, &rig.keys, key(KeyCode::Down));
+    assert!(matches!(
+        send(&mut o, &rig.keys, key(KeyCode::Enter)),
+        OverlayEvent::None
+    ));
+    assert_eq!(
+        o.feedback.as_deref(),
+        Some("Configure an API key in Providers")
+    );
+    assert!(matches!(
+        send(&mut o, &rig.keys, key(KeyCode::Enter)),
+        OverlayEvent::None
+    ));
+    send(&mut o, &rig.keys, key(KeyCode::Home));
+    let (path, value, _) = expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
+    assert_eq!(path, "voice.tts.backend");
+    assert_eq!(value.as_str(), Some("espeak"));
+}

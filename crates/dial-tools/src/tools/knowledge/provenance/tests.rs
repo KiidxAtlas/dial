@@ -774,3 +774,95 @@ fn clear_scope_redacts_project_entries_without_touching_global_memory() {
             .contains("Project fact to clear")
     );
 }
+
+#[test]
+fn automatic_notes_abstain_on_glue_and_incidental_session_matches() {
+    let (_home, _project, layout) = layout();
+    let memory = ProvenanceMemory::open(&layout).unwrap();
+    memory
+        .retain(
+            Scope::Project,
+            "You can fix all of these session archives.",
+            "report",
+            "session",
+            None,
+        )
+        .unwrap();
+    for query in [
+        "can you fix all of these",
+        "look at ur current session check if anything flooded your context",
+    ] {
+        assert!(
+            memory.context_lookup(query, 8, 6000).unwrap().is_empty(),
+            "{query}"
+        );
+    }
+    assert!(
+        !memory
+            .context_lookup("session archives", 8, 6000)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !memory
+            .recall("can", None, 8, 6000)
+            .unwrap()
+            .entries
+            .is_empty(),
+        "explicit recall keeps its full vocabulary"
+    );
+}
+
+#[test]
+fn automatic_notes_preserve_identifier_candidates() {
+    let (_home, _project, layout) = layout();
+    let memory = ProvenanceMemory::open(&layout).unwrap();
+    for identifier in ["takePresented", "take_presented"] {
+        memory
+            .retain(
+                Scope::Project,
+                &format!("{identifier} requires complete capture"),
+                "report",
+                "session",
+                None,
+            )
+            .unwrap();
+        assert!(
+            memory
+                .context_lookup(identifier, 8, 6000)
+                .unwrap()
+                .contains(identifier)
+        );
+    }
+}
+
+#[test]
+fn automatic_notes_require_more_than_two_generic_matches_in_a_long_prompt() {
+    let (_home, _project, layout) = layout();
+    let memory = ProvenanceMemory::open(&layout).unwrap();
+    memory
+        .retain(
+            Scope::Global,
+            "Image generation context is scoped to a session.",
+            "report",
+            "session",
+            None,
+        )
+        .unwrap();
+    let query = "from your current session did you see or put anything in your context that would be better if collapsed";
+    assert!(memory.context_lookup(query, 8, 6000).unwrap().is_empty());
+    assert!(
+        !memory
+            .context_lookup("image generation", 8, 6000)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        memory
+            .recall("context session", None, 8, 6000)
+            .unwrap()
+            .entries
+            .len(),
+        1
+    );
+}

@@ -16,6 +16,33 @@ pub struct ToolOutput {
 }
 
 impl ToolOutput {
+    /// Attach validated evidence without replacing another producer's data or execution facts.
+    pub fn with_evidence(
+        mut self,
+        evidence: super::evidence::EvidenceBundle,
+    ) -> anyhow::Result<Self> {
+        evidence.validate()?;
+        let data = self.data.get_or_insert_with(|| serde_json::json!({}));
+        let object = data
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("evidence requires object-shaped tool data"))?;
+        anyhow::ensure!(
+            !object.contains_key("evidence"),
+            "tool data already contains evidence"
+        );
+        object.insert("evidence".into(), serde_json::to_value(evidence)?);
+        Ok(self)
+    }
+
+    /// Read a validated envelope. Absence is compatible with older results; malformed data fails.
+    pub fn evidence(&self) -> anyhow::Result<Option<super::evidence::EvidenceBundle>> {
+        let Some(value) = self.data.as_ref().and_then(|data| data.get("evidence")) else {
+            return Ok(None);
+        };
+        let evidence: super::evidence::EvidenceBundle = serde_json::from_value(value.clone())?;
+        evidence.validate()?;
+        Ok(Some(evidence))
+    }
     pub fn with_effects(mut self, effects: Effects) -> Self {
         self.execution.effects = effects;
         if effects == Effects::Unknown {

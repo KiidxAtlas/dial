@@ -6,6 +6,7 @@ pub(in crate::agent) mod cache_warm;
 pub(in crate::agent) mod constrained_repair;
 pub mod laya;
 pub(in crate::agent) mod local_profile;
+pub(in crate::agent) mod preparation;
 pub(in crate::agent) mod provider_slots;
 pub(in crate::agent) mod roles;
 pub(in crate::agent) mod route;

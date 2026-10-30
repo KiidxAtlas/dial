@@ -2,6 +2,43 @@
 use super::*;
 pub(super) static DECLARATIONS: &[SettingDef] = &[
     field!(
+        "experimental.batch_approvals",
+        experimental.batch_approvals,
+        EX,
+        "Execution",
+        "Finite batch approvals",
+        "Approve a visible finite set of exact native edits once. Never creates reusable permission rules; hooks and shell commands stay individually authorized.",
+        Kind::Bool,
+    ),
+    field!(
+        "experimental.dependency_dispatch",
+        experimental.dependency_dispatch,
+        EX,
+        "Execution",
+        "Dependency dispatch",
+        "Overlap operations only where trusted native resource contracts prove independence. Unknown effects, hooks and shell commands remain barriers.",
+        Kind::Bool,
+    ),
+    field!(
+        "experimental.background_checks",
+        experimental.background_checks,
+        EX,
+        "Verification",
+        "Background focused checks",
+        "Start configured focused checks after committed edits and allow independent reads while they run. Writers and completion drain checks; freshness and ordinary approvals still apply.",
+        Kind::Bool,
+    ),
+    field!(
+        "experimental.video_analysis",
+        experimental.video_analysis,
+        EX,
+        "Media",
+        "Video investigation",
+        "Offer explicit bounded video frame extraction. Disabled by default because each frame can consume image tokens; calls require approval and never sample a whole video automatically.",
+        Kind::Bool,
+        true,
+    ),
+    field!(
         "experimental.work_packet_contracts",
         experimental.work_packet_contracts,
         EX,
@@ -43,7 +80,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         EX,
         "Execution",
         "Speculative reads",
-        "Prefetch admitted native AST searches of one bounded local file. Cache reuse requires identical owner policy and source bytes. Disabled until measured on your workload.",
+        "Prefetch admitted native AST searches and hashline read/grep results of one bounded local file. Reuse validates identical owner policy and source bytes; read witnesses publish only at ordinary delivery. Disabled until measured on your workload.",
         Kind::Bool,
     ),
     field!(

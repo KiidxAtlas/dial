@@ -92,6 +92,9 @@ impl<'a> Agent<'a> {
                     .min(context_bytes),
             )
         };
+        if !self.hermetic {
+            crate::agent::window::file_handles::project(&self.workspace, messages);
+        }
         crate::agent::workflow::evidence::project(messages, superseded, &policy);
         let sent_messages = messages
             .iter()

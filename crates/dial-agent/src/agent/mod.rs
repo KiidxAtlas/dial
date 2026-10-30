@@ -35,7 +35,7 @@ pub use memory::selfplay::{check_case, check_case_measured, selfplay_run};
 pub use model::backend::{Runtime, make_backend, make_session_backend};
 pub use model::laya;
 pub use run::call_summary::{legacy_tool_presentation, legacy_tool_result, summarize_call};
-pub use run::coordination::CoordinationCarry;
+pub use run::coordination::{BoardPeer, CoordinationCarry, PeerBoard};
 pub use safety::approval;
 pub use ui::surface::{Decision, NullUi, RequestPhase, Ui};
 pub use workflow::todo;
@@ -300,6 +300,8 @@ pub struct Agent<'a> {
     subagent_backend: Option<(String, Backend)>,
     /// Lazily created, cached side backends for role-routed requests (compaction, …).
     role_backends: BTreeMap<String, Backend>,
+    /// Extension-owned task ids, isolated by session and registration generation.
+    extension_jobs: BTreeMap<(String, String, u64), std::collections::BTreeSet<String>>,
     /// Context the serving endpoint reports as currently loaded; may be far below the configured window.
     context_cap: Option<u32>,
     /// The configured route's backend-bound state: fallback cooldown and the primary's loaded cap.
@@ -316,6 +318,7 @@ pub struct Agent<'a> {
     /// notes in the next request (see `queue_hook_context`).
     hook_context: Vec<String>,
     peer_state: run::coordination::State,
+    monitor_state: run::monitoring::State,
     /// Build/test results shared with peer sessions through the run ledger.
     shared_runs: verify::shared_runs::State,
     todo: TodoList,
@@ -373,6 +376,9 @@ pub struct Agent<'a> {
     /// Controller-owned, never derived from untrusted tool output metadata.
     portable_callback_intercepted: bool,
     edit_preview_intercepted: bool,
+    /// Round-local exact one-shot choices, never permission rules.
+    pending_batch_approvals: Vec<(ToolCall, bool)>,
+    pending_check: Option<verify::checks::PendingCheck>,
     cur_step: u32,
     pub last_prompt_tokens: u64,
     context_meter: window::context_meter::ContextMeter,
@@ -391,6 +397,7 @@ pub struct Agent<'a> {
     usage_scope: llm::usage::Scope,
     /// Prompt-cache warmer for `cache.warm`; `None` while warming is off.
     cache_warm: Option<model::cache_warm::CacheWarm>,
+    preparation: model::preparation::State,
     compaction_runtime: compact::compaction_runtime::CompactionRuntime,
     memory_controller: memory::memory_controller::Controller,
     usage_cost_base: f64,

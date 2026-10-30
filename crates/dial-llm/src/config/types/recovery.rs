@@ -28,7 +28,7 @@ impl Default for ReasoningGuardConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RequestRecoveryConfig {
-    /// Seconds without a model-worker event before cancelling just that attempt; 0 disables the watchdog.
+    /// Seconds without meaningful inference progress before cancelling just that attempt; 0 disables it.
     pub silence_secs: u64,
     /// Retry the same request once automatically; subsequent recovery needs user direction.
     pub retry_once: bool,
@@ -36,7 +36,7 @@ pub struct RequestRecoveryConfig {
 impl Default for RequestRecoveryConfig {
     fn default() -> Self {
         Self {
-            silence_secs: 120,
+            silence_secs: 30,
             retry_once: true,
         }
     }

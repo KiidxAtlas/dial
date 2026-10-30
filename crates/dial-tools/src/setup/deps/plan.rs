@@ -1,5 +1,5 @@
-//! Turns a recipe into the exact commands that will run. Plans never include sudo and never
-//! write outside Dial's install directory, except for Homebrew, which the user chooses.
+//! Turns a recipe into the exact commands that will run, without sudo. Language-server plans
+//! leave install destinations to their package managers; private runtime plans use Dial storage.
 
 use super::prebuilt::Asset;
 use super::{Env, Method, Recipe, install_dir, locate, recipe};
@@ -84,12 +84,20 @@ pub fn plan(recipe: &Recipe, env: &Env) -> Result<Plan, Blocked> {
                 Some(uv) => return Ok(uv_plan(recipe, &destination, package, &uv)),
                 None => missing.push("uv"),
             },
+            Method::NpmGlobal(packages) => match env.find("npm") {
+                Some(npm) => return Ok(global_plan(recipe, packages, &npm, env)),
+                None => missing.push("npm"),
+            },
+            Method::UvTool(package) => match env.find("uv") {
+                Some(uv) => return Ok(tool_plan(recipe, package, &uv)),
+                None => missing.push("uv"),
+            },
             Method::Brew(formula) => match env.find("brew") {
                 Some(brew) => return Ok(brew_plan(recipe, formula, &brew)),
                 None => missing.push("brew"),
             },
             Method::Go(package) => match env.find("go") {
-                Some(go) => return Ok(go_plan(recipe, &destination, package, &go)),
+                Some(go) => return Ok(go_plan(recipe, package, &go)),
                 None => missing.push("go"),
             },
             Method::Rustup(component) => match env.find("rustup") {
@@ -189,6 +197,43 @@ fn uv_plan(recipe: &Recipe, destination: &Path, package: &str, uv: &Path) -> Pla
     }
 }
 
+fn global_plan(recipe: &Recipe, packages: &[&str], npm: &Path, env: &Env) -> Plan {
+    let mut args = vec![
+        "install".into(),
+        "--global".into(),
+        "--no-audit".into(),
+        "--no-fund".into(),
+    ];
+    args.extend(packages.iter().map(|package| (*package).to_owned()));
+    Plan {
+        id: recipe.id,
+        method: "npm global (configured npm prefix)".into(),
+        destination: PathBuf::from("npm global prefix"),
+        fetch: None,
+        steps: vec![Step {
+            program: program_text(npm),
+            args,
+            env: vec![("PATH".into(), path_with(npm, env))],
+        }],
+        expected: PathBuf::new(),
+    }
+}
+
+fn tool_plan(recipe: &Recipe, package: &str, uv: &Path) -> Plan {
+    Plan {
+        id: recipe.id,
+        method: "uv tool (configured uv tool directories)".into(),
+        destination: PathBuf::from("uv tool directories"),
+        fetch: None,
+        steps: vec![Step {
+            program: program_text(uv),
+            args: vec!["tool".into(), "install".into(), package.into()],
+            env: Vec::new(),
+        }],
+        expected: PathBuf::new(),
+    }
+}
+
 fn brew_plan(recipe: &Recipe, formula: &str, brew: &Path) -> Plan {
     Plan {
         id: recipe.id,
@@ -204,19 +249,18 @@ fn brew_plan(recipe: &Recipe, formula: &str, brew: &Path) -> Plan {
     }
 }
 
-fn go_plan(recipe: &Recipe, destination: &Path, package: &str, go: &Path) -> Plan {
-    let bin = destination.join("bin");
+fn go_plan(recipe: &Recipe, package: &str, go: &Path) -> Plan {
     Plan {
         id: recipe.id,
-        method: format!("go install into {}", bin.display()),
-        destination: destination.to_path_buf(),
+        method: "go install (configured GOBIN or GOPATH/bin)".into(),
+        destination: PathBuf::from("GOBIN or GOPATH/bin"),
         fetch: None,
         steps: vec![Step {
             program: program_text(go),
             args: vec!["install".into(), package.into()],
-            env: vec![("GOBIN".into(), program_text(&bin))],
+            env: Vec::new(),
         }],
-        expected: bin.join(recipe.program),
+        expected: PathBuf::new(),
     }
 }
 

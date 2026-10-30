@@ -1,0 +1,7 @@
+{
+  "name": "workflow-pack",
+  "version": "0.1.0",
+  "description": "Personal review workflow, scoped agent and explicit project context",
+  "apiVersion": 1,
+  "python": {"entry": "extension.py", "runtime": "worker", "dependencies": []}
+}

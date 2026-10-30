@@ -148,35 +148,34 @@ fn watch(shell: &mut Shell, app: &App, args: &str) -> Result<()> {
         &shell.session_id,
         crate::cli::watch::Event::Text {
             title: "Dial live feed".into(),
-            body:
-                "Edits and language-server advisories appear here. Advisories are not verification."
-                    .into(),
+            body: "Edits, reviews, screenshots and turn results appear here; the other tabs show the plan, jobs, workers, side threads and peers. Language-server advisories are not verification."
+                .into(),
         },
     )?;
-    let command = shlex::try_join([
-        std::env::current_exe()?.to_string_lossy().as_ref(),
-        "-C",
-        app.layout.project_root.to_string_lossy().as_ref(),
-        "watch",
-        &shell.session_id,
-    ])?;
-    // Keep the manual command available even if Automation is denied or the job slot is busy.
-    shell.note("Watch", format!("Run in another pane: {command}"));
+    let argv = vec![
+        std::env::current_exe()?.to_string_lossy().into_owned(),
+        "-C".to_owned(),
+        app.layout.project_root.to_string_lossy().into_owned(),
+        "watch".to_owned(),
+        shell.session_id.clone(),
+    ];
+    let command = shlex::try_join(argv.iter().map(String::as_str))?;
     match watch_launch::target() {
-        Ok(Some(session)) => {
-            spawn_job_streaming(
-                shell,
-                "Watch",
-                move |cancel, _progress| match watch_launch::launch(&session, &command, &cancel) {
-                    Ok(()) => Ok("Opened the live feed in an iTerm2 split.".into()),
-                    Err(error) => Ok(format!(
-                        "Could not open the iTerm2 split: {error:#}. Check macOS Automation permission for your terminal, or run in another pane: {command}"
-                    )),
-                },
-            )
+        Ok(Some(launcher)) => {
+            // Keep the manual command visible even if the split fails or the job slot is busy.
+            shell.note("Watch", watch_launch::opening_message(&launcher, &command));
+            spawn_job_streaming(shell, "Watch", move |cancel, _progress| {
+                Ok(match watch_launch::launch(&launcher, &argv, &cancel) {
+                    Ok(()) => watch_launch::opened_message(&launcher),
+                    Err(error) => watch_launch::failed_message(&launcher, &error, &command),
+                })
+            })
         }
-        Ok(None) => {}
-        Err(error) => shell.note("Watch", format!("Automatic split unavailable: {error:#}")),
+        Ok(None) => shell.note("Watch", watch_launch::unavailable_message(None, &command)),
+        Err(error) => shell.note(
+            "Watch",
+            watch_launch::unavailable_message(Some(&error), &command),
+        ),
     }
     Ok(())
 }
@@ -442,7 +441,14 @@ fn images(shell: &mut Shell, app: &App, args: &str) -> Result<()> {
 
 fn update(shell: &mut Shell, app: &App, args: &str) -> Result<()> {
     let mut argv = vec!["update".to_owned()];
-    argv.extend(split_args(args)?);
+    let mut words = split_args(args)?;
+    // `/update 0.2.8` names a version the way the hint shows; the CLI spells it `--version`.
+    if let [version] = words.as_slice()
+        && !version.starts_with('-')
+    {
+        words = vec!["--version".to_owned(), version.clone()];
+    }
+    argv.extend(words);
     spawn_dial(
         shell,
         app,

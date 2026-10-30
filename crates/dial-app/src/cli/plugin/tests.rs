@@ -50,6 +50,29 @@ fn bare_plugin_has_no_command_and_alias_works() {
 #[test]
 fn parses_plugin_lifecycle_commands() {
     assert_eq!(
+        parse(&[
+            "plugin",
+            "new",
+            "./example",
+            "--name",
+            "demo",
+            "--python",
+            "python3.12"
+        ]),
+        Some(PluginCmd::New {
+            directory: "./example".into(),
+            name: Some("demo".into()),
+            python: "python3.12".into()
+        })
+    );
+    assert_eq!(
+        parse(&["plugin", "check", "./example"]),
+        Some(PluginCmd::Check {
+            directory: "./example".into(),
+            python: "python3".into()
+        })
+    );
+    assert_eq!(
         parse(&["plugin", "install", "./p"]),
         Some(PluginCmd::Install {
             source: "./p".into()
@@ -61,11 +84,17 @@ fn parses_plugin_lifecycle_commands() {
     );
     assert_eq!(
         parse(&["plugin", "remove", "x"]),
-        Some(PluginCmd::Remove { name: "x".into() })
+        Some(PluginCmd::Remove {
+            name: "x".into(),
+            purge_state: false
+        })
     );
     assert_eq!(
         parse(&["plugin", "uninstall", "x"]),
-        Some(PluginCmd::Remove { name: "x".into() })
+        Some(PluginCmd::Remove {
+            name: "x".into(),
+            purge_state: false
+        })
     );
     assert_eq!(
         parse(&["plugin", "enable", "x"]),
@@ -138,4 +167,97 @@ fn parses_marketplace_commands() {
 #[test]
 fn rejects_unknown_subcommand() {
     assert!(Cli::try_parse_from(["dial", "plugin", "bogus"]).is_err());
+}
+
+#[test]
+fn settings_and_preset_commands_persist_only_valid_public_values() {
+    use serde_json::json;
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let layout = Layout::with_user_dir(&project, temp.path().join("private")).unwrap();
+    let source = temp.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    let manifest = json!({"name":"demo","contributions":{"settings":{"type":"object","properties":{"count":{"type":"integer","default":2,"minimum":1},"token":{"type":"string","writeOnly":true}},"additionalProperties":false}}});
+    std::fs::write(source.join("dial-plugin.json"), manifest.to_string()).unwrap();
+    PluginStore::new(layout.user_dir.join("plugins"))
+        .install(&format!("file:{}", source.display()))
+        .unwrap();
+    settings(
+        &layout,
+        "demo",
+        SettingsCmd::Set {
+            key: "count".into(),
+            value: "3".into(),
+        },
+        false,
+    )
+    .unwrap();
+    assert!(
+        settings(
+            &layout,
+            "demo",
+            SettingsCmd::Set {
+                key: "count".into(),
+                value: "0".into()
+            },
+            false
+        )
+        .is_err()
+    );
+    let path = temp.path().join("preset.json");
+    presets(
+        &layout,
+        "demo",
+        PresetCmd::Export { path: path.clone() },
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap(),
+        json!({"count":3})
+    );
+    std::fs::write(&path, r#"{"token":"never-save"}"#).unwrap();
+    assert!(presets(&layout, "demo", PresetCmd::Import { path }, false).is_err());
+    settings(&layout, "demo", SettingsCmd::Reset, false).unwrap();
+    let (store, schema) = settings_store(&layout, "demo").unwrap();
+    assert_eq!(store.load("demo", &schema).unwrap(), json!({"count":2}));
+}
+
+#[test]
+fn parses_explicit_purge_and_settings_scopes() {
+    assert_eq!(
+        parse(&["plugin", "remove", "demo", "--purge-state"]),
+        Some(PluginCmd::Remove {
+            name: "demo".into(),
+            purge_state: true
+        })
+    );
+    assert_eq!(
+        parse(&[
+            "plugin",
+            "settings",
+            "demo",
+            "--workspace",
+            "set",
+            "count",
+            "3"
+        ]),
+        Some(PluginCmd::Settings {
+            name: "demo".into(),
+            workspace: true,
+            command: Some(SettingsCmd::Set {
+                key: "count".into(),
+                value: "3".into()
+            })
+        })
+    );
+    assert_eq!(
+        parse(&["plugin", "dev", "./demo", "--once"]),
+        Some(PluginCmd::Dev {
+            directory: "./demo".into(),
+            once: true,
+            interval_ms: 500
+        })
+    );
 }

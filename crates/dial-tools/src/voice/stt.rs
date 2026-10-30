@@ -291,5 +291,106 @@ pub fn clean_transcript(text: &str) -> String {
     trimmed.to_owned()
 }
 
+/// A backend-reported speech interval, relative to the supplied clip, not word alignment.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct TranscriptSegment {
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub text: String,
+    /// No supported backend here performs speaker diarization.
+    pub speaker: Option<String>,
+}
+
+/// Transcribe an existing WAV with real whisper.cpp JSON offsets. Other backends explicitly fail
+/// rather than synthesizing timestamps from the plain-text dictation API.
+pub fn transcribe_timeline(
+    env: &VoiceEnv,
+    backend: &SttBackend,
+    audio: &Path,
+    duration_ms: u64,
+    cancel: &AtomicBool,
+) -> Result<Vec<TranscriptSegment>> {
+    let SttBackend::WhisperCpp { program, model } = backend else {
+        bail!(
+            "timestamped transcription currently requires whisper.cpp; selected backend has no implemented timeline adapter (plain dictation remains supported)"
+        );
+    };
+    let dir = tempfile::tempdir()?;
+    let prefix = dir.path().join("timeline");
+    let spec = CommandSpec::new(program)
+        .arg("-m")
+        .arg(model)
+        .arg("-f")
+        .arg(audio)
+        .arg("-l")
+        .arg(language_or_auto(&env.voice.stt.language))
+        .arg("-oj")
+        .arg("-of")
+        .arg(&prefix)
+        .arg("-np");
+    process::run(
+        &spec,
+        None,
+        cancel,
+        Duration::from_secs(env.voice.stt.timeout_secs.clamp(5, 3600)),
+    )?;
+    let bytes = read_timeline(&prefix.with_extension("json"))?;
+    parse_timeline(&bytes, duration_ms)
+}
+
+fn read_timeline(path: &Path) -> Result<Vec<u8>> {
+    const MAX_TIMELINE: u64 = 4 * 1024 * 1024;
+    let file = std::fs::File::open(path).context("whisper.cpp did not write timeline JSON")?;
+    ensure!(
+        file.metadata()?.is_file() && file.metadata()?.len() <= MAX_TIMELINE,
+        "transcript JSON must be a regular file no larger than 4 MiB"
+    );
+    let mut bytes = Vec::new();
+    file.take(MAX_TIMELINE + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 <= MAX_TIMELINE,
+        "transcript JSON exceeds 4 MiB"
+    );
+    Ok(bytes)
+}
+
+fn parse_timeline(bytes: &[u8], duration_ms: u64) -> Result<Vec<TranscriptSegment>> {
+    let value: Value = serde_json::from_slice(bytes)?;
+    let entries = value["transcription"]
+        .as_array()
+        .context("missing whisper.cpp transcription array")?;
+    ensure!(
+        entries.len() <= 2000,
+        "too many transcript segments; refine a shorter interval"
+    );
+    entries
+        .iter()
+        .map(|entry| {
+            let start_ms = entry["offsets"]["from"]
+                .as_u64()
+                .context("missing segment start offset")?;
+            let end_ms = entry["offsets"]["to"]
+                .as_u64()
+                .context("missing segment end offset")?;
+            ensure!(
+                start_ms <= end_ms && end_ms <= duration_ms,
+                "backend timestamp outside requested clip"
+            );
+            let text = entry["text"]
+                .as_str()
+                .context("missing segment text")?
+                .trim()
+                .to_owned();
+            ensure!(text.len() <= 8192, "segment text exceeds 8 KiB");
+            Ok(TranscriptSegment {
+                start_ms,
+                end_ms,
+                text,
+                speaker: None,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests;

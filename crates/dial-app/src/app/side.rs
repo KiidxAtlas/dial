@@ -110,6 +110,22 @@ impl SideThreadState {
             .map(|job| (job.thread.as_str(), job.streamed.as_str()))
     }
 
+    /// Threads of the bound session, oldest first.
+    pub(in crate::app) fn threads(&self) -> &[SideThread] {
+        &self.threads.threads
+    }
+
+    /// The streaming request as `(thread, question, answer so far)`.
+    pub(in crate::app) fn streaming(&self) -> Option<(&str, &str, &str)> {
+        self.job.as_ref().map(|job| {
+            (
+                job.thread.as_str(),
+                job.question.as_str(),
+                job.streamed.as_str(),
+            )
+        })
+    }
+
     /// Freezes the side context for the turn about to run, including its prompt. Busy `/btw`
     /// answers from this snapshot.
     pub(in crate::app) fn prepare_turn(&mut self, agent: &Agent<'_>, prompt: &str) -> Result<()> {

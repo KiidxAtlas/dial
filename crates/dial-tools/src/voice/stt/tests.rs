@@ -98,3 +98,57 @@ fn explicit_backends_report_missing_prerequisites() {
     let error = resolve_backend(&env).unwrap_err().to_string();
     assert!(error.contains("not installed"), "{error}");
 }
+
+#[test]
+fn timeline_uses_backend_offsets_and_never_invents_speakers() {
+    let segments = parse_timeline(
+        br#"{"transcription":[{"offsets":{"from":100,"to":700},"text":" hello "}]}"#,
+        1000,
+    )
+    .unwrap();
+    assert_eq!(
+        segments[0],
+        TranscriptSegment {
+            start_ms: 100,
+            end_ms: 700,
+            text: "hello".into(),
+            speaker: None
+        }
+    );
+    for offsets in [
+        r#"{"from":800,"to":700}"#,
+        r#"{"from":100,"to":1001}"#,
+        r#"{"from":-1,"to":700}"#,
+    ] {
+        let input = format!(r#"{{"transcription":[{{"offsets":{offsets},"text":"x"}}]}}"#);
+        assert!(parse_timeline(input.as_bytes(), 1000).is_err());
+    }
+    assert!(parse_timeline(br#"{"text":"no timestamps"}"#, 1000).is_err());
+}
+
+#[test]
+fn timeline_rejects_text_only_backend_without_network_or_process() {
+    let result = transcribe_timeline(
+        &VoiceEnv::default(),
+        &SttBackend::OpenAi,
+        Path::new("absent.wav"),
+        1000,
+        &AtomicBool::new(false),
+    );
+    assert!(result.unwrap_err().to_string().contains("timeline adapter"));
+}
+
+#[test]
+fn timeline_file_reads_are_bounded_before_loading() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), b"{}").unwrap();
+    assert_eq!(read_timeline(file.path()).unwrap(), b"{}");
+    file.as_file().set_len(4 * 1024 * 1024 + 1).unwrap();
+    assert!(
+        read_timeline(file.path())
+            .unwrap_err()
+            .to_string()
+            .contains("4 MiB")
+    );
+    assert!(read_timeline(file.path().with_extension("missing").as_path()).is_err());
+}

@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn with_agent(overlay: &str, f: impl FnOnce(&mut Agent<'_>)) {
+pub(in crate::agent::run) fn with_agent(overlay: &str, f: impl FnOnce(&mut Agent<'_>)) {
     let temp = tempfile::tempdir().unwrap();
     let project = temp.path().join("project");
     std::fs::create_dir(&project).unwrap();
@@ -186,6 +186,113 @@ fn scope_overlap_is_component_based() {
     assert!(overlap("src/auth.rs", "src"));
     assert!(!overlap("src/auth", "src/authorize"));
     assert!(!overlap("src", "src2"));
+}
+
+#[test]
+fn automatic_roster_hides_routine_intent_but_reacts_to_new_overlaps_and_mail() {
+    with_agent("", |agent| {
+        let layout = agent.layout().unwrap().clone();
+        let peer = Participant::join(&layout, "other-session").unwrap();
+        peer.publish("unrelated task detail", "working", &["src/client".into()])
+            .unwrap();
+        let notes = agent.poll_coordination(&mut NullUi);
+        let text = notes[0]["content"].as_str().unwrap();
+        assert!(text.contains(peer.id()));
+        assert!(!text.contains("unrelated task detail") && !text.contains("src/client"));
+        peer.publish("updated routine detail", "working", &["src/client".into()])
+            .unwrap();
+        assert!(agent.poll_coordination(&mut NullUi).is_empty());
+        // A local claim changes relevance even when the remote roster did not change.
+        agent.peer_coordination(&json!({"action":"claim","scopes":["src"]}));
+        let notes = agent.poll_coordination(&mut NullUi);
+        let text = notes[0]["content"].as_str().unwrap();
+        assert!(text.contains("src/client") && text.contains("updated routine detail"));
+        let own_id = agent.peer_board().unwrap().id;
+        peer.send(&own_id, "fresh coordination message").unwrap();
+        let notes = agent.poll_coordination(&mut NullUi);
+        assert!(
+            notes[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("fresh coordination message")
+        );
+        assert!(agent.poll_coordination(&mut NullUi).is_empty());
+        let explicit = agent
+            .peer_coordination(&json!({"action":"list"}))
+            .data
+            .unwrap();
+        assert_eq!(explicit["peers"][0]["summary"], "updated routine detail");
+        assert_eq!(explicit["peers"][0]["scopes"], json!(["src/client"]));
+        assert_eq!(
+            agent.peer_board().unwrap().peers[0].peer.scopes,
+            ["src/client"]
+        );
+    });
+}
+
+#[test]
+fn automatic_roster_prioritizes_overlaps_past_the_routine_preview_limit() {
+    let mut peers: Vec<_> = (0..10)
+        .map(|i| Peer {
+            id: format!("peer-{i}"),
+            session_id: format!("session-{i}"),
+            summary: format!("task-{i}"),
+            phase: "working".into(),
+            scopes: vec![format!("unrelated/{i}")],
+        })
+        .collect();
+    peers[9].scopes = vec!["src/important.rs".into()];
+    let roster = model_roster(&peers, &["src".into()]);
+    assert_eq!(roster["total"], 10);
+    assert_eq!(roster["omitted"], 2);
+    assert_eq!(roster["preview"].as_array().unwrap().len(), 8);
+    assert_eq!(roster["preview"][0]["id"], "peer-9");
+    assert_eq!(
+        roster["preview"][0]["overlapping_scopes"],
+        json!(["src/important.rs"])
+    );
+    assert!(roster["preview"][1].get("summary").is_none());
+}
+
+#[test]
+fn peer_board_marks_overlaps_and_counts_queued_mail_without_draining() {
+    with_agent("", |agent| {
+        let layout = agent.layout().unwrap().clone();
+        let peer = Participant::join(&layout, "other-session").unwrap();
+        peer.publish(
+            "update client",
+            "working",
+            &["src/client".into(), "docs".into()],
+        )
+        .unwrap();
+        agent.peer_coordination(&json!({"action":"claim","scopes":["src","tests"]}));
+        let board = agent.peer_board().unwrap();
+        assert_eq!(board.scopes, ["src", "tests"]);
+        assert_eq!(board.overlapping, ["src"]);
+        assert_eq!(board.peers.len(), 1);
+        assert_eq!(board.peers[0].peer.id, peer.id());
+        assert_eq!(board.peers[0].peer.phase, "working");
+        assert_eq!(board.peers[0].overlapping, ["src/client"]);
+        assert_eq!(board.queued, 0);
+        peer.send(&board.id, "first").unwrap();
+        peer.send(&board.id, "second").unwrap();
+        assert_eq!(agent.peer_board().unwrap().queued, 2);
+        assert_eq!(
+            agent.peer_board().unwrap().queued,
+            2,
+            "snapshot must not drain"
+        );
+        let notes = agent.poll_coordination(&mut NullUi);
+        assert!(notes[0]["content"].as_str().unwrap().contains("second"));
+        assert_eq!(agent.peer_board().unwrap().queued, 0);
+    });
+}
+
+#[test]
+fn peer_board_reports_disabled_coordination() {
+    with_agent("[coordination]\nenabled=false", |agent| {
+        assert!(agent.peer_board().is_err());
+    });
 }
 
 #[test]

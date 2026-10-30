@@ -1,10 +1,12 @@
 //! Mutually exclusive, session-owned memory backends. Provenance remains a separate lexical backend.
 
+mod ambient;
 #[cfg(unix)]
 pub mod files;
 #[cfg(windows)]
 #[path = "files_windows.rs"]
 pub mod files;
+pub use ambient::is_term as ambient_term;
 mod hindsight;
 mod local;
 mod managed;
@@ -772,7 +774,9 @@ impl MemoryRuntime {
         let history: Vec<Value> = messages
             .iter()
             .rev()
-            .filter(|message| matches!(message["role"].as_str(), Some("user" | "assistant")))
+            // Classify before projection drops harness tags; only human user turns may supply
+            // continuation subjects. Raw observation/retention records stay untouched below.
+            .filter(|message| message["role"] == "assistant" || ambient::user_message(message))
             .take(64)
             .map(|message| json!({"role":message["role"],"content":redact(&visible_text(message))}))
             .collect::<Vec<_>>()
@@ -947,7 +951,10 @@ impl MemoryRuntime {
             MemoryBackendId::Semantic => (2, 2000, self.recall_limit()),
             _ => return Ok(None),
         };
-        let Some(last) = messages.iter().rfind(|message| message["role"] == "user") else {
+        let Some(last) = messages
+            .iter()
+            .rfind(|message| ambient::user_message(message))
+        else {
             return Ok(None);
         };
         let latest = redact(&visible_text(last));
@@ -962,7 +969,19 @@ impl MemoryRuntime {
         let query = recall_query(&latest, messages, context_turns, max_chars);
         let mut driver = self.foreground_driver(&op, runner)?;
         op.check()?;
-        let value = driver.search(&op, &query, limit, runner)?;
+        let mut value = driver.search(&op, &query, limit, runner)?;
+        if let Some(items) = value.get_mut("items").and_then(Value::as_array_mut) {
+            let admission = ambient::query(&latest, messages);
+            items.retain(|item| {
+                ambient::relevant(
+                    admission,
+                    item["content"]
+                        .as_str()
+                        .or_else(|| item["text"].as_str())
+                        .unwrap_or(""),
+                )
+            });
+        }
         op.check()?;
         drop(timer);
         Ok(render_search(&value, self.context_bytes()))
@@ -1047,6 +1066,7 @@ impl MemoryRuntime {
                     .or_else(|| item["text"].as_str())
                     .unwrap_or("");
                 if fresh.len() < limit
+                    && ambient::relevant(ambient::query(user, &history), content)
                     && !content.trim().is_empty()
                     && !active.shown.contains(&shown_key)
                     && !fresh.iter().any(|(seen, _)| *seen == shown_key)

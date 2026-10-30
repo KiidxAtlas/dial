@@ -1,6 +1,8 @@
 //! Project-local artifact imports for session relocation. Never follows embedded paths or roots.
 use super::*;
 
+mod references;
+
 impl ArtifactStore {
     /// Path of the blob for `uri`, after checking the identifier shape. The blob is not read.
     pub(crate) fn blob_path(&self, uri: &str) -> Result<std::path::PathBuf> {

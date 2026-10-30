@@ -274,7 +274,7 @@ fn presets_map_to_their_segment_lists_and_custom_uses_the_configured_ones() {
                 "path",
                 "git"
             ]),
-            names(&["workers", "context"])
+            names(&["workers", "cost", "context"])
         )
     );
     assert_eq!(
@@ -288,7 +288,7 @@ fn presets_map_to_their_segment_lists_and_custom_uses_the_configured_ones() {
         segments(&cfg_with(StatusPreset::Compact)),
         (
             names(&["spinner", "model", "thinking", "inference", "git"]),
-            names(&["workers", "context", "tokens"])
+            names(&["workers", "cost", "context", "tokens"])
         )
     );
     assert_eq!(
@@ -305,7 +305,7 @@ fn presets_map_to_their_segment_lists_and_custom_uses_the_configured_ones() {
                 "approval",
                 "sandbox"
             ]),
-            names(&["workers", "tokens", "rate", "learning", "context"])
+            names(&["workers", "tokens", "rate", "cost", "learning", "context"])
         )
     );
     assert_eq!(
@@ -977,6 +977,104 @@ fn workers_segment_shows_running_out_of_total_and_hides_when_idle() {
         ..data()
     };
     assert!(!plain(&render(&cfg_with(StatusPreset::Default), &idle, 160)).contains("workers"));
+}
+
+#[test]
+fn cost_segment_shows_turn_and_session_spend_in_every_preset_that_lists_it() {
+    let priced = StatusData {
+        turn_cost: Some(0.0412),
+        session_cost: Some(1.2),
+        ..data()
+    };
+    for preset in [
+        StatusPreset::Default,
+        StatusPreset::Compact,
+        StatusPreset::Full,
+    ] {
+        let line = plain(&render(&cfg_with(preset), &priced, 200));
+        assert!(
+            line.contains("$0.0412 turn · $1.20 session"),
+            "{preset:?}: {line:?}"
+        );
+    }
+    // Minimal keeps to model and context.
+    assert!(!plain(&render(&cfg_with(StatusPreset::Minimal), &priced, 200)).contains("turn"));
+    // A custom layout opts in by name.
+    let custom = UiConfig {
+        status: StatusPreset::Custom,
+        status_left: Vec::new(),
+        status_right: vec!["cost".to_owned()],
+        ..UiConfig::default()
+    };
+    assert!(plain(&render(&custom, &priced, 120)).contains("$0.0412 turn"));
+    // The first turn of a session is the session: the total is not repeated.
+    let first = StatusData {
+        turn_cost: Some(0.0412),
+        session_cost: Some(0.0412),
+        ..data()
+    };
+    let line = plain(&render(&custom, &first, 120));
+    assert!(
+        line.contains("$0.0412 turn") && !line.contains("session"),
+        "{line:?}"
+    );
+    // A turn without a known session total still shows its own spend.
+    let unknown_session = StatusData {
+        turn_cost: Some(2.5),
+        session_cost: None,
+        ..data()
+    };
+    let line = plain(&render(&custom, &unknown_session, 120));
+    assert!(
+        line.contains("$2.50 turn") && !line.contains("session"),
+        "{line:?}"
+    );
+}
+
+#[test]
+fn cost_segment_is_hidden_when_the_turn_cost_is_unknown_or_zero() {
+    for turn_cost in [
+        None,
+        Some(0.0),
+        Some(-0.5),
+        Some(f64::NAN),
+        Some(f64::INFINITY),
+    ] {
+        let status = StatusData {
+            turn_cost,
+            session_cost: Some(3.0),
+            ..data()
+        };
+        for preset in ALL_PRESETS {
+            let line = plain(&render(&cfg_with(preset), &status, 200));
+            assert!(
+                !line.contains('$') && !line.contains("turn"),
+                "{turn_cost:?} {preset:?}: {line:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn cost_amounts_use_the_dollar_form_and_never_round_spend_to_zero() {
+    assert_eq!(usd(0.0412), "$0.0412");
+    assert_eq!(usd(0.00004), "<$0.0001");
+    assert_eq!(usd(0.5), "$0.5000");
+    assert_eq!(usd(1.0), "$1.00");
+    assert_eq!(usd(12.345), "$12.35");
+}
+
+#[test]
+fn cost_segment_leaves_before_the_model_and_context_on_a_narrow_line() {
+    let status = StatusData {
+        turn_cost: Some(0.0412),
+        session_cost: Some(1.2),
+        ..data()
+    };
+    let cfg = cfg_with(StatusPreset::Default);
+    let line = plain(&render(&cfg, &status, 40));
+    assert!(!line.contains("turn"), "{line:?}");
+    assert!(line.contains("qwen3-9b"), "{line:?}");
 }
 
 #[test]

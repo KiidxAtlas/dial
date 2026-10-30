@@ -383,24 +383,29 @@ fn task_labels_are_searchable_without_changing_command_dispatch() {
 }
 
 #[test]
-fn manage_goal_lists_todo_alongside_work_commands() {
+fn manage_goal_lists_todo_and_watch_alongside_work_commands() {
     let keys = Keymap::defaults();
     let mut source = entries();
-    source.push(PaletteEntry {
-        command: CommandEntry {
-            name: "todo".into(),
-            description: "Browse the task plan".into(),
-            kind: CommandKind::Builtin,
-            args_hint: None,
-        },
-        during_turn: "Runs after this turn.",
-    });
+    for (name, description) in [
+        ("todo", "Browse the task plan"),
+        ("watch", "Open live edits in a separate pane"),
+    ] {
+        source.push(PaletteEntry {
+            command: CommandEntry {
+                name: name.into(),
+                description: description.into(),
+                kind: CommandKind::Builtin,
+                args_hint: None,
+            },
+            during_turn: "Runs after this turn.",
+        });
+    }
     let mut palette = PaletteOverlay::new(source, false);
     palette.handle(&plain(KeyCode::Down), &keys);
     palette.handle(&plain(KeyCode::Down), &keys);
     palette.handle(&plain(KeyCode::Enter), &keys);
     assert_eq!(palette.view, View::Goal(2));
-    assert_eq!(names(&palette), ["todo", "compute"]);
+    assert_eq!(names(&palette), ["watch", "todo", "compute"]);
 }
 
 #[test]

@@ -1352,3 +1352,186 @@ fn teacher_runs_are_ignored_unless_distillation_is_enabled() {
     let report = f.run();
     assert_eq!((report.from_teacher, report.added()), (0, 0));
 }
+
+fn approved_snapshot(turn: &str, payload: Value) -> crate::storage::store::SessionTrainingExample {
+    crate::storage::store::SessionTrainingExample {
+        version: 1,
+        source_session: "source-session-a".into(),
+        source_turn: turn.into(),
+        source_model: "source-model-a".into(),
+        source_state: None,
+        source_trajectory: None,
+        prompt: format!("source task {turn}"),
+        payload,
+    }
+}
+
+#[test]
+fn explicit_session_imports_screen_snapshots_and_strip_foreign_reasoning() {
+    let mut f = Fixture::new();
+    // Explicit user approval is independent of automatic session/sibling learning.
+    f.config.improve.learn_from_sessions = false;
+    f.config.training.learn_from.clear();
+    let payload = json!({"examples":[
+        {"messages":[system(),user("sealed import"),say("no")],"tools":schemas()},
+        {"messages":[system(),user("large import"),say(&"x".repeat(10000))],"tools":schemas()},
+        {"messages":[system(),user("invalid import"),{"role":"assistant","content":"no","unknown":true}],"tools":schemas()},
+        {"messages":[system(),user("retained constraints"),think(say("previous answer"),"private prior reasoning"),user("continue import"),think(say("new answer"),"target reasoning")],"tools":schemas()}
+    ]});
+    f.store
+        .approve_session_examples(&[approved_snapshot("screened", payload)])
+        .unwrap();
+    let report = f.run_with(&HashSet::from(["sealed import".into()]));
+    assert_eq!(
+        (
+            report.skipped_overlap,
+            report.skipped_oversize,
+            report.skipped_invalid
+        ),
+        (1, 1, 1)
+    );
+    assert_eq!(report.added(), 1);
+    let records = f.records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        roles(&records[0]),
+        ["system", "user", "assistant", "user", "assistant"]
+    );
+    assert_eq!(records[0]["messages"][2]["content"], "previous answer");
+    assert!(records[0]["messages"][2].get("reasoning_content").is_none());
+    assert!(records[0]["messages"][4].get("reasoning_content").is_none());
+    assert_eq!(
+        f.run_with(&HashSet::from(["sealed import".into()])).added(),
+        0
+    );
+}
+
+#[test]
+fn explicit_session_corpus_is_not_capped_to_the_training_minimum_or_sibling_share() {
+    let mut f = Fixture::new();
+    f.config.improve.learn_from_sessions = false;
+    f.config.training.batch_size = 1;
+    f.config.improve.lora_min_examples = 2;
+    let examples: Vec<_> = (0..12).map(|i| {
+        let mut example = approved_snapshot(&format!("turn-{i}"), json!({"examples":[{
+            "messages":[system(), user(&format!("independent imported task {i}")), say(&format!("answer {i}"))],
+            "tools":schemas()
+        }]}));
+        // Adjacent turns share a source session but have different post-compaction prompts.
+        example.source_session = format!("source-session-{}", i / 2);
+        example
+    }).collect();
+    f.store.approve_session_examples(&examples).unwrap();
+    let report = f.run();
+    assert_eq!(report.added(), examples.len());
+    assert!(report.added_train >= 2);
+    assert!(report.added_valid > 0);
+    for path in [&f.config.training.train_data, &f.config.training.valid_data] {
+        let prompts: HashSet<String> = fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let record: Value = serde_json::from_str(line).unwrap();
+                record["messages"][1]["content"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        for session in 0..6 {
+            assert_eq!(
+                prompts.contains(&format!("independent imported task {}", session * 2)),
+                prompts.contains(&format!("independent imported task {}", session * 2 + 1)),
+                "source session {session} must not cross splits at {}",
+                path.display()
+            );
+        }
+    }
+    assert_eq!(f.store.verified_live_turns().unwrap(), 0);
+    assert_eq!(
+        f.store.live_score(f.store.active().unwrap().id).unwrap(),
+        (0, None)
+    );
+    assert_eq!(f.run().added(), 0);
+}
+
+#[test]
+fn imported_snapshot_rechecks_source_verdict_before_harvesting() {
+    let mut f = Fixture::new();
+    f.config.state_dir = f.dir.path().join("state");
+    let source = sibling(&f, "source-a");
+    let trajectory = source
+        .begin_trajectory(
+            source.active().unwrap().id,
+            "coding",
+            "task",
+            "later rejected import",
+        )
+        .unwrap();
+    source
+        .finish_trajectory(trajectory, Some("done"), None)
+        .unwrap();
+    let mut retained = approved_snapshot(
+        "later-rejected",
+        json!({"examples":[{
+            "messages":[system(),user("later rejected import"),say("not good enough")],"tools":schemas()
+        }]}),
+    );
+    retained.source_state = Some(f.dir.path().join("source-a"));
+    retained.source_trajectory = Some(trajectory);
+    f.store.approve_session_examples(&[retained]).unwrap();
+    source
+        .outcome(&Outcome {
+            trajectory,
+            score: 40.0,
+            source: "user".into(),
+            reference: None,
+        })
+        .unwrap();
+    assert_eq!(f.run().added(), 0);
+    assert!(f.records().is_empty());
+    assert_eq!(source.trajectory_score(trajectory).unwrap(), Some(40.0));
+    assert_eq!(f.store.session_training_examples().unwrap().len(), 1);
+
+    // Export while approved, then reject that old turn and add a post-compaction turn.
+    // Frozen exported records still anchor the entire source session to its original split.
+    source
+        .outcome(&Outcome {
+            trajectory,
+            score: 100.0,
+            source: "user".into(),
+            reference: None,
+        })
+        .unwrap();
+    assert_eq!(f.run().added(), 1);
+    let was_valid = fs::read_to_string(&f.config.training.valid_data)
+        .unwrap_or_default()
+        .lines()
+        .count()
+        == 1;
+    source
+        .outcome(&Outcome {
+            trajectory,
+            score: 40.0,
+            source: "user".into(),
+            reference: None,
+        })
+        .unwrap();
+    let next_prompt = (0..1000)
+        .map(|i| format!("post-compaction task {i}"))
+        .find(|prompt| {
+            (u8::from_str_radix(&digest(&json!(prompt))[..2], 16).unwrap() % 5 == 0) != was_valid
+        })
+        .unwrap();
+    f.store.approve_session_examples(&[approved_snapshot("next-turn", json!({"examples":[{
+        "messages":[system(),user(&next_prompt),say("new successful work")],"tools":schemas()
+    }]}))]).unwrap();
+    assert_eq!(f.run().added(), 1);
+    let (same, other) = if was_valid {
+        (&f.config.training.valid_data, &f.config.training.train_data)
+    } else {
+        (&f.config.training.train_data, &f.config.training.valid_data)
+    };
+    assert_eq!(fs::read_to_string(same).unwrap().lines().count(), 2);
+    assert!(fs::read_to_string(other).unwrap_or_default().is_empty());
+}

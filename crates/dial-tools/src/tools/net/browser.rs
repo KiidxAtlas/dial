@@ -106,6 +106,24 @@ pub fn prerequisites(config: &BrowserConfig, workspace: &Path) -> Result<(), Str
 fn installation_allowed(config: &BrowserConfig) -> bool {
     config.allow_install
 }
+
+/// Bun for installing the pinned browser dependencies. A missing Bun is installed with the
+/// `bun` setup recipe into Dial's tools directory (never with sudo), gated like any other
+/// native effect of this browser call; a refusal or failure names the manual command.
+fn provision_bun(ctx: &ToolContext, interrupt: &AtomicBool) -> Result<PathBuf, String> {
+    let env = crate::setup::deps::Env::current(&crate::config::types::default_user_dir());
+    match runtime::bun_source(std::env::var_os("DIAL_BUN"), &env) {
+        runtime::BunSource::Ready(path) => Ok(path),
+        runtime::BunSource::Install => {
+            ctx.authorize_mutation("browser", &[], true)
+                .map_err(|error| runtime::bun_unavailable(&error))?;
+            crate::setup::deps::run::install_with_requirements("bun", &env, interrupt, &mut |_| {})
+                .map_err(|error| {
+                    runtime::bun_unavailable(&format!("automatic install failed: {error:#}"))
+                })
+        }
+    }
+}
 struct BrowserTool {
     config: BrowserConfig,
     session: Mutex<Option<BrowserSession>>,
@@ -809,7 +827,9 @@ fn start(
         None => None,
     };
     let trusted = resolve_operator_executable(ctx.workspace.root(), &config.node, "browser.node")?;
-    let runtime = runtime::provision(interrupt, installation_allowed(config))?;
+    let runtime = runtime::provision(interrupt, installation_allowed(config), || {
+        provision_bun(ctx, interrupt)
+    })?;
     if interrupt.load(Ordering::Acquire) {
         return Err("browser startup cancelled".into());
     }

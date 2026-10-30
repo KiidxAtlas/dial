@@ -1772,7 +1772,7 @@ impl ProviderOverlay {
                 hint(Action::SelectCancel, "cancel"),
             ],
             Mode::Headers { .. } => vec![
-                ("F10".to_owned(), "save".to_owned()),
+                ("Ctrl+S".to_owned(), "save".to_owned()),
                 hint(Action::SelectCancel, "cancel"),
             ],
             Mode::Confirm(_, removal) => vec![

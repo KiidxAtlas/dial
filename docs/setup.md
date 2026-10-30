@@ -37,9 +37,8 @@ outside software. Dial sets it up on request, never at startup.
 
 Each recipe tries methods in order and stops at the first one whose tool is available:
 
-1. npm into `~/.dial/tools/<id>` (for example Bun and the language servers; they use the npm that
-   comes with a Dial-installed Node.js);
-2. `uv tool install` into `~/.dial/tools/<id>` (Piper, mlx-whisper);
+1. npm into `~/.dial/tools/<id>` for private runtimes such as Bun;
+2. `uv tool install` into `~/.dial/tools/<id>` for Piper and mlx-whisper;
 3. Homebrew, with no sudo (installs into Homebrew's own prefix);
 4. a direct download of the project's own release archive for Node.js, Bun and uv, when none of
    the above is available.
@@ -50,8 +49,24 @@ unless the archive's SHA-256 matches the digest pinned in `crates/dial-tools/src
 directory; entries with absolute paths, `..`, hard links, or symlinks that leave the directory are
 rejected. Nothing runs with sudo.
 
-Prerequisites are installed first: a language server that needs npm sets up Node.js, and
-mlx-whisper or Piper sets up uv.
+Prerequisites for private runtimes are installed first (for example uv for mlx-whisper or Piper).
+
+### Automatic language servers
+
+With the `lsp` integration enabled, the first approved LSP request detects the language from
+the file type and project markers, reuses an existing server, or installs a missing built-in
+server with a known recipe. Startup and installation remain approval-gated; enabling the
+integration does not install every server at launch. Custom server commands are never replaced.
+
+Language servers use their package manager's normal locations, not the project or Dial storage:
+`npm install --global` respects npm's configured prefix, `uv tool install` respects uv's tool
+directories, `go install` respects `GOBIN`/`GOPATH`, rustup uses the selected Rust toolchain,
+and Homebrew uses its own prefix. Dial does not override these destinations or use sudo.
+An existing npm, uv, Go, rustup or Homebrew installation is required for the corresponding
+method; missing managers and unsupported recipes produce actionable errors instead of
+downloading a private language-server runtime. Bins outside `PATH` are resolved through the
+package manager after approval and used directly. Existing project-local and older Dial-managed
+servers remain usable; no existing installation is moved or removed.
 
 Local model runtime (`dial setup -m`) and Hindsight are manual: Dial shows the hint, not an install.
 Ollama uses Homebrew when present and otherwise points to https://ollama.com/download.

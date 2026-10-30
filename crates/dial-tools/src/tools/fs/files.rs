@@ -226,6 +226,11 @@ fn read_target(
         }
         return resolver.read(input, cancel);
     }
+    // Text-only recursive paths (batched targets and file URIs) must not bypass the
+    // controller-owned media entry point or silently discard an image attachment.
+    if super::media::needs_approval(&ws.expand_file_handle(input)?) {
+        return Err("external media reads require a single path through the controller-owned read entry point (not paths or file URI)".into());
+    }
     let scheme = crate::tools::integrations::resources::scheme(input)?;
     if !crate::tools::integrations::resources::descriptor(scheme).accepts_line_arguments
         && (opt_u64(args, "offset")?.is_some() || opt_u64(args, "limit")?.is_some())

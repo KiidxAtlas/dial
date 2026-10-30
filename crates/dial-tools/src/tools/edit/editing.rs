@@ -1198,3 +1198,20 @@ pub(crate) fn edit(ws: &Workspace, args: &Value) -> Result<String, String> {
     }
     finish_with(ws, prepare(ws, args)?, true, &execution)
 }
+
+/// Keep the built-in hashline model projection separate from the raw transcript result.
+pub(crate) fn edit_output(
+    ws: &Workspace,
+    args: &Value,
+) -> Result<crate::tools::ToolOutput, String> {
+    if ws.edit_mode == EditMode::Hashline {
+        validate_shape(ws.edit_mode, args)?;
+        let execution = Execution {
+            refuse_syntax_errors: syntax_gate(ws, args)?,
+            ..Default::default()
+        };
+        hashline::edit_output_with(ws, hashline::input_arg(args)?, true, &execution)
+    } else {
+        edit(ws, args).map(crate::tools::ToolOutput::ok)
+    }
+}

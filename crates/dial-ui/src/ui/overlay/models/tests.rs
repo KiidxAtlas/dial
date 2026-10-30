@@ -791,6 +791,11 @@ fn capability_icons_labels_and_search_use_metadata_in_every_glyph_preset() {
         let detail = capability_detail(&rig.theme, &model);
         assert!(detail.contains("tools no") && detail.contains("reasoning unknown"));
         assert!(!capability_badges(&rig.theme, &model).contains(rig.theme.sym(Sym::IconTools)));
+        // A chat model without tool calls is flagged: Dial's tools cannot run on it.
+        assert!(tool_warning(&model).is_some());
+        model.metadata.tools = None;
+        assert!(tool_warning(&model).is_none());
+        model.metadata.tools = Some(false);
         let mut embed = entry("ollama", "embed-model", "Ollama", false, None);
         embed.metadata.kind = ModelKind::Embedding;
         assert_eq!(
@@ -2144,4 +2149,34 @@ fn image_role_picker_and_chooser_share_capability_policy_and_inheritance() {
     assert_eq!(names(&o), ["local-image"]);
     o.open_chooser();
     assert_eq!(o.chooser.as_ref().unwrap().roles, ["image"]);
+}
+
+#[test]
+fn chatgpt_plan_models_are_image_role_candidates_unless_disabled() {
+    use crate::llm::profiles::ImageGenerationApi;
+    let mut plan = entry(
+        crate::llm::chatgpt::PROVIDER,
+        "gpt-plan",
+        "ChatGPT plan",
+        true,
+        None,
+    );
+    assert!(!plan.supports_images(), "no declared image output");
+    assert!(role_accepts("image", &plan));
+    assert!(role_accepts("main", &plan));
+    let other = entry("openai", "gpt-text", "OpenAI", true, None);
+    assert!(!role_accepts("image", &other));
+
+    let mut d = discovery();
+    d.models.push(plan.clone());
+    let mut o = ModelOverlay::new(Some(d), roles_with_main(), Scope::Global);
+    o.group = Group::Images;
+    assert_eq!(names(&o), ["gpt-plan"]);
+    assert!(
+        matches!(o.confirm(), OverlayEvent::AssignModel { role, selection, .. }
+        if role == "image" && selection.model == "gpt-plan")
+    );
+
+    plan.metadata.image_generation = Some(ImageGenerationApi::Disabled);
+    assert!(!role_accepts("image", &plan));
 }

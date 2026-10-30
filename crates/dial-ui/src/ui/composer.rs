@@ -102,6 +102,15 @@ pub enum ComposerEvent {
     Action(Action),
 }
 
+/// Whether submitted text is a slash command. Command names never contain a slash, so text whose
+/// first word has a second `/` (a pasted path such as `/Users/me/notes.md`) is an ordinary message.
+pub fn is_slash_command(text: &str) -> bool {
+    text.trim_start()
+        .strip_prefix('/')
+        .and_then(|rest| rest.split(char::is_whitespace).next())
+        .is_some_and(|name| !name.contains('/'))
+}
+
 #[derive(Clone, Copy)]
 pub struct ComposerCtx<'a> {
     pub theme: &'a Theme,
@@ -995,18 +1004,18 @@ impl Composer {
                 return ComposerEvent::None;
             }
         }
-        if keys.matches(Action::FollowUp, &key) {
+        if keys.triggers(Action::FollowUp, &key) {
             if !self.busy {
                 self.editor.insert("\n");
                 return ComposerEvent::None;
             }
-            return if self.editor.text.trim_start().starts_with('/') {
+            return if is_slash_command(&self.editor.text) {
                 self.submit()
             } else {
                 self.submit_queued(true)
             };
         }
-        if keys.matches(Action::SubagentsHub, &key) {
+        if keys.triggers(Action::SubagentsHub, &key) {
             return ComposerEvent::Action(Action::SubagentsHub);
         }
         // Left twice on an empty draft is the gesture form of the hub key.
@@ -1017,7 +1026,7 @@ impl Composer {
         {
             return ComposerEvent::Action(Action::SubagentsHub);
         }
-        if let Some(action) = APP_ACTIONS.into_iter().find(|a| keys.matches(*a, &key)) {
+        if let Some(action) = APP_ACTIONS.into_iter().find(|a| keys.triggers(*a, &key)) {
             return ComposerEvent::Action(action);
         }
         if keys.matches(Action::HistorySearch, &key) {
@@ -1119,7 +1128,7 @@ impl Composer {
             }
             return ComposerEvent::None;
         }
-        if self.busy && !self.editor.text.trim_start().starts_with('/') {
+        if self.busy && !is_slash_command(&self.editor.text) {
             if self.editing_queue.is_some() {
                 return self.submit_queued(false);
             }
@@ -1491,7 +1500,9 @@ impl Composer {
             return None;
         }
         let rest = text.strip_prefix('/')?;
-        if rest.chars().any(char::is_control) {
+        // A pasted path is not a command: no menu, and Enter sends it as typed instead of
+        // completing a fuzzy command match.
+        if rest.chars().any(char::is_control) || !is_slash_command(text) {
             return None;
         }
         (!rest.chars().any(char::is_whitespace) || self.argument_entries(rest).is_some())
@@ -2351,7 +2362,7 @@ impl Composer {
                     hint(Action::Dismiss, "dismiss"),
                 ]);
             } else if self.busy {
-                let command = self.editor.text.trim_start().starts_with('/');
+                let command = is_slash_command(&self.editor.text);
                 let blank = self.editor.text.trim().is_empty();
                 // Mirrors `submit`: an empty Enter asks to stop (only with queued work); a blank draft
                 // is ignored; otherwise Enter asks whether to send now or after the turn.

@@ -589,6 +589,21 @@ pub(crate) fn selection_model(selection: &ModelSelection) -> Option<BundledModel
 /// Fill capability gaps the live catalog left open and attach the bundled list price.
 pub(super) fn complete_metadata(
     selection: &ModelSelection,
+    metadata: ModelMetadata,
+) -> ModelMetadata {
+    let mut metadata = complete_capabilities(selection, metadata);
+    if let Some(model) = selection_model(selection) {
+        metadata.pricing = metadata
+            .pricing
+            .or_else(|| model.list_price.map(ListPrice::token_pricing));
+    }
+    metadata
+}
+
+/// Fill purpose, vision, reasoning and output-limit gaps from the exact bundled record. Values the
+/// live catalog reported win; pricing is left to [`complete_metadata`].
+pub(super) fn complete_capabilities(
+    selection: &ModelSelection,
     mut metadata: ModelMetadata,
 ) -> ModelMetadata {
     metadata.kind = known_kind(selection, metadata.kind);
@@ -596,9 +611,6 @@ pub(super) fn complete_metadata(
         metadata.vision = metadata.vision.or(Some(model.vision));
         metadata.reasoning = metadata.reasoning.or(Some(model.reasoning));
         metadata.max_output_tokens = metadata.max_output_tokens.or(model.max_output_tokens);
-        metadata.pricing = metadata
-            .pricing
-            .or_else(|| model.list_price.map(ListPrice::token_pricing));
     }
     metadata
 }

@@ -17,14 +17,18 @@ pub const BUN_MIN: (u64, u64, u64) = (1, 3, 14);
 /// Minimum Node.js major.minor.patch for the `node` recipe (`eval.node` needs Node 22+).
 pub const NODE_MIN: (u64, u64, u64) = (22, 0, 0);
 
-/// One way to obtain a dependency. Every method installs only into Dial's user directory,
-/// or uses an existing package manager without elevated privileges. Nothing runs with sudo.
+/// One way to obtain a dependency. Language servers use the package manager's normal locations;
+/// other optional runtimes may use Dial's user directory. Nothing runs with sudo.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Method {
     /// npm packages installed with `npm install --prefix <install dir>`.
     Npm(&'static [&'static str]),
     /// A Python tool installed with `uv tool install` into the install dir.
     Uv(&'static str),
+    /// npm packages installed in npm's configured global prefix.
+    NpmGlobal(&'static [&'static str]),
+    /// A Python CLI installed in uv's normal tool environment and bin directory.
+    UvTool(&'static str),
     /// A Homebrew formula. Homebrew installs into its own prefix, without sudo.
     Brew(&'static str),
     /// Needs the user: a service, a model file, or a privileged install. Dial shows the hint.
@@ -32,7 +36,7 @@ pub enum Method {
     /// A pinned release archive from the project's own download, verified by SHA-256 and unpacked
     /// into Dial's install directory. Used only when no package manager above is available.
     Download(prebuilt::Prebuilt),
-    /// A Go program installed with `go install <package>` into the install dir's `bin`.
+    /// A Go program installed with `go install <package>` using normal GOBIN/GOPATH settings.
     Go(&'static str),
     /// A rustup component (`rustup component add <name>`), which lands in the Rust toolchain.
     Rustup(&'static str),
@@ -71,11 +75,11 @@ macro_rules! npm_lsp {
         Recipe {
             id: $program,
             title: $title,
-            requires: &["node"],
+            requires: &[],
             program: $program,
             base: Base::Install,
             artifact: concat!("node_modules/.bin/", $program),
-            methods: &[Method::Npm($packages)],
+            methods: &[Method::NpmGlobal($packages)],
         }
     };
 }
@@ -86,11 +90,11 @@ macro_rules! uv_lsp {
         Recipe {
             id: $program,
             title: $title,
-            requires: &["uv"],
+            requires: &[],
             program: $program,
             base: Base::Install,
             artifact: concat!("bin/", $program),
-            methods: &[Method::Uv($package)],
+            methods: &[Method::UvTool($package)],
         }
     };
 }
@@ -207,20 +211,20 @@ pub const RECIPES: &[Recipe] = &[
     Recipe {
         id: "typescript-language-server",
         title: "typescript-language-server",
-        requires: &["node"],
+        requires: &[],
         program: "typescript-language-server",
         base: Base::Install,
         artifact: "node_modules/.bin/typescript-language-server",
-        methods: &[Method::Npm(LSP_TS)],
+        methods: &[Method::NpmGlobal(LSP_TS)],
     },
     Recipe {
         id: "pyright-langserver",
         title: "pyright",
-        requires: &["node"],
+        requires: &[],
         program: "pyright-langserver",
         base: Base::Install,
         artifact: "node_modules/.bin/pyright-langserver",
-        methods: &[Method::Npm(&["pyright"])],
+        methods: &[Method::NpmGlobal(&["pyright"])],
     },
     Recipe {
         id: "gopls",

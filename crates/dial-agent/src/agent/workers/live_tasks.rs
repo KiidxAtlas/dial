@@ -732,6 +732,17 @@ impl LiveTasks {
     }
     /// Records that one worker result reached the model; it is never queued again.
     pub fn deliver(&mut self, id: &str) {
+        // A queued aggregate may contain only a suffix of a pool's items. Acknowledge exactly
+        // those reports, never newer runs that have not appeared in the parent's request.
+        let items = self
+            .completed
+            .iter()
+            .find(|result| result["id"].as_str() == Some(id))
+            .and_then(|result| result["items"].as_array())
+            .cloned();
+        if let Some(items) = items {
+            self.acknowledge(&json!(items));
+        }
         if let Some(job) = self.jobs.get_mut(id)
             && !job.running()
         {
@@ -748,12 +759,40 @@ impl LiveTasks {
             None => vec![reply],
         };
         for job in jobs {
+            if let Some(items) = job.get("items").filter(|items| items.is_array()) {
+                self.acknowledge(items);
+                if let Some(id) = job["id"].as_str() {
+                    self.deliver(id);
+                }
+            }
             if let (Some(id), Some(status)) = (job["id"].as_str(), job["status"].as_str())
                 && status != "running"
             {
                 self.deliver(id);
             }
         }
+    }
+    /// Polling replies keep typed reports intact but do not repeat already delivered narratives.
+    /// Explicit targeted status uses `output` instead to recover the original preview.
+    pub(in crate::agent) fn polling_output(&mut self, reply: Result<Value, String>) -> ToolOutput {
+        let mut rendered = output(reply);
+        if let Some(value) = &rendered.data {
+            rendered.text = model_summary_view(value, &|record| {
+                record["id"]
+                    .as_str()
+                    .and_then(|id| self.jobs.get(id))
+                    .is_some_and(|job| {
+                        let mut canonical = job.status();
+                        // Item ordinals are pool presentation, not part of the worker report.
+                        if let Some(item) = record.get("item") {
+                            canonical["item"] = item.clone();
+                        }
+                        job.delivered && !job.running() && canonical == *record
+                    })
+            });
+            self.acknowledge(value);
+        }
+        rendered
     }
     /// Ids of workers that have not settled yet; a turn that tries to finish waits for them.
     pub fn running_ids(&self) -> Vec<String> {
@@ -845,6 +884,7 @@ impl LiveTasks {
         };
         let effective = resume.as_ref().map_or(args, |resume| &resume.task).clone();
         let mut request = subagents::parse(&effective, &config)?;
+        subagents::check_isolation_backends(&request.jobs, workspace, &config)?;
         subagents::seance::attach(
             &mut request.jobs,
             layout,
@@ -969,6 +1009,10 @@ impl LiveTasks {
             if job.isolated {
                 assignment["isolation"] = json!("copy");
                 task["isolation"] = json!("copy");
+            }
+            if let Some(preference) = job.isolation_backend {
+                assignment["isolation_backend"] = json!(preference);
+                task["isolation_backend"] = json!(preference);
             }
             if let Some(schema) = &job.schema {
                 task["output_schema"] = schema.clone();
@@ -1479,6 +1523,7 @@ impl LiveTasks {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .remove(&id);
+                    let pooled = self.pool_owns_job(&id);
                     if let Some(job) = self.jobs.get_mut(&id) {
                         // Workers normally publish directly; retain this fallback for interrupted
                         // owners and synthetic events without overwriting an already terminal body.
@@ -1487,7 +1532,7 @@ impl LiveTasks {
                         }
                         if self.tree.owns(&job.body) {
                             ui.result_node(&job.body);
-                            if !job.delivered {
+                            if !job.delivered && !pooled {
                                 self.completed.push(job.status());
                             }
                         }
@@ -1641,7 +1686,11 @@ pub(in crate::agent) fn output(result: Result<Value, String>) -> ToolOutput {
 
 /// Model-facing result projection. Observers retain the full typed state in `data`.
 pub(in crate::agent) fn model_summary(value: &Value) -> String {
-    fn one(job: &Value) -> String {
+    model_summary_view(value, &|_| false)
+}
+
+fn model_summary_view(value: &Value, delivered: &impl Fn(&Value) -> bool) -> String {
+    fn one(job: &Value, delivered: bool) -> String {
         let id = job["id"]
             .as_str()
             .or_else(|| job["name"].as_str())
@@ -1649,6 +1698,12 @@ pub(in crate::agent) fn model_summary(value: &Value) -> String {
         let status = job["status"].as_str().unwrap_or("unknown");
         let steps = job["steps"].as_u64().unwrap_or(0);
         let mut text = format!("Worker {id}: {status} ({steps} requests)");
+        // Never elide a failed/unknown result or one without a retained full report.
+        let compact = delivered
+            && matches!(status, "done" | "completed")
+            && job["artifact"].as_str().is_some()
+            && job.get("artifact_error").is_none()
+            && job.get("transcript_error").is_none();
         for (key, label) in [
             ("artifact_error", "Worker report retention failed"),
             ("transcript_error", "Worker transcript persistence failed"),
@@ -1657,6 +1712,17 @@ pub(in crate::agent) fn model_summary(value: &Value) -> String {
                 let error = crate::agent::window::prompt::truncate_chars(error, 1000);
                 text.push_str(&format!("\n[{label}: {error}]"));
             }
+        }
+        if matches!(status, "running" | "queued")
+            && job
+                .get("result")
+                .is_none_or(|result| result.is_null() || result.as_str().is_some_and(str::is_empty))
+            && job.get("projection").is_none()
+        {
+            if let Some(phase) = job["phase"].as_str().filter(|phase| *phase != status) {
+                text.push_str(&format!("; {phase}"));
+            }
+            return text;
         }
         let derived;
         let projection = if let Some(projection) = job.get("projection") {
@@ -1680,10 +1746,33 @@ pub(in crate::agent) fn model_summary(value: &Value) -> String {
             );
             &derived
         };
-        text.push_str(&format!(
-            "\nWorker result projection (claims, not verification):\n{projection}"
-        ));
-        if let Some(result) = job.get("result") {
+        let mut projection = projection.clone();
+        if compact {
+            if let Some(fields) = projection.as_object_mut() {
+                for key in ["summary", "evidence_refs", "changed_paths", "provenance"] {
+                    fields.remove(key);
+                }
+                fields.retain(|_, value| match value {
+                    Value::Null => false,
+                    Value::Array(items) => !items.is_empty(),
+                    Value::Object(fields) => !fields.is_empty(),
+                    _ => true,
+                });
+            }
+            text.push_str(
+                "\n[Report already delivered; task status with this id recovers the full preview.]",
+            );
+        }
+        if !compact
+            || projection
+                .as_object()
+                .is_none_or(|fields| !fields.is_empty())
+        {
+            text.push_str(&format!(
+                "\nWorker result projection (claims, not verification):\n{projection}"
+            ));
+        }
+        if let Some(result) = job.get("result").filter(|_| !compact) {
             let report = result
                 .as_str()
                 .map(str::to_owned)
@@ -1701,14 +1790,28 @@ pub(in crate::agent) fn model_summary(value: &Value) -> String {
         }
         text
     }
+    if let Some(items) = value["items"].as_array() {
+        let id = value["id"].as_str().unwrap_or("pool");
+        let state = value["state"].as_str().unwrap_or("unknown");
+        let mut text = format!("Worker pool {id}: {state}; counts: {}", value["counts"]);
+        for item in items {
+            text.push_str("\n\n");
+            text.push_str(&one(item, delivered(item)));
+        }
+        return text;
+    }
     if let Some(jobs) = value.as_array().or_else(|| value["jobs"].as_array()) {
         if jobs.is_empty() {
             return "No workers.".into();
         }
-        return jobs.iter().map(one).collect::<Vec<_>>().join("\n\n");
+        return jobs
+            .iter()
+            .map(|job| one(job, delivered(job)))
+            .collect::<Vec<_>>()
+            .join("\n\n");
     }
     if value.get("status").is_some() {
-        return one(value);
+        return one(value, delivered(value));
     }
     value.to_string()
 }

@@ -425,6 +425,7 @@ pub fn is_read_only(ext: &Registry, name: &str, args: &Value) -> bool {
                 crate::tools::integrations::ssh::url::is_ssh_url(path)
                     || crate::tools::integrations::host_uri::is_foreign_target(path)
                     || crate::tools::net::web::is_url(path)
+                    || crate::tools::media_read_needs_approval(path)
                     || crate::tools::fs::documents::needs_approval(
                         &serde_json::json!({ "path": path }),
                     )
@@ -736,7 +737,7 @@ impl PermissionRule {
         Ok(())
     }
 
-    fn matches(&self, call: &ToolCall, root: &Path) -> bool {
+    pub(in crate::agent) fn matches(&self, call: &ToolCall, root: &Path) -> bool {
         if self.tool != call.name {
             return false;
         }
@@ -1273,6 +1274,49 @@ pub(crate) fn authorize_with_cancel(
 ) -> Result<bool, Denial> {
     authorize_inner(approval, rules, root, call, summary, ui, Some(cancel))
 }
+/// Recheck policy using a finite exact-call choice instead of asking again. This never
+/// creates a permission rule; callers must consume the matching call identity once.
+pub(in crate::agent) fn authorize_once(
+    approval: Approval,
+    rules: &mut Vec<PermissionRule>,
+    root: &Path,
+    call: &ToolCall,
+    ui: &mut dyn Ui,
+    cancel: &std::sync::atomic::AtomicBool,
+    allowed: bool,
+) -> Result<bool, Denial> {
+    if !allowed {
+        explain(ui, call, PolicyReason::OperatorDeny);
+        return Err(Denial::User);
+    }
+    struct Once<'a>(&'a mut dyn Ui);
+    impl Ui for Once<'_> {
+        fn approve_call(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: Option<&std::sync::atomic::AtomicBool>,
+        ) -> Decision {
+            Decision::Allow
+        }
+        fn policy_explanation(&mut self, id: &str, tool: &str, explanation: &PolicyExplanation) {
+            self.0.policy_explanation(id, tool, explanation);
+        }
+        fn notice(&mut self, message: &str) {
+            self.0.notice(message);
+        }
+    }
+    authorize_with_cancel(
+        approval,
+        rules,
+        root,
+        call,
+        &crate::agent::describe(call),
+        &mut Once(ui),
+        cancel,
+    )
+}
 
 /// A harness-run verification command: its check name and the exact shell text.
 pub(in crate::agent) struct AutomaticCheck<'a> {
@@ -1346,6 +1390,26 @@ fn authorize_inner(
     if denied_by_rule(rules, call, root) {
         explain_rule(ui, call, root, rules, Effect::Deny);
         return Err(Denial::Rule);
+    }
+    // A watch grants future automatic continuation; never reuse a broad tool grant or Auto mode.
+    if call.name == "monitor" && call.arguments["action"] == "start" {
+        if approval == Approval::Readonly {
+            explain(ui, call, PolicyReason::ReadOnly);
+            return Err(Denial::ReadOnly);
+        }
+        explain(ui, call, PolicyReason::PromptRequired);
+        let summary = format!(
+            "{summary}\nApprove this one-shot application watch? New matching output may wake Dial to diagnose and fix within the current task and existing permissions. No additional process control is granted. This approval is not reusable."
+        );
+        let decision = ui.approve_call(&call.id, &call.name, &summary, cancel);
+        if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+            return Err(Denial::User);
+        }
+        return if decision == Decision::Deny {
+            Err(Denial::User)
+        } else {
+            Ok(false)
+        };
     }
     match approval {
         Approval::Readonly => {

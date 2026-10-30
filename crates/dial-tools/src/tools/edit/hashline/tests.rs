@@ -20,6 +20,61 @@ fn tag_is_four_uppercase_hex_and_ignores_crlf() {
 }
 
 #[test]
+fn successful_edit_model_projection_keeps_fresh_anchors_and_raw_diff() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.txt");
+    fs::write(&path, "one\ntwo\nthree\n").unwrap();
+    let ws = Workspace::new(dir.path()).unwrap();
+    let tag = ws.store().record_all(&path, "one\ntwo\nthree\n");
+    let output = edit_output_with(
+        &ws,
+        &format!("[a.txt#{tag}]\nPUT 2.=2:\n+TWO\n"),
+        true,
+        &super::super::editing::Execution::default(),
+    )
+    .unwrap();
+    let history = crate::tools::surface::outcome::message_for("edit", "call", &output);
+    let model = history["content"].as_str().unwrap();
+    assert!(output.text.contains("change preview"));
+    assert!(output.text.contains("-two\n+TWO"));
+    assert!(!model.contains("change preview"), "{model}");
+    assert!(model.contains("2:TWO\n"), "{model}");
+    let fresh = tag_of("one\nTWO\nthree\n");
+    assert!(model.contains(&format!("[a.txt#{fresh}]")), "{model}");
+    // The retained anchor is immediately usable without a redundant read.
+    edit(&ws, &format!("[a.txt#{fresh}]\nPUT 2.=2:\n+again\n")).unwrap();
+    assert_eq!(fs::read_to_string(path).unwrap(), "one\nagain\nthree\n");
+}
+
+#[test]
+fn incomplete_numbered_previews_keep_the_distinct_diff_evidence() {
+    for replacement in [
+        "x".repeat(PREVIEW_LINE_CAP + 1),
+        "x\n".repeat(PREVIEW_MAX_ROWS + 1),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        fs::write(&path, "old\n").unwrap();
+        let ws = Workspace::new(dir.path()).unwrap();
+        let tag = ws.store().record_all(&path, "old\n");
+        let body = replacement
+            .lines()
+            .map(|line| format!("+{line}\n"))
+            .collect::<String>();
+        let output = edit_output_with(
+            &ws,
+            &format!("[a.txt#{tag}]\nPUT 1.=1:\n{body}"),
+            true,
+            &super::super::editing::Execution::default(),
+        )
+        .unwrap();
+        let history = crate::tools::surface::outcome::message_for("edit", "call", &output);
+        assert_eq!(history["content"], output.text);
+        assert!(output.text.contains("change preview"));
+    }
+}
+
+#[test]
 fn parser_reads_every_operation_form() {
     let patch = "*** Begin Patch\n[a.rs#1a2B]\nPUT 1.=2:\n+x\n+\n++plus\n+-minus\nPUT <1:\n+h\nPUT >3:\n+t\nPUT >$:\n+e\nPUT 4*:\n+b\nPUT >5*:\n+ab\nCUT 6.=7\nCUT 8* @n\nPUT <2\nPUT >9 @n\nPUT >$ @n\nPUT 1.=1 @n\nPUT 2* @n\n[b.rs#FFFF]\nREM\n[c.rs#0000]\nMV \"new dir/c.rs\"\n*** End Patch\n";
     let sections = parse_patch(patch).unwrap();

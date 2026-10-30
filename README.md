@@ -85,6 +85,13 @@ versions and next steps.
 **Homebrew, Nix and Docker** are also published; see
 [docs/release-and-install.md](docs/release-and-install.md#other-distribution-channels).
 
+**Updating.** Run `dial update` in a terminal, or `/update` inside Dial (then `/restart`). It
+updates the way Dial was installed: installer copies get the latest signed release (or
+`dial update --version 0.2.6` for a specific one), Homebrew and Cargo installs run `brew upgrade` or
+`cargo install` for you, and a source build pulls its checkout (`git pull --ff-only`) and runs
+`make update`. Nix installs are left to the flake. The interactive terminal tells you when a newer
+release is available.
+
 <details>
 <summary><b>Platform requirements</b></summary>
 

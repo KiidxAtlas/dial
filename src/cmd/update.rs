@@ -1,12 +1,13 @@
-//! Verified self-update for binaries installed by the release installer.
+//! `dial update` (and `/update`, which runs it): brings this executable up to date the way it was
+//! installed, following [`release::plan`]: a verified signed release for installer copies, the
+//! package manager for Homebrew and Cargo, and `git pull` plus `make update` for source builds.
 use anyhow::{Context, Result, bail, ensure};
 use base64::Engine as _;
+use dial::release::{self, Installation, REPOSITORY, SIGNING_KEY, UpdatePlan};
 use ring::signature;
 use sha2::{Digest, Sha256};
-use std::{fs, path::Path};
-
-const REPOSITORY: &str = "KiidxAtlas/dial";
-const SIGNING_KEY: Option<&str> = option_env!("DIAL_RELEASE_PUBLIC_KEY");
+use std::process::Command;
+use std::{fs, path::Path, time::Duration};
 
 fn target() -> Result<&'static str> {
     // The libc is fixed at compile time: a musl build must fetch the musl archive, never the glibc one.
@@ -43,55 +44,9 @@ fn fetch(url: &str) -> Result<Vec<u8>> {
         .context("reading download response")
 }
 
-fn release_tag(version: Option<&str>) -> Result<String> {
-    if let Some(version) = version {
-        let tag = if version.starts_with('v') {
-            version.to_owned()
-        } else {
-            format!("v{version}")
-        };
-        ensure!(
-            tag.len() > 1
-                && tag[1..]
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+')),
-            "invalid version tag"
-        );
-        return Ok(tag);
-    }
-    let value: serde_json::Value = ureq::get(&format!(
-        "https://api.github.com/repos/{REPOSITORY}/releases/latest"
-    ))
-    .header("User-Agent", "dial-updater")
-    .config()
-    .timeout_global(Some(std::time::Duration::from_secs(30)))
-    .build()
-    .call()?
-    .into_body()
-    .read_json()?;
-    value
-        .get("tag_name")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-        .context("GitHub latest release has no tag_name")
-}
-
 /// The version in a `dial <version> (<build info>)` line printed by `--version`.
 fn dial_version_token(line: &str) -> Option<&str> {
     line.trim().strip_prefix("dial ")?.split_whitespace().next()
-}
-
-fn installation_kind(path: &Path) -> &'static str {
-    let text = path.to_string_lossy().replace('\\', "/");
-    if text.contains("/Cellar/") || text.contains("/homebrew/") {
-        "Homebrew"
-    } else if text.contains("/.cargo/bin/") {
-        "Cargo"
-    } else if text.contains("/nix/store/") {
-        "Nix"
-    } else {
-        "script"
-    }
 }
 
 fn verify_signature_with_key(sums: &[u8], signature_text: &[u8], public_key: &str) -> Result<()> {
@@ -127,18 +82,143 @@ fn checksum(sums: &str, archive: &str) -> Result<String> {
 
 pub fn run(version: Option<&str>) -> Result<()> {
     let executable = std::env::current_exe().context("locating running executable")?;
-    let kind = installation_kind(&executable);
-    if kind != "script" {
-        let command = match kind {
-            "Homebrew" => "brew upgrade dial",
-            "Cargo" => "cargo install --locked dial",
-            "Nix" => "update the dial flake input and rebuild",
-            _ => unreachable!(),
-        };
-        println!("This installation is managed by {kind}. Update it with: {command}");
+    let installation = Installation::of(&executable);
+    match release::plan(
+        installation,
+        SIGNING_KEY.is_some(),
+        release::source_checkout().as_deref(),
+    ) {
+        UpdatePlan::Release => install_release(&executable, version),
+        UpdatePlan::PackageManager(installation) => run_package_manager(installation, version),
+        UpdatePlan::Checkout(root) => update_checkout(&root, version),
+        UpdatePlan::Manual(how) if installation == Installation::Nix => {
+            println!("This installation is managed by Nix: {how}.");
+            Ok(())
+        }
+        UpdatePlan::Manual(how) => bail!(
+            "this build has no embedded release verification key and its source checkout is gone, so it cannot update itself; {how}"
+        ),
+    }
+}
+
+/// Runs `program ARGS` with this terminal's output (or `/update`'s transcript pipe).
+fn run_visible(program: &str, args: &[&str], cwd: Option<&Path>) -> Result<()> {
+    let shown = std::iter::once(program)
+        .chain(args.iter().copied())
+        .collect::<Vec<_>>()
+        .join(" ");
+    println!("$ {shown}");
+    let mut command = Command::new(program);
+    command.args(args);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let status = command.status().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            anyhow::anyhow!("`{program}` was not found on PATH; it is needed to run `{shown}`")
+        } else {
+            anyhow::Error::new(error).context(format!("starting `{shown}`"))
+        }
+    })?;
+    ensure!(status.success(), "`{shown}` failed ({status})");
+    Ok(())
+}
+
+fn run_package_manager(installation: Installation, version: Option<&str>) -> Result<()> {
+    let tag = version.map(release::tag).transpose()?;
+    ensure!(
+        tag.is_none() || installation != Installation::Homebrew,
+        "Homebrew installs the version its formula pins; run `dial update` without --version"
+    );
+    let argv = installation
+        .package_manager_argv(tag.as_deref())
+        .context("this installation has no package-manager update command")?;
+    println!("Updating Dial with {}.", installation.name());
+    let args: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
+    run_visible(&argv[0], &args, None)
+}
+
+/// Whether the build from `revision` (dirty state `dirty`) is already `head`.
+fn built_from(head: &str, revision: &str, dirty: &str) -> bool {
+    dirty == "false"
+        && revision.len() >= 7
+        && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && head.starts_with(revision)
+}
+
+fn git_output(root: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .args(["-c", "core.fsmonitor=false"])
+        .args(args)
+        .current_dir(root)
+        .output()
+        .with_context(|| format!("running git {}", args.join(" ")))?;
+    ensure!(
+        output.status.success(),
+        "git {} failed in {}: {}",
+        args.join(" "),
+        root.display(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// Fast-forwards the checkout this executable was built from, then rebuilds and reinstalls it
+/// with `make update`. Uncommitted changes to tracked files stop it before anything changes, and
+/// `git pull --ff-only` refuses a diverged branch, so local work is never merged or discarded.
+fn update_checkout(root: &Path, version: Option<&str>) -> Result<()> {
+    ensure!(
+        version.is_none(),
+        "this Dial is built from the source checkout at {}, which updates to the latest commit of its branch; to build a release, check out its tag there and run `make update`",
+        root.display()
+    );
+    println!("Updating the source checkout at {}.", root.display());
+    let changed = git_output(root, &["status", "--porcelain", "--untracked-files=no"])?;
+    if !changed.is_empty() {
+        const SHOWN: usize = 10;
+        let lines: Vec<&str> = changed.lines().collect();
+        let mut listing = lines[..lines.len().min(SHOWN)].join("\n");
+        if lines.len() > SHOWN {
+            listing.push_str(&format!("\n… and {} more", lines.len() - SHOWN));
+        }
+        bail!(
+            "the checkout at {} has uncommitted changes to {} tracked files; commit or stash them, then run `dial update` again. Nothing was changed.\n{listing}",
+            root.display(),
+            lines.len()
+        );
+    }
+    run_visible("git", &["pull", "--ff-only"], Some(root))?;
+    let head = git_output(root, &["rev-parse", "HEAD"])?;
+    let build = dial::build_info::REVISION;
+    if built_from(&head, build, dial::build_info::DIRTY) {
+        println!("Dial is up to date: it was built from {build}, the checkout's current commit.");
         return Ok(());
     }
-    let tag = release_tag(version)?;
+    run_visible("make", &["update"], Some(root))?;
+    println!(
+        "Updated Dial to {} from {}.",
+        &head[..head.len().min(12)],
+        root.display()
+    );
+    Ok(())
+}
+
+fn install_release(executable: &Path, version: Option<&str>) -> Result<()> {
+    let tag = match version {
+        Some(version) => release::tag(version)?,
+        None => {
+            let latest = release::latest_tag(Duration::from_secs(30))
+                .context("checking the latest Dial release")?;
+            if !release::is_newer(&latest, release::CURRENT) {
+                println!(
+                    "Dial {} is up to date (latest release: {latest}).",
+                    release::CURRENT
+                );
+                return Ok(());
+            }
+            latest
+        }
+    };
     let platform = target()?;
     let extension = if cfg!(windows) { "zip" } else { "tar.gz" };
     let archive_name = format!("dial-{tag}-{platform}.{extension}");
@@ -250,7 +330,7 @@ try {
                 "-Command",
                 script,
             ])
-            .env("DIAL_UPDATE_CURRENT", &executable)
+            .env("DIAL_UPDATE_CURRENT", executable)
             .env("DIAL_UPDATE_STAGED", &staged)
             .env("DIAL_UPDATE_BACKUP", &backup)
             .env("DIAL_UPDATE_PARENT_PID", std::process::id().to_string())
@@ -267,13 +347,9 @@ try {
     }
     #[cfg(unix)]
     {
-        activate_unix(
-            &executable,
-            &staged,
-            &backup,
-            temp.path(),
-            &|path: &Path| verify_version(path, tag.trim_start_matches('v')),
-        )?;
+        activate_unix(executable, &staged, &backup, temp.path(), &|path: &Path| {
+            verify_version(path, tag.trim_start_matches('v'))
+        })?;
         println!(
             "Updated Dial to {} (backup: {})",
             tag.trim_start_matches('v'),
