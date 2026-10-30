@@ -254,17 +254,20 @@ fn context_metadata_omits_text_and_selected_messages_need_explicit_approval() {
     with_agent("", |agent| {
         agent
             .session
-            .append(json!({"role":"user","content":"private user text"}))
+            .append(json!({"role":"user","content":"EXT-USER-SECRET-TEXT"}))
             .unwrap();
-        agent.session.append(json!({"role":"assistant","content":"private assistant text","reasoning_content":"never disclose"})).unwrap();
+        agent.session.append(json!({"role":"assistant","content":"EXT-ASSISTANT-SECRET-TEXT","reasoning_content":"never disclose"})).unwrap();
         let host = host(&["host.context", "host.conversation"]);
         let owner = Owner::new(&host, "fixture").unwrap();
         let mut backend = agent.backend.take().unwrap();
         let metadata = agent
             .extension_callback(&mut backend, &mut DenyUi, &owner, "context.get", &json!({}))
             .unwrap();
-        assert!(!metadata.to_string().contains("private"));
-        assert!(!metadata.to_string().contains("never disclose"));
+        // Unique markers: the metadata carries the workspace path, which may contain "private".
+        let shown = metadata.to_string();
+        assert!(!shown.contains("EXT-USER-SECRET-TEXT"), "{shown}");
+        assert!(!shown.contains("EXT-ASSISTANT-SECRET-TEXT"), "{shown}");
+        assert!(!shown.contains("never disclose"), "{shown}");
         let id = metadata["conversation"][0]["id"].as_str().unwrap();
         let error = agent
             .extension_callback(
