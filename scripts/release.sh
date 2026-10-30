@@ -5,9 +5,11 @@
 #   scripts/release.sh 0.1.23 --push     # ...then push main and the tag (starts release.yml)
 #   scripts/release.sh 0.1.23 --no-check # skip local fmt/clippy/tests (CI still gates publishing)
 #
-# Steps: require a clean checkout on main; set [workspace.package] version in Cargo.toml; refresh
-# Cargo.lock for workspace members only; move `## [Unreleased]` entries under `## [<version>] -
-# <date>` in CHANGELOG.md; run the local gate; commit `release: v<version>`; tag `v<version>`.
+# Steps: require a clean checkout on main that matches origin/main and has a successful CI run;
+# set [workspace.package] version in Cargo.toml; refresh Cargo.lock for workspace members only;
+# move `## [Unreleased]` entries under `## [<version>] - <date>` in CHANGELOG.md; run the local
+# gate (`make preflight`); commit `release: v<version>`; tag `v<version>`. The release commit
+# only changes version metadata, so a green CI on its parent is the evidence the tag depends on.
 set -euo pipefail
 
 usage() { sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
@@ -35,6 +37,20 @@ branch="$(git rev-parse --abbrev-ref HEAD)"
 [[ -z "$(git status --porcelain)" ]] || { echo "working tree is not clean; commit or stash your changes first" >&2; exit 1; }
 if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
   echo "tag $tag already exists" >&2
+  exit 1
+fi
+
+# The release workflow publishes only after CI passes on the tagged commit. Tagging a commit whose
+# code never passed CI means discovering failures after the tag and re-pointing it, so require a
+# green run on the commit being released first.
+git fetch -q origin main
+head="$(git rev-parse HEAD)"
+[[ "$head" == "$(git rev-parse origin/main)" ]] || { echo "HEAD must match origin/main; push and let CI pass first" >&2; exit 1; }
+if command -v gh >/dev/null 2>&1; then
+  ci="$(gh run list --workflow ci.yml --commit "$head" --json status,conclusion --jq '[.[] | select(.conclusion == "success")] | length')"
+  [[ "$ci" -gt 0 ]] || { echo "no successful CI run for $head yet; wait for CI (gh run list --commit $head)" >&2; exit 1; }
+else
+  echo "gh is not installed; cannot confirm CI passed for $head" >&2
   exit 1
 fi
 
@@ -81,9 +97,7 @@ PY
 cargo update --workspace --offline >/dev/null 2>&1 || cargo update --workspace
 
 if [[ "$check" == 1 ]]; then
-  cargo fmt --check
-  make lint
-  make test-rust
+  make preflight
 fi
 
 git add Cargo.toml Cargo.lock CHANGELOG.md

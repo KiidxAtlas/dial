@@ -180,22 +180,11 @@ jobs:
           path: dist/*.zip
           if-no-files-found: error
 
-  windows-contract:
-    name: Windows Rust contract (gates publication)
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-      - name: Install pinned Rust
-        run: rustup show active-toolchain
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          key: windows-contract
-      - name: Run focused Windows contract suite
-        run: python scripts/windows-contract.py --profile ci
-
   publish:
     name: Publish GitHub release
-    needs: [build, windows-build, windows-contract]
+    # CI's `windows-rust` job runs the same focused Windows contract suite on every push, and the
+    # first publish step requires CI to pass for this commit, so it is not repeated here.
+    needs: [build, windows-build]
     runs-on: ubuntu-latest
     permissions:
       contents: write

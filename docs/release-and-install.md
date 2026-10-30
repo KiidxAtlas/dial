@@ -250,17 +250,26 @@ prompt resolves its weights; a missing default MLX runtime gets an installation 
 ### Publishing a release (maintainers)
 
 The release workflow runs on pushed `v*` tags and requires the tag to match
-`Cargo.toml`'s version. `scripts/release.sh <version>` prepares the release from a clean `main`:
-it sets `[workspace.package] version`, refreshes `Cargo.lock` for workspace members only, moves the
+`Cargo.toml`'s version. `scripts/release.sh <version>` prepares the release from a clean `main`.
+It first refuses unless `HEAD` matches `origin/main` and a `CI` run on that commit succeeded (it
+asks `gh`), so a tag is never placed on code CI has not passed. It then sets
+`[workspace.package] version`, refreshes `Cargo.lock` for workspace members only, moves the
 `## [Unreleased]` changelog entries under a dated version heading (refusing an empty section), runs
-`cargo fmt --check`, `make lint` and `make test-rust` (skip with `--no-check`), then commits
-`release: v<version>` and creates an annotated tag. It pushes only with `--push`:
+`make preflight` (skip with `--no-check`), commits `release: v<version>` and creates an annotated
+tag. It pushes only with `--push`:
 
 ```sh
+make preflight                     # optional dry run of the CI gate
 scripts/release.sh 0.1.23          # commit + tag locally
 git push origin main
 git push origin v0.1.23
 ```
+
+`make preflight` runs CI's test-job gate locally: `cargo fmt --check`, `make lint`, the driver
+contracts, `make test-rust` with the system temp directory (on macOS this sits behind the
+`/var` -> `/private/var` symlink, as on CI runners, so path-comparison bugs surface locally), the
+artifact smoke test and the real-terminal smoke scripts. CI additionally runs `cargo check` for the
+two musl release targets on every push, so target-specific build failures appear before tagging.
 
 CI skips commits that only touch Markdown under `docs/`, root-level Markdown or the PR template.
 Changes to protocol files such as `docs/rpc-schema.json` still trigger CI. A release commit always
@@ -272,11 +281,17 @@ sandbox probes, and the terminal smoke test, on macOS arm64, macOS Intel and Ubu
 tagged commit, waiting while that run is in progress; with no successful run it fails. Push the
 commit to `main` and let CI pass before tagging. The jobs then build Apple Silicon/Intel Mac and
 Linux x86-64 and arm64 (glibc and musl) release binaries and smoke-test each extracted archive outside the checkout. Only
-after **all** platform builds (macOS arm64 and Intel, Linux x86-64 and arm64 in glibc and musl, Windows x86-64 and arm64) and the native Windows Rust contract job (`scripts/windows-contract.txt`, which lists its skipped tests with reasons) pass,
+after **all** platform builds (macOS arm64 and Intel, Linux x86-64 and arm64 in glibc and musl, Windows x86-64 and arm64) pass,
 does it create a GitHub release with the archives, bundled MIT license and README, a
 combined `SHA256SUMS` with its `SHA256SUMS.sig` and `SHA256SUMS.sshsig` signatures, and generated notes. CI runs on both
 macOS and Ubuntu without weakening host security. CI builds the `dial` library and its unit-test
 build one after the other: each peaks near 5 GB in rustc, and together they would swap on the
-7 GB macOS arm64 runner. The Windows release jobs (x86-64 and ARM64) build `dial.exe`, smoke-test the packaged archive (`--version`, `--help`), verify the binary format for the target, and run `scripts/test-install.ps1` under Windows PowerShell 5.1 and PowerShell 7, as does the CI `installer-windows` job. The publish job builds `install.ps1` with the release key embedded and publishes it with `SHA256SUMS`, `SHA256SUMS.sig`, and `SHA256SUMS.sshsig`.
+7 GB macOS arm64 runner. The native Windows Rust contract (`scripts/windows-contract.txt`, which lists its skipped tests with reasons) runs in CI's `windows-rust` job, so the CI requirement above covers it; the release does not repeat it. The Windows release jobs (x86-64 and ARM64) build `dial.exe`, smoke-test the packaged archive (`--version`, `--help`), verify the binary format for the target, and run `scripts/test-install.ps1` under Windows PowerShell 5.1 and PowerShell 7, as does the CI `installer-windows` job. The publish job builds `install.ps1` with the release key embedded and publishes it with `SHA256SUMS`, `SHA256SUMS.sig`, and `SHA256SUMS.sshsig`.
+
+CI caches compiled dependencies per job with `Swatinem/rust-cache`. Caches are saved only from
+`main`, and also after a failing run, so one red test does not force the next run on that OS to
+rebuild from scratch. The repository's 10 GB cache quota evicts the least recently used entries
+first.
+
 The workflow preserves repository visibility. Dial is MIT licensed; see `LICENSE` for
 permission to use, modify, and redistribute it.

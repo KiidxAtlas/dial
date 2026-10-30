@@ -17,6 +17,10 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+### Changed
+
+- Releases are gated before tagging, not after: `scripts/release.sh` refuses unless `HEAD` matches `origin/main` with a successful CI run, and runs the new `make preflight` (CI's test-job gate locally, using the system temp directory and the real-terminal smoke scripts). CI also checks both musl release targets on every push, keeps its build cache after a failing run (macOS runs had been rebuilding everything from scratch), and saves caches only from `main`; the release no longer repeats CI's Windows contract job (`docs/release-and-install.md`).
+
 ## [0.2.9] - 2026-10-29
 
 ### Added

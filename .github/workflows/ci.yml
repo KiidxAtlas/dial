@@ -48,6 +48,12 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: test-${{ matrix.os }}
+          # A failing test or smoke step still leaves a valid build; without this a red run
+          # discards ~10 minutes of compilation and the next run on that OS starts cold.
+          cache-on-failure: true
+          # The repository's 10 GB cache quota evicts least-recently-used entries; pull requests
+          # restore main's caches but do not add their own.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install installer test dependencies
         run: python3 -m pip install --disable-pip-version-check cryptography
       - name: Test terminal installer
@@ -118,12 +124,43 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: lint
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check
           command-arguments: advisories licenses bans sources
+
+  musl:
+    # Release builds ship musl binaries; check them on every push so target-specific type
+    # differences (for example libc's ioctl request type) fail here, not at publish time.
+    name: musl check (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Install musl toolchain
+        env:
+          CHECK_TARGET: ${{ matrix.target }}
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          rustup show active-toolchain
+          rustup target add "$CHECK_TARGET"
+          echo "CC_${CHECK_TARGET//-/_}=musl-gcc" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: musl-${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Check
+        run: cargo check --locked --profile ci -p dial --target "${{ matrix.target }}"
 
   python:
     name: Python tests
@@ -169,6 +206,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: windows-contract
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # Focused native suite with a tracked exclusion list: scripts/windows-contract.txt.
       - name: Run focused Windows contract suite
         run: python scripts/windows-contract.py --profile ci
