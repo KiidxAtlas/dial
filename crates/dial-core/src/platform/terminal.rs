@@ -129,7 +129,8 @@ pub fn controlling_child(command: &mut Command) {
     // access parent locks or allocate. Stdin is the slave descriptor installed by Command.
     unsafe {
         command.pre_exec(|| {
-            if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) == -1 {
+            // `as _`: the request type is `c_ulong` on glibc/macOS but `c_int` on musl.
+            if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
                 return Err(io::Error::last_os_error());
             }
             // A wrapper launched by a background shell may inherit ignored SIGINT/job-control
