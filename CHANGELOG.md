@@ -86,6 +86,17 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 - Plain-language questions about local runtime captures, HAR files and SQLite snapshots now offer eligible system-investigation tools without requiring tool names or inspection jargon. Coding/conceptual questions, tool allowlists and schema budgets retain their existing boundaries (`docs/system-investigation.md`).
 
 - `/models` capabilities now match what requests assume. Anthropic's `capabilities` object (image input, thinking) and Gemini's `thinking` flag are read. Ollama's `/api/show` list sets tools, vision and reasoning. Hosted rows with no live capability fields (OpenAI, Anthropic, Gemini) fall back to the same bundled record the runtime uses, instead of showing unknown. A chat model that declares no tool calls is flagged in the detail line, because Dial's tools cannot run on it (`docs/provider-catalog.md`).
+
+## [0.2.8] - 2026-10-28
+
+### Fixed
+
+- Terminal lifecycle checks wait for pasted input to render before submitting and use per-scenario model-discovery gates, avoiding lost Enter presses and premature discovery timeouts on busy runners.
+
+## [0.2.7] - 2026-10-28
+
+### Fixed
+
 - Local-server shutdown tests distinguish exited Linux zombies from running processes, avoiding false failures while still checking that the failed server and its helper stop before retry.
 
 ## [0.2.6] - 2026-10-28

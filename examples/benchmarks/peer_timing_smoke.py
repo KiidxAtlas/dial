@@ -42,8 +42,8 @@ class PeerProvider(http.server.ThreadingHTTPServer):
 
     def __init__(self):
         super().__init__(("127.0.0.1", 0), PeerHandler)
-        self.discovery = threading.Event()
-        self.discovery.set()
+        self.discovery = smoke.DiscoveryGate()
+        self.discovery.open()
         self.lock = threading.Lock()
         self.wake_requests = 0
         self.fixture_errors = []
