@@ -451,6 +451,42 @@ fn http_errors_are_typed_and_classified() {
     assert!(is_transient(&refused), "{refused:#}");
 }
 
+/// A server may answer before it has read the whole request (a rate limit, an oversized body) and
+/// close the connection. The early answer is the real outcome; a broken pipe on the unsent rest
+/// of the body must not replace it.
+#[test]
+fn an_early_response_wins_over_the_broken_pipe_of_the_unsent_body() {
+    use std::io::{Read as _, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            socket.read_exact(&mut byte).unwrap();
+            head.push(byte[0]);
+        }
+        let body = r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#;
+        write!(
+            socket,
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nretry-after: 7\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        // Closing with the body unread resets the connection under the client's write.
+    });
+    let mut request = chat_request(vec![]);
+    request.messages = vec![json!({"role": "user", "content": "x".repeat(8 << 20)})];
+    let error = chat(&url, SERVER_MODEL, &request, 10).unwrap_err();
+    server.join().unwrap();
+    let http = error
+        .downcast_ref::<HttpError>()
+        .unwrap_or_else(|| panic!("expected the early HTTP 429, got: {error:#}"));
+    assert_eq!(http.status, 429);
+    assert_eq!(http.retry_after, Some(Duration::from_secs(7)));
+}
+
 #[test]
 fn server_error_messages_replace_raw_json_and_load_failures_get_a_next_step() {
     let server = fake::serve(vec![

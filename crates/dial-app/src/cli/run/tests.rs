@@ -89,8 +89,11 @@ fn pty_wrapper_child() {
     let original = unsafe { original.assume_init() };
     let mut capture = Capture::start(&layout, "interactive").unwrap();
     capture.append(b"history-before-attach\n").unwrap();
+    // The driver attaches its readers after this marker. The shell prints nothing until the
+    // driver's go line, so no output is in flight between the two attaches.
+    println!("wrapper-armed");
     let mut command = Command::new("sh");
-    command.args(["-c", r#"trap 'exit 42' INT; printf '\033[32mwrapper-ready\033[0m\n'; read line; stty size; printf 'received:%s\n' "$line"; while :; do sleep 1; done"#]);
+    command.args(["-c", r#"trap 'exit 42' INT; read go; printf '\033[32mwrapper-ready\033[0m\n'; read line; stty size; printf 'received:%s\n' "$line"; while :; do sleep 1; done"#]);
     assert_eq!(unix::execute(&mut command, &mut capture, true).unwrap(), 42);
     capture.finish(None).unwrap();
     let mut restored = std::mem::MaybeUninit::<libc::termios>::uninit();
@@ -154,13 +157,15 @@ fn pty_wrapper_forwards_input_resize_ctrl_c_and_restores_terminal() {
         }
         false
     };
-    let ready = until(b"wrapper-ready", &mut master);
+    let armed = until(b"wrapper-armed", &mut master);
     // Reader and wrapper are distinct OS processes: exercise the actual lifetime flock
     // and generation protocol, not only independent objects in the same process.
     let layout =
         Layout::with_user_dir(&dir.path().join("project"), dir.path().join("private")).unwrap();
     let first = crate::storage::process_capture::Reader::attach(&layout, "interactive");
     let second = crate::storage::process_capture::Reader::attach(&layout, "interactive");
+    let started = master.write_all(b"go\n").is_ok();
+    let ready = until(b"wrapper-ready", &mut master);
     let resized = terminal::resize(&master, 31, 99).is_ok();
     // Give the wrapper's bounded resize poll time to update the child's PTY before stty runs.
     std::thread::sleep(Duration::from_millis(150));
@@ -173,7 +178,9 @@ fn pty_wrapper_forwards_input_resize_ctrl_c_and_restores_terminal() {
     drop(master);
     let status = child.wait().unwrap();
     assert!(
-        ready
+        armed
+            && started
+            && ready
             && resized
             && sent
             && received
