@@ -1520,7 +1520,10 @@ fn imported_snapshot_rechecks_source_verdict_before_harvesting() {
     let next_prompt = (0..1000)
         .map(|i| format!("post-compaction task {i}"))
         .find(|prompt| {
-            (u8::from_str_radix(&digest(&json!(prompt))[..2], 16).unwrap() % 5 == 0) != was_valid
+            u8::from_str_radix(&digest(&json!(prompt))[..2], 16)
+                .unwrap()
+                .is_multiple_of(5)
+                != was_valid
         })
         .unwrap();
     f.store.approve_session_examples(&[approved_snapshot("next-turn", json!({"examples":[{

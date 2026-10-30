@@ -133,14 +133,8 @@ impl OverlayEnv<'_> {
         {
             return;
         }
-        if self
-            .auth_job
-            .as_ref()
-            .is_some_and(|job| job.model.is_some())
-        {
-            for (_, line) in AuthJob::drain_lines(self.auth_job) {
-                overlay.banner(line, false);
-            }
+        for (_, line) in AuthJob::drain_lines(self.auth_job) {
+            overlay.banner(line, false);
         }
         let result = AuthJob::collect(self.auth_job, self.app);
         if let Some((provider, result)) = result {

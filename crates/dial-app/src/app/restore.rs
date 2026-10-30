@@ -111,7 +111,7 @@ fn announce(shell: &mut Shell, report: &Report) {
     let mut lines = Vec::new();
     if report.restored.is_empty() && report.rejected.is_empty() {
         lines.push("no interrupted workers in this session".to_owned());
-    } else {
+    } else if !report.restored.is_empty() {
         lines.push(format!(
             "restored {}: {}",
             report.restored.len(),

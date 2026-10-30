@@ -172,19 +172,19 @@ fn pump(
                 *size = next;
             }
         }
-        if let Some(sink) = input.as_mut() {
-            if !pending.is_empty() {
-                match sink.write(&pending) {
-                    Ok(n) => {
-                        pending.drain(..n);
-                    }
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                        ) => {}
-                    Err(e) => return Err(e.into()),
+        if let Some(sink) = input.as_mut()
+            && !pending.is_empty()
+        {
+            match sink.write(&pending) {
+                Ok(n) => {
+                    pending.drain(..n);
                 }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) => {}
+                Err(e) => return Err(e.into()),
             }
         }
         let (read_input, _) = terminal::ready(

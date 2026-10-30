@@ -1944,7 +1944,12 @@ fn optional_findings_redirect_duplicate_reads_and_survive_resume() {
         .unwrap()["content"]
         .as_str()
         .unwrap();
-    assert!(duplicate.starts_with("[Unchanged read]"), "{duplicate}");
+    assert!(
+        duplicate
+            .lines()
+            .any(|line| line.starts_with("[Unchanged read]")),
+        "{duplicate}"
+    );
     assert!(duplicate.contains("still shown above"));
     assert!(
         !requests[6]["messages"]
@@ -2081,7 +2086,7 @@ fn repeated_reads_across_failed_checks_stop_and_keep_compact_evidence() {
         .filter(|m| {
             m["content"]
                 .as_str()
-                .is_some_and(|s| s.starts_with("[Unchanged read]"))
+                .is_some_and(|s| s.lines().any(|line| line.starts_with("[Unchanged read]")))
         })
         .collect();
     assert_eq!(duplicates.len(), 1);
@@ -3506,7 +3511,7 @@ fn read_is_anchored_and_an_approved_write_is_undone_by_rollback() {
     a.turn("rewrite f.txt", &mut ui).unwrap();
     let read_result = server.requests.lock()[1]["messages"].to_string();
     assert!(
-        read_result.contains("f.txt#") && read_result.contains("1:one"),
+        read_result.contains("[@f1#") && read_result.contains("1:one"),
         "anchored read output: {read_result}"
     );
     assert_eq!(
@@ -3707,13 +3712,13 @@ fn a_single_long_turn_can_be_compacted_instead_of_failing_with_nothing_to_compac
     script.extend((0..64).map(|_| Reply::Text("SUMMARY: read the whole big file")));
     let server = serve(script);
     let mut e = env(&server.url, "auto");
-    // The default 20k keep-recent budget exceeds this 16k window, so the one turn would never be cut.
+    // Keep only a small recent tail so this single 32k-window turn is eligible for a manual cut.
     e.config.compaction.keep_recent_tokens = 1000;
     // This fixture exercises the explicit manual boundary, independent of automatic trigger timing.
     e.config.compaction.enabled = false;
     e.config.compaction.mid_turn_enabled = false;
     let body: String = (0..1200)
-        .map(|n| format!("line {n:04} {}\n", "x".repeat(40)))
+        .map(|n| format!("line {n:04} {}\n", "x".repeat(36)))
         .collect();
     std::fs::write(e.project.path().join("big.txt"), body).unwrap();
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
@@ -4878,7 +4883,12 @@ fn child_repeated_reads_reuse_evidence_and_stop_before_exhausting_steps() {
             .contains("ORIGINAL_EVIDENCE")
     );
     let duplicate = results[1]["content"].as_str().unwrap();
-    assert!(duplicate.starts_with("[Unchanged read]"), "{duplicate}");
+    assert!(
+        duplicate
+            .lines()
+            .any(|line| line.starts_with("[Unchanged read]")),
+        "{duplicate}"
+    );
     assert!(duplicate.contains("tool call read-0"));
     assert!(duplicate.contains("still shown above"));
     assert!(!duplicate.contains("ORIGINAL_EVIDENCE"));
@@ -5715,7 +5725,7 @@ fn malformed_read_gets_immediate_guidance_and_corrected_read_continues() {
     assert!(feedback.contains("Read recovery"), "{feedback}");
     assert!(feedback.contains("offset/limit"), "{feedback}");
     let evidence = requests[2]["messages"].to_string();
-    assert!(evidence.contains("f.txt#"), "{evidence}");
+    assert!(evidence.contains("[@f1#"), "{evidence}");
 }
 
 #[test]
@@ -6395,7 +6405,7 @@ fn tool_groups_preserve_order_and_mutations_are_barriers() {
         "reread happened after mutation: {latest_evidence}"
     );
     assert_eq!(
-        results[2]["content"], stored_results[2]["content"],
+        results[2]["content"], stored_results[2]["dial_model_content"],
         "mutation evidence is never superseded"
     );
     assert!(results[1]["content"].as_str().unwrap().contains("second"));
@@ -8628,7 +8638,7 @@ fn semantic_find_uses_current_model_and_preserves_native_tool_pairs() {
     assert_eq!(results[0]["tool_call_id"], "call_1");
     let evidence = results[0]["content"].as_str().unwrap();
     assert!(
-        evidence.contains("cache.rs:1-4 semantic_rank=1"),
+        evidence.contains("@f1(cache.rs):1-4 semantic_rank=1"),
         "{evidence}"
     );
     assert!(!evidence.contains("render.py:"));
@@ -8680,7 +8690,11 @@ fn semantic_find_rejects_fabricated_ranking_and_exact_mode_bypasses_inference() 
     a.turn("literal query", &mut Recorder::default()).unwrap();
     let requests = exact.requests.lock();
     assert_eq!(requests.len(), 2, "exact retrieval has no ranking request");
-    assert!(requests[1]["messages"].to_string().contains("cache.rs:2-2"));
+    assert!(
+        requests[1]["messages"]
+            .to_string()
+            .contains("@f1(cache.rs):2-2")
+    );
     assert!(
         !a.usage()
             .0
@@ -8749,7 +8763,7 @@ fn delegated_semantic_find_reuses_the_child_backend_and_request_budget() {
             .any(|m| m["content"]
                 .as_str()
                 .unwrap()
-                .contains("cache.rs:1-4 semantic_rank=1"))
+                .contains("@f1(cache.rs):1-4 semantic_rank=1"))
     );
 }
 
@@ -8760,18 +8774,12 @@ fn live_training_targets_match_actual_requests_across_turns_and_harvest_final_so
             "working_state",
             json!({"action":"update","goal":"preserve SQLite constraints"}),
         ),
-        Reply::Call(
-            "retain",
-            json!({"scope":"project","content":"SQLite uses transactions for atomic updates.","source":"test fixture"}),
-        ),
         Reply::Call("read", json!({"path":"facts.txt"})),
         Reply::Text("first answer"),
         Reply::Text("continued answer"),
     ]);
     let mut e = env(&server.url, "auto");
-    if !e.config.harness.tools.iter().any(|t| t == "retain") {
-        e.config.harness.tools.push("retain".into());
-    }
+    e.config.memory.backend = dial::config::memory_backend::MemoryBackendId::Provenance;
     e.config.training.max_seq_length = 131072;
     std::fs::write(e.project.path().join("facts.txt"), "SQLite evidence").unwrap();
     let store = Store::open(&e.layout.state_dir, "scripted", "t", &e.config.harness).unwrap();
@@ -8780,14 +8788,27 @@ fn live_training_targets_match_actual_requests_across_turns_and_harvest_final_so
     let first = a
         .turn("Read facts.txt; preserve SQLite constraints", &mut ui)
         .unwrap();
-    let second = a.turn("Continue the SQLite task", &mut ui).unwrap();
+    // Simulate a note retained by another session, absent from this turn's tool results.
+    dial::tools::provenance::ProvenanceMemory::open(&e.layout)
+        .unwrap()
+        .retain(
+            dial::tools::provenance::Scope::Project,
+            "SQLite uses transactions for atomic updates.",
+            "test fixture",
+            "other-session",
+            None,
+        )
+        .unwrap();
+    let second = a
+        .turn("Continue the SQLite transactions task", &mut ui)
+        .unwrap();
     let requests = server.requests.lock();
     let first_payload = store
         .trajectory_messages(first.trajectory.unwrap())
         .unwrap()
         .unwrap();
     let snapshots = first_payload["examples"].as_array().unwrap();
-    assert_eq!(snapshots.len(), 4);
+    assert_eq!(snapshots.len(), 3);
     for (snapshot, request) in snapshots.iter().zip(requests.iter()) {
         let messages = snapshot["messages"].as_array().unwrap();
         assert_eq!(json!(&messages[..messages.len() - 1]), request["messages"]);
@@ -8803,13 +8824,19 @@ fn live_training_targets_match_actual_requests_across_turns_and_harvest_final_so
         .unwrap();
     assert_eq!(
         json!(&messages[..messages.len() - 1]),
-        requests[4]["messages"]
+        requests[3]["messages"]
     );
     let context = json!(&messages[..messages.len() - 1]).to_string();
     assert!(context.contains("first answer") && context.contains("preserve SQLite constraints"));
     // Recalled notes travel with the user message they were recalled for; the working state the model wrote is
     // visible in its own earlier call instead of being re-inserted before the conversation on every request.
-    assert!(context.contains("Relevant persistent notes"));
+    assert!(messages.iter().any(|m| {
+        m["role"] == "user"
+            && m["content"].as_str().is_some_and(|text| {
+                text.contains("Relevant persistent notes")
+                    && text.contains("SQLite uses transactions")
+            })
+    }));
     let system_count = messages.iter().filter(|m| m["role"] == "system").count();
     assert_eq!(
         system_count,
@@ -8879,29 +8906,34 @@ fn every_request_extends_the_previous_one_so_prompt_caches_stay_valid() {
     // whenever a new user turn arrived, forcing the provider (or LM Studio) to prefill the history again.
     // (A deliberate one-time supersession of a repeated read is covered by the `evidence` unit tests.)
     let server = serve(vec![
-        Reply::Call(
-            "retain",
-            json!({"scope":"project","content":"SQLite uses transactions for atomic updates.","source":"fixture"}),
-        ),
         Reply::Call("read", json!({"path":"facts.txt"})),
         Reply::Text("first answer"),
         Reply::Text("second answer"),
         Reply::Text("third answer"),
     ]);
     let mut e = env(&server.url, "auto");
-    if !e.config.harness.tools.iter().any(|t| t == "retain") {
-        e.config.harness.tools.push("retain".into());
-    }
+    e.config.memory.backend = dial::config::memory_backend::MemoryBackendId::Provenance;
     std::fs::write(e.project.path().join("facts.txt"), "SQLite evidence").unwrap();
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     let mut ui = Recorder::default();
     a.turn("Remember and read the SQLite facts", &mut ui)
         .unwrap();
-    a.turn("What do the notes say about SQLite transactions?", &mut ui)
+    // A previously visible retain result is intentionally deduplicated by ambient recall.
+    // Seed an unseen record instead, so this test exercises recall admission and caching.
+    dial::tools::provenance::ProvenanceMemory::open(&e.layout)
+        .unwrap()
+        .retain(
+            dial::tools::provenance::Scope::Project,
+            "SQLite uses transactions for atomic updates.",
+            "test fixture",
+            "other-session",
+            None,
+        )
         .unwrap();
+    a.turn("SQLite transactions", &mut ui).unwrap();
     a.turn("Anything else about SQLite?", &mut ui).unwrap();
     let requests = server.requests.lock();
-    assert!(requests.len() >= 5);
+    assert_eq!(requests.len(), 4);
     for (n, pair) in requests.windows(2).enumerate() {
         let (before, after) = (
             conversation_messages(&pair[0]),
@@ -8915,11 +8947,14 @@ fn every_request_extends_the_previous_one_so_prompt_caches_stay_valid() {
             n + 1
         );
     }
+    let latest = conversation_messages(requests.last().unwrap());
     assert!(
-        requests.last().unwrap()["messages"]
-            .to_string()
-            .contains("Relevant persistent notes"),
-        "recall still reaches the model"
+        latest.iter().any(|m| m["role"] == "user"
+            && m["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("Relevant persistent notes")
+                    && text.contains("SQLite uses transactions"))),
+        "recalled facts still reach the model in user context, not just the retain tool result: {latest:?}"
     );
 }
 #[test]

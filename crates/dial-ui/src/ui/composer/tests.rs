@@ -2981,6 +2981,59 @@ fn recording_hint_says_release_when_held_and_busy_paste_lands_in_draft() {
 }
 
 #[test]
+fn voice_submission_ignores_autocomplete_and_keeps_full_queue_drafts() {
+    let mut c = Composer::new(vec![], 10);
+    c.set_files(vec!["file.rs".into()]);
+    c.handle_paste("explain @fi");
+    assert_eq!(
+        c.submit_voice(),
+        ComposerEvent::Submit("explain @fi".into())
+    );
+    c.set_busy(true);
+    for index in 0..32 {
+        c.handle_paste(&format!("message {index}"));
+        assert_eq!(c.submit_voice(), ComposerEvent::None);
+    }
+    c.handle_paste("keep this speech");
+    assert_eq!(c.submit_voice(), ComposerEvent::None);
+    assert_eq!(c.draft(), "keep this speech");
+    assert_eq!(c.queued_messages().len(), 32);
+}
+
+#[test]
+fn voice_leaves_history_search_and_requires_review_of_an_empty_queue_edit() {
+    let env = Env::new();
+    let mut c = Composer::new(vec!["old prompt".into()], 10);
+    c.search = Some(Search {
+        query: Editor::default(),
+        entries: vec!["old prompt".into()],
+        selected: 0,
+        scroll: 0,
+    });
+    c.paste_voice("new speech");
+    assert!(c.search.is_none());
+    assert_eq!(c.submit_voice(), ComposerEvent::Submit("new speech".into()));
+    c.set_busy(true);
+    c.handle_paste("original queue item");
+    c.submit_queued(false);
+    assert!(c.edit_queued(0));
+    // Unlike set_draft(), actual Backspace editing retains the queued edit's identity.
+    for _ in 0.."original queue item".len() {
+        press(&mut c, &env, KeyCode::Backspace);
+    }
+    assert!(c.draft().is_empty());
+    c.paste_voice("replacement speech");
+    assert_eq!(c.submit_voice(), ComposerEvent::None);
+    assert_eq!(c.draft(), "replacement speech");
+    assert!(c.queued_messages().is_empty());
+    c.clear();
+    assert_eq!(
+        c.queued_messages(),
+        vec![("original queue item".into(), false)]
+    );
+}
+
+#[test]
 fn option_v_character_dispatches_voice_but_paste_stays_literal() {
     let mut env = Env::new();
     let mut c = Composer::new(vec![], 10);
@@ -3865,4 +3918,65 @@ fn extension_argument_completion_keeps_the_command_and_arguments_separate() {
         press(&mut c, &env, KeyCode::Enter),
         ComposerEvent::Submit("/zz words".into())
     );
+}
+
+// ---- pending jumps, history and menu precedence ----------------------------------------
+
+#[test]
+fn a_pending_jump_is_cancelled_by_composer_keys_and_paste() {
+    let env = Env::new();
+    let mut c = Composer::new(vec![], 10);
+    c.set_draft("ab");
+    c.set_busy(true);
+    ctrl(&mut c, &env, ']');
+    assert_eq!(press(&mut c, &env, KeyCode::Esc), ComposerEvent::Interrupt);
+    typed(&mut c, &env, "x");
+    assert_eq!(
+        c.draft(),
+        "abx",
+        "a key the composer consumed cancels the jump"
+    );
+
+    c.set_busy(false);
+    c.set_draft("ab");
+    ctrl(&mut c, &env, ']');
+    c.handle_paste("y");
+    typed(&mut c, &env, "b");
+    assert_eq!(c.draft(), "abyb", "paste cancels the pending jump");
+}
+
+#[test]
+fn ctrl_c_while_browsing_history_restores_the_unsent_draft() {
+    let env = Env::new();
+    let mut c = composer();
+    c.set_draft("unsent draft");
+    press(&mut c, &env, KeyCode::Left);
+    press(&mut c, &env, KeyCode::Up);
+    assert_eq!(c.draft(), "recent prompt");
+    assert_eq!(ctrl(&mut c, &env, 'c'), ComposerEvent::None);
+    assert_eq!(
+        c.draft(),
+        "unsent draft",
+        "leaves history and gives back the stashed draft"
+    );
+}
+
+#[test]
+fn ctrl_p_moves_an_open_menu_selection_instead_of_running_the_palette() {
+    let env = Env::new();
+    let mut up = with_commands();
+    typed(&mut up, &env, "/mod");
+    press(&mut up, &env, KeyCode::Up);
+    press(&mut up, &env, KeyCode::Tab);
+    let expected = up.draft();
+
+    let mut c = with_commands();
+    typed(&mut c, &env, "/mod");
+    assert_eq!(
+        ctrl(&mut c, &env, 'p'),
+        ComposerEvent::None,
+        "SelectUp alias moves the menu"
+    );
+    press(&mut c, &env, KeyCode::Tab);
+    assert_eq!(c.draft(), expected);
 }

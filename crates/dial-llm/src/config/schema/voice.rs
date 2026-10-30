@@ -15,8 +15,8 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         voice.tts.auto_speak,
         VO,
         "Read-aloud",
-        "Read answers aloud",
-        "Read each final answer aloud when a turn finishes. Press Esc or send a new prompt to stop.",
+        "Spoken replies",
+        "Speak each final agent answer aloud. Press the speech key, Esc, or send a new prompt to stop playback. Off by default; microphone input is separate.",
         Kind::Bool,
     ),
     field!(
@@ -25,7 +25,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         VO,
         "Dictation",
         "Dictation",
-        "Allow the dictation shortcut to record speech and insert the transcript into the composer. See /hotkeys for the active binding. Needs a recognition program: whisper.cpp, MLX Whisper, or OpenAI with an API key.",
+        "Enable the speech key. Press once, speak, then pause to send a normal turn. See /hotkeys for the binding. Needs whisper.cpp, MLX Whisper, or OpenAI with an API key. Choose Never under Send speech to review transcripts first.",
         Kind::Bool,
     ),
     field!(
@@ -36,5 +36,28 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Recognition program",
         "Program that turns speech into text. Auto uses the first one installed: whisper-cli (whisper.cpp), mlx-whisper (pip install mlx-whisper), or OpenAI with an API key.",
         Kind::Enum(STT_BACKENDS),
+    ),
+    field!(
+        "voice.stt.input_mode",
+        voice.stt.input_mode,
+        VO,
+        "Dictation",
+        "Speech key behavior",
+        "Press to talk records until a pause or another press. Hold to talk records until release, if the terminal reports key releases; otherwise it uses press to talk.",
+        Kind::Enum(&[("toggle", "Press to talk"), ("hold", "Hold to talk")]),
+    ),
+    field!(
+        "voice.stt.submit_trigger",
+        voice.stt.submit_trigger,
+        VO,
+        "Dictation",
+        "Send speech",
+        "Send finished speech as a normal turn, or queue it after the active turn. Existing drafts and command-like transcripts stay for review. Never keeps all speech in the composer until Enter.",
+        Kind::Enum(&[
+            ("release", "When recording finishes"),
+            ("never", "Never (review first)"),
+            ("release-complete", "After a complete sentence"),
+            ("say-submit", "When I say submit"),
+        ]),
     ),
 ];

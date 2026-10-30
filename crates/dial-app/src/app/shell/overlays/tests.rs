@@ -67,6 +67,43 @@ fn malformed_live_worker_commands_do_not_silently_queue() {
 }
 
 #[test]
+fn busy_retry_reports_no_wait_or_usage_without_stopping_or_queueing() {
+    use crate::llm::provider::RetryControl;
+    use crate::ui::transcript::TranscriptCtx;
+
+    for has_control in [false, true] {
+        for (command, expected) in [
+            ("/retry", "No pending provider retry wait."),
+            ("/retry now", "Usage: /retry"),
+            ("/retry 120", "Usage: /retry"),
+        ] {
+            let (_home, _project, app, mut shell) = shell();
+            shell.composer.set_busy(true);
+            shell.retry_control = has_control.then(RetryControl::default);
+            assert!(!shell.route_busy_command(&app, command.into()));
+            assert!(shell.deferred.is_empty(), "{command}");
+            assert!(shell.startup.is_none(), "{command}");
+            let ctx = TranscriptCtx {
+                theme: shell.themes.current(),
+                ui: &shell.ui,
+                tick: 0,
+                tools_expanded: false,
+                expand_key: "Ctrl+O",
+            };
+            let text = shell
+                .transcript
+                .document(100, &ctx)
+                .0
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains(expected), "{command}: {text}");
+        }
+    }
+}
+
+#[test]
 fn busy_settings_command_can_be_reverted_before_agent_adoption() {
     let (_home, _project, app, mut shell) = shell();
     let original = app.config.ui.show_tools;

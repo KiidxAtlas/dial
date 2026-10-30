@@ -220,9 +220,20 @@ impl SideThreadState {
             !self.busy(),
             "a side answer is still streaming; /btw cancel stops it"
         );
-        let thread_id = match self.open.clone() {
-            Some(id) if !new && self.threads.thread(&id).is_some() => id,
-            _ => {
+        let existing = match self.open.clone() {
+            Some(id) if !new && self.threads.thread(&id).is_some() => Some(id),
+            _ => None,
+        };
+        let prior = existing
+            .as_deref()
+            .and_then(|id| self.threads.thread(id))
+            .map(answered_pairs)
+            .unwrap_or_default();
+        // Build the request before creating a thread, so a failure leaves no empty thread behind.
+        let request = snapshot.request(&prior, question)?;
+        let thread_id = match existing {
+            Some(id) => id,
+            None => {
                 let id = self.threads.create(snapshot.anchor().map(str::to_string));
                 self.open = Some(id.clone());
                 id
@@ -237,12 +248,6 @@ impl SideThreadState {
                 "this thread is a full conversation: /resume {session}; /btw new starts another side thread"
             );
         }
-        let prior = self
-            .threads
-            .thread(&thread_id)
-            .map(answered_pairs)
-            .unwrap_or_default();
-        let request = snapshot.request(&prior, question)?;
         let thread = self
             .threads
             .thread_mut(&thread_id)

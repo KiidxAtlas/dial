@@ -117,6 +117,57 @@ fn shows(o: &SettingsOverlay, path: &str) -> bool {
 }
 
 #[test]
+fn voice_tab_shows_dictation_without_search_or_advanced_and_allows_enabling_it() {
+    let rig = Rig::new();
+    for coding_only in [false, true] {
+        let mut o = if coding_only {
+            overlay().coding_only()
+        } else {
+            overlay()
+        };
+        o.tab = o.tabs.iter().position(|(tab, _)| *tab == "Voice").unwrap();
+        for path in [
+            "voice.stt.enabled",
+            "voice.stt.backend",
+            "voice.stt.input_mode",
+            "voice.stt.submit_trigger",
+            "voice.tts.auto_speak",
+        ] {
+            assert!(
+                shows(&o, path),
+                "{path} missing (coding_only={coding_only})"
+            );
+        }
+        let screen = draw(&mut o, &rig, 100, 30);
+        assert!(screen.contains("Dictation"), "{screen}");
+        assert!(screen.contains("Recognition program"), "{screen}");
+        for (path, value) in [
+            ("voice.stt.input_mode", Value::String("hold".into())),
+            ("voice.stt.submit_trigger", Value::String("never".into())),
+            ("voice.tts.auto_speak", Value::Boolean(true)),
+        ] {
+            goto(&mut o, &rig.keys, path);
+            send(&mut o, &rig.keys, key(KeyCode::Enter));
+            if value.is_str() {
+                send(&mut o, &rig.keys, key(KeyCode::Home));
+                send(&mut o, &rig.keys, key(KeyCode::Down));
+                send(&mut o, &rig.keys, key(KeyCode::Enter));
+            }
+            assert!(
+                matches!(o.pending.get(path), Some(Pending::Set(actual, _)) if actual == &value),
+                "{path} did not save the selected value"
+            );
+        }
+        o.cursor = o.visible().iter().position(|row| matches!(row, Row::Setting(i) if crate::config::schema::registry()[*i].path == "voice.stt.enabled")).unwrap();
+        send(&mut o, &rig.keys, key(KeyCode::Enter));
+        assert!(matches!(
+            o.pending.get("voice.stt.enabled"),
+            Some(Pending::Set(Value::Boolean(true), _))
+        ));
+    }
+}
+
+#[test]
 fn hints_and_optional_offers_read_as_information_not_errors() {
     let rig = Rig::new();
     let mut o = overlay();

@@ -149,6 +149,21 @@ fn tree_includes_empty_sessions_and_never_reorders_ancestry_for_search() {
 }
 
 #[test]
+fn tab_is_a_no_op_in_tree_mode_because_the_tree_always_shows_empty_sessions() {
+    let mut p = Picker::new(
+        vec![session("parent", "Parent", 0), session("child", "Child", 1)],
+        vec![],
+        "",
+        "",
+        true,
+    );
+    let before = p.found.clone();
+    p.handle(&key(KeyCode::Tab, KeyModifiers::NONE), 24);
+    assert!(p.show_empty(), "tree mode keeps empty sessions visible");
+    assert_eq!(p.found, before);
+}
+
+#[test]
 fn tree_orders_children_under_parents_by_recent_activity() {
     let mut root = session("root", "Root", 1);
     root.updated = "2026-01-01T00:00:00Z".into();

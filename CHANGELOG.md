@@ -17,6 +17,8 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+## [0.2.9] - 2026-10-29
+
 ### Added
 
 - Opt-in idle session preparation: local one-token prefix warming, explicitly approved language-server source preparation and offline locked Cargo checks. All activity defaults off; no hosted fallback, model download or final-verification credit (`docs/session-preparation.md`).
@@ -53,6 +55,16 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ### Fixed
 
+- Speech input now defaults to press-to-talk with silence-ended recording and automatic normal-turn submission, rather than interpreting a tap as a short held recording and leaving every transcript unsent. Voice settings expose hold-to-talk, review-before-send and spoken replies; speech during active work queues after the turn, and starting capture stops reply playback (`docs/voice.md`).
+- Microphone capture now stops before segment recognition begins, so slow transcription cannot delay release/deadline handling. Queued audio remains available within the configured recording cap, and cancellation still discards the transcript (`docs/voice.md`).
+- Ordinary automatic provider retries now wait five minutes (bounded by `retry.max_delay_secs`) while preserving server minimum-delay hints, attempt limits and failover. During a turn, `/retry` skips a pending retry wait immediately, including a server-requested delay, without cancelling the turn or queueing input; its idle failed-turn retry behavior is unchanged (`docs/llm-transport.md`, `docs/composer.md`).
+- Question dialogs now submit Other/custom input on Enter instead of returning to the choices; multi-question dialogs advance to the next question, while notes still save without submitting (`docs/terminal-interface.md`).
+- Model settings now page by the visible list height, and section navigation reaches local setting suggestions before wrapping back to the first section (`docs/terminal-interface.md`).
+- Removing a `/queue` picker row now takes a second `Delete`/`x` press on the same row, and the first press names the item; any other key cancels, and `Backspace` only edits the search instead of removing the selected message (`docs/terminal-interface.md`).
+- In model downloads, `Backspace` with a result selected now edits the query and returns focus to it rather than doing nothing. Saving a provider API key without a base URL now explains why instead of silently ignoring Enter. Extensions panel errors from the controller show as a failed job, and a later neutral notice clears that failure.
+- Reduced built-in lean prompt overhead to preserve response headroom on small context windows. Default manual compaction of an already-safe history within the configured keep-recent budget is now a no-op instead of attempting summaries that cannot reduce it (`docs/agent-loop.md`).
+- Fixed dictation discarding queued microphone audio when recording stops, and distinguished missing/short recordings from undetected speech and empty transcription results. The disabled-input notice now names the actual Voice → Dictation setting (`docs/voice.md`).
+- Updated CI and release workflows to SHA-pinned Node.js 24–based `actions/checkout` v5 and `actions/setup-python` v6, removing their Node.js 20 deprecation warnings.
 - After a stream-journal append fails (for example because the disk is full), the next turn retries the writer instead of retaining the old error forever. Recovery preserves committed frames, discards only the failed append's partial row and refuses removed or replaced journals; it does not replay tools or recover unpublished output (`docs/terminal-interface.md`).
 - Voice settings now ask before installing a missing local backend, prepare its runtime and required model, and select it only after successful setup. Cancellation or failure preserves the previous backend (`docs/voice.md`).
 - Silent-inference recovery now defaults to 30 seconds instead of 120. Anthropic lifecycle and signed-thinking activity reaches the agent watchdog, so that hidden activity renews the silence timer instead of producing a false stall; keepalives and usage-only updates still cannot hide a stall. Explicit configured silence limits remain unchanged (`docs/tools.md`).

@@ -603,6 +603,9 @@ impl Ui for StateUi<'_> {
     fn request_latency(&self) -> Value {
         self.request_timing.snapshot()
     }
+    fn provider_retry_control(&mut self, control: Option<crate::llm::provider::RetryControl>) {
+        self.inner.provider_retry_control(control);
+    }
     fn request_phase(&mut self, phase: crate::agent::RequestPhase) {
         use crate::agent::RequestPhase;
         if phase == RequestPhase::Waiting {

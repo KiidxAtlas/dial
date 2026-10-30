@@ -2,7 +2,21 @@
 
 The shared LLM layer provides bounded streaming, provider-aware error classification, retries, and request budgeting. Context-overflow classifications are kept attached to errors before any header redaction so compaction remains reliable. HTTP 413 is classified as a payload failure unless the body identifies a token/context limit; it must not trigger token compaction merely because its status is 413.
 
-`[retry]` settings bound attempts and delays. Explicit `retry-after`, `retry-after-ms`, and `x-ratelimit-reset[-ms]` delays are honored as minimum waits. Window-reset headers are treated as quota information, not mandatory waits. A throttle (including HTTP 529) remains distinct from account quota exhaustion. Incomplete or truncated streams are discarded and retried; partial tool calls are never executed.
+`[retry]` settings bound attempts and delays. Ordinary automatic provider retries wait a fixed
+300 seconds (five minutes), bounded by `retry.max_delay_secs`, rather than increasing an
+exponential backoff. Explicit `retry-after`, `retry-after-ms`, and `x-ratelimit-reset[-ms]`
+delays are still honored as minimum waits; a hint beyond `retry.max_delay_secs` stops the request
+instead of waiting longer than configured. Window-reset headers are treated as quota information,
+not mandatory waits. A throttle (including HTTP 529) remains
+distinct from account quota exhaustion. Incomplete or truncated streams are discarded and retried;
+partial tool calls are never executed. Maximum attempts and failover behavior are unchanged.
+
+While a turn is running, `/retry` skips the remaining provider retry wait and requests the next
+attempt immediately, including any remaining server-requested delay. It does not cancel the turn,
+queue a follow-up, or add retry attempts. With no pending provider retry wait, it reports that
+explicitly and does nothing; requests made during active inference are not saved for later waits.
+The command takes no arguments. When idle, `/retry` keeps its existing meaning: retry the last
+failed, unanswered turn.
 
 Streaming reads have bounded raw and line sizes. Reasoning markup leaked into visible text is routed to reasoning events where recognized, and tool-call markup is kept out of user-visible output. Remote model context is taken from configuration or the bundled catalog, falling back to a conservative 32768 tokens. Image inputs are resized to model limits before transmission. Provider-specific OAuth credentials are refreshed per request/retry, without exposing secrets in errors.
 
@@ -223,8 +237,8 @@ Devin also requires its successful completion trailer and complete framing befor
 
 **API-key pools.** A provider can name several keys: `api_key_env` plus `api_key_envs = ["KEY_B", "KEY_C"]` on `[providers.<id>]`. When the active key is rate limited or out of quota, that key is blocked until the Retry-After or quota reset time (60 seconds when the provider gives none, at most one hour) and the same request is retried at once with the next key whose variable is set. This consumes one attempt. The key that works keeps serving later requests, and blocks are shared by every session in the process. If no other key is available the ordinary backoff applies. Pool state is process-local and never persisted; only variable names are tracked, so key values are never logged. Each variable must belong to the provider's origin, as for `api_key_env`. A pool needs a key-authenticated endpoint; OAuth and subscription routes do not use one.
 
-Transient provider errors use bounded backoff with server retry hints and visible notices (up to `[retry].max_attempts`
-attempts, default 10; backoff without a server hint is capped at 60 seconds, and server-requested waits are honoured up to `[retry].max_delay_secs`, default 300). This includes macOS socket `Invalid argument (os error 22)` and
+Transient provider errors use fixed retry waits with server retry hints and visible notices (up to `[retry].max_attempts`
+attempts, default 10; ordinary waits are 300 seconds, bounded by `[retry].max_delay_secs`, default 300, and longer server hints stop the request). This includes macOS socket `Invalid argument (os error 22)` and
 TLS `BadRecordMac` alerts before a response arrives. Each retry opens a fresh connection; TLS certificate
 verification remains enabled. Disconnected or prematurely closed ChatGPT, compatible chat, and
 Anthropic streams also retry within that bound, discarding the failed attempt's partial reply and tool

@@ -75,6 +75,11 @@ pub(super) fn run(
     name: &str,
     args: &str,
 ) -> Option<Result<Step>> {
+    // Idle `/retry` replays a failed turn; busy dispatch calls `run_live` directly to release
+    // only a pending provider wait, without needing or cancelling the agent.
+    if name == "retry" {
+        return session::run(shell, app, agent, name, args);
+    }
     if let Some(result) = run_live(shell, app, name, args) {
         return Some(result);
     }

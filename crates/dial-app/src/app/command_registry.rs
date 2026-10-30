@@ -279,6 +279,7 @@ pub(super) const RUNS_NOW: &[&str] = &[
     "workers",
     "message",
     "cancel",
+    "retry",
     "queue",
     "archive",
     "changes",

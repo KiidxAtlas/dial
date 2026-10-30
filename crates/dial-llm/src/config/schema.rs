@@ -1010,6 +1010,8 @@ static REGISTRY: &[SettingDef] = &[
     voice::DECLARATIONS[1],
     voice::DECLARATIONS[2],
     voice::DECLARATIONS[3],
+    voice::DECLARATIONS[4],
+    voice::DECLARATIONS[5],
     ida::DECLARATIONS[0],
     ida::DECLARATIONS[1],
     ida::DECLARATIONS[2],

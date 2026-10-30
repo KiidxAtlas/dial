@@ -30,7 +30,9 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-const RETRY_BACKOFF: Duration = Duration::from_secs(1);
+pub use super::retry::RetryControl;
+
+const RETRY_BACKOFF: Duration = Duration::from_secs(300);
 /// `config.json` files larger than this are not read for the context hint.
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 /// Shown once per conversation when llama.cpp's `/props` `chat_template_caps` say the model's chat
@@ -332,6 +334,7 @@ pub struct Backend {
     startup_timeout_secs: u64,
     allow_insecure: bool,
     pub retry_backoff: Duration,
+    retry_control: RetryControl,
     remote_idle_timeout_secs: u64,
     server: Option<ModelServer>,
     adapter_monitor: AdapterMonitor,
@@ -401,6 +404,11 @@ impl Backend {
         &self.kind
     }
 
+    /// Control only the pending retry wait for this backend, never an active inference call.
+    pub fn retry_control(&self) -> RetryControl {
+        self.retry_control.clone()
+    }
+
     pub fn new(kind: ProviderKind, python: PathBuf, startup_timeout_secs: u64) -> Self {
         let account = match &kind {
             ProviderKind::ChatGpt { user_dir, .. } => {
@@ -418,6 +426,7 @@ impl Backend {
             startup_timeout_secs,
             allow_insecure: false,
             retry_backoff: RETRY_BACKOFF,
+            retry_control: RetryControl::default(),
             remote_idle_timeout_secs: crate::config::types::DEFAULT_REMOTE_IDLE_TIMEOUT_SECS,
             server: None,
             adapter_monitor: Default::default(),
@@ -2217,20 +2226,11 @@ impl Backend {
                 attempt + 1,
                 retry_policy.attempts(&class)
             ));
+            let pending = self.retry_control.begin_wait();
             if !on_event(&llm::StreamEvent::Retry { waiting: true }) {
                 return Err(llm::Interrupted.into());
             }
-            let start = Instant::now();
-            while start.elapsed() < delay {
-                if interrupted() {
-                    return Err(llm::Interrupted.into());
-                }
-                std::thread::sleep(
-                    delay
-                        .saturating_sub(start.elapsed())
-                        .min(Duration::from_millis(50)),
-                );
-            }
+            pending.wait(delay, &interrupt)?;
         }
         unreachable!("bounded retries return on the final attempt")
     }

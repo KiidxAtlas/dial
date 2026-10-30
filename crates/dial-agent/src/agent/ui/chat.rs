@@ -351,6 +351,7 @@ pub(in crate::agent) fn chat_attempt_with_ui(
     if let Some(progress) = &progress {
         ui.model_progress(&progress.value);
     }
+    ui.provider_retry_control(Some(backend.retry_control()));
     ui.request_phase(RequestPhase::Waiting);
     ui.model_wait(Duration::ZERO);
     // Model family picks the detectors; `None` means the kill switch is set.
@@ -806,6 +807,7 @@ pub(in crate::agent) fn chat_attempt_with_ui(
         }
         result
     });
+    ui.provider_retry_control(None);
     ui.request_finished(result.is_ok());
     result
 }

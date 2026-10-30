@@ -119,6 +119,17 @@ fn turn_lists_drive_stops_turn_and_the_palette_notes_alike() {
 }
 
 #[test]
+fn retry_is_registered_without_arguments_and_runs_now_even_for_invalid_args() {
+    let entries = command_entries(&[], &[], &[]);
+    let retry = entries.iter().find(|entry| entry.name == "retry").unwrap();
+    assert!(retry.args_hint.is_none());
+    for args in ["", "now", "120"] {
+        assert_eq!(during_turn("retry", args), DuringTurn::Now);
+        assert!(!Shell::stops_turn(&format!("/retry {args}")));
+    }
+}
+
+#[test]
 fn model_aliases_and_subcommands_share_live_policy_and_panel_destinations() {
     use crate::app::overlay::Which;
     for name in ["model", "models"] {

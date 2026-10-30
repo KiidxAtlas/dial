@@ -1,7 +1,7 @@
 //! Bounded microphone recording and energy-endpointed transcription for push-to-talk.
 use super::{
     VoiceEnv,
-    capture::Capture,
+    capture::{Capture, Chunk},
     endpointer::{Endpointer, EndpointerConfig, EndpointerEvent},
     stt::{self, SttBackend},
 };
@@ -10,7 +10,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc::RecvTimeoutError,
+        mpsc::{Receiver, RecvTimeoutError},
     },
     time::{Duration, Instant},
 };
@@ -50,6 +50,7 @@ pub fn record_held(
 struct Segments {
     texts: Vec<String>,
     first_failure: Option<anyhow::Error>,
+    attempted: usize,
 }
 
 impl Segments {
@@ -60,6 +61,7 @@ impl Segments {
         segment: &[f32],
         abort: &Arc<AtomicBool>,
     ) -> Result<()> {
+        self.attempted += 1;
         match stt::transcribe(env, backend, segment, abort) {
             Ok(text) => {
                 if !text.trim().is_empty() {
@@ -75,13 +77,28 @@ impl Segments {
         }
     }
 
-    fn finish(self) -> Result<String> {
+    fn finish(self, sample_count: usize, min_speech_ms: u32, source: &str) -> Result<String> {
+        ensure!(
+            sample_count > 0,
+            "no microphone audio received from {source}; hold the speech key while speaking and check microphone permission and the input device"
+        );
+        ensure!(
+            sample_count as u64 * 1000 >= u64::from(min_speech_ms) * 16_000,
+            "recording from {source} was too short; hold the speech key while speaking"
+        );
+        ensure!(
+            self.attempted > 0,
+            "no speech detected in audio from {source}; check the input device and microphone level"
+        );
         if self.texts.is_empty()
             && let Some(error) = self.first_failure
         {
             return Err(error);
         }
-        ensure!(!self.texts.is_empty(), "no speech detected");
+        ensure!(
+            !self.texts.is_empty(),
+            "speech was detected, but the transcription backend returned no text"
+        );
         Ok(self.texts.join(" "))
     }
 }
@@ -99,24 +116,35 @@ fn record(
     );
     let backend = stt::resolve_backend(env)?;
     let (capture, rx) = Capture::start(config, abort)?;
-    let _source = capture.source().to_owned();
+    let source = capture.source().to_owned();
     let mut endpointer = Endpointer::new(EndpointerConfig {
         end_silence_ms: config.end_silence_ms.clamp(100, 5000),
         min_speech_ms: config.min_speech_ms.clamp(50, 5000),
         ..Default::default()
     });
-    let deadline = Instant::now() + Duration::from_secs(config.max_recording_secs.clamp(1, 600));
-    let mut segments = Segments::default();
+    let max_secs = config.max_recording_secs.clamp(1, 600);
+    let deadline = Instant::now() + Duration::from_secs(max_secs);
+    let sample_limit = max_secs as usize * super::wav::SAMPLE_RATE as usize;
+    // Backend calls can block for minutes. Keep recording responsive to release/cancellation,
+    // then decode only after capture is stopped. The sample cap bounds buffered speech too.
+    let mut pending = Vec::new();
     let mut completed = false;
-    while !completed && !finish.load(Ordering::SeqCst) && !abort.load(Ordering::SeqCst) {
+    let mut sample_count = 0usize;
+    while !completed
+        && sample_count < sample_limit
+        && !finish.load(Ordering::SeqCst)
+        && !abort.load(Ordering::SeqCst)
+    {
         if Instant::now() >= deadline {
             break;
         }
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(Ok(samples)) => {
-                for event in endpointer.push(&samples) {
+                let samples = &samples[..samples.len().min(sample_limit - sample_count)];
+                sample_count += samples.len();
+                for event in endpointer.push(samples) {
                     let EndpointerEvent::Segment(segment) = event;
-                    segments.add(env, &backend, &segment, abort)?;
+                    pending.push(segment);
                     if end == EndRule::Silence && !endpointer.in_speech() {
                         completed = true;
                         break;
@@ -128,18 +156,56 @@ fn record(
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
-    drop(rx);
-    capture.stop();
+    stop_and_drain(
+        &rx,
+        || capture.stop(),
+        abort,
+        |chunk| {
+            // Silence completion is already an endpoint; never admit beyond the hard cap.
+            if completed || sample_count == sample_limit {
+                return Ok(());
+            }
+            let samples =
+                chunk.map_err(|error| anyhow::anyhow!("microphone capture failed: {error}"))?;
+            let samples = &samples[..samples.len().min(sample_limit - sample_count)];
+            sample_count += samples.len();
+            for event in endpointer.push(samples) {
+                let EndpointerEvent::Segment(segment) = event;
+                pending.push(segment);
+            }
+            Ok(())
+        },
+    )?;
     ensure!(!abort.load(Ordering::SeqCst), "speech input was cancelled");
     if endpointer.in_speech() {
         // Finishing only ends recording: trailing speech is still transcribed, not aborted.
         for event in endpointer.flush() {
             let EndpointerEvent::Segment(segment) = event;
-            segments.add(env, &backend, &segment, abort)?;
+            pending.push(segment);
         }
     }
+    let mut segments = Segments::default();
+    for segment in pending {
+        ensure!(!abort.load(Ordering::SeqCst), "speech input was cancelled");
+        segments.add(env, &backend, &segment, abort)?;
+    }
     ensure!(!abort.load(Ordering::SeqCst), "speech input was cancelled");
-    segments.finish()
+    segments.finish(sample_count, config.min_speech_ms.clamp(50, 5000), &source)
+}
+
+/// Stop and join the producer before draining, retaining chunks queued during shutdown as well.
+fn stop_and_drain(
+    rx: &Receiver<Chunk>,
+    stop: impl FnOnce(),
+    abort: &AtomicBool,
+    mut consume: impl FnMut(Chunk) -> Result<()>,
+) -> Result<()> {
+    stop();
+    for chunk in rx.try_iter() {
+        ensure!(!abort.load(Ordering::SeqCst), "speech input was cancelled");
+        consume(chunk)?;
+    }
+    Ok(())
 }
 
 #[cfg(all(test, unix))]

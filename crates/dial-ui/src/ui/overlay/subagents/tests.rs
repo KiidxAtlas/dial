@@ -107,6 +107,38 @@ fn message_composes_and_sends_to_the_selected_worker() {
 }
 
 #[test]
+fn a_failed_message_keeps_the_draft_for_correction() {
+    let keys = keymap();
+    let mut hub = SubagentsOverlay::new();
+    hub.set_snapshot(snapshot(vec![agent("task-1", AgentStatus::Done)]));
+    hub.handle(&key(KeyCode::Char('m')), &keys);
+    for c in "hi".chars() {
+        hub.handle(&key(KeyCode::Char(c)), &keys);
+    }
+    assert!(matches!(
+        hub.handle(&key(KeyCode::Enter), &keys),
+        OverlayEvent::Action(a) if a == "subagent-message:task-1\nhi"
+    ));
+    assert_eq!(
+        hub.compose.as_deref(),
+        Some("hi"),
+        "the draft stays until delivery is confirmed"
+    );
+    hub.message_outcome(false);
+    assert_eq!(
+        hub.compose.as_deref(),
+        Some("hi"),
+        "a failed send keeps the text"
+    );
+    assert!(matches!(
+        hub.handle(&key(KeyCode::Enter), &keys),
+        OverlayEvent::Action(a) if a == "subagent-message:task-1\nhi"
+    ));
+    hub.message_outcome(true);
+    assert_eq!(hub.compose, None, "a delivered message closes the composer");
+}
+
+#[test]
 fn paste_fills_an_open_message_draft_and_is_ignored_otherwise() {
     let keys = keymap();
     let mut hub = SubagentsOverlay::new();

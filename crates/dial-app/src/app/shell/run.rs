@@ -116,7 +116,7 @@ impl Shell {
                 self.note("Tan", note);
                 dirty = true;
             }
-            if self.poll_voice() {
+            if self.poll_voice(app) {
                 dirty = true;
             }
             for (label, line) in AuthJob::drain_lines(&mut self.auth_job) {

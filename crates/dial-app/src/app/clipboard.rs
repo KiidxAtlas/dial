@@ -30,5 +30,5 @@ pub(super) fn copy_text(text: &str) -> Result<&'static str> {
     }
     let encoded = base64::engine::general_purpose::STANDARD.encode(text);
     crate::ui::term::write_control(format!("\x1b]52;c;{encoded}\x07").into_bytes())?;
-    Ok("clipboard sent via OSC52 (terminal support required)")
+    Ok("sent to terminal via OSC52; paste to confirm — your terminal may not support it")
 }

@@ -365,6 +365,19 @@ pub fn compact_history(
         fixed_tokens < budget,
         "immutable system/tool/transient context and next response reserve cannot fit; history compaction cannot fix this"
     );
+    // Adaptive budgeting reserves room for a future summary. With a large fixed prompt it can
+    // shrink to zero even when today's tiny history is already safe and needs no summary.
+    if options.reason == CompactionReason::Manual
+        && options.method.is_none()
+        && options.strategy.is_none()
+        && options.keep_recent_tokens.is_none()
+        && options.instructions.is_none()
+        && policy.summary_instructions.is_none()
+        && before <= budget
+        && cut(&request.messages, u64::from(policy.keep_recent_tokens)).is_none()
+    {
+        return Err(NothingToCompact.into());
+    }
     let keep_budget = match options.keep_recent_tokens {
         Some(explicit) => u64::from(explicit),
         None => policy.keep_recent_budget(context.identity, context.window, fixed_tokens)?,

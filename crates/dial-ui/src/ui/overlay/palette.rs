@@ -293,8 +293,10 @@ pub struct PaletteOverlay {
     list_bounds: Option<Rect>,
     arguments: Option<(usize, Editor)>,
     choice: Option<ChoiceSpec>,
-    /// Why the last Enter did nothing, shown until the next key.
+    /// Why the last Enter did nothing, or a pending removal to confirm; shown until the next key.
     notice: Option<String>,
+    /// The picker item a first Delete/x armed for removal; any other key disarms it.
+    remove_armed: Option<usize>,
     busy: bool,
 }
 
@@ -331,6 +333,7 @@ impl PaletteOverlay {
             arguments: None,
             choice: None,
             notice: None,
+            remove_armed: None,
             busy,
         }
     }
@@ -503,6 +506,7 @@ impl PaletteOverlay {
         if let Event::Paste(value) = event {
             let value = text::one_line(value);
             self.notice = None;
+            self.remove_armed = None;
             if let Some((_, editor)) = &mut self.arguments {
                 editor.insert(&value);
             } else {
@@ -518,6 +522,7 @@ impl PaletteOverlay {
             return OverlayEvent::None;
         }
         self.notice = None;
+        let armed = self.remove_armed.take();
         if keys.matches(Action::SelectCancel, key) {
             if self.arguments.take().is_some() {
                 return OverlayEvent::None;
@@ -557,14 +562,24 @@ impl PaletteOverlay {
         if let Some(spec) = &self.choice
             && let Some(verb) = spec.remove
         {
-            let clear = self.search.text.is_empty();
-            let removes = matches!(key.code, KeyCode::Delete)
-                || (clear && matches!(key.code, KeyCode::Backspace | KeyCode::Char('x')));
-            if removes {
-                return match self.entry_rows().get(self.cursor) {
-                    Some(&index) => choice_action(spec, &spec.items[index].value, verb),
-                    None => OverlayEvent::None,
+            // Removal needs a second press on the same row, so a stray key cannot drop an item.
+            // Backspace only edits the filter.
+            let key_name = match key.code {
+                KeyCode::Delete => Some("Delete"),
+                KeyCode::Char('x') if self.search.text.is_empty() => Some("x"),
+                _ => None,
+            };
+            if let Some(key_name) = key_name {
+                let Some(&index) = self.entry_rows().get(self.cursor) else {
+                    return OverlayEvent::None;
                 };
+                if armed == Some(index) {
+                    return choice_action(spec, &spec.items[index].value, verb);
+                }
+                let label = text::one_line(&spec.items[index].label);
+                self.notice = Some(format!("Press {key_name} again to remove {label}"));
+                self.remove_armed = Some(index);
+                return OverlayEvent::None;
             }
         }
         if self.choice.is_none()
@@ -656,6 +671,7 @@ impl PaletteOverlay {
 
     /// Select the action drawn at this screen position; clicking the selected action runs it.
     pub fn click(&mut self, column: u16, row: u16) -> OverlayEvent {
+        self.remove_armed = None;
         let Some(bounds) = self.list_bounds else {
             return OverlayEvent::None;
         };
@@ -726,7 +742,7 @@ impl PaletteOverlay {
                 items.push(keys_hint(keys, Action::SelectConfirm, verb));
             }
             if spec.remove.is_some() && !empty {
-                items.push("Delete/x remove".to_owned());
+                items.push("Delete/x remove (press twice)".to_owned());
             }
         } else if self.arguments.is_some() {
             items.push(keys_hint(keys, Action::SelectConfirm, "run"));
@@ -1071,7 +1087,14 @@ impl PaletteOverlay {
                         .into_iter()
                         .map(|value| line(format!(" {value}"), Tok::Text)),
                 );
-                out.push(line(note, Tok::Muted));
+                match &self.notice {
+                    // A pending removal replaces the note until the next key.
+                    Some(notice) => out.push(line(
+                        text::ellipsize(&format!(" {notice}"), w, ascii),
+                        Tok::Warning,
+                    )),
+                    None => out.push(line(note, Tok::Muted)),
+                }
             }
         }
         while out.len() + 1 < h {

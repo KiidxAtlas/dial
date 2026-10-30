@@ -127,12 +127,78 @@ fn picker_with_remove_edits_or_removes_the_selected_row() {
     ));
     assert!(matches!(
         palette.handle(&plain(KeyCode::Delete), &keys),
-        OverlayEvent::Action(action) if action == "command:/queue remove 2"
+        OverlayEvent::None
     ));
     assert!(matches!(
-        palette.handle(&plain(KeyCode::Char('x')), &keys),
+        palette.handle(&plain(KeyCode::Delete), &keys),
         OverlayEvent::Action(action) if action == "command:/queue remove 2"
     ));
+}
+
+#[test]
+fn remove_needs_a_second_press_on_the_same_row_and_names_the_item() {
+    let keys = Keymap::defaults();
+    for (code, key_name) in [(KeyCode::Delete, "Delete"), (KeyCode::Char('x'), "x")] {
+        let spec = ChoiceSpec {
+            title: "Queued messages".into(),
+            command: "queue".into(),
+            verb: "edit",
+            remove: Some("remove"),
+            items: vec![item("1", false), item("2", false)],
+            ..Default::default()
+        };
+        let mut palette = PaletteOverlay::choice(spec);
+        palette.handle(&plain(KeyCode::Down), &keys);
+        assert!(matches!(
+            palette.handle(&plain(code), &keys),
+            OverlayEvent::None
+        ));
+        let shown = rendered(&mut palette, 100).join("\n");
+        assert!(
+            shown.contains(&format!("Press {key_name} again to remove 2")),
+            "{shown}"
+        );
+        assert!(matches!(
+            palette.handle(&plain(code), &keys),
+            OverlayEvent::Action(action) if action == "command:/queue remove 2"
+        ));
+    }
+}
+
+#[test]
+fn backspace_never_removes_and_any_other_key_disarms_a_pending_remove() {
+    let keys = Keymap::defaults();
+    let spec = ChoiceSpec {
+        title: "Queued messages".into(),
+        command: "queue".into(),
+        verb: "edit",
+        remove: Some("remove"),
+        items: vec![item("1", false), item("2", false)],
+        ..Default::default()
+    };
+    let mut palette = PaletteOverlay::choice(spec);
+    palette.handle(&plain(KeyCode::Down), &keys);
+    for _ in 0..2 {
+        assert!(matches!(
+            palette.handle(&plain(KeyCode::Backspace), &keys),
+            OverlayEvent::None
+        ));
+    }
+    assert!(matches!(
+        palette.handle(&plain(KeyCode::Delete), &keys),
+        OverlayEvent::None
+    ));
+    palette.handle(&plain(KeyCode::Up), &keys);
+    palette.handle(&plain(KeyCode::Down), &keys);
+    assert!(
+        matches!(
+            palette.handle(&plain(KeyCode::Delete), &keys),
+            OverlayEvent::None
+        ),
+        "moving away and back disarmed the first press"
+    );
+    let footer = rendered(&mut palette, 100).pop().unwrap();
+    assert!(footer.contains("remove (press twice)"), "{footer}");
 }
 
 #[test]

@@ -395,6 +395,8 @@ pub struct ModelSettingsOverlay {
     fields: Vec<Field>,
     cursor: usize,
     scroll: usize,
+    /// Page-key step from the most recently drawn list height.
+    page: usize,
     scope: Scope,
     editor: Option<Editor>,
     pending: Option<(ModelProfile, String)>,
@@ -418,6 +420,7 @@ impl ModelSettingsOverlay {
             fields,
             cursor: 0,
             scroll: 0,
+            page: 6,
             scope: Scope::Project,
             editor: None,
             pending: None,
@@ -996,9 +999,9 @@ impl ModelSettingsOverlay {
         } else if keys.matches(Action::SelectDown, key) {
             self.cursor = (self.cursor + 1).min(last);
         } else if keys.matches(Action::SelectPageUp, key) {
-            self.cursor = self.cursor.saturating_sub(6);
+            self.cursor = self.cursor.saturating_sub(self.page);
         } else if keys.matches(Action::SelectPageDown, key) {
-            self.cursor = (self.cursor + 6).min(last);
+            self.cursor = (self.cursor + self.page).min(last);
         } else if key.code == KeyCode::Tab {
             // Jump to the first row of the next section.
             if let Some(next) = self.fields.iter().position(|f| {
@@ -1007,6 +1010,10 @@ impl ModelSettingsOverlay {
                 }
             }) {
                 self.cursor = next;
+            } else if self.cursor < self.fields.len() && !self.suggestions.is_empty() {
+                self.cursor = self.fields.len();
+            } else {
+                self.cursor = 0;
             }
         } else if key.code == KeyCode::BackTab {
             // Jump to the start of this section, or of the previous one when already there.
@@ -1015,7 +1022,9 @@ impl ModelSettingsOverlay {
                 .iter()
                 .position(|f| f.section == section)
                 .unwrap_or(0);
-            let target = if self.cursor > first {
+            let target = if self.cursor >= self.fields.len() {
+                self.fields.len() - 1
+            } else if self.cursor > first {
                 first
             } else {
                 first.saturating_sub(1)
@@ -1177,6 +1186,7 @@ impl ModelSettingsOverlay {
             0
         };
         let list_h = h.saturating_sub(2 + 1 + 1 + detail_h).max(1);
+        self.page = list_h;
 
         // Section headers interleaved with fields, scrolled so the selected field stays visible.
         let mut rows: Vec<(Option<&'static str>, usize)> = Vec::new();

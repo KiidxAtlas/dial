@@ -165,7 +165,9 @@ impl Picker {
             return;
         };
         let mut parent = self.nodes[current].parent.clone();
-        while let Some(id) = parent {
+        // At most one step per node, so a cyclic parent chain ends the walk instead of hanging.
+        for _ in 0..self.nodes.len() {
+            let Some(id) = parent else { return };
             let Some(index) = self.nodes.iter().position(|node| node.id == id) else {
                 return;
             };

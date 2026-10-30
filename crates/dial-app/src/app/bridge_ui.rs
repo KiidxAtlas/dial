@@ -504,6 +504,10 @@ impl Ui for Bridge<'_> {
         self.repaint(true);
     }
 
+    fn provider_retry_control(&mut self, control: Option<crate::llm::provider::RetryControl>) {
+        self.shell.retry_control = control;
+    }
+
     fn request_phase(&mut self, phase: agent::RequestPhase) {
         let changed = phase != self.shell.request_phase;
         self.shell.request_phase = phase;
@@ -849,7 +853,9 @@ impl Ui for Bridge<'_> {
             match event {
                 Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
                     KeyCode::Enter => {
-                        break (!editor.text.trim().is_empty()).then_some(editor.text);
+                        if !editor.text.trim().is_empty() {
+                            break Some(editor.text);
+                        }
                     }
                     KeyCode::Esc => break None,
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {

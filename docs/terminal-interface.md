@@ -77,8 +77,10 @@ failures (including checkpoint failures) are not reset by this recovery.
   Pasting never runs an action. Provider discovery waits until Models or Providers opens.
 - **Pickers and `/help`:** run bare, `/approval`, `/effort` (`/reasoning` and `/thinking` too), `/profile`,
   `/theme`, `/queue` and `/permissions remove` open a searchable list in the TUI with the current value
-  marked; `Enter` applies it and `Esc` cancels. `/queue` rows edit on `Enter` and remove on `Delete`,
-  `Backspace` or `x` (on an empty search). The argument forms still work in scripts and text output.
+  marked; `Enter` applies it and `Esc` cancels. `/queue` rows edit on `Enter` and remove on a second
+  press of `Delete` or `x` (on an empty search) on the same row; the first press names the item, any
+  other key cancels, and `Backspace` only edits the search. The argument forms still work in scripts
+  and text output.
   `/help` opens the goal-first palette; `/help text` prints the command list and `/help all` includes
   the advanced sections. The footer lists the keys the current mode uses; Esc clears before going back.
 - **Work plan:** the live summary shows the current step, blockers and the next step rather than
@@ -109,6 +111,9 @@ failures (including checkpoint failures) are not reset by this recovery.
 - Questions and approvals quarantine input queued before the dialog opens, so a buffered Enter
   cannot approve an unseen action. A question opened over a nonempty draft starts with draft
   focus: Enter edits that draft, Tab/Escape moves to the choices, and Ctrl+C cancels the question.
+- In question dialogs, Enter in **Other/custom input** submits the answer (or advances to the next
+  question). Shift+Enter inserts a newline. Enter in **Note** saves the note and returns to the
+  choices without submitting.
 - **Inline suggestions:** command arguments offer valid choices as dim ghost text even before you have
   used them: `/understanding ` suggests `architecture`, `/skills s` suggests `sources`, and
   `/skills enable ` suggests an installed skill name (including disabled skills). Built-in choices
@@ -483,6 +488,8 @@ and other projects can override global defaults.
 
 `/model settings` (alias `/model-settings`; also `F7` in `/model`) tunes the **current main model**.
 Settings are grouped into sections, with a description and the accepted range for the selected row.
+PageUp/PageDown move by the visible list height; Tab jumps to the next section, including local
+setting suggestions, then wraps to the first section. Shift+Tab moves back through field sections.
 `↑/↓` move, `←/→` cycle a choice or toggle and step a number (the first press starts from a sensible
 value), `Enter` types an exact value, `r` resets a row to its default, `s` switches between project and
 global storage, `d` opens shared context defaults, and `g` opens all shared settings. Changes validate against the model's declared

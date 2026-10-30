@@ -971,6 +971,17 @@ impl Composer {
         if self.busy && key.kind == KeyEventKind::Repeat && ctx.keys.matches(Action::Submit, &key) {
             return ComposerEvent::None;
         }
+        // A pending Ctrl-] jump takes the next typed letter; any other key cancels it before dispatch.
+        let plain = matches!(key.code, KeyCode::Char(_))
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
+        if self.search.is_none() && self.editor.jump_pending() && plain {
+            self.editor.key_with(key, ctx.keys);
+            self.refresh();
+            return ComposerEvent::None;
+        }
+        self.editor.cancel_jump();
         let event = if self.search.is_some() {
             self.search_key(key, ctx)
         } else {
@@ -1026,6 +1037,14 @@ impl Composer {
         {
             return ComposerEvent::Action(Action::SubagentsHub);
         }
+        // An open menu owns Up/Down, so a remapped app key that shares them (Ctrl-P) moves the selection.
+        if self.menu_open()
+            && (keys.matches(Action::SelectUp, &key) || keys.matches(Action::SelectDown, &key))
+        {
+            let up = keys.matches(Action::SelectUp, &key);
+            self.step_menu(if up { -1 } else { 1 }, true, rows);
+            return ComposerEvent::None;
+        }
         if let Some(action) = APP_ACTIONS.into_iter().find(|a| keys.triggers(*a, &key)) {
             return ComposerEvent::Action(action);
         }
@@ -1047,6 +1066,11 @@ impl Composer {
             return ComposerEvent::Interrupt;
         }
         if keys.matches(Action::ClearDraft, &key) {
+            if self.history_index.is_some() {
+                // Ctrl-C while browsing returns to the unsent draft instead of discarding it.
+                self.leave_history();
+                return ComposerEvent::None;
+            }
             if !self.editor.text.is_empty() {
                 self.set_draft("");
                 return ComposerEvent::None;
@@ -1098,6 +1122,29 @@ impl Composer {
         }
         self.editor.key_with(key, keys);
         ComposerEvent::None
+    }
+
+    /// Speech belongs to the draft, not an open history-search query.
+    pub fn paste_voice(&mut self, transcript: &str) {
+        self.search = None;
+        self.handle_paste(transcript);
+    }
+
+    /// Sends a finished speech draft without accepting autocomplete. During a turn it uses the
+    /// existing after-turn queue rather than interrupting work or opening the busy chooser.
+    pub fn submit_voice(&mut self) -> ComposerEvent {
+        // An empty draft can still be an in-progress queue edit. Leave it for review rather than
+        // consuming the original queued message or changing its route.
+        if self.editing_queue.is_some() {
+            return ComposerEvent::None;
+        }
+        self.menu = None;
+        self.choice = None;
+        if self.busy {
+            self.submit_queued(true)
+        } else {
+            self.submit()
+        }
     }
 
     fn submit(&mut self) -> ComposerEvent {
@@ -1401,10 +1448,15 @@ impl Composer {
                 self.history_index = Some(index + 1);
                 self.editor.set(&self.history[index + 1]);
             } else {
-                self.history_index = None;
-                self.editor = self.saved_draft.take().unwrap_or_default();
+                self.leave_history();
             }
         }
+    }
+
+    /// Leaves history browsing and gives back the draft that was stashed when browsing began.
+    fn leave_history(&mut self) {
+        self.history_index = None;
+        self.editor = self.saved_draft.take().unwrap_or_default();
     }
 
     fn search_matches(&self) -> Vec<usize> {

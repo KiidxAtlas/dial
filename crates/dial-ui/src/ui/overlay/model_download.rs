@@ -406,8 +406,13 @@ impl ModelDownloads {
             return Step::Handled;
         }
         if key.code == KeyCode::Backspace {
+            // Backspace always edits the query; from the results it returns focus there, unless
+            // there is nothing to delete.
             if self.focus == Focus::Query {
                 self.query.pop();
+                self.query_changed();
+            } else if self.query.pop().is_some() {
+                self.focus = Focus::Query;
                 self.query_changed();
             }
             return Step::Handled;

@@ -213,3 +213,23 @@ fn ctrl_arrows_jump_between_turns_and_to_the_parent() {
     picker.handle(&ctrl(KeyCode::Up), 20);
     assert_eq!(picker.selected_id(), Some("b"));
 }
+
+#[test]
+fn select_parent_terminates_on_a_cyclic_parent_chain() {
+    let mut matched = node("m", 0, "match");
+    matched.parent = Some("a".into());
+    let mut a = node("a", 0, "hidden");
+    a.parent = Some("b".into());
+    let mut b = node("b", 0, "hidden");
+    b.parent = Some("a".into());
+    let mut picker = Picker::new(vec![a, b, matched]);
+    picker.query = "match".into();
+    picker.refilter();
+    assert_eq!(picker.selected_id(), Some("m"));
+    picker.handle(&ctrl(KeyCode::Left), 20);
+    assert_eq!(
+        picker.selected_id(),
+        Some("m"),
+        "no ancestor is visible, so the selection stays put"
+    );
+}

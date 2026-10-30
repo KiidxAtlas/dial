@@ -147,11 +147,15 @@ fn attempts_and_delay_ceiling_bound_retries() {
 #[test]
 fn a_ready_fallback_shortens_only_the_failures_it_accepts() {
     use crate::config::types::FallbackOn;
-    let failover = policy().with_failover(Some(FallbackOn::UsageLimit));
+    let failover = Policy::new(
+        &crate::config::types::RetryConfig::default(),
+        Duration::from_secs(300),
+    )
+    .with_failover(Some(FallbackOn::UsageLimit));
     let throttled = ErrorClass::RateLimited { retry_after: None };
     assert!(matches!(
         decide(&throttled, None, 1, &failover),
-        Decision::Retry { .. }
+        Decision::Retry { delay, .. } if delay == Duration::from_secs(1)
     ));
     assert!(
         matches!(decide(&throttled, None, FAILOVER_ATTEMPTS, &failover), Decision::Stop(Some(why)) if why.contains("fallback"))
@@ -164,11 +168,63 @@ fn a_ready_fallback_shortens_only_the_failures_it_accepts() {
     // A failure the fallback does not take keeps every configured attempt.
     assert!(matches!(
         decide(&ErrorClass::Transient, None, FAILOVER_ATTEMPTS, &failover),
-        Decision::Retry { .. }
+        Decision::Retry { delay, .. } if delay == Duration::from_secs(300)
     ));
     assert_eq!(
         failover.attempts(&ErrorClass::Transient),
         failover.max_attempts
     );
     assert_eq!(failover.attempts(&throttled), FAILOVER_ATTEMPTS);
+}
+
+#[test]
+fn automatic_retry_interval_is_fixed_and_respects_limits_and_server_minimums() {
+    let mut policy = Policy::new(
+        &crate::config::types::RetryConfig::default(),
+        Duration::from_secs(300),
+    );
+    for attempt in [1, 2, 9] {
+        assert!(matches!(
+            decide(&ErrorClass::Transient, None, attempt, &policy),
+            Decision::Retry { delay, .. } if delay == Duration::from_secs(300)
+        ));
+    }
+    policy.max_delay = Duration::from_secs(120);
+    assert!(matches!(
+        decide(&ErrorClass::Transient, None, 1, &policy),
+        Decision::Retry { delay, .. } if delay == Duration::from_secs(120)
+    ));
+    policy.max_delay = Duration::from_secs(600);
+    assert!(matches!(
+        decide(&ErrorClass::Transient, Some(Duration::from_secs(500)), 1, &policy),
+        Decision::Retry { delay, .. } if delay == Duration::from_secs(500)
+    ));
+}
+
+#[test]
+fn manual_retry_only_releases_the_current_wait_and_cancellation_wins() {
+    let control = RetryControl::default();
+    let other = RetryControl::default();
+    let interrupt = AtomicBool::new(false);
+    assert!(!control.request_now(), "idle requests must not be queued");
+    {
+        let pending = control.begin_wait();
+        assert!(!other.request_now(), "another request's wait is isolated");
+        assert!(control.request_now());
+        assert!(!control.request_now(), "do not queue multiple retries");
+        pending.wait(Duration::from_secs(300), &interrupt).unwrap();
+    }
+    assert!(!control.request_now());
+    {
+        let pending = control.begin_wait();
+        assert!(control.request_now(), "each wait needs its own command");
+        interrupt.store(true, Ordering::SeqCst);
+        assert!(pending.wait(Duration::from_secs(300), &interrupt).is_err());
+    }
+    assert!(!control.request_now(), "cancelled waits are cleared");
+    drop(control.begin_wait());
+    assert!(
+        !control.request_now(),
+        "early exits also clear the pending wait"
+    );
 }

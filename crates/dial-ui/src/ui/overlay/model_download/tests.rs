@@ -692,3 +692,25 @@ fn image_download_stays_image_after_switching_shelves_before_completion() {
     group.shelf = Shelf::Memory;
     assert!(group.installed_rows().is_empty());
 }
+
+#[test]
+fn backspace_after_moving_to_results_edits_the_query_again() {
+    let keys = Keymap::defaults();
+    let mut group = ModelDownloads::fixed(dashboard(vec![row("a")]));
+    group.paste("qwen");
+    group.focus = Focus::Results;
+    group.key(&key(KeyCode::Backspace), &keys);
+    assert_eq!(group.query_text(), "qwe");
+    assert_eq!(group.focus, Focus::Query);
+    assert!(group.idle_now(), "editing the query never starts a search");
+
+    let mut empty = ModelDownloads::fixed(dashboard(vec![row("a")]));
+    empty.focus = Focus::Results;
+    empty.key(&key(KeyCode::Backspace), &keys);
+    assert_eq!(empty.query_text(), "");
+    assert_eq!(
+        empty.focus,
+        Focus::Results,
+        "nothing to delete leaves the results focused"
+    );
+}

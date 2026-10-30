@@ -1949,6 +1949,61 @@ fn transient_failures_retry_with_visible_notices_and_stop_at_the_bound() {
 }
 
 #[test]
+fn manual_retry_skips_five_minute_waits_without_leaking_into_other_attempts() {
+    let server = fake::serve(vec![
+        fake::json(503, &json!({"error":"busy"})),
+        Script::HttpHeaders {
+            status: 429,
+            headers: vec![("Retry-After", "300".into())],
+            body: b"{}".to_vec(),
+        },
+        ok("recovered"),
+    ]);
+    // Exercise the production default, not the test helper's short backoff.
+    let mut remote = Backend::new(endpoint(&server.url), PathBuf::new(), 5);
+    let control = remote.retry_control();
+    assert!(!control.request_now());
+    let mut notices = Vec::new();
+    let mut phases = Vec::new();
+    let reply = remote
+        .chat_with_control_events(
+            None,
+            &request(),
+            llm::Limits {
+                timeout_secs: 5,
+                interrupt: Arc::new(AtomicBool::new(false)),
+            },
+            None,
+            &mut |notice| notices.push(notice.to_owned()),
+            &mut |event| {
+                if let llm::StreamEvent::Retry { waiting } = event {
+                    phases.push(*waiting);
+                    assert_eq!(control.request_now(), *waiting);
+                    assert!(
+                        !control.request_now(),
+                        "no duplicate or future retry requests"
+                    );
+                }
+                true
+            },
+        )
+        .unwrap();
+    assert_eq!(reply.text, "recovered");
+    assert_eq!(phases, [true, false, true, false]);
+    assert_eq!(server.requests().len(), 3);
+    assert_eq!(notices.len(), 2);
+    assert!(
+        notices
+            .iter()
+            .all(|notice| notice.contains("retrying in 300.0s"))
+    );
+    assert!(
+        !control.request_now(),
+        "finished requests cannot be retried by this handle"
+    );
+}
+
+#[test]
 fn backoff_is_interruptible_and_obeys_retry_after() {
     let server = fake::serve(vec![Script::HttpHeaders {
         status: 429,

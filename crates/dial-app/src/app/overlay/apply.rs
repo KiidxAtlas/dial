@@ -531,12 +531,6 @@ impl OverlayEnv<'_> {
                 if let Some(payload) = action.strip_prefix("extensions:") {
                     Shell::queue_extensions(self.extensions_pending, *self.scope, payload, overlay);
                 } else if let Some(payload) = action.strip_prefix("compute:") {
-                    if compute_starts(payload)
-                        && let Some(release) = self.release_compute.as_mut()
-                    {
-                        // The training worker needs the compute lease and the resident server's memory.
-                        release();
-                    }
                     if let Some(monitor) = &self.compute_monitor {
                         match serde_json::from_str(payload)
                             .map_err(anyhow::Error::from)
@@ -546,7 +540,17 @@ impl OverlayEnv<'_> {
                                     .try_send(action)
                                     .map_err(anyhow::Error::from)
                             }) {
-                            Ok(()) => overlay.banner("Applying compute control…".into(), false),
+                            Ok(()) => {
+                                // Release only once the monitor accepted the action: a dropped
+                                // command must not unload the resident server's memory.
+                                if compute_starts(payload)
+                                    && let Some(release) = self.release_compute.as_mut()
+                                {
+                                    // The training worker needs the compute lease and the resident server's memory.
+                                    release();
+                                }
+                                overlay.banner("Applying compute control…".into(), false);
+                            }
                             Err(error) => overlay.banner(error.to_string(), true),
                         }
                     } else {

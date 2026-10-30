@@ -246,6 +246,8 @@ impl Editor {
 
     /// Insert at the cursor as one undo unit.
     pub fn insert(&mut self, text: &str) {
+        // Inserted text is never a jump target: a pending Ctrl-] is cancelled, as for any other edit.
+        self.jump = None;
         let clean = sanitize(text);
         if clean.is_empty() {
             return;
@@ -369,6 +371,16 @@ impl Editor {
     /// Handle a key with the default bindings (dialog text fields).
     pub fn key(&mut self, key: KeyEvent) -> bool {
         self.key_with(key, default_keymap())
+    }
+
+    /// Whether a Ctrl-] jump is waiting for its target character.
+    pub(crate) fn jump_pending(&self) -> bool {
+        self.jump.is_some()
+    }
+
+    /// Drops a pending jump without acting on it.
+    pub(crate) fn cancel_jump(&mut self) {
+        self.jump = None;
     }
 
     /// Handle a key with the user's bindings. False means the key was not an editing key.

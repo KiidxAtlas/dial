@@ -386,8 +386,21 @@ impl ExtensionsOverlay {
         action(&self.browser.begin_catalog(tab, query, page))
     }
 
-    pub fn banner(&mut self, message: impl Into<String>) {
-        self.browser.message = message.into();
+    pub fn banner(&mut self, message: impl Into<String>, is_error: bool) {
+        let message = message.into();
+        if is_error {
+            self.browser.job = Job::Done {
+                label: "Extensions".into(),
+                ok: false,
+                message,
+            };
+        } else {
+            // A later neutral notice supersedes an earlier failure; a running install stays.
+            if matches!(self.browser.job, Job::Done { ok: false, .. }) {
+                self.browser.job = Job::Idle;
+            }
+            self.browser.message = message;
+        }
     }
 
     pub fn draw(&mut self, frame: &mut Frame, ctx: &DrawCtx) {

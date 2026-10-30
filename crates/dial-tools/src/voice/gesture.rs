@@ -29,7 +29,6 @@ pub struct Gesture {
 }
 
 impl Gesture {
-    #[cfg(test)]
     pub fn recording(&self) -> bool {
         self.state != State::Idle
     }

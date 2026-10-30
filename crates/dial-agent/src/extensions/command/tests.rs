@@ -134,11 +134,15 @@ fn registered_command_schema_is_admitted_before_the_extension_runs() {
         fn contributions(&self) -> Contributions {
             serde_json::from_value(json!({"commands":[{"name":"typed","description":"Typed input","parameters":{"type":"object","properties":{"count":{"type":"integer","minimum":1}},"required":["count"],"additionalProperties":false},"keybinding":null}]})).unwrap()
         }
-        fn on_event(&self, _: &str, params: &Value, _: &AtomicBool) -> Result<Option<Value>> {
+        fn on_event(&self, _: &str, _: &Value, _: &AtomicBool) -> Result<Option<Value>> {
+            Ok(None)
+        }
+        fn call(&self, method: &str, params: Value, _: &AtomicBool) -> Result<Value> {
+            assert_eq!(method, "command");
             self.0.fetch_add(1, Ordering::SeqCst);
             assert_eq!(params["args"], "{\"count\":2}");
             assert_eq!(params["arguments"], json!({"count":2}));
-            Ok(Some(json!({"text":"accepted"})))
+            Ok(json!({"text":"accepted"}))
         }
     }
     let calls = Arc::new(AtomicUsize::new(0));

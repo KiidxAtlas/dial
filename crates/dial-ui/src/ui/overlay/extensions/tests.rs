@@ -598,3 +598,16 @@ fn rejected_catalog_retains_earlier_form_and_completion_and_allows_retry() {
     assert!(overlay.browser.form.is_none());
     assert!(!overlay.take_refresh());
 }
+
+#[test]
+fn errors_from_the_controller_show_as_a_failed_job_and_notices_stay_neutral() {
+    let mut overlay = ExtensionsOverlay::new();
+    overlay.banner("compute refused", true);
+    assert!(matches!(
+        &overlay.browser.job,
+        Job::Done { ok: false, message, .. } if message == "compute refused"
+    ));
+    overlay.banner("Applying", false);
+    assert!(matches!(overlay.browser.job, Job::Idle));
+    assert_eq!(overlay.browser.message, "Applying");
+}

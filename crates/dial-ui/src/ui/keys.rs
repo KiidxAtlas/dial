@@ -270,7 +270,7 @@ impl Action {
             Action::SectionNext => "Next section",
             Action::SectionPrev => "Previous section",
             Action::PasteImage => "Attach the clipboard image (or copied image file)",
-            Action::VoiceInput => "Dictate into the composer (press again to stop)",
+            Action::VoiceInput => "Speak a turn (press again to stop)",
             Action::EditorLeft => "Move the cursor left",
             Action::EditorRight => "Move the cursor right",
             Action::EditorWordLeft => "Move to the previous word",

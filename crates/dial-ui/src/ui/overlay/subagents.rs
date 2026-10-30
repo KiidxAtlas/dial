@@ -29,8 +29,8 @@ use crate::ui::{
 
 /// Panels at least this wide show the roster and inspector side by side.
 const SPLIT_AT: usize = 96;
-/// A second `x` within this window confirms a cancel.
-const CANCEL_CONFIRM: Duration = Duration::from_secs(2);
+/// A second `x` (or Ctrl+C in the worker viewer) within this window confirms a cancel.
+pub(super) const CANCEL_CONFIRM: Duration = Duration::from_secs(2);
 /// Inspector recent-activity lines.
 const RECENT_ACTIVITY: usize = 8;
 /// Lines per roster card: header, task, detail.
@@ -162,6 +162,14 @@ impl SubagentsOverlay {
 
     pub fn banner(&mut self, message: String, is_error: bool) {
         self.message = Some((message, is_error));
+    }
+
+    /// Settles the draft behind a `subagent-message:` action: a delivered message closes the
+    /// composer, a failed one keeps its text for correction or retry.
+    pub fn message_outcome(&mut self, delivered: bool) {
+        if delivered {
+            self.compose = None;
+        }
     }
 
     #[cfg(test)]
@@ -437,7 +445,13 @@ impl SubagentsOverlay {
         }
         match key.code {
             KeyCode::Enter => {
-                let body = self.compose.take().unwrap_or_default().trim().to_owned();
+                // The draft stays until delivery is settled (`message_outcome`), so a failure keeps it.
+                let body = self
+                    .compose
+                    .as_deref()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned();
                 if body.is_empty() {
                     return OverlayEvent::None;
                 }

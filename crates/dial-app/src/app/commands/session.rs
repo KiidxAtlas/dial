@@ -57,7 +57,7 @@ pub(super) const COMMANDS: &[super::CommandSpec] = &[
     },
     super::CommandSpec {
         name: "retry",
-        description: "Retry the last failed agent turn",
+        description: "Skip a live provider retry wait; when idle, retry the last failed turn",
         args_hint: "",
         subcommands: &[],
     },
@@ -106,7 +106,11 @@ pub(super) fn run(
         "label" => label(shell, agent, args),
         // `/tree forks` stays the cross-session fork browser, handled by the dispatcher.
         "tree" if args.is_empty() => tree(shell, agent),
-        "retry" => retry(shell, app, agent),
+        "retry" if args.is_empty() => retry(shell, app, agent),
+        "retry" => {
+            shell.note("Retry", "Usage: /retry");
+            Ok(Step::Done)
+        }
         "session" => session(shell, app, agent, args),
         "delete" => delete_current(shell, app, agent),
         "pin" => pin_current(shell, app, agent),
@@ -118,8 +122,8 @@ pub(super) fn run(
     Some(result)
 }
 
-/// Sign-in, sign-out, statistics and the changelog never touch the session, so they run at once
-/// even during a turn.
+/// Sign-in, sign-out, statistics, the changelog and the provider retry override run at once
+/// even during a turn. Idle failed-turn retry remains in [`run`].
 pub(super) fn run_live(
     shell: &mut Shell,
     app: &App,
@@ -127,6 +131,21 @@ pub(super) fn run_live(
     args: &str,
 ) -> Option<Result<Step>> {
     let result = match name {
+        "retry" => {
+            let text = if !args.is_empty() {
+                "Usage: /retry"
+            } else if shell
+                .retry_control
+                .as_ref()
+                .is_some_and(crate::llm::provider::RetryControl::request_now)
+            {
+                "Immediate provider retry requested."
+            } else {
+                "No pending provider retry wait."
+            };
+            shell.note("Retry", text);
+            Ok(Step::Done)
+        }
         "login" => login(shell, app, args),
         "logout" => logout(shell, app, args),
         "stats" => stats_command(shell, app, args),

@@ -64,7 +64,10 @@ pub(super) fn command_argument_completions(
                 "settings", "defaults", "local", "memory", "next", "prev", "cancel", "restart",
             ][..],
         ),
-        ("understanding", &["architecture", "build", "clear"][..]),
+        (
+            "understanding",
+            &["architecture", "build", "clear", "query"][..],
+        ),
         ("code-history", &["show", "clear"]),
         ("checks", &["list", "add", "remove", "help"][..]),
         ("experience", &["ledger"]),
@@ -133,3 +136,6 @@ pub(super) fn command_argument_completions(
     candidates.extend(crate::app::commands::completions(config));
     candidates
 }
+
+#[cfg(test)]
+mod tests;

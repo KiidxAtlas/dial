@@ -384,6 +384,11 @@ fn typing_cannot_cancel_or_navigate_away_and_ctrl_c_targets_only_the_worker() {
     );
     assert_eq!(
         tag(view.key(&ctrl('c'), &keys, now)),
+        "none",
+        "the first Ctrl+C only arms the cancel"
+    );
+    assert_eq!(
+        tag(view.key(&ctrl('c'), &keys, now)),
         "action:subagent-cancel:w1"
     );
     assert_eq!(
@@ -392,6 +397,31 @@ fn typing_cannot_cancel_or_navigate_away_and_ctrl_c_targets_only_the_worker() {
     );
     view.agent = Some(agent(AgentStatus::Done));
     assert_eq!(tag(view.key(&ctrl('c'), &keys, now)), "none");
+}
+
+#[test]
+fn ctrl_c_needs_a_second_press_within_the_window() {
+    let keys = Keymap::defaults();
+    let now = Instant::now();
+    let mut view = viewer(None, false);
+    view.agent = Some(AgentEntry {
+        cancellable: true,
+        ..agent(AgentStatus::Running)
+    });
+    assert_eq!(tag(view.key(&ctrl('c'), &keys, now)), "none");
+    assert!(
+        view.notice
+            .as_deref()
+            .is_some_and(|text| text.contains("again")),
+        "the armed press says what the next press does"
+    );
+    // A press after the window only re-arms; it must not cancel.
+    let late = now + Duration::from_secs(3);
+    assert_eq!(tag(view.key(&ctrl('c'), &keys, late)), "none");
+    assert_eq!(
+        tag(view.key(&ctrl('c'), &keys, late)),
+        "action:subagent-cancel:w1"
+    );
 }
 
 #[test]

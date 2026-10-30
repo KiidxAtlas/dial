@@ -23,6 +23,7 @@ use serde_json::Value;
 use super::{
     DrawCtx, OverlayEvent,
     settings::{editor_spans, filled, hint, hint_line, is_ctrl, panel, pressed},
+    subagents::CANCEL_CONFIRM,
 };
 use crate::{
     config::paths::Layout,
@@ -365,6 +366,8 @@ pub struct SubagentViewer {
     editor_key: String,
     pending_submit: bool,
     notice: Option<String>,
+    /// When the first Ctrl+C armed a cancel; a second press within `CANCEL_CONFIRM` confirms it.
+    cancel_armed: Option<Instant>,
     left_at: Option<Instant>,
     cache: Option<Cache>,
     /// Total rows and visible rows from the last draw, for paging and wheel scrolling.
@@ -399,6 +402,7 @@ impl SubagentViewer {
             expanded: false,
             draft: Editor::default(),
             notice: None,
+            cancel_armed: None,
             left_at: None,
             cache: None,
             geometry: (0, 0),
@@ -524,12 +528,22 @@ impl SubagentViewer {
             };
         }
         if is_ctrl(key, 'c') {
-            return if self.agent.as_ref().is_some_and(|agent| agent.cancellable) {
-                OverlayEvent::Action(format!("subagent-cancel:{}", self.id))
-            } else {
+            if !self.agent.as_ref().is_some_and(|agent| agent.cancellable) {
+                self.cancel_armed = None;
                 self.notice = Some("This worker is not running".to_owned());
-                OverlayEvent::None
-            };
+                return OverlayEvent::None;
+            }
+            // Same two-press confirmation as the hub's `x`: the first press only arms the cancel.
+            let armed = self.cancel_armed.take();
+            if armed.is_some_and(|at| now.saturating_duration_since(at) <= CANCEL_CONFIRM) {
+                return OverlayEvent::Action(format!("subagent-cancel:{}", self.id));
+            }
+            self.cancel_armed = Some(now);
+            self.notice = Some(format!(
+                "Press Ctrl+C again within {} s to cancel this worker",
+                CANCEL_CONFIRM.as_secs()
+            ));
+            return OverlayEvent::None;
         }
         if keys.matches(Action::Submit, key) {
             let text = self.draft.text.trim().to_owned();

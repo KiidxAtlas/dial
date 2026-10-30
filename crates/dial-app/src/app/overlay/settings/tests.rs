@@ -93,8 +93,10 @@ fn model_rows_offer_downloads_only_for_missing_suggestions_and_assign_chat_model
 #[test]
 fn voice_choices_distinguish_missing_models_ready_custom_programs_and_credentials() {
     let home = tempfile::tempdir().unwrap();
-    let mut config = Config::default();
-    config.user_dir = home.path().into();
+    let mut config = Config {
+        user_dir: home.path().into(),
+        ..Config::default()
+    };
     // Readiness probes only executable availability; the fixture never runs this program.
     config.voice.tts.piper_program = std::env::current_exe().unwrap();
     config.voice.tts.espeak_program = std::env::current_exe().unwrap();

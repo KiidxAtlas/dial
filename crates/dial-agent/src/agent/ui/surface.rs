@@ -220,6 +220,8 @@ pub trait Ui {
     /// Elapsed time without visible model output while its request is still pending.
     fn model_wait(&mut self, _silence: Duration) {}
     fn request_phase(&mut self, _phase: RequestPhase) {}
+    /// Bind the current model request's retry-wait control; `None` unbinds a finished request.
+    fn provider_retry_control(&mut self, _control: Option<crate::llm::provider::RetryControl>) {}
     /// Ends an inference attempt, including errors and cancellations, before tool execution.
     fn request_finished(&mut self, _succeeded: bool) {}
     /// Observed inference-phase wall time for this surface's current turn.

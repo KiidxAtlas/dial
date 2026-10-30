@@ -88,8 +88,10 @@ fn ready_custom_backends_do_not_install_or_change_settings() {
         r#"{"audio":{"sample_rate":22050},"phoneme_id_map":{}}"#,
     )
     .unwrap();
-    let mut config = Config::default();
-    config.user_dir = home.path().to_owned();
+    let mut config = Config {
+        user_dir: home.path().to_owned(),
+        ..Config::default()
+    };
     config.voice.tts.piper_program = program.clone();
     config.voice.tts.piper_model = Some(model.clone());
     config.voice.tts.espeak_program = program.clone();
@@ -193,8 +195,10 @@ fn preparing_default_piper_model_returns_changes_for_caller_selected_scope() {
         for path in [&program, &python] {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let mut config = Config::default();
-        config.user_dir = home.path().to_owned();
+        let mut config = Config {
+            user_dir: home.path().to_owned(),
+            ..Config::default()
+        };
         config.voice.tts.piper_program = program.clone();
         let changes = prepare(
             &layout,

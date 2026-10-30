@@ -195,6 +195,8 @@ impl<'a> Dialog<'a> {
                             if !self.request.questions[self.page].multi {
                                 answer.selected_options.clear();
                             }
+                            self.presented = false;
+                            return self.advance();
                         }
                         Field::Note => answer.note = Some(questions::sanitize(&editor.text)),
                     }
@@ -344,7 +346,11 @@ impl<'a> Dialog<'a> {
                     }
                     .into(),
                 );
-                rows.push("Enter saves · Shift+Enter newline · Ctrl+A attach image path · Esc returns · Ctrl+C cancels turn".into());
+                let enter = match field {
+                    Field::Custom => "Enter submits",
+                    Field::Note => "Enter saves",
+                };
+                rows.push(format!("{enter} · Shift+Enter newline · Ctrl+A attach image path · Esc returns · Ctrl+C cancels turn"));
                 let before = &editor.text[..editor.cursor];
                 let after = &editor.text[editor.cursor..];
                 let lines = text::wrap_words(&format!("{before}│{after}"), width.max(1));

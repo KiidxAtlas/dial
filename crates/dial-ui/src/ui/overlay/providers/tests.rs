@@ -1196,3 +1196,36 @@ fn oauth_accounts_submenu_selects_and_removes_one_account() {
         OverlayEvent::OAuthRemoveAccount { id, key } if id == flow.id && key == "a"
     ));
 }
+
+#[test]
+fn key_entry_without_a_base_url_says_why_it_cannot_save() {
+    let rig = Rig::new();
+    let mut o = overlay();
+    let entry = Entry {
+        id: "custom".into(),
+        label: "Custom".into(),
+        base_url: None,
+        state: "unavailable".into(),
+        detail: String::new(),
+        models: 0,
+        spec: None,
+    };
+    let mut secret = Secret::new();
+    secret.push('k');
+    o.mode = Mode::Key {
+        entry,
+        secret,
+        error: None,
+    };
+    assert!(matches!(
+        send(&mut o, &rig, key(KeyCode::Enter)),
+        OverlayEvent::None
+    ));
+    match &o.mode {
+        Mode::Key { error, .. } => assert!(
+            error.as_deref().is_some_and(|e| e.contains("base URL")),
+            "{error:?}"
+        ),
+        _ => panic!("the key stays in the prompt with the reason"),
+    }
+}

@@ -6,16 +6,83 @@
 //! `anthropic-ratelimit-*-reset`) say when a bucket refills, not how long a throttled request
 //! must wait, so they are recorded only as a quota reset time and never force a wait.
 use super::errors::ErrorClass;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// Longest exponential backoff step when the server gives no explicit delay.
-const BACKOFF_CAP: Duration = Duration::from_secs(60);
+/// A request-local handle for explicitly skipping a pending provider retry wait.
+/// Commands issued during inference or after the wait ends never affect a later retry.
+#[derive(Debug, Clone, Default)]
+pub struct RetryControl {
+    state: Arc<parking_lot::Mutex<WaitState>>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+enum WaitState {
+    #[default]
+    Idle,
+    Waiting,
+    Requested,
+}
+
+impl RetryControl {
+    /// Release the current wait, including a server-requested delay. Returns false if there is
+    /// no pending wait or an immediate retry has already been requested.
+    pub fn request_now(&self) -> bool {
+        let mut state = self.state.lock();
+        if *state != WaitState::Waiting {
+            return false;
+        }
+        *state = WaitState::Requested;
+        true
+    }
+
+    pub(crate) fn begin_wait(&self) -> PendingWait {
+        *self.state.lock() = WaitState::Waiting;
+        PendingWait(self.clone())
+    }
+}
+
+pub(crate) struct PendingWait(RetryControl);
+
+impl PendingWait {
+    pub(crate) fn wait(
+        &self,
+        delay: Duration,
+        interrupt: &AtomicBool,
+    ) -> Result<(), super::Interrupted> {
+        let start = Instant::now();
+        loop {
+            if interrupt.load(Ordering::SeqCst) {
+                return Err(super::Interrupted);
+            }
+            if *self.0.state.lock() == WaitState::Requested || start.elapsed() >= delay {
+                return Ok(());
+            }
+            std::thread::sleep(
+                delay
+                    .saturating_sub(start.elapsed())
+                    .min(Duration::from_millis(50)),
+            );
+        }
+    }
+}
+
+impl Drop for PendingWait {
+    fn drop(&mut self) {
+        *self.0.state.lock() = WaitState::Idle;
+    }
+}
 
 /// Attempts on one model, including the first, before a failure a configured fallback accepts
 /// moves the request on to that fallback instead of waiting out further retries.
 pub(crate) const FAILOVER_ATTEMPTS: usize = 2;
 /// Longest wait before a retry while a fallback is ready; a longer one fails over instead.
 pub(crate) const FAILOVER_MAX_WAIT: Duration = Duration::from_secs(10);
+/// Keep a ready fallback's brief first retry independent of the ordinary automatic interval.
+const FAILOVER_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Server timing hints from one non-2xx response.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -167,7 +234,7 @@ pub(crate) struct Policy {
     pub(crate) max_delay: Duration,
     pub(crate) wait_for_quota_reset: bool,
     pub(crate) rotate_accounts: bool,
-    /// First exponential backoff step.
+    /// Automatic retry interval, bounded by `max_delay`.
     pub(crate) backoff: Duration,
     /// A fallback model is ready for failures of this class (`retry.fallback_on`): such failures
     /// are retried briefly here, then handed to the caller to fail over.
@@ -267,15 +334,13 @@ pub(crate) fn decide(
             )
         }));
     }
-    let exponential = policy
-        .backoff
-        .saturating_mul(1u32 << (attempt - 1).min(16))
-        .min(BACKOFF_CAP)
-        .min(policy.max_delay);
-    let jitter = exponential
-        .mul_f64(0.75 + rand::random::<f64>() * 0.5)
-        .min(policy.max_delay);
-    let delay = minimum.map_or(jitter, |minimum| minimum.max(jitter));
+    let interval = if failing_over {
+        policy.backoff.min(FAILOVER_INTERVAL)
+    } else {
+        policy.backoff
+    }
+    .min(policy.max_delay);
+    let delay = minimum.map_or(interval, |minimum| minimum.max(interval));
     if failing_over && delay > FAILOVER_MAX_WAIT {
         return Decision::Stop(Some(format!(
             "provider asked to wait {:.0}s; moving to the configured fallback model instead",

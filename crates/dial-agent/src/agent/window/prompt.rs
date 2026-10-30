@@ -126,7 +126,12 @@ fn full_guidance(presentation: Presentation, has: &dyn Fn(&str) -> bool) -> Stri
     } else {
         (RULES, if concise { LEAN_DELIVERY } else { DELIVERY })
     };
-    format!("{HEADER}{policy}\n\n# Execution\n{FOCUSED_WORK}{rules}{visual}{delivery}")
+    let (header, focused) = if lean {
+        (LEAN_HEADER, LEAN_FOCUSED_WORK)
+    } else {
+        (HEADER, FOCUSED_WORK)
+    };
+    format!("{header}{policy}\n\n# Execution\n{focused}{rules}{visual}{delivery}")
 }
 
 /// Scope optional workflow prose to the configured catalog, not per-request tool

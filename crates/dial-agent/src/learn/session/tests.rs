@@ -129,8 +129,10 @@ fn negative_source_verdict_is_not_overridden_by_target_approval() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     let layout = Layout::with_user_dir(project.path(), home.path().join("dial")).unwrap();
-    let mut config = Config::default();
-    config.state_dir = home.path().join("models/target-b");
+    let config = Config {
+        state_dir: home.path().join("models/target-b"),
+        ..Config::default()
+    };
     let target = Store::open(&config.state_dir, "target-b", "case", &Default::default()).unwrap();
     let source_path = home.path().join("models/source-a");
     let source = Store::open(&source_path, "source-a", "case", &Default::default()).unwrap();

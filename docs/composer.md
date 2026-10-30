@@ -14,4 +14,14 @@ Image file paths explicitly pasted into a prompt are recognized during user-mess
 
 Word completion offers the rest of the word under the cursor as dim ghost text when no history or command-argument suggestion applies. Candidates come from two sources. The first is a learned model in `learned-words.json` under the Dial home directory. Prompts are learned when submitted, including queued follow-ups, and older words decay as newer prompts arrive. The second is a project index of identifiers and file stems, built on a worker thread from the workspace file list and cancelled when the list is refreshed. Prefixes shorter than two characters get no suggestion. Text that looks like a credential is never learned. The file is stored with owner-only permissions, and it is capped at 20,000 words. `Tab` or `Right` accepts the suggestion. The setting is `ui.word_completion` (default `true`), which is also the "Word completion" row in Settings. Turning it off stops both suggestions and learning.
 
+## Commands during a turn
+
+Live slash commands run immediately rather than queueing a follow-up or stopping the turn.
+`/retry` takes no arguments and requests an immediate provider retry only while a retry wait is
+pending. It skips the remaining automatic or server-requested delay without cancelling the turn
+or increasing the attempt limit. During active inference or other work with no pending provider
+retry wait, it reports that no wait is pending and does not save a request for later. When idle,
+`/retry` instead retries the last failed, unanswered turn, as before. See
+[LLM transport behavior](llm-transport.md) for automatic retry timing and bounds.
+
 Editor behavior is covered in `crates/dial-ui/src/ui/editor.rs` and composer behavior in `crates/dial-ui/src/ui/composer.rs`; run `cargo test --workspace --lib ui::editor` and `cargo test --workspace --lib ui::composer` from the repository root.

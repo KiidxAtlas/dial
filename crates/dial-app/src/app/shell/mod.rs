@@ -97,6 +97,8 @@ pub(super) struct Shell {
     pub(super) restart_requested: bool,
     /// A provider retry was already explained in this turn; later attempts update nothing new.
     pub(super) retry_noted: bool,
+    /// Bound only while the foreground model request is running.
+    pub(super) retry_control: Option<crate::llm::provider::RetryControl>,
     pub(super) smithery_resume: Option<crate::app::commands::smithery::Resume>,
     pub(super) commit_job: Option<crate::app::commands::commit::CommitJob>,
     pub(super) busy_overlay: Option<BusyOverlay>,
@@ -185,7 +187,7 @@ pub(super) struct Shell {
     pending_favorite: Option<PendingFavorite>,
     pub(super) resources: ResourceWatch,
     pub(super) pending_resource_rebuild: bool,
-    /// Push-to-talk capture in progress (`Alt+V`); its transcript goes into the draft.
+    /// Speech capture in progress (`Alt+V`); finished speech can submit or queue a normal turn.
     voice_input: Option<crate::voice::tui::PushToTalk>,
     /// Press/release state for the voice key; decides hold-to-talk or press-to-toggle.
     voice_gesture: crate::voice::gesture::Gesture,

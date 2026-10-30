@@ -89,7 +89,12 @@ impl SubagentHub {
     /// Runs a `subagent-*` action. Returns an action for the app to launch (a finished worker
     /// resumed with a message); banners carry every other outcome.
     pub fn act(&mut self, action: &str, live: Option<&LiveTaskControl>) -> Option<String> {
-        match subagent_model::act(action, live)? {
+        let is_message = action.starts_with("subagent-message:");
+        let outcome = subagent_model::act(action, live)?;
+        if is_message {
+            self.panel.message_outcome(outcome.is_ok());
+        }
+        match outcome {
             Ok(ActionOutcome::Banner(message)) => {
                 self.panel.banner(message, false);
                 None

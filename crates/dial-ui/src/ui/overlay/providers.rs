@@ -1002,6 +1002,10 @@ impl ProviderOverlay {
                 return OverlayEvent::None;
             }
             let Some(base_url) = entry.base_url.clone() else {
+                *error = Some(
+                    "This provider has no base URL; set one in its settings before saving a key"
+                        .to_owned(),
+                );
                 return OverlayEvent::None;
             };
             let token = secret.take();

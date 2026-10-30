@@ -81,7 +81,7 @@ pub(in crate::app) fn refresh_overlay(env: &mut OverlayEnv<'_>, overlay: &mut Ac
                     crate::ui::overlay::extensions::model::Tab::Mcp,
                     query,
                 ),
-                Err(error) => panel.banner(format!("could not read settings: {error:#}")),
+                Err(error) => panel.banner(format!("could not read settings: {error:#}"), true),
             }
         }
     }

@@ -149,29 +149,6 @@ fn lean_guidance_is_materially_shorter_and_keeps_the_safety_contracts() {
     let tools = names(&["read", "edit", "task"]);
     let default = guidance_for(&tools, false, false);
     let lean = guidance_for(&tools, true, false);
-    // Presentation and call-mode adjustments must not duplicate or drop the common policy.
-    for lean in [false, true] {
-        for one_call in [false, true] {
-            for concise in [false, true] {
-                let rendered = full_guidance(
-                    Presentation {
-                        visual: true,
-                        lean,
-                        one_call,
-                        concise,
-                    },
-                    &|_| true,
-                );
-                for shared in [HEADER, TRUST_RULE, FOCUSED_WORK] {
-                    assert_eq!(
-                        rendered.matches(shared).count(),
-                        1,
-                        "shared policy must appear once (lean={lean}, one_call={one_call}, concise={concise})"
-                    );
-                }
-            }
-        }
-    }
     assert!(
         lean.len() * 10 < default.len() * 7,
         "lean {} vs default {} bytes",
@@ -476,7 +453,18 @@ fn task_evidence_changes_leave_policy_bytes_and_tool_gating_stable() {
                         );
                         assert_ne!(before.last(), after.last());
                         let policy = before[0]["content"].as_str().unwrap();
-                        assert_eq!(policy.matches(FOCUSED_WORK).count(), 1);
+                        for section in [
+                            "# Engineering",
+                            "# Tool policy",
+                            "# Execution",
+                            "# Workflow",
+                        ] {
+                            assert_eq!(
+                                policy.lines().filter(|line| *line == section).count(),
+                                1,
+                                "policy section {section}: lean={lean}, concise={concise}, one_call={one_call}"
+                            );
+                        }
                         for (rule, selected) in [
                             (TESTER_DELEGATION_RULES, prefer_subagents),
                             (SELECTIVE_DELEGATION_RULES, !prefer_subagents),
@@ -765,58 +753,32 @@ fn oversized_mcp_instructions_skip_only_that_server() {
     assert!(!body.contains("name=\"fourth\""), "{body}");
 }
 
-/// Pin the pre-refactor transformation while checking complete rendered output across selections.
+/// Visual guidance is optional; selecting it must not rewrite the other policy sections.
 #[test]
-fn explicit_workflow_composition_preserves_rendered_bytes() {
-    for visual in [false, true] {
-        for lean in [false, true] {
-            for one_call in [false, true] {
-                for concise in [false, true] {
-                    let presentation = Presentation {
-                        visual,
-                        lean,
-                        one_call,
-                        concise,
-                    };
-                    let actual = full_guidance(presentation, &|_| true);
-                    let policy = if lean || one_call {
-                        format!(
-                            "{LEAN_TOOL_POLICY}{}{LEAN_WRITE_RULE}\n- {SKILL_RULE}{TRUST_RULE}",
-                            if one_call {
-                                LEAN_ONE_CALL
-                            } else {
-                                LEAN_BATCHING
-                            }
-                        )
-                    } else {
-                        format!(
-                            "{TOOL_POLICY}\n- {SKILL_RULE} {PROJECT_MAP_RULE} {LSP_RULE}{TRUST_RULE}"
-                        )
-                    };
-                    let rules = if one_call {
-                        LEAN_RULES.replacen("work, never alone.", "work.", 1)
-                    } else if lean {
-                        LEAN_RULES.to_owned()
-                    } else {
-                        RULES.to_owned()
-                    };
-                    let delivery = if lean || one_call || concise {
-                        LEAN_DELIVERY
-                    } else {
-                        DELIVERY
-                    };
-                    let visual = if visual { VISUAL_VERIFICATION } else { "" };
-                    let expected = format!(
-                        "{HEADER}{policy}\n\n# Execution\n{FOCUSED_WORK}{rules}{visual}{delivery}"
-                    );
-                    // The later request-contract clarification is an intentional wording change.
-                    assert_eq!(
-                        actual.replace(CALL_CONTRACT_PRECEDENCE, "").as_bytes(),
-                        expected.as_bytes()
-                    );
-                }
-            }
-        }
+fn visual_selection_preserves_the_rest_of_each_presentation() {
+    for (lean, one_call, concise) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+    ] {
+        let presentation = Presentation {
+            visual: false,
+            lean,
+            one_call,
+            concise,
+        };
+        let without = full_guidance(presentation, &|_| true);
+        let with = full_guidance(
+            Presentation {
+                visual: true,
+                ..presentation
+            },
+            &|_| true,
+        );
+        assert!(!without.contains(VISUAL_VERIFICATION));
+        assert_eq!(with.matches(VISUAL_VERIFICATION).count(), 1);
+        assert_eq!(with.replace(VISUAL_VERIFICATION, ""), without);
     }
 }
 

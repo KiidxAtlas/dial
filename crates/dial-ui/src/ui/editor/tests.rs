@@ -196,3 +196,17 @@ fn jump_to_character_searches_across_lines_and_any_key_cancels() {
     press(&mut e, KeyCode::Char('q'), KeyModifiers::NONE);
     assert_eq!(e.cursor, 0, "no match leaves the cursor");
 }
+
+#[test]
+fn inserting_text_cancels_a_pending_jump() {
+    let mut e = Editor::default();
+    e.set("abc");
+    e.cursor = 0;
+    press(&mut e, KeyCode::Char(']'), KeyModifiers::CONTROL);
+    e.insert("z");
+    typed(&mut e, "c");
+    assert_eq!(
+        e.text, "zcabc",
+        "the typed letter is text, not a jump target"
+    );
+}

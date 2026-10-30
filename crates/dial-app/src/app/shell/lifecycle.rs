@@ -69,6 +69,7 @@ impl Shell {
             extension_keys: Default::default(),
             restart_requested: false,
             retry_noted: false,
+            retry_control: None,
             smithery_resume: None,
             commit_job: None,
             worker_editors: Default::default(),

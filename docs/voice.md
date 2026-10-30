@@ -1,6 +1,6 @@
 # Voice
 
-Voice is off by default. Settings are under the Voice tab in `/settings`, or in `[voice.tts]` and `[voice.stt]` of the config.
+Voice is off by default. In `/settings`, open **Voice**, then enable **Dictation** in the **Dictation** section and choose a **Recognition program**. The corresponding config keys are under `[voice.tts]` and `[voice.stt]`.
 
 Selecting a missing local speech or recognition program in the Voice settings asks whether to
 install and configure it. Press Enter again to confirm, or Esc to cancel. Setup runs in the
@@ -12,40 +12,50 @@ separate toggles, so installing a backend does not turn on the microphone or aut
 
 ## Read answers aloud
 
-- `voice.tts.auto_speak = true` reads each final answer aloud when a turn finishes. Answers longer than `voice.tts.auto_speak_max_chars` are cut short.
-- Press Esc, or send a new prompt, to stop a read-out in progress.
+- In `/settings` → **Voice** → **Spoken replies**, turn on `voice.tts.auto_speak` to hear each final agent answer. It is off by default and independent of microphone input. Answers longer than `voice.tts.auto_speak_max_chars` are cut short.
+- Press the speech key, Esc, or send a new prompt to stop a read-out in progress. Starting microphone capture stops playback so it is not transcribed as your speech.
 - `voice.tts.backend` picks the program: `auto` (first installed), `say` (built into macOS), `piper`, `espeak` (espeak-ng), or `openai`.
 - The `tts` tool uses the same backend.
 - A missing program is reported as an error; nothing is claimed as spoken when it was not.
 
-## Dictation (push-to-talk)
+## Speak a turn
 
-- Turn on `voice.stt.enabled`. The default push-to-talk key is `Option+V` on macOS and `Alt+V` elsewhere. `/hotkeys` shows the active binding, including remaps.
-- On macOS, terminals that send `√` instead of an Alt key event are supported too: Dial treats that key as Option+V while `Alt+V` is bound to dictation. This reserves typed `√` for the shortcut (even when speech recognition is off); bracketed paste still inserts it literally. Remapping dictation away from `Alt+V` disables this fallback. This fallback covers layouts where Option+V produces `√`; other layouts can use `F9` or remap in `/hotkeys`.
-- The transcript is inserted into the draft. It is never sent on its own; review it and press Enter.
-- `voice.stt.backend` picks the program: `auto`, `openai`, `whisper-cpp` (whisper-cli), or `mlx-whisper`.
+- Enable **Dictation** in `/settings` → **Voice** and choose a **Recognition program**. The microphone only listens after you press the speech key; it is not an always-on listener.
+- The default speech keys are `Option+V` on macOS (`Alt+V` elsewhere) and `F9`. `/hotkeys` shows the active bindings and lets you remap them.
+- Press once, speak, then pause: recording ends after trailing silence and the transcript is sent as a normal user turn. You can also press again to finish sooner. A short key tap no longer selects hold-to-talk just because the terminal supports key releases.
+- On macOS, terminals that send `√` instead of an Alt key event are supported too: Dial treats that key as Option+V while `Alt+V` is bound to speech input. This reserves typed `√` for the shortcut (even when speech recognition is off); bracketed paste still inserts it literally. Remapping away from `Alt+V` disables this fallback. Other layouts can use `F9` or remap in `/hotkeys`.
+- `voice.stt.backend` picks the recognition program: `auto`, `openai`, `whisper-cpp` (whisper-cli), or `mlx-whisper`.
 
-### Hold to talk
+### Speech key behavior
 
-Used when the terminal reports key releases (the kitty keyboard protocol with event types). Dial requests it at startup and uses hold mode only when the terminal accepts it.
+In Settings, **Speech key behavior** (`voice.stt.input_mode`) offers:
 
-- Hold the dictation shortcut to record. Release it to stop; the transcript goes into the draft.
-- Recording does not end on silence while the key is held. It ends at release, or at `voice.stt.max_recording_secs`.
-- The composer border shows the active shortcut and asks you to release it to stop.
+- **Press to talk** (`toggle`, default): press once to listen; pause or press again to finish.
+- **Hold to talk** (`hold`): hold the key while speaking and release it to finish. This requires terminal key-release reporting; otherwise Dial falls back to press-to-talk. Silence does not end a held recording.
 
-### Press to toggle
+The composer shows the active shortcut and how to stop. Both modes stop at `voice.stt.max_recording_secs`.
 
-Used when the terminal does not report key releases, or does not support the keyboard protocol.
+### Sending or reviewing speech
 
-- Press the dictation shortcut to start recording. Press it again to stop, or let recording stop by itself after a silence or after `voice.stt.max_recording_secs`.
-- The composer border shows the active shortcut to stop recording.
+**Send speech** (`voice.stt.submit_trigger`) controls what happens after recognition:
 
-Both modes insert the transcript into the draft and show "No speech was heard." when nothing was recognised.
+- **When recording finishes** (`release`, default): send the transcript, including single-word replies, without Enter.
+- **Never (review first)** (`never`): insert the transcript into the composer; review and press Enter yourself. Set this to restore dictation-only behavior.
+- **After a complete sentence** (`release-complete`): send only if the transcript ends in `.`, `?`, or `!`.
+- **When I say submit** (`say-submit`): send only if the final word is “submit”; that word is removed.
 
-### During a turn
+Existing drafts are never sent automatically: speech is inserted for review instead. Transcripts starting with `/` or `!` also stay in the composer so recognition cannot automatically run commands. Empty or failed recordings do not send turns. While an agent is working, automatically submitted speech goes into the existing after-turn queue rather than interrupting its work. A full queue keeps the transcript in the draft.
 
-- The dictation shortcut works while a turn is running. The transcript is inserted into the draft while the turn keeps going; nothing is interrupted.
-- Submit the draft with Enter as you would any other message typed during a turn.
+### Recording problems
+
+Stopping a recording preserves audio already queued by the microphone. Recognition starts only
+after capture stops, so a slow backend cannot delay release/deadline handling. Queued audio and
+buffered speech are bounded by the maximum recording duration.
+Failures distinguish no microphone audio, a recording shorter than the minimum speech duration,
+audio without detected speech, and a recognition backend returning no text. For missing or quiet
+audio, check the default input device and microphone level; on macOS, also check the terminal's
+microphone permission in System Settings → Privacy & Security → Microphone. If you select hold
+mode, keep the key held while speaking. In the default press-to-talk mode, release it and speak.
 
 ## Live voice
 

@@ -114,16 +114,27 @@ pub enum CaptureChoice {
     Command,
 }
 
+/// How the speech key starts and stops microphone capture.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum InputMode {
+    /// Press once, speak, then pause or press again to finish.
+    #[default]
+    Toggle,
+    /// Hold to record and release to finish; falls back to toggle without key releases.
+    Hold,
+}
+
 /// When a dictated utterance is sent without pressing Enter.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum SubmitTrigger {
     /// Insert the transcript and stay in the composer.
-    #[default]
     Never,
-    /// Send on release when the utterance has two or more words.
+    /// Send when recording finishes, including after trailing silence in toggle mode.
+    #[default]
     Release,
-    /// Send on release when the utterance ends with sentence punctuation.
+    /// Send when recording finishes if the utterance ends with sentence punctuation.
     ReleaseComplete,
     /// Send when the utterance ends with the word "submit" (the word is removed).
     SaySubmit,
@@ -138,6 +149,7 @@ pub struct SttConfig {
     pub backend: SttBackendChoice,
     /// Spoken language (ISO 639-1), or `auto`.
     pub language: String,
+    pub input_mode: InputMode,
     pub submit_trigger: SubmitTrigger,
     pub openai_model: String,
     pub whisper_cpp_program: PathBuf,
@@ -165,7 +177,8 @@ impl Default for SttConfig {
             enabled: false,
             backend: SttBackendChoice::Auto,
             language: "en".into(),
-            submit_trigger: SubmitTrigger::Never,
+            input_mode: InputMode::Toggle,
+            submit_trigger: SubmitTrigger::Release,
             openai_model: "whisper-1".into(),
             whisper_cpp_program: "whisper-cli".into(),
             whisper_cpp_model: None,

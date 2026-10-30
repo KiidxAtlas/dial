@@ -229,7 +229,7 @@ impl ActiveOverlay {
             Self::Models(o) => o.set_status(message, is_error),
             Self::Compute(o) => o.banner(message, is_error),
             Self::Improve(o) => o.banner(message, is_error),
-            Self::Extensions(o) => o.banner(message),
+            Self::Extensions(o) => o.banner(message, is_error),
             Self::Providers(o) => o.set_status(message, is_error),
             Self::ModelSettings(o) => o.banner(message, is_error),
             Self::ImageSettings(o) => o.banner(message, is_error),

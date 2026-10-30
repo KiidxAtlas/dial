@@ -95,11 +95,11 @@ pub fn run(directory: &Path, once: bool, interval_ms: u64) -> Result<()> {
                 }
             }
         }
-        if let Some(loaded) = &session {
-            if let Err(error) = poll(loaded, &interrupt) {
-                eprintln!("development poll failed: {error:#}; waiting for a source change");
-                drop(session.take());
-            }
+        if let Some(loaded) = &session
+            && let Err(error) = poll(loaded, &interrupt)
+        {
+            eprintln!("development poll failed: {error:#}; waiting for a source change");
+            drop(session.take());
         }
     }
     Ok(())

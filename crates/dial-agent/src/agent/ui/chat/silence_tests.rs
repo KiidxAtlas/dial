@@ -22,6 +22,108 @@ fn provider_backoff_is_not_a_silent_stall() {
 }
 
 #[test]
+fn live_retry_control_reaches_the_ui_through_state_ui_and_is_unbound_on_finish() {
+    struct RetryUi {
+        control: Option<llm::provider::RetryControl>,
+        requests: usize,
+        cancel: bool,
+        interrupt: Arc<AtomicBool>,
+    }
+    impl Ui for RetryUi {
+        fn provider_retry_control(&mut self, control: Option<llm::provider::RetryControl>) {
+            self.control = control;
+        }
+        fn request_phase(&mut self, phase: RequestPhase) {
+            if phase == RequestPhase::Backoff {
+                let control = self
+                    .control
+                    .as_ref()
+                    .expect("active request must bind its control");
+                self.requests += 1;
+                if self.cancel {
+                    // Cancellation travels from the UI to the worker on its heartbeat. Do not
+                    // race it with a separate command that releases the wait first.
+                    self.interrupt.store(true, Ordering::SeqCst);
+                } else {
+                    assert!(control.request_now());
+                    assert!(!control.request_now());
+                }
+            }
+        }
+    }
+    for cancel in [false, true] {
+        let answer = json!({"choices":[{"delta":{"content":"recovered"},"finish_reason":"stop"}]});
+        let mut scripts = vec![llm::fake::json(503, &json!({"error":"busy"}))];
+        if !cancel {
+            scripts.push(llm::fake::Script::Sse(format!(
+                "data: {answer}\n\ndata: [DONE]\n\n"
+            )));
+        }
+        let server = llm::fake::serve(scripts);
+        let mut backend = Backend::new(
+            ProviderKind::Endpoint {
+                base_url: server.url.clone(),
+                model: "test".into(),
+                api_key: None,
+            },
+            PathBuf::new(),
+            5,
+        );
+        let request = Chat {
+            messages: vec![json!({"role":"user","content":"finish the task"})],
+            tools: vec![],
+            temperature: 0.0,
+            max_tokens: 64,
+            seed: None,
+        };
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let mut ui = RetryUi {
+            control: None,
+            requests: 0,
+            cancel,
+            interrupt: interrupt.clone(),
+        };
+        let mut wrapped = crate::agent::ui::state_ui::StateUi::new(
+            &mut ui,
+            crate::runtime::Tree::default(),
+            None,
+        );
+        let result = chat_with_ui(
+            &mut backend,
+            None,
+            &request,
+            ChatOptions {
+                timeout: 5,
+                render_text: true,
+                context_tokens: None,
+                policy: None,
+                recovery: None,
+            },
+            interrupt,
+            &mut wrapped,
+            &mut |_| {},
+        );
+        if cancel {
+            assert!(
+                result
+                    .unwrap_err()
+                    .downcast_ref::<llm::Interrupted>()
+                    .is_some()
+            );
+        } else {
+            assert_eq!(result.unwrap().text, "recovered");
+        }
+        assert_eq!(ui.requests, 1);
+        assert!(
+            ui.control.is_none(),
+            "finished request must unbind its control"
+        );
+        assert!(!backend.retry_control().request_now());
+        assert_eq!(server.requests().len(), if cancel { 1 } else { 2 });
+    }
+}
+
+#[test]
 fn telemetry_requires_advancing_phase_or_token_counts() {
     let mut watch = TelemetryProgress::default();
     let mut value = llm::ModelProgress::new(llm::InferencePhase::Generating);

@@ -613,3 +613,75 @@ fn server_rows_follow_the_provider() {
         );
     }
 }
+
+#[test]
+fn page_keys_move_by_the_visible_list_height() {
+    let rig = Rig::new();
+    let ctx = DrawCtx {
+        theme: &rig.theme,
+        keys: &rig.keys,
+        status: &rig.status,
+        preview_status: &status_preview,
+    };
+    let mut overlay = ModelSettingsOverlay::new("local".into(), mlx());
+    let _ = render(100, 10, |frame| overlay.draw(frame, &ctx));
+    assert!(
+        overlay.page < 6,
+        "a short panel shows fewer rows than a fixed jump: {}",
+        overlay.page
+    );
+    assert!(
+        overlay.fields.len() > overlay.page,
+        "the page must not cover every field"
+    );
+    overlay.event(&key(KeyCode::PageDown), &rig.keys);
+    assert_eq!(overlay.cursor, overlay.page);
+    overlay.event(&key(KeyCode::PageUp), &rig.keys);
+    assert_eq!(overlay.cursor, 0);
+}
+
+#[test]
+fn tab_and_backtab_reach_suggestion_rows_and_wrap_back() {
+    let rig = Rig::new();
+    let mut overlay = ModelSettingsOverlay::new("local".into(), mlx());
+    overlay.suggestions = vec![
+        Suggestion {
+            path: "edit_mode".into(),
+            global: false,
+            value: serde_json::json!("apply_patch"),
+            title: "Use the apply_patch edit grammar".into(),
+            evidence: "edits failed 9 of 20 times under replace".into(),
+        },
+        Suggestion {
+            path: "assistance.local.side_models".into(),
+            global: true,
+            value: serde_json::json!("reuse_main"),
+            title: "Reuse the main model for side requests".into(),
+            evidence: "side requests swapped the loaded model 4 times".into(),
+        },
+    ];
+    let fields = overlay.fields.len();
+    let last_section = overlay.fields[fields - 1].section;
+    let last_start = overlay
+        .fields
+        .iter()
+        .position(|f| f.section == last_section)
+        .unwrap();
+    overlay.cursor = fields - 1;
+    overlay.event(&key(KeyCode::Tab), &rig.keys);
+    assert_eq!(
+        overlay.cursor, fields,
+        "Tab leaves the last section for the first suggestion"
+    );
+    overlay.event(&key(KeyCode::Tab), &rig.keys);
+    assert_eq!(
+        overlay.cursor, 0,
+        "Tab from a suggestion wraps to the first field"
+    );
+    overlay.cursor = fields + 1;
+    overlay.event(&key(KeyCode::BackTab), &rig.keys);
+    assert_eq!(
+        overlay.cursor, last_start,
+        "BackTab from a suggestion lands on the last field section"
+    );
+}

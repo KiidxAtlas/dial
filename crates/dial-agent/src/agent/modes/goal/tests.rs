@@ -149,15 +149,15 @@ fn coach_finish_repairs_once_and_discloses_remaining_gaps() {
         sse_reply("Inspected notes."),
         sse_reply(gap),
     ]);
-    let config = coached_config(&server.url);
+    let mut config = coached_config(&server.url);
+    // Keep the explicit finish-only offer stable in this hermetic fixture.
+    config.image.auto = false;
     let dir = workspace();
     let mut agent = new_agent(&config, &server.url, dir.path());
     agent.set_advisor(true);
     agent
         .push(json!({"role":"user","content":"Inspect notes"}))
         .unwrap();
-    // Supply the live control schema explicitly to exercise finish termination without
-    // enabling non-hermetic provider discovery in this scripted loop test.
     let mut backend = agent.backend.take().unwrap();
     let mut schemas = vec![crate::agent::verify::completion::schema()];
     let (report, _) = agent
@@ -172,8 +172,14 @@ fn coach_finish_repairs_once_and_discloses_remaining_gaps() {
         .unwrap();
     assert!(
         report.text.contains("Unresolved coach findings"),
-        "{}",
-        report.text
+        "{}; tool results: {:?}",
+        report.text,
+        agent
+            .session
+            .messages()
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .collect::<Vec<_>>()
     );
     assert_eq!(server.requests().len(), 4);
 }

@@ -415,6 +415,7 @@ fn named_run_watchers_have_independent_cursors_and_stop_never_controls_app() {
     capture.append(b"ERROR: historical\n").unwrap();
     let first = Monitor::new(None);
     let second = Monitor::new(None);
+    let pattern = Regex::new(DEFAULT_PATTERN).unwrap();
     for monitor in [&first, &second] {
         assert!(monitor.needs_approval(&json!({"action":"start", "run":"web"})));
         lock(&monitor.watches).push(Watch {
@@ -423,7 +424,7 @@ fn named_run_watchers_have_independent_cursors_and_stop_never_controls_app() {
                 name: "web".into(),
                 reader: Reader::attach(&layout, "web").unwrap(),
             },
-            pattern: Regex::new(DEFAULT_PATTERN).unwrap(),
+            pattern: pattern.clone(),
             expires: Instant::now() + Duration::from_secs(60),
             pending: Vec::new(),
             context: String::new(),

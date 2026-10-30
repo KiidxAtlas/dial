@@ -68,6 +68,8 @@ not only after it fills the entire window. Lean discovery keeps exact loadable n
 their optional descriptions; discovery still supplies those on demand. If immutable instructions
 and pinned schemas still cannot fit, the request fails before inference without silently unloading
 explicit tools or discarding the session's unfinished work.
+The lean presentation also shortens built-in engineering and execution guidance while retaining
+approval, trust, preservation and verification rules; operator-supplied instructions are not shortened.
 
 Ambient provenance recall and saved-codebase records are appended only when absent from the current
 visible branch, even with optional efficiency settings disabled. Exact note records and source/finding
@@ -916,6 +918,9 @@ unrecognized first words are focus instructions. Snapcompact and Shake reject fo
 RPC `compact` accepts the closed `CompactionOptions` object and returns the actual outcome;
 manual maintenance never silently resumes an old turn. Its `compacted` and `context_reset`
 flags distinguish compaction from a committed notes-backed reset.
+With no per-call overrides or summary focus, an already-safe history entirely within the configured
+keep-recent budget is a successful no-op, even if adaptive small-window budgeting would retain less.
+No summary request is made and no compaction is counted.
 CLI overrides include `--compaction-strategy`, `--compaction-threshold-tokens` and
 `--compaction-reserve-tokens`; the numeric flags accept positive integers or `auto` to clear
 an inherited value. Omission follows persisted configuration.

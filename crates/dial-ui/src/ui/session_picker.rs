@@ -361,7 +361,8 @@ impl Picker {
                             return Action::LoadAll;
                         }
                     }
-                    KeyCode::Tab => {
+                    // Tree mode always shows empty sessions, so Tab has nothing to toggle there.
+                    KeyCode::Tab if !self.tree => {
                         let id = self.selected_id().map(str::to_owned);
                         self.show_empty = !self.show_empty;
                         self.refilter(id.as_deref());

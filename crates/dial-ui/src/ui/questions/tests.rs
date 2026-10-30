@@ -194,3 +194,80 @@ fn a_single_question_has_no_counter_and_hints_only_working_keys() {
         "{rows:?}"
     );
 }
+
+#[test]
+fn custom_enter_submits_and_preserves_only_compatible_selections() {
+    let keys = Keymap::defaults();
+    for multi in [false, true] {
+        let mut request = request(1, None);
+        request.questions[0].multi = multi;
+        let mut dialog = Dialog::new(&request, Path::new("/tmp"));
+        // Select an option first, then choose Other through the choices list.
+        dialog.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &keys);
+        if multi {
+            dialog.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &keys);
+        } else {
+            for _ in 0..3 {
+                dialog.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &keys);
+            }
+        }
+        dialog.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &keys);
+        dialog.paste("custom");
+        assert!(
+            dialog
+                .key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT), &keys)
+                .is_none()
+        );
+        dialog.paste("answer");
+        let Some(QuestionOutcome::Answered(answers)) =
+            dialog.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &keys)
+        else {
+            panic!("custom Enter must submit, multi={multi}");
+        };
+        assert_eq!(answers[0].custom_input.as_deref(), Some("custom\nanswer"));
+        let expected = if multi { vec!["yes"] } else { Vec::new() };
+        assert_eq!(answers[0].selected_options, expected, "multi={multi}");
+    }
+}
+
+#[test]
+fn custom_enter_advances_questions_and_submits_the_last_answer() {
+    let request = request(2, None);
+    let mut dialog = Dialog::new(&request, Path::new("/tmp"));
+    let keys = Keymap::defaults();
+    dialog.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE), &keys);
+    dialog.paste("first");
+    assert!(
+        dialog
+            .key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &keys)
+            .is_none()
+    );
+    assert_eq!(dialog.page, 1);
+    assert!(matches!(dialog.mode, Mode::Choices));
+    dialog.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE), &keys);
+    dialog.paste("second");
+    let Some(QuestionOutcome::Answered(answers)) =
+        dialog.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &keys)
+    else {
+        panic!("the last custom answer must submit all answers");
+    };
+    assert_eq!(answers[0].custom_input.as_deref(), Some("first"));
+    assert_eq!(answers[1].custom_input.as_deref(), Some("second"));
+}
+
+#[test]
+fn note_enter_saves_without_advancing_or_submitting() {
+    let request = request(2, None);
+    let mut dialog = Dialog::new(&request, Path::new("/tmp"));
+    let keys = Keymap::defaults();
+    dialog.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), &keys);
+    dialog.paste("context");
+    assert!(
+        dialog
+            .key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &keys)
+            .is_none()
+    );
+    assert_eq!(dialog.page, 0);
+    assert!(matches!(dialog.mode, Mode::Choices));
+    assert_eq!(dialog.answers[0].note.as_deref(), Some("context"));
+}
