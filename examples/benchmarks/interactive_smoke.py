@@ -410,6 +410,19 @@ class Terminal:
         subprocess.run(["tmux", "-L", self.socket, "kill-server"], env=self.environment, capture_output=True, timeout=10)
 
 
+def settled(read, quiet=2.0, timeout=30):
+    """Return read() once it has stayed unchanged for `quiet` seconds."""
+    deadline = time.monotonic() + timeout
+    value, since = read(), time.monotonic()
+    while time.monotonic() < deadline:
+        time.sleep(0.1)
+        current = read()
+        if current != value:
+            value, since = current, time.monotonic()
+        elif time.monotonic() - since >= quiet:
+            return value
+    raise AssertionError(f"value never settled within {timeout}s (last {value})")
+
 def model(home):
     files = list((home / "projects").glob("*/config.toml"))
     files.append(home / "config.toml")
@@ -483,11 +496,15 @@ def workers_case(server, binary, captures):
             pinned = terminal.wait("1 active")
             assert "1/2 workers" in pinned, pinned
             terminal.capture("workers-pinned")
-            parent_requests = server.worker_parent_requests
+            # The parent turn keeps going while workers run: each finished result and each
+            # live-worker notice prompts one more parent request. Take the baseline once that
+            # count has settled, or a slow host attributes an in-flight request to the restore.
+            parent_requests = settled(lambda: server.worker_parent_requests)
             terminal.crash_and_resume(restore=True)
             terminal.wait("mock-main")
             assert server.worker_restored.wait(12), "restore did not rebind the saved interrupted worker"
-            assert server.worker_parent_requests == parent_requests, "restore resubmitted the main prompt"
+            assert server.worker_parent_requests == parent_requests, (
+                f"restore resubmitted the main prompt ({parent_requests} -> {server.worker_parent_requests} parent requests)")
             terminal.wait("restored 1: task-2")
             terminal.capture("parent-first-worker-restore")
             terminal.command("/agents")
