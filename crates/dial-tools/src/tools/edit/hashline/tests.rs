@@ -22,9 +22,10 @@ fn tag_is_four_uppercase_hex_and_ignores_crlf() {
 #[test]
 fn successful_edit_model_projection_keeps_fresh_anchors_and_raw_diff() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("a.txt");
-    fs::write(&path, "one\ntwo\nthree\n").unwrap();
+    // Key the read record by the workspace's canonical root (macOS tempdirs sit behind /var).
     let ws = Workspace::new(dir.path()).unwrap();
+    let path = ws.root().join("a.txt");
+    fs::write(&path, "one\ntwo\nthree\n").unwrap();
     let tag = ws.store().record_all(&path, "one\ntwo\nthree\n");
     let output = edit_output_with(
         &ws,
@@ -53,9 +54,9 @@ fn incomplete_numbered_previews_keep_the_distinct_diff_evidence() {
         "x\n".repeat(PREVIEW_MAX_ROWS + 1),
     ] {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a.txt");
-        fs::write(&path, "old\n").unwrap();
         let ws = Workspace::new(dir.path()).unwrap();
+        let path = ws.root().join("a.txt");
+        fs::write(&path, "old\n").unwrap();
         let tag = ws.store().record_all(&path, "old\n");
         let body = replacement
             .lines()

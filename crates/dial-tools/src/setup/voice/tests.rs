@@ -226,12 +226,14 @@ fn preparing_default_piper_model_returns_changes_for_caller_selected_scope() {
 #[test]
 fn backend_python_follows_entry_point_symlink_and_fails_closed_without_interpreter() {
     use std::os::unix::fs::symlink;
+    // Canonical root: macOS temp dirs live behind the /var -> /private/var symlink.
     let tmp = tempfile::tempdir().unwrap();
-    let bin = tmp.path().join("venv/bin");
+    let root = tmp.path().canonicalize().unwrap();
+    let bin = root.join("venv/bin");
     std::fs::create_dir_all(&bin).unwrap();
     let program = bin.join("piper");
     executable(&program);
-    let link = tmp.path().join("exposed-piper");
+    let link = root.join("exposed-piper");
     symlink(&program, &link).unwrap();
     assert!(adjacent_python(&link).is_err());
     let python = bin.join("python3");
