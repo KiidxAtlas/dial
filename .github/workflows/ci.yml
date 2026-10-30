@@ -79,10 +79,20 @@ jobs:
           cargo build --locked --profile ci --workspace --lib
           cargo test --locked --profile ci --workspace --lib --no-run
           cargo build --locked --profile ci --workspace --all-targets
+      - name: Install cargo-nextest
+        # Pinned prebuilt binary (Linux x86-64 glibc, macOS universal) from the nextest releases.
+        env:
+          NEXTEST_VERSION: 0.9.150
+        run: |
+          platform=linux
+          [[ "$RUNNER_OS" == macOS ]] && platform=mac
+          curl -fsSL "https://get.nexte.st/$NEXTEST_VERSION/$platform" | tar -xzf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
+          cargo nextest --version
       - name: Test
-        # Parallel: tests that change process HOME/PATH hold a shared lock; process fixtures set
-        # their environment per child. Serial execution made the lib tests ~4x slower.
-        run: make test-rust TEST_PROFILE=ci
+        # cargo-nextest runs every test binary at once, one process per test (.config/nextest.toml
+        # fails a test still running after 5 minutes); `cargo test` ran the binaries one after
+        # another. Doctests still run under `cargo test --doc`.
+        run: make test-nextest TEST_PROFILE=ci
       - name: Check slim build
         run: cargo check --locked --profile ci --no-default-features -p dial --bin dial
       - name: Install executable and verify artifact contracts

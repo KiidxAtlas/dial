@@ -279,9 +279,11 @@ and a tree that passed is recorded and not checked again. It covers, in CI's ter
   as CI's MSVC build) and the slim build;
 - the installer, build, Windows-contract-runner, packaging, driver and Python contracts (Python 3.12
   with CI's packages, in a throwaway `uv` environment);
-- the workspace tests in the system temp directory (on macOS this sits behind the `/var` ->
-  `/private/var` symlink, as on CI runners, so path-comparison bugs surface locally), then the
-  installed binary's artifact smoke test and the real-terminal smoke scripts.
+- the workspace tests under `cargo-nextest`, as CI runs them (`brew install cargo-nextest`;
+  without it `cargo test` runs the same tests one binary at a time, several minutes slower), in the
+  system temp directory (on macOS this sits behind the `/var` -> `/private/var` symlink, as on CI
+  runners, so path-comparison bugs surface locally), then the installed binary's artifact smoke
+  test and the real-terminal smoke scripts.
 
 Cross targets compile their C dependencies with `zig` (`scripts/zig-cc`); install it
 (`brew install zig`) and the rustup targets, or those steps are reported as not covered.

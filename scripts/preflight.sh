@@ -203,7 +203,13 @@ main() {
   # macOS runners resolve the temp directory through /var -> /private/var; use it as CI does.
   local tmp
   tmp="$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || printf '%s' /tmp)"
-  step test-rust env TMPDIR="$tmp" make test-rust TEST_PROFILE=ci
+  if command -v cargo-nextest >/dev/null 2>&1; then
+    step test-rust env TMPDIR="$tmp" make test-nextest TEST_PROFILE=ci
+  else
+    # Same tests, run one binary at a time: several minutes slower than CI's nextest run.
+    echo "  (cargo-nextest not installed: brew install cargo-nextest; using cargo test)"
+    step test-rust env TMPDIR="$tmp" make test-rust TEST_PROFILE=ci
+  fi
   local installed="$CARGO_TARGET_DIR/installed" s
   step install cargo install --locked --path . --profile ci --root "$installed" --force
   local dial="$installed/bin/dial"

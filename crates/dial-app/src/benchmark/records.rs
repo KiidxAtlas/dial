@@ -134,7 +134,7 @@ impl Contract {
             schema_version: 1,
             suite_sha256: format!("{:x}", Sha256::digest(serde_json::to_vec(suite)?)),
             source_sha256: source_digest(isolated_source)?,
-            executable_sha256: digest_file(&std::env::current_exe()?)?,
+            executable_sha256: executable_digest()?,
             configuration_sha256: format!(
                 "{:x}",
                 Sha256::digest(serde_json::to_vec(&configuration)?)
@@ -147,6 +147,17 @@ impl Contract {
             && self.suite_sha256 == other.suite_sha256
             && self.source_sha256 == other.source_sha256
     }
+}
+
+/// SHA-256 of the running executable, computed once per process: it is the same file for every
+/// contract, and hashing a debug test binary (hundreds of MB) for each one dominated test time.
+fn executable_digest() -> Result<String> {
+    static DIGEST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if let Some(digest) = DIGEST.get() {
+        return Ok(digest.clone());
+    }
+    let digest = digest_file(&std::env::current_exe()?)?;
+    Ok(DIGEST.get_or_init(|| digest).clone())
 }
 impl Recorder {
     pub fn open(path: &Path, contract: Contract, resume: bool) -> Result<Self> {

@@ -21,6 +21,7 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 - The skill hint no longer asks for a standalone `skill` call: it says to load a matching skill in the same response as the first reads (`crates/dial-storage/src/storage/skills.rs`). `check` refuses a top-level `command` with the exact `repro` contract instead of an unexplained error (`crates/dial-agent/src/agent/verify/check_tool.rs`).
 - `make preflight` (`scripts/preflight.sh`) runs CI's checks on a clean snapshot of a commit: fmt, clippy for the host and Linux, cargo-deny, musl and Windows compile checks via `zig`, the slim build, every contract and Python suite, the workspace tests in the system temp directory, and the smoke and real-terminal suites. Passing trees are cached. `make hooks` installs a pre-push hook that runs it; `scripts/release.sh` runs its quick compile/lint gate (`docs/release-and-install.md`).
+- The Rust test suite runs under `cargo-nextest` in CI and `make preflight`, so test binaries run in parallel instead of one after another. Three tests that spent minutes waiting now finish in under a second: a reconnect test that waited out the 300 s production retry backoff, and benchmark-contract tests that re-hashed the ~260 MB test binary for every contract (the executable digest is now computed once per process, and `sha2` is optimized in dev/CI builds).
 
 ### Added
 

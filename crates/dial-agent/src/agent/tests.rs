@@ -710,6 +710,9 @@ fn reconnect_resets_context_and_reasoning_budget_and_keeps_ui_responsive() {
         PathBuf::new(),
         5,
     );
+    // The production backoff is 300 s; keep a few 50 ms wait slices so the heartbeat assertion
+    // still proves the backoff pumps the UI.
+    backend.retry_backoff = std::time::Duration::from_millis(100);
     let request = Chat {
         messages: vec![json!({"role":"user","content":"hi"})],
         tools: vec![],

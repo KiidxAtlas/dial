@@ -201,6 +201,11 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 debug = false
 
+# Hashing runs at a few MB/s unoptimized; tests that fingerprint the test binary (benchmark
+# contracts) spent over a minute in SHA-256. Optimize just the digest crates in dev/ci builds.
+[profile.dev.package.sha2]
+opt-level = 3
+
 # Shipped binaries: thin cross-crate LTO, no symbols. Fat LTO with one codegen unit took
 # 14-43 min per release target for no measurable gain in an I/O-bound agent; thin LTO keeps
 # cross-crate inlining and compiles in parallel.
