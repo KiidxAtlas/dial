@@ -83,7 +83,7 @@ impl Drop for ParentCleanup {
         }
     }
 }
-struct Directory {
+pub(super) struct Directory {
     file: File,
     path: PathBuf,
 }
@@ -92,6 +92,15 @@ impl Directory {
         ws: &Workspace,
         target: &Path,
         create: bool,
+        parents: Option<&mut ParentCleanup>,
+    ) -> Result<Self, String> {
+        Self::open_access(ws, target, create, create, parents)
+    }
+    fn open_access(
+        ws: &Workspace,
+        target: &Path,
+        create: bool,
+        write: bool,
         mut parents: Option<&mut ParentCleanup>,
     ) -> Result<Self, String> {
         // Added directories are workspace roots too; confine the walk to the one holding `target`.
@@ -102,7 +111,7 @@ impl Directory {
             .strip_prefix(base)
             .map_err(|_| "edit target escapes workspace")?;
         let parent = relative.parent().unwrap_or(Path::new(""));
-        let mut held = if create {
+        let mut held = if write {
             crate::platform::fs::open_dir_nofollow_write(base)
         } else {
             crate::platform::fs::open_dir_nofollow(base)
@@ -142,7 +151,7 @@ impl Directory {
                     identity,
                 });
             }
-            held = if create {
+            held = if write {
                 crate::platform::fs::open_dir_beneath_handle_write(&held, &part)
             } else {
                 Ok(next)
@@ -151,7 +160,7 @@ impl Directory {
         }
         Ok(Self { file: held, path })
     }
-    fn validate_location(&self, ws: &Workspace, target: &Path) -> Result<(), String> {
+    pub(super) fn validate_location(&self, ws: &Workspace, target: &Path) -> Result<(), String> {
         let current = Self::open(ws, target, false, None)?;
         let held = crate::platform::fs::identity(&self.file).map_err(|e| e.to_string())?;
         let now = crate::platform::fs::identity(&current.file).map_err(|e| e.to_string())?;
@@ -191,11 +200,11 @@ impl Directory {
             identity,
         }))
     }
-    fn link(&self, from: &Path, to: &Path) -> Result<(), String> {
+    pub(super) fn link(&self, from: &Path, to: &Path) -> Result<(), String> {
         crate::platform::fs::link_beneath(&self.file, from, to)
             .map_err(|e| err("exclusively installing edit", &self.path, e))
     }
-    fn unlink(&self, name: &Path) -> Result<(), String> {
+    pub(super) fn unlink(&self, name: &Path) -> Result<(), String> {
         crate::platform::fs::remove_beneath(&self.file, name)
             .map_err(|e| err("removing transaction entry", &self.path, e))
     }
@@ -220,35 +229,59 @@ impl Directory {
         permissions: Option<&fs::Permissions>,
         kind: &str,
     ) -> Result<PathBuf, String> {
+        let (name, mut file) = self.temp_file(permissions, kind)?;
+        if let Err(error) = file
+            .write_all(content.as_bytes())
+            .and_then(|_| file.sync_all())
+        {
+            let _ = self.unlink(&name);
+            return Err(format!("staging edit: {error}"));
+        }
+        Ok(name)
+    }
+
+    fn temp_file(
+        &self,
+        permissions: Option<&fs::Permissions>,
+        kind: &str,
+    ) -> Result<(PathBuf, File), String> {
         for _ in 0..16 {
             let name = PathBuf::from(format!(
                 ".dial-edit-{}-{}-{kind}",
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
-            let mut file = match crate::platform::fs::create_new_beneath(&self.file, &name, true) {
+            let file = match crate::platform::fs::create_new_beneath(&self.file, &name, true) {
                 Ok(file) => file,
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(err("staging edit", &self.path, e)),
             };
-            let result = file
-                .write_all(content.as_bytes())
-                .and_then(|_| {
-                    if let Some(p) = permissions {
-                        file.set_permissions(p.clone())
-                    } else {
-                        Ok(())
-                    }
-                })
-                .and_then(|_| file.sync_all());
-            if let Err(e) = result {
+            if let Some(perms) = permissions
+                && let Err(error) = file.set_permissions(perms.clone())
+            {
                 let _ = self.unlink(&name);
-                return Err(format!("staging edit: {e}"));
+                return Err(format!("staging edit: {error}"));
             }
-            return Ok(name);
+            return Ok((name, file));
         }
         Err("cannot allocate exclusive edit staging entry".into())
     }
+}
+
+pub(super) type EntryName = PathBuf;
+
+pub(super) fn entry_name(path: &Path) -> Result<EntryName, String> {
+    name(path)
+}
+
+pub(super) fn stage_binary(
+    ws: &Workspace,
+    path: &Path,
+) -> Result<(Directory, EntryName, File), String> {
+    let dir = Directory::open_access(ws, path, false, true, None)?;
+    dir.validate_location(ws, path)?;
+    let (temporary, file) = dir.temp_file(None, "binary")?;
+    Ok((dir, temporary, file))
 }
 pub(crate) fn open_read(ws: &Workspace, path: &Path) -> Result<File, String> {
     let dir = Directory::open(ws, path, false, None)?;

@@ -306,13 +306,6 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Named Debug Adapter Protocol executable and argument definitions."
     ),
     structured!(
-        "extensions",
-        "Tools",
-        "Configuration",
-        "Extension configuration",
-        "Extension discovery, timeout, plugin definitions and flags. Contents are masked."
-    ),
-    structured!(
         "verification",
         "Tools",
         "Configuration",

@@ -24,7 +24,7 @@ fn registered(name: &str) -> bool {
 
 #[test]
 fn every_alias_resolves_to_a_registered_command_and_is_not_listed() {
-    let listed = command_entries(&[], &[], &[]);
+    let listed = command_entries(&[], &[]);
     for (alias, target) in COMMAND_ALIASES {
         assert!(
             registered(target),
@@ -120,7 +120,7 @@ fn turn_lists_drive_stops_turn_and_the_palette_notes_alike() {
 
 #[test]
 fn retry_is_registered_without_arguments_and_runs_now_even_for_invalid_args() {
-    let entries = command_entries(&[], &[], &[]);
+    let entries = command_entries(&[], &[]);
     let retry = entries.iter().find(|entry| entry.name == "retry").unwrap();
     assert!(retry.args_hint.is_none());
     for args in ["", "now", "120"] {
@@ -253,43 +253,4 @@ fn settings_panel_rejects_unreadable_layers_instead_of_empty_defaults() {
     settings_store::write_private(&layout.config_files()[1], b"invalid = [").unwrap();
     let error = settings_tables(&app, &config).unwrap_err();
     assert!(format!("{error:#}").contains("reading project settings"));
-}
-
-#[test]
-fn extension_commands_yield_to_builtins_and_custom_commands() {
-    let custom = vec![crate::agent::window::context::CommandDef {
-        name: "demo".into(),
-        description: "mine".into(),
-        template: String::new(),
-        source: Default::default(),
-    }];
-    let extensions = vec![
-        ("help".to_owned(), "rogue".to_owned()),
-        ("demo".to_owned(), "fixture".to_owned()),
-        ("ext-only".to_owned(), "fixture".to_owned()),
-    ];
-    let entries = command_entries(&custom, &[], &extensions);
-    let named = |name: &str| {
-        entries
-            .iter()
-            .filter(|e| e.name == name)
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(named("help").len(), 1);
-    assert!(matches!(
-        named("help")[0].kind,
-        crate::ui::composer::CommandKind::Builtin
-    ));
-    assert_eq!(named("demo").len(), 1);
-    assert!(matches!(
-        named("demo")[0].kind,
-        crate::ui::composer::CommandKind::Custom
-    ));
-    let ext = named("ext-only");
-    assert_eq!(ext.len(), 1);
-    assert!(matches!(
-        ext[0].kind,
-        crate::ui::composer::CommandKind::Extension
-    ));
-    assert_eq!(ext[0].description, "command from extension fixture");
 }

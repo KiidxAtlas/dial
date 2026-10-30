@@ -152,8 +152,10 @@ Configure the same values in TOML, for example `context_window = "auto"`,
 `cloud_context_window = 64000`, and `local_context_window = 16384`.
 
 Anthropic discovery reads `max_input_tokens`; older catalogs with missing windows use
-documented limits for known models, including 1M tokens for Claude Opus 5.5. The status meter and
-compaction share this resolved window. Custom endpoints use their own reported limits.
+documented limits and bundled model metadata, including 1M tokens for Claude Opus 5.5 and
+Sonnet 4.6. This fallback also works before discovery has populated the catalog cache. The status
+meter and compaction share this resolved window. Explicit user caps remain authoritative;
+custom endpoints use their own reported limits rather than official Anthropic fallback capacities.
 
 **LoRA indicators.** `/improve models` is the dedicated learning model picker. It has a LoRA column: `unverified` for a local MLX model whose architecture
 the installed mlx-lm implements (a static check of `config.json`, not proof of trainable adapter targets), `unsupported` when Dial’s adapter probe rejects it, and `-` for models another server runs. The main model distinguishes awaiting training,

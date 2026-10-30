@@ -78,6 +78,11 @@ fn efficient_guidance_shrinks_the_prefix_without_changing_capabilities() {
         assert_eq!(concise.0, full.0, "callable schemas must not change");
         assert_eq!(concise.1, full.1, "discovery descriptions must not change");
         assert_eq!(concise.2, full.2, "the tool offer must not change");
+        eprintln!(
+            "built-in system prefix: {} -> {} bytes",
+            full.3.len(),
+            concise.3.len()
+        );
         assert!(concise.3.len() < full.3.len());
         agent.rebuild_system();
         assert_eq!(capture(agent), concise, "prefix must remain cache-stable");
@@ -180,9 +185,12 @@ fn default_offer_defers_overlapping_specialists_but_lists_them_as_loadable() {
             "grep",
             "glob",
             "find",
+            "bg",
+            "task",
             "recall",
             "retain",
             "codebase_memory",
+            "working_state",
             "tool_load",
             "tool_search",
         ] {

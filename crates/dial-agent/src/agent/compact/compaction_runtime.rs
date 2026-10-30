@@ -38,7 +38,6 @@ pub struct PortableSummaryContext {
 pub fn portable_summary_completion(
     context: PortableSummaryContext,
     hooks_config: Vec<crate::config::types::HookConfig>,
-    hook_plugins: Option<Arc<crate::tools::integrations::plugin::Host>>,
 ) -> impl FnMut(&mut Backend, &Chat, &mut dyn Ui, Arc<AtomicBool>, u64) -> Result<String> + Send {
     let PortableSummaryContext {
         config,
@@ -67,7 +66,9 @@ pub fn portable_summary_completion(
         let catalog = if portable.enabled {
             layout
                 .as_ref()
-                .map(|layout| crate::agent::safety::rules::Catalog::discover(layout, &root))
+                .map(|layout| {
+                    crate::agent::safety::rules::Catalog::discover(layout, &root, &portable)
+                })
                 .unwrap_or_default()
         } else {
             crate::agent::safety::rules::Catalog::default()
@@ -102,7 +103,6 @@ pub fn portable_summary_completion(
             )?);
             let rewritten = crate::agent::safety::hooks::provider_request(
                 &hooks_config,
-                hook_plugins.as_deref(),
                 &root,
                 &request,
                 &cancel,
@@ -1336,7 +1336,6 @@ impl crate::agent::Agent<'_> {
                 hermetic: self.hermetic,
             },
             self.tool_hooks().to_vec(),
-            self.hook_plugins(),
         );
         let scope = if kind == WorkKind::Idle {
             self.usage_scope.next_turn(0)?

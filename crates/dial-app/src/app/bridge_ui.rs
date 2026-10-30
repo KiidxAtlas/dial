@@ -713,53 +713,6 @@ impl Ui for Bridge<'_> {
         outcome
     }
 
-    fn run_panel(
-        &mut self,
-        panel: &crate::extensions::panel::Panel,
-        cancel: &AtomicBool,
-    ) -> crate::extensions::panel::Outcome {
-        use crate::extensions::panel::Outcome;
-        let mut dialog = match crate::ui::panel::PanelDialog::new(panel.clone()) {
-            Ok(dialog) => dialog,
-            Err(error) => return Outcome::Unsupported(format!("{error:#}")),
-        };
-        self.shell.park_pending_input();
-        let was_waiting = std::mem::replace(&mut self.shell.awaiting_user, true);
-        let outcome = loop {
-            if cancel.load(Ordering::SeqCst) || self.interrupt.load(Ordering::SeqCst) {
-                break Outcome::Cancelled;
-            }
-            let (width, height) = self.shell.term.size();
-            let rows = dialog.rows(
-                usize::from(width),
-                usize::from(height).saturating_sub(1),
-                self.shell.themes.current(),
-            );
-            if self.shell.paint(Some(rows)).is_err() {
-                break Outcome::Cancelled;
-            }
-            match poll(Duration::from_millis(50)) {
-                Ok(false) => continue,
-                Err(_) => break Outcome::Cancelled,
-                Ok(true) => {}
-            }
-            match read() {
-                Ok(Event::Key(key)) => {
-                    if let Some(outcome) = dialog.key(key) {
-                        break outcome;
-                    }
-                }
-                Ok(Event::Paste(value)) => dialog.paste(&value),
-                Ok(Event::Resize(..)) => self.shell.term.on_resize(),
-                Ok(_) => {}
-                Err(_) => break Outcome::Cancelled,
-            }
-        };
-        self.shell.awaiting_user = was_waiting;
-        self.repaint(true);
-        outcome
-    }
-
     fn ask_user(&mut self, title: &str, question: &str, options: &[String]) -> Option<String> {
         let mut choices: Vec<(String, char)> = options
             .iter()

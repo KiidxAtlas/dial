@@ -23,8 +23,6 @@ pub(crate) mod commit;
 mod config_cmds;
 pub(crate) use config_cmds::UsageStatus;
 mod evidence;
-mod extension_commands;
-mod extension_runtime;
 pub(crate) mod extensions;
 pub(crate) mod extensions_browser;
 mod graphify;
@@ -53,7 +51,6 @@ pub(super) fn specs() -> impl Iterator<Item = &'static CommandSpec> {
         .iter()
         .chain(advanced::COMMANDS)
         .chain(extensions::COMMANDS)
-        .chain(extension_runtime::COMMANDS)
         .chain(graphify::COMMANDS)
         .chain(image::COMMANDS)
         .chain(evidence::COMMANDS)
@@ -122,12 +119,6 @@ pub(super) fn run(
     if let Some(result) = setup::run_command(shell, app, agent, name, args) {
         return Some(result);
     }
-    if let Some(result) = extension_runtime::run(shell, app, agent, name, args) {
-        return Some(result);
-    }
-    if let Some(result) = extension_commands::run(shell, app, agent, name, args) {
-        return Some(result);
-    }
     modes::run(shell, app, agent, name, args)
 }
 
@@ -175,7 +166,7 @@ pub(super) fn run_settings(
 }
 
 /// Composer argument candidates: `/<name> <subcommand>` for every static subcommand, plus each
-/// group's dynamic candidates (sessions, servers, plugins).
+/// group's dynamic candidates (sessions, servers).
 pub(super) fn completions(config: &Config) -> Vec<String> {
     let mut candidates: Vec<String> = specs()
         .flat_map(|spec| {

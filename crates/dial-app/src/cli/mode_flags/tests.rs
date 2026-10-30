@@ -37,11 +37,7 @@ fn protocol_launch_rejects_agent_modes_instead_of_ignoring_intent() {
             assert!(error.contains(protocol), "{error}");
         }
     }
-    let flags = resolve(
-        &parse(&["--hide-thinking", "--no-extensions"]),
-        interactive(),
-    )
-    .unwrap();
+    let flags = resolve(&parse(&["--hide-thinking"]), interactive()).unwrap();
     assert!(flags.validate_protocol("RPC").is_ok());
 }
 
@@ -106,39 +102,13 @@ fn goal_startup_rejects_conflicting_inputs() {
 }
 
 #[test]
-fn trusted_extensions_must_be_absolute_and_exclusive() {
-    let abs = vec!["/opt/ext.js".to_string()];
-    assert_eq!(
-        validate_trusted_extensions(&abs, false).unwrap(),
-        vec![PathBuf::from("/opt/ext.js")]
-    );
-    let rel = vec!["ext.js".to_string()];
-    assert!(
-        validate_trusted_extensions(&rel, false)
-            .unwrap_err()
-            .to_string()
-            .contains("absolute")
-    );
-    assert!(validate_trusted_extensions(&[" ".to_string()], false).is_err());
-    assert!(
-        validate_trusted_extensions(&abs, true)
-            .unwrap_err()
-            .to_string()
-            .contains("cannot be combined")
-    );
-    assert!(validate_trusted_extensions(&[], true).unwrap().is_empty());
-}
-
-#[test]
 fn overlay_sets_only_requested_keys() {
-    assert!(config_overlay(false, false).is_empty());
-    let o = config_overlay(true, true);
+    assert!(config_overlay(false).is_empty());
+    let o = config_overlay(true);
     assert_eq!(o["ui"]["show_thinking"].as_bool(), Some(false));
-    assert_eq!(o["extensions"]["enabled"].as_bool(), Some(false));
     let mut base = toml::Table::new();
-    crate::config::merge(&mut base, config_overlay(true, false));
+    crate::config::merge(&mut base, config_overlay(true));
     assert_eq!(base["ui"]["show_thinking"].as_bool(), Some(false));
-    assert!(base.get("extensions").is_none());
 }
 
 #[test]
@@ -147,8 +117,6 @@ fn parses_bare_and_named_plan_and_repeatable_flags() {
     assert_eq!(bare.plan.as_deref(), Some(""));
     let named = parse(&["--plan", "smart"]);
     assert_eq!(named.plan.as_deref(), Some("smart"));
-    let ext = parse(&["-e", "a.js", "--extension", "b.js"]);
-    assert_eq!(ext.extensions, vec!["a.js", "b.js"]);
 }
 
 #[test]
@@ -196,16 +164,8 @@ fn plan_model_resolves_aliases_into_the_planner_role() {
 
 #[test]
 fn honored_flags_produce_overlay() {
-    let flags = resolve(
-        &parse(&["--hide-thinking", "--no-extensions"]),
-        interactive(),
-    )
-    .unwrap();
+    let flags = resolve(&parse(&["--hide-thinking"]), interactive()).unwrap();
     assert_eq!(flags.overlay["ui"]["show_thinking"].as_bool(), Some(false));
-    assert_eq!(
-        flags.overlay["extensions"]["enabled"].as_bool(),
-        Some(false)
-    );
     let mut target = toml::Table::new();
     flags.merge_into_overlay(&mut target);
     assert_eq!(target, flags.overlay);
@@ -299,63 +259,6 @@ fn temp_module_dir(tag: &str) -> PathBuf {
 }
 
 #[test]
-fn extension_flag_lands_in_plugins_overlay() {
-    let dir = temp_module_dir("extension");
-    let module = dir.join("ext.js");
-    std::fs::write(&module, "").unwrap();
-    let flags = resolve(&parse(&["-e", module.to_str().unwrap()]), interactive()).unwrap();
-    let program = flags.overlay["extensions"]["plugins"]["cli-0-ext.js"]["program"]
-        .as_str()
-        .unwrap();
-    assert_eq!(
-        program,
-        std::fs::canonicalize(&module).unwrap().to_str().unwrap()
-    );
-    assert!(flags.overlay["extensions"].get("discover").is_none());
-    let missing = resolve(&parse(&["-e", "/no/such/module.js"]), interactive())
-        .unwrap_err()
-        .to_string();
-    assert!(missing.contains("not found"), "{missing}");
-    std::fs::remove_dir_all(&dir).unwrap();
-}
-
-#[test]
-fn trusted_extension_flag_is_an_exact_allowlist_without_discovery() {
-    let dir = temp_module_dir("trusted");
-    let module = dir.join("policy.js");
-    std::fs::write(&module, "").unwrap();
-    let flags = resolve(
-        &parse(&["--trusted-extension", module.to_str().unwrap()]),
-        interactive(),
-    )
-    .unwrap();
-    assert_eq!(
-        flags.overlay["extensions"]["discover"].as_bool(),
-        Some(false)
-    );
-    assert!(
-        flags.overlay["extensions"]["plugins"]
-            .as_table()
-            .unwrap()
-            .contains_key("trusted-0-policy.js")
-    );
-    assert!(resolve(&parse(&["--trusted-extension", "rel.js"]), interactive()).is_err());
-    let mixed = [
-        "--trusted-extension",
-        module.to_str().unwrap(),
-        "-e",
-        module.to_str().unwrap(),
-    ];
-    assert!(
-        resolve(&parse(&mixed), interactive())
-            .unwrap_err()
-            .to_string()
-            .contains("cannot be combined")
-    );
-    std::fs::remove_dir_all(&dir).unwrap();
-}
-
-#[test]
 fn hook_flag_lands_in_hooks_overlay_for_every_event() {
     let dir = temp_module_dir("hook");
     let module = dir.join("hook.sh");
@@ -393,30 +296,4 @@ fn hook_overlay_appends_to_configured_hooks_instead_of_replacing_them() {
     assert_eq!(hooks[0], project_hook, "the configured hook is kept first");
     assert_eq!(hooks.len(), 1 + crate::config::hooks::EVENTS.len());
     std::fs::remove_dir_all(&dir).unwrap();
-}
-
-#[test]
-fn plugin_dir_flag_lands_every_plugin_program_in_overlay() {
-    let dir = temp_module_dir("plugin-dir");
-    std::fs::write(dir.join("a.js"), "").unwrap();
-    std::fs::write(dir.join("b.sh"), "").unwrap();
-    let flags = resolve(
-        &parse(&["--plugin-dir", dir.to_str().unwrap()]),
-        interactive(),
-    )
-    .unwrap();
-    let plugins = flags.overlay["extensions"]["plugins"].as_table().unwrap();
-    assert_eq!(plugins.len(), 2);
-    assert!(plugins.contains_key("dir-0-a.js") && plugins.contains_key("dir-0-b.sh"));
-    let empty = temp_module_dir("plugin-dir-empty");
-    let err = resolve(
-        &parse(&["--plugin-dir", empty.to_str().unwrap()]),
-        interactive(),
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(err.contains("no plugin programs"), "{err}");
-    assert!(resolve(&parse(&["--plugin-dir", "/no/such/dir"]), interactive()).is_err());
-    std::fs::remove_dir_all(&dir).unwrap();
-    std::fs::remove_dir_all(&empty).unwrap();
 }

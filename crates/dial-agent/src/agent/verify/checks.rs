@@ -1122,6 +1122,28 @@ impl<'a> Agent<'a> {
             .then(|| checks.into_iter().map(|check| check.name).collect())
     }
 
+    /// The completion gate's evidence question, answered by running the applicable checks once
+    /// (same approval and freshness path as the `check` tool) before a model round is spent on a
+    /// reminder. Returns the still-unverified check names and the observed failures, which keep
+    /// the reminder even when another applicable check passed.
+    pub(in crate::agent) fn gate_unverified_edits(
+        &mut self,
+        run: bool,
+        ui: &mut dyn Ui,
+    ) -> (Option<Vec<String>>, Vec<String>) {
+        let unverified = self.unverified_edits();
+        if !run || unverified.is_none() || self.interrupt.load(Ordering::SeqCst) {
+            return (unverified, Vec::new());
+        }
+        let checks = self.current_focused_checks();
+        let failures = self.run_checks(&checks, ui).failures;
+        if failures.is_empty() {
+            (self.unverified_edits(), failures)
+        } else {
+            (unverified, failures)
+        }
+    }
+
     /// One completion boundary for plain reports and explicit finish calls. Pumps worker results
     /// first, so a worker that already finished is not reported as running.
     pub(in crate::agent) fn validate_completion(&mut self, ui: &mut dyn Ui) -> Result<(), String> {

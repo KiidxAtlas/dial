@@ -1,5 +1,4 @@
-//! Extension slash commands: `/mcp`, `/tools`, `/extensions`, `/agents`, `/hub`, `/plugins`,
-//! `/marketplace`, `/reload-plugins`, `/security`.
+//! Extension slash commands: `/mcp`, `/tools`, `/extensions`, `/agents`.
 
 use crate::agent::Agent;
 use crate::agent::base::agent_defs::Catalog;
@@ -9,10 +8,6 @@ use crate::config::tools::mcp::validate_server;
 use crate::config::types::{Config, McpServerConfig, McpTransport};
 use crate::llm::oauth::BannerInteraction;
 use crate::tools::integrations::mcp::connect_extra;
-use crate::tools::integrations::plugin::installer::{InstalledPlugin, PluginStore};
-use crate::tools::integrations::plugin::marketplace::{
-    MarketplaceEntry, MarketplaceInfo, Marketplaces, SkillListing,
-};
 use anyhow::{Result, anyhow, bail};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -54,38 +49,7 @@ pub(super) const COMMANDS: &[super::CommandSpec] = &[
     },
     super::CommandSpec {
         name: "extensions",
-        description: "browse and install MCP servers, plugins and skills (/status shows the configuration)",
-        args_hint: "",
-        subcommands: &[],
-    },
-    super::CommandSpec {
-        name: "plugins",
-        description: "list, enable, or disable installed plugins (alias: /plugin)",
-        args_hint: "[list|enable|disable] [name]",
-        subcommands: &["list", "enable", "disable", "help"],
-    },
-    super::CommandSpec {
-        name: "marketplace",
-        description: "list plugins and skills from marketplaces; add, remove, enable, disable, install",
-        args_hint: "[list|add|remove|enable|disable|update|discover|install|uninstall|installed|upgrade|help]",
-        subcommands: &[
-            "add",
-            "remove",
-            "enable",
-            "disable",
-            "update",
-            "list",
-            "discover",
-            "install",
-            "uninstall",
-            "installed",
-            "upgrade",
-            "help",
-        ],
-    },
-    super::CommandSpec {
-        name: "reload-plugins",
-        description: "reload resources and restart the runtime to load plugin changes",
+        description: "browse and install MCP servers and skills (/status shows the configuration)",
         args_hint: "",
         subcommands: &[],
     },
@@ -112,7 +76,7 @@ pub(super) fn run(
     Some(noted(shell, title, result))
 }
 
-/// `/mcp`, `/plugins` and `/reload-plugins` forms that change settings or ask for a rebuild.
+/// `/mcp` forms that change settings or ask for a rebuild.
 /// `agent` is `None` during a turn: writes land at once and the rebuild waits for the turn's end.
 pub(super) fn run_settings(
     shell: &mut Shell,
@@ -124,14 +88,6 @@ pub(super) fn run_settings(
     let (title, result) = match name {
         "mcp" if !split_subcommand(args).0.starts_with("smithery-") => {
             ("MCP", mcp(shell, app, agent, args))
-        }
-        "plugins" | "plugin" => ("Plugins", plugins(shell, app, args)),
-        "reload-plugins" => {
-            shell.note("Plugins", "Reloading plugins.");
-            (
-                "Plugins",
-                Ok(Step::Rebuild(Box::new(shell.settings_config(app).clone()))),
-            )
         }
         _ => return None,
     };
@@ -146,7 +102,6 @@ pub(super) fn run_live(
     name: &str,
     args: &str,
 ) -> Option<Result<Step>> {
-    let (sub, _) = split_subcommand(args);
     let (title, result) = match name {
         "status" => {
             shell.note("Extensions", extensions_report(&app.config));
@@ -157,10 +112,6 @@ pub(super) fn run_live(
             ("Agents", Ok(Step::Done))
         }
         "mcp" => ("MCP", mcp_live(shell, app, args)?),
-        "plugins" | "plugin" if !matches!(sub, "enable" | "disable") => {
-            ("Plugins", plugins(shell, app, args))
-        }
-        "marketplace" => ("Marketplace", marketplace(shell, app, args)),
         _ => return None,
     };
     Some(noted(shell, title, result))
@@ -200,11 +151,6 @@ pub(super) fn completions(config: &Config) -> Vec<String> {
         "notifications",
     ] {
         out.push(format!("/mcp {sub}"));
-    }
-    for plugin in plugin_store(config).list().unwrap_or_default() {
-        for sub in ["enable", "disable"] {
-            out.push(format!("/plugins {sub} {}", plugin.name));
-        }
     }
     out
 }
@@ -703,25 +649,7 @@ fn tools_report(agent: &Agent<'_>) -> String {
 }
 
 fn extensions_report(config: &Config) -> String {
-    let ext = &config.extensions;
-    let mut lines = vec![
-        format!("Runtime plugins: {}", on_off(ext.enabled)),
-        format!("Discover ~/.dial/extensions: {}", on_off(ext.discover)),
-        format!("Request timeout: {}s (0 disables)", ext.timeout_secs),
-    ];
-    if ext.plugins.is_empty() {
-        lines.push("Configured plugins: none".into());
-    } else {
-        lines.push("Configured plugins:".into());
-        for (name, plugin) in &ext.plugins {
-            lines.push(format!(
-                "  {name}  {}  {}",
-                on_off(plugin.enabled),
-                plugin.program.display()
-            ));
-        }
-    }
-    lines.join("\n")
+    format!("Configured MCP servers: {}", config.mcp.len())
 }
 
 fn agents_report(config: &Config) -> String {
@@ -745,328 +673,6 @@ fn agents_report(config: &Config) -> String {
     } else {
         lines.join("\n")
     }
-}
-
-// ---- /plugins, /marketplace, /reload-plugins -------------------------------------------------
-
-fn plugins(shell: &mut Shell, app: &App, args: &str) -> Result<Step> {
-    let (sub, rest) = split_subcommand(args);
-    let rest = user_scope_only(rest)?;
-    let store = plugin_store(&app.config);
-    match sub {
-        "" | "list" => {
-            shell.note("Plugins", plugin_list(&store.list()?));
-            Ok(Step::Done)
-        }
-        "enable" | "disable" => {
-            let name = one_arg(&rest, sub)?;
-            let enabled = sub == "enable";
-            store.set_enabled(name, enabled)?;
-            shell.note(
-                "Plugins",
-                format!(
-                    "{} plugin {name}.",
-                    if enabled { "Enabled" } else { "Disabled" }
-                ),
-            );
-            Ok(Step::Rebuild(Box::new(shell.settings_config(app).clone())))
-        }
-        "help" => {
-            shell.note(
-                "Plugins",
-                "/plugins list\n/plugins enable <name>\n/plugins disable <name>",
-            );
-            Ok(Step::Done)
-        }
-        other => bail!("Unknown /plugins subcommand: {other}. Use list, enable, or disable."),
-    }
-}
-
-fn marketplace(shell: &mut Shell, app: &App, args: &str) -> Result<Step> {
-    let (sub, rest) = split_subcommand(args);
-    let plugins_root = plugins_root(&app.config);
-    let markets_root = marketplaces_root(&app.config);
-    match sub {
-        "" | "list" => {
-            let markets = Marketplaces::new(&markets_root);
-            let mut text = marketplace_list(&markets.list()?);
-            text.push_str("\n\n");
-            text.push_str(&offerings(&markets.entries(None)?, &markets.skills(None)?));
-            text.push_str("\n\nInstall and manage these in /extensions (Plugins, Skills and Marketplaces tabs).");
-            shell.note("Marketplace", text);
-            Ok(Step::Done)
-        }
-        "add" => {
-            let (name, index) = two_args(rest, "add")?;
-            Marketplaces::new(&markets_root).add(name, index)?;
-            shell.note("Marketplace", format!("Added marketplace {name}."));
-            Ok(Step::Done)
-        }
-        "remove" => {
-            let name = one_arg(rest, "remove")?;
-            Marketplaces::new(&markets_root).remove(name)?;
-            shell.note("Marketplace", format!("Removed marketplace {name}."));
-            Ok(Step::Done)
-        }
-        "enable" | "disable" => {
-            let name = one_arg(rest, sub)?;
-            let enabled = sub == "enable";
-            Marketplaces::new(&markets_root).set_enabled(name, enabled)?;
-            shell.note(
-                "Marketplace",
-                format!(
-                    "{} marketplace {name}.",
-                    if enabled { "Enabled" } else { "Disabled" }
-                ),
-            );
-            Ok(Step::Done)
-        }
-        "update" => {
-            let name = optional(rest);
-            spawn_job(shell, "Marketplace", move |_| {
-                Marketplaces::new(&markets_root).refresh(name.as_deref())?;
-                Ok(match name {
-                    Some(name) => format!("Refreshed marketplace {name}."),
-                    None => "Refreshed all marketplaces.".to_owned(),
-                })
-            });
-            Ok(Step::Done)
-        }
-        "discover" => {
-            let filter = optional(rest);
-            let markets = Marketplaces::new(&markets_root);
-            let text = offerings(
-                &markets.entries(filter.as_deref())?,
-                &markets.skills(filter.as_deref())?,
-            );
-            shell.note("Marketplace", text);
-            Ok(Step::Done)
-        }
-        "install" => {
-            let (force, reference) = parse_install(rest)?;
-            spawn_job(shell, "Marketplace", move |_| {
-                let store = PluginStore::new(&plugins_root);
-                // A forced reinstall moves the old tree aside instead of deleting it first, so a
-                // failed install restores the working plugin.
-                let mut backup = None;
-                if force {
-                    let bare = reference
-                        .split('@')
-                        .next()
-                        .unwrap_or(reference.as_str())
-                        .to_owned();
-                    if let Ok(existing) = store.get(&bare) {
-                        let aside =
-                            plugins_root.join(format!(".replaced-{bare}-{}", std::process::id()));
-                        std::fs::rename(&existing.path, &aside).map_err(|error| {
-                            anyhow!("could not move plugin {bare} aside: {error}")
-                        })?;
-                        backup = Some((aside, existing.path));
-                    }
-                }
-                let plugin = match Marketplaces::new(&markets_root).install(&reference, &store) {
-                    Ok(plugin) => {
-                        if let Some((aside, _)) = &backup {
-                            let _ = std::fs::remove_dir_all(aside);
-                        }
-                        plugin
-                    }
-                    Err(error) => {
-                        if let Some((aside, original)) = &backup {
-                            std::fs::rename(aside, original).map_err(|restore| {
-                                anyhow!(
-                                    "{error:#}; also could not restore the previous plugin from {}: {restore}",
-                                    aside.display()
-                                )
-                            })?;
-                        }
-                        return Err(error);
-                    }
-                };
-                Ok(format!(
-                    "Installed {} {}. Run /reload-plugins to load it.",
-                    plugin.name,
-                    plugin.version.as_deref().unwrap_or("")
-                ))
-            });
-            Ok(Step::Done)
-        }
-        "uninstall" => {
-            let name = one_arg(rest, "uninstall")?;
-            PluginStore::new(&plugins_root).remove(name)?;
-            shell.note(
-                "Marketplace",
-                format!("Uninstalled {name}. Run /reload-plugins to apply."),
-            );
-            Ok(Step::Done)
-        }
-        "installed" => {
-            shell.note(
-                "Marketplace",
-                plugin_list(&PluginStore::new(&plugins_root).list()?),
-            );
-            Ok(Step::Done)
-        }
-        "upgrade" => {
-            let name = optional(rest);
-            spawn_job(shell, "Marketplace", move |_| {
-                let store = PluginStore::new(&plugins_root);
-                let updates = Marketplaces::new(&markets_root).upgrade(&store, name.as_deref())?;
-                Ok(if updates.is_empty() {
-                    "No plugins to upgrade.".to_owned()
-                } else {
-                    updates
-                        .iter()
-                        .map(|u| {
-                            format!(
-                                "{}: {} -> {}{}",
-                                u.name,
-                                u.from.as_deref().unwrap_or("-"),
-                                u.to.as_deref().unwrap_or("-"),
-                                if u.changed { "" } else { " (unchanged)" }
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                })
-            });
-            Ok(Step::Done)
-        }
-        "help" => {
-            shell.note(
-                "Marketplace",
-                "/marketplace list\n/marketplace add <name> <index-url-or-path>\n/marketplace remove <name>\n/marketplace enable <name>\n/marketplace disable <name>\n/marketplace update [name]\n/marketplace discover [name]\n/marketplace install [--force] <plugin@marketplace>\n/marketplace uninstall <plugin>\n/marketplace installed\n/marketplace upgrade [plugin]\nThe built-in anthropic-skills marketplace is on by default. Browse and install in /extensions.",
-            );
-            Ok(Step::Done)
-        }
-        other => bail!("Unknown /marketplace subcommand: {other}. Run /marketplace help."),
-    }
-}
-
-fn plugin_list(plugins: &[InstalledPlugin]) -> String {
-    if plugins.is_empty() {
-        return "No plugins installed.".into();
-    }
-    plugins
-        .iter()
-        .map(|p| {
-            format!(
-                "{}  {}  {}  {}",
-                p.name,
-                p.version.as_deref().unwrap_or("-"),
-                if p.enabled { "enabled" } else { "disabled" },
-                p.source
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn marketplace_list(markets: &[MarketplaceInfo]) -> String {
-    if markets.is_empty() {
-        return "No marketplaces configured. Use /marketplace add <name> <index>.".into();
-    }
-    markets
-        .iter()
-        .map(|m| {
-            let refreshed = m
-                .refreshed_at
-                .map(|t| t.to_string())
-                .unwrap_or_else(|| "never".into());
-            let index = if m.builtin {
-                "built into Dial".to_owned()
-            } else {
-                m.index.clone()
-            };
-            format!(
-                "{}  {}  {index}  refreshed: {refreshed}",
-                m.name,
-                if m.enabled { "enabled" } else { "disabled" }
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Plugin entries and skills offered by marketplaces, one per line.
-fn offerings(entries: &[MarketplaceEntry], skills: &[SkillListing]) -> String {
-    if entries.is_empty() && skills.is_empty() {
-        return "No marketplace plugins or skills found.".into();
-    }
-    let mut lines: Vec<String> = entries
-        .iter()
-        .map(|entry| {
-            format!(
-                "plugin  {}@{}  {}  {}",
-                entry.name,
-                entry.marketplace,
-                entry.version.as_deref().unwrap_or("-"),
-                entry
-                    .description
-                    .as_deref()
-                    .unwrap_or(entry.source.as_str())
-            )
-        })
-        .collect();
-    lines.extend(skills.iter().map(|skill| {
-        format!(
-            "skill   {}@{}  {}",
-            skill.name, skill.marketplace, skill.description
-        )
-    }));
-    lines.join("\n")
-}
-
-fn parse_install(rest: &str) -> Result<(bool, String)> {
-    let mut force = false;
-    let mut reference = None;
-    for token in rest.split_whitespace() {
-        if token == "--force" {
-            force = true;
-        } else if reference.is_none() {
-            reference = Some(token.to_owned());
-        } else {
-            bail!("unexpected argument {token}");
-        }
-    }
-    let reference = reference
-        .ok_or_else(|| anyhow!("usage: /marketplace install [--force] <plugin@marketplace>"))?;
-    Ok((force, reference))
-}
-
-fn user_scope_only(rest: &str) -> Result<String> {
-    let tokens: Vec<&str> = rest.split_whitespace().collect();
-    let mut kept = Vec::new();
-    let mut i = 0;
-    while i < tokens.len() {
-        if tokens[i] == "--scope" {
-            let value = tokens
-                .get(i + 1)
-                .ok_or_else(|| anyhow!("--scope needs a value"))?;
-            if *value != "user" {
-                bail!(
-                    "Plugins are installed in the user directory only; --scope {value} is not supported."
-                );
-            }
-            i += 2;
-        } else {
-            kept.push(tokens[i]);
-            i += 1;
-        }
-    }
-    Ok(kept.join(" "))
-}
-
-fn plugin_store(config: &Config) -> PluginStore {
-    PluginStore::new(plugins_root(config))
-}
-
-fn plugins_root(config: &Config) -> PathBuf {
-    config.user_dir.join("plugins")
-}
-
-fn marketplaces_root(config: &Config) -> PathBuf {
-    config.user_dir.join("marketplaces")
 }
 
 // ---- shared helpers --------------------------------------------------------------------------
@@ -1130,19 +736,6 @@ fn one_arg<'a>(rest: &'a str, sub: &str) -> Result<&'a str> {
     }
 }
 
-fn two_args<'a>(rest: &'a str, sub: &str) -> Result<(&'a str, &'a str)> {
-    let mut parts = rest.split_whitespace();
-    match (parts.next(), parts.next(), parts.next()) {
-        (Some(a), Some(b), None) => Ok((a, b)),
-        _ => bail!("usage: {sub} <name> <index>"),
-    }
-}
-
-fn optional(rest: &str) -> Option<String> {
-    let trimmed = rest.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_owned())
-}
-
 fn valid_server_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
@@ -1161,10 +754,6 @@ fn join_or_none<S: AsRef<str>>(items: &[S]) -> String {
             .collect::<Vec<_>>()
             .join(", ")
     }
-}
-
-fn on_off(value: bool) -> &'static str {
-    if value { "on" } else { "off" }
 }
 
 #[cfg(test)]

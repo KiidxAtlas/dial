@@ -174,6 +174,21 @@ fn child_cost_boundary(env: Env) -> Result<()> {
     Ok(())
 }
 
+/// Journals stream-rule matches whose interruptMode let an accepted child reply proceed, so their
+/// reminders reach the child's next request, and announces each one.
+fn admit_child_rule_hits(
+    rule_state: &mut crate::agent::safety::rules::State,
+    agent: &str,
+    hits: &[crate::agent::safety::rules::Hit],
+    approver: &mut dyn Approver,
+) -> Result<(), String> {
+    for hit in hits {
+        rule_state.remember(hit, agent)?;
+        approver.notice(&hit.notice(crate::agent::safety::rules::Trigger::Deferred));
+    }
+    Ok(())
+}
+
 /// Stats/OTLP row for one child-side model call, mirroring the main turn path. Children run only
 /// under non-hermetic parents (the hermetic tool set omits `task`), so the hermetic gate is open;
 /// rows carry the child's private session id, the only session a child owns.
@@ -631,8 +646,8 @@ fn with_child_role_backend<T>(
     result
 }
 
-/// `before_provider_request` for one child model call, under the child's hook configuration and
-/// plugin scope (the same scope its tool hooks use). Hook notices go to the child's observer.
+/// `before_provider_request` for one child model call, under the child's hook configuration (the
+/// same hooks its tool calls use). Hook notices go to the child's observer.
 fn child_provider_request(
     env: &Env,
     request: &Chat,
@@ -646,11 +661,8 @@ fn child_provider_request(
             env.ext,
         )?,
     );
-    let plugin_host = env.ext.plugins();
-    let plugins = plugin_host.as_deref().filter(|_| env.layout.is_some());
     let rewritten = crate::agent::safety::hooks::provider_request(
         &env.config.hooks,
-        plugins,
         env.workspace.root(),
         projected.as_ref().unwrap_or(request),
         env.interrupt,
@@ -1630,6 +1642,8 @@ fn compact_child(
         timeout_secs: env.config.worker_timeout_secs,
         user_dir: &env.config.user_dir,
         native_request: Some(request),
+        // Child commit uses this candidate directly; it adds no regenerated notes or state carry.
+        retained_overhead_tokens: 0,
         supplemental_context: None,
     };
     let observer = std::cell::RefCell::new(approver);
@@ -1941,7 +1955,13 @@ fn run_inner(
     let rule_root = env.workspace.root();
     let rule_catalog = if env.config.portable_rules.enabled {
         env.layout
-            .map(|layout| crate::agent::safety::rules::Catalog::discover(layout, rule_root))
+            .map(|layout| {
+                crate::agent::safety::rules::Catalog::discover(
+                    layout,
+                    rule_root,
+                    &env.config.portable_rules,
+                )
+            })
             .unwrap_or_default()
     } else {
         crate::agent::safety::rules::Catalog::default()
@@ -2483,6 +2503,8 @@ fn run_inner(
             },
             Some(&mut rule_monitor),
         );
+        // Matches whose interruptMode let this reply proceed; journaled once the reply is accepted.
+        let rule_deferred = std::mem::take(&mut rule_monitor.deferred);
         stream_ui.finish(result.is_err());
         if let Some(error) = rule_ui.stream_error.take() {
             return Ok(crate::agent::run::engine::Tick::Finished(Outcome::failed(steps, error)));
@@ -2584,7 +2606,12 @@ fn run_inner(
             return Ok(crate::agent::run::engine::Tick::Again);
         }
         let mut reply = match result {
-            Ok(reply) => reply,
+            Ok(reply) => {
+                if let Err(error) = admit_child_rule_hits(rule_state, &rule_agent, &rule_deferred, approver) {
+                    return Ok(crate::agent::run::engine::Tick::Finished(Outcome::failed(steps, error)));
+                }
+                reply
+            }
             Err(error)
                 if error.downcast_ref::<reasoning::GateHit>().is_some()
                     && !env.interrupt.load(Ordering::SeqCst) =>
@@ -3013,6 +3040,9 @@ fn run_inner(
             approver.notice("Discarded normalized tool attempt; delivering applicable portable guidance before execution.");
             return Ok(crate::agent::run::engine::Tick::Again);
         }
+        if let Err(error) = admit_child_rule_hits(rule_state, &rule_agent, &normalized_rules.deferred, approver) {
+            return Ok(crate::agent::run::engine::Tick::Finished(Outcome::failed(steps, error)));
+        }
         if let Err(error) = rule_catalog.observe_paths(rule_root, rule_state, &reply.tool_calls) {
             return Ok(crate::agent::run::engine::Tick::Finished(Outcome::failed(steps, error)));
         }
@@ -3128,11 +3158,7 @@ fn run_inner(
             if parallel.is_empty()
                 && !child_speculation_key(env, job, call, &children.namespace)
                     .is_some_and(|key| env.workspace.speculation.pending(&key, &call.arguments))
-                && !crate::agent::safety::hooks::wanted(
-                    &env.config.hooks,
-                    env.ext.plugins().as_deref(),
-                    "pre_tool_use",
-                )
+                && !crate::agent::safety::hooks::wanted(&env.config.hooks, "pre_tool_use")
             {
                 let count = reply.tool_calls[index..]
                     .iter()
@@ -3976,11 +4002,7 @@ fn child_speculation_key(
         || (!matches!(call.name.as_str(), "read" | "grep")
             && env.ext.origin(&call.name) != Some(tools::surface::catalog::Origin::Native))
         || (matches!(call.name.as_str(), "read" | "grep") && env.ext.get(&call.name).is_some())
-        || crate::agent::safety::hooks::wanted(
-            &env.config.hooks,
-            env.ext.plugins().as_deref(),
-            "pre_tool_use",
-        )
+        || crate::agent::safety::hooks::wanted(&env.config.hooks, "pre_tool_use")
     {
         return None;
     }
@@ -4082,10 +4104,8 @@ fn call_tool_inner(
         return refuse(reason);
     }
     if call.name == "task" {
-        let plugins = env.ext.plugins();
         match crate::agent::safety::hooks::pre_tool_with(
             &env.config.hooks,
-            plugins.as_deref(),
             env.workspace.root(),
             &call.name,
             &call.arguments,
@@ -4113,7 +4133,6 @@ fn call_tool_inner(
             crate::agent::workers::subagents::nested(env, job, &call.arguments, names, approver);
         crate::agent::safety::hooks::post_tool_with(
             &env.config.hooks,
-            plugins.as_deref(),
             env.workspace.root(),
             &call.name,
             &call.arguments,
@@ -4317,13 +4336,10 @@ fn call_tool_inner(
             ));
         }
     }
-    let plugin_host = env.ext.plugins();
-    let plugins = plugin_host.as_deref().filter(|_| env.layout.is_some());
     let root = env.workspace.root().to_path_buf();
     let mut rewritten;
     let call = match crate::agent::safety::hooks::pre_tool_with(
         &env.config.hooks,
-        plugins,
         &root,
         &call.name,
         &call.arguments,
@@ -4732,7 +4748,6 @@ fn call_tool_inner(
     if !approval_denied.get() {
         crate::agent::safety::hooks::post_tool_with(
             &env.config.hooks,
-            plugins,
             &root,
             &call.name,
             &call.arguments,

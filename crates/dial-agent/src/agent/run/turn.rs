@@ -319,7 +319,13 @@ impl Agent<'_> {
         let rule_catalog = Arc::new(if !self.hermetic && self.config.portable_rules.enabled {
             self.layout
                 .as_ref()
-                .map(|layout| crate::agent::safety::rules::Catalog::discover(layout, &rule_root))
+                .map(|layout| {
+                    crate::agent::safety::rules::Catalog::discover(
+                        layout,
+                        &rule_root,
+                        &self.config.portable_rules,
+                    )
+                })
                 .unwrap_or_default()
         } else {
             crate::agent::safety::rules::Catalog::default()
@@ -534,3 +540,6 @@ mod reliability_tests;
 
 #[cfg(test)]
 mod thinking_tests;
+
+#[cfg(test)]
+mod rule_tests;

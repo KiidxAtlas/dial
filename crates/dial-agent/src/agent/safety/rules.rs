@@ -3,10 +3,14 @@
 //! Within a provider a project rule replaces a same relative-name user rule; paths sort lexically.
 //! Frontmatter is a deliberately strict YAML subset: scalar strings/bools, inline string arrays,
 //! and indented `- string` arrays. `applyTo`/`globs` and `agents` accept brace-aware CSV strings.
-//! GitHub instructions require applyTo. Cursor/native rules require globs, alwaysApply:true, or
-//! condition. `condition` is a Rust regex string/array (OR); `scope` is text, thinking, or tool:NAME
-//! (optionally tool:NAME(GLOB)). astCondition matches finalized source-bearing tool arguments;
-//! astLanguage optionally selects one parser. Judged questions and unsupported modes are refused.
+//! GitHub instructions require applyTo. Cursor/native rules require globs, alwaysApply:true,
+//! condition, astCondition or question. `condition` is a Rust regex string/array (OR); `scope` is
+//! text, thinking, or tool:NAME (optionally tool:NAME(GLOB)). astCondition matches finalized
+//! source-bearing tool arguments; astLanguage optionally selects one parser. `interruptMode`
+//! (always, prose-only, tool-only, never) picks which matches abort the inference; the others are
+//! deferred to the next request. A `question` is asked of the judge role after a reply completes,
+//! with any condition/astCondition as its prefilter; judged rules never interrupt.
+//! `portable_rules.repeat_after_turns` lets a fired rule fire again after that many user turns.
 //! Matching is bounded to 64 KiB per stream / 128 KiB total / 64 tool streams. Exhausted matching
 //! coverage aborts the inference without executing tools; it never silently skips a suffix.
 //! Structural matching uses the shared ast-grep engine and never inspects workspace files.
@@ -43,6 +47,51 @@ struct Rule {
     conditions: Vec<Regex>,
     ast: ast::Conditions,
     scopes: Vec<Scope>,
+    interrupt: Interrupt,
+    /// Judged trigger: asked of the `judge` role about each completed output. `condition` and
+    /// `astCondition` then only prefilter which outputs are judged.
+    question: Option<String>,
+}
+/// `interruptMode`: which match sources abort the inference. A match that does not interrupt is
+/// deferred: the reply proceeds and the rule's reminder is delivered with the next request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Interrupt {
+    Always,
+    ProseOnly,
+    ToolOnly,
+    Never,
+}
+impl Interrupt {
+    fn parse(mode: &str) -> Result<Self, String> {
+        Ok(match mode {
+            "always" => Self::Always,
+            "prose-only" => Self::ProseOnly,
+            "tool-only" => Self::ToolOnly,
+            "never" => Self::Never,
+            other => {
+                return Err(format!(
+                    "unsupported interruptMode {other}; use always, prose-only, tool-only or never"
+                ));
+            }
+        })
+    }
+    /// Whether a match from a tool stream (`tool`) or from text/thinking aborts the inference.
+    fn interrupts(self, tool: bool) -> bool {
+        match self {
+            Self::Always => true,
+            Self::ProseOnly => !tool,
+            Self::ToolOnly => tool,
+            Self::Never => false,
+        }
+    }
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::ProseOnly => "prose-only",
+            Self::ToolOnly => "tool-only",
+            Self::Never => "never",
+        }
+    }
 }
 #[derive(Debug)]
 enum Scope {
@@ -57,6 +106,9 @@ enum Scope {
 pub(in crate::agent) struct Catalog {
     rules: Vec<Rule>,
     pub warnings: Vec<String>,
+    /// `portable_rules.repeat_after_turns`: 0 keeps a fired rule quiet for the session; N lets it
+    /// fire again once N user turns have begun since it last fired.
+    repeat_after_turns: u32,
 }
 
 #[derive(Default, Clone, Serialize, Deserialize)]
@@ -77,6 +129,12 @@ pub(in crate::agent) struct State {
     callback_pending: bool,
     #[serde(default)]
     callback_retry: bool,
+    /// User turns begun in this session; the clock of the repeat policy.
+    #[serde(default)]
+    turns: u64,
+    /// The turn each `agent:rule` key last fired in.
+    #[serde(default)]
+    fired_turns: BTreeMap<String, u64>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Reminder {
@@ -109,6 +167,7 @@ impl State {
         self.callback_retry = false;
     }
     pub fn begin(&mut self, root: &Path, prompt: &str) {
+        self.turns = self.turns.saturating_add(1);
         self.paths.clear();
         self.delivered.clear();
         self.delivered_paths.clear();
@@ -136,9 +195,15 @@ impl State {
     }
     pub fn remember(&mut self, hit: &Hit, agent: &str) -> Result<(), String> {
         let key = format!("{agent}:{}", hit.id);
-        if self.fired.len() >= RULE_LIMIT
-            || self.reminders.values().map(|r| r.body.len()).sum::<usize>() + hit.body.len()
-                > TOTAL_BYTES
+        // A rule that fires again replaces its own reminder, so only count the others.
+        let journaled: usize = self
+            .reminders
+            .iter()
+            .filter(|(existing, _)| **existing != key)
+            .map(|(_, r)| r.body.len())
+            .sum();
+        if (self.fired.len() >= RULE_LIMIT && !self.fired.contains(&key))
+            || journaled + hit.body.len() > TOTAL_BYTES
         {
             return Err(
                 "portable rule reminder journal is full; no stale tool call was executed".into(),
@@ -148,6 +213,7 @@ impl State {
             self.activate(hit.paths.clone())?;
         }
         self.fired.insert(key.clone());
+        self.fired_turns.insert(key.clone(), self.turns);
         self.reminders.insert(
             key,
             Reminder {
@@ -158,6 +224,26 @@ impl State {
         );
         Ok(())
     }
+    /// Whether `agent:rule` already fired and the repeat policy still keeps it quiet. A rule fired
+    /// before turn tracking existed counts as fired in turn 0.
+    fn suppressed(&self, key: &str, repeat_after_turns: u32) -> bool {
+        if !self.fired.contains(key) {
+            return false;
+        }
+        repeat_after_turns == 0
+            || self
+                .turns
+                .saturating_sub(self.fired_turns.get(key).copied().unwrap_or(0))
+                < u64::from(repeat_after_turns)
+    }
+    /// Journals non-interrupting matches of an accepted reply so their reminders reach the next
+    /// request. Returns whether the state changed.
+    pub fn remember_deferred(&mut self, hits: &[Hit], agent: &str) -> Result<bool, String> {
+        for hit in hits {
+            self.remember(hit, agent)?;
+        }
+        Ok(!hits.is_empty())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -166,6 +252,37 @@ pub(in crate::agent) struct Hit {
     source: String,
     body: String,
     paths: BTreeSet<String>,
+}
+impl Hit {
+    /// Where the rule was loaded from, such as `project:dial:.dial/rules/x.md`.
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+    /// The user-visible notice for this rule firing through `trigger`.
+    pub fn notice(&self, trigger: Trigger) -> String {
+        match trigger {
+            Trigger::Interrupt => format!("{self}; regenerating with its guidance"),
+            Trigger::Deferred => format!("{self}; its reminder reaches the next request"),
+            Trigger::Judged => format!("{self} (judged); its reminder reaches the next request"),
+        }
+    }
+}
+/// How a stream rule fired: it aborted the inference, matched without interrupting, or the judge
+/// answered its `question` with yes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::agent) enum Trigger {
+    Interrupt,
+    Deferred,
+    Judged,
+}
+impl Trigger {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Interrupt => "interrupt",
+            Self::Deferred => "deferred",
+            Self::Judged => "judged",
+        }
+    }
 }
 impl std::fmt::Display for Hit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -180,7 +297,7 @@ impl std::error::Error for Hit {}
 
 impl Rule {
     fn conditional(&self) -> bool {
-        !self.conditions.is_empty() || !self.ast.is_empty()
+        !self.conditions.is_empty() || !self.ast.is_empty() || self.question.is_some()
     }
     fn agent(&self, name: &str) -> bool {
         self.agents.as_ref().is_none_or(|set| set.is_match(name))
@@ -199,12 +316,111 @@ impl Rule {
         }
     }
 }
+/// One judged rule with the completed output it is asked about.
+pub(in crate::agent) struct Judged {
+    pub hit: Hit,
+    pub question: String,
+    /// The rule's in-scope output: assistant prose, reasoning and matching tool calls.
+    pub content: String,
+}
 impl Catalog {
-    pub fn discover(layout: &Layout, workspace: &Path) -> Self {
+    pub fn discover(
+        layout: &Layout,
+        workspace: &Path,
+        policy: &crate::config::types::PortableRulesConfig,
+    ) -> Self {
         let home = crate::agent::window::context::home_dir();
         let copilot =
             crate::agent::window::context::copilot_instruction_dirs(workspace, home.as_deref());
-        Self::discover_with(layout, workspace, home.as_deref(), &[], &copilot)
+        let mut catalog = Self::discover_with(layout, workspace, home.as_deref(), &[], &copilot);
+        catalog.repeat_after_turns = policy.repeat_after_turns;
+        catalog
+    }
+
+    /// Judged rules for `agent` whose scope, paths, repeat policy and optional prefilter admit
+    /// `reply`, each with the in-scope content to judge. Pure: no model call.
+    pub fn judged_candidates(
+        &self,
+        root: &Path,
+        state: &State,
+        agent: &str,
+        reply: &crate::llm::Reply,
+    ) -> Vec<Judged> {
+        let mut out = Vec::new();
+        for rule in &self.rules {
+            let Some(question) = &rule.question else {
+                continue;
+            };
+            if !rule.agent(agent)
+                || state.suppressed(&format!("{agent}:{}", rule.id), self.repeat_after_turns)
+            {
+                continue;
+            }
+            let mut pieces = Vec::new();
+            let mut calls = Vec::new();
+            let mut paths = BTreeSet::new();
+            for scope in &rule.scopes {
+                match scope {
+                    Scope::Text if !reply.text.trim().is_empty() => {
+                        pieces.push(format!("assistant text:\n{}", reply.text));
+                    }
+                    Scope::Thinking if !reply.reasoning.trim().is_empty() => {
+                        pieces.push(format!("assistant reasoning:\n{}", reply.reasoning));
+                    }
+                    Scope::Tool {
+                        name,
+                        paths: scope_paths,
+                    } => {
+                        for call in &reply.tool_calls {
+                            if (name != "*" && name != &call.name)
+                                || calls.iter().any(|c: &&ToolCall| c.id == call.id)
+                            {
+                                continue;
+                            }
+                            let call_paths = call_paths(root, call);
+                            if scope_paths
+                                .as_ref()
+                                .is_some_and(|set| !call_paths.iter().any(|p| set.is_match(p)))
+                            {
+                                continue;
+                            }
+                            pieces.push(format!("tool call {}: {}", call.name, call.arguments));
+                            paths.extend(call_paths);
+                            calls.push(call);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let scoped = if paths.is_empty() {
+                &state.paths
+            } else {
+                &paths
+            };
+            if pieces.is_empty() || !rule.path(scoped) {
+                continue;
+            }
+            let content = pieces.join("\n\n");
+            let prefiltered = rule.conditions.is_empty() && rule.ast.is_empty()
+                || rule.conditions.iter().any(|regex| regex.is_match(&content))
+                || (!rule.ast.is_empty()
+                    && calls
+                        .iter()
+                        .any(|call| rule.ast.matches(&call.arguments).unwrap_or(false)));
+            if !prefiltered {
+                continue;
+            }
+            let mut hit = rule.hit();
+            if !paths.is_empty() && paths.len() <= PATH_LIMIT {
+                hit.paths = paths;
+            }
+            out.push(Judged {
+                hit,
+                question: question.clone(),
+                content,
+            });
+        }
+        out
     }
 
     /// `foreign_user` lists opted-in foreign providers (`windsurf`) whose user-level rules may load.
@@ -542,16 +758,126 @@ impl Catalog {
         state.activate(paths)?;
         Ok(true)
     }
+    /// Stream monitor for `agent`. Judged rules are not streamed: they are asked after a reply
+    /// completes, through [`Catalog::judged_candidates`].
     pub fn monitor<'a>(&'a self, root: &'a Path, state: &'a State, agent: &'a str) -> Monitor<'a> {
         let rules = self
             .rules
             .iter()
             .filter(|rule| {
                 rule.agent(agent)
+                    && rule.question.is_none()
                     && rule.conditional()
-                    && !state.fired.contains(&format!("{agent}:{}", rule.id))
+                    && !state.suppressed(&format!("{agent}:{}", rule.id), self.repeat_after_turns)
             })
             .collect();
+        Monitor::over(rules, root, state)
+    }
+
+    /// `dial rules list`: every loaded rule, in precedence order.
+    pub fn inspect(&self) -> Vec<super::rule_inspect::RuleSummary> {
+        self.rules
+            .iter()
+            .map(|rule| {
+                let mut triggers = Vec::new();
+                if !rule.conditions.is_empty() {
+                    triggers.push("condition");
+                }
+                if !rule.ast.is_empty() {
+                    triggers.push("astCondition");
+                }
+                if rule.question.is_some() {
+                    triggers.push("question");
+                }
+                if !rule.conditional() {
+                    triggers.push(if rule.paths.is_some() {
+                        "globs"
+                    } else {
+                        "alwaysApply"
+                    });
+                }
+                super::rule_inspect::RuleSummary {
+                    id: rule.id.clone(),
+                    source: rule.source.clone(),
+                    triggers: triggers.into_iter().map(str::to_owned).collect(),
+                    interrupt_mode: rule.interrupt.as_str().to_owned(),
+                    scopes: rule.scope_patterns.clone(),
+                    globs: rule.path_patterns.clone(),
+                    question: rule.question.clone(),
+                }
+            })
+            .collect()
+    }
+
+    /// `dial rules test`: runs each stream rule for `agent` alone over one sample, so every rule
+    /// that would match is reported rather than only the first to interrupt. Rules restricted by
+    /// globs see the paths of a tool sample only. Judged rules are listed when their scope and
+    /// prefilter admit the sample; they are never asked here.
+    pub fn probe(
+        &self,
+        root: &Path,
+        agent: &str,
+        sample: &super::rule_inspect::Sample,
+    ) -> Result<super::rule_inspect::Probe, String> {
+        use super::rule_inspect::{Probe, ProbeMatch, Sample};
+        let state = State::default();
+        let mut matches = Vec::new();
+        for rule in self
+            .rules
+            .iter()
+            .filter(|rule| rule.agent(agent) && rule.question.is_none() && rule.conditional())
+        {
+            let mut monitor = Monitor::over(vec![rule], root, &state);
+            match sample {
+                Sample::Text(text) => {
+                    monitor.text(text, false);
+                }
+                Sample::Thinking(text) => {
+                    monitor.text(text, true);
+                }
+                Sample::Tool(call) => {
+                    monitor.completed_tool(0, call);
+                }
+            }
+            if let Some(failure) = monitor.failure {
+                return Err(format!("{}: {failure}", rule.source));
+            }
+            let fired = match (monitor.hit, monitor.deferred.pop()) {
+                (Some(_), _) => Trigger::Interrupt,
+                (None, Some(_)) => Trigger::Deferred,
+                (None, None) => continue,
+            };
+            matches.push(ProbeMatch {
+                id: rule.id.clone(),
+                source: rule.source.clone(),
+                trigger: fired.as_str().to_owned(),
+            });
+        }
+        let reply = crate::llm::Reply {
+            text: match sample {
+                Sample::Text(text) => text.clone(),
+                _ => String::new(),
+            },
+            reasoning: match sample {
+                Sample::Thinking(text) => text.clone(),
+                _ => String::new(),
+            },
+            tool_calls: match sample {
+                Sample::Tool(call) => vec![call.clone()],
+                _ => Vec::new(),
+            },
+            ..Default::default()
+        };
+        let judged = self
+            .judged_candidates(root, &state, agent, &reply)
+            .into_iter()
+            .map(|candidate| candidate.hit.source)
+            .collect();
+        Ok(Probe { matches, judged })
+    }
+}
+impl<'a> Monitor<'a> {
+    fn over(rules: Vec<&'a Rule>, root: &'a Path, state: &'a State) -> Self {
         Monitor {
             rules,
             root,
@@ -560,6 +886,7 @@ impl Catalog {
             thinking: String::new(),
             tools: BTreeMap::new(),
             hit: None,
+            deferred: Vec::new(),
             failure: None,
             bytes: 0,
         }
@@ -658,7 +985,12 @@ impl<'a> CallbackGate<'a> {
             monitor.tool(0, &call.name, &call.arguments.to_string());
             monitor.structural(call);
         }
-        let Monitor { hit, failure, .. } = monitor;
+        let Monitor {
+            hit,
+            failure,
+            deferred,
+            ..
+        } = monitor;
         let paths = self.rules.catalog.pending_paths(
             root,
             self.rules.state,
@@ -667,6 +999,12 @@ impl<'a> CallbackGate<'a> {
         );
         let result = (|| -> Result<Option<String>, String> {
             if failure.is_none() && hit.is_none() && paths.is_none() {
+                // Non-interrupting matches let the callback run; their reminders reach the
+                // next generation.
+                self.state_changed |= self
+                    .rules
+                    .state
+                    .remember_deferred(&deferred, self.rules.agent)?;
                 self.state_changed |= self.rules.catalog.observe_paths(
                     root,
                     self.rules.state,
@@ -718,26 +1056,39 @@ pub(in crate::agent) struct Monitor<'a> {
     text: String,
     thinking: String,
     tools: BTreeMap<usize, (String, String)>,
+    /// The first interrupting match; the inference is aborted and regenerated.
     pub hit: Option<Hit>,
+    /// Matches whose `interruptMode` does not interrupt this source. The reply proceeds; callers
+    /// journal these with [`State::remember_deferred`] once they accept it.
+    pub deferred: Vec<Hit>,
     pub failure: Option<String>,
     bytes: usize,
 }
-impl Monitor<'_> {
+impl<'a> Monitor<'a> {
     pub fn restart(&mut self) {
         self.text.clear();
         self.thinking.clear();
         self.tools.clear();
         self.hit = None;
+        self.deferred.clear();
         self.failure = None;
         self.bytes = 0;
+    }
+    /// Routes one match: an interrupting rule aborts the inference; any other is deferred once.
+    fn record(&mut self, rule: &Rule, hit: Hit, tool: bool) {
+        if rule.interrupt.interrupts(tool) {
+            self.hit = Some(hit);
+        } else if !self.deferred.iter().any(|d| d.id == hit.id) {
+            self.deferred.push(hit);
+        }
     }
     pub fn text(&mut self, delta: &str, thinking: bool) -> bool {
         if self.hit.is_some() || self.failure.is_some() {
             return false;
         }
-        let paths = &self.state.paths;
+        let state = self.state;
         let eligible = |rule: &&Rule| {
-            rule.path(paths)
+            rule.path(&state.paths)
                 && rule.scopes.iter().any(|s| {
                     if thinking {
                         matches!(s, Scope::Thinking)
@@ -746,7 +1097,7 @@ impl Monitor<'_> {
                     }
                 })
         };
-        if !self.rules.iter().any(&eligible) {
+        if !self.rules.iter().any(eligible) {
             return true;
         }
         let value = if thinking {
@@ -760,12 +1111,23 @@ impl Monitor<'_> {
         }
         self.bytes += delta.len();
         value.push_str(delta);
-        self.hit = self
+        let value: &str = value;
+        let matched: Vec<&'a Rule> = self
             .rules
             .iter()
-            .filter(|rule| eligible(rule))
-            .find(|rule| rule.conditions.iter().any(|regex| regex.is_match(value)))
-            .map(|rule| rule.hit());
+            .copied()
+            .filter(|rule| {
+                eligible(rule)
+                    && !self.deferred.iter().any(|d| d.id == rule.id)
+                    && rule.conditions.iter().any(|regex| regex.is_match(value))
+            })
+            .collect();
+        for rule in matched {
+            if self.hit.is_some() {
+                break;
+            }
+            self.record(rule, rule.hit(), false);
+        }
         self.hit.is_none()
     }
     pub fn retry(&mut self) {
@@ -806,34 +1168,42 @@ impl Monitor<'_> {
             self.failure = Some("portable tool path coverage limit exceeded; split this attempt; no stale tools executed".into());
             return false;
         }
-        self.hit = self
+        let matched: Vec<&'a Rule> = self
             .rules
             .iter()
-            .find(|r| {
-                r.paths.as_ref().is_none_or(|set| {
-                    paths
-                        .as_ref()
-                        .is_some_and(|paths| paths.iter().any(|p| set.is_match(p)))
-                }) && r.scopes.iter().any(|scope| match scope {
-                    Scope::Tool {
-                        name,
-                        paths: scope_paths,
-                    } => {
-                        (name == "*" || name == tool)
-                            && scope_paths.as_ref().is_none_or(|set| {
-                                paths
-                                    .as_ref()
-                                    .is_some_and(|paths| paths.iter().any(|p| set.is_match(p)))
-                            })
-                    }
-                    _ => false,
-                }) && r.conditions.iter().any(|regex| regex.is_match(text))
+            .copied()
+            .filter(|r| {
+                !self.deferred.iter().any(|d| d.id == r.id)
+                    && r.paths.as_ref().is_none_or(|set| {
+                        paths
+                            .as_ref()
+                            .is_some_and(|paths| paths.iter().any(|p| set.is_match(p)))
+                    })
+                    && r.scopes.iter().any(|scope| match scope {
+                        Scope::Tool {
+                            name,
+                            paths: scope_paths,
+                        } => {
+                            (name == "*" || name == tool)
+                                && scope_paths.as_ref().is_none_or(|set| {
+                                    paths
+                                        .as_ref()
+                                        .is_some_and(|paths| paths.iter().any(|p| set.is_match(p)))
+                                })
+                        }
+                        _ => false,
+                    })
+                    && r.conditions.iter().any(|regex| regex.is_match(text))
             })
-            .map(|rule| {
-                let mut hit = rule.hit();
-                hit.paths = paths.unwrap_or_default();
-                hit
-            });
+            .collect();
+        for rule in matched {
+            if self.hit.is_some() {
+                break;
+            }
+            let mut hit = rule.hit();
+            hit.paths = paths.clone().unwrap_or_default();
+            self.record(rule, hit, true);
+        }
         self.hit.is_none()
     }
     fn structural(&mut self, call: &ToolCall) {
@@ -841,8 +1211,9 @@ impl Monitor<'_> {
             return;
         }
         let paths = call_paths(self.root, call);
-        for rule in &self.rules {
+        for rule in self.rules.clone() {
             if rule.ast.is_empty()
+                || self.deferred.iter().any(|d| d.id == rule.id)
                 || !rule.path(&paths)
                 || !rule.scopes.iter().any(|scope| match scope {
                     Scope::Tool {
@@ -862,9 +1233,11 @@ impl Monitor<'_> {
             match rule.ast.matches(&call.arguments) {
                 Ok(true) => {
                     let mut hit = rule.hit();
-                    hit.paths = paths;
-                    self.hit = Some(hit);
-                    return;
+                    hit.paths = paths.clone();
+                    self.record(rule, hit, true);
+                    if self.hit.is_some() {
+                        return;
+                    }
                 }
                 Ok(false) => {}
                 Err(error) => {
@@ -890,13 +1263,17 @@ impl Monitor<'_> {
         self.hit.is_none() && self.failure.is_none()
     }
 
+    /// Rechecks the complete reply. Deferred matches already seen while streaming, including
+    /// thinking matches the completed reply no longer carries, are kept.
     pub fn completed(&mut self, reply: &crate::llm::Reply) -> Option<Hit> {
         // Providers without argument deltas still have a pre-execution boundary.
         if self.rules.is_empty() || self.failure.is_some() {
             return self.hit.clone();
         }
         if self.hit.is_none() {
+            let deferred = std::mem::take(&mut self.deferred);
             self.restart();
+            self.deferred = deferred;
             self.text(&reply.text, false);
             for (index, call) in reply.tool_calls.iter().enumerate() {
                 if self.hit.is_some() || self.failure.is_some() {
@@ -1308,13 +1685,14 @@ fn globset(patterns: &[String], agent: bool) -> Result<GlobSet, String> {
     }
     builder.build().map_err(|e| format!("invalid globs: {e}"))
 }
-/// `/omfg` validation: parses one candidate exactly as discovery loads a project rule file.
+/// `/rule` validation: parses one candidate exactly as discovery loads a project rule file.
 pub(in crate::agent) fn parse_candidate(text: &str, source: &str) -> Result<Catalog, String> {
     let rule = parse_rule(text, source, false, false)?
         .ok_or_else(|| "rule is disabled (`enabled: false`)".to_string())?;
     Ok(Catalog {
         rules: vec![rule],
         warnings: Vec::new(),
+        repeat_after_turns: 0,
     })
 }
 fn parse_rule(
@@ -1343,19 +1721,11 @@ fn parse_rule(
                 | "astCondition"
                 | "astLanguage"
                 | "question"
-                | "ttsr_trigger"
-                | "ttsrTrigger"
         )
     }) {
         return Err(format!(
             "unsupported frontmatter field {key}; no operator controls may be set by rules"
         ));
-    }
-    if fields.contains_key("ttsr_trigger") || fields.contains_key("ttsrTrigger") {
-        return Err("legacy trigger aliases are unsupported; use condition".into());
-    }
-    if fields.contains_key("question") {
-        return Err("judged triggers are unsupported".into());
     }
     let ast_patterns = values(&fields, "astCondition", false)?.unwrap_or_default();
     let ast_language = values(&fields, "astLanguage", false)?;
@@ -1366,11 +1736,13 @@ fn parse_rule(
         &ast_patterns,
         ast_language.as_ref().map(|langs| langs[0].as_str()),
     )?;
-    if let Some(mode) = values(&fields, "interruptMode", false)?
-        && mode != ["always"]
-    {
-        return Err("only interruptMode: always is supported".into());
-    }
+    let interrupt = match values(&fields, "interruptMode", false)? {
+        None => Interrupt::Always,
+        Some(modes) => match modes.as_slice() {
+            [mode] => Interrupt::parse(mode)?,
+            _ => return Err("interruptMode requires one mode".into()),
+        },
+    };
     if fields.contains_key("applyTo") && fields.contains_key("globs") {
         return Err("use one path-scope field, not both applyTo and globs".into());
     }
@@ -1404,8 +1776,20 @@ fn parse_rule(
                 .map_err(|e| format!("invalid regex: {e}"))?,
         );
     }
-    if !always && paths.is_none() && conditions.is_empty() && ast.is_empty() {
-        return Err("rule needs globs, alwaysApply:true, or condition; manual/description-only rules are not auto-global".into());
+    let question = values(&fields, "question", false)?
+        .map(|questions| match questions.as_slice() {
+            [question] if !question.trim().is_empty() => Ok(question.trim().to_owned()),
+            _ => Err("question requires one nonempty question".to_owned()),
+        })
+        .transpose()?;
+    if question.is_some() && interrupt != Interrupt::Always {
+        return Err("judged question rules never interrupt; remove interruptMode".into());
+    }
+    if interrupt != Interrupt::Always && conditions.is_empty() && ast.is_empty() {
+        return Err("interruptMode applies only to rules with condition or astCondition".into());
+    }
+    if !always && paths.is_none() && conditions.is_empty() && ast.is_empty() && question.is_none() {
+        return Err("rule needs globs, alwaysApply:true, condition or question; manual/description-only rules are not auto-global".into());
     }
     let mut scopes = Vec::new();
     let scope_patterns = values(&fields, "scope", true)?
@@ -1465,6 +1849,8 @@ fn parse_rule(
         ast,
         scopes,
         scope_patterns,
+        interrupt,
+        question,
     }))
 }
 

@@ -445,6 +445,13 @@ fn find(provider: &str, model: &str) -> Option<BundledModel> {
     if let Some(public) = fireworks_public_id(&lower) {
         candidates.push(public);
     }
+    if let Some((base, suffix)) = lower.rsplit_once('-')
+        && suffix.len() == 8
+        && suffix.starts_with("20")
+        && suffix.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        candidates.push(base.to_owned());
+    }
     candidates
         .iter()
         .find_map(|id| models.index.get(id))

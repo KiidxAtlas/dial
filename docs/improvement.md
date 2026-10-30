@@ -230,7 +230,8 @@ api_key_env = "OPENAI_API_KEY"
 ```
 
 **Actionable advisor mode** (`--advisor` or `/advisor on`) is a separate, launch-scoped opt-in.
-While it is on, the coach also reviews every main-agent round that ran tool calls (live review):
+While it is on, the coach also reviews every main-agent round that ran tool calls and continues
+the turn (live review; a round that ends with an accepted `finish` gets the completion review instead):
 it sees the user goal and a bounded summary of that round's tool results and returns
 `{severity: none|aside|concern|blocker, note}`. A non-`none` note is added to the next request as
 one advisory guidance note and shown in the UI labelled by severity. Priorities: a blocker ranks

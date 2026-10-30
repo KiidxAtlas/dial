@@ -199,7 +199,7 @@ impl Shell {
         let overlay = match which {
             Which::Choice(spec) => ActiveOverlay::Palette(PaletteOverlay::choice(*spec)),
             Which::Palette => ActiveOverlay::Palette(PaletteOverlay::new(
-                palette_entries(&self.commands, &self.skills, &self.extension_commands),
+                palette_entries(&self.commands, &self.skills),
                 self.status.phase != Phase::Idle,
             )),
             Which::Compute => ActiveOverlay::Compute(ComputeOverlay::new()),

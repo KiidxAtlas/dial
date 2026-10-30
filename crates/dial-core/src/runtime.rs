@@ -4,7 +4,6 @@ pub mod cancellation;
 pub mod clock;
 pub mod evidence;
 pub mod execution;
-pub mod extensions;
 pub mod fingerprint;
 pub mod integration;
 pub mod json_transport;

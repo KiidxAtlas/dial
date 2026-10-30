@@ -49,8 +49,9 @@ const DESCRIPTION: &str = "Generate one image, or edit an existing workspace ima
     image-output capability, and write it to a new workspace file. Explicit image settings/role \
     win; otherwise available configured routes are selected automatically. ChatGPT hosted-image \
     support may be unverified for the model/account; provider rejection is reported without \
-    retrying another billing route. Output must be PNG, JPEG, or WebP, and the extension must \
-    match. Existing files are never overwritten and the source image is only read. The image is \
+    retrying another billing route. Output is PNG, JPEG, or WebP, chosen by the output extension; \
+    valid provider images are converted locally when needed (JPEG is lossy and drops transparency). \
+    Existing files are never overwritten and the source image is only read. The image is \
     attached for vision-capable models to inspect and revise into a new file. Requires approval.";
 
 /// Hosted session providers whose `images/generations` route returns base64 images:
@@ -87,8 +88,8 @@ pub fn auto_tools(config: &Config) -> Result<Vec<Arc<dyn Tool>>> {
     }
 }
 
-/// The file extension a new output should use for the resolved route, read from local state only
-/// (no generation or network probe). xAI returns JPEG; every other route can deliver PNG.
+/// The default file extension for the resolved route, read from local state only (no generation
+/// or network probe). xAI defaults to JPEG; other routes default to PNG, converting locally if needed.
 ///
 /// # Errors
 /// Returns the same route failures generation would report.
@@ -160,7 +161,7 @@ fn edit_unsupported(target: &Target) -> Option<String> {
 /// Per-model settings each image API accepts. `size` is the default for calls that omit it.
 fn supported(wire: Wire, model: &str) -> &'static [&'static str] {
     match wire {
-        Wire::MlxServe => &["size", "steps", "seed", "strength", "loras"],
+        Wire::MlxServe => &["size", "steps", "seed", "strength", "loras", "cond_weights"],
         Wire::OpenAi if model.starts_with("dall-e") => &["size", "quality"],
         Wire::OpenAi | Wire::Responses => &["size", "quality", "background", "moderation"],
         Wire::Xai | Wire::ChatCompletions => &["size"],
@@ -196,6 +197,10 @@ fn apply_settings(target: &Target, object: &mut Value, edit: bool) {
                     })
                     .collect();
                 object["lora_scales"] = settings.loras.iter().map(|lora| lora.scale).collect();
+                None
+            }
+            "cond_weights" if !settings.cond_weights.is_empty() => {
+                object["cond_weights"] = settings.cond_weights.iter().copied().collect();
                 None
             }
             _ => None,
@@ -488,7 +493,7 @@ impl Tool for ImageGen {
                 },
                 "output": {
                     "type": "string",
-                    "description": "Workspace-relative file to create. Its extension must match the returned format: .png, .jpg/.jpeg, or .webp."
+                    "description": "Workspace-relative file to create: .png, .jpg/.jpeg, or .webp. Valid provider images are converted locally to this format when needed; JPEG is lossy and drops transparency."
                 },
                 "image": {
                     "type": "string",
@@ -634,7 +639,7 @@ fn read_source(ctx: &ToolContext, relative: &str) -> Result<Source> {
 }
 
 /// Decodes an image fully under dimension and allocation limits.
-fn decode_bounded(bytes: &[u8]) -> Result<()> {
+fn decode_bounded(bytes: &[u8]) -> Result<image::DynamicImage> {
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .context("detecting image format")?;
@@ -643,8 +648,7 @@ fn decode_bounded(bytes: &[u8]) -> Result<()> {
     limits.max_image_height = Some(16_384);
     limits.max_alloc = Some(512 * 1024 * 1024);
     reader.limits(limits);
-    reader.decode()?;
-    Ok(())
+    reader.decode().context("decoding image")
 }
 
 fn parse_request(args: &Value) -> Result<Request<'_>> {
@@ -722,11 +726,21 @@ impl Format {
     }
 }
 
+impl From<Format> for image::ImageFormat {
+    fn from(format: Format) -> Self {
+        match format {
+            Format::Png => Self::Png,
+            Format::Jpeg => Self::Jpeg,
+            Format::Webp => Self::WebP,
+        }
+    }
+}
+
 struct Written {
     relative: String,
     path: PathBuf,
     format: Format,
-    bytes: usize,
+    bytes: u64,
     model: String,
     source: Option<String>,
 }
@@ -758,12 +772,10 @@ fn generate(
         .and_then(|value| value.to_str())
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
-    ensure!(
-        [Format::Png, Format::Jpeg, Format::Webp]
-            .iter()
-            .any(|format| format.extensions().contains(&extension.as_str())),
-        "image_gen output extension must be .png, .jpg/.jpeg, or .webp"
-    );
+    let format = [Format::Png, Format::Jpeg, Format::Webp]
+        .into_iter()
+        .find(|format| format.extensions().contains(&extension.as_str()))
+        .context("image_gen output extension must be .png, .jpg/.jpeg, or .webp")?;
     let target = resolve(ctx.config)?;
     if let Some(source) = source_arg(args)? {
         if let Some(reason) = edit_unsupported(&target) {
@@ -782,10 +794,6 @@ fn generate(
             request.size = "auto";
         }
     }
-    ensure!(
-        target.wire != Wire::MlxServe || extension == "png",
-        "MLX-Serve returns PNG images; use a .png output path"
-    );
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("output has no parent directory"))?;
@@ -796,24 +804,29 @@ fn generate(
     client.check()?;
     let bytes = request_image(&target, ctx.config, &request, &client)
         .map_err(|error| client.redact(error))?;
-    let format = Format::detect(&bytes)
+    let native_format = Format::detect(&bytes)
         .ok_or_else(|| anyhow!("image API returned data that is not PNG, JPEG, or WebP"))?;
-    decode_bounded(&bytes).context("decoding generated image")?;
+    let decoded = decode_bounded(&bytes).context("decoding generated image")?;
+    if native_format == format {
+        file.write_all(&bytes)
+            .with_context(|| format!("writing {}", request.output))?;
+    } else {
+        // JPEG cannot encode alpha; the caller chose that loss of transparency via the extension.
+        let decoded = if format == Format::Jpeg {
+            image::DynamicImage::ImageRgb8(decoded.into_rgb8())
+        } else {
+            decoded
+        };
+        decoded
+            .write_to(file.as_file_mut(), format.into())
+            .with_context(|| format!("converting generated image to {}", format.name()))?;
+    }
+    let written_bytes = file.as_file().metadata()?.len();
     ensure!(
-        format.extensions().contains(&extension.as_str()),
-        "{} is {} data; name the output with {}",
-        request.output,
-        format.name(),
-        format
-            .extensions()
-            .iter()
-            .map(|ext| format!(".{ext}"))
-            .collect::<Vec<_>>()
-            .join(" or ")
+        written_bytes <= MAX_RESPONSE_BYTES,
+        "generated image output exceeds {} MiB",
+        MAX_RESPONSE_BYTES / (1024 * 1024)
     );
-
-    file.write_all(&bytes)
-        .with_context(|| format!("writing {}", request.output))?;
     client.check()?;
     crate::tools::exec::execution::before_commit().map_err(|error| anyhow!(error))?;
     file.persist_noclobber(&path)
@@ -822,7 +835,7 @@ fn generate(
         relative: request.output.to_owned(),
         path,
         format,
-        bytes: bytes.len(),
+        bytes: written_bytes,
         model: target.model,
         source: request.source.map(|source| source.relative),
     })

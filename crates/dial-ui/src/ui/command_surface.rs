@@ -162,14 +162,14 @@ pub fn category(name: &str) -> Category {
         "workers" | "processes" | "bg" | "jobs" | "agents" | "message" | "cancel" | "queue"
         | "todo" | "goal" | "guided-goal" | "loop" | "btw" | "tan" | "compute" => Category::Work,
         "plan" | "plan-yolo" | "advisor" | "external-thinking" | "vibe" | "skillful"
-        | "prewalk" | "ratchet" | "omfg" | "debug" | "fresh" | "handoff" | "shake" | "cleanse" => {
+        | "prewalk" | "ratchet" | "rule" | "debug" | "fresh" | "handoff" | "shake" | "cleanse" => {
             Category::Modes
         }
         "context" | "compact" | "memory" | "skills" | "commands" | "add-dir" | "remove-dir"
         | "dirs" | "trace" => Category::Context,
-        "extensions" | "mcp" | "plugins" | "marketplace" | "reload-plugins" | "tools"
-        | "computer" | "ssh" | "git" | "wt" | "security" | "collab" | "join" | "leave" | "hub"
-        | "relay" | "hooks" | "login" | "logout" | "graphify" | "image" => Category::Integrations,
+        "extensions" | "mcp" | "tools" | "computer" | "ssh" | "git" | "wt" | "security"
+        | "collab" | "join" | "leave" | "hub" | "relay" | "hooks" | "login" | "logout"
+        | "graphify" | "image" => Category::Integrations,
         "gc" | "anonymize" | "images" | "update" | "benchmark" | "schedule" | "stats" => {
             Category::Maintenance
         }

@@ -362,7 +362,6 @@ fn before_provider_request_rewrites_validates_and_refuses() {
     let mut notices = Vec::new();
     let sent = provider_request(
         &[rewrite, check],
-        None,
         dir.path(),
         &request,
         &interrupt,
@@ -383,17 +382,7 @@ fn before_provider_request_rewrites_validates_and_refuses() {
         None,
         r#"printf '{"payload":{"messages":"nope"}}'"#,
     );
-    assert!(
-        provider_request(
-            &[malformed],
-            None,
-            dir.path(),
-            &request,
-            &interrupt,
-            &mut |_| {}
-        )
-        .is_err()
-    );
+    assert!(provider_request(&[malformed], dir.path(), &request, &interrupt, &mut |_| {}).is_err());
 
     // A block refuses the request and carries its reason.
     let blocked = hook(
@@ -401,21 +390,14 @@ fn before_provider_request_rewrites_validates_and_refuses() {
         None,
         r#"printf '{"decision":"block","reason":"no egress"}'"#,
     );
-    let error = provider_request(
-        &[blocked],
-        None,
-        dir.path(),
-        &request,
-        &interrupt,
-        &mut |_| {},
-    )
-    .unwrap_err()
-    .to_string();
+    let error = provider_request(&[blocked], dir.path(), &request, &interrupt, &mut |_| {})
+        .unwrap_err()
+        .to_string();
     assert!(error.contains("no egress"), "{error}");
 
     // Without hooks the request is sent unchanged and nothing is cloned.
     assert!(
-        provider_request(&[], None, dir.path(), &request, &interrupt, &mut |_| {})
+        provider_request(&[], dir.path(), &request, &interrupt, &mut |_| {})
             .unwrap()
             .is_none()
     );
@@ -450,11 +432,11 @@ fn matchers_are_compiled_once() {
 #[test]
 fn scheduling_ignores_hooks_that_match_other_tools() {
     let hooks = [hook("pre_tool_use", Some("bash"), "true")];
-    assert!(wanted_for_tool(&hooks, None, "pre_tool_use", "bash"));
-    assert!(!wanted_for_tool(&hooks, None, "pre_tool_use", "read"));
-    assert!(!wanted_for_tool(&hooks, None, "post_tool_use", "bash"));
+    assert!(wanted_for_tool(&hooks, "pre_tool_use", "bash"));
+    assert!(!wanted_for_tool(&hooks, "pre_tool_use", "read"));
+    assert!(!wanted_for_tool(&hooks, "post_tool_use", "bash"));
     let unmatched = [hook("tool_call", None, "true")];
-    assert!(wanted_for_tool(&unmatched, None, "pre_tool_use", "read"));
+    assert!(wanted_for_tool(&unmatched, "pre_tool_use", "read"));
 }
 
 fn chat(messages: Vec<Value>) -> crate::llm::Chat {
@@ -505,7 +487,6 @@ fn context_hook_replaces_one_request_without_touching_the_original() {
     ];
     let sent = provider_request(
         &hooks,
-        None,
         dir.path(),
         &original,
         &AtomicBool::new(false),
@@ -535,7 +516,6 @@ fn context_hook_invalid_or_oversized_replacements_are_skipped_and_blocks_refuse(
         let mut notices = Vec::new();
         let sent = provider_request(
             &[hook("context", None, &script)],
-            None,
             dir.path(),
             &original,
             &AtomicBool::new(false),
@@ -551,7 +531,6 @@ fn context_hook_invalid_or_oversized_replacements_are_skipped_and_blocks_refuse(
             None,
             r#"printf '{"messages":[{"nope":1}]}'"#,
         )],
-        None,
         dir.path(),
         &original,
         &AtomicBool::new(false),
@@ -564,7 +543,6 @@ fn context_hook_invalid_or_oversized_replacements_are_skipped_and_blocks_refuse(
     );
     let refused = provider_request(
         &[hook("context", None, "echo stale >&2; exit 2")],
-        None,
         dir.path(),
         &original,
         &AtomicBool::new(false),
@@ -598,7 +576,6 @@ fn additional_context_is_bounded_deduplicated_and_dropped_by_a_block() {
     ];
     let (result, context) = pre_tool_noted(
         &hooks,
-        None,
         dir.path(),
         "bash",
         &json!({}),
@@ -621,7 +598,6 @@ fn additional_context_is_bounded_deduplicated_and_dropped_by_a_block() {
     ];
     let (result, context) = pre_tool_noted(
         &hooks,
-        None,
         dir.path(),
         "bash",
         &json!({}),
@@ -648,7 +624,6 @@ fn post_tool_context_stays_outside_the_tool_result() {
             None,
             r#"printf '{"additional_context":"retry with --force-with-lease"}'"#,
         )],
-        None,
         dir.path(),
         "bash",
         &json!({}),
@@ -672,7 +647,6 @@ fn additional_context_is_ignored_on_events_that_do_not_deliver_it() {
     )];
     let outcome = fire_with(
         &hooks,
-        None,
         dir.path(),
         "stop",
         None,
@@ -697,7 +671,6 @@ fn assistant_message_hooks_get_the_reply_and_may_queue_context_but_never_block_i
     )];
     let outcome = fire_with(
         &hooks,
-        None,
         dir.path(),
         "assistant_message",
         None,
@@ -733,7 +706,6 @@ fn after_provider_response_reports_usage_and_cannot_block() {
     let mut notices = Vec::new();
     provider_response(
         &hooks,
-        None,
         dir.path(),
         "gpt-test",
         &reply,
@@ -766,7 +738,6 @@ fn session_change_gates_refuse_with_the_hook_reason_and_honor_aliases() {
         )];
         let refused = gate(
             &hooks,
-            None,
             dir.path(),
             event,
             json!({"reason":"branch"}),
@@ -783,7 +754,6 @@ fn session_change_gates_refuse_with_the_hook_reason_and_honor_aliases() {
     assert_eq!(
         gate(
             &hooks,
-            None,
             dir.path(),
             "session_before_branch",
             json!({}),
@@ -811,7 +781,6 @@ fn user_prompt_submit_prompt_rewrite_reaches_later_hooks_and_the_outcome() {
     );
     let outcome = fire_with(
         &[rewrite, check],
-        None,
         dir.path(),
         "user_prompt_submit",
         None,
@@ -842,7 +811,6 @@ fn before_compact_notes_are_attributed_bounded_and_discarded_on_refusal() {
     let mut notices = Vec::new();
     let note = gate_noted(
         &hooks,
-        None,
         root.path(),
         "before_compact",
         json!({}),
@@ -859,7 +827,6 @@ fn before_compact_notes_are_attributed_bounded_and_discarded_on_refusal() {
     assert_eq!(
         gate_noted(
             &hooks,
-            None,
             root.path(),
             "before_compact",
             json!({}),
@@ -875,7 +842,6 @@ fn before_compact_notes_are_attributed_bounded_and_discarded_on_refusal() {
     assert!(
         gate_noted(
             &hooks,
-            None,
             root.path(),
             "before_compact",
             json!({}),

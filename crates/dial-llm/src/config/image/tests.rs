@@ -10,6 +10,8 @@ fn settings(model: &str) -> ImageModelSettings {
 #[test]
 fn settings_are_found_by_exact_model_and_round_trip_through_toml() {
     let mut config = ImageConfig::default();
+    assert!(!config.allow_weight_edits);
+    config.allow_weight_edits = true;
     let mut flux = settings("mlx-community/flux2-klein-9b-4bit");
     flux.steps = Some(8);
     flux.seed = Some(4_241_330_180);

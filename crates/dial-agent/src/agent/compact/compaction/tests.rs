@@ -300,6 +300,7 @@ fn supplemental_context_counts_toward_native_budget_but_is_not_history() {
         timeout_secs: 5,
         user_dir: dir.path(),
         native_request: None,
+        retained_overhead_tokens: 0,
         supplemental_context: Some(&data),
     };
     let mut request = Chat {
@@ -320,4 +321,202 @@ fn supplemental_context_counts_toward_native_budget_but_is_not_history() {
         ..context
     };
     assert!(absent.supplemental_message().is_none());
+}
+
+#[test]
+fn summary_planning_reserves_commit_overhead_and_keeps_complete_tool_groups() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let policy = CompactionConfig::default();
+    let identity = CompactionIdentity {
+        provider: "endpoint",
+        model: "summarizer",
+        agent: None,
+    };
+    let mut messages = vec![
+        json!({"role":"system","content":"s".repeat(4000)}),
+        json!({"role":"user","content":"inspect the project"}),
+    ];
+    for i in 0..40 {
+        messages.push(json!({"role":"assistant","content":"","tool_calls":[{"id":format!("c{i}"),"function":{"name":"read","arguments":"{}"}}]}));
+        messages.push(json!({"role":"tool","tool_call_id":format!("c{i}"),"content":"x".repeat(4000)}));
+    }
+    let request = Chat {
+        messages,
+        tools: vec![],
+        temperature: 0.0,
+        max_tokens: 64,
+        seed: None,
+    };
+    for (window, overhead) in [(16_384, 3_000), (32_768, 8_000), (65_536, 20_000)] {
+        let context = CompactionContext {
+            identity,
+            window,
+            summary_window: 200_000,
+            summary_output_limit: Some(1_000),
+            timeout_secs: 5,
+            user_dir: user_dir.path(),
+            native_request: None,
+            retained_overhead_tokens: overhead,
+            supplemental_context: None,
+        };
+        let mut backend = compaction_backend();
+        let mut summary_requests = Vec::new();
+        let mut calls = 0;
+        let prepared = compact_history(
+            &mut backend,
+            HistoryCompaction {
+                request: &request,
+                policy: &policy,
+                context,
+                options: &CompactionOptions {
+                    method: Some(CompactionMethod::Soft),
+                    require_method: true,
+                    keep_recent_tokens: Some(20_000),
+                    ..Default::default()
+                },
+            },
+            Arc::new(AtomicBool::new(false)),
+            &mut crate::agent::NullUi,
+            &mut |_, chat, _| {
+                calls += 1;
+                summary_requests.push(serde_json::to_vec(&chat.messages).unwrap().len());
+                // Exercise recovery when returned text is larger than the output allowance.
+                Ok(if window == 32_768 {
+                    "S".repeat(16_000)
+                } else {
+                    "Summary: inspected the older results; continue the task.".into()
+                })
+            },
+            None,
+        )
+        .unwrap_or_else(|error| panic!("window {window}, overhead {overhead}: {error:#}"));
+        let history = prepared.history(&request);
+        let candidate = replacement_request(&request, &history);
+        assert!(calls > 0, "window {window}: the summary route was exercised");
+        assert!(
+            request_tokens_with_policy(&candidate, &policy, identity) + overhead
+                <= prompt_budget(&policy, window, backend.output_budget(request.max_tokens)),
+            "window {window}: the summary and tail must leave room for commit-time context"
+        );
+        assert!(complete_boundary(&history, history.len()), "window {window}");
+        assert_eq!(
+            &history[history.len() - 2..],
+            &request.messages[request.messages.len() - 2..],
+            "window {window}: preserve the newest call/result group verbatim"
+        );
+        if window == 32_768 {
+            assert!(calls > 1, "an oversized summary requires an incremental fold");
+            assert!(
+                summary_requests.last().unwrap() < summary_requests.first().unwrap(),
+                "the fold must not replay the full original prefix"
+            );
+        }
+    }
+}
+
+#[test]
+fn impossible_retained_context_is_rejected_before_requesting_a_summary() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let policy = CompactionConfig::default();
+    for (label, overhead, newest_bytes) in [
+        ("fixed carry cannot fit", 32_768, 100),
+        ("newest indivisible group cannot fit", 0, 200_000),
+    ] {
+        let request = Chat {
+            messages: vec![
+                json!({"role":"user","content":"older task"}),
+                json!({"role":"assistant","content":"old answer"}),
+                json!({"role":"assistant","content":"","tool_calls":[{"id":"new","function":{"name":"read","arguments":"{}"}}]}),
+                json!({"role":"tool","tool_call_id":"new","content":"x".repeat(newest_bytes)}),
+            ],
+            tools: vec![],
+            temperature: 0.0,
+            max_tokens: 64,
+            seed: None,
+        };
+        let result = compact_history(
+            &mut compaction_backend(),
+            HistoryCompaction {
+                request: &request,
+                policy: &policy,
+                context: CompactionContext {
+                    identity: CompactionIdentity {
+                        provider: "endpoint",
+                        model: "summarizer",
+                        agent: None,
+                    },
+                    window: 32_768,
+                    summary_window: 200_000,
+                    summary_output_limit: Some(1_000),
+                    timeout_secs: 5,
+                    user_dir: user_dir.path(),
+                    native_request: None,
+                    retained_overhead_tokens: overhead,
+                    supplemental_context: None,
+                },
+                options: &CompactionOptions {
+                    method: Some(CompactionMethod::Soft),
+                    require_method: true,
+                    ..Default::default()
+                },
+            },
+            Arc::new(AtomicBool::new(false)),
+            &mut crate::agent::NullUi,
+            &mut |_, _, _| panic!("{label}: no summary request can recover this context"),
+            None,
+        );
+        assert!(result.is_err(), "{label}: refuse without replacing history");
+    }
+}
+
+#[test]
+fn safe_manual_noop_does_not_reserve_context_that_will_not_be_regenerated() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let request = Chat {
+        messages: vec![json!({"role":"user","content":"a short task"})],
+        tools: vec![],
+        temperature: 0.0,
+        max_tokens: 64,
+        seed: None,
+    };
+    let result = compact_history(
+        &mut compaction_backend(),
+        HistoryCompaction {
+            request: &request,
+            policy: &CompactionConfig::default(),
+            context: CompactionContext {
+                identity: CompactionIdentity {
+                    provider: "endpoint",
+                    model: "summarizer",
+                    agent: None,
+                },
+                window: 32_768,
+                summary_window: 200_000,
+                summary_output_limit: Some(1_000),
+                timeout_secs: 5,
+                user_dir: user_dir.path(),
+                native_request: None,
+                retained_overhead_tokens: 32_768,
+                supplemental_context: None,
+            },
+            options: &CompactionOptions::default(),
+        },
+        Arc::new(AtomicBool::new(false)),
+        &mut crate::agent::NullUi,
+        &mut |_, _, _| panic!("a safe manual no-op must not request a summary"),
+        None,
+    );
+    assert!(result.err().unwrap().is::<NothingToCompact>());
+}
+
+fn compaction_backend() -> Backend {
+    Backend::new(
+        crate::llm::provider::ProviderKind::Endpoint {
+            base_url: "http://127.0.0.1:9/v1".to_owned(),
+            model: "summarizer".to_owned(),
+            api_key: None,
+        },
+        std::path::PathBuf::from("/nonexistent/python"),
+        5,
+    )
 }

@@ -504,4 +504,28 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Prefer specialist workers and tester-owned verification when useful. Off keeps coupled implementation and focused testing in the main loop, delegating for independent parallel work, fresh-context review or context isolation. Guidance only; permissions and worker limits are unchanged.",
         Kind::Bool,
     ),
+    field!(
+        "portable_rules.repeat_after_turns",
+        portable_rules.repeat_after_turns,
+        TO,
+        "Portable rules",
+        "Repeat after turns",
+        "User turns after which a stream rule that already fired may fire again. 0 fires each rule at most once per session; its reminder stays delivered either way.",
+        Kind::Int {
+            min: 0,
+            max: 1000,
+            step: 1
+        },
+        true
+    ),
+    field!(
+        "portable_rules.judge",
+        portable_rules.judge,
+        TO,
+        "Portable rules",
+        "Judge question rules",
+        "Ask judged `question` rules about each completed main-agent reply. Auto: only when the judge role is assigned. On: the judge role, falling back to small and then the main model. Off: never. Judging never interrupts a reply.",
+        Kind::Enum(RULE_JUDGE),
+        true
+    ),
 ];

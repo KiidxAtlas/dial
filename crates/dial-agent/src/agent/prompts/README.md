@@ -39,7 +39,7 @@ the common policy into model code.
 | Lean guidance (`lean`) | `base/lifecycle.rs::rebuild_system`: `lean_tools` (context-overflow fallback), `lean_local()` or `local_escalated()`; local tier/escalation decisions stay in `model/local_profile.rs` | `window/prompt.rs::full_guidance`, `system.rs::LEAN_*` |
 | One-call operation (`one_call`) | `model/local_profile.rs::local_one_call`: small local tier with reliability enabled and no passing saved batch fixture | `window/prompt.rs::full_guidance`: `LEAN_ONE_CALL` replaces `LEAN_BATCHING`; explicit workflow composition selects the standalone todo step. The active request contract overrides batching/todo pairing on every tier, including later reliability recovery |
 | Worked loop (`worked_example`) | `base/lifecycle.rs::rebuild_system`: `local_one_call()` | `window/prompt.rs::worked_example` / `example_edit`: active edit grammar; requires `grep`, `read`, `edit` and either `check` (preferred) or `bash`; built-in guidance only |
-| Concise reporting (`concise_guidance`) | `base/lifecycle.rs::rebuild_system`: efficiency enabled, non-hermetic run | `window/prompt.rs::full_guidance` / `scoped_guidance`: shorter delivery/delegation, not different tool policy or workflow |
+| Compact guidance (`concise_guidance`) | `base/lifecycle.rs::rebuild_system`: efficiency enabled, non-hermetic run | `window/prompt.rs::full_guidance` / `scoped_guidance`: compact engineering, execution, workflow, delivery and delegation, with full tool policy and visual rules; `environment_prompt` bounds searchable deferred MCP previews without changing eligibility |
 | Capability scoping | Configured tool offer, not transient tool loading | `window/prompt.rs::full_guidance` / `scoped_guidance`: tool-specific rules, visual/preview sections and delegation sections |
 | Delegation preference (`prefer_subagents`) | `base/lifecycle.rs::rebuild_system`: `task.prefer_subagents` | `window/prompt.rs::scoped_guidance`: shared selective/specialist policy, only when `task` is offered |
 
@@ -51,9 +51,10 @@ an explicit selection condition and evaluation again after model upgrades. Assem
 alone do not establish a live-model improvement.
 
 Presentation inputs are named in `window/prompt.rs::Presentation`; one-call mode implies lean
-workflow, while concise reporting alone does not narrow workflow or tools. Tool loading does not
-rewrite these sections; local escalation can rebuild them at turn boundaries. Verification follows
-the selected delegation preference and existing check ownership, not merely tool availability.
+workflow. Compact guidance reuses existing short policy sections without narrowing the tool offer
+or changing approval/check enforcement. Tool loading does not rewrite these sections; local
+escalation can rebuild them at turn boundaries. Verification follows the selected delegation
+preference and existing check ownership, not merely tool availability.
 
 Custom-template deduplication recognizes complete normalized lines/blocks (including note bullets),
 not embedded substrings. Notes are filtered individually in both inline and message-band assembly.
@@ -77,7 +78,7 @@ here just to make a second catalog. This index is the common navigation entry po
 | [window/prompt.rs](../window/prompt.rs) | Environment/MCP/context trust framing, schema-shaped worked examples, template data and message ordering are assembly code |
 | [workers/child.rs](../workers/child.rs), [workers/subagents.rs](../workers/subagents.rs) | Role/assignment envelopes and lifecycle-specific instructions depend on admitted permissions, coordination and execution state |
 | [modes/cleanse/prompts.rs](../modes/cleanse/prompts.rs) | Already isolated prompt renderer, coupled to cleanse discovery and assignment types |
-| [modes/resources/omfg.md](../modes/resources/omfg.md) | Existing compile-time mode resource, loaded by its owner |
+| [modes/resources/rule_author.md](../modes/resources/rule_author.md) | Existing compile-time mode resource, loaded by its owner |
 | [commit/prompts.rs](../../commit/prompts.rs), [commit/prompts/](../../commit/prompts/), [commit/agentic/prompts/](../../commit/agentic/prompts/), [commit/changelog/prompts/](../../commit/changelog/prompts/) | Separate commit/changelog workflow with its own output formats and consumers |
 | [dial-computer prompts](../../../../dial-computer/src/computer/prompts/computer.md) | Desktop capability contract belongs to the lower-layer computer crate |
 | [tool surface](../../../../dial-tools/src/tools/surface/) | Tool descriptions, schemas and contract identities belong to the tool owner; do not duplicate them in system policy |

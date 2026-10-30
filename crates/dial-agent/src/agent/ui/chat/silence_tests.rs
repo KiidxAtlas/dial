@@ -22,6 +22,30 @@ fn provider_backoff_is_not_a_silent_stall() {
 }
 
 #[test]
+fn remote_watchdog_never_undercuts_the_transport_stall_limit() {
+    // (configured, local, transport) -> effective
+    for (configured, local, transport, effective) in [
+        // Hosted reasoning may be silent up to the transport's semantic-progress limit.
+        (30, false, 300, 300),
+        (600, false, 300, 600),
+        // An unlimited remote transport leaves no remote silence limit either.
+        (30, false, 0, 0),
+        // Local routes keep the configured generation-silence limit.
+        (30, true, 300, 30),
+        (30, true, 0, 30),
+        // Disabled stays disabled.
+        (0, false, 300, 0),
+        (0, true, 300, 0),
+    ] {
+        assert_eq!(
+            silence_limit_secs(configured, local, transport),
+            effective,
+            "configured={configured} local={local} transport={transport}"
+        );
+    }
+}
+
+#[test]
 fn live_retry_control_reaches_the_ui_through_state_ui_and_is_unbound_on_finish() {
     struct RetryUi {
         control: Option<llm::provider::RetryControl>,

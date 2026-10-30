@@ -34,7 +34,7 @@ fn short_and_stop_words_never_match_on_their_own() {
     let skills = [skill("review", "Review this and that with care")];
     assert_eq!(match_hint(&skills, "this is with that"), None);
     assert_eq!(match_hint(&skills, "review the diff"), Some(
-        "Skill hint: review may match this request. Load the matching skill with the `skill` tool before covered work."
+        "Skill hint: review may match this request. If a matching skill covers substantial multi-step work, load it with the `skill` tool in the same response as your first reads, not as a round of its own."
             .into()
     ));
 }

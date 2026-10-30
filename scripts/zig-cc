@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# C compiler for local cross-target checks (scripts/preflight.sh): `scripts/zig-cc <zig-target> ...`
+# runs `zig cc -target <zig-target>`. cc-rs also passes clang-style `--target=<rust triple>`,
+# which zig does not understand, so that flag is dropped.
+set -euo pipefail
+target="$1"
+shift
+args=()
+for arg in "$@"; do
+  case "$arg" in
+    --target=*) ;;
+    *) args+=("$arg") ;;
+  esac
+done
+exec zig cc -target "$target" ${args[@]+"${args[@]}"}

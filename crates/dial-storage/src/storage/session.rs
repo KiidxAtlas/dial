@@ -2225,7 +2225,7 @@ impl Session {
         })
     }
 
-    /// Appends a non-model record, such as a plugin transcript entry. Model context never reads
+    /// Appends a non-model record, such as a training-turn capture. Model context never reads
     /// these entries; they exist for replay and display only.
     pub fn append_custom_entry(
         &mut self,

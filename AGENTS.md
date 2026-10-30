@@ -35,7 +35,13 @@ make test-module MOD=llm::retry  # fast loop for one module (searches every crat
 make test-integration          # integration test binary
 make test-rust                 # whole workspace
 make test-nextest              # same suite under cargo-nextest, if installed (.config/nextest.toml)
+make preflight-quick           # fmt + clippy (host and Linux) + musl/Windows/slim compile checks
+make preflight                 # every CI check on a clean snapshot of HEAD; run before pushing
 ```
+
+`make preflight` checks the committed tree, not the working tree, so commit first; it skips trees
+that already passed. With `make hooks` it runs on every `git push`. See
+[`docs/release-and-install.md`](docs/release-and-install.md#checking-a-commit-locally-before-pushing).
 
 Report the commands you actually ran. Tests that need a model, a display, a device or network are
 optional tiers (`make test-mlx`, `make test-smoke`); never present a skipped tier as passing.

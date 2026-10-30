@@ -18,7 +18,7 @@
 //!   The sandbox forbids creating them from inside bash, but a pre-existing
 //!   hard link in the workspace would be readable.
 //!   Likewise, pre-existing hard links to protected Dial files are not identified by path checks.
-//! * Native protected-path checks do not confine external language servers, plugins, remote SSH
+//! * Native protected-path checks do not confine external language servers, MCP servers, remote SSH
 //!   tools, or unsandboxed shell commands; those need their own execution/approval boundary.
 //! * Timeouts kill the bash process group. A command that calls `setsid` can
 //!   outlive the call (still sandboxed, but orphaned).
@@ -63,12 +63,27 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Selected tools withheld from the default per-request offer. They stay in the catalog, so the
 /// system prompt lists them under "Loadable tools" and `tool_load` (or `tool_search`) enables them
-/// for the next round; schemas and historical contracts are unchanged. Each overlaps a tool that
-/// stays offered: `memory_update` corrects a fact by the id and revision only `recall` supplies
-/// (`retain` records new facts), and `ast_search` is the structural variant of `grep`/`find`,
-/// joining `ast_edit`, which was already loadable. An operator-pinned `[harness] tools` list, a
-/// hermetic run and the selection lent to subagents keep every selected tool offered.
-pub const DEFERRED_BY_DEFAULT: &[&str] = &["memory_update", "ast_search"];
+/// for the next round; schemas and historical contracts are unchanged. Each is either an
+/// overlapping variant of a tool that stays offered (`memory_update` corrects a fact by the id and
+/// revision only `recall` supplies; `ast_search` is the structural variant of `grep`/`find`; `git`
+/// overlaps `bash`) or a specialist most turns never call (language servers, MCP runtime status,
+/// archived-session search, independent-session coordination and side questions). Two stay
+/// offered: `working_state`, the record that survives compaction, and `codebase_memory`, whose
+/// saved understanding feeds the ambient codebase context; a long task should not pay a discovery
+/// round to keep either. The deferred schemas cost about 10 KB on every request; a first use costs
+/// one `tool_load` round, after which the tool stays offered for the session. An operator-pinned
+/// `[harness] tools` list, a hermetic run and the selection lent to subagents keep every selected
+/// tool offered.
+pub const DEFERRED_BY_DEFAULT: &[&str] = &[
+    "memory_update",
+    "ast_search",
+    "lsp",
+    "git",
+    "mcp_servers",
+    "session_search",
+    "peers",
+    "side_request",
+];
 
 const MAX_LIST: usize = 500;
 

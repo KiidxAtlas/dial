@@ -1,7 +1,0 @@
-{
-  "name": "build-dashboard",
-  "version": "0.1.0",
-  "description": "Approved build/test commands with watched-source status",
-  "apiVersion": 1,
-  "python": {"entry": "extension.py", "runtime": "worker", "dependencies": []}
-}

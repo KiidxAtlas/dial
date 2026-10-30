@@ -185,6 +185,78 @@ fn coach_finish_repairs_once_and_discloses_remaining_gaps() {
 }
 
 #[test]
+fn accepted_finish_skips_live_advice_but_keeps_completion_review() {
+    use crate::agent::verify::completion::TurnOutcome;
+    #[derive(Default)]
+    struct CoachEvents(Vec<String>);
+    impl crate::agent::Ui for CoachEvents {
+        fn event(&mut self, event: &crate::agent::ui::ui_event::UiEvent) {
+            if event.kind == crate::agent::ui::ui_event::EventKind::Coach {
+                self.0.push(event.text.clone());
+            }
+        }
+    }
+    for (outcome, expected) in [
+        ("completed", TurnOutcome::Completed),
+        ("blocked", TurnOutcome::Blocked),
+        ("needs_input", TurnOutcome::NeedsInput),
+    ] {
+        let mut args = json!({"outcome":outcome,"summary":"Inspected notes."});
+        if outcome != "completed" {
+            args["reason"] = json!("Which file should be inspected next?");
+        }
+        // Spare malformed coach replies let a redundant live review run and fail visibly instead
+        // of waiting on a closed server. Unused scripts are never awaited by this test.
+        let server = fake::serve(vec![
+            sse_tool_call("finish", args),
+            sse_reply("not JSON"),
+            sse_reply("not JSON"),
+        ]);
+        let mut config = coached_config(&server.url);
+        config.provider = Some("endpoint".into());
+        config.model = "test".into();
+        config.image.auto = false;
+        let dir = workspace();
+        let mut agent = new_agent(&config, &server.url, dir.path());
+        // Exercise the live advisor, which is intentionally disabled in hermetic mode.
+        agent.hermetic = false;
+        agent.set_advisor(true);
+        agent
+            .push(json!({"role":"user","content":"Inspect notes"}))
+            .unwrap();
+        let mut backend = agent.backend.take().unwrap();
+        let mut schemas = vec![crate::agent::verify::completion::schema()];
+        let mut ui = CoachEvents::default();
+        let (report, _) = agent
+            .run_loop(
+                &mut backend,
+                &["finish".into()],
+                &mut schemas,
+                4,
+                "Inspect notes",
+                &mut ui,
+            )
+            .unwrap();
+        assert_eq!(report.outcome, expected, "{outcome}");
+        assert!(
+            ui.0.iter().all(|event| !event.contains("round review")),
+            "{outcome}: terminal finish started live advice: {:?}",
+            ui.0
+        );
+        let completion_reviews =
+            ui.0.iter()
+                .filter(|event| event.starts_with("Coach review skipped"))
+                .count();
+        assert_eq!(
+            completion_reviews,
+            usize::from(outcome == "completed"),
+            "{outcome}: {:?}",
+            ui.0
+        );
+    }
+}
+
+#[test]
 fn malformed_coach_review_does_not_loop_or_hide_original_reply() {
     let server = fake::serve(vec![sse_reply("Answer."), sse_reply("not JSON")]);
     let config = coached_config(&server.url);

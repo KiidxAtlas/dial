@@ -376,6 +376,8 @@ fn slots() -> llm::fake::Script {
     llm::fake::json(200, &json!({"total_slots":1}))
 }
 
+const FAILING_NOTE_CHECK: &str = "[compaction]\nenabled=false\n[[verification.commands]]\nname=\"notes\"\ncommand=\"echo note check failed; exit 1\"\nfile_extensions=[\"txt\"]\ntimeout_secs=5\n";
+
 #[test]
 fn an_edit_with_no_passing_check_is_reminded_once_then_disclosed() {
     let server = llm::fake::serve(vec![
@@ -385,9 +387,9 @@ fn an_edit_with_no_passing_check_is_reminded_once_then_disclosed() {
         ),
         slots(),
         response("The note is written.", None),
-        response("The note is written; I did not run the check.", None),
+        response("The note is written; the check still fails.", None),
     ]);
-    let report = with_agent(NOTE_CHECK, |agent| {
+    let report = with_agent(FAILING_NOTE_CHECK, |agent| {
         connect(agent, &server.url);
         agent.turn("Write the note", &mut NullUi).unwrap()
     });
@@ -400,7 +402,39 @@ fn an_edit_with_no_passing_check_is_reminded_once_then_disclosed() {
     let requests = completion_requests(&server);
     assert_eq!(requests.len(), 3, "exactly one reminder round");
     assert!(mentions(&requests[2], "no relevant check has passed"));
+    assert!(
+        mentions(&requests[2], "note check failed"),
+        "the reminder carries the gate's own check output"
+    );
     assert!(!mentions(&requests[1], "no relevant check has passed"));
+}
+
+#[test]
+fn the_completion_gate_runs_a_passing_check_instead_of_spending_a_reminder_round() {
+    let server = llm::fake::serve(vec![
+        response(
+            "",
+            Some(("write", json!({"path":"note.txt","content":"x\n"}))),
+        ),
+        slots(),
+        response("The note is written.", None),
+    ]);
+    let report = with_agent(NOTE_CHECK, |agent| {
+        connect(agent, &server.url);
+        let report = agent.turn("Write the note", &mut NullUi).unwrap();
+        assert_eq!(
+            agent.step_checks.evidence.latest_status("test -f note.txt"),
+            Some(crate::agent::verify::verification::CheckStatus::Passed)
+        );
+        report
+    });
+    assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+    assert!(!report.text.contains("Unverified"), "{}", report.text);
+    assert_eq!(
+        completion_requests(&server).len(),
+        2,
+        "no reminder round when the gate's own run passes"
+    );
 }
 
 #[test]

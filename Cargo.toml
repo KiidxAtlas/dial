@@ -52,6 +52,8 @@ encoding_rs = "0.8"
 tempfile = "3"
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 sha2 = "0.10"
+safetensors = "0.8"
+half = "2"
 sha1 = "0.10"
 ring = "0.17"
 # The SDK default HTTPS client would pull aws-lc-rs (a C build); its HTTP client is built on ring instead.

@@ -344,7 +344,7 @@ pub(super) fn start_request(start: &Start<'_>) -> Result<Value> {
         mcp_tools.push(json!({
             "name": name,
             "originalToolName": name,
-            "serverName": "omp",
+            "serverName": "dial",
             "description": function.get("description").and_then(Value::as_str).unwrap_or(""),
             "inputSchema": schema.to_string(),
             "isApproved": true,
@@ -391,7 +391,7 @@ fn flow_config(system: &str) -> Value {
         }],
         "routers": [{ "from": AGENT_NAME, "to": "end" }],
         "prompts": [{
-            "name": "OMP inline prompt",
+            "name": "Dial inline prompt",
             "prompt_id": PROMPT_ID,
             "unit_primitives": ["duo_agent_platform"],
             "prompt_template": {

@@ -1111,8 +1111,9 @@ fn cloud_tool_economy_preserves_core_and_requires_loading_specialists() {
             .collect::<Vec<_>>()
     };
     let initial = names(0);
-    // Core tools are always offered, including `task`, `skill`, `message`, `check`, `side_request`
-    // and the memory tools, so the initial set is the core, not `initial_tool_limit`.
+    // Core tools are always offered, including `task`, `skill`, `message`, `check`,
+    // `working_state` and the memory tools, so the initial set is the core, not
+    // `initial_tool_limit`. Specialists such as `side_request` and `git` are loadable.
     assert!(initial.len() <= 21, "{initial:?}");
     for core in [
         "read",
@@ -1129,9 +1130,11 @@ fn cloud_tool_economy_preserves_core_and_requires_loading_specialists() {
         "tool_search",
         "artifact_read",
         "working_state",
-        "side_request",
     ] {
         assert!(initial.contains(&core), "{core}");
+    }
+    for deferred in ["side_request", "git", "lsp", "peers"] {
+        assert!(!initial.contains(&deferred), "{deferred}");
     }
     assert!(!initial.contains(&"web_fetch"));
     assert!(names(1).contains(&"web_fetch"));

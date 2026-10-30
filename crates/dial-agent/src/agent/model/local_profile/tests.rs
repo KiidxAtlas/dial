@@ -173,7 +173,7 @@ fn small_tier_defaults_to_one_call_with_a_worked_example() {
             text.contains(r#"\"old_string\":\"    total / size\""#),
             "{text}"
         );
-        assert!(!text.contains("load it with `skill` first"));
+        assert!(!text.contains(crate::agent::prompts::system::SKILL_RULE));
         agent.rebuild_system();
         assert_eq!(prompt_text(agent), text, "byte-stable");
     });

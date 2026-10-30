@@ -15,8 +15,6 @@ use crate::tools::integrations::mcp::catalog::{
     self, CURATED, Candidate, CheckFailure, Endpoints, Install, Source,
 };
 use crate::tools::integrations::mcp::{foreign, smithery};
-use crate::tools::integrations::plugin::installer::PluginStore;
-use crate::tools::integrations::plugin::marketplace::{Marketplaces, SkillListing};
 use crate::ui::overlay::extensions::ExtensionsOverlay;
 use crate::ui::overlay::extensions::model::{
     CatalogUpdate, Field, Form, Intent, JobProgress, Origin, Row, SharedCatalog, SharedProgress,
@@ -37,17 +35,13 @@ use std::{
 #[derive(Default)]
 pub(crate) struct Snapshot {
     pub mcp: Vec<Row>,
-    pub plugins: Vec<Row>,
     pub skills: Vec<Row>,
-    pub marketplaces: Vec<Row>,
 }
 
 pub(crate) fn snapshot(layout: &Layout, config: &Config) -> Snapshot {
     Snapshot {
         mcp: mcp_rows(config, foreign::home_dir().as_deref()),
-        plugins: plugin_rows(config),
-        skills: skill_rows(layout, config),
-        marketplaces: marketplace_rows(config),
+        skills: skill_rows(layout),
     }
 }
 
@@ -77,9 +71,9 @@ pub(crate) fn refresh(panel: &mut ExtensionsOverlay, layout: &Layout, config: &C
         .filter(|row| row.origin == Origin::Remote)
         .cloned();
     rows.mcp.extend(found);
-    panel.set_snapshot(rows.mcp, rows.plugins, rows.skills, rows.marketplaces);
+    panel.set_snapshot(rows.mcp, rows.skills);
     // Listings are fetched in the background; the rows above already show what is cached.
-    for tab in [Tab::Mcp, Tab::Plugins, Tab::Skills] {
+    for tab in [Tab::Mcp, Tab::Skills] {
         fetch_catalog(panel, layout, config, tab, String::new());
     }
 }
@@ -107,7 +101,7 @@ pub(crate) fn fetch_catalog(
     panel.attach_catalog(tab, query, listing);
 }
 
-fn skill_rows(layout: &Layout, config: &Config) -> Vec<Row> {
+fn skill_rows(layout: &Layout) -> Vec<Row> {
     let installed = packages::list_packages(layout).unwrap_or_default();
     let mut taken = installed_skill_names(&installed);
     let mut rows: Vec<Row> = installed
@@ -131,11 +125,7 @@ fn skill_rows(layout: &Layout, config: &Config) -> Vec<Row> {
             }
         })
         .collect();
-    let found = match Marketplaces::new(marketplaces_root(config)).skills(None) {
-        Ok(listed) => listed.into_iter().map(listing_entry).collect(),
-        Err(_) => Vec::new(),
-    };
-    rows.extend(available_skills(found, &mut taken));
+    rows.extend(available_skills(Vec::new(), &mut taken));
     rows
 }
 
@@ -148,17 +138,6 @@ fn installed_skill_names(installed: &[packages::Package]) -> BTreeSet<String> {
             std::iter::once(package.name.clone()).chain(package.skills.iter().cloned())
         })
         .collect()
-}
-
-fn listing_entry(skill: SkillListing) -> (String, SkillEntry) {
-    (
-        skill.marketplace,
-        SkillEntry {
-            name: skill.name,
-            description: skill.description,
-            url: skill.url,
-        },
-    )
 }
 
 /// Rows for skills that are not installed. `taken` starts with the installed names and grows, so
@@ -289,113 +268,6 @@ pub(super) fn server_command(server: &McpServerConfig) -> String {
     } else {
         summary
     }
-}
-
-fn plugin_rows(config: &Config) -> Vec<Row> {
-    let mut rows = Vec::new();
-    if let Ok(installed) = PluginStore::new(plugins_root(config)).list() {
-        for plugin in installed {
-            rows.push(Row {
-                id: plugin.name.clone(),
-                title: plugin.name.clone(),
-                summary: plugin.version.clone().unwrap_or_else(|| "installed".into()),
-                tags: vec!["installed".into()],
-                origin: Origin::Installed,
-                state: if plugin.enabled {
-                    State::Enabled
-                } else {
-                    State::Disabled
-                },
-                details: vec![
-                    format!("source: {}", plugin.source),
-                    format!("location: {}", plugin.path.display()),
-                ],
-            });
-        }
-    }
-    // Marketplace entries come from the cached index; refresh runs through `/marketplace refresh`.
-    if let Ok(entries) = Marketplaces::new(marketplaces_root(config)).entries(None) {
-        for entry in entries {
-            let id = format!("{}@{}", entry.name, entry.marketplace);
-            let installed = rows
-                .iter()
-                .any(|r| r.id == id || (r.origin == Origin::Installed && r.id == entry.name));
-            if installed {
-                continue;
-            }
-            rows.push(Row {
-                id,
-                title: entry.name.clone(),
-                summary: entry.description.clone().unwrap_or_default(),
-                tags: vec![entry.marketplace.clone()],
-                origin: Origin::Remote,
-                state: State::Available,
-                details: vec![
-                    format!("marketplace: {}", entry.marketplace),
-                    format!("source: {}", entry.source),
-                    format!("installs to: {}", plugins_root(config).display()),
-                ],
-            });
-        }
-    }
-    rows
-}
-
-fn plugins_root(config: &Config) -> PathBuf {
-    config.user_dir.join("plugins")
-}
-
-fn marketplaces_root(config: &Config) -> PathBuf {
-    config.user_dir.join("marketplaces")
-}
-
-/// Rows for the Marketplaces tab: one per registered marketplace, with what it offers.
-fn marketplace_rows(config: &Config) -> Vec<Row> {
-    let markets = Marketplaces::new(marketplaces_root(config));
-    let Ok(infos) = markets.list() else {
-        return Vec::new();
-    };
-    infos
-        .into_iter()
-        .map(|info| {
-            let plugins = markets
-                .entries(Some(info.name.as_str()))
-                .map_or(0, |e| e.len());
-            let skills = markets
-                .skills(Some(info.name.as_str()))
-                .map_or(0, |s| s.len());
-            let refreshed = info
-                .refreshed_at
-                .map_or_else(|| "never".to_owned(), |time| time.to_string());
-            Row {
-                id: info.name.clone(),
-                title: info.name.clone(),
-                summary: format!("{plugins} plugins · {skills} skills"),
-                tags: if info.builtin {
-                    vec!["built-in".into()]
-                } else {
-                    Vec::new()
-                },
-                origin: Origin::Installed,
-                state: if info.enabled {
-                    State::Enabled
-                } else {
-                    State::Disabled
-                },
-                details: vec![
-                    format!(
-                        "index: {}",
-                        if info.builtin {
-                            "built into Dial".to_owned()
-                        } else {
-                            info.index.clone()
-                        }
-                    ),
-                    format!("refreshed: {refreshed}"),
-                ],
-            }
-        })
-        .collect()
 }
 
 fn mcp_cache_dir(user_dir: &Path) -> PathBuf {
@@ -667,15 +539,6 @@ fn run_at(
                 path: format!("mcp.{id}"),
             }],
         }),
-        Intent::InstallPlugin { id } => install_plugin(config, id, progress),
-        Intent::RemovePlugin { id } => {
-            PluginStore::new(plugins_root(config)).remove(id)?;
-            Ok(Outcome {
-                ok: true,
-                message: format!("Removed plugin {id}"),
-                changes: Vec::new(),
-            })
-        }
         Intent::RemoveSkill { id } => {
             let message = packages::remove(layout, id)?;
             Ok(Outcome {
@@ -709,35 +572,6 @@ fn run_at(
                 changes: Vec::new(),
             })
         }
-        Intent::AddMarketplace { name, index } => {
-            Marketplaces::new(marketplaces_root(config)).add(name, index)?;
-            Ok(Outcome {
-                ok: true,
-                message: format!("Added marketplace {name}"),
-                changes: Vec::new(),
-            })
-        }
-        Intent::RemoveMarketplace { name } => {
-            Marketplaces::new(marketplaces_root(config)).remove(name)?;
-            Ok(Outcome {
-                ok: true,
-                message: format!(
-                    "Removed marketplace {name}. Plugins and skills it installed stay installed."
-                ),
-                changes: Vec::new(),
-            })
-        }
-        Intent::ToggleMarketplace { name, enable } => {
-            Marketplaces::new(marketplaces_root(config)).set_enabled(name, *enable)?;
-            Ok(Outcome {
-                ok: true,
-                message: format!(
-                    "{} marketplace {name}",
-                    if *enable { "Enabled" } else { "Disabled" }
-                ),
-                changes: Vec::new(),
-            })
-        }
         Intent::InstallSkill { source } => install_skill(layout, source, progress),
     }
 }
@@ -752,104 +586,56 @@ fn catalog_update(
     page: usize,
 ) -> CatalogUpdate {
     let page = page.max(1);
-    let result = (|| -> Result<(Vec<Row>, bool, String)> {
-        match tab {
-            Tab::Mcp => {
-                let found = catalog::discover(endpoints, config, query, page);
-                let rows: Vec<_> = found.candidates.iter().map(candidate_row).collect();
-                let mut message = format!(
-                    "MCP page {page}: {} servers from the official registry, Smithery, npm, GitHub and curated · {}",
-                    rows.len(),
-                    if found.more {
-                        "n loads more"
-                    } else {
-                        "end of results"
-                    }
-                );
-                if !found.notices.is_empty() {
-                    message.push_str(&format!(" · unavailable: {}", found.notices.join("; ")));
-                }
-                Ok((rows, found.more, message))
-            }
-            Tab::Plugins => {
-                let markets = Marketplaces::new(marketplaces_root(config));
-                markets.refresh(None)?;
-                // Validate the cached listing here so a corrupt index is not silently shown as empty.
-                markets.entries(None)?;
-                let rows: Vec<_> = plugin_rows(config)
-                    .into_iter()
-                    .filter(|row| row.origin == Origin::Remote)
-                    .collect();
-                let message = if rows.is_empty() {
-                    "No plugins listed by enabled marketplaces. The Marketplaces tab adds or enables one.".to_owned()
+    let (rows, more, message) = match tab {
+        Tab::Mcp => {
+            let found = catalog::discover(endpoints, config, query, page);
+            let rows: Vec<_> = found.candidates.iter().map(candidate_row).collect();
+            let mut message = format!(
+                "MCP page {page}: {} servers from the official registry, Smithery, npm, GitHub and curated · {}",
+                rows.len(),
+                if found.more {
+                    "n loads more"
                 } else {
-                    format!(
-                        "{} marketplace plugins · / filters by name, description or marketplace",
-                        rows.len()
-                    )
-                };
-                Ok((rows, false, message))
-            }
-            Tab::Skills => {
-                let installed = packages::list_packages(layout).unwrap_or_default();
-                let mut taken = installed_skill_names(&installed);
-                let mut found = Vec::new();
-                let mut notices = Vec::new();
-                match Marketplaces::new(marketplaces_root(config)).skills(None) {
-                    Ok(listed) => found.extend(listed.into_iter().map(listing_entry)),
-                    Err(error) => notices.push(format!("marketplaces: {error:#}")),
+                    "end of results"
                 }
-                for (name, url) in &config.skills.registries {
-                    match packages::registry::fetch_index(url) {
-                        Ok(entries) => {
-                            found.extend(entries.into_iter().map(|entry| (name.clone(), entry)))
-                        }
-                        Err(error) => notices.push(format!("{name}: {error:#}")),
-                    }
-                }
-                let rows = available_skills(found, &mut taken);
-                let mut message = format!(
-                    "{} skills from marketplaces and skill registries · installed skills are hidden",
-                    rows.len()
-                );
-                if !notices.is_empty() {
-                    message.push_str(&format!(" · unavailable: {}", notices.join("; ")));
-                }
-                Ok((rows, false, message))
+            );
+            if !found.notices.is_empty() {
+                message.push_str(&format!(" · unavailable: {}", found.notices.join("; ")));
             }
-            Tab::Marketplaces => {
-                let markets = Marketplaces::new(marketplaces_root(config));
-                markets.refresh(None)?;
-                let count = markets.list()?.len();
-                Ok((
-                    Vec::new(),
-                    false,
-                    format!(
-                        "{count} marketplaces · a adds an index · e enables or disables · x removes"
-                    ),
-                ))
-            }
+            (rows, found.more, message)
         }
-    })();
-    match result {
-        Ok((rows, more, message)) => CatalogUpdate {
-            tab,
-            query: query.into(),
-            page,
-            rows,
-            more,
-            message,
-            error: None,
-        },
-        Err(error) => CatalogUpdate {
-            tab,
-            query: query.into(),
-            page,
-            rows: Vec::new(),
-            more: false,
-            message: String::new(),
-            error: Some(format!("{error:#}")),
-        },
+        Tab::Skills => {
+            let installed = packages::list_packages(layout).unwrap_or_default();
+            let mut taken = installed_skill_names(&installed);
+            let mut found = Vec::new();
+            let mut notices = Vec::new();
+            for (name, url) in &config.skills.registries {
+                match packages::registry::fetch_index(url) {
+                    Ok(entries) => {
+                        found.extend(entries.into_iter().map(|entry| (name.clone(), entry)))
+                    }
+                    Err(error) => notices.push(format!("{name}: {error:#}")),
+                }
+            }
+            let rows = available_skills(found, &mut taken);
+            let mut message = format!(
+                "{} skills from marketplaces and skill registries · installed skills are hidden",
+                rows.len()
+            );
+            if !notices.is_empty() {
+                message.push_str(&format!(" · unavailable: {}", notices.join("; ")));
+            }
+            (rows, false, message)
+        }
+    };
+    CatalogUpdate {
+        tab,
+        query: query.into(),
+        page,
+        rows,
+        more,
+        message,
+        error: None,
     }
 }
 
@@ -1347,20 +1133,6 @@ fn import_mcp(
         ok: true,
         message: format!("Imported `{id}` from {}", found.provider),
         changes: vec![smithery::config_change(id, &server)?],
-    })
-}
-
-fn install_plugin(config: &Config, id: &str, progress: &SharedProgress) -> Result<Outcome> {
-    let store = PluginStore::new(plugins_root(config));
-    say(
-        progress,
-        format!("installing {id} into {}", plugins_root(config).display()),
-    );
-    let plugin = Marketplaces::new(marketplaces_root(config)).install(id, &store)?;
-    Ok(Outcome {
-        ok: true,
-        message: format!("{} installed at {}", plugin.name, plugin.path.display()),
-        changes: Vec::new(),
     })
 }
 

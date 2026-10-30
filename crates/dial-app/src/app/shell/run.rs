@@ -6,7 +6,6 @@ use crate::app::core::App;
 use crate::app::display::local_time;
 use crate::app::drive::Step;
 use crate::app::overlay::auth::AuthJob;
-use crate::app::shell::plugin_effects::Drained;
 use crate::app::shell::{PAINT_EVERY, STATUS_TTL, Shell, TICK};
 use crate::ui::composer::ComposerEvent;
 use crate::ui::input::{poll, read};
@@ -38,9 +37,6 @@ impl Shell {
             dirty |= self.refresh_resources(app, false, false);
             // Large @file rankings finish on a worker; land them without waiting for a keystroke.
             dirty |= self.composer.poll_autocomplete();
-            // Plugin header, status, footer and title, plus autocomplete answers, once per pass.
-            dirty |= self.refresh_plugin_chrome(agent);
-            dirty |= self.drain_extension_view_events(app, agent);
             if let Some(notice) = self.composer.take_word_notice() {
                 self.note("Word completion", notice);
             }
@@ -60,12 +56,6 @@ impl Shell {
             {
                 self.note("Notice", notice);
                 dirty = true;
-            }
-            // Plugin actions queued during the turn apply here, each behind its own approval.
-            match self.drain_plugin_effects(app, agent) {
-                Drained::Nothing => {}
-                Drained::Changed => dirty = true,
-                Drained::Rebuild(step) => return Ok(step),
             }
             if let Some(config) = self.pending_config.take() {
                 if let step @ Step::Rebuild(_) = self.config_changed(app, agent, config) {
@@ -340,6 +330,9 @@ impl Shell {
             let timeout = agent
                 .monitor_wakeup_interval()
                 .map_or(timeout, |monitor| timeout.min(monitor));
+            let timeout = agent
+                .worker_message_wakeup_interval()
+                .map_or(timeout, |workers| timeout.min(workers));
             let timeout = self.loop_mode.next_due().map_or(timeout, |due| {
                 timeout.min(due.saturating_duration_since(Instant::now()))
             });
@@ -360,14 +353,6 @@ impl Shell {
             };
             // An attached side pane sees requests and fresh state within half a second.
             let timeout = if self.live_pane.attached() {
-                timeout.min(Duration::from_millis(500))
-            } else {
-                timeout
-            };
-            let timeout = if agent
-                .extension_host()
-                .is_some_and(|host| !host.persistent_names().is_empty())
-            {
                 timeout.min(Duration::from_millis(500))
             } else {
                 timeout

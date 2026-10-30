@@ -3819,97 +3819,10 @@ fn dismissed_history_search_does_not_apply_a_late_provider_response() {
 }
 
 #[test]
-fn plugin_suggestions_join_the_slash_menu_and_stale_answers_are_dropped() {
-    let env = Env::new();
-    let mut c = with_commands();
-    typed(&mut c, &env, "/dep");
-    assert_eq!(c.plugin_query(), Some("dep"));
-    // An answer for a query the user has since left must not reach the menu.
-    assert!(!c.set_plugin_suggestions("de", vec![cmd("deploy", "Deploy", CommandKind::Extension)]));
-    assert!(c.set_plugin_suggestions("dep", vec![cmd("deploy", "Deploy", CommandKind::Extension)]));
-    let rows = screen(&c, &env, 80).join("\n");
-    assert!(rows.contains("deploy"), "{rows}");
-}
-
-#[test]
-fn builtin_commands_win_over_plugin_names_in_the_slash_menu() {
-    let env = Env::new();
-    let mut c = with_commands();
-    typed(&mut c, &env, "/model");
-    assert!(c.set_plugin_suggestions(
-        "model",
-        vec![cmd("model", "Plugin model", CommandKind::Extension)]
-    ));
-    let rows = screen(&c, &env, 80).join("\n");
-    assert!(!rows.contains("Plugin model"), "{rows}");
-}
-
-#[test]
-fn plugin_header_status_and_footer_frame_the_composer_and_stay_sanitized() {
-    use crate::ui::plugin_slots::{Placement, PluginSlots};
-    let env = Env::new();
-    let mut c = composer();
-    let baseline = screen(&c, &env, 60).len();
-    assert!(!c.set_plugin_slots(PluginSlots::default()));
-    assert_eq!(screen(&c, &env, 60).len(), baseline);
-
-    let header = vec!["\x1b[2Jhead".to_owned()];
-    let status = vec!["mail 3".to_owned()];
-    let footer = vec!["foot".to_owned()];
-    let slots = PluginSlots::collect([
-        (Placement::Header, header.as_slice()),
-        (Placement::Status, status.as_slice()),
-        (Placement::Footer, footer.as_slice()),
-    ]);
-    assert!(c.set_plugin_slots(slots.clone()));
-    assert!(!c.set_plugin_slots(slots));
-
-    let rows = screen(&c, &env, 60);
-    let at = |needle: &str| rows.iter().position(|r| r.contains(needle));
-    let (header_at, status_at, footer_at) = (
-        at("head").expect("header row"),
-        at("mail 3").expect("status row"),
-        at("foot").expect("footer row"),
-    );
-    assert!(header_at < status_at && status_at < footer_at, "{rows:?}");
-    assert!(rows.iter().all(|r| !r.contains('\x1b')), "{rows:?}");
-}
-
-#[test]
-fn plugin_suggestions_insert_command_text_without_shell_quoting() {
-    let env = Env::new();
-    for value in [
-        "zz words",
-        "zz 'two words'",
-        "zz \"two words\"",
-        "zz path\\name",
-    ] {
-        for accept in [KeyCode::Tab, KeyCode::Right] {
-            let mut c = with_commands();
-            typed(&mut c, &env, "/zz");
-            assert!(c.set_plugin_suggestions(
-                "zz",
-                vec![cmd(value, "Suggested command", CommandKind::Extension)]
-            ));
-            let rows = screen(&c, &env, 80).join("\n");
-            assert!(rows.contains(value), "{rows}");
-            press(&mut c, &env, accept);
-            let expected = format!("/{value} ");
-            assert_eq!(c.editor.text, expected);
-            // Tab/Right leave a space for more arguments; submission preserves that draft.
-            assert_eq!(
-                press(&mut c, &env, KeyCode::Enter),
-                ComposerEvent::Submit(expected)
-            );
-        }
-    }
-}
-
-#[test]
 fn extension_argument_completion_keeps_the_command_and_arguments_separate() {
     let env = Env::new();
     let mut c = composer();
-    c.set_commands(vec![cmd("zz", "Extension command", CommandKind::Extension)]);
+    c.set_commands(vec![cmd("zz", "Extension command", CommandKind::Custom)]);
     c.set_argument_completions(vec!["/zz words".into()]);
     typed(&mut c, &env, "/zz w");
     press(&mut c, &env, KeyCode::Tab);

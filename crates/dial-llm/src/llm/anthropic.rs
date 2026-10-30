@@ -66,7 +66,8 @@ pub(crate) fn documented_context_window(model: &str) -> Option<u32> {
             return Some(window);
         }
     }
-    None
+    // Exact older model cards remain authoritative when the live Models API omits capacity.
+    super::catalog::bundled_model("anthropic", model).and_then(|model| model.context_window)
 }
 
 pub(crate) fn subscription_token(token: &str) -> bool {

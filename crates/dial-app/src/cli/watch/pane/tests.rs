@@ -63,6 +63,18 @@ fn state() -> Snapshot {
                 phase: "working".into(),
                 scopes: vec!["docs/terminal-interface.md".into()],
                 overlapping: vec!["docs/terminal-interface.md".into()],
+                messages: vec![
+                    state::PeerMessage {
+                        outgoing: true,
+                        text: "I am editing the keymap".into(),
+                        unread: false,
+                    },
+                    state::PeerMessage {
+                        outgoing: false,
+                        text: "ok, I will stay in docs".into(),
+                        unread: true,
+                    },
+                ],
             }],
             ..Peers::default()
         },
@@ -186,6 +198,48 @@ fn messaging_a_peer_composes_then_sends_and_escape_discards() {
     assert_eq!(pane.key(key(KeyCode::Esc)), KeyOutcome::Continue);
     assert!(matches!(pane.mode, Mode::Browse));
     assert_eq!(pane.key(key(KeyCode::Char('q'))), KeyOutcome::Quit);
+}
+
+#[test]
+fn enter_on_a_peer_opens_the_chat_which_survives_composing() {
+    let mut pane = pane();
+    pane.key(key(KeyCode::Char('6')));
+    assert!(!screen(&mut pane, 1_500).contains("ok, I will stay in docs"));
+    pane.key(key(KeyCode::Enter));
+    let chat = screen(&mut pane, 1_500);
+    for expected in [
+        "Chat with 01234567 · shortcut fixes",
+        "You",
+        "I am editing the keymap",
+        "01234567  unread by the agent",
+        "ok, I will stay in docs",
+    ] {
+        assert!(chat.contains(expected), "{expected}:\n{chat}");
+    }
+    // Messaging from the chat targets its peer and returns to the conversation.
+    pane.key(key(KeyCode::Char('m')));
+    pane.key(key(KeyCode::Char('y')));
+    assert_eq!(
+        pane.key(key(KeyCode::Enter)),
+        KeyOutcome::Send(Request::MessagePeer {
+            to: "0123456789abcdef".into(),
+            text: "y".into()
+        })
+    );
+    assert!(screen(&mut pane, 1_500).contains("Chat with 01234567"));
+    // A peer that leaves is reported instead of showing a stale conversation.
+    let mut gone = state();
+    gone.peers.rows.clear();
+    pane.set_state(Ok(Some(gone)));
+    assert!(screen(&mut pane, 1_500).contains("Peer 01234567 is no longer active"));
+    pane.set_state(Ok(Some(state())));
+    pane.key(key(KeyCode::Esc));
+    assert!(pane.chat.is_none());
+    assert!(screen(&mut pane, 1_500).contains("Overlaps yours"));
+    // Switching tabs closes the chat too.
+    pane.key(key(KeyCode::Enter));
+    pane.key(key(KeyCode::Tab));
+    assert!(pane.chat.is_none() && pane.tab == Tab::Feed);
 }
 
 #[test]

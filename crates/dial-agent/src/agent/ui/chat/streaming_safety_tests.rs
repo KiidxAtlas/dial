@@ -54,7 +54,7 @@ fn run(rule: &str, arguments: &str, prefix: Option<&str>, external_cancel: bool)
     let server = llm::fake::serve(vec![llm::fake::Script::Sse(wire)]);
     let mut backend = crate::agent::make_backend(&config).unwrap();
     backend.chatgpt_url = Some(format!("{}/codex/responses", server.url));
-    let catalog = Catalog::discover(&layout, &project);
+    let catalog = Catalog::discover(&layout, &project, &config.portable_rules);
     let state = State::default();
     let mut monitor = catalog.monitor(&project, &state, "main");
     let interrupt = Arc::new(AtomicBool::new(false));

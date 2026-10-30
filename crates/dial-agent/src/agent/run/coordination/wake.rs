@@ -120,6 +120,12 @@ impl Agent<'_> {
         };
         if participant.has_mail()? {
             for letter in participant.drain()? {
+                super::remember(
+                    &mut self.peer_state.history,
+                    &letter.from,
+                    false,
+                    &letter.text,
+                );
                 if wake.remember(&letter) {
                     self.peer_state.pending_letters.push(letter);
                 }

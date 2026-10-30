@@ -22,7 +22,7 @@
 //! A `tools/list_changed` notice refreshes that server's tool list: notices arriving together share
 //! one listing, and the registry takes the new list at the next model request. A failed refresh keeps
 //! the previous list, marks the catalog stale (calls are refused until a refresh succeeds) and
-//! yields a notice. Each server also keeps a bounded event queue ([`Live::take_events`]).
+//! yields a notice.
 //! Limits: `sampling` and `roots` are not offered, and servers are killed when the returned tools are
 //! dropped.
 
@@ -49,7 +49,7 @@ use crate::tools::integrations::ext::Tool;
 use anyhow::{Context, Result, bail, ensure};
 use client::{Client, Shared};
 use live::Catalog;
-pub use live::{Live, McpEvent, McpEventKind};
+pub use live::Live;
 use parking_lot::{Mutex, MutexGuard};
 use serde_json::{Value, json};
 use std::borrow::Cow;
@@ -134,8 +134,6 @@ pub struct Session {
     catalog: Mutex<Catalog>,
     /// User-visible notices about catalog changes and failed refreshes, drained by the registry.
     notices: Mutex<Vec<String>>,
-    /// Bounded queue of plugin-facing events; the oldest entry is dropped when it is full.
-    events: Mutex<std::collections::VecDeque<McpEvent>>,
     reported_transitions: AtomicU64,
 }
 
@@ -420,20 +418,13 @@ impl Session {
     /// stale until recovery succeeds.
     fn on_signal(self: &Arc<Self>, signal: Signal) {
         match signal {
-            Signal::ResourcesChanged => {
-                self.push_event(McpEventKind::ResourcesChanged);
-                self.listing.lock().generation += 1;
-            }
+            Signal::ResourcesChanged => self.listing.lock().generation += 1,
             Signal::ResourceUpdated => {
-                self.push_event(McpEventKind::ResourceUpdated);
                 let mut listing = self.listing.lock();
                 listing.resources = None;
                 listing.generation += 1;
             }
-            Signal::PromptsChanged => {
-                self.push_event(McpEventKind::PromptsChanged);
-                self.listing.lock().generation += 1;
-            }
+            Signal::PromptsChanged => self.listing.lock().generation += 1,
             Signal::ToolsChanged => {
                 self.update_health(|health| health.catalog = CatalogFreshness::Stale)
             }
@@ -749,7 +740,6 @@ fn connect(
         }),
         catalog: Mutex::new(Catalog::default()),
         notices: Mutex::new(Vec::new()),
-        events: Mutex::new(std::collections::VecDeque::new()),
     });
 
     let mut tools = Vec::new();

@@ -267,6 +267,79 @@ fn write_creates_parents_and_enforces_limit() {
 }
 
 #[test]
+fn refused_unread_overwrite_shows_small_files_as_a_witness_for_the_next_edit() {
+    let (dir, ws) = workspace();
+    let ws = ws.with_edit_mode(crate::tools::EditMode::Hashline);
+    fs::write(dir.path().join("README.md"), "# Old\n").unwrap();
+    let refused = run(
+        &ws,
+        "write",
+        json!({"path": "README.md", "content": "# New\n"}),
+    );
+    assert!(refused.is_error && refused.text.contains("no current source/read witness"));
+    assert!(
+        refused.text.contains("Nothing was written") && refused.text.contains("\n1:# Old\n"),
+        "{}",
+        refused.text
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("README.md")).unwrap(),
+        "# Old\n"
+    );
+    let header = refused
+        .text
+        .lines()
+        .find(|line| line.starts_with("[README.md#"))
+        .unwrap();
+    let edited = run(
+        &ws,
+        "edit",
+        json!({"input": format!("{header}\nPUT 1.=1:\n+# New\n")}),
+    );
+    assert!(!edited.is_error, "{}", edited.text);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("README.md")).unwrap(),
+        "# New\n"
+    );
+
+    // A file too large to show whole keeps the plain refusal and gains no witness.
+    let large: String = (0..201).map(|n| format!("line {n}\n")).collect();
+    fs::write(dir.path().join("large.txt"), &large).unwrap();
+    let refused = run(&ws, "write", json!({"path": "large.txt", "content": "x\n"}));
+    assert!(
+        refused.is_error && !refused.text.contains("Nothing was written"),
+        "{}",
+        refused.text
+    );
+    // The real current tag still has no witness, so an edit against it is refused too.
+    let tag = crate::tools::edit::hashline::tag_of(&large);
+    let edit = run(
+        &ws,
+        "edit",
+        json!({"input": format!("[large.txt#{tag}]\nPUT 1.=1:\n+x\n")}),
+    );
+    assert!(edit.is_error, "{}", edit.text);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("large.txt")).unwrap(),
+        large
+    );
+}
+
+#[test]
+fn overwrite_recovery_witness_binds_the_snapshot_not_a_second_disk_read() {
+    let (dir, ws) = workspace();
+    let ws = ws.with_edit_mode(crate::tools::EditMode::Hashline);
+    let path = dir.path().join("file.txt");
+    let before = "original\n";
+    let now = "new\n".repeat(201);
+    fs::write(&path, &now).unwrap();
+    let shown = unseen_overwrite_projection(&ws, &path, before).unwrap();
+    assert!(shown.contains("\n1:original\n") && !shown.contains("\n1:new\n"));
+    assert!(crate::tools::edit::editing::seen_guard(&ws, &path, before, &[(1, 1)]).is_ok());
+    assert!(crate::tools::edit::editing::seen_guard(&ws, &path, &now, &[(1, 201)]).is_err());
+}
+
+#[test]
 fn edit_requires_unique_match_unless_replace_all() {
     let (dir, ws) = workspace();
     let file = dir.path().join("e.txt");

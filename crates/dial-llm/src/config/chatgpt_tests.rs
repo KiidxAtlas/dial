@@ -184,23 +184,39 @@ fn profile_context_size_overrides_shared_caps_and_respects_capacity() {
 
 #[test]
 fn claude_context_resolves_on_load_and_selection_without_overriding_user_limits() {
-    let config = resolve("provider='anthropic'\nmodel='claude-opus-5-5'\n").unwrap();
-    assert_eq!(config.context_window, 1_000_000);
-    let capped =
-        resolve("provider='anthropic'\nmodel='claude-opus-5-5'\ncontext_window=32768\n").unwrap();
-    assert_eq!(capped.context_window, 32768);
-    let mut selection = crate::llm::model_config::ModelSelection {
-        provider: "anthropic".into(),
-        model: "claude-opus-5-5".into(),
-        base_url: Some(crate::llm::anthropic::BASE_URL.into()),
-        ..Default::default()
-    };
-    assert_eq!(capped.with_selection(&selection).context_window, 1_000_000);
-    selection.context_window = Some(200_000);
-    assert_eq!(config.with_selection(&selection).context_window, 200_000);
-    selection.base_url = Some("https://proxy.example/v1".into());
-    selection.context_window = None;
-    assert_eq!(config.with_selection(&selection).context_window, 32768);
+    for model in ["claude-opus-5-5", "claude-sonnet-4-6"] {
+        let config = resolve(&format!("provider='anthropic'\nmodel='{model}'\n")).unwrap();
+        assert_eq!(config.context_window, 1_000_000, "{model}");
+        let capped = resolve(&format!(
+            "provider='anthropic'\nmodel='{model}'\ncontext_window=32768\n"
+        ))
+        .unwrap();
+        assert_eq!(capped.context_window, 32768, "{model}: explicit cap");
+        let mut selection = crate::llm::model_config::ModelSelection {
+            provider: "anthropic".into(),
+            model: model.into(),
+            base_url: Some(crate::llm::anthropic::BASE_URL.into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            capped.with_selection(&selection).context_window,
+            1_000_000,
+            "{model}: auto selection"
+        );
+        selection.context_window = Some(200_000);
+        assert_eq!(
+            config.with_selection(&selection).context_window,
+            200_000,
+            "{model}: selected cap"
+        );
+        selection.base_url = Some("https://proxy.example/v1".into());
+        selection.context_window = None;
+        assert_eq!(
+            config.with_selection(&selection).context_window,
+            32768,
+            "{model}: custom endpoint"
+        );
+    }
 }
 
 #[test]

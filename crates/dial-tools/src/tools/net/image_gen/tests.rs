@@ -127,22 +127,52 @@ fn writes_decoded_png_and_sends_model_prompt_and_key() {
 }
 
 #[test]
-fn rejects_extension_that_does_not_match_returned_format() {
-    let (_dir, ws) = testkit::workspace();
-    let (base, server) = serve_once(200, ok_body(&image_bytes(image::ImageFormat::Jpeg)));
-    let user_dir = user_dir_with_key(&base);
-    let config = config_for(&base, user_dir.path());
+fn converts_native_output_to_the_requested_format() {
+    for (native, output, expected) in [
+        (
+            image::ImageFormat::Jpeg,
+            "lake.png",
+            image::ImageFormat::Png,
+        ),
+        (
+            image::ImageFormat::Png,
+            "lake.jpg",
+            image::ImageFormat::Jpeg,
+        ),
+        (
+            image::ImageFormat::Png,
+            "lake.webp",
+            image::ImageFormat::WebP,
+        ),
+    ] {
+        let (_dir, ws) = testkit::workspace();
+        let bytes = if native == image::ImageFormat::Jpeg {
+            image_bytes(native)
+        } else {
+            // High-bit-depth RGBA must work with JPEG and WebP's 8-bit encoders.
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba16(image::ImageBuffer::from_pixel(
+                2,
+                2,
+                image::Rgba([u16::MAX, 0, 0, u16::MAX / 2]),
+            ))
+            .write_to(&mut bytes, native)
+            .unwrap();
+            bytes.into_inner()
+        };
+        let (base, server) = serve_once(200, ok_body(&bytes));
+        let user_dir = user_dir_with_key(&base);
+        let config = config_for(&base, user_dir.path());
+        let out = run(&ws, &config, json!({"prompt": "a lake", "output": output}));
+        server.join().unwrap();
 
-    let out = run(
-        &ws,
-        &config,
-        json!({"prompt": "a lake", "output": "lake.png"}),
-    );
-
-    assert!(out.is_error);
-    assert!(out.text.contains(".jpg"), "{}", out.text);
-    assert!(!ws.root().join("lake.png").exists());
-    server.join().unwrap();
+        assert!(!out.is_error, "{output}: {}", out.text);
+        let saved = std::fs::read(ws.root().join(output)).unwrap();
+        assert_eq!(image::guess_format(&saved).unwrap(), expected, "{output}");
+        let decoded = image::load_from_memory(&saved).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (2, 2), "{output}");
+        assert_eq!(std::fs::read_dir(ws.root()).unwrap().count(), 1);
+    }
 }
 
 #[test]
@@ -316,7 +346,6 @@ fn registry_offers_image_gen_without_an_integrations_entry_when_keyed() {
         integrations: Vec::new(),
         ..Config::default()
     };
-    config.extensions.enabled = false;
     config.image.base_url = base.into();
     assert!(Registry::standard(&config, Vec::new()).contains("image_gen"));
 
@@ -337,7 +366,6 @@ fn opus_without_an_image_role_keeps_the_automatic_tool_available() {
         ..Default::default()
     }
     .with_selection(&ModelSelection::new("anthropic", "claude-opus-4-6"));
-    config.extensions.enabled = false;
     // Make this independent of developer/CI provider credentials.
     for provider in ["openai", "xai"] {
         config.providers.insert(
@@ -500,7 +528,6 @@ fn registry_explains_why_auto_registration_failed() {
     config.project_root = ws.root().to_path_buf();
     config.state_dir = ws.root().join("state");
     config.integrations.clear();
-    config.extensions.enabled = false;
     let mut registry = Registry::standard(&config, Vec::new());
     assert!(!registry.contains("image_gen"));
     assert!(
@@ -859,19 +886,21 @@ fn native_mlx_serve_generates_png_without_a_key() {
 }
 
 #[test]
-fn native_mlx_serve_rejects_non_png_before_request() {
+fn native_mlx_serve_can_save_non_png_output() {
     use crate::llm::profiles::ImageGenerationApi;
     let (_dir, ws) = testkit::workspace();
+    let (base, server) = serve_once(200, ok_body(&image_bytes(image::ImageFormat::Png)));
     let user = tempfile::tempdir().unwrap();
-    let config = selected_config(
-        "http://127.0.0.1:9/v1",
-        user.path(),
-        ImageGenerationApi::MlxServe,
-    );
+    let config = selected_config(&base, user.path(), ImageGenerationApi::MlxServe);
     let out = run(&ws, &config, json!({"prompt":"dog", "output":"dog.webp"}));
-    assert!(out.is_error);
-    assert!(out.text.contains("PNG"), "{}", out.text);
-    assert_eq!(std::fs::read_dir(ws.root()).unwrap().count(), 0);
+    assert!(!out.is_error, "{}", out.text);
+    server.join().unwrap();
+    let saved = std::fs::read(ws.root().join("dog.webp")).unwrap();
+    assert_eq!(
+        image::guess_format(&saved).unwrap(),
+        image::ImageFormat::WebP
+    );
+    assert_eq!(std::fs::read_dir(ws.root()).unwrap().count(), 1);
 }
 
 fn chatgpt_session(user_dir: &std::path::Path) -> Config {
@@ -1182,6 +1211,7 @@ fn image_settings(model: &str) -> crate::config::image::ImageModelSettings {
         background: Some("transparent".into()),
         moderation: Some("low".into()),
         strength: Some(0.6),
+        cond_weights: vec![1.0, 0.5, 1.5],
         ..Default::default()
     }
 }
@@ -1208,7 +1238,7 @@ fn mlx_serve_receives_its_model_settings_and_the_configured_default_size() {
     assert_eq!(route.model, "selected-image-model");
     assert_eq!(
         route.settings,
-        ["size", "steps", "seed", "strength", "loras"]
+        ["size", "steps", "seed", "strength", "loras", "cond_weights"]
     );
     assert!(route.edits);
 
@@ -1219,6 +1249,7 @@ fn mlx_serve_receives_its_model_settings_and_the_configured_default_size() {
     assert_eq!(body["steps"], 8, "{body}");
     assert_eq!(body["seed"], 42, "{body}");
     assert_eq!(body["lora_scales"], json!([1.5, 0.5]), "{body}");
+    assert_eq!(body["cond_weights"], json!([1.0, 0.5, 1.5]), "{body}");
     let paths = body["lora_paths"].as_array().unwrap();
     assert_eq!(paths[0], "/loras/style.safetensors");
     // Bare names resolve inside MLX-Serve's LoRA directory.
@@ -1257,7 +1288,7 @@ fn explicit_call_size_wins_and_openai_gets_only_its_settings() {
     assert_eq!(body["quality"], "high", "{body}");
     assert_eq!(body["background"], "transparent", "{body}");
     assert_eq!(body["moderation"], "low", "{body}");
-    for absent in ["steps", "seed", "lora_paths", "lora_scales"] {
+    for absent in ["steps", "seed", "lora_paths", "lora_scales", "cond_weights"] {
         assert!(body.get(absent).is_none(), "{absent} sent: {body}");
     }
 }

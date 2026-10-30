@@ -61,24 +61,20 @@ const MAX_LISTED_COMMAND: usize = 80;
 const DEFAULT_WAIT_SECS: u64 = 5;
 const MAX_WAIT_SECS: u64 = 300;
 
-const DESCRIPTION: &str = "Run session-owned background jobs without persistent shell state. POSIX \
+const DESCRIPTION: &str = "Session-owned background jobs without persistent shell state. POSIX \
 commands use bash's sandbox, cwd and network policy; Windows uses PowerShell only with explicit \
-unsandboxed opt-in. Pipe output bytes are captured in artifacts plus a 256 KiB ring. PTY jobs keep raw \
-bytes in artifacts and show the rendered terminal screen (a snapshot, not a delta). At most 32 KiB inline. \
-`start`: command, optional unique name/cwd, pty=true for a private \
-terminal (rows/cols), or stdin=true for a pipe; otherwise stdin is null. `input`: name and text (exact \
-UTF-8 bytes, no automatic newline, max 64 KiB); `resize`: name, rows/cols; `close_stdin`: pipe EOF or \
-canonical PTY VEOF (raw PTYs cannot half-close). Input/close timeout defaults 0 unlimited but remains \
-cancellable; partial writes are reported. `list`, `output` (pipe: delta; PTY: current screen; optional \
-tail), `wait` (until regex, \
-or exit), `kill` (name or all=true). `ready` on named start or wait: log regex and/or numeric host/port, \
-both required if supplied; port readiness needs network permission and approval, and requires lsof-proven \
-owned listeners on POSIX (unsupported on Windows). Waits default to 5s; explicit 0 is unlimited, positive waits max 300s. \
-At most 8 live session jobs, 8 retained finished entries. Explicit persist=true selects Unix-only, named, \
-finite-lifetime pipe jobs in a separate restart-surviving namespace (no PTY/stdin/ready); use persist=true \
-on every durable call. Ordinary drop/session exit kills owned \
-process groups or Windows Job Objects; POSIX descendants that escape with setsid/job control may not \
-be cleaned up.";
+unsandboxed opt-in. Output is kept in artifacts plus a 256 KiB ring (PTY: raw bytes, rendered screen \
+snapshot); at most 32 KiB inline. `start`: command, optional unique name/cwd, pty=true (rows/cols) or \
+stdin=true for a pipe, else stdin is null. `input`: name, text (exact UTF-8, no automatic newline, \
+max 64 KiB); `resize`: name, rows/cols; `close_stdin`: pipe EOF or PTY VEOF (raw PTYs cannot \
+half-close); their timeout defaults 0 (unlimited, cancellable) and partial writes are reported. \
+`list`; `output` (pipe: delta; PTY: screen; optional tail); `wait` (until regex, or exit); `kill` \
+(name or all=true). `ready` on named start/wait: log regex and/or numeric host/port, both required if \
+given; port readiness needs network permission and approval and lsof-proven owned listeners (POSIX \
+only). Waits default 5s; 0 is unlimited, positive max 300s. At most 8 live and 8 finished entries. \
+persist=true: Unix-only named finite-lifetime pipe jobs that survive restarts (no PTY/stdin/ready); \
+pass it on every durable call. Session exit kills owned process groups or Windows Job Objects; POSIX \
+descendants that escape with setsid/job control may survive.";
 
 /// Owns every background process; dropping it kills them all (each entry kills its process
 /// group when dropped).

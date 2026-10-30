@@ -369,8 +369,10 @@ impl Agent<'_> {
                         || self.config.sandbox.allow_network),
                 "PR review requires network access; the active sandbox policy forbids it"
             );
+            // The host makes this call itself, so the git integration must be enabled and allowed
+            // under the current mode; its schema need not be in the model's offer.
             anyhow::ensure!(
-                self.offered().iter().any(|tool| tool == "git"),
+                self.catalog().iter().any(|tool| tool == "git") && self.tool_eligible("git"),
                 "PR review requires the enabled git tool network policy"
             );
             let call = crate::llm::ToolCall {

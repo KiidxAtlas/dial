@@ -179,14 +179,7 @@ fn section_of(title: &str) -> Section {
         Section::Primary
     } else if has(&["memory", "learn", "understand"]) {
         Section::Learn
-    } else if has(&[
-        "mcp",
-        "extension",
-        "plugin",
-        "provider",
-        "connect",
-        "collab",
-    ]) {
+    } else if has(&["mcp", "extension", "provider", "connect", "collab"]) {
         Section::Connect
     } else if has(&["setup", "doctor", "install"]) {
         Section::Dial

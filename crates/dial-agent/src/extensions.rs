@@ -7,9 +7,6 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use std::{collections::BTreeMap, sync::Arc};
 
-pub mod command;
-pub mod panel;
-
 pub const SDK_VERSION: u32 = 1;
 /// Extensions are operator-trusted native code, not executable workspace content.
 pub trait Extension: Send + Sync {
@@ -26,7 +23,7 @@ pub trait Extension: Send + Sync {
 }
 /// A command handler: takes the argument text and the UI, returns the prompt text to expand.
 pub type CommandHandler = Arc<dyn Fn(&str, &mut dyn Ui) -> Result<String> + Send + Sync>;
-/// Commands may render a panel and expand into a user-visible prompt, not bypass tool execution.
+/// Commands expand into a user-visible prompt; they never bypass tool execution.
 #[derive(Clone)]
 pub struct Command {
     pub name: String,

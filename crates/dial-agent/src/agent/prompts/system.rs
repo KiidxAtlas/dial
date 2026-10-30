@@ -59,7 +59,7 @@ pub(crate) const TOOL_POLICY: &str = concat!("
 );
 // Each sentence is included only when its tool is offered, so the prompt never names a tool the
 // model cannot call.
-pub(crate) const SKILL_RULE: &str = "When a skill covers substantial multi-step work, load it with `skill` first; small or single-file changes need no skill.";
+pub(crate) const SKILL_RULE: &str = "When a skill covers substantial multi-step work, load it with `skill` in the same response as your first reads, not as a round of its own; small or single-file changes need no skill.";
 pub(crate) const PROJECT_MAP_RULE: &str =
     "Saved project maps locate owners and helpers; they are not proof of current code.";
 pub(crate) const LSP_RULE: &str = "Use the configured LSP when resolving definitions, references or semantic edits; if unavailable, use source search and disclose any unresolved ambiguity.";
@@ -146,8 +146,9 @@ macro_rules! lean_rules {
 ")
     };
 }
-pub(crate) const LEAN_RULES: &str =
-    lean_rules!("3. Plan: use `todo` only for substantial multi-step work, never alone.");
+pub(crate) const LEAN_RULES: &str = lean_rules!(
+    "3. Plan: use `todo` only for substantial multi-step work. NEVER send it alone: pair updates with useful work; do not add a final bookkeeping call before answering."
+);
 pub(crate) const LEAN_ONE_CALL_RULES: &str =
     lean_rules!("3. Plan: use `todo` only for substantial multi-step work.");
 pub(crate) const LEAN_DELIVERY: &str = concat!("

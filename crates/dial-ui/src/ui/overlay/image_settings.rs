@@ -43,6 +43,8 @@ enum Kind {
         int: bool,
     },
     Toml,
+    /// Comma or space separated numbers, saved as a TOML array.
+    Numbers,
 }
 
 #[derive(Clone)]
@@ -60,6 +62,7 @@ struct Field {
 /// The first LoRA's file and scale; `loras` edits the whole list.
 const LORA: &str = "lora";
 const LORA_SCALE: &str = "lora_scale";
+const COND_WEIGHTS: &str = "cond_weights";
 
 fn fields(installed_loras: &[String]) -> Vec<Field> {
     let choice = |options: &[&str]| Kind::Choice(options.iter().map(|s| (*s).to_owned()).collect());
@@ -137,6 +140,14 @@ fn fields(installed_loras: &[String]) -> Vec<Field> {
                 int: false,
             },
             help: "How far `/image edit` may move from the source image: low keeps it close, 1.0 repaints freely. Used only for edits.",
+        },
+        Field {
+            path: COND_WEIGHTS,
+            setting: "cond_weights",
+            label: "Layer weights",
+            section: "Diffusion",
+            kind: Kind::Numbers,
+            help: "One number per tapped text-encoder layer, comma or space separated (1 = neutral). The count depends on the model (for example FLUX 3, Krea 12); MLX-Serve rejects a wrong count. Blank resets to off.",
         },
         Field {
             path: LORA,
@@ -290,6 +301,21 @@ impl ImageSettingsOverlay {
         if text.trim().is_empty() {
             return self.with(path, None);
         }
+        if path == COND_WEIGHTS {
+            let numbers = text
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .filter(|token| !token.is_empty())
+                .map(|token| {
+                    token
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|n| n.is_finite())
+                        .map(toml::Value::Float)
+                        .ok_or_else(|| anyhow::anyhow!("{token:?} is not a number"))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            return self.with(path, Some(toml::Value::Array(numbers)));
+        }
         let parsed: toml::Table = format!("value = {text}").parse().map_err(|_| {
             anyhow::anyhow!(
                 "Not a valid value: numbers are bare, text needs \"quotes\", lists use [ ]"
@@ -381,7 +407,7 @@ impl ImageSettingsOverlay {
                 None => number_text(*start, *int),
                 Some(v) => number_text((v + step * direction as f64).clamp(*min, *max), *int),
             }),
-            Kind::Toml => return OverlayEvent::None,
+            Kind::Toml | Kind::Numbers => return OverlayEvent::None,
         };
         self.apply(&literal.unwrap_or_default())
     }
@@ -650,7 +676,7 @@ impl ImageSettingsOverlay {
                 let shown = value
                     .as_ref()
                     .map_or_else(|| "default".to_owned(), Self::show);
-                let adjustable = selected && !matches!(field.kind, Kind::Toml);
+                let adjustable = selected && !matches!(field.kind, Kind::Toml | Kind::Numbers);
                 let (left, right) = if theme.ascii() {
                     ("<", ">")
                 } else {
@@ -710,6 +736,9 @@ impl ImageSettingsOverlay {
                 }
                 Kind::Choice(options) => format!("Choose: {} · default", options.join(" · ")),
                 Kind::Toml => "Enter edits a TOML list; blank resets to default".to_owned(),
+                Kind::Numbers => {
+                    "Enter numbers, comma or space separated; count depends on the model; blank resets to off".to_owned()
+                }
             };
             lines.truncate(detail_h - 1);
             while lines.len() < detail_h - 1 {

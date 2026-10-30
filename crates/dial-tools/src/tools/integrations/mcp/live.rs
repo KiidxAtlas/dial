@@ -3,7 +3,7 @@
 //! A [`Session`] owns a versioned [`Catalog`]: its revision moves only when the list changes.
 //! [`Live`] mirrors that catalog per server. The registry calls [`Live::sync`] at a request
 //! boundary, and only servers whose revision moved are reconciled, so unchanged tools keep their
-//! identity. Every change is also recorded as a bounded [`McpEvent`] for plugin subscribers.
+//! identity.
 
 use super::client::Client;
 use super::names::Namer;
@@ -12,73 +12,12 @@ use super::{MAX_TOOLS_PER_SERVER, Session, list_all};
 use crate::runtime::integration::CatalogFreshness;
 use crate::tools::integrations::ext::Tool;
 use anyhow::Result;
-use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-/// Most events a session keeps while no one drains them; the oldest are dropped first.
-const EVENT_QUEUE_LIMIT: usize = 64;
 /// Most notices a session keeps while no one drains them; the oldest are dropped first.
 const NOTICE_LIMIT: usize = 16;
-
-/// What happened to a server's tool or list, for plugin subscribers (`mcp_notification`).
-#[derive(Clone, Debug, PartialEq)]
-pub enum McpEventKind {
-    /// The server announced a tool-list change; a refresh follows.
-    ToolsChanged,
-    /// A refresh applied a changed tool list; the names are the server's remote tool names.
-    ToolsRefreshed {
-        added: Vec<String>,
-        removed: Vec<String>,
-        changed: Vec<String>,
-    },
-    /// A refresh failed; the previous tool list stays in effect.
-    ToolsRefreshFailed {
-        error: String,
-    },
-    PromptsChanged,
-    ResourcesChanged,
-    ResourceUpdated,
-}
-
-/// One server event. Plugins receive [`McpEvent::to_json`] as the `mcp_notification` payload.
-#[derive(Clone, Debug, PartialEq)]
-pub struct McpEvent {
-    pub server: String,
-    pub kind: McpEventKind,
-}
-
-impl McpEvent {
-    /// The payload plugins receive for `mcp_notification`.
-    pub fn to_json(&self) -> Value {
-        let server = self.server.as_str();
-        match &self.kind {
-            McpEventKind::ToolsChanged => json!({"server": server, "kind": "tools_changed"}),
-            McpEventKind::ToolsRefreshed {
-                added,
-                removed,
-                changed,
-            } => json!({
-                "server": server,
-                "kind": "tools_refreshed",
-                "added": added,
-                "removed": removed,
-                "changed": changed,
-            }),
-            McpEventKind::ToolsRefreshFailed { error } => json!({
-                "server": server,
-                "kind": "tools_refresh_failed",
-                "error": error,
-            }),
-            McpEventKind::PromptsChanged => json!({"server": server, "kind": "prompts_changed"}),
-            McpEventKind::ResourcesChanged => {
-                json!({"server": server, "kind": "resources_changed"})
-            }
-            McpEventKind::ResourceUpdated => json!({"server": server, "kind": "resource_updated"}),
-        }
-    }
-}
 
 /// A server's tool list, versioned: `revision` moves only when the list changes.
 #[derive(Default)]
@@ -175,8 +114,8 @@ impl Session {
         diff
     }
 
-    /// Fetches, applies, and reports the server's tool list. Reports (notice and event) only when
-    /// the list changed. Errors propagate so the caller decides the freshness.
+    /// Fetches, applies, and reports the server's tool list. Reports a notice only when the list
+    /// changed. Errors propagate so the caller decides the freshness.
     pub(super) fn sync_catalog(
         &self,
         client: &Client,
@@ -193,11 +132,6 @@ impl Session {
                 diff.removed.len(),
                 diff.changed.len()
             ));
-            self.push_event(McpEventKind::ToolsRefreshed {
-                added: diff.added.clone(),
-                removed: diff.removed.clone(),
-                changed: diff.changed.clone(),
-            });
         }
         Ok(diff)
     }
@@ -206,7 +140,6 @@ impl Session {
     /// the signal thread, so a burst of notices is serialized here; the turn lock keeps a request
     /// from reading the catalog mid-refresh. A failure keeps the previous list and marks it stale.
     pub(super) fn refresh_tools(&self) {
-        self.push_event(McpEventKind::ToolsChanged);
         let _turn = self.turn.lock();
         let client = self.current();
         if client.is_closed() {
@@ -223,7 +156,6 @@ impl Session {
                     "mcp `{}`: tools/list refresh failed; keeping previous tools: {error}",
                     self.name
                 ));
-                self.push_event(McpEventKind::ToolsRefreshFailed { error });
             }
         }
     }
@@ -251,23 +183,8 @@ impl Session {
         notices.push(notice);
     }
 
-    pub(super) fn push_event(&self, kind: McpEventKind) {
-        let mut events = self.events.lock();
-        if events.len() == EVENT_QUEUE_LIMIT {
-            events.pop_front();
-        }
-        events.push_back(McpEvent {
-            server: self.name.clone(),
-            kind,
-        });
-    }
-
     fn drain_notices(&self) -> Vec<String> {
         std::mem::take(&mut *self.notices.lock())
-    }
-
-    fn drain_events(&self) -> Vec<McpEvent> {
-        self.events.lock().drain(..).collect()
     }
 }
 
@@ -441,14 +358,6 @@ impl Live {
             }
             mounted.applied = Some(revision);
         }
-    }
-
-    /// Drains every server's queued events, in server order.
-    pub fn take_events(&self) -> Vec<McpEvent> {
-        self.servers
-            .iter()
-            .flat_map(|mounted| mounted.session.drain_events())
-            .collect()
     }
 
     /// Whether `name` was a tool a server withdrew and has not returned.

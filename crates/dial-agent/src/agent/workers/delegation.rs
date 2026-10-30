@@ -2,6 +2,9 @@
 
 use crate::agent::*;
 
+/// Idle terminal sleep cap while live workers may message the parent.
+const WORKER_MESSAGE_POLL: Duration = Duration::from_millis(250);
+
 impl<'a> Agent<'a> {
     pub fn pump_subagents(&mut self, ui: &mut dyn Ui) {
         self.memory_maintenance_tick(ui, true);
@@ -105,6 +108,14 @@ impl<'a> Agent<'a> {
         }
         Ok(())
     }
+    /// The terminal's maximum idle sleep while a live worker can message the parent, so its
+    /// message is shown promptly instead of at the next status refresh.
+    pub fn worker_message_wakeup_interval(&self) -> Option<Duration> {
+        self.live_tasks
+            .control()
+            .any_running()
+            .then_some(WORKER_MESSAGE_POLL)
+    }
     pub fn subagent_status(&mut self, id: Option<&str>, ui: &mut dyn Ui) -> Result<Value> {
         self.pump_subagents(ui);
         self.live_tasks.status(id).map_err(anyhow::Error::msg)
@@ -165,19 +176,17 @@ impl<'a> Agent<'a> {
         result
     }
 
-    /// Run `before_subagent_spawn` hooks and plugins; `Err(reason)` refuses the spawn.
+    /// Run `before_subagent_spawn` hooks; `Err(reason)` refuses the spawn.
     pub(in crate::agent) fn gate_subagent_spawn(
         &self,
         args: &Value,
         ui: &mut dyn Ui,
     ) -> Result<(), String> {
-        let plugins = self.hook_plugins();
         let root = self.workspace.root().to_path_buf();
         let payload = json!({"session_id":self.session.id(),"args":args});
         let mut notices = Vec::new();
         let gate = crate::agent::safety::hooks::gate(
             self.tool_hooks(),
-            plugins.as_deref(),
             &root,
             "before_subagent_spawn",
             payload,
@@ -268,15 +277,13 @@ impl<'a> Agent<'a> {
                     &self.interrupt,
                     ui,
                 );
-                let (reply, stopped_for_input) = match reply {
+                let (reply, stopped) = match reply {
                     Ok((value, stopped)) => (Ok(value), stopped),
-                    Err(error) => (Err(error), false),
+                    Err(error) => (Err(error), None),
                 };
                 let mut output = self.live_tasks.polling_output(reply);
-                if stopped_for_input {
-                    output
-                        .text
-                        .push_str(crate::agent::workers::live_tasks::STOPPED_FOR_INPUT);
+                if let Some(stopped) = stopped {
+                    output.text.push_str(stopped.note());
                 }
                 return output;
             }

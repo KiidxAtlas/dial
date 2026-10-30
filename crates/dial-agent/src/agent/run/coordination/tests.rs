@@ -103,6 +103,10 @@ fn disabled_coordination_is_absent_even_when_explicitly_loaded() {
 #[test]
 fn coordination_never_enters_worker_offer_or_changes_stable_prefix() {
     with_agent("[assistance]\nlean_local=false", |agent| {
+        // Loadable by default; once loaded it is offered to the foreground agent only.
+        assert!(agent.catalog().iter().any(|name| name == "peers"));
+        assert!(!agent.offered().iter().any(|name| name == "peers"));
+        agent.activate_tools(&["peers".into()]).unwrap();
         assert!(agent.offered().iter().any(|name| name == "peers"));
         assert!(
             !agent
@@ -285,6 +289,37 @@ fn peer_board_marks_overlaps_and_counts_queued_mail_without_draining() {
         let notes = agent.poll_coordination(&mut NullUi);
         assert!(notes[0]["content"].as_str().unwrap().contains("second"));
         assert_eq!(agent.peer_board().unwrap().queued, 0);
+    });
+}
+
+#[test]
+fn peer_messages_keep_both_directions_and_show_queued_mail_as_unread() {
+    with_agent("", |agent| {
+        let layout = agent.layout().unwrap().clone();
+        let peer = Participant::join(&layout, "other-session").unwrap();
+        let own_id = agent.peer_board().unwrap().id;
+        let sent = agent.peer_coordination(&json!({"action":"send","to":peer.id(),"text":"hello"}));
+        assert!(!sent.is_error, "{}", sent.text);
+        peer.send(&own_id, "delivered").unwrap();
+        agent.poll_coordination(&mut NullUi);
+        peer.send(&own_id, "still queued").unwrap();
+        let message = |outgoing, text: &str, unread| PeerMessage {
+            peer: peer.id().to_owned(),
+            outgoing,
+            text: text.into(),
+            unread,
+        };
+        let expected = vec![
+            message(true, "hello", false),
+            message(false, "delivered", false),
+            message(false, "still queued", true),
+        ];
+        assert_eq!(agent.peer_messages().unwrap(), expected);
+        assert_eq!(
+            agent.peer_board().unwrap().queued,
+            1,
+            "reading the chat must not drain"
+        );
     });
 }
 

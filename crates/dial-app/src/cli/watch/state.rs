@@ -113,6 +113,21 @@ pub(crate) struct PeerRow {
     pub phase: String,
     pub scopes: Vec<String>,
     pub overlapping: Vec<String>,
+    /// The recent conversation with this peer, oldest first, bounded to [`PEER_MESSAGES`].
+    #[serde(default)]
+    pub messages: Vec<PeerMessage>,
+}
+
+/// Messages published per peer; older ones stay out of the pane.
+pub(crate) const PEER_MESSAGES: usize = 50;
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct PeerMessage {
+    /// Sent by this session; otherwise received from the peer.
+    pub outgoing: bool,
+    pub text: String,
+    /// Still queued for this session; the model has not received it yet.
+    pub unread: bool,
 }
 
 /// One pane request. Unknown fields or actions are refused.

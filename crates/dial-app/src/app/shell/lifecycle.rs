@@ -1,7 +1,6 @@
 //! Shell start, adoption of a new configuration, and teardown.
 
 use crate::agent;
-use crate::agent::Agent;
 use crate::agent::window::context;
 use crate::agent::workflow::todo::TodoList;
 use crate::app::command_registry::command_entries;
@@ -64,9 +63,6 @@ impl Shell {
             auth_job: None,
             extensions_pending: None,
             extensions_job: None,
-            extension_commands: Vec::new(),
-            extension_views: Default::default(),
-            extension_keys: Default::default(),
             restart_requested: false,
             retry_noted: false,
             retry_control: None,
@@ -132,7 +128,6 @@ impl Shell {
             deferred: Default::default(),
             deferred_editor: false,
             deferred_approval_cycle: false,
-            plugin_chrome: Default::default(),
             held: Default::default(),
             live_tasks: None,
             workers: Default::default(),
@@ -325,11 +320,8 @@ impl Shell {
         // completion, palette, help and dispatch.
         self.commands = context::discover_commands(&app.layout);
         let found = skills::discover(&app.layout);
-        self.composer.set_commands(command_entries(
-            &self.commands,
-            &found,
-            &self.extension_commands,
-        ));
+        self.composer
+            .set_commands(command_entries(&self.commands, &found));
         let mut arguments =
             command_argument_completions(&app.config, &skills::discover_all(&app.layout));
         arguments.extend(
@@ -348,20 +340,6 @@ impl Shell {
     pub(super) fn refresh_commands(&mut self, app: &App) {
         self.refresh_command_resources(app);
         self.files.request(&app.layout.project_root);
-    }
-
-    /// Re-reads the commands the loaded extensions answer. Called when an agent is bound, since the
-    /// extension host is loaded with the agent; completion, palette and help all read the result.
-    pub(in crate::app) fn sync_extension_commands(&mut self, agent: &Agent<'_>) {
-        self.extension_commands = agent
-            .extension_host()
-            .map(|host| host.command_names())
-            .unwrap_or_default();
-        self.composer.set_commands(command_entries(
-            &self.commands,
-            &self.skills,
-            &self.extension_commands,
-        ));
     }
 
     /// Home screen and, for a resumed session, its earlier conversation.
@@ -396,7 +374,7 @@ impl Shell {
                     ("!".to_owned(), "run a shell command".to_owned()),
                     (
                         "/extensions".to_owned(),
-                        "MCP servers and plugins".to_owned(),
+                        "MCP servers and skills".to_owned(),
                     ),
                 ]
             } else {

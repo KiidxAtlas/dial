@@ -34,7 +34,7 @@ fn sample() -> Browser {
 fn tabs_wrap_both_ways() {
     let mut b = Browser::new();
     b.prev_tab();
-    assert_eq!(b.tab(), Tab::Marketplaces);
+    assert_eq!(b.tab(), Tab::Skills);
     b.next_tab();
     assert_eq!(b.tab(), Tab::Mcp);
 }
@@ -90,9 +90,6 @@ fn registry_search_results_are_not_filtered_a_second_time() {
     assert!(b.visible(Tab::Mcp).is_empty());
     b.pop_query();
     assert_eq!(b.selected(), Some(&remote));
-    // A plugin listing is not a server-side search response.
-    b.set_rows(Tab::Plugins, vec![remote]);
-    assert!(b.visible(Tab::Plugins).is_empty());
     b.clear_search();
     assert_eq!(b.visible(Tab::Mcp).len(), 4);
 }
@@ -122,17 +119,14 @@ fn search_filters_title_summary_and_tags_case_insensitively() {
 fn match_summary_counts_each_tab_while_searching() {
     let mut b = sample();
     b.set_rows(
-        Tab::Plugins,
-        vec![row("hello", "Hello plugin", "Greets", &["web"])],
+        Tab::Skills,
+        vec![row("hello", "Hello skill", "Greets", &["web"])],
     );
     assert_eq!(b.match_summary(), "");
     for c in "web".chars() {
         b.push_query(c);
     }
-    assert_eq!(
-        b.match_summary(),
-        "MCP servers 1 · Plugins 1 · Skills 0 · Marketplaces 0"
-    );
+    assert_eq!(b.match_summary(), "MCP servers 1 · Skills 1");
 }
 
 #[test]
@@ -239,27 +233,13 @@ fn job_progress_goes_running_then_done() {
 }
 
 #[test]
-fn marketplace_and_skill_changes_wait_for_confirmation() {
+fn skill_changes_wait_for_confirmation() {
     let mut b = Browser::new();
-    for intent in [
-        Intent::RemoveMarketplace { name: "x".into() },
-        Intent::ToggleMarketplace {
-            name: "x".into(),
-            enable: false,
-        },
-        Intent::InstallSkill {
-            source: "https://example.com/org/skills.git#pdf".into(),
-        },
-    ] {
-        assert!(b.request(intent).is_none());
-        b.decline();
-    }
-    // Enabling a marketplace is reversible and runs at once.
     assert!(
-        b.request(Intent::ToggleMarketplace {
-            name: "x".into(),
-            enable: true,
+        b.request(Intent::InstallSkill {
+            source: "https://example.com/org/skills.git#pdf".into(),
         })
-        .is_some()
+        .is_none()
     );
+    b.decline();
 }

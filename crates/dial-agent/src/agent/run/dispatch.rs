@@ -221,12 +221,7 @@ pub(in crate::agent) fn parallel_tools(
             );
             if let Some(&source) = unique.get(&key)
                 && !["pre_tool_use", "post_tool_use"].iter().any(|event| {
-                    crate::agent::safety::hooks::wanted_for_tool(
-                        &config.hooks,
-                        ext.plugins().as_deref(),
-                        event,
-                        &call.name,
-                    )
+                    crate::agent::safety::hooks::wanted_for_tool(&config.hooks, event, &call.name)
                 })
             {
                 sources.push(source);
@@ -259,8 +254,7 @@ pub(in crate::agent) fn parallel_tools(
                     if interrupt.load(Ordering::SeqCst) {
                         return interrupted_tool();
                     }
-                    let plugins = ext.plugins();
-                    match crate::agent::safety::hooks::pre_tool_with(&config.hooks, plugins.as_deref(), workspace.root(), &call.name, &call.arguments, interrupt, &mut |notice| notices.push(notice.to_owned())) {
+                    match crate::agent::safety::hooks::pre_tool_with(&config.hooks, workspace.root(), &call.name, &call.arguments, interrupt, &mut |notice| notices.push(notice.to_owned())) {
                         Err(error) => {
                             policy_reason = Some(crate::agent::safety::approval::PolicyReason::HookVeto);
                             return ToolOutput::err(error).with_status(tools::ToolStatus::Blocked);
@@ -275,7 +269,7 @@ pub(in crate::agent) fn parallel_tools(
                         &ToolContext { workspace, config, mutation_authorizer: None, confirm: None },
                         ext, &call.name, &call.arguments, &|_| {}, interrupt,
                     ).unwrap_or_else(|| ToolOutput::err("parallel tool unavailable"));
-                    crate::agent::safety::hooks::post_tool_with(&config.hooks, plugins.as_deref(), workspace.root(), &call.name, &call.arguments, &mut output, interrupt, &mut |notice| notices.push(notice.to_owned()));
+                    crate::agent::safety::hooks::post_tool_with(&config.hooks, workspace.root(), &call.name, &call.arguments, &mut output, interrupt, &mut |notice| notices.push(notice.to_owned()));
                     output
                 }));
                 let _ = completed.send((source, (output, started.elapsed().as_secs_f64()), notices, policy_reason));
@@ -487,33 +481,6 @@ impl<'a> Agent<'a> {
         }
     }
 
-    /// The plugin host lifecycle hooks dispatch through. Hermetic runs get none, like `tool_hooks`.
-    pub(in crate::agent) fn hook_plugins(
-        &self,
-    ) -> Option<Arc<crate::tools::integrations::plugin::Host>> {
-        if self.hermetic {
-            None
-        } else {
-            self.ext.plugins()
-        }
-    }
-
-    /// Queues an observational plugin event (`turn_start`, `tool_call`, ...). The payload is built
-    /// only when a protocol 2 plugin subscribes; the call never waits for plugins or changes the
-    /// turn. Hermetic runs emit nothing, like hooks.
-    pub(in crate::agent) fn emit_event(&self, event: &str, payload: impl FnOnce() -> Value) {
-        if let Some(plugins) = self.hook_plugins()
-            && plugins.observes(event)
-        {
-            plugins.emit(event, &payload());
-        }
-    }
-
-    /// The extension host that answers slash commands. Hermetic runs get none, like hooks.
-    pub fn extension_host(&self) -> Option<Arc<crate::tools::integrations::plugin::Host>> {
-        self.hook_plugins()
-    }
-
     /// `before_provider_request` for one model call made by this agent. Hook notices reach `ui`;
     /// `None` means send the borrowed request unchanged.
     pub(in crate::agent) fn provider_request_with(
@@ -532,7 +499,6 @@ impl<'a> Agent<'a> {
         let mut notices = Vec::new();
         let rewritten = crate::agent::safety::hooks::provider_request(
             self.tool_hooks(),
-            self.hook_plugins().as_deref(),
             self.workspace.root(),
             projected.as_ref().unwrap_or(request),
             self.interrupt.as_ref(),
@@ -628,14 +594,9 @@ impl<'a> Agent<'a> {
         if call.name == "finish" {
             self.step_checks.finish_accepted = false;
         }
-        let plugins = self.hook_plugins();
         let mut rewritten = None;
         if call.name != "exit_plan"
-            && crate::agent::safety::hooks::wanted(
-                self.tool_hooks(),
-                plugins.as_deref(),
-                "pre_tool_use",
-            )
+            && crate::agent::safety::hooks::wanted(self.tool_hooks(), "pre_tool_use")
         {
             let root = self.workspace.root().to_path_buf();
             let configured_hooks = self.tool_hooks();
@@ -644,7 +605,6 @@ impl<'a> Agent<'a> {
             let (result, context) = crate::agent::safety::hooks::with_heartbeat(ui, || {
                 crate::agent::safety::hooks::pre_tool_noted(
                     configured_hooks,
-                    plugins.as_deref(),
                     &root,
                     &call.name,
                     &call.arguments,
@@ -700,11 +660,7 @@ impl<'a> Agent<'a> {
             self.dispatch_inner(backend, call, ui, &mut approval_denied, arguments_changed);
         if call.name != "exit_plan"
             && !approval_denied
-            && crate::agent::safety::hooks::wanted(
-                self.tool_hooks(),
-                plugins.as_deref(),
-                "post_tool_use",
-            )
+            && crate::agent::safety::hooks::wanted(self.tool_hooks(), "post_tool_use")
         {
             let root = self.workspace.root().to_path_buf();
             let configured_hooks = self.tool_hooks();
@@ -713,7 +669,6 @@ impl<'a> Agent<'a> {
             let context = crate::agent::safety::hooks::with_heartbeat(ui, || {
                 crate::agent::safety::hooks::post_tool_with(
                     configured_hooks,
-                    plugins.as_deref(),
                     &root,
                     &call.name,
                     &call.arguments,

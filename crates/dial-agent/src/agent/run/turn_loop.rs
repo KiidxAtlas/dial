@@ -115,16 +115,12 @@ impl<'a> Agent<'a> {
         for backend in self.role_backends.values_mut() {
             backend.set_usage_scope(Some(self.usage_scope.clone()));
         }
-        let plugins = self
-            .hook_plugins()
-            .map(|host| host as std::sync::Arc<dyn crate::agent::ui::state_ui::EventSink>);
         let mut observed = crate::agent::ui::state_ui::StateUi::with_registry(
             ui,
             self.session.runtime(),
             None,
             self.ext.clone(),
-        )
-        .observed_by(plugins, self.session.id());
+        );
         self.live_tasks.bind(self.session.runtime());
         let turn_clock = Instant::now();
         self.coordination_phase("working", Some(user_text));
@@ -200,9 +196,6 @@ impl<'a> Agent<'a> {
             ),
             Err(_) => ("failed".to_string(), 0),
         };
-        self.emit_event("turn_end", || {
-            json!({"session_id": self.session.id(), "outcome": outcome.clone(), "steps": steps, "interrupted": result.as_ref().is_ok_and(|report| report.interrupted)})
-        });
         // A failed turn keeps its cause in the journal; the transcript alone loses it on resume.
         let (error, error_class) = match &result {
             Err(error) => (
@@ -273,16 +266,8 @@ impl<'a> Agent<'a> {
             self.interrupt.store(false, Ordering::SeqCst);
         }
         let mut prompt_rewrite: Option<String> = None;
-        self.emit_event("turn_start", || {
-            json!({"session_id": self.session.id(), "prompt": crate::agent::window::prompt::truncate_chars(user_text, 8000)})
-        });
-        let plugins = self.hook_plugins();
         if !matches!(origin, TurnOrigin::Peer | TurnOrigin::Monitor)
-            && crate::agent::safety::hooks::wanted(
-                self.tool_hooks(),
-                plugins.as_deref(),
-                "user_prompt_submit",
-            )
+            && crate::agent::safety::hooks::wanted(self.tool_hooks(), "user_prompt_submit")
         {
             let configured_hooks = self.tool_hooks();
             let root = self.workspace.root();
@@ -292,7 +277,6 @@ impl<'a> Agent<'a> {
                 crate::agent::safety::hooks::with_heartbeat(ui, || {
                     let outcome = crate::agent::safety::hooks::fire_with(
                         configured_hooks,
-                        plugins.as_deref(),
                         root,
                         "user_prompt_submit",
                         None,
@@ -814,7 +798,6 @@ impl<'a> Agent<'a> {
         };
         let mut repair_attempts = 0u64;
         let mut stop_rounds = 0u32;
-        let plugins = self.hook_plugins();
         let mut candidate_summary = String::new();
         loop {
             if let Ok(report) = &result
@@ -964,7 +947,7 @@ impl<'a> Agent<'a> {
                 }
                 Err(_) => break,
             };
-            if !crate::agent::safety::hooks::wanted(self.tool_hooks(), plugins.as_deref(), "stop") {
+            if !crate::agent::safety::hooks::wanted(self.tool_hooks(), "stop") {
                 break;
             }
             let configured_hooks = self.tool_hooks();
@@ -973,7 +956,6 @@ impl<'a> Agent<'a> {
             let (verdict, notices) = crate::agent::safety::hooks::with_heartbeat(ui, || {
                 let outcome = crate::agent::safety::hooks::fire_with(
                     configured_hooks,
-                    plugins.as_deref(),
                     root,
                     "stop",
                     None,

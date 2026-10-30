@@ -17,3 +17,23 @@ fn global_hook_survives_project_hooks() {
         .collect();
     assert_eq!(commands, ["global-policy", "fmt"]);
 }
+
+#[test]
+fn provider_layers_preserve_inferred_routes_and_replace_changed_routes() {
+    let base: toml::Table = toml::from_str("model='chat'\n[endpoint]\nbase_url='https://proxy.example/v1/'\nheaders=[{name='X-Route',value={literal='custom'}}]\n[providers.proxy]\nbase_url='https://proxy.example/v1'\n").unwrap();
+    for (provider, retains_endpoint) in [("proxy", true), ("openai", false)] {
+        let mut merged = base.clone();
+        merge_overlay(
+            &mut merged,
+            toml::from_str(&format!("provider='{provider}'")).unwrap(),
+        );
+        assert_eq!(
+            merged.get("endpoint").is_some(),
+            retains_endpoint,
+            "{provider}"
+        );
+        if retains_endpoint {
+            assert_eq!(merged.get("endpoint"), base.get("endpoint"));
+        }
+    }
+}

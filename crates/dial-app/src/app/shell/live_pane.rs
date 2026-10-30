@@ -11,7 +11,10 @@ use crate::agent::Agent;
 use crate::app::core::App;
 use crate::cli::watch::{
     self,
-    state::{self, Exchange, Job, JobKind, PeerRow, Peers, Request, Snapshot, Thread, Worker},
+    state::{
+        self, Exchange, Job, JobKind, PeerMessage, PeerRow, Peers, Request, Snapshot, Thread,
+        Worker,
+    },
 };
 use crate::storage::side_thread::Outcome;
 use std::collections::VecDeque;
@@ -247,6 +250,8 @@ impl Shell {
                 let output = agent.peer_coordination(
                     &serde_json::json!({"action": "send", "to": to, "text": text}),
                 );
+                // Republish the board at once, so the chat view shows the message just sent.
+                self.live_pane.peers_at = None;
                 if output.is_error {
                     format!("Message to {} failed: {}", short(&to), output.text)
                 } else {
@@ -406,28 +411,46 @@ impl Shell {
 }
 
 fn peers(agent: &mut Agent<'_>) -> Peers {
-    match agent.peer_board() {
-        Ok(board) => Peers {
-            error: None,
-            scopes: board.scopes,
-            overlapping: board.overlapping,
-            queued: board.queued,
-            rows: board
-                .peers
-                .into_iter()
-                .map(|row| PeerRow {
+    let board = match agent.peer_board() {
+        Ok(board) => board,
+        Err(error) => {
+            return Peers {
+                error: Some(format!("Project peers are unavailable: {error:#}")),
+                ..Peers::default()
+            };
+        }
+    };
+    // The board already reports an unavailable registry; a chat that cannot be read stays empty.
+    let messages = agent.peer_messages().unwrap_or_default();
+    Peers {
+        error: None,
+        scopes: board.scopes,
+        overlapping: board.overlapping,
+        queued: board.queued,
+        rows: board
+            .peers
+            .into_iter()
+            .map(|row| {
+                let mut chat: Vec<PeerMessage> = messages
+                    .iter()
+                    .filter(|message| message.peer == row.peer.id)
+                    .map(|message| PeerMessage {
+                        outgoing: message.outgoing,
+                        text: state::bounded(&message.text, state::TEXT_LIMIT),
+                        unread: message.unread,
+                    })
+                    .collect();
+                chat.drain(..chat.len().saturating_sub(state::PEER_MESSAGES));
+                PeerRow {
                     id: row.peer.id,
                     summary: row.peer.summary,
                     phase: row.peer.phase,
                     scopes: row.peer.scopes,
                     overlapping: row.overlapping,
-                })
-                .collect(),
-        },
-        Err(error) => Peers {
-            error: Some(format!("Project peers are unavailable: {error:#}")),
-            ..Peers::default()
-        },
+                    messages: chat,
+                }
+            })
+            .collect(),
     }
 }
 

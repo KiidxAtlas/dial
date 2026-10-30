@@ -7,7 +7,14 @@ pub(crate) fn overlay(cli: &Cli) -> Result<toml::Table> {
         table.insert("model".into(), model.clone().into());
     }
     if let Some(url) = &cli.endpoint {
-        table.insert("provider".into(), "endpoint".into());
+        table.insert(
+            "provider".into(),
+            cli.model_flags
+                .provider
+                .as_deref()
+                .unwrap_or("endpoint")
+                .into(),
+        );
         let mut endpoint = toml::Table::new();
         endpoint.insert("base_url".into(), url.clone().into());
         if let Some(var) = &cli.api_key_env {
@@ -85,3 +92,6 @@ pub(crate) fn overlay(cli: &Cli) -> Result<toml::Table> {
     }
     Ok(table)
 }
+
+#[cfg(test)]
+mod tests;

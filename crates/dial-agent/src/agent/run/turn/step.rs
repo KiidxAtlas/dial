@@ -655,7 +655,6 @@ impl Agent<'_> {
                     self.interrupt.clone(),
                     crate::agent::run::streaming_dispatch::Admission {
                         hooks: self.tool_hooks().to_vec(),
-                        plugins: self.hook_plugins(),
                         always: self.always.clone(),
                         schemas: provider_request.tools.clone(),
                         names: turn.names.clone(),
@@ -668,11 +667,6 @@ impl Agent<'_> {
         backend.next_request_failover(
             (!self.hermetic && self.fallback_ready())
                 .then_some(self.effective_config().retry.fallback_on),
-        );
-        ui.message_started();
-        self.emit_event(
-            "message_start",
-            || json!({"session_id": self.session.id(), "step": step}),
         );
         let result = if self.hermetic {
             crate::learn::compute::background_call(self.config, backend, |backend, cancel| {
@@ -744,6 +738,8 @@ impl Agent<'_> {
                 },
             )
         };
+        // Matches whose interruptMode let this reply proceed; journaled once the reply is accepted.
+        let rule_deferred = std::mem::take(&mut rule_monitor.deferred);
         if let Some(previous) = previous_usage {
             backend.set_usage_scope(previous);
         }
@@ -911,6 +907,7 @@ impl Agent<'_> {
             }
             Ok(reply) => {
                 turn.reply_received();
+                self.admit_rule_triggers(turn, &reply, rule_deferred, ui)?;
                 reply
             }
             Err(error)
@@ -1469,7 +1466,6 @@ impl Agent<'_> {
             }
         }
         turn.stall_continues = 0;
-        ui.message_settled();
         if reply.tool_calls.is_empty() {
             if let (Some(warm), Some(sent)) = (&self.cache_warm, &warm_request) {
                 warm.settled(sent, &reply, &self.usage_scope);
@@ -1545,13 +1541,14 @@ impl Agent<'_> {
             }
             // Past a deadline or cost cap the answer is delivered without another request.
             let can_remind = self.stop_boundary().is_none();
-            let unverified = self.unverified_edits();
+            let run = can_remind && !turn.completion.reminder_spent();
+            let (unverified, failures) = self.gate_unverified_edits(run, ui);
             match turn.completion.evidence(unverified.as_deref(), can_remind) {
                 crate::agent::verify::completion::EvidenceGate::Accept => {}
                 crate::agent::verify::completion::EvidenceGate::Remind(note) => {
                     turn.pending_nudges.push(crate::agent::run::guidance::note(
                         crate::agent::run::guidance::Priority::Review,
-                        note,
+                        crate::agent::verify::completion::with_gate_failures(note, &failures),
                     ));
                     return Ok(crate::agent::run::engine::Tick::Again);
                 }
@@ -1703,6 +1700,7 @@ impl Agent<'_> {
         if let Some(failure) = normalized_rules.failure {
             bail!("{failure}");
         }
+        let normalized_deferred = normalized_rules.deferred;
         let scoped_paths = turn.rule_catalog.pending_paths(
             &turn.rule_root,
             &turn.rule_state,
@@ -1719,6 +1717,9 @@ impl Agent<'_> {
                 Some("Applicable portable guidance must be delivered before the normalized tool attempt; no tools executed."),
                 ui,
             );
+        }
+        if !normalized_deferred.is_empty() {
+            self.admit_rule_triggers_judged(turn, normalized_deferred, Vec::new(), ui)?;
         }
         if let (Some(warm), Some(sent)) = (&self.cache_warm, &warm_request) {
             warm.settled(sent, &reply, &self.usage_scope);
@@ -1815,7 +1816,7 @@ impl Agent<'_> {
             turn.rule_state
                 .remember(&hit, "main")
                 .map_err(anyhow::Error::msg)?;
-            ui.notice(&hit.to_string());
+            self.announce_rule(&hit, crate::agent::safety::rules::Trigger::Interrupt, ui);
         }
         if let Some(paths) = paths {
             turn.rule_state
@@ -1835,6 +1836,95 @@ impl Agent<'_> {
         )?;
         turn.budget.give_back();
         Ok(crate::agent::run::engine::Tick::Again)
+    }
+
+    /// Journals the stream-rule matches that let an accepted main-agent reply proceed, then asks
+    /// judged `question` rules about it. Every rule that fires is announced and its reminder
+    /// reaches the next request.
+    fn admit_rule_triggers(
+        &mut self,
+        turn: &mut TurnState<'_>,
+        reply: &llm::Reply,
+        deferred: Vec<crate::agent::safety::rules::Hit>,
+        ui: &mut dyn Ui,
+    ) -> Result<()> {
+        let mut judged = Vec::new();
+        if self.judges_rules() && !self.interrupt.load(Ordering::SeqCst) {
+            for candidate in turn.rule_catalog.judged_candidates(
+                &turn.rule_root,
+                &turn.rule_state,
+                "main",
+                reply,
+            ) {
+                match crate::judgment::judge_rule(
+                    &self.auth_config,
+                    &self.config.user_dir,
+                    &candidate.question,
+                    &candidate.content,
+                    Some(&self.usage_scope),
+                    self.interrupt.clone(),
+                ) {
+                    Ok(judgment) if judgment.choice == crate::judgment::RULE_CHOICES[0] => {
+                        judged.push(candidate.hit);
+                    }
+                    Ok(_) => {}
+                    Err(error) => ui.diagnostic(&format!(
+                        "Stream rule {} was not judged: {error:#}",
+                        candidate.hit.source()
+                    )),
+                }
+            }
+        }
+        self.admit_rule_triggers_judged(turn, deferred, judged, ui)
+    }
+
+    fn admit_rule_triggers_judged(
+        &mut self,
+        turn: &mut TurnState<'_>,
+        deferred: Vec<crate::agent::safety::rules::Hit>,
+        judged: Vec<crate::agent::safety::rules::Hit>,
+        ui: &mut dyn Ui,
+    ) -> Result<()> {
+        use crate::agent::safety::rules::Trigger;
+        if deferred.is_empty() && judged.is_empty() {
+            return Ok(());
+        }
+        let fired = deferred
+            .iter()
+            .map(|hit| (hit, Trigger::Deferred))
+            .chain(judged.iter().map(|hit| (hit, Trigger::Judged)));
+        for (hit, trigger) in fired {
+            turn.rule_state
+                .remember(hit, "main")
+                .map_err(anyhow::Error::msg)?;
+            self.announce_rule(hit, trigger, ui);
+        }
+        let mut control = self.session.control_state();
+        turn.rule_state.save(&mut control);
+        self.session.set_control_state(control)?;
+        Ok(())
+    }
+
+    /// Whether judged `question` rules are asked: `portable_rules.judge`, where `auto` requires
+    /// an explicitly assigned `judge` role.
+    fn judges_rules(&self) -> bool {
+        use crate::config::types::RuleJudge;
+        !self.hermetic
+            && match self.config.portable_rules.judge {
+                RuleJudge::Off => false,
+                RuleJudge::On => true,
+                RuleJudge::Auto => self.auth_config.role_selection("judge").is_some(),
+            }
+    }
+
+    /// Shows that a stream rule fired.
+    fn announce_rule(
+        &self,
+        hit: &crate::agent::safety::rules::Hit,
+        trigger: crate::agent::safety::rules::Trigger,
+        ui: &mut dyn Ui,
+    ) {
+        ui.notice(&hit.notice(trigger));
     }
 
     /// The malformed tool-call form that justifies the turn's one constrained retry, when

@@ -613,8 +613,22 @@ pub(crate) fn write_plan(
     )?;
     if let Some(before) = &change.before {
         let count = hashline::split_lines(&hashline::normalize(&before.text)).len();
-        if count > 0 {
-            crate::tools::edit::editing::seen_guard(ws, &change.path, &before.text, &[(1, count)])?;
+        if count > 0
+            && let Err(error) = crate::tools::edit::editing::seen_guard(
+                ws,
+                &change.path,
+                &before.text,
+                &[(1, count)],
+            )
+        {
+            return Err(
+                match unseen_overwrite_projection(ws, &change.path, &before.text) {
+                    Some(current) => format!(
+                        "{error}\nNothing was written. The complete current content is shown below and now counts as read; replace it with `edit` against this tag (unchanged write arguments are not retried).\n{current}"
+                    ),
+                    None => error,
+                },
+            );
         }
     }
     change.authored_whole = true;
@@ -634,6 +648,35 @@ pub(crate) fn write_plan(
         }
     ));
     Ok(vec![change])
+}
+
+/// A refused overwrite of a small file shows it whole, so recovery needs no separate read round.
+/// Larger, truncated or notebook sources keep the plain refusal: a partial view is no witness.
+fn unseen_overwrite_projection(ws: &Workspace, path: &Path, before: &str) -> Option<String> {
+    const MAX_LINES: usize = 200;
+    const MAX_BYTES: usize = 16 * 1024;
+    let normalized = hashline::normalize(before);
+    let lines = hashline::split_lines(&normalized);
+    if ws.edit_mode != crate::tools::EditMode::Hashline
+        || crate::tools::edit::edit_source::notebook_path(path)
+        || lines.len() > MAX_LINES
+        || normalized.len() > MAX_BYTES
+        || lines.iter().any(|line| line.len() > select::MAX_READ_LINE)
+    {
+        return None;
+    }
+    // Use the already-loaded snapshot, not another disk read that could return a larger file.
+    let tag = ws.store().record(path, &normalized, &[(1, lines.len())]);
+    let rel = crate::tools::edit::edit_source::display_path(ws.rel(path));
+    let revision = crate::tools::edit::edit_source::hex_revision(
+        crate::tools::edit::edit_source::revision(before),
+    );
+    let mut text = format!("[{rel}#{tag}]\n[Source raw SHA256:{revision}]\n");
+    for (index, line) in lines.iter().enumerate() {
+        use std::fmt::Write;
+        writeln!(text, "{}:{line}", index + 1).expect("writing to a String cannot fail");
+    }
+    Some(text)
 }
 pub(in crate::tools) fn write_tool(ws: &Workspace, args: &Value) -> Result<String, String> {
     write_with(ws, args, &crate::tools::edit::editing::Execution::default())

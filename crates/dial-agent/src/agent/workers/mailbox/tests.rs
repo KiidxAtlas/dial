@@ -122,9 +122,12 @@ fn a_worker_reaches_the_parent_and_the_parent_reaches_a_worker() {
     team.enlist("task-1", "scout", quiet()).unwrap();
     let receipt = team.send("task-1", PARENT, "found it").unwrap();
     assert_eq!(receipt.queued, [PARENT]);
+    assert!(team.has_mail(PARENT) && !team.has_mail("task-1"));
+    assert!(team.has_mail(PARENT), "checking for mail never takes it");
     let letters = team.drain(PARENT);
     assert_eq!(letters[0].from, "task-1 (scout)");
     assert_eq!(letters[0].text, "found it");
+    assert!(!team.has_mail(PARENT) && !team.has_mail("task-9"));
 }
 
 #[test]

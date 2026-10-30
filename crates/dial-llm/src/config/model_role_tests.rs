@@ -180,7 +180,8 @@ fn removed_settings_migrate_and_the_rest_still_loads() {
              [model_roles.embedding]\nprovider='mlx'\nmodel='e'\n\
              [model_roles.memory]\nprovider='mlx'\nmodel='m'\n\
              [model_presets.work.roles.embedding]\nprovider='mlx'\nmodel='e'\n\
-             [retry.fallback_chains]\nmemory=['@embedding','@coach']\n[ui]\nworker_shards=false\nsession_rail=true\n",
+             [retry.fallback_chains]\nmemory=['@embedding','@coach']\n[ui]\nworker_shards=false\nsession_rail=true\n\
+             [extensions]\nenabled=true\n[extensions.plugins.demo]\nprogram='/bin/demo'\n",
     )
     .unwrap();
     assert!(migrate_removed_settings(&mut table));
@@ -200,6 +201,7 @@ fn removed_settings_migrate_and_the_rest_still_loads() {
     );
     assert!(!table["browser"].as_table().unwrap().contains_key("tern"));
     assert!(!table["memory"].as_table().unwrap().contains_key("mnemopi"));
+    assert!(!table.contains_key("extensions"));
     assert_eq!(table["memory"]["backend"].as_str(), Some("semantic"));
     assert!(
         !table["reliability"]

@@ -30,7 +30,6 @@ struct Runner {
 /// Controller-side admission data, evaluated on the UI thread before a read starts.
 pub(in crate::agent) struct Admission {
     pub(in crate::agent) hooks: Vec<crate::config::types::HookConfig>,
-    pub(in crate::agent) plugins: Option<Arc<crate::tools::integrations::plugin::Host>>,
     pub(in crate::agent) always: Vec<crate::agent::safety::approval::PermissionRule>,
     pub(in crate::agent) schemas: Vec<Value>,
     pub(in crate::agent) names: Vec<String>,
@@ -103,12 +102,7 @@ impl StreamingDispatch {
                 &call.arguments,
             )
             && ["pre_tool_use", "post_tool_use"].iter().all(|event| {
-                !crate::agent::safety::hooks::wanted_for_tool(
-                    &admission.hooks,
-                    admission.plugins.as_deref(),
-                    event,
-                    &call.name,
-                )
+                !crate::agent::safety::hooks::wanted_for_tool(&admission.hooks, event, &call.name)
             })
             && !crate::agent::safety::approval::denied_by_rule(
                 &admission.always,

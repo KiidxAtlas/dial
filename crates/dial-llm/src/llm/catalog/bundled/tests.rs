@@ -212,6 +212,10 @@ fn selectors_resolve_qualified_bare_vendor_and_fireworks_wire_ids() {
         Some(1_000_000)
     );
     assert_eq!(
+        known_context_window("anthropic/claude-sonnet-4-6-20260514"),
+        Some(1_000_000)
+    );
+    assert_eq!(
         model_capabilities("claude-opus-4-6").unwrap().provider,
         "anthropic"
     );
@@ -222,6 +226,9 @@ fn selectors_resolve_qualified_bare_vendor_and_fireworks_wire_ids() {
     );
     assert!(bundled_model("fireworks", "accounts/fireworks/models/kimi-k3").is_some());
     assert!(model_capabilities("definitely-not-a-model").is_none());
+    for model in ["ééééé", "claude-sonnet-4-6-2026051x"] {
+        assert!(bundled_model("anthropic", model).is_none(), "{model}");
+    }
 }
 
 #[test]

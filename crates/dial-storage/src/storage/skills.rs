@@ -531,7 +531,7 @@ pub fn match_hint(skills: &[Skill], text: &str) -> Option<String> {
         .map(|(_, skill)| skill.name.as_str())
         .collect();
     Some(format!(
-        "Skill hint: {} may match this request. Load the matching skill with the `skill` tool before covered work.",
+        "Skill hint: {} may match this request. If a matching skill covers substantial multi-step work, load it with the `skill` tool in the same response as your first reads, not as a round of its own.",
         names.join(", ")
     ))
 }

@@ -545,6 +545,7 @@ impl crate::agent::Agent<'_> {
                     std::sync::Arc::new(crate::agent::safety::rules::Catalog::discover(
                         layout,
                         self.workspace.root(),
+                        &self.config.portable_rules,
                     ))
                 })
             } else {

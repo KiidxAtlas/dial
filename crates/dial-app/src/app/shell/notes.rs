@@ -129,7 +129,7 @@ impl Shell {
     }
 
     /// Holds a rebuild that a command asked for during a turn until the turn finishes: a changed
-    /// config through `pending_config`, a same-config rebuild (plugins, resources) through
+    /// config through `pending_config`, a same-config rebuild (resources) through
     /// `pending_resource_rebuild`. The idle loop applies both at its next boundary.
     pub(in crate::app) fn adopt_after_turn(&mut self, app: &App, step: Step) {
         let Step::Rebuild(config) = step else {

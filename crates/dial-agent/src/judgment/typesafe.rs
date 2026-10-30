@@ -1,6 +1,6 @@
 //! TypeSafe System One judgment backend, selected by `provider = "typesafe"` on the `judge` role.
 //!
-//! Wire contract (OMP `packages/ai/src/judgment/systemone.ts`, `typesafeWire`): `POST {base}/v1/systemone`
+//! Wire contract (`typesafeWire`): `POST {base}/v1/systemone`
 //! with bearer auth and body `{ model, state, questions }`, where `questions` maps a key to a choice
 //! question `{ type: "choice", instructions, criteria: { option: rubric | null } }`. The reply carries
 //! `answers.<key>.choice` plus `usage.cost` (USD) for the call.

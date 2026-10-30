@@ -61,7 +61,7 @@ fn letter_keys_never_remove_without_confirmation() {
             };
             let remove = matches!(
                 intent,
-                Intent::RemoveMcp { .. } | Intent::RemovePlugin { .. } | Intent::RemoveSkill { .. }
+                Intent::RemoveMcp { .. } | Intent::RemoveSkill { .. }
             );
             let ran_now = b.request(intent).is_some();
             assert!(
@@ -123,7 +123,7 @@ fn remove_waits_for_enter_and_esc_cancels() {
 fn enter_installs_available_rows_and_shows_details_for_installed_ones() {
     let mut b = Browser::new();
     b.set_rows(
-        Tab::Plugins,
+        Tab::Skills,
         vec![
             row("alpha@market", Origin::Remote, State::Available),
             row("beta", Origin::Installed, State::Enabled),
@@ -132,8 +132,8 @@ fn enter_installs_available_rows_and_shows_details_for_installed_ones() {
     b.next_tab();
     assert_eq!(
         enter_install(&b),
-        Some(Intent::InstallPlugin {
-            id: "alpha@market".into()
+        Some(Intent::InstallSkill {
+            source: "alpha@market".into(),
         })
     );
     assert_eq!(enter_label(&b), "install");
@@ -440,7 +440,7 @@ fn search_keys_do_not_run_actions_or_repeat_completed_queries() {
     assert!(overlay.browser.confirm.is_none());
     overlay.browser.start_search();
     overlay.handle(&key(KeyCode::Right), &rig.keys);
-    assert_eq!(overlay.browser.tab(), Tab::Plugins);
+    assert_eq!(overlay.browser.tab(), Tab::Skills);
     assert_eq!(overlay.browser.query(), "jkrx");
 }
 
@@ -527,15 +527,6 @@ fn paste_edits_only_the_focused_field_without_submitting() {
     assert!(form.fields[0].secret);
     assert_eq!(overlay.browser.query(), "/exit秘密");
     assert!(overlay.browser.confirm.is_none());
-    overlay.browser.form = Some(Form::marketplace());
-    overlay.browser.form.as_mut().unwrap().focus_next();
-    overlay.handle(
-        &Event::Paste("https://example.com/index.json".into()),
-        &rig.keys,
-    );
-    let form = overlay.browser.form.as_ref().unwrap();
-    assert!(form.fields[0].value.is_empty());
-    assert_eq!(form.fields[1].value, "https://example.com/index.json");
     overlay.browser.form = None;
     overlay.browser.request(Intent::RemoveMcp {
         id: "fixture".into(),

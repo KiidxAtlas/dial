@@ -257,3 +257,76 @@ fn thinking_auto_is_stored_without_a_profile() {
     assert!(auto.thinking_auto);
     assert!(auto.model_profile.is_none());
 }
+
+#[test]
+fn provider_switch_resolves_a_fresh_route_and_preserves_same_provider_overrides() {
+    use crate::config::types::EndpointConfig;
+    use crate::llm::model_config::ApiProtocol;
+    let mut config = Config {
+        provider: Some("chatgpt".into()),
+        model: "claude-sonnet-4-6".into(),
+        endpoint: Some(EndpointConfig {
+            base_url: "https://chatgpt.com/backend-api/codex".into(),
+            api_key_env: Some("OLD_ROUTE_KEY".into()),
+            protocol: Some(ApiProtocol::Responses),
+            headers: Some(vec![crate::llm::model_config::RequestHeader {
+                name: "X-Old-Route".into(),
+                value: crate::llm::model_config::HeaderValue::Literal("stale".into()),
+            }]),
+            account_id: Some("old-account".into()),
+            allow_insecure: true,
+        }),
+        ..Default::default()
+    };
+    let selected = apply(
+        config.clone(),
+        &ModelFlags {
+            provider: Some("anthropic".into()),
+            ..Default::default()
+        },
+    )
+    .expect("changing providers must discard the previous route");
+    let endpoint = selected.endpoint.unwrap();
+    assert_eq!(endpoint.base_url, "https://api.anthropic.com/v1");
+    assert_eq!(endpoint.protocol, Some(ApiProtocol::Anthropic));
+    assert_eq!(endpoint.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
+    assert!(endpoint.account_id.is_none());
+    assert!(endpoint.headers.is_none());
+    assert!(!endpoint.allow_insecure);
+    // A valid custom API route retains all its metadata when re-selecting the same provider.
+    config.provider = Some("openai".into());
+    config.endpoint.as_mut().unwrap().account_id = None;
+    let unchanged = apply(
+        config.clone(),
+        &ModelFlags {
+            provider: Some("openai".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(unchanged.selection(), config.selection());
+}
+
+#[test]
+fn provider_switch_survives_config_reload_without_old_endpoint_metadata() {
+    use crate::config::paths::Layout;
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(project.path(), home.path().to_path_buf()).unwrap();
+    std::fs::write(home.path().join("config.toml"), "provider='chatgpt'\nmodel='claude-sonnet-4-6'\n[endpoint]\nbase_url='https://chatgpt.com/backend-api'\nprotocol='responses'\n").unwrap();
+    let before = Config::load(&layout, None).unwrap();
+    let selected = apply(
+        before.clone(),
+        &ModelFlags {
+            provider: Some("anthropic".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut overlay = toml::Table::new();
+    capture_overlay(&mut overlay, &before, &selected).unwrap();
+    let reloaded = Config::load(&layout, Some(overlay)).unwrap();
+    assert_eq!(reloaded.provider, selected.provider);
+    assert_eq!(reloaded.endpoint, selected.endpoint);
+    assert_eq!(reloaded.model, selected.model);
+}

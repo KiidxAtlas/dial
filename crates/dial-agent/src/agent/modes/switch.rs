@@ -7,7 +7,6 @@ use crate::llm::model_config::ModelSelection;
 use crate::llm::profiles::ReasoningEffort;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::collections::BTreeMap;
 
 /// The session's `/switch` selection, stored in mode state so it survives agent rebuilds and session swaps.
@@ -201,9 +200,6 @@ impl Agent<'_> {
             effort,
         });
         self.save_modes()?;
-        self.emit_event("model_changed", || {
-            json!({"session_id": self.session.id(), "provider": selection.provider, "model": selection.model})
-        });
         Ok(())
     }
 

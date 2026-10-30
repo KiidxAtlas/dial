@@ -224,23 +224,31 @@ impl Team {
         }
     }
 
+    /// The mailbox of `who` (`parent` or a worker id). The rooms lock is released on return, so
+    /// callers lock only the inbox.
+    fn inbox(&self, who: &str) -> Option<Arc<Inbox>> {
+        let rooms = rooms();
+        let room = rooms.get(&self.id())?;
+        if who == PARENT {
+            Some(room.parent.clone())
+        } else {
+            room.workers.get(who).map(|member| member.inbox.clone())
+        }
+    }
+
     /// Takes every queued letter for `who` (`parent` or a worker id), in send order.
     pub fn drain(&self, who: &str) -> Vec<Letter> {
-        let inbox = {
-            let rooms = rooms();
-            let Some(room) = rooms.get(&self.id()) else {
-                return Vec::new();
-            };
-            if who == PARENT {
-                room.parent.clone()
-            } else {
-                match room.workers.get(who) {
-                    Some(member) => member.inbox.clone(),
-                    None => return Vec::new(),
-                }
-            }
-        };
-        inbox.drain()
+        self.inbox(who)
+            .map(|inbox| inbox.drain())
+            .unwrap_or_default()
+    }
+
+    /// Whether `who` (`parent` or a worker id) has undelivered letters. Never takes them.
+    pub fn has_mail(&self, who: &str) -> bool {
+        self.inbox(who).is_some_and(|inbox| {
+            let queue = inbox.queue.lock().unwrap_or_else(|e| e.into_inner());
+            !queue.letters.is_empty()
+        })
     }
 
     /// Sends `text` from `from` (`parent` or a worker id) to `to`. Never blocks on the recipient.

@@ -54,7 +54,6 @@ fn compaction_summary_request_gets_before_provider_request() {
             hermetic: false,
         },
         vec![rewrite],
-        None,
     );
     let source = Chat {
         messages: vec![json!({"role":"user","content":"original"})],
@@ -119,7 +118,6 @@ fn compaction_summary_chatgpt_completes_without_injected_overrides() {
             hermetic: false,
         },
         vec![],
-        None,
     );
     let request = Chat {
         messages: vec![json!({"role":"user","content":"Summarize this conversation."})],
@@ -218,6 +216,7 @@ fn armed_background_summary_is_claimed_only_at_the_auto_trigger() {
             user_dir: Default::default(),
             role_config: None,
             evidence_notes: String::new(),
+            retained_overhead_tokens: 0,
             archive_migration: false,
         };
         let prepared = PreparedCompaction {

@@ -8,14 +8,32 @@ use super::*;
 pub struct PortableRulesConfig {
     pub enabled: bool,
     pub max_regenerations: u32,
+    /// User turns after which a fired stream rule may fire again; 0 keeps it quiet for the session.
+    pub repeat_after_turns: u32,
+    /// When judged `question` rules are asked of the `judge` role.
+    pub judge: RuleJudge,
 }
 impl Default for PortableRulesConfig {
     fn default() -> Self {
         Self {
             enabled: true,
             max_regenerations: 8,
+            repeat_after_turns: 0,
+            judge: RuleJudge::Auto,
         }
     }
+}
+
+/// `portable_rules.judge`. `auto` judges `question` rules only when the `judge` role is explicitly
+/// assigned, so no main-model calls are spent silently; `on` uses the judge role with its `small`
+/// and main-model fallbacks; `off` never judges.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RuleJudge {
+    #[default]
+    Auto,
+    On,
+    Off,
 }
 
 /// `assistance.lean_local`. TOML `true` (the default) turns the lean profile on for every local route,

@@ -27,7 +27,11 @@ impl Agent<'_> {
                 self.layout
                     .as_ref()
                     .map(|layout| {
-                        crate::agent::safety::rules::Catalog::discover(layout, &turn.rule_root)
+                        crate::agent::safety::rules::Catalog::discover(
+                            layout,
+                            &turn.rule_root,
+                            &self.config.portable_rules,
+                        )
                     })
                     .unwrap_or_default()
             } else {
@@ -211,8 +215,8 @@ impl Agent<'_> {
     }
 
     /// Applies dynamic tool-list changes at a request boundary: the offered schemas and system
-    /// prompt follow MCP lists and selected-model image availability; queued MCP notices and
-    /// events reach the UI and `mcp_notification` subscribers.
+    /// prompt follow MCP lists and selected-model image availability; queued MCP notices reach the
+    /// UI.
     fn sync_mcp_tools(&mut self, schemas: &mut Vec<Value>, ui: &mut dyn Ui) -> Result<()> {
         let images_changed = match self.ext.sync_image_generation(&self.auth_config) {
             Ok(changed) => changed,
@@ -231,27 +235,6 @@ impl Agent<'_> {
         }
         for notice in self.ext.take_notices() {
             ui.notice(&notice);
-        }
-        let events = self.ext.take_mcp_events();
-        if !events.is_empty() {
-            let root = self.workspace.root().to_path_buf();
-            for event in events {
-                let payload = event.to_json();
-                // Shell hooks keep their blocking path; plugins get the queued observer event.
-                for notice in crate::agent::safety::hooks::observe(
-                    self.tool_hooks(),
-                    None,
-                    &root,
-                    "mcp_notification",
-                    payload.clone(),
-                    self.interrupt.as_ref(),
-                ) {
-                    ui.notice(&notice);
-                }
-                let mut plugin_payload = payload;
-                plugin_payload["session_id"] = json!(self.session.id());
-                self.emit_event("mcp_notification", || plugin_payload);
-            }
         }
         Ok(())
     }

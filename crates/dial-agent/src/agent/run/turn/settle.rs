@@ -235,9 +235,10 @@ impl Agent<'_> {
             turn.automatic_coach_pending = false;
         }
         let role_configured = self.config.model_roles.contains_key("coach");
-        // A turn already ending is not charged for a coach-model call.
-        if stop.is_none()
-            && boundary.is_none()
+        // An accepted finish ends the round. A turn already ending is not charged for a
+        // coach-model call; completion review below still applies to completed outcomes.
+        let continuing = stop.is_none() && boundary.is_none() && finished.is_none();
+        if continuing
             && self.step_checks.auto_escalation.round(
                 tool_round_failed,
                 &self.config.escalation,
@@ -315,10 +316,9 @@ impl Agent<'_> {
                 }
             }
         }
-        // Live advisor: the coach reviews this round; its note reaches the next request. A
-        // turn already ending is not charged for a coach-model call.
-        if stop.is_none()
-            && boundary.is_none()
+        // Live advisor: the coach reviews this round; its note reaches the next request. An
+        // ending turn has no next request, so it is not charged for a live review.
+        if continuing
             && let Some(note) =
                 self.coach_round(&mut turn.coach_turn, backend, turn.user_goal, step, ui)?
         {
@@ -424,13 +424,14 @@ impl Agent<'_> {
             // Past a deadline or cost cap the answer is delivered without another coach call.
             let reviewable = self.stop_boundary().is_none();
             if finish.outcome == TurnOutcome::Completed {
-                let unverified = self.unverified_edits();
+                let run = reviewable && !turn.completion.reminder_spent();
+                let (unverified, failures) = self.gate_unverified_edits(run, ui);
                 match turn.completion.evidence(unverified.as_deref(), reviewable) {
                     crate::agent::verify::completion::EvidenceGate::Accept => {}
                     crate::agent::verify::completion::EvidenceGate::Remind(note) => {
                         turn.pending_nudges.push(crate::agent::run::guidance::note(
                             crate::agent::run::guidance::Priority::Review,
-                            note,
+                            crate::agent::verify::completion::with_gate_failures(note, &failures),
                         ));
                         return Ok(crate::agent::run::engine::Tick::Again);
                     }

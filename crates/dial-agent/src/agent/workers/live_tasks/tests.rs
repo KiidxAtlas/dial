@@ -610,3 +610,58 @@ fn worker_policy_provenance_keeps_deny_before_readonly_and_cancel_before_deny() 
         assert_eq!(rules.len(), 1);
     }
 }
+
+#[test]
+fn a_worker_message_to_the_parent_ends_a_wait_early_and_stays_queued() {
+    struct View;
+    impl Ui for View {}
+    let mut tasks = LiveTasks::default();
+    let body = tasks.tree.start("worker", "still working", None);
+    body.settle(
+        String::new(),
+        Some(json!({"id":"task-1","status":"running"})),
+        crate::runtime::Phase::Running,
+    );
+    tasks.jobs.insert(
+        "task-1".into(),
+        JobState {
+            body,
+            interrupt: Arc::new(AtomicBool::new(false)),
+            worker: None,
+            active_tool: Arc::default(),
+            delivered: false,
+        },
+    );
+    tasks
+        .team
+        .enlist("task-1", "scout", Box::new(|| {}))
+        .unwrap();
+    tasks
+        .team
+        .send("task-1", mailbox::PARENT, "found it")
+        .unwrap();
+    let started = Instant::now();
+    let (status, stopped) = tasks
+        .wait(
+            Some("task-1"),
+            30,
+            ApprovalGate {
+                approval: Approval::Ask,
+                read_only: false,
+                rules: &mut Vec::new(),
+                root: std::path::Path::new("."),
+                extra_roots: &[],
+                layout: None,
+                cost: &mut None,
+            },
+            &AtomicBool::new(false),
+            &mut View,
+        )
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(stopped, Some(WaitStop::Message));
+    assert_eq!(status["status"], "running", "the worker keeps running");
+    // The wait only observes: the parent's next pump delivers the letter.
+    assert!(tasks.team.has_mail(mailbox::PARENT));
+    assert_eq!(tasks.take_parent_messages()[0].text, "found it");
+}

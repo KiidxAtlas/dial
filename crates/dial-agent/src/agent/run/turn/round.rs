@@ -165,7 +165,6 @@ impl Agent<'_> {
                         || engine.rejection_at(&self.workspace, call).is_some()
                         || crate::agent::safety::hooks::wanted_for_tool(
                             self.tool_hooks(),
-                            self.hook_plugins().as_deref(),
                             "pre_tool_use",
                             &call.name,
                         )
@@ -203,13 +202,11 @@ impl Agent<'_> {
                 )
                 && !crate::agent::safety::hooks::wanted_for_tool(
                     self.tool_hooks(),
-                    self.hook_plugins().as_deref(),
                     "pre_tool_use",
                     &call.name,
                 )
                 && !crate::agent::safety::hooks::wanted_for_tool(
                     self.tool_hooks(),
-                    self.hook_plugins().as_deref(),
                     "post_tool_use",
                     &call.name,
                 );
@@ -450,7 +447,6 @@ impl Agent<'_> {
                         // Rewrites must pass the serial controller's schema and approval checks.
                         && !crate::agent::safety::hooks::wanted_for_tool(
                             self.tool_hooks(),
-                            self.hook_plugins().as_deref(),
                             "pre_tool_use",
                             &call.name,
                         )
@@ -463,7 +459,6 @@ impl Agent<'_> {
                         .take_while(|c| {
                             !crate::agent::safety::hooks::wanted_for_tool(
                                 self.tool_hooks(),
-                                self.hook_plugins().as_deref(),
                                 "pre_tool_use",
                                 &c.name,
                             ) && (self.pending_check.is_none() || c.name != "bash")

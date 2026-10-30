@@ -517,6 +517,45 @@ recorded as a `constrained_repair` event. Its JSON may appear as streamed text b
 can set `capabilities.structured_output` to `json_schema`, `ollama_format`, or `none`. The default is
 `json_schema` for `lm-studio`, `ollama_format` for `ollama`, and `none` for other providers.
 
+## Comparing with other agent CLIs
+
+`examples/benchmarks/cross_agent.py` runs the same suite cases through different coding-agent
+CLIs and scores every agent with one evaluator. Agents are listed in a TOML file such as
+`examples/benchmarks/cross-agent.toml` (Dial and oh-my-pi's `omp`): argument lists for the first turn
+and for follow-up turns that continue the session, plus a parser for the agent's JSON output.
+
+```sh
+python3 examples/benchmarks/cross_agent.py examples/benchmarks/quality.toml examples/benchmarks/efficiency.toml \
+  --agents examples/benchmarks/cross-agent.toml --model claude-sonnet-4-6 --repetitions 3 \
+  --report target/cross-agent/report.json
+```
+
+Each trial runs in a fresh fixture copy with the same prompt and model. The script copies the fixture,
+runs the agent and then runs the outcome checks against that copy. Seeded `context_messages` have no
+portable CLI form, so every agent receives them inline before the first request. `metric` and
+`tool_invoked` checks and `compact_before` need Dial's internal observations. They are reported
+under `excluded_checks` / `skipped_compactions` and left out of every agent's score. A case with no
+portable checks is not scored. Missing JSON output makes usage incomplete rather than zero.
+Prompt tokens are normalized to include cache reads and writes. Tool calls are counted by name.
+`delegation_tools` (default `["task"]`) identifies delegation calls; their trials are marked
+usage-incomplete unless the agent definition declares `delegated_usage = "included"`. Dial's
+ledger includes worker requests; omp's delegated usage is unknown. Incomplete trials remain
+scored for correctness and wall time, but are excluded from token/request medians.
+Each turn's raw stdout and stderr, including partial output on timeouts, are kept next to the
+report in `<report-stem>.logs/<agent>-<case>-r<N>/`. Reports and existing log directories are not
+overwritten. Logs can contain source, commands and provider output: treat them as private artifacts.
+
+Agents run as installed, with their user configuration, sessions and global skills, so the report
+records each agent's command, environment overrides, version and the models it actually used.
+Opt-in features count: for example Dial's `experimental.turn_optimizer` adds one auxiliary request
+per user turn. Every agent receives the same `--thinking` level (default `off`). Without it, Dial
+would apply the model catalog's default thinking for Claude. An agent's `env` table (values expand
+`{work_root}`, `~` and `$VAR`) can isolate state. For example, `DIAL_HOME = "{work_root}/dial-home"`
+with `DIAL_SUBSCRIPTION_AUTH_HOME = "~/.dial"` runs Dial with default configuration on the
+signed-in subscription.
+The results compare these setups on these fixtures. They are not a leaderboard score.
+The stub-agent regressions run with `python3 -m unittest discover -s examples/benchmarks -p 'test_*.py'`.
+
 ## Recorded runs
 
 Single-model runs accept `--checkpoint PATH` and `--resume` for durable case checkpoints. Resume

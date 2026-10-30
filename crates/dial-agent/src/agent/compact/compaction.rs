@@ -108,6 +108,10 @@ pub fn prompt_budget(policy: &CompactionConfig, window: u32, output: u32) -> u64
 
 /// Retain whole assistant/tool groups, including the newest group when it alone exceeds the budget.
 pub fn cut(messages: &[Value], budget: u64) -> Option<usize> {
+    cut_with(messages, budget, estimate)
+}
+
+fn cut_with(messages: &[Value], budget: u64, weigh: impl Fn(&Value) -> u64) -> Option<usize> {
     let mut boundaries = Vec::new();
     let mut pending = std::collections::BTreeSet::new();
     for (index, message) in messages.iter().enumerate() {
@@ -134,13 +138,13 @@ pub fn cut(messages: &[Value], budget: u64) -> Option<usize> {
     let mut total: u64 = messages[newest..]
         .iter()
         .filter(|m| is_history(m))
-        .map(estimate)
+        .map(&weigh)
         .sum();
     for pair in boundaries.windows(2).rev() {
         let next: u64 = messages[pair[0]..pair[1]]
             .iter()
             .filter(|m| is_history(m))
-            .map(estimate)
+            .map(&weigh)
             .sum();
         if total.saturating_add(next) > budget {
             break;
@@ -149,6 +153,20 @@ pub fn cut(messages: &[Value], budget: u64) -> Option<usize> {
         keep = pair[0];
     }
     messages[..keep].iter().any(is_history).then_some(keep)
+}
+
+/// Use the same image policy for selecting a tail as for validating the candidate request.
+fn cut_with_policy(
+    messages: &[Value],
+    budget: u64,
+    policy: &CompactionConfig,
+    identity: CompactionIdentity<'_>,
+) -> Option<usize> {
+    let fallback = crate::config::snapcompact::ImageTokenization::PixelCeiling;
+    let billing = match_selector(&policy.snapcompact_models, identity).unwrap_or(&fallback);
+    cut_with(messages, budget, |message| {
+        image_message_tokens(message, billing)
+    })
 }
 
 /// A durable boundary never separates a matched call from its result.
@@ -187,6 +205,8 @@ pub struct CompactionContext<'a> {
     pub user_dir: &'a std::path::Path,
     /// The actual projected provider request, when the source history is an immutable archive view.
     pub native_request: Option<&'a Chat>,
+    /// Commit-time notes, exact state carry and provider calibration absent from the source estimate.
+    pub retained_overhead_tokens: u64,
     /// Bounded untrusted hook data for this summarization only, never retained conversation.
     pub supplemental_context: Option<&'a str>,
 }
@@ -227,6 +247,7 @@ pub struct CompactionSnapshot {
     pub user_dir: std::path::PathBuf,
     pub role_config: Option<crate::config::types::Config>,
     pub evidence_notes: String,
+    pub retained_overhead_tokens: u64,
     pub archive_migration: bool,
 }
 impl CompactionSnapshot {
@@ -243,6 +264,7 @@ impl CompactionSnapshot {
             timeout_secs: self.timeout_secs,
             user_dir: &self.user_dir,
             native_request: Some(&self.native_request),
+            retained_overhead_tokens: self.retained_overhead_tokens,
             supplemental_context: None,
         }
     }
@@ -354,17 +376,14 @@ pub fn compact_history(
         policy,
         context.identity,
     );
-    let budget = prompt_budget(
+    let safe_budget = prompt_budget(
         policy,
         context.window,
         backend.output_budget(request.max_tokens),
     );
+    let budget = safe_budget.saturating_sub(context.retained_overhead_tokens);
     let fixed = replacement_request(request, &[]);
     let fixed_tokens = request_tokens_with_policy(&fixed, policy, context.identity);
-    ensure!(
-        fixed_tokens < budget,
-        "immutable system/tool/transient context and next response reserve cannot fit; history compaction cannot fix this"
-    );
     // Adaptive budgeting reserves room for a future summary. With a large fixed prompt it can
     // shrink to zero even when today's tiny history is already safe and needs no summary.
     if options.reason == CompactionReason::Manual
@@ -373,17 +392,26 @@ pub fn compact_history(
         && options.keep_recent_tokens.is_none()
         && options.instructions.is_none()
         && policy.summary_instructions.is_none()
-        && before <= budget
+        && before <= safe_budget
+        && fixed_tokens < safe_budget
         && cut(&request.messages, u64::from(policy.keep_recent_tokens)).is_none()
     {
         return Err(NothingToCompact.into());
     }
+    ensure!(
+        fixed_tokens < budget,
+        "immutable system/tool/transient context, retained state and next response reserve cannot fit; history compaction cannot fix this"
+    );
     let keep_budget = match options.keep_recent_tokens {
         Some(explicit) => u64::from(explicit),
-        None => policy.keep_recent_budget(context.identity, context.window, fixed_tokens)?,
+        None => policy.keep_recent_budget(
+            context.identity,
+            context.window,
+            fixed_tokens.saturating_add(context.retained_overhead_tokens),
+        )?,
     };
-    let original_cut =
-        cut(&request.messages, keep_budget).ok_or_else(|| anyhow::Error::new(NothingToCompact))?;
+    let original_cut = cut_with_policy(&request.messages, keep_budget, policy, context.identity)
+        .ok_or_else(|| anyhow::Error::new(NothingToCompact))?;
     let non_summary = matches!(
         options.method,
         Some(CompactionMethod::Snapcompact | CompactionMethod::Shake)
@@ -540,30 +568,30 @@ pub fn compact_history(
                     )
                 }
                 CompactionMethod::Remote | CompactionMethod::Soft | CompactionMethod::Handoff => {
-                    let mut keep = original_cut;
-                    // A kept tail that cannot fit even without a summary is unrecoverable by the summary;
-                    // choose the harder cut up front so one summarization pass covers the right prefix
-                    // instead of spending the turn's worker budget on a second full pass.
-                    let tail_alone = request_tokens_with_policy(
-                        &replacement_request(
-                            request,
-                            &request.messages[keep..]
-                                .iter()
-                                .filter(|m| is_history(m))
-                                .cloned()
-                                .collect::<Vec<_>>(),
-                        ),
+                    // Reserve the expected summary before selecting a complete retained tail.
+                    // Fixed window fractions can still retain too much when tools/state dominate.
+                    let tail_budget = budget
+                        .saturating_sub(fixed_tokens)
+                        .saturating_sub(u64::from(summary_output(policy, &context)));
+                    let mut keep = cut_with_policy(
+                        &request.messages,
+                        keep_budget.min(tail_budget),
                         policy,
                         context.identity,
+                    )
+                    .ok_or_else(|| anyhow::Error::new(NothingToCompact))?;
+                    let tail = replacement_request(
+                        request,
+                        &request.messages[keep..]
+                            .iter()
+                            .filter(|m| is_history(m))
+                            .cloned()
+                            .collect::<Vec<_>>(),
                     );
-                    if tail_alone > budget {
-                        let harder_budget = keep_budget.min(u64::from(context.window) / 8);
-                        if let Some(harder_cut) =
-                            cut(&request.messages, harder_budget).filter(|cut| *cut > keep)
-                        {
-                            keep = harder_cut;
-                        }
-                    }
+                    ensure!(
+                        request_tokens_with_policy(&tail, policy, context.identity) < budget,
+                        "newest complete history group and retained context leave no room for a summary; no summary was requested"
+                    );
                     let mut summary = summary::summarize_prefix(
                         backend,
                         &request.messages,
@@ -594,9 +622,20 @@ pub fn compact_history(
                         context.identity,
                     ) > budget
                     {
-                        let harder_budget = keep_budget.min(u64::from(context.window) / 8);
-                        if let Some(harder_cut) =
-                            cut(&request.messages, harder_budget).filter(|cut| *cut > keep)
+                        // The replacement includes immutable system/tools as well as the summary.
+                        let prefix_tokens = request_tokens_with_policy(
+                            &replacement_request(request, &prefix),
+                            policy,
+                            context.identity,
+                        );
+                        let harder_budget = keep_budget.min(budget.saturating_sub(prefix_tokens));
+                        if let Some(harder_cut) = cut_with_policy(
+                            &request.messages,
+                            harder_budget,
+                            policy,
+                            context.identity,
+                        )
+                        .filter(|cut| *cut > keep)
                         {
                             // Fold only the newly hidden groups into the summary just produced
                             // instead of re-reading the whole prefix a second time.

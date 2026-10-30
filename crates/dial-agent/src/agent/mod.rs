@@ -35,7 +35,7 @@ pub use memory::selfplay::{check_case, check_case_measured, selfplay_run};
 pub use model::backend::{Runtime, make_backend, make_session_backend};
 pub use model::laya;
 pub use run::call_summary::{legacy_tool_presentation, legacy_tool_result, summarize_call};
-pub use run::coordination::{BoardPeer, CoordinationCarry, PeerBoard};
+pub use run::coordination::{BoardPeer, CoordinationCarry, PeerBoard, PeerMessage};
 pub use safety::approval;
 pub use ui::surface::{Decision, NullUi, RequestPhase, Ui};
 pub use workflow::todo;
@@ -300,8 +300,6 @@ pub struct Agent<'a> {
     subagent_backend: Option<(String, Backend)>,
     /// Lazily created, cached side backends for role-routed requests (compaction, …).
     role_backends: BTreeMap<String, Backend>,
-    /// Extension-owned task ids, isolated by session and registration generation.
-    extension_jobs: BTreeMap<(String, String, u64), std::collections::BTreeSet<String>>,
     /// Context the serving endpoint reports as currently loaded; may be far below the configured window.
     context_cap: Option<u32>,
     /// The configured route's backend-bound state: fallback cooldown and the primary's loaded cap.

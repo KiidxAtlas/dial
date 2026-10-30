@@ -20,7 +20,7 @@ DIAL ?= $(BUILD_DIR)/dial
 
 
 .DEFAULT_GOAL := help
-.PHONY: help update install build check test test-lib test-integration test-module test-nextest lint test-rust test-drivers test-python test-bench-offline test-smoke test-mlx preflight
+.PHONY: help update install build check test test-lib test-integration test-module test-nextest lint test-rust test-drivers test-python test-bench-offline test-smoke test-mlx preflight preflight-quick hooks
 
 help:
 	@printf '%s\n' \
@@ -40,7 +40,9 @@ help:
 		'make test-bench-offline  Run benchmark grader/reporting tests, no model or binary needed' \
 		'make test-smoke DIAL=target/local/dial  Check an already-built binary and scripted recovery' \
 		'make test-mlx  Run optional local MLX checks; explicitly skip unsupported hosts, never download' \
-		'make preflight  Run the CI gate locally before tagging: fmt, clippy, tests in the system temp dir, smoke'
+		'make preflight  Run every CI check locally on a clean snapshot of HEAD (REV=<commit> for another)' \
+		'make preflight-quick  Only the compile and lint gates: fmt, clippy (host + Linux), musl, Windows, slim' \
+		'make hooks    Run make preflight automatically before every git push (pre-push hook)'
 
 update:
 	$(PYTHON) scripts/install-dev.py check --keep "$(KEEP_BACKUPS)"
@@ -106,18 +108,15 @@ test-smoke:
 test-mlx:
 	HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 $(PYTHON) scripts/test-mlx.py
 
-# What CI's test job runs, in CI's order, so a release never discovers failures after tagging.
-# Tests use the system temp directory (macOS: behind the /var -> /private/var symlink, as on CI
-# runners) rather than an inherited project-local TMPDIR. musl checks run only in CI.
-PREFLIGHT_TMPDIR := $(shell getconf DARWIN_USER_TEMP_DIR 2>/dev/null || printf '%s' /tmp)
+# CI's checks on a clean snapshot of a commit (default HEAD), cross-compiling the Linux, musl and
+# Windows targets with zig; see scripts/preflight.sh. Results are cached per tree.
+REV ?= HEAD
 preflight:
-	$(CARGO) fmt --check
-	$(MAKE) lint
-	$(MAKE) test-drivers
-	TMPDIR="$(PREFLIGHT_TMPDIR)" $(MAKE) test-rust
-	$(CARGO) build --locked -p dial --bin dial --profile $(TEST_PROFILE)
-	$(MAKE) test-smoke DIAL="$(CARGO_TARGET_DIR)/$(if $(filter dev,$(TEST_PROFILE)),debug,$(TEST_PROFILE))/dial"
-	@set -e; dial="$(CARGO_TARGET_DIR)/$(if $(filter dev,$(TEST_PROFILE)),debug,$(TEST_PROFILE))/dial"; \
-	for s in interactive_smoke interactive_surfaces session_contention_smoke side_lifecycle_smoke; do \
-		$(PYTHON) examples/benchmarks/$$s.py --dial "$$dial" --captures "$(CARGO_TARGET_DIR)/pty-captures/$$s"; \
-	done
+	scripts/preflight.sh "$(REV)"
+
+preflight-quick:
+	scripts/preflight.sh --quick "$(REV)"
+
+hooks:
+	git config core.hooksPath .githooks
+	@printf '%s\n' 'pre-push now runs scripts/preflight.sh; DIAL_PREFLIGHT=quick or skip changes that per push.'

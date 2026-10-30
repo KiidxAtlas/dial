@@ -11,7 +11,6 @@ fn dispatch(dir: &std::path::Path) -> StreamingDispatch {
         Arc::new(AtomicBool::new(false)),
         Admission {
             hooks: Vec::new(),
-            plugins: None,
             always: Vec::new(),
             schemas: vec![read, edit],
             names: vec!["read".into(), "edit".into()],

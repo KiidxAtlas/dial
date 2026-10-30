@@ -21,6 +21,8 @@ pub const MAX_LORAS: usize = 8;
 /// Bounds on an inline ComfyUI graph: real exported workflows are far below both.
 pub const MAX_COMFY_NODES: usize = 512;
 pub const MAX_COMFY_WORKFLOW_BYTES: usize = 1024 * 1024;
+/// Most per-layer conditioning weights accepted; real text encoders tap 3 (FLUX) to 12 (Krea).
+pub const MAX_COND_WEIGHTS: usize = 64;
 /// LoRA scales outside this range are refused; real adapters use roughly 0..2.
 pub const LORA_SCALE_LIMIT: f64 = 8.0;
 
@@ -47,6 +49,9 @@ pub struct ImageConfig {
     /// Offer `image_gen` without an `integrations` entry whenever a shared image route resolves
     /// with its required credentials, independently of the main chat model's vision capability.
     pub auto: bool,
+    /// Enable approved image_weights calls to scale floating-point checkpoint tensors into a
+    /// separate file. Does not permit overwrites, bypass confinement or reload a running server.
+    pub allow_weight_edits: bool,
     /// Generation settings per image model, matched by each entry's exact `model` identifier. Keys
     /// are free bare TOML names (`/image settings` derives one from the model).
     pub models: BTreeMap<String, ImageModelSettings>,
@@ -61,6 +66,7 @@ impl Default for ImageConfig {
             api_key_env: None,
             timeout_secs: 180,
             auto: true,
+            allow_weight_edits: false,
             models: BTreeMap::new(),
         }
     }
@@ -159,6 +165,10 @@ pub struct ImageModelSettings {
     /// How far an edit may move from its source image, 0–1 (MLX-Serve; used only for edits).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strength: Option<f64>,
+    /// Per-tapped-text-encoder-layer conditioning weights (MLX-Serve; 1 = neutral). The count is
+    /// model specific (FLUX 3, Krea 12), so the server validates it. Empty leaves the model as is.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cond_weights: Vec<f64>,
     /// Model-specific request fields for fal and Replicate (e.g. `aspect_ratio`). Adapter-owned
     /// prompt, size, output count and format fields cannot be overridden by these inputs.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -276,6 +286,11 @@ impl ImageModelSettings {
                 "strength must be between 0 and 1"
             );
         }
+        ensure!(
+            self.cond_weights.len() <= MAX_COND_WEIGHTS
+                && self.cond_weights.iter().all(|w| w.is_finite()),
+            "cond_weights must be at most {MAX_COND_WEIGHTS} finite numbers"
+        );
         ensure!(
             self.loras.len() <= MAX_LORAS,
             "at most {MAX_LORAS} LoRAs are allowed"

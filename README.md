@@ -195,6 +195,7 @@ This README is an overview. Detailed documentation lives in [`docs/`](docs/), an
 **Extending and automating**
 
 - [Extensions and project context](docs/extensibility.md): skills import and toggles, custom tools, Rust SDK, [hooks, path permissions and schedules](docs/extensibility.md#lifecycle-hooks-path-permissions-isolated-workers-and-schedules), [git tool, budgets, custom agents and HTTP MCP](docs/extensibility.md#git-tools-budgets-custom-agents-and-http-mcp)
+- [Stream rules](docs/stream-rules.md): portable rules that interrupt or remind the model as it streams, judged `question` rules, `/rule` and `dial rules list|test`
 - [RPC and ACP](docs/rpc-and-acp.md): print mode JSON output, session CLI, persistent RPC, ACP
 - [Background services](docs/background-services.md), [Encrypted collaboration](docs/collab.md), [Sharing, statistics and telemetry](docs/share-stats-telemetry.md)
 

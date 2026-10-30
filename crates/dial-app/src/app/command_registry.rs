@@ -224,7 +224,6 @@ pub(super) const COMMAND_ALIASES: &[(&str, &str)] = &[
     ("hub", "workers"),
     ("bg", "processes"),
     ("doctor", "setup"),
-    ("plugin", "plugins"),
 ];
 
 /// The dispatch name for `name`, following one hidden alias.
@@ -305,8 +304,6 @@ pub(super) const RUNS_NOW: &[&str] = &[
     "modelpreset",
     "ssh",
     "checks",
-    "plugins",
-    "reload-plugins",
     "effort",
     "theme",
     "drafter",
@@ -432,12 +429,10 @@ pub(super) fn command_panel(name: &str, args: &str) -> Option<Which> {
     }
 }
 
-/// Built-ins always win at dispatch, so a custom or extension command with a built-in's name is
-/// never offered. `extensions` are the loaded extensions' `(command, owner)` pairs.
+/// Built-ins always win at dispatch, so a custom command with a built-in's name is never offered.
 pub(super) fn command_entries(
     custom: &[context::CommandDef],
     skills: &[skills::Skill],
-    extensions: &[(String, String)],
 ) -> Vec<CommandEntry> {
     let mut entries: Vec<CommandEntry> = BUILTIN_COMMANDS
         .iter()
@@ -482,17 +477,6 @@ pub(super) fn command_entries(
                 def.description.clone()
             },
             kind: CommandKind::Custom,
-            args_hint: None,
-        });
-    }
-    for (name, owner) in extensions {
-        if reserved(name) || entries.iter().any(|e| e.name == *name) {
-            continue;
-        }
-        entries.push(CommandEntry {
-            name: name.clone(),
-            description: format!("command from extension {owner}"),
-            kind: CommandKind::Extension,
             args_hint: None,
         });
     }
@@ -546,9 +530,8 @@ pub(super) fn during_turn_note(name: &str) -> &'static str {
 pub(super) fn palette_entries(
     custom: &[context::CommandDef],
     skills: &[skills::Skill],
-    extensions: &[(String, String)],
 ) -> Vec<PaletteEntry> {
-    let mut entries = command_entries(custom, skills, extensions)
+    let mut entries = command_entries(custom, skills)
         .into_iter()
         .map(|command| PaletteEntry {
             during_turn: during_turn_note(&command.name),

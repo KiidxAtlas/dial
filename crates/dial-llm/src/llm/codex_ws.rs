@@ -31,7 +31,7 @@ type Socket = WebSocket<MaybeTlsStream<setup::Transport>>;
 /// Steering commands queued for one active response.
 const STEER_QUEUE: usize = 8;
 /// Longest quiet period a cached socket is trusted for. The backend evicts idle sockets without
-/// a close frame; reusing one fails on first use (OMP: `CODEX_WEBSOCKET_MAX_IDLE_REUSE_MS`).
+/// a close frame; reusing one fails on first use.
 const MAX_IDLE_REUSE: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]

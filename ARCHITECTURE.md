@@ -66,7 +66,7 @@ The root `build.rs` only declares rerun inputs; per-crate build scripts own thei
 | `code` | LSP, DAP, diagnostics and navigation |
 | `net` | web fetch and the browser tool |
 | `vcs` | git and GitHub (`gh_*`) tools |
-| `integrations` | external tool extensions (`ext`), MCP, plugins, SSH and resources |
+| `integrations` | external tool extensions (`ext`), MCP, SSH and resources |
 | `knowledge` | codebase index, provenance, immutable evidence operations, history and autoresearch |
 | `surface` | tool catalog, contracts, outcomes and presentation |
 
@@ -260,19 +260,16 @@ of each feature. The reviewed areas and resulting decisions are:
 | Terminal, print CLI, RPC and ACP | Keep adapters over shared events; add independent terminal I/O, bounded rendering, draft-safe dialogs and native transcript navigation without moving execution authority into presentation. |
 | Session persistence and runtime streams | Preserve writer leases; contention creates an independent sibling. Move/archive/delete associated side history and roll back failed destination publication without damaging the source. |
 | Side conversations and worker controls | Freeze side context without borrowing the running agent; persist streamed prefixes. Keep worker editors and model revisions local, and restore only safely acknowledged starts. |
-| Extension panels | Validate bounded declarative layouts, report typed outcomes, and keep human input separate from tool permission. |
 | Steering, import and automatic improvement | Share mutation leases and admission checks rather than duplicating weaker promotion gates. |
 | Provider acquisition and optional learning | Retain acquisition ownership; centralize existing identity policy without changing its scope or running downloads/training. |
 | Background execution | Long `eval` cells and named shells hand off through the existing bash adopter into the `bg` table; handed-off cells refuse host callbacks and busy names/runtimes refuse new work. |
 | Media and remote reads | `read` keeps one dispatch path: hooks and approval run before vision questions; URL reads reuse the guarded web fetch client; archive formats share one admission walk with entry, size and decode limits. |
-| Plugin protocol 2 | `dial-tools` validates capabilities and queues effects; the app drains them at safe boundaries behind user approval; the UI renders sanitized slots. Observed events are asynchronous and never block the turn. |
-| Python extensions | The bundled stdlib SDK supports legacy EOF and managed framed request/session-worker transport. Explicit install/update prepares isolated dependencies; loading never installs packages. Neutral bounded contributions live in `dial-core::runtime::extensions`; `dial-tools` owns registration, worker leases and settings, `dial-agent::run::extension_api` admits host tool/task/model/context requests, and the app/UI own rendering and input. Plugin tools retain approvals, versioned contracts and registration ownership. Python is trusted user code, not sandboxed workspace content. |
 | Portable sessions | Packing is versioned and hash-verified; unpack never overwrites and refuses traversal, links and newer schemas. A global transfer ledger makes a moved-away source fork. |
 | Provider resilience | Cache-field refusals narrow a per-endpoint latch; cache warming runs on its own client and folds replay cost into session usage; OAuth accounts share one store and rotate like the API-key pool. |
 | Consultation and host integration | `seance` is a read-only worker over stored transcripts; RPC host tools and URI schemes are ordinary tools subject to approval and reset on session switch. |
 
 Verification includes the workspace build and Rust suite, Clippy with `-D warnings`, and real-PTY
-scripted-provider probes for streaming controls, worker restoration, panels, navigation, writer
+scripted-provider probes for streaming controls, worker restoration, navigation, writer
 contention and side-session lifecycle.
 These checks are not certification of every platform or feature: native Windows ProjFS, Linux
 overlay mounts, real provider inference, training and third-party client rendering were not exercised.

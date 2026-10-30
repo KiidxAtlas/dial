@@ -127,6 +127,13 @@ fn run_plain(layout: Layout, config: Config, options: Options) -> Result<()> {
 const PRINT_MEMORY_BUDGET: Duration = Duration::from_secs(20);
 
 /// Run one turn without terminal control sequences; JSON modes reserve stdout for their protocol.
+/// Print mode has no human input channel (`PrintUi::ask_questions` always answers Unsupported),
+/// so offering `ask` only adds its schema to every request and invites a wasted call.
+fn print_config(mut config: Config) -> Config {
+    config.ask.enabled = false;
+    config
+}
+
 pub fn run_print(
     layout: Layout,
     config: Config,
@@ -135,9 +142,13 @@ pub fn run_print(
     allowed: Vec<String>,
 ) -> Result<i32> {
     let started = Instant::now();
+    let config = print_config(config);
     let mut ui = PrintUi::new(format, allowed);
     ui.set_print_thoughts(options.print_thoughts);
     config.require_model()?;
+    // Connect MCP servers while the session, backend and agent are set up; the registry adopts
+    // the result instead of waiting for each server on the first request.
+    crate::tools::integrations::mcp::prefetch(&config);
     let _compute = if config.requires_compute_lock() {
         Some(auto::compute_lock(&layout)?)
     } else {

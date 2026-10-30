@@ -232,21 +232,21 @@ pub fn schema(config: &Config) -> Value {
         format!("{presets}\nCustom agents:{custom}")
     };
     let description = format!(
-        "Delegate self-contained slices to subagents. For test authoring, execution and failure diagnosis, prefer test-runner with action=start while the parent continues independent work; coordinate owned files and wait for relevant inputs to settle before checks. Batch independent slices in one call: `context` is shared; each item gives `task`, `solution_space`, and optionally `skills` and `agent`. Default model-role preference chains (first configured role, otherwise the conversation model): worker task → coach → small; scout small → task; reviewer and test-runner tester → coach → task → small; planner planner → coach → task → small. Custom agents inherit their base role unless explicitly overridden. Agent types:{types}{presets}"
+        "Delegate self-contained slices to subagents. Batch independent slices in one call: `context` is shared; each item gives `task`, `solution_space`, optional `skills` and `agent`. For test authoring, execution and failure diagnosis prefer test-runner with action=start while you continue independent work; coordinate owned files and let relevant inputs settle before checks. Model-role chains (first configured role, else the conversation model): worker task → coach → small; scout small → task; reviewer, test-runner tester → coach → task → small; planner planner → coach → task → small; custom agents inherit their base role unless overridden. Agent types:{types}{presets}"
     );
     let mut entry_properties = json!({
         "agent":{"type":"string","description":"Agent type or preset (default scout)."},
-        "task":{"type":"string","description":"Complete assignment for this item: what to do, scope and acceptance criteria. Shared background belongs in context."},
-        "solution_space":{"type":"string","description":"How open this item is: fixed decisions the child must follow versus choices it may make."},
-        "skills":{"type":"array","items":{"type":"string"},"description":"Skill names to load before this item starts."},
-        "max_steps":{"type":"integer","minimum":0,"description":"Model step limit; default 0 means unlimited."},
-        "name":{"type":"string","description":"Optional label shown to the user."},
+        "task":{"type":"string","description":"Complete assignment: scope and acceptance criteria; shared background goes in context."},
+        "solution_space":{"type":"string","description":"Fixed decisions the child must follow versus choices it may make."},
+        "skills":{"type":"array","items":{"type":"string"},"description":"Skills to load first."},
+        "max_steps":{"type":"integer","minimum":0,"description":"Step limit; 0 means unlimited."},
+        "name":{"type":"string","description":"Label shown to the user."},
         "output_schema":{"type":"object","description":"JSON Schema the final answer must satisfy."},
-        "isolation":{"type":"string","enum":["copy"],"description":"Workers only: use a private copy and native-tool session. Successful changed files merge unless the parent changed them. Failed/interrupted edits remain in a recovery copy. The result's separate isolation metadata reports the backend used, applied files, conflicts, I/O errors and recovery_location; output_schema data is never altered."},
-        "isolation_backend":{"type":"string","enum":ISOLATION_BACKENDS,"description":"Workers only: how this task's private copy is made, overriding the configured [isolation] backend for this task: clone (copy-on-write clone), worktree (git worktree of HEAD plus uncommitted files), overlay (Linux), projfs (Windows), copy (plain file copy), auto (first available). Implies isolation copy. An unavailable backend fails the call before any worker starts; omit to use the configured backend."}
+        "isolation":{"type":"string","enum":["copy"],"description":"Workers only: private copy and native-tool session. Changed files merge on success unless the parent changed them; failed or interrupted edits stay in a recovery copy. Separate isolation metadata reports backend, applied files, conflicts, I/O errors and recovery_location; output_schema data is never altered."},
+        "isolation_backend":{"type":"string","enum":ISOLATION_BACKENDS,"description":"Workers only; implies isolation copy and overrides the [isolation] backend: clone (copy-on-write), worktree (git worktree of HEAD plus uncommitted files), overlay (Linux), projfs (Windows), copy (plain), auto (first available). An unavailable backend fails before any worker starts."}
     });
-    entry_properties.as_object_mut().unwrap().insert("source_session".into(), json!({"type":"string","minLength":1,"description":"agent seance only: a session id prefix or a worker id from this session whose record the consultant reads."}));
-    entry_properties.as_object_mut().unwrap().insert("model".into(), json!({"type":"string","description":"agent seance only: model to answer on; default is the source session's saved model, else the main model."}));
+    entry_properties.as_object_mut().unwrap().insert("source_session".into(), json!({"type":"string","minLength":1,"description":"seance only: session id prefix or worker id whose record is read."}));
+    entry_properties.as_object_mut().unwrap().insert("model".into(), json!({"type":"string","description":"seance only: answering model (default the source session's, else the main model)."}));
     if config.experimental.work_packet_contracts {
         entry_properties.as_object_mut().unwrap().insert("work_packet".into(), json!({
             "type":"object",
@@ -265,71 +265,71 @@ pub fn schema(config: &Config) -> Value {
     let mut properties = serde_json::Map::from_iter([
         (
             "action".into(),
-            json!({"type":"string","enum":["run","start","resume","status","wait","cancel","create","push","peek","close"],"description":"Default run waits for results and blocks you until every task finishes; for work that may take more than a few minutes, use start and then wait, so you can keep working and check progress. start returns live job IDs. resume continues a retained worker by id and message, only after its previous execution stopped safely. create opens a worker pool with its first tasks, push adds tasks to a pool id, peek reports a pool id's status, and close (or cancel with a pool id) closes a pool. Use the message tool to talk to a live worker."}),
+            json!({"type":"string","enum":["run","start","resume","status","wait","cancel","create","push","peek","close"],"description":"run (default) blocks until every task finishes; for work over a few minutes use start, keep working, then wait. start returns live job IDs. resume continues a retained worker by id with message, only after it stopped safely. create opens a worker pool with first tasks; push adds tasks to a pool id; peek reports it; close (or cancel with a pool id) closes it. Talk to a live worker with the message tool."}),
         ),
         (
             "id".into(),
-            json!({"type":"string","description":"Job ID (task-N) for resume/status/wait/cancel, or pool ID (pool-N) for push/peek/close; omit status/wait ID for all jobs."}),
+            json!({"type":"string","description":"task-N for resume/status/wait/cancel, pool-N for push/peek/close; omit on status/wait for all jobs."}),
         ),
         (
             "message".into(),
-            json!({"type":"string","description":"Steering text for resume, delivered before the resumed job's next model request."}),
+            json!({"type":"string","description":"resume only: steering delivered before the job's next model request."}),
         ),
         (
             "timeout".into(),
-            json!({"type":"integer","minimum":0,"maximum":120,"description":"wait only: seconds to block for results before returning current status (default 30). Jobs keep running after a timeout."}),
+            json!({"type":"integer","minimum":0,"maximum":120,"description":"wait only: seconds to block (default 30); jobs keep running after it."}),
         ),
         (
             "task".into(),
-            json!({"type":"string","description":"Complete assignment for a single task: what to do, scope and acceptance criteria."}),
+            json!({"type":"string","description":"Single task: complete assignment, scope and acceptance criteria."}),
         ),
         (
             "solution_space".into(),
-            json!({"type":"string","description":"How open a single task is: fixed decisions versus choices the child may make."}),
+            json!({"type":"string","description":"Single task: fixed decisions versus choices the child may make."}),
         ),
         (
             "context".into(),
-            json!({"type":"string","description":"Shared background for every task in this call: goal, constraints, interfaces and conventions. Keep it concise and factual."}),
+            json!({"type":"string","description":"Shared background for every task in this call: goal, constraints, interfaces, conventions; concise and factual."}),
         ),
         (
             "skills".into(),
-            json!({"type":"array","items":{"type":"string"},"description":"Skill names to load for a single task before it starts."}),
+            json!({"type":"array","items":{"type":"string"},"description":"Single task: skills to load first."}),
         ),
         (
             "agent".into(),
-            json!({"type":"string","description":"Agent type or preset for a single task (default scout)."}),
+            json!({"type":"string","description":"Single task: agent type or preset (default scout)."}),
         ),
         (
             "max_steps".into(),
-            json!({"type":"integer","minimum":0,"description":"Model step limit for a single task; default 0 means unlimited."}),
+            json!({"type":"integer","minimum":0,"description":"Single task: step limit; 0 means unlimited."}),
         ),
         (
             "concurrency".into(),
-            json!({"type":"integer","minimum":1,"maximum":32,"description":"create only: most pool workers running at once; default follows task.max_concurrency, clamped to 1..4."}),
+            json!({"type":"integer","minimum":1,"maximum":32,"description":"create only: most pool workers running at once (default task.max_concurrency, clamped to 1..4)."}),
         ),
         (
             "name".into(),
-            json!({"type":"string","description":"Optional label for a single task."}),
+            json!({"type":"string","description":"Single task: label."}),
         ),
         (
             "output_schema".into(),
-            json!({"type":"object","description":"JSON Schema the final answer must satisfy; in a batch, the default for tasks without their own."}),
+            json!({"type":"object","description":"JSON Schema for the final answer; in a batch, the default for items without one."}),
         ),
         (
             "isolation".into(),
-            json!({"type":"string","enum":["copy"],"description":"Single worker task: run in an isolated project copy and merge back (see tasks[].isolation)."}),
+            json!({"type":"string","enum":["copy"],"description":"Single worker: as tasks[].isolation."}),
         ),
         (
             "isolation_backend".into(),
-            json!({"type":"string","enum":ISOLATION_BACKENDS,"description":"Single worker task: backend for its isolated copy, overriding the configured [isolation] backend (see tasks[].isolation_backend). Implies isolation copy."}),
+            json!({"type":"string","enum":ISOLATION_BACKENDS,"description":"Single worker: as tasks[].isolation_backend."}),
         ),
         (
             "tasks".into(),
-            json!({"type":"array","maxItems":MAX_BATCH,"items":entry,"description":"Independent tasks to run instead of `task`; each needs its own task and solution_space."}),
+            json!({"type":"array","maxItems":MAX_BATCH,"items":entry,"description":"Independent tasks instead of `task`; each needs task and solution_space."}),
         ),
     ]);
-    properties.insert("source_session".into(), json!({"type":"string","minLength":1,"description":"agent seance only: a session id prefix or a worker id from this session whose record the consultant reads. Other agents reject this field."}));
-    properties.insert("model".into(), json!({"type":"string","description":"agent seance only: model to answer on; default is the source session's saved model, else the main model. Other agents reject this field."}));
+    properties.insert("source_session".into(), json!({"type":"string","minLength":1,"description":"seance only: session id prefix or worker id whose record is read; other agents reject it."}));
+    properties.insert("model".into(), json!({"type":"string","description":"seance only: answering model (default the source session's, else the main model); other agents reject it."}));
     if config.experimental.work_packet_contracts {
         properties.insert("work_packet".into(), json!({
             "type":"object",
@@ -2097,10 +2097,8 @@ pub(in crate::agent) fn nested(
     if !env.config.task.can_spawn_at(parent.depth) {
         return ToolOutput::err("task recursion depth reached");
     }
-    let plugins = env.ext.plugins();
     if let Err(reason) = crate::agent::safety::hooks::gate(
         &env.config.hooks,
-        plugins.as_deref(),
         env.workspace.root(),
         "before_subagent_spawn",
         json!({"args":args,"agent":parent.kind,"depth":parent.depth}),

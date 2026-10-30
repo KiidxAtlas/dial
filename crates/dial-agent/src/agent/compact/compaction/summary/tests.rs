@@ -80,6 +80,7 @@ fn a_rejected_window_lowers_the_budget_for_every_remaining_sibling() {
         timeout_secs: 5,
         user_dir: &user_dir,
         native_request: None,
+        retained_overhead_tokens: 0,
         supplemental_context: None,
     };
     // 24 parts of ~10k tokens: four ~60k-token windows under the planned budget, while the
@@ -310,6 +311,7 @@ fn summary_context(user_dir: &std::path::Path) -> CompactionContext<'_> {
         timeout_secs: 5,
         user_dir,
         native_request: None,
+        retained_overhead_tokens: 0,
         supplemental_context: None,
     }
 }

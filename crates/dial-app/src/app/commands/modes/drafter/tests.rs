@@ -15,7 +15,7 @@ fn toggle_status_and_invalid_arguments_do_not_guess() {
 #[test]
 fn drafter_is_discoverable_and_saves_without_stopping_a_busy_turn() {
     use crate::app::command_registry::{DuringTurn, command_entries, during_turn};
-    let entries = command_entries(&[], &[], &[]);
+    let entries = command_entries(&[], &[]);
     assert!(entries.iter().any(|entry| entry.name == "drafter"));
     let completions = crate::app::commands::completions(&Default::default());
     for argument in ["on", "off", "status"] {

@@ -809,7 +809,10 @@ impl Backend {
         self
     }
 
-    fn response_timeout(&self, worker_timeout_secs: u64) -> u64 {
+    /// The transport's stall limit for one request: remote routes are bounded by the remote idle
+    /// timeout as well as the worker timeout, local routes only by the worker timeout. `0` is
+    /// unlimited.
+    pub fn response_timeout(&self, worker_timeout_secs: u64) -> u64 {
         let remote = match &self.kind {
             ProviderKind::ChatGpt { .. } | ProviderKind::AnthropicSubscription { .. } => true,
             ProviderKind::Local { .. } | ProviderKind::Apple => false,

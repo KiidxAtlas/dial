@@ -116,12 +116,7 @@ impl Agent<'_> {
         let mut footprints = Vec::new();
         for call in calls.iter().take(self.config.task.max_concurrency.min(32)) {
             if ["pre_tool_use", "post_tool_use"].iter().any(|event| {
-                crate::agent::safety::hooks::wanted_for_tool(
-                    self.tool_hooks(),
-                    self.hook_plugins().as_deref(),
-                    event,
-                    &call.name,
-                )
+                crate::agent::safety::hooks::wanted_for_tool(self.tool_hooks(), event, &call.name)
             }) || self.repro_first_fires(call, crate::config::types::ReproFirst::Gate)
                 || self.speculative_pending(call)
             {

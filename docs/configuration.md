@@ -17,6 +17,11 @@ Both text and JSON redact credential values recursively (also when requesting an
 ordinary token budgets such as `harness.max_tokens` remain visible. Environment-variable names are not
 credential values. The settings panel reports read failures instead of displaying empty fallback layers.
 
+Changing the provider discards the previous provider's endpoint metadata before resolving the new
+route: its URL, protocol, credentials, headers and account pin are not inherited. Re-selecting the
+same provider preserves its configured custom endpoint. `--provider` with `--endpoint` uses the
+explicit URL for the requested provider; launch overrides remain in effect across settings reloads.
+
 A running session reloads settings that change on disk, except its model choices. The main model
 (`model`, `provider`, `endpoint`, `model_profile`, `context_window`) and `[model_roles]` stay as
 they were when the session started, so picking a model in one terminal never switches another
@@ -158,6 +163,12 @@ boundary. The fallback's first successful reply and each return to the primary a
 
 `image_gen` is a shared tool: any tool-calling main model can use an available image route, even when that chat model cannot output images. An assigned **image role** wins; otherwise Dial first tries main, then configured image-capable model profiles (stable profile-name order), before the dedicated provider defaults. Image input (`vision`) is independent and never implies image generation. MLX-Serve's native `image` capability enables its PNG Images API. Catalog `experimental_supported_tools` / `supported_tools` containing `image_generation` enables the Responses hosted tool; `output_modalities` containing `image` enables compatible inline-image chat completions.
 
+**Allow layer weight edits** (`image.allow_weight_edits`, default `false`) enables approved
+`image_weights` inspection and exact floating-point tensor scaling into a new local `.safetensors`
+file. It does not grant filesystem access, overwrite originals or reload MLX-Serve. See
+[actual layer-weight edits](image-generation.md#actual-layer-weight-edits-local-checkpoints) for
+supported dtypes, memory limits and loading the result into a separate model copy.
+
 An operator can declare the transport for an exact model using its existing model profile:
 
 ```toml
@@ -170,7 +181,7 @@ image_generation = "responses"
 
 Supported declarations are `responses` (the selected model calls the hosted `image_generation` tool), `chat-completions` (inline base64 image data URLs), `images` (the selected model itself serves `images/generations`), and `disabled` (do not use this model for generation). Declaring support does not grant provider access. ChatGPT's official Codex Responses endpoint can offer the approval-gated hosted image tool even when catalog capability metadata is missing; this is **unverified model/account support**, not a claim that the chat model outputs images. An explicit `disabled` declaration prevents that attempt. ChatGPT uses the selected account's OAuth credentials, with no separate API key and no automatic fallback to API billing after a failure. Account access remains subject to private account restrictions and provider plan/model permissions.
 
-`mlx-serve` declares the native MLX-Serve PNG-only Images API. Local endpoints can operate without an API key; remote endpoints still require credentials. MLX-Serve discovery defaults to `http://127.0.0.1:11234/v1`; use `MLX_SERVE_BASE_URL` or a configured provider for a different address. Servers on the LM Studio default port 1234 are also identified by their structured MLX-Serve metadata. After a successful rescan, cached rows remain visible as unverified while the server is stopped; start it again before generation.
+`mlx-serve` declares the native MLX-Serve Images API, which returns PNG. Dial can also save its results as JPEG or WebP through local conversion. Local endpoints can operate without an API key; remote endpoints still require credentials. MLX-Serve discovery defaults to `http://127.0.0.1:11234/v1`; use `MLX_SERVE_BASE_URL` or a configured provider for a different address. Servers on the LM Studio default port 1234 are also identified by their structured MLX-Serve metadata. After a successful rescan, cached rows remain visible as unverified while the server is stopped; start it again before generation.
 
 Explicit `[image]` overrides take precedence over all automatic routing. `base_url` (default `https://api.openai.com/v1`), `model` (default `gpt-image-1`) and `timeout_secs` (default `180`, `0` disables) configure the dedicated Images API. `api_key_env` names its credential variable; when unset, Dial uses the provider's standard variable or a saved `/providers` key. Changing `base_url` or `model`, or setting `api_key_env`, always uses these settings as written. An assigned image role never falls back to another model on a configuration error.
 
@@ -190,6 +201,7 @@ steps = 8            # MLX-Serve, 1–200
 seed = 42            # MLX-Serve, 0–4294967295; unset picks a random seed per image
 strength = 0.6       # MLX-Serve edits only, 0–1: how far an edit may move from its source
 loras = [{ path = "style.safetensors", scale = 1.25 }]   # MLX-Serve, at most 8
+cond_weights = [1.0, 0.8, 1.2]   # MLX-Serve, one per tapped text-encoder layer (1 = neutral)
 
 [image.models.gpt]
 model = "gpt-image-1"
@@ -200,15 +212,21 @@ moderation = "low"        # auto, low
 
 Each image API receives only the settings it accepts, and the panel shows only those rows:
 
-- MLX-Serve: `size`, `steps`, `seed`, `strength` (edits only) and `loras`.
+- MLX-Serve: `size`, `steps`, `seed`, `strength` (edits only), `loras` and `cond_weights`.
 - OpenAI Images and the Responses hosted image tool: `size`, `quality`, `background` and `moderation`. DALL·E takes only `size` and `quality`.
 - xAI and inline chat-image output: only `size`.
 
 Values set for another API are kept but not sent. A LoRA `path` is absolute, or a `.safetensors` file name inside `~/.mlx-serve/models/loras`; the panel offers the files installed there, and **All LoRAs** edits the full list for stacking. LoRA scales range from −8 to 8, and 1.0 (the default) is full strength. The provider still checks values against the specific model, and rejects any it does not support.
 
+`cond_weights` (the **Layer weights** row) rescales each tapped text-encoder layer's contribution. The number of layers depends on the model (FLUX.2 taps 3, Krea 12; models with a single final hidden state take none), so Dial accepts up to 64 comma- or space-separated numbers and sends them as `cond_weights`; MLX-Serve rejects a wrong count for the model. Blank leaves the model unchanged.
+
 ## Context files (`[context_files]`)
 
 `context_files.extra` lists extra plain file names (for example `TEAM.md`) read beside each directory of the project hierarchy, after the built-in files. Names must be bare file names; path separators, `.`/`..`, empty entries, duplicates and the reserved built-ins (`AGENTS.md`, `AGENTS.local.md`, `CLAUDE.md`, `.cursorrules`, `GEMINI.md`) are rejected at validation. `foreign_sources` (for example `"windsurf"`) opts in to foreign user-level memory; `COPILOT_CUSTOM_INSTRUCTIONS_DIRS` adds Copilot instruction directories.
+
+## Stream rules (`[portable_rules]`)
+
+`enabled` loads portable rule files; `max_regenerations` (1–64, default 8) bounds interrupting regenerations per turn; `repeat_after_turns` (0–1000, default 0) lets a fired rule fire again after that many user turns, where 0 means once per session; `judge` (`auto`, `on`, `off`) decides when judged `question` rules are asked, where `auto` requires an explicitly assigned `judge` role. See [Stream rules](stream-rules.md).
 
 ## Example configuration
 

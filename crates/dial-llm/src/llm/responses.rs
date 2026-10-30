@@ -699,6 +699,15 @@ impl Accumulator {
             Some(_) => {}
             None => bail!("Responses stream event has no type"),
         }
+        // Output items have no content callback of their own. The agent's silence watchdog must
+        // see the same lifecycle progress the transport's idle clock does (`advances_reply`).
+        if matches!(
+            event["type"].as_str(),
+            Some("response.output_item.added" | "response.output_item.done")
+        ) && !on_event(&StreamEvent::Activity)
+        {
+            return Err(Interrupted.into());
+        }
         Ok(false)
     }
 

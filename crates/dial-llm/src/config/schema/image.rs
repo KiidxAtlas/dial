@@ -46,6 +46,16 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         true,
     ),
     field!(
+        "image.allow_weight_edits",
+        image.allow_weight_edits,
+        TO,
+        "Image generation",
+        "Allow layer weight edits",
+        "Enable image_weights to inspect and scale actual local image-model tensors into a separate checkpoint file. Scaling still requires approval and authorized source/output paths. Originals are never overwritten; MLX-Serve must load the modified checkpoint separately. Off by default.",
+        Kind::Bool,
+        false,
+    ),
+    field!(
         "image.base_url",
         image.base_url,
         TO,

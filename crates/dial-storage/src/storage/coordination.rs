@@ -168,8 +168,13 @@ impl Participant {
 
     /// How many letters are queued for this instance, without taking them.
     pub fn mail_count(&self) -> Result<usize> {
+        Ok(self.queued()?.len())
+    }
+
+    /// The letters queued for this instance, oldest first, without taking them.
+    pub fn queued(&self) -> Result<Vec<Letter>> {
         let _transaction = transaction(&self.dir)?;
-        Ok(load(&self.dir, &self.id)?.inbox.len())
+        Ok(load(&self.dir, &self.id)?.inbox)
     }
 }
 

@@ -108,6 +108,11 @@ impl Agent<'_> {
         {
             return ToolOutput::err("expect must be \"pass\" or \"fail\"");
         }
+        if args.get("repro").is_none_or(Value::is_null) && args.get("command").is_some() {
+            return ToolOutput::err(
+                "check takes no top-level `command`. To register a bug reproduction, call check with repro: {\"name\": \"<short-name>\", \"command\": \"<shell command>\"}; the command must exit non-zero while the bug is present and zero once fixed. To run the selected checks, call check with no arguments.",
+            );
+        }
         self.refresh_check_inputs();
         let mut names: Option<Vec<String>> = args["names"].as_array().map(|names| {
             names
@@ -312,9 +317,8 @@ impl Agent<'_> {
         args: &Value,
         ui: &mut dyn Ui,
     ) -> Option<String> {
-        let plugins = self.hook_plugins();
         let hooks = self.tool_hooks();
-        if !crate::agent::safety::hooks::wanted(hooks, plugins.as_deref(), "pre_tool_use") {
+        if !crate::agent::safety::hooks::wanted(hooks, "pre_tool_use") {
             return None;
         }
         let root = self.workspace.root().to_path_buf();
@@ -323,7 +327,6 @@ impl Agent<'_> {
         let result = crate::agent::safety::hooks::with_heartbeat(ui, || {
             crate::agent::safety::hooks::pre_tool_with(
                 hooks,
-                plugins.as_deref(),
                 &root,
                 "bash",
                 args,

@@ -631,14 +631,8 @@ impl<'a> Agent<'a> {
         self.plan_mode
     }
     pub fn set_plan_mode(&mut self, enabled: bool) {
-        let before = self.plan_mode;
         self.plan_mode = enabled && !self.hermetic;
         self.rebuild_system();
-        if before != self.plan_mode {
-            self.emit_event("mode_changed", || {
-                json!({"session_id": self.session.id(), "mode": "plan", "enabled": self.plan_mode})
-            });
-        }
     }
     /// Plan text that must survive a same-session rebuild: the latest proposal for `/plan-review`
     /// and an approved plan not yet delivered to a turn.

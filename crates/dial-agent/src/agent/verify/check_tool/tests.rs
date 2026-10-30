@@ -508,3 +508,16 @@ fn unsafe_reproduction_rerun_cannot_earn_its_own_fix_credit() {
         0
     );
 }
+
+#[test]
+fn a_top_level_command_is_refused_with_the_repro_contract_and_runs_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    let config = Config::default();
+    let mut agent = hermetic_agent(&config, root.path());
+    let refused = agent.check_tool(&json!({"command": REPRO}), &mut NullUi);
+    assert!(refused.is_error, "{}", refused.text);
+    assert!(refused.text.contains("repro"), "{}", refused.text);
+    assert!(refused.text.contains("non-zero"), "{}", refused.text);
+    // No reproduction was registered, so nothing was executed or recorded for this turn.
+    assert!(agent.step_checks.evidence.repros().is_empty());
+}

@@ -224,6 +224,8 @@ pub fn judge_uses_typesafe(config: &Config) -> bool {
 
 /// Days a judged thinking choice stays valid before it is asked again.
 const THINKING_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+/// Days a judged stream-rule answer stays valid; the same reply content is not asked twice.
+const RULE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 /// Most judgments kept on disk; least recently used rows go first.
 const CACHE_MAX_ROWS: u64 = 5000;
 
@@ -237,16 +239,72 @@ pub fn judge_turn_thinking(
     usage: Option<&crate::llm::usage::Scope>,
     cancel: Arc<AtomicBool>,
 ) -> Result<Judgment> {
+    with_judge(
+        main,
+        user_dir,
+        THINKING_TTL_SECS,
+        usage,
+        cancel,
+        |cache, backend, model| judge_thinking(cache, backend, model, prompt, now_secs()),
+    )
+}
+
+/// Answers of a judged stream rule.
+pub const RULE_CHOICES: [&str; 2] = ["yes", "no"];
+const RULE_CRITERIA: [&str; 2] = [
+    "The output clearly does what the question asks about; the rule's guidance applies.",
+    "It does not, or the output gives too little evidence to say.",
+];
+
+/// Ask a stream rule's `question` about one completed reply's in-scope `content` through the judge
+/// role. `yes` triggers the rule.
+pub fn judge_rule(
+    main: &Config,
+    user_dir: &std::path::Path,
+    question: &str,
+    content: &str,
+    usage: Option<&crate::llm::usage::Scope>,
+    cancel: Arc<AtomicBool>,
+) -> Result<Judgment> {
+    with_judge(
+        main,
+        user_dir,
+        RULE_TTL_SECS,
+        usage,
+        cancel,
+        |cache, backend, model| {
+            judge(
+                cache,
+                backend,
+                model,
+                &Question {
+                    question,
+                    choices: &RULE_CHOICES,
+                    criteria: &RULE_CRITERIA,
+                    context: bounded(content),
+                },
+                now_secs(),
+            )
+        },
+    )
+}
+
+/// Runs `ask` with the persistent cache under `user_dir` (when it can be opened) and the backend the
+/// `judge` role selects: Laya, TypeSafe, or a chat model through the judge/small/main fallbacks.
+fn with_judge(
+    main: &Config,
+    user_dir: &std::path::Path,
+    ttl_secs: u64,
+    usage: Option<&crate::llm::usage::Scope>,
+    cancel: Arc<AtomicBool>,
+    ask: impl FnOnce(Option<&cache::Cache>, &mut dyn Backend, &str) -> Result<Judgment>,
+) -> Result<Judgment> {
     ensure!(
         !cancel.load(std::sync::atomic::Ordering::SeqCst),
-        "thinking judgment cancelled"
+        "judgment cancelled"
     );
     let cache = match cache::default_path(user_dir) {
-        Some(path) => Some(cache::Cache::open(
-            &path,
-            THINKING_TTL_SECS,
-            CACHE_MAX_ROWS,
-        )?),
+        Some(path) => Some(cache::Cache::open(&path, ttl_secs, CACHE_MAX_ROWS)?),
         None => None,
     };
     if judge_uses_laya(main) {
@@ -258,13 +316,7 @@ pub fn judge_turn_thinking(
         })?;
         // The checkpoint is the model identity: a new checkpoint is asked again instead of hitting the cache.
         let model = format!("{}:{checkpoint}", crate::config::laya::PROVIDER);
-        return judge_thinking(
-            cache.as_ref(),
-            &mut LayaBackend { config, cancel },
-            &model,
-            prompt,
-            now_secs(),
-        );
+        return ask(cache.as_ref(), &mut LayaBackend { config, cancel }, &model);
     }
     if judge_uses_typesafe(main) {
         let selection = main
@@ -276,11 +328,11 @@ pub fn judge_turn_thinking(
             cancel,
         )?;
         let model = format!("{}:{}", typesafe::PROVIDER, backend.model());
-        return judge_thinking(cache.as_ref(), &mut backend, &model, prompt, now_secs());
+        return ask(cache.as_ref(), &mut backend, &model);
     }
     let judge = judge_config(main);
     let model = judge.selection().display_name();
-    judge_thinking(
+    ask(
         cache.as_ref(),
         &mut ProviderBackend {
             config: &judge,
@@ -288,8 +340,6 @@ pub fn judge_turn_thinking(
             cancel,
         },
         &model,
-        prompt,
-        now_secs(),
     )
 }
 

@@ -3,13 +3,14 @@
 #
 #   scripts/release.sh 0.1.23            # bump, roll the changelog, check, commit, tag
 #   scripts/release.sh 0.1.23 --push     # ...then push main and the tag (starts release.yml)
-#   scripts/release.sh 0.1.23 --no-check # skip local fmt/clippy/tests (CI still gates publishing)
+#   scripts/release.sh 0.1.23 --no-check # skip the local compile/lint gate (CI still gates publishing)
 #
 # Steps: require a clean checkout on main that matches origin/main and has a successful CI run;
 # set [workspace.package] version in Cargo.toml; refresh Cargo.lock for workspace members only;
-# move `## [Unreleased]` entries under `## [<version>] - <date>` in CHANGELOG.md; run the local
-# gate (`make preflight`); commit `release: v<version>`; tag `v<version>`. The release commit
-# only changes version metadata, so a green CI on its parent is the evidence the tag depends on.
+# move `## [Unreleased]` entries under `## [<version>] - <date>` in CHANGELOG.md; run the quick
+# local gate (scripts/preflight.sh --quick); commit `release: v<version>`; tag `v<version>`. The
+# release commit only changes version metadata, so a green CI on its parent is the evidence the
+# tag depends on; the quick gate confirms the bumped manifests still build for every target.
 set -euo pipefail
 
 usage() { sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
@@ -97,7 +98,7 @@ PY
 cargo update --workspace --offline >/dev/null 2>&1 || cargo update --workspace
 
 if [[ "$check" == 1 ]]; then
-  make preflight
+  scripts/preflight.sh --quick --in-place
 fi
 
 git add Cargo.toml Cargo.lock CHANGELOG.md

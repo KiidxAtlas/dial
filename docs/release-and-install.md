@@ -255,21 +255,45 @@ It first refuses unless `HEAD` matches `origin/main` and a `CI` run on that comm
 asks `gh`), so a tag is never placed on code CI has not passed. It then sets
 `[workspace.package] version`, refreshes `Cargo.lock` for workspace members only, moves the
 `## [Unreleased]` changelog entries under a dated version heading (refusing an empty section), runs
-`make preflight` (skip with `--no-check`), commits `release: v<version>` and creates an annotated
-tag. It pushes only with `--push`:
+`scripts/preflight.sh --quick` on the bumped tree (skip with `--no-check`), commits
+`release: v<version>` and creates an annotated tag. It pushes only with `--push`:
 
 ```sh
-make preflight                     # optional dry run of the CI gate
 scripts/release.sh 0.1.23          # commit + tag locally
 git push origin main
 git push origin v0.1.23
 ```
 
-`make preflight` runs CI's test-job gate locally: `cargo fmt --check`, `make lint`, the driver
-contracts, `make test-rust` with the system temp directory (on macOS this sits behind the
-`/var` -> `/private/var` symlink, as on CI runners, so path-comparison bugs surface locally), the
-artifact smoke test and the real-terminal smoke scripts. CI additionally runs `cargo check` for the
-two musl release targets on every push, so target-specific build failures appear before tagging.
+#### Checking a commit locally before pushing
+
+`make preflight` runs CI's checks on a clean snapshot of `HEAD` (`REV=<commit>` for another), so
+uncommitted edits in the checkout neither hide nor cause failures. The snapshot is a detached
+worktree in `.tmp/preflight/wt` with a persistent target directory, so repeat runs are incremental,
+and a tree that passed is recorded and not checked again. It covers, in CI's terms:
+
+- the lint job: `cargo fmt --check`, clippy with `-D warnings` for the host **and** for
+  `x86_64-unknown-linux-gnu` (so `cfg(target_os = "linux")` code is linted, as on CI's Ubuntu
+  runner), and `cargo deny`;
+- the musl job: `cargo check` for both musl release targets;
+- a Windows compile check (`x86_64-pc-windows-gnu`, which type-checks the same `cfg(windows)` code
+  as CI's MSVC build) and the slim build;
+- the installer, build, Windows-contract-runner, packaging, driver and Python contracts (Python 3.12
+  with CI's packages, in a throwaway `uv` environment);
+- the workspace tests in the system temp directory (on macOS this sits behind the `/var` ->
+  `/private/var` symlink, as on CI runners, so path-comparison bugs surface locally), then the
+  installed binary's artifact smoke test and the real-terminal smoke scripts.
+
+Cross targets compile their C dependencies with `zig` (`scripts/zig-cc`); install it
+(`brew install zig`) and the rustup targets, or those steps are reported as not covered.
+Tests run only on the host, so Linux-only tests (sandbox enforcement) and the native Windows suite
+still run only in CI; they are compile-checked locally. `make preflight-quick` runs only the compile
+and lint gates (about four minutes warm). A run stops at the first failing step and prints the end
+of its log; `PREFLIGHT_KEEP_GOING=1` reports every failing step. Logs are in `.tmp/preflight/logs/`.
+
+`make hooks` points `core.hooksPath` at `.githooks`, whose `pre-push` hook runs `make preflight`
+on every commit pushed to a branch and refuses the push if it fails. `DIAL_PREFLIGHT=quick git
+push` runs only the compile and lint gates; `DIAL_PREFLIGHT=skip git push` (or `--no-verify`)
+bypasses it. Runs in one checkout are serialized.
 
 CI skips commits that only touch Markdown under `docs/`, root-level Markdown or the PR template.
 Changes to protocol files such as `docs/rpc-schema.json` still trigger CI. A release commit always

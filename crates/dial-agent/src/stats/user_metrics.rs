@@ -1,6 +1,5 @@
-//! Deterministic user-message behaviour signals, ported from OMP `packages/stats/src/user-metrics.ts`
-//! (`/api/stats/frustration`). These are keyword and shape heuristics only; the model-judged
-//! frustration run of OMP (`/api/frustration/judge`) is not implemented.
+//! Deterministic user-message behaviour signals (`/api/stats/frustration`). These are keyword and
+//! shape heuristics only; a model-judged frustration score is not implemented.
 //!
 //! Message text is never stored: [`Db::frustration`] reads the in-tree transcripts on demand and
 //! returns aggregate counts only.
@@ -218,7 +217,7 @@ fn count_yelling_sentences(prose: &str) -> u64 {
 }
 
 /// Computes the signals for one user message. Volume (`chars`, `words`) is always reported; the
-/// behaviour signals are only computed for short prose, as in OMP.
+/// behaviour signals are only computed for short prose.
 pub fn compute(text: &str) -> UserMessageMetrics {
     let trimmed = text.trim();
     let mut metrics = UserMessageMetrics {

@@ -73,11 +73,6 @@ fn a_lone_near_miss_word_is_a_mistyped_subcommand_not_a_request() {
     };
     assert_eq!(suggest(&["dial", "sesions"]).as_deref(), Some("sessions"));
     assert_eq!(suggest(&["dial", "modles"]).as_deref(), Some("models"));
-    assert_eq!(
-        suggest(&["dial", "plugins"]),
-        None,
-        "aliases parse directly"
-    );
     assert_eq!(suggest(&["dial", "img"]), None, "aliases parse directly");
     assert_eq!(suggest(&["dial", "bnech"]).as_deref(), Some("benchmark"));
     // Real requests, short words, explicit `--` and unrelated words still reach the model.
@@ -123,4 +118,63 @@ fn restore_is_a_resume_flag_that_excludes_print_mode_and_no_session() {
     assert!(!cli.continue_session);
     assert!(Cli::try_parse_from(["dial", "--restore", "--print", "hi"]).is_err());
     assert!(Cli::try_parse_from(["dial", "--restore", "--no-session"]).is_err());
+}
+
+#[test]
+fn rules_cli_samples_are_exclusive_and_do_not_clash_with_global_flags() {
+    use dial::cli::rules::RulesAction;
+    // `--reasoning`, `--tool`, `--args` and `--agent` must stay distinct from global flag ids
+    // (a `--thinking` sample once collided with the global thinking level and panicked).
+    for (args, ok) in [
+        (&["dial", "rules", "test", "some text"][..], true),
+        (
+            &[
+                "dial",
+                "rules",
+                "test",
+                "--reasoning",
+                "plan",
+                "--agent",
+                "w",
+            ],
+            true,
+        ),
+        (
+            &["dial", "rules", "test", "--tool", "bash", "--args", "{}"],
+            true,
+        ),
+        (&["dial", "--thinking", "high", "rules", "test", "x"], true),
+        (&["dial", "rules", "--json", "list"], true),
+        (&["dial", "rules"], true),
+        (&["dial", "rules", "test", "--tool", "bash"], false),
+        (
+            &[
+                "dial", "rules", "test", "x", "--tool", "bash", "--args", "{}",
+            ],
+            false,
+        ),
+        (
+            &["dial", "rules", "test", "x", "--reasoning", "plan"],
+            false,
+        ),
+    ] {
+        assert_eq!(Cli::try_parse_from(args).is_ok(), ok, "{args:?}");
+    }
+    let cli = Cli::try_parse_from([
+        "dial",
+        "rules",
+        "test",
+        "--reasoning",
+        "plan",
+        "--agent",
+        "w",
+    ])
+    .unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::Rules(args)) if matches!(
+            &args.action,
+            Some(RulesAction::Test { reasoning: Some(plan), agent, .. }) if plan == "plan" && agent == "w"
+        )
+    ));
 }

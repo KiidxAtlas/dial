@@ -15,10 +15,10 @@ mod fresh;
 mod goal;
 mod handoff;
 mod loop_cmd;
-mod omfg;
 mod plan_review;
 mod prewalk;
 mod ratchet;
+mod rule;
 mod shake;
 mod switch;
 mod tan;
@@ -105,8 +105,8 @@ pub(super) const COMMANDS: &[super::CommandSpec] = &[
         ],
     },
     super::CommandSpec {
-        name: "omfg",
-        description: "Author a TTSR rule from a complaint and save it",
+        name: "rule",
+        description: "Author a stream rule from a complaint and save it",
         args_hint: "<complaint>",
         subcommands: &[],
     },
@@ -170,7 +170,7 @@ pub(super) fn run(
         "btw" => Some(btw::run(shell, app, agent, args)),
         "tan" => Some(tan::run(shell, app, agent, args)),
         "debug" => Some(debug::run(shell, app, agent, args)),
-        "omfg" => Some(omfg::run(shell, app, agent, args)),
+        "rule" => Some(rule::run(shell, app, agent, args)),
         "prewalk" => Some(prewalk::run(shell, app, agent, args)),
         "switch" => Some(switch::run(shell, app, agent, args)),
         "plan-review" => Some(plan_review::run(shell, app, agent)),

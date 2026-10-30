@@ -211,6 +211,11 @@ impl CompletionGuard {
         }
     }
 
+    /// Whether this round's evidence reminder was already sent.
+    pub fn reminder_spent(&self) -> bool {
+        self.evidence_reminded
+    }
+
     /// `unverified` names the applicable checks when this turn's edits have no passing check on the
     /// current revision, `None` when evidence is not owed. Without `can_remind`, or once the
     /// reminder was spent, the gap is disclosed instead of blocking the answer.
@@ -232,6 +237,18 @@ impl CompletionGuard {
     pub fn reset_for_steering(&mut self) {
         *self = Self::default();
     }
+}
+
+/// The evidence reminder plus what the gate's own check run observed, so the next request can
+/// repair without rerunning the check first.
+pub fn with_gate_failures(note: String, failures: &[String]) -> String {
+    if failures.is_empty() {
+        return note;
+    }
+    format!(
+        "{note}\nThe completion gate ran the applicable checks:\n{}",
+        failures.join("\n")
+    )
 }
 
 /// Plain reports receive actionable rejection feedback, just as explicit finish calls do.

@@ -2387,6 +2387,8 @@ fn documented_context_window(selection: &ModelSelection) -> Option<u32> {
             .is_none_or(|url| url.trim_end_matches('/') == super::anthropic::BASE_URL)
     {
         super::anthropic::documented_context_window(&selection.model)
+    } else if selection.provider != super::chatgpt::PROVIDER {
+        bundled::selection_model(selection).and_then(|model| model.context_window)
     } else {
         None
     }

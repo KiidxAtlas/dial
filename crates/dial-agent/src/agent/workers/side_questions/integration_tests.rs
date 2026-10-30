@@ -238,11 +238,20 @@ fn wait_then_delivery_then_poll_never_repeats_success_failure_or_cancellation_bo
 }
 
 #[test]
-fn side_request_is_offered_to_the_parent_but_never_to_children() {
+fn side_request_is_loadable_by_the_parent_but_never_offered_to_children() {
     with_agent("", |agent| {
+        let offered = agent.offered();
+        assert!(!offered.iter().any(|n| n == "side_request"), "{offered:?}");
+        assert!(
+            agent
+                .discoverable_tools(&offered)
+                .iter()
+                .any(|(n, _)| n == "side_request")
+        );
+        agent.activate_tools(&["side_request".into()]).unwrap();
         assert!(
             agent.offered().iter().any(|n| n == "side_request"),
-            "parent should be offered side_request: {:?}",
+            "parent should be offered side_request once loaded: {:?}",
             agent.offered()
         );
         assert!(

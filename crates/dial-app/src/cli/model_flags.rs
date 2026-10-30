@@ -252,8 +252,18 @@ pub fn apply(mut config: Config, flags: &ModelFlags) -> Result<Config> {
         .to_owned();
     }
     if let Some(provider) = &flags.provider {
-        let mut selection = config.selection();
-        selection.provider = provider.clone();
+        let current = config.selection();
+        let mut selection = if current.provider == *provider {
+            current
+        } else {
+            // Endpoint metadata belongs to its provider. Re-resolve the new route rather than
+            // carrying credentials, protocol, headers or account pins across providers.
+            ModelSelection {
+                provider: provider.clone(),
+                model: current.model,
+                ..Default::default()
+            }
+        };
         selection.context_window = config.context_limit.tokens();
         config = config.with_selection(&selection);
     }
@@ -306,8 +316,17 @@ pub fn capture_overlay(overlay: &mut toml::Table, before: &Config, after: &Confi
             .collect()
     }
     let before = toml::Table::try_from(before)?;
-    let after = toml::Table::try_from(after)?;
-    crate::config::merge(overlay, changed(&before, after));
+    let mut after = toml::Table::try_from(after)?;
+    let endpoint = (before.get("provider") != after.get("provider"))
+        .then(|| after.get("endpoint").cloned())
+        .flatten();
+    after = changed(&before, after);
+    // Route changes replace the inherited endpoint on reload. Keep the entire new endpoint,
+    // including fields whose values happened to match the previous provider's route.
+    if let Some(endpoint) = endpoint {
+        after.insert("endpoint".into(), endpoint);
+    }
+    crate::config::merge(overlay, after);
     Ok(())
 }
 

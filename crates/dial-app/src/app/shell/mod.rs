@@ -31,9 +31,6 @@ use std::time::{Duration, Instant};
 pub(in crate::app) mod busy;
 mod checkpoint_review;
 pub(in crate::app) mod command;
-pub(in crate::app) mod extension_keys;
-pub(in crate::app) mod extension_settings;
-pub(in crate::app) mod extension_views;
 mod file_discovery;
 pub(in crate::app) mod frame_pacing;
 pub(in crate::app) mod help;
@@ -46,8 +43,6 @@ pub(in crate::app) mod notes;
 pub(in crate::app) mod overlays;
 pub(in crate::app) mod paint;
 pub(in crate::app) mod pickers;
-pub(in crate::app) mod plugin_chrome;
-pub(in crate::app) mod plugin_effects;
 pub(in crate::app) mod prompts;
 mod release_notice;
 pub(in crate::app) mod run;
@@ -90,10 +85,7 @@ pub(super) struct Shell {
     pub(crate) extensions_pending: Option<crate::app::commands::extensions_browser::Pending>,
     /// The running `/extensions` install, if any.
     pub(crate) extensions_job: Option<crate::app::commands::extensions_browser::InstallJob>,
-    pub(super) extension_commands: Vec<(String, String)>,
-    pub(in crate::app) extension_views: extension_views::ExtensionViews,
     /// Set by `/restart`; `run_interactive` relaunches the binary once the terminal is restored.
-    pub(in crate::app) extension_keys: extension_keys::ExtensionKeys,
     pub(super) restart_requested: bool,
     /// A provider retry was already explained in this turn; later attempts update nothing new.
     pub(super) retry_noted: bool,
@@ -166,8 +158,6 @@ pub(super) struct Shell {
     pub(super) deferred_editor: bool,
     /// Shift+Tab pressed during a turn; applied at the next idle boundary.
     pub(super) deferred_approval_cycle: bool,
-    /// Plugin chrome refresh and autocomplete state.
-    pub(super) plugin_chrome: plugin_chrome::PluginChrome,
     /// Input read before the main loop could take it (typing while the first agent is built);
     /// the loop handles these before reading the terminal again.
     pub(super) held: std::collections::VecDeque<crossterm::event::Event>,

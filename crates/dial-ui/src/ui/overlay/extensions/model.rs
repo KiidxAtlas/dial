@@ -8,24 +8,20 @@ use std::collections::BTreeMap;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Tab {
     Mcp,
-    Plugins,
     Skills,
-    Marketplaces,
 }
 
 /// Number of tabs; sizes the per-tab arrays in [`Browser`].
-const TABS: usize = 4;
+const TABS: usize = 2;
 const _: () = assert!(Tab::ALL.len() == TABS);
 
 impl Tab {
-    pub const ALL: [Tab; TABS] = [Tab::Mcp, Tab::Plugins, Tab::Skills, Tab::Marketplaces];
+    pub const ALL: [Tab; TABS] = [Tab::Mcp, Tab::Skills];
 
     pub fn label(self) -> &'static str {
         match self {
             Tab::Mcp => "MCP servers",
-            Tab::Plugins => "Plugins",
             Tab::Skills => "Skills",
-            Tab::Marketplaces => "Marketplaces",
         }
     }
 
@@ -76,7 +72,7 @@ impl State {
 /// One line in a tab. Built by the controller; the UI only displays it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Row {
-    /// Stable key: server name or `plugin@marketplace`.
+    /// Stable key: server name or skill source.
     pub id: String,
     pub title: String,
     pub summary: String,
@@ -119,12 +115,6 @@ pub enum Intent {
     TestMcp {
         id: String,
     },
-    InstallPlugin {
-        id: String,
-    },
-    RemovePlugin {
-        id: String,
-    },
     /// Remove an installed skill package (both its skills and its lock entry).
     RemoveSkill {
         id: String,
@@ -153,20 +143,6 @@ pub enum Intent {
         query: String,
         page: usize,
     },
-    /// Register a user-supplied marketplace index after confirmation.
-    AddMarketplace {
-        name: String,
-        index: String,
-    },
-    /// Remove a registered marketplace. Plugins and skills it installed stay installed.
-    RemoveMarketplace {
-        name: String,
-    },
-    /// Turn a registered marketplace on or off without forgetting it.
-    ToggleMarketplace {
-        name: String,
-        enable: bool,
-    },
     /// Install a skill package from a skill listing; `source` is `repo[@ref][#path]`.
     InstallSkill {
         source: String,
@@ -184,8 +160,6 @@ impl Intent {
             Intent::ToggleMcp { id, enable: false } => format!("Disable MCP server `{id}`"),
             Intent::RemoveMcp { id } => format!("Remove MCP server `{id}`"),
             Intent::TestMcp { id } => format!("Test MCP server `{id}`"),
-            Intent::InstallPlugin { id } => format!("Install plugin `{id}`"),
-            Intent::RemovePlugin { id } => format!("Remove plugin `{id}`"),
             Intent::RemoveSkill { id } => format!("Remove skill package `{id}`"),
             Intent::SmitheryInstall { name } => format!("Install Smithery server `{name}`"),
             Intent::SmitheryKey { .. } => "Check and save the Smithery API key".to_owned(),
@@ -194,17 +168,6 @@ impl Intent {
             }
             Intent::CatalogBrowse { tab, query, page } => {
                 format!("Browse {}: `{query}` (page {page})", tab.label())
-            }
-            Intent::AddMarketplace { name, .. } => format!("Add marketplace `{name}`"),
-            Intent::RemoveMarketplace { name } => format!("Remove marketplace `{name}`"),
-            Intent::ToggleMarketplace { name, enable: true } => {
-                format!("Enable marketplace `{name}`")
-            }
-            Intent::ToggleMarketplace {
-                name,
-                enable: false,
-            } => {
-                format!("Disable marketplace `{name}`")
             }
             Intent::InstallSkill { source } => format!("Install skill package `{source}`"),
         }
@@ -218,16 +181,11 @@ impl Intent {
             Intent::InstallCuratedMcp { .. }
                 | Intent::ImportMcp { .. }
                 | Intent::InstallMcp { .. }
-                | Intent::InstallPlugin { .. }
                 | Intent::RemoveMcp { .. }
-                | Intent::RemovePlugin { .. }
                 | Intent::RemoveSkill { .. }
                 | Intent::ToggleMcp { enable: false, .. }
                 | Intent::SmitheryInstall { .. }
                 | Intent::SmitheryDeploy { .. }
-                | Intent::AddMarketplace { .. }
-                | Intent::RemoveMarketplace { .. }
-                | Intent::ToggleMarketplace { enable: false, .. }
                 | Intent::InstallSkill { .. }
         )
     }
@@ -262,18 +220,11 @@ pub struct Form {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FormKind {
     /// Smithery API key. `name` is the server to install once the key is accepted.
-    Key {
-        name: String,
-    },
+    Key { name: String },
     /// Settings for the Smithery server `name`.
-    Config {
-        name: String,
-    },
+    Config { name: String },
     /// Values for the curated or official-registry server `id`.
-    McpInputs {
-        id: String,
-    },
-    Marketplace,
+    McpInputs { id: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -344,20 +295,6 @@ impl Form {
             fields,
             focus: 0,
             error,
-        }
-    }
-
-    pub fn marketplace() -> Self {
-        Self {
-            kind: FormKind::Marketplace,
-            title: "Add plugin marketplace".into(),
-            note: "Supply a trusted JSON index (HTTPS URL or local file). Adding one lists its plugins and skills; nothing is installed.".into(),
-            fields: ["name", "index"].into_iter().map(|key| Field {
-                key: key.into(), label: key.into(), hint: String::new(), required: true,
-                secret: false, value: String::new(),
-            }).collect(),
-            focus: 0,
-            error: None,
         }
     }
 
@@ -582,7 +519,7 @@ impl Browser {
             && state.query.trim().to_lowercase() != needle
     }
 
-    /// Match counts for every tab while a query is active, e.g. "MCP servers 1 · Plugins 0".
+    /// Match counts for every tab while a query is active, e.g. "MCP servers 1 · Skills 0".
     /// Empty when no query is set.
     pub fn match_summary(&self) -> String {
         if self.query.trim().is_empty() {

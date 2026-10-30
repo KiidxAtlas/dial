@@ -25,12 +25,7 @@ impl Agent<'_> {
         {
             return None;
         }
-        let plugins = self.hook_plugins();
-        if crate::agent::safety::hooks::wanted(
-            self.tool_hooks(),
-            plugins.as_deref(),
-            "pre_tool_use",
-        ) {
+        if crate::agent::safety::hooks::wanted(self.tool_hooks(), "pre_tool_use") {
             return None;
         }
         let tool = self.ext.get(name);
@@ -406,7 +401,11 @@ impl Agent<'_> {
             self.layout
                 .as_ref()
                 .map(|layout| {
-                    crate::agent::safety::rules::Catalog::discover(layout, self.workspace.root())
+                    crate::agent::safety::rules::Catalog::discover(
+                        layout,
+                        self.workspace.root(),
+                        &self.config.portable_rules,
+                    )
                 })
                 .unwrap_or_default()
         } else {

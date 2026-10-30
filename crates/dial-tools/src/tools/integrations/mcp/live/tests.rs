@@ -1,6 +1,7 @@
 use super::*;
 use crate::tools::integrations::mcp::tests::{config_with, fake_config};
 use crate::tools::integrations::mcp::{McpLoad, load};
+use serde_json::json;
 
 fn remote(name: &str, version: u64) -> RemoteTool {
     RemoteTool {
@@ -116,53 +117,34 @@ fn a_refresh_applies_the_servers_current_list_and_reports_the_diff() {
     let mut registry = BTreeMap::new();
     session.apply_catalog(vec![remote("only", 1)]);
     apply(&mut registry, loaded.live.sync());
-    assert!(loaded.live.take_events().is_empty());
 
     session.refresh_tools();
-
-    let events = loaded.live.take_events();
-    assert!(
-        events
-            .iter()
-            .any(|event| event.kind == McpEventKind::ToolsChanged),
-        "{events:?}"
-    );
-    let refreshed = events.iter().find_map(|event| match &event.kind {
-        McpEventKind::ToolsRefreshed { added, removed, .. } => {
-            Some((added.clone(), removed.clone()))
-        }
-        _ => None,
-    });
-    let (added, removed) = refreshed.expect("the diff is reported");
-    assert_eq!(removed, vec!["only".to_owned()]);
-    assert!(added.iter().any(|name| name == "echo"), "{added:?}");
     assert!(!session.offers(&remote("only", 1)));
 
-    apply(&mut registry, loaded.live.sync());
+    let change = loaded.live.sync();
+    assert!(
+        change
+            .notices
+            .iter()
+            .any(|notice| notice.contains("tools updated") && notice.contains(" -1 ")),
+        "{:?}",
+        change.notices
+    );
+    apply(&mut registry, change);
     assert!(!registry.contains_key("mcp__fake__only"));
     assert!(registry.contains_key("mcp__fake__echo"));
 
     session.refresh_tools();
-    assert_eq!(
-        loaded.live.take_events(),
-        vec![McpEvent {
-            server: "fake".into(),
-            kind: McpEventKind::ToolsChanged,
-        }],
-        "an unchanged list only announces the refresh"
+    assert!(
+        loaded.live.sync().notices.is_empty(),
+        "an unchanged list reports nothing"
     );
 }
 
 #[test]
-fn events_and_notices_are_bounded_and_drain_once() {
+fn notices_are_bounded_and_drain_once() {
     let loaded = connected();
     let session = loaded.sessions[0].clone();
-    for _ in 0..EVENT_QUEUE_LIMIT + 5 {
-        session.push_event(McpEventKind::PromptsChanged);
-    }
-    assert_eq!(loaded.live.take_events().len(), EVENT_QUEUE_LIMIT);
-    assert!(loaded.live.take_events().is_empty());
-
     for index in 0..NOTICE_LIMIT + 3 {
         session.push_notice(format!("notice {index}"));
     }
@@ -170,38 +152,7 @@ fn events_and_notices_are_bounded_and_drain_once() {
     let notices = live.sync().notices;
     assert_eq!(notices.len(), NOTICE_LIMIT);
     assert_eq!(notices.last().map(String::as_str), Some("notice 18"));
-}
-
-#[test]
-fn event_payloads_name_the_server_and_kind() {
-    let event = McpEvent {
-        server: "fake".into(),
-        kind: McpEventKind::ToolsRefreshed {
-            added: vec!["x".into()],
-            removed: vec![],
-            changed: vec!["y".into()],
-        },
-    };
-    assert_eq!(
-        event.to_json(),
-        json!({
-            "server": "fake",
-            "kind": "tools_refreshed",
-            "added": ["x"],
-            "removed": [],
-            "changed": ["y"],
-        })
-    );
-    assert_eq!(
-        McpEvent {
-            server: "fake".into(),
-            kind: McpEventKind::ToolsRefreshFailed {
-                error: "boom".into()
-            },
-        }
-        .to_json(),
-        json!({"server": "fake", "kind": "tools_refresh_failed", "error": "boom"})
-    );
+    assert!(live.sync().notices.is_empty());
 }
 
 /// Polls `done` until it holds, failing the test rather than hanging when a refresh never lands.

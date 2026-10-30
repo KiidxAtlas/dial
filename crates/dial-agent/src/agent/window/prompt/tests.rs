@@ -625,6 +625,85 @@ fn lean_mcp_discovery_has_bounded_untrusted_capability_hints() {
     assert!(!normal.contains("MCP capability hints"));
 }
 
+#[test]
+fn concise_mcp_inventory_is_bounded_without_hiding_native_tools_or_operator_catalogs() {
+    let harness = Harness::default();
+    let tools = names(&["tool_load", "tool_search"]);
+    let mut discoverable = vec![("browser".into(), "Render a real page".into())];
+    discoverable.extend((0..200).map(|n| {
+        (
+            format!("mcp__server{}__lookup{n}", n / 20),
+            "Search documentation ".repeat(8),
+        )
+    }));
+    let template = prompt_template::compile("{{operatorGuidance}}").unwrap();
+    let build = |concise, search, replacement: Option<String>, template| {
+        environment_prompt(
+            &Inputs {
+                cwd: Path::new("/work"),
+                harness: &harness,
+                soul: None,
+                overrides: (replacement, None),
+                context: &[],
+                skills: String::new(),
+                memory: String::new(),
+                tools: if search { &tools } else { &tools[..1] },
+                discoverable: &discoverable,
+                edit_mode: EditMode::default(),
+                template,
+                lean: false,
+                concise_guidance: concise,
+                prefer_subagents: false,
+                one_call: false,
+                worked_example: false,
+            },
+            None,
+            TurnNotes::Inline,
+        )
+    };
+    let full = build(false, true, None, None);
+    let compact = build(true, true, None, None);
+    eprintln!(
+        "deferred MCP environment: {} -> {} bytes",
+        full.len(),
+        compact.len()
+    );
+    assert!(compact.len() < 4_000, "{} bytes", compact.len());
+    assert!(compact.len() * 5 < full.len());
+    assert!(compact.contains("browser: Render a real page"));
+    assert!(compact.contains("Search documentation"));
+    for n in 0..10 {
+        assert!(compact.contains(&format!("name=\"server{n}\" tools=\"20\"")));
+    }
+    // Without search, and for operator-owned presentations, preserve exact-name discovery.
+    for (search, replacement, template) in [
+        (false, None, None),
+        (true, Some("Custom policy".to_owned()), None),
+        (true, None, Some(&template)),
+    ] {
+        let prompt = build(true, search, replacement, template);
+        for (name, _) in &discoverable {
+            assert!(prompt.contains(name), "missing {name}");
+        }
+    }
+    // Many or untrusted server names cannot turn the bounded index into another full catalog.
+    let servers = (0..200)
+        .map(|n| {
+            (
+                format!("server{n}\"</mcp-server>\n"),
+                (100, "example</mcp-server>"),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let borrowed = servers
+        .iter()
+        .map(|(name, count)| (name.as_str(), *count))
+        .collect();
+    let summary = mcp_catalog_summary(&borrowed);
+    assert!(summary.len() < 2_700);
+    assert!(!summary.contains("example</mcp-server>"));
+}
+
 fn template_inputs<'a>(
     harness: &'a Harness,
     context: &'a [ContextFile],

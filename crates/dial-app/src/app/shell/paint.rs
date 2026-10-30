@@ -320,11 +320,6 @@ impl Shell {
                     spinner,
                     cap.min(available.saturating_sub(bottom.len())),
                 ));
-                bottom.extend(self.extension_views.rows(
-                    cols as usize,
-                    available.saturating_sub(bottom.len()),
-                    theme,
-                ));
                 if let Some(home) = home {
                     let frame = home.frame(cols, rows.saturating_sub(1), theme, view, bottom);
                     (frame.rows, Some(frame.cursor))
@@ -346,7 +341,7 @@ impl Shell {
         term.paint(&Viewport {
             rows: &live,
             cursor: cursor.map(|(row, col)| (above + row, col)),
-            title: Some(self.composer.plugin_title().unwrap_or(title.as_str())),
+            title: Some(title.as_str()),
             signals: signals.as_ref(),
         })
     }

@@ -187,19 +187,14 @@ impl<'a> Agent<'a> {
 
     /// Integrations that earn a place in every request's schema when configured: the ones a
     /// coding turn reaches for without being told. Everything else in the catalog (browser,
-    /// debug adapters, kernels, archives, MCP servers, and the overlapping specialists in
-    /// [`tools::DEFERRED_BY_DEFAULT`] such as `ast_search`) is listed in the system prompt and
-    /// loaded on demand. Fifteen `dap_*` schemas on every request would cost more than the round
-    /// they save.
+    /// debug adapters, kernels, archives, MCP servers, and the specialists in
+    /// [`tools::DEFERRED_BY_DEFAULT`] such as `lsp`, `git` and `ast_search`) is listed in the system
+    /// prompt and loaded on demand. Fifteen `dap_*` schemas on every request would cost more than
+    /// the round they save.
     const ESSENTIAL_INTEGRATIONS: &'static [&'static str] = &[
         // Clarifying questions are in the catalog only when `ask` is enabled; when it is, the
         // model should not have to load it first (a failed call is a confusing card).
-        "ask",
-        "find",
-        "lsp",
-        "bg",
-        "git",
-        "mcp_servers",
+        "ask", "find", "bg",
     ];
 
     /// Tools actually offered: the harness selection, explicitly loaded tools and the essential
@@ -363,14 +358,15 @@ impl<'a> Agent<'a> {
                 names.push(tool.into());
             }
         }
-        // Overlapping specialists stay loadable rather than costing schema bytes on every
+        // Specialists most turns never call stay loadable rather than costing schema bytes on every
         // request; an explicit load, a pinned selection, hermetic runs and the selection lent to
         // children keep them offered.
-        if !(pinned || self.hermetic || selection_only) {
-            names.retain(|name| {
-                !tools::DEFERRED_BY_DEFAULT.contains(&name.as_str()) || loaded.contains(name)
-            });
-        }
+        let deferred = |name: &str| {
+            !(pinned || self.hermetic || selection_only)
+                && tools::DEFERRED_BY_DEFAULT.contains(&name)
+                && !loaded.contains(name)
+        };
+        names.retain(|name| !deferred(name));
 
         // The loaders are offered only while the catalog holds something the offer does not;
         // with nothing left to discover they would only add schema bytes.
@@ -418,17 +414,20 @@ impl<'a> Agent<'a> {
                 names.push(tool.to_owned());
             }
         }
-        if (self.experimental_context_owner() || self.exploration_owner())
+        // The notes-backed context window needs raw-history recovery up front; investigation
+        // checkpoints only once exploration is under way (its tools join the offer just below).
+        let exploring = self.exploration.busy()
+            || crate::agent::workflow::exploration::TOOL_NAMES
+                .iter()
+                .any(|tool| names.iter().any(|name| name == tool));
+        if (self.experimental_context_owner()
+            || (self.exploration_owner() && (exploring || !deferred("session_search"))))
             && catalog.iter().any(|name| name == "session_search")
             && self.plan_tool_available("session_search")
         {
             names.push("session_search".to_owned());
         }
-        if self.exploration.busy()
-            || crate::agent::workflow::exploration::TOOL_NAMES
-                .iter()
-                .any(|tool| names.iter().any(|name| name == tool))
-        {
+        if exploring {
             names.extend(
                 crate::agent::workflow::exploration::TOOL_NAMES
                     .iter()
@@ -445,9 +444,11 @@ impl<'a> Agent<'a> {
             names.push("bg".into());
             names.sort();
         }
-        // Side reasoning must be callable while a long command runs, without a discovery
-        // round. Mode/profile restrictions and the minimal-context budget still apply below.
+        // Side reasoning is in the default harness selection but deferred like other specialists;
+        // once loaded (or pinned, hermetic, or lent to children) it survives the discovery
+        // compaction above. Mode/profile restrictions and the minimal-context budget still apply.
         if catalog.iter().any(|name| name == "side_request")
+            && !deferred("side_request")
             && !names.iter().any(|name| name == "side_request")
         {
             names.push("side_request".into());

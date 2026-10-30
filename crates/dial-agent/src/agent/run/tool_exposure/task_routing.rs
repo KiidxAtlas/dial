@@ -376,6 +376,20 @@ fn native(query: &str, terms: &BTreeSet<String>) -> Vec<&'static str> {
     {
         names.push("image_gen");
     }
+    // Version-control operations and runtime inventory, not code that merely mentions a branch or
+    // a server.
+    if any(
+        terms,
+        &[
+            "git", "commit", "commits", "blame", "rebase", "stash", "staged", "unstaged",
+        ],
+    ) || (terms.contains("pull") && terms.contains("request"))
+    {
+        names.push("git");
+    }
+    if terms.contains("mcp") {
+        names.push("mcp_servers");
+    }
     names
 }
 

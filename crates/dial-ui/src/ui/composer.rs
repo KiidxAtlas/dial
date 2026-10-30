@@ -19,7 +19,6 @@ use super::{
     Rows,
     editor::Editor,
     keys::{Action, Keymap},
-    plugin_slots::PluginSlots,
     status::{InputMode, StatusData},
     statusline, text,
     theme::{Sym, Theme, Tok},
@@ -79,7 +78,6 @@ pub enum CommandKind {
     Builtin,
     Custom,
     Skill,
-    Extension,
     /// A project file offered by `@` mentions.
     File,
 }
@@ -333,12 +331,6 @@ pub struct Composer {
     history_index: Option<usize>,
     saved_draft: Option<Editor>,
     commands: Vec<CommandEntry>,
-    /// The controller's command list, kept apart so plugin suggestions merge in and out of `commands`.
-    base_commands: Vec<CommandEntry>,
-    /// Suggestions plugins returned for the typed command name, merged into `commands`.
-    plugin_entries: Vec<CommandEntry>,
-    /// Header, footer, status and title contributions from plugins (see `plugin_slots`).
-    plugin_slots: PluginSlots,
     /// Push-to-talk is capturing: `Some(hold)` while recording (`hold` means release ends it).
     recording: Option<bool>,
     argument_completions: Vec<String>,
@@ -401,9 +393,6 @@ impl Composer {
             history_index: None,
             saved_draft: None,
             commands: Vec::new(),
-            base_commands: Vec::new(),
-            plugin_entries: Vec::new(),
-            plugin_slots: PluginSlots::default(),
             menu: None,
             dismissed: None,
             search: None,
@@ -568,60 +557,9 @@ impl Composer {
     /// Commands come from the controller so the menu matches real dispatch. Names that could not be
     /// typed as a command (empty, padded with whitespace, slashes, controls) and duplicates are dropped.
     pub fn set_commands(&mut self, commands: Vec<CommandEntry>) {
-        self.base_commands = clean_commands(commands);
-        self.merge_commands();
-    }
-
-    /// Plugin suggestions for the command name being typed. A result applies only while the menu
-    /// still shows `query`, so a late answer never lands on a different word. Returns `true` when
-    /// the open menu changed and the caller should repaint.
-    pub fn set_plugin_suggestions(&mut self, query: &str, suggestions: Vec<CommandEntry>) -> bool {
-        if self.plugin_query() != Some(query) {
-            return false;
-        }
-        self.plugin_entries = clean_commands(suggestions);
-        self.merge_commands();
-        true
-    }
-
-    /// The command name being typed while the menu offers command names (no arguments, no `@file`),
-    /// so plugins can suggest names for it. `None` otherwise.
-    pub fn plugin_query(&self) -> Option<&str> {
-        match self.menu_query()? {
-            (query, None) if !query.is_empty() && !query.contains(char::is_whitespace) => {
-                Some(query)
-            }
-            _ => None,
-        }
-    }
-
-    /// Replaces the plugin chrome. Returns `true` when it changed, so the caller repaints only then.
-    pub fn set_plugin_slots(&mut self, slots: PluginSlots) -> bool {
-        if self.plugin_slots == slots {
-            return false;
-        }
-        self.plugin_slots = slots;
-        true
-    }
-
-    /// The plugin title that replaces the session title, if a plugin set one.
-    pub fn plugin_title(&self) -> Option<&str> {
-        self.plugin_slots.title()
-    }
-
-    /// Rebuilds the command list: controller commands first, then plugin suggestions whose names are
-    /// new. Keeps the menu selection where it was.
-    fn merge_commands(&mut self) {
         self.candidates_generation += 1;
         let selection = self.menu_selection();
-        let mut seen = std::collections::HashSet::new();
-        self.commands = self
-            .base_commands
-            .iter()
-            .chain(self.plugin_entries.iter())
-            .filter(|c| seen.insert(c.name.clone()))
-            .cloned()
-            .collect();
+        self.commands = clean_commands(commands);
         self.menu = None;
         self.refresh();
         self.restore_selection(selection);
@@ -1917,9 +1855,8 @@ impl Composer {
         } else {
             ctx.ui
         };
-        let header_rows = self.plugin_slots.header_rows(w, theme);
-        let activity_rows = usize::from(activity.is_some()) + header_rows.len();
-        let mut rows: Rows = activity.into_iter().chain(header_rows).collect();
+        let activity_rows = usize::from(activity.is_some());
+        let mut rows: Rows = activity.into_iter().collect();
         let tint = theme.bg(Tok::UserBg);
         let band = |spans: Vec<Span<'static>>| band_row(spans, w, tint);
         // The band is a tinted card with an accent edge; the edge carries the input mode (accent
@@ -2045,9 +1982,6 @@ impl Composer {
                 w, &hints, bottom_l, bottom_r, bar, border, theme,
             ));
         }
-        // Plugin status and footer rows sit below the composer's bottom border.
-        rows.extend(self.plugin_slots.status_row(w, theme));
-        rows.extend(self.plugin_slots.footer_rows(w, theme));
 
         let mut cursor = cursor;
         if let Some(search) = &self.search {
@@ -2519,7 +2453,7 @@ impl Composer {
                 let command = &entries[found.index];
                 let icon = theme.sym(match command.kind {
                     CommandKind::Builtin => Sym::IconCommand,
-                    CommandKind::Custom | CommandKind::Extension => Sym::IconSettings,
+                    CommandKind::Custom => Sym::IconSettings,
                     CommandKind::Skill => Sym::IconSkill,
                     CommandKind::File => Sym::IconFile,
                 });
@@ -3085,8 +3019,7 @@ fn group_rank(command: &CommandEntry) -> usize {
         }
         CommandKind::Skill => MENU_GROUPS.len() + 1,
         CommandKind::Custom => MENU_GROUPS.len() + 2,
-        CommandKind::Extension => MENU_GROUPS.len() + 3,
-        CommandKind::File => MENU_GROUPS.len() + 4,
+        CommandKind::File => MENU_GROUPS.len() + 3,
     }
 }
 
@@ -3096,7 +3029,6 @@ fn group_of(command: &CommandEntry) -> &'static str {
         CommandKind::Builtin => crate::ui::command_surface::category(&command.name).tab(),
         CommandKind::Skill => "Skills",
         CommandKind::Custom => "Custom",
-        CommandKind::Extension => "Extensions",
         CommandKind::File => "",
     }
 }

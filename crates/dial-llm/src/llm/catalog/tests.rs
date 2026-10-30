@@ -1188,58 +1188,82 @@ fn hosted_catalog_capabilities_match_what_requests_assume() {
 
 #[test]
 fn old_claude_cache_recovers_context_without_network_or_rewriting_saved_metadata() {
-    let home = tempfile::tempdir().unwrap();
-    let selection = ModelSelection {
-        provider: "anthropic".into(),
-        model: "claude-opus-5-5".into(),
-        base_url: Some(super::super::anthropic::BASE_URL.into()),
-        ..Default::default()
-    };
-    let mut row = ModelEntry {
-        selection: selection.clone(),
-        label: "Opus".into(),
-        source: "cached".into(),
-        available: false,
-        metadata: Default::default(),
-    };
-    let path = home.path().join("model-catalog.json");
-    let bytes = serde_json::to_vec(&BTreeMap::from([(
-        super::super::anthropic::BASE_URL,
-        vec![row.clone()],
-    )]))
-    .unwrap();
-    write_private(&path, &bytes).unwrap();
-    assert_eq!(
-        model_context_window(home.path(), &selection),
-        Some(1_000_000)
-    );
-    assert_eq!(
-        cached(home.path())[&selection_cache_key(&selection)][0]
-            .selection
-            .context_window,
-        Some(1_000_000)
-    );
-    assert_eq!(fs::read(&path).unwrap(), bytes);
-    row.selection.context_window = Some(400_000);
-    write_private(
-        &path,
-        &serde_json::to_vec(&BTreeMap::from([(
+    for model in ["claude-opus-5-5", "claude-sonnet-4-6"] {
+        let home = tempfile::tempdir().unwrap();
+        let selection = ModelSelection {
+            provider: "anthropic".into(),
+            model: model.into(),
+            base_url: Some(super::super::anthropic::BASE_URL.into()),
+            ..Default::default()
+        };
+        let mut row = ModelEntry {
+            selection: selection.clone(),
+            label: model.into(),
+            source: "cached".into(),
+            available: false,
+            metadata: Default::default(),
+        };
+        let path = home.path().join("model-catalog.json");
+        let bytes = serde_json::to_vec(&BTreeMap::from([(
             super::super::anthropic::BASE_URL,
-            vec![row],
+            vec![row.clone()],
         )]))
-        .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(model_context_window(home.path(), &selection), Some(400_000));
-    let mut selected = selection.clone();
-    selected.context_window = Some(64_000);
-    assert_eq!(model_context_window(home.path(), &selected), Some(64_000));
-    selected.context_window = None;
-    selected.base_url = Some("https://proxy.example/v1".into());
-    assert_eq!(model_context_window(home.path(), &selected), None);
-    selected.base_url = selection.base_url;
-    selected.model = "claude-future-99".into();
-    assert_eq!(model_context_window(home.path(), &selected), None);
+        .unwrap();
+        write_private(&path, &bytes).unwrap();
+        assert_eq!(
+            model_context_window(home.path(), &selection),
+            Some(1_000_000),
+            "{model}: recover capacity"
+        );
+        assert_eq!(
+            cached(home.path())[&selection_cache_key(&selection)][0]
+                .selection
+                .context_window,
+            Some(1_000_000),
+            "{model}: repair legacy cache in memory"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            bytes,
+            "{model}: preserve saved cache"
+        );
+        row.selection.context_window = Some(400_000);
+        write_private(
+            &path,
+            &serde_json::to_vec(&BTreeMap::from([(
+                super::super::anthropic::BASE_URL,
+                vec![row],
+            )]))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            model_context_window(home.path(), &selection),
+            Some(400_000),
+            "{model}: live capacity wins"
+        );
+        let mut selected = selection.clone();
+        selected.context_window = Some(64_000);
+        assert_eq!(
+            model_context_window(home.path(), &selected),
+            Some(64_000),
+            "{model}: selected capacity wins"
+        );
+        selected.context_window = None;
+        selected.base_url = Some("https://proxy.example/v1".into());
+        assert_eq!(
+            model_context_window(home.path(), &selected),
+            None,
+            "{model}: custom route"
+        );
+        selected.base_url = selection.base_url;
+        selected.model = "claude-future-99".into();
+        assert_eq!(
+            model_context_window(home.path(), &selected),
+            None,
+            "{model}: unknown model"
+        );
+    }
 }
 
 /// A catalog saved before a Gemini image model was documented lists it as an image model on the

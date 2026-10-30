@@ -1,5 +1,6 @@
 //! The interactive side pane `dial watch` opens in a terminal: one full-screen view with tabs for
-//! the live feed, the plan, jobs, workers, side threads and peers.
+//! the live feed, the plan, jobs, workers, side threads and peers. Enter on a peer opens the
+//! conversation between this session and that peer.
 //!
 //! The pane renders what the session publishes (`state.json`, see [`super::state`]) plus the
 //! append-only feed, and never reads session internals. Its only effects are requests in the
@@ -103,6 +104,10 @@ pub(super) struct Pane {
     error: Option<String>,
     status: Option<String>,
     mode: Mode,
+    /// The peer whose conversation fills the Peers tab, if one is open.
+    chat: Option<String>,
+    /// Chat lines scrolled up from the newest; 0 follows new messages.
+    chat_back: usize,
     /// Body height at the last render, for page keys.
     page: usize,
 }
@@ -119,6 +124,8 @@ impl Pane {
             error: None,
             status: None,
             mode: Mode::Browse,
+            chat: None,
+            chat_back: 0,
             page: 10,
         }
     }
@@ -226,11 +233,17 @@ impl Pane {
             }
         }
         self.status = None;
+        if self.chat.is_some() && self.chat_key(key.code) {
+            return KeyOutcome::Continue;
+        }
         match key.code {
             KeyCode::Char('q') => return KeyOutcome::Quit,
             KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => self.switch(1),
             KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => self.switch(TABS.len() - 1),
-            KeyCode::Char(c @ '1'..='6') => self.tab = TABS[c as usize - '1' as usize],
+            KeyCode::Char(c @ '1'..='6') => {
+                self.chat = None;
+                self.tab = TABS[c as usize - '1' as usize];
+            }
             KeyCode::Up | KeyCode::Char('k') => self.step(false),
             KeyCode::Down | KeyCode::Char('j') => self.step(true),
             KeyCode::PageUp => self.page_scroll(false),
@@ -239,12 +252,31 @@ impl Pane {
             KeyCode::End | KeyCode::Char('G') => self.ends(true),
             KeyCode::Char('x') => self.confirm_stop(),
             KeyCode::Char('m') if self.tab == Tab::Peers => self.compose(),
+            KeyCode::Enter if self.tab == Tab::Peers => self.open_chat(),
             _ => {}
         }
         KeyOutcome::Continue
     }
 
+    /// Keys of the open chat view; `false` leaves the key to the tab-level handling.
+    fn chat_key(&mut self, code: KeyCode) -> bool {
+        let page = self.page.max(2) / 2;
+        match code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Backspace => self.chat = None,
+            KeyCode::Up | KeyCode::Char('k') => self.chat_back += 1,
+            KeyCode::Down | KeyCode::Char('j') => self.chat_back = self.chat_back.saturating_sub(1),
+            KeyCode::PageUp => self.chat_back += page,
+            KeyCode::PageDown => self.chat_back = self.chat_back.saturating_sub(page),
+            KeyCode::Home | KeyCode::Char('g') => self.chat_back = usize::MAX / 2,
+            KeyCode::End | KeyCode::Char('G') => self.chat_back = 0,
+            KeyCode::Char('m') => self.compose(),
+            _ => return false,
+        }
+        true
+    }
+
     fn switch(&mut self, by: usize) {
+        self.chat = None;
         self.tab = TABS[(self.tab.index() + by) % TABS.len()];
     }
 
@@ -358,12 +390,38 @@ impl Pane {
         }
     }
 
+    fn selected_peer(&self) -> Option<&state::PeerRow> {
+        self.state.as_ref()?.peers.rows.get(self.selected())
+    }
+
+    /// The peer whose chat is open, while it is still published.
+    fn chat_peer(&self) -> Option<&state::PeerRow> {
+        let id = self.chat.as_deref()?;
+        self.state
+            .as_ref()?
+            .peers
+            .rows
+            .iter()
+            .find(|peer| peer.id == id)
+    }
+
+    fn open_chat(&mut self) {
+        match self.selected_peer() {
+            Some(peer) => {
+                self.chat = Some(peer.id.clone());
+                self.chat_back = 0;
+            }
+            None => self.status = Some("No peer selected.".into()),
+        }
+    }
+
     fn compose(&mut self) {
-        match self
-            .state
-            .as_ref()
-            .and_then(|state| state.peers.rows.get(self.selected()))
-        {
+        let peer = if self.chat.is_some() {
+            self.chat_peer()
+        } else {
+            self.selected_peer()
+        };
+        match peer {
             Some(peer) => {
                 self.mode = Mode::Compose {
                     to: peer.id.clone(),
@@ -411,6 +469,8 @@ impl Pane {
         self.page = body.height as usize;
         let lines = if self.tab == Tab::Feed {
             self.feed_view(body.width as usize, body.height as usize, theme)
+        } else if self.tab == Tab::Peers && self.chat.is_some() {
+            self.chat_view(body.width as usize, body.height as usize, theme)
         } else {
             self.split_view(body.width as usize, body.height as usize, theme)
         };
@@ -507,8 +567,9 @@ impl Pane {
                 Some(status) => Line::styled(status.clone(), theme.fg(Tok::Accent)),
                 None => {
                     let action = match self.tab {
+                        Tab::Peers if self.chat.is_some() => " · m message · Esc back",
                         Tab::Jobs | Tab::Workers | Tab::Threads => " · x stop",
-                        Tab::Peers => " · m message",
+                        Tab::Peers => " · Enter chat · m message",
                         Tab::Feed | Tab::Plan => "",
                     };
                     let outcome = self
@@ -576,6 +637,65 @@ impl Pane {
             .saturating_sub(self.feed_back.min(lines.len().saturating_sub(height)));
         let start = end.saturating_sub(height);
         lines[start..end].to_vec()
+    }
+
+    /// The open conversation with one peer under a pinned title, newest at the bottom.
+    fn chat_view(&self, width: usize, height: usize, theme: &Theme) -> Vec<Line<'static>> {
+        let id = self.chat.as_deref().unwrap_or_default();
+        let Some(peer) = self.chat_peer() else {
+            return vec![Line::styled(
+                format!(
+                    "Peer {} is no longer active in this checkout. Esc goes back.",
+                    short(id)
+                ),
+                theme.fg(Tok::Muted),
+            )];
+        };
+        let mut title = format!("Chat with {}", short(&peer.id));
+        if !peer.summary.trim().is_empty() {
+            title.push_str(&format!(" · {}", text::one_line(&peer.summary)));
+        }
+        let mut lines = Vec::new();
+        if peer.messages.is_empty() {
+            lines.push(Line::styled(
+                "No messages with this peer yet. m sends one.",
+                theme.fg(Tok::Muted),
+            ));
+        }
+        for message in &peer.messages {
+            let (who, tok) = if message.outgoing {
+                ("You", Tok::Accent)
+            } else {
+                (short(&peer.id), Tok::Success)
+            };
+            let mut label = vec![Span::styled(
+                who.to_owned(),
+                theme.fg(tok).add_modifier(Modifier::BOLD),
+            )];
+            if message.unread {
+                label.push(Span::styled(
+                    "  unread by the agent",
+                    theme.fg(Tok::Warning),
+                ));
+            }
+            lines.push(Line::from(label));
+            for line in text::sanitize(&message.text).lines() {
+                lines.push(Line::styled(line.to_owned(), theme.fg(Tok::Text)));
+            }
+            lines.push(Line::default());
+        }
+        let lines = text::wrap(lines, width.max(1));
+        let room = height.saturating_sub(1);
+        let end = lines
+            .len()
+            .saturating_sub(self.chat_back.min(lines.len().saturating_sub(room)));
+        let start = end.saturating_sub(room);
+        let mut view = vec![clip_line(
+            Line::styled(title, theme.fg(Tok::Accent).add_modifier(Modifier::BOLD)),
+            width,
+        )];
+        view.extend_from_slice(&lines[start..end]);
+        view
     }
 
     fn split_view(&self, width: usize, height: usize, theme: &Theme) -> Vec<Line<'static>> {

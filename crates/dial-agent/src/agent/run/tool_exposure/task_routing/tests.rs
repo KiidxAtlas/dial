@@ -110,7 +110,20 @@ fn task_intents_select_native_specialists_without_discovery_calls() {
             "Generate a logo image for the landing page",
             vec!["image_gen"],
         ),
+        ("Commit the staged changes", vec!["git"]),
+        ("Open a pull request for this fix", vec!["git"]),
+        ("Which MCP servers are connected?", vec!["mcp_servers"]),
     ];
+    // A branch in code is not a version-control request.
+    let git = [("git".to_owned(), "Capability".to_owned())];
+    assert!(
+        select(
+            "Fix the branch condition in the parser",
+            &BTreeSet::new(),
+            &git
+        )
+        .is_empty()
+    );
     for (query, expected) in cases {
         let candidates = expected
             .iter()
@@ -734,9 +747,18 @@ fn observed_dependency_context_is_used_only_for_implementation_tasks() {
 }
 
 #[test]
-fn runtime_inventory_remains_available_without_a_discovery_round() {
+fn runtime_inventory_is_loadable_and_routed_for_mcp_requests() {
     with_agent("[assistance]\nlean_local=false", |agent| {
         register(agent, "mcp_servers", "Inspect MCP runtime status");
+        let offered = agent.offered();
+        assert!(!offered.iter().any(|name| name == "mcp_servers"));
+        assert!(
+            agent
+                .discoverable_tools(&offered)
+                .iter()
+                .any(|(name, _)| name == "mcp_servers")
+        );
+        agent.begin_tool_routing("Which MCP servers are connected?");
         assert!(agent.offered().iter().any(|name| name == "mcp_servers"));
     });
 }

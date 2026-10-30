@@ -3,8 +3,7 @@
 //!
 //! Not implemented (no Dial subsystem): `config init-xdg` (Dial stores state under
 //! `DIAL_HOME`, not XDG), `models refresh` (the catalog is local discovery only),
-//! and the `-e/--extensions`, `--no-extensions`, `--config` overlay flags (no extension model
-//! registry).
+//! and the `--config` overlay flag.
 
 use crate::cli::models_recommend;
 use crate::config::paths::Layout;

@@ -69,7 +69,7 @@ fn err(action: &str, path: &Path) -> String {
         std::io::Error::last_os_error()
     )
 }
-struct Directory {
+pub(super) struct Directory {
     file: File,
     path: PathBuf,
 }
@@ -198,7 +198,7 @@ impl Directory {
         }
         Ok(Self { file, path })
     }
-    fn validate_location(&self, ws: &Workspace, target: &Path) -> Result<(), String> {
+    pub(super) fn validate_location(&self, ws: &Workspace, target: &Path) -> Result<(), String> {
         let current = Self::open(ws, target, false, None)?;
         let expected = self.file.metadata().map_err(|e| e.to_string())?;
         let actual = current.file.metadata().map_err(|e| e.to_string())?;
@@ -250,7 +250,7 @@ impl Directory {
             identity,
         }))
     }
-    fn link(&self, from: &CString, to: &CString) -> Result<(), String> {
+    pub(super) fn link(&self, from: &CString, to: &CString) -> Result<(), String> {
         if unsafe {
             libc::linkat(
                 self.file.as_raw_fd(),
@@ -265,7 +265,7 @@ impl Directory {
         }
         Ok(())
     }
-    fn unlink(&self, name: &CString) -> Result<(), String> {
+    pub(super) fn unlink(&self, name: &CString) -> Result<(), String> {
         if unsafe { libc::unlinkat(self.file.as_raw_fd(), name.as_ptr(), 0) } < 0 {
             return Err(err("removing transaction entry", &self.path));
         }
@@ -291,6 +291,22 @@ impl Directory {
         permissions: Option<&fs::Permissions>,
         kind: &str,
     ) -> Result<CString, String> {
+        let (name, mut file) = self.temp_file(permissions, kind)?;
+        if let Err(error) = file
+            .write_all(content.as_bytes())
+            .and_then(|_| file.sync_all())
+        {
+            let _ = self.unlink(&name);
+            return Err(format!("staging edit: {error}"));
+        }
+        Ok(name)
+    }
+
+    fn temp_file(
+        &self,
+        permissions: Option<&fs::Permissions>,
+        kind: &str,
+    ) -> Result<(CString, File), String> {
         for _ in 0..16 {
             let name = CString::new(format!(
                 ".dial-edit-{}-{}-{kind}",
@@ -322,25 +338,37 @@ impl Directory {
                 }
                 return Err(err("staging edit", &self.path));
             }
-            let mut file = unsafe { File::from_raw_fd(fd) };
-            let result = file
-                .write_all(content.as_bytes())
-                .and_then(|_| {
-                    if let Some(perms) = permissions {
-                        file.set_permissions(perms.clone())
-                    } else {
-                        Ok(())
-                    }
-                })
-                .and_then(|_| file.sync_all());
-            if let Err(e) = result {
+            // SAFETY: openat returned a new, exclusively owned descriptor.
+            let file = unsafe { File::from_raw_fd(fd) };
+            if let Some(perms) = permissions
+                && let Err(error) = file.set_permissions(perms.clone())
+            {
                 let _ = self.unlink(&name);
-                return Err(format!("staging edit: {e}"));
+                return Err(format!("staging edit: {error}"));
             }
-            return Ok(name);
+            return Ok((name, file));
         }
         Err("cannot allocate exclusive edit staging entry".into())
     }
+}
+
+pub(super) type EntryName = CString;
+
+pub(super) fn entry_name(path: &Path) -> Result<EntryName, String> {
+    cstr(
+        path.file_name()
+            .ok_or("binary destination has no filename")?,
+    )
+}
+
+pub(super) fn stage_binary(
+    ws: &Workspace,
+    path: &Path,
+) -> Result<(Directory, EntryName, File), String> {
+    let dir = Directory::open(ws, path, false, None)?;
+    dir.validate_location(ws, path)?;
+    let (temporary, file) = dir.temp_file(None, "binary")?;
+    Ok((dir, temporary, file))
 }
 
 pub(crate) fn open_read(ws: &Workspace, path: &Path) -> Result<File, String> {

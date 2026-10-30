@@ -78,6 +78,25 @@ pub(in crate::agent) fn silence_watch_armed(local_model: bool, generating: bool)
     !local_model || generating
 }
 
+/// The watchdog's effective limit in seconds (`0` disables it). Hosted reasoning models can stay
+/// silent for minutes before their first or next streamed event, and remote transports already
+/// retry genuine stalls by semantic progress (`transport_secs`). A remote request is therefore
+/// never cancelled sooner than its transport stall limit, and not at all when that limit is
+/// unlimited. Local routes keep the configured limit.
+pub(in crate::agent) fn silence_limit_secs(
+    configured_secs: u64,
+    local_model: bool,
+    transport_secs: u64,
+) -> u64 {
+    if local_model || configured_secs == 0 {
+        configured_secs
+    } else if transport_secs == 0 {
+        0
+    } else {
+        configured_secs.max(transport_secs)
+    }
+}
+
 /// Whether generation silence has lasted past its limit. Provider backoff is an explicit wait, not
 /// a stall: it never arms the watchdog, and the clock restarts when the next attempt begins.
 pub(in crate::agent) fn silence_exceeded(
@@ -337,8 +356,14 @@ pub(in crate::agent) fn chat_attempt_with_ui(
     let external_interrupt = interrupt;
     let interrupt = Arc::new(AtomicBool::new(false));
     let cancel_request = interrupt.clone();
-    let silence_limit = recovery.map_or(0, |policy| policy.silence_secs);
     let local_model = backend.local_inference();
+    let silence_limit = recovery.map_or(0, |policy| {
+        silence_limit_secs(
+            policy.silence_secs,
+            local_model,
+            backend.response_timeout(timeout),
+        )
+    });
     let mut context =
         context_tokens.map(crate::agent::window::context_meter::StreamingContext::new);
     if let Some(tokens) = context_tokens {

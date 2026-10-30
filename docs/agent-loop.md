@@ -36,11 +36,15 @@ leave API cost unknown instead of producing a guessed or inflated charge.
 When a request overflows even after ordinary maintenance, the existing lean-tool fallback also
 uses the lean instruction variants. It does not keep paying for full workflow prose after reducing
 the schemas; configured rules, project context, safety boundaries and explicitly loaded tools remain.
-With efficiency enabled, interactive sessions reuse concise delivery and delegation guidance
-on hosted models. Full tool policy and workflow rules remain in place. This reduces repeated
-reporting prose without enabling the lean local tool profile: offered schemas, loadable-tool
-descriptions, visual-verification guidance, operator instructions, custom templates and project
-context are unchanged. Disabling efficiency restores the full built-in delivery/delegation prose.
+With efficiency enabled, non-hermetic sessions use compact built-in engineering, execution,
+workflow, delivery and delegation prose, including hosted models. Full specialized-tool rules,
+visual-verification guidance and the callable schemas stay in place; this does not enable the
+lean local tool profile. Deferred MCP tools use a bounded, untrusted per-server index when
+`tool_search` is available, instead of repeating every tool's name and description. Discovery
+still searches the entire eligible catalog and loads schemas for the next request. Native tool
+previews, operator instructions, custom templates/replacement prompts and project context are
+preserved. Without search, the full MCP inventory remains. Disabling efficiency restores the
+full built-in prose and inventory. Prompt-byte savings alone do not prove a live-model speedup.
 Built-in guidance asks agents to scale effort to uncertainty, impact and reversibility, reuse
 visible evidence, and implement once the path is supported. New or contradictory evidence can
 reopen investigation; successful edits alone do not prove correctness. Isolated tests with test
@@ -130,8 +134,11 @@ end a turn with a stop report and keep completed work, instead of failing it:
 - The `portable_rules.max_regenerations` limit and a refusal to continue after uncertain effects.
 
 When `[verification].automatic_checks` is off and the turn edited files without any passing focused
-or shell check, the first final answer gets one reminder to run one; a second final answer is
-accepted with a disclosure that the edits are unverified. A long report that ends with a promise to
+or shell check, the first final answer makes the completion gate run the applicable focused checks
+itself, through the same approval and freshness path as the `check` tool. If they pass, the answer
+is accepted without another request. Otherwise the answer gets one reminder that carries the
+observed failure output, and a second final answer is accepted with a disclosure that the edits are
+unverified. Past a deadline or cost cap the gate runs nothing and discloses. A long report that ends with a promise to
 act is challenged once. An interrupt during a tool round keeps finished parallel results and records
 calls that never started as not run. A panicking read-only tool is a failure with no effects
 (except `bash`, or a tool that committed before panicking). A timed-out or killed check counts as
@@ -584,12 +591,15 @@ Dial's shared agent loop applies these controls to cloud and local models withou
 limits, reasoning budgets, approvals or verification requirements:
 
 - The default tool offer is the core roster plus the essential integrations when configured
-  (`ask` when enabled, `find`, `lsp`, `bg`, `git`, `web_fetch`, `web_search`). `task` and `skill` are
+  (`ask` when enabled, `find`, `bg`). `task` and `skill` are
   offered with them, and `message` is offered whenever `task` is, so peer messaging does not appear or
-  disappear as workers start and stop. Overlapping specialists are deferred
-  (`tools::DEFERRED_BY_DEFAULT`: `memory_update`, which needs an id and revision from `recall`, and
-  `ast_search`, the structural variant of `grep`/`find`). Every catalog tool not offered is
-  listed in the system prompt under "Loadable tools" with a one-line description, so the model
+  disappear as workers start and stop. Specialists most turns never call are deferred
+  (`tools::DEFERRED_BY_DEFAULT`: `memory_update`, `ast_search`, `lsp`, `git`, `mcp_servers`,
+  `session_search`, `peers` and `side_request`); task routing
+  offers `lsp`, `git`, `mcp_servers` and `session_search` directly when the request
+  names their work (symbol references, commits or pull requests, MCP servers, an earlier
+  session). Every catalog tool not offered is
+  listed in the system prompt under "Loadable tools" with the first sentence of its description (at most 110 characters), so the model
   loads it with `tool_load` in one round; schemas and recorded tool contracts are unchanged. The
   list changes only when a tool is loaded or unloaded, and the offer never reads live-worker state,
   so the provider's cached prefix survives ordinary rounds.
@@ -941,6 +951,16 @@ the same provider calibration. Automatic continuation requires a reduced request
 compaction trigger and within the safe prompt budget, with `auto_continue` enabled and no
 durability warning. The stricter recovery band still gates speculative results with live growth;
 it does not pause an otherwise safe foreground continuation.
+
+Preparation reserves estimated space for regenerated evidence notes, exact session-control carry
+and the positive provider-token calibration offset before requesting a summary. Superseded exact
+carry is replaced, not counted again in the portable history tail. Portable summaries retain whole
+assistant/tool groups according to the remaining budget (including image-token policy), rather
+than a fixed fraction of the context window. If the emitted summary needs more space, one bounded
+incremental pass folds only newly hidden groups into it. An indivisible newest group that cannot fit
+with required context is refused before a summary request is spent. These are planning estimates;
+commit still validates the exact live projection, output reserve, strict reduction and snapshot
+freshness before replacing history.
 
 ```toml
 [compaction]

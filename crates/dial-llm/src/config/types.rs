@@ -199,8 +199,6 @@ pub struct Config {
     /// Operator-owned lifecycle hooks (`[[hooks]]`); see `agent::hooks`. Arrays from every config
     /// layer are appended, so a project layer can add hooks but never drop global ones.
     pub hooks: Vec<HookConfig>,
-    /// Runtime extension plugins (`[extensions]`).
-    pub extensions: ExtensionsConfig,
     pub budget: BudgetConfig,
     /// Named subagents (`[agents.<name>]`) built on a built-in type, with their own instructions,
     /// tool subset, step budget, spawn policy and model. Markdown definitions: `agent::agent_defs`.
@@ -313,7 +311,6 @@ impl Default for Config {
             eval: Default::default(),
             memory: Default::default(),
             hooks: Vec::new(),
-            extensions: ExtensionsConfig::default(),
             budget: BudgetConfig::default(),
             agents: BTreeMap::new(),
             task: Default::default(),

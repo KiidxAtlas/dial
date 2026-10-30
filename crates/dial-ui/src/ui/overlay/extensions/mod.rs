@@ -1,4 +1,4 @@
-//! `/extensions`: one browser for MCP servers, plugins, skills and marketplaces.
+//! `/extensions`: one browser for MCP servers and skills.
 //!
 //! The overlay only shows rows and emits [`Intent`]s as `extensions:<json>` actions. Detection,
 //! installs and config writes happen in `commands::extensions_browser`.
@@ -158,17 +158,9 @@ impl ExtensionsOverlay {
     }
 
     /// Replace every tab with freshly built rows.
-    pub fn set_snapshot(
-        &mut self,
-        mcp: Vec<Row>,
-        plugins: Vec<Row>,
-        skills: Vec<Row>,
-        marketplaces: Vec<Row>,
-    ) {
+    pub fn set_snapshot(&mut self, mcp: Vec<Row>, skills: Vec<Row>) {
         self.browser.set_rows(Tab::Mcp, mcp);
-        self.browser.set_rows(Tab::Plugins, plugins);
         self.browser.set_rows(Tab::Skills, skills);
-        self.browser.set_rows(Tab::Marketplaces, marketplaces);
     }
 
     /// Route one key. Returns an action for the app or the controller to run.
@@ -239,8 +231,7 @@ impl ExtensionsOverlay {
                 b.end_search();
                 let tab = b.tab();
                 let catalog = b.catalog(tab);
-                if !matches!(tab, Tab::Plugins | Tab::Marketplaces)
-                    && !catalog.loading
+                if !catalog.loading
                     && (catalog.page == 0 || catalog.query.trim() != b.query().trim())
                 {
                     let query = b.query().to_owned();
@@ -330,10 +321,6 @@ impl ExtensionsOverlay {
                 let query = b.query().to_owned();
                 self.browse(tab, query, 1)
             }
-            Some('a') if b.tab() == Tab::Marketplaces => {
-                b.form = Some(Form::marketplace());
-                OverlayEvent::None
-            }
             Some('v') => {
                 b.toggle_details();
                 OverlayEvent::None
@@ -357,8 +344,7 @@ impl ExtensionsOverlay {
     fn load_more_near_end(&mut self) -> OverlayEvent {
         let b = &self.browser;
         let tab = b.tab();
-        if matches!(tab, Tab::Plugins | Tab::Marketplaces)
-            || matches!(b.job, Job::Running { .. })
+        if matches!(b.job, Job::Running { .. })
             || b.cursor() + Self::PREFETCH < b.visible(tab).len()
         {
             return OverlayEvent::None;
@@ -492,9 +478,6 @@ impl ExtensionsOverlay {
                         )
                     } else if !browser.query().is_empty() {
                         "No matches on this tab. Left/Right checks the other tabs; Esc clears the search.".to_owned()
-                    } else if browser.tab() == Tab::Marketplaces {
-                        "No marketplaces yet. Press a to add a plugin index, or r to refresh."
-                            .to_owned()
                     } else {
                         format!(
                             "Nothing listed under {} yet. Press r to refresh, or / to search the catalog.",
@@ -561,15 +544,11 @@ impl ExtensionsOverlay {
                 for (key, label) in [('t', "test"), ('e', "enable"), ('x', "remove")] {
                     if let Some(intent) = primary_intent(browser, key) {
                         let label = match (&intent, label) {
-                            (Intent::ToggleMcp { enable: false, .. }, _)
-                            | (Intent::ToggleMarketplace { enable: false, .. }, _) => "disable",
+                            (Intent::ToggleMcp { enable: false, .. }, _) => "disable",
                             (_, label) => label,
                         };
                         items.push((key.to_string(), label.to_owned()));
                     }
-                }
-                if browser.tab() == Tab::Marketplaces {
-                    items.push(("a".to_owned(), "add".to_owned()));
                 }
                 items.push((
                     pair_label(ctx.keys, Action::TabPrev, Action::TabNext),
@@ -598,7 +577,7 @@ impl ExtensionsOverlay {
             return;
         }
         let block =
-            chrome::panel_block_titled(ctx.theme, Section::Connect, "Extensions", "MCP · plugins");
+            chrome::panel_block_titled(ctx.theme, Section::Connect, "Extensions", "MCP · skills");
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let lines = body(inner.width, inner.height);
@@ -648,18 +627,9 @@ fn primary_intent(b: &Browser, key: char) -> Option<Intent> {
             enable: row.state == State::Disabled,
         }),
         (Tab::Mcp, 'x', true) => Some(Intent::RemoveMcp { id: row.id.clone() }),
-        (Tab::Plugins, 'i', false) => Some(Intent::InstallPlugin { id: row.id.clone() }),
-        (Tab::Plugins, 'x', true) => Some(Intent::RemovePlugin { id: row.id.clone() }),
         (Tab::Skills, 'x', true) => Some(Intent::RemoveSkill { id: row.id.clone() }),
         (Tab::Skills, 'i', false) if row.origin == Origin::Remote => Some(Intent::InstallSkill {
             source: row.id.clone(),
-        }),
-        (Tab::Marketplaces, 'x', true) => Some(Intent::RemoveMarketplace {
-            name: row.id.clone(),
-        }),
-        (Tab::Marketplaces, 'e', true) => Some(Intent::ToggleMarketplace {
-            name: row.id.clone(),
-            enable: row.state == State::Disabled,
         }),
         _ => None,
     }
@@ -780,10 +750,6 @@ fn submit_form(b: &mut Browser) -> OverlayEvent {
         },
         FormKind::Config { name } => Intent::SmitheryDeploy { name, values },
         FormKind::McpInputs { id } => Intent::InstallMcp { id, values },
-        FormKind::Marketplace => Intent::AddMarketplace {
-            name: values.get("name").cloned().unwrap_or_default(),
-            index: values.get("index").cloned().unwrap_or_default(),
-        },
     };
     match b.request(intent) {
         Some(now) => action(&now),

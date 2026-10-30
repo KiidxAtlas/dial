@@ -640,7 +640,7 @@ struct LastRecall {
     user_cache: &'static str,
 }
 
-/// Recency window of the `recency` voice, matching OMP's seven-day temporal window.
+/// Recency window of the `recency` voice: seven days.
 const RECENCY_WINDOW_SECS: i64 = 7 * 24 * 60 * 60;
 
 /// A query vector and the embedding model that produced it.
@@ -707,7 +707,7 @@ fn ranked(store: &Store, request: Request<'_>, at: i64) -> Result<Recall> {
         mode = "hybrid";
     }
     // A query that names a time adds the newest facts of the last week as one more voice, so
-    // recency breaks ties in the fused order, as OMP's temporal voice does.
+    // recency breaks ties in the fused order.
     if !blank && looks_temporal(request.query) {
         lists.push(store.recent_since(at - RECENCY_WINDOW_SECS, candidates)?);
         voices.push("recency");
@@ -740,7 +740,7 @@ struct Request<'a> {
     token_budget: usize,
 }
 
-/// Whether the query names a time. The keywords match OMP's temporal voice.
+/// Whether the query names a time.
 fn looks_temporal(query: &str) -> bool {
     let lower = query.to_lowercase();
     [

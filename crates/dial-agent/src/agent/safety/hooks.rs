@@ -1,5 +1,4 @@
-//! Operator-owned lifecycle hooks: programs run at fixed points of a session, plus the same events
-//! delivered to runtime extension plugins (`crate::tools::integrations::plugin`).
+//! Operator-owned lifecycle hooks: programs run at fixed points of a session.
 //!
 //! Hooks come from the user's configuration (`[[hooks]]`), which lives outside the project, so the
 //! agent cannot add or edit them. Arrays from every configuration layer are appended, so a project
@@ -61,7 +60,7 @@ pub enum Verdict {
     Block { reason: String },
 }
 
-/// One hook's or plugin's structured answer.
+/// One hook's structured answer.
 #[derive(Debug, Default, PartialEq)]
 pub struct Reply {
     pub block: Option<String>,
@@ -145,7 +144,7 @@ impl Reply {
     }
 }
 
-/// Everything one event produced, after every hook and plugin ran.
+/// Everything one event produced, after every hook ran.
 #[derive(Debug)]
 pub struct Outcome {
     pub verdict: Verdict,
@@ -385,81 +384,67 @@ pub fn fire(
     payload: Value,
     interrupt: &AtomicBool,
 ) -> (Verdict, Vec<String>) {
-    let outcome = fire_with(hooks, None, root, event, tool, payload, interrupt);
+    let outcome = fire_with(hooks, root, event, tool, payload, interrupt);
     (outcome.verdict, outcome.notices)
 }
 
-/// Whether any hook or plugin observes `event`; callers skip building payloads otherwise.
-pub fn wanted(
-    hooks: &[HookConfig],
-    plugins: Option<&crate::tools::integrations::plugin::Host>,
-    event: &str,
-) -> bool {
+/// Whether any hook observes `event`; callers skip building payloads otherwise.
+pub fn wanted(hooks: &[HookConfig], event: &str) -> bool {
     let event = canonical(event);
     hooks.iter().any(|hook| canonical(&hook.event) == event)
-        || plugins.is_some_and(|host| host.subscribed(event))
 }
 
-/// Whether a hook or plugin observes `event` for this specific tool. Shell hooks honour their
-/// matcher; plugins subscribe per event, so any subscriber counts. Scheduling uses this so a hook
-/// that matches only `bash` no longer serializes reads or disables batch reuse for other tools.
-pub fn wanted_for_tool(
-    hooks: &[HookConfig],
-    plugins: Option<&crate::tools::integrations::plugin::Host>,
-    event: &str,
-    tool: &str,
-) -> bool {
+/// Whether a hook observes `event` for this specific tool, honouring its matcher. Scheduling uses
+/// this so a hook that matches only `bash` does not serialize reads or disable batch reuse for
+/// other tools.
+pub fn wanted_for_tool(hooks: &[HookConfig], event: &str, tool: &str) -> bool {
     let event = canonical(event);
     hooks
         .iter()
         .any(|hook| canonical(&hook.event) == event && matches(hook, Some(tool)))
-        || plugins.is_some_and(|host| host.subscribed(event))
 }
 
 /// Run an observe-only lifecycle event (`session_start`, `session_end`). Failures and output come
 /// back as notices; nothing blocks.
 pub fn observe(
     hooks: &[HookConfig],
-    plugins: Option<&crate::tools::integrations::plugin::Host>,
     root: &Path,
     event: &str,
     payload: Value,
     interrupt: &AtomicBool,
 ) -> Vec<String> {
-    if !wanted(hooks, plugins, event) {
+    if !wanted(hooks, event) {
         return Vec::new();
     }
-    fire_with(hooks, plugins, root, event, None, payload, interrupt).notices
+    fire_with(hooks, root, event, None, payload, interrupt).notices
 }
 
 /// Run a `before_*` lifecycle event that may refuse its action. `Err(reason)` refuses; notices and
 /// output go to `notice`.
 pub fn gate(
     hooks: &[HookConfig],
-    plugins: Option<&crate::tools::integrations::plugin::Host>,
     root: &Path,
     event: &str,
     payload: Value,
     interrupt: &AtomicBool,
     notice: &mut dyn FnMut(&str),
 ) -> Result<(), String> {
-    gate_noted(hooks, plugins, root, event, payload, interrupt, notice).map(|_| ())
+    gate_noted(hooks, root, event, payload, interrupt, notice).map(|_| ())
 }
 
 /// Admit a lifecycle action and return bounded supplemental data, discarded on refusal.
 pub fn gate_noted(
     hooks: &[HookConfig],
-    plugins: Option<&crate::tools::integrations::plugin::Host>,
     root: &Path,
     event: &str,
     payload: Value,
     interrupt: &AtomicBool,
     notice: &mut dyn FnMut(&str),
 ) -> Result<Option<String>, String> {
-    if !wanted(hooks, plugins, event) {
+    if !wanted(hooks, event) {
         return Ok(None);
     }
-    let outcome = fire_with(hooks, plugins, root, event, None, payload, interrupt);
+    let outcome = fire_with(hooks, root, event, None, payload, interrupt);
     let note = outcome.context_note();
     outcome.notices.iter().for_each(|n| notice(n));
     match outcome.verdict {
@@ -497,18 +482,17 @@ const MAX_CONTEXT_MESSAGES: usize = 256 * 1024;
 /// is reported and skipped; a block refuses the request.
 fn context_request(
     hooks: &[HookConfig],
-    plugins: Option<&crate::tools::integrations::plugin::Host>,
     root: &Path,
     request: &crate::llm::Chat,
     interrupt: &AtomicBool,
     notice: &mut dyn FnMut(&str),
 ) -> anyhow::Result<Option<crate::llm::Chat>> {
     const EVENT: &str = "context";
-    if !wanted(hooks, plugins, EVENT) {
+    if !wanted(hooks, EVENT) {
         return Ok(None);
     }
     let payload = json!({"messages": request.messages});
-    let outcome = fire_with(hooks, plugins, root, EVENT, None, payload, interrupt);
+    let outcome = fire_with(hooks, root, EVENT, None, payload, interrupt);
     outcome.notices.iter().for_each(|n| notice(n));
     match &outcome.verdict {
         Verdict::Block { reason } => {
@@ -540,24 +524,23 @@ fn context_request(
 }
 
 /// Run `context` and then `before_provider_request` over a built request. `Ok(None)` means the
-/// request is sent unchanged; `Ok(Some(body))` is the rewritten request. Hooks and plugins run in
-/// order and each sees earlier rewrites; a block refuses the request with its reason.
+/// request is sent unchanged; `Ok(Some(body))` is the rewritten request. Hooks run in order and
+/// each sees earlier rewrites; a block refuses the request with its reason.
 pub fn provider_request(
     hooks: &[HookConfig],
-    plugins: Option<&crate::tools::integrations::plugin::Host>,
     root: &Path,
     request: &crate::llm::Chat,
     interrupt: &AtomicBool,
     notice: &mut dyn FnMut(&str),
 ) -> anyhow::Result<Option<crate::llm::Chat>> {
     const EVENT: &str = "before_provider_request";
-    let contextual = context_request(hooks, plugins, root, request, interrupt, notice)?;
+    let contextual = context_request(hooks, root, request, interrupt, notice)?;
     let request = contextual.as_ref().unwrap_or(request);
-    if !wanted(hooks, plugins, EVENT) {
+    if !wanted(hooks, EVENT) {
         return Ok(contextual);
     }
     let payload = json!({"request": request.to_payload()});
-    let outcome = fire_with(hooks, plugins, root, EVENT, None, payload, interrupt);
+    let outcome = fire_with(hooks, root, EVENT, None, payload, interrupt);
     outcome.notices.iter().for_each(|n| notice(n));
     match outcome.verdict {
         Verdict::Block { reason } => {
@@ -579,7 +562,6 @@ pub fn provider_request(
 /// latency). Hooks cannot change or block the response; failures and output become notices.
 pub fn provider_response(
     hooks: &[HookConfig],
-    plugins: Option<&crate::tools::integrations::plugin::Host>,
     root: &Path,
     model: &str,
     reply: &crate::llm::Reply,
@@ -587,7 +569,7 @@ pub fn provider_response(
     notice: &mut dyn FnMut(&str),
 ) {
     const EVENT: &str = "after_provider_response";
-    if !wanted(hooks, plugins, EVENT) {
+    if !wanted(hooks, EVENT) {
         return;
     }
     let payload = json!({
@@ -605,7 +587,7 @@ pub fn provider_response(
     });
     // A response was already received; an unrelated cancel flag must not skip observers.
     let interrupt = AtomicBool::new(false);
-    observe(hooks, plugins, root, EVENT, payload, &interrupt)
+    observe(hooks, root, EVENT, payload, &interrupt)
         .iter()
         .for_each(|n| notice(n));
 }
@@ -645,7 +627,7 @@ fn apply(
     match event {
         "pre_tool_use" => {
             if let Some(input) = reply.input {
-                // Later hooks and plugins see the rewritten call.
+                // Later hooks see the rewritten call.
                 payload["input"] = input.clone();
                 outcome.input = Some(input);
             }
@@ -662,21 +644,21 @@ fn apply(
         }
         "before_provider_request" => {
             if let Some(request) = reply.payload {
-                // Later hooks and plugins see the rewritten body.
+                // Later hooks see the rewritten body.
                 payload["request"] = request.clone();
                 outcome.request = Some(request);
             }
         }
         "context" => {
             if let Some(messages) = reply.messages {
-                // Later hooks and plugins see the replacement list.
+                // Later hooks see the replacement list.
                 payload["messages"] = messages.clone();
                 outcome.messages = Some(messages);
             }
         }
         "user_prompt_submit" => {
             if let Some(prompt) = reply.prompt {
-                // Later hooks and plugins see the rewritten message.
+                // Later hooks see the rewritten message.
                 payload["prompt"] = json!(prompt);
                 outcome.prompt = Some(prompt);
             }
@@ -686,11 +668,9 @@ fn apply(
     None
 }
 
-/// Run the shell hooks and then the subscribed plugins for `event`. Hooks run in configuration
-/// order and each sees earlier rewrites; plugins receive the resulting payload together.
+/// Run the shell hooks for `event` in configuration order; each sees earlier rewrites.
 pub fn fire_with(
     hooks: &[HookConfig],
-    plugins: Option<&crate::tools::integrations::plugin::Host>,
     root: &Path,
     event: &str,
     tool: Option<&str>,
@@ -755,36 +735,6 @@ pub fn fire_with(
             break;
         }
     }
-    if let Some(host) = plugins
-        && host.subscribed(event)
-        && !interrupt.load(Ordering::Acquire)
-    {
-        for answer in host.dispatch(event, &payload, interrupt) {
-            match answer.result {
-                Ok(value) => {
-                    let Some(mut reply) = Reply::from_json(&value) else {
-                        continue;
-                    };
-                    compact_attribution(event, &mut reply, &format!("extension {}", answer.plugin));
-                    if let Some(reason) =
-                        apply(event, reply, &mut payload, &mut outcome, &mut output)
-                    {
-                        outcome.notices.extend(host.take_notices());
-                        block(
-                            &mut outcome,
-                            reason,
-                            &format!("extension {}", answer.plugin),
-                        );
-                        return outcome;
-                    }
-                }
-                Err(why) => outcome
-                    .notices
-                    .push(format!("{event} extension {} failed: {why}", answer.plugin)),
-            }
-        }
-        outcome.notices.extend(host.take_notices());
-    }
     outcome.verdict = Verdict::Continue {
         output: output.join("\n"),
     };
@@ -803,38 +753,35 @@ pub fn pre_tool(
     interrupt: &AtomicBool,
     notice: &mut dyn FnMut(&str),
 ) -> Result<Option<Value>, String> {
-    pre_tool_with(hooks, None, root, name, args, interrupt, notice)
+    pre_tool_with(hooks, root, name, args, interrupt, notice)
 }
 
 pub fn pre_tool_with(
     hooks: &[HookConfig],
-    plugins: Option<&crate::tools::integrations::plugin::Host>,
     root: &Path,
     name: &str,
     args: &Value,
     interrupt: &AtomicBool,
     notice: &mut dyn FnMut(&str),
 ) -> Result<Option<Value>, String> {
-    pre_tool_noted(hooks, plugins, root, name, args, interrupt, notice).0
+    pre_tool_noted(hooks, root, name, args, interrupt, notice).0
 }
 
 /// `pre_tool_with` that also returns the bounded `additional_context` note the hooks queued for
 /// the next request (`None` when refused or when no hook supplied one).
 pub fn pre_tool_noted(
     hooks: &[HookConfig],
-    plugins: Option<&crate::tools::integrations::plugin::Host>,
     root: &Path,
     name: &str,
     args: &Value,
     interrupt: &AtomicBool,
     notice: &mut dyn FnMut(&str),
 ) -> (Result<Option<Value>, String>, Option<String>) {
-    if !wanted(hooks, plugins, "pre_tool_use") {
+    if !wanted(hooks, "pre_tool_use") {
         return (Ok(None), None);
     }
     let outcome = fire_with(
         hooks,
-        plugins,
         root,
         "pre_tool_use",
         Some(name),
@@ -871,13 +818,11 @@ pub fn post_tool(
     interrupt: &AtomicBool,
     notice: &mut dyn FnMut(&str),
 ) {
-    let _ = post_tool_with(hooks, None, root, name, args, out, interrupt, notice);
+    let _ = post_tool_with(hooks, root, name, args, out, interrupt, notice);
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn post_tool_with(
     hooks: &[HookConfig],
-    plugins: Option<&crate::tools::integrations::plugin::Host>,
     root: &Path,
     name: &str,
     args: &Value,
@@ -885,12 +830,11 @@ pub fn post_tool_with(
     interrupt: &AtomicBool,
     notice: &mut dyn FnMut(&str),
 ) -> Option<String> {
-    if !wanted(hooks, plugins, "post_tool_use") {
+    if !wanted(hooks, "post_tool_use") {
         return None;
     }
     let outcome = fire_with(
         hooks,
-        plugins,
         root,
         "post_tool_use",
         Some(name),

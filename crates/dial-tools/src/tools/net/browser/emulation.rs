@@ -7,8 +7,8 @@ use serde_json::{Map, Value, json};
 #[cfg(test)]
 mod tests;
 
-/// Device preset names accepted by `emulate` and listed by `devices` (OMP's Puppeteer
-/// `KnownDevices` table). Names the installed Playwright runtime lacks are reported at runtime.
+/// Device preset names accepted by `emulate` and listed by `devices` (the Puppeteer `KnownDevices`
+/// table). Names the installed Playwright runtime lacks are reported at runtime.
 pub(super) const DEVICE_NAMES: &[&str] = &[
     "Blackberry PlayBook",
     "Blackberry PlayBook landscape",

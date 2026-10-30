@@ -157,6 +157,10 @@ impl Config {
             "portable_rules.max_regenerations must be 1..64"
         );
         ensure!(
+            self.portable_rules.repeat_after_turns <= 1000,
+            "portable_rules.repeat_after_turns must be 0..1000"
+        );
+        ensure!(
             self.training.learn_from_max_percent <= 50,
             "training.learn_from_max_percent must be 0..50"
         );

@@ -15,6 +15,61 @@ use self::windows as imp;
 
 pub(crate) use imp::{Change, MAX_BYTES, MAX_FILE, Original, inherit_permissions, open_read, read};
 
+/// A new binary file staged and published relative to a pinned, no-follow directory handle.
+/// Unlike text edits, this streams arbitrary bytes and never replaces an existing destination.
+pub(crate) struct NewBinary {
+    dir: imp::Directory,
+    temporary: imp::EntryName,
+    path: PathBuf,
+    file: std::fs::File,
+}
+
+impl NewBinary {
+    pub(crate) fn create(ws: &Workspace, path: &std::path::Path) -> Result<Self, String> {
+        let (dir, temporary, file) = imp::stage_binary(ws, path)?;
+        Ok(Self {
+            dir,
+            temporary,
+            path: path.to_owned(),
+            file,
+        })
+    }
+
+    pub(crate) fn file_mut(&mut self) -> &mut std::fs::File {
+        &mut self.file
+    }
+
+    pub(crate) fn publish(
+        self,
+        ws: &Workspace,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), String> {
+        self.file.sync_all().map_err(|e| e.to_string())?;
+        let _lease = super::document_transaction::Lease::acquire([self.path.clone()])?;
+        if ws.resolve(&ws.rel(&self.path))? != self.path {
+            return Err("binary destination physical alias changed".into());
+        }
+        ws.observe_write(&self.path)?;
+        self.dir.validate_location(ws, &self.path)?;
+        // Sync and observers may take time; turn cancellation must still prevent publication.
+        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("binary publication interrupted".into());
+        }
+        crate::tools::exec::execution::before_commit()?;
+        // The exclusive link uses the pinned directory, never a re-resolved pathname.
+        self.dir
+            .link(&self.temporary, &imp::entry_name(&self.path)?)?;
+        crate::tools::exec::execution::committed([self.path.clone()]);
+        Ok(())
+    }
+}
+
+impl Drop for NewBinary {
+    fn drop(&mut self) {
+        let _ = self.dir.unlink(&self.temporary);
+    }
+}
+
 /// Commits every change atomically, then notifies LSP servers (watched files, format-on-write,
 /// diagnostics). LSP output is appended to the warnings. It never fails the commit, because the
 /// files are already written when it runs.

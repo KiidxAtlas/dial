@@ -1,5 +1,4 @@
 //! One reducer in front of every surface. Callbacks are projections of the same mutable results.
-use crate::agent::safety::approval::PolicyReason;
 use crate::agent::{Decision, Ui, workflow::todo::TodoList};
 use crate::{
     llm::ModelProgress,
@@ -8,7 +7,7 @@ use crate::{
 };
 use serde_json::{Value, json};
 use std::{
-    sync::{Arc, atomic::AtomicBool},
+    sync::atomic::AtomicBool,
     time::{Duration, Instant},
 };
 
@@ -17,46 +16,6 @@ struct PendingTool {
     call_id: Option<String>,
     body: Body,
     args: Value,
-}
-
-/// Destination for plugin observer events. The plugin host implements it; tests record into it.
-pub(in crate::agent) trait EventSink {
-    fn observes(&self, event: &str) -> bool;
-    fn emit(&self, event: &str, payload: &Value);
-}
-
-impl EventSink for crate::tools::integrations::plugin::Host {
-    fn observes(&self, event: &str) -> bool {
-        crate::tools::integrations::plugin::Host::observes(self, event)
-    }
-    fn emit(&self, event: &str, payload: &Value) {
-        crate::tools::integrations::plugin::Host::emit(self, event, payload);
-    }
-}
-
-/// Minimum spacing between `message_update` events of one turn (at most ten per second).
-const MESSAGE_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
-
-/// Plugin observer state for one turn. Absent unless a sink is attached, so nothing is buffered.
-struct Observers {
-    sink: Arc<dyn EventSink>,
-    session_id: String,
-    streams_messages: bool,
-    text: String,
-    last_sent: Option<Instant>,
-    dirty: bool,
-    /// Whether observers have received text of the current message since it last started or was retracted.
-    sent: bool,
-}
-
-/// Maps a user decision to the stable label observers receive.
-fn decision_label(decision: Decision) -> &'static str {
-    match decision {
-        Decision::Allow => "allow",
-        Decision::AllowAlways => "allow_always",
-        Decision::AllowProject => "allow_project",
-        Decision::Deny => "deny",
-    }
 }
 
 pub(in crate::agent) struct StateUi<'a> {
@@ -72,7 +31,6 @@ pub(in crate::agent) struct StateUi<'a> {
     request_timing: super::request_timing::Timing,
     tools: Vec<PendingTool>,
     registry: crate::tools::integrations::ext::Registry,
-    observers: Option<Observers>,
 }
 impl<'a> StateUi<'a> {
     /// Runtime observations reach every observer only after their journal write succeeded.
@@ -121,88 +79,9 @@ impl<'a> StateUi<'a> {
             reasoning: None,
             tools: Vec::new(),
             registry,
-            observers: None,
-        }
-    }
-    /// Delivers this turn's plugin observer events to `sink`, tagged with `session_id`. Without a
-    /// sink nothing is buffered or emitted, and `message_update` streams only when a plugin asks.
-    pub fn observed_by(mut self, sink: Option<Arc<dyn EventSink>>, session_id: &str) -> Self {
-        self.observers = sink.map(|sink| Observers {
-            streams_messages: sink.observes("message_update"),
-            sink,
-            session_id: session_id.to_owned(),
-            text: String::new(),
-            last_sent: None,
-            dirty: false,
-            sent: false,
-        });
-        self
-    }
-    /// Observer events are plugin observations, so they share `publish`'s durability gate.
-    fn emit_observed(&self, event: &str, fields: impl FnOnce() -> Value) {
-        let Some(observers) = &self.observers else {
-            return;
-        };
-        if !observers.sink.observes(event) || self.tree.check_persistence().is_err() {
-            return;
-        }
-        let mut payload = fields();
-        payload["session_id"] = Value::from(observers.session_id.as_str());
-        observers.sink.emit(event, &payload);
-    }
-    /// Accumulates streamed answer text and sends `message_update` at most once per
-    /// [`MESSAGE_UPDATE_INTERVAL`]; text received in between goes out with the next update or flush.
-    fn stream_message(&mut self, text: &str) {
-        let Some(observers) = self.observers.as_mut() else {
-            return;
-        };
-        if !observers.streams_messages {
-            return;
-        }
-        observers.text.push_str(text);
-        observers.dirty = true;
-        if observers
-            .last_sent
-            .is_none_or(|at| at.elapsed() >= MESSAGE_UPDATE_INTERVAL)
-        {
-            self.flush_message();
-        }
-    }
-    /// Sends the accumulated text of the current message when it changed since the last update.
-    fn flush_message(&mut self) {
-        let Some(observers) = self.observers.as_mut() else {
-            return;
-        };
-        if !std::mem::take(&mut observers.dirty) {
-            return;
-        }
-        observers.last_sent = Some(Instant::now());
-        observers.sent = true;
-        let text = observers.text.clone();
-        self.emit_observed("message_update", || json!({"text": text}));
-    }
-    /// A new assistant message starts: pending text from the previous one is dropped silently.
-    fn reset_message(&mut self) {
-        if let Some(observers) = self.observers.as_mut() {
-            observers.text.clear();
-            observers.dirty = false;
-            observers.sent = false;
-        }
-    }
-    /// A failed attempt is withdrawn: observers that saw its text get an empty update to clear it.
-    fn retract_message(&mut self) {
-        let Some(observers) = self.observers.as_mut() else {
-            return;
-        };
-        let was_sent = std::mem::take(&mut observers.sent);
-        observers.text.clear();
-        observers.dirty = false;
-        if was_sent {
-            self.emit_observed("message_update", || json!({"text": ""}));
         }
     }
     fn close_prose(&mut self) {
-        self.flush_message();
         for body in [self.prose.take(), self.reasoning.take()]
             .into_iter()
             .flatten()
@@ -284,7 +163,6 @@ impl<'a> StateUi<'a> {
         self.settle_inference(Phase::Interrupted);
     }
     pub fn finish(&mut self, interrupted: bool) {
-        self.flush_message();
         self.settle_inference(if interrupted {
             Phase::Interrupted
         } else {
@@ -342,7 +220,6 @@ impl Ui for StateUi<'_> {
             ui.result_node(&body);
             ui.text_delta(text);
         });
-        self.stream_message(text);
     }
     fn reasoning_delta(&mut self, text: &str) {
         if self.prose.is_some() {
@@ -493,23 +370,7 @@ impl Ui for StateUi<'_> {
         tool: &str,
         explanation: &crate::agent::safety::approval::PolicyExplanation,
     ) {
-        if let PolicyReason::AllowRule | PolicyReason::DenyRule = explanation.reason {
-            let decision = if explanation.reason == PolicyReason::AllowRule {
-                "allow"
-            } else {
-                "deny"
-            };
-            self.emit_observed("tool_approval_resolved", || {
-                json!({"call_id": call_id, "name": tool, "decision": decision, "source": "rule"})
-            });
-        }
         self.inner.policy_explanation(call_id, tool, explanation);
-    }
-    fn message_started(&mut self) {
-        self.reset_message();
-    }
-    fn message_settled(&mut self) {
-        self.flush_message();
     }
     fn approve(&mut self, t: &str, s: &str) -> Decision {
         self.inner.approve(t, s)
@@ -524,32 +385,10 @@ impl Ui for StateUi<'_> {
         s: &str,
         c: Option<&AtomicBool>,
     ) -> Decision {
-        self.emit_observed(
-            "tool_approval_requested",
-            || json!({"call_id": call_id, "name": t}),
-        );
-        let decision = self.inner.approve_call(call_id, t, s, c);
-        self.emit_observed("tool_approval_resolved", || {
-            json!({"call_id": call_id, "name": t, "decision": decision_label(decision), "source": "user"})
-        });
-        decision
+        self.inner.approve_call(call_id, t, s, c)
     }
     fn approve_batch(&mut self, calls: &[crate::llm::ToolCall], cancel: &AtomicBool) -> Vec<bool> {
-        for call in calls {
-            self.emit_observed(
-                "tool_approval_requested",
-                || json!({"call_id":call.id,"name":call.name,"batch":true}),
-            );
-        }
-        let choices = self.inner.approve_batch(calls, cancel);
-        for (index, call) in calls.iter().enumerate() {
-            let allowed = choices.get(index) == Some(&true)
-                && !cancel.load(std::sync::atomic::Ordering::Acquire);
-            self.emit_observed("tool_approval_resolved", || {
-                json!({"call_id":call.id,"name":call.name,"decision":if allowed {"allow"} else {"deny"},"source":"finite_batch"})
-            });
-        }
-        choices
+        self.inner.approve_batch(calls, cancel)
     }
     fn ask_user(&mut self, title: &str, question: &str, options: &[String]) -> Option<String> {
         self.inner.ask_user(title, question, options)
@@ -561,16 +400,8 @@ impl Ui for StateUi<'_> {
     ) -> crate::agent::workflow::questions::QuestionOutcome {
         self.inner.ask_questions(request, cancel)
     }
-    fn run_panel(
-        &mut self,
-        panel: &crate::extensions::panel::Panel,
-        cancel: &AtomicBool,
-    ) -> crate::extensions::panel::Outcome {
-        self.inner.run_panel(panel, cancel)
-    }
     fn inference_discarded(&mut self, reason: &str) {
         self.discard_inference();
-        self.retract_message();
         self.inner.inference_discarded(reason);
     }
     fn interactive_input(&self) -> bool {

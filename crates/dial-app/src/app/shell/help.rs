@@ -94,7 +94,7 @@ impl Shell {
         lines.push(row("Anything else", "runs when the turn finishes"));
         // Commands, grouped the same way as the action palette. Advanced sections stay folded
         // unless asked for, so the first screen of help is about everyday work.
-        let entries = command_entries(&self.commands, &self.skills, &self.extension_commands);
+        let entries = command_entries(&self.commands, &self.skills);
         let command_row = |entry: &CommandEntry| -> String {
             let name = format!("/{}", entry.name);
             match &entry.args_hint {

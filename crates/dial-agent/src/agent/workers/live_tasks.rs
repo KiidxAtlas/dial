@@ -1589,8 +1589,9 @@ impl LiveTasks {
             let _ = self.pool_close(&id);
         }
     }
-    /// Waits for the selected workers. The flag is true when the wait ended early because the
-    /// user typed input; the workers keep running either way.
+    /// Waits for the selected workers. The second value says why the wait ended early, if it
+    /// did: the user typed input, or a worker sent the parent a message. The workers keep
+    /// running either way, and the message stays queued for the parent's next request.
     pub fn wait(
         &mut self,
         id: Option<&str>,
@@ -1598,7 +1599,7 @@ impl LiveTasks {
         gate: ApprovalGate<'_>,
         interrupt: &AtomicBool,
         ui: &mut dyn Ui,
-    ) -> Result<(Value, bool), String> {
+    ) -> Result<(Value, Option<WaitStop>), String> {
         let ApprovalGate {
             approval,
             read_only,
@@ -1632,10 +1633,17 @@ impl LiveTasks {
                 return Err("wait interrupted by the user".into());
             }
             if !pending || Instant::now() >= until {
-                return self.status(id).map(|status| (status, false));
+                return self.status(id).map(|status| (status, None));
             }
             if ui.pending_input() {
-                return self.status(id).map(|status| (status, true));
+                return self
+                    .status(id)
+                    .map(|status| (status, Some(WaitStop::Input)));
+            }
+            if self.team.has_mail(mailbox::PARENT) {
+                return self
+                    .status(id)
+                    .map(|status| (status, Some(WaitStop::Message)));
             }
             ui.heartbeat();
             thread::sleep(Duration::from_millis(40));
@@ -1664,8 +1672,27 @@ impl Drop for LiveTasks {
         }
     }
 }
+/// Why a live-task wait returned before its workers settled or its timeout passed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::agent) enum WaitStop {
+    /// The user typed input.
+    Input,
+    /// A worker sent the parent a message.
+    Message,
+}
+impl WaitStop {
+    /// The note appended to the wait's result.
+    pub(in crate::agent) fn note(self) -> &'static str {
+        match self {
+            Self::Input => STOPPED_FOR_INPUT,
+            Self::Message => STOPPED_FOR_MESSAGE,
+        }
+    }
+}
 /// Appended to a pure wait that ended early because the user typed input.
 pub(in crate::agent) const STOPPED_FOR_INPUT: &str = "\n[Stopped waiting early: the user sent a new message. Nothing was cancelled; the awaited work keeps running and its results arrive at request boundaries.]";
+/// Appended to a live-task wait that ended early because a worker messaged the parent.
+const STOPPED_FOR_MESSAGE: &str = "\n[Stopped waiting early: a worker sent you a message, delivered with your next request. Nothing was cancelled; the awaited work keeps running and its results arrive at request boundaries.]";
 
 pub(in crate::agent) fn output(result: Result<Value, String>) -> ToolOutput {
     match result {

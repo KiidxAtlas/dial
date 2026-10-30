@@ -40,7 +40,7 @@ The existing cross-platform sandbox policy cannot safely express a subtree
 exception to a denied storage ancestor; removing that deny would expose sibling
 storage. Dial does not do that. Full sensitive shell access is not implemented.
 Native protected-path checks also cannot confine external language servers,
-plugins, SSH tools, or explicitly unsandboxed commands; their existing separate
+MCP servers, SSH tools, or explicitly unsandboxed commands; their existing separate
 execution/approval boundaries still apply.
 
 Credential-containing directories, including those holding Dial's `credentials.json`,

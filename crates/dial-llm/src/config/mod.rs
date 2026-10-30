@@ -75,8 +75,38 @@ pub fn merge(base: &mut toml::Table, over: toml::Table) {
 
 /// Like `merge`, but the top-level `hooks` array appends to the hooks already configured (identical
 /// hooks are kept once), so a launch overlay such as `--hook` adds hooks instead of dropping the
-/// project's. Every other value is merged as in `merge`.
+/// project's. Changing the provider discards the inherited endpoint before merging the new route.
 pub fn merge_overlay(base: &mut toml::Table, mut over: toml::Table) {
+    if let Some(provider) = over.get("provider").and_then(toml::Value::as_str) {
+        let inherited = base
+            .get("provider")
+            .and_then(toml::Value::as_str)
+            .or_else(|| {
+                // Match selection(): an endpoint can name a configured provider implicitly.
+                let url = base.get("endpoint")?.get("base_url")?.as_str()?;
+                base.get("providers")?
+                    .as_table()?
+                    .iter()
+                    .find(|(_, spec)| {
+                        spec.get("base_url")
+                            .and_then(toml::Value::as_str)
+                            .is_some_and(|base| {
+                                base.trim_end_matches('/') == url.trim_end_matches('/')
+                            })
+                    })
+                    .map(|(id, _)| id.as_str())
+            })
+            .unwrap_or_else(|| {
+                if base.contains_key("endpoint") {
+                    "endpoint"
+                } else {
+                    "mlx"
+                }
+            });
+        if provider != inherited {
+            base.remove("endpoint");
+        }
+    }
     let hooks = over.remove("hooks");
     merge(base, over);
     if let Some(toml::Value::Array(added)) = hooks {
@@ -201,8 +231,9 @@ pub fn migrate_edit_configuration(table: &mut toml::Table) -> bool {
 /// Drops settings whose features were removed so saved configuration from older releases still loads
 /// under `deny_unknown_fields`: the sidecar memory backend's settings and its `memory_edit` tool, memory
 /// role fields that named the embedding role (an embedding model cannot extract or consolidate),
-/// skill install scripts, the browser relay and the automatic reliability check. The retired `mnemopi`
-/// backend is translated to `semantic`, its successor, rather than dropped. Unrelated values are preserved.
+/// skill install scripts, the browser relay, the automatic reliability check and the runtime
+/// extension plugins (`[extensions]`). The retired `mnemopi` backend is translated to `semantic`,
+/// its successor, rather than dropped. Unrelated values are preserved.
 /// Returns whether anything changed.
 pub fn migrate_removed_settings(table: &mut toml::Table) -> bool {
     fn table_mut<'a>(table: &'a mut toml::Table, key: &str) -> Option<&'a mut toml::Table> {
@@ -225,6 +256,7 @@ pub fn migrate_removed_settings(table: &mut toml::Table) -> bool {
         changed
     }
     let mut changed = drop_removed_items(table);
+    changed |= table.remove("extensions").is_some();
     if let Some(memory) = table_mut(table, "memory") {
         changed |= memory.remove("mnemopi").is_some();
         if memory.get("backend").and_then(toml::Value::as_str) == Some("mnemopi") {

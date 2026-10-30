@@ -1,4 +1,4 @@
-//! External programs and services: lifecycle hooks, runtime plugins, MCP servers and the web tools.
+//! External programs and services: lifecycle hooks, MCP servers and the web tools.
 use super::*;
 
 /// A program run at a lifecycle event. Trusted and unsandboxed, like MCP servers.
@@ -23,51 +23,6 @@ pub struct HookConfig {
 
 fn default_hook_timeout() -> u64 {
     30
-}
-
-/// Runtime extension plugins: executables speaking JSON-RPC over stdio (`tools::plugin`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
-pub struct ExtensionsConfig {
-    /// Start runtime plugins at all.
-    pub enabled: bool,
-    /// Also run executables found in `~/.dial/extensions` (trusted) and, once explicitly trusted,
-    /// in the project's `.dial/extensions`.
-    pub discover: bool,
-    /// Deadline for each plugin request (initialize, events, commands, tool calls); 0 disables it.
-    pub timeout_secs: u64,
-    /// Explicitly configured plugins keyed by name. Trusted operator programs: they run unsandboxed.
-    pub plugins: BTreeMap<String, PluginConfig>,
-    /// Values for flags registered by plugins (`registerFlag`); `--ext-flag name=value` sets them.
-    pub flags: BTreeMap<String, toml::Value>,
-}
-
-impl Default for ExtensionsConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            discover: true,
-            timeout_secs: 30,
-            plugins: BTreeMap::new(),
-            flags: BTreeMap::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct PluginConfig {
-    pub program: PathBuf,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub env: BTreeMap<String, String>,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 /// An MCP server: a stdio program or a streamable-HTTP endpoint. Like `[tools.*]` it

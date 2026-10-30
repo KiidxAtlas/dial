@@ -822,10 +822,8 @@ pub(in crate::agent) fn ask(
     };
     let mut backend = crate::agent::make_backend(&role)?;
     let started = std::time::Instant::now();
-    let plugins = env.ext.plugins().filter(|_| env.layout.is_some());
     let rewritten = crate::agent::safety::hooks::provider_request(
         &env.config.hooks,
-        plugins.as_deref(),
         env.workspace.root(),
         &request,
         env.interrupt,

@@ -10,7 +10,7 @@ pub mod rpc;
 pub mod schedule;
 
 pub(crate) use dial_agent::{
-    adaptive, agent, commit, extensions, learn, reliability, stats, steering, telemetry,
+    adaptive, agent, commit, learn, reliability, stats, steering, telemetry,
 };
 pub(crate) use dial_build_info::build_info;
 pub(crate) use dial_computer::computer;

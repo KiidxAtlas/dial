@@ -78,7 +78,6 @@ pub(super) fn drive(
             } else {
                 agent.begin_session_lifecycle();
             }
-            shell.sync_extension_commands(&agent);
             if std::mem::take(&mut restore_pending) {
                 super::restore::restore_interrupted(app, shell, &mut agent)?;
             }

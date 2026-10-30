@@ -154,6 +154,10 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
         Some(Command::Gc(args)) => {
             return exit_with(dial::cli::gc::run(&layout, args.clone())?);
         }
+        Some(Command::Rules(args)) => {
+            let config = Config::load(&layout, Some(overlay(&cli)?))?;
+            return exit_with(dial::cli::rules::run(&layout, &cwd, &config, args)?);
+        }
         Some(Command::EditBench(args)) => {
             return exit_with(dial::cli::edit_bench::run(args)?);
         }
@@ -165,9 +169,6 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
         }
         Some(Command::Ps(args)) => {
             return exit_with(dial::cli::ps::run(&layout.user_dir, args.clone())?);
-        }
-        Some(Command::Plugin(args)) => {
-            return exit_with(dial::cli::plugin::run(args.clone(), &layout)?);
         }
         Some(Command::Search(args)) => {
             let config = Config::load(&layout, Some(overlay(&cli)?))?;

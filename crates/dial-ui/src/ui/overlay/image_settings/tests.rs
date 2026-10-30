@@ -1,7 +1,7 @@
 use super::*;
 use crate::ui::overlay::settings::testkit::{Rig, ch, key, render, screen, status_preview};
 
-const MLX: &[&str] = &["size", "steps", "seed", "strength", "loras"];
+const MLX: &[&str] = &["size", "steps", "seed", "strength", "loras", "cond_weights"];
 const OPENAI: &[&str] = &["size", "quality", "background", "moderation"];
 
 fn overlay(supported: &[&str]) -> ImageSettingsOverlay {
@@ -42,6 +42,7 @@ fn rows_follow_the_settings_the_image_api_accepts() {
             "steps",
             "seed",
             "strength",
+            "cond_weights",
             "lora",
             "lora_scale",
             "loras"
@@ -105,6 +106,28 @@ fn typed_values_are_validated_and_failed_saves_keep_the_old_value() {
     let rig = Rig::new();
     let mut overlay = overlay(MLX);
     assert!(overlay.candidate("steps", "0").is_err());
+
+    // Layer weights take any count (it depends on the model), comma or space separated.
+    let weights = overlay.candidate("cond_weights", "1, 0.5  2").unwrap();
+    assert_eq!(weights.cond_weights, [1.0, 0.5, 2.0]);
+    assert!(overlay.candidate("cond_weights", "1 x").is_err());
+    assert!(overlay.candidate("cond_weights", "1 inf").is_err());
+    let twelve = ["1"; 12].join(" ");
+    assert_eq!(
+        overlay
+            .candidate("cond_weights", &twelve)
+            .unwrap()
+            .cond_weights
+            .len(),
+        12
+    );
+    assert!(
+        overlay
+            .candidate("cond_weights", "")
+            .unwrap()
+            .cond_weights
+            .is_empty()
+    );
     assert!(overlay.candidate("size", "\"512x512\"").is_err());
     assert!(
         overlay

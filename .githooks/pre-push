@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Run CI's checks locally on every commit pushed to a branch, so failures show up here rather than
+# on GitHub. Enable with `make hooks`. A tree that already passed is not checked again.
+# Bypass for one push: DIAL_PREFLIGHT=skip git push (or --no-verify);
+# compile and lint gates only: DIAL_PREFLIGHT=quick git push.
+set -euo pipefail
+
+mode="${DIAL_PREFLIGHT:-full}"
+[[ "$mode" == skip ]] && exit 0
+args=()
+[[ "$mode" == quick ]] && args+=(--quick)
+
+zero=0000000000000000000000000000000000000000
+status=0
+while read -r local_ref local_sha _remote_ref _remote_sha; do
+  # Deletions and tags carry no new code: tags point at commits that were pushed to a branch.
+  [[ "$local_sha" == "$zero" || "$local_ref" != refs/heads/* ]] && continue
+  echo "pre-push: preflight for ${local_ref#refs/heads/} (${local_sha:0:12}); DIAL_PREFLIGHT=skip to bypass" >&2
+  "$(git rev-parse --show-toplevel)/scripts/preflight.sh" ${args[@]+"${args[@]}"} "$local_sha" </dev/null >&2 || status=1
+done
+exit "$status"

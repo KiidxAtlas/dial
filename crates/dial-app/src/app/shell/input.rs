@@ -19,12 +19,6 @@ impl Shell {
     /// Keys for the live home while the input is empty: Down enters its list, Up walks back to the
     /// input, Enter picks, Esc leaves. `None` passes the key on; `Some(Some(command))` asks to run it.
     pub(super) fn home_key(&mut self, key: &crossterm::event::KeyEvent) -> Option<Option<String>> {
-        if let Some(command) = self.extension_keys.key(*key, &self.keys) {
-            return Some(Some(command));
-        }
-        if self.extension_views.key(*key, &self.keys) {
-            return Some(None);
-        }
         let home = self.home.as_mut()?;
         if !key.modifiers.is_empty()
             || !self.composer.draft().is_empty()

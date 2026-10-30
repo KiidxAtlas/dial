@@ -2,6 +2,7 @@
 //! Peer guidance stays task-scoped and untrusted; it cannot grant authority or permissions.
 use crate::agent::*;
 use crate::storage::coordination::{Letter, Participant, Peer};
+use std::collections::VecDeque;
 
 mod wake;
 
@@ -19,6 +20,35 @@ pub(in crate::agent) struct State {
     retry_at: Option<Instant>,
     wake: wake::Wake,
     pending_letters: Vec<Letter>,
+    /// Recent letters this process sent and drained, oldest first, for the side pane's chat view.
+    history: VecDeque<PeerMessage>,
+}
+
+/// Letters kept in [`State::history`]; older ones are forgotten.
+const HISTORY: usize = 128;
+
+/// One letter between this session and a peer. History is process-local and never persisted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerMessage {
+    /// The other session's instance id.
+    pub peer: String,
+    /// Sent by this session; otherwise received from `peer`.
+    pub outgoing: bool,
+    pub text: String,
+    /// Still queued in this session's inbox: the model has not received it yet.
+    pub unread: bool,
+}
+
+fn remember(history: &mut VecDeque<PeerMessage>, peer: &str, outgoing: bool, text: &str) {
+    if history.len() == HISTORY {
+        history.pop_front();
+    }
+    history.push_back(PeerMessage {
+        peer: peer.to_owned(),
+        outgoing,
+        text: text.to_owned(),
+        unread: false,
+    });
 }
 
 /// Opaque process-owned presence carried across an interactive same-session rebuild.
@@ -252,6 +282,24 @@ impl Agent<'_> {
         })
     }
 
+    /// This session's conversation with its peers, oldest first: the letters it sent and received
+    /// in this process, then any still queued for it (marked unread). Reading never drains mail.
+    pub fn peer_messages(&self) -> Result<Vec<PeerMessage>> {
+        let state = &self.peer_state;
+        let participant = state
+            .participant
+            .as_ref()
+            .with_context(|| unavailable(state))?;
+        let mut messages: Vec<PeerMessage> = state.history.iter().cloned().collect();
+        messages.extend(participant.queued()?.into_iter().map(|letter| PeerMessage {
+            peer: letter.from,
+            outgoing: false,
+            text: letter.text,
+            unread: true,
+        }));
+        Ok(messages)
+    }
+
     fn peer_coordination_inner(&mut self, args: &Value) -> Result<Value> {
         let state = &mut self.peer_state;
         let participant = state
@@ -268,6 +316,7 @@ impl Agent<'_> {
                     .context("send requires an exact peer id in to")?;
                 let text = args["text"].as_str().context("send requires text")?;
                 participant.send(to, text)?;
+                remember(&mut state.history, to, true, text);
                 Ok(
                     json!({"to":to,"status":"queued","delivery":"next model-request boundary, or bounded terminal wake-up after a completed or incomplete turn; not acknowledgement"}),
                 )
@@ -349,7 +398,11 @@ impl Agent<'_> {
                 }
             }
             let letters = if state.pending_letters.is_empty() {
-                participant.drain()?
+                let letters = participant.drain()?;
+                for letter in &letters {
+                    remember(&mut state.history, &letter.from, false, &letter.text);
+                }
+                letters
             } else {
                 std::mem::take(&mut state.pending_letters)
             };

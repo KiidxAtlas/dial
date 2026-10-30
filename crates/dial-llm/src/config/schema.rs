@@ -77,7 +77,6 @@ impl SettingDef {
                 | "model_presets"
                 | "tools"
                 | "hooks"
-                | "extensions"
                 | "dap"
                 | "lsp"
         )
@@ -223,6 +222,11 @@ const SHELL_BACKEND: EnumValues = &[
 const GIT_GUARD: EnumValues = &[
     ("workers", "Workers sharing the checkout"),
     ("always", "Always"),
+    ("off", "Off"),
+];
+const RULE_JUDGE: EnumValues = &[
+    ("auto", "When the judge role is assigned"),
+    ("on", "Always (judge, small or main model)"),
     ("off", "Off"),
 ];
 const EDIT_MODE: EnumValues = &[
@@ -956,6 +960,8 @@ static REGISTRY: &[SettingDef] = &[
     tools::DECLARATIONS[25],
     tools::DECLARATIONS[26],
     tools::DECLARATIONS[27],
+    tools::DECLARATIONS[53],
+    tools::DECLARATIONS[54],
     tools::DECLARATIONS[28],
     tools::DECLARATIONS[29],
     tools::DECLARATIONS[30],
@@ -1020,6 +1026,7 @@ static REGISTRY: &[SettingDef] = &[
     image::DECLARATIONS[2],
     image::DECLARATIONS[3],
     image::DECLARATIONS[4],
+    image::DECLARATIONS[5],
     tools::DECLARATIONS[35],
     tools::DECLARATIONS[36],
     tools::DECLARATIONS[37],
@@ -1190,6 +1197,8 @@ const ADVANCED: &[&str] = &[
     "subagent_max_live_jobs",
     "isolation.backend",
     "portable_rules.max_regenerations",
+    "portable_rules.repeat_after_turns",
+    "portable_rules.judge",
     "memory.local.max_rollouts_per_startup",
     "memory.local.max_rollout_age_days",
     "memory.local.min_rollout_idle_hours",

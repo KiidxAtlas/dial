@@ -59,6 +59,7 @@ integrations! {
     ("dep_source", true, true),
     // Registered only while the `image_embedding` role is assigned.
     ("image_search", true, true),
+    ("image_weights", true, true),
     ("github", false, false),
     ("notebook", false, false),
     ("security_scan", false, false),

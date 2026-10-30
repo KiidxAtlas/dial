@@ -397,7 +397,9 @@ fn completed_stream_yields_tools_and_partial_stream_never_does() {
             .unwrap();
     }
     assert!(accumulator.finish().is_err());
-    assert!(matches!(&seen[0],StreamEvent::ToolArguments { name,.. } if name=="write"));
+    // The added item is lifecycle progress for the agent watchdog; its arguments follow.
+    assert_eq!(seen[0], StreamEvent::Activity);
+    assert!(matches!(&seen[1],StreamEvent::ToolArguments { name,.. } if name=="write"));
     let mut events = events;
     events.push(json!({"type":"response.completed","response":response(vec![call()])}));
     let server = fake::serve(vec![Script::Sse(sse(events))]);

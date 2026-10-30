@@ -591,7 +591,13 @@ not repaint).
 | **Jobs** | Background (`bg`) processes and slash-command jobs such as `/update`, `/gc` or `/benchmark`, with their recent output | `x` stops the selected job |
 | **Workers** | Subagents with status, current step, usage and recent activity | `x` cancels the selected worker |
 | **Threads** | `/btw` side threads, including the answer streaming now | `x` stops the streaming answer |
-| **Peers** | Other Dial sessions in this checkout, their claims and overlaps with yours | `m` writes a message to the selected peer |
+| **Peers** | Other Dial sessions in this checkout, their claims and overlaps with yours | `Enter` opens the chat with the selected peer; `m` writes a message to it |
+
+The peer chat lists the messages this session sent to and received from that peer since it started,
+oldest first (the last 50 are shown). Messages still queued for this session are marked **unread by
+the agent** until the next model request delivers them; reading the chat never takes them. History
+lives only in the running session's memory and disappears with the peer. In the chat, `↑`/`↓` and
+`PgUp`/`PgDn` scroll, `m` writes to the peer and returns to the chat, and `Esc` goes back to the list.
 
 Every stop asks `y`/`n` first. Requests go through the same controls the main window uses; each
 outcome is noted in the conversation under **Side pane** and shown in the pane's footer. A peer

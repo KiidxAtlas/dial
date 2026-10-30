@@ -7,7 +7,6 @@
 //! - `--advisor` → the `coach` role reviews tool evidence and can request one in-loop repair (launch-scoped).
 //! - `--external-thinking` → private `<scratchpad>` reasoning with provider reasoning forced off (launch-scoped).
 //! - `--hide-thinking` → config overlay `[ui] show_thinking = false`.
-//! - `--no-extensions` → config overlay `[extensions] enabled = false`.
 //! - `--prewalk` / `--prewalk-into` → arm the todo-gated handoff to `@small` (or the named target) once per session.
 //! - `--no-prewalk` → no startup arm (the default).
 //!
@@ -64,25 +63,9 @@ pub struct ModeArgs {
     #[arg(long)]
     pub hide_thinking: bool,
 
-    /// Disable all extensions.
-    #[arg(long, help_heading = crate::cli::help_heading::EXTENSIONS)]
-    pub no_extensions: bool,
-
-    /// Load an extension module (`--extension` / `-e`, repeatable).
-    #[arg(short = 'e', long = "extension", value_name = "PATH", help_heading = crate::cli::help_heading::EXTENSIONS)]
-    pub extensions: Vec<String>,
-
     /// Load a hook module (repeatable).
     #[arg(long, value_name = "PATH", help_heading = crate::cli::help_heading::EXTENSIONS)]
     pub hook: Vec<String>,
-
-    /// Load an absolute-path extension that is trusted (repeatable).
-    #[arg(long, value_name = "ABS_PATH", help_heading = crate::cli::help_heading::EXTENSIONS)]
-    pub trusted_extension: Vec<String>,
-
-    /// Add a plugin root directory (repeatable).
-    #[arg(long, value_name = "DIR", help_heading = crate::cli::help_heading::EXTENSIONS)]
-    pub plugin_dir: Vec<PathBuf>,
 }
 
 /// Launch facts the validators need that are not part of the mode flags.
@@ -176,45 +159,12 @@ pub fn validate_goal_startup(goal: Option<&str>, startup: GoalStartup) -> Result
     Ok(())
 }
 
-/// Validate `--trusted-extension` paths: non-empty and absolute. Returns them as paths.
-pub fn validate_trusted_extensions(
-    paths: &[String],
-    extension_or_hook_given: bool,
-) -> Result<Vec<PathBuf>> {
-    if paths.is_empty() {
-        return Ok(Vec::new());
-    }
-    if extension_or_hook_given {
-        bail!("--trusted-extension cannot be combined with --extension, -e, or --hook.");
-    }
-    paths
-        .iter()
-        .map(|raw| {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                bail!("--trusted-extension requires a non-empty absolute path.");
-            }
-            let path = PathBuf::from(trimmed);
-            if !path.is_absolute() {
-                bail!("--trusted-extension requires an absolute path: {trimmed}");
-            }
-            Ok(path)
-        })
-        .collect()
-}
-
-/// Build the config overlay for the flags Dial honors.
-pub fn config_overlay(hide_thinking: bool, no_extensions: bool) -> toml::Table {
+pub fn config_overlay(hide_thinking: bool) -> toml::Table {
     let mut overlay = toml::Table::new();
     if hide_thinking {
         let mut ui = toml::Table::new();
         ui.insert("show_thinking".to_string(), toml::Value::from(false));
         overlay.insert("ui".to_string(), toml::Value::Table(ui));
-    }
-    if no_extensions {
-        let mut ext = toml::Table::new();
-        ext.insert("enabled".to_string(), toml::Value::from(false));
-        overlay.insert("extensions".to_string(), toml::Value::Table(ext));
     }
     overlay
 }
@@ -232,71 +182,10 @@ fn module_file(path: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-fn plugin_entry(program: &Path) -> toml::Value {
-    let mut entry = toml::Table::new();
-    entry.insert(
-        "program".to_string(),
-        toml::Value::from(program.to_string_lossy().into_owned()),
-    );
-    toml::Value::Table(entry)
-}
-
-fn plugin_name(prefix: &str, index: usize, program: &Path) -> String {
-    let file = program
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    format!("{prefix}-{index}-{file}")
-}
-
-/// Config overlay for the module flags. `--extension` and `--trusted-extension` become
-/// `[extensions.plugins]` stdio programs. `--trusted-extension` is an exact allowlist, so it also
-/// turns off ambient discovery. `--hook` adds one `[[hooks]]`
-/// entry per lifecycle event, each running the same program. `--plugin-dir` adds every regular
-/// file directly inside the directory as a plugin program.
+/// Config overlay for the module flags. `--hook` adds one `[[hooks]]` entry per lifecycle event,
+/// each running the same program.
 fn module_overlay(args: &ModeArgs) -> Result<toml::Table> {
     let mut overlay = toml::Table::new();
-    let mut plugins = toml::Table::new();
-    for (index, raw) in args.extensions.iter().enumerate() {
-        let program = module_file(Path::new(raw.trim()))?;
-        plugins.insert(plugin_name("cli", index, &program), plugin_entry(&program));
-    }
-    let trusted = validate_trusted_extensions(&args.trusted_extension, false)?;
-    for (index, raw) in trusted.iter().enumerate() {
-        let program = module_file(raw)?;
-        plugins.insert(
-            plugin_name("trusted", index, &program),
-            plugin_entry(&program),
-        );
-    }
-    for (index, dir) in args.plugin_dir.iter().enumerate() {
-        let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-            .map_err(|err| {
-                anyhow::anyhow!("--plugin-dir cannot be read: {} ({err})", dir.display())
-            })?
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| path.is_file())
-            .collect();
-        if files.is_empty() {
-            bail!(
-                "--plugin-dir contains no plugin programs: {}",
-                dir.display()
-            );
-        }
-        files.sort();
-        for file in &files {
-            let program = module_file(file)?;
-            plugins.insert(plugin_name("dir", index, &program), plugin_entry(&program));
-        }
-    }
-    if !plugins.is_empty() {
-        let mut extensions = toml::Table::new();
-        extensions.insert("plugins".to_string(), toml::Value::Table(plugins));
-        if !trusted.is_empty() {
-            extensions.insert("discover".to_string(), toml::Value::from(false));
-        }
-        overlay.insert("extensions".to_string(), toml::Value::Table(extensions));
-    }
     let mut hooks = Vec::new();
     for raw in &args.hook {
         let program = module_file(Path::new(raw.trim()))?;
@@ -320,16 +209,7 @@ fn module_overlay(args: &ModeArgs) -> Result<toml::Table> {
 
 /// Every launch-time config overlay: UI/extension flags plus the module flags.
 fn launch_overlay(args: &ModeArgs) -> Result<toml::Table> {
-    let module_given = !args.extensions.is_empty()
-        || !args.hook.is_empty()
-        || !args.trusted_extension.is_empty()
-        || !args.plugin_dir.is_empty();
-    if args.no_extensions && module_given {
-        bail!(
-            "--no-extensions cannot be combined with -e/--extension, --trusted-extension, --hook, or --plugin-dir."
-        );
-    }
-    let mut overlay = config_overlay(args.hide_thinking, args.no_extensions);
+    let mut overlay = config_overlay(args.hide_thinking);
     crate::config::merge_overlay(&mut overlay, module_overlay(args)?);
     Ok(overlay)
 }
@@ -351,9 +231,6 @@ pub fn resolve(args: &ModeArgs, ctx: LaunchContext) -> Result<ModeFlags> {
             plan_starts_on_startup: args.plan.is_some(),
         },
     )?;
-
-    let extension_or_hook_given = !args.extensions.is_empty() || !args.hook.is_empty();
-    validate_trusted_extensions(&args.trusted_extension, extension_or_hook_given)?;
 
     if args.prewalk && args.no_prewalk {
         bail!("--prewalk and --no-prewalk cannot be used together.");

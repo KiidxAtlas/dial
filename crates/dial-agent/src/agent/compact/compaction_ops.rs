@@ -69,7 +69,8 @@ impl<'a> Agent<'a> {
         template: Option<&Chat>,
     ) -> Result<crate::agent::compact::compaction::CompactionSnapshot> {
         // Validate lossless carry before spending any summary request.
-        super::critical::message(&self.session.control_state(), &self.todo.snapshot())?;
+        let critical =
+            super::critical::message(&self.session.control_state(), &self.todo.snapshot())?;
         let visible_history = self.session.messages();
         let native_request = self.projected_request(&visible_history, template)?;
         let archive_migration = visible_history
@@ -87,7 +88,12 @@ impl<'a> Agent<'a> {
             max_tokens: native_request.max_tokens,
             seed: native_request.seed,
         };
-        source.messages.extend(history);
+        // Commit replaces this carry rather than retaining it. Do not budget an obsolete copy too.
+        source.messages.extend(
+            history
+                .into_iter()
+                .filter(|message| message["dial_compaction_critical"] != true),
+        );
         source.messages.extend(
             native_request
                 .messages
@@ -134,14 +140,33 @@ impl<'a> Agent<'a> {
         let evidence_notes = self.compaction_evidence_notes("", &source.messages);
         // The regenerated notes are part of every committed projection. Refuse a notes block that cannot
         // fit the window before any summary request is spent on a projection that cannot commit.
-        let notes_tokens =
-            crate::llm::wire::estimate(&json!({"role":"user","content":evidence_notes}));
+        let notes_tokens = crate::llm::wire::estimate(&json!({
+            "role":"user", "dial_compaction_notes":true,
+            "content":format!("<compaction-notes>\n{evidence_notes}\n</compaction-notes>")
+        }));
         ensure!(
             notes_tokens < u64::from(self.budget_window()) / 2,
             "regenerated compaction notes need about {notes_tokens} tokens, too large for the context window; no summary was requested. Reduce retained instructions or select a larger-window model"
         );
+        let selection = self.auth_config.selection();
+        let raw_tokens = crate::agent::compact::compaction::request_tokens_with_policy(
+            &native_request,
+            &policy,
+            crate::config::compaction::CompactionIdentity {
+                provider: &selection.provider,
+                model: &selection.model,
+                agent: None,
+            },
+        );
+        let retained_overhead_tokens = notes_tokens
+            .saturating_add(crate::llm::wire::estimate(&critical))
+            .saturating_add(
+                self.projected_tokens(&native_request)
+                    .saturating_sub(raw_tokens),
+            );
         Ok(crate::agent::compact::compaction::CompactionSnapshot {
             evidence_notes,
+            retained_overhead_tokens,
             source,
             native_request,
             visible_history,
@@ -176,13 +201,11 @@ impl<'a> Agent<'a> {
         options: &crate::config::compaction::CompactionOptions,
     ) -> Result<crate::agent::compact::compaction::CompactionOutcome> {
         self.compaction_runtime.cancel();
-        let plugins = self.hook_plugins();
         let root = self.workspace.root().to_path_buf();
         let payload = json!({"session_id":self.session.id(),"reason":options.reason});
         let mut notices = Vec::new();
         let gate = crate::agent::safety::hooks::gate_noted(
             self.tool_hooks(),
-            plugins.as_deref(),
             &root,
             "before_compact",
             payload,

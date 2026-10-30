@@ -121,6 +121,45 @@ fn coherent_runtime_coding_does_not_open_or_schedule_learning() {
 }
 
 #[test]
+fn print_mode_does_not_offer_ask_without_a_human_input_channel() {
+    let offers_ask = |config: crate::config::Config| {
+        let (_home, _project, layout, _) = self::config();
+        let app = App::new(
+            layout,
+            config,
+            toml::Table::new(),
+            Default::default(),
+            Vec::new(),
+            Default::default(),
+        )
+        .unwrap();
+        let session = Session::create(
+            &app.layout,
+            SessionMeta {
+                model: "test-model".into(),
+            },
+        )
+        .unwrap();
+        let agent = app.make_agent(session).unwrap();
+        agent.tool_names().iter().any(|name| name == "ask")
+    };
+    let (_home, _project, _layout, mut saved) = config();
+    saved.endpoint = Some(crate::config::types::EndpointConfig {
+        base_url: "https://api.example.com/v1".into(),
+        api_key_env: None,
+        allow_insecure: false,
+        protocol: None,
+        headers: None,
+        account_id: None,
+    });
+    saved.model = "test-model".into();
+    saved.ask.enabled = true;
+    assert!(offers_ask(saved.clone()), "interactive sessions keep ask");
+    assert!(!offers_ask(super::print_config(saved.clone())));
+    assert!(saved.ask.enabled, "Saved ask preference stays intact");
+}
+
+#[test]
 fn teaching_a_local_model_opens_its_learning_store_for_coding() {
     let (_home, _project, layout, mut saved) = config();
     saved.model = "scripted".into();
@@ -323,7 +362,7 @@ fn action_palette_uses_registered_commands_and_real_turn_policies() {
         source: skills::Scope::Project,
         origin: "Dial",
     };
-    let entries = palette_entries(&[custom], &[skill], &[]);
+    let entries = palette_entries(&[custom], &[skill]);
     let find = |name: &str| entries.iter().find(|e| e.command.name == name).unwrap();
     assert!(find("undo").during_turn.starts_with("Stops"));
     assert!(find("model").during_turn.starts_with("Opens now"));
@@ -1745,7 +1784,7 @@ fn command_menu_lists_builtins_then_custom_then_skills_and_builtins_win() {
         source: skills::Scope::Project,
         origin: "Dial",
     };
-    let entries = command_entries(&custom, &[skill], &[]);
+    let entries = command_entries(&custom, &[skill]);
     let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(
         names.iter().filter(|n| **n == "help").count(),

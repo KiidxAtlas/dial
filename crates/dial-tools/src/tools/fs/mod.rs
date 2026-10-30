@@ -5,6 +5,7 @@ pub mod audio;
 pub(in crate::tools) mod conflicts;
 pub mod documents;
 pub(in crate::tools) mod files;
+pub mod image_weights;
 pub(in crate::tools) mod media;
 pub mod notebook;
 pub(in crate::tools) mod outline;

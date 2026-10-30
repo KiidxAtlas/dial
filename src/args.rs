@@ -421,9 +421,6 @@ pub(crate) enum Command {
         #[command(subcommand)]
         action: SkillCommand,
     },
-    /// Manage plugins and marketplaces.
-    #[command(alias = "plugins")]
-    Plugin(dial::cli::plugin::PluginArgs),
     /// Verify and install the latest signed release, or a specified release version.
     Update {
         /// Version number or v-prefixed release tag (defaults to latest).
@@ -481,6 +478,8 @@ pub(crate) enum Command {
     Anonymize(dial::cli::anonymize::AnonymizeArgs),
     /// Sweep stale blobs, archives, and WAL state (dry run unless --apply).
     Gc(dial::cli::gc::GcArgs),
+    /// List the stream rules this workspace loads, or test which ones a sample output fires.
+    Rules(dial::cli::rules::RulesArgs),
     /// Inspect tool reliability or run a bounded backend capability check.
     Reliability {
         #[command(subcommand)]

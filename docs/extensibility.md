@@ -1,6 +1,6 @@
 # Extensions and project context
 
-Dial has two extension boundaries. Trusted operator integrations can register tools and commands through the Rust `Extension` SDK or through configured stdio extension programs. Workspace-provided guidance and skills are untrusted input: they are read-only, size-limited, and never execute programs. Dial never reads configuration from the workspace.
+Dial has two extension boundaries. Trusted operator integrations can register tools and commands through the Rust `Extension` SDK, configured custom tools, MCP servers and lifecycle hooks. Workspace-provided guidance and skills are untrusted input: they are read-only, size-limited, and never execute programs. Dial never reads configuration from the workspace.
 
 ## Lifecycle hooks
 
@@ -8,158 +8,11 @@ Configure hooks with `[[hooks]]`; `event` names a lifecycle point, `command` is 
 
 Supported lifecycle points include user prompt submission, session start/end, before compaction, before subagent spawn, before provider requests, pre/post tool use, and stop. Matchers are compiled and cached. A failing fail-closed policy hook prevents the action; hook failures must not be silently converted into permission.
 
+`message_end`, `tool_call` and `tool_result` are aliases of `assistant_message`, `pre_tool_use` and `post_tool_use`. A `user_prompt_submit` reply `{"prompt":"..."}` replaces the user message for later hooks and the model request; the replacement must be non-empty and at most 256 KiB, or the turn fails.
+
 ## Custom tools
 
 `[tools.<name>]` declares `program`, optional `args` and `timeout_secs`, plus `description` and a JSON Schema `parameters` object. When parameters are supplied, the tool receives the full JSON arguments object on stdin; otherwise it receives a single `input` string. Custom programs are operator-trusted and run outside the workspace sandbox. Do not configure workspace-controlled executables.
-
-## Runtime extensions
-
-Runtime plugins are operator-installed stdio programs: those declared under `[extensions.plugins.<name>]` and those installed with `dial plugin install` (started from the user `plugins` directory). Dial does not scan `~/.dial/extensions` or the project for plugin executables, so no project-local extension runs without an explicit configuration entry. Plugins communicate using JSON-RPC messages over stdio and may register tools, commands, shortcuts and flags, update active tools, and observe lifecycle events. They run with the privileges of the Dial process; only install code you trust. The Rust SDK is for embedding trusted native integrations and does not bypass tool approvals or workspace controls. Plugins and skills offered by marketplaces are found and installed in `/extensions`; see Marketplaces below.
-
-### Python extensions
-
-Python 3.11+ extensions use the same installed-plugin runtime, with a bundled standard-library-only
-SDK and an isolated virtual environment prepared during explicit installation or update. Start with
-`dial plugin new ./my-extension`, validate without executing it with
-`dial plugin check ./my-extension`, then review and install with
-`dial plugin install ./my-extension`. Managed extensions can use framed approved host APIs,
-session-owned persistent workers, declarative workspaces, typed settings/credentials, task profiles,
-workflows, context sources and public presets. `dial plugin dev DIR` explicitly runs a temporary
-reloadable development preview. See [Python extension authoring](python-extensions.md) for
-contracts, examples, dependency locks and trust limitations. The SDK is bundled in Dial;
-extension authors do not need a separately published PyPI package.
-
-An initialization reply may also declare up to 64 `tools`, each with `name`, `description`,
-`parameters` (JSON Schema) and positive `revision` (default 1). Tool names are plugin-local ASCII
-letters, digits, `_` and `-`, at most 48 bytes. The model sees
-`ext__<extension namespace>__<tool name>`; the namespace escapes `_` as `_u` and `.` as `_d`.
-Generated names must fit Dial's 128-byte tool-name bound. Registration refuses collisions instead of
-shadowing another tool. Tool invocation sends `tool.call` with `{name, arguments, workspace}` and
-expects `{text, is_error}`. All plugin tools require normal host approval, are treated as potentially
-workspace-mutating, and participate in durable schema/revision identities. Unload revokes adapters;
-a new registration under the same name does not inherit an old adapter's contract.
-Process failures, cancellation after dispatch and malformed results leave effects unknown rather
-than imply rollback. Tools cannot declare themselves approval-free through their manifests.
-
-### Commands and declarative panels
-
-A stdio plugin advertises slash-command names in its `initialize` result, for example
-`{"commands":["demo"]}`. Command-only plugins need no event subscription. Names are nonempty ASCII
-graphic strings of at most 48 bytes, without a leading `/`. Commands appear in action navigation;
-built-ins keep precedence. Invocation sends `command` with `{"name":"demo","args":"..."}`.
-
-The result may contain `{"text":"..."}` or a `panel`:
-
-```json
-{
-  "panel": {
-    "title": "Review choice",
-    "generation": 7,
-    "elements": [
-      {"type": "input", "id": "name", "label": "Name", "value": ""},
-      {"type": "select", "id": "mode", "label": "Mode", "options": ["fast", "safe"], "selected": 1},
-      {"type": "button", "id": "save", "label": "Save", "primary": true}
-    ]
-  }
-}
-```
-
-Elements are `text`, `markdown` (wrapped source), `list`, `input`, `select` and `button`. A panel
-requires a title and a button. The layout budget is 64 widgets plus nested list rows/select choices;
-each author-supplied string is limited to 2048 bytes. Interactive IDs must be unique, at most 64
-ASCII letters, digits, `_` or `-`; selects require a valid starting option. Invalid layouts are
-refused rather than partially displayed.
-
-The UI owns focus, editing and cancellation. Closing sends `command.panel` with the command name,
-the opened `generation`, and an `outcome`: `{"status":"submitted","button":"save","values":{"name":"Ada","mode":1}}`,
-`{"status":"cancelled"}`, or `{"status":"unsupported","reason":"..."}` for a surface without panels.
-Input values are strings; select values are zero-based indexes. The close reply may contain text.
-Requests still use plugin timeout/cancellation and loaded-plugin checks; an unloaded plugin does
-not receive a fabricated successful close. Embedders use the same `Panel`/`Outcome` contract
-through `Ui::run_panel`. A panel outcome is human input, never tool approval or an expanded grant.
-
-### Protocol 2: capabilities, actions and UI slots
-
-The host's `initialize` request sends `protocolVersion: "2"`, `supportedProtocolVersions: ["1","2"]`,
-and an empty `capabilities` object. A plugin that answers with `"protocolVersion": "2"` and a
-`capabilities` array of names opts in. Plugins that omit the version, or answer `"1"`, stay legacy:
-they keep hooks, commands and panels, and any `actions` or `ui` entries they return are refused with
-a notice. An unsupported version fails startup. Unknown capability names are ignored.
-
-Protocol 2 replies may contain an `actions` array. Each entry needs a `type` and the capability it
-requires; an entry without its capability is refused with a notice while other entries still apply.
-
-- `ui` with `slot` (`status`, `header`, `footer`, `title`) and `lines`: display-only text, sanitized
-  (control sequences removed, newlines flattened) and clamped to 240 characters per line. Status and
-  title take one line; header and footer take up to 8. An empty `lines` clears the slot. Capabilities:
-  `ui.status`, `ui.header`, `ui.footer`, `ui.title`. Placement: header rows sit above the composer;
-  status and footer rows sit below it; a title replaces the session title in the terminal title.
-  Empty slots take no rows. When several plugins set a title, the first one wins.
-- `send_user_message` `{text}` (`actions.send_user_message`), `append_entry` `{kind,text}`
-  (`actions.append_entry`), `set_model` `{model,effort?}` (`actions.set_model`), `set_thinking`
-  `{effort}` (`actions.set_thinking`), `register_provider` `{name,config}` and `unregister_provider`
-  `{name}` (`actions.register_provider`, `actions.unregister_provider`). Names are ASCII letters,
-  digits and `._-/:`, at most 64 characters. Messages are capped at 256 KiB and entries at 64 KiB.
-  Replies carry at most 16 actions.
-
-Actions are requests, not commands. They are applied at the idle boundary, never mid-turn. Before
-applying one, Dial shows an approval prompt that names the plugin and the exact change. These require
-approval (Allow once or Deny): `send_user_message`, `set_model`, `set_thinking`, `register_provider` and
-`unregister_provider`. `append_entry` needs none. A declined action is reported as a notice and dropped.
-Model and thinking changes are session-only. Provider changes are saved to the global settings like a
-manual change. The provider prompt shows the endpoint and the name of the environment variable that
-holds the key, never the key or header values. A key given as a literal value is refused, and the
-refusal does not echo it.
-
-`append_entry` may carry an optional `renderer`: `{title?, fields?: [{label,value}], markdown?}`, with at
-most 12 fields and 4 KiB of markdown. Dial shows it as a transcript notice titled by `title` (default
-`<plugin>: <kind>`): fields first, then the markdown text. Markdown is shown as plain text and is never
-interpreted. Without a renderer the sanitized `text` is the body. Entries are recorded in the session
-under the `plugin.entry` custom type, which model context never reads. When a session is resumed, each
-entry is rebuilt into the transcript between the messages it followed, through the same renderer.
-
-Editor-mode contributions are not supported. Composer keystrokes, including typed secrets, would have to
-route to an external process, and protocol 2 has no declarative form that keeps them out.
-
-Autocomplete: a plugin that declares `autocomplete` receives `autocomplete` with `{"query":"..."}`
-and replies `{"items":[{"value","label?","description?"}]}`. At most 20 suggestions are shown, and
-empty values are dropped. Suggestions appear in the slash-command menu as extension commands while the
-command name is typed; built-in commands win on a name collision. Values are inserted as command text,
-without added shell quoting; whitespace separates the command from its arguments, and any quotes or
-backslashes supplied in the value are preserved. Lookups run on a worker, bounded by the plugin timeout,
-and answers for a query the user has moved past are discarded, so a slow plugin never delays typing.
-
-Observational events are delivered in order on a background worker to protocol 2 plugins that list
-them in `events`. Each payload is a JSON object that carries `session_id`. Their replies may carry
-actions and UI slots but cannot block or rewrite the agent. A full queue of 256 drops events with a
-notice. Text fields are truncated to 8000 characters.
-
-- `turn_start` `{session_id, prompt}`: before `user_prompt_submit` hooks run; `prompt` is the original message.
-- `turn_end` `{session_id, outcome, steps, interrupted}`: once per turn, after the outcome is settled.
-- `message_start` `{session_id, step}`: before each model request.
-- `message_end` and `tool_call`/`tool_result` are not observer events: they are aliases of the blocking
-  hooks `assistant_message`, `pre_tool_use` and `post_tool_use`. Subscribe to those hook names to see
-  them; each is delivered once, through the blocking path, with its payload `{session_id, step, text, tool_calls}`
-  (`message_end`) or `{session_id, call_id, name, arguments}` / `{session_id, call_id, name, is_error, output}`.
-- `mode_changed` `{session_id, mode, enabled}`: when plan mode flips (`mode` is `"plan"`).
-- `model_changed` `{session_id, provider, model}`: after a model switch, including on session resume.
-- `mcp_notification` `{session_id, server, kind, added?, removed?, changed?, error?}`: an MCP change. `kind` is one of `tools_changed`, `tools_refreshed`, `tools_refresh_failed`, `prompts_changed`, `resources_changed`, or `resource_updated`. `added`, `removed`, and `changed` list tool names on `tools_refreshed`; `error` is set on `tools_refresh_failed`.
-
-Hook-alias names listed in `events` are delivered by the blocking path only, so the observer queue
-never sends them. Blocking hook events keep their synchronous `rewrite` contract.
-
-`user_prompt_submit` accepts a reply `{"prompt":"..."}` that replaces the user message for later hooks
-and the model request. The replacement must be non-empty and at most 256 KiB, or the turn fails.
-Approval events fire only from the turn's own UI reducer, so they cover the parent agent's tool calls
-(child workers are not observed).
-- `message_update` `{session_id, text}`: the accumulated answer text of the current assistant message.
-  Sent at most ten times a second, with the final text delivered before `message_end`. Text from a
-  discarded attempt is never sent. Subscribe only when you need streaming; other observers pay nothing.
-- `tool_approval_requested` `{session_id, call_id, name}`: a user prompt for a tool call is about to show.
-- `tool_approval_resolved` `{session_id, call_id, name, decision, source}`: the call was decided. `source`
-  is `user` after a prompt, or `rule` when a permission rule decided it without a prompt (no matching
-  requested event). `decision` is `allow`, `allow_always`, `allow_project` or `deny`; rule decisions are
-  `allow` or `deny`.
 
 ## Context and skills
 
@@ -223,7 +76,7 @@ An index is one JSON document:
 
 ## Marketplaces and /extensions
 
-`/extensions` is the one place to find and install MCP servers, plugins and skills. Its tabs are MCP servers, Plugins, Skills and Marketplaces. Listings load in the background when the browser opens. Press `/` to type a filter; MCP catalogs are searched when typing pauses, or immediately with Enter. Arrow keys leave the search field with the filter retained: Up/Down select results and Left/Right switch tabs. Page Up/Down and Home/End also navigate results; `/` resumes editing and Esc clears the filter. Enter in the search field finishes searching, without installing or re-fetching an already loaded query. On a result, Enter (or `i`) requests installation and then waits for confirmation. Adding, refreshing or searching an index installs nothing; removing, disabling and installing always wait for confirmation.
+`/extensions` is the one place to find and install MCP servers and skills. Its tabs are MCP servers, Skills and Marketplaces. Listings load in the background when the browser opens. Press `/` to type a filter; MCP catalogs are searched when typing pauses, or immediately with Enter. Arrow keys leave the search field with the filter retained: Up/Down select results and Left/Right switch tabs. Page Up/Down and Home/End also navigate results; `/` resumes editing and Esc clears the filter. Enter in the search field finishes searching, without installing or re-fetching an already loaded query. On a result, Enter (or `i`) requests installation and then waits for confirmation. Adding, refreshing or searching an index installs nothing; removing, disabling and installing always wait for confirmation.
 
 Search and setup fields accept pasted text without submitting it; single-line fields discard control characters. A rejected catalog request clears its loading state, and earlier install progress and setup forms remain subscribed until completion.
 
@@ -231,7 +84,7 @@ MCP result tags appear before descriptions so credential requirements are visibl
 
 Installed/imported MCP command displays omit arguments and remote URLs because either may carry credentials; the saved execution configuration is unchanged. Installations recheck name availability under the settings locks and refuse conflicts rather than overwrite a server installed by another session. Smithery names use the same bare-key normalization as other MCP catalogs.
 
-A marketplace is a named index of plugins and skills. Dial bundles three curated skill catalogs:
+A marketplace is a named index of skills. Dial bundles three curated skill catalogs:
 
 | Marketplace | Upstream | Selection |
 |---|---|---|
@@ -241,31 +94,27 @@ A marketplace is a named index of plugins and skills. Dial bundles three curated
 
 These indexes ship in the binary: browsing and refreshing them requires no network and installs or executes nothing. They are curated selections, not complete mirrors of upstream repositories. Each entry targets its own skill directory (`#skills/<name>` or OpenAI's `#skills/.curated/<name>`). The added OpenAI and Vercel paths and frontmatter were checked against upstream `SKILL.md` files. Listings use package directory names; installed skill names may differ (for example, Vercel's `react-best-practices` package provides `vercel-react-best-practices`). Upstream skills may assume other harness tools or external dependencies; review the skill and its license before explicitly installing or using it. Refreshing a built-in catalog does not discover new upstream entries; catalog updates ship with Dial.
 
-Add an index with the Marketplaces tab (`a`, then a name and an `https://` URL or local JSON file), `/marketplace add <name> <index>`, or `dial plugin marketplace add <name> <index>`. Turn one on or off with `e` (or `/marketplace enable|disable <name>`, `dial plugin marketplace enable|disable <name>`), and remove it with `x`. Removing a marketplace leaves what it installed in place.
+Add an index with the Marketplaces tab (`a`, then a name and an `https://` URL or local JSON file) or `/marketplace add <name> <index>`. Turn one on or off with `e` (or `/marketplace enable|disable <name>`), and remove it with `x`. Removing a marketplace leaves what it installed in place.
 
-Index format (`plugins` and `skills` are both optional):
+Index format:
 
 ```json
 {
-  "plugins": [
-    {"name": "alpha", "version": "1.0.0", "source": "git+https://example.com/alpha.git#v1.0.0", "description": "Example plugin"}
-  ],
   "skills": [
     {"name": "code-review", "description": "Review diffs for correctness", "url": "https://github.com/acme/skills.git#skills/code-review"}
   ]
 }
 ```
 
-- A plugin `source` is `git+<url>[#ref]`, `npm:<name>[@version]` or `file:<dir>`, as for `dial plugin install`.
 - A skill `url` uses the skill package syntax (`url[@ref][#path]`), so the path and symlink checks above apply.
-- Claude Code `.claude-plugin/marketplace.json` files are not read: their plugin sources are objects, not strings. Use a Dial-format index instead.
+- Claude Code `.claude-plugin/marketplace.json` files are not read. Use a Dial-format index instead.
 
 Marketplace state lives in `~/.dial/marketplaces/marketplaces.json`, which Dial writes. Each entry has `index`, `enabled` (default `true`) and `refreshed_at`. Downloaded snapshots sit beside it as `<name>.json`. Built-in catalogs use `index: "builtin"` and their marketplace name selects the bundled index. `seeded_builtins` tracks which catalogs were offered, so new catalogs appear once without restoring removed ones or re-enabling disabled ones. Migration honors the legacy `seeded` marker for the original Anthropic catalog and preserves existing custom indexes, including name collisions. Browsing does not write state; these migration markers persist on the next marketplace change. Removing a catalog never removes its installed skills.
 
 
 ## Configuration files
 
-Repository files are never read as configuration. Settings come from the user's global `~/.dial/config.toml`, the per-project `config.toml` in Dial's state directory (`~/.dial/projects/<name>-<hash>/config.toml`, outside the workspace and user-owned), and command-line flags, merged in that order. Hooks and extensions may be configured in either file. `/settings sources` reports effective key provenance. Live reload keeps the last valid configuration when a changed file cannot be parsed.
+Repository files are never read as configuration. Settings come from the user's global `~/.dial/config.toml`, the per-project `config.toml` in Dial's state directory (`~/.dial/projects/<name>-<hash>/config.toml`, outside the workspace and user-owned), and command-line flags, merged in that order. Hooks may be configured in either file. `/settings sources` reports effective key provenance. Live reload keeps the last valid configuration when a changed file cannot be parsed.
 
 ## Plan mode
 
@@ -340,10 +189,10 @@ see [Writing and evaluating skills](skills.md). Skills are procedures, not execu
 
 ## Rust embedding SDK
 
-The Rust SDK exposes `extensions::{Extension, ExtensionHost, Command}`, versioned `tools::ext::Tool`,
-atomic tool registration and observational lifecycle events. Operator-trusted extensions can register
-tools, prompt commands and render panels through `Ui`; executions still pass the agent's normal
-validation/approval boundaries. It is a Rust embedding API, not a loader for arbitrary workspace plugins.
+The Rust SDK exposes `extensions::{Extension, ExtensionHost, Command}` and versioned
+`tools::ext::Tool` with atomic tool registration. Operator-trusted extensions can register tools and
+prompt commands; executions still pass the agent's normal validation/approval boundaries. It is a Rust
+embedding API, not a loader for arbitrary workspace programs.
 
 ## Lifecycle hooks, path permissions, isolated workers and schedules
 
@@ -503,7 +352,7 @@ next session; `/mcp` shows its status. Smithery servers still install through th
 (`/extensions` → `i`, or `/mcp smithery-install`). Archived upstream packages (Brave, Slack,
 GitLab, Puppeteer) are listed with that note because they still install.
 
-MCP lists refresh while the session runs. A server that sends `notifications/tools/list_changed`, `resources/list_changed`, or `prompts/list_changed` is re-listed once: tool announcements are debounced for 100 ms and a refresh that is already running is not repeated, so a burst of announcements costs one `tools/list`. Tools change only at the next model request, never mid-request. A tool the server removed refuses calls with "removed by its server", and a tool whose definition changed gets a new identity and is offered from the next request. A failed re-list keeps the previous list and shows a notice. Each session keeps at most 64 pending events and 16 notices, dropping the oldest first; hook plugins that observe `mcp_notification` receive these events. Resource and prompt listings are cached until the server announces a change.
+MCP lists refresh while the session runs. A server that sends `notifications/tools/list_changed`, `resources/list_changed`, or `prompts/list_changed` is re-listed once: tool announcements are debounced for 100 ms and a refresh that is already running is not repeated, so a burst of announcements costs one `tools/list`. Tools change only at the next model request, never mid-request. A tool the server removed refuses calls with "removed by its server", and a tool whose definition changed gets a new identity and is offered from the next request. A failed re-list keeps the previous list and shows a notice. Each session keeps at most 16 notices, dropping the oldest first. Resource and prompt listings are cached until the server announces a change.
 
 `/mcp prompt <server> <name> [key=value…]` fetches a prompt and puts its rendered messages in the composer for review; it is not sent. Arguments are split like shell words, so a value with spaces can be quoted (`topic="release notes"`); an unclosed quote or an argument without `=` is rejected with the usage line. Non-text content is shown as `[<type> content omitted]`. Output is sanitized before it reaches the composer. The fetch runs as a background job, so the UI stays responsive; when it finishes, the prompt is appended below any draft already in the composer. Cancel it with the usual job cancel, and only one background operation runs at a time.
 
@@ -513,5 +362,6 @@ Portable rules may declare `astCondition` (one pattern or a bounded list) and an
 `astLanguage`. Structural matching inspects finalized source-bearing tool arguments before effects,
 including native editor replacement and insertion fragments. It does not parse incomplete streamed
 JSON or claim to lint the complete prospective file. File scopes use the editor's native target
-parser, including sloppy-editor paths and rename destinations. AST rules cannot use judged-question
-triggers. Invalid grammar and matching-budget failures stop the proposed execution.
+parser, including sloppy-editor paths and rename destinations. On a judged `question` rule,
+`astCondition` only prefilters which tool calls are judged. Invalid grammar and matching-budget
+failures stop the proposed execution. See [Stream rules](stream-rules.md) for the full rule format.

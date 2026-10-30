@@ -11,9 +11,10 @@ fn setup() -> (
     let workspace = Workspace::new(root.path())
         .unwrap()
         .with_edit_mode(crate::tools::EditMode::Hashline);
-    let mut config = crate::config::types::Config::default();
-    config.extensions.enabled = false;
-    config.integrations = vec!["ast_search".into(), "read".into(), "grep".into()];
+    let config = crate::config::types::Config {
+        integrations: vec!["ast_search".into(), "read".into(), "grep".into()],
+        ..Default::default()
+    };
     let registry = Registry::standard(&config, Vec::new());
     (root, workspace, config, registry)
 }
