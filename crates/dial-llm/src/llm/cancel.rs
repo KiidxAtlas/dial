@@ -260,6 +260,7 @@ impl<T: Transport> Connector<T> for CancelConnector {
             inner,
             interrupt: Arc::clone(&self.interrupt),
             patience: self.patience.clone(),
+            send_closed: false,
             send_failure: None,
         }))
     }
@@ -270,7 +271,10 @@ struct CancelTransport<T> {
     inner: T,
     interrupt: Arc<AtomicBool>,
     patience: Option<Patience>,
-    /// The peer closed the connection while the request was being sent (see [`early_close`]).
+    /// The peer closed the connection while the request was being sent (see [`early_close`]);
+    /// the connection is never reused afterwards.
+    send_closed: bool,
+    /// Why the send stopped, reported if the peer closed without answering.
     send_failure: Option<std::io::Error>,
 }
 impl<T: Transport> CancelTransport<T> {
@@ -283,16 +287,13 @@ impl<T: Transport> CancelTransport<T> {
 /// body) and then close, which resets the connection under the remaining write. That answer is the
 /// real outcome, so the send stops and the response is read; a close with no answer still fails
 /// with the original send error. The TLS handshake is not a request phase and is never covered.
-fn early_close(error: &ureq::Error, reason: ureq::Timeout) -> bool {
+fn early_close(io: &std::io::Error, reason: ureq::Timeout) -> bool {
     matches!(
         reason,
         ureq::Timeout::SendRequest | ureq::Timeout::SendBody
     ) && matches!(
-        error,
-        ureq::Error::Io(io) if matches!(
-            io.kind(),
-            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
-        )
+        io.kind(),
+        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
     )
 }
 
@@ -302,17 +303,15 @@ impl<T: Transport> Transport for CancelTransport<T> {
     }
     fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
         self.check()?;
-        if self.send_failure.is_some() {
+        if self.send_closed {
             // The peer stopped reading; the rest of the request is dropped, never replayed.
             return Ok(());
         }
         // A partial write must never be replayed; the TCP transport resumes at the sent offset and
         // checks the interrupt between short write slices.
         match self.inner.transmit_output(amount, timeout) {
-            Err(error) if early_close(&error, timeout.reason) => {
-                let ureq::Error::Io(io) = error else {
-                    unreachable!("early_close matches only I/O errors")
-                };
+            Err(ureq::Error::Io(io)) if early_close(&io, timeout.reason) => {
+                self.send_closed = true;
                 self.send_failure = Some(io);
                 Ok(())
             }
@@ -344,18 +343,23 @@ impl<T: Transport> Transport for CancelTransport<T> {
             };
             match self.inner.await_input(slice) {
                 Err(ureq::Error::Timeout(_)) => continue,
-                // Nothing arrived after the peer closed mid-send: report why the send stopped.
-                Ok(false) | Err(_) if self.send_failure.is_some() => {
-                    return Err(self.send_failure.take().expect("checked above").into());
+                Ok(true) => {
+                    // The peer answered; its response decides the outcome.
+                    self.send_failure = None;
+                    return Ok(true);
                 }
-                result => return result,
+                // Nothing arrived after the peer closed mid-send: report why the send stopped.
+                result => {
+                    return match self.send_failure.take() {
+                        Some(io) => Err(io.into()),
+                        None => result,
+                    };
+                }
             }
         }
     }
     fn is_open(&mut self) -> bool {
-        self.send_failure.is_none()
-            && !self.interrupt.load(Ordering::SeqCst)
-            && self.inner.is_open()
+        !self.send_closed && !self.interrupt.load(Ordering::SeqCst) && self.inner.is_open()
     }
     fn is_tls(&self) -> bool {
         self.inner.is_tls()
