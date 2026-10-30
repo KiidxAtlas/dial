@@ -12,6 +12,7 @@ import http.server
 import json
 import os
 import pathlib
+import re
 import shlex
 import signal
 import subprocess
@@ -298,18 +299,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.call(index, "task", {"action": "create", "concurrency": 1, "tasks": [
                     {"agent": "scout", "task": "PTY-POOL-FIRST complete the first item", "solution_space": "read-only"},
                 ]})
-            reports = []
-            for message in messages:
-                if message["role"] != "tool" or not isinstance(message.get("content"), str):
-                    continue
-                try:
-                    report = json.loads(message["content"])
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(report, dict) and str(report.get("id", "")).startswith("pool-"):
-                    reports.append(report)
-            assert reports, "pool creation did not expose its usable id"
-            pool_id = reports[-1]["id"]
+            # The model sees the readable pool summary ("Worker pool pool-1: running; ..."), not the
+            # typed report, which observers keep in the tool output's data.
+            pool_ids = [match.group(1) for message in messages
+                        if message["role"] == "tool" and isinstance(message.get("content"), str)
+                        for match in [re.match(r"Worker pool (pool-\d+):", message["content"])] if match]
+            assert pool_ids, "pool creation did not expose its usable id"
+            pool_id = pool_ids[-1]
             if "push" not in actions:
                 return self.call(index, "task", {"action": "push", "id": pool_id, "tasks": [
                     {"agent": "scout", "task": "PTY-POOL-SECOND continue on the retained worker", "solution_space": "read-only"},
