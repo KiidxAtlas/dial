@@ -260,6 +260,7 @@ impl<T: Transport> Connector<T> for CancelConnector {
             inner,
             interrupt: Arc::clone(&self.interrupt),
             patience: self.patience.clone(),
+            send_failure: None,
         }))
     }
 }
@@ -269,21 +270,54 @@ struct CancelTransport<T> {
     inner: T,
     interrupt: Arc<AtomicBool>,
     patience: Option<Patience>,
+    /// The peer closed the connection while the request was being sent (see [`early_close`]).
+    send_failure: Option<std::io::Error>,
 }
 impl<T: Transport> CancelTransport<T> {
     fn check(&self) -> Result<(), ureq::Error> {
         check(&self.interrupt)
     }
 }
+
+/// A server may answer before reading the whole request (a rate limit, an oversized or invalid
+/// body) and then close, which resets the connection under the remaining write. That answer is the
+/// real outcome, so the send stops and the response is read; a close with no answer still fails
+/// with the original send error. The TLS handshake is not a request phase and is never covered.
+fn early_close(error: &ureq::Error, reason: ureq::Timeout) -> bool {
+    matches!(
+        reason,
+        ureq::Timeout::SendRequest | ureq::Timeout::SendBody
+    ) && matches!(
+        error,
+        ureq::Error::Io(io) if matches!(
+            io.kind(),
+            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+        )
+    )
+}
+
 impl<T: Transport> Transport for CancelTransport<T> {
     fn buffers(&mut self) -> &mut dyn Buffers {
         self.inner.buffers()
     }
     fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
         self.check()?;
+        if self.send_failure.is_some() {
+            // The peer stopped reading; the rest of the request is dropped, never replayed.
+            return Ok(());
+        }
         // A partial write must never be replayed; the TCP transport resumes at the sent offset and
         // checks the interrupt between short write slices.
-        self.inner.transmit_output(amount, timeout)
+        match self.inner.transmit_output(amount, timeout) {
+            Err(error) if early_close(&error, timeout.reason) => {
+                let ureq::Error::Io(io) = error else {
+                    unreachable!("early_close matches only I/O errors")
+                };
+                self.send_failure = Some(io);
+                Ok(())
+            }
+            result => result,
+        }
     }
     fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
         let started = Instant::now();
@@ -310,12 +344,18 @@ impl<T: Transport> Transport for CancelTransport<T> {
             };
             match self.inner.await_input(slice) {
                 Err(ureq::Error::Timeout(_)) => continue,
+                // Nothing arrived after the peer closed mid-send: report why the send stopped.
+                Ok(false) | Err(_) if self.send_failure.is_some() => {
+                    return Err(self.send_failure.take().expect("checked above").into());
+                }
                 result => return result,
             }
         }
     }
     fn is_open(&mut self) -> bool {
-        !self.interrupt.load(Ordering::SeqCst) && self.inner.is_open()
+        self.send_failure.is_none()
+            && !self.interrupt.load(Ordering::SeqCst)
+            && self.inner.is_open()
     }
     fn is_tls(&self) -> bool {
         self.inner.is_tls()
