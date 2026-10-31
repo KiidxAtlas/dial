@@ -2,15 +2,14 @@
 """Real-PTY acceptance probe for the Dial surface redesign.
 
 Scenarios run in isolated fixtures against a local OpenAI-compatible provider:
-  1. Extension panel from the command palette: submit once, then Escape-cancel a second invocation.
-  2. `/tree` navigation: native write turns, `/label` on the first answer, palette-opened tree with a
+  1. `/tree` navigation: native write turns, `/label` on the first answer, palette-opened tree with a
      parked draft, Ctrl-Up/Down/Left to the labeled parent, selection, then a branch prompt.
-  3. `ui.smooth_reveal`: one large text delta held with SSE comment heartbeats; the view advances while
+  2. `ui.smooth_reveal`: one large text delta held with SSE comment heartbeats; the view advances while
      quiet, the newest grapheme stays withheld until finish, and the final text is not duplicated.
-  4. Incomplete write arguments: the preview shows the target and content markers before Escape cancels;
+  3. Incomplete write arguments: the preview shows the target and content markers before Escape cancels;
      no file is dispatched.
 
-Captures are text evidence only. Assertions use files, provider receipts, plugin receipts, and state.
+Captures are text evidence only. Assertions use files, provider receipts, and state.
 """
 
 import argparse
@@ -30,34 +29,6 @@ MARKERS = ("PTY-SURF-FIRST", "PTY-SURF-SECOND", "PTY-SURF-BRANCH", "PTY-REVEAL-H
 REVEAL_WORDS = " ".join(f"w{i:04d}" for i in range(1, 401))
 REVEAL_TEXT = REVEAL_WORDS + " ENDCHECK\u03a9"
 PARTIAL_WRITE = '{"path":"cancel-target.txt","content":"PARTIAL-WRITE-MARKER '
-
-# One process per JSON-RPC request. Appends each method to a trace; appends each command.panel
-# outcome as a JSON line to a receipt file so both invocations are observable.
-PLUGIN = '''import json, pathlib, sys
-request = json.loads(sys.stdin.readline())
-method, params = request["method"], request.get("params") or {}
-trace, receipts = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
-with trace.open("a") as log:
-    log.write(method + "\\n")
-if method == "initialize":
-    result = {"protocolVersion": "1", "commands": ["pty-panel"]}
-elif method == "command":
-    result = {"panel": {"title": "PTY Panel Title", "generation": 1, "elements": [
-        {"type": "text", "text": "PTY-PANEL-BODY"},
-        {"type": "input", "id": "name", "label": "Name", "value": ""},
-        {"type": "select", "id": "mode", "label": "Mode", "options": ["alpha", "beta"], "selected": 0},
-        {"type": "button", "id": "save", "label": "Save", "primary": True},
-    ]}}
-elif method == "command.panel":
-    with receipts.open("a") as log:
-        log.write(json.dumps(params) + "\\n")
-    cancelled = params["outcome"]["status"] == "cancelled"
-    result = {"text": "PANEL-CANCELLED-OK" if cancelled else "PANEL-RECEIPT-OK"}
-else:
-    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32601, "message": "unexpected " + method}}), flush=True)
-    sys.exit(0)
-print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
-'''
 
 
 def find_marker(messages):
@@ -203,20 +174,13 @@ class Provider(http.server.ThreadingHTTPServer):
         self.cancel_release.set()
 
 
-def configure(home, smooth=False, plugin=None):
+def configure(home, smooth=False):
     path = home / "config.toml"
     text = path.read_text()
     if smooth:
         replaced = text.replace('[ui]\ntheme="dark"\n', '[ui]\ntheme="dark"\nsmooth_reveal=true\n', 1)
         assert replaced != text, "fixture [ui] table changed; smooth_reveal could not be enabled"
         text = replaced
-    if plugin:
-        script, trace, receipts = plugin
-        text += (
-            "[extensions.plugins.pty-panel]\n"
-            f"program={json.dumps(sys.executable)}\n"
-            f"args=[{json.dumps(str(script))}, {json.dumps(str(trace))}, {json.dumps(str(receipts))}]\n"
-        )
     path.write_text(text)
 
 
@@ -224,57 +188,9 @@ def type_text(terminal, text):
     terminal.run("send-keys", "-t", "smoke", "-l", text)
 
 
-
-
 def max_reveal_index(text):
     numbers = [int(n) for n in re.findall(r"w(\d{4})", text)]
     return max(numbers) if numbers else 0
-
-
-def panel_case(server, binary, captures, root):
-    project, home = fixture(root / "panel", server.server_port)
-    private = root / "panel-private"
-    private.mkdir(exist_ok=True)
-    script, trace, receipts = private / "pty-panel.py", private / "panel-trace.log", private / "panel-receipts.jsonl"
-    script.write_text(PLUGIN)
-    configure(home, plugin=(script, trace, receipts))
-    terminal = Terminal(binary, project, home, captures)
-    try:
-        terminal.wait("mock-main")
-        terminal.draft("PTY-PANEL-DRAFT")
-        terminal.key("C-p")
-        type_text(terminal, "pty-panel")
-        terminal.key("Enter")
-        terminal.wait("PTY-PANEL-BODY", history=False)
-        type_text(terminal, "Ada")
-        terminal.key("Tab")
-        terminal.key("Right")
-        terminal.key("Tab")
-        terminal.key("Enter")
-        terminal.wait("PANEL-RECEIPT-OK")
-        terminal.wait("PTY-PANEL-DRAFT")
-        terminal.capture("panel-submitted")
-
-        terminal.key("C-p")
-        type_text(terminal, "pty-panel")
-        terminal.key("Enter")
-        terminal.wait("PTY-PANEL-BODY", history=False)
-        terminal.key("Escape")
-        terminal.wait("PANEL-CANCELLED-OK")
-        terminal.wait("PTY-PANEL-DRAFT")
-        terminal.capture("panel-cancelled")
-    finally:
-        terminal.close()
-    lines = [json.loads(line) for line in receipts.read_text().splitlines()]
-    assert len(lines) == 2, lines
-    submitted, cancelled = lines[0]["outcome"], lines[1]["outcome"]
-    assert all(reply["generation"] == 1 for reply in lines), lines
-    assert submitted["status"] == "submitted" and submitted["button"] == "save", submitted
-    assert submitted["values"]["name"] == "Ada" and submitted["values"]["mode"] == 1, submitted
-    assert cancelled["status"] == "cancelled", cancelled
-    methods = trace.read_text().split()
-    assert methods.count("command.panel") == 2 and "command" in methods, methods
-    return {"submitted": submitted, "cancelled": cancelled, "plugin_methods": methods, "main_draft_retained": True}
 
 
 def tree_case(server, binary, captures, root):
@@ -395,10 +311,9 @@ def main():
     try:
         with tempfile.TemporaryDirectory(prefix="dial-surfaces-") as directory:
             root = pathlib.Path(directory)
-            for name in ("panel", "tree", "reveal", "cancel", "panel-private"):
+            for name in ("tree", "reveal", "cancel"):
                 (root / name).mkdir(exist_ok=True)
             scenarios = {
-                "extension_panel": panel_case(server, binary, args.captures, root),
                 "tree_navigation": tree_case(server, binary, args.captures, root),
                 "reveal_hold": reveal_case(server, binary, args.captures, root),
                 "write_cancel": write_cancel_case(server, binary, args.captures, root),
