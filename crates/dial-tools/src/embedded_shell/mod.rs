@@ -129,6 +129,7 @@ pub fn run_host_with_state(script_path: &Path, state_path: Option<&Path>) -> i32
             return 2;
         }
     };
+    let inherited = state::inherited_env();
     runtime.block_on(async move {
         let mut shell = match brush_core::Shell::builder()
             .default_builtins(BuiltinSet::BashMode)
@@ -161,20 +162,18 @@ pub fn run_host_with_state(script_path: &Path, state_path: Option<&Path>) -> i32
         match shell.run_string(script, &source, &params).await {
             Ok(result) => {
                 if let Some(path) = state_path {
-                    let exported = shell
-                        .env()
-                        .iter_exported()
-                        .filter_map(|(name, variable)| {
+                    let exported = state::changed_exports(
+                        shell.env().iter_exported().filter_map(|(name, variable)| {
                             if let brush_core::variables::ShellValue::String(value) =
                                 variable.value()
-                                && state::allowed(name, value)
                             {
                                 Some((name.clone(), value.clone()))
                             } else {
                                 None
                             }
-                        })
-                        .collect();
+                        }),
+                        &inherited,
+                    );
                     let state = state::State {
                         schema_version: 1,
                         completed: true,

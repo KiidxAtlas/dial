@@ -105,6 +105,54 @@ fn named_session_restores_cwd_and_env_after_a_job_and_refuses_while_busy() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn named_state_saves_only_changed_exports_with_a_large_inherited_environment() {
+    use dial::embedded_shell::state::{Exchange, State};
+    use std::process::Command;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().canonicalize().unwrap();
+    let mut seed = State::new(&cwd);
+    seed.exported.insert("SEEDED_VAR".into(), "retained".into());
+    let exchange = Exchange::new(dir.path(), &seed).unwrap();
+    let script = dir.path().join("state.sh");
+    let inherited: Vec<_> = (0..300)
+        .map(|i| (format!("CI_FILLER_{i}"), format!("value-{i}")))
+        .collect();
+    let run = || {
+        let output = Command::new(env!("CARGO_BIN_EXE_dial"))
+            .arg(dial::embedded_shell::HOST_ARG)
+            .arg(&script)
+            .arg(exchange.path())
+            .current_dir(&cwd)
+            .envs(inherited.iter().cloned())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "host failed: {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let state = exchange.read().unwrap();
+        assert!(state.completed);
+        assert_eq!(state.exported["SEEDED_VAR"], "retained");
+        assert_eq!(state.exported["NAMED_VAR"], "kept");
+        assert_eq!(state.exported["CI_FILLER_2"], "changed");
+        assert!(
+            !state.exported.contains_key("CI_FILLER_1"),
+            "an unchanged inherited variable consumed the state budget"
+        );
+    };
+
+    std::fs::write(&script, "export NAMED_VAR=kept CI_FILLER_2=changed\n").unwrap();
+    run();
+    // The next command must retain the previous command's delta, not just new changes.
+    std::fs::write(&script, "test \"$NAMED_VAR\" = kept\n").unwrap();
+    run();
+}
+
 /// Unit fixtures re-execute a test helper; this checks the shipping binary's private entry point.
 #[cfg(unix)]
 #[test]

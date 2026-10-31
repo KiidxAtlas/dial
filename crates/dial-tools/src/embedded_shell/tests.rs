@@ -61,3 +61,32 @@ fn discard_script_removes_only_dial_script_files() {
     discard_script([HOST_ARG.to_owned(), other.display().to_string()]);
     assert!(other.exists());
 }
+
+#[test]
+fn saved_exports_keep_only_allowed_changes_against_the_inherited_baseline() {
+    // A CI runner exports far more than the 128-entry state budget; only the shell's own
+    // allowed changes are kept.
+    let inherited: std::collections::BTreeMap<String, String> = (0..300)
+        .map(|i| (format!("CI_VAR_{i}"), format!("value-{i}")))
+        .collect();
+    let exported = inherited.clone().into_iter().chain([
+        ("CI_VAR_0".to_owned(), "changed".to_owned()),
+        ("NAMED_VAR".to_owned(), "kept".to_owned()),
+        ("GITHUB_TOKEN".to_owned(), "secret".to_owned()),
+        ("HOME".to_owned(), "/elsewhere".to_owned()),
+    ]);
+
+    let delta = state::changed_exports(exported, &inherited);
+    assert_eq!(
+        delta.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["CI_VAR_0", "NAMED_VAR"]
+    );
+    assert_eq!(delta["CI_VAR_0"], "changed");
+    let saved = state::State {
+        schema_version: 1,
+        completed: true,
+        cwd: PathBuf::from("/"),
+        exported: delta,
+    };
+    assert!(saved.validate().is_ok());
+}

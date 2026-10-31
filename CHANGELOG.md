@@ -24,6 +24,7 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ### Changed
 
+- Named embedded-shell sessions save only exported changes from the inherited host environment, preventing large CI environments from exhausting the bounded state exchange. The 128-variable and 256 KiB limits and protected-variable filtering remain in force (`docs/shell.md`).
 - Long-history housekeeping now uses incremental worker-activity projections, shared token/wire accounting, dirty-node runtime flushing and candidate-scoped ambient source validation. Content hashes and scope coverage remain authoritative for remembered findings; no stat-only freshness cache is introduced. The offline runtime baseline adds deterministic long-history workloads without claiming model-quality gains or a measured end-to-end speedup (`docs/benchmarks.md`, `docs/subagents.md`, `ARCHITECTURE.md`).
 - `tool_search` can enumerate eligible tools in bounded pages without activating them, giving models a general fallback when a capability search misses (`docs/agent-loop.md`).
 - Plan mode can discover read-only computer actions without permitting desktop input (`docs/agent-loop.md`).

@@ -106,3 +106,29 @@ pub fn read(path: &Path) -> Result<State, String> {
     state.validate()?;
     Ok(state)
 }
+
+/// The process environment the host started with.
+pub fn inherited_env() -> BTreeMap<String, String> {
+    std::env::vars_os()
+        .map(|(name, value)| {
+            (
+                name.to_string_lossy().into_owned(),
+                value.to_string_lossy().into_owned(),
+            )
+        })
+        .collect()
+}
+
+/// Keeps only the exports the shell created or changed and that may be saved. An inherited
+/// variable with an unchanged value is already present for the next command, so saving it would
+/// count the whole host environment against the state budget. `allowed` still applies to every
+/// export, so blocked names never reach the saved state.
+pub fn changed_exports(
+    exported: impl IntoIterator<Item = (String, String)>,
+    inherited: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    exported
+        .into_iter()
+        .filter(|(name, value)| allowed(name, value) && inherited.get(name) != Some(value))
+        .collect()
+}

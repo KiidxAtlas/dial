@@ -62,7 +62,9 @@ Explicit and automatic background handoff retain the session claim until the job
 Normal completion publishes state even for a nonzero exit code; cancellation, timeout, a signal
 or an incomplete state exchange invalidates it. Functions, unexported variables and process-restart
 persistence are not retained. Protected host variables and credentials are excluded, and each
-command keeps the ordinary sandbox policy.
+command keeps the ordinary sandbox policy. Saved exports contain only changes from the host's
+inherited environment, so unchanged runner variables do not consume the 128-variable, 256 KiB
+state budget. Previously retained session changes remain available on later commands.
 
 ## Output minimizer
 
