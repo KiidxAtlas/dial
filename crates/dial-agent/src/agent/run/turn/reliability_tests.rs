@@ -39,8 +39,7 @@ fn a_new_turn_recovers_a_failed_stream_writer_without_replaying_the_failed_turn(
 
         let error = agent
             .turn("Do not replay this request", &mut NullUi)
-            .err()
-            .expect("the first turn must stop on the failed journal write");
+            .expect_err("the first turn must stop on the failed journal write");
         assert!(
             error.to_string().contains("stream journal failed"),
             "{error:#}"
@@ -374,6 +373,32 @@ const NOTE_CHECK: &str = "[compaction]\nenabled=false\n[[verification.commands]]
 /// The endpoint's slot probe (`GET /props`) follows the first request; a valid answer is cached.
 fn slots() -> llm::fake::Script {
     llm::fake::json(200, &json!({"total_slots":1}))
+}
+
+#[test]
+fn a_write_and_known_check_in_one_response_run_in_order() {
+    let server = llm::fake::serve(vec![
+        calls(&[
+            ("write", json!({"path":"note.txt","content":"ready\n"})),
+            ("bash", json!({"command":"test -f note.txt"})),
+        ]),
+        slots(),
+        response("The note is ready.", None),
+    ]);
+    with_agent(NOTE_CHECK, |agent| {
+        connect(agent, &server.url);
+        let report = agent.turn("Write and check the note", &mut NullUi).unwrap();
+        assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+        assert_eq!(
+            std::fs::read_to_string(agent.workspace.root().join("note.txt")).unwrap(),
+            "ready\n"
+        );
+        assert_eq!(
+            agent.step_checks.evidence.latest_status("test -f note.txt"),
+            Some(crate::agent::verify::verification::CheckStatus::Passed)
+        );
+    });
+    assert_eq!(completion_requests(&server).len(), 2);
 }
 
 const FAILING_NOTE_CHECK: &str = "[compaction]\nenabled=false\n[[verification.commands]]\nname=\"notes\"\ncommand=\"echo note check failed; exit 1\"\nfile_extensions=[\"txt\"]\ntimeout_secs=5\n";
@@ -809,5 +834,109 @@ fn file_handles_are_projected_for_the_model_but_expanded_for_approval_and_ui() {
             .iter()
             .any(|request| request["messages"].to_string().contains("dial_model_")),
         "private projections are not wire fields"
+    );
+}
+
+#[test]
+fn a_known_tool_typed_into_bash_gets_tool_load_guidance_and_the_unchanged_retry_stays_withheld() {
+    // `todo` is a Dial tool name that is not a shell program, so the real shell reports it missing.
+    let typed = json!({"command":"todo list"});
+    let server = llm::fake::serve(vec![
+        calls(&[("bash", typed.clone())]),
+        slots(),
+        calls(&[("bash", typed)]),
+        response("Reported the limit.", None),
+    ]);
+    let report = with_agent("[compaction]\nenabled=false\n", |agent| {
+        connect(agent, &server.url);
+        agent.turn("Show the todo list", &mut NullUi).unwrap()
+    });
+    assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+    let requests = completion_requests(&server);
+    assert_eq!(requests.len(), 3);
+    let tool_results = |request: &Value| -> Vec<String> {
+        request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .map(|message| message["content"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    };
+    let first = tool_results(&requests[1]);
+    assert_eq!(first.len(), 1, "{first:?}");
+    assert!(
+        first[0].contains("tool_not_shell") && first[0].contains("tool_load"),
+        "{}",
+        first[0]
+    );
+    let second = tool_results(&requests[2]);
+    assert_eq!(second.len(), 2, "{second:?}");
+    assert_eq!(
+        second[0], first[0],
+        "the first result is replayed unchanged"
+    );
+    assert!(
+        second[1].contains("retry barrier") && second[1].contains("not executed again"),
+        "the identical retry must stay withheld: {}",
+        second[1]
+    );
+}
+
+#[test]
+fn an_empty_tool_search_keeps_the_raw_result_and_enables_no_new_capability() {
+    let server = llm::fake::serve(vec![
+        response("", Some(("tool_search", json!({"query":"zzqxjvkmnop"})))),
+        slots(),
+        response("No such capability is available.", None),
+    ]);
+    // Pin a small offer: context-budget trimming is independent of discovery and may remove
+    // incidental tools between requests. Here the callable surface must remain exactly stable.
+    let report = with_agent(
+        "[compaction]\nenabled=false\n[assistance]\ncompact_tools=true\n[harness]\ntools=['read','tool_search','tool_load']\n",
+        |agent| {
+            connect(agent, &server.url);
+            agent.turn("Find a zzqx capability", &mut NullUi).unwrap()
+        },
+    );
+    assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+    let requests = completion_requests(&server);
+    assert_eq!(requests.len(), 2);
+    let offered = |request: &Value| -> Vec<String> {
+        request["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert!(
+        offered(&requests[0])
+            .iter()
+            .any(|name| name == "tool_search"),
+        "tool_search must be offered, so the empty result comes from a real dispatch"
+    );
+    let result = requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "tool")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        result.starts_with("[]"),
+        "the raw empty result stays: {result}"
+    );
+    assert!(
+        result.contains("No tool was loaded") && result.contains("current configuration"),
+        "the next request carries the no-eligible note: {result}"
+    );
+    assert_eq!(
+        offered(&requests[0]),
+        offered(&requests[1]),
+        "an empty search must not change the next request's callable tools"
     );
 }

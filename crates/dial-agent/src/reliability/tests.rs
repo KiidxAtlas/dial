@@ -33,8 +33,10 @@ fn capability_deadline_aborts_incomplete_reply_without_scoring_it() {
         sync::{Arc, atomic::AtomicBool},
         time::Duration,
     };
+    // The stall outlasts the budget by far, and the budget is far above loopback connect latency,
+    // so the request reaches the server before the deadline even on a loaded machine.
     let server = crate::llm::fake::serve(vec![crate::llm::fake::Script::Stall {
-        silence: Duration::from_millis(250),
+        silence: Duration::from_secs(3),
     }]);
     let config = AppConfig::default();
     let mut backend = llm::provider::Backend::new(
@@ -59,7 +61,7 @@ fn capability_deadline_aborts_incomplete_reply_without_scoring_it() {
         &mut backend,
         &chat,
         &Arc::new(AtomicBool::new(false)),
-        Duration::from_millis(20),
+        Duration::from_millis(300),
     )
     .unwrap_err();
     assert!(
@@ -68,7 +70,8 @@ fn capability_deadline_aborts_incomplete_reply_without_scoring_it() {
             .contains("previous measured profile preserved"),
         "{error:#}"
     );
-    assert!(started.elapsed() < Duration::from_secs(2));
+    // Aborted by the deadline, not by the server closing the stalled stream.
+    assert!(started.elapsed() < Duration::from_millis(2500));
     assert_eq!(server.requests().len(), 1);
 }
 #[test]
@@ -210,4 +213,128 @@ fn busy_report_uses_session_snapshot_without_loading_saved_profile() {
     let value = live_report(&config, &control);
     assert_eq!(value["measured"]["passed"], 4);
     assert!(render(&value).contains("1 successful / 2 calls"));
+}
+#[test]
+fn batch_permission_and_single_call_agree_on_partial_fixtures() {
+    let mut config = AppConfig::default();
+    config.reliability.measured_interfaces = true;
+    for (record, permitted) in [
+        (json!({"batch_passed":true,"passed":6,"total":6}), true),
+        (json!({"batch_passed":true,"passed":5,"total":6}), false),
+        (json!({"batch_passed":false,"passed":6,"total":6}), false),
+    ] {
+        assert_eq!(batch_permitted(&record), permitted, "{record}");
+        assert_eq!(
+            single_call(&config, Some(&record), &Stats::default()),
+            !permitted,
+            "{record}"
+        );
+    }
+}
+#[test]
+fn route_report_shows_only_the_redacted_hosted_endpoint() {
+    let root = tempfile::tempdir().unwrap();
+    let config = AppConfig {
+        state_dir: root.path().into(),
+        endpoint: Some(
+            serde_json::from_value(json!({
+                "base_url": "https://user:pass@api.example.com/v1?key=secret"
+            }))
+            .unwrap(),
+        ),
+        ..Default::default()
+    };
+    let value = route(&config);
+    assert_eq!(value["endpoint"], "https://api.example.com/v1");
+    assert_eq!(value["local"], false);
+    assert!(value["server"].is_null(), "hosted routes are never asked");
+    let text = value.to_string();
+    assert!(
+        !text.contains("secret") && !text.contains("user:pass"),
+        "{text}"
+    );
+    let rendered = render(&json!({"enabled":true,"route":value}));
+    assert!(
+        rendered.contains("endpoint https://api.example.com/v1"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("secret"), "{rendered}");
+}
+#[test]
+fn binding_changes_with_context_window_and_sampling() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = AppConfig {
+        state_dir: root.path().into(),
+        ..Default::default()
+    };
+    let data = json!({"version":1,"measured_at":crate::learn::improve::now(),"binding":binding(&config),"batch_passed":true,"passed":7,"total":7});
+    std::fs::write(
+        root.path().join("reliability.json"),
+        serde_json::to_vec(&data).unwrap(),
+    )
+    .unwrap();
+    assert!(measured(&config).is_some());
+    config.context_window += 1;
+    assert!(
+        measured(&config).is_none(),
+        "a changed window is a new binding"
+    );
+    config.context_window -= 1;
+    config.assistance.local.sampling = crate::config::types::LocalSamplingSource::Harness;
+    assert!(
+        measured(&config).is_none(),
+        "a changed sampling source is a new binding"
+    );
+}
+#[test]
+fn session_snapshot_uses_the_turn_record_and_interface_without_probing() {
+    let root = tempfile::tempdir().unwrap();
+    let config = AppConfig {
+        state_dir: root.path().into(),
+        ..Default::default()
+    };
+    let record = json!({"batch_passed":true,"passed":7,"total":7,"cases":[]});
+    let value = route_snapshot(&config, 4096, Some(&record), true);
+    assert_eq!(value["selected_interface"], "one_call");
+    assert_eq!(value["selected_interface_source"], "this session");
+    assert_eq!(value["context_window"]["effective"], 4096);
+    assert_eq!(value["server_probed"], false);
+    assert!(value["server"].is_null());
+    assert_eq!(
+        route_snapshot(&config, 4096, Some(&record), false)["selected_interface"],
+        "batch"
+    );
+    assert!(route_snapshot(&config, 4096, None, false)["measured"].is_null());
+}
+#[test]
+fn live_report_reads_only_the_session_snapshot() {
+    let root = tempfile::tempdir().unwrap();
+    let config = AppConfig {
+        state_dir: root.path().into(),
+        ..Default::default()
+    };
+    // A saved record that a live report must not read.
+    let saved = json!({"version":1,"measured_at":crate::learn::improve::now(),"binding":binding(&config),"batch_passed":true,"passed":9,"total":9});
+    std::fs::write(
+        root.path().join("reliability.json"),
+        serde_json::to_vec(&saved).unwrap(),
+    )
+    .unwrap();
+    let control = json!({"reliability":{"measured":{"passed":4,"total":7},"route":{"selected_interface":"batch"}}});
+    let value = live_report(&config, &control);
+    assert_eq!(value["measured"]["passed"], 4);
+    assert_eq!(value["route"]["selected_interface"], "batch");
+}
+#[test]
+fn only_a_failed_or_text_lifted_non_batch_case_is_a_native_failure() {
+    let failed = json!({"cases":[{"tool":"read","passed":true},{"tool":"edit","passed":false}]});
+    assert!(native_failure(&failed));
+    let batch_only =
+        json!({"cases":[{"tool":"read","passed":true},{"tool":"batch","passed":false}]});
+    assert!(!native_failure(&batch_only));
+    let lifted = json!({"cases":[{"tool":"read","passed":true,"native":false,"text_lifted":true}]});
+    assert!(
+        native_failure(&lifted),
+        "text-lifted calls are not native parsing"
+    );
 }

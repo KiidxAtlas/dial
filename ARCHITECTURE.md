@@ -144,6 +144,15 @@ Changing a rule means editing that test and stating why here.
   Recovery marks unfinished nodes interrupted; rewind and fork restore only the active branch.
   These records never become provider chat roles. Structured tool data stays separate from its
   model-facing text, so protocol clients do not reconstruct objects from rendered summaries.
+  Persistence candidates are tracked by dirty node ID, not discovered by locking every historical
+  body. Mutations mark the ID under the body lock; journal acknowledgement clears it only when the
+  acknowledged snapshot matches the live body, including its content. Stale acknowledgements cannot
+  clear newer changes or replaced bodies, and failed session writes remain pending.
+- Ambient codebase retrieval re-hashes selected, walker-admitted source candidates within shared
+  byte, file and time bounds. A matched finding additionally requires a fresh whole-scope snapshot
+  with dependency, neighbourhood and inventory coverage; that snapshot is built lazily once per
+  retrieval, not reused across calls. Partial coverage never certifies a finding. Explicit recall
+  retains its complete bounded scan, and candidate validation never trusts only mtime or size.
 - Child configuration follows `Config::for_role`: inherit parent controls and model profile unless
   an explicit role assignment overrides them. Automatic steering/adaptation remain main-agent
   controls. Child permissions still use the parent policy; inheritance does not grant permissions.

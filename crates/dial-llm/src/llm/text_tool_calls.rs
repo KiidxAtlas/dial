@@ -1,6 +1,8 @@
-//! Text-embedded tool calls: `<tool_call>` blocks (Hermes JSON or Qwen3-Coder
-//! XML), Mistral `[TOOL_CALLS]`, Llama `<|python_tag|>`, gpt-oss harmony
-//! `to=functions.NAME` commentary, and strict fenced JSON calls.
+//! Text-embedded tool calls: `<tool_call>` blocks (Hermes JSON, Qwen3-Coder
+//! XML, or GLM `<arg_key>`/`<arg_value>` pairs), Mistral `[TOOL_CALLS]`, Llama
+//! `<|python_tag|>`, DeepSeek `<｜tool▁call▁begin｜>` and Kimi K2 `<|tool_call_begin|>`
+//! special-token calls, gpt-oss harmony `to=functions.NAME` commentary, and strict fenced JSON
+//! calls.
 //!
 //! Servers that do not parse a model's tool-call syntax return it as plain
 //! assistant text. [`apply`] lifts those calls into structured [`ToolCall`]s and
@@ -11,12 +13,24 @@
 //! cannot be read becomes a call with `malformed_arguments`, so the engine can
 //! tell the model its call was unreadable instead of dropping it silently.
 
+mod pythonic;
+
 use super::{Reply, ToolCall, normalize_arguments};
 use serde_json::Value;
 
 pub(super) const OPEN: &str = "<tool_call>";
 const CLOSE: &str = "</tool_call>";
 const FENCE: &str = "```";
+
+/// Whether `text` still holds the opener of a call form this module reads. [`apply`] lifts every
+/// such call, so this is true only for text that never went through it (a route that does not run
+/// it) or an opener it could not lift. Section markers alone are not calls.
+pub fn mentions_call_markup(text: &str) -> bool {
+    HIDE_OPENERS
+        .iter()
+        .filter(|marker| !SECTION_MARKERS.contains(marker))
+        .any(|marker| text.contains(marker))
+}
 
 /// When `reply` has no structured tool calls but its text contains textual
 /// ones, move them into `reply.tool_calls`, strip them from `reply.text`, and
@@ -29,6 +43,50 @@ pub(super) fn apply(reply: &mut Reply) {
         return;
     };
     reply.text = text;
+    reply.tool_calls = calls;
+    reply.finish_reason = "tool_calls".to_string();
+}
+
+/// Pythonic calls (`[read(path="a.rs")]`, see [`pythonic`]) when `reply` has no calls and its whole
+/// text is a list of calls to `offered` tools. These have no marker to recognise, so unlike
+/// [`apply`] this needs the offered names and callers run it only for local endpoints; the streamed
+/// text callback has already shown such a reply. Not checked against a live model.
+pub(super) fn apply_pythonic(reply: &mut Reply, offered: &[String]) {
+    if !reply.tool_calls.is_empty() || offered.is_empty() {
+        return;
+    }
+    let Some(calls) = pythonic::parse(&reply.text, offered) else {
+        return;
+    };
+    reply.tool_calls = calls
+        .into_iter()
+        .enumerate()
+        .map(|(index, (name, arguments))| ToolCall {
+            id: call_id(index),
+            name,
+            arguments,
+            malformed_arguments: false,
+        })
+        .collect();
+    reply.text.clear();
+    reply.finish_reason = "tool_calls".to_string();
+}
+
+/// A local model that ends its reasoning with a call and writes no answer text (the call sits inside
+/// an unclosed `<think>` block, or in the server's separate reasoning field) would otherwise end the
+/// turn empty. When `reply` has no calls and no text, the calls that close `reply.reasoning` are
+/// lifted. Only well-formed call markup counts, and only when nothing follows the last call:
+/// reasoning that merely discusses a call, or fenced JSON examples, never runs. The reasoning is
+/// left as it was.
+pub(super) fn apply_from_reasoning(reply: &mut Reply) {
+    if !reply.tool_calls.is_empty() || !reply.text.trim().is_empty() {
+        return;
+    }
+    let (segments, calls) = extract_markup(&reply.reasoning);
+    let closes = segments.last().is_some_and(|tail| tail.trim().is_empty());
+    if calls.is_empty() || !closes || calls.iter().any(|call| call.malformed_arguments) {
+        return;
+    }
     reply.tool_calls = calls;
     reply.finish_reason = "tool_calls".to_string();
 }
@@ -52,8 +110,38 @@ pub(super) fn extract(text: &str) -> Option<(String, Vec<ToolCall>)> {
     Some((kept.join("\n"), calls))
 }
 
-/// Markers that open a call, tried in order at each position.
-const HIDE_OPENERS: [&str; 4] = [OPEN, "<function=", "[TOOL_CALLS]", "<|python_tag|>"];
+/// DeepSeek V3/R1: `<｜tool▁call▁begin｜>function<｜tool▁sep｜>NAME` then the arguments in a
+/// ```` ```json ```` fence, ended by `<｜tool▁call▁end｜>`.
+const DEEPSEEK_CALL: &str = "<｜tool▁call▁begin｜>";
+const DEEPSEEK_SEP: &str = "<｜tool▁sep｜>";
+const DEEPSEEK_CALL_END: &str = "<｜tool▁call▁end｜>";
+/// Kimi K2: `<|tool_call_begin|>functions.NAME:IDX<|tool_call_argument_begin|>{json}<|tool_call_end|>`.
+const KIMI_CALL: &str = "<|tool_call_begin|>";
+const KIMI_ARGS: &str = "<|tool_call_argument_begin|>";
+const KIMI_CALL_END: &str = "<|tool_call_end|>";
+/// Section markers around one or more DeepSeek or Kimi calls. They carry no data and are removed
+/// with the calls they wrap.
+const SECTION_MARKERS: [&str; 4] = [
+    "<｜tool▁calls▁begin｜>",
+    "<｜tool▁calls▁end｜>",
+    "<|tool_calls_section_begin|>",
+    "<|tool_calls_section_end|>",
+];
+
+/// Markers that open a call (or, for the section markers, bracket calls), tried in order at each
+/// position. `Hider` withholds everything from the first of these, so streamed text never shows them.
+const HIDE_OPENERS: [&str; 10] = [
+    OPEN,
+    "<function=",
+    "[TOOL_CALLS]",
+    "<|python_tag|>",
+    DEEPSEEK_CALL,
+    KIMI_CALL,
+    SECTION_MARKERS[0],
+    SECTION_MARKERS[1],
+    SECTION_MARKERS[2],
+    SECTION_MARKERS[3],
+];
 /// gpt-oss harmony markers. A header counts only when it names `to=functions.NAME`.
 const HARMONY_OPENERS: [&str; 3] = ["<|start|>", "<|channel|>", TO_FUNCTION];
 const TO_FUNCTION: &str = "to=functions.";
@@ -112,6 +200,17 @@ fn parse_at(s: &str, index: usize) -> Option<(Vec<ToolCall>, usize)> {
         let (call, consumed) = parse_llama(after, index);
         return Some((vec![call], "<|python_tag|>".len() + consumed));
     }
+    if let Some(after) = s.strip_prefix(DEEPSEEK_CALL) {
+        let (call, consumed) = parse_deepseek(after, index);
+        return Some((vec![call], DEEPSEEK_CALL.len() + consumed));
+    }
+    if let Some(after) = s.strip_prefix(KIMI_CALL) {
+        let (call, consumed) = parse_kimi(after, index);
+        return Some((vec![call], KIMI_CALL.len() + consumed));
+    }
+    if let Some(marker) = SECTION_MARKERS.iter().find(|m| s.starts_with(*m)) {
+        return Some((Vec::new(), marker.len()));
+    }
     let (call, consumed) = parse_harmony(s, index)?;
     Some((vec![call], consumed))
 }
@@ -131,8 +230,6 @@ fn malformed(index: usize, name: String) -> ToolCall {
 
 /// Parse the text following an opening tag. Returns the call and how many bytes
 /// of `after` the block occupied (through the closing tag when present).
-/// Parse the text following an opening tag. Returns the call and how many bytes
-/// of `after` the block occupied (through the closing tag when present).
 fn parse_block(after: &str, index: usize) -> (ToolCall, usize) {
     let lead = after.len() - after.trim_start().len();
     if after[lead..].starts_with("<function=") {
@@ -141,6 +238,9 @@ fn parse_block(after: &str, index: usize) -> (ToolCall, usize) {
             call,
             lead + consumed + skip_close(&after[lead + consumed..]),
         );
+    }
+    if let Some((call, consumed)) = parse_glm(&after[lead..], index) {
+        return (call, lead + consumed);
     }
     // A JSON parser, not brace counting or a search for the closing tag: both
     // would be fooled by braces or `</tool_call>` inside argument strings.
@@ -270,6 +370,58 @@ fn strict_fenced_call(body: &str, index: usize) -> Option<ToolCall> {
     Some(call_from_value(&value, index))
 }
 
+const ARG_KEY: &str = "<arg_key>";
+const ARG_KEY_END: &str = "</arg_key>";
+const ARG_VALUE: &str = "<arg_value>";
+const ARG_VALUE_END: &str = "</arg_value>";
+
+/// GLM-4.5 and later: `NAME` followed by `<arg_key>K</arg_key><arg_value>V</arg_value>` pairs,
+/// ended by `</tool_call>` (or by the end of the text once every pair is closed). `body` follows
+/// the opening tag and its whitespace. `None` when the block does not have this shape, so JSON
+/// blocks are left to their own parser; otherwise the call and the bytes of `body` it occupies.
+fn parse_glm(body: &str, index: usize) -> Option<(ToolCall, usize)> {
+    let name_len = body
+        .find(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '-' | '.')))
+        .unwrap_or(body.len());
+    let name = &body[..name_len];
+    if !name.starts_with(|c: char| c.is_alphabetic() || c == '_') {
+        return None;
+    }
+    let mut rest = body[name_len..].trim_start();
+    if !(rest.starts_with(ARG_KEY) || rest.starts_with(CLOSE)) {
+        return None;
+    }
+    let mut arguments = serde_json::Map::new();
+    loop {
+        let trimmed = rest.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with(CLOSE) {
+            let closed = if trimmed.is_empty() { 0 } else { CLOSE.len() };
+            let call = ToolCall {
+                id: call_id(index),
+                name: name.to_string(),
+                arguments: Value::Object(arguments),
+                malformed_arguments: false,
+            };
+            return Some((call, body.len() - trimmed.len() + closed));
+        }
+        let pair = trimmed
+            .strip_prefix(ARG_KEY)
+            .and_then(|t| t.split_once(ARG_KEY_END))
+            .and_then(|(key, t)| Some((key.trim(), t.trim_start().strip_prefix(ARG_VALUE)?)))
+            .and_then(|(key, t)| {
+                let (value, next) = t.split_once(ARG_VALUE_END)?;
+                Some((key, value, next))
+            })
+            .filter(|(key, ..)| !key.is_empty());
+        let Some((key, value, next)) = pair else {
+            let (call, consumed) = malformed_until(body, &[CLOSE], index, Some(name.to_string()));
+            return Some((call, consumed));
+        };
+        arguments.insert(key.to_string(), qwen_value(value));
+        rest = next;
+    }
+}
+
 /// Qwen3-Coder XML: `<function=NAME>` with `<parameter=KEY>VALUE</parameter>`
 /// children. `s` starts at `<function=`; the result runs through `</function>`.
 fn parse_qwen(s: &str, index: usize) -> (ToolCall, usize) {
@@ -314,7 +466,7 @@ fn parse_qwen(s: &str, index: usize) -> (ToolCall, usize) {
     }
 }
 
-/// Qwen parameter values are raw text with one leading and one trailing newline
+/// Qwen and GLM parameter values are raw text with one leading and one trailing newline
 /// removed. Only a value that is clearly a JSON object or array is parsed; numbers,
 /// booleans and everything else stay strings, because the tool schemas are not
 /// available to this module to coerce them by type.
@@ -353,6 +505,91 @@ fn parse_llama(after: &str, index: usize) -> (ToolCall, usize) {
         return (call_from_value(&value, index), consumed);
     }
     malformed_until(after, &ENDS, index, None)
+}
+
+/// Arguments from the JSON value that starts `body` (after whitespace). Returns the arguments, the
+/// malformed flag and the bytes consumed through the value, or `None` when no JSON value starts there.
+fn json_arguments(body: &str) -> Option<(Value, bool, usize)> {
+    let lead = body.len() - body.trim_start().len();
+    let mut values = serde_json::Deserializer::from_str(&body[lead..]).into_iter::<Value>();
+    let value = values.next()?.ok()?;
+    let (arguments, malformed_arguments) = normalize_arguments(Some(&value));
+    Some((arguments, malformed_arguments, lead + values.byte_offset()))
+}
+
+/// Bytes of `tail` taken by optional whitespace and then `token`, or 0 when `token` does not follow.
+fn skip_token(tail: &str, token: &str) -> usize {
+    let padding = tail.len() - tail.trim_start().len();
+    if tail[padding..].starts_with(token) {
+        padding + token.len()
+    } else {
+        0
+    }
+}
+
+/// DeepSeek: `TYPE<｜tool▁sep｜>NAME`, a newline, then the arguments in a ```` ```json ```` fence.
+/// `after` follows `<｜tool▁call▁begin｜>`; the result runs through `<｜tool▁call▁end｜>` when present.
+fn parse_deepseek(after: &str, index: usize) -> (ToolCall, usize) {
+    let ends = [DEEPSEEK_CALL_END];
+    let Some((_, rest)) = after.split_once(DEEPSEEK_SEP) else {
+        return malformed_until(after, &ends, index, Some(String::new()));
+    };
+    let head = after.len() - rest.len();
+    let (name, body) = rest.split_once('\n').unwrap_or((rest, ""));
+    let name = name.trim();
+    if name.is_empty() || name.contains('<') {
+        return malformed_until(after, &ends, index, Some(String::new()));
+    }
+    let body_at = head + (rest.len() - body.len());
+    let fence = body.trim_start();
+    let Some(fenced) = fence.strip_prefix(FENCE) else {
+        return malformed_until(after, &ends, index, Some(name.to_string()));
+    };
+    let fenced = fenced.strip_prefix("json").unwrap_or(fenced);
+    let json_at = body_at + (body.len() - fenced.len());
+    let Some((arguments, malformed_arguments, used)) = json_arguments(&after[json_at..]) else {
+        return malformed_until(after, &ends, index, Some(name.to_string()));
+    };
+    let mut end = json_at + used;
+    end += skip_token(&after[end..], FENCE);
+    end += skip_token(&after[end..], DEEPSEEK_CALL_END);
+    let call = ToolCall {
+        id: call_id(index),
+        name: name.to_string(),
+        arguments,
+        malformed_arguments,
+    };
+    (call, end)
+}
+
+/// Kimi K2: the id `functions.NAME:IDX`, `<|tool_call_argument_begin|>`, then a JSON object.
+/// `after` follows `<|tool_call_begin|>`; the result runs through `<|tool_call_end|>` when present.
+fn parse_kimi(after: &str, index: usize) -> (ToolCall, usize) {
+    let ends = [KIMI_CALL_END];
+    let Some((id, rest)) = after.split_once(KIMI_ARGS) else {
+        return malformed_until(after, &ends, index, Some(String::new()));
+    };
+    let id = id.trim();
+    let id = id.strip_prefix("functions.").unwrap_or(id);
+    let name = match id.rsplit_once(':') {
+        Some((head, idx)) if !idx.is_empty() && idx.bytes().all(|b| b.is_ascii_digit()) => head,
+        _ => id,
+    };
+    if name.is_empty() || name.contains('<') {
+        return malformed_until(after, &ends, index, Some(String::new()));
+    }
+    let args_at = after.len() - rest.len();
+    let Some((arguments, malformed_arguments, used)) = json_arguments(rest) else {
+        return malformed_until(after, &ends, index, Some(name.to_string()));
+    };
+    let end = args_at + used;
+    let call = ToolCall {
+        id: call_id(index),
+        name: name.to_string(),
+        arguments,
+        malformed_arguments,
+    };
+    (call, end + skip_token(&after[end..], KIMI_CALL_END))
 }
 
 /// Mistral `[TOOL_CALLS]`: either a JSON array of calls, or `NAME[ARGS]{...}`.

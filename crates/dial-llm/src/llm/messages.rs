@@ -30,11 +30,34 @@ pub fn canonicalize(message: &mut Value) {
     }
 }
 
+/// How a route lays out the conversation on the wire. Dispatch decides it once from the resolved
+/// route and reports it on the reply, so training capture records exactly the messages sent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WireForm {
+    /// Messages are sent as the conversation holds them.
+    #[default]
+    Canonical,
+    /// Strict local chat templates: one initial system message (see [`local`]).
+    SingleSystemPrefix,
+}
+
+impl WireForm {
+    /// The messages this form sends. Harness bookkeeping is still stripped later, at
+    /// serialization; `local` needs the `dial_transient` marker to place request-local guidance.
+    pub fn apply<'a>(self, messages: &'a [Value]) -> anyhow::Result<std::borrow::Cow<'a, [Value]>> {
+        Ok(match self {
+            Self::Canonical => std::borrow::Cow::Borrowed(messages),
+            Self::SingleSystemPrefix => std::borrow::Cow::Owned(local(messages)?),
+        })
+    }
+}
+
 /// Local chat templates commonly accept exactly one initial system message. Keep the
 /// stable prefix there; like the Anthropic adapter, carry later/request-local guidance
 /// as user messages at its original boundary rather than hoisting it over history.
-/// This is a wire projection only: the canonical conversation is never rewritten.
-pub(crate) fn local(messages: &[Value]) -> anyhow::Result<Vec<Value>> {
+/// This is a wire projection only: the canonical conversation is never rewritten. Use it through
+/// [`WireForm::SingleSystemPrefix`] so dispatch and training capture share one decision.
+pub fn local(messages: &[Value]) -> anyhow::Result<Vec<Value>> {
     use anyhow::Context;
 
     let mut projected: Vec<Value> = Vec::with_capacity(messages.len());

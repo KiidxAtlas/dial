@@ -112,8 +112,7 @@ fn completion_persistence_failure_keeps_the_original_error_and_backend() {
             None,
             crate::agent::run::turn_draft::TurnOrigin::User,
         )
-        .err()
-        .expect("completion persistence must fail");
+        .expect_err("completion persistence must fail");
     assert!(format!("{error:#}").contains("completion persistence regression"));
     assert!(
         agent.backend.is_some(),
@@ -121,6 +120,7 @@ fn completion_persistence_failure_keeps_the_original_error_and_backend() {
     );
 
     db.execute_batch("DROP TRIGGER reject_completion").unwrap();
+    let storage_before = agent.session.io_metrics();
     let report = agent
         .turn_inner(
             "Report again",
@@ -135,5 +135,23 @@ fn completion_persistence_failure_keeps_the_original_error_and_backend() {
     assert!(
         agent.backend.is_some(),
         "the next turn can reuse the backend"
+    );
+    let efficiency = &agent.session.control_state()["efficiency"];
+    assert_eq!(efficiency["projection_bytes"]["requests"], 0);
+    assert_eq!(
+        efficiency["projection_bytes"]["requests_by_phase"],
+        json!({})
+    );
+    let observed_publications = efficiency["storage_io"]["control_publication_attempts"]
+        .as_u64()
+        .expect("a settled turn must expose storage counters, including zero counts");
+    assert_eq!(
+        agent
+            .session
+            .io_metrics()
+            .since(&storage_before)
+            .control_publication_attempts,
+        observed_publications + 1,
+        "the efficiency snapshot excludes only its own final control publication"
     );
 }

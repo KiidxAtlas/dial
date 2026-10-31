@@ -29,3 +29,17 @@ fn old_payload_only_process_facts_remain_readable() {
     let output = ToolOutput::structured(serde_json::json!({"process": outcome(4)}));
     assert_eq!(output.process_outcome(), Some(outcome(4)));
 }
+
+#[test]
+fn recovery_is_derived_from_execution_facts_not_a_payload_claim() {
+    use crate::runtime::execution::{Effects, Retry};
+    // A payload that claims success and no effects must not override controller facts.
+    let output = ToolOutput::structured(serde_json::json!({
+        "status": "ok", "effects": "none", "rolled_back": true
+    }))
+    .with_effects(Effects::Unknown);
+    let recovery = output.recovery().expect("unknown effects need recovery");
+    assert_eq!(recovery.effects, Effects::Unknown);
+    assert_eq!(recovery.retry, Retry::AfterInspection);
+    assert!(ToolOutput::ok("rolled back".into()).recovery().is_none());
+}

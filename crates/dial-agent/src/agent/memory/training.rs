@@ -22,11 +22,20 @@ impl Capture {
         self.source_turn = entry_id.filter(|id| !id.is_empty()).map(str::to_owned);
     }
 
-    pub fn record(&mut self, context: &[Value], tools: &[Value], target: Value) {
-        let mut messages: Vec<_> = context
-            .iter()
-            .map(crate::llm::messages::canonical)
-            .collect();
+    /// Record the request exactly as `form` sent it, then the target. Dispatch already applied
+    /// the same projection to these messages, so a failure here means they diverged: skip the
+    /// example rather than train on a request the model never saw.
+    pub fn record(
+        &mut self,
+        context: &[Value],
+        tools: &[Value],
+        target: Value,
+        form: crate::llm::messages::WireForm,
+    ) {
+        let Ok(sent) = form.apply(context) else {
+            return;
+        };
+        let mut messages: Vec<_> = sent.iter().map(crate::llm::messages::canonical).collect();
         messages.push(crate::llm::messages::canonical(&target));
         let example = json!({"messages":messages,"tools":tools});
         let size = example.to_string().len();

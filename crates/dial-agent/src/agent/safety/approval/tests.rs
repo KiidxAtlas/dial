@@ -661,3 +661,64 @@ fn finite_batch_surface_never_converts_persistent_choices_into_grants() {
     assert_eq!(ui.approve_batch(&calls, &cancel), vec![false; 2]);
     assert_eq!(ui.1, 0, "cancelled batch must not prompt");
 }
+
+#[test]
+fn read_only_inspection_batches_split_only_at_unquoted_separators() {
+    let git = "git -c core.fsmonitor=false -c core.pager=cat --no-pager";
+    let mixed_git = format!(
+        "{git} status --short --untracked-files=all; {git} diff --no-color --no-ext-diff --no-textconv --stat"
+    );
+    for command in [
+        r#"ls -la "a b"; ls -d */"#,
+        "ls -la\nls -d */",
+        "ls && pwd",
+        r#"ls "a;rm x""#,
+        r"ls \;",
+        mixed_git.as_str(),
+    ] {
+        assert!(read_only_inspection_batch(command), "{command}");
+    }
+    for command in [
+        "ls > out.txt",
+        "ls | wc -l",
+        "ls &",
+        "ls && rm x",
+        "ls; rm -rf target",
+        "ls\nrm x",
+        "ls;;ls",
+        "ls;",
+        "ls $HOME; ls",
+        "ls `pwd`; ls",
+        "ls $(pwd); ls",
+        "(ls; ls)",
+        "for f in *; do ls \"$f\"; done",
+        "ls; sed -i s/a/b/ f",
+        "ls; sed -n 'w x' f",
+        "cd crates && ls",
+        "sh -c 'ls'",
+        "env ls",
+        "x=1; ls",
+        "ls \"unterminated",
+        "ls \\\n",
+        "ls \\\n; rm x",
+    ] {
+        assert!(!read_only_inspection_batch(command), "{command}");
+    }
+}
+
+#[test]
+fn opaque_shell_effect_counts_only_unverified_batches() {
+    for (command, opaque) in [
+        (r#"ls -la "a b"; ls -d */"#, false),
+        ("ls -la\nls -d */", false),
+        ("ls && pwd", false),
+        ("ls > out.txt", true),
+        ("ls; rm -rf target", true),
+        ("ls; sed -i s/a/b/ f", true),
+        ("for f in *; do ls \"$f\"; done", true),
+        ("sh -c 'ls'", true),
+        ("ls \\\n; rm x", true),
+    ] {
+        assert_eq!(opaque_shell_effect(command), opaque, "{command}");
+    }
+}

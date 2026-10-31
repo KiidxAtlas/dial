@@ -58,7 +58,7 @@ static KEYBOARD_FLAGS: AtomicBool = AtomicBool::new(false);
 static IN_ALT_SCREEN: AtomicBool = AtomicBool::new(false);
 static HOOK: Once = Once::new();
 static UI_THREAD: std::sync::Mutex<Option<std::thread::ThreadId>> = std::sync::Mutex::new(None);
-/// What restores the tab color, progress, attention and user variables Dial set (panic hook).
+/// What restores progress, attention and user variables Dial set (panic hook).
 static SIGNALS_RESET: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
 const SYNC_BEGIN: &str = "\x1b[?2026h";

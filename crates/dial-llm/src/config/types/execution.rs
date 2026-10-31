@@ -145,6 +145,12 @@ pub struct SandboxConfig {
     pub allow_network: bool,
     /// Extra writable directories in dev mode (for example `~/.cargo`, `~/.npm`).
     pub extra_write: Vec<PathBuf>,
+    /// Domains sandboxed commands may reach when network is allowed: `example.com` (exact) or
+    /// `*.example.com` (subdomains), `*` for any. Non-empty (or a non-empty `network_deny`) routes
+    /// command traffic through Dial's filtering proxy; empty with no denials leaves it unfiltered.
+    pub network_allow: Vec<String>,
+    /// Domains sandboxed commands may never reach; wins over `network_allow`.
+    pub network_deny: Vec<String>,
 }
 
 impl Default for SandboxConfig {
@@ -153,6 +159,8 @@ impl Default for SandboxConfig {
             mode: SandboxMode::Dev,
             allow_network: true,
             extra_write: vec![],
+            network_allow: vec![],
+            network_deny: vec![],
         }
     }
 }

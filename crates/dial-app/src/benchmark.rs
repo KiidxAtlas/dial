@@ -646,6 +646,9 @@ pub struct AssistanceOverrides {
     /// Maps to `assistance.local.enabled`: the local-model profile (tiers, edit default, sampling,
     /// reasoning cap, escalation) for locally served models. Absent in older reports.
     pub local_profile: Option<bool>,
+    /// Pins `harness.tools` to the bash-only roster (`config::tools::BASH_ONLY`) when `true`, or to the
+    /// shipped default roster when `false`. Absent in older reports.
+    pub bash_only: Option<bool>,
 }
 
 impl AssistanceOverrides {
@@ -674,6 +677,8 @@ pub struct EfficiencyOverrides {
     pub compaction_enabled: Option<bool>,
     /// Maps to `compaction.keep_recent_tokens`.
     pub keep_recent_tokens: Option<u32>,
+    /// Maps to `compaction.method_order`: no duplicates. Absent in older reports.
+    pub compaction_method_order: Option<Vec<crate::config::compaction::CompactionMethod>>,
 }
 
 impl EfficiencyOverrides {
@@ -689,6 +694,16 @@ impl EfficiencyOverrides {
                 cap == 0 || (8192..=2_000_000).contains(&cap),
                 "configuration efficiency.history_token_cap must be 0 or 8192..=2000000"
             );
+        }
+        if let Some(order) = &self.compaction_method_order {
+            let mut seen = Vec::new();
+            for method in order {
+                ensure!(
+                    !seen.contains(method),
+                    "configuration compaction.method_order contains a duplicate method"
+                );
+                seen.push(*method);
+            }
         }
         Ok(())
     }

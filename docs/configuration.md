@@ -61,6 +61,47 @@ Once Enter or another action is queued, subsequent input is held in order until 
 it does not bypass initialization. Slow or unavailable servers still have their configured connection
 deadline and report connection failures normally.
 
+## Settings layout
+
+`/settings` lists tabs and sections in the order of the `LAYOUT` table in
+`crates/dial-llm/src/config/schema.rs`, not in registry declaration order: **Appearance**,
+**Interaction**, **Model**, **Tools**, **Memory**, **Improvement**, **Voice**, **Experimental**
+(then the panel's own **Setup** tab). Everyday coding controls come first, learning and voice
+after them, experiments last; inside a tab the most-used sections lead and the catch-all
+**Configuration** section (whole-table editors) is last. A test fails when a setting names a tab or
+section that `LAYOUT` does not list, so new settings always get a deliberate place. The section list
+shows a `● n` count beside any section where you have overridden `n` settings in the global or
+project layer, so customised areas are visible without opening them.
+
+Reordering changes only presentation: configuration keys, files and saved overrides are untouched.
+
+## Default baseline
+
+Defaults aim at a safe, low-surprise first run: nothing leaves the machine without approval,
+nothing runs unbounded where a runaway is likely, and nothing important is silent. Defaults changed
+in this revision, with the reason; saved explicit values are never rewritten.
+
+| Setting | Was | Now | Why |
+| --- | --- | --- | --- |
+| `ui.notify_errors` | `false` | `true` | The turn-end notification exists for the case where you looked away. A failed, blocked or incomplete turn is the one that needs you, and previously it was the only outcome that stayed silent. `ui.notify = false` still silences everything; an explicit `notify_errors = false` is kept. |
+
+New settings (previously hard-coded) default to the old behavior:
+
+| Setting | Default | Notes |
+| --- | --- | --- |
+| `web.timeout_secs` | `30` | Total seconds per `web_fetch` / `web_search` request, redirects included; validated to 1..600. Reading a URL through `read` keeps the built-in 30 s. |
+
+`web.search_provider` and `web.jina_reader` already existed as fields; they now also have rows in
+`/settings` → **Tools** → **Web** (previously only the whole-table editor reached them).
+
+Reviewed and deliberately kept: the unlimited execution caps and `auto` context windows (see below;
+changing them would alter cost and behavior for existing users), `sandbox.mode = "dev"`,
+`approval = "write"`, `ssh.host_key_checking = "accept-new"`, and every telemetry, sharing and
+background-learning switch (telemetry and sharing stay off; learning only uses local models and
+requires AC power).
+
+`DIAL_NO_THINKING_LOOP_GUARD=1` (stream loop detectors) remains an environment-only switch.
+
 ## Unlimited execution defaults
 
 Most configurable execution limits and result/context size caps default to `0`, meaning **unlimited**:
@@ -300,6 +341,8 @@ context_window = "auto" # defaults to 32768 tokens; serving endpoints may cap to
 mode = "dev"              # dev | strict | off
 allow_network = true
 extra_write = ["~/.cargo", "~/.npm"]
+# network_allow = ["crates.io", "*.crates.io", "github.com"]  # optional: filter command traffic by domain
+# network_deny = ["pastebin.com"]
 [shell]
 backend = "auto"         # auto | system | embedded | inprocess (sandbox.mode = "off" only) | powershell
 [endpoint]                # optional: OpenAI-compatible server instead of local MLX

@@ -528,4 +528,24 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         Kind::Enum(RULE_JUDGE),
         true
     ),
+    field!(
+        "sandbox.network_allow",
+        sandbox.network_allow,
+        TO,
+        "Sandbox",
+        "Allowed network domains",
+        "Domains shell commands may reach when network is allowed, comma separated: example.com (exact), *.example.com (subdomains) or * (any). When this or the deny list is set, command traffic goes through Dial's filtering proxy and private addresses are blocked unless named exactly. Empty: unfiltered.",
+        Kind::StringList,
+        true
+    ),
+    field!(
+        "sandbox.network_deny",
+        sandbox.network_deny,
+        TO,
+        "Sandbox",
+        "Denied network domains",
+        "Domains shell commands may never reach, comma separated (same patterns as the allow list); denials win over allows.",
+        Kind::StringList,
+        true
+    ),
 ];

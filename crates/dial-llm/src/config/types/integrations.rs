@@ -104,9 +104,11 @@ pub struct McpOAuthConfig {
     pub callback_port: u16,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WebConfig {
+    /// Seconds a `web_fetch` or `web_search` request may take in total, redirects included.
+    pub timeout_secs: u64,
     /// Search endpoint override; empty uses the built-in default provider.
     pub search_url: String,
     /// Environment variable holding the search endpoint's API key, when it needs one.
@@ -123,4 +125,20 @@ pub struct WebConfig {
     /// bing, searxng, firecrawl, parallel, zai, xai, duckduckgo, startpage, mojeek, ecosia.
     /// Ignored when `search_url` is set.
     pub search_provider: String,
+}
+
+/// Seconds a web request may take unless `web.timeout_secs` says otherwise.
+pub const DEFAULT_WEB_TIMEOUT_SECS: u64 = 30;
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            timeout_secs: DEFAULT_WEB_TIMEOUT_SECS,
+            search_url: String::new(),
+            search_api_key_env: None,
+            reader_chain: Vec::new(),
+            jina_reader: false,
+            search_provider: String::new(),
+        }
+    }
 }

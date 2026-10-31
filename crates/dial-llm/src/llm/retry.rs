@@ -83,6 +83,10 @@ pub(crate) const FAILOVER_ATTEMPTS: usize = 2;
 pub(crate) const FAILOVER_MAX_WAIT: Duration = Duration::from_secs(10);
 /// Keep a ready fallback's brief first retry independent of the ordinary automatic interval.
 const FAILOVER_INTERVAL: Duration = Duration::from_secs(1);
+/// First retry after a connection-level failure (refused, reset, broken pipe, DNS, connect
+/// timeout): the provider never answered, so a fresh connection is tried promptly before the
+/// ordinary interval applies to later attempts.
+pub(crate) const CONNECTION_RETRY: Duration = Duration::from_secs(2);
 
 /// Server timing hints from one non-2xx response.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -291,10 +295,13 @@ pub(crate) enum Decision {
 /// Decide whether attempt `attempt` (1-based) that failed with `class` is retried, and after how long.
 /// `hinted` is the server's explicit minimum delay; it is never shortened, and a hint beyond
 /// `max_delay` ends the request rather than waiting longer than the operator allowed.
+/// `connection` marks a failure before any response arrived; its first retry waits only
+/// [`CONNECTION_RETRY`].
 pub(crate) fn decide(
     class: &ErrorClass,
     hinted: Option<Duration>,
     attempt: usize,
+    connection: bool,
     policy: &Policy,
 ) -> Decision {
     let (reason, minimum) = match class {
@@ -336,6 +343,8 @@ pub(crate) fn decide(
     }
     let interval = if failing_over {
         policy.backoff.min(FAILOVER_INTERVAL)
+    } else if connection && attempt == 1 {
+        policy.backoff.min(CONNECTION_RETRY)
     } else {
         policy.backoff
     }

@@ -34,6 +34,10 @@ pub struct TaskConfig {
     pub persist: bool,
     /// Pending steering messages a running or parked agent may hold (1..=4096).
     pub inbox_limit: usize,
+    /// Seconds a running worker may show no progress before the parent is told it looks stalled
+    /// (0 disables; 0..=86400). It also marks a worker as slow after three times that run time.
+    /// The default matches the remote model idle timeout.
+    pub stall_secs: u64,
 }
 
 impl Default for TaskConfig {
@@ -53,6 +57,7 @@ impl Default for TaskConfig {
             max_schema_retries: 3,
             persist: true,
             inbox_limit: 256,
+            stall_secs: 300,
         }
     }
 }
@@ -83,6 +88,10 @@ impl TaskConfig {
         anyhow::ensure!(
             (1..=4096).contains(&self.inbox_limit),
             "task.inbox_limit must be 1..4096"
+        );
+        anyhow::ensure!(
+            self.stall_secs <= 86_400,
+            "task.stall_secs must be 0 (disabled)..86400"
         );
         for (provider, limit) in &self.provider_concurrency {
             anyhow::ensure!(

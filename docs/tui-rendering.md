@@ -63,7 +63,7 @@ Native calls are told apart by kind (`tool_cards.rs`):
 trees, writes, command failure/running states, sent/received notes, skills and workers at three sizes
 to `$TMPDIR/dial-ux-review/after.{html,txt}`.
 
-Panel motion comprises the start-up wordmark sweep (`fx::SWEEP`, 0.7 s) and a 140 ms reveal when any full-screen panel opens; both follow `ui.motion` and are off under `NO_COLOR`, ASCII glyphs and non-truecolor terminals (`fx::motion`). Panels share one footer vocabulary, documented on `chrome::key_hint_spans`, and one tab style, `chrome::tab_style`.
+Panel motion comprises the start-up wordmark sweep (`fx::SWEEP`, 0.7 s), a 140 ms reveal when any full-screen panel opens and, on the resting launch screen only, a slow ambient loop at `fx::AMBIENT` (8 frames a second: the needle breathes and a glint crosses, driven by `Home::ambient` and absent at tick 0); all follow `ui.motion` and are off under `NO_COLOR`, ASCII glyphs and non-truecolor terminals (`fx::motion`). Panels share one footer vocabulary, documented on `chrome::key_hint_spans`, and one tab style, `chrome::tab_style`.
 
 `ui.smooth_reveal = true` optionally reveals streaming assistant text in grapheme-safe increments, independently of panel motion. It defaults to false. A newest grapheme is held until its successor is known; tool, turn-end and interruption boundaries flush the complete retained text.
 

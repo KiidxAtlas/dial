@@ -90,6 +90,13 @@ impl LocalHints {
                 }
                 put_penalties(object, self, "repeat_penalty");
             }
+            // vLLM and SGLang take `chat_template_kwargs`, `presence_penalty` and `repetition_penalty`
+            // as extensions of the chat completions body. Taken from their documentation; not
+            // checked against a live server. Neither has a prompt-cache slot or a keep-alive.
+            LocalServer::Vllm | LocalServer::Sglang => {
+                put_thinking(object, self.thinking);
+                put_penalties(object, self, "repetition_penalty");
+            }
             // Ollama's native API is applied by `apply_ollama`; its OpenAI-compatible route is not used.
             LocalServer::Ollama | LocalServer::Other => {}
         }
@@ -182,6 +189,11 @@ impl LocalServer {
             (_, Some(base)) if crate::llm::catalog::is_llama_server(base, token, headers) => {
                 Self::LlamaCpp
             }
+            (_, Some(base)) => match crate::llm::catalog::openai_runtime(base, token, headers) {
+                Some(crate::llm::catalog::OpenAiRuntime::Vllm) => Self::Vllm,
+                Some(crate::llm::catalog::OpenAiRuntime::Sglang) => Self::Sglang,
+                None => Self::Other,
+            },
             _ => Self::Other,
         }
     }
@@ -199,6 +211,10 @@ pub enum LocalServer {
     LmStudio,
     /// Ollama's native `/api/chat` (`ollama` provider).
     Ollama,
+    /// vLLM, recognised from its `/v1/models` list (`catalog::openai_runtime`).
+    Vllm,
+    /// SGLang, recognised the same way.
+    Sglang,
     /// Another local OpenAI-compatible server: no hint is sent.
     Other,
 }

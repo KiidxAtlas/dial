@@ -3162,19 +3162,47 @@ impl SettingsOverlay {
             None => vec![LINK_SECTION],
         };
         let active = cursor_row.map(Self::section_of);
+        // A trailing count tells where the user's own overrides live, so a customised section
+        // is visible without opening it. Folded advanced rows count too.
+        let tab = self.tabs.get(self.tab).map(|(tab, _)| *tab);
+        let overrides = |section: &str| {
+            crate::config::schema::registry()
+                .iter()
+                .filter(|def| {
+                    Some(def.tab) == tab
+                        && def.section == section
+                        && self.scope_shown(def)
+                        && self.source(def.path) != "default"
+                })
+                .count()
+        };
         for section in sections {
             let on = Some(section) == active;
-            let label = text::ellipsize(section, width.saturating_sub(3), theme.ascii());
+            let changed = overrides(section);
+            let badge = if changed > 0 {
+                format!(" {}{changed}", theme.sym(Sym::Bullet))
+            } else {
+                String::new()
+            };
+            let label = text::ellipsize(
+                section,
+                width.saturating_sub(3 + text::width(&badge)),
+                theme.ascii(),
+            );
             // The section holding the selection is named in the accent; the selection marker
             // belongs to the selected row alone.
-            out.push(if on {
-                vec![Span::styled(
-                    format!("   {label}"),
-                    theme.fg(Tok::Accent).add_modifier(Modifier::BOLD),
-                )]
-            } else {
-                vec![Span::styled(format!("   {label}"), theme.fg(Tok::Muted))]
-            });
+            let mut spans = vec![Span::styled(
+                format!("   {label}"),
+                if on {
+                    theme.fg(Tok::Accent).add_modifier(Modifier::BOLD)
+                } else {
+                    theme.fg(Tok::Muted)
+                },
+            )];
+            if !badge.is_empty() {
+                spans.push(Span::styled(badge, theme.fg(Tok::Accent)));
+            }
+            out.push(spans);
         }
         out
     }

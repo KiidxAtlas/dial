@@ -1,0 +1,48 @@
+# Run Dial in a container against the project in the current directory.
+#
+#   docker compose run --rm dial                       # interactive terminal UI
+#   docker compose run --rm dial -p -y "summarize this repo"
+#
+# See docs/docker.md for the sandbox, hosted-provider and Docker Model Runner notes.
+services:
+  dial:
+    build:
+      context: .
+      args:
+        # .dockerignore excludes .git, so pass the revision: DIAL_BUILD_REVISION=$(git rev-parse HEAD)
+        DIAL_BUILD_REVISION: ${DIAL_BUILD_REVISION:-}
+    image: ${DIAL_IMAGE:-ghcr.io/kiidxatlas/dial:latest}
+    stdin_open: true
+    tty: true
+    working_dir: /workspace
+    volumes:
+      - ${DIAL_WORKSPACE:-.}:/workspace
+      - dial-home:/home/dial/.dial
+    environment:
+      # Names without values pass the host's value through; unset variables stay unset.
+      - OPENAI_API_KEY
+      - ANTHROPIC_API_KEY
+      - GEMINI_API_KEY
+      - OPENROUTER_API_KEY
+      - GROQ_API_KEY
+      - MISTRAL_API_KEY
+      - DEEPSEEK_API_KEY
+      # Docker Model Runner (Docker Desktop, "Docker AI"): reachable from containers by this name.
+      - DOCKER_MODEL_RUNNER_BASE_URL=${DOCKER_MODEL_RUNNER_BASE_URL:-http://model-runner.docker.internal/engines/v1}
+      # LM Studio, Ollama and llama.cpp servers running on the host.
+      - LM_STUDIO_BASE_URL=${LM_STUDIO_BASE_URL:-http://host.docker.internal:1234/v1}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      - LLAMA_CPP_BASE_URL=${LLAMA_CPP_BASE_URL:-http://host.docker.internal:8080/v1}
+    extra_hosts:
+      # Docker Desktop defines this already; Docker Engine on Linux needs the mapping.
+      - "host.docker.internal:host-gateway"
+    # Dial runs commands under Bubblewrap, which needs unprivileged user namespaces and a fresh
+    # /proc mount. Docker's default seccomp profile and masked /proc paths block both; without
+    # these Dial disables command execution rather than running unsandboxed. On hosts that
+    # enforce AppArmor for containers (Ubuntu), also add `apparmor=unconfined`.
+    security_opt:
+      - seccomp=unconfined
+      - systempaths=unconfined
+
+volumes:
+  dial-home:

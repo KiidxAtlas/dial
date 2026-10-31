@@ -6,7 +6,7 @@ pub(in crate::agent) use crate::agent::prompts::recovery::{
 use crate::{
     llm::ToolCall,
     runtime::{
-        execution::{Effects, ToolStatus},
+        execution::{Effects, Retry, ToolStatus},
         tool_output::ToolOutput,
     },
 };
@@ -42,18 +42,25 @@ pub(in crate::agent) fn report(
             "Effects are uncertain; partial work may exist. Automatic continuation is stopped."
         }
     };
-    let changes = output
-        .execution
-        .changed_paths
-        .iter()
-        .collect::<std::collections::BTreeSet<_>>()
-        .len();
-    let changed = if changes == 0 {
-        "No committed file paths recorded (not proof that nothing changed).".to_owned()
-    } else {
-        format!(
-            "Committed file paths recorded: {changes}; preserve these changes while resolving the failure."
-        )
+    let Some(recovery) = output.recovery() else {
+        return format!("\n{}", feedback(kind, advice, consecutive));
+    };
+    let changed = match recovery.committed_paths {
+        0 => "No committed file paths recorded (not proof that nothing changed).".to_owned(),
+        n => format!(
+            "Committed file paths recorded: {n}; preserve these changes while resolving the failure."
+        ),
+    };
+    let retry = match recovery.retry {
+        Retry::AfterCorrection if recovery.committed_paths > 0 => {
+            "Committed work is preserved: inspect it and correct the named cause; do not repeat the whole operation."
+        }
+        Retry::AfterCorrection => "Retry only after correcting the named cause.",
+        Retry::AfterInspection => "Do not retry until the recorded state or process is inspected.",
+        Retry::OnlyByDirection => {
+            "Do not replay automatically; resume only on the user's direction."
+        }
+        Retry::Withheld => "A boundary withholds this operation; do not retry or bypass it.",
     };
     let retained = match output.process_outcome() {
         Some(process) if !process.output_complete => {
@@ -64,9 +71,9 @@ pub(in crate::agent) fn report(
         }
     };
     format!(
-        "\nRecovery state: tool `{}`; status {}. {effects} {changed}\nRetained: {retained}\nNext action:{}",
+        "\nRecovery state: tool `{}`; status {}. {effects} {changed}\nRetry: {retry}\nRetained: {retained}\nNext action:{}",
         call.name,
-        ToolStatus::from_output(output).as_str(),
+        recovery.status.as_str(),
         feedback(kind, advice, consecutive),
     )
 }
@@ -131,6 +138,58 @@ pub(in crate::agent) fn classify(
         return Some(("source_or_call_contract", policy::SOURCE_OR_CALL_CONTRACT));
     }
     Some(("tool_failure", policy::TOOL_FAILURE))
+}
+
+/// Coach a known tool invoked as a shell executable, using both the original call and a
+/// completed process failure. This is advice only: catalog membership grants no permission.
+pub(in crate::agent) fn shell_tool_mistake(
+    call: &ToolCall,
+    output: &ToolOutput,
+    known: impl Fn(&str) -> bool,
+) -> Option<String> {
+    if call.name != "bash"
+        || ToolStatus::from_output(output) != ToolStatus::Error
+        || output.execution.effects == Effects::Unknown
+    {
+        return None;
+    }
+    let process = output.execution.process.as_ref()?;
+    if !process.started
+        || process.exit_code != Some(127)
+        || process.signal.is_some()
+        || process.timed_out
+        || process.cancelled
+        || !process.output_complete
+    {
+        return None;
+    }
+    let words = crate::agent::safety::approval::shell_words(call.arguments["command"].as_str()?)?;
+    let name = words.first()?;
+    if !known(name) {
+        return None;
+    }
+    let missing = format!("{name}: command not found");
+    let reverse = format!("command not found: {name}");
+    if !output.text.lines().any(|line| {
+        let line = line.trim();
+        line == missing || line.ends_with(&format!(": {missing}")) || line.ends_with(&reverse)
+    }) {
+        return None;
+    }
+    Some(policy::shell_tool_mistake(name))
+}
+
+/// An empty eligible search is not proof that every capability is absent. Keep the raw
+/// search result and offer a bounded next step, without activating fallback tools.
+pub(in crate::agent) fn empty_discovery(
+    call: &ToolCall,
+    output: &ToolOutput,
+) -> Option<&'static str> {
+    (call.name == "tool_search"
+        && ToolStatus::from_output(output) == ToolStatus::Ok
+        && output.execution.effects != Effects::Unknown
+        && output.text.trim() == "[]")
+        .then_some(policy::EMPTY_DISCOVERY)
 }
 
 #[cfg(test)]

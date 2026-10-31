@@ -43,16 +43,16 @@ impl Tool for Find {
     fn schema(&self) -> Value {
         tool_schema(
             "find",
-            "Find implementation evidence from a behavior description. Behavior mode defaults to deterministic local retrieval over lexical/syntax candidates; every row states its attribution (via=lexical, via=exact-text or via=model-rerank). By default (related=true in behavior mode) the top hits also get a bounded related-evidence bundle: the enclosing owner and signature type definitions (syntax spans), plus call-sites, mentions and config references found by whole-word lexical match (not a resolved call graph or symbol resolution). Related rows are navigation aids, never edit witnesses: read the lines before editing. Set related=false for hit rows only. Set ranking=semantic to have the configured model rerank bounded candidates (one extra model request), which can surface declarations with no matching query terms; evidence stays grounded to indexed paths and spans. Exact mode matches literal text case-sensitively (including multiline) deterministically and omits the bundle unless related=true. Optional lsp_path requests actual language-server metadata, the only resolved-symbol source.",
+            "Locate code from a behavior description (mode=behavior, default) or literal text (mode=exact). Rows state lexical/syntax provenance, not resolved symbols. Top code hits may include bounded, freshly read source excerpts: complete numbered rows are editable without another read; summaries and related aids are not. ranking=semantic adds one model rerank request; lsp_path adds real language-server symbols.",
             json!({
                 "query": {"type":"string", "description":"Behavior description, quoted mandatory phrases, or exact text"},
                 "path": {"type":"string", "description":"File/directory scope, default workspace"},
                 "mode": {"type":"string", "enum":["behavior", "exact"]},
                 "ranking": {"type":"string", "enum":["lexical", "semantic"], "description":"Behavior mode defaults to lexical; semantic adds one configured-model reranking request. Exact mode is always deterministic."},
                 "grep_keywords": {"type":"array", "items":{"type":"string"}, "description":"Optional known literal terms to boost in behavior mode"},
-                "lsp_path": {"type":"string", "description":"Optional source file selecting a real language server for supplementary workspace-symbol metadata; startup needs approval"},
-                "lsp_query": {"type":"string", "description":"Optional exact symbol query for language-server metadata, defaults to query"},
-                "related": {"type":"boolean", "description":"Append bounded related owner/type/call-site/config evidence for the top hits (lexical provenance, not resolved). Defaults to true in behavior mode and false in exact mode."},
+                "lsp_path": {"type":"string", "description":"Source file selecting a language server for symbol metadata; startup needs approval"},
+                "lsp_query": {"type":"string", "description":"Exact symbol for language-server metadata (default query)"},
+                "related": {"type":"boolean", "description":"Include related evidence (default true in behavior mode, false in exact)"},
                 "limit": {"type":"integer", "minimum":1, "maximum":100}
             }),
             &["query"],
@@ -261,6 +261,8 @@ fn quoted(query: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 pub(crate) fn declarations(path: &Path, text: &str) -> Vec<(usize, usize, String)> {
+    #[cfg(test)]
+    tests::record_declaration_parse(path);
     let Some(lang) = SupportLang::from_path(path) else {
         return vec![];
     };
@@ -554,7 +556,30 @@ fn retrieve(ws: &Workspace, args: &Value, semantic: bool) -> Result<Retrieval, S
             // at most four nonoverlapping spans to the bounded global pool.
             let mut file_heap = BinaryHeap::new();
             let target = if semantic { &mut file_heap } else { &mut heap };
-            let source = cache::evidence(ws.root(), path, &rel, &identity, digest.into(), text);
+            let Some(source) = cache::evidence(
+                ws.root(),
+                path,
+                &rel,
+                &identity,
+                digest.into(),
+                text,
+                |source| {
+                    // A necessary condition for a span to match, using the same normalized
+                    // text/postings as scoring. Keep broad semantic candidates unchanged.
+                    semantic
+                        || source.lines() > 0
+                            && phrases
+                                .iter()
+                                .all(|phrase| source.folded(1, source.lines()).contains(phrase))
+                            && (!phrases.is_empty()
+                                || terms.iter().any(|term| source.postings.contains_key(term))
+                                || keywords.iter().any(|keyword| {
+                                    source.body(1, source.lines()).contains(keyword)
+                                }))
+                },
+            ) else {
+                return true;
+            };
             // Query tokens are compiled once; resolve their per-file postings once.
             // A range query is equivalent to tokens(joined full-source lines), without
             // copying, lowercasing or tokenizing each overlapping declaration/window.
@@ -742,9 +767,88 @@ fn find(ws: &Workspace, args: &Value) -> Result<String, String> {
         args,
         retrieved.exact,
         &targets,
-        MAX_OUTPUT.saturating_sub(out.len()),
+        MAX_OUTPUT.saturating_sub(out.len() + SOURCE_BYTES),
     )?);
+    out.push_str(&source_section(
+        ws,
+        &targets,
+        MAX_OUTPUT.saturating_sub(out.len()),
+    ));
     Ok(out)
+}
+
+const SOURCE_SECTION: &str =
+    "\nSource excerpts (fresh reads; only complete numbered rows are edit witnesses):\n";
+const SOURCE_FILES: usize = 3;
+const SOURCE_BYTES: usize = 6 * 1024;
+const SOURCE_LINES: usize = 40;
+
+/// Fuse navigation with the next bounded read, using the ordinary reader's confinement,
+/// formatting, truncation and witness recording. Never grant authority from ranked snippets.
+fn source_section(ws: &Workspace, hits: &[(&str, usize, usize, &str)], budget: usize) -> String {
+    let mut out = String::new();
+    let budget = budget.min(SOURCE_BYTES);
+    let mut visited = BTreeSet::new();
+    for &(path, start, end, _) in hits {
+        if visited.len() >= SOURCE_FILES || budget.saturating_sub(out.len()) < 1024 {
+            break;
+        }
+        // Documents, notebooks and other resource schemes have different rendering/approval
+        // contracts. Only local code files found by the confined lexical walk qualify here.
+        if path.len() > 256
+            || path
+                .chars()
+                .any(|ch| ch.is_control() || matches!(ch, '\\' | '"'))
+            || related::sensitive_path(path)
+            || SupportLang::from_path(Path::new(path)).is_none()
+            || !visited.insert(path)
+        {
+            continue;
+        }
+        if out.is_empty() {
+            out.push_str(SOURCE_SECTION);
+        }
+        if let Ok(text) = crate::tools::edit::hashline::read_navigation(
+            ws,
+            path,
+            start,
+            (end - start + 1).min(SOURCE_LINES),
+            budget.saturating_sub(out.len() + 1),
+        ) {
+            // The reader budgets before publishing witnesses. Always return its entire result;
+            // clipping here would incorrectly authorize rows the model never received.
+            out.push_str(&text);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Source-excerpt files in an authentic retained find result, bounded to the original search
+/// scope. The hashline rehydrator still verifies the raw digest, tag and every numbered row.
+pub(crate) fn source_targets(ws: &Workspace, args: &Value, text: &str) -> Vec<String> {
+    let Some((_, excerpts)) = text.split_once(SOURCE_SECTION) else {
+        return Vec::new();
+    };
+    let Ok(scope) = ws.resolve(args["path"].as_str().unwrap_or(".")) else {
+        return Vec::new();
+    };
+    excerpts
+        .lines()
+        .filter_map(|line| {
+            let (path, _) = line
+                .strip_prefix('[')?
+                .strip_suffix(']')?
+                .rsplit_once('#')?;
+            let path = serde_json::from_str::<String>(path).unwrap_or_else(|_| path.to_owned());
+            let resolved = ws.resolve(&path).ok()?;
+            (resolved.starts_with(&scope)
+                && !related::sensitive_path(&path)
+                && SupportLang::from_path(&resolved).is_some())
+            .then_some(path)
+        })
+        .take(SOURCE_FILES)
+        .collect()
 }
 /// `related` defaults to true in behavior mode and false in exact mode; an explicit value wins.
 fn related_enabled(args: &Value, exact: bool) -> Result<bool, String> {

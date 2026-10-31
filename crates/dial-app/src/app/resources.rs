@@ -210,6 +210,9 @@ pub(super) fn resource_events(layout: &Layout) -> Option<ResourceEvents> {
             .into_iter()
             .map(|(dir, _)| (dir, true)),
     );
+    // Register every path in one batch: on macOS each separate `watch` call stops and restarts the
+    // FSEvents stream, which made opening a shell take about a second.
+    let mut batch = watcher.paths_mut();
     for (path, is_dir) in paths {
         let (target, mode) = if is_dir && path.is_dir() {
             (path, RecursiveMode::Recursive)
@@ -222,9 +225,12 @@ pub(super) fn resource_events(layout: &Layout) -> Option<ResourceEvents> {
             };
             (parent.to_path_buf(), RecursiveMode::NonRecursive)
         };
-        if !target.is_dir() || watcher.watch(&target, mode).is_err() {
+        if !target.is_dir() || batch.add(&target, mode).is_err() {
             complete = false;
         }
+    }
+    if batch.commit().is_err() {
+        complete = false;
     }
     Some(ResourceEvents {
         dirty,

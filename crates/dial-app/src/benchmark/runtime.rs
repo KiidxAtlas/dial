@@ -1,4 +1,6 @@
-//! Non-gating observations of runtime journaling and actual markdown/terminal encoding.
+//! Non-gating observations of runtime journaling, encoding and long-history workloads.
+mod workloads;
+
 use anyhow::{Result, ensure};
 use serde::Serialize;
 use std::time::Instant;
@@ -11,6 +13,19 @@ pub struct Baseline {
     pub journaled_append_ns: u128,
     pub journal_overhead_ratio: f64,
     pub render_encode_p95_ns: u128,
+    pub workloads: Vec<Workload>,
+}
+
+/// Warm-cache observations of one deterministic workload, not a model-quality score.
+#[derive(Debug, Serialize)]
+pub struct Workload {
+    pub name: &'static str,
+    pub samples: usize,
+    pub fixture_items: usize,
+    pub fixture_bytes: usize,
+    pub median_ns: u128,
+    pub p95_ns: u128,
+    pub total_ns: u128,
 }
 
 pub fn measure(samples: usize) -> Result<Baseline> {
@@ -55,12 +70,13 @@ pub fn measure(samples: usize) -> Result<Baseline> {
     }
     timings.sort_unstable();
     Ok(Baseline {
-        schema_version: 1,
+        schema_version: 2,
         samples,
         raw_append_ns,
         journaled_append_ns,
         journal_overhead_ratio: journaled_append_ns as f64 / raw_append_ns as f64,
         render_encode_p95_ns: timings[(samples * 95).div_ceil(100).saturating_sub(1)],
+        workloads: workloads::measure(samples)?,
     })
 }
 

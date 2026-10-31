@@ -520,7 +520,9 @@ fn unknown_tags_and_unseen_lines_are_rejected_with_guidance() {
         &format!("[f.txt#{}]\nPUT 1.=1:\n+x\n", tag_of(&numbered(20))),
     );
     assert!(
-        never_read.is_error && never_read.text.contains("read it"),
+        never_read.is_error
+            && never_read.text.contains("no read of this file is recorded")
+            && never_read.text.contains("f.txt:START-END"),
         "{}",
         never_read.text
     );

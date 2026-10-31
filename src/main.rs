@@ -27,6 +27,14 @@ fn main() {
     {
         std::process::exit(dial::tools::exec::background::durable::owner_main());
     }
+    // Re-exec target inside the Linux sandbox's network namespace: bridges the filtering proxy.
+    #[cfg(target_os = "linux")]
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == dial::tools::exec::sandbox::netproxy::BRIDGE_ARG)
+    {
+        std::process::exit(dial::tools::exec::sandbox::netproxy::bridge_main());
+    }
     // Re-exec target for isolated document parsing; never reaches the CLI parser.
     if std::env::args_os()
         .nth(1)

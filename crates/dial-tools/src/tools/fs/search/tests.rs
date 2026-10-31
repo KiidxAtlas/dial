@@ -916,3 +916,28 @@ fn retrieval_measurement_matrix() {
         }
     }
 }
+
+#[test]
+fn glob_no_match_with_spaces_says_whitespace_is_literal() {
+    let (dir, ws) = workspace();
+    fs::write(dir.path().join("game.rs"), "x\n").unwrap();
+    fs::write(dir.path().join("my game.rs"), "x\n").unwrap();
+    // Whitespace is literal and never separates patterns, including inside braces, so these
+    // empty results carry the hint.
+    for pattern in ["*snake* *game*", "{*snake*, *game*}", "my  game.rs"] {
+        let text = run(&ws, "glob", json!({"pattern": pattern})).text;
+        assert!(
+            text.contains("pattern_hint=whitespace is literal"),
+            "{pattern}: {text}"
+        );
+        assert!(!text.contains("spaces included"), "{text}");
+    }
+    // Brace alternatives without whitespace match and get no hint; a literal filename with a
+    // space is found without one.
+    let braces = run(&ws, "glob", json!({"pattern": "{*snake*,game.rs}"})).text;
+    assert_eq!(body(&braces), "game.rs\n", "{braces}");
+    assert!(!braces.contains("pattern_hint="), "{braces}");
+    let spaced = run(&ws, "glob", json!({"pattern": "my game.rs"})).text;
+    assert_eq!(body(&spaced), "my game.rs\n", "{spaced}");
+    assert!(!spaced.contains("pattern_hint="), "{spaced}");
+}

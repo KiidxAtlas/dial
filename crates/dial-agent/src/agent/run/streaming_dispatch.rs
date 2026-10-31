@@ -187,6 +187,10 @@ impl StreamingDispatch {
     }
 
     /// A call ran outside the parallel-read path: later early results may be stale.
+    ///
+    /// Detached early reads are not cancelled here: they finish on their own, bounded by `limit`
+    /// and the shared interrupt flag, and their results are dropped with the receivers. Cancelling
+    /// them would need a polled per-read scope (`Scope::sync`), which this observer has no pump for.
     pub(in crate::agent) fn invalidate(&mut self) {
         self.clean = false;
         self.started.clear();

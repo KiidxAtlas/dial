@@ -6,12 +6,15 @@
 //! `no-tools` lists nothing, `bad-list` answers `tools/list` with an error. `announce-burst` sends
 //! three `tools/list_changed` notices after the first list, `list-counts` adds a `seen-<n>` tool
 //! per refresh (n counts first-page lists), and `list-fails-after-first` errors every later list.
+//! `gate` answers `initialize` only once the file named by [`GATE_ENV`] exists.
 
 use serde_json::{Value, json};
 use std::io::{BufRead, Write};
 
 /// Environment variable that turns the test binary into this server; its value is the flag list.
 pub const ENV: &str = "DIAL_FAKE_MCP_SERVER";
+/// With the `gate` flag: the file whose existence releases the `initialize` answer.
+pub const GATE_ENV: &str = "DIAL_FAKE_MCP_GATE";
 
 pub fn run(flags: &str) -> ! {
     let has = |flag: &str| flags.split(',').any(|f| f == flag);
@@ -38,6 +41,16 @@ pub fn run(flags: &str) -> ! {
             "initialize" => {
                 if has("silent") {
                     continue;
+                }
+                if has("gate")
+                    && let Ok(gate) = std::env::var(GATE_ENV)
+                {
+                    // Bounded, so a server the test abandons cannot outlive it for long.
+                    let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                    while !std::path::Path::new(&gate).exists() && std::time::Instant::now() < until
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
                 }
                 // Noise a real server may produce before answering.
                 println!("starting up... (not JSON)");

@@ -112,52 +112,42 @@ pub(in crate::agent) fn looks_like_overflow(error: &anyhow::Error) -> bool {
     crate::llm::errors::is_context_overflow(error)
 }
 
-/// Merge this request's plain harness notes (transient user messages with text content and no
-/// other Dial marker than the advisory priority) from `start` on into one message at the first
-/// note's position, so the model reads one harness note per request instead of a stack of
-/// competing instructions. Advisory notes are capped first by `run::guidance::cap`.
-pub(in crate::agent) fn coalesce_harness_notes(messages: &mut Vec<Value>, start: usize) {
-    let plain = crate::agent::run::guidance::is_plain_note;
-    let Some(first) = (start..messages.len()).find(|&index| plain(&messages[index])) else {
-        return;
-    };
-    let mut texts = vec![
-        messages[first]["content"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned(),
-    ];
-    let mut index = first + 1;
-    while index < messages.len() {
-        if plain(&messages[index]) {
-            texts.push(
-                messages.remove(index)["content"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned(),
-            );
-        } else {
-            index += 1;
-        }
-    }
-    if texts.len() > 1 {
-        messages[first]["content"] = json!(texts.join("\n\n"));
-    }
-}
-
-/// A reply that is just a JSON-looking object naming an offered tool. Small models often emit
-/// slightly broken ones (`{{"name": ...}` with unbalanced braces), so this matches the shape
-/// rather than requiring valid JSON.
+/// A reply that was meant to be a tool call but arrived as text. Two shapes count, both only when
+/// the text names an offered tool: a JSON-looking object with `name` and `arguments`/`parameters`
+/// (possibly in a code fence, and matched by shape because small models often emit slightly broken
+/// ones such as `{{"name": ...}`), or call markup of a dialect `llm::text_tool_calls` reads that it
+/// did not lift (the opener list is shared with that module).
 pub(in crate::agent) fn looks_like_text_call(text: &str, names: &[String]) -> bool {
     let t = text.trim();
-    if !t.starts_with('{')
-        || t.len() > 8000
-        || !t.contains("\"arguments\"") && !t.contains("\"parameters\"")
-    {
+    if t.len() > 8000 {
         return false;
     }
-    names.iter().any(|n| {
-        t.contains(&format!("\"name\": \"{n}\"")) || t.contains(&format!("\"name\":\"{n}\""))
+    if crate::llm::mentions_call_markup(t) {
+        return names.iter().any(|n| t.contains(n.as_str()));
+    }
+    let body = t
+        .strip_prefix("```")
+        .map(|fenced| {
+            fenced
+                .trim_start_matches(|c: char| c.is_ascii_alphabetic())
+                .trim_start()
+        })
+        .unwrap_or(t);
+    body.starts_with('{')
+        && (body.contains("\"arguments\"") || body.contains("\"parameters\""))
+        && names.iter().any(|n| names_tool(body, n))
+}
+
+/// Whether `body` has a `"name"` key whose string value is exactly `tool`, ignoring whitespace
+/// around the colon.
+fn names_tool(body: &str, tool: &str) -> bool {
+    body.match_indices("\"name\"").any(|(at, key)| {
+        body[at + key.len()..]
+            .trim_start()
+            .strip_prefix(':')
+            .and_then(|rest| rest.trim_start().strip_prefix('"'))
+            .and_then(|rest| rest.strip_prefix(tool))
+            .is_some_and(|rest| rest.starts_with('"'))
     })
 }
 
@@ -174,3 +164,5 @@ pub(in crate::agent) fn capped_window(window: u32, cap: u32, economy: bool) -> u
 
 #[cfg(test)]
 mod history_cap_tests;
+#[cfg(test)]
+mod text_call_tests;

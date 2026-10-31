@@ -27,6 +27,8 @@ use ureq::unversioned::transport::{
     Buffers, ConnectionDetails, Connector, Either, LazyBuffers, NextTimeout, Transport,
 };
 
+use super::Bound;
+
 /// Idle time before the first probe.
 const KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
 /// Time between unanswered probes.
@@ -45,7 +47,7 @@ const MAX_WRITE: usize = 64 << 10;
 /// Opens the TCP connection unless an earlier connector (a CONNECT proxy) already did.
 #[derive(Debug)]
 pub(super) struct KeepaliveConnector {
-    pub(super) interrupt: Arc<AtomicBool>,
+    pub(super) bound: Bound,
 }
 
 impl<In: Transport> Connector<In> for KeepaliveConnector {
@@ -59,7 +61,8 @@ impl<In: Transport> Connector<In> for KeepaliveConnector {
         if chained.is_some() {
             return Ok(chained.map(Either::A));
         }
-        let stream = connect_cancellable(&details.addrs, details.timeout, &self.interrupt)?;
+        let interrupt = Arc::clone(&self.bound.lock().interrupt);
+        let stream = connect_cancellable(&details.addrs, details.timeout, &interrupt)?;
         keepalive(&stream)?;
         if details.config.no_delay() {
             stream.set_nodelay(true)?;
@@ -71,7 +74,7 @@ impl<In: Transport> Connector<In> for KeepaliveConnector {
         Ok(Some(Either::B(KeepaliveTransport {
             stream,
             buffers,
-            interrupt: Arc::clone(&self.interrupt),
+            bound: Arc::clone(&self.bound),
             read_timeout: None,
         })))
     }
@@ -103,7 +106,7 @@ fn connect_cancellable(
     }
 }
 
-fn keepalive(stream: &TcpStream) -> io::Result<()> {
+pub(in crate::llm) fn keepalive(stream: &TcpStream) -> io::Result<()> {
     SockRef::from(stream).set_tcp_keepalive(
         &TcpKeepalive::new()
             .with_time(KEEPALIVE_IDLE)
@@ -170,7 +173,8 @@ fn address_specific(error: &io::Error) -> bool {
 pub(super) struct KeepaliveTransport {
     stream: TcpStream,
     buffers: LazyBuffers,
-    interrupt: Arc<AtomicBool>,
+    /// The request this connection serves; rebound when a pooled connection is lent again.
+    bound: Bound,
     read_timeout: Option<Duration>,
 }
 
@@ -187,9 +191,10 @@ impl KeepaliveTransport {
     fn send_nonblocking(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
         let budget = timeout.not_zero().map(|after| *after);
         let started = Instant::now();
+        let interrupt = Arc::clone(&self.bound.lock().interrupt);
         let mut sent = 0;
         while sent < amount {
-            super::check(&self.interrupt)?;
+            super::check(&interrupt)?;
             let mut slice = CANCEL_POLL;
             if let Some(budget) = budget {
                 let remaining = budget.saturating_sub(started.elapsed());
@@ -211,6 +216,17 @@ impl KeepaliveTransport {
             }
         }
         Ok(())
+    }
+
+    /// macOS refuses socket options (EINVAL) once the peer has reset the connection, yet what the
+    /// peer sent before the reset (an early response) is still readable. Without a timeout a
+    /// blocking read is unsafe, so this reads only what is already buffered. `None` when nothing
+    /// is: the caller reports the original error.
+    fn read_after_reset(&mut self) -> Option<usize> {
+        self.stream.set_nonblocking(true).ok()?;
+        let read = self.stream.read(self.buffers.input_append_buf());
+        let _ = self.stream.set_nonblocking(false);
+        read.ok()
     }
 }
 
@@ -269,16 +285,19 @@ impl Transport for KeepaliveTransport {
     }
 
     fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
-        arm(
+        let armed = arm(
             &self.stream,
             &mut self.read_timeout,
             timeout,
             TcpStream::set_read_timeout,
-        )?;
-        let amount = self
-            .stream
-            .read(self.buffers.input_append_buf())
-            .map_err(|error| io_failure(error, timeout))?;
+        );
+        let amount = match armed {
+            Ok(()) => self
+                .stream
+                .read(self.buffers.input_append_buf())
+                .map_err(|error| io_failure(error, timeout))?,
+            Err(error) => self.read_after_reset().ok_or(error)?,
+        };
         self.buffers.input_appended(amount);
         Ok(amount > 0)
     }

@@ -259,12 +259,15 @@ fn built_in_python_reuses_without_input_declarations_and_tracks_external_edits()
     // Reuse needs a recognized CPython layout with no loader injection. CI's setup-python sets
     // LD_LIBRARY_PATH (Linux) or installs a toolcache layout (macOS); there the check must fall
     // back to running every time, never to reusing an unproven result.
-    let reusable = crate::agent::verify::inputs::python_snapshot(
-        &agent.workspace,
-        Path::new("app.py"),
-        &config.python,
-    )
-    .is_some();
+    let reusable = crate::agent::verify::inputs::python_runtime(&config.python)
+        .and_then(|runtime| {
+            crate::agent::verify::inputs::python_snapshot(
+                &agent.workspace,
+                Path::new("app.py"),
+                &runtime,
+            )
+        })
+        .is_some();
     let first = agent.run_checks(&checks, &mut NullUi);
     assert!(first.failures.is_empty(), "{:?}", first.failures);
     assert_eq!(agent.verifications.len(), 1);

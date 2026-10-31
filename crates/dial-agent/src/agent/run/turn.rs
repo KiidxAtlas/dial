@@ -359,18 +359,8 @@ impl Agent<'_> {
             && !self.hermetic
             && self.external_thinking_instruction().is_none())
         .then_some(instruction);
-        let measured = if self.hermetic
-            || adapter.is_some()
-            || self.config.steering.enabled
-            || crate::llm::steering::specification(self.config, &self.config.model)
-                .ok()
-                .flatten()
-                .is_some()
-        {
-            None
-        } else {
-            crate::reliability::measured(self.config)
-        };
+        // Reuse the same base-model eligibility and saved record as the prompt and seed.
+        let measured = self.take_turn_record();
         let reliability: crate::reliability::Stats =
             serde_json::from_value(self.session.control_state()["reliability"]["stats"].clone())
                 .unwrap_or_default();

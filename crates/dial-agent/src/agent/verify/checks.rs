@@ -35,6 +35,28 @@ impl<'a> Agent<'a> {
         &self,
         check: &verify::verification::FocusedCheck,
     ) -> Result<Option<verify::inputs::Snapshot>, ()> {
+        self.capture_check_inputs_sharing(check, &mut None)
+    }
+
+    /// `runtime` holds the interpreter identity for one revalidation sweep, captured on first need.
+    /// Captures around a check's own run never share one: each must observe the runtime afresh.
+    fn capture_check_inputs_sharing(
+        &self,
+        check: &verify::verification::FocusedCheck,
+        runtime: &mut Option<Option<verify::inputs::PythonRuntime>>,
+    ) -> Result<Option<verify::inputs::Snapshot>, ()> {
+        let started = Instant::now();
+        let result = self.capture_check_inputs_inner(check, runtime);
+        self.efficiency_metrics
+            .backend_operation("check_input_capture", started.elapsed());
+        result
+    }
+
+    fn capture_check_inputs_inner(
+        &self,
+        check: &verify::verification::FocusedCheck,
+        runtime: &mut Option<Option<verify::inputs::PythonRuntime>>,
+    ) -> Result<Option<verify::inputs::Snapshot>, ()> {
         if self.step_checks.evidence.is_repro(&check.command) {
             return Ok(None);
         }
@@ -78,11 +100,10 @@ impl<'a> Agent<'a> {
             // Automatic inputs are an optional reuse optimization, not an operator contract.
             // Unknown runtimes still execute normally; a snapshot appearing/disappearing across
             // the run remains stale because the caller compares both captures.
-            Ok(verify::inputs::python_snapshot(
-                &self.workspace,
-                &source,
-                &python,
-            ))
+            let runtime = runtime.get_or_insert_with(|| verify::inputs::python_runtime(&python));
+            Ok(runtime.as_ref().and_then(|runtime| {
+                verify::inputs::python_snapshot(&self.workspace, &source, runtime)
+            }))
         })
     }
 
@@ -116,6 +137,14 @@ impl<'a> Agent<'a> {
         &mut self,
         check: &verify::verification::FocusedCheck,
     ) -> bool {
+        let started = Instant::now();
+        let reused = self.reuse_check_inner(check);
+        self.efficiency_metrics
+            .backend_operation("check_reuse", started.elapsed());
+        reused
+    }
+
+    fn reuse_check_inner(&mut self, check: &verify::verification::FocusedCheck) -> bool {
         if self.interrupt.load(Ordering::SeqCst)
             || !self.step_checks.evidence.has_inputs(&check.command)
         {
@@ -135,9 +164,15 @@ impl<'a> Agent<'a> {
     }
 
     /// Revalidate even at an unchanged effect epoch: user edits do not advance controller counters.
+    /// One sweep is one observation of the installed interpreter, shared by its checks.
     pub(in crate::agent) fn refresh_check_inputs(&mut self) {
+        let started = Instant::now();
+        let mut runtime = None;
         for check in self.step_checks.evidence.input_checks() {
-            let inputs = self.check_inputs(&check);
+            let inputs = self
+                .capture_check_inputs_sharing(&check, &mut runtime)
+                .ok()
+                .flatten();
             if self.step_checks.evidence.validate_inputs(
                 &check.command,
                 inputs.as_ref(),
@@ -148,6 +183,8 @@ impl<'a> Agent<'a> {
                 self.step_checks.checked_extension_calls = 0;
             }
         }
+        self.efficiency_metrics
+            .backend_operation("check_input_refresh", started.elapsed());
     }
 
     pub(in crate::agent) fn note_verification(
@@ -797,6 +834,20 @@ impl<'a> Agent<'a> {
         self.publish_edit_loop_status(ui);
     }
 
+    fn verification_source_identity(
+        &self,
+        paths: &[String],
+    ) -> crate::agent::verify::verification_receipts::SourceIdentity {
+        let started = Instant::now();
+        let identity = crate::agent::verify::verification_receipts::source_identity(
+            self.workspace.root(),
+            paths,
+        );
+        self.efficiency_metrics
+            .backend_operation("verification_source_identity", started.elapsed());
+        identity
+    }
+
     /// Run `checks` until interrupted; one entry per failed check with its (clipped) output.
     pub(in crate::agent) fn run_checks(
         &mut self,
@@ -820,12 +871,7 @@ impl<'a> Agent<'a> {
         } else {
             Default::default()
         };
-        let source_before = receipts.then(|| {
-            crate::agent::verify::verification_receipts::source_identity(
-                self.workspace.root(),
-                &receipt_paths,
-            )
-        });
+        let source_before = receipts.then(|| self.verification_source_identity(&receipt_paths));
         for (index, check) in checks.iter().enumerate() {
             if self.interrupt.load(Ordering::SeqCst) {
                 for skipped in &checks[index..] {
@@ -1003,10 +1049,7 @@ impl<'a> Agent<'a> {
                     json!(state["reused_passing_checks"].as_u64().unwrap_or(0) + reused_count);
                 state["edit_loop"] = self.step_checks.status();
                 if let Some(before) = source_before.as_ref().filter(|_| !outcomes.is_empty()) {
-                    let after = crate::agent::verify::verification_receipts::source_identity(
-                        self.workspace.root(),
-                        &receipt_paths,
-                    );
+                    let after = self.verification_source_identity(&receipt_paths);
                     crate::agent::verify::verification_receipts::append(
                         state,
                         crate::agent::verify::verification_receipts::receipt(

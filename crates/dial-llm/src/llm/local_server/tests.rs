@@ -23,7 +23,8 @@ fn dial_runtime_reads_the_thinking_switch_from_the_mlx_template() {
         facts,
         ServerFacts {
             slots: None,
-            thinking_switch: Some(true)
+            thinking_switch: Some(true),
+            native_tools: None
         }
     );
     let without = template_dir(Some("{{ messages }}"));
@@ -63,7 +64,8 @@ fn llama_cpp_props_report_slots_and_the_template_switch() {
         facts,
         ServerFacts {
             slots: Some(4),
-            thinking_switch: Some(true)
+            thinking_switch: Some(true),
+            native_tools: None
         }
     );
     let plain = routed(vec![(
@@ -76,7 +78,8 @@ fn llama_cpp_props_report_slots_and_the_template_switch() {
         facts,
         ServerFacts {
             slots: Some(1),
-            thinking_switch: Some(false)
+            thinking_switch: Some(false),
+            native_tools: None
         }
     );
     let not_llama = routed(vec![]);
@@ -97,7 +100,8 @@ fn ollama_capabilities_report_the_thinking_switch_and_lm_studio_reports_none() {
         facts,
         ServerFacts {
             slots: None,
-            thinking_switch: Some(true)
+            thinking_switch: Some(true),
+            native_tools: Some(false)
         }
     );
     let plain = routed(vec![(
@@ -108,12 +112,30 @@ fn ollama_capabilities_report_the_thinking_switch_and_lm_studio_reports_none() {
         super::facts("ollama", "llama3", Some(&plain), None, &[]).thinking_switch,
         Some(false)
     );
-    // LM Studio is never asked: its answer is always unknown here.
-    let studio = routed(vec![("/api/v0/models", r#"{"data":[]}"#.into())]);
+    let tools = routed(vec![(
+        "/api/show",
+        r#"{"capabilities":["completion","tools"]}"#.into(),
+    )]);
     assert_eq!(
-        super::facts("lm-studio", "x", Some(&studio), None, &[]),
-        ServerFacts::default()
+        super::facts("ollama", "llama3.1", Some(&tools), None, &[]).native_tools,
+        Some(true)
     );
+    // LM Studio has no thinking switch to read; its rows say whether a model declares tool use. A
+    // row without a capability list, or without a row, says nothing.
+    let studio = routed(vec![(
+        "/api/v0/models",
+        r#"{"data":[
+            {"id":"tools","capabilities":["tool_use"]},
+            {"id":"plain","capabilities":[]},
+            {"id":"silent"}]}"#
+            .into(),
+    )]);
+    let native = |model: &str| super::facts("lm-studio", model, Some(&studio), None, &[]);
+    assert_eq!(native("tools").native_tools, Some(true));
+    assert_eq!(native("plain").native_tools, Some(false));
+    assert_eq!(native("silent"), ServerFacts::default());
+    assert_eq!(native("absent"), ServerFacts::default());
+    assert_eq!(native("tools").thinking_switch, None);
 }
 
 #[test]

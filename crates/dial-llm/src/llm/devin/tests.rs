@@ -62,6 +62,122 @@ fn route<'a>(base_url: &'a str, model: &'a str) -> Route<'a> {
     }
 }
 
+/// Serves `(status, body)` per connection and reports the request paths in order.
+fn serve_paths(replies: Vec<(u16, Vec<u8>)>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let mut paths = Vec::new();
+        for (status, body) in replies {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = [0u8; 256];
+            let n = stream.peek(&mut head).unwrap();
+            let line = String::from_utf8_lossy(&head[..n]).into_owned();
+            paths.push(
+                line.split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_owned(),
+            );
+            read_request(&mut stream);
+            let head = format!(
+                "HTTP/1.1 {status} X\r\ncontent-type: application/connect+proto\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(&body).unwrap();
+        }
+        paths
+    });
+    (format!("http://{addr}"), handle)
+}
+
+fn jwt_body(jwt: &str) -> Vec<u8> {
+    let mut body = Enc::default();
+    body.string(1, jwt);
+    body.0
+}
+
+fn done_stream(text: &str) -> Vec<u8> {
+    let mut frames = text_frame(text);
+    frames.extend(frame(FLAG_END_STREAM, b"{}").unwrap());
+    frames
+}
+
+fn hello_exchange(base: &str) -> Result<Reply> {
+    let chat = Chat {
+        messages: vec![json!({"role":"user","content":"hi"})],
+        tools: Vec::new(),
+        temperature: 0.0,
+        max_tokens: 10,
+        seed: None,
+    };
+    exchange(
+        &route(base, "swe-1-6"),
+        &chat,
+        5,
+        &mut None,
+        Arc::new(AtomicBool::new(false)),
+        None,
+        &mut |_| true,
+    )
+}
+
+#[test]
+fn consecutive_exchanges_reuse_the_authenticated_session() {
+    let (base, server) = serve_paths(vec![
+        (200, jwt_body("jwt-1")),
+        (200, done_stream("one")),
+        (200, done_stream("two")),
+    ]);
+    assert_eq!(hello_exchange(&base).unwrap().text, "one");
+    assert_eq!(hello_exchange(&base).unwrap().text, "two");
+    assert_eq!(
+        server.join().unwrap(),
+        [AUTH_PATH, CHAT_PATH, CHAT_PATH],
+        "the second exchange must not call GetUserJwt again"
+    );
+}
+
+#[test]
+fn an_expired_user_jwt_is_not_reused() {
+    use base64::Engine as _;
+    let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"exp":1}"#);
+    let expired = format!("e30.{claims}.sig");
+    let (base, server) = serve_paths(vec![
+        (200, jwt_body(&expired)),
+        (200, done_stream("one")),
+        (200, jwt_body(&expired)),
+        (200, done_stream("two")),
+    ]);
+    assert_eq!(hello_exchange(&base).unwrap().text, "one");
+    assert_eq!(hello_exchange(&base).unwrap().text, "two");
+    assert_eq!(
+        server.join().unwrap(),
+        [AUTH_PATH, CHAT_PATH, AUTH_PATH, CHAT_PATH]
+    );
+}
+
+#[test]
+fn a_rejected_chat_drops_the_cached_session() {
+    let (base, server) = serve_paths(vec![
+        (200, jwt_body("jwt-1")),
+        (
+            401,
+            br#"{"code":"unauthenticated","message":"expired"}"#.to_vec(),
+        ),
+        (200, jwt_body("jwt-2")),
+        (200, done_stream("again")),
+    ]);
+    let error = hello_exchange(&base).unwrap_err();
+    assert_eq!(crate::llm::errors::classify(&error), ErrorClass::Auth);
+    assert_eq!(hello_exchange(&base).unwrap().text, "again");
+    assert_eq!(
+        server.join().unwrap(),
+        [AUTH_PATH, CHAT_PATH, AUTH_PATH, CHAT_PATH]
+    );
+}
+
 #[test]
 fn metadata_fields_match_the_cli_identity() {
     let meta = metadata("devin-session-token$abc", "jwt-1");

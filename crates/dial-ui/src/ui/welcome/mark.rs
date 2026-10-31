@@ -1,7 +1,9 @@
 //! The launch mark: a braille knob beside a geometric braille "dial". Shapes are distance tests
 //! sampled on the braille dot grid (2×4 dots per cell), so the needle turns smoothly while the
 //! mark settles at start-up: the needle swings up from its stop, the ticks it passes light up and
-//! the wordmark tunes in from left to right. Progress `>= 1.0` is the resting frame.
+//! the wordmark tunes in from left to right. Progress `>= 1.0` is the resting frame. After that
+//! an optional ambient clock keeps the mark quietly alive: the needle breathes and a glint of
+//! light crosses now and then.
 use super::*;
 
 /// Dot offsets of a braille cell with their bit in U+2800.
@@ -74,10 +76,10 @@ fn level(progress: f32) -> f32 {
     1.0 + (C1 + 1.0) * t.powi(3) + C1 * t.powi(2)
 }
 
-fn knob(x: f32, y: f32, level: f32) -> Option<Ink> {
+fn knob(x: f32, y: f32, level: f32, sway: f32) -> Option<Ink> {
     let (dx, dy) = (x - CENTER.0, y - CENTER.1);
     let r = dx.hypot(dy);
-    let reach = ARC * REST * level;
+    let reach = ARC * REST * level + sway;
     let needle = START + reach;
     // A hollow hub and a one-dot needle: thin strokes stay crisp at braille resolution.
     if (r - 2.0).abs() <= 0.75 || segment(x, y, polar(3.2, needle), polar(10.0, needle)) <= 0.6 {
@@ -166,11 +168,58 @@ fn wordmark_cells(level: f32) -> Cells {
     })
 }
 
-/// The knob and wordmark side by side, exactly [`LOCKUP`] cells.
-pub(super) fn lockup(theme: &Theme, progress: f32) -> Vec<Vec<Span<'static>>> {
+/// A wordmark-sized glint of light crosses the mark once per [`GLINT_PERIOD`] ambient ticks.
+const GLINT_PERIOD: u64 = 96;
+/// How many ambient ticks one crossing takes; the rest of the period is still.
+const GLINT_RUN: u64 = 28;
+const GLINT_BAND: f32 = 3.5;
+/// How far the resting needle sways either way, in degrees, and the ticks in one slow breath.
+const SWAY: f32 = 5.0;
+const BREATH: f32 = 48.0;
+
+/// The needle's drift from its resting angle after `idle` ambient ticks: zero at tick 0, so the
+/// resting frame is exactly the settled one, then a slow sine that now and then nudges the needle
+/// across the next tick mark.
+fn sway(idle: u64) -> f32 {
+    SWAY * (idle as f32 / BREATH * std::f32::consts::TAU).sin()
+}
+
+/// Where the glint's head is after `idle` ambient ticks, in cells from the mark's left edge, or
+/// `None` while it is between crossings (always at tick 0).
+fn glint(idle: u64, cells: usize) -> Option<f32> {
+    let at = (idle % GLINT_PERIOD).checked_sub(GLINT_PERIOD - GLINT_RUN)?;
+    let along = (at + 1) as f32 / GLINT_RUN as f32;
+    Some(along * (cells as f32 + 2.0 * GLINT_BAND) - GLINT_BAND)
+}
+
+/// Lights the columns near `head` (cells from this block's left edge) in every row.
+fn shine(theme: &Theme, rows: &mut [Vec<Span<'static>>], head: Option<f32>) {
+    if let Some(head) = head {
+        for row in rows {
+            fx::brighten(theme, row, head, GLINT_BAND);
+        }
+    }
+}
+
+/// The knob and wordmark side by side, exactly [`LOCKUP`] cells. `idle` counts the slow ambient
+/// ticks since the mark settled: the needle sways and a glint crosses; `0` is the resting frame.
+pub(super) fn lockup(theme: &Theme, progress: f32, idle: u64) -> Vec<Vec<Span<'static>>> {
     let level = level(progress);
-    let knob = paint(theme, &cells(KNOB, |x, y| knob(x, y, level)), 0, LOCKUP.0);
-    let word = paint(theme, &wordmark_cells(level), KNOB.0 / 2 + GAP, LOCKUP.0);
+    let sway = sway(idle);
+    let head = glint(idle, LOCKUP.0);
+    let mut knob = paint(
+        theme,
+        &cells(KNOB, |x, y| knob(x, y, level, sway)),
+        0,
+        LOCKUP.0,
+    );
+    let mut word = paint(theme, &wordmark_cells(level), KNOB.0 / 2 + GAP, LOCKUP.0);
+    shine(theme, &mut knob, head);
+    shine(
+        theme,
+        &mut word,
+        head.map(|head| head - (KNOB.0 / 2 + GAP) as f32),
+    );
     knob.into_iter()
         .enumerate()
         .map(|(row, mut spans)| {
@@ -184,7 +233,10 @@ pub(super) fn lockup(theme: &Theme, progress: f32) -> Vec<Vec<Span<'static>>> {
         .collect()
 }
 
-/// The wordmark alone, exactly [`WORDMARK`] cells, for windows too small for the knob.
-pub(super) fn wordmark(theme: &Theme, progress: f32) -> Vec<Vec<Span<'static>>> {
-    paint(theme, &wordmark_cells(level(progress)), 0, WORDMARK.0)
+/// The wordmark alone, exactly [`WORDMARK`] cells, for windows too small for the knob. Its glint
+/// follows the same `idle` clock as [`lockup`].
+pub(super) fn wordmark(theme: &Theme, progress: f32, idle: u64) -> Vec<Vec<Span<'static>>> {
+    let mut word = paint(theme, &wordmark_cells(level(progress)), 0, WORDMARK.0);
+    shine(theme, &mut word, glint(idle, WORDMARK.0));
+    word
 }

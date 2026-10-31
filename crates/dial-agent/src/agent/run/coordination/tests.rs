@@ -324,6 +324,57 @@ fn peer_messages_keep_both_directions_and_show_queued_mail_as_unread() {
 }
 
 #[test]
+fn a_sender_handle_delivers_without_the_agent_and_keeps_the_chat_history() {
+    with_agent("", |agent| {
+        let layout = agent.layout().unwrap().clone();
+        let peer = Participant::join(&layout, "other-session").unwrap();
+        let sender = agent.peer_sender().expect("coordination is enabled");
+        // The agent is free to be borrowed elsewhere (a turn); the sender stands alone.
+        sender.send(peer.id(), "hold off on src").unwrap();
+        assert!(sender.send("not-a-peer", "x").is_err());
+        assert_eq!(peer.drain().unwrap()[0].text, "hold off on src");
+        let chat = agent.peer_messages().unwrap();
+        assert_eq!(chat.len(), 1, "a refused send leaves no history");
+        assert!(chat[0].outgoing && chat[0].text == "hold off on src");
+    });
+}
+
+#[test]
+fn disabled_coordination_offers_no_sender() {
+    with_agent("[coordination]\nenabled=false", |agent| {
+        assert!(agent.peer_sender().is_none());
+    });
+}
+
+#[test]
+fn mail_readiness_looks_without_taking_and_is_throttled() {
+    with_agent("", |agent| {
+        let layout = agent.layout().unwrap().clone();
+        let peer = Participant::join(&layout, "other-session").unwrap();
+        let own_id = agent.peer_board().unwrap().id;
+        assert!(!agent.peer_mail_ready());
+        peer.send(&own_id, "interface changed").unwrap();
+        assert!(
+            !agent.peer_mail_ready(),
+            "the inbox is probed once a second"
+        );
+        agent.peer_state.mail_probe = None;
+        assert!(agent.peer_mail_ready());
+        assert_eq!(
+            agent.peer_board().unwrap().queued,
+            1,
+            "readiness must not drain"
+        );
+        agent.peer_state.error = Some("registry unavailable".into());
+        agent.peer_state.mail_probe = None;
+        assert!(
+            !agent.peer_mail_ready(),
+            "a failing registry never ends a wait"
+        );
+    });
+}
+
+#[test]
 fn peer_board_reports_disabled_coordination() {
     with_agent("[coordination]\nenabled=false", |agent| {
         assert!(agent.peer_board().is_err());

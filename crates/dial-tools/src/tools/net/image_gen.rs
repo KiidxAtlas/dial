@@ -32,6 +32,8 @@ use crate::tools::{ToolOutput, tool_schema};
 
 mod comfyui;
 mod google;
+#[cfg(test)]
+mod loopback;
 mod native;
 mod queued;
 mod selected;

@@ -95,6 +95,54 @@ fn running_side_question_blocks_completion_until_it_settles() {
 }
 
 #[test]
+fn event_wait_resumes_for_side_answer_and_preserves_exactly_once_delivery() {
+    struct Release(mpsc::Sender<()>);
+    impl crate::agent::Ui for Release {
+        fn notice(&mut self, text: &str) {
+            if text.starts_with("Waiting for running work without model polling:") {
+                self.0.send(()).unwrap();
+            }
+        }
+    }
+    with_agent("", |agent| {
+        let (send, receive) = mpsc::channel();
+        let id = agent
+            .side_questions
+            .start(move |_| {
+                receive
+                    .recv_timeout(Duration::from_secs(3))
+                    .map_err(|e| e.to_string())?;
+                Err("deterministic side failure".into())
+            })
+            .unwrap();
+        assert!(agent.wait_for_background_event(&mut Release(send)).unwrap());
+        assert!(agent.side_questions.running_ids().is_empty());
+        assert_eq!(delivered_count(agent, &id), 0);
+        assert!(agent.side_questions.has_undelivered());
+        agent.deliver_worker_results().unwrap();
+        agent.deliver_worker_results().unwrap();
+        assert_eq!(delivered_count(agent, &id), 1);
+        let delivered = agent
+            .session
+            .messages()
+            .into_iter()
+            .find(|message| message["dial_side_result"] == id)
+            .unwrap();
+        assert!(
+            delivered["content"]
+                .as_str()
+                .unwrap()
+                .contains("deterministic side failure")
+        );
+        assert!(
+            !agent
+                .wait_for_background_event(&mut crate::agent::NullUi)
+                .unwrap()
+        );
+    });
+}
+
+#[test]
 fn completed_side_result_blocks_completion_until_delivered() {
     with_agent("", |agent| {
         let id = agent.side_questions.start(|_| Ok("answer".into())).unwrap();

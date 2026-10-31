@@ -17,14 +17,16 @@
 //! Everything here reads disk or locks; call [`snapshot`] at most about once a second and never
 //! from draw code.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 
 use crate::agent::LiveTaskControl;
-use crate::agent::workers::child_transcript::{self, TranscriptSummary};
+use crate::agent::workers::child_transcript::{
+    self, Change, Follow, MessageFollower, TranscriptSummary,
+};
 use crate::config::paths::Layout;
 use crate::runtime::{Phase, Tree};
 
@@ -32,6 +34,10 @@ use crate::runtime::{Phase, Tree};
 const ACTIVITY_TRANSCRIPTS: usize = 12;
 /// Activity events kept in a snapshot (newest last).
 const ACTIVITY_LIMIT: usize = 300;
+/// Follower reads one persistent [`HubCache`] refresh may spend on each transcript. One read
+/// covers [`child_transcript::FOLLOW_CHUNK`] bytes, so a long history is followed over several
+/// refreshes, each keeping its position. A free [`snapshot`] follows it to the end at once.
+const PERSISTENT_FOLLOW_ROUNDS: usize = 1;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AgentStatus {
@@ -183,157 +189,223 @@ pub struct HubSnapshot {
     pub totals: Totals,
 }
 
-/// Build the hub projection. Disk reads happen here, so throttle callers to about once a second.
+/// Build the hub projection without keeping state between calls. A refresh that repeats should
+/// hold a [`HubCache`], which follows each transcript incrementally instead of rereading it.
 pub fn snapshot(
     layout: &Layout,
     session_id: &str,
     runtime: &Tree,
     live: Option<&LiveTaskControl>,
 ) -> HubSnapshot {
-    let now = epoch_ms();
-    let live_running: HashSet<String> = live
-        .map(|control| {
-            control
-                .list()
-                .into_iter()
-                .filter(|(_, running)| *running)
-                .map(|(id, _)| id)
-                .collect()
-        })
-        .unwrap_or_default();
-    let summaries = child_transcript::scan(layout, session_id);
+    HubCache {
+        unbounded: true,
+        ..HubCache::default()
+    }
+    .snapshot(layout, session_id, runtime, live)
+}
 
-    let mut agents: Vec<AgentEntry> = Vec::new();
-    let mut recorded_nodes = HashMap::new();
-    for summary in &summaries {
-        let Some(id) = summary.header["id"].as_str() else {
-            continue;
-        };
-        // `scan` is newest first: a resumed worker shows its latest transcript only.
-        if agents.iter().any(|agent| agent.id == id) {
-            continue;
+/// Per-transcript projection kept between refreshes: the follower's position and at most
+/// [`ACTIVITY_LIMIT`] activity events. It never holds message bodies.
+struct TranscriptFeed {
+    follower: MessageFollower,
+    events: VecDeque<ActivityEvent>,
+}
+
+/// Projection state owned by one hub view. It follows the newest [`ACTIVITY_TRANSCRIPTS`]
+/// transcripts incrementally, so an unchanged transcript costs a header-sized check and an
+/// appended one parses only its new records. Feeds that leave that window are dropped, which
+/// bounds the cache to the window.
+#[derive(Default)]
+pub struct HubCache {
+    feeds: HashMap<PathBuf, TranscriptFeed>,
+    bytes_read: u64,
+    read_errors: u64,
+    /// Free snapshots follow each transcript to its end in one call. The persistent cache stops
+    /// after [`PERSISTENT_FOLLOW_ROUNDS`] reads per transcript and resumes on the next refresh.
+    unbounded: bool,
+}
+
+/// Size and I/O counters of a [`HubCache`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HubCacheStats {
+    /// Transcripts currently followed.
+    pub transcripts: usize,
+    /// Activity events held across those transcripts.
+    pub cached_events: usize,
+    /// Bytes read by the activity followers over the cache's lifetime: transcript records and
+    /// rewrite checks. Header and status scans are not counted.
+    pub bytes_read: u64,
+    /// Transcript reads that failed; their activity is omitted until a later read succeeds.
+    pub read_errors: u64,
+}
+
+impl HubCache {
+    pub fn stats(&self) -> HubCacheStats {
+        HubCacheStats {
+            transcripts: self.feeds.len(),
+            cached_events: self.feeds.values().map(|feed| feed.events.len()).sum(),
+            bytes_read: self.bytes_read,
+            read_errors: self.read_errors,
         }
-        if let Some(node) = summary.header["runtime_node"].as_str() {
-            recorded_nodes.insert(id, node);
-        }
-        agents.push(entry_from_transcript(id, summary, &live_running));
     }
 
-    for body in runtime.bodies("worker") {
-        let (node_id, phase, data) =
-            body.read(|node| (node.id.clone(), node.result.phase, node.result.data.clone()));
-        let data = data.unwrap_or(Value::Null);
-        let id = data["id"]
-            .as_str()
-            .map_or_else(|| node_id.clone(), str::to_owned);
-        let owned_node = live.and_then(|control| control.current_node(&id));
-        if owned_node
-            .as_deref()
-            .or_else(|| recorded_nodes.get(id.as_str()).copied())
-            .is_some_and(|current| current != node_id.as_str())
-        {
-            continue;
-        }
-        let index = match agents.iter().position(|agent| agent.id == id) {
-            Some(index) => index,
-            None => {
-                agents.push(AgentEntry {
-                    id: id.clone(),
-                    ..AgentEntry::default()
-                });
-                agents.len() - 1
+    /// Build the hub projection. Disk reads happen here, so throttle callers to about once a second.
+    /// A persistent cache reads at most [`PERSISTENT_FOLLOW_ROUNDS`] chunks per transcript per call.
+    pub fn snapshot(
+        &mut self,
+        layout: &Layout,
+        session_id: &str,
+        runtime: &Tree,
+        live: Option<&LiveTaskControl>,
+    ) -> HubSnapshot {
+        let now = epoch_ms();
+        let live_running: HashSet<String> = live
+            .map(|control| {
+                control
+                    .list()
+                    .into_iter()
+                    .filter(|(_, running)| *running)
+                    .map(|(id, _)| id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let summaries = child_transcript::scan(layout, session_id);
+
+        let mut agents: Vec<AgentEntry> = Vec::new();
+        let mut recorded_nodes = HashMap::new();
+        for summary in &summaries {
+            let Some(id) = summary.header["id"].as_str() else {
+                continue;
+            };
+            // `scan` is newest first: a resumed worker shows its latest transcript only.
+            if agents.iter().any(|agent| agent.id == id) {
+                continue;
             }
-        };
-        apply_body(&mut agents[index], &data, phase, now);
-    }
+            if let Some(node) = summary.header["runtime_node"].as_str() {
+                recorded_nodes.insert(id, node);
+            }
+            agents.push(entry_from_transcript(id, summary, &live_running));
+        }
 
-    for agent in &mut agents {
-        finish_projection(agent, &live_running, now);
-    }
-    sort_agents(&mut agents);
-
-    let mut unread_by_id: HashMap<String, usize> = HashMap::new();
-    let mut traffic_events: Vec<ActivityEvent> = Vec::new();
-    let mut seen_traffic: HashSet<(String, String, String)> = HashSet::new();
-    if let Some(control) = live {
-        for agent in &agents {
-            for letter in control.traffic(&agent.id) {
-                if letter.to == agent.id {
-                    *unread_by_id.entry(agent.id.clone()).or_default() += 1;
-                }
-                let key = (
-                    letter.from.clone(),
-                    letter.to.clone(),
-                    letter.preview.clone(),
-                );
-                if seen_traffic.insert(key) {
-                    traffic_events.push(ActivityEvent {
-                        agent_id: agent.id.clone(),
-                        at_ms: agent.last_activity_ms.or(agent.started_ms).unwrap_or(now),
-                        kind: ActivityKind::Message,
-                        title: format!("{} → {}", letter.from, letter.to),
-                        summary: crate::ui::text::clip(
-                            &crate::ui::text::one_line(&letter.preview),
-                            160,
-                        ),
-                        entry: None,
+        for body in runtime.bodies("worker") {
+            let (node_id, phase, data) =
+                body.read(|node| (node.id.clone(), node.result.phase, node.result.data.clone()));
+            let data = data.unwrap_or(Value::Null);
+            let id = data["id"]
+                .as_str()
+                .map_or_else(|| node_id.clone(), str::to_owned);
+            let owned_node = live.and_then(|control| control.current_node(&id));
+            if owned_node
+                .as_deref()
+                .or_else(|| recorded_nodes.get(id.as_str()).copied())
+                .is_some_and(|current| current != node_id.as_str())
+            {
+                continue;
+            }
+            let index = match agents.iter().position(|agent| agent.id == id) {
+                Some(index) => index,
+                None => {
+                    agents.push(AgentEntry {
+                        id: id.clone(),
+                        ..AgentEntry::default()
                     });
+                    agents.len() - 1
+                }
+            };
+            apply_body(&mut agents[index], &data, phase, now);
+        }
+
+        for agent in &mut agents {
+            finish_projection(agent, &live_running, now);
+        }
+        sort_agents(&mut agents);
+
+        let mut unread_by_id: HashMap<String, usize> = HashMap::new();
+        let mut traffic_events: Vec<ActivityEvent> = Vec::new();
+        let mut seen_traffic: HashSet<(String, String, String)> = HashSet::new();
+        if let Some(control) = live {
+            for agent in &agents {
+                for letter in control.traffic(&agent.id) {
+                    if letter.to == agent.id {
+                        *unread_by_id.entry(agent.id.clone()).or_default() += 1;
+                    }
+                    let key = (
+                        letter.from.clone(),
+                        letter.to.clone(),
+                        letter.preview.clone(),
+                    );
+                    if seen_traffic.insert(key) {
+                        traffic_events.push(ActivityEvent {
+                            agent_id: agent.id.clone(),
+                            at_ms: agent.last_activity_ms.or(agent.started_ms).unwrap_or(now),
+                            kind: ActivityKind::Message,
+                            title: format!("{} → {}", letter.from, letter.to),
+                            summary: crate::ui::text::clip(
+                                &crate::ui::text::one_line(&letter.preview),
+                                160,
+                            ),
+                            entry: None,
+                        });
+                    }
                 }
             }
         }
-    }
-    for agent in &mut agents {
-        agent.unread = unread_by_id.get(&agent.id).copied().unwrap_or(0);
-    }
-
-    let mut activity = Vec::new();
-    for summary in summaries.iter().take(ACTIVITY_TRANSCRIPTS) {
-        let Some(id) = summary.header["id"].as_str() else {
-            continue;
-        };
-        let Some(agent) = agents.iter().find(|agent| agent.id == id) else {
-            continue;
-        };
-        activity.extend(activity_from_transcript(agent, summary));
-    }
-    for agent in &agents {
-        if let Some(started) = agent.started_ms {
-            activity.push(ActivityEvent {
-                agent_id: agent.id.clone(),
-                at_ms: started,
-                kind: ActivityKind::Lifecycle,
-                title: "started".into(),
-                summary: agent.task.clone(),
-                entry: None,
-            });
+        for agent in &mut agents {
+            agent.unread = unread_by_id.get(&agent.id).copied().unwrap_or(0);
         }
-        if agent.status.is_finished() {
-            activity.push(ActivityEvent {
-                agent_id: agent.id.clone(),
-                at_ms: agent.last_activity_ms.or(agent.started_ms).unwrap_or(now),
-                kind: if agent.status == AgentStatus::Failed {
-                    ActivityKind::Error
-                } else {
-                    ActivityKind::Lifecycle
-                },
-                title: agent.status.label().into(),
-                summary: agent.current.clone().unwrap_or_default(),
-                entry: None,
-            });
-        }
-    }
-    activity.extend(traffic_events);
-    activity.sort_by_key(|event| event.at_ms);
-    if activity.len() > ACTIVITY_LIMIT {
-        let excess = activity.len() - ACTIVITY_LIMIT;
-        activity.drain(..excess);
-    }
 
-    let totals = totals(&agents);
-    HubSnapshot {
-        agents,
-        activity,
-        totals,
+        let mut activity = Vec::new();
+        let recent = &summaries[..summaries.len().min(ACTIVITY_TRANSCRIPTS)];
+        for summary in recent {
+            let Some(id) = summary.header["id"].as_str() else {
+                continue;
+            };
+            let Some(agent) = agents.iter().find(|agent| agent.id == id) else {
+                continue;
+            };
+            activity.extend(self.feed_activity(agent, summary));
+        }
+        self.feeds
+            .retain(|path, _| recent.iter().any(|summary| &summary.path == path));
+        for agent in &agents {
+            if let Some(started) = agent.started_ms {
+                activity.push(ActivityEvent {
+                    agent_id: agent.id.clone(),
+                    at_ms: started,
+                    kind: ActivityKind::Lifecycle,
+                    title: "started".into(),
+                    summary: agent.task.clone(),
+                    entry: None,
+                });
+            }
+            if agent.status.is_finished() {
+                activity.push(ActivityEvent {
+                    agent_id: agent.id.clone(),
+                    at_ms: agent.last_activity_ms.or(agent.started_ms).unwrap_or(now),
+                    kind: if agent.status == AgentStatus::Failed {
+                        ActivityKind::Error
+                    } else {
+                        ActivityKind::Lifecycle
+                    },
+                    title: agent.status.label().into(),
+                    summary: agent.current.clone().unwrap_or_default(),
+                    entry: None,
+                });
+            }
+        }
+        activity.extend(traffic_events);
+        activity.sort_by_key(|event| event.at_ms);
+        if activity.len() > ACTIVITY_LIMIT {
+            let excess = activity.len() - ACTIVITY_LIMIT;
+            activity.drain(..excess);
+        }
+
+        let totals = totals(&agents);
+        HubSnapshot {
+            agents,
+            activity,
+            totals,
+        }
     }
 }
 
@@ -790,92 +862,150 @@ fn totals(agents: &[AgentEntry]) -> Totals {
     totals
 }
 
-fn activity_from_transcript(agent: &AgentEntry, summary: &TranscriptSummary) -> Vec<ActivityEvent> {
-    let Ok(messages) = child_transcript::entries(&summary.path) else {
-        return Vec::new();
-    };
-    let base = agent
-        .last_activity_ms
-        .or(agent.started_ms)
-        .unwrap_or_else(epoch_ms);
-    let mut events = Vec::new();
-    for (index, message) in messages.iter().enumerate() {
-        let role = message["role"].as_str().unwrap_or_default();
-        let text = message_text(message);
-        let at_ms = base;
-        let event = match role {
-            "assistant" => {
-                let tool_blocks: Vec<&Value> = message["content"]
-                    .as_array()
-                    .map(|blocks| {
-                        blocks
-                            .iter()
-                            .filter(|block| block["type"] == "tool_use")
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                if tool_blocks.is_empty() {
-                    ActivityEvent {
-                        agent_id: agent.id.clone(),
-                        at_ms,
-                        kind: ActivityKind::Response,
-                        title: "response".into(),
-                        summary: crate::ui::text::clip(&crate::ui::text::one_line(&text), 160),
-                        entry: Some(index),
-                    }
-                } else {
-                    if !text.trim().is_empty() {
-                        events.push(ActivityEvent {
-                            agent_id: agent.id.clone(),
-                            at_ms,
-                            kind: ActivityKind::Response,
-                            title: "response".into(),
-                            summary: crate::ui::text::clip(&crate::ui::text::one_line(&text), 160),
-                            entry: Some(index),
-                        });
-                    }
-                    for block in tool_blocks {
-                        events.push(ActivityEvent {
-                            agent_id: agent.id.clone(),
-                            at_ms,
-                            kind: ActivityKind::Tool,
-                            title: block["name"].as_str().unwrap_or("tool").to_owned(),
-                            summary: String::new(),
-                            entry: Some(index),
-                        });
-                    }
-                    continue;
-                }
-            }
-            "tool" => {
-                let failed = message["is_error"].as_bool().unwrap_or(false)
-                    || message["isError"].as_bool().unwrap_or(false);
-                ActivityEvent {
-                    agent_id: agent.id.clone(),
-                    at_ms,
-                    kind: if failed {
-                        ActivityKind::Error
-                    } else {
-                        ActivityKind::Tool
-                    },
-                    title: message["name"].as_str().unwrap_or("tool result").to_owned(),
-                    summary: crate::ui::text::clip(&crate::ui::text::one_line(&text), 160),
-                    entry: Some(index),
-                }
-            }
-            "user" => ActivityEvent {
-                agent_id: agent.id.clone(),
-                at_ms,
-                kind: ActivityKind::Message,
-                title: "prompt".into(),
-                summary: crate::ui::text::clip(&crate::ui::text::one_line(&text), 160),
-                entry: Some(index),
-            },
-            _ => continue,
+impl HubCache {
+    /// Advances the feed of one transcript by at most the round budget and returns its events,
+    /// timed by the agent. A persistent cache spends [`PERSISTENT_FOLLOW_ROUNDS`] reads per
+    /// refresh, so a long or still-growing transcript never stalls the view; the rest is followed
+    /// on later refreshes from the same position. A failed read drops the feed (the next call
+    /// rebuilds it) and is counted, never reported as an empty fresh transcript.
+    fn feed_activity(
+        &mut self,
+        agent: &AgentEntry,
+        summary: &TranscriptSummary,
+    ) -> Vec<ActivityEvent> {
+        let rounds = if self.unbounded {
+            usize::MAX
+        } else {
+            PERSISTENT_FOLLOW_ROUNDS
         };
-        events.push(event);
+        let feed = self
+            .feeds
+            .entry(summary.path.clone())
+            .or_insert_with(|| TranscriptFeed {
+                follower: MessageFollower::new(summary.path.clone()),
+                events: VecDeque::new(),
+            });
+        let TranscriptFeed { follower, events } = feed;
+        let before = follower.bytes_read();
+        let mut result = Ok(());
+        for _ in 0..rounds {
+            let step = follower.follow(&mut |change| match change {
+                Change::Reset => events.clear(),
+                Change::Message(index, message) => {
+                    push_bounded(events, activity_of_message(&agent.id, index, message));
+                }
+            });
+            match step {
+                Ok(Follow::Unchanged) => break,
+                Ok(_) => {}
+                Err(error) => {
+                    result = Err(error);
+                    break;
+                }
+            }
+        }
+        self.bytes_read += follower.bytes_read() - before;
+        if result.is_err() {
+            self.read_errors += 1;
+            self.feeds.remove(&summary.path);
+            return Vec::new();
+        }
+        let base = agent
+            .last_activity_ms
+            .or(agent.started_ms)
+            .unwrap_or_else(epoch_ms);
+        self.feeds
+            .get(&summary.path)
+            .into_iter()
+            .flat_map(|feed| feed.events.iter())
+            .map(|event| ActivityEvent {
+                at_ms: base,
+                ..event.clone()
+            })
+            .collect()
     }
-    events
+}
+
+/// Keeps the newest [`ACTIVITY_LIMIT`] events of one transcript; older ones are dropped.
+fn push_bounded(events: &mut VecDeque<ActivityEvent>, new: Vec<ActivityEvent>) {
+    for event in new {
+        if events.len() == ACTIVITY_LIMIT {
+            events.pop_front();
+        }
+        events.push_back(event);
+    }
+}
+
+/// Activity events of one archived message. `index` is its `#entry` deep-link index. Times are
+/// placeholders; [`HubCache::feed_activity`] assigns the agent's time when it reads the feed.
+fn activity_of_message(agent_id: &str, index: usize, message: &Value) -> Vec<ActivityEvent> {
+    let text = message_text(message);
+    let event = |kind: ActivityKind, title: String, summary: String| ActivityEvent {
+        agent_id: agent_id.to_owned(),
+        at_ms: 0,
+        kind,
+        title,
+        summary,
+        entry: Some(index),
+    };
+    let short = |body: &str| crate::ui::text::clip(&crate::ui::text::one_line(body), 160);
+    match message["role"].as_str().unwrap_or_default() {
+        "assistant" => {
+            let tool_blocks: Vec<&Value> = message["content"]
+                .as_array()
+                .map(|blocks| {
+                    blocks
+                        .iter()
+                        .filter(|block| block["type"] == "tool_use")
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut events = Vec::new();
+            if tool_blocks.is_empty() {
+                events.push(event(
+                    ActivityKind::Response,
+                    "response".into(),
+                    short(text.as_str()),
+                ));
+            } else {
+                if !text.trim().is_empty() {
+                    events.push(event(
+                        ActivityKind::Response,
+                        "response".into(),
+                        short(text.as_str()),
+                    ));
+                }
+                for block in tool_blocks {
+                    events.push(event(
+                        ActivityKind::Tool,
+                        block["name"].as_str().unwrap_or("tool").to_owned(),
+                        String::new(),
+                    ));
+                }
+            }
+            events
+        }
+        "tool" => {
+            let failed = message["is_error"].as_bool().unwrap_or(false)
+                || message["isError"].as_bool().unwrap_or(false);
+            let kind = if failed {
+                ActivityKind::Error
+            } else {
+                ActivityKind::Tool
+            };
+            vec![event(
+                kind,
+                message["name"].as_str().unwrap_or("tool result").to_owned(),
+                short(text.as_str()),
+            )]
+        }
+        "user" => vec![event(
+            ActivityKind::Message,
+            "prompt".into(),
+            short(text.as_str()),
+        )],
+        _ => Vec::new(),
+    }
 }
 
 fn message_text(message: &Value) -> String {

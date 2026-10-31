@@ -119,7 +119,7 @@ impl Stats {
         }
     }
 }
-fn binding(config: &AppConfig) -> String {
+pub(crate) fn binding(config: &AppConfig) -> String {
     // No credentials or prompts are persisted. Local metadata invalidates changed installations.
     let metadata = std::fs::metadata(&config.model).ok().map(|m| {
         (
@@ -160,7 +160,9 @@ fn binding(config: &AppConfig) -> String {
                 revision,
                 config.edit,
                 crate::llm::server::SERVER_SOURCES,
-                config.active_model_profile()
+                config.active_model_profile(),
+                config.context_window,
+                config.assistance.local.sampling
             ])
             .to_string()
         )
@@ -180,6 +182,24 @@ pub fn measured(config: &AppConfig) -> Option<Value> {
         }))
     .then_some(value)
 }
+/// Whether a saved record shows the two-call batch fixture passing in full. The prompt's one-call
+/// rule and the offered contract both read this, so they cannot disagree.
+pub fn batch_permitted(record: &Value) -> bool {
+    record["batch_passed"] == true
+        && record["passed"]
+            .as_u64()
+            .zip(record["total"].as_u64())
+            .is_none_or(|(passed, total)| passed >= total)
+}
+/// Whether a saved record has a fixture case (other than the batch case) that did not pass natively:
+/// it failed, or Dial had to lift its calls out of text, which is not the server's own parsing.
+pub fn native_failure(record: &Value) -> bool {
+    record["cases"].as_array().is_some_and(|cases| {
+        cases
+            .iter()
+            .any(|c| c["tool"] != "batch" && (c["passed"] == false || c["text_lifted"] == true))
+    })
+}
 pub fn single_call(config: &AppConfig, profile: Option<&Value>, stats: &Stats) -> bool {
     config.reliability.enabled
         && config.reliability.measured_interfaces
@@ -187,16 +207,107 @@ pub fn single_call(config: &AppConfig, profile: Option<&Value>, stats: &Stats) -
             .active_model_profile()
             .is_some_and(|p| p.capabilities.parallel_tool_calls == Some(false))
             || stats.consecutive_contract_failures >= 2
-            || profile.is_some_and(|p| {
-                p["batch_passed"] == false
-                    || p["passed"]
-                        .as_u64()
-                        .zip(p["total"].as_u64())
-                        .is_some_and(|(passed, total)| passed < total)
-            }))
+            || profile.is_some_and(|p| !batch_permitted(p)))
+}
+/// Route facts for the CLI report (`dial reliability`). Only this path may probe a local server or
+/// read the saved record; the live session never calls it.
+pub fn route(config: &AppConfig) -> Value {
+    let record = measured(config);
+    let selected = record
+        .as_ref()
+        .map(|r| interface_name(single_call(config, Some(r), &Stats::default())));
+    let source = if selected.is_some() {
+        "measured record (CLI, default stats)"
+    } else {
+        "unmeasured"
+    };
+    let server = config.local_main_model().then(|| probe_server(config));
+    route_json(config, None, server, record.as_ref(), selected, source)
+}
+/// Route facts for the turn being sent. The caller passes the record it already read for this turn
+/// and the interface it selected, so no disk read, server probe or model call happens here.
+pub fn route_snapshot(
+    config: &AppConfig,
+    effective_window: u32,
+    record: Option<&Value>,
+    one_call: bool,
+) -> Value {
+    route_json(
+        config,
+        Some(effective_window),
+        None,
+        record,
+        Some(interface_name(one_call)),
+        "this session",
+    )
+}
+fn interface_name(one_call: bool) -> &'static str {
+    if one_call { "one_call" } else { "batch" }
+}
+/// The local server's own facts. Asked only by the CLI route report.
+fn probe_server(config: &AppConfig) -> Value {
+    let selection = config.selection();
+    let base = config.endpoint.as_ref().map(|e| e.base_url.as_str());
+    let token = config.endpoint.as_ref().and_then(|e| {
+        crate::llm::catalog::resolve_credential(
+            &config.user_dir,
+            &e.base_url,
+            e.api_key_env.as_deref(),
+        )
+        .ok()
+        .flatten()
+    });
+    let headers = config.request_headers();
+    let facts = crate::llm::local_server::facts(
+        &selection.provider,
+        &selection.model,
+        base,
+        token.as_deref(),
+        headers,
+    );
+    let kind = crate::llm::local_hints::LocalServer::detect(
+        &selection.provider,
+        &selection.model,
+        base,
+        token.as_deref(),
+        headers,
+    );
+    json!({"kind":format!("{kind:?}"),"slots":facts.slots,"native_tools":facts.native_tools,"thinking_switch":facts.thinking_switch})
+}
+fn route_json(
+    config: &AppConfig,
+    effective: Option<u32>,
+    server: Option<Value>,
+    record: Option<&Value>,
+    selected: Option<&str>,
+    source: &str,
+) -> Value {
+    let selection = config.selection();
+    let profile = config.active_model_profile();
+    let local = config.local_main_model();
+    let base = config.endpoint.as_ref().map(|e| e.base_url.as_str());
+    json!({
+        "provider": selection.provider,
+        "model": selection.model,
+        "endpoint": base.map(crate::llm::display_url),
+        "local": local,
+        // `effective` is the window this session plans with; null when only the config is known.
+        "context_window": {"configured": config.context_window, "effective": effective},
+        "sampling": local.then_some(config.assistance.local.sampling),
+        "server_probed": server.is_some(),
+        "declared": {
+            "strict_tools": profile.is_some_and(|p| p.capabilities.strict_tools),
+            "parallel_tool_calls": profile.and_then(|p| p.capabilities.parallel_tool_calls),
+        },
+        "server": server,
+        "measured": record.map(|r| json!({"batch_passed":r["batch_passed"],"passed":r["passed"],"total":r["total"],"cases":r["cases"]})),
+        // Null when no fixture record exists and no session selection is known; never a guess.
+        "selected_interface": selected,
+        "selected_interface_source": source,
+    })
 }
 pub fn report(config: &AppConfig, control: &Value) -> Value {
-    json!({"enabled":config.reliability.enabled,"measured":measured(config),"session":control["reliability"],"max_contract_failures":config.reliability.max_contract_failures,"strict_tools":config.active_model_profile().is_some_and(|p|p.capabilities.strict_tools),"scope":"fixture tool contracts and execution; not a full coding benchmark"})
+    json!({"enabled":config.reliability.enabled,"measured":measured(config),"route":route(config),"session":control["reliability"],"max_contract_failures":config.reliability.max_contract_failures,"strict_tools":config.active_model_profile().is_some_and(|p|p.capabilities.strict_tools),"scope":"fixture tool contracts and execution; not a full coding benchmark"})
 }
 pub fn render(value: &Value) -> String {
     let mut out = format!(
@@ -227,6 +338,28 @@ pub fn render(value: &Value) -> String {
             } else {
                 value["measured"]["batch_passed"].to_string()
             }
+        ));
+    }
+    if value["route"].is_object() {
+        let route = &value["route"];
+        let fact = |v: &Value| v.as_bool().map_or("unknown".to_owned(), |b| b.to_string());
+        out.push_str(&format!(
+            "\nRoute: {}/{} · endpoint {} · context configured {} tokens, effective {} · sampling {}",
+            route["provider"].as_str().unwrap_or("?"),
+            route["model"].as_str().unwrap_or("?"),
+            route["endpoint"].as_str().unwrap_or("none (Dial runtime)"),
+            route["context_window"]["configured"],
+            route["context_window"]["effective"].as_u64().map_or("not probed".to_owned(), |t| format!("{t} tokens")),
+            route["sampling"].as_str().map_or("not local".to_owned(), |s| format!("{s} (policy, not measured)")),
+        ));
+        out.push_str(&format!(
+            "\nServer: {} · declared strict tools {} · declared parallel calls {} · server native tools {} · server thinking switch {}\nSelected interface: {}",
+            route["server"]["kind"].as_str().unwrap_or("not asked (hosted or unavailable)"),
+            fact(&route["declared"]["strict_tools"]),
+            fact(&route["declared"]["parallel_tool_calls"]),
+            fact(&route["server"]["native_tools"]),
+            fact(&route["server"]["thinking_switch"]),
+            route["selected_interface"].as_str().map_or("unmeasured (no fixture record for this backend)".to_owned(), |s| format!("{s} · {}", route["selected_interface_source"].as_str().unwrap_or("?"))),
         ));
     }
     let session = &value["session"];
@@ -464,6 +597,8 @@ pub fn check(config: &AppConfig) -> Result<Value> {
         }
         // Transport failures invalidate the run, not the model's tool capability.
         let mut reply = result?;
+        // Reply-level marker: tool calls Dial lifted out of text are not native server parsing.
+        let lifted = reply.text_calls_lifted;
         if config
             .active_model_profile()
             .is_some_and(|p| p.capabilities.strict_tools)
@@ -501,7 +636,7 @@ pub fn check(config: &AppConfig) -> Result<Value> {
         } else {
             passed
         };
-        results.push(json!({"tool":name,"passed":passed && executed,"elapsed_ms":started.elapsed().as_millis()}));
+        results.push(json!({"tool":name,"passed":passed && executed,"native":passed && executed && !lifted,"text_lifted":lifted,"elapsed_ms":started.elapsed().as_millis()}));
         eprintln!(
             "Capability check {}/{}: {name} {}",
             results.len(),
@@ -571,7 +706,7 @@ pub fn check(config: &AppConfig) -> Result<Value> {
 }
 
 pub fn live_report(config: &AppConfig, control: &Value) -> Value {
-    json!({"enabled":config.reliability.enabled,"measured":control["reliability"]["measured"],"session":control["reliability"],"max_contract_failures":config.reliability.max_contract_failures,"strict_tools":config.active_model_profile().is_some_and(|p|p.capabilities.strict_tools)})
+    json!({"enabled":config.reliability.enabled,"measured":control["reliability"]["measured"],"route":control["reliability"]["route"],"session":control["reliability"],"max_contract_failures":config.reliability.max_contract_failures,"strict_tools":config.active_model_profile().is_some_and(|p|p.capabilities.strict_tools)})
 }
 
 /// Keep essential tools and explicitly loaded specialists; discovery can restore every allowed tool.

@@ -3,22 +3,34 @@
 use super::*;
 use std::path::PathBuf;
 
-pub(in crate::agent::verify) fn python_snapshot(
-    workspace: &Workspace,
-    source: &Path,
-    python: &Path,
-) -> Option<Snapshot> {
-    // Shell startup and loader injection can run arbitrary code even for an isolated interpreter.
-    if std::env::vars_os().any(|(key, _)| {
-        let key = key.to_string_lossy();
-        matches!(key.as_ref(), "BASH_ENV" | "ENV")
-            || key.starts_with("LD_")
-            || key.starts_with("DYLD_")
-    }) {
+/// The installed interpreter's identity. A capture is a point-in-time observation, so one
+/// revalidation sweep may share it across its checks; a check's before/after captures never do.
+pub(in crate::agent::verify) struct PythonRuntime {
+    executable: PathBuf,
+    identity: Snapshot,
+}
+
+pub(in crate::agent::verify) fn python_runtime(python: &Path) -> Option<PythonRuntime> {
+    if unsafe_environment() {
         return None;
     }
     let executable = executable(python)?;
     let (runtime, inputs, excluded) = runtime_inputs(&executable)?;
+    let identity = capture_excluding(&runtime, &inputs, excluded, IdentityKind::InstalledRuntime)?;
+    Some(PythonRuntime {
+        executable,
+        identity,
+    })
+}
+
+pub(in crate::agent::verify) fn python_snapshot(
+    workspace: &Workspace,
+    source: &Path,
+    runtime: &PythonRuntime,
+) -> Option<Snapshot> {
+    if unsafe_environment() {
+        return None;
+    }
     let project = capture(
         workspace,
         &VerificationInputs {
@@ -26,11 +38,10 @@ pub(in crate::agent::verify) fn python_snapshot(
             environment: vec![],
         },
     )?;
-    let runtime = capture_excluding(&runtime, &inputs, excluded, IdentityKind::InstalledRuntime)?;
     let mut hash = Sha256::new();
     hash.update(b"dial-automatic-python-v1");
     hash.update(project.0);
-    hash.update(runtime.0);
+    hash.update(runtime.identity.0);
     // Bind resolution and all inherited environment, without storing values in evidence.
     let mut environment = std::env::vars_os().collect::<Vec<_>>();
     environment.sort();
@@ -40,8 +51,18 @@ pub(in crate::agent::verify) fn python_snapshot(
             hash.update(bytes);
         }
     }
-    hash.update(executable.as_os_str().as_encoded_bytes());
+    hash.update(runtime.executable.as_os_str().as_encoded_bytes());
     Some(Snapshot(hash.finalize().into()))
+}
+
+/// Shell startup and loader injection can run arbitrary code even for an isolated interpreter.
+fn unsafe_environment() -> bool {
+    std::env::vars_os().any(|(key, _)| {
+        let key = key.to_string_lossy();
+        matches!(key.as_ref(), "BASH_ENV" | "ENV")
+            || key.starts_with("LD_")
+            || key.starts_with("DYLD_")
+    })
 }
 
 fn executable(python: &Path) -> Option<PathBuf> {

@@ -70,6 +70,37 @@ fn local_endpoints_take_one_request_at_a_time_unless_configured() {
 }
 
 #[test]
+fn explicitly_limited_remote_provider_announces_its_queue_once() {
+    let mut config = endpoint_config("https://api.example.com/v1");
+    config.task.provider_concurrency.insert("ollama".into(), 1);
+    let (key, limit) = route(&config);
+    assert_eq!((key.as_str(), limit), ("ollama", 1));
+    let held = acquire_key(key.clone(), limit, &AtomicBool::new(false)).unwrap();
+    let notices = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let (queued_tx, queued_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (config, notices) = (&config, &notices);
+        scope.spawn(move || {
+            let slot = acquire_checked(
+                config,
+                || Ok::<(), ()>(()),
+                || {
+                    notices.fetch_add(1, Ordering::SeqCst);
+                    queued_tx.send(()).unwrap();
+                },
+            );
+            done_tx.send(slot.is_ok()).unwrap();
+        });
+        queued_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        drop(held);
+        assert!(done_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+    });
+    assert_eq!(notices.load(Ordering::SeqCst), 1);
+    assert!(try_acquire_key(key, limit).is_some());
+}
+
+#[test]
 fn queued_cancellation_exits_before_release_without_leaking_capacity() {
     let key = "test-provider-checked-cancel".to_owned();
     let held = acquire_key(key.clone(), 1, &AtomicBool::new(false)).unwrap();
@@ -161,4 +192,54 @@ fn checked_admission_rejects_cancelled_free_and_unlimited_routes() {
         assert_eq!(result.err(), Some("cancel cause"));
         assert!(try_acquire_key(key, 1).is_some());
     }
+}
+
+#[test]
+fn queued_notice_fires_once_only_when_the_slot_is_taken() {
+    let key = "test-provider-queued-notice".to_owned();
+    let notices = std::sync::atomic::AtomicUsize::new(0);
+    let free = acquire_key_checked_notify(
+        key.clone(),
+        1,
+        || Ok::<(), ()>(()),
+        || {
+            notices.fetch_add(1, Ordering::SeqCst);
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        notices.load(Ordering::SeqCst),
+        0,
+        "a free slot must not announce a wait"
+    );
+    drop(free);
+
+    let held = acquire_key(key.clone(), 1, &AtomicBool::new(false)).unwrap();
+    std::thread::scope(|scope| {
+        let (queued_tx, queued_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter_key = key.clone();
+        let notices = &notices;
+        scope.spawn(move || {
+            let slot = acquire_key_checked_notify(
+                waiter_key,
+                1,
+                || Ok::<(), ()>(()),
+                || {
+                    notices.fetch_add(1, Ordering::SeqCst);
+                    queued_tx.send(()).unwrap();
+                },
+            );
+            done_tx.send(slot.is_ok()).unwrap();
+        });
+        queued_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        drop(held);
+        assert!(done_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+    });
+    assert_eq!(
+        notices.load(Ordering::SeqCst),
+        1,
+        "the wait is announced exactly once"
+    );
+    assert!(try_acquire_key(key, 1).is_some());
 }

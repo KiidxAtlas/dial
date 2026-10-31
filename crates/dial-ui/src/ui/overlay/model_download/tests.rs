@@ -348,7 +348,7 @@ fn unknown_sources_render_as_unknown_not_as_numbers() {
         .find(|line| line.contains("mlx-model"))
         .unwrap_or_default();
     assert!(
-        line.contains("[MLX]") && line.contains("tok/s unknown") && line.contains("fit unknown"),
+        line.contains("[MLX]") && line.contains("e2e unknown") && line.contains("fit unknown"),
         "{shown}"
     );
     let (_, about) = group.detail(&theme);
@@ -357,6 +357,23 @@ fn unknown_sources_render_as_unknown_not_as_numbers() {
     assert!(
         about.contains("no recorded turns for this model yet"),
         "{about}"
+    );
+}
+
+#[test]
+fn installed_speed_is_labelled_end_to_end_and_keeps_its_columns() {
+    let mut model = row("mlx-model");
+    model.speed = crate::stats::speed_summary(&[40.0, 42.0, 44.0]);
+    let theme = Theme::dark();
+    let line: String = list_spans(&model, &theme, 120)
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    assert!(line.contains("42.0 tok/s e2e"), "{line}");
+    assert!(!line.contains("decode"), "{line}");
+    assert!(
+        line.contains("[MLX]") && line.contains("fit unknown"),
+        "{line}"
     );
 }
 

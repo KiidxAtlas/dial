@@ -1,14 +1,17 @@
 # Agent CLIs compared by cross_agent.py. Each argument is substituted separately (no shell):
 # {model}, {thinking}, {timeout} (seconds) and {prompt}. `follow_up` continues the latest session
-# in the trial's own fixture directory. Both agents run with their installed user configuration,
-# including opt-in features such as Dial's `experimental.turn_optimizer` (one extra auxiliary
-# request per user turn); the report records each agent's command and environment.
+# in the trial's own fixture directory. Dial runs with a default configuration: `DIAL_HOME` is a
+# fresh directory per trial (no user settings, MCP servers, skills, memory or experimental
+# options), and `DIAL_SUBSCRIPTION_AUTH_HOME` shares only the signed-in subscription from `~/.dial`.
+# Remove that `env` to measure an installed configuration instead. omp runs with its installed user
+# configuration, which is NOT isolated per trial: its sessions and skills persist across trials, so
+# its results are not comparable to isolated runs unless that state is reset. Trial wall times are
+# comparable only with `--jobs 1`; the report records `timing_comparable` and the trial order `seed`.
 # Without --thinking, Dial applies Claude's catalog default (adaptive) thinking, so both agents
 # receive the same {thinking} level. Dial accepts `--thinking off` for Anthropic without a model
 # profile; other levels need a [model_profiles] entry declaring reasoning_efforts.
-# Optional per-agent `env` (string values; `{work_root}`, `~` and `$VAR` expand) can isolate state,
-# for example `env = { DIAL_HOME = "{work_root}/dial-home", DIAL_SUBSCRIPTION_AUTH_HOME = "~/.dial" }`
-# runs Dial with a default configuration while sharing the signed-in subscription.
+# Optional per-agent `env` (string values; `{work_root}`, `{trial_root}`, `~` and `$VAR` expand;
+# a `*_HOME` value starting with `{work_root}` or `{trial_root}` is created first).
 
 [[agents]]
 name = "dial"
@@ -18,6 +21,7 @@ first = ["dial", "-p", "--output-format", "json", "--yes", "--provider", "anthro
          "--endpoint", "https://api.anthropic.com/v1", "--thinking", "{thinking}", "--max-time", "{timeout}", "{prompt}"]
 follow_up = ["dial", "-p", "-c", "--output-format", "json", "--yes", "--provider", "anthropic", "--model", "{model}",
              "--endpoint", "https://api.anthropic.com/v1", "--thinking", "{thinking}", "--max-time", "{timeout}", "{prompt}"]
+env = { DIAL_HOME = "{trial_root}/dial-home", DIAL_SUBSCRIPTION_AUTH_HOME = "~/.dial" }
 # Dial's result usage comes from the session ledger, which includes worker requests.
 delegated_usage = "included"
 

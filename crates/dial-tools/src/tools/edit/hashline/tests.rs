@@ -663,3 +663,143 @@ fn store_bounds_snapshots_and_unions_seen() {
     store.forget(Path::new("/w/f70"));
     assert!(!store.files.contains_key(Path::new("/w/f70")));
 }
+
+#[test]
+fn resume_rehydrates_witnesses_from_a_multi_path_read() {
+    // Benchmark follow-up turns run in a new process: a `paths` read from the previous turn must
+    // still count as read, or the first edit is refused with "no read of this file is recorded".
+    let dir = tempfile::tempdir().unwrap();
+    let first = Workspace::new(dir.path()).unwrap();
+    fs::create_dir(dir.path().join("pkg")).unwrap();
+    fs::write(dir.path().join("a.py"), "x = 1\ny = 2\n").unwrap();
+    fs::write(dir.path().join("b.py"), "def f():\n    return 1\n").unwrap();
+    let args = serde_json::json!({"paths": ["pkg", "a.py", "b.py:1-1"]});
+    let read = crate::tools::execute(&first, "read", &args, 20);
+    assert!(!read.is_error, "{}", read.text);
+    let tag_a = tag_of("x = 1\ny = 2\n");
+    let tag_b = tag_of("def f():\n    return 1\n");
+
+    let resumed = Workspace::new(dir.path()).unwrap();
+    let refused = edit(&resumed, &format!("[a.py#{tag_a}]\nPUT 2.=2:\n+y = 3\n")).unwrap_err();
+    assert!(
+        refused.contains("no read of this file is recorded")
+            && refused.contains("a.py:START-END")
+            && refused.contains("fresh [path#TAG] header"),
+        "{refused}"
+    );
+    rehydrate(&resumed, [("read", &args, read.text.as_str())]);
+    edit(&resumed, &format!("[a.py#{tag_a}]\nPUT 2.=2:\n+y = 3\n")).unwrap();
+    assert_eq!(
+        fs::read_to_string(dir.path().join("a.py")).unwrap(),
+        "x = 1\ny = 3\n"
+    );
+    // Only the rows that read returned are witnesses: line 2 of b.py was never shown.
+    let unseen = edit(
+        &resumed,
+        &format!("[b.py#{tag_b}]\nPUT 2.=2:\n+    return 2\n"),
+    )
+    .unwrap_err();
+    assert!(unseen.contains("have not been shown"), "{unseen}");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("b.py")).unwrap(),
+        "def f():\n    return 1\n"
+    );
+}
+
+#[test]
+fn check_version_ranges_names_the_unseen_span_and_the_targeted_retry() {
+    let mut store = EditStore::default();
+    let path = Path::new("/w/a.txt");
+    let lf = "one\ntwo\nthree\n";
+    store.record(path, lf, &[(1, 1)]);
+    store
+        .check_version_ranges(path, lf, None, &[(1, 1)])
+        .unwrap();
+    let err = store
+        .check_version_ranges(path, lf, None, &[(1, 3)])
+        .unwrap_err();
+    assert!(
+        err.contains("/w/a.txt lines 2-3 were not displayed in full"),
+        "{err}"
+    );
+    assert!(err.contains("read `/w/a.txt:2-3` first"), "{err}");
+    assert!(
+        err.contains("for a hashline edit, retry with the fresh [path#TAG] header"),
+        "{err}"
+    );
+    assert!(
+        err.contains("otherwise retry the edit after the refreshed read"),
+        "{err}"
+    );
+}
+
+#[test]
+fn check_version_ranges_without_a_matching_witness_asks_for_a_targeted_read() {
+    let mut store = EditStore::default();
+    let path = Path::new("/w/a.txt");
+    let lf = "one\ntwo\n";
+    store.record(path, lf, &[(1, 2)]);
+    // Different text, and the same text under a different revision, both lack a witness.
+    for (text, revision) in [("other\n", None), (lf, Some([7u8; 32]))] {
+        let err = store
+            .check_version_ranges(path, text, revision, &[(1, 1)])
+            .unwrap_err();
+        assert!(
+            err.contains("/w/a.txt has no current source/read witness"),
+            "{err}"
+        );
+        assert!(
+            err.contains("targeted read such as `/w/a.txt:START-END`"),
+            "{err}"
+        );
+        assert!(
+            err.contains("for a hashline edit, retry with the fresh [path#TAG] header"),
+            "{err}"
+        );
+        assert!(
+            err.contains("otherwise retry the edit after the refreshed read"),
+            "{err}"
+        );
+    }
+    let unknown = Path::new("/w/never.txt");
+    let err = store
+        .check_version_ranges(unknown, lf, None, &[(1, 1)])
+        .unwrap_err();
+    assert!(
+        err.contains("/w/never.txt has no current source/read witness"),
+        "{err}"
+    );
+}
+
+#[test]
+fn unread_and_stale_headers_direct_a_targeted_read_and_fresh_header() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::new(dir.path()).unwrap();
+    fs::write(dir.path().join("a.py"), "x = 1\ny = 2\n").unwrap();
+    fs::write(dir.path().join("b.py"), "p\n").unwrap();
+    // Never read: the header matches the current file, so the no-read branch fires.
+    let unread = edit(
+        &ws,
+        &format!("[a.py#{}]\nPUT 2.=2:\n+y = 3\n", tag_of("x = 1\ny = 2\n")),
+    )
+    .unwrap_err();
+    assert!(
+        unread.contains("no read of this file is recorded"),
+        "{unread}"
+    );
+    assert!(unread.contains("a.py:START-END"), "{unread}");
+    assert!(unread.contains("fresh [path#TAG] header"), "{unread}");
+    // Read b.py, then send a header for other content: the header is stale.
+    let args = serde_json::json!({"paths": ["b.py"]});
+    let read = crate::tools::execute(&ws, "read", &args, 20);
+    assert!(!read.is_error, "{}", read.text);
+    let stale = edit(
+        &ws,
+        &format!("[b.py#{}]\nPUT 1.=1:\n+q\n", tag_of("other\n")),
+    )
+    .unwrap_err();
+    assert!(stale.contains("unknown snapshot tag"), "{stale}");
+    assert!(stale.contains("b.py:START-END"), "{stale}");
+    assert!(stale.contains("fresh [path#TAG] header"), "{stale}");
+    assert_eq!(fs::read_to_string(dir.path().join("b.py")).unwrap(), "p\n");
+}

@@ -134,6 +134,30 @@ pub trait WriteObserver: Send + Sync {
     }
 }
 
+/// Text file I/O that an ACP client performs for the agent (`fs/read_text_file`, `fs/write_text_file`),
+/// so the editor's unsaved buffers are what is read and written. An operation the client did not
+/// advertise reports `false` from `reads`/`writes`, and that operation stays local.
+pub trait ClientFileIo: Send + Sync {
+    fn reads(&self) -> bool;
+    fn writes(&self) -> bool;
+    fn read_text(&self, path: &Path) -> Result<String, String>;
+    fn write_text(&self, path: &Path, content: &str) -> Result<(), String>;
+}
+
+/// Installed client bridge; `None` keeps every file operation local.
+#[derive(Clone, Default)]
+struct ClientFilesSlot(Option<Arc<dyn ClientFileIo>>);
+
+impl std::fmt::Debug for ClientFilesSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "Some(ClientFileIo)"
+        } else {
+            "None"
+        })
+    }
+}
+
 #[derive(Clone, Default)]
 struct ObserverSlot(Option<Arc<dyn WriteObserver>>);
 
@@ -162,6 +186,9 @@ pub struct Workspace {
     credential_paths: Vec<PathBuf>,
     sandbox: Option<Sandbox>,
     allow_network: bool,
+    /// Domain rules for sandboxed commands' network (`sandbox.network_allow`/`network_deny`);
+    /// `None` leaves allowed network unfiltered.
+    network_rules: Option<exec::sandbox::netproxy::NetworkRules>,
     /// Why web fetches and URL reads are refused, or `None` when they may reach the network.
     /// A workspace with no session network policy attached refuses them.
     web_network_block: Option<&'static str>,
@@ -194,6 +221,8 @@ pub struct Workspace {
     edit_blackbox_dir: Option<PathBuf>,
     native_edits: Arc<edit::edit_native::store::EditStore>,
     observer: ObserverSlot,
+    /// ACP client file bridge (see [`ClientFileIo`]); `None` leaves reads and writes local.
+    client_files: ClientFilesSlot,
     /// Session snapshots / seen lines / registers for hashline; shared by clones.
     edits: Arc<Mutex<edit::hashline::EditStore>>,
     file_handles: Arc<Mutex<file_handles::Registry>>,
@@ -233,6 +262,7 @@ impl Workspace {
             credential_paths: Vec::new(),
             sandbox: None,
             allow_network: false,
+            network_rules: None,
             web_network_block: Some("no session network policy is attached"),
             policy: None,
             unsandboxed: false,
@@ -250,6 +280,7 @@ impl Workspace {
             edit_blackbox_dir: None,
             native_edits: Arc::default(),
             observer: ObserverSlot::default(),
+            client_files: ClientFilesSlot::default(),
             edits: Arc::default(),
             file_handles: Arc::default(),
             staged_rewrites: Arc::default(),
@@ -269,6 +300,7 @@ impl Workspace {
         isolated.edits = Arc::default();
         isolated.staged_rewrites = Arc::default();
         isolated.observer = ObserverSlot::default();
+        isolated.client_files = ClientFilesSlot::default();
         isolated.artifacts = None;
         isolated
     }
@@ -328,6 +360,31 @@ impl Workspace {
     pub fn with_network(mut self, allow: bool) -> Self {
         self.allow_network = allow;
         self
+    }
+
+    /// Route sandboxed commands' network through the filtering proxy for `rules`.
+    pub fn with_network_rules(
+        mut self,
+        rules: Option<exec::sandbox::netproxy::NetworkRules>,
+    ) -> Self {
+        self.network_rules = rules;
+        self
+    }
+
+    pub fn network_rules(&self) -> Option<&exec::sandbox::netproxy::NetworkRules> {
+        self.network_rules.as_ref()
+    }
+
+    /// The running filtering proxy sandboxed commands must use, started on first need; `None`
+    /// when no rules are configured.
+    #[cfg(unix)]
+    pub(crate) fn network_proxy(
+        &self,
+    ) -> std::result::Result<Option<Arc<exec::sandbox::netproxy::Endpoint>>, String> {
+        self.network_rules
+            .as_ref()
+            .map(exec::sandbox::netproxy::endpoint)
+            .transpose()
     }
 
     /// Set the web network gate from the session's sandbox policy (`None` allows the network).
@@ -518,6 +575,17 @@ impl Workspace {
         self
     }
 
+    /// Route this session's text reads and writes through the ACP client (see [`ClientFileIo`]).
+    /// Copies from [`Workspace::rebased`] and speculative workspaces never inherit the bridge: an
+    /// isolated copy is a different tree, and the editor's buffers belong to the live project.
+    pub fn set_client_files(&mut self, client: Arc<dyn ClientFileIo>) {
+        self.client_files = ClientFilesSlot(Some(client));
+    }
+
+    pub(crate) fn client_files(&self) -> Option<&dyn ClientFileIo> {
+        self.client_files.0.as_deref()
+    }
+
     /// The installed write observer, shared with a child that edits the same project directly.
     pub fn observer(&self) -> Option<Arc<dyn WriteObserver>> {
         self.observer.0.clone()
@@ -563,6 +631,7 @@ impl Workspace {
         let mut copy = Workspace::new(root)?;
         copy.sandbox = self.sandbox.clone();
         copy.allow_network = self.allow_network;
+        copy.network_rules = self.network_rules.clone();
         copy.web_network_block = self.web_network_block;
         copy.host_uris = self.host_uris.clone();
         copy.policy = self.policy.clone();
@@ -766,6 +835,10 @@ impl Workspace {
     }
 
     fn sensitive_access(&self, path: &Path) -> bool {
+        // Only an explicitly granted sensitive root can apply; skip canonicalizing for the common case.
+        if self.sensitive_roots.is_empty() {
+            return false;
+        }
         let canonical = Self::canonical_prefix(path);
         !self
             .credential_paths
@@ -830,7 +903,7 @@ impl Workspace {
         let path = Path::new(input);
         // An explicit sensitive root may be nested beneath the primary workspace.
         // Resolve it from that most-specific root, not through a protected ancestor.
-        if !path.is_absolute() {
+        if !path.is_absolute() && !self.sensitive_roots.is_empty() {
             let absolute = Self::canonical_prefix(&self.root.join(path));
             if self.sensitive_access(&absolute) {
                 return self.resolve_literal(&absolute.to_string_lossy());
@@ -1044,15 +1117,11 @@ impl Workspace {
     }
 }
 
-const HASHLINE_READ_DESC: &str = "Read a text file (or list a directory). Output starts with a header `[PATH#TAG]` \
-followed by `LINE:TEXT` rows; copy that header's TAG into `edit` sections. Select lines by appending to the path \
-`:50-100`, `:50+20` (20 lines from 50), `:50-` (from 50), `:-30` (last 30 lines) or comma-joined ranges such as \
-`:5-16,960-973`; or use offset/limit (not together with a selector). A footer states the lines returned and the \
-file's total line count. \
-`:raw` (e.g. `src/a.rs:raw:1-40`) returns verbatim text without anchors; raw output cannot be edited. \
-`:outline` lists declarations with line ranges. \
-Without a range, output is capped at 48 KiB and the footer names the range to read next, so read large files in \
-ranges. `edit` may only touch lines you have been shown.";
+const HASHLINE_READ_DESC: &str = "Read a text file or list a directory. Output starts with a `[PATH#TAG]` \
+header, then `LINE:TEXT` rows; `edit` needs that TAG and may only touch lines a read has shown. Select lines \
+with a path suffix: `:50-100`, `:50+20` (20 from 50), `:50-`, `:-30` (last 30), `:5-16,960-973`; or \
+offset/limit (not both). `:outline` lists declarations with line ranges; `:raw` returns unanchored, \
+non-editable text. Unranged output stops at 48 KiB and the footer names the next range.";
 
 const HASHLINE_WRITE_DESC: &str = "Create a new file or replace a whole file (max 1 MiB). BEFORE replacing an existing file, read its complete current contents; prefer edit for changes, especially to large files. The whole call must fit your output budget: keep each call coherent and complete, never a placeholder, and do not also paste the file into chat. Missing parent directories are created. Notebook content is literal JSON, not the editable # %% source projection. In hashline mode, complete copied read headers/numbered prefixes are stripped; incomplete/truncated projections reject. Existing files require complete source witnesses unless the operator disables the seen-line guard. Returns the fresh `[PATH#TAG]` header.";
 
@@ -1079,11 +1148,10 @@ PUT >$:
 Put all changes to one file in one section. On success you get the fresh [PATH#TAG] and the changed lines; use that tag next time. If the file changed since your read, the edit is re-anchored only when the lines it touches are unchanged; otherwise you receive the current lines so you can retry."#
 );
 
-const REPLACE_READ_DESC: &str = "Read a text file in the workspace with line numbers (or list a directory). \
-Select lines by appending to the path `:50-100`, `:50+150` (150 lines from 50), `:50-` (from 50), `:-60` (last 60 lines) \
-or comma-joined ranges such as `:5-16,960-973`; or use offset/limit (not together with a selector). A footer states \
-the lines returned and the file's total line count. `path:outline` lists declarations with line ranges. Without a \
-range, output is capped at 48 KiB and the footer names the range to read next, so read large files in ranges.";
+const REPLACE_READ_DESC: &str = "Read a text file with line numbers, or list a directory. Select lines \
+with a path suffix: `:50-100`, `:50+150` (150 from 50), `:50-`, `:-60` (last 60), `:5-16,960-973`; or \
+offset/limit (not both). `:outline` lists declarations with line ranges. Unranged output stops at 48 KiB \
+and the footer names the next range.";
 
 fn schema(name: &str, mode: EditMode) -> Option<Value> {
     let hashline = mode == EditMode::Hashline;
@@ -1097,10 +1165,10 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
                     REPLACE_READ_DESC
                 },
                 json!({
-                    "path": {"type": "string", "description": "Workspace file/directory, `ssh://host/path` remote file, or `http(s)://` URL. SSH URL reads require explicit approval; absolute and `~/` remote paths supported. HTTP(S) URLs are fetched through the web network gate (approval required) with selectors and archive `:member` supported. `pr://N[/diff]` and `issue://N` read GitHub through gh; `conflict://` lists unmerged paths and `conflict://PATH` reads its merge-conflict hunks with edit anchors. Use paths instead to read several targets in one call."},
+                    "path": {"type": "string", "description": "Workspace path with an optional selector. Also: `ssh://host/path` and `http(s)://` URLs (approval required; archives take `:member`), `pr://N[/diff]` and `issue://N` (GitHub via gh), `conflict://` (unmerged paths) or `conflict://PATH` (merge hunks with edit anchors)."},
                     "offset": {"type": "integer", "minimum": 1, "description": "1-based line to start at (default 1); not together with a path selector."},
                     "limit": {"type": "integer", "minimum": 1, "description": "Maximum number of lines (default 2000)."},
-                    "paths": {"type": "array", "items": {"type": "string"}, "maxItems": 16, "description": "Several targets read in one call, each a path with its own optional selector (e.g. `src/a.rs:1-80`); results come back in order. Use instead of path."},
+                    "paths": {"type": "array", "items": {"type": "string"}, "maxItems": 16, "description": "Several targets, each with its own selector, read in one call; use instead of path."},
                 }),
                 &[],
             );
@@ -1127,60 +1195,55 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
         "edit" => edit::editing::schema(mode),
         "glob" => tool_schema(
             "glob",
-            "List pageable workspace files in sorted order, max 500 per page. Supports \
-             `*`, `?`, `[a-z]`, `{a,b}` and `**`; bare patterns match names at any depth. \
-             The footer reports coverage and next_cursor/remaining_skip; copy them to cursor/skip with the \
-             same query to continue. Oversized directories are reported as omitted; narrow the scope to \
-             their children. Symlinks, .git and scratch are never searched.",
+            "List workspace paths matching a glob (`*`, `?`, `[a-z]`, `{a,b}`, `**`; a bare pattern \
+             matches names at any depth), sorted, at most 500 per page. The footer reports coverage and \
+             next_cursor/remaining_skip to continue. .git, scratch and symlinks are never listed.",
             json!({
                 "pattern": {"type": "string", "description": "Glob such as `src/**/*.rs` or `*.py`, relative to the workspace root."},
-                "path": {"type": "string", "description": "File/directory scope, or semicolon-separated scopes; an existing literal filename wins. Default workspace root."},
+                "path": {"type": "string", "description": "Scope: file, directory or semicolon-separated scopes (default workspace root)."},
                 "hidden": {"type": "boolean", "description": "Include hidden entries (default true)."},
-                "gitignore": {"type": "boolean", "description": "Honor local ignore rules and skip dependency/build directories (default true); false includes them, but never .git or scratch."},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Maximum paths per page (default 500)."},
-                "skip": {"type": "integer", "minimum": 0, "description": "Skip this many matching paths in deterministic file order (default 0); when resuming use remaining_skip from the footer."},
-                "cursor": {"type": "object", "properties": {"path": {"type": "string"}, "match": {"type": "integer", "minimum": 0, "maximum": 0}}, "required": ["path", "match"], "additionalProperties": false, "description": "Inclusive workspace-relative continuation position copied from next_cursor, not a pattern. Null next_cursor means traversal completed within the reported coverage."},
+                "gitignore": {"type": "boolean", "description": "Honor ignore rules and skip dependency/build directories (default true)."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Paths per page (default 500)."},
+                "skip": {"type": "integer", "minimum": 0, "description": "Paths to skip; resume with remaining_skip."},
+                "cursor": {"type": "object", "properties": {"path": {"type": "string"}, "match": {"type": "integer", "minimum": 0, "maximum": 0}}, "required": ["path", "match"], "additionalProperties": false, "description": "next_cursor from the previous page, unchanged."},
             }),
             &["pattern"],
         ),
         "grep" => tool_schema(
             "grep",
-            "Search with Rust regex (no lookaround/backreferences) or fixed_string. Line matching returns \
-             path:line:text; context uses path-line-text and -- groups. Newline patterns or multiline match \
-             whole files and return path:start:end:text. The footer reports coverage (skipped, unreadable, \
-             ignored or capped entries are named, never silently empty) and next_cursor/remaining_skip; copy \
-             them to cursor/skip with the same query to continue. Oversized directories are reported as \
-             omitted; narrow to their children.",
+            "Search file contents with a Rust regex (no lookaround/backreferences) or fixed_string. Returns \
+             path:line:text (context rows path-line-text; multiline matches path:start:end:text). The footer \
+             names anything skipped or capped and gives next_cursor/remaining_skip to continue.",
             json!({
-                "pattern": {"type": "string", "description": "Regular expression (Rust `regex` syntax, e.g. `fn \\w+\\(` or `TODO|FIXME`; non-empty). Set fixed_string to search literal text instead."},
-                "fixed_string": {"type": "boolean", "description": "Treat pattern as literal text, not a regex (default false)."},
-                "path": {"type": "string", "description": "Workspace file/directory or one `ssh://host/path` remote file (requires approval); semicolon-separated local scopes are supported."},
-                "glob": {"type": "string", "description": "Only search files whose workspace-relative path matches this glob."},
-                "ignore_case": {"type": "boolean", "description": "Case-insensitive match (default false)."},
-                "context": {"type": "integer", "minimum": 0, "description": "Lines of context to show before and after each match (default 0; values above 10 are capped at 10)."},
-                "max_results": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Maximum number of matching lines (default 400). Without max_results a single file contributes at most 20 matching lines to a page; its remaining matches are named in the footer and later files still appear. An explicit max_results lifts that per-file cap."},
-                "output": {"type": "string", "enum": ["lines", "files", "count"], "description": "lines (default) shows matches; files lists matching files with counts (max_results/skip count files); count gives totals."},
-                "multiline": {"type": "boolean", "description": "Match whole-file bytes (default false, automatic for actual newlines or regex \\n). Anchors match each line; use (?s) to make dot match newline."},
+                "pattern": {"type": "string", "description": "Non-empty Rust regex such as `fn \\w+\\(` or `TODO|FIXME`; set fixed_string for literal text."},
+                "fixed_string": {"type": "boolean", "description": "Treat pattern as literal text (default false)."},
+                "path": {"type": "string", "description": "File, directory or semicolon-separated scopes, or one `ssh://host/path` file (approval required)."},
+                "glob": {"type": "string", "description": "Only files whose workspace-relative path matches this glob."},
+                "ignore_case": {"type": "boolean", "description": "Case-insensitive (default false)."},
+                "context": {"type": "integer", "minimum": 0, "description": "Lines before and after each match (default 0, max 10)."},
+                "max_results": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Most matching lines (default 400). Without it each file shows at most 20 and the footer names the rest."},
+                "output": {"type": "string", "enum": ["lines", "files", "count"], "description": "lines (default); files lists matching files with counts; count gives totals."},
+                "multiline": {"type": "boolean", "description": "Match across lines (automatic when the pattern has \\n); use (?s) for dot to match newline."},
                 "hidden": {"type": "boolean", "description": "Include hidden entries (default true)."},
-                "gitignore": {"type": "boolean", "description": "Honor local ignore rules and skip dependency/build directories (default true); false includes them, never .git/scratch/symlinks."},
-                "skip": {"type": "integer", "minimum": 0, "description": "Skip matching lines, or non-overlapping multiline matches, in deterministic order. Default 0; use remaining_skip when resuming a capped scan."},
-                "cursor": {"type": "object", "properties": {"path": {"type": "string"}, "match": {"type": "integer", "minimum": 0}}, "required": ["path", "match"], "additionalProperties": false, "description": "Inclusive file position and already consumed result count from next_cursor. Copy unchanged; null next_cursor means traversal completed within reported coverage."},
+                "gitignore": {"type": "boolean", "description": "Honor ignore rules and skip dependency/build directories (default true)."},
+                "skip": {"type": "integer", "minimum": 0, "description": "Matches to skip; resume with remaining_skip."},
+                "cursor": {"type": "object", "properties": {"path": {"type": "string"}, "match": {"type": "integer", "minimum": 0}}, "required": ["path", "match"], "additionalProperties": false, "description": "next_cursor from the previous page, unchanged."},
             }),
             &["pattern"],
         ),
         "bash" => tool_schema(
             "bash",
             if cfg!(windows) {
-                "Run a bash command in the workspace root, or in `cwd` when supplied. It runs in Git for Windows bash when installed, otherwise in Dial's built-in bash-compatible shell; only when `shell.backend = \"powershell\"` is it Windows PowerShell source. Windows filesystem/network isolation is unavailable; execution requires `sandbox.mode = \"off\"` and runs with the current user's privileges. stdout and stderr are merged; large output keeps its beginning and end. Commands run non-interactively without a controlling terminal. To wait for a long build or test in one call, set `timeout` to cover it; use `background: true` for servers and work to overlap; check or stop it with the bg tool."
+                "Run a bash command in the workspace root, or in `cwd`. It runs in Git for Windows bash when installed, otherwise in Dial's built-in bash-compatible shell; only with `shell.backend = \"powershell\"` is it PowerShell source. Windows has no filesystem/network isolation: execution requires `sandbox.mode = \"off\"` and runs with the user's privileges. stdout and stderr are merged; long output keeps its start and end. No controlling terminal. A command still running after `shell.auto_background_secs` (default 15) becomes a `bg` job whatever its timeout: do independent work, then `bg wait` for the result."
             } else {
-                "Run a shell command with `/bin/bash -c` in the workspace root, or in `cwd` when supplied. It may run inside a sandbox: writes are confined to the project and added directories, some paths outside them can be unreadable, and the network may be blocked. Temporary files belong in `$TMPDIR`. stdout and stderr are merged; large output keeps its beginning and end. Commands run non-interactively without a controlling terminal; that does not mean there is no display: on macOS, and on Linux with `DISPLAY` or `WAYLAND_DISPLAY` set, GUI programs open on the user's desktop, so run the real command before concluding otherwise. To wait for a long build or test in one call, set `timeout` to cover it; use `background: true` for servers and work to overlap; check or stop it with the bg tool."
+                "Run a command with `/bin/bash -c` in the workspace root, or in `cwd`. It may be sandboxed: writes confined to the project and added directories, some outside paths unreadable, network possibly blocked; temporary files go in `$TMPDIR`. stdout and stderr are merged; long output keeps its start and end. No controlling terminal, but GUI programs still open on the user's desktop (macOS, or Linux with a display), so run the real command before concluding otherwise. A command still running after `shell.auto_background_secs` (default 15) becomes a `bg` job whatever its timeout: do independent work, then `bg wait` for the result."
             },
             json!({
                 "command": {"type": "string", "description": "Shell command to run."},
-                "cwd": {"type": "string", "description": "Working directory: relative to the primary workspace root, or absolute inside the primary root or an added workspace root. Default is the project root: do not prefix commands with `cd <root> &&`."},
-                "session": {"type":"string", "description":"With the embedded backend, retain cwd and exported string variables between completed foreground commands in this named workspace session. Does not retain functions, unexported variables or background jobs. Cancelled/timed-out exchanges invalidate the state."},
-                "timeout": {"type": "integer", "minimum": 1, "description": "Seconds the command may run before it is killed. A command still running after `shell.auto_background_secs` (15 by default) moves to bg whatever the timeout, so set a timeout only as an upper bound; it does not keep the command in the foreground."},
-                "background": {"type": "boolean", "description": "Start this command as a managed background job now (servers, watchers, work to overlap). Without `timeout`, commands still running after ~15s move to background automatically. Check or stop jobs with the bg tool."},
+                "cwd": {"type": "string", "description": "Working directory: relative to the workspace root, or absolute in an added root. Defaults to the root; do not prefix `cd <root> &&`."},
+                "session": {"type":"string", "description":"Embedded backend only: keep cwd and exported string variables across completed foreground commands with the same session name. A cancelled or timed-out command resets it."},
+                "timeout": {"type": "integer", "minimum": 1, "description": "Seconds before the command is killed: an upper bound, not a way to stay in the foreground."},
+                "background": {"type": "boolean", "description": "Start as a `bg` job immediately (servers, watchers, work to overlap)."},
                 "async": {"type": "boolean", "description": "Alias of background."},
             }),
             &["command"],
@@ -1627,7 +1690,12 @@ pub fn apply_sandbox_config(
         ]),
         None => ws,
     };
-    let mut ws = ws.with_web_network_block(net::web::network_disabled(config));
+    let mut ws = ws
+        .with_web_network_block(net::web::network_disabled(config))
+        .with_network_rules(
+            exec::sandbox::netproxy::NetworkRules::new(&config.network_allow, &config.network_deny)
+                .map_err(anyhow::Error::msg)?,
+        );
     if let Some((_, user)) = protected {
         let auth = crate::config::paths::subscription_auth_dir(user)?;
         ws.credential_paths = vec![

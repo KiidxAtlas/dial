@@ -85,3 +85,14 @@ fn edit_projection_is_named_digest_bound_and_never_applied_to_errors() {
         );
     }
 }
+
+#[test]
+fn recovery_annotation_is_additive_and_only_present_when_recovery_is_needed() {
+    let blocked = ToolOutput::err("denied").with_status(ToolStatus::Blocked);
+    let blocked_message = message("id", &blocked);
+    assert_eq!(blocked_message["dial_recovery"]["retry"], "withheld");
+    assert_eq!(blocked_message["dial_recovery"]["next"], "respect_boundary");
+    assert_eq!(blocked_message["dial_execution_status"], "blocked");
+    let plain = message("id", &ToolOutput::ok("done".into()));
+    assert!(plain.get("dial_recovery").is_none());
+}

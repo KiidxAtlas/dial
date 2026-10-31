@@ -27,16 +27,16 @@ fn centered(spans: Vec<Span<'static>>, width: usize, theme: &Theme) -> Line<'sta
     Line::from(out)
 }
 
-fn hero(width: usize, budget: usize, theme: &Theme, sweep: f32) -> Rows {
+fn hero(width: usize, budget: usize, theme: &Theme, sweep: f32, idle: u64) -> Rows {
     if budget < 2 {
         return Vec::new();
     }
     let art = if theme.ascii() {
         None
     } else if budget > mark::LOCKUP.1 && width >= mark::LOCKUP.0 {
-        Some(mark::lockup(theme, sweep))
+        Some(mark::lockup(theme, sweep, idle))
     } else if budget > mark::WORDMARK.1 && width >= mark::WORDMARK.0 {
-        Some(mark::wordmark(theme, sweep))
+        Some(mark::wordmark(theme, sweep, idle))
     } else {
         None
     };
@@ -110,7 +110,7 @@ pub fn frame(
     let above = (height / 2)
         .saturating_sub(composer.cursor.0 as usize)
         .min(remaining.saturating_sub(reserve));
-    let hero = hero(inner, above, theme, view.sweep);
+    let hero = hero(inner, above, theme, view.sweep, view.idle);
     let mut rows = vec![Line::default(); above.saturating_sub(hero.len())];
     let indent = |mut line: Line<'static>| {
         line.spans.insert(0, Span::raw(" ".repeat(inset)));

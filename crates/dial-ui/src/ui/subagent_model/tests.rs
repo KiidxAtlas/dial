@@ -1,5 +1,6 @@
 use super::*;
-use crate::agent::workers::child_transcript::ChildTranscript;
+use crate::agent::workers::child_transcript::{ChildTranscript, FOLLOW_CHUNK};
+use std::fs;
 
 fn entry(id: &str, parent: Option<&str>, status: AgentStatus, last: Option<u64>) -> AgentEntry {
     AgentEntry {
@@ -338,4 +339,226 @@ fn runtime_body_overrides_transcript_and_reports_live_state() {
     assert_eq!(snap.totals.running, 1);
     // Without a live owner a running body is not steerable or cancellable.
     assert!(!agent.steerable && !agent.cancellable);
+}
+
+#[test]
+fn cached_hub_matches_the_uncached_projection_and_follows_appends() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(project.path(), home.path().to_path_buf()).unwrap();
+    let sink = ChildTranscript::create(
+        &layout,
+        "parent",
+        "task-cache",
+        serde_json::json!({"id": "task-cache", "name": "w", "agent": "worker", "started_ms": 1000}),
+    )
+    .unwrap();
+    sink.record(&serde_json::json!({"role":"user","content":"start"}))
+        .unwrap();
+    sink.record(&serde_json::json!({"role":"assistant","content":"first answer"}))
+        .unwrap();
+    let runtime = Tree::default();
+    let mut cache = HubCache::default();
+    assert_eq!(
+        cache.snapshot(&layout, "parent", &runtime, None).activity,
+        snapshot(&layout, "parent", &runtime, None).activity
+    );
+    sink.record(&serde_json::json!({"role":"user","content":"next"}))
+        .unwrap();
+    let cached = cache.snapshot(&layout, "parent", &runtime, None);
+    assert_eq!(
+        cached.activity,
+        snapshot(&layout, "parent", &runtime, None).activity
+    );
+    let prompt = cached
+        .activity
+        .iter()
+        .find(|event| event.summary == "next")
+        .unwrap();
+    assert_eq!(prompt.entry, Some(2), "absolute deep-link index");
+    assert_eq!(cache.stats().cached_events, 3);
+    assert_eq!(cache.stats().transcripts, 1);
+    assert_eq!(cache.stats().read_errors, 0);
+    let before = cache.stats().bytes_read;
+    cache.snapshot(&layout, "parent", &runtime, None);
+    assert!(
+        cache.stats().bytes_read - before < 1024,
+        "an unchanged transcript is only checked"
+    );
+}
+
+#[test]
+fn cached_activity_is_bounded_per_transcript() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(project.path(), home.path().to_path_buf()).unwrap();
+    let sink = ChildTranscript::create(
+        &layout,
+        "parent",
+        "task-long",
+        serde_json::json!({"id": "task-long", "started_ms": 1000}),
+    )
+    .unwrap();
+    let total = ACTIVITY_LIMIT + 20;
+    for i in 0..total {
+        sink.record(&serde_json::json!({"role":"user","content":format!("prompt {i}")}))
+            .unwrap();
+    }
+    let mut cache = HubCache::default();
+    let snap = cache.snapshot(&layout, "parent", &Tree::default(), None);
+    assert_eq!(cache.stats().cached_events, ACTIVITY_LIMIT);
+    assert!(snap.activity.len() <= ACTIVITY_LIMIT);
+    let newest = format!("prompt {}", total - 1);
+    let event = snap
+        .activity
+        .iter()
+        .find(|event| event.summary == newest)
+        .unwrap();
+    assert_eq!(event.entry, Some(total - 1));
+}
+
+#[test]
+fn cache_follows_only_the_newest_transcripts() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(project.path(), home.path().to_path_buf()).unwrap();
+    for i in 0..=ACTIVITY_TRANSCRIPTS {
+        let job = format!("task-window-{i}");
+        let sink = ChildTranscript::create(
+            &layout,
+            "parent",
+            &job,
+            serde_json::json!({"id": job, "started_ms": 1000 + i as u64}),
+        )
+        .unwrap();
+        sink.record(&serde_json::json!({"role":"user","content":format!("window {i}")}))
+            .unwrap();
+    }
+    let mut cache = HubCache::default();
+    cache.snapshot(&layout, "parent", &Tree::default(), None);
+    let stats = cache.stats();
+    assert_eq!(stats.transcripts, ACTIVITY_TRANSCRIPTS);
+    assert_eq!(stats.cached_events, ACTIVITY_TRANSCRIPTS);
+}
+
+/// One message record in the raw transcript line format that the follower replays.
+fn message_line(text: &str) -> String {
+    format!(
+        "{}\n",
+        serde_json::json!({"type": "message", "message": {"role": "user", "content": text}})
+    )
+}
+
+/// Entry index and summary of each activity event, in order.
+fn shown(events: &[ActivityEvent]) -> Vec<(Option<usize>, String)> {
+    events
+        .iter()
+        .map(|event| (event.entry, event.summary.clone()))
+        .collect()
+}
+
+#[test]
+fn persistent_refresh_reads_one_chunk_and_resumes_on_later_refreshes() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(project.path(), home.path().to_path_buf()).unwrap();
+    let sink = ChildTranscript::create(
+        &layout,
+        "parent",
+        "task-large",
+        serde_json::json!({"id": "task-large", "started_ms": 1000}),
+    )
+    .unwrap();
+    // 25 records of about 200 KiB make a history larger than one FOLLOW_CHUNK (4 MiB).
+    let total = 25;
+    let body = "x".repeat(200 * 1024);
+    for i in 0..total {
+        sink.record(&serde_json::json!({"role":"user","content":format!("{i} {body}")}))
+            .unwrap();
+    }
+    let runtime = Tree::default();
+    let is_latest = |snap: &HubSnapshot| {
+        snap.activity
+            .iter()
+            .any(|event| event.entry == Some(total - 1))
+    };
+
+    // The free projection drains the whole history in one call.
+    let free = snapshot(&layout, "parent", &runtime, None);
+    assert!(is_latest(&free), "free snapshot sees the newest record");
+
+    let mut cache = HubCache::default();
+    let mut refreshes = 0;
+    let mut first_cached = None;
+    let last = loop {
+        refreshes += 1;
+        let before = cache.stats().bytes_read;
+        let snap = cache.snapshot(&layout, "parent", &runtime, None);
+        let read = cache.stats().bytes_read - before;
+        assert!(
+            read <= FOLLOW_CHUNK as u64 + 1024,
+            "refresh {refreshes} read {read} bytes, above one chunk"
+        );
+        first_cached.get_or_insert(cache.stats().cached_events);
+        if is_latest(&snap) {
+            break snap;
+        }
+        assert!(
+            refreshes < total,
+            "history is followed one chunk per refresh"
+        );
+    };
+    assert!(
+        first_cached.is_some_and(|cached| cached < total),
+        "the first refresh does not drain a history larger than a chunk"
+    );
+    assert!(refreshes > 1, "the newest record needs a later refresh");
+    assert_eq!(
+        last.activity, free.activity,
+        "the bounded cache converges on the free projection"
+    );
+}
+
+#[test]
+fn feed_drops_on_read_error_and_replays_a_truncated_transcript() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("task-feed.jsonl");
+    let agent = entry("task-feed", None, AgentStatus::Running, None);
+    let summary = TranscriptSummary {
+        path: path.clone(),
+        header: serde_json::json!({"id": "task-feed"}),
+        status: None,
+    };
+    let mut cache = HubCache::default();
+
+    fs::write(
+        &path,
+        format!("{}{}", message_line("one"), message_line("two")),
+    )
+    .unwrap();
+    assert_eq!(
+        shown(&cache.feed_activity(&agent, &summary)),
+        [(Some(0), "one".to_owned()), (Some(1), "two".to_owned())]
+    );
+
+    // A read error drops the feed, is counted, and reports no stale or empty activity.
+    fs::remove_file(&path).unwrap();
+    assert!(cache.feed_activity(&agent, &summary).is_empty());
+    assert_eq!(cache.stats().read_errors, 1);
+    assert_eq!(cache.stats().transcripts, 0);
+
+    // The next successful read rebuilds the feed from the start of the new file.
+    fs::write(&path, message_line("three")).unwrap();
+    assert_eq!(
+        shown(&cache.feed_activity(&agent, &summary)),
+        [(Some(0), "three".to_owned())]
+    );
+
+    // A rewrite that shrinks the file is replayed from the start, never mixed with old records.
+    fs::write(&path, message_line("x")).unwrap();
+    assert_eq!(
+        shown(&cache.feed_activity(&agent, &summary)),
+        [(Some(0), "x".to_owned())]
+    );
+    assert_eq!(cache.stats().read_errors, 1);
 }

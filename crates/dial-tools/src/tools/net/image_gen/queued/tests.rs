@@ -1,3 +1,4 @@
+use super::super::loopback::Server;
 use super::*;
 use crate::config::image::ImageModelSettings;
 use crate::config::types::Config;
@@ -7,7 +8,6 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 fn target(wire: Wire, model: &str, settings: ImageModelSettings) -> Target {
@@ -327,20 +327,18 @@ fn body_of(raw: &str) -> Value {
 }
 
 /// Answers scripted replies in order. `build` receives the server's base URL so replies can point
-/// back at it. The thread stops once the script is spent and the client has been quiet, or at a
-/// fixed deadline, so an extra request cannot hang the test. Returns every request received.
-fn serve(build: impl FnOnce(&str) -> Vec<Reply>) -> (String, JoinHandle<Vec<String>>) {
+/// back at it. The thread stops when the test joins it, when the script is spent and another
+/// request arrives, or at a fixed deadline, so an extra request cannot hang the test. Joining
+/// returns every request received.
+fn serve(build: impl FnOnce(&str) -> Vec<Reply>) -> (String, Server) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let replies = build(&base);
-    let handle = std::thread::spawn(move || {
+    let server = Server::spawn(move |stop| {
         let deadline = Instant::now() + Duration::from_secs(15);
-        let total = replies.len();
         let mut replies = replies.into_iter();
         let mut seen = Vec::new();
-        let mut answered = 0usize;
-        let mut last = Instant::now();
         while Instant::now() < deadline {
             match listener.accept() {
                 Ok((mut stream, _)) => {
@@ -349,9 +347,7 @@ fn serve(build: impl FnOnce(&str) -> Vec<Reply>) -> (String, JoinHandle<Vec<Stri
                         .set_read_timeout(Some(Duration::from_secs(10)))
                         .unwrap();
                     seen.push(read_request(&stream));
-                    last = Instant::now();
                     let Some(reply) = replies.next() else { break };
-                    answered += 1;
                     let head = format!(
                         "HTTP/1.1 {} Test\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         reply.status,
@@ -362,8 +358,7 @@ fn serve(build: impl FnOnce(&str) -> Vec<Reply>) -> (String, JoinHandle<Vec<Stri
                     let _ = stream.write_all(&reply.body);
                 }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                    // Once the script is spent and the client has been quiet, stop early.
-                    if answered == total && last.elapsed() > Duration::from_millis(300) {
+                    if stop.load(Ordering::SeqCst) {
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(5));
@@ -373,7 +368,7 @@ fn serve(build: impl FnOnce(&str) -> Vec<Reply>) -> (String, JoinHandle<Vec<Stri
         }
         seen
     });
-    (base, handle)
+    (base, server)
 }
 
 fn loopback_target(base: &str, wire: Wire, model: &str) -> Target {

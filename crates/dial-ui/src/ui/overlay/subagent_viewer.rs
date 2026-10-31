@@ -35,7 +35,7 @@ use crate::{
         editor::Editor,
         fx,
         keys::{Action, Keymap},
-        subagent_model::{self, AgentEntry, AgentStatus},
+        subagent_model::{AgentEntry, AgentStatus, HubCache},
         text,
         theme::{Sym, Theme, Tok},
         transcript::{Replay, Transcript, TranscriptCtx},
@@ -357,6 +357,8 @@ pub struct SubagentViewer {
     finished_applied: bool,
     next_model: Instant,
     next_tail: Instant,
+    /// Persistent hub projection for this worker's model refresh; never rereads unchanged transcripts.
+    model_cache: HubCache,
     scroll: Scroll,
     /// Message entry to scroll to once it has been replayed.
     pending_entry: Option<usize>,
@@ -397,6 +399,7 @@ impl SubagentViewer {
             finished_applied: false,
             next_model: now,
             next_tail: now,
+            model_cache: HubCache::default(),
             scroll: Scroll::default(),
             pending_entry: entry,
             expanded: false,
@@ -454,7 +457,9 @@ impl SubagentViewer {
     ) {
         if now >= self.next_model {
             self.next_model = now + MODEL_EVERY;
-            let snapshot = subagent_model::snapshot(layout, &self.session_id, runtime, live);
+            let snapshot = self
+                .model_cache
+                .snapshot(layout, &self.session_id, runtime, live);
             self.agent = snapshot
                 .agents
                 .into_iter()

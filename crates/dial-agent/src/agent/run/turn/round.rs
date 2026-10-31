@@ -25,6 +25,9 @@ impl Agent<'_> {
         self.settle_round(turn, engine, backend, schemas, ui, round)
     }
 
+    /// Pre-edit context for one native write/edit. The lookup runs on a scoped thread only so the
+    /// controller can keep pumping `ui.heartbeat()` while it waits; the call is serial by design,
+    /// because the result gates this call's admission and ordering of `prechecked_paths`.
     fn native_edit_preflight(
         &mut self,
         turn: &mut TurnState<'_>,
@@ -39,6 +42,7 @@ impl Agent<'_> {
         {
             if turn.prechecked_paths.insert(path.to_owned()) {
                 let path = path.to_owned();
+                let started = Instant::now();
                 let check = thread::scope(|scope| -> Result<_> {
                     let (tx, rx) = mpsc::sync_channel(1);
                     scope.spawn(move || {
@@ -46,6 +50,8 @@ impl Agent<'_> {
                     });
                     receive_with_heartbeat(&rx, ui)?
                 });
+                self.efficiency_metrics
+                    .backend_operation("native_edit_preflight", started.elapsed());
                 match check {
                     Ok(Some(text)) => {
                         preflight = Some(ToolOutput {
@@ -757,10 +763,10 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                 }
             }
             if call.name == "bash" {
-                if call.arguments["command"].as_str().is_some_and(|command| {
-                    !crate::agent::safety::approval::safe_bash(command)
-                        && !crate::agent::safety::approval::safe_review_batch(command)
-                }) {
+                if call.arguments["command"]
+                    .as_str()
+                    .is_some_and(crate::agent::safety::approval::opaque_shell_effect)
+                {
                     self.step_checks.uncheckpointed_shell_commands += 1;
                 }
             } else if let Some(tool) = self.ext.get(&call.name)
@@ -810,6 +816,22 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                     crate::agent::verify::completion::Finish::parse(&call.arguments)
                         .map_err(anyhow::Error::msg)?,
                 );
+            }
+            if let Some(advice) =
+                crate::agent::run::failure_guidance::empty_discovery(call, &output)
+            {
+                output.text.push_str(advice);
+            }
+            // The catalog identifies the name; shell prose alone cannot invent a tool or
+            // authorize a replacement action. Shared foreground/worker settlement keeps the
+            // original failure and unchanged-retry barrier intact.
+            if call.name == "bash"
+                && let Some(advice) =
+                    crate::agent::run::failure_guidance::shell_tool_mistake(call, &output, |name| {
+                        self.catalog().iter().any(|tool| tool == name)
+                    })
+            {
+                output.text.push_str(&advice);
             }
             let (duplicate, repeat_advice, recovery_stop) = engine.settle(
                 &self.workspace,

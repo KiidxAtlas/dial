@@ -14,13 +14,13 @@ use crate::{
 };
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
-    thread::{self, JoinHandle},
+    thread::JoinHandle,
     time::{Duration, Instant},
 };
 /// Permission inputs the pump authorizes live-task events against.
@@ -375,6 +375,7 @@ impl Drop for WorkerExit {
         self.team.retire(&self.id);
         self.control.finished.store(true, Ordering::SeqCst);
         let _ = self.tx.send(Event::Done(self.id.clone(), value));
+        crate::platform::wake::signal();
     }
 }
 pub(in crate::agent) struct LiveTasks {
@@ -389,6 +390,12 @@ pub(in crate::agent) struct LiveTasks {
     /// Reusable worker pools by `pool-N` id; see `pool.rs`.
     pools: BTreeMap<String, pool::WorkerPool>,
     next_pool: u64,
+    /// `task.stall_secs` of the batch that started the newest worker; 0 disables stall detection.
+    stall_secs: u64,
+    /// Running workers already reported as stalled, so each stall is reported once until it recovers.
+    flagged: BTreeSet<String>,
+    /// Stalls found by `pump` that no `wait` has reported to the parent yet.
+    stall_alerts: Vec<String>,
 }
 impl Default for LiveTasks {
     fn default() -> Self {
@@ -404,6 +411,9 @@ impl Default for LiveTasks {
             completed: Vec::new(),
             pools: BTreeMap::new(),
             next_pool: 0,
+            stall_secs: Config::default().task.stall_secs,
+            flagged: BTreeSet::new(),
+            stall_alerts: Vec::new(),
         }
     }
 }
@@ -476,6 +486,7 @@ impl Approver for Bridge {
                 answer,
             })
             .map_err(|_| "memory capture owner disconnected".to_owned())?;
+        crate::platform::wake::signal();
         loop {
             if cancel.load(Ordering::SeqCst) || self.interrupt.load(Ordering::SeqCst) {
                 return Err("memory capture cancelled".into());
@@ -518,6 +529,7 @@ impl Approver for Bridge {
         {
             return QuestionOutcome::Disconnected;
         }
+        crate::platform::wake::signal();
         loop {
             if cancel.load(Ordering::SeqCst) || self.interrupt.load(Ordering::SeqCst) {
                 return QuestionOutcome::Cancelled;
@@ -578,6 +590,7 @@ impl Approver for Bridge {
         {
             return Err(Denial::User);
         }
+        crate::platform::wake::signal();
         loop {
             if interrupted() {
                 return Err(Denial::User);
@@ -630,6 +643,7 @@ impl Approver for Bridge {
         {
             return Err("native mutation controller unavailable".into());
         }
+        crate::platform::wake::signal();
         loop {
             if interrupted() {
                 return Err("native mutation cancelled".into());
@@ -653,12 +667,15 @@ impl Approver for Bridge {
         let _ = self
             .tx
             .send(Event::Policy(call.clone(), explanation.clone()));
+        crate::platform::wake::signal();
     }
     fn notice(&mut self, message: &str) {
         let _ = self.tx.send(Event::Notice(message.to_owned()));
+        crate::platform::wake::signal();
     }
     fn add_cost(&mut self, cost: f64) {
         let _ = self.tx.send(Event::Cost(cost));
+        crate::platform::wake::signal();
     }
     fn take_messages(&mut self) -> Vec<String> {
         self.signals.clear();
@@ -1085,6 +1102,7 @@ impl LiveTasks {
                 }
             };
             self.team.set_limit(config.task.inbox_limit);
+            self.stall_secs = config.task.stall_secs;
             let interrupt = Arc::new(AtomicBool::new(false));
             let cancel = interrupt.clone();
             let tx = self.tx.clone();
@@ -1315,6 +1333,7 @@ impl LiveTasks {
                 team.retire(&done_id);
                 control.finished.store(true, Ordering::SeqCst);
                 let _ = tx.send(Event::Done(done_id, value));
+                crate::platform::wake::signal();
             });
             let store = slot_store.unwrap_or_default();
             let spawned = slot::run_on(store, work, format!("dial-{id}")).map_err(|e| {
@@ -1543,6 +1562,13 @@ impl LiveTasks {
                 }
             }
         }
+        let now = epoch_ms();
+        for id in self.scan_stalls(now) {
+            ui.background_notice(&format!(
+                "{id} has shown no progress for at least {}s; check its status, message it or cancel it.",
+                self.stall_secs
+            ));
+        }
         self.advance_pools();
     }
     pub fn status(&self, id: Option<&str>) -> Result<Value, String> {
@@ -1551,18 +1577,56 @@ impl LiveTasks {
             Some(id) => self
                 .jobs
                 .get(id)
-                .map(|j| j.status())
+                .map(|j| self.watched(j))
                 .ok_or_else(|| format!("unknown job {id}")),
             None => {
                 let mut jobs: Vec<_> = self.jobs.iter().collect();
                 jobs.sort_by_key(|(id, _)| {
                     id.trim_start_matches("task-").parse::<u64>().unwrap_or(0)
                 });
-                let mut entries: Vec<Value> = jobs.into_iter().map(|(_, j)| j.status()).collect();
+                let mut entries: Vec<Value> =
+                    jobs.into_iter().map(|(_, j)| self.watched(j)).collect();
                 entries.extend(self.pool_entries());
                 Ok(json!(entries))
             }
         }
+    }
+    /// A job's status; a running one also reports `running_secs`, `idle_secs` and `health`
+    /// (`active`, `slow` or `stalled`) so the parent can decide whether to keep waiting.
+    fn watched(&self, job: &JobState) -> Value {
+        let mut status = job.status();
+        watch(&mut status, epoch_ms(), self.stall_secs);
+        status
+    }
+    /// Records running workers that have gone quiet for `task.stall_secs`. Returns those newly
+    /// stalled and queues them for the next `wait`. A worker that resumes or settles is forgotten,
+    /// so a later stall is reported again.
+    fn scan_stalls(&mut self, now_ms: u64) -> Vec<String> {
+        let stall = self.stall_secs;
+        let stalled: BTreeSet<String> = self
+            .jobs
+            .iter()
+            .filter(|(_, job)| {
+                job.running()
+                    && matches!(
+                        health(&job.status(), now_ms, stall),
+                        Some((_, _, "stalled"))
+                    )
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        let fresh: Vec<String> = stalled.difference(&self.flagged).cloned().collect();
+        self.flagged = stalled;
+        self.stall_alerts.retain(|id| self.flagged.contains(id));
+        self.stall_alerts.extend(fresh.iter().cloned());
+        fresh
+    }
+    /// Whether an unreported stall concerns `id` (any worker when `None`); reports it once.
+    fn take_stall_alert(&mut self, id: Option<&str>) -> bool {
+        let concerns = |alert: &String| id.is_none_or(|id| id == alert);
+        let hit = self.stall_alerts.iter().any(concerns);
+        self.stall_alerts.retain(|alert| !concerns(alert));
+        hit
     }
     pub fn message(&self, id: &str, text: &str) -> Result<Value, String> {
         self.control().send(id, text).map_err(|e| e.to_string())
@@ -1611,6 +1675,7 @@ impl LiveTasks {
         } = gate;
         self.status(id)?;
         let until = Instant::now() + Duration::from_secs(seconds.min(120));
+        let waiter = crate::platform::wake::Waiter::new().map_err(|e| e.to_string())?;
         loop {
             self.pump(
                 approval,
@@ -1645,8 +1710,23 @@ impl LiveTasks {
                     .status(id)
                     .map(|status| (status, Some(WaitStop::Message)));
             }
+            if self.take_stall_alert(id) {
+                return self
+                    .status(id)
+                    .map(|status| (status, Some(WaitStop::Stalled)));
+            }
             ui.heartbeat();
-            thread::sleep(Duration::from_millis(40));
+            waiter
+                .wait::<std::io::PipeReader>(
+                    None,
+                    None,
+                    Some(
+                        until
+                            .saturating_duration_since(Instant::now())
+                            .min(Duration::from_millis(250)),
+                    ),
+                )
+                .map_err(|e| e.to_string())?;
         }
     }
 }
@@ -1662,6 +1742,42 @@ fn epoch_ms() -> u64 {
             duration.as_millis().min(u128::from(u64::MAX)) as u64
         })
 }
+
+/// Seconds a running worker has run and been silent, and its health: `stalled` after `stall_secs`
+/// without progress, `slow` once it has run `SLOW_AFTER_STALLS` stall periods, else `active`.
+/// `None` for a settled job, a job without timestamps, or when `stall_secs` is 0.
+fn health(status: &Value, now_ms: u64, stall_secs: u64) -> Option<(u64, u64, &'static str)> {
+    if status["status"] != "running" || stall_secs == 0 {
+        return None;
+    }
+    let started = status["started_ms"].as_u64()?;
+    let last = status["updated_ms"]
+        .as_u64()
+        .unwrap_or(started)
+        .max(started);
+    let running = now_ms.saturating_sub(started) / 1000;
+    let idle = now_ms.saturating_sub(last) / 1000;
+    let label = if idle >= stall_secs {
+        "stalled"
+    } else if running >= stall_secs.saturating_mul(SLOW_AFTER_STALLS) {
+        "slow"
+    } else {
+        "active"
+    };
+    Some((running, idle, label))
+}
+
+/// Adds `running_secs`, `idle_secs` and `health` to a running job's status.
+fn watch(status: &mut Value, now_ms: u64, stall_secs: u64) {
+    if let Some((running, idle, label)) = health(status, now_ms, stall_secs) {
+        status["running_secs"] = json!(running);
+        status["idle_secs"] = json!(idle);
+        status["health"] = json!(label);
+    }
+}
+
+/// A progressing worker is reported `slow` after this many stall periods of run time.
+const SLOW_AFTER_STALLS: u64 = 3;
 impl Drop for LiveTasks {
     fn drop(&mut self) {
         self.cancel_all();
@@ -1679,6 +1795,8 @@ pub(in crate::agent) enum WaitStop {
     Input,
     /// A worker sent the parent a message.
     Message,
+    /// A worker showed no progress for `task.stall_secs`.
+    Stalled,
 }
 impl WaitStop {
     /// The note appended to the wait's result.
@@ -1686,6 +1804,7 @@ impl WaitStop {
         match self {
             Self::Input => STOPPED_FOR_INPUT,
             Self::Message => STOPPED_FOR_MESSAGE,
+            Self::Stalled => STOPPED_FOR_STALL,
         }
     }
 }
@@ -1693,6 +1812,8 @@ impl WaitStop {
 pub(in crate::agent) const STOPPED_FOR_INPUT: &str = "\n[Stopped waiting early: the user sent a new message. Nothing was cancelled; the awaited work keeps running and its results arrive at request boundaries.]";
 /// Appended to a live-task wait that ended early because a worker messaged the parent.
 const STOPPED_FOR_MESSAGE: &str = "\n[Stopped waiting early: a worker sent you a message, delivered with your next request. Nothing was cancelled; the awaited work keeps running and its results arrive at request boundaries.]";
+/// Appended to a live-task wait that ended early because a worker stopped making progress.
+const STOPPED_FOR_STALL: &str = "\n[Stopped waiting early: a worker has shown no progress for the stall limit (see `health`, `idle_secs`, `phase` in its status). Nothing was cancelled. Keep waiting, message it, or cancel it and tell the user.]";
 
 pub(in crate::agent) fn output(result: Result<Value, String>) -> ToolOutput {
     match result {
@@ -1748,6 +1869,11 @@ fn model_summary_view(value: &Value, delivered: &impl Fn(&Value) -> bool) -> Str
         {
             if let Some(phase) = job["phase"].as_str().filter(|phase| *phase != status) {
                 text.push_str(&format!("; {phase}"));
+            }
+            if let (Some(health), Some(idle)) = (job["health"].as_str(), job["idle_secs"].as_u64())
+                && health != "active"
+            {
+                text.push_str(&format!("; {health}, idle {idle}s"));
             }
             return text;
         }

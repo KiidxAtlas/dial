@@ -547,10 +547,12 @@ fn inventory_reports_runtime_status_without_exposing_configuration_secrets() {
         .find(|session| session.name() == "live")
         .unwrap();
     let _turn = session.turn.lock(); // Keep automatic recovery from racing this observation.
-    let _ = session.current().request(
+    let _ = session.current().request_with(
         "tools/call",
         json!({"name":"die","arguments":{}}),
         Duration::from_secs(5),
+        &|| false,
+        None,
     );
     let listing: Value = serde_json::from_str(&inventory.call(&ctx, &json!({})).text).unwrap();
     assert_eq!(
@@ -1020,6 +1022,211 @@ fn listing_fetched_before_an_invalidation_is_not_cached() {
         .lock()
         .store(after, |cache| cache.prompts = Some(json!({"fresh": true})));
     assert!(session.listing.lock().prompts.is_some());
+}
+
+/// A server that answers `initialize` only once the returned path exists.
+fn gated(dir: &tempfile::TempDir) -> (Config, std::path::PathBuf) {
+    let open = dir.path().join("open");
+    let mut server = fake_config("gate", 30);
+    server
+        .env
+        .insert(fake::GATE_ENV.to_owned(), open.display().to_string());
+    (config_with(vec![("gated", server)]), open)
+}
+
+fn until_finished(connecting: &Connecting) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !connecting.is_finished() {
+        assert!(
+            Instant::now() < deadline,
+            "the gated server never connected"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn a_registry_does_not_wait_for_servers_still_connecting_and_adopts_them_once_ready() {
+    use crate::tools::integrations::ext::Registry;
+    let dir = tempfile::tempdir().unwrap();
+    let (config, open) = gated(&dir);
+    let connecting = Connecting::spawn(&config).unwrap();
+    let mut registry = Registry::new();
+    registry.attach_mcp(&config, Startup::Connecting(connecting.clone()));
+
+    assert!(!connecting.is_finished(), "the gate holds `initialize`");
+    assert!(registry.contains("mcp_servers"));
+    assert!(!registry.contains("mcp__gated__echo"));
+    assert_eq!(registry.mcp_connecting(), Some(vec!["gated".to_owned()]));
+    assert!(
+        !registry.adopt_mcp(false),
+        "nothing is adopted before it connects"
+    );
+    assert!(!registry.sync_mcp());
+
+    std::fs::write(&open, "").unwrap();
+    until_finished(&connecting);
+    assert!(registry.adopt_mcp(false));
+    assert!(registry.contains("mcp__gated__echo"));
+    assert_eq!(registry.mcp_connecting(), None);
+    assert!(
+        registry.sync_mcp(),
+        "adoption is reported once, so offered schemas and the prompt are rebuilt"
+    );
+    assert!(!registry.sync_mcp());
+}
+
+#[test]
+fn an_explicit_need_waits_for_servers_still_connecting() {
+    use crate::tools::integrations::ext::Registry;
+    let dir = tempfile::tempdir().unwrap();
+    let (config, open) = gated(&dir);
+    let connecting = Connecting::spawn(&config).unwrap();
+    let mut registry = Registry::new();
+    registry.attach_mcp(&config, Startup::Connecting(connecting));
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        std::fs::write(open, "").unwrap();
+    });
+
+    // Listing servers reports their real state, not "failed" for one still connecting.
+    let (_dir, workspace) = testkit::workspace();
+    let ctx = ToolContext {
+        workspace: &workspace,
+        config: &config,
+        mutation_authorizer: None,
+        confirm: None,
+    };
+    let listing = registry.get("mcp_servers").unwrap().call(&ctx, &json!({}));
+    let listing: Value = serde_json::from_str(&listing.text).unwrap();
+    assert_eq!(listing["servers"][0]["status"], "connected");
+
+    assert!(registry.adopt_mcp(true));
+    release.join().unwrap();
+    assert!(registry.contains("mcp__gated__echo"));
+    assert!(registry.contains("mcp_servers"));
+}
+
+#[test]
+fn dropping_a_pass_still_connecting_cancels_it_without_waiting_for_its_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let (config, _never_opened) = gated(&dir);
+    let connecting = Connecting::spawn(&config).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    let started = Instant::now();
+    drop(connecting);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "exit waited {:?} for a server's 30 s startup budget",
+        started.elapsed()
+    );
+}
+
+/// A streamable-HTTP server that takes `delay` to answer the `DELETE` ending a session and counts
+/// the deletions it answered.
+fn slow_teardown_server(delay: Duration) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!(
+        "http://127.0.0.1:{}/mcp",
+        listener.local_addr().unwrap().port()
+    );
+    let deleted = Arc::new(AtomicUsize::new(0));
+    let count = deleted.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let count = count.clone();
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut stream = stream;
+                let (mut method, mut length) = (String::new(), 0usize);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if method.is_empty() {
+                        method = line.split(' ').next().unwrap_or_default().to_owned();
+                    }
+                    if let Some(v) = line.to_lowercase().strip_prefix("content-length:") {
+                        length = v.trim().parse().unwrap();
+                    }
+                }
+                let respond = |stream: &mut std::net::TcpStream,
+                               status: &str,
+                               extra: &str,
+                               body: String| {
+                    let _ = stream.write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    );
+                };
+                match method.as_str() {
+                    "GET" => respond(&mut stream, "405 Method Not Allowed", "", String::new()),
+                    "DELETE" => {
+                        std::thread::sleep(delay);
+                        count.fetch_add(1, Ordering::SeqCst);
+                        respond(&mut stream, "200 OK", "", String::new());
+                    }
+                    _ => {
+                        let mut body = vec![0; length];
+                        reader.read_exact(&mut body).unwrap();
+                        let message: Value = serde_json::from_slice(&body).unwrap();
+                        let id = message["id"].clone();
+                        match message["method"].as_str().unwrap_or_default() {
+                            "initialize" => respond(&mut stream, "200 OK", "Mcp-Session-Id: sess-slow\r\n",
+                                json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"slow","version":"1"}}}).to_string()),
+                            "tools/list" => respond(&mut stream, "200 OK", "",
+                                json!({"jsonrpc":"2.0","id":id,"result":{"tools":[]}}).to_string()),
+                            _ => respond(&mut stream, "202 Accepted", "", String::new()),
+                        }
+                    }
+                }
+            });
+        }
+    });
+    (url, deleted)
+}
+
+#[test]
+fn dropping_a_load_ends_every_server_session_at_once() {
+    use std::sync::atomic::Ordering;
+    let delay = Duration::from_secs(1);
+    let servers: Vec<_> = (0..3).map(|_| slow_teardown_server(delay)).collect();
+    let config = config_with(
+        servers
+            .iter()
+            .enumerate()
+            .map(|(index, (url, _))| {
+                (
+                    ["one", "two", "three"][index],
+                    McpServerConfig {
+                        url: Some(url.clone()),
+                        program: Default::default(),
+                        ..McpServerConfig::default()
+                    },
+                )
+            })
+            .collect(),
+    );
+    let connecting = Connecting::spawn(&config).unwrap();
+    until_finished(&connecting);
+
+    let started = Instant::now();
+    drop(connecting);
+    let elapsed = started.elapsed();
+    for (_, deleted) in &servers {
+        assert_eq!(deleted.load(Ordering::SeqCst), 1, "every session is ended");
+    }
+    // One after another the three deletions take at least 3 s; together about one delay.
+    assert!(
+        elapsed < delay * 5 / 2,
+        "ending three sessions took {elapsed:?}, one after another"
+    );
 }
 
 mod health_tests;

@@ -75,3 +75,77 @@ fn journaled_invalidation_names_are_unchanged() {
         assert_eq!(value.to_string(), name);
     }
 }
+
+#[test]
+fn prefix_measurements_partition_bytes_without_retaining_content() {
+    let mut tracker = Tracker::default();
+    let mut request = chat();
+    request
+        .messages
+        .insert(1, json!({"role":"developer","content":"private policy"}));
+    request
+        .tools
+        .push(json!({"type":"function","function":{"name":"read"}}));
+    let initial = tracker.observe("model", &request);
+    assert_eq!(initial.stable_message_count, 0);
+    assert_eq!(initial.changed_message_bytes, initial.request_message_bytes);
+    assert_eq!(
+        initial.system_bytes,
+        request.messages[..2]
+            .iter()
+            .map(|m| serde_json::to_vec(m).unwrap().len())
+            .sum::<usize>()
+    );
+    assert_eq!(
+        initial.tool_schema_bytes,
+        serde_json::to_vec(&request.tools).unwrap().len()
+    );
+    assert_eq!(initial.tool_count, 1);
+    request
+        .messages
+        .push(json!({"role":"assistant","content":"answer"}));
+    let appended = tracker.observe("model", &request);
+    assert_eq!(appended.stable_message_count, 3);
+    assert_eq!(appended.stable_message_bytes, initial.request_message_bytes);
+    assert_eq!(
+        appended.changed_message_bytes,
+        serde_json::to_vec(request.messages.last().unwrap())
+            .unwrap()
+            .len()
+    );
+    request.messages[2]["content"] = json!("corrected question");
+    let corrected = tracker.observe("model", &request);
+    assert_eq!(corrected.invalidation, Invalidation::HistoryChanged);
+    assert_eq!(corrected.stable_message_count, 2);
+    assert_eq!(
+        corrected.stable_message_bytes + corrected.changed_message_bytes,
+        corrected.request_message_bytes
+    );
+    request.messages[1]["content"] = json!("corrected private policy");
+    let policy = tracker.observe("model", &request);
+    assert_eq!(policy.invalidation, Invalidation::SystemChanged);
+    assert_eq!(policy.stable_message_count, 0);
+    assert_eq!(policy.stable_message_bytes, 0);
+    let report = serde_json::to_string(&policy).unwrap();
+    assert!(!report.contains("private policy"));
+    assert!(!report.contains("corrected question"));
+}
+
+#[test]
+fn empty_and_shortened_requests_have_bounded_prefix_measurements() {
+    let mut tracker = Tracker::default();
+    let mut request = chat();
+    tracker.observe("model", &request);
+    request.messages.pop();
+    let shorter = tracker.observe("model", &request);
+    assert_eq!(shorter.invalidation, Invalidation::HistoryChanged);
+    assert_eq!(shorter.stable_message_count, 1);
+    assert_eq!(shorter.changed_message_bytes, 0);
+    request.messages.clear();
+    let empty = tracker.observe("model", &request);
+    assert_eq!(empty.stable_message_count, 0);
+    assert_eq!(empty.changed_message_bytes, 0);
+    assert_eq!(empty.system_bytes, 0);
+    assert_eq!(empty.tool_schema_bytes, 2);
+    assert_eq!(empty.tool_count, 0);
+}

@@ -207,3 +207,199 @@ fn pending_prose_is_bounded_discardable_and_recovers_on_drop() {
     );
     assert!(pending_assistant(&path, 0).is_none());
 }
+
+fn archive(messages: &[&str]) -> String {
+    let mut text = json!({"type":"header","job":"j"}).to_string() + "\n";
+    for message in messages {
+        let record = json!({"type":"message","message":{"role":"user","content":message}});
+        text += &(record.to_string() + "\n");
+    }
+    text
+}
+
+/// Runs `follow` until it reports no progress; each change is rendered as `reset` or `index:text`.
+fn drain(follower: &mut MessageFollower) -> Vec<String> {
+    let mut seen = Vec::new();
+    loop {
+        let step = follower
+            .follow(&mut |change| match change {
+                Change::Reset => seen.push("reset".to_owned()),
+                Change::Message(index, message) => {
+                    seen.push(format!(
+                        "{index}:{}",
+                        message["content"].as_str().unwrap_or_default()
+                    ));
+                }
+            })
+            .unwrap();
+        if step == Follow::Unchanged {
+            return seen;
+        }
+    }
+}
+
+#[test]
+fn follower_emits_absolute_indices_and_only_new_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let sink = ChildTranscript::create(&layout(dir.path()), "s", "follow", json!({"job":"follow"}))
+        .unwrap();
+    sink.record(&json!({"role":"user","content":"a"})).unwrap();
+    sink.record(&json!({"role":"user","content":"b"})).unwrap();
+    let mut follower = MessageFollower::new(sink.path.clone());
+    assert_eq!(drain(&mut follower), ["0:a", "1:b"]);
+    let before = follower.bytes_read();
+    assert_eq!(
+        follower.follow(&mut |_| unreachable!()).unwrap(),
+        Follow::Unchanged
+    );
+    assert!(
+        follower.bytes_read() - before < 1024,
+        "unchanged file costs only anchor checks"
+    );
+    sink.record(&json!({"role":"user","content":"c"})).unwrap();
+    assert_eq!(drain(&mut follower), ["2:c"]);
+    assert_eq!(follower.message_count(), 3);
+}
+
+#[test]
+fn torn_tail_waits_for_its_newline_even_inside_a_multibyte_character() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("torn.jsonl");
+    let next = (json!({"type":"message","message":{"role":"user","content":"é"}}).to_string()
+        + "\n")
+        .into_bytes();
+    // 0xC3 starts the two-byte `é`; stop the first write between its bytes.
+    let split = next.iter().position(|byte| *byte == 0xC3).unwrap() + 1;
+    let mut bytes = archive(&["a"]).into_bytes();
+    bytes.extend_from_slice(&next[..split]);
+    fs::write(&path, &bytes).unwrap();
+    let mut follower = MessageFollower::new(&path);
+    assert_eq!(drain(&mut follower), ["0:a"]);
+    OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(&next[split..])
+        .unwrap();
+    assert_eq!(drain(&mut follower), ["1:é"]);
+}
+
+#[test]
+fn truncation_and_replacement_restart_the_replay() {
+    // (case, next archive, replaced by a new inode, expected changes)
+    let cases: [(&str, &[&str], bool, &[&str]); 4] = [
+        ("truncated", &["x"], false, &["reset", "0:x"]),
+        (
+            "replaced by another file",
+            &["a", "b"],
+            true,
+            &["reset", "0:a", "1:b"],
+        ),
+        (
+            "rewritten in place at the head",
+            &["z", "b"],
+            false,
+            &["reset", "0:z", "1:b"],
+        ),
+        (
+            "rewritten in place at the tail",
+            &["a", "z"],
+            false,
+            &["reset", "0:a", "1:z"],
+        ),
+    ];
+    for (case, next, by_rename, expected) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        fs::write(&path, archive(&["a", "b"])).unwrap();
+        let mut follower = MessageFollower::new(&path);
+        assert_eq!(drain(&mut follower), ["0:a", "1:b"], "{case}: first replay");
+        if by_rename {
+            let replacement = dir.path().join("next.jsonl");
+            fs::write(&replacement, archive(next)).unwrap();
+            fs::rename(&replacement, &path).unwrap();
+        } else {
+            fs::write(&path, archive(next)).unwrap();
+        }
+        assert_eq!(drain(&mut follower), expected, "{case}");
+    }
+}
+
+#[test]
+fn oversized_line_is_skipped_without_buffering_it_even_while_torn() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("big.jsonl");
+    let mut bytes = archive(&["a"]).into_bytes();
+    bytes.extend(std::iter::repeat_n(b'x', MAX_LINE + 5));
+    fs::write(&path, &bytes).unwrap();
+    let mut follower = MessageFollower::new(&path);
+    assert_eq!(drain(&mut follower), ["0:a"]);
+    let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+    file.write_all(b"\n").unwrap();
+    file.write_all(
+        (json!({"type":"message","message":{"role":"user","content":"b"}}).to_string() + "\n")
+            .as_bytes(),
+    )
+    .unwrap();
+    assert_eq!(drain(&mut follower), ["1:b"]);
+}
+
+#[test]
+fn oversized_or_malformed_headers_are_not_listed() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout(dir.path());
+    let parent = transcript_dir(&layout, "s");
+    fs::create_dir_all(&parent).unwrap();
+    let pad = "x".repeat(MAX_HEADER);
+    fs::write(
+        parent.join("huge.jsonl"),
+        format!("{{\"type\":\"header\",\"id\":\"huge\",\"pad\":\"{pad}\"}}\n"),
+    )
+    .unwrap();
+    fs::write(
+        parent.join("ok.jsonl"),
+        "{\"type\":\"header\",\"id\":\"ok\"}\n",
+    )
+    .unwrap();
+    fs::write(
+        parent.join("torn.jsonl"),
+        "{\"type\":\"header\",\"id\":\"to",
+    )
+    .unwrap();
+    let ids: Vec<String> = scan(&layout, "s")
+        .iter()
+        .map(|found| found.header["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(ids, ["ok"]);
+}
+
+#[test]
+fn status_is_found_when_the_tail_window_starts_inside_a_character() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("status.jsonl");
+    let mut tail = json!({"type":"status","status":"done"}).to_string();
+    if tail.len().is_multiple_of(2) {
+        tail.push(' ');
+    }
+    // Two-byte characters with an odd tail length put the 4 KiB window on a continuation byte.
+    fs::write(&path, format!("{}\n{tail}\n", "é".repeat(3000))).unwrap();
+    assert_eq!(read_status(&path).unwrap()["status"], "done");
+}
+
+#[test]
+fn deep_link_entries_share_the_message_index_space() {
+    let dir = tempfile::tempdir().unwrap();
+    let sink =
+        ChildTranscript::create(&layout(dir.path()), "s", "links", json!({"job":"links"})).unwrap();
+    for text in ["a", "b", "c"] {
+        sink.record(&json!({"role":"user","content":text})).unwrap();
+    }
+    sink.finish(json!({"status":"done"})).unwrap();
+    let found = entries(&sink.path).unwrap();
+    let texts: Vec<&str> = found
+        .iter()
+        .map(|m| m["content"].as_str().unwrap())
+        .collect();
+    assert_eq!(texts, ["a", "b", "c"]);
+    assert_eq!(messages(&sink.path).unwrap(), found);
+}

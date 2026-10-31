@@ -93,7 +93,9 @@ fn pty_wrapper_child() {
     // driver's go line, so no output is in flight between the two attaches.
     println!("wrapper-armed");
     let mut command = Command::new("sh");
-    command.args(["-c", r#"trap 'exit 42' INT; read go; printf '\033[32mwrapper-ready\033[0m\n'; read line; stty size; printf 'received:%s\n' "$line"; while :; do sleep 1; done"#]);
+    // `stty size` runs only once the wrapper has propagated the driver's resize, so the size
+    // check below does not depend on how quickly the wrapper's resize poll runs.
+    command.args(["-c", r#"trap 'exit 42' INT; read go; printf '\033[32mwrapper-ready\033[0m\n'; read line; while [ "$(stty size)" != "31 99" ]; do sleep 0.02; done; stty size; printf 'received:%s\n' "$line"; while :; do sleep 1; done"#]);
     assert_eq!(unix::execute(&mut command, &mut capture, true).unwrap(), 42);
     capture.finish(None).unwrap();
     let mut restored = std::mem::MaybeUninit::<libc::termios>::uninit();
@@ -167,8 +169,6 @@ fn pty_wrapper_forwards_input_resize_ctrl_c_and_restores_terminal() {
     let started = master.write_all(b"go\n").is_ok();
     let ready = until(b"wrapper-ready", &mut master);
     let resized = terminal::resize(&master, 31, 99).is_ok();
-    // Give the wrapper's bounded resize poll time to update the child's PTY before stty runs.
-    std::thread::sleep(Duration::from_millis(150));
     let sent = master.write_all(b"hello\n").is_ok();
     let received = until(b"received:hello", &mut master);
     let interrupted = master.write_all(&[3]).is_ok();

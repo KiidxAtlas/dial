@@ -87,51 +87,53 @@ fn full_guidance(presentation: Presentation, has: &dyn Fn(&str) -> bool) -> Stri
     } = presentation;
     let visual = if visual { VISUAL_VERIFICATION } else { "" };
     let lean = lean || one_call;
-    let mut policy = String::from(if lean { LEAN_TOOL_POLICY } else { TOOL_POLICY });
-    let mut optional = vec![];
-    if lean {
+    // Compact prose applies to the lean profile and to efficiency-enabled hosted sessions alike.
+    let compact = lean || concise;
+    let mut policy = String::from(if compact {
+        LEAN_TOOL_POLICY
+    } else {
+        TOOL_POLICY
+    });
+    if compact {
         policy.push_str(if one_call {
             LEAN_ONE_CALL
         } else {
             LEAN_BATCHING
         });
-        policy.push_str(LEAN_WRITE_RULE);
-        if has("skill") {
-            optional.push(SKILL_RULE);
-        }
-    } else {
-        for (tool, rule) in [
-            ("skill", SKILL_RULE),
-            ("codebase_memory", PROJECT_MAP_RULE),
-            ("lsp", LSP_RULE),
-        ] {
-            if has(tool) {
-                optional.push(rule);
-            }
-        }
     }
+    let optional: Vec<&str> = [
+        ("skill", SKILL_RULE),
+        ("codebase_memory", PROJECT_MAP_RULE),
+        ("lsp", LSP_RULE),
+    ]
+    .into_iter()
+    .filter(|(tool, _)| has(tool))
+    .map(|(_, rule)| rule)
+    .collect();
     if !optional.is_empty() {
         policy.push_str("\n- ");
         policy.push_str(&optional.join(" "));
     }
     policy.push_str(TRUST_RULE);
     policy.push_str(CALL_CONTRACT_PRECEDENCE);
-    let (rules, delivery) = if lean || concise {
-        let rules = if one_call {
-            LEAN_ONE_CALL_RULES
-        } else {
-            LEAN_RULES
-        };
-        (rules, LEAN_DELIVERY)
-    } else {
-        (RULES, DELIVERY)
-    };
-    let (header, focused) = if lean || concise {
-        (LEAN_HEADER, LEAN_FOCUSED_WORK)
-    } else {
-        (HEADER, FOCUSED_WORK)
-    };
-    format!("{header}{policy}\n\n# Execution\n{focused}{rules}{visual}{delivery}")
+    if !compact {
+        return format!("{HEADER}{policy}\n\n# Execution\n{FOCUSED_WORK}{RULES}{visual}{DELIVERY}");
+    }
+    let mut focused = String::from(LEAN_FOCUSED_WORK);
+    focused.push_str(LEAN_WAITING);
+    // Name a parallel helper only when it is offered, never a deferred one.
+    let helpers: Vec<&str> = [
+        ("side_request", LEAN_SIDE_REQUEST),
+        ("task", LEAN_TASK_START),
+    ]
+    .into_iter()
+    .filter(|(tool, _)| has(tool))
+    .map(|(_, clause)| clause)
+    .collect();
+    if !helpers.is_empty() {
+        focused.push_str(&format!(" Meanwhile you may {}.", helpers.join(", or ")));
+    }
+    format!("{LEAN_HEADER}{policy}\n\n# Execution\n{focused}{LEAN_RULES}{visual}{LEAN_DELIVERY}")
 }
 
 /// Scope optional workflow prose to the configured catalog, not per-request tool
@@ -160,10 +162,10 @@ fn scoped_guidance(offer: &Offer<'_>, concise: bool, prefer_subagents: bool) -> 
         out.push_str(MONITOR_RULES);
     }
     if has("task") {
-        out.push_str(if prefer_subagents {
-            TESTER_DELEGATION_RULES
-        } else {
-            SELECTIVE_DELEGATION_RULES
+        out.push_str(match (prefer_subagents, lean || concise) {
+            (true, _) => TESTER_DELEGATION_RULES,
+            (false, true) => LEAN_SELECTIVE_DELEGATION_RULES,
+            (false, false) => SELECTIVE_DELEGATION_RULES,
         });
         out.push_str(if lean || concise {
             LEAN_DELEGATION_RULES
@@ -321,20 +323,20 @@ fn environment_prompt(i: &Inputs<'_>, rendered: Option<&str>, notes: TurnNotes) 
     ));
     out.push_str(crate::agent::window::file_handles::GUIDANCE);
     out.push('\n');
+    if i.tools.iter().any(|tool| tool == "tool_search") {
+        out.push_str("- Before concluding a needed capability is unavailable, search the eligible tool catalog. If a search misses, query `*` to list eligible tools and follow `next_query`; listing does not load tools or grant permission.\n");
+    }
     if !i.discoverable.is_empty() {
         out.push_str("- Loadable tools, not in the schema yet: call `tool_load` with the exact name and use the tool next round. NEVER call one before loading it.\n");
+        // Names alone suffice when `tool_search` can describe them on demand.
+        let names_only = i.concise_guidance
+            && i.template.is_none()
+            && i.overrides.0.is_none()
+            && i.tools.iter().any(|tool| tool == "tool_search");
         if i.lean || i.one_call {
             // Keep the existing name inventory, and add bounded capability hints for MCP tools.
             // Descriptions are third-party data, not instructions or permission grants.
-            out.push_str("  Names: ");
-            out.push_str(
-                &i.discoverable
-                    .iter()
-                    .map(|(name, _)| name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            );
-            out.push('\n');
+            out.push_str(&loadable_names(i.discoverable.iter()));
             let mut hints = String::new();
             for (name, description) in i.discoverable {
                 if !name.starts_with("mcp__") || description.trim().is_empty() {
@@ -351,28 +353,31 @@ fn environment_prompt(i: &Inputs<'_>, rendered: Option<&str>, notes: TurnNotes) 
                 out.push_str(&hints);
                 out.push('\n');
             }
-        } else {
-            let compact_mcp = i.concise_guidance
-                && i.template.is_none()
-                && i.overrides.0.is_none()
-                && i.tools.iter().any(|tool| tool == "tool_search");
+        } else if names_only {
             let mut servers = std::collections::BTreeMap::<&str, (usize, &str)>::new();
-            for (name, description) in i.discoverable {
-                if compact_mcp
-                    && let Some((server, _)) =
-                        name.strip_prefix("mcp__").and_then(|n| n.split_once("__"))
-                {
-                    servers.entry(server).or_insert((0, description.as_str())).0 += 1;
-                    continue;
+            let mut builtin = Vec::new();
+            for entry @ (name, description) in i.discoverable {
+                match name.strip_prefix("mcp__").and_then(|n| n.split_once("__")) {
+                    Some((server, _)) => {
+                        servers.entry(server).or_insert((0, description.as_str())).0 += 1
+                    }
+                    None => builtin.push(entry),
                 }
+            }
+            if !builtin.is_empty() {
+                out.push_str(&loadable_names(builtin.into_iter()));
+                out.push_str("  `tool_search` returns their descriptions.\n");
+            }
+            if !servers.is_empty() {
+                out.push_str(&mcp_catalog_summary(&servers));
+            }
+        } else {
+            for (name, description) in i.discoverable {
                 if description.is_empty() {
                     out.push_str(&format!("  - {name}\n"));
                 } else {
                     out.push_str(&format!("  - {name}: {description}\n"));
                 }
-            }
-            if !servers.is_empty() {
-                out.push_str(&mcp_catalog_summary(&servers));
             }
         }
     }
@@ -405,6 +410,21 @@ fn environment_prompt(i: &Inputs<'_>, rendered: Option<&str>, notes: TurnNotes) 
         }
     }
     out
+}
+
+/// One `Names:` line of loadable tools. A placeholder family name such as `dap_<adapter>` is not
+/// loadable itself, so it keeps its description, which lists the real names.
+fn loadable_names<'a>(entries: impl Iterator<Item = &'a (String, String)>) -> String {
+    let names: Vec<String> = entries
+        .map(|(name, description)| {
+            if name.contains('<') && !description.is_empty() {
+                format!("{name} ({description})")
+            } else {
+                name.clone()
+            }
+        })
+        .collect();
+    format!("  Names: {}\n", names.join(", "))
 }
 
 /// Deferred MCP tools are searchable by name, server and capability. Listing every schema's

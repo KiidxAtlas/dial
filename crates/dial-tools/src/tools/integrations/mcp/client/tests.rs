@@ -398,7 +398,13 @@ fn admission_is_bounded_before_any_remote_dispatch() {
         .map(|_| client.admit().unwrap())
         .collect();
     let error = client
-        .request("tools/call", json!({}), Duration::from_secs(2))
+        .request_with(
+            "tools/call",
+            json!({}),
+            Duration::from_secs(2),
+            &|| false,
+            None,
+        )
         .unwrap_err();
     let facts = error.downcast_ref::<RequestFailure>().unwrap();
     assert!(!facts.dispatched);
@@ -419,10 +425,12 @@ fn cancelling_a_blocked_stdio_write_kills_and_reaps_the_connection() {
     let client = Client::spawn("blocked", &config, Shared::new(Vec::new(), None)).unwrap();
     let began = Instant::now();
     let error = client
-        .request(
+        .request_with(
             "tools/call",
             json!({"large": "x".repeat(2 * 1024 * 1024)}),
             Duration::from_millis(100),
+            &|| false,
+            None,
         )
         .unwrap_err();
     assert!(began.elapsed() < Duration::from_secs(2));
@@ -493,10 +501,12 @@ fn closed_stdout_settles_an_inflight_blocked_stdin_write_before_return() {
     };
     let client = Client::spawn("closed-output", &config, Shared::new(Vec::new(), None)).unwrap();
     let error = client
-        .request(
+        .request_with(
             "tools/call",
             json!({"large":"x".repeat(2 * 1024 * 1024)}),
             Duration::from_secs(2),
+            &|| false,
+            None,
         )
         .unwrap_err();
     assert_eq!(

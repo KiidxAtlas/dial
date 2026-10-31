@@ -127,6 +127,12 @@ pub(in crate::app) fn refresh_overlay(env: &mut OverlayEnv<'_>, overlay: &mut Ac
             panel.set_screen(view.screen, view.cursor);
         }
     }
+    if let (Some(source), ActiveOverlay::Peers(panel)) = (env.peer_source.as_mut(), &mut *overlay) {
+        let now = Instant::now();
+        if panel.refresh_due(now) {
+            panel.update(source(), now);
+        }
+    }
     if let ActiveOverlay::Git(git) = overlay {
         git.tick();
     }

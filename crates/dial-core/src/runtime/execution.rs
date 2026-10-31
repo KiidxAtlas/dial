@@ -118,6 +118,83 @@ impl ToolStatus {
     }
 }
 
+/// What the controller permits after a failed or uncertain operation. Derived from execution
+/// facts only; a diagnostic, payload or printed claim never selects or changes these values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Retry {
+    /// Correct the named cause (arguments, prerequisite or source) before a new attempt.
+    AfterCorrection,
+    /// Inspect the recorded state or process before any new attempt.
+    AfterInspection,
+    /// Do not replay automatically; resume only on the user's explicit direction.
+    OnlyByDirection,
+    /// A permission or policy boundary withholds the operation; no retry is implied.
+    Withheld,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NextAction {
+    Correct,
+    InspectProcess,
+    InspectState,
+    FollowDirection,
+    RespectBoundary,
+    ResolvePrerequisite,
+}
+
+/// Typed recovery state. Uncertain effects always stop automatic continuation, whatever status
+/// was printed or recorded; a known commit is preserved rather than rolled back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Recovery {
+    pub status: ToolStatus,
+    pub effects: Effects,
+    pub committed_paths: usize,
+    pub retry: Retry,
+    pub next: NextAction,
+}
+
+impl Recovery {
+    /// `None` when nothing needs recovery: a successful status with no uncertain effects.
+    pub fn derive(status: ToolStatus, effects: Effects, committed_paths: usize) -> Option<Self> {
+        if status == ToolStatus::Ok && effects != Effects::Unknown {
+            return None;
+        }
+        let (retry, next) = if effects == Effects::Unknown {
+            (Retry::AfterInspection, NextAction::InspectState)
+        } else {
+            match status {
+                ToolStatus::Blocked => (Retry::Withheld, NextAction::RespectBoundary),
+                ToolStatus::Aborted => (Retry::OnlyByDirection, NextAction::FollowDirection),
+                ToolStatus::Timeout => (Retry::AfterInspection, NextAction::InspectProcess),
+                ToolStatus::Skipped => (Retry::AfterCorrection, NextAction::ResolvePrerequisite),
+                ToolStatus::Ok | ToolStatus::Error => (Retry::AfterCorrection, NextAction::Correct),
+            }
+        };
+        Some(Self {
+            status,
+            effects,
+            committed_paths,
+            retry,
+            next,
+        })
+    }
+}
+
+impl Execution {
+    /// Recovery for an operation whose status the caller resolved (`ToolOutput` holds `is_error`).
+    /// Distinct committed paths are counted, so repeated observations of one file do not inflate it.
+    pub fn recovery(&self, status: ToolStatus) -> Option<Recovery> {
+        let committed = self
+            .changed_paths
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        Recovery::derive(status, self.effects, committed)
+    }
+}
+
 thread_local! { static CHANGES: std::cell::RefCell<Vec<Execution>> = const { std::cell::RefCell::new(Vec::new()) }; }
 /// Called by the transaction owner after a real commit, never from rendered output.
 pub fn committed(paths: impl IntoIterator<Item = PathBuf>) {

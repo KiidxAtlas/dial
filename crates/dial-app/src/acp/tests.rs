@@ -284,3 +284,115 @@ fn reconnect_does_not_replay_pending_replies_permissions_or_partial_tools() {
     assert!(request.is_none());
     assert!(replies[0].get("error").is_some());
 }
+
+fn initialized(fs: Value) -> Adapter {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(project.path(), home.path().to_path_buf()).unwrap();
+    let mut adapter = Adapter::new(layout);
+    let (_, replies) = adapter.receive(json!({"jsonrpc":"2.0","id":0,"method":"initialize",
+        "params":{"protocolVersion":1,"clientCapabilities":{"fs":fs}}}));
+    assert!(replies[0].get("result").is_some(), "{replies:?}");
+    adapter.active = Some("s1".into());
+    adapter
+}
+
+#[test]
+fn initialize_records_and_reports_client_fs_bridges() {
+    for (fs, caps, bridges) in [
+        (
+            json!({"readTextFile":true,"writeTextFile":true}),
+            (true, true),
+            json!(["fs/read_text_file", "fs/write_text_file"]),
+        ),
+        (
+            json!({"writeTextFile":true}),
+            (false, true),
+            json!(["fs/write_text_file"]),
+        ),
+        // Reads alone are never bridged: an edit must commit through the same client.
+        (json!({"readTextFile":true}), (true, false), json!([])),
+        (Value::Null, (false, false), json!([])),
+    ] {
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::with_user_dir(project.path(), home.path().to_path_buf()).unwrap();
+        let mut adapter = Adapter::new(layout);
+        let (_, replies) = adapter.receive(json!({"jsonrpc":"2.0","id":0,"method":"initialize",
+            "params":{"protocolVersion":1,"clientCapabilities":{"fs":fs}}}));
+        assert_eq!(adapter.client_fs(), caps);
+        assert_eq!(
+            replies[0]["result"]["_meta"]["dial"]["clientBridges"],
+            bridges
+        );
+    }
+}
+
+#[test]
+fn fs_requests_go_to_the_client_and_answers_return_to_the_call() {
+    let mut adapter = initialized(json!({"readTextFile":true,"writeTextFile":true}));
+    let read = adapter.emit(json!({"event":"client_fs_request","call_id":"host-1",
+        "operation":"read","path":"/p/a.rs"}));
+    assert_eq!(read.len(), 1);
+    assert_eq!(read[0]["method"], "fs/read_text_file");
+    assert_eq!(
+        read[0]["params"],
+        json!({"sessionId":"s1","path":"/p/a.rs"})
+    );
+    let (relay, replies) = adapter
+        .receive(json!({"jsonrpc":"2.0","id":read[0]["id"],"result":{"content":"buffer text"}}));
+    assert!(replies.is_empty());
+    assert_eq!(
+        relay.unwrap()["params"],
+        json!({"call_id":"host-1","output":"buffer text","is_error":false})
+    );
+    // A repeated answer has no slot and is not mistaken for a permission reply.
+    let (relay, _) =
+        adapter.receive(json!({"jsonrpc":"2.0","id":read[0]["id"],"result":{"content":"again"}}));
+    assert!(relay.is_none());
+
+    let write = adapter.emit(json!({"event":"client_fs_request","call_id":"host-2",
+        "operation":"write","path":"/p/a.rs","content":"new"}));
+    assert_eq!(write[0]["method"], "fs/write_text_file");
+    assert_eq!(write[0]["params"]["content"], "new");
+    let (relay, _) = adapter.receive(json!({"jsonrpc":"2.0","id":write[0]["id"],
+        "error":{"code":-32000,"message":"read-only buffer"}}));
+    assert_eq!(
+        relay.unwrap()["params"],
+        json!({"call_id":"host-2","output":"read-only buffer","is_error":true})
+    );
+
+    let read = adapter.emit(json!({"event":"client_fs_request","call_id":"host-3",
+        "operation":"read","path":"/p/a.rs"}));
+    let (relay, _) = adapter.receive(json!({"jsonrpc":"2.0","id":read[0]["id"],"result":{}}));
+    assert_eq!(relay.unwrap()["params"]["is_error"], true);
+}
+
+#[test]
+fn unadvertised_fs_operations_are_never_sent() {
+    let mut adapter = initialized(json!({"writeTextFile":true}));
+    assert!(
+        adapter
+            .emit(json!({"event":"client_fs_request","call_id":"host-1","operation":"read","path":"/p/a"}))
+            .is_empty()
+    );
+    let mut adapter = initialized(Value::Null);
+    assert!(
+        adapter
+            .emit(json!({"event":"client_fs_request","call_id":"host-1","operation":"write","path":"/p/a","content":""}))
+            .is_empty()
+    );
+}
+
+#[test]
+fn cancel_drops_pending_fs_requests() {
+    let mut adapter = initialized(json!({"readTextFile":true,"writeTextFile":true}));
+    adapter.sessions.insert("s1".into());
+    let read = adapter.emit(json!({"event":"client_fs_request","call_id":"host-1",
+        "operation":"read","path":"/p/a"}));
+    adapter.receive(json!({"jsonrpc":"2.0","id":9,"method":"session/cancel",
+        "params":{"sessionId":"s1"}}));
+    let (relay, _) =
+        adapter.receive(json!({"jsonrpc":"2.0","id":read[0]["id"],"result":{"content":"late"}}));
+    assert!(relay.is_none());
+}

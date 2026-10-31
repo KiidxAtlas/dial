@@ -631,6 +631,21 @@ fn scripted_worker(
     max_steps: u32,
     resume: Vec<Value>,
 ) -> (Outcome, Vec<Value>, usize, Vec<String>) {
+    scripted_worker_with_tools(
+        &["fixture_lookup", "edit", "read"],
+        scripts,
+        max_steps,
+        resume,
+    )
+}
+
+/// Like `scripted_worker`, with the child's enabled built-in tools chosen by the caller.
+fn scripted_worker_with_tools(
+    enabled: &[&str],
+    scripts: Vec<llm::fake::Script>,
+    max_steps: u32,
+    resume: Vec<Value>,
+) -> (Outcome, Vec<Value>, usize, Vec<String>) {
     use std::sync::atomic::AtomicUsize;
     struct Counted(Arc<AtomicUsize>);
     impl Tool for Counted {
@@ -687,7 +702,7 @@ fn scripted_worker(
         .with_edit_settings(config.edit.clone())
         .with_edit_mode(crate::config::types::EditMode::Sloppy);
     let harness = Harness {
-        tools: vec!["fixture_lookup".into(), "edit".into(), "read".into()],
+        tools: enabled.iter().map(|tool| (*tool).to_owned()).collect(),
         ..Harness::default()
     };
     let count = Arc::new(AtomicUsize::new(0));
@@ -997,6 +1012,26 @@ fn research_checkpoint_renews_worker_without_working_state() {
         !outcome.status.text.trim_start().starts_with('{'),
         "checkpoint claims cannot become the final report"
     );
+    // Requests after the accepted checkpoint (index 24).
+    for request in &requests[25..] {
+        let messages = request["messages"].as_array().unwrap();
+        assert!(
+            !messages.iter().any(|message| message["role"] == "assistant"
+                && message["content"].as_str().is_some_and(|text| {
+                    text.contains("\"finding\"") && text.contains("\"next_action\"")
+                })),
+            "internal checkpoint JSON must not be replayed as an assistant answer"
+        );
+        assert!(
+            messages.iter().any(|message| {
+                message["content"].as_str().is_some_and(|text| {
+                    text.contains("Resolve the remaining lookup and report findings")
+                        && text.contains("untrusted")
+                })
+            }),
+            "follow-through must retain the concrete next action as an untrusted claim"
+        );
+    }
 }
 
 enum CoordinationBoundary {
@@ -1016,6 +1051,7 @@ fn coordinated_worker(boundary: CoordinationBoundary) {
         generating: bool,
         delivered: bool,
         started: Vec<String>,
+        notices: Vec<String>,
     }
     impl Approver for Observer {
         fn authorize(
@@ -1052,6 +1088,9 @@ fn coordinated_worker(boundary: CoordinationBoundary) {
         }
         fn tool_started(&mut self, _call_id: &str, name: &str, _: &Registry) {
             self.started.push(name.into());
+        }
+        fn notice(&mut self, message: &str) {
+            self.notices.push(message.to_owned());
         }
     }
     let usage_event = json!({"choices":[{"delta":{"content":"Obsolete answer", "tool_calls":[{
@@ -1126,6 +1165,7 @@ fn coordinated_worker(boundary: CoordinationBoundary) {
         generating: false,
         delivered: false,
         started: Vec::new(),
+        notices: Vec::new(),
     };
     // A regression that stops polling admission must fail rather than hang with
     // the fixture's deliberately held slot. This timeout does not deliver mail.
@@ -1165,6 +1205,12 @@ fn coordinated_worker(boundary: CoordinationBoundary) {
     );
     assert_eq!(outcome.steps, if streaming { 2 } else { 1 });
     assert!(observer.delivered);
+    let queued_notices: Vec<&String> = observer
+        .notices
+        .iter()
+        .filter(|message| message.as_str() == crate::agent::model::provider_slots::QUEUED_NOTICE)
+        .collect();
+    assert_eq!(queued_notices.len(), usize::from(queued));
     assert!(
         observer.started.is_empty(),
         "obsolete tools executed: {:?}",
@@ -1416,5 +1462,41 @@ fn queued_settings_switch_only_the_next_worker_request() {
     assert_eq!(
         config.model, "default-model",
         "the launched config stays unchanged"
+    );
+}
+
+#[test]
+fn a_known_tool_typed_into_a_workers_bash_gets_load_coaching_and_never_runs() {
+    let typed = json!({"command":"fixture_lookup list"});
+    let (outcome, requests, calls, started) = scripted_worker_with_tools(
+        &["fixture_lookup", "bash"],
+        vec![
+            scripted_reply("Looking it up.", Some(("bash", typed))),
+            scripted_reply("Reported the limit.", None),
+        ],
+        4,
+        Vec::new(),
+    );
+    assert_eq!(
+        outcome.status.phase,
+        crate::runtime::Phase::Completed,
+        "{}",
+        outcome.status.text
+    );
+    assert_eq!(calls, 0, "the known tool must not execute through any path");
+    assert_eq!(started, ["bash"], "only the typed bash call starts");
+    assert_eq!(requests.len(), 2);
+    let results: Vec<String> = requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .map(|message| message["content"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(
+        results[0].contains("tool_not_shell") && results[0].contains("tool_load"),
+        "the next worker request carries the coaching: {}",
+        results[0]
     );
 }

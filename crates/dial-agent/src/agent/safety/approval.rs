@@ -413,6 +413,53 @@ pub(in crate::agent) fn safe_review_batch(command: &str) -> bool {
         })
 }
 
+/// Effect tracking only: a `;`, `&&` or newline batch whose every segment passes `safe_bash` runs only
+/// inspections. Separators come from a quote-aware scan that mirrors `shell_words`; anything it cannot
+/// follow (an open quote, a backslash-newline) makes the batch unsafe. Approval never uses this.
+pub(in crate::agent) fn read_only_inspection_batch(command: &str) -> bool {
+    top_level_segments(command).is_some_and(|segments| segments.iter().all(|s| safe_bash(s)))
+}
+
+/// Splits at unquoted `;`, `&&` and newlines. `None` when quoting or a line continuation cannot be followed.
+fn top_level_segments(command: &str) -> Option<Vec<&str>> {
+    let mut segments = Vec::new();
+    let mut quote: Option<char> = None;
+    let mut start = 0;
+    let mut chars = command.char_indices().peekable();
+    while let Some((index, c)) = chars.next() {
+        match (quote, c) {
+            (Some('\''), '\'') | (Some('"'), '"') => quote = None,
+            (Some('\''), _) => {}
+            (None, '\'' | '"') => quote = Some(c),
+            (_, '\\') => match chars.next() {
+                Some((_, '\n' | '\r')) | None => return None,
+                Some(_) => {}
+            },
+            (None, ';' | '\n') => {
+                segments.push(&command[start..index]);
+                start = index + c.len_utf8();
+            }
+            (None, '&') if chars.peek().is_some_and(|&(_, next)| next == '&') => {
+                chars.next();
+                segments.push(&command[start..index]);
+                start = index + 2;
+            }
+            _ => {}
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    segments.push(&command[start..]);
+    Some(segments)
+}
+
+/// True when a bash command may change the workspace without a checkpoint: it is neither one plain
+/// inspection, nor a git review batch, nor a batch of plain inspections. Effect tracking only.
+pub(in crate::agent) fn opaque_shell_effect(command: &str) -> bool {
+    !safe_bash(command) && !safe_review_batch(command) && !read_only_inspection_batch(command)
+}
+
 pub fn is_read_only(ext: &Registry, name: &str, args: &Value) -> bool {
     match name {
         "experience" => args["action"] != "run",

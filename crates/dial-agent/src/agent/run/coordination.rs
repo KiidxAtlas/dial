@@ -8,7 +8,7 @@ mod wake;
 
 #[derive(Default)]
 pub(in crate::agent) struct State {
-    participant: Option<Participant>,
+    participant: Option<Arc<Participant>>,
     session_id: String,
     summary: String,
     phase: String,
@@ -21,11 +21,18 @@ pub(in crate::agent) struct State {
     wake: wake::Wake,
     pending_letters: Vec<Letter>,
     /// Recent letters this process sent and drained, oldest first, for the side pane's chat view.
-    history: VecDeque<PeerMessage>,
+    /// Shared with [`PeerSender`], which records letters sent while a turn owns the agent.
+    history: History,
+    /// Earliest time the next suspended wait may look at the inbox again.
+    mail_probe: Option<Instant>,
 }
 
 /// Letters kept in [`State::history`]; older ones are forgotten.
 const HISTORY: usize = 128;
+/// A suspended wait looks at the inbox at most this often.
+const MAIL_PROBE: Duration = Duration::from_secs(1);
+
+type History = Arc<std::sync::Mutex<VecDeque<PeerMessage>>>;
 
 /// One letter between this session and a peer. History is process-local and never persisted.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,7 +46,8 @@ pub struct PeerMessage {
     pub unread: bool,
 }
 
-fn remember(history: &mut VecDeque<PeerMessage>, peer: &str, outgoing: bool, text: &str) {
+fn remember(history: &History, peer: &str, outgoing: bool, text: &str) {
+    let mut history = history.lock().unwrap_or_else(|e| e.into_inner());
     if history.len() == HISTORY {
         history.pop_front();
     }
@@ -49,6 +57,23 @@ fn remember(history: &mut VecDeque<PeerMessage>, peer: &str, outgoing: bool, tex
         text: text.to_owned(),
         unread: false,
     });
+}
+
+/// Sends letters for this session while a turn holds the agent. Writing to a peer's inbox does
+/// not touch this session's work, so the terminal can send at once instead of at the turn's end.
+#[derive(Clone)]
+pub struct PeerSender {
+    participant: Arc<Participant>,
+    history: History,
+}
+
+impl PeerSender {
+    /// Same validation and chat-history record as the `peers` send action.
+    pub fn send(&self, to: &str, text: &str) -> Result<()> {
+        self.participant.send(to, text)?;
+        remember(&self.history, to, true, text);
+        Ok(())
+    }
 }
 
 /// Opaque process-owned presence carried across an interactive same-session rebuild.
@@ -205,7 +230,7 @@ impl Agent<'_> {
             Ok(participant)
         }) {
             Ok(participant) => {
-                self.peer_state.participant = Some(participant);
+                self.peer_state.participant = Some(Arc::new(participant));
                 self.peer_state.error = None;
                 self.peer_state.retry_at = None;
             }
@@ -282,6 +307,42 @@ impl Agent<'_> {
         })
     }
 
+    /// A handle for sending peer letters while a turn holds the agent; `None` when coordination is
+    /// unavailable (the caller then waits for the idle agent). Joins the registry like a turn start.
+    pub fn peer_sender(&mut self) -> Option<PeerSender> {
+        self.initialize_coordination();
+        Some(PeerSender {
+            participant: Arc::clone(self.peer_state.participant.as_ref()?),
+            history: Arc::clone(&self.peer_state.history),
+        })
+    }
+
+    /// Whether peer mail is queued for the next request, without taking it. A suspended wait on
+    /// background work ends on it: the turn is parked at a request boundary, so the letters reach
+    /// the model now instead of when the awaited work finishes. The inbox is read at most once
+    /// per `MAIL_PROBE`, and a failing registry never ends a wait (that would only loop).
+    pub(in crate::agent) fn peer_mail_ready(&mut self) -> bool {
+        if self.hermetic || !self.config.coordination.enabled {
+            return false;
+        }
+        let state = &mut self.peer_state;
+        if state.error.is_some() {
+            return false;
+        }
+        if !state.pending_letters.is_empty() {
+            return true;
+        }
+        let Some(participant) = &state.participant else {
+            return false;
+        };
+        let now = Instant::now();
+        if state.mail_probe.is_some_and(|next| now < next) {
+            return false;
+        }
+        state.mail_probe = Some(now + MAIL_PROBE);
+        participant.has_mail().unwrap_or(false)
+    }
+
     /// This session's conversation with its peers, oldest first: the letters it sent and received
     /// in this process, then any still queued for it (marked unread). Reading never drains mail.
     pub fn peer_messages(&self) -> Result<Vec<PeerMessage>> {
@@ -290,7 +351,13 @@ impl Agent<'_> {
             .participant
             .as_ref()
             .with_context(|| unavailable(state))?;
-        let mut messages: Vec<PeerMessage> = state.history.iter().cloned().collect();
+        let mut messages: Vec<PeerMessage> = state
+            .history
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect();
         messages.extend(participant.queued()?.into_iter().map(|letter| PeerMessage {
             peer: letter.from,
             outgoing: false,
@@ -316,7 +383,7 @@ impl Agent<'_> {
                     .context("send requires an exact peer id in to")?;
                 let text = args["text"].as_str().context("send requires text")?;
                 participant.send(to, text)?;
-                remember(&mut state.history, to, true, text);
+                remember(&state.history, to, true, text);
                 Ok(
                     json!({"to":to,"status":"queued","delivery":"next model-request boundary, or bounded terminal wake-up after a completed or incomplete turn; not acknowledgement"}),
                 )
@@ -400,7 +467,7 @@ impl Agent<'_> {
             let letters = if state.pending_letters.is_empty() {
                 let letters = participant.drain()?;
                 for letter in &letters {
-                    remember(&mut state.history, &letter.from, false, &letter.text);
+                    remember(&state.history, &letter.from, false, &letter.text);
                 }
                 letters
             } else {
@@ -443,7 +510,7 @@ impl Agent<'_> {
 
     /// This session's live registration, for the shared run ledger.
     pub(in crate::agent) fn coordination_participant(&self) -> Option<&Participant> {
-        self.peer_state.participant.as_ref()
+        self.peer_state.participant.as_deref()
     }
 }
 

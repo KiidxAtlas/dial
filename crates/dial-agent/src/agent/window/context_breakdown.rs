@@ -2,7 +2,7 @@
 //! `context_meter::overhead`, so the total equals `llm::wire::estimate_parts`. Tokens are estimates
 //! (serialized bytes ÷ 4, images at the fixed image cost), never provider-billed usage.
 use super::prompt::CONTEXT_HEADING;
-use crate::llm::wire::{WireParts, json_bytes};
+use crate::llm::wire::WireParts;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 
@@ -45,8 +45,8 @@ fn display_name(name: &str) -> String {
 }
 
 impl ContextBreakdown {
-    pub(in crate::agent) fn add_tools(&mut self, tools: &[Value]) {
-        self.tool_definitions += tools.iter().map(json_bytes).sum::<usize>();
+    pub(in crate::agent) fn add_tool_bytes(&mut self, bytes: &[usize]) {
+        self.tool_definitions += bytes.iter().sum::<usize>();
     }
 
     /// Adds one message given its wire parts. A provider-native replay that the request sends

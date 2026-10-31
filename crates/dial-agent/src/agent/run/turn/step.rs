@@ -99,7 +99,7 @@ impl Agent<'_> {
                 &turn.reliability,
             );
         // The small local tier defaults to one call per response unless its saved record passed
-        // the batch fixture; the system prompt states the same mode for the whole session. Its
+        // the batch fixture; the system prompt states the same mode for the whole turn. Its
         // offer is already minimal and listed in that prompt, so it is not simplified further.
         let single_call = measured_single || (!self.hermetic && self.local_one_call());
         let mut contract = crate::reliability::Contract::new(offer)?;
@@ -199,11 +199,11 @@ impl Agent<'_> {
         if let Some(note) = engine.research_prompt() {
             messages.push(note);
         }
-        // One advisory note per request, by priority; protocol notes and gates are unaffected.
-        // A previous request that was discarded before any reply delivered nothing.
+        // One advisory note per request, by priority, then one merged harness message; protocol
+        // notes and gates are unaffected. A previous request that was discarded before any reply
+        // delivered nothing.
         turn.emissions.retract();
-        crate::agent::run::guidance::curate(&mut messages, &mut turn.emissions);
-        coalesce_harness_notes(&mut messages, notes_start);
+        crate::agent::run::guidance::assemble(&mut messages, notes_start, &mut turn.emissions);
         if !self.experimental_context_owner()
             && let Some(guidance) = turn.rule_catalog.guidance(&mut turn.rule_state, "main")
         {
@@ -237,11 +237,12 @@ impl Agent<'_> {
             model: &compaction_selection.model,
             agent: None,
         };
-        let mut request_estimate = crate::agent::compact::compaction::request_tokens_with_policy(
+        let mut accounting = crate::agent::compact::compaction::request_accounting_with_policy(
             &request,
             &self.config.compaction,
             compaction_identity,
         );
+        let mut request_estimate = accounting.tokens;
         if self.experimental_context_owner()
             && self.config.compaction.enabled
             && crate::agent::window::context_notes::TOOL_NAMES
@@ -270,12 +271,16 @@ impl Agent<'_> {
             ) {
                 // Price only the appended message; re-serializing the whole history again
                 // per step is pure overhead at large context sizes.
-                request_estimate =
-                    request_estimate.saturating_add(crate::llm::wire::estimate(&guidance));
+                request_estimate = accounting.push_message(
+                    &guidance,
+                    &self.config.compaction,
+                    compaction_identity,
+                );
                 request.messages.push(guidance);
             }
         }
-        let mut request_overhead = crate::agent::window::context_meter::overhead(&request);
+        let mut request_overhead =
+            crate::agent::window::context_meter::overhead(&request, &accounting);
         self.context_meter
             .record_breakdown(std::mem::take(&mut request_overhead.breakdown));
         let request_context = self
@@ -485,7 +490,7 @@ impl Agent<'_> {
         // One-shot notes stay queued until a reply proves delivery (`TurnState::reply_received`):
         // every path below that discards this request before a reply resends them.
         self.efficiency_metrics
-            .request(&request_overhead, lightweight);
+            .request(&request_overhead, lightweight, self.request_phase.phase);
         let requested_tokens = request.max_tokens;
         let repairing = turn.repair.take_request();
         let mut request_selection = None;
@@ -554,6 +559,13 @@ impl Agent<'_> {
             } else {
                 "standard"
             });
+            // Session snapshot of this turn: reuses the turn's record and actual interface, no probe.
+            control["reliability"]["route"] = crate::reliability::route_snapshot(
+                self.config,
+                self.context_window(),
+                turn.measured.as_ref(),
+                single_call,
+            );
             control["reliability"]["current_tools"] = json!(turn.names);
             self.session.set_control_state(control)?;
             let mut selected = serde_json::to_value(&selection)?;
@@ -626,6 +638,7 @@ impl Agent<'_> {
             provider_request,
         );
         self.record(step, "request_prefix", serde_json::to_value(&prefix)?)?;
+        self.efficiency_metrics.prefix(&prefix);
         // Wall time before primary inference, including synchronous maintenance and waits.
         self.record(
             step,
@@ -645,6 +658,7 @@ impl Agent<'_> {
         });
         // Experimental: admitted reads start while the reply still streams (`run/streaming_dispatch.rs`).
         let mut streamed = (!self.hermetic
+            && !research_step
             && !single_call
             && self.effective_config().experimental.streaming_dispatch)
             .then(|| {
@@ -697,7 +711,9 @@ impl Agent<'_> {
                 provider_request,
                 ChatOptions {
                     timeout,
-                    render_text: self.external_thinking_instruction().is_none() && !repairing,
+                    render_text: !research_step
+                        && self.external_thinking_instruction().is_none()
+                        && !repairing,
                     context_tokens: Some(request_context),
                     policy: Some(&reasoning_policy),
                     recovery: Some(&self.config.request_recovery),
@@ -712,6 +728,12 @@ impl Agent<'_> {
                             generation_cancel.store(true, Ordering::SeqCst);
                         }
                         generation_scope.sync();
+                        // The user already chose a separate worker: start it now instead of
+                        // making it wait for this reply to finish. The generation is untouched.
+                        if let Err(error) = self.start_independent_messages(ui) {
+                            steering_error.get_or_insert(error);
+                            generation_cancel.store(true, Ordering::SeqCst);
+                        }
                         let result = self.steer_during_generation(
                             ui,
                             live_steering_key.as_deref(),
@@ -1107,7 +1129,7 @@ impl Agent<'_> {
         self.metrics.tool_trace.record_offered(&request_tools);
         if self.external_thinking_instruction().is_some() {
             reply.text = crate::agent::modes::external_thinking::strip_scratchpad(&reply.text);
-            if !reply.text.is_empty() {
+            if !research_step && !reply.text.is_empty() {
                 ui.text_delta(&reply.text);
             }
         }
@@ -1174,6 +1196,7 @@ impl Agent<'_> {
             self.reported_messages = sent_messages;
         }
         self.probe_context();
+        self.efficiency_metrics.generation(&reply);
         self.record(step, "generation", json!({"output":reply.text,"tool_calls":reply.tool_calls.len(),
                 "prompt_tokens":reply.prompt_tokens,"completion_tokens":reply.completion_tokens,"cache_read_tokens":reply.cached_prompt_tokens,"cache_write_tokens":reply.cache_creation_tokens,"elapsed_ms":started.elapsed().as_millis()}))?;
         let steering = self.drain_steering(ui);
@@ -1194,15 +1217,20 @@ impl Agent<'_> {
             let result = engine.synthesize(&reply);
             let message = match result {
                 Synthesis::Accepted => {
-                    self.push(llm::assistant_message(&reply))?;
+                    // Keep protocol data for audit without replaying it as an assistant answer.
+                    let mut control = self.session.control_state();
+                    control["research_checkpoint"] =
+                        json!({"response":reply.text,"verified":false});
+                    self.session.set_control_state(control)?;
                     self.record(step, "research_synthesis", json!({"accepted":true}))?;
-                    "Research checkpoint recorded as unverified model findings. Resume the existing task: act on the supported path, deliver the requested report, or investigate the stated remaining question. Tools, scope, permissions and completion checks are unchanged.".to_owned()
+                    ui.notice("Research checkpoint recorded as unverified findings; following through on the next action.");
+                    None
                 }
                 Synthesis::Retry(message) => {
                     record_rejected_reply(&self.usage_scope, backend, repairing)?;
                     self.record(step, "research_synthesis", json!({"accepted":false}))?;
                     ui.inference_discarded("Research checkpoint not satisfied; no tools from this reply were executed.");
-                    message
+                    Some(message)
                 }
                 Synthesis::Incomplete(message) => {
                     record_rejected_reply(&self.usage_scope, backend, repairing)?;
@@ -1211,55 +1239,45 @@ impl Agent<'_> {
                         .map(crate::agent::run::engine::Tick::Finished);
                 }
             };
-            turn.pending_nudges
-                .push(json!({"role":"user","dial_transient":true,"content":message}));
+            if let Some(message) = message {
+                turn.pending_nudges
+                    .push(json!({"role":"user","dial_transient":true,"content":message}));
+            }
             return Ok(crate::agent::run::engine::Tick::Again);
         }
-        if reply.finish_reason == "length" {
-            if self.config.reasoning_guard.enabled
-                && reply.text.trim().is_empty()
-                && reply.tool_calls.is_empty()
-            {
-                turn.reasoning_budget = Some(requested_tokens);
-                turn.recovering_output = true;
-                self.request_phase
-                    .recover("output budget consumed without an action or answer");
-                self.metrics.reasoning_interceptions += 1;
-                let reason = "the output token limit was spent without any answer or tool call";
-                self.record(
-                    step,
-                    "reasoning_gate",
-                    json!({"reason":reason,"elapsed_ms":started.elapsed().as_millis()}),
-                )?;
-                let plan_gate = self.config.reasoning_guard.require_plan && !self.todo.has_open();
-                let recovered = if plan_gate {
-                    self.reasoning_recovery.intercept_planned(reason)
-                } else {
-                    self.reasoning_recovery.intercept(reason)
-                };
-                turn.plan_after_gate = plan_gate && recovered.is_ok();
-                match recovered {
-                    Ok(message) => {
-                        ui.notice(&message);
-                        self.push(
-                            json!({"role":"user","content":message,"dial_reminder":"reasoning"}),
-                        )?;
-                    }
-                    Err(message) => {
-                        return self
-                            .stop_turn(ui, message, step + 1)
-                            .map(crate::agent::run::engine::Tick::Finished);
-                    }
+        let length_facts = crate::agent::run::reply_triage::LengthFacts {
+            reasoning_guard: self.config.reasoning_guard.enabled,
+            plan_gate: self.config.reasoning_guard.require_plan && !self.todo.has_open(),
+            requested_tokens,
+            window: self.context_window(),
+            prompt_tokens: self.last_prompt_tokens,
+        };
+        if let Some(truncation) = crate::agent::run::reply_triage::truncation(
+            engine,
+            &mut self.reasoning_recovery,
+            &reply,
+            &length_facts,
+        ) {
+            use crate::agent::run::reply_triage::{REASONING_REASON, Truncation};
+            match truncation {
+                Truncation::Reasoning { message, planned } => {
+                    turn.reasoning_budget = Some(requested_tokens);
+                    turn.recovering_output = true;
+                    self.request_phase
+                        .recover("output budget consumed without an action or answer");
+                    self.metrics.reasoning_interceptions += 1;
+                    self.record(
+                        step,
+                        "reasoning_gate",
+                        json!({"reason":REASONING_REASON,"elapsed_ms":started.elapsed().as_millis()}),
+                    )?;
+                    turn.plan_after_gate = planned;
+                    ui.notice(&message);
+                    self.push(
+                        json!({"role":"user","content":message,"dial_reminder":"reasoning"}),
+                    )?;
                 }
-                return Ok(crate::agent::run::engine::Tick::Again);
-            }
-            match engine.length(
-                requested_tokens,
-                self.context_window(),
-                self.last_prompt_tokens,
-                &reply,
-            ) {
-                crate::agent::safety::guard::LengthAction::Retry { max_tokens: raised } => {
+                Truncation::Raise(raised) => {
                     if let Some(report) =
                         self.setback(turn, super::progress::Setback::Truncation, step, ui)?
                     {
@@ -1271,9 +1289,8 @@ impl Agent<'_> {
                     ui.event(&crate::agent::ui::ui_event::UiEvent::new(crate::agent::ui::ui_event::EventKind::Recovery, format!("the model hit its output limit ({requested_tokens} tokens); retrying with {raised}")));
                     turn.max_tokens = raised;
                     turn.refund_unusable(ui);
-                    return Ok(crate::agent::run::engine::Tick::Again);
                 }
-                crate::agent::safety::guard::LengthAction::Nudge { partial, message } => {
+                Truncation::Continue { partial, message } => {
                     // Partial output that keeps advancing is new work, not a failed recovery.
                     if engine.length_stalling()
                         && let Some(report) =
@@ -1295,14 +1312,14 @@ impl Agent<'_> {
                     turn.pending_nudges
                         .push(json!({"role":"user","content":message,"dial_transient":true}));
                     turn.refund_unusable(ui);
-                    return Ok(crate::agent::run::engine::Tick::Again);
                 }
-                crate::agent::safety::guard::LengthAction::Incomplete(message) => {
+                Truncation::Stop(reason) | Truncation::ReasoningExhausted(reason) => {
                     return self
-                        .stop_turn(ui, message, step + 1)
+                        .stop_turn(ui, reason, step + 1)
                         .map(crate::agent::run::engine::Tick::Finished);
                 }
             }
+            return Ok(crate::agent::run::engine::Tick::Again);
         }
         engine.length_recovered(&reply);
         if turn.recovering_output {
@@ -1374,8 +1391,8 @@ impl Agent<'_> {
         }
         // Form failures bypass tool-result guards. Bound their recovery independently of
         // the optional step limit, including when providers alternate failure formats.
-        let unusable = reply.dropped_tool_call()
-            || (reply.tool_calls.is_empty() && looks_like_text_call(&reply.text, &turn.names));
+        let form_failure = crate::agent::run::reply_triage::FormFailure::of(&reply, &turn.names);
+        let unusable = form_failure.is_some();
         if let Err(reason) = engine.recovery.form(unusable) {
             return self
                 .stop_turn(ui, reason, step + 1)
@@ -1394,45 +1411,56 @@ impl Agent<'_> {
             selection.profile.as_ref(),
             backend,
         ) {
-            return self.request_constrained_repair(turn, step, kind, context_before, ui);
+            let form = reply.wire_form;
+            return self.request_constrained_repair(turn, step, kind, context_before, form, ui);
         }
-        if reply.dropped_tool_call() {
+        if let Some(failure) = form_failure {
+            use crate::agent::run::reply_triage::FormFailure;
             if let Some(report) =
                 self.setback(turn, super::progress::Setback::UnusableReply, step, ui)?
             {
                 return Ok(crate::agent::run::engine::Tick::Finished(report));
             }
-            self.request_phase
-                .recover("the previous tool call was malformed");
-            self.record(step, "tool_form_failure", json!({"kind":"dropped_call"}))?;
+            self.request_phase.recover(match failure {
+                FormFailure::DroppedCall => "the previous tool call was malformed",
+                FormFailure::TextCall => "tool syntax appeared as text instead of a valid call",
+            });
+            // A form failure is learnable: never run it, never hide it.
+            self.record(step, "tool_form_failure", json!({"kind":failure.kind()}))?;
             let failed = turn
                 .pending
-                .get_or_insert_with(|| Pending::new(context_before));
-            failed.kinds.push("dropped_call".into());
-            // Starts with the correction prefix `learn::harvest` recognizes.
-            turn.pending_nudges.push(json!({"role":"user","content":"Your tool call was unreadable: its arguments were not valid JSON, so it was dropped and nothing ran. Issue it again with arguments that are exactly one JSON object (no doubled braces, comments or trailing commas; strings fully quoted and escaped), or answer directly.","dial_transient":true}));
+                .get_or_insert_with(|| Pending::new(context_before, reply.wire_form));
+            failed.kinds.push(failure.kind().into());
+            match failure {
+                FormFailure::DroppedCall => {
+                    turn.pending_nudges.push(
+                        json!({"role":"user","content":failure.correction(),"dial_transient":true}),
+                    );
+                }
+                FormFailure::TextCall => {
+                    failed.reject(json!({"role":"assistant","content":reply.text.clone()}));
+                    self.push(json!({"role":"assistant","content":reply.text}))?;
+                    self.push(json!({"role":"user","content":failure.correction()}))?;
+                }
+            }
             turn.refund_unusable(ui);
             return Ok(crate::agent::run::engine::Tick::Again);
         }
-        if reply.tool_calls.is_empty() && looks_like_text_call(&reply.text, &turn.names) {
-            if let Some(report) =
-                self.setback(turn, super::progress::Setback::UnusableReply, step, ui)?
-            {
-                return Ok(crate::agent::run::engine::Tick::Finished(report));
+        // A tool-free yield with outstanding owned work is a runtime wait, not a reason to
+        // spend another inference asking the model to poll. Explicit blockers/questions still
+        // end normally; uncertain effects must stop rather than enter another continuation.
+        if reply.tool_calls.is_empty()
+            && !self.hermetic
+            && (turn.budget.limit() == 0 || turn.budget.spent() < turn.budget.limit())
+            && engine.pending_refusal().is_none()
+            && !crate::agent::verify::completion::awaiting_input(&reply.text)
+            && crate::agent::verify::completion::declared_outcome(&reply.text)
+                .is_none_or(|outcome| outcome == TurnOutcome::Completed)
+            && self.wait_for_background_event(ui)?
+        {
+            if !reply.text.trim().is_empty() {
+                self.push(json!({"role":"assistant","content":reply.text}))?;
             }
-            self.request_phase
-                .recover("tool syntax appeared as text instead of a valid call");
-            // The model wrote a tool call as plain text instead of using the tool-call channel.
-            // That is a form failure (and a learnable one): do not run it, do not hide it.
-            self.record(step, "tool_form_failure", json!({"kind":"text_call"}))?;
-            let failed = turn
-                .pending
-                .get_or_insert_with(|| Pending::new(context_before));
-            failed.kinds.push("text_call".into());
-            failed.reject(json!({"role":"assistant","content":reply.text.clone()}));
-            self.push(json!({"role":"assistant","content":reply.text}))?;
-            self.push(json!({"role":"user","content":"That looked like a tool call written as plain text, so nothing ran. Call the tool through the tool-calling interface, or answer in words."}))?;
-            turn.refund_unusable(ui);
             return Ok(crate::agent::run::engine::Tick::Again);
         }
         match engine
@@ -1609,6 +1637,7 @@ impl Agent<'_> {
                     &context_before,
                     &request_tools,
                     llm::assistant_message(&reply),
+                    reply.wire_form,
                 );
             }
             let streamed_len = reply.text.len();
@@ -1635,7 +1664,8 @@ impl Agent<'_> {
                     continue;
                 }
                 let canonical =
-                    crate::agent::run::tool_compat::canonical_name(&call.name, &catalog).to_owned();
+                    crate::agent::run::tool_compat::canonical_name(&call.name, &catalog)
+                        .into_owned();
                 if canonical != call.name {
                     ui.diagnostic(&format!("Tool compatibility: {} -> {canonical}", call.name));
                     call.name = canonical;
@@ -1689,7 +1719,8 @@ impl Agent<'_> {
             selection.profile.as_ref(),
             backend,
         ) {
-            return self.request_constrained_repair(turn, step, kind, context_before, ui);
+            let form = reply.wire_form;
+            return self.request_constrained_repair(turn, step, kind, context_before, form, ui);
         }
         // Compatibility can decode JSON containers and rename arguments. Recheck that exact
         // executable form before journaling any assistant/tool pair or prefetching a read.
@@ -1964,6 +1995,7 @@ impl Agent<'_> {
         step: u32,
         kind: &'static str,
         context_before: Vec<Value>,
+        form: llm::messages::WireForm,
         ui: &mut dyn Ui,
     ) -> Result<crate::agent::run::engine::Tick<TurnReport>> {
         if let Some(report) =
@@ -1977,7 +2009,7 @@ impl Agent<'_> {
             .recover("the previous tool call was malformed");
         let failed = turn
             .pending
-            .get_or_insert_with(|| Pending::new(context_before));
+            .get_or_insert_with(|| Pending::new(context_before, form));
         failed.kinds.push(kind.into());
         turn.repair.request();
         turn.refund_unusable(ui);

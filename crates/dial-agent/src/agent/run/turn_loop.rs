@@ -65,7 +65,7 @@ impl<'a> Agent<'a> {
         let stops = if self.hermetic {
             Vec::new()
         } else {
-            model::cache_warm::CacheWarm::sync(&mut self.cache_warm, self.config)?
+            model::cache_warm::CacheWarm::sync(&mut self.cache_warm, &self.auth_config)?
         };
         for stop in stops {
             ui.notice(&format!(
@@ -254,6 +254,7 @@ impl<'a> Agent<'a> {
         prepared: Option<Value>,
         origin: TurnOrigin,
     ) -> Result<TurnReport> {
+        let storage_before = self.session.io_metrics();
         let capture_start = (self.config.memory.autolearn
             && self.config.memory.autolearn_auto_continue)
             .then(|| self.session.branch_leaf().map(str::to_owned));
@@ -358,6 +359,8 @@ impl<'a> Agent<'a> {
             }
         }
         // A step this local model reached in an earlier session applies from the first request.
+        // The saved record for this turn is read once, before the prompt and the seed use it.
+        self.refresh_turn_record();
         self.seed_local_escalation();
         self.begin_local_turn(ui);
         // The probed context can change the local profile and its routing budget.
@@ -1145,6 +1148,7 @@ impl<'a> Agent<'a> {
             "usage":usage,
             "completion_evidence":completion_evidence,
             "projection_bytes":self.efficiency_metrics,
+            "storage_io":self.session.io_metrics().since(&storage_before),
             "note":"Usage is provider-reported and may be partial; cache semantics vary by protocol. Projection bytes are not billed tokens. Completion is not independent correctness proof."
         });
         let mut control = self.session.control_state();
@@ -1205,6 +1209,8 @@ impl<'a> Agent<'a> {
         result
     }
 
+    /// Persists at most three findings. The write runs on a scoped thread only to keep the UI
+    /// heartbeat alive while the cache is busy; the call itself waits for it.
     pub(in crate::agent) fn save_investigation_findings(&self, ui: &mut dyn Ui) {
         if !self.config.improve.enabled {
             return;

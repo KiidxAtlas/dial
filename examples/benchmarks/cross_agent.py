@@ -13,8 +13,12 @@ import argparse
 import collections
 import concurrent.futures
 import datetime
+import hashlib
 import json
 import os
+import random
+import signal
+import re
 import shutil
 import statistics
 import subprocess
@@ -27,6 +31,31 @@ from pathlib import Path
 PORTABLE_CHECKS = {"file_exists", "file_contains", "file_equals", "command", "response_equals"}
 CHECK_TIMEOUT_SECS = 120
 TOKEN_FIELDS = ("input_total", "uncached_input", "cache_read", "cache_write", "output")
+# Dial's per-turn `efficiency` object, as emitted by turn_loop.rs. `inference_latency` is the request timer
+# snapshot (additive counters plus an `attribution` string); `storage_io` holds inclusive SessionIoMetrics
+# counters; `projection_bytes` is the request-attribution Metrics. `requests_by_phase`, `prefix_invalidations`,
+# `recovery_attempts` and `backend_operations` are nested inside `projection_bytes`, not at the root.
+# Inclusive costs nest inside `duration_ms` and are never summed as wall time.
+EFFICIENCY_FIELDS = ("duration_ms", "inference_latency", "storage_io", "projection_bytes")
+# Count maps keyed by dynamic labels: a label absent from one turn means a zero count.
+DYNAMIC_MAPS = frozenset({"requests_by_phase", "prefix_invalidations", "recovery_attempts", "backend_operations"})
+# First-result timestamps are observations relative to each turn's start, not additive counters.
+PER_TURN_FIELDS = frozenset({"first_tool_result_ms", "first_workspace_change_result_ms"})
+PROJECTION_COUNTERS = ("requests", "requests_before_first_workspace_change_result", "stable_message_bytes",
+                       "changed_message_bytes", "observed_reply_text_bytes", "observed_tool_argument_bytes")
+UNKNOWN = object()
+SKIP = object()
+STDERR_EXCERPT_CHARS = 800
+REDACTED = "[redacted]"
+# Bounded, best-effort redaction for excerpts shown in reports and progress lines. Raw per-turn logs
+# are kept unredacted beside the report, so they remain private artifacts.
+SECRET_PATTERNS = (
+    (re.compile(r"(?i)\b(api[_-]?key|access[_-]?token|auth[_-]?token|token|secret|password|passwd"
+                r"|authorization|cookie)(\s*[:=]\s*)(?:bearer\s+)?\S+"), r"\1\2" + REDACTED),
+    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+"), "Bearer " + REDACTED),
+    (re.compile(r"\b(?:sk|pk|ghp|gho|xox[abp])[-_][A-Za-z0-9._-]{8,}"), REDACTED),
+    (re.compile(r"\b[0-9a-fA-F]{32,}\b"), REDACTED),
+)
 
 
 def load_agents(path):
@@ -61,12 +90,14 @@ def load_agents(path):
 
 
 def agent_environment(agent, values):
-    """Per-agent variables: `{work_root}` placeholders, then `~` and `$VAR` expansion."""
+    """Per-agent variables. `{work_root}` is the run's directory; `{trial_root}` is the trial's own
+    directory, so state written there (a `*_HOME`, sessions) cannot leak into another trial. Then `~`
+    and `$VAR` expand."""
     environment = dict(os.environ)
     for name, value in agent["env"].items():
         expanded = os.path.expandvars(os.path.expanduser(value.format(**values)))
         environment[name] = expanded
-        if name.endswith("_HOME") and value.startswith("{work_root}"):
+        if name.endswith("_HOME") and value.startswith(("{work_root}", "{trial_root}")):
             Path(expanded).mkdir(parents=True, exist_ok=True)
     return environment
 
@@ -124,6 +155,111 @@ def count_tool(usage, name):
     usage["tools"][name] = usage["tools"].get(name, 0) + 1
 
 
+def as_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
+def redact(text):
+    for pattern, replacement in SECRET_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def stderr_excerpt(text):
+    """The tail of stderr after redaction, bounded so a report never carries a whole transcript."""
+    return redact(as_text(text))[-STDERR_EXCERPT_CHARS:]
+
+
+def parse_efficiency(result):
+    """Dial's `efficiency` object for one turn, kept as emitted. A missing object or field is None (unknown)."""
+    value = result.get("efficiency")
+    if not isinstance(value, dict):
+        return {field: None for field in EFFICIENCY_FIELDS}
+    return {field: value.get(field) for field in EFFICIENCY_FIELDS}
+
+
+def _is_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def numeric_tree(value):
+    """Additive numeric leaves only. Strings, bools, nulls and per-turn first-result latencies are
+    kept per turn, never summed."""
+    if isinstance(value, dict):
+        out = {}
+        for key, child in value.items():
+            if key in PER_TURN_FIELDS:
+                continue
+            part = numeric_tree(child)
+            if part is not SKIP:
+                out[key] = part
+        return out
+    return value if _is_number(value) else SKIP
+
+
+def zero_like(value):
+    return {key: zero_like(child) for key, child in value.items()} if isinstance(value, dict) else 0
+
+
+def add_values(left, right, dynamic=False):
+    """Add two numeric trees. A key missing on one side is UNKNOWN for fixed fields, and zero for a dynamic
+    count map where absence means the label never occurred. Any UNKNOWN inside a tree makes the tree UNKNOWN."""
+    if left is UNKNOWN or right is UNKNOWN:
+        return UNKNOWN
+    if isinstance(left, dict) and isinstance(right, dict):
+        out = {}
+        for key in dict.fromkeys([*left, *right]):
+            a = left[key] if key in left else (zero_like(right[key]) if dynamic else UNKNOWN)
+            b = right[key] if key in right else (zero_like(left[key]) if dynamic else UNKNOWN)
+            value = add_values(a, b, dynamic=key in DYNAMIC_MAPS)
+            if value is UNKNOWN:
+                return UNKNOWN
+            out[key] = value
+        return out
+    if _is_number(left) and _is_number(right):
+        return left + right
+    return UNKNOWN
+
+
+def aggregate_efficiency(turns, failed):
+    """One trial's efficiency: per field, the sum over turns of its numeric leaves. A field is None when the
+    trial failed, a turn lacks the object, or a turn lacks that field. Non-numeric leaves stay per turn only."""
+    unknown = {field: None for field in EFFICIENCY_FIELDS}
+    if failed or not turns or any(turn.get("efficiency") is None for turn in turns):
+        return unknown
+    total = {}
+    for field in EFFICIENCY_FIELDS:
+        values = [turn["efficiency"].get(field) for turn in turns]
+        if any(value is None for value in values):
+            total[field] = None
+            continue
+        acc = numeric_tree(values[0])
+        for value in values[1:]:
+            acc = add_values(acc, numeric_tree(value))
+        total[field] = None if acc is UNKNOWN or acc is SKIP else acc
+    return total
+
+
+def efficiency_known(trial):
+    """True only when every required Dial efficiency field was reported for the whole trial."""
+    efficiency = trial.get("efficiency") or {}
+    return all(efficiency.get(field) is not None for field in EFFICIENCY_FIELDS)
+
+
+def projection_totals(trials):
+    """Attribution counters summed over fully known trials; None when none is known or a counter is absent."""
+    known = [t["efficiency"]["projection_bytes"] for t in trials if efficiency_known(t)]
+    totals = {}
+    for name in PROJECTION_COUNTERS:
+        values = [projection.get(name) for projection in known]
+        totals[name] = sum(values) if known and all(_is_number(v) for v in values) else None
+    return totals
+
+
 def parse_dial_json(stdout):
     """`dial -p --output-format json`: one result object per invocation."""
     usage = empty_usage()
@@ -154,6 +290,8 @@ def parse_dial_json(stdout):
     usage["tool_errors"] = sum(1 for call in calls if call.get("is_error"))
     by_model = (((result.get("usage") or {}).get("total") or {}).get("by_model")) or {}
     usage["models"] = sorted(by_model)
+    # Kept beside the usage record so `add_usage` never mixes it into token totals.
+    usage["efficiency"] = parse_efficiency(result)
     return result.get("text"), usage
 
 
@@ -225,7 +363,33 @@ def add_usage(total, part, agent):
                                and not (delegations and agent["delegated_usage"] != "included"))
 
 
-def run_trial(agent, case, suite_root, repetition, work_root, values, timeout, keep, logs=None):
+def run_agent_process(command, *, timeout, cwd, env, stdin, **_):
+    """Stop the entire agent process group before a caller snapshots its files."""
+    process = subprocess.Popen(command, cwd=cwd, env=env, stdin=stdin,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, start_new_session=True)
+    try:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            stdout, stderr = process.communicate()
+            raise subprocess.TimeoutExpired(command, timeout, output=stdout, stderr=stderr)
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+    finally:
+        # Background descendants must not outlive a successful CLI exit either.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+
+
+def run_trial(agent, case, suite_root, repetition, work_root, values, timeout, keep, logs=None,
+              prepare_workspace=None, *, hard_timeout=None):
     trial_dir = Path(tempfile.mkdtemp(prefix=f"{agent['name']}-{case['id']}-r{repetition}-", dir=work_root))
     workspace = trial_dir / "project"
     source = suite_root / case["project"] if case.get("project") else None
@@ -233,38 +397,43 @@ def run_trial(agent, case, suite_root, repetition, work_root, values, timeout, k
         shutil.copytree(source, workspace, ignore=shutil.ignore_patterns("__pycache__", ".git"))
     else:
         workspace.mkdir()
+    if prepare_workspace is not None:
+        prepare_workspace(workspace)
     log_dir = None
     if logs is not None:
         log_dir = logs / f"{agent['name']}-{case['id']}-r{repetition}"
         log_dir.mkdir(parents=True, exist_ok=True)
-    environment = agent_environment(agent, {**values, "work_root": str(work_root)})
+    environment = agent_environment(agent, {**values, "work_root": str(work_root), "trial_root": str(trial_dir)})
     prompts = [first_prompt(case)] + [turn["prompt"] for turn in case.get("turns", [])]
     usage = empty_usage()
     turns = []
     final_text = None
+    process_timeout = timeout + 30 if hard_timeout is None else hard_timeout
     agent_error = None
     started = time.monotonic()
     for index, prompt in enumerate(prompts):
         template = agent["first"] if index == 0 else agent["follow_up"]
         command = render(template, {**values, "prompt": prompt, "timeout": str(timeout)})
+        stderr_path = str(log_dir / f"turn-{index}.stderr") if log_dir is not None else None
         turn_started = time.monotonic()
         try:
-            process = subprocess.run(command, cwd=workspace, capture_output=True, text=True, env=environment,
-                                     stdin=subprocess.DEVNULL, timeout=timeout + 30)
+            process = run_agent_process(command, cwd=workspace, capture_output=True, text=True, env=environment,
+                                        stdin=subprocess.DEVNULL, timeout=process_timeout)
         except subprocess.TimeoutExpired as error:
+            stdout, stderr = as_text(error.stdout), as_text(error.stderr)
             if log_dir is not None:
-                for stream in ("stdout", "stderr"):
-                    captured = getattr(error, stream) or b""
-                    if isinstance(captured, bytes):
-                        captured = captured.decode("utf-8", errors="replace")
-                    (log_dir / f"turn-{index}.{stream}").write_text(captured)
+                (log_dir / f"turn-{index}.stdout").write_text(stdout)
+                (log_dir / f"turn-{index}.stderr").write_text(stderr)
             usage["usage_complete"] = False
-            agent_error = f"turn {index} exceeded {timeout + 30}s"
-            turns.append({"exit": None, "elapsed_ms": round((time.monotonic() - turn_started) * 1000)})
+            agent_error = f"turn {index} exceeded {process_timeout}s"
+            turns.append({"exit": None, "elapsed_ms": round((time.monotonic() - turn_started) * 1000),
+                          "efficiency": None, "stderr_log": stderr_path, "stderr_tail": stderr_excerpt(stderr)})
             break
         except OSError as error:
             usage["usage_complete"] = False
             agent_error = f"turn {index} could not start: {error}"
+            turns.append({"exit": None, "elapsed_ms": round((time.monotonic() - turn_started) * 1000),
+                          "efficiency": None, "stderr_log": None, "stderr_tail": ""})
             break
         if log_dir is not None:
             (log_dir / f"turn-{index}.stdout").write_text(process.stdout)
@@ -272,9 +441,13 @@ def run_trial(agent, case, suite_root, repetition, work_root, values, timeout, k
         text, part = PARSERS[agent["output"]](process.stdout)
         add_usage(usage, part, agent)
         final_text = text
+        # A non-zero exit keeps its exit code, the stderr log path and a redacted excerpt. Successful
+        # turns carry no stderr excerpt, so routine warnings never reach the report.
         turns.append({"exit": process.returncode,
                       "elapsed_ms": round((time.monotonic() - turn_started) * 1000),
-                      "stderr_tail": process.stderr[-400:] if process.returncode else ""})
+                      "efficiency": part.get("efficiency"),
+                      "stderr_log": stderr_path,
+                      "stderr_tail": stderr_excerpt(process.stderr) if process.returncode else ""})
         if process.returncode != 0:
             agent_error = f"turn {index} exited {process.returncode}"
             break
@@ -294,6 +467,7 @@ def run_trial(agent, case, suite_root, repetition, work_root, values, timeout, k
         "passed": bool(scored) and agent_error is None and all(c["result"] == "passed" for c in scored),
         "scored": bool(scored),
         "agent_error": agent_error, "elapsed_ms": elapsed_ms, "turns": turns,
+        "efficiency": aggregate_efficiency(turns, failed=agent_error is not None),
         "checks": checks, "usage": usage,
         "skipped_compactions": sum(1 for turn in case.get("turns", []) if turn.get("compact_before")),
     }
@@ -332,6 +506,9 @@ def summarize(trials, agents):
             "tool_calls_by_name": dict(sorted(sum(
                 (collections.Counter(t["usage"]["tools"]) for t in own), collections.Counter()).items())),
             "observed_models": sorted({m for t in own for m in t["usage"]["models"]}),
+            # Trials whose every required Dial efficiency field was reported; others are unknown, not zero.
+            "efficiency_known_trials": sum(1 for t in own if efficiency_known(t)),
+            "efficiency_projection_totals": projection_totals(own),
         }
     by_case = {}
     for trial in trials:
@@ -357,7 +534,8 @@ def table(summary, by_case, agents):
             ("median requests", "median_requests", lambda v: f"{v:g}"),
             ("tool calls (total)", "total_tool_calls", str),
             ("delegated calls (total)", "total_delegations", str),
-            ("tool errors (total)", "total_tool_errors", str)]
+            ("tool errors (total)", "total_tool_errors", str),
+            ("trials with efficiency", "efficiency_known_trials", str)]
     lines.append("")
     for label, key, fmt in rows:
         cells = [summary[n][key] for n in names]
@@ -375,6 +553,42 @@ def version_of(agent):
         return f"unavailable: {error}"
 
 
+def binary_identity(command):
+    """Path and SHA-256 of the agent executable, hashed in chunks; unknown values are None."""
+    path = shutil.which(command[0]) if command else None
+    if path is None:
+        return {"binary_path": None, "binary_sha256": None}
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as stream:
+            for chunk in iter(lambda: stream.read(1 << 20), b""):
+                digest.update(chunk)
+    except OSError as error:
+        return {"binary_path": path, "binary_sha256": None, "binary_error": str(error)}
+    return {"binary_path": path, "binary_sha256": digest.hexdigest()}
+
+
+def agent_identity(agent):
+    """Captured before any trial, so the report states which binary and version produced its trials."""
+    return {"version": version_of(agent), **binary_identity(agent["first"])}
+
+
+def trial_plan(agents, cases, repetitions, seed):
+    """Seeded, balanced trial order. Each (repetition, case) block lists every agent once; blocks are
+    shuffled and each block rotates one seeded agent order by its position. Across the run every agent
+    takes each slot equally often when the block count is a multiple of the agent count."""
+    rng = random.Random(seed)
+    blocks = [(repetition, case) for repetition in range(repetitions) for case in cases]
+    rng.shuffle(blocks)
+    base = list(agents)
+    rng.shuffle(base)
+    plan = []
+    for position, (repetition, case) in enumerate(blocks):
+        shift = position % len(base)
+        plan.extend((agent, case, repetition) for agent in base[shift:] + base[:shift])
+    return plan
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("suites", nargs="+", type=Path, help="benchmark suite TOML files")
@@ -385,7 +599,9 @@ def main():
     parser.add_argument("--thinking", default="off", help="thinking level substituted for {thinking}")
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--timeout", type=int, default=600, help="per-turn deadline in seconds")
-    parser.add_argument("--jobs", type=int, default=2, help="concurrent trials")
+    parser.add_argument("--jobs", type=int, default=2,
+                        help="concurrent trials; use 1 for wall times that compare agents")
+    parser.add_argument("--seed", type=int, default=0, help="seed for the balanced trial order")
     parser.add_argument("--root", type=Path, default=Path.cwd(), help="directory case projects are relative to")
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--keep-workspaces", action="store_true")
@@ -413,13 +629,15 @@ def main():
     if len(set(ids)) != len(ids):
         print("error: selected suites have duplicate case ids", file=sys.stderr)
         return 2
+    if args.jobs > 1:
+        print("note: jobs > 1 shares the machine between trials; wall times are not comparable", file=sys.stderr)
     args.report.parent.mkdir(parents=True, exist_ok=True)
     values = {"model": args.model, "thinking": args.thinking}
     work_root = Path(tempfile.mkdtemp(prefix="dial-cross-agent-"))
     # Raw agent stdout/stderr per turn, kept beside the report for later diagnosis.
     logs = args.report.with_name(args.report.stem + ".logs")
-    # Agents alternate within each case and repetition so drift affects them evenly.
-    plan = [(agent, case, rep) for rep in range(args.repetitions) for case in cases for agent in agents]
+    identities = {agent["name"]: agent_identity(agent) for agent in agents}
+    plan = trial_plan(agents, cases, args.repetitions, args.seed)
     trials = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futures = [pool.submit(run_trial, agent, case, args.root, rep, work_root, values,
@@ -430,6 +648,10 @@ def main():
             state = "PASS" if trial["passed"] else ("ERROR " + trial["agent_error"] if trial["agent_error"] else "FAIL")
             print(f"[{len(trials)}/{len(plan)}] {trial['agent']:>8} {trial['case']} r{trial['repetition']}: "
                   f"{state} ({trial['elapsed_ms'] / 1000:.1f}s)", file=sys.stderr, flush=True)
+            failing = trial["turns"][-1] if trial["agent_error"] and trial["turns"] else None
+            if failing and failing.get("stderr_log"):
+                # Code and path only: the redacted excerpt stays in the report, never on the console.
+                print(f"    exit={failing['exit']} stderr_log={failing['stderr_log']}", file=sys.stderr, flush=True)
     trials.sort(key=lambda t: (t["case"], t["repetition"], t["agent"]))
     summary, by_case = summarize(trials, agents)
     not_portable = sorted({f"{case['id']}#{index}:{check['kind']}" for case in cases
@@ -439,9 +661,11 @@ def main():
         "created": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "suites": [suite["name"] for suite in suites], "model": args.model, "thinking": args.thinking,
         "repetitions": args.repetitions, "timeout_secs": args.timeout, "jobs": args.jobs,
+        "timing_comparable": args.jobs == 1, "seed": args.seed,
+        "trial_order": [f"{agent['name']}/{case['id']}/r{rep}" for agent, case, rep in plan],
         "agents": [{"name": a["name"], "first": a["first"], "follow_up": a["follow_up"], "env": a["env"],
                     "delegation_tools": a["delegation_tools"], "delegated_usage": a["delegated_usage"],
-                    "version": version_of(a)} for a in agents],
+                    **identities[a["name"]]} for a in agents],
         "logs": str(logs),
         "excluded_checks": not_portable, "summary": summary, "by_case": by_case, "trials": trials,
     }

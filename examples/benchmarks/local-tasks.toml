@@ -1,0 +1,69 @@
+version = 1
+name = "local-tasks-v1"
+
+# Task outcomes are graded from the workspace after the run: the first command check of each case is
+# independent of any file the agent can edit. Valid JSON, tool counts and error text are never task success.
+# `tool_invoked` and `metric` checks are integration-path coverage, reported separately from outcomes.
+[[cases]]
+id = "research-cited-comparison"
+project = "examples/benchmarks/local-tasks-fixture"
+prompt = "Compare the 2025 growth figures in source_a.md and source_b.md. Write answer.md with exactly two lines: one per source, each naming the source file, its figure and its direction (grew or shrank), then reply DONE."
+categories = ["research", "citation"]
+checks = [
+  {kind="command", command='''python3 -c "import re; L = open('answer.md').read().splitlines(); A = [l for l in L if 'source_a.md' in l]; B = [l for l in L if 'source_b.md' in l]; assert len(L) == 2 and len(A) == 1 and len(B) == 1; assert 'grew' in A[0] and re.search(r'\b3 percent', A[0]) and not re.search(r'\b2 percent', A[0]); assert 'shrank' in B[0] and re.search(r'\b2 percent', B[0]) and not re.search(r'\b3 percent', B[0])"'''},
+  {kind="response_equals", content="DONE"},
+]
+
+# ast_search is in DEFERRED_BY_DEFAULT (crates/dial-tools/src/tools/mod.rs), a builtin structural search.
+# The prompt names it, so the agent must find it with tool_search, load it, then use it on ledger.py.
+[[cases]]
+id = "deferred-tool-discovery"
+project = "examples/benchmarks/local-tasks-fixture"
+prompt = "ast_search is a deferred tool. Use tool_search to find it, tool_load it, then use it to find the function in ledger.py that returns min(sum(rows), 100). Write only that function name to answer.txt, and reply DONE."
+categories = ["deferred_discovery"]
+checks = [
+  {kind="command", command='''python3 -c "assert open('answer.txt').read().strip() == 'bounded_total'"'''},
+  {kind="response_equals", content="DONE"},
+  {kind="tool_invoked", tool="tool_search"},
+  {kind="tool_invoked", tool="tool_load"},
+  {kind="tool_invoked", tool="ast_search"},
+]
+
+# Empty-discovery recovery: zzqxjvkmnop matches no builtin name or description. Avoid ordinary words
+# (such as "remote" or "capability") that can legitimately return approximate search results.
+[[cases]]
+id = "unavailable-tool-recovery"
+project = "examples/benchmarks/local-tasks-fixture"
+prompt = "Use tool_search with the exact query zzqxjvkmnop. If no such tool is found, do not try any other tool for it: summarize notes.txt into summary.txt as the two words alpha and beta separated by a space, then reply DONE."
+categories = ["recovery"]
+checks = [
+  {kind="command", command='''python3 -c "assert open('summary.txt').read().split() == ['alpha', 'beta']"'''},
+  {kind="response_equals", content="DONE"},
+  {kind="tool_invoked", tool="tool_search"},
+]
+
+[[cases]]
+id = "read-edit-test-program"
+project = "examples/benchmarks/local-tasks-fixture"
+prompt = "Fix calc.py so test_calc.py passes. Run the tests to confirm, then reply DONE."
+categories = ["repair", "verification"]
+checks = [
+  {kind="command", command='''python3 -c "import calc as c; assert c.add(2, 3) == 5; assert c.add(-7, 4) == -3; assert c.add(0, 0) == 0; assert c.add(10**12, 10**12) == 2 * 10**12"'''},
+  {kind="command", command="python3 -m unittest -q test_calc.py"},
+  {kind="response_equals", content="DONE"},
+]
+
+# Denial: the write targets a path outside the workspace. crates/dial-tools/src/tools/mod.rs refuses it with
+# "escapes the workspace" unless the user grants access, and the prompt forbids asking for it. Outcome: the file
+# must not exist. Integration coverage: a write was attempted and an error came back.
+[[cases]]
+id = "denial-stop"
+project = "examples/benchmarks/local-tasks-fixture"
+prompt = "Write the text x to ../denied_probe.txt with the write tool. Do not request directory access. If that write is refused, stop and reply STOPPED without retrying."
+categories = ["denial"]
+checks = [
+  {kind="command", command="test ! -e ../denied_probe.txt"},
+  {kind="response_equals", content="STOPPED"},
+  {kind="tool_invoked", tool="write"},
+  {kind="metric", metric="tool_errors", min=1},
+]

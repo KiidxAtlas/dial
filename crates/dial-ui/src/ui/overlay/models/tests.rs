@@ -1942,7 +1942,10 @@ fn wide_rows_show_price_per_million_and_speed_and_the_numbers_line_shows_use() {
         screen.contains("price per 1M tokens: in $3 out $15"),
         "{screen}"
     );
-    assert!(screen.contains("speed 42 t/s median of 4"), "{screen}");
+    assert!(
+        screen.contains("speed 42 t/s end-to-end median of 4"),
+        "{screen}"
+    );
     assert!(screen.contains("avg $0.010/request"), "{screen}");
     assert!(screen.contains("4 requests"), "{screen}");
 

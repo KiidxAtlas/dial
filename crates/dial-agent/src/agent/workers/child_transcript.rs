@@ -28,6 +28,16 @@ pub const MAX_RECORD: usize = 256 * 1024;
 pub const TAIL_BYTES: u64 = 2 * 1024 * 1024;
 /// Most in-flight tool calls one job exposes to live views; extra starts are not tracked.
 const MAX_LIVE_TOOLS: usize = 64;
+/// Longest line that can be a message record: a writer keeps at most `MAX_RECORD` bytes of
+/// message plus a short envelope. Longer lines are never messages and are skipped unbuffered.
+pub const MAX_LINE: usize = MAX_RECORD + 16 * 1024;
+/// Largest header line a reader accepts; a larger first line is not a transcript header.
+pub const MAX_HEADER: usize = 1024 * 1024;
+/// Bytes read per [`MessageFollower::follow`] call. Always larger than [`MAX_LINE`].
+pub const FOLLOW_CHUNK: usize = 4 << 20;
+const _: () = assert!(FOLLOW_CHUNK > MAX_LINE);
+/// Bytes kept from the start and the end of the consumed prefix to detect a rewrite in place.
+const ANCHOR: usize = 256;
 
 #[derive(Default)]
 struct PendingAssistant {
@@ -344,41 +354,244 @@ pub fn messages(path: &Path) -> Result<Vec<Value>> {
     file.seek(SeekFrom::Start(start))?;
     let mut bytes = Vec::new();
     file.take(TAIL_BYTES).read_to_end(&mut bytes)?;
-    let text = String::from_utf8_lossy(&bytes);
-    let mut lines = text.lines();
+    let mut lines = bytes.split(|byte| *byte == b'\n');
     if start > 0 {
         // The first line may be cut mid-record; drop it.
         lines.next();
     }
-    Ok(lines
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter(|record| record["type"] == "message")
-        .map(|record| record["message"].clone())
-        .collect())
+    Ok(lines.filter_map(message_record).collect())
 }
 
 /// Every message record from the start of a transcript, oldest first. This is the index space of
-/// `#<entry>` deep links: entry `i` is the `i`th message record in the file.
+/// `#<entry>` deep links: entry `i` is the `i`th message record in the file. It is read through
+/// [`MessageFollower`], so live followers and deep links share one index space.
 pub fn entries(path: &Path) -> Result<Vec<Value>> {
-    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut follower = MessageFollower::new(path);
     let mut out = Vec::new();
-    for line in BufReader::new(file).lines() {
-        let line = line?;
-        let Ok(record) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        if record["type"] == "message" {
-            out.push(record["message"].clone());
+    loop {
+        let progress = follower.follow(&mut |change| match change {
+            Change::Reset => out.clear(),
+            Change::Message(_, message) => out.push(message.clone()),
+        })?;
+        if progress == Follow::Unchanged {
+            return Ok(out);
         }
     }
-    Ok(out)
+}
+
+/// The message of one transcript line, if the line is a message record within [`MAX_LINE`].
+fn message_record(line: &[u8]) -> Option<Value> {
+    if line.len() > MAX_LINE {
+        return None;
+    }
+    let record: Value = serde_json::from_slice(line).ok()?;
+    (record["type"] == "message").then(|| record["message"].clone())
+}
+
+/// What one [`MessageFollower::follow`] call changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Follow {
+    /// No complete record was consumed and nothing was reset.
+    Unchanged,
+    /// Complete records were consumed after the ones already emitted.
+    Appended,
+    /// The file was truncated, replaced or rewritten; a [`Change::Reset`] preceded the replay.
+    Replaced,
+}
+
+/// One step of the message replay, in file order.
+#[derive(Debug)]
+pub enum Change<'a> {
+    /// Discard every message emitted so far; the messages that follow replace them.
+    Reset,
+    /// Message record `index` (the `#entry` deep-link index) with its redacted value.
+    Message(usize, &'a Value),
+}
+
+/// Incremental reader of the message records of one transcript. It keeps a byte offset, the file
+/// identity and two short byte anchors, never the messages, so the caller owns replayed memory.
+///
+/// Only complete newline-terminated lines are consumed; a torn tail waits for its newline. A line
+/// longer than [`MAX_LINE`] is skipped without being buffered. A file that was truncated, replaced
+/// by another inode, or rewritten (its first or last consumed bytes differ) is replayed from the
+/// start after a [`Change::Reset`]. An I/O error makes the next successful call begin with that
+/// reset too, so a caller that drops its state on `Err` never mixes two versions of the file.
+#[derive(Debug, Default)]
+pub struct MessageFollower {
+    path: PathBuf,
+    /// Bytes consumed; always the end of a complete line or of a skipped oversized line.
+    offset: u64,
+    /// Device and inode of the file the offset refers to.
+    identity: Option<(u64, u64)>,
+    /// First bytes of the file as consumed, to catch an in-place rewrite at the start.
+    head: Vec<u8>,
+    /// Last bytes consumed, to catch an in-place rewrite at the end.
+    anchor: Vec<u8>,
+    /// Message records emitted since the last reset: the next absolute index.
+    messages: usize,
+    /// Inside an oversized line whose bytes are dropped up to its newline.
+    discarding: bool,
+    /// Set by an error; the next call resets the caller before replaying.
+    reset_pending: bool,
+    /// Bytes read from the file, including verification reads.
+    bytes_read: u64,
+}
+
+impl MessageFollower {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            ..Self::default()
+        }
+    }
+
+    /// Message records emitted since the last reset.
+    pub fn message_count(&self) -> usize {
+        self.messages
+    }
+
+    /// Bytes read from the file so far, including the checks that detect a rewrite.
+    pub fn bytes_read(&self) -> u64 {
+        self.bytes_read
+    }
+
+    /// Emits what was appended since the last call, at most [`FOLLOW_CHUNK`] bytes per call.
+    pub fn follow(&mut self, sink: &mut impl FnMut(Change<'_>)) -> Result<Follow> {
+        let outcome = self.advance(sink);
+        if outcome.is_err() {
+            self.reset_pending = true;
+        }
+        outcome
+    }
+
+    fn advance(&mut self, sink: &mut impl FnMut(Change<'_>)) -> Result<Follow> {
+        let mut file =
+            File::open(&self.path).with_context(|| format!("opening {}", self.path.display()))?;
+        let meta = file
+            .metadata()
+            .with_context(|| format!("reading {}", self.path.display()))?;
+        let len = meta.len();
+        let identity = file_identity(&meta);
+        let mut replaced = false;
+        if self.reset_pending || self.is_rewritten(&mut file, identity, len)? {
+            sink(Change::Reset);
+            self.restart();
+            replaced = true;
+        }
+        let mut consumed = 0;
+        if self.offset < len {
+            let end = len.min(self.offset + FOLLOW_CHUNK as u64);
+            let chunk = self.read_span(&mut file, self.offset, end)?;
+            consumed = self.emit_lines(&chunk, sink);
+            if consumed > 0 {
+                self.commit(&mut file, identity, &chunk[..consumed])?;
+            }
+        }
+        Ok(if replaced {
+            Follow::Replaced
+        } else if consumed > 0 {
+            Follow::Appended
+        } else {
+            Follow::Unchanged
+        })
+    }
+
+    /// Emits the records of the complete lines in `chunk`; returns the bytes they consumed.
+    fn emit_lines(&mut self, chunk: &[u8], sink: &mut impl FnMut(Change<'_>)) -> usize {
+        let mut pos = 0;
+        while pos < chunk.len() {
+            let rest = &chunk[pos..];
+            match rest.iter().position(|byte| *byte == b'\n') {
+                Some(newline) => {
+                    if !self.discarding
+                        && let Some(message) = message_record(&rest[..newline])
+                    {
+                        sink(Change::Message(self.messages, &message));
+                        self.messages += 1;
+                    }
+                    self.discarding = false;
+                    pos += newline + 1;
+                }
+                None if self.discarding || rest.len() > MAX_LINE => {
+                    self.discarding = true;
+                    pos = chunk.len();
+                }
+                None => break,
+            }
+        }
+        pos
+    }
+
+    fn commit(&mut self, file: &mut File, identity: (u64, u64), consumed: &[u8]) -> Result<()> {
+        self.offset += consumed.len() as u64;
+        self.identity = Some(identity);
+        self.anchor
+            .extend_from_slice(&consumed[consumed.len().saturating_sub(ANCHOR)..]);
+        let excess = self.anchor.len().saturating_sub(ANCHOR);
+        self.anchor.drain(..excess);
+        if self.head.len() < ANCHOR {
+            self.head = self.read_span(file, 0, self.offset.min(ANCHOR as u64))?;
+        }
+        Ok(())
+    }
+
+    fn is_rewritten(&mut self, file: &mut File, identity: (u64, u64), len: u64) -> Result<bool> {
+        if self.offset == 0 {
+            return Ok(false);
+        }
+        if self.identity != Some(identity) || len < self.offset {
+            return Ok(true);
+        }
+        let head = self.read_span(file, 0, self.head.len() as u64)?;
+        if head != self.head {
+            return Ok(true);
+        }
+        let start = self.offset - self.anchor.len() as u64;
+        let anchor = self.read_span(file, start, self.offset)?;
+        Ok(anchor != self.anchor)
+    }
+
+    fn restart(&mut self) {
+        self.offset = 0;
+        self.identity = None;
+        self.head.clear();
+        self.anchor.clear();
+        self.messages = 0;
+        self.discarding = false;
+        self.reset_pending = false;
+    }
+
+    fn read_span(&mut self, file: &mut File, start: u64, end: u64) -> Result<Vec<u8>> {
+        let wanted = end.saturating_sub(start);
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = Vec::with_capacity(wanted as usize);
+        Read::by_ref(file).take(wanted).read_to_end(&mut bytes)?;
+        self.bytes_read += bytes.len() as u64;
+        Ok(bytes)
+    }
+}
+
+#[cfg(unix)]
+fn file_identity(meta: &fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (meta.dev(), meta.ino())
+}
+
+#[cfg(not(unix))]
+fn file_identity(_: &fs::Metadata) -> (u64, u64) {
+    (0, 0)
 }
 
 fn read_first(path: &Path) -> Option<Value> {
     let file = File::open(path).ok()?;
-    let mut line = String::new();
-    BufReader::new(file).read_line(&mut line).ok()?;
-    let value: Value = serde_json::from_str(&line).ok()?;
+    let mut line = Vec::new();
+    BufReader::new(file.take(MAX_HEADER as u64 + 1))
+        .read_until(b'\n', &mut line)
+        .ok()?;
+    if line.len() > MAX_HEADER {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(&line).ok()?;
     (value["type"] == "header").then_some(value)
 }
 
@@ -387,11 +600,13 @@ fn read_status(path: &Path) -> Option<Value> {
     let len = file.metadata().ok()?.len();
     let start = len.saturating_sub(4096);
     file.seek(SeekFrom::Start(start)).ok()?;
-    let mut text = String::new();
-    file.read_to_string(&mut text).ok()?;
-    text.lines()
+    // Bytes, not text: the window may begin inside a multi-byte character of an earlier line.
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    bytes
+        .split(|byte| *byte == b'\n')
         .rev()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
         .find(|record| record["type"] == "status")
 }
 

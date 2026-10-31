@@ -3,7 +3,7 @@ use crate::agent::window::context_meter::RequestOverhead;
 use crate::{config::types::EfficiencyConfig, tools};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 mod commands;
 pub(in crate::agent) use commands::compact_command;
@@ -48,10 +48,27 @@ impl Inspections {
     }
 }
 
+/// Inclusive operation costs. Nested operations overlap and must not be summed as wall time.
+#[derive(Default, Serialize)]
+pub(in crate::agent) struct OperationTiming {
+    pub calls: u64,
+    pub elapsed_us: u64,
+}
+
 #[derive(Default, Serialize)]
 pub(in crate::agent) struct Metrics {
     pub requests: u64,
     pub lightweight_requests: u64,
+    /// Observed controller phases, not a judgment that a request was avoidable.
+    pub requests_by_phase: BTreeMap<String, u64>,
+    pub requests_before_first_workspace_change_result: u64,
+    pub prefix_invalidations: BTreeMap<String, u64>,
+    pub stable_message_bytes: u64,
+    pub changed_message_bytes: u64,
+    pub observed_reply_text_bytes: u64,
+    pub observed_tool_argument_bytes: u64,
+    pub recovery_attempts: BTreeMap<String, u64>,
+    pub backend_operations: std::cell::RefCell<BTreeMap<&'static str, OperationTiming>>,
     pub system_bytes: u64,
     pub history_bytes: u64,
     pub request_tail_bytes: u64,
@@ -71,6 +88,15 @@ pub(in crate::agent) struct Metrics {
     delivered_worker_ids: BTreeSet<String>,
 }
 impl Metrics {
+    pub fn backend_operation(&self, name: &'static str, elapsed: std::time::Duration) {
+        let mut operations = self.backend_operations.borrow_mut();
+        let timing = operations.entry(name).or_default();
+        timing.calls = timing.calls.saturating_add(1);
+        timing.elapsed_us = timing
+            .elapsed_us
+            .saturating_add(elapsed.as_micros().min(u128::from(u64::MAX)) as u64);
+    }
+
     pub fn tool_result(
         &mut self,
         call: &crate::llm::ToolCall,
@@ -128,13 +154,48 @@ impl Metrics {
             self.worker_inspection_coverage_truncated |= self.worker_inspections.truncated;
         }
     }
-    pub fn request(&mut self, overhead: &RequestOverhead, lightweight: bool) {
+    pub fn request(
+        &mut self,
+        overhead: &RequestOverhead,
+        lightweight: bool,
+        phase: crate::config::adaptive::Phase,
+    ) {
         self.requests += 1;
         self.lightweight_requests += u64::from(lightweight);
+        *self
+            .requests_by_phase
+            .entry(phase.label().to_owned())
+            .or_default() += 1;
+        if self.first_workspace_change_result_ms.is_none() {
+            self.requests_before_first_workspace_change_result += 1;
+        }
         self.tool_schema_bytes += overhead.tool_schema_bytes as u64;
         self.system_bytes += overhead.economy_system_bytes as u64;
         self.request_tail_bytes += overhead.request_tail_bytes as u64;
         self.history_bytes += overhead.history_bytes as u64;
+    }
+    pub fn prefix(&mut self, prefix: &crate::agent::window::request_prefix::Observation) {
+        *self
+            .prefix_invalidations
+            .entry(prefix.invalidation.as_str().to_owned())
+            .or_default() += 1;
+        self.stable_message_bytes += prefix.stable_message_bytes as u64;
+        self.changed_message_bytes += prefix.changed_message_bytes as u64;
+    }
+
+    /// Decoded replies observed at the generation event; excludes hidden reasoning and errors
+    /// without a decoded reply. Arguments are serialized JSON bytes, not raw provider output.
+    pub fn generation(&mut self, reply: &crate::llm::Reply) {
+        self.observed_reply_text_bytes += reply.text.len() as u64;
+        self.observed_tool_argument_bytes += reply
+            .tool_calls
+            .iter()
+            .map(|call| crate::llm::wire::json_bytes(&call.arguments) as u64)
+            .sum::<u64>();
+    }
+
+    pub fn recovery(&mut self, kind: &'static str) {
+        *self.recovery_attempts.entry(kind.to_owned()).or_default() += 1;
     }
     pub fn result(&mut self, full: &str, visible: &str) {
         self.full_result_bytes += full.len() as u64;

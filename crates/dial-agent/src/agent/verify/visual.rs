@@ -6,27 +6,28 @@ pub type Revision = super::evidence::Revision;
 pub fn useful(prompt: &str) -> bool {
     let words: HashSet<String> = dial_core::prose::words(prompt).collect();
     let any = |terms: &[&str]| terms.iter().any(|term| words.contains(*term));
+    // Words that describe how something looks, not merely that it changes.
+    const APPEARANCE: &[&str] = &[
+        "design",
+        "look",
+        "looks",
+        "overlap",
+        "spacing",
+        "color",
+        "alignment",
+        "render",
+        "layout",
+    ];
     any(&["screenshot", "visually", "appearance"])
+        || (words.contains("visual") && any(&["inspect", "inspection", "verify", "verification"]))
         || (any(&[
-            "website", "webpage", "page", "frontend", "ui", "css", "layout", "button", "image",
-            "picture", "photo",
-        ]) && any(&[
-            "fix",
-            "edit",
-            "change",
-            "build",
-            "create",
-            "design",
-            "inspect",
-            "look",
-            "compare",
-            "looks",
-            "overlap",
-            "spacing",
-            "color",
-            "alignment",
-            "render",
-        ]) && !any(&["docker", "container"]))
+            "website", "webpage", "frontend", "ui", "css", "layout", "button", "image", "picture",
+            "photo",
+        ]) && (any(&["fix", "edit", "change", "build", "create", "inspect", "compare"])
+            || any(APPEARANCE))
+            && !any(&["docker", "container"]))
+        // "page" is also pagination ("page size", `page_count`), so it needs an appearance word.
+        || (words.contains("page") && any(APPEARANCE))
 }
 
 fn rendered_file(path: &Path) -> bool {

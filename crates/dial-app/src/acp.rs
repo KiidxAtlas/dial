@@ -1,5 +1,8 @@
 //! Agent Client Protocol v1 over stdio JSON-RPC 2.0.
-//! Uses the RPC actor in-process; client filesystem, terminal and MCP bridges are not installed.
+//! Uses the RPC actor in-process. When the client advertises `fs.writeTextFile` (and optionally
+//! `fs.readTextFile`), plain text edits inside the project go through `fs/write_text_file` and reads
+//! through `fs/read_text_file`, so the editor's buffers are used (see `rpc::client_fs`). Terminal,
+//! authentication and MCP bridges are not installed.
 use crate::{config::paths::Layout, config::types::Config};
 use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -51,6 +54,10 @@ pub(crate) struct Adapter {
     tools: Vec<ActiveTool>,
     next_tool: u64,
     modes: HashMap<String, bool>,
+    /// Client `fs` capabilities from `initialize`: (readTextFile, writeTextFile).
+    client_fs: (bool, bool),
+    /// Agent-to-client fs requests awaiting the client's answer: wire id key -> (call id, is read).
+    fs_requests: HashMap<String, (String, bool)>,
 }
 
 fn key(id: &Value) -> String {
@@ -165,9 +172,16 @@ impl Adapter {
             tools: Vec::new(),
             next_tool: 0,
             modes: HashMap::new(),
+            client_fs: (false, false),
+            fs_requests: HashMap::new(),
         }
     }
-    /// Return an actor request and immediate wire responses. Client responses are permission-only.
+    /// Client fs capabilities negotiated at `initialize`: (read, write).
+    pub(crate) fn client_fs(&self) -> (bool, bool) {
+        self.client_fs
+    }
+    /// Return an actor request and immediate wire responses. Client responses answer permission
+    /// requests or the agent's `fs/*` requests.
     pub(crate) fn receive(&mut self, wire: Value) -> (Option<Value>, Vec<Value>) {
         let id = wire.get("id").cloned().unwrap_or(Value::Null);
         if !wire.is_object()
@@ -180,6 +194,28 @@ impl Adapter {
             );
         }
         if wire.get("method").is_none() {
+            if let Some((call, read)) = self.fs_requests.remove(&key(&id)) {
+                let (output, is_error) = match (wire.get("error"), &wire["result"]["content"]) {
+                    (Some(e), _) => (
+                        e["message"]
+                            .as_str()
+                            .unwrap_or("client filesystem error")
+                            .to_owned(),
+                        true,
+                    ),
+                    (None, Value::String(text)) if read => (text.clone(), false),
+                    (None, _) if read => (
+                        "the client's fs/read_text_file result has no text content".into(),
+                        true,
+                    ),
+                    (None, _) => (String::new(), false),
+                };
+                return (
+                    Some(json!({"id":null,"method":"_fs_result",
+                        "params":{"call_id":call,"output":output,"is_error":is_error}})),
+                    Vec::new(),
+                );
+            }
             let Some(approval) = self.permissions.remove(&key(&id)) else {
                 return (None, Vec::new());
             };
@@ -249,7 +285,14 @@ impl Adapter {
                 params["protocolVersion"].as_u64().is_some(),
                 "protocolVersion must be an integer"
             );
-            // The capabilities are client offers, not requests. Do not silently claim their bridges.
+            // The capabilities are client offers, not requests. Only the fs bridge is used.
+            let fs = &params["clientCapabilities"]["fs"];
+            self.client_fs = (fs["readTextFile"] == true, fs["writeTextFile"] == true);
+            let bridges: Vec<&str> = match self.client_fs {
+                (true, true) => vec!["fs/read_text_file", "fs/write_text_file"],
+                (_, true) => vec!["fs/write_text_file"],
+                _ => Vec::new(),
+            };
             self.initialized = true;
             return Ok((
                 None,
@@ -260,7 +303,7 @@ impl Adapter {
                         "authMethods":[{"id":"local","name":"Existing Dial provider configuration","description":"Configure credentials outside ACP; no terminal or OAuth authentication bridge"}],
                         "agentCapabilities":{"loadSession":true,"promptCapabilities":{"embeddedContext":true,"image":self.image_input,"audio":false},
                             "mcpCapabilities":{"http":false,"sse":false},"sessionCapabilities":{"list":{},"fork":{},"resume":{},"close":{}}},
-                        "_meta":{"dial":{"cwd":self.layout.project_root,"clientBridges":[],"permissionRequests":"required for operator ask policy; failure denies","questionInput":{"supported":false,"reason":"No custom human-input capability is negotiated; permission responses are not question answers"},"cwdPolicy":"one launched project; start dial -C <cwd> acp for another project"}}
+                        "_meta":{"dial":{"cwd":self.layout.project_root,"clientBridges":bridges,"permissionRequests":"required for operator ask policy; failure denies","questionInput":{"supported":false,"reason":"No custom human-input capability is negotiated; permission responses are not question answers"},"cwdPolicy":"one launched project; start dial -C <cwd> acp for another project"}}
                     }),
                 )],
             ));
@@ -350,6 +393,7 @@ impl Adapter {
                     ));
                 }
                 self.permissions.clear();
+                self.fs_requests.clear();
                 "abort"
             }
             "session/close" => {
@@ -382,7 +426,7 @@ impl Adapter {
                         id,
                         -32601,
                         format!(
-                            "unsupported ACP method {method}; client filesystem/terminal/auth/MCP bridges are not implemented"
+                            "unsupported ACP method {method}; client terminal/auth/MCP bridges are not implemented"
                         ),
                     )],
                 ));
@@ -674,6 +718,7 @@ impl Adapter {
                 "session/list" => value.clone(),
                 "session/prompt" => {
                     self.permissions.clear();
+                    self.fs_requests.clear();
                     let plan = value["plan_mode"].as_bool().unwrap_or(false);
                     if let Some(session) = self.active.clone()
                         && self.modes.insert(session, plan) != Some(plan)
@@ -731,6 +776,27 @@ impl Adapter {
             }
             "reasoning" => {
                 json!({"sessionUpdate":"agent_thought_chunk","content":text_content(&event["delta"])})
+            }
+            "client_fs_request" => {
+                let (Some(session), Some(call)) = (&self.active, event["call_id"].as_str()) else {
+                    return Vec::new();
+                };
+                let (method, params, read) = match event["operation"].as_str() {
+                    Some("read") if self.client_fs.0 => (
+                        "fs/read_text_file",
+                        json!({"sessionId":session,"path":event["path"]}),
+                        true,
+                    ),
+                    Some("write") if self.client_fs.1 => (
+                        "fs/write_text_file",
+                        json!({"sessionId":session,"path":event["path"],"content":event["content"]}),
+                        false,
+                    ),
+                    _ => return Vec::new(),
+                };
+                let id = json!(format!("dial-fs-{call}"));
+                self.fs_requests.insert(key(&id), (call.to_owned(), read));
+                return vec![json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})];
             }
             "approval" => {
                 let Some(session) = &self.active else {

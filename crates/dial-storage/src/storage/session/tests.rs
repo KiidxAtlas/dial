@@ -1,5 +1,6 @@
 use super::*;
 use serde_json::json;
+mod io_metrics;
 mod relocation_artifacts;
 mod schema;
 mod timing;

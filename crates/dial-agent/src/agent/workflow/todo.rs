@@ -663,7 +663,7 @@ pub fn schema() -> Value {
         "type": "function",
         "function": {
             "name": "todo",
-            "description": "Track a numbered plan. Calls: {\"op\":\"set\",\"tasks\":[{\"content\":\"...\"}]} replaces the plan; {\"op\":\"append\",\"tasks\":[...]} adds tasks; {\"op\":\"start\"} or {\"op\":\"start\",\"index\":2} switches focus (no index: first pending task); {\"op\":\"done\"} closes the active task and starts the next pending one; {\"op\":\"drop\"} or {\"op\":\"block\",\"reason\":\"...\"} close without completing; {\"op\":\"view\"} shows the plan. Findings and evidence are optional notes. Do not resend set to mark tasks done. Explicit indices are 1-based and may change when old closed tasks are pruned. Skip for trivial requests. Never call todo alone: send it in parallel with the call that starts or continues the work. Skip a closing update before the final answer: an accepted completed answer closes only the in-progress task, and pending tasks stay open.",
+            "description": "Track a numbered plan for substantial multi-step work. op: set (tasks replaces the plan), append, start (index; default first pending), done (closes the active task and starts the next), drop or block (reason), view. Mark progress with done, never by resending set. Indices are 1-based and shift when closed tasks are pruned. Send todo in the same response as a real call, never alone, and skip a closing update before the final answer: it closes only the in-progress task; pending tasks stay open.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -681,10 +681,10 @@ pub fn schema() -> Value {
                             }
                         }
                     },
-                    "index": {"type": "integer", "minimum": 1, "description": "1-based task number. Optional: start defaults to the first pending task; done/drop/block default to the in-progress task, or the only open task."},
-                    "reason": {"type": "string", "maxLength": MAX_REASON_CHARS, "description": format!("For block (required) and drop: why, including relevant evidence and detail; up to {MAX_REASON_CHARS} chars.")},
-                    "finding": {"type": "string", "maxLength": MAX_FINDING_CHARS, "description": format!("Optional finding: answer, including relevant detail, ruled-out hypotheses or remaining uncertainty; up to {MAX_FINDING_CHARS} chars.")},
-                    "evidence": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 4, "description": "Optional notes: 1-4 supporting file:line locations, check results or artifact references; max 240 chars each. For other steps, optional: cite a call earlier in this turn that already did the step's work. References are agent observations, not proof."}
+                    "index": {"type": "integer", "minimum": 1, "description": "1-based task number. start defaults to the first pending task; done/drop/block to the in-progress or only open task."},
+                    "reason": {"type": "string", "maxLength": MAX_REASON_CHARS, "description": format!("block (required) and drop: why, with evidence; up to {MAX_REASON_CHARS} chars.")},
+                    "finding": {"type": "string", "maxLength": MAX_FINDING_CHARS, "description": format!("Optional answer, ruled-out hypotheses or remaining uncertainty; up to {MAX_FINDING_CHARS} chars.")},
+                    "evidence": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 4, "description": "Optional file:line, check or artifact references (240 chars each), or an earlier call that already did the step; observations, not proof."}
                 }
             }
         }

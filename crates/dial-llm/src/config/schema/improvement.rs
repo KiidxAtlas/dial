@@ -501,7 +501,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         IM,
         "Tool reliability",
         "Adapt tool interface",
-        "Use measured batch failures and observed contract errors to request one call at a time. Serializes parallel work; meant for local models that cannot batch tool calls.",
+        "Use measured batch failures and observed contract errors to request one call at a time. On an enabled local profile, failed native-tool fixtures also start the minimal tool offer. Meant for local models that struggle with tool calls; serializes parallel work.",
         Kind::Bool,
     ),
     field!(

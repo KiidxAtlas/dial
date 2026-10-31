@@ -5,68 +5,41 @@ fn names(list: &[&str]) -> Vec<String> {
 }
 
 #[test]
-fn capability_prose_includes_guidance_when_every_named_tool_is_present() {
-    let offered = names(&[
-        "tool_search",
-        "working_state",
-        "artifact_read",
-        "task",
-        "web_search",
-        "web_fetch",
-    ]);
-    assert_eq!(
-        capability_prose(&offered, &[]),
-        "\ntool_search enables up to three strongest matches for the next model round. Prefer relevant eligible native or MCP specialists already offered over generic shell/web substitutes. If a needed capability is missing, search by the task and domain, then use the returned next-round schemas. Do not rediscover offered tools or make calls merely to exercise available tools; answer directly when no tool is needed. Discovery does not grant permissions; normal approvals still apply. working_state preserves goals, decisions, constraints and evidence. artifact_read retrieves omitted output; task tasks[] batches independent substantial work, and action=start creates live runs controlled by status/wait/message/cancel. Descendants require explicit role spawn permissions and obey the configured depth limit.\nFor live web research, use web_search and web_fetch; cite source URLs and report actual search/network failures. Never invent results."
-    );
-}
-
-#[test]
-fn capability_prose_omits_clauses_for_tools_that_are_neither_offered_nor_loadable() {
+fn capability_prose_names_only_tools_that_are_offered_or_loadable() {
     assert_eq!(capability_prose(&[], &[]), "");
+    // Tools whose own descriptions carry their mechanics add no system prose.
     assert_eq!(
-        capability_prose(&names(&["artifact_read"]), &[]),
-        "\nartifact_read retrieves omitted output."
+        capability_prose(
+            &names(&["working_state", "artifact_read", "task", "todo"]),
+            &[]
+        ),
+        ""
     );
-    let loadable = vec![("web_fetch".to_owned(), String::new())];
-    let prose = capability_prose(&names(&["working_state"]), &loadable);
-    assert_eq!(
-        prose,
-        "\nworking_state preserves goals, decisions, constraints and evidence.\nFor live web research, discover web_fetch and use their next-round schemas; cite source URLs and report actual search/network failures. Never invent results."
-    );
-    for absent in [
-        "tool_search",
-        "task",
-        "Descendants",
-        "web_search",
-        "action=start",
+    let all = capability_prose(&names(&["tool_search", "web_search", "web_fetch"]), &[]);
+    for expected in [
+        "`tool_search`",
+        "use web_search and web_fetch",
+        "cite source URLs",
     ] {
+        assert!(all.contains(expected), "{expected}: {all}");
+    }
+    assert!(!all.contains("load web"), "{all}");
+    let loadable = vec![("web_fetch".to_owned(), String::new())];
+    let prose = capability_prose(&[], &loadable);
+    assert!(prose.contains("load web_fetch first"), "{prose}");
+    for absent in ["tool_search", "web_search"] {
         assert!(!prose.contains(absent), "{absent}: {prose}");
     }
 }
 
 #[test]
-fn capability_prose_only_asks_to_discover_web_tools_that_are_not_offered() {
+fn capability_prose_only_asks_to_load_web_tools_that_are_not_offered() {
     let loadable = vec![("web_fetch".to_owned(), String::new())];
     let prose = capability_prose(&names(&["web_search"]), &loadable);
     assert!(
-        prose.contains("For live web research, use web_search; discover web_fetch and use their next-round schemas;"),
+        prose.contains("use web_search; load web_fetch first;"),
         "{prose}"
     );
-    assert!(!prose.contains("discover web_search"), "{prose}");
-}
-
-#[test]
-fn specialist_guidance_does_not_require_an_mcp_inventory() {
-    let prose = capability_prose(&names(&["tool_search"]), &[]);
-    for expected in [
-        "Prefer relevant eligible native or MCP specialists already offered",
-        "If a needed capability is missing, search by the task and domain",
-        "use the returned next-round schemas",
-        "Do not rediscover offered tools",
-        "answer directly when no tool is needed",
-        "Discovery does not grant permissions; normal approvals still apply",
-    ] {
-        assert!(prose.contains(expected), "{expected}: {prose}");
-    }
+    assert!(!prose.contains("load web_search"), "{prose}");
     assert!(!prose.contains("mcp_servers"), "{prose}");
 }

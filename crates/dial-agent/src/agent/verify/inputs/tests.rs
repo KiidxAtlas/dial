@@ -100,6 +100,49 @@ fn installed_runtime_identity_detects_replacement_with_preserved_size_and_mtime(
     assert_ne!(snapshot(), before);
 }
 
+#[cfg(unix)]
+#[test]
+fn installed_runtime_members_keep_symlink_exclusion_and_metadata_rules() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.path().join("lib/pkg")).unwrap();
+    fs::create_dir_all(root.path().join("lib/site-packages")).unwrap();
+    fs::write(root.path().join("lib/pkg/mod.py"), "one").unwrap();
+    let workspace = Workspace::new(root.path()).unwrap();
+    let excluded: BTreeSet<String> = ["lib/site-packages".to_owned()].into();
+    let snapshot = || {
+        capture_excluding(
+            &workspace,
+            &declared(&["lib"]),
+            excluded.clone(),
+            IdentityKind::InstalledRuntime,
+        )
+    };
+    let before = snapshot().unwrap();
+    // Excluded trees are skipped; a nested member's metadata is part of the identity.
+    fs::write(root.path().join("lib/site-packages/extra.py"), "x").unwrap();
+    assert_eq!(snapshot(), Some(before.clone()));
+    fs::write(root.path().join("lib/pkg/mod.py"), "longer").unwrap();
+    assert_ne!(snapshot(), Some(before));
+    // A symlink anywhere below the declared directory still makes the identity unknown.
+    std::os::unix::fs::symlink("mod.py", root.path().join("lib/pkg/alias.py")).unwrap();
+    assert_eq!(snapshot(), None);
+}
+
+#[test]
+fn project_directory_members_still_pass_protected_storage_policy() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.path().join("src/private")).unwrap();
+    fs::write(root.path().join("src/private/state"), "secret").unwrap();
+    fs::write(root.path().join("src/a"), "one").unwrap();
+    let inputs = declared(&["src"]);
+    let open = Workspace::new(root.path()).unwrap();
+    assert!(capture(&open, &inputs).is_some());
+    let protected = Workspace::new(root.path())
+        .unwrap()
+        .with_protected_paths(&[std::path::PathBuf::from("src/private")]);
+    assert_eq!(capture(&protected, &inputs), None);
+}
+
 #[test]
 fn an_exhausted_time_budget_is_unknown_never_a_snapshot() {
     let root = tempfile::tempdir().unwrap();

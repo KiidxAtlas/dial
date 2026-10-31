@@ -63,6 +63,11 @@ impl ToolOutput {
                 .and_then(|value| serde_json::from_value(value.clone()).ok())
         })
     }
+    /// Controller-derived recovery state; an unknown-effects result stops continuation even if
+    /// its status reads as success.
+    pub fn recovery(&self) -> Option<crate::runtime::execution::Recovery> {
+        self.execution.recovery(ToolStatus::from_output(self))
+    }
     pub fn with_process(mut self, process: crate::runtime::execution::ProcessOutcome) -> Self {
         self.execution.process = Some(process.clone());
         let data = self.data.get_or_insert_with(|| serde_json::json!({}));

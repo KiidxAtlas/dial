@@ -389,7 +389,7 @@ impl Ui for Bridge<'_> {
                 self.shell.note(
                     "Retrying",
                     format!(
-                        "The model request failed ({}). Dial retries up to {} times with growing waits; Esc stops.",
+                        "The model request failed ({}). Dial retries up to {} times; the status line shows each wait. /retry retries now; Esc stops.",
                         retry.cause, retry.max
                     ),
                 );

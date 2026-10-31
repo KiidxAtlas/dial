@@ -76,6 +76,7 @@ impl Questions {
                     result
                 };
                 let _ = sender.send(result);
+                crate::platform::wake::signal();
             })?;
         self.jobs.push_back(Job {
             id: id.clone(),
@@ -153,6 +154,9 @@ impl Questions {
             .transpose()?
             .unwrap_or(5);
         let deadline = Instant::now() + Duration::from_secs(seconds);
+        let waiter = (action == "wait")
+            .then(crate::platform::wake::Waiter::new)
+            .transpose()?;
         loop {
             self.pump();
             if interrupt.load(Ordering::Relaxed) {
@@ -179,7 +183,17 @@ impl Questions {
                     stopped,
                 ));
             }
-            std::thread::sleep(Duration::from_millis(20));
+            if let Some(waiter) = &waiter {
+                waiter.wait::<std::io::PipeReader>(
+                    None,
+                    None,
+                    Some(
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(Duration::from_millis(250)),
+                    ),
+                )?;
+            }
         }
     }
 }

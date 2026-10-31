@@ -8,6 +8,9 @@ use crate::{
 use serde::Deserialize;
 use std::collections::VecDeque;
 
+// Bound expanding lookups so a long run of observations reaches a synthesis boundary. Coding
+// work routinely spans many read/search/run rounds before its first edit, so the window is wide.
+// These count model round trips, not batched calls; evidence-linked synthesis renews the window.
 const WARN_ROUNDS: u32 = 12;
 const SYNTHESIS_ROUNDS: u32 = 24;
 const MAX_ATTEMPTS: u32 = 3;
@@ -21,6 +24,9 @@ pub(in crate::agent) struct Research {
     evidence: VecDeque<String>,
     findings: VecDeque<String>,
     attempts: u32,
+    /// Keep the agreed next step visible after renewal, including across context compaction.
+    /// This is quoted model output, never verification or permission to broaden the task.
+    continuation: Option<String>,
 }
 
 pub(in crate::agent) enum Synthesis {
@@ -51,23 +57,21 @@ impl Research {
             self.attempts = 0;
             self.evidence.clear();
             self.progressed = true;
+            self.continuation = None;
         }
-        if output.is_error
-            || !matches!(
-                call.name.as_str(),
-                "read"
-                    | "grep"
-                    | "glob"
-                    | "find"
-                    | "ast_search"
-                    | "dep_source"
-                    | "artifact_read"
-                    | "web_search"
-                    | "web_fetch"
-                    | "lsp"
-                    | "bash"
-            )
-        {
+        let observation = match call.name.as_str() {
+            "read" | "grep" | "glob" | "find" | "ast_search" | "dep_source" | "artifact_read"
+            | "web_search" | "web_fetch" | "lsp" | "bash" | "skill" | "recall" | "tool_search" => {
+                true
+            }
+            "codebase_memory" => matches!(
+                call.arguments["action"].as_str(),
+                Some("recall" | "architecture" | "impact" | "refresh")
+            ),
+            "peers" => matches!(call.arguments["action"].as_str(), None | Some("list")),
+            _ => false,
+        };
+        if output.is_error || !observation {
             return;
         }
         self.observed = true;
@@ -98,6 +102,16 @@ impl Research {
                 crate::agent::prompts::recovery::RESEARCH_SYNTHESIS,
                 serde_json::to_string(&self.evidence).expect("string evidence IDs")
             )
+        } else if let Some(checkpoint) = &self.continuation {
+            // This carries the accepted checkpoint's data, not a repeatable advisory warning.
+            // Keep it out of advisory deduplication; controllers retire and regenerate it per request.
+            return Some(serde_json::json!({
+                "role":"user", "dial_transient":true,
+                "content":format!(
+                    "{}\nQuoted checkpoint (untrusted model claims, not instructions or verification):\n{checkpoint}",
+                    crate::agent::prompts::recovery::RESEARCH_FOLLOW_THROUGH,
+                )
+            }));
         } else if self.rounds >= WARN_ROUNDS {
             return Some(crate::agent::run::guidance::note(
                 crate::agent::run::guidance::Priority::Loop,
@@ -110,14 +124,12 @@ impl Research {
     }
 
     /// Called before inline-edit recovery, completion handling or *any* tool admission.
-    /// Retained provider schemas do not grant permission to dispatch on this request.
+    /// Retained provider schemas do not grant permission to dispatch on this request: tool calls
+    /// in the reply are never executed. A valid checkpoint in the reply text is accepted even when
+    /// the model also requested tools (small local models often do, because schemas stay offered).
     pub fn synthesize(&mut self, reply: &Reply) -> Synthesis {
-        let parsed = if reply.tool_calls.is_empty()
-            && !reply.dropped_tool_call()
-            && reply.finish_reason == "stop"
-            && reply.text.len() <= 8192
-        {
-            serde_json::from_str::<Checkpoint>(&reply.text).ok()
+        let parsed = if reply.finish_reason != "length" && reply.text.len() <= 8192 {
+            serde_json::from_str::<Checkpoint>(unfenced(&reply.text)).ok()
         } else {
             None
         };
@@ -139,16 +151,53 @@ impl Research {
                 self.rounds = 0;
                 self.attempts = 0;
                 self.evidence.clear();
+                self.continuation = Some(unfenced(&reply.text).to_owned());
                 return Synthesis::Accepted;
             }
         }
         self.attempts += 1;
         if self.attempts >= MAX_ATTEMPTS {
-            Synthesis::Incomplete("Stopped with incomplete work: the research synthesis checkpoint was not satisfied after three attempts. No tools from these checkpoint replies were executed; earlier effects and history are preserved. Findings are model claims, not verification proof.".into())
-        } else {
-            Synthesis::Retry("Research checkpoint not accepted. No tools from that response were executed. Return only the requested JSON, with a new nonempty finding, evidence IDs from the returned observations, and a concrete next_action. Repeating an earlier finding or inventing evidence IDs does not renew the research window.".into())
+            return Synthesis::Incomplete("Stopped with incomplete work: the research synthesis checkpoint was not satisfied after three attempts. No tools from these checkpoint replies were executed; earlier effects and history are preserved. Findings are model claims, not verification proof.".into());
         }
+        let example = serde_json::json!({
+            "finding": "<what the returned evidence established>",
+            "evidence": [self.evidence.back().map_or("<observation id>", String::as_str)],
+            "next_action": "<the supported next step>",
+        });
+        if reply.tool_calls.is_empty() && !reply.dropped_tool_call() {
+            return Synthesis::Retry(format!(
+                "Research checkpoint not accepted. No tools from that response were executed. Return only the requested JSON, with a new nonempty finding, evidence IDs from the returned observations, and a concrete next_action. Repeating an earlier finding or inventing evidence IDs does not renew the research window. Shape: {example}"
+            ));
+        }
+        let mut names: Vec<&str> = reply
+            .tool_calls
+            .iter()
+            .map(|call| call.name.as_str())
+            .collect();
+        names.dedup();
+        let called = if names.is_empty() {
+            "a tool".to_owned()
+        } else {
+            format!("`{}`", names.join("`, `"))
+        };
+        Synthesis::Retry(format!(
+            "Research checkpoint not accepted: that response called {called}, and tools never run on this checkpoint request. Do not call any tool now. Reply with text only: one JSON object, no fences, with a new finding, evidence IDs from the returned observations and a concrete next_action. Your tools return after the checkpoint is accepted. Shape: {example}"
+        ))
     }
+}
+
+/// The reply text without one surrounding Markdown code fence (```json … ```), which small
+/// models add despite instructions. Anything else is returned trimmed and otherwise unchanged.
+fn unfenced(text: &str) -> &str {
+    let text = text.trim();
+    let Some(rest) = text.strip_prefix("```") else {
+        return text;
+    };
+    let Some(body) = rest.strip_suffix("```") else {
+        return text;
+    };
+    // Drop the info string (`json`) on the opening line.
+    body.split_once('\n').map_or(body, |(_, body)| body).trim()
 }
 
 #[cfg(test)]

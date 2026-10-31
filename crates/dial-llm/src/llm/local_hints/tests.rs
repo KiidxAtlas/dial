@@ -84,6 +84,43 @@ fn existing_body_fields_win_over_hints_on_every_server() {
 }
 
 #[test]
+fn vllm_and_sglang_wire_uses_template_kwargs_and_repetition_penalty_only() {
+    for server in [LocalServer::Vllm, LocalServer::Sglang] {
+        let mut body = json!({"model":"m"});
+        all().apply_openai(server, &mut body);
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+        assert_eq!(body["repetition_penalty"], 1.2);
+        assert_eq!(body["presence_penalty"], 0.5);
+        for absent in ["repeat_penalty", "cache_prompt", "id_slot", "ttl", "think"] {
+            assert!(body.get(absent).is_none(), "{absent}");
+        }
+    }
+}
+
+#[test]
+fn detect_recognises_vllm_and_sglang_on_local_hosts_only() {
+    use crate::llm::catalog::tests::routed;
+    let models = |owner: &str| {
+        json!({"data":[{"id":"m","owned_by":owner,"max_model_len":4096}]}).to_string()
+    };
+    let vllm = routed(vec![("/v1/models", models("vllm"))]);
+    let sglang = routed(vec![("/v1/models", models("sglang"))]);
+    let plain = routed(vec![("/v1/models", models("someone"))]);
+    assert_eq!(
+        LocalServer::detect("openai", "m", Some(&vllm), None, &[]),
+        LocalServer::Vllm
+    );
+    assert_eq!(
+        LocalServer::detect("openai", "m", Some(&sglang), None, &[]),
+        LocalServer::Sglang
+    );
+    assert_eq!(
+        LocalServer::detect("openai", "m", Some(&plain), None, &[]),
+        LocalServer::Other
+    );
+}
+
+#[test]
 fn ollama_and_other_servers_send_nothing_through_the_openai_path() {
     for server in [LocalServer::Ollama, LocalServer::Other] {
         let mut body = json!({"model":"m"});

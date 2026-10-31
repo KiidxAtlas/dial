@@ -7,13 +7,14 @@
 //! * One overall deadline across all hops, and a cap on how much of the body is read.
 
 use super::guard::GuardedResolver;
+use crate::config::types::DEFAULT_WEB_TIMEOUT_SECS;
 #[cfg(test)]
 use dial_llm::url::MAX_URL_LEN;
 use dial_llm::url::has_scheme;
 pub use dial_llm::url::parse_url;
 use std::io::Read;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -23,7 +24,6 @@ use ureq::unversioned::transport::DefaultConnector;
 
 pub const MAX_REDIRECTS: usize = 5;
 pub const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
-const TIMEOUT: Duration = Duration::from_secs(30);
 /// How often a blocked request re-checks the interrupt flag.
 const INTERRUPT_POLL: Duration = Duration::from_millis(50);
 pub const USER_AGENT: &str = concat!(
@@ -47,6 +47,8 @@ pub struct Response {
 pub struct Client {
     agent: ureq::Agent,
     interrupt: Arc<AtomicBool>,
+    /// Total seconds one request may take, set from `web.timeout_secs` at each tool call.
+    timeout_secs: AtomicU64,
 }
 
 impl Client {
@@ -69,7 +71,13 @@ impl Client {
         Self {
             agent: ureq::Agent::with_parts(config, DefaultConnector::new(), resolver),
             interrupt: Arc::new(AtomicBool::new(false)),
+            timeout_secs: AtomicU64::new(DEFAULT_WEB_TIMEOUT_SECS),
         }
+    }
+
+    /// Bound later requests to `secs` seconds in total (`web.timeout_secs`).
+    pub fn set_timeout_secs(&self, secs: u64) {
+        self.timeout_secs.store(secs, Ordering::Release);
     }
 
     /// Abort in-flight and future requests until [`reset_interrupt`](Self::reset_interrupt).
@@ -137,6 +145,7 @@ impl Client {
         cancel: &AtomicBool,
     ) -> Result<Response, String> {
         let agent = self.agent.clone();
+        let timeout = Duration::from_secs(self.timeout_secs.load(Ordering::Acquire));
         let url = url.to_owned();
         let accept = accept.to_owned();
         let headers: Vec<(String, String)> = headers
@@ -154,7 +163,7 @@ impl Client {
                 .as_ref()
                 .map(|(content_type, body)| (content_type.as_str(), body.as_slice()));
             let _ = tx.send(Self::send_hops(
-                &agent, &url, &accept, &headers, post, limit,
+                &agent, &url, &accept, &headers, post, limit, timeout,
             ));
         });
         loop {
@@ -177,8 +186,9 @@ impl Client {
         headers: &[(&str, &str)],
         mut post: Option<(&str, &[u8])>,
         limit: usize,
+        timeout: Duration,
     ) -> Result<Response, String> {
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = Instant::now() + timeout;
         let first = parse_url(url)?;
         let mut current = first.clone();
         for _ in 0..=MAX_REDIRECTS {

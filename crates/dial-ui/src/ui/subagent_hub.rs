@@ -14,7 +14,7 @@ use crate::{
     ui::{
         keys::Keymap,
         overlay::{DrawCtx, OverlayEvent, subagents::SubagentsOverlay},
-        subagent_model::{self, ActionOutcome, HubSnapshot},
+        subagent_model::{self, ActionOutcome, HubCache, HubSnapshot},
     },
 };
 
@@ -25,6 +25,8 @@ pub struct SubagentHub {
     session: String,
     panel: SubagentsOverlay,
     snapshot_at: Option<Instant>,
+    /// Persistent projection state; repeated refreshes follow transcripts instead of rereading them.
+    cache: HubCache,
 }
 
 impl SubagentHub {
@@ -33,6 +35,7 @@ impl SubagentHub {
             session,
             panel: SubagentsOverlay::new(),
             snapshot_at: None,
+            cache: HubCache::default(),
         }
     }
 
@@ -76,7 +79,7 @@ impl SubagentHub {
             .is_none_or(|at| now.duration_since(at) >= REFRESH_EVERY)
         {
             self.snapshot_at = Some(now);
-            let snapshot = subagent_model::snapshot(layout, &self.session, runtime, live);
+            let snapshot = self.cache.snapshot(layout, &self.session, runtime, live);
             self.panel.set_snapshot(snapshot);
         }
     }

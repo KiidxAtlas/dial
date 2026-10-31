@@ -268,6 +268,54 @@ fn native_read_compact_edit_and_resume_keep_real_paths_and_read_witnesses() {
 }
 
 #[test]
+fn find_excerpt_handle_restores_witnesses_on_resume() {
+    let root = tempfile::tempdir().unwrap();
+    let ws = Workspace::new(root.path()).unwrap();
+    std::fs::write(
+        root.path().join("calc.py"),
+        "def add(a, b):\n    return a - b\n",
+    )
+    .unwrap();
+    let find_call = call("find", json!({"query":"add", "related":false}));
+    let config = crate::config::types::Config::default();
+    let tool = crate::tools::code::navigation::tools(&config).remove(0);
+    let output = tool.call(
+        &crate::tools::integrations::ext::ToolContext {
+            workspace: &ws,
+            config: &config,
+            mutation_authorizer: None,
+            confirm: None,
+        },
+        &find_call.arguments,
+    );
+    assert!(!output.is_error, "{}", output.text);
+    let compact = model_result(&ws, &find_call, &output.text);
+    let header = compact
+        .lines()
+        .find(|line| line.starts_with("[@f") && line.contains('#'))
+        .unwrap();
+    let resumed = Workspace::new(root.path()).unwrap();
+    resumed
+        .restore_file_handles(&ws.file_handle_snapshot())
+        .unwrap();
+    crate::tools::edit::hashline::rehydrate(
+        &resumed,
+        [("find", &find_call.arguments, compact.as_str())],
+    );
+    let mut edit = call(
+        "edit",
+        json!({"input": format!("{header}\nPUT 2.=2:\n+    return a + b\n")}),
+    );
+    expand(&resumed, &mut edit).unwrap();
+    let edited = crate::tools::execute(&resumed, "edit", &edit.arguments, 20);
+    assert!(!edited.is_error, "{}", edited.text);
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("calc.py")).unwrap(),
+        "def add(a, b):\n    return a + b\n"
+    );
+}
+
+#[test]
 fn discovery_labels_do_not_depend_on_another_worker_registering_the_path() {
     let root = tempfile::tempdir().unwrap();
     let ws = Workspace::new(root.path()).unwrap();

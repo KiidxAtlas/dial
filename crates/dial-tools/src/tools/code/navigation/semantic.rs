@@ -123,6 +123,11 @@ impl SemanticRequest {
                 super::MAX_OUTPUT.saturating_sub(out.len()),
             ));
         }
+        out.push_str(&super::source_section(
+            &self.workspace,
+            &top,
+            super::MAX_OUTPUT.saturating_sub(out.len()),
+        ));
         Ok(out)
     }
 }

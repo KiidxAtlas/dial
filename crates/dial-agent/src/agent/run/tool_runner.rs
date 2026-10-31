@@ -642,6 +642,10 @@ impl Agent<'_> {
                         }
                     }
                     self.pump_subagents(ui);
+                    // Explicit independent-worker requests start now, not after these tools finish.
+                    if let Err(error) = self.start_independent_messages(ui) {
+                        ui.notice(&format!("Independent worker: {error:#}"));
+                    }
                 }
                 Err(_) => {
                     for output in &mut outputs {

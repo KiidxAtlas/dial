@@ -8,6 +8,8 @@ const SCHEMA_BYTES: usize = 24 * 1024;
 const LEAN_TOOL_LIMIT: usize = 2;
 const LEAN_SCHEMA_BYTES: usize = 8 * 1024;
 const CONTEXT_LIMIT: usize = 24;
+/// Native web pair offered together for research intent. Small profiles keep it ahead of MCP matches.
+const WEB_TOOLS: [&str; 2] = ["web_search", "web_fetch"];
 
 #[derive(Default)]
 pub(in crate::agent) struct ToolRouting {
@@ -247,7 +249,7 @@ fn native(query: &str, terms: &BTreeSet<String>) -> Vec<&'static str> {
     // Web schemas are not a coding core. Offer them directly for web intent rather than
     // making research pay for a discovery round, or every unrelated coding step pay for them.
     if any(terms, &["web", "online", "internet", "research", "browse"]) {
-        names.extend(["web_search", "web_fetch"]);
+        names.extend(WEB_TOOLS);
     } else if any(terms, &["http", "https", "url", "website"]) {
         names.push("web_fetch");
     }
@@ -712,9 +714,11 @@ impl Agent<'_> {
             &self.tool_routing.context,
             &candidates,
         );
-        // Small contexts retain the core offer and route only the requested MCP capabilities.
+        // Small contexts keep the core offer and route requested MCP capabilities plus the native
+        // web pair. The pair leads, so an incidental MCP match cannot take the bounded slots first.
         if self.lean_local() || self.minimal_tools() {
-            matches.retain(|name| parts(name).is_some());
+            matches.retain(|name| parts(name).is_some() || WEB_TOOLS.contains(&name.as_str()));
+            matches.sort_by_key(|name| !WEB_TOOLS.contains(&name.as_str()));
         }
         self.add_task_tools(matches, false)
     }

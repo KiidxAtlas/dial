@@ -384,6 +384,7 @@ pub use sources::{
     Source,
 };
 mod voice;
+mod web;
 static UI: &[SettingDef] = &[
     field!(
         "ui.theme",
@@ -656,7 +657,7 @@ static UI: &[SettingDef] = &[
         IN,
         "Notifications",
         "Error notification",
-        "Also notify when a turn stops with an error.",
+        "Also notify when a turn fails, is blocked or ends incomplete. A turn you walked away from is the one that most needs a ping.",
         Kind::Bool,
     ),
     field!(
@@ -665,7 +666,7 @@ static UI: &[SettingDef] = &[
         IN,
         "Notifications",
         "Terminal integration",
-        "Tab color, attention, progress, status variables, working directory and file links in terminals that support them (iTerm2, Ghostty, WezTerm, kitty).",
+        "Tab state circle and title, attention, progress, status variables, working directory and file links in terminals that support them (iTerm2, Ghostty, WezTerm, kitty).",
         Kind::Bool,
     ),
     field!(
@@ -904,6 +905,8 @@ static REGISTRY: &[SettingDef] = &[
     tools::DECLARATIONS[1],
     tools::DECLARATIONS[2],
     tools::DECLARATIONS[3],
+    tools::DECLARATIONS[55],
+    tools::DECLARATIONS[56],
     tools::DECLARATIONS[4],
     tools::DECLARATIONS[5],
     tools::DECLARATIONS[6],
@@ -1027,6 +1030,9 @@ static REGISTRY: &[SettingDef] = &[
     image::DECLARATIONS[3],
     image::DECLARATIONS[4],
     image::DECLARATIONS[5],
+    web::DECLARATIONS[0],
+    web::DECLARATIONS[1],
+    web::DECLARATIONS[2],
     tools::DECLARATIONS[35],
     tools::DECLARATIONS[36],
     tools::DECLARATIONS[37],
@@ -1060,6 +1066,7 @@ const _: () = assert!(
             + voice::DECLARATIONS.len()
             + ida::DECLARATIONS.len()
             + image::DECLARATIONS.len()
+            + web::DECLARATIONS.len()
 );
 
 pub fn registry() -> &'static [SettingDef] {
@@ -1118,7 +1125,103 @@ pub fn check_value_for(values: &Table, path: &str, value: &Value) -> Result<(), 
     }
 }
 
-/// Tabs and their sections, in registry order. The panel adds a `Providers` tab of its own that
+/// Canonical order of the settings panel: each tab with its sections. Declaration order in the
+/// registry modules is an implementation detail, so the panel follows this table instead:
+/// everyday coding controls first, learning and voice after them, experiments last. A section
+/// missing here is a test failure (`layout_lists_every_registered_section`), so new settings
+/// always get a deliberate place.
+const LAYOUT: &[(&str, &[&str])] = &[
+    (
+        AP,
+        &["Theme", "Symbols", "Composer", "Status Line", "Display"],
+    ),
+    (IN, &["Approvals", "Input", "Notifications", "Terminal"]),
+    (
+        MO,
+        &[
+            "Context",
+            "Requests",
+            "Roles & Sampling",
+            "Compaction",
+            "Project understanding",
+            "Cache warming",
+            "Local worker",
+            "Runtime",
+            "Laya",
+            "Learning",
+            "Adaptive policy",
+            "Configuration",
+        ],
+    ),
+    (
+        TO,
+        &[
+            "Sandbox",
+            "Shell",
+            "Editing",
+            "Verification",
+            "Language servers",
+            "Web",
+            "Browser",
+            "JavaScript code mode",
+            "Image generation",
+            "IDA",
+            "Subagents",
+            "Session coordination",
+            "Portable rules",
+            "Worktree",
+            "Commit",
+            "Questions",
+            "Investigation",
+            "Skills",
+            "Context",
+            "Secrets",
+            "Configuration",
+        ],
+    ),
+    (
+        LE,
+        &[
+            "Memory",
+            "Semantic memory",
+            "Rollout memory",
+            "Hindsight memory",
+            "Decision memory",
+        ],
+    ),
+    (
+        IM,
+        &[
+            "Automatic improvement",
+            "Local model assistance",
+            "Tool reliability",
+            "Learn from other models",
+            "Training",
+            "Escalation",
+            "Activation steering",
+            "Local runtime",
+            "Configuration",
+        ],
+    ),
+    (VO, &["Read-aloud", "Dictation", "Configuration"]),
+    (
+        EX,
+        &[
+            "Execution",
+            "Verification",
+            "Context",
+            "Agent loop",
+            "Agent routing",
+            "Agent coordination",
+            "Preparation",
+            "Media",
+            "Configuration",
+        ],
+    ),
+];
+
+/// Tabs and their sections in panel order (see [`LAYOUT`]). Names the table does not list keep
+/// their registry order after the listed ones. The panel adds a `Providers` tab of its own that
 /// launches the provider and model screens; it holds no settings, so it is not listed here.
 pub fn tabs() -> Vec<(&'static str, Vec<&'static str>)> {
     let mut out: Vec<(&'static str, Vec<&'static str>)> = Vec::new();
@@ -1131,6 +1234,21 @@ pub fn tabs() -> Vec<(&'static str, Vec<&'static str>)> {
             }
             None => out.push((def.tab, vec![def.section])),
         }
+    }
+    let tab_rank = |tab: &str| LAYOUT.iter().position(|(name, _)| *name == tab);
+    // `sort_by_key` is stable, so unlisted names keep registry order behind the listed ones.
+    out.sort_by_key(|(tab, _)| tab_rank(tab).unwrap_or(usize::MAX));
+    for (tab, sections) in &mut out {
+        let listed = LAYOUT
+            .iter()
+            .find(|(name, _)| name == tab)
+            .map_or(&[][..], |(_, sections)| *sections);
+        sections.sort_by_key(|section| {
+            listed
+                .iter()
+                .position(|name| name == section)
+                .unwrap_or(usize::MAX)
+        });
     }
     out
 }

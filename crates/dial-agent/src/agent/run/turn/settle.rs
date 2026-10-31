@@ -462,6 +462,7 @@ impl Agent<'_> {
                         &context_before,
                         &request_tools,
                         llm::assistant_message(&reply),
+                        reply.wire_form,
                     );
                 }
             }
@@ -492,12 +493,13 @@ impl Agent<'_> {
                 &context_before,
                 &request_tools,
                 llm::assistant_message(&reply),
+                reply.wire_form,
             );
         }
         if !form_kinds.is_empty() {
             let failed = turn
                 .pending
-                .get_or_insert_with(|| Pending::new(context_before));
+                .get_or_insert_with(|| Pending::new(context_before, reply.wire_form));
             failed.kinds.extend(form_kinds);
             for rejected in rejected_calls {
                 failed.reject(rejected);

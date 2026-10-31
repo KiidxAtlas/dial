@@ -5,7 +5,6 @@ fn iterm(tmux: bool) -> Integration {
         hyperlinks: !tmux,
         line_fragments: true,
         cwd: true,
-        tab_color: true,
         attention: true,
         user_vars: true,
         progress: true,
@@ -22,19 +21,15 @@ fn writer(caps: Integration) -> SignalWriter {
 }
 
 #[test]
-fn waiting_colors_the_tab_requests_attention_and_pauses_progress() {
+fn waiting_requests_attention_and_pauses_progress_without_coloring_the_tab() {
     let mut writer = writer(iterm(false));
     let out = writer.update(&Signals {
         activity: Activity::Waiting,
         progress: Progress::Paused,
         ..Default::default()
     });
-    assert_eq!(
-        out,
-        "\x1b]6;1;bg;red;brightness;230\x07\x1b]6;1;bg;green;brightness;64\x07\x1b]6;1;bg;blue;brightness;64\x07\
-         \x1b]1337;RequestAttention=yes\x07\x1b]9;4;4\x07"
-    );
-    // Failed keeps the same tab color; attention is withdrawn.
+    assert_eq!(out, "\x1b]1337;RequestAttention=yes\x07\x1b]9;4;4\x07");
+    // Failed withdraws attention.
     let out = writer.update(&Signals {
         activity: Activity::Failed,
         ..Default::default()
@@ -121,10 +116,7 @@ fn reset_restores_everything_but_the_directory() {
     let preview = writer.reset_sequence();
     assert!(!writer.is_clear());
     assert_eq!(writer.reset(), preview);
-    assert_eq!(
-        preview,
-        "\x1b]6;1;bg;*;default\x07\x1b]9;4;0\x07\x1b]1337;SetUserVar=dialState=\x07"
-    );
+    assert_eq!(preview, "\x1b]9;4;0\x07\x1b]1337;SetUserVar=dialState=\x07");
     assert!(writer.is_clear());
     assert_eq!(writer.reset(), "");
 }
@@ -136,4 +128,21 @@ fn turn_outcomes_map_to_activity() {
     assert_eq!(Activity::after_turn(Phase::NeedsInput), Activity::Waiting);
     assert_eq!(Activity::after_turn(Phase::Blocked), Activity::Failed);
     assert_eq!(Activity::after_turn(Phase::Interrupted), Activity::Idle);
+}
+
+#[test]
+fn the_tab_circle_follows_the_state_and_idle_has_none() {
+    assert_eq!(Activity::Idle.marker(), "");
+    assert_eq!(Activity::Working.marker(), "\u{1F7E0}");
+    assert_eq!(Activity::Waiting.marker(), Activity::Failed.marker());
+    assert_ne!(Activity::Done.marker(), Activity::Working.marker());
+    let mut writer = writer(iterm(false));
+    let out = writer.update(&Signals {
+        activity: Activity::Working,
+        ..Default::default()
+    });
+    assert!(
+        !out.contains("\x1b]6;"),
+        "no whole-tab color is written: {out:?}"
+    );
 }

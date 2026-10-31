@@ -55,6 +55,7 @@ fn root_after_help() -> String {
         "\n{h}Print mode exit codes:{h:#} 0 completed · 1 error (execution, provider or configuration)\n  \
          · 2 incomplete, blocked, needs input, no answer or interrupted · 3 tool approval denied.\n  \
          Approve named tools with {l}--allow write,bash{l:#}; {l}--yes{l:#} approves every tool.\n\
+         --output-schema FILE: an answer that still fails the schema after its corrections exits 2.\n\
          \nInside the TUI, press {l}/{l:#} for commands or {l}/help{l:#} for the action palette."
     ));
     out
@@ -209,6 +210,13 @@ pub(crate) struct Cli {
     /// Pre-approve these named tools in print mode (comma-separated); does not override readonly.
     #[arg(long, value_delimiter = ',', help_heading = section::RUN)]
     pub(crate) allow: Vec<String>,
+    /// Print mode: the final answer must be JSON that validates against this JSON Schema file. A
+    /// rejected answer gets bounded correction turns; the validated JSON becomes the answer.
+    #[arg(long, value_name = "FILE", help_heading = section::RUN)]
+    pub(crate) output_schema: Option<std::path::PathBuf>,
+    /// Print mode: also write the final answer to FILE, atomically. No answer leaves FILE untouched.
+    #[arg(short = 'o', long = "output-last-message", value_name = "FILE", help_heading = section::RUN)]
+    pub(crate) output_last_message: Option<std::path::PathBuf>,
     /// Attach a PNG, JPEG, GIF or WebP image to the print turn (repeatable; vision models only).
     /// Pass `-` to read the image bytes from stdin (format detected by magic bytes; stdin is then
     /// not read as prompt text).
@@ -365,6 +373,8 @@ pub(crate) enum Command {
     Setup,
     /// Explicit paid native API batches (never runs automatically).
     ProviderBatch(dial::cli::provider_batches::Args),
+    /// Review changes read-only, like /review in the TUI: --uncommitted (default), --base, --commit or a prompt.
+    Review(dial::cli::review::Args),
     /// List and inspect models; `recommend` checks which local models fit in memory.
     Models(dial::cli::config_models::ModelsArgs),
     /// Show, read, or change Dial configuration.

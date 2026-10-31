@@ -1,0 +1,14 @@
+# Local-only profile for `dial benchmark examples/benchmarks/local-tasks.toml --profiles <this file>`.
+# allow_remote=false: nothing here may send inference off the machine. Replace the placeholder with the
+# exact ID of a model that is already loaded in LM Studio; no model availability is assumed or guessed.
+[machine]
+repetitions = 3
+case_timeout_secs = 180
+minimum_correctness = 1.0
+allow_remote = false
+
+[[configurations]]
+name = "local-loaded"
+provider = "lm-studio"
+model = "REPLACE_WITH_LOADED_MODEL_ID"
+context_window = 32768

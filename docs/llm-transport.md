@@ -1,10 +1,12 @@
 # LLM transport behavior
 
-The shared LLM layer provides bounded streaming, provider-aware error classification, retries, and request budgeting. Context-overflow classifications are kept attached to errors before any header redaction so compaction remains reliable. HTTP 413 is classified as a payload failure unless the body identifies a token/context limit; it must not trigger token compaction merely because its status is 413.
+The shared LLM layer provides bounded streaming, provider-aware error classification, retries, and request budgeting. Context-overflow classifications are kept attached to errors before any header redaction so compaction remains reliable. HTTP 413 is classified as a payload failure unless the body identifies a token/context limit; it must not trigger token compaction merely because its status is 413. oMLX's "prefill memory guard rejected this prompt" refusal (prefill would exceed the server's memory ceiling) is classified as context overflow, as an HTTP body or a stream error, so the turn compacts and retries a smaller prompt instead of failing.
 
 `[retry]` settings bound attempts and delays. Ordinary automatic provider retries wait a fixed
 300 seconds (five minutes), bounded by `retry.max_delay_secs`, rather than increasing an
-exponential backoff. Explicit `retry-after`, `retry-after-ms`, and `x-ratelimit-reset[-ms]`
+exponential backoff. A connection-level failure before any response arrived (connection refused
+or reset, broken pipe, DNS or connect timeout) is retried once after 2 seconds on a fresh
+connection; later attempts use the ordinary interval. Explicit `retry-after`, `retry-after-ms`, and `x-ratelimit-reset[-ms]`
 delays are still honored as minimum waits; a hint beyond `retry.max_delay_secs` stops the request
 instead of waiting longer than configured. Window-reset headers are treated as quota information,
 not mandatory waits. A throttle (including HTTP 529) remains
@@ -26,7 +28,18 @@ that stall, like incomplete streams, select HTTP Responses streaming on the next
 session/account/model. If the agent's earlier silence watchdog cancels a Codex attempt first, the
 backend switches to HTTP streaming until rebuilt. Neither path retries inline after partial
 callbacks or replays completed tools. User cancellation remains interruption, not a transport-fallback
-signal; history/account validation and retry bounds still apply.
+signal; history/account validation and retry bounds still apply. Codex and GitLab Duo Agent
+WebSockets honour the same `ALL_PROXY`/`HTTPS_PROXY`/`HTTP_PROXY` and `NO_PROXY` settings as HTTP
+requests through an `http://` CONNECT proxy (other proxy kinds fail with a clear error; Codex then
+uses HTTP streaming); loopback and LAN hosts are reached directly.
+
+Model requests to a remote host reuse a warm connection instead of opening a new TCP and TLS
+connection for every request. A connection returns to a process-wide pool only after its response
+was read to the end with nothing left over and the request was not interrupted. The SSE reader reads
+the few bytes that follow a stream's final event, for at most 250 ms. The next request to the same
+origin borrows the connection with its own cancellation and silence limits. A borrowed connection
+is probed again before use, and an idle one is dropped after 30 seconds. Connections to loopback
+and LAN hosts, connections through a proxy, and agents with their own DNS resolver are never shared.
 
 For GGUF startup failures, Dial reports the selected server executable and its stderr. An
 `unknown model architecture` error means that llama.cpp build cannot load the architecture:
@@ -42,6 +55,14 @@ policies automatically. A nearby background-compaction notice does not by itself
 compaction as the source of a foreground provider rejection.
 
 ## Local server request fields
+
+Dial's local chat-completions requests (including LM Studio and other OpenAI-compatible endpoints
+on loopback or private hosts) use a single initial system message. Leading system/developer
+instructions are merged into that prefix; later and transient instructions are sent as user
+messages at their original position. This avoids strict chat-template errors such as
+`System message must be at the beginning` without moving guidance ahead of earlier history.
+The projection changes only the outgoing request, not saved conversation history. Hosted
+chat-completions routes and other API protocols keep their existing message handling.
 
 Local-profile requests (`[assistance.local]`) add server-specific fields only when the route is a
 locally served model (Dial's MLX runtime, LM Studio, Ollama, or llama.cpp on a loopback or private
@@ -147,13 +168,15 @@ state, requests report `registry_default` routing.
 
 ## Remote idle limits and prompt-cache keys
 
+- Eligible direct HTTP connections are shared across per-request agents after the previous response is fully consumed. The pool keeps at most four idle connections per origin and rejects connections idle for 30 seconds or more when borrowing them. Each request rebinds cancellation and silence controls. Loopback/LAN targets, proxies, and caller-supplied guarded resolvers do not share this pool. This is reuse after traffic, not a hosted-model startup ping or preconnect.
 - `remote_model_idle_timeout_secs` defaults to 300 seconds for remote routes (ChatGPT, Anthropic, and OpenAI-compatible hosts that are not localhost or LAN). It bounds the wait for the first event and silence between events. Only actual stream progress resets it; keep-alives do not.
 - A stall maps to an incomplete stream, which is transient. It retries under `retry.max_attempts`, and the partial reply and its tool calls are discarded before the retry.
-- Remote model connections send TCP keepalive probes after 30 seconds of silence (every 10 seconds, 3 probes). A path that dies while the model is silent (sleep/wake, a network or VPN switch, an expired NAT mapping) fails within about a minute and retries on a fresh connection instead of waiting out the idle limit. A live server answers probes however long the model takes, so slow replies keep the full limit. Retry notices show how long the failed attempt ran.
+- Sockets opened by the cancellable HTTP transport and WebSocket TCP connector enable TCP keepalive probes after 30 seconds of silence (every 10 seconds, 3 probes). For WebSockets this includes the socket underneath an HTTP CONNECT tunnel. A path that dies while the model is silent (sleep/wake, a network or VPN switch, an expired NAT mapping) can fail sooner than the model idle limit and retry on a fresh connection. A live server answers probes however long the model takes, so slow replies keep the full limit. These are kernel probes, not billed requests or prompt-cache refreshes, and they do not renew model-progress deadlines. Retry notices show how long the failed attempt ran.
 - Local model servers (localhost or LAN) keep an unlimited first-event wait. `worker_timeout_secs` (default `0`) still governs local workers. `0` on `remote_model_idle_timeout_secs` is an explicit opt-out.
 - The agent's silence-recovery watchdog does not interrupt local model loading or prompt processing before generation begins. It still bounds silent generation and remote requests. Loading/prefill may remain silent when an engine cannot report measured progress; user cancellation and configured transport/startup limits remain active.
 - The silence watchdog requires advancing telemetry (phase or token-count high-water marks), nonempty text/reasoning, or tool argument progress. Repeated status/rate reports and notices do not renew its deadline. Once generation starts, stale loading/prefill reports cannot disarm it; a provider retry resets the attempt's watchdog state.
 - A failed or cancelled request to a Dial-managed server stops that server and its descendants before reuse. The next request starts a fresh process rather than queueing behind abandoned inference. External servers are never killed. Non-cancellation failures include a bounded stderr tail from the failed request, preserving the original error classification.
+- Local startup health checks and embedding warm-up observe cancellation, including when the startup timeout is unlimited. The supervised server's one-shot generation/embedding warm-up is distinct from optional `preparation.local_prefix` and paid hosted prompt-cache refresh.
 - ChatGPT/Codex Responses requests (HTTP and websocket) send `prompt_cache_key` whenever the session has one, unless the profile sets `prompt_cache = false`. The key is derived from the session identity, account, and history generation, so it is stable within a session. API-key Responses requests keep the declared `capabilities.prompt_cache` gate and `prompt_cache` breakpoint policy.
 - The Codex backend routes prompt-cache affinity by the `session_id`/`conversation_id` headers, not by `prompt_cache_key`. The websocket handshake and HTTP SSE requests both send them (the dial session id), so a websocket-to-SSE fallback keeps its cache. A cached websocket idle for more than 30 seconds is replaced before use, because the backend evicts idle sockets without a close frame. A reused socket that fails before any event (a broken-pipe write, or a close with nothing received) is replaced inline and the request replayed in full. Only a fresh socket's failure moves that session/account/model to SSE for the process.
 - Codex WebSocket setup uses one elapsed timeout budget across address attempts and TLS/HTTP upgrade, rather than restarting the budget for each address or read. Handshake network I/O checks cancellation at intervals of at most 100 ms; cancellation propagates without selecting SSE. System DNS, native certificate loading, and an in-flight blocking TCP connect cannot be preempted. Their elapsed time counts against the budget, but DNS/certificate loading can exceed it; with a zero timeout, TCP connect retains the OS timeout.
@@ -167,8 +190,9 @@ state, requests report `registry_default` routing.
   - `streaming`: replays only while an agent run is streaming a reply, for up to 30 minutes from the last settled prefix.
   - `idle`: also replays between runs, for up to 60 minutes from the last settled prefix.
 - A replay is armed only when the economics favor it: the expected savings over the next replay must exceed $0.001 at catalog prices. Without catalog pricing for the model, warming does not start. The successful native request supplies its effective cache lifetime, including cache-control refusal fallback: five-minute prefixes refresh after four minutes; one-hour prefixes after 59 minutes. Unknown or disabled retention disarms the previous prefix rather than guessing.
-- Warming stops when the mode changes to `off`, the model changes, the window ends, a replay wrote the cache instead of reading it, or the replay backend is unavailable. Accepted tool-call and text-only replies both replace the armed prefix with the request that produced them, not the newly generated reply. The reason is shown as a notice at the start of the next turn. Hermetic evaluation runs never replay.
+- Warming stops when the mode changes to `off`, the active route/configuration changes, the window ends, a replay wrote the cache instead of reading it, or the replay backend is unavailable. Replays are bound to the configuration of the route that actually served the request, including session switches and fallbacks, rather than the initial default model. Accepted tool-call and text-only replies both replace the armed prefix with the request that produced them, not the newly generated reply. Worker stop reports appear as notices at the start of the next turn; route changes discard the old worker. Hermetic evaluation runs never replay.
 - Warming applies to native Anthropic routes only. Other providers and local servers have no equivalent cache control and never replay.
+- Pending invalidations and run-end events are applied before a due replay. If the bounded event queue overflows, warming stops rather than silently losing a stop event; a later request can start a fresh worker. Dropping the session's warmer prevents new replays even if a run guard remains alive. A request already in flight may finish within its bounded replay timeout.
 
 ## Stable prompts and immutable media
 
@@ -231,14 +255,14 @@ the machine and are not masked.
 
 ## Retries and image input
 
-Devin also requires its successful completion trailer and complete framing before releasing text or tool calls. Connect responses from Devin and Cursor enforce expanded-byte limits as well as wire-byte limits. Endpoint API-key credentials are resolved again for each retry attempt, so replacement or removal during backoff takes effect before the next dispatch.
+Devin also requires its successful completion trailer and complete framing before releasing text or tool calls. The session resolved by `GetUserJwt` is reused across requests in the process until shortly before its user JWT expires (five minutes when no expiry is readable); an authentication failure discards it so the next attempt signs in again. Connect responses from Devin and Cursor enforce expanded-byte limits as well as wire-byte limits. Cursor reuses one connection for the appends and heartbeats of a request. Endpoint API-key credentials are resolved again for each retry attempt, so replacement or removal during backoff takes effect before the next dispatch.
 
 **Rejected reasoning parameter.** If a request fails with HTTP 400 and the body names `reasoning_effort`, `reasoning.effort`, or an unsupported parameter involving `reasoning`, Dial retries once without the reasoning parameter (including an explicit thinking-off). A retry that succeeds is remembered for that endpoint URL and model for the life of the process, so later requests omit the parameter up front. Nothing is written to configuration. An unrelated 400, or a request that sent no reasoning parameter, is not retried.
 
 **API-key pools.** A provider can name several keys: `api_key_env` plus `api_key_envs = ["KEY_B", "KEY_C"]` on `[providers.<id>]`. When the active key is rate limited or out of quota, that key is blocked until the Retry-After or quota reset time (60 seconds when the provider gives none, at most one hour) and the same request is retried at once with the next key whose variable is set. This consumes one attempt. The key that works keeps serving later requests, and blocks are shared by every session in the process. If no other key is available the ordinary backoff applies. Pool state is process-local and never persisted; only variable names are tracked, so key values are never logged. Each variable must belong to the provider's origin, as for `api_key_env`. A pool needs a key-authenticated endpoint; OAuth and subscription routes do not use one.
 
 Transient provider errors use fixed retry waits with server retry hints and visible notices (up to `[retry].max_attempts`
-attempts, default 10; ordinary waits are 300 seconds, bounded by `[retry].max_delay_secs`, default 300, and longer server hints stop the request). This includes macOS socket `Invalid argument (os error 22)` and
+attempts, default 10; ordinary waits are 300 seconds, bounded by `[retry].max_delay_secs`, default 300, and longer server hints stop the request; the first retry after a connection-level failure waits 2 seconds). This includes macOS socket `Invalid argument (os error 22)` and
 TLS `BadRecordMac` alerts before a response arrives. Each retry opens a fresh connection; TLS certificate
 verification remains enabled. Disconnected or prematurely closed ChatGPT, compatible chat, and
 Anthropic streams also retry within that bound, discarding the failed attempt's partial reply and tool

@@ -343,11 +343,12 @@ impl EditStore {
         ranges: &[(usize, usize)],
     ) -> Result<(), String> {
         let snapshot=self.files.get(path).and_then(|snaps|snaps.iter().rev().find(|snap|snap.text.as_ref()==lf&&snap.raw_revision==revision))
-            .ok_or_else(||format!("{} has no current source/read witness (notebook metadata must match too); read its affected lines first",path.display()))?;
+            .ok_or_else(||format!("{} has no current source/read witness (notebook metadata must match too); read its affected lines with a targeted read such as `{}:START-END`; for a hashline edit, retry with the fresh [path#TAG] header that read returns, otherwise retry the edit after the refreshed read",path.display(),path.display()))?;
         for &(a, b) in ranges {
             if let Some((first, last)) = snapshot.seen.first_unseen(a, b) {
                 return Err(format!(
-                    "{} lines {first}-{last} were not displayed in full; read them before editing",
+                    "{} lines {first}-{last} were not displayed in full; read `{}:{first}-{last}` first; for a hashline edit, retry with the fresh [path#TAG] header that read returns, otherwise retry the edit after the refreshed read",
+                    path.display(),
                     path.display()
                 ));
             }
@@ -1543,12 +1544,12 @@ fn load_job(
         None => {
             return Err(if cur_tag == sec.tag {
                 format!(
-                    "{rel}#{}: no read of this file is recorded; read its affected lines first",
+                    "{rel}#{}: no read of this file is recorded; read the affected lines with a targeted read such as `{rel}:START-END` first, then retry the edit with the fresh [path#TAG] header that read returns",
                     sec.tag
                 )
             } else {
                 format!(
-                    "{rel}#{}: unknown snapshot tag (current {cur_tag}); read again",
+                    "{rel}#{}: unknown snapshot tag (current {cur_tag}); the header is stale; read the affected lines with a targeted read such as `{rel}:START-END`, then retry the edit with the fresh [path#TAG] header that read returns",
                     sec.tag
                 )
             });
@@ -2552,12 +2553,46 @@ pub(crate) fn read(
     limit: usize,
     budget: usize,
 ) -> Result<String, String> {
+    read_impl(ws, path_text, sel, offset, limit, budget, false)
+}
+
+/// Automatic navigation excerpts screen the exact same snapshot that is rendered and witnessed.
+pub(crate) fn read_navigation(
+    ws: &Workspace,
+    path_text: &str,
+    offset: usize,
+    limit: usize,
+    budget: usize,
+) -> Result<String, String> {
+    read_impl(
+        ws,
+        path_text,
+        &Selector::default(),
+        offset,
+        limit,
+        budget,
+        true,
+    )
+}
+
+fn read_impl(
+    ws: &Workspace,
+    path_text: &str,
+    sel: &Selector,
+    offset: usize,
+    limit: usize,
+    budget: usize,
+    screen: bool,
+) -> Result<String, String> {
     let abs = ws.resolve(path_text)?;
     let meta = fs::metadata(&abs).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => format!("reading {path_text:?}: no such file or directory"),
         std::io::ErrorKind::PermissionDenied => format!("reading {path_text:?}: permission denied"),
         _ => format!("reading {path_text:?}: {e}"),
     })?;
+    if screen && !meta.is_file() {
+        return Err("automatic source excerpt requires a regular file".into());
+    }
     if meta.is_dir() {
         return crate::tools::fs::files::list_dir(ws, &abs);
     }
@@ -2578,6 +2613,9 @@ pub(crate) fn read(
     let raw_text = super::edit_transaction::read(ws, &abs)?
         .ok_or("read target disappeared")?
         .text;
+    if screen && crate::storage::memory::screen(&raw_text).is_err() {
+        return Err("automatic source excerpt withheld by secret screening".into());
+    }
     let source = if sel.raw {
         super::edit_source::Source::plain(&raw_text)
     } else {
@@ -2695,27 +2733,30 @@ pub fn rehydrate<'a>(
     for (tool, args, text) in results {
         let requested = match tool {
             "read" => {
-                let Some(input) = args["path"].as_str() else {
-                    continue;
+                // One target, or several (`paths`) whose sections each start with their own header.
+                let inputs: Vec<&str> = match args["paths"].as_array() {
+                    Some(paths) => paths.iter().filter_map(Value::as_str).collect(),
+                    None => args["path"].as_str().into_iter().collect(),
                 };
-                let Ok((path, selector)) = select::split_target(ws, input) else {
-                    continue;
+                let editable = |input: &str| -> Option<String> {
+                    let (path, selector) = select::split_target(ws, input).ok()?;
+                    if selector.raw {
+                        return None;
+                    }
+                    let physical = ws.resolve(path).ok()?;
+                    (physical.is_file()
+                        && !crate::llm::images::is_image(&physical)
+                        && (crate::tools::fs::documents::kind(path).is_none()
+                            || super::edit_source::notebook_path(Path::new(path))))
+                    .then(|| path.to_owned())
                 };
-                if selector.raw {
+                let editable: Vec<String> = inputs.into_iter().filter_map(editable).collect();
+                if editable.is_empty() {
                     continue;
                 }
-                let Ok(physical) = ws.resolve(path) else {
-                    continue;
-                };
-                if !physical.is_file()
-                    || crate::llm::images::is_image(&physical)
-                    || (crate::tools::fs::documents::kind(path).is_some()
-                        && !super::edit_source::notebook_path(Path::new(path)))
-                {
-                    continue;
-                }
-                vec![path.to_owned()]
+                editable
             }
+            "find" => crate::tools::code::navigation::source_targets(ws, args, text),
             "write" => {
                 let Some(path) = args["path"].as_str() else {
                     continue;
@@ -2740,7 +2781,9 @@ pub fn rehydrate<'a>(
         requested.sort();
         requested.dedup();
         let mut current = None;
+        let multiple = tool == "find" || (tool == "read" && args["paths"].is_array());
         if tool == "read"
+            && !multiple
             && !text
                 .lines()
                 .find(|line| !line.trim().is_empty())
@@ -2749,6 +2792,12 @@ pub fn rehydrate<'a>(
             continue;
         }
         for line in text.lines() {
+            // `read_paths` separates targets with a blank line; a later section without an
+            // editable header (a directory, an error) never extends the previous file's rows.
+            if multiple && line.is_empty() {
+                current = None;
+                continue;
+            }
             if let Some(key) = header(ws, &requested, line) {
                 if found.len() < 512 {
                     found.push((

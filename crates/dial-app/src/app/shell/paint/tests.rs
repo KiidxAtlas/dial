@@ -136,3 +136,16 @@ fn terminal_signals_follow_the_session_state() {
     ui.terminal_integration = false;
     assert!(terminal_signals(&ui, &status, Activity::Idle, true).is_none());
 }
+
+#[test]
+fn the_tab_title_leads_with_the_state_circle_and_ends_with_the_session_scope() {
+    assert_eq!(tab_title("dial · app", "", ""), "dial · app");
+    assert_eq!(
+        tab_title("dial · app", "fix the parser", Activity::Working.marker()),
+        "\u{1F7E0} dial · app · fix the parser"
+    );
+    let long = "x".repeat(200);
+    let title = tab_title("dial · app", &long, Activity::Done.marker());
+    assert!(title.starts_with("\u{1F7E2} dial · app · "), "{title}");
+    assert!(crate::ui::text::width(&title) < 70, "{title}");
+}

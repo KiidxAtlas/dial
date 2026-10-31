@@ -48,8 +48,9 @@ pub struct ExperimentalConfig {
     /// the turn's changed files restored to their turn-start content: a failure there witnesses
     /// that the change mattered; a pass there marks the check vacuous for this change.
     pub fault_witness: bool,
-    /// On debugging tasks, the first edit to a non-test source file before any reproduction has
-    /// failed gets advice (`advise`) or is refused once (`gate`).
+    /// On debugging tasks whose request asks for verification, the first edit to a non-test
+    /// source file before any reproduction has failed gets advice (`advise`) or is refused once
+    /// (`gate`).
     pub repro_first: ReproFirst,
     /// Isolated check runs allowed to locate the changed files that turned a passing focused check
     /// into a failing one; 0 disables bisection.

@@ -451,11 +451,9 @@ fn http_errors_are_typed_and_classified() {
     assert!(is_transient(&refused), "{refused:#}");
 }
 
-/// A server may answer before it has read the whole request (a rate limit, an oversized body) and
-/// close the connection. The early answer is the real outcome; a broken pipe on the unsent rest
-/// of the body must not replace it.
-#[test]
-fn an_early_response_wins_over_the_broken_pipe_of_the_unsent_body() {
+/// A scripted server that reads only the request head, writes `answer` (if any) and closes with
+/// the rest of the request unread, which resets the connection under the client's write.
+fn answer_before_reading_the_body(answer: Option<String>) -> (String, std::thread::JoinHandle<()>) {
     use std::io::{Read as _, Write as _};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -467,24 +465,48 @@ fn an_early_response_wins_over_the_broken_pipe_of_the_unsent_body() {
             socket.read_exact(&mut byte).unwrap();
             head.push(byte[0]);
         }
-        let body = r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#;
-        write!(
-            socket,
-            "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nretry-after: 7\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        )
-        .unwrap();
-        // Closing with the body unread resets the connection under the client's write.
+        if let Some(answer) = answer {
+            socket.write_all(answer.as_bytes()).unwrap();
+        }
     });
+    (url, server)
+}
+
+fn oversized_request() -> Chat {
     let mut request = chat_request(vec![]);
     request.messages = vec![json!({"role": "user", "content": "x".repeat(8 << 20)})];
-    let error = chat(&url, SERVER_MODEL, &request, 10).unwrap_err();
+    request
+}
+
+/// A server may answer before it has read the whole request (a rate limit, an oversized body) and
+/// close the connection. The early answer is the real outcome; a broken pipe on the unsent rest
+/// of the body must not replace it, or its status and retry hint are lost.
+#[test]
+fn an_early_response_wins_over_the_broken_pipe_of_the_unsent_body() {
+    let body = r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#;
+    let (url, server) = answer_before_reading_the_body(Some(format!(
+        "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nretry-after: 7\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )));
+    let (result, _) = collect(&url, None, &oversized_request(), 10);
     server.join().unwrap();
+    let error = result.unwrap_err();
     let http = error
         .downcast_ref::<HttpError>()
         .unwrap_or_else(|| panic!("expected the early HTTP 429, got: {error:#}"));
     assert_eq!(http.status, 429);
     assert_eq!(http.retry_after, Some(Duration::from_secs(7)));
+}
+
+/// Without an answer, a connection closed mid-send stays a retryable connection failure.
+#[test]
+fn a_close_mid_send_without_an_answer_stays_a_transient_connection_error() {
+    let (url, server) = answer_before_reading_the_body(None);
+    let (result, _) = collect(&url, None, &oversized_request(), 10);
+    server.join().unwrap();
+    let error = result.unwrap_err();
+    assert!(error.downcast_ref::<HttpError>().is_none(), "{error:#}");
+    assert!(is_transient(&error), "{error:#}");
 }
 
 #[test]
@@ -698,4 +720,46 @@ fn structured_calls_are_left_alone_by_the_text_fallback() {
     let reply = chat(&server.url, SERVER_MODEL, &chat_request(a_tool()), 5).unwrap();
     assert_eq!(reply.tool_calls.len(), 1);
     assert_eq!(reply.tool_calls[0].name, "read_file");
+}
+
+#[test]
+fn only_calls_read_from_text_are_marked_lifted() {
+    let text = "<tool_call>{\"name\": \"read_file\", \"arguments\": {}}</tool_call>";
+    let structured = json!({"choices": [{"finish_reason": "tool_calls", "message": {
+        "content": null,
+        "tool_calls": [{"id": "s", "function": {"name": "read_file", "arguments": "{}"}}]}}]});
+    let lifted = json!({"choices": [{"finish_reason": "stop", "message": {"content": text}}]});
+    let server = fake::serve(vec![fake::json(200, &structured), fake::json(200, &lifted)]);
+    let request = chat_request(a_tool());
+    let reply = chat(&server.url, SERVER_MODEL, &request, 5).unwrap();
+    assert!(!reply.text_calls_lifted && reply.tool_calls.len() == 1);
+    let reply = chat(&server.url, SERVER_MODEL, &request, 5).unwrap();
+    assert!(reply.text_calls_lifted && reply.tool_calls.len() == 1);
+}
+
+/// Reasoning-tail and pythonic recovery are for local endpoints; a hosted URL gets only the marker
+/// forms.
+#[test]
+fn reasoning_and_pythonic_recovery_are_gated_to_local_hosts() {
+    let tools = a_tool();
+    let reasoning_call = "<tool_call>{\"name\": \"read_file\", \"arguments\": {}}</tool_call>";
+    // A call closing the reasoning of an empty reply, and a reply that is only pythonic calls.
+    let cases = [("", reasoning_call), ("[read_file(path=\"a\")]", "")];
+    for (text, reasoning) in cases {
+        for (url, expect) in [
+            ("http://127.0.0.1:8000/v1", true),
+            ("http://192.168.1.5:8000/v1", true),
+            ("https://api.example.com/v1", false),
+        ] {
+            let mut reply = Reply {
+                text: text.into(),
+                reasoning: reasoning.into(),
+                finish_reason: "stop".into(),
+                ..Default::default()
+            };
+            lift_text_calls(&mut reply, url, &tools);
+            assert_eq!(!reply.tool_calls.is_empty(), expect, "{url} {text:?}");
+            assert_eq!(reply.text_calls_lifted, expect, "{url} {text:?}");
+        }
+    }
 }

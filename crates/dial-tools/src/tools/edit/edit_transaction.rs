@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::tools::Workspace;
 use crate::tools::code::lsp;
@@ -14,6 +14,98 @@ use self::unix as imp;
 use self::windows as imp;
 
 pub(crate) use imp::{Change, MAX_BYTES, MAX_FILE, Original, inherit_permissions, open_read, read};
+
+/// The editor-client target for `path`: a plain text file inside a workspace root. Rich documents,
+/// images, notebooks and paths outside the roots keep their local readers and writers.
+fn client_target<'a>(ws: &'a Workspace, path: &Path) -> Option<&'a dyn crate::tools::ClientFileIo> {
+    let client = ws.client_files()?;
+    let shown = path.to_str()?;
+    (ws.root_containing(path).is_some()
+        && crate::tools::fs::documents::kind(shown).is_none()
+        && !crate::llm::images::is_image(path)
+        && !crate::tools::edit::edit_source::notebook_path(path))
+    .then_some(client)
+}
+
+/// Client used for reads of `path`. Reads are bridged only when the client also takes writes:
+/// a read from the editor buffer must be committed back through the same client, or the local
+/// stage would compare the buffer against disk and refuse the edit.
+pub(crate) fn read_bridge<'a>(
+    ws: &'a Workspace,
+    path: &Path,
+) -> Option<&'a dyn crate::tools::ClientFileIo> {
+    client_target(ws, path).filter(|c| c.reads() && c.writes())
+}
+
+/// Text of `path` for a streaming read: the editor's buffer when the bridge serves it, otherwise
+/// the local file opened through its pinned directory.
+pub(crate) fn open_text(
+    ws: &Workspace,
+    path: &std::path::Path,
+) -> Result<Box<dyn std::io::BufRead>, String> {
+    if let Some(client) = read_bridge(ws, path)
+        && path.is_file()
+    {
+        let text = client.read_text(path)?;
+        return Ok(Box::new(std::io::Cursor::new(text.into_bytes())));
+    }
+    Ok(Box::new(std::io::BufReader::new(open_read(ws, path)?)))
+}
+
+/// Publishes a change set through the editor client. Runs after every check and after the
+/// checkpoint observer, so approvals, confinement and the seen-line guard are unchanged. `None`
+/// keeps the local transaction (no bridged target). A bridged read of a deleted file, or a batch
+/// that mixes bridged and local targets, is refused before any write. A client error stops the
+/// batch as a tool error; no local write follows.
+pub(crate) fn client_commit(
+    ws: &Workspace,
+    changes: &[Change],
+) -> Option<Result<Vec<String>, String>> {
+    let mut targets: Vec<Option<&dyn crate::tools::ClientFileIo>> =
+        Vec::with_capacity(changes.len());
+    for change in changes {
+        let write =
+            client_target(ws, &change.path).filter(|c| c.writes() && change.after.is_some());
+        if write.is_none() && read_bridge(ws, &change.path).is_some() {
+            return Some(Err(format!(
+                "{} is read through the editor client, so it cannot be deleted locally; no change was made",
+                ws.rel(&change.path)
+            )));
+        }
+        targets.push(write);
+    }
+    if targets.iter().all(Option::is_none) {
+        return None;
+    }
+    if targets.iter().any(Option::is_none) {
+        return Some(Err(
+            "edit mixes editor-client files with local files; split it so each batch is entirely one or the other; no change was made"
+                .into(),
+        ));
+    }
+    let mut written: Vec<String> = Vec::new();
+    for (client, change) in targets.into_iter().flatten().zip(changes) {
+        let text = change.after.as_deref().unwrap_or_default();
+        if let Err(error) = client.write_text(&change.path, text) {
+            let already = if written.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; already written by the editor client: {}",
+                    written.join(", ")
+                )
+            };
+            return Some(Err(format!(
+                "{} was not written by the editor client ({error}); no local write was made{already}",
+                ws.rel(&change.path)
+            )));
+        }
+        written.push(ws.rel(&change.path));
+    }
+    Some(Ok(Vec::new()))
+}
+#[cfg(test)]
+mod tests;
 
 /// A new binary file staged and published relative to a pinned, no-follow directory handle.
 /// Unlike text edits, this streams arbitrary bytes and never replaces an existing destination.

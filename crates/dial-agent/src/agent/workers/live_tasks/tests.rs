@@ -665,3 +665,215 @@ fn a_worker_message_to_the_parent_ends_a_wait_early_and_stays_queued() {
     assert!(tasks.team.has_mail(mailbox::PARENT));
     assert_eq!(tasks.take_parent_messages()[0].text, "found it");
 }
+
+#[test]
+fn event_wait_wakes_for_a_worker_terminal_result_without_delivering_it_twice() {
+    use crate::agent::run::tool_exposure::default_offer_tests::with_agent;
+    struct Release(mpsc::Sender<()>);
+    impl Ui for Release {
+        fn notice(&mut self, text: &str) {
+            if text.starts_with("Waiting for running work without model polling:") {
+                self.0.send(()).unwrap();
+            }
+        }
+    }
+    with_agent("", |agent| {
+        agent.live_tasks.bind(agent.session.runtime());
+        let body = agent.live_tasks.tree.start("worker", "event wait", None);
+        body.settle(
+            String::new(),
+            Some(json!({"id":"task-1","status":"running"})),
+            crate::runtime::Phase::Running,
+        );
+        agent.live_tasks.jobs.insert(
+            "task-1".into(),
+            JobState {
+                body,
+                interrupt: Arc::new(AtomicBool::new(false)),
+                worker: None,
+                active_tool: Arc::default(),
+                delivered: false,
+            },
+        );
+        let (send, receive) = mpsc::channel();
+        let tx = agent.live_tasks.tx.clone();
+        let worker = std::thread::spawn(move || {
+            receive.recv_timeout(Duration::from_secs(3)).unwrap();
+            tx.send(Event::Done(
+                "task-1".into(),
+                json!({"id":"task-1","status":"failed","result":"deterministic worker failure"}),
+            ))
+            .unwrap();
+            crate::platform::wake::signal();
+        });
+        assert!(agent.wait_for_background_event(&mut Release(send)).unwrap());
+        worker.join().unwrap();
+        assert!(agent.live_tasks.running_ids().is_empty());
+        assert_eq!(agent.live_tasks.undelivered().len(), 1);
+        agent.deliver_worker_results().unwrap();
+        agent.deliver_worker_results().unwrap();
+        assert_eq!(
+            agent
+                .session
+                .messages()
+                .iter()
+                .filter(|message| message["dial_worker_result"] == "task-1")
+                .count(),
+            1
+        );
+        assert!(
+            !agent
+                .wait_for_background_event(&mut crate::agent::NullUi)
+                .unwrap()
+        );
+    });
+}
+
+fn running_job(tasks: &mut LiveTasks, id: &str, data: Value) -> crate::runtime::Body {
+    let body = tasks.tree.start("worker", "watched", None);
+    body.settle(String::new(), Some(data), crate::runtime::Phase::Running);
+    tasks.jobs.insert(
+        id.into(),
+        JobState {
+            body: body.clone(),
+            interrupt: Arc::new(AtomicBool::new(false)),
+            worker: None,
+            active_tool: Arc::default(),
+            delivered: false,
+        },
+    );
+    body
+}
+
+#[test]
+fn health_separates_active_slow_and_stalled_workers_from_the_last_progress_stamp() {
+    let status = |started: u64, updated: Option<u64>| {
+        let mut value = json!({"status":"running","started_ms":started});
+        if let Some(updated) = updated {
+            value["updated_ms"] = json!(updated);
+        }
+        value
+    };
+    let now = 10_000_000;
+    // Progress a moment ago: active, however long it has run before the slow limit.
+    assert_eq!(
+        health(&status(now - 100_000, Some(now - 5_000)), now, 300),
+        Some((100, 5, "active"))
+    );
+    // Running past three stall periods but still progressing: slow.
+    assert_eq!(
+        health(&status(now - 900_000, Some(now - 5_000)), now, 300),
+        Some((900, 5, "slow"))
+    );
+    // Silent for the stall limit: stalled, measured from the start when nothing was ever stamped.
+    assert_eq!(
+        health(&status(now - 400_000, None), now, 300),
+        Some((400, 400, "stalled"))
+    );
+    assert_eq!(
+        health(&status(now - 400_000, Some(now - 301_000)), now, 300),
+        Some((400, 301, "stalled"))
+    );
+    // Disabled, settled and unstamped jobs carry no health.
+    assert_eq!(health(&status(now - 400_000, None), now, 0), None);
+    assert_eq!(
+        health(&json!({"status":"done","started_ms":1}), now, 300),
+        None
+    );
+    assert_eq!(health(&json!({"status":"running"}), now, 300), None);
+}
+
+#[test]
+fn status_reports_health_for_running_workers_only() {
+    let mut tasks = LiveTasks::default();
+    let now = epoch_ms();
+    running_job(
+        &mut tasks,
+        "task-1",
+        json!({"id":"task-1","status":"running","started_ms":now.saturating_sub(1_000_000)}),
+    );
+    running_job(
+        &mut tasks,
+        "task-2",
+        json!({"id":"task-2","status":"running","started_ms":now,"updated_ms":now}),
+    );
+    let all = tasks.status(None).unwrap();
+    assert_eq!(all[0]["health"], "stalled");
+    assert!(all[0]["idle_secs"].as_u64().unwrap() >= 999);
+    assert_eq!(all[1]["health"], "active");
+    assert_eq!(tasks.status(Some("task-1")).unwrap()["health"], "stalled");
+    // The rendered line the model reads names the problem.
+    let text = model_summary(&tasks.status(Some("task-1")).unwrap());
+    assert!(text.contains("stalled, idle"), "{text}");
+    assert!(!model_summary(&all[1]).contains("idle"));
+    // The raw body is untouched: health is computed at read time.
+    assert!(tasks.jobs["task-1"].status().get("health").is_none());
+    tasks.stall_secs = 0;
+    assert!(
+        tasks
+            .status(Some("task-1"))
+            .unwrap()
+            .get("health")
+            .is_none()
+    );
+}
+
+#[test]
+fn a_stall_is_reported_once_until_the_worker_makes_progress_again() {
+    let mut tasks = LiveTasks::default();
+    let now = epoch_ms();
+    let body = running_job(
+        &mut tasks,
+        "task-1",
+        json!({"id":"task-1","status":"running","started_ms":now.saturating_sub(1_000_000)}),
+    );
+    assert_eq!(tasks.scan_stalls(now), vec!["task-1".to_string()]);
+    assert!(tasks.scan_stalls(now).is_empty(), "already reported");
+    assert!(!tasks.take_stall_alert(Some("task-2")));
+    assert!(tasks.take_stall_alert(Some("task-1")));
+    assert!(!tasks.take_stall_alert(None), "a wait reports it once");
+    // Progress stamps the body; the next scan forgets the stall, so a later one is new.
+    body.progress("generating", 1);
+    assert!(tasks.scan_stalls(epoch_ms()).is_empty());
+    assert!(tasks.flagged.is_empty());
+    assert_eq!(
+        tasks.scan_stalls(epoch_ms() + 301_000),
+        vec!["task-1".to_string()]
+    );
+}
+
+#[test]
+fn a_wait_ends_early_when_a_worker_stalls_and_leaves_it_running() {
+    struct View;
+    impl Ui for View {}
+    let mut tasks = LiveTasks::default();
+    let now = epoch_ms();
+    running_job(
+        &mut tasks,
+        "task-1",
+        json!({"id":"task-1","status":"running","started_ms":now.saturating_sub(1_000_000)}),
+    );
+    let started = Instant::now();
+    let (status, stopped) = tasks
+        .wait(
+            Some("task-1"),
+            30,
+            ApprovalGate {
+                approval: Approval::Ask,
+                read_only: false,
+                rules: &mut Vec::new(),
+                root: std::path::Path::new("."),
+                extra_roots: &[],
+                layout: None,
+                cost: &mut None,
+            },
+            &AtomicBool::new(false),
+            &mut View,
+        )
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(stopped, Some(WaitStop::Stalled));
+    assert_eq!(status["status"], "running", "nothing is cancelled");
+    assert_eq!(status["health"], "stalled");
+    assert!(WaitStop::Stalled.note().contains("no progress"));
+}

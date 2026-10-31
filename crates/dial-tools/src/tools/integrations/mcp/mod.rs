@@ -55,7 +55,7 @@ use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -95,7 +95,7 @@ const RECONNECT_BURST_LIMIT: usize = 5;
 const RECONNECT_BURST_WINDOW: Duration = Duration::from_secs(30);
 
 /// The tools of every server that connected, plus one line per problem for the user.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct McpLoad {
     /// Mirror of every connected server's tools; the registry adopts it and keeps it in sync.
     pub live: Live,
@@ -572,21 +572,42 @@ fn listen(session: &Arc<Session>, signals: mpsc::Receiver<Signal>) -> Result<()>
     Ok(())
 }
 
-/// Connects every configured server. Spawns nothing when `config.mcp` is empty. Takes over a
-/// [`prefetch`] started for the same servers, so startup only waits for what is still connecting.
+/// Connects every configured server and waits for them. Takes over a [`prefetch`] started for the
+/// same servers, so startup only waits for what is still connecting.
 pub fn load(config: &Config) -> McpLoad {
-    let started = PREFETCH.lock().unwrap_or_else(|e| e.into_inner()).take();
-    if let Some((key, handle)) = started
-        && Some(key) == prefetch_key(config)
-        && let Ok(loaded) = handle.join()
-    {
-        return loaded;
+    match take_prefetch(config) {
+        Some(connecting) => connecting.wait().clone(),
+        None => load_with(config, CONNECT_TIMEOUT),
     }
-    load_with(config, CONNECT_TIMEOUT)
+}
+
+/// The configured servers as startup finds them.
+pub enum Startup {
+    Ready(McpLoad),
+    /// A [`prefetch`] for the same servers that is still connecting. The owner adopts it once
+    /// [`Connecting::is_finished`], or waits with [`Connecting::wait`] when a capability needs it.
+    Connecting(Arc<Connecting>),
+}
+
+/// Like [`load`], but does not wait for a matching [`prefetch`] that is still connecting: the
+/// first model request should not wait for servers it may never use.
+pub fn start(config: &Config) -> Startup {
+    match take_prefetch(config) {
+        Some(connecting) if connecting.is_finished() => Startup::Ready(connecting.wait().clone()),
+        Some(connecting) => Startup::Connecting(connecting),
+        None => Startup::Ready(load_with(config, CONNECT_TIMEOUT)),
+    }
+}
+
+/// The prefetch for exactly these servers. A prefetch for other servers is dropped, which cancels
+/// it and stops its servers.
+fn take_prefetch(config: &Config) -> Option<Arc<Connecting>> {
+    let (key, connecting) = PREFETCH.lock().unwrap_or_else(|e| e.into_inner()).take()?;
+    (Some(key) == prefetch_key(config)).then_some(connecting)
 }
 
 /// A connection pass started before the first agent exists, keyed by the servers it connects.
-type Prefetch = (String, thread::JoinHandle<McpLoad>);
+type Prefetch = (String, Arc<Connecting>);
 static PREFETCH: std::sync::Mutex<Option<Prefetch>> = std::sync::Mutex::new(None);
 
 /// Everything `load_with` reads from the config; a prefetch is reused only for an equal key.
@@ -594,9 +615,10 @@ fn prefetch_key(config: &Config) -> Option<String> {
     serde_json::to_string(&(&config.mcp, &config.project_root, &config.user_dir)).ok()
 }
 
-/// Start connecting the configured servers in the background, so the interface can draw while
-/// slow servers start; the next [`load`] for the same servers adopts the result. A config that
-/// changes first discards the prefetch (dropping its sessions stops those servers).
+/// Start connecting the configured servers in the background, so the interface can draw and the
+/// first request can start while slow servers start; the next [`load`] or [`start`] for the same
+/// servers adopts the result. A config that changes first discards the prefetch (dropping it
+/// cancels the connect and stops those servers).
 pub fn prefetch(config: &Config) {
     if !config.mcp.values().any(|server| server.enabled) {
         return;
@@ -604,14 +626,15 @@ pub fn prefetch(config: &Config) {
     let Some(key) = prefetch_key(config) else {
         return;
     };
-    let config = config.clone();
-    let Ok(handle) = thread::Builder::new()
-        .name("mcp-prefetch".into())
-        .spawn(move || load_with(&config, CONNECT_TIMEOUT))
-    else {
+    let Some(connecting) = Connecting::spawn(config) else {
         return;
     };
-    *PREFETCH.lock().unwrap_or_else(|e| e.into_inner()) = Some((key, handle));
+    // The replaced pass is dropped after the lock is released: its drop waits for the cancel.
+    let replaced = PREFETCH
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .replace((key, connecting));
+    drop(replaced);
 }
 
 /// Whether a [`prefetch`] is still connecting, so the interface can keep accepting input
@@ -621,26 +644,142 @@ pub fn prefetch_pending() -> bool {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
-        .is_some_and(|(_, handle)| !handle.is_finished())
+        .is_some_and(|(_, connecting)| !connecting.is_finished())
+}
+
+/// Servers connecting on a background thread. Dropping the last handle cancels a connect still in
+/// progress and stops its servers, so an early exit leaves no orphaned server processes.
+pub struct Connecting {
+    config: Config,
+    cancel: Arc<AtomicBool>,
+    handle: Mutex<Option<thread::JoinHandle<McpLoad>>>,
+    loaded: std::sync::OnceLock<McpLoad>,
+}
+
+impl Connecting {
+    fn spawn(config: &Config) -> Option<Arc<Self>> {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (owned, flag) = (config.clone(), cancel.clone());
+        let handle = thread::Builder::new()
+            .name("mcp-prefetch".into())
+            .spawn(move || load_cancellable(&owned, CONNECT_TIMEOUT, &flag))
+            .ok()?;
+        Some(Arc::new(Self {
+            config: config.clone(),
+            cancel,
+            handle: Mutex::new(Some(handle)),
+            loaded: std::sync::OnceLock::new(),
+        }))
+    }
+
+    /// Whether [`Connecting::wait`] would return without waiting.
+    pub fn is_finished(&self) -> bool {
+        self.loaded.get().is_some()
+            || self
+                .handle
+                .try_lock()
+                .is_some_and(|handle| handle.as_ref().is_none_or(thread::JoinHandle::is_finished))
+    }
+
+    /// The connected servers, waiting for every server's startup budget if necessary.
+    pub fn wait(&self) -> &McpLoad {
+        let mut handle = self.handle.lock();
+        if let Some(running) = handle.take() {
+            let loaded = running.join().unwrap_or_else(|_| McpLoad {
+                notices: vec!["mcp: the connection thread panicked".into()],
+                ..McpLoad::default()
+            });
+            let _ = self.loaded.set(loaded);
+        }
+        drop(handle);
+        self.loaded.get_or_init(McpLoad::default)
+    }
+
+    /// The configuration this pass connects.
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// Names of the enabled servers this pass connects.
+    pub fn servers(&self) -> Vec<String> {
+        self.config
+            .mcp
+            .iter()
+            .filter(|(_, server)| server.enabled)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// `mcp_servers` before the pass finished: its first call waits for the real state.
+    pub fn inventory_tool(self: &Arc<Self>) -> Arc<dyn Tool> {
+        Arc::new(inventory::Inventory::connecting(self.clone()))
+    }
+}
+
+impl Drop for Connecting {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::SeqCst);
+        let finished = self
+            .handle
+            .get_mut()
+            .take()
+            .and_then(|running| running.join().ok());
+        if let Some(loaded) = finished.or_else(|| self.loaded.take()) {
+            stop_together(loaded);
+        }
+    }
+}
+
+/// Releases every server of a load at once. Stopping one waits for its process to exit or for a
+/// remote session's termination request; one after another they added up at every exit.
+/// Sessions still shared elsewhere (an adopted load) only lose this reference.
+fn stop_together(loaded: McpLoad) {
+    let McpLoad { live, sessions, .. } = loaded;
+    drop(live);
+    thread::scope(|scope| {
+        for session in sessions {
+            // A thread that cannot start drops its session here instead.
+            let _ = thread::Builder::new()
+                .name("mcp-stop".into())
+                .spawn_scoped(scope, move || drop(session));
+        }
+    });
 }
 
 fn load_with(config: &Config, connect_timeout: Duration) -> McpLoad {
+    load_cancellable(config, connect_timeout, &Arc::default())
+}
+
+fn load_cancellable(
+    config: &Config,
+    connect_timeout: Duration,
+    cancel: &Arc<AtomicBool>,
+) -> McpLoad {
     let mut loaded = McpLoad::default();
     let attempts: Vec<_> = config
         .mcp
         .iter()
         .filter(|(_, server)| server.enabled)
         .map(|(name, server)| {
-            let (thread_name, server_name, server, root, user_dir) = (
+            let (thread_name, server_name, server, root, user_dir, cancel) = (
                 format!("mcp-{name}-connect"),
                 name.clone(),
                 server.clone(),
                 config.project_root.clone(),
                 config.user_dir.clone(),
+                cancel.clone(),
             );
-            let handle = thread::Builder::new()
-                .name(thread_name)
-                .spawn(move || connect(&server_name, &server, &root, &user_dir, connect_timeout));
+            let handle = thread::Builder::new().name(thread_name).spawn(move || {
+                let cancelled = || cancel.load(Ordering::SeqCst);
+                connect(
+                    &server_name,
+                    &server,
+                    &root,
+                    &user_dir,
+                    connect_timeout,
+                    &cancelled,
+                )
+            });
             (name, handle)
         })
         .collect();
@@ -708,9 +847,10 @@ fn connect(
     root: &std::path::Path,
     user_dir: &Path,
     connect_timeout: Duration,
+    cancel: &dyn Fn() -> bool,
 ) -> Result<Connected> {
     let deadline = crate::tools::exec::kernel::execution_deadline(connect_timeout);
-    let (client, signals) = open(name, server, root, user_dir, deadline, &|| false)?;
+    let (client, signals) = open(name, server, root, user_dir, deadline, cancel)?;
     let (resources, prompts) = (
         client.has_capability("resources"),
         client.has_capability("prompts"),
@@ -754,7 +894,7 @@ fn connect(
         let params = cursor
             .as_ref()
             .map_or_else(|| json!({}), |cursor| json!({"cursor": cursor}));
-        let page = client.request("tools/list", params, budget())?;
+        let page = client.request_with("tools/list", params, budget(), cancel, None)?;
         let Some(entries) = page.get("tools").and_then(Value::as_array) else {
             bail!("`tools/list` returned no `tools` array");
         };

@@ -55,6 +55,7 @@ impl Shell {
         self.transcript = Transcript::new();
         replay_session(&mut self.transcript, session);
         self.session_id = session.id().to_owned();
+        self.set_scope(&session.title());
     }
 
     pub(super) fn pick_session(

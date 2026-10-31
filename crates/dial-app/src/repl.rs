@@ -180,6 +180,9 @@ pub struct PrintUi {
     write_error: Option<io::Error>,
     print_thoughts: bool,
     reasoning: String,
+    /// `--output-schema`: the raw answer is held back from stdout; the validated JSON is printed.
+    structured_mode: bool,
+    structured: Option<serde_json::Value>,
 }
 
 impl PrintUi {
@@ -212,11 +215,19 @@ impl PrintUi {
             usage_breakdown: serde_json::Value::Null,
             print_thoughts: false,
             reasoning: String::new(),
+            structured_mode: false,
+            structured: None,
         }
     }
     /// `--print-thoughts`: write the turn's reasoning to stdout ahead of the answer (text mode only).
     pub fn set_print_thoughts(&mut self, enabled: bool) {
         self.print_thoughts = enabled;
+    }
+    pub fn set_structured_mode(&mut self, enabled: bool) {
+        self.structured_mode = enabled;
+    }
+    pub fn set_structured(&mut self, value: serde_json::Value) {
+        self.structured = Some(value);
     }
     pub fn set_interrupt(&mut self, interrupt: Arc<AtomicBool>) {
         self.terminal.set_interrupt(interrupt);
@@ -305,6 +316,9 @@ impl PrintUi {
             if let Some(error) = error {
                 result["error"] = error.into();
             }
+            if let Some(value) = &self.structured {
+                result["structured"] = value.clone();
+            }
             self.emit(result);
         }
         self.terminal.drain_output()?;
@@ -362,7 +376,7 @@ impl Ui for PrintUi {
         if self.format != OutputFormat::Text {
             self.text.push_str(text);
         }
-        if self.format == OutputFormat::Text {
+        if self.format == OutputFormat::Text && !self.structured_mode {
             self.terminal.text_delta(text);
         }
         self.event(|| serde_json::json!({"type":"text", "delta":text}));

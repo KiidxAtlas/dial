@@ -170,6 +170,36 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
         Some(Command::Ps(args)) => {
             return exit_with(dial::cli::ps::run(&layout.user_dir, args.clone())?);
         }
+        Some(Command::Review(args)) => {
+            let run = args.run(&layout)?;
+            let table = overlay(&cli)?;
+            let config = Config::load(&layout, Some(table.clone()))?.for_coding();
+            let options = dial::app::Options {
+                session: None,
+                prompt: String::new(),
+                interactive: false,
+                restore: false,
+                overlay: table,
+                notices: Vec::new(),
+                print_thoughts: false,
+                launch: Default::default(),
+                add_dirs: Vec::new(),
+                mode_flags: Default::default(),
+                images: Vec::new(),
+                stdin_image: None,
+                output_schema: None,
+                output_last_message: args.output_last_message.clone(),
+                review: Some(run),
+            };
+            let format = args.output_format.unwrap_or(cli.output_format);
+            return exit_with(dial::app::run_print(
+                layout,
+                config,
+                options,
+                format,
+                cli.allow.clone(),
+            )?);
+        }
         Some(Command::Search(args)) => {
             let config = Config::load(&layout, Some(overlay(&cli)?))?;
             return exit_with(dial::cli::search::run(&layout, &config, args)?);

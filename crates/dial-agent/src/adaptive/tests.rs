@@ -83,9 +83,71 @@ fn local_request_settings_reports_overrides_and_delegation_without_template_data
     assert!(
         render_request_settings(&delegated, true)
             .unwrap()
-            .contains("server default")
+            .contains("temp unset")
     );
     assert!(render_request_settings(&Value::Null, true).is_none());
+}
+
+#[test]
+fn request_settings_are_labelled_as_dial_requests_with_unconfirmed_enforcement() {
+    let request = crate::llm::Chat {
+        messages: vec![],
+        tools: vec![],
+        temperature: 0.2,
+        max_tokens: 4096,
+        seed: None,
+    };
+    let settings = local_request_settings(
+        &request,
+        None,
+        &json!({}),
+        "unchanged; sampling capability unverified or unsupported",
+    );
+    let detail = render_request_settings(&settings, false).unwrap();
+    assert!(detail.contains("Dial-side requested controls, not confirmed backend behavior"));
+    assert!(detail.contains("Unset fields may be provider defaults, not confirmed unsent"));
+    assert!(detail.contains(
+        "Sampling selection: unchanged; sampling capability unverified or unsupported; server enforcement unconfirmed"
+    ));
+    assert!(
+        render_request_settings(&settings, true)
+            .unwrap()
+            .starts_with("temp 0.2 ·")
+    );
+
+    let mut unknown = settings.clone();
+    unknown.as_object_mut().unwrap().remove("sampling_source");
+    assert!(
+        render_request_settings(&unknown, false)
+            .unwrap()
+            .contains("Sampling selection: unconfirmed; server enforcement unconfirmed")
+    );
+
+    let value = json!({
+        "config": {"enabled": true, "sampling": false, "pin_sampling": false},
+        "last_request": {
+            "result": "ok",
+            "selection": {
+                "task": "editing",
+                "phase": "editing",
+                "reason": "r",
+                "temperature": null,
+                "top_p": null,
+                "max_tokens": 4096,
+                "pre_action_secs": 40,
+                "sampling_source": "unchanged; sampling capability unverified or unsupported",
+                "reasoning_effort": null,
+                "reasoning_source": "provider default or explicit profile",
+                "effective": settings,
+            }
+        }
+    });
+    let text = render(&value);
+    assert!(text.contains("Local request settings (Dial-side requested; backend not confirmed):"));
+    assert!(text.contains("Temperature unverified/provider-controlled"));
+    assert!(text.contains(
+        "Sampling selection: unchanged; sampling capability unverified or unsupported (server enforcement unconfirmed)"
+    ));
 }
 
 #[test]

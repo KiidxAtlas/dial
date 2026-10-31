@@ -109,6 +109,7 @@ impl Agent<'_> {
         step: u32,
         ui: &mut dyn Ui,
     ) -> Result<Option<TurnReport>> {
+        self.efficiency_metrics.recovery(kind.label());
         match turn.progress.setback(kind) {
             Rung::Retry => Ok(None),
             Rung::Redirect(note) => {

@@ -1,4 +1,144 @@
 use super::*;
+
+#[derive(Default)]
+struct RetrievalWork {
+    declarations: Vec<PathBuf>,
+}
+thread_local! {
+    static RETRIEVAL_WORK: std::cell::RefCell<Option<RetrievalWork>> = const { std::cell::RefCell::new(None) };
+}
+pub(super) fn record_declaration_parse(path: &Path) {
+    RETRIEVAL_WORK.with_borrow_mut(|work| {
+        if let Some(work) = work {
+            work.declarations.push(path.to_owned());
+        }
+    });
+}
+fn capture_work<T>(run: impl FnOnce() -> T) -> (T, RetrievalWork) {
+    RETRIEVAL_WORK.set(Some(RetrievalWork::default()));
+    let result = run();
+    (result, RETRIEVAL_WORK.take().unwrap())
+}
+
+#[test]
+fn lexical_retrieval_parses_only_matching_sources_and_rechecks_nonmatches() {
+    let (dir, ws) = crate::tools::testkit::workspace();
+    for index in 0..16 {
+        fs::write(
+            dir.path().join(format!("unrelated_{index}.rs")),
+            "pub fn unrelated() {}\n",
+        )
+        .unwrap();
+    }
+    fs::write(
+        dir.path().join("network.rs"),
+        "pub fn reconnect_network() {}\n",
+    )
+    .unwrap();
+    let args = json!({"query":"reconnect network"});
+    let (first, cold) = capture_work(|| retrieve(&ws, &args, false).unwrap());
+    assert!(!first.results.is_empty());
+    assert!(first.results.iter().all(|hit| hit.path == "network.rs"));
+    assert_eq!(cold.declarations, [dir.path().join("network.rs")]);
+    let (again, _) = capture_work(|| retrieve(&ws, &args, false).unwrap());
+    assert_eq!(
+        first
+            .results
+            .iter()
+            .map(|hit| (&hit.path, hit.start, hit.end, hit.score))
+            .collect::<Vec<_>>(),
+        again
+            .results
+            .iter()
+            .map(|hit| (&hit.path, hit.start, hit.end, hit.score))
+            .collect::<Vec<_>>()
+    );
+    fs::write(
+        dir.path().join("unrelated_0.rs"),
+        "pub fn reconnect_network_again() {}\n",
+    )
+    .unwrap();
+    let (refreshed, changed) = capture_work(|| retrieve(&ws, &args, false).unwrap());
+    assert!(
+        refreshed
+            .results
+            .iter()
+            .any(|hit| hit.path == "unrelated_0.rs")
+    );
+    assert!(
+        changed
+            .declarations
+            .contains(&dir.path().join("unrelated_0.rs"))
+    );
+    let other_query = retrieve(&ws, &json!({"query":"unrelated"}), false).unwrap();
+    assert!(
+        other_query
+            .results
+            .iter()
+            .any(|hit| hit.path == "unrelated_1.rs")
+    );
+}
+
+#[test]
+fn lexical_prefilter_keeps_literal_only_and_multiline_phrase_matches() {
+    let (dir, ws) = crate::tools::testkit::workspace();
+    fs::write(dir.path().join("literal.txt"), "a\r\nb\r\n").unwrap();
+    for args in [
+        json!({"query":"unmatched", "grep_keywords":["a\nb"]}),
+        json!({"query":"\"a\nb\""}),
+    ] {
+        let retrieval = retrieve(&ws, &args, false).unwrap();
+        assert!(
+            retrieval
+                .results
+                .iter()
+                .any(|hit| hit.path == "literal.txt")
+        );
+    }
+    // Semantic retrieval must retain lexically unrelated candidates for reranking.
+    assert!(
+        !retrieve(&ws, &json!({"query":"unmatched"}), true)
+            .unwrap()
+            .results
+            .is_empty()
+    );
+}
+
+#[test]
+fn related_reference_quota_stops_unusable_syntax_work() {
+    use sha2::{Digest, Sha256};
+    let (dir, ws) = crate::tools::testkit::workspace();
+    let source = "pub fn reconnect_network(_session: Session) {}\n";
+    fs::write(dir.path().join("network.rs"), source).unwrap();
+    for index in 0..48 {
+        fs::write(
+            dir.path().join(format!("caller_{index:02}.rs")),
+            format!("pub fn caller_{index}() {{ reconnect_network(); }}\n"),
+        )
+        .unwrap();
+    }
+    fs::write(dir.path().join("z_type.rs"), "pub struct Session;\n").unwrap();
+    let targets = [related::Target {
+        path: "network.rs".into(),
+        start: 1,
+        end: 1,
+        sha256: format!("{:x}", Sha256::digest(source)),
+    }];
+    let (out, work) = capture_work(|| related::render(&ws, ws.root(), &targets, 6 * 1024));
+    assert!(out.contains("call-site caller_00.rs"), "{out}");
+    assert!(out.contains("call-site caller_03.rs"), "{out}");
+    assert!(!out.contains("call-site caller_04.rs"), "{out}");
+    assert!(out.contains("type-definition z_type.rs"), "{out}");
+    for index in 40..48 {
+        assert!(
+            !work
+                .declarations
+                .contains(&dir.path().join(format!("caller_{index:02}.rs"))),
+            "reference quota is full; this source cannot contribute a type or config row"
+        );
+    }
+}
+
 #[test]
 fn protected_trees_are_not_retrieved_from_warm_cache() {
     let (dir, ws) = crate::tools::testkit::workspace();
@@ -38,6 +178,81 @@ fn finds_declarations_and_literal_multiline_deterministically() {
     assert!(exact.contains("retry.rs:3-4"));
     assert!(!exact.contains("other.py:"));
 }
+
+#[test]
+fn find_excerpts_witness_only_returned_rows_and_survive_resume() {
+    let (dir, ws) = crate::tools::testkit::workspace();
+    let ws = ws.with_edit_mode(crate::config::types::EditMode::Hashline);
+    let source = format!("def compute_total():\n{}", "    value = 1\n".repeat(44));
+    fs::write(dir.path().join("calc.py"), &source).unwrap();
+    let args = json!({"query":"compute_total", "related":false});
+    let result = find(&ws, &args).unwrap();
+    let excerpts = result.split_once(SOURCE_SECTION).unwrap().1;
+    assert!(excerpts.contains("40:    value = 1"), "{excerpts}");
+    assert!(!excerpts.contains("41:    value = 1"), "{excerpts}");
+    let tag = crate::tools::edit::hashline::tag_of(&source);
+    let unseen = format!("[calc.py#{tag}]\nPUT 41.=41:\n+    value = 2\n");
+    let resumed = Workspace::new(dir.path()).unwrap();
+    crate::tools::edit::hashline::rehydrate(&resumed, [("find", &args, result.as_str())]);
+    let refused = crate::tools::edit::hashline::edit(&resumed, &unseen).unwrap_err();
+    assert!(refused.contains("have not been shown"), "{refused}");
+    let edit = format!("[calc.py#{tag}]\nPUT 2.=2:\n+    value = 2\n");
+    crate::tools::edit::hashline::edit(&resumed, &edit).unwrap();
+    assert!(
+        fs::read_to_string(dir.path().join("calc.py"))
+            .unwrap()
+            .starts_with("def compute_total():\n    value = 2\n")
+    );
+}
+
+#[test]
+fn stale_find_excerpt_does_not_restore_edit_witnesses() {
+    let (dir, ws) = crate::tools::testkit::workspace();
+    let ws = ws.with_edit_mode(crate::config::types::EditMode::Hashline);
+    let original = "def compute_total():\n    return 1\n";
+    fs::write(dir.path().join("calc.py"), original).unwrap();
+    let args = json!({"query":"compute_total", "related":false});
+    let result = find(&ws, &args).unwrap();
+    fs::write(
+        dir.path().join("calc.py"),
+        "def compute_total():\n    return 3\n",
+    )
+    .unwrap();
+    let resumed = Workspace::new(dir.path()).unwrap();
+    crate::tools::edit::hashline::rehydrate(&resumed, [("find", &args, result.as_str())]);
+    let tag = crate::tools::edit::hashline::tag_of(original);
+    let error = crate::tools::edit::hashline::edit(
+        &resumed,
+        &format!("[calc.py#{tag}]\nPUT 2.=2:\n+    return 2\n"),
+    )
+    .unwrap_err();
+    assert!(error.contains("unknown snapshot tag"), "{error}");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("calc.py")).unwrap(),
+        "def compute_total():\n    return 3\n"
+    );
+}
+
+#[test]
+fn automatic_excerpt_does_not_disclose_or_witness_screened_source() {
+    let (dir, ws) = crate::tools::testkit::workspace();
+    let ws = ws.with_edit_mode(crate::config::types::EditMode::Hashline);
+    let source = "def compute_total():\n    value = 1\n    value += 2\n    value += 3\n    value += 4\n    value += 5\n    value += 6\n    key = 'sk-abcdefghijklmnopqrstuvwxyz123456'\n    return value\n";
+    fs::write(dir.path().join("calc.py"), source).unwrap();
+    let result = find(&ws, &json!({"query":"compute_total", "related":false})).unwrap();
+    let excerpts = result
+        .split_once(SOURCE_SECTION)
+        .map_or("", |(_, text)| text);
+    assert!(!excerpts.contains("abcdefghijklmnopqrstuvwxyz"));
+    let tag = crate::tools::edit::hashline::tag_of(source);
+    let edit = format!("[calc.py#{tag}]\nPUT 2.=2:\n+    value = 2\n");
+    assert!(crate::tools::edit::hashline::edit(&ws, &edit).is_err());
+    assert_eq!(
+        fs::read_to_string(dir.path().join("calc.py")).unwrap(),
+        source
+    );
+}
+
 #[test]
 fn language_declarations_and_optional_server_contract() {
     let (dir, ws) = crate::tools::testkit::workspace();

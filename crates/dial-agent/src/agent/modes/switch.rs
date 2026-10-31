@@ -191,6 +191,7 @@ impl Agent<'_> {
         let auth = session_auth_config(&config, &backend, &mut self.session)?;
         self.backend = Some(backend);
         self.auth_config = auth;
+        self.cache_warm = None;
         self.model_override = Some(config);
         self.route.reset();
         // The loaded-size cap belonged to the previous server/model; the next probe re-reads it.

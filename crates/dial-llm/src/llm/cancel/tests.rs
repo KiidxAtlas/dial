@@ -123,6 +123,16 @@ fn zero_patience_has_no_deadline_before_or_after_progress() {
 }
 
 #[test]
+fn a_later_terminal_grace_may_shorten_but_never_extend_the_deadline() {
+    let patience = Patience::new(None, Duration::from_secs(60));
+    patience.finish_within(Duration::from_millis(2500));
+    patience.finish_within(Duration::from_millis(250));
+    assert!(patience.remaining().unwrap() <= Duration::from_millis(250));
+    patience.finish_within(Duration::from_secs(10));
+    assert!(patience.remaining().unwrap() <= Duration::from_millis(250));
+}
+
+#[test]
 fn remote_default_bounds_first_event_and_silence_unless_local_or_opted_out() {
     let limit = Duration::from_secs(crate::config::types::DEFAULT_REMOTE_IDLE_TIMEOUT_SECS);
     let remote = Patience::for_stream(

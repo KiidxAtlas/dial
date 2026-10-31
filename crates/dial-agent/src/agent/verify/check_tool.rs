@@ -49,6 +49,19 @@ fn prediction(enabled: bool, args: &Value, all_passed: bool, cancelled: bool) ->
 /// is only validated for shape here and authorized like a shell call when it runs.
 fn requested_repro(args: &Value) -> Option<Result<FocusedCheck, String>> {
     let repro = args.get("repro").filter(|value| !value.is_null())?;
+    if !repro.is_object() {
+        // Schema-directed normalization already decodes a JSON-encoded object; what remains is a
+        // string that is not valid JSON or another type. Name that instead of a misleading
+        // `repro.name` error.
+        let detail = match repro.as_str().map(serde_json::from_str::<Value>) {
+            Some(Err(error)) => format!("a string that is not valid JSON ({error})"),
+            Some(Ok(_)) => "a JSON-encoded value that is not an object".to_owned(),
+            None => "not an object".to_owned(),
+        };
+        return Some(Err(format!(
+            "repro must be an object {{\"name\": \"<short-name>\", \"command\": \"<shell command>\"}}; got {detail}"
+        )));
+    }
     let name = repro["name"].as_str().unwrap_or_default().trim();
     let name = name
         .strip_prefix(REPRO_PREFIX.trim_end())
@@ -200,6 +213,7 @@ impl Agent<'_> {
         let mut text = Vec::new();
         let mut all_passed = true;
         let mut cancelled = false;
+        let mut refused = None;
         for check in &selected {
             let reused = names.is_none() && !failed_only && self.reuse_check(check);
             let (status, output) = if self.interrupt.load(Ordering::SeqCst) {
@@ -255,12 +269,27 @@ impl Agent<'_> {
                     json!(self.step_checks.evidence.observed_revision(&check.command));
             }
             if self.step_checks.evidence.is_repro(&check.command) {
-                let state = self
-                    .step_checks
-                    .evidence
-                    .repro_state(&check.command, self.step_checks.revision());
-                text.push(format!("  reproduction: {}", state.describe()));
-                result["reproduction"] = json!(state.as_str());
+                // A reproduction that passes before any change does not show the bug (often
+                // inverted exit logic). Registering it would make the final gate rerun a command
+                // that fails once the code is fixed, so it is withdrawn and the call says why.
+                if registered.as_ref() == Some(&check.name)
+                    && !changed
+                    && status == CheckStatus::Passed
+                {
+                    self.step_checks.evidence.withdraw_repro(&check.command);
+                    result["registration"] = json!("refused");
+                    refused = Some(format!(
+                        "Not registered: {} passed before any change, so it does not reproduce the bug. A reproduction must exit non-zero while the bug is present and zero once fixed; check its exit logic (for example an inverted assertion or a misplaced `||`/`&&`), then register a corrected command.",
+                        check.name
+                    ));
+                } else {
+                    let state = self
+                        .step_checks
+                        .evidence
+                        .repro_state(&check.command, self.step_checks.revision());
+                    text.push(format!("  reproduction: {}", state.describe()));
+                    result["reproduction"] = json!(state.as_str());
+                }
             }
             results.push(result);
         }
@@ -278,7 +307,9 @@ impl Agent<'_> {
             .map(PathBuf::from)
             .collect();
         let limits = self.related_test_plan(&changed_paths).limits;
-        text.push(if all_passed {
+        text.push(if let Some(refused) = &refused {
+            refused.clone()
+        } else if all_passed {
             "Passes count toward final verification. Later changes stale evidence unless complete declared inputs are revalidated unchanged.".into()
         } else if registered.is_some() && selected.len() == 1 {
             "Reproduction registered. Fix the code, then rerun it with `names` or failed_only; the final gate reruns it.".into()
@@ -306,7 +337,7 @@ impl Agent<'_> {
             execution: Default::default(),
             data: Some(data),
             text: text.join("\n"),
-            is_error: !all_passed,
+            is_error: !all_passed || refused.is_some(),
         }
     }
 

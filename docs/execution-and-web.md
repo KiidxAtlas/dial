@@ -22,6 +22,13 @@ observed bytes, not unread estimates; generated labels and omission markers are 
 output. Clipping or summarizing a model-facing result downgrades presentation only. Artifact
 retention caps can remove the middle of a stream even when capture reached EOF.
 
+At a tool-free yield or `finish completed`, the foreground harness waits for completion-blocking
+background work without asking the model to poll. New input, cancellation and turn limits
+remain responsive. Explicit `bg start` services are not automatically awaited. For an earlier
+output condition, use the existing `bg wait` `until` regex or approved readiness conditions;
+ending a wait never establishes that the command passed. See
+[event-driven continuation](agent-loop.md#event-driven-continuation).
+
 ## Persistent kernels and evaluation
 
 The `eval` tool runs persistent cells in two languages selected by `language`: `js` (the default) and `py`. Each language keeps its own namespace between successful cells. Recorded `kernel` calls from earlier sessions replay as `eval` Python cells. Interrupting a running Python cell first sends SIGINT; an interrupt that does not unwind within five seconds escalates to terminating the kernel. Failed transport, cancellation and timeout paths discard the namespace. Effects already performed remain; loss of the final cell result is recorded as uncertain. Python interpreters may be selected from the project virtual environment (`.venv`/`VIRTUAL_ENV`) or conda environment when configured/approved, but execution remains subject to the mandatory process-creation fence. The cell deadline pauses while a tool callback requested by the cell is running, so callback time is not charged to the cell.

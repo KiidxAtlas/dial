@@ -1,6 +1,19 @@
 use super::*;
-use crate::llm::wire::wire_message_bytes;
+use crate::llm::wire::{json_bytes, wire_message_bytes};
 use serde_json::json;
+
+fn overhead_of(request: &Chat) -> RequestOverhead {
+    let accounting = crate::agent::compact::compaction::request_accounting_with_policy(
+        request,
+        &crate::config::compaction::CompactionConfig::default(),
+        crate::config::compaction::CompactionIdentity {
+            provider: "test",
+            model: "test",
+            agent: None,
+        },
+    );
+    overhead(request, &accounting)
+}
 #[test]
 fn categories_are_disjoint_and_preserve_the_total_estimate() {
     let mut request = Chat {
@@ -19,7 +32,7 @@ fn categories_are_disjoint_and_preserve_the_total_estimate() {
         json!({"role":"user","content":"transient 尾","dial_transient":true}),
     ];
     request.tools = vec![json!({"type":"function","description":"\"雪\"\n\\"})];
-    let cost = overhead(&request);
+    let cost = overhead_of(&request);
     let total: usize = request
         .messages
         .iter()
@@ -63,10 +76,10 @@ fn internal_evidence_metadata_does_not_inflate_request_economy() {
         max_tokens: 512,
         seed: None,
     };
-    let before = overhead(&request);
+    let before = overhead_of(&request);
     request.messages[0]["dial_evidence"] =
         json!({"artifact":"artifact://source", "internal":"x".repeat(40_000)});
-    let after = overhead(&request);
+    let after = overhead_of(&request);
     assert_eq!(before.total(), after.total());
     assert_eq!(before.history_bytes, after.history_bytes);
     assert_eq!(before.tool_result_bytes, after.tool_result_bytes);

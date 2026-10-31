@@ -5,7 +5,7 @@
 //! lacks an OAuth sign-in is saved too, and the result asks the user to run `/mcp login`.
 use super::catalog::{self, CheckFailure, Endpoints, Input};
 use super::smithery;
-use super::{McpLoad, Session};
+use super::{Connecting, McpLoad, Session};
 use crate::config::paths::Layout;
 use crate::config::settings_store::{self, Scope};
 use crate::config::types::{Config, McpServerConfig};
@@ -14,7 +14,7 @@ use crate::tools::integrations::ext::{Tool, ToolContext};
 use anyhow::Result;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 struct Server {
     name: String,
@@ -24,46 +24,71 @@ struct Server {
 }
 
 pub(super) struct Inventory {
-    servers: Vec<Server>,
+    servers: OnceLock<Vec<Server>>,
+    /// Set while startup still connects: the first listing waits for it.
+    connecting: Option<Arc<Connecting>>,
 }
 
 impl Inventory {
     pub(super) fn new(config: &Config, loaded: &McpLoad) -> Self {
-        let servers = config
-            .mcp
-            .iter()
-            .map(|(name, config)| {
-                let session = loaded
-                    .sessions
-                    .iter()
-                    .find(|session| session.name() == name)
-                    .cloned();
-                let offered = loaded.live.offered_tools();
-                let tools = offered
-                    .iter()
-                    .filter(|tool| tool.lifecycle_channel() == Some(name.as_str()))
-                    .map(|tool| {
-                        json!({
-                            "name": tool.name(),
-                            "description": tool.schema()["function"]["description"],
-                            "read_only": tool.read_only_hint(),
-                        })
-                    })
-                    .collect();
-                Server {
-                    name: name.clone(),
-                    enabled: config.enabled,
-                    session,
-                    tools,
-                }
-            })
-            .collect();
-        Self { servers }
+        Self {
+            servers: OnceLock::from(servers(config, loaded)),
+            connecting: None,
+        }
     }
 
+    /// The inventory of a startup pass still connecting; listing waits for its result.
+    pub(super) fn connecting(connecting: Arc<Connecting>) -> Self {
+        Self {
+            servers: OnceLock::new(),
+            connecting: Some(connecting),
+        }
+    }
+
+    fn servers(&self) -> &[Server] {
+        self.servers.get_or_init(|| match &self.connecting {
+            Some(connecting) => servers(connecting.config(), connecting.wait()),
+            None => Vec::new(),
+        })
+    }
+}
+
+fn servers(config: &Config, loaded: &McpLoad) -> Vec<Server> {
+    let offered = loaded.live.offered_tools();
+    config
+        .mcp
+        .iter()
+        .map(|(name, config)| {
+            let session = loaded
+                .sessions
+                .iter()
+                .find(|session| session.name() == name)
+                .cloned();
+            let tools = offered
+                .iter()
+                .filter(|tool| tool.lifecycle_channel() == Some(name.as_str()))
+                .map(|tool| {
+                    json!({
+                        "name": tool.name(),
+                        "description": tool.schema()["function"]["description"],
+                        "read_only": tool.read_only_hint(),
+                    })
+                })
+                .collect();
+            Server {
+                name: name.clone(),
+                enabled: config.enabled,
+                session,
+                tools,
+            }
+        })
+        .collect()
+}
+
+impl Inventory {
     fn snapshot(&self) -> Value {
         let servers: Vec<_> = self
-            .servers
+            .servers()
             .iter()
             .map(|server| {
                 let status = if !server.enabled {

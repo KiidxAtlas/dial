@@ -293,6 +293,70 @@ fn qwen_malformed_blocks_are_not_executed() {
 }
 
 #[test]
+fn glm_arg_pairs_become_a_call_with_raw_text_values() {
+    let r = applied(
+        "Looking.\n<tool_call>edit_file\n<arg_key>path</arg_key>\n<arg_value>a.rs</arg_value>\n<arg_key>text</arg_key>\n<arg_value>fn f() { \"x\" }</arg_value>\n<arg_key>opts</arg_key>\n<arg_value>{\"force\": true}</arg_value>\n<arg_key>limit</arg_key>\n<arg_value>10</arg_value>\n</tool_call>\nDone.",
+    );
+    assert_eq!(r.text, "Looking.\nDone.");
+    assert_eq!(r.finish_reason, "tool_calls");
+    assert_eq!(
+        r.tool_calls,
+        vec![ToolCall {
+            id: "call_0".into(),
+            name: "edit_file".into(),
+            arguments: json!({"path": "a.rs", "text": "fn f() { \"x\" }", "opts": {"force": true}, "limit": "10"}),
+            malformed_arguments: false
+        }]
+    );
+}
+
+#[test]
+fn glm_calls_without_arguments_and_several_in_a_row() {
+    let r = applied(
+        "<tool_call>git_status</tool_call><tool_call>read\n<arg_key>path</arg_key><arg_value>b.rs</arg_value></tool_call>",
+    );
+    assert_eq!(r.tool_calls.len(), 2);
+    assert_eq!(r.tool_calls[0].name, "git_status");
+    assert_eq!(r.tool_calls[0].arguments, json!({}));
+    assert!(!r.tool_calls[0].malformed_arguments);
+    assert_eq!(r.tool_calls[1].id, "call_1");
+    assert_eq!(r.tool_calls[1].arguments, json!({"path": "b.rs"}));
+    assert_eq!(r.text, "");
+}
+
+#[test]
+fn glm_unterminated_blocks_are_only_calls_when_every_pair_is_closed() {
+    let closed = applied("<tool_call>read\n<arg_key>path</arg_key><arg_value>a.rs</arg_value>");
+    assert!(!closed.tool_calls[0].malformed_arguments);
+    assert_eq!(closed.tool_calls[0].arguments, json!({"path": "a.rs"}));
+    for cut in [
+        "<tool_call>bash\n<arg_key>cmd</arg_key><arg_value>rm -rf /",
+        "<tool_call>bash\n<arg_key>cmd</arg_key>",
+        "<tool_call>bash\n<arg_key></arg_key><arg_value>x</arg_value></tool_call>after",
+        "<tool_call>bash\n<arg_key>cmd</arg_key>oops<arg_value>x</arg_value></tool_call>after",
+    ] {
+        let r = applied(cut);
+        assert_eq!(r.tool_calls.len(), 1, "{cut}");
+        assert!(r.tool_calls[0].malformed_arguments, "{cut}");
+        assert!(r.tool_calls[0].arguments.is_null(), "{cut}");
+        assert_eq!(r.tool_calls[0].name, "bash", "{cut}");
+    }
+}
+
+#[test]
+fn glm_form_needs_a_name_followed_by_pairs_or_the_closing_tag() {
+    // Prose or a bare number inside the tag is not a GLM call.
+    for text in [
+        "<tool_call>42</tool_call>",
+        "<tool_call>read the file</tool_call>",
+    ] {
+        let r = applied(text);
+        assert!(r.tool_calls[0].malformed_arguments, "{text}");
+        assert!(r.tool_calls[0].name.is_empty(), "{text}");
+    }
+}
+
+#[test]
 fn mistral_json_array_and_name_args_forms() {
     let array = applied(
         "Let me.[TOOL_CALLS][{\"name\": \"a\", \"arguments\": {\"x\": 1}}, {\"name\": \"b\", \"arguments\": {}}] ok",
@@ -405,4 +469,205 @@ fn hider_releases_harmony_headers_that_are_not_calls() {
     ]);
     assert_eq!(all, text);
     assert_eq!(out, all);
+}
+
+const DS_BEGIN: &str = "<｜tool▁calls▁begin｜>";
+const DS_END: &str = "<｜tool▁calls▁end｜>";
+
+fn deepseek(name: &str, args: &str) -> String {
+    format!(
+        "<｜tool▁call▁begin｜>function<｜tool▁sep｜>{name}\n```json\n{args}\n```<｜tool▁call▁end｜>"
+    )
+}
+
+#[test]
+fn deepseek_calls_in_a_section_become_calls_and_the_markers_are_removed() {
+    let text = format!(
+        "I will look.\n{DS_BEGIN}{}\n{}{DS_END}",
+        deepseek("read", "{\"path\": \"a.rs\"}"),
+        deepseek("bash", "{\"command\": \"echo \\\"```\\\"\"}"),
+    );
+    let r = applied(&text);
+    assert_eq!(r.text, "I will look.");
+    assert_eq!(r.finish_reason, "tool_calls");
+    assert_eq!(r.tool_calls.len(), 2);
+    assert_eq!(r.tool_calls[0].name, "read");
+    assert_eq!(r.tool_calls[0].arguments, json!({"path": "a.rs"}));
+    assert_eq!(r.tool_calls[1].id, "call_1");
+    assert_eq!(
+        r.tool_calls[1].arguments,
+        json!({"command": "echo \"```\""})
+    );
+}
+
+#[test]
+fn deepseek_unreadable_calls_are_malformed_and_never_executed() {
+    for text in [
+        // Arguments cut off inside the string.
+        "<｜tool▁call▁begin｜>function<｜tool▁sep｜>bash\n```json\n{\"command\": \"rm -rf",
+        // No fence.
+        "<｜tool▁call▁begin｜>function<｜tool▁sep｜>bash\n{\"command\": \"ls\"}<｜tool▁call▁end｜>",
+        // Arguments that are not an object.
+        "<｜tool▁call▁begin｜>function<｜tool▁sep｜>bash\n```json\n[1]\n```<｜tool▁call▁end｜>",
+    ] {
+        let r = applied(text);
+        assert_eq!(r.tool_calls.len(), 1, "{text}");
+        assert!(r.tool_calls[0].malformed_arguments, "{text}");
+        assert_eq!(r.tool_calls[0].name, "bash", "{text}");
+    }
+    let nameless = applied("<｜tool▁call▁begin｜>function<｜tool▁call▁end｜>");
+    assert!(nameless.tool_calls[0].malformed_arguments && nameless.tool_calls[0].name.is_empty());
+}
+
+#[test]
+fn kimi_calls_parse_the_function_name_from_the_id() {
+    let r = applied(
+        "Checking.<|tool_calls_section_begin|><|tool_call_begin|>functions.read:0<|tool_call_argument_begin|>{\"path\": \"a.rs\"}<|tool_call_end|><|tool_call_begin|>functions.bash:1<|tool_call_argument_begin|>{\"command\": \"ls <|tool_call_end|>\"}<|tool_call_end|><|tool_calls_section_end|>",
+    );
+    assert_eq!(r.text, "Checking.");
+    assert_eq!(r.tool_calls.len(), 2);
+    assert_eq!(r.tool_calls[0].name, "read");
+    assert_eq!(r.tool_calls[0].arguments, json!({"path": "a.rs"}));
+    assert_eq!(r.tool_calls[1].name, "bash");
+    assert_eq!(
+        r.tool_calls[1].arguments,
+        json!({"command": "ls <|tool_call_end|>"})
+    );
+}
+
+#[test]
+fn kimi_unreadable_calls_are_malformed_and_never_executed() {
+    for text in [
+        "<|tool_call_begin|>functions.bash:0<|tool_call_argument_begin|>{\"command\": \"rm",
+        "<|tool_call_begin|>functions.bash:0{\"command\": \"ls\"}<|tool_call_end|>",
+    ] {
+        let r = applied(text);
+        assert_eq!(r.tool_calls.len(), 1, "{text}");
+        assert!(r.tool_calls[0].malformed_arguments, "{text}");
+    }
+    // A name without the `functions.` prefix or the index is still read.
+    let bare = applied("<|tool_call_begin|>ls<|tool_call_argument_begin|>{}<|tool_call_end|>");
+    assert_eq!(bare.tool_calls[0].name, "ls");
+    assert!(!bare.tool_calls[0].malformed_arguments);
+}
+
+#[test]
+fn section_markers_alone_are_not_calls() {
+    let text = format!("{DS_BEGIN}{DS_END}");
+    let r = applied(&text);
+    assert!(r.tool_calls.is_empty());
+    assert_eq!(r.text, text);
+}
+
+#[test]
+fn hider_withholds_deepseek_and_kimi_markers_split_across_deltas() {
+    let (out, _) = feed(&[
+        "Plan. <｜tool▁calls",
+        "▁begin｜><｜tool▁call▁be",
+        "gin｜>function",
+    ]);
+    assert_eq!(out, "Plan. ");
+    let (out, _) = feed(&[
+        "Go. <|tool_calls_sec",
+        "tion_begin|><|tool_call_",
+        "begin|>functions.ls:0",
+    ]);
+    assert_eq!(out, "Go. ");
+    let (out, all) = feed(&["use the <|tool", " list"]);
+    assert_eq!(out, all);
+}
+
+fn reasoning_only(reasoning: &str) -> Reply {
+    let mut r = reply("");
+    r.reasoning = reasoning.into();
+    apply_from_reasoning(&mut r);
+    r
+}
+
+#[test]
+fn a_call_that_closes_the_reasoning_is_lifted_when_there_is_no_answer_text() {
+    let r = reasoning_only(
+        "I should read it.\n<tool_call>\n{\"name\": \"read\", \"arguments\": {\"path\": \"a.rs\"}}\n</tool_call>\n",
+    );
+    assert_eq!(r.finish_reason, "tool_calls");
+    assert_eq!(r.tool_calls.len(), 1);
+    assert_eq!(r.tool_calls[0].arguments, json!({"path": "a.rs"}));
+    assert!(r.reasoning.starts_with("I should read it."));
+    let kimi = reasoning_only(
+        "<|tool_call_begin|>functions.ls:0<|tool_call_argument_begin|>{}<|tool_call_end|>",
+    );
+    assert_eq!(kimi.tool_calls[0].name, "ls");
+}
+
+#[test]
+fn reasoning_calls_are_ignored_unless_they_are_complete_and_last() {
+    for reasoning in [
+        // Text follows the call.
+        "<tool_call>{\"name\":\"a\",\"arguments\":{}}</tool_call> Actually, no.",
+        // Cut off, so malformed.
+        "<tool_call>{\"name\":\"a\",\"arguments\":{\"p\":\"x",
+        // Only fenced JSON, which reasoning uses for examples.
+        "```json\n{\"name\":\"a\",\"arguments\":{}}\n```",
+        "no call here",
+    ] {
+        let r = reasoning_only(reasoning);
+        assert!(r.tool_calls.is_empty(), "{reasoning}");
+        assert_eq!(r.finish_reason, "stop", "{reasoning}");
+    }
+}
+
+#[test]
+fn reasoning_calls_never_override_answer_text_or_structured_calls() {
+    let call = "<tool_call>{\"name\":\"a\",\"arguments\":{}}</tool_call>";
+    let mut with_text = reply("Here is the answer.");
+    with_text.reasoning = call.into();
+    apply_from_reasoning(&mut with_text);
+    assert!(with_text.tool_calls.is_empty());
+    let mut structured = reply("");
+    structured.reasoning = call.into();
+    structured.tool_calls = vec![ToolCall {
+        id: "x".into(),
+        name: "b".into(),
+        arguments: json!({}),
+        malformed_arguments: false,
+    }];
+    apply_from_reasoning(&mut structured);
+    assert_eq!(structured.tool_calls.len(), 1);
+    assert_eq!(structured.tool_calls[0].name, "b");
+}
+
+#[test]
+fn pythonic_calls_are_lifted_only_for_offered_tools_and_whole_replies() {
+    let offered = vec!["read".to_string()];
+    let lift = |text: &str| {
+        let mut r = reply(text);
+        apply_pythonic(&mut r, &offered);
+        r
+    };
+    let r = lift("[read(path=\"a.rs\")]");
+    assert_eq!(r.finish_reason, "tool_calls");
+    assert_eq!(r.text, "");
+    assert_eq!(r.tool_calls[0].name, "read");
+    assert_eq!(r.tool_calls[0].arguments, json!({"path": "a.rs"}));
+    for text in [
+        "[other(path=\"a\")]",
+        "I will [read(path=\"a\")]",
+        "[1, 2, 3]",
+    ] {
+        let r = lift(text);
+        assert!(r.tool_calls.is_empty(), "{text}");
+        assert_eq!(r.text, text);
+    }
+    let mut structured = reply("[read(path=\"a\")]");
+    structured.tool_calls = vec![ToolCall {
+        id: "x".into(),
+        name: "read".into(),
+        arguments: json!({}),
+        malformed_arguments: false,
+    }];
+    apply_pythonic(&mut structured, &offered);
+    assert_eq!(structured.tool_calls[0].id, "x");
+    let mut none_offered = reply("[read(path=\"a\")]");
+    apply_pythonic(&mut none_offered, &[]);
+    assert!(none_offered.tool_calls.is_empty());
 }

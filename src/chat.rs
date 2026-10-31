@@ -110,6 +110,13 @@ pub(crate) fn chat(
             "--image is only available in print mode; interactive sessions attach images with @path"
         );
     }
+    let output_schema = match &cli.output_schema {
+        Some(path) => Some(dial::cli::print_output::load_schema(path)?),
+        None => None,
+    };
+    if (output_schema.is_some() || cli.output_last_message.is_some()) && !cli.print {
+        bail!("--output-schema and -o/--output-last-message need print mode (-p)");
+    }
     let options = Options {
         session,
         prompt: text,
@@ -123,6 +130,9 @@ pub(crate) fn chat(
         mode_flags: mode,
         images,
         stdin_image,
+        output_schema,
+        output_last_message: cli.output_last_message.clone(),
+        review: None,
     };
     if interactive {
         if !cli.allow.is_empty() {

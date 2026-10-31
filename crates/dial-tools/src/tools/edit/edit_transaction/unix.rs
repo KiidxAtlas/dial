@@ -1,4 +1,5 @@
 //! Rollback-atomic edit transactions. Paths are opened relative to no-follow directory handles.
+
 //! Originals are captured before installation; exclusive links never overwrite a racing writer.
 //! This is not a cross-filesystem/crash transaction. Failed recovery retains named originals.
 use crate::tools::Workspace;
@@ -393,12 +394,19 @@ pub(crate) fn open_read(ws: &Workspace, path: &Path) -> Result<File, String> {
     Ok(file)
 }
 pub(crate) fn read(ws: &Workspace, path: &Path) -> Result<Option<Original>, String> {
-    match Directory::open(ws, path, false, None) {
+    let original = match Directory::open(ws, path, false, None) {
         Ok(dir) => dir.read(&cstr(
             path.file_name().ok_or("edit target has no filename")?,
         )?),
         Err(_) if !path.parent().is_some_and(Path::exists) => Ok(None),
         Err(e) => Err(e),
+    }?;
+    match (original, super::read_bridge(ws, path)) {
+        (Some(mut original), Some(client)) => {
+            original.text = client.read_text(path)?;
+            Ok(Some(original))
+        }
+        (original, _) => Ok(original),
     }
 }
 impl Change {
@@ -508,6 +516,10 @@ pub(crate) fn commit(ws: &Workspace, changes: &[Change]) -> Result<Vec<String>, 
         } else {
             ws.observe_delete(&change.path)?;
         }
+    }
+    // Plain text in a workspace root goes to the editor client: no local stage or rename.
+    if let Some(done) = super::client_commit(ws, changes) {
+        return done;
     }
     let mut parents = ParentCleanup::default();
     let mut staged = Vec::with_capacity(changes.len());

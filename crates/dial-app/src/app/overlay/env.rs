@@ -45,6 +45,10 @@ pub(in crate::app) struct OverlayEnv<'a> {
     /// Unloads resident models before a compute action starts training. Absent in busy panels,
     /// where the chat loop's compute handoff runs while the panel is open.
     pub(in crate::app) release_compute: Option<&'a mut dyn FnMut()>,
+    /// Builds a fresh `/peers` snapshot (absent unless that panel is open with an agent), so the
+    /// board follows sessions that start or stop while it is visible.
+    pub(in crate::app) peer_source:
+        Option<&'a mut dyn FnMut() -> Option<crate::ui::overlay::peers::PeersView>>,
 }
 
 pub(in crate::app) fn settings_tables(

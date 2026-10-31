@@ -54,6 +54,9 @@ pub fn constrain_openai(body: &mut Value, profile: &ModelProfile) {
         .filter(|tools| !tools.is_empty())
     {
         for tool in tools {
+            if profile.provider == "docker-model-runner" {
+                docker_grammar_schema(&mut tool["function"]["parameters"]);
+            }
             if profile.capabilities.strict_tools
                 && let Some(parameters) = strict_parameters(&tool["function"]["parameters"])
             {
@@ -63,6 +66,72 @@ pub fn constrain_openai(body: &mut Value, profile: &ModelProfile) {
         }
         if let Some(parallel) = profile.capabilities.parallel_tool_calls {
             body["parallel_tool_calls"] = json!(parallel);
+        }
+    }
+}
+
+/// Docker's llama.cpp grammar parser rejects large bounded repetitions, including string bounds
+/// nested inside array items. Project only the outbound schema; runtime argument validation keeps
+/// the original contract. 1024 is conservative: nested bounds of 1024 passed a live reproduction,
+/// while 2048 and larger failed. This is not a universal llama.cpp implementation limit.
+fn docker_grammar_schema(schema: &mut Value) {
+    let Some(object) = schema.as_object_mut() else {
+        return;
+    };
+    for key in ["minLength", "maxLength", "minItems", "maxItems"] {
+        if object
+            .get(key)
+            .and_then(Value::as_u64)
+            .is_some_and(|n| n > 1024)
+        {
+            object.remove(key);
+        }
+    }
+    // These objects map arbitrary names to schemas. Names and annotation/default/enum values
+    // are data, not schema keywords, and must never be rewritten.
+    for key in [
+        "properties",
+        "patternProperties",
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+        "dependencies",
+    ] {
+        if let Some(children) = object.get_mut(key).and_then(Value::as_object_mut) {
+            for child in children.values_mut() {
+                docker_grammar_schema(child);
+            }
+        }
+    }
+    for key in [
+        "items",
+        "additionalItems",
+        "additionalProperties",
+        "contains",
+        "propertyNames",
+        "contentSchema",
+        "not",
+        "if",
+        "then",
+        "else",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+    ] {
+        if let Some(child) = object.get_mut(key) {
+            if let Some(children) = child.as_array_mut() {
+                for child in children {
+                    docker_grammar_schema(child);
+                }
+            } else {
+                docker_grammar_schema(child);
+            }
+        }
+    }
+    for key in ["allOf", "anyOf", "oneOf", "prefixItems"] {
+        if let Some(children) = object.get_mut(key).and_then(Value::as_array_mut) {
+            for child in children {
+                docker_grammar_schema(child);
+            }
         }
     }
 }
@@ -105,3 +174,6 @@ pub fn normalize_reply(reply: &mut super::Reply, schemas: &[Value]) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

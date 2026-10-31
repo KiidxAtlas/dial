@@ -494,9 +494,12 @@ pub fn catalog_block(skills: &[Skill]) -> String {
 }
 
 /// One line naming up to three skills that share words with the prose of the user's message: every
-/// word of the skill's name, or at least two from its description. One generic word ("code",
-/// "file") is too weak a signal. Deterministic word overlap only: the model still decides whether a
-/// skill applies. Returns `None` when nothing matches, so ordinary prompts get no hint.
+/// word of the skill's name, or at least [`HINT_DESCRIPTION_WORDS`] distinctive words from its
+/// description. Words of the coding task itself ([`TASK_WORDS`]: "verify", "behavior", "wrong",
+/// "test") occur in most requests, so they never count as description overlap: an ordinary bug
+/// report shares them with a debugging skill, and the hint would cost a skill load on a small fix.
+/// Deterministic word overlap only: the model still decides whether a skill applies. Returns
+/// `None` when nothing matches, so ordinary prompts get no hint.
 pub fn match_hint(skills: &[Skill], text: &str) -> Option<String> {
     const STOP: &[&str] = &[
         "with", "this", "that", "from", "when", "your", "into", "about", "should", "will", "need",
@@ -517,8 +520,12 @@ pub fn match_hint(skills: &[Skill], text: &str) -> Option<String> {
         .filter_map(|skill| {
             let name = words(&skill.name);
             let named = !name.is_empty() && name.is_subset(&asked);
-            let description = asked.intersection(&words(&skill.description)).count();
-            (named || description >= 2).then_some((2 * usize::from(named) + description, skill))
+            let description = asked
+                .intersection(&words(&skill.description))
+                .filter(|word| !TASK_WORDS.contains(&word.as_str()))
+                .count();
+            (named || description >= HINT_DESCRIPTION_WORDS)
+                .then_some((2 * usize::from(named) + description, skill))
         })
         .collect();
     if hits.is_empty() {
@@ -535,6 +542,50 @@ pub fn match_hint(skills: &[Skill], text: &str) -> Option<String> {
         names.join(", ")
     ))
 }
+
+/// Distinctive shared description words that suggest a skill the request does not name.
+const HINT_DESCRIPTION_WORDS: usize = 3;
+
+/// Vocabulary of coding work in general rather than of any one skill's domain. A skill named by
+/// the request still matches through its name.
+const TASK_WORDS: &[&str] = &[
+    "behavior",
+    "behaviors",
+    "behaviour",
+    "change",
+    "changed",
+    "changes",
+    "check",
+    "checks",
+    "correct",
+    "correctly",
+    "error",
+    "errors",
+    "fixed",
+    "fixes",
+    "implement",
+    "implementation",
+    "issue",
+    "issues",
+    "problem",
+    "request",
+    "requested",
+    "result",
+    "results",
+    "test",
+    "tests",
+    "update",
+    "using",
+    "verification",
+    "verified",
+    "verifies",
+    "verify",
+    "verifying",
+    "work",
+    "working",
+    "works",
+    "wrong",
+];
 
 #[cfg(test)]
 mod match_hint_tests;

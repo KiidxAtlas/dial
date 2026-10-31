@@ -190,7 +190,7 @@ impl Agent<'_> {
     /// Messages the user explicitly sent as independent work. The user already decided, so no model
     /// classifies them and they never steer the running task: each starts a worker, or, when none
     /// can start, goes back to the surface as a follow-up for after this turn.
-    fn start_independent_messages(&mut self, ui: &mut dyn Ui) -> Result<()> {
+    pub(in crate::agent) fn start_independent_messages(&mut self, ui: &mut dyn Ui) -> Result<()> {
         let mut messages = ui.take_independent_messages().into_iter();
         let mut deferred = Vec::new();
         while let Some(text) = messages.next() {

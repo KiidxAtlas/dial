@@ -157,6 +157,7 @@ Private, loopback and link-local addresses are refused. The result is untrusted 
             return *denied;
         }
         self.client.reset_interrupt();
+        self.client.set_timeout_secs(ctx.config.web.timeout_secs);
         match self.fetch(ctx.config, ctx.workspace, args) {
             Ok(text) => ToolOutput::ok(text),
             Err(message) => ToolOutput::err(format!("web_fetch failed: {message}")),
@@ -457,6 +458,7 @@ impl Tool for WebSearch {
             return *denied;
         }
         self.client.reset_interrupt();
+        self.client.set_timeout_secs(ctx.config.web.timeout_secs);
         match self.search(ctx.config, args) {
             Ok(text) => ToolOutput::ok(text),
             Err(message) => ToolOutput::err(format!("web_search failed: {message}")),

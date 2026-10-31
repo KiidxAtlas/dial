@@ -535,8 +535,7 @@ fn continuing_after_uncertain_effects_is_a_typed_refusal_adapters_can_stop_on() 
     let error = edits
         .engine
         .drive(|_| Ok(Tick::<crate::agent::TurnReport>::Again))
-        .err()
-        .expect("an automatic continuation after uncertain effects is refused");
+        .expect_err("an automatic continuation after uncertain effects is refused");
     assert!(
         error.downcast_ref::<UncertainRefusal>().is_some(),
         "{error:#}"
@@ -775,6 +774,53 @@ fn an_edit_refused_only_for_unread_lines_it_revealed_may_be_reissued() {
 }
 
 #[test]
+fn reading_a_failed_edit_target_releases_only_that_edits_barrier() {
+    let mut edits = Edits::new();
+    edits.write("a.rs", "one\n");
+    edits.write("b.rs", "two\n");
+    // A resumed session's tag without restored witnesses: the edit failed before writing.
+    let edit = edits.call(
+        "edit",
+        serde_json::json!({"input":"[a.rs#ABCD]\nPUT 1.=1:\n+uno\n"}),
+    );
+    let other = edits.call(
+        "edit",
+        serde_json::json!({"input":"[b.rs#ABCD]\nPUT 1.=1:\n+dos\n"}),
+    );
+    for call in [&edit, &other] {
+        edits.settle(
+            call,
+            vec![],
+            ToolOutput::err("no read of this file is recorded; read its affected lines first"),
+        );
+    }
+    let unrelated = edits.call("read", serde_json::json!({"path": "b.rs:9-12"}));
+    let failed_read = edits.call("read", serde_json::json!({"path": "a.rs"}));
+    edits.settle(&failed_read, vec![], ToolOutput::err("permission denied"));
+    assert!(edits.engine.rejection_at(&edits.workspace, &edit).is_some());
+    let read = edits.call("read", serde_json::json!({"paths": ["a.rs:1-1"]}));
+    edits.settle(&read, vec![], ToolOutput::ok("1:one".to_owned()));
+    assert!(edits.engine.rejection_at(&edits.workspace, &edit).is_none());
+    assert!(
+        edits
+            .engine
+            .rejection_at(&edits.workspace, &other)
+            .is_some(),
+        "a read of another file is not this edit's missing evidence"
+    );
+    edits.settle(&unrelated, vec![], ToolOutput::ok("[b.rs#ABCD]".to_owned()));
+    assert!(
+        edits
+            .engine
+            .rejection_at(&edits.workspace, &other)
+            .is_none()
+    );
+    // The released retry fails again: the barrier re-arms until the next read.
+    edits.settle(&edit, vec![], ToolOutput::err("unknown snapshot tag"));
+    assert!(edits.engine.rejection_at(&edits.workspace, &edit).is_some());
+}
+
+#[test]
 fn a_failed_shell_command_may_rerun_after_another_session_changes_the_tree() {
     let mut edits = Edits::new();
     let root = edits.workspace.root().to_path_buf();
@@ -858,4 +904,280 @@ fn nonexecuted_refusals_do_not_poison_an_otherwise_valid_retry() {
         );
         assert!(edits.engine.failed_calls().is_empty());
     }
+}
+
+/// Whether the engine withholds the identical retry of `call` right now.
+fn barred(edits: &mut Edits, call: &ToolCall) -> bool {
+    edits.engine.rejection_at(&edits.workspace, call).is_some()
+}
+
+/// A read of `base`, optionally with a read selector. Path resolution sees only the bare path.
+fn read_of(edits: &mut Edits, base: &str, selector: &str) -> ToolCall {
+    edits.call(
+        "read",
+        serde_json::json!({"path": format!("{base}{selector}")}),
+    )
+}
+
+/// A grant request for `dir`, as the model would issue it.
+fn grant_of(edits: &mut Edits, dir: &std::path::Path) -> ToolCall {
+    edits.call(
+        "request_directory",
+        serde_json::json!({"path": dir.display().to_string(), "reason": "read notes"}),
+    )
+}
+
+#[test]
+fn a_granted_directory_releases_the_failed_outside_read_for_an_identical_retry() {
+    let outside = tempfile::tempdir().unwrap();
+    let base = outside.path().join("notes.md").display().to_string();
+    for selector in ["", ":1-2"] {
+        let mut edits = Edits::new();
+        let error = edits
+            .workspace
+            .resolve(&base)
+            .expect_err("outside the workspace");
+        let read = read_of(&mut edits, &base, selector);
+        edits.settle(&read, vec![], ToolOutput::err(error));
+        assert!(barred(&mut edits, &read), "{selector}");
+        assert!(
+            !edits.engine.failed_access.is_empty(),
+            "access error was not tracked for {selector}"
+        );
+        let grant = grant_of(&mut edits, outside.path());
+        // The root is what authorizes the read; the grant's success text alone is not authority.
+        assert!(edits.workspace.add_root(outside.path()).unwrap());
+        edits.settle(
+            &grant,
+            vec![],
+            ToolOutput::ok("Added the directory. Retry the original tool.".into()),
+        );
+        edits
+            .workspace
+            .resolve(&base)
+            .expect("granted directory resolves");
+        let retry = read_of(&mut edits, &base, selector);
+        let rejection = edits.engine.rejection_at(&edits.workspace, &retry);
+        assert!(rejection.is_none(), "{selector}: {rejection:?}");
+    }
+}
+
+#[test]
+fn a_failed_directory_grant_does_not_release_the_outside_read() {
+    use crate::runtime::execution::ToolStatus;
+    let outside = tempfile::tempdir().unwrap();
+    let base = outside.path().join("notes.md").display().to_string();
+    let mut edits = Edits::new();
+    let error = edits
+        .workspace
+        .resolve(&base)
+        .expect_err("outside the workspace");
+    let read = read_of(&mut edits, &base, "");
+    edits.settle(&read, vec![], ToolOutput::err(error));
+    let grant = grant_of(&mut edits, outside.path());
+    edits.settle(
+        &grant,
+        vec![],
+        ToolOutput::err("directory access denied")
+            .with_status(ToolStatus::Blocked)
+            .with_effects(Effects::None),
+    );
+    edits
+        .workspace
+        .resolve(&base)
+        .expect_err("no root was attached");
+    assert!(barred(&mut edits, &read));
+}
+
+#[test]
+fn an_ordinary_failed_read_inside_a_granted_directory_stays_barred() {
+    let outside = tempfile::tempdir().unwrap();
+    let base = outside.path().join("missing.md").display().to_string();
+    let mut edits = Edits::new();
+    assert!(edits.workspace.add_root(outside.path()).unwrap());
+    for selector in ["", ":1-2"] {
+        edits
+            .workspace
+            .resolve(&base)
+            .expect("inside the granted root");
+        let read = read_of(&mut edits, &base, selector);
+        edits.settle(&read, vec![], ToolOutput::err("missing file: missing.md"));
+        assert!(barred(&mut edits, &read), "{selector}");
+        // A repeated grant of a directory already attached is not new evidence for this read.
+        let grant = grant_of(&mut edits, outside.path());
+        edits.settle(
+            &grant,
+            vec![],
+            ToolOutput::ok("Added the directory. Retry the original tool.".into()),
+        );
+        assert!(barred(&mut edits, &read), "{selector}");
+    }
+}
+
+#[test]
+fn a_successful_grant_that_does_not_cover_the_read_is_not_authority() {
+    let outside = tempfile::tempdir().unwrap();
+    let base = outside.path().join("notes.md").display().to_string();
+    let mut edits = Edits::new();
+    let error = edits
+        .workspace
+        .resolve(&base)
+        .expect_err("outside the workspace");
+    let read = read_of(&mut edits, &base, ":1-2");
+    edits.settle(&read, vec![], ToolOutput::err(error));
+    let check = edits.call("bash", serde_json::json!({"command": "cargo test"}));
+    edits.settle(&check, vec![], ToolOutput::err("assertion failed"));
+    // An ok grant with no root attached authorizes nothing.
+    let grant = grant_of(&mut edits, outside.path());
+    edits.settle(
+        &grant,
+        vec![],
+        ToolOutput::ok("Added the directory. Retry the original tool.".into()),
+    );
+    edits
+        .workspace
+        .resolve(&base)
+        .expect_err("a successful result alone is not authority");
+    assert!(barred(&mut edits, &read));
+    // A root for a different directory leaves this read outside and barred.
+    let other = tempfile::tempdir().unwrap();
+    assert!(edits.workspace.add_root(other.path()).unwrap());
+    let other_grant = grant_of(&mut edits, other.path());
+    edits.settle(
+        &other_grant,
+        vec![],
+        ToolOutput::ok("Added the directory. Retry the original tool.".into()),
+    );
+    edits
+        .workspace
+        .resolve(&base)
+        .expect_err("another root does not cover the read");
+    assert!(barred(&mut edits, &read));
+    assert!(
+        barred(&mut edits, &check),
+        "an unrelated failure stays barred through grants"
+    );
+}
+
+/// Primary root plus an ordinary attached root holding protected Dial storage (`private/`).
+/// Returns the edits, the protected storage dir and the nested sensitive directory.
+fn protected_storage() -> (
+    Edits,
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    let outside = tempfile::tempdir().unwrap();
+    let private = outside.path().join("private");
+    let sessions = private.join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let mut edits = Edits::new();
+    assert!(edits.workspace.add_root(outside.path()).unwrap());
+    edits.workspace = edits
+        .workspace
+        .clone()
+        .with_protected_paths(std::slice::from_ref(&private));
+    (edits, outside, private, sessions)
+}
+
+fn sensitive_grant_of(edits: &mut Edits, dir: &std::path::Path) -> ToolCall {
+    edits.call(
+        "request_directory",
+        serde_json::json!({"path": dir.display().to_string(), "reason": "session notes", "sensitive": true}),
+    )
+}
+
+#[test]
+fn a_sensitive_grant_admits_the_protected_read_and_releases_its_barrier() {
+    let (mut edits, _outside, _private, sessions) = protected_storage();
+    let base = sessions.join("notes.md").display().to_string();
+    let error = edits
+        .workspace
+        .resolve(&base)
+        .expect_err("protected storage is refused");
+    assert!(error.contains("enters protected Dial storage"), "{error}");
+    let read = read_of(&mut edits, &base, "");
+    edits.settle(&read, vec![], ToolOutput::err(error));
+    assert!(barred(&mut edits, &read));
+    // The human-approved canonical directory is what the agent grants; the engine only observes
+    // the successful result and releases the barrier when the target now resolves.
+    let canonical = edits.workspace.directory_request(&sessions, true).unwrap();
+    let grant = sensitive_grant_of(&mut edits, &sessions);
+    edits
+        .workspace
+        .grant_sensitive_directory(&canonical)
+        .unwrap();
+    edits.settle(
+        &grant,
+        vec![],
+        ToolOutput::ok("Added the directory. Sensitive native-file access granted.".into()),
+    );
+    edits
+        .workspace
+        .resolve(&base)
+        .expect("the sensitive grant admits the target");
+    let retry = read_of(&mut edits, &base, "");
+    assert!(!barred(&mut edits, &retry));
+    // Second rejection checkpoint: the released retry fails again, so the barrier re-arms.
+    edits.settle(&retry, vec![], ToolOutput::err("missing file: notes.md"));
+    assert!(barred(&mut edits, &retry));
+}
+
+#[test]
+fn a_normal_root_for_protected_storage_stays_protected_and_keeps_the_barrier() {
+    let (mut edits, _outside, _private, sessions) = protected_storage();
+    let base = sessions.join("notes.md").display().to_string();
+    let error = edits
+        .workspace
+        .resolve(&base)
+        .expect_err("protected storage is refused");
+    let read = read_of(&mut edits, &base, "");
+    edits.settle(&read, vec![], ToolOutput::err(error));
+    // An ordinary (non-sensitive) root attaches the directory but never unlocks protected storage.
+    let grant = grant_of(&mut edits, &sessions);
+    assert!(edits.workspace.add_root(&sessions).unwrap());
+    edits.settle(
+        &grant,
+        vec![],
+        ToolOutput::ok("Added the directory. Normal tool approvals remain.".into()),
+    );
+    let error = edits
+        .workspace
+        .resolve(&base)
+        .expect_err("an ordinary root does not unlock protected storage");
+    assert!(error.contains("enters protected Dial storage"), "{error}");
+    assert!(barred(&mut edits, &read));
+}
+
+#[test]
+fn a_sensitive_request_outside_protected_storage_is_refused_and_releases_nothing() {
+    use crate::runtime::execution::ToolStatus;
+    let (mut edits, outside, _private, sessions) = protected_storage();
+    let base = sessions.join("notes.md").display().to_string();
+    let error = edits
+        .workspace
+        .resolve(&base)
+        .expect_err("protected storage is refused");
+    let read = read_of(&mut edits, &base, "");
+    edits.settle(&read, vec![], ToolOutput::err(error));
+    // An ancestor of protected storage and an unrelated sibling are not sensitive targets.
+    assert!(
+        edits
+            .workspace
+            .directory_request(outside.path(), true)
+            .is_err()
+    );
+    let sibling = outside.path().join("elsewhere");
+    std::fs::create_dir(&sibling).unwrap();
+    assert!(edits.workspace.directory_request(&sibling, true).is_err());
+    let grant = sensitive_grant_of(&mut edits, &sibling);
+    edits.settle(
+        &grant,
+        vec![],
+        ToolOutput::err("sensitive access must name a directory inside protected Dial storage")
+            .with_status(ToolStatus::Blocked)
+            .with_effects(Effects::None),
+    );
+    assert!(barred(&mut edits, &read));
+    assert!(edits.workspace.resolve(&base).is_err());
 }

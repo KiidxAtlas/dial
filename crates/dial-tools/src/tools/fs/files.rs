@@ -8,7 +8,7 @@ use crate::tools::{EditMode, Workspace, edit::hashline, io_message, opt_u64, pre
 use anyhow::Result;
 use serde_json::Value;
 use std::fs;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead};
 use std::path::Path;
 
 const MAX_WRITE: usize = 1024 * 1024;
@@ -458,7 +458,7 @@ pub(in crate::tools) fn read_plain(
         return list_dir(ws, &path);
     }
     let fail = |e: io::Error| io_message("reading", input, &e);
-    let open = || crate::tools::edit::edit_transaction::open_read(ws, &path).map(BufReader::new);
+    let open = || crate::tools::edit::edit_transaction::open_text(ws, &path);
     // Only a tail selector needs the length before the first row.
     let known_len = if sel.tail.is_some() {
         Some(count_remaining_lines(&mut open()?).map_err(fail)?)

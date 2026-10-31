@@ -1,27 +1,84 @@
 //! Session binding for the prompt-cache warmer.
 //!
-//! The warmer's worker thread owns a backend of its own, built for the armed model, so no
+//! The warmer's worker thread owns a backend of its own, built for the armed route, so no
 //! backend is shared across threads. Replays are real requests: their usage is recorded under
 //! `Purpose::CacheWarm` in the session's usage scope, so they appear in cost accounting.
 
 use crate::agent::*;
+use crate::config::types::EndpointConfig;
 use crate::llm::cache_warmer::worker::{Clock, Event, Factory, Handle, Replayer, Report, RunGuard};
 use crate::llm::cache_warmer::{Mode, Stop};
 use crate::llm::catalog::TokenPricing;
+use crate::llm::model_config::{ModelSelection, RequestHeaders};
 use crate::llm::usage::{Purpose, Scope};
+use serde_json::Value;
+use std::path::PathBuf;
 use std::time::Instant;
+
+/// The live route a warmed prefix was settled on. A replay must reach the same provider, endpoint,
+/// credentials, profile and request headers, so any change to these makes the armed worker stale.
+/// Provider and profile settings enter as serialized snapshots of the entries the route uses, never
+/// as `Debug` output and never as the whole configuration.
+#[derive(Debug, PartialEq)]
+struct WarmRoute {
+    selection: ModelSelection,
+    context_window: u32,
+    endpoint: Option<EndpointConfig>,
+    request_headers: RequestHeaders,
+    service_tier: String,
+    extended_context: bool,
+    user_dir: PathBuf,
+    replay_timeout_secs: u64,
+    state_dir: PathBuf,
+    provider_spec: Option<Value>,
+    model_profile: Option<Value>,
+}
+
+impl WarmRoute {
+    /// The route `config` resolves to. `config` is the live resolved configuration. The profile is
+    /// the one the backend binds, including an auto-selected match, and the headers are the
+    /// effective ones, including headers inherited from the provider entry.
+    fn of(config: &Config) -> Result<Self> {
+        let selection = config.selection();
+        let provider_spec = config
+            .providers
+            .get(&selection.provider)
+            .map(serde_json::to_value)
+            .transpose()?;
+        let model_profile = config
+            .active_model_profile()
+            .map(serde_json::to_value)
+            .transpose()?;
+        Ok(Self {
+            selection,
+            context_window: config.context_window,
+            endpoint: config.endpoint.clone(),
+            request_headers: config.request_headers().to_vec(),
+            service_tier: config.effective_service_tier().to_owned(),
+            extended_context: config.extended_context,
+            user_dir: config.user_dir.clone(),
+            state_dir: config.state_dir.clone(),
+            replay_timeout_secs: replay_timeout(config.worker_timeout_secs),
+            provider_spec,
+            model_profile,
+        })
+    }
+}
 
 /// Armed-prefix state for one session. Exists only while `cache.warm` is not `off`.
 pub(in crate::agent) struct CacheWarm {
     handle: Handle,
     mode: Mode,
-    model: String,
+    route: WarmRoute,
     pricing: Option<TokenPricing>,
 }
 
 impl CacheWarm {
-    /// Brings the session's warmer in line with `config`, creating or dropping it as needed.
-    /// Returns the worker's reports since the last call, for the caller to surface.
+    /// Brings the session's warmer in line with the live route `config`, creating, restarting or
+    /// dropping it as needed. A route change or a stopped worker replaces the worker, so a replay
+    /// never reuses a stale factory. The old worker is dropped before a replacement starts, and a
+    /// replacement is only stored after it was built. Returns the worker's reports since the last
+    /// call.
     pub(in crate::agent) fn sync(
         slot: &mut Option<CacheWarm>,
         config: &Config,
@@ -31,39 +88,39 @@ impl CacheWarm {
             *slot = None;
             return Ok(Vec::new());
         }
+        let route = WarmRoute::of(config)?;
+        let mut stops = Vec::new();
+        if let Some(warm) = slot
+            .as_ref()
+            .filter(|warm| warm.route != route || !warm.handle.is_running())
+        {
+            stops.extend(stopped(warm.handle.drain()));
+            *slot = None;
+        }
         let Some(warm) = slot.as_mut() else {
-            *slot = Some(Self::start(config)?);
-            return Ok(Vec::new());
+            *slot = Some(Self::start(config, route)?);
+            return Ok(stops);
         };
         if warm.mode != mode {
             warm.mode = mode;
             warm.handle.send(Event::ModeChanged(mode));
         }
-        if warm.model != config.model {
-            warm.model = config.model.clone();
-            warm.pricing = pricing(config);
-            warm.handle.send(Event::ModelChanged(warm.model.clone()));
-        }
-        Ok(warm
-            .handle
-            .drain()
-            .into_iter()
-            .filter_map(|report| match report {
-                Report::Stopped(stop) => Some(stop),
-                Report::Replayed { .. } => None,
-            })
-            .collect())
+        stops.extend(stopped(warm.handle.drain()));
+        Ok(stops)
     }
 
-    fn start(config: &Config) -> Result<Self> {
+    fn start(config: &Config, route: WarmRoute) -> Result<Self> {
         let replay_config = config.clone();
         let factory: Factory = Box::new(move |model: &str| {
             let mut cfg = replay_config.clone();
             cfg.model = model.to_string();
+            // Warming is best-effort: a failed replay stops the warmer instead of waiting out
+            // provider retries, so one replay never holds the worker for long.
+            cfg.retry.max_attempts = 1;
             let backend = make_backend(&cfg)?;
             Ok(Box::new(BackendReplayer {
                 backend,
-                timeout_secs: cfg.worker_timeout_secs,
+                timeout_secs: replay_timeout(cfg.worker_timeout_secs),
             }) as Box<dyn Replayer>)
         });
         let clock: Clock = Box::new(Instant::now);
@@ -71,7 +128,7 @@ impl CacheWarm {
         Ok(Self {
             handle,
             mode: config.cache.warm,
-            model: config.model.clone(),
+            route,
             pricing: pricing(config),
         })
     }
@@ -85,7 +142,7 @@ impl CacheWarm {
         };
         self.handle.send(Event::Settled {
             chat: chat.clone(),
-            model: self.model.clone(),
+            model: self.route.selection.model.clone(),
             prompt_tokens,
             pricing: self.pricing,
             tier,
@@ -95,7 +152,7 @@ impl CacheWarm {
 
     /// The conversation prefix was rewritten (compaction, rollover): disarm the armed prefix.
     pub(in crate::agent) fn context_changed(&self) {
-        // A dropped event is harmless: the next settled request replaces the armed prefix.
+        // Overflow fails closed in the handle, so a lost invalidation stops future replays.
         let _ = self.handle.send(Event::ContextChanged);
     }
 
@@ -103,6 +160,17 @@ impl CacheWarm {
     pub(in crate::agent) fn run_guard(&self) -> RunGuard {
         self.handle.run_guard()
     }
+}
+
+/// Stop reports from a batch of worker reports, for the caller to surface.
+fn stopped(reports: Vec<Report>) -> Vec<Stop> {
+    reports
+        .into_iter()
+        .filter_map(|report| match report {
+            Report::Stopped(stop) => Some(stop),
+            Report::Replayed { .. } => None,
+        })
+        .collect()
 }
 
 /// Operator-facing reason a warmer stopped, shown once at the next turn.
@@ -132,6 +200,16 @@ fn pricing(config: &Config) -> Option<TokenPricing> {
         selection.headers = Some(config.request_headers().to_vec());
     }
     llm::catalog::model_metadata(&layout, &selection).pricing
+}
+
+/// Longest a one-token replay may take; `worker_timeout_secs` may only shorten it.
+const REPLAY_TIMEOUT_SECS: u64 = 120;
+
+fn replay_timeout(worker_timeout_secs: u64) -> u64 {
+    match worker_timeout_secs {
+        0 => REPLAY_TIMEOUT_SECS,
+        secs => secs.min(REPLAY_TIMEOUT_SECS),
+    }
 }
 
 /// Replays a settled request on a backend owned by the worker thread.

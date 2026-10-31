@@ -22,6 +22,11 @@ pub(in crate::agent) struct Engine {
     /// Tree a failed shell command ran against. Another session can repair the checkout, so a
     /// later tree (different HEAD or uncommitted content) releases that command's barrier.
     failed_trees: std::collections::HashMap<[u8; 32], String>,
+    /// Files a failed `edit`/`write` targeted. A later successful read of one of them supplies the
+    /// witnesses those tools require, so it releases that call's barrier.
+    failed_writes: std::collections::HashMap<[u8; 32], Vec<std::path::PathBuf>>,
+    /// Read targets refused by workspace confinement, tracked until a grant admits them.
+    failed_access: std::collections::HashMap<[u8; 32], (String, Vec<String>)>,
     repeats: guard::RepeatGuard,
     investigation: investigation::InvestigationGuard,
     returned_reads: investigation::ReturnedReads,
@@ -334,6 +339,8 @@ impl Engine {
         if mutated && !output.is_error && !check_failed {
             self.failed.clear();
             self.failed_trees.clear();
+            self.failed_writes.clear();
+            self.failed_access.clear();
         }
         // An edit refused only because its anchors were unread shows those lines and makes them
         // witnesses, so the identical edit is now valid and must not be withheld.
@@ -341,13 +348,42 @@ impl Engine {
             && output
                 .text
                 .contains(crate::tools::edit::hashline::UNSEEN_LINES_NOW_READ);
-        if crate::runtime::execution::ToolStatus::from_output(output).failed() && !witnessed {
+        let status = crate::runtime::execution::ToolStatus::from_output(output);
+        if status.failed() && !witnessed {
             let identity = failed_identity(call);
+            let targets = inaccessible_read_targets(workspace, call, &output.text);
+            if !targets.is_empty() {
+                self.failed_access
+                    .insert(identity, (call_identity(call), targets));
+            }
             self.failed.insert(identity);
             if let Some(tree) = shell_tree(workspace, call) {
                 self.failed_trees.insert(identity, tree);
             }
             output.text.push_str("\nFailed-operation retry barrier: unchanged arguments are now withheld. Correct the arguments, inspect a different source, or repair the source before retrying; completed effects are retained.");
+            let targets = write_targets(workspace, call);
+            if !targets.is_empty() {
+                output
+                    .text
+                    .push_str(" Reading the target file releases this call.");
+                self.failed_writes.insert(identity, targets);
+            }
+        } else if status == crate::runtime::execution::ToolStatus::Ok {
+            if call.name == "read" {
+                self.release_read_targets(workspace, call);
+            } else if call.name == "request_directory" {
+                let checkpoint = &mut self.checkpoint;
+                self.failed_access.retain(|identity, (key, targets)| {
+                    let released = targets
+                        .iter()
+                        .any(|target| workspace.resolve(target).is_ok());
+                    if released {
+                        self.failed.remove(identity);
+                        checkpoint.release_key(key);
+                    }
+                    !released
+                });
+            }
         }
         // Duplicate memory may only cite results the model still sees in full.
         self.investigation.retain_visible(&holds_result);
@@ -375,6 +411,62 @@ impl Engine {
         self.returned_reads = Default::default();
         self.checkpoint.forget_evidence();
     }
+
+    /// A read of a file a failed edit or write targeted is the observation that edit lacked
+    /// (for example a tag whose witnesses did not survive a restart), so the unchanged call may be
+    /// issued again. A retry that still fails re-arms the barrier.
+    fn release_read_targets(&mut self, workspace: &Workspace, call: &ToolCall) {
+        if self.failed_writes.is_empty() {
+            return;
+        }
+        let read: Vec<std::path::PathBuf> =
+            crate::agent::verify::caller_obligations::read_targets(workspace, &call.arguments)
+                .iter()
+                .filter_map(|path| workspace.resolve(path).ok())
+                .collect();
+        let failed = &mut self.failed;
+        self.failed_writes.retain(|identity, targets| {
+            let released = targets.iter().any(|target| read.contains(target));
+            if released {
+                failed.remove(identity);
+            }
+            !released
+        });
+    }
+}
+
+/// Capture only read paths whose actual failure was a workspace access boundary. The error is
+/// produced by workspace resolution, not inferred from arbitrary tool output or grant text.
+fn inaccessible_read_targets(workspace: &Workspace, call: &ToolCall, text: &str) -> Vec<String> {
+    if call.name != "read" {
+        return Vec::new();
+    }
+    let paths = call.arguments["path"].as_str().into_iter().chain(
+        call.arguments["paths"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str()),
+    );
+    let mut targets = Vec::new();
+    for path in paths {
+        let mut candidate = path;
+        loop {
+            if let Err(error) = workspace.resolve(candidate)
+                && (error.contains("outside the workspace; call request_directory")
+                    || error.contains("enters protected Dial storage"))
+                && text.contains(&error)
+            {
+                targets.push(candidate.to_owned());
+                break;
+            }
+            let Some((prefix, _)) = candidate.rsplit_once(':') else {
+                break;
+            };
+            candidate = prefix;
+        }
+    }
+    targets
 }
 
 /// Normalized identity shared with the recovery checkpoint, so equivalent retries match.
@@ -396,6 +488,23 @@ fn shell_tree(workspace: &Workspace, call: &ToolCall) -> Option<String> {
         call.arguments["command"].as_str().unwrap_or_default(),
         call.arguments["cwd"].as_str().unwrap_or_default(),
     )
+}
+
+/// Resolved files an `edit` or `write` call declares; empty for other tools or unparsable input.
+fn write_targets(workspace: &Workspace, call: &ToolCall) -> Vec<std::path::PathBuf> {
+    let declared = match call.name.as_str() {
+        "edit" => crate::tools::declared_edit_targets(&call.arguments).unwrap_or_default(),
+        "write" => call.arguments["path"]
+            .as_str()
+            .map(str::to_owned)
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    };
+    declared
+        .iter()
+        .filter_map(|path| workspace.resolve(path).ok())
+        .collect()
 }
 
 #[cfg(test)]

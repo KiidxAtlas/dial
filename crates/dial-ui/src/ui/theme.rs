@@ -488,9 +488,10 @@ impl Theme {
         }
     }
 
-    /// One frame of the activity spinner for an animation `tick` (~12 fps).
+    /// One frame of the activity spinner for an animation `tick` (~12 fps). The default is a
+    /// two-dot comet circling its braille cell like the knob's needle, in step with the launch mark.
     pub fn spinner(&self, tick: u64) -> &str {
-        const BRAILLE: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        const BRAILLE: &[&str] = &["⠉", "⠘", "⠰", "⢠", "⣀", "⡄", "⠆", "⠃"];
         const ASCII: &[&str] = &["|", "/", "-", "\\"];
         if let Some(frames) = self.spinner_frames.as_ref().filter(|f| !f.is_empty()) {
             return &frames[(tick as usize) % frames.len()];

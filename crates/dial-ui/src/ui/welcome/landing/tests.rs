@@ -96,20 +96,24 @@ fn resting_home_has_no_metadata_stack_or_action_list() {
 #[test]
 fn knob_turns_into_place_then_rests_on_one_fixed_frame() {
     let theme = Theme::builtin("dial-dark").unwrap();
-    let rest = mark::lockup(&theme, 1.0);
+    let rest = mark::lockup(&theme, 1.0, 0);
     assert_eq!(rest.len(), mark::LOCKUP.1);
     for row in &rest {
         let width: usize = row.iter().map(|s| text::width(&s.content)).sum();
         assert_eq!(width, mark::LOCKUP.0);
     }
-    assert_eq!(rest, mark::lockup(&theme, 4.0), "settled frames never move");
+    assert_eq!(
+        rest,
+        mark::lockup(&theme, 4.0, 0),
+        "settled frames never move"
+    );
     assert_ne!(
-        mark::lockup(&theme, 0.0),
+        mark::lockup(&theme, 0.0, 0),
         rest,
         "the needle starts at its stop"
     );
-    assert_ne!(mark::lockup(&theme, 0.5), rest);
-    let word = mark::wordmark(&theme, 1.0);
+    assert_ne!(mark::lockup(&theme, 0.5, 0), rest);
+    let word = mark::wordmark(&theme, 1.0, 0);
     assert_eq!(word.len(), mark::WORDMARK.1);
     assert!(
         rest.iter()
@@ -118,6 +122,48 @@ fn knob_turns_into_place_then_rests_on_one_fixed_frame() {
             .flat_map(|s| s.content.chars())
             .all(|c| c == ' ' || ('\u{2801}'..='\u{28ff}').contains(&c))
     );
+}
+
+#[test]
+fn ambient_motion_keeps_the_mark_alive_without_changing_its_size() {
+    let theme = Theme::builtin("dial-dark").unwrap();
+    let rest = mark::lockup(&theme, 1.0, 0);
+    let word_rest = mark::wordmark(&theme, 1.0, 0);
+    let frames: Vec<_> = (0..200).map(|t| mark::lockup(&theme, 1.0, t)).collect();
+    let words: Vec<_> = (0..200).map(|t| mark::wordmark(&theme, 1.0, t)).collect();
+    for frame in &frames {
+        assert_eq!(frame.len(), mark::LOCKUP.1);
+        for row in frame {
+            let width: usize = row.iter().map(|s| text::width(&s.content)).sum();
+            assert_eq!(
+                width,
+                mark::LOCKUP.0,
+                "ambient frames keep the lockup width"
+            );
+        }
+    }
+    for word in &words {
+        assert_eq!(word.len(), mark::WORDMARK.1);
+    }
+    let glyphs = |rows: &Vec<Vec<Span<'static>>>| -> String {
+        rows.iter().flatten().map(|s| s.content.as_ref()).collect()
+    };
+    assert!(
+        frames.iter().any(|f| glyphs(f) != glyphs(&rest)),
+        "the needle sways across tick marks"
+    );
+    assert!(
+        frames
+            .iter()
+            .any(|f| f != &rest && glyphs(f) == glyphs(&rest)),
+        "a glint changes colors only"
+    );
+    assert!(
+        words.iter().any(|w| w != &word_rest),
+        "the wordmark alone glints too"
+    );
+    assert_eq!(frames[0], rest, "tick 0 is the resting frame");
+    assert_eq!(frames[96], rest, "the sway is periodic and the glint rests");
 }
 
 #[test]

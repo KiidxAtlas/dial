@@ -6,8 +6,9 @@
 //! the ASCII glyph set, the art drops and the same facts stay as plain rows.
 //!
 //! [`Home`] keeps it live in the viewport until the conversation starts: its list rows are
-//! selectable, the wordmark gets one start-up sweep, and on the first message it collapses to the
-//! one-line [`Home::summary`] in scrollback.
+//! selectable, the wordmark gets one start-up sweep and then moves quietly (see
+//! [`Home::ambient`]), and on the first message it collapses to the one-line [`Home::summary`] in
+//! scrollback.
 use super::{
     Rows,
     chrome::{key_hint_spans, label, selected_style},
@@ -229,6 +230,8 @@ pub struct View {
     pub selected: Option<usize>,
     /// Sweep progress; `1.0` and above is the resting frame.
     pub sweep: f32,
+    /// Slow ambient ticks since the mark settled; `0` is the resting frame.
+    pub idle: u64,
     pub max_rows: usize,
     /// Live in the viewport, where list rows can be picked, rather than a scrollback banner.
     pub live: bool,
@@ -239,6 +242,7 @@ impl Default for View {
         View {
             selected: None,
             sweep: 1.0,
+            idle: 0,
             max_rows: usize::MAX,
             live: false,
         }
@@ -669,6 +673,8 @@ pub struct Home {
     /// Set by the first draw, so the sweep runs on screen rather than during start-up work.
     started: Option<Instant>,
     settled: bool,
+    /// When the sweep finished; the ambient clock counts from here.
+    settled_at: Option<Instant>,
 }
 
 impl Home {
@@ -680,6 +686,7 @@ impl Home {
             motion,
             started: None,
             settled: !motion,
+            settled_at: None,
         }
     }
 
@@ -732,6 +739,12 @@ impl Home {
         !self.settled
     }
 
+    /// Whether the settled mark still moves, a few frames a second ([`fx::AMBIENT`]): its needle
+    /// breathes and a glint crosses now and then. False without motion, and until the sweep ends.
+    pub fn ambient(&self) -> bool {
+        self.motion && self.settled
+    }
+
     /// Compose the centered launch screen with the live input and auxiliary rows.
     pub fn frame(
         &mut self,
@@ -742,6 +755,7 @@ impl Home {
         auxiliary: Rows,
     ) -> super::composer::ComposerView {
         let sweep = self.sweep();
+        let idle = self.idle();
         frame(
             &self.info,
             width,
@@ -750,6 +764,7 @@ impl Home {
             View {
                 selected: self.selected,
                 sweep,
+                idle,
                 max_rows: height as usize,
                 live: true,
             },
@@ -765,10 +780,20 @@ impl Home {
         } else {
             1.0
         };
-        if sweep >= 1.0 {
+        if sweep >= 1.0 && !self.settled {
             self.settled = true;
         }
+        if sweep >= 1.0 && self.motion {
+            self.settled_at.get_or_insert_with(Instant::now);
+        }
         sweep
+    }
+
+    /// Slow ambient ticks since the mark settled (`0` before that and without motion).
+    fn idle(&self) -> u64 {
+        self.settled_at.map_or(0, |at| {
+            (at.elapsed().as_millis() / fx::AMBIENT.as_millis()) as u64
+        })
     }
 
     /// The live banner rows, at most `max_rows`; advances the sweep.
@@ -781,6 +806,7 @@ impl Home {
             View {
                 selected: self.selected,
                 sweep,
+                idle: 0,
                 max_rows,
                 live: true,
             },

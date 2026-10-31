@@ -15,6 +15,22 @@ Use `--allow read,edit` for named tool approval instead of blanket `-y`; read-on
 still win. With both a prompt argument and piped stdin, stdin is appended as fenced context.
 Exit status: `0` completed, `1` error, `2` incomplete, blocked, needs input, no answer or interrupted, `3` a required tool approval was denied (takes precedence over 2).
 
+`--output-schema FILE` makes the final answer structured: FILE is a JSON Schema checked before any request
+(an unreadable, malformed or invalid schema fails the run with no model call). The answer is validated with the
+same validator and bounded correction budget (`task.max_schema_retries`) that subagent `output_schema` uses;
+fenced JSON is accepted. On success stdout carries the validated compact JSON (text mode prints it; `json` and
+`stream-json` put it in a new `structured` field of the result object, next to `text`). A still-invalid answer
+prints nothing, reports the validation error on stderr (and in the result's `error` field), and exits `2`.
+`-o FILE` / `--output-last-message FILE` also writes the final answer (the validated JSON when a schema is in
+force) to FILE through an atomic replace. When the turn produces no answer, FILE is neither created nor
+overwritten. The flags need `-p`. Both are root-only: `dial sessions pack` keeps its own `-o`.
+
+`dial review [--uncommitted | --base BRANCH | --commit SHA | PROMPT...]` runs the TUI `/review` workflow
+non-interactively. With no target it reviews the uncommitted changes. The four target kinds are mutually
+exclusive (clap rejects combinations), and refs must be single words. The target is frozen by the same review
+code the TUI uses. The run is read-only: the approval policy is forced to `readonly` and reviewers have no
+write tools. It honours `--output-format` (on the subcommand) and `-o`, and uses the print exit codes.
+
 `dial sessions` lists this project's sessions by latest activity (`--all` lists every project). On a
 terminal it prints a table (id, relative age, message count, title, and project with `--all`) with
 the resume and export commands; piped output keeps the stable

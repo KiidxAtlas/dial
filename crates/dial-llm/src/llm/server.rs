@@ -991,7 +991,10 @@ fn wait_ready(
             remaining.is_none_or(|remaining| !remaining.is_zero()),
             "model server not ready before the startup timeout; last health probe: {last_probe}"
         );
-        match llm::agent(2).get(&models_url).call() {
+        match llm::agent_with(2, false, interrupt.clone(), None)
+            .get(&models_url)
+            .call()
+        {
             Ok(response) if response.status().as_u16() == 200 => break,
             Ok(response) => last_probe = format!("HTTP {}", response.status().as_u16()),
             Err(error) => last_probe = error.to_string(),
@@ -1010,7 +1013,7 @@ fn wait_ready(
             .max(1)
     });
     let warmed = if embedding {
-        warm_embedding(base_url, model, remaining)
+        warm_embedding(base_url, model, remaining, interrupt.clone())
     } else {
         let warmup = Chat {
             messages: vec![json!({"role": "user", "content": "ping"})],
@@ -1062,9 +1065,14 @@ fn wait_ready(
 }
 
 /// One text embedding blocks until the embedding weights load and proves the route works.
-fn warm_embedding(base_url: &str, model: &str, timeout_secs: u64) -> Result<()> {
+fn warm_embedding(
+    base_url: &str,
+    model: &str,
+    timeout_secs: u64,
+    interrupt: Option<Arc<AtomicBool>>,
+) -> Result<()> {
     let body = json!({"model": model, "input": ["ping"]});
-    let mut response = llm::agent(timeout_secs)
+    let mut response = llm::agent_with(timeout_secs, false, interrupt, None)
         .post(&format!("{base_url}/v1/embeddings"))
         .header("Content-Type", "application/json")
         .send(&serde_json::to_vec(&body)?)

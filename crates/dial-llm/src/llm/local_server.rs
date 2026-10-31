@@ -22,6 +22,11 @@ pub struct ServerFacts {
     /// Whether the model's chat template or server exposes a thinking switch. `Some(false)` is a
     /// known absence; `None` is unknown.
     pub thinking_switch: Option<bool>,
+    /// Whether the server reports native tool support for the model: llama.cpp's chat-template
+    /// capabilities, Ollama's `capabilities` (`tools`), LM Studio's `capabilities` (`tool_use`).
+    /// `Some(false)` is a reported absence; `None` is unknown, including servers that report no
+    /// capability list at all.
+    pub native_tools: Option<bool>,
 }
 
 /// Template marker of the switch Qwen-style templates read from `enable_thinking`.
@@ -45,13 +50,11 @@ pub fn facts(
     let Some(base) = base_url else {
         return dial_runtime_facts(model);
     };
-    if provider == "lm-studio" {
-        // LM Studio's REST API documents no template thinking switch to read.
-        return ServerFacts::default();
-    }
     cached(base, model, || {
         let resolved = resolve_headers(headers).ok()?;
-        if provider == "ollama" {
+        if provider == "lm-studio" {
+            lm_studio_facts(base, model, token, &resolved)
+        } else if provider == "ollama" {
             ollama_facts(base, model, token, &resolved)
         } else {
             llama_facts(base, token, &resolved)
@@ -203,6 +206,7 @@ fn dial_runtime_facts(model: &str) -> ServerFacts {
         _ => None,
     };
     ServerFacts {
+        native_tools: None,
         slots: (format == Some(LocalFormat::Gguf))
             .then(super::server::dial_llama_slots)
             .flatten(),
@@ -223,6 +227,7 @@ fn llama_facts(
     }
     catalog::record_llama_props(base, &props);
     Some(ServerFacts {
+        native_tools: catalog::LlamaProps::parse(&props).and_then(|p| p.native_tool_template),
         slots: props["total_slots"]
             .as_u64()
             .and_then(|n| u32::try_from(n).ok())
@@ -248,9 +253,32 @@ fn ollama_facts(
         headers,
     )?;
     let capabilities = shown["capabilities"].as_array()?;
+    let has = |name: &str| capabilities.iter().any(|c| c.as_str() == Some(name));
     Some(ServerFacts {
         slots: None,
-        thinking_switch: Some(capabilities.iter().any(|c| c.as_str() == Some("thinking"))),
+        thinking_switch: Some(has("thinking")),
+        native_tools: Some(has("tools")),
+    })
+}
+
+/// LM Studio `/api/v0/models`: the row's `capabilities` list says whether the model declares native
+/// tool use. LM Studio documents no template thinking switch to read. A row without a capability
+/// list, or no row for `model`, says nothing.
+fn lm_studio_facts(
+    base: &str,
+    model: &str,
+    token: Option<&str>,
+    headers: &ResolvedHeaders<'_>,
+) -> Option<ServerFacts> {
+    let list = local_get(base, "/api/v0/models", token, headers)?;
+    let capabilities = list["data"]
+        .as_array()?
+        .iter()
+        .find(|row| row["id"] == model)?["capabilities"]
+        .as_array()?;
+    Some(ServerFacts {
+        native_tools: Some(capabilities.iter().any(|c| c.as_str() == Some("tool_use"))),
+        ..ServerFacts::default()
     })
 }
 

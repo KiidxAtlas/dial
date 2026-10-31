@@ -230,6 +230,7 @@ fn hosted_turn_without_store_retains_exact_requests_and_original_identity() {
         assert_eq!(requests.len(), examples.len());
         for (example, request) in examples.iter().zip(&requests) {
             let messages = example["messages"].as_array().unwrap();
+            // Training records the request exactly as this loopback route sent it.
             let context: Vec<_> = request["messages"]
                 .as_array()
                 .unwrap()

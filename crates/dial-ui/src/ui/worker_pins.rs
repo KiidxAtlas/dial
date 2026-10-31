@@ -1,5 +1,5 @@
 //! Pinned block above the composer that lists active workers, the `workers` status segment, and
-//! finish notices. A `WorkerBoard` holds one throttled `subagent_model::snapshot`, so the block,
+//! finish notices. A `WorkerBoard` holds one throttled `subagent_model::HubCache`, so the block,
 //! the status segment and the hub count the same workers. A refresh reads session files, so it runs
 //! from the event loop only, never from draw.
 use std::{
@@ -10,7 +10,7 @@ use std::{
 use super::{
     Rows, chrome,
     markdown::truncate_spans,
-    subagent_model::{AgentEntry, AgentStatus, HubSnapshot, snapshot},
+    subagent_model::{AgentEntry, AgentStatus, HubCache, HubSnapshot},
     text,
     theme::{Sym, Theme, Tok},
 };
@@ -43,6 +43,8 @@ enum Outcome {
 pub struct WorkerBoard {
     refreshed_at: Option<Instant>,
     snapshot: HubSnapshot,
+    /// Persistent projection state, so each refresh follows transcripts instead of rereading them.
+    cache: HubCache,
     primed: bool,
     last: HashMap<String, AgentStatus>,
     announced: HashSet<(String, Outcome)>,
@@ -94,7 +96,7 @@ impl WorkerBoard {
             return false;
         }
         self.refreshed_at = Some(now);
-        let snapshot = snapshot(layout, session_id, runtime, live);
+        let snapshot = self.cache.snapshot(layout, session_id, runtime, live);
         self.observe(&snapshot);
         self.snapshot = snapshot;
         true

@@ -1,6 +1,8 @@
 //! Off-thread driver for [`Warmer`]. One worker per session owns its replayer and schedule, so the
 //! agent loop only sends events and drains reports; it never waits on a replay.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -13,7 +15,7 @@ use crate::llm::usage::Scope;
 
 /// How often the worker re-checks the clock while nothing is due; bounds replay latency.
 const POLL: Duration = Duration::from_millis(50);
-/// Queue depth for events and reports. Warming is best-effort, so a full queue drops messages.
+/// Queue depth for events and reports. Event overflow stops warming; reports are best-effort.
 const QUEUE: usize = 32;
 
 /// Sends one replay request. The agent crate implements it over a real backend; tests use fakes.
@@ -29,7 +31,7 @@ pub type Factory = Box<dyn FnMut(&str) -> Result<Box<dyn Replayer>> + Send>;
 /// Monotonic time source; injectable so tests can advance time without sleeping.
 pub type Clock = Box<dyn Fn() -> Instant + Send>;
 
-/// Messages from the agent. Sends never block: when the queue is full the event is dropped.
+/// Messages from the agent. Sends never block; a full event queue stops the worker.
 pub enum Event {
     /// A real request settled; it becomes the prefix to keep warm.
     Settled {
@@ -61,11 +63,12 @@ pub enum Report {
     Stopped(Stop),
 }
 
-/// Agent-side handle. Dropping it disconnects the queue and the worker exits after any replay
-/// already in flight.
+/// Agent-side handle. Dropping it stops the worker after any replay already in flight,
+/// even when an outstanding run guard still holds a sender.
 pub struct Handle {
     tx: SyncSender<Event>,
     reports: Receiver<Report>,
+    running: Arc<AtomicBool>,
 }
 
 impl Handle {
@@ -73,6 +76,7 @@ impl Handle {
     pub fn spawn(mode: Mode, factory: Factory, clock: Clock) -> std::io::Result<Self> {
         let (tx, rx) = mpsc::sync_channel(QUEUE);
         let (report_tx, reports) = mpsc::sync_channel(QUEUE);
+        let running = Arc::new(AtomicBool::new(true));
         let worker = Worker {
             mode,
             warmer: Warmer::default(),
@@ -82,16 +86,35 @@ impl Handle {
             factory,
             clock,
             reports: report_tx,
+            running: Arc::clone(&running),
         };
         std::thread::Builder::new()
             .name("dial-cache-warm".into())
             .spawn(move || worker.run(rx))?;
-        Ok(Self { tx, reports })
+        Ok(Self {
+            tx,
+            reports,
+            running,
+        })
     }
 
-    /// Queues an event without blocking. Returns `false` when it was dropped.
+    /// Queues an event without blocking. Overflow fails closed: a lost invalidation must
+    /// never leave a stale prefix eligible for another paid replay.
     pub fn send(&self, event: Event) -> bool {
-        self.tx.try_send(event).is_ok()
+        if !self.is_running() {
+            return false;
+        }
+        let sent = self.tx.try_send(event).is_ok();
+        if !sent {
+            self.running.store(false, Ordering::Release);
+        }
+        sent
+    }
+
+    /// Whether the worker may still schedule replays. A stopped worker must be replaced
+    /// before a later real request can arm warming again.
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::Acquire)
     }
 
     /// Reports produced since the last drain, without blocking.
@@ -107,16 +130,30 @@ impl Handle {
 
     /// Marks an agent run; dropping the guard reports `RunIdle` on every exit path.
     pub fn run_guard(&self) -> RunGuard {
-        RunGuard(self.tx.clone())
+        RunGuard {
+            tx: self.tx.clone(),
+            running: Arc::clone(&self.running),
+        }
+    }
+}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Release);
     }
 }
 
 /// Reports the end of an agent run when dropped.
-pub struct RunGuard(SyncSender<Event>);
+pub struct RunGuard {
+    tx: SyncSender<Event>,
+    running: Arc<AtomicBool>,
+}
 
 impl Drop for RunGuard {
     fn drop(&mut self) {
-        let _ = self.0.try_send(Event::RunIdle);
+        if self.tx.try_send(Event::RunIdle).is_err() {
+            self.running.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -130,11 +167,16 @@ struct Worker {
     factory: Factory,
     clock: Clock,
     reports: SyncSender<Report>,
+    running: Arc<AtomicBool>,
 }
 
 impl Worker {
     fn run(mut self, rx: Receiver<Event>) {
         loop {
+            if !self.running.load(Ordering::Acquire) {
+                self.report(Report::Stopped(Stop::Unavailable));
+                return;
+            }
             let now = (self.clock)();
             let wait = self
                 .warmer
@@ -144,6 +186,19 @@ impl Worker {
                 Ok(Event::Shutdown) | Err(RecvTimeoutError::Disconnected) => return,
                 Ok(event) => self.handle(event),
                 Err(RecvTimeoutError::Timeout) => {}
+            }
+            // Invalidation and RunIdle can already be queued behind Settled. Apply the
+            // whole pending batch before deciding to spend money on its prefix.
+            loop {
+                if !self.running.load(Ordering::Acquire) {
+                    self.report(Report::Stopped(Stop::Unavailable));
+                    return;
+                }
+                match rx.try_recv() {
+                    Ok(Event::Shutdown) | Err(TryRecvError::Disconnected) => return,
+                    Ok(event) => self.handle(event),
+                    Err(TryRecvError::Empty) => break,
+                }
             }
             self.tick();
         }
@@ -213,6 +268,9 @@ impl Worker {
     }
 
     fn fire(&mut self, chat: &Chat) {
+        if !self.running.load(Ordering::Acquire) {
+            return;
+        }
         let Some(model) = self.model.clone() else {
             return;
         };
@@ -225,6 +283,11 @@ impl Worker {
                     return;
                 }
             }
+        }
+        // Backend construction may block. A stop received during that work must still
+        // prevent the paid request; once replay starts it may finish within its timeout.
+        if !self.running.load(Ordering::Acquire) {
+            return;
         }
         let Some(replayer) = self.replayer.as_mut() else {
             return;
@@ -251,6 +314,12 @@ impl Worker {
     /// Best-effort: a full report queue drops the report rather than stalling the worker.
     fn report(&self, report: Report) {
         let _ = self.reports.try_send(report);
+    }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Release);
     }
 }
 

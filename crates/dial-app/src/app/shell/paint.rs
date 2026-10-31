@@ -157,6 +157,26 @@ fn side_rows(
     rows
 }
 
+/// Longest session title the terminal title carries, in cells.
+const TAB_SCOPE_WIDTH: usize = 40;
+
+/// The terminal title: the state circle (when there is one), `dial · <project>`, then the
+/// session's scope clipped to [`TAB_SCOPE_WIDTH`] so a tab strip stays readable.
+pub(super) fn tab_title(base: &str, scope: &str, marker: &str) -> String {
+    let mut title = String::new();
+    if !marker.is_empty() {
+        title.push_str(marker);
+        title.push(' ');
+    }
+    title.push_str(base);
+    let scope = crate::ui::text::clip(scope, TAB_SCOPE_WIDTH);
+    if !scope.is_empty() {
+        title.push_str(" · ");
+        title.push_str(&scope);
+    }
+    title
+}
+
 impl Shell {
     // ----- painting -------------------------------------------------------------------------
 
@@ -166,6 +186,11 @@ impl Shell {
         if self.home.is_some() && self.home_mark.is_none() {
             self.home_mark = Some(self.transcript.block_count());
         }
+    }
+
+    /// Names the tab after the session's scope (see [`tab_title`]); an empty title clears it.
+    pub(super) fn set_scope(&mut self, session_title: &str) {
+        self.tab_scope = crate::ui::text::one_line(session_title.trim());
     }
 
     pub(in crate::app) fn paint(&mut self, panel: Option<Rows>) -> Result<()> {
@@ -220,6 +245,7 @@ impl Shell {
             ui,
             tools_expanded,
             title,
+            tab_scope,
             todo,
             home,
             ..
@@ -338,10 +364,15 @@ impl Shell {
         let above = live.len() as u16;
         live.extend(bottom);
         let signals = terminal_signals(ui, status, self.term_activity, self.awaiting_user);
+        let marker = signals
+            .as_ref()
+            .filter(|_| !theme.ascii())
+            .map_or("", |signals| signals.activity.marker());
+        let tab = tab_title(title, tab_scope, marker);
         term.paint(&Viewport {
             rows: &live,
             cursor: cursor.map(|(row, col)| (above + row, col)),
-            title: Some(title.as_str()),
+            title: Some(tab.as_str()),
             signals: signals.as_ref(),
         })
     }

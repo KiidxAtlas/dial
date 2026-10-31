@@ -214,7 +214,6 @@ fn iterm2_gets_every_integration_and_progress_only_from_3_6() {
             hyperlinks: true,
             line_fragments: true,
             cwd: true,
-            tab_color: true,
             attention: true,
             user_vars: true,
             progress: true,
@@ -228,7 +227,7 @@ fn iterm2_gets_every_integration_and_progress_only_from_3_6() {
         ]),
         TerminalId::Iterm2,
     );
-    assert!(!old.progress && old.tab_color);
+    assert!(!old.progress && old.attention);
     let unknown = detect_integration(&env(&[("TERM_PROGRAM", "iTerm.app")]), TerminalId::Iterm2);
     assert!(!unknown.progress);
 }
@@ -245,7 +244,7 @@ fn inside_tmux_iterm2_reports_its_version_through_lc_terminal() {
         ]),
         TerminalId::Iterm2,
     );
-    assert!(caps.tmux && caps.progress && caps.tab_color && caps.cwd);
+    assert!(caps.tmux && caps.progress && caps.attention && caps.cwd);
     assert!(!caps.hyperlinks);
     assert_eq!(
         caps.wrap("\x1b]9;4;0\x07"),
@@ -263,7 +262,7 @@ fn other_terminals_get_only_what_they_implement() {
         TerminalId::Ghostty,
     );
     assert!(
-        ghostty.progress && ghostty.hyperlinks && !ghostty.tab_color && !ghostty.line_fragments
+        ghostty.progress && ghostty.hyperlinks && !ghostty.attention && !ghostty.line_fragments
     );
     let wezterm = detect_integration(&env(&[]), TerminalId::WezTerm);
     assert!(wezterm.user_vars && !wezterm.attention && !wezterm.progress);

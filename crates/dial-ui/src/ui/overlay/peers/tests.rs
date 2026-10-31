@@ -163,6 +163,51 @@ fn keys_close_refresh_clear_and_carry_the_selection() {
 }
 
 #[test]
+fn board_follows_sessions_while_open_and_keeps_the_selection() {
+    let rig = Rig::new();
+    let mut overlay = PeersOverlay::new(PeersView {
+        peers: Vec::new(),
+        ..board()
+    });
+    let opened = overlay.refreshed;
+    assert!(!overlay.refresh_due(opened));
+    let later = opened + REFRESH_EVERY;
+    assert!(overlay.refresh_due(later));
+
+    overlay.update(Some(board()), later);
+    assert!(!overlay.refresh_due(later));
+    assert!(shown(&mut overlay, &rig, 90, 24).contains("update the client"));
+
+    overlay.handle(&key(KeyCode::Down), &rig.keys);
+    let mut reordered = board();
+    reordered.peers.reverse();
+    overlay.update(Some(reordered), later);
+    assert_eq!(overlay.selected(), Some(PEER_B));
+
+    // An unavailable registry keeps the last board and still waits before the next try.
+    let next = later + REFRESH_EVERY;
+    overlay.update(None, next);
+    assert_eq!(overlay.selected(), Some(PEER_B));
+    assert!(!overlay.refresh_due(next));
+
+    // A peer that ended leaves a valid selection behind.
+    let mut ended = board();
+    ended.peers.truncate(1);
+    overlay.update(Some(ended), next);
+    assert_eq!(overlay.selected(), Some(PEER_A));
+}
+
+#[test]
+fn board_holds_still_while_a_message_is_typed() {
+    let rig = Rig::new();
+    let mut overlay = PeersOverlay::new(board());
+    overlay.handle(&key(KeyCode::Enter), &rig.keys);
+    assert!(!overlay.refresh_due(overlay.refreshed + REFRESH_EVERY));
+    overlay.handle(&key(KeyCode::Esc), &rig.keys);
+    assert!(overlay.refresh_due(overlay.refreshed + REFRESH_EVERY));
+}
+
+#[test]
 fn compose_sends_to_the_selected_peer_and_esc_only_cancels_it() {
     let rig = Rig::new();
     let mut overlay = PeersOverlay::new(board());

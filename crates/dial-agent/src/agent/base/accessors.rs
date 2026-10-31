@@ -30,6 +30,7 @@ impl<'a> Agent<'a> {
             anyhow::bail!(message);
         }
         self.auth_config = session_auth_config(self.config, backend, &mut self.session)?;
+        self.cache_warm = None;
         self.role_backends.clear();
         self.subagent_backend = None;
         Ok(())
@@ -208,6 +209,7 @@ impl<'a> Agent<'a> {
         // The loaded-window cap was probed for the outgoing session's model.
         self.context_cap = None;
         self.route.reset();
+        self.cache_warm = None;
         self.context_meter = crate::agent::window::context_meter::ContextMeter::default();
         self.reported_messages = 0;
         if let Err(error) = self.restore_control()
@@ -482,7 +484,7 @@ impl<'a> Agent<'a> {
                     return None;
                 }
                 let name = call["function"]["name"].as_str()?;
-                if !matches!(name, "read" | "write" | "edit") {
+                if !matches!(name, "read" | "write" | "edit" | "find") {
                     return None;
                 }
                 let arguments = match &call["function"]["arguments"] {
@@ -691,6 +693,7 @@ impl<'a> Agent<'a> {
         let auth = session_auth_config(effective, &backend, &mut self.session)?;
         self.backend = Some(backend);
         self.auth_config = auth;
+        self.cache_warm = None;
         self.model_override = config;
         self.context_cap = None;
         self.route.reset();

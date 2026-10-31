@@ -444,3 +444,58 @@ fn fake_server_receives_the_run_request_and_streams_the_reply() {
             .is_some()
     );
 }
+
+/// Appends and heartbeats in one exchange share the uplink agent, so a keep-alive server sees
+/// them on a single connection instead of one connection per append.
+#[test]
+fn uplink_appends_reuse_one_connection() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let mut connections = 0;
+        let mut requests = 0;
+        listener.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while requests < 3 && std::time::Instant::now() < deadline {
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(_) => {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            connections += 1;
+            while requests < 3 {
+                let (path, _) = read_request(&mut stream);
+                assert!(path.ends_with("BidiAppend"), "{path}");
+                requests += 1;
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .unwrap();
+            }
+        }
+        (connections, requests)
+    });
+    let url = format!("http://{addr}{BIDI_APPEND_PATH}");
+    let interrupt = Arc::new(AtomicBool::new(false));
+    let ctx = UplinkCtx {
+        agent: crate::llm::agent_for(
+            &url,
+            APPEND_BASE_TIMEOUT_SECS,
+            Some(Arc::clone(&interrupt)),
+            None,
+        ),
+        url,
+        token: "test-token".into(),
+        headers: Vec::new(),
+        request_id: "request-1".into(),
+        interrupt,
+        stop: Arc::new(AtomicBool::new(false)),
+        failure: Arc::new(Mutex::new(None)),
+    };
+    for seqno in 0..3 {
+        append(&ctx, seqno, &heartbeat_message()).unwrap();
+    }
+    assert_eq!(server.join().unwrap(), (1, 3));
+}

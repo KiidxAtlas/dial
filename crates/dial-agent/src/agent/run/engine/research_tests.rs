@@ -161,3 +161,102 @@ fn parent_research_synthesis_resumes_read_only_work_and_ordinary_completion() {
     );
     assert_eq!(server.requests().len(), 27);
 }
+
+#[test]
+fn accepted_checkpoint_follow_through_is_cleared_by_new_steering() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(dir.path()).unwrap();
+    let mut engine = Engine::default();
+    for index in 0..24 {
+        observation(&mut engine, &workspace, index);
+    }
+    let reply = crate::llm::Reply { text: json!({"finding":"Steering probe finding","evidence":["observation-23"],"next_action":"Report the probe"}).to_string(), finish_reason:"stop".into(), ..Default::default() };
+    assert!(matches!(engine.synthesize(&reply), Synthesis::Accepted));
+    assert!(
+        engine.research_prompt().is_some(),
+        "accepted checkpoint keeps follow-through guidance"
+    );
+    engine.transition(RecoveryTransition::Steering);
+    assert!(engine.research_prompt().is_none());
+}
+
+#[test]
+fn accepted_checkpoint_is_control_state_not_streamed_or_replayed_as_answer() {
+    use crate::agent::*;
+    #[derive(Default)]
+    struct StreamSpy {
+        streamed: String,
+    }
+    impl Ui for StreamSpy {
+        fn text_delta(&mut self, text: &str) {
+            self.streamed.push_str(text);
+        }
+    }
+    let finding = json!({"finding":"Source files carry distinct evidence","evidence":["observation-23"],"next_action":"Report the source evidence and its verification limits"}).to_string();
+    let answer = "The 24 source files contain distinct numbered evidence. Runtime behavior was not exercised.";
+    let mut scripts: Vec<_> = (0..24)
+        .map(|index| {
+            response(
+                "",
+                Some((index, "read", json!({"path":format!("source-{index}.txt")}))),
+            )
+        })
+        .collect();
+    scripts.push(response(&finding, None));
+    scripts.push(response(answer, None));
+    scripts.insert(1, crate::llm::fake::json(200, &json!({"total_slots":1})));
+    let server = llm::fake::serve(scripts);
+    crate::agent::run::tool_exposure::default_offer_tests::with_agent(
+        "[compaction]\nenabled=false",
+        |agent| {
+            for index in 0..24 {
+                std::fs::write(
+                    agent.workspace.root().join(format!("source-{index}.txt")),
+                    format!("source evidence {index}\n"),
+                )
+                .unwrap();
+            }
+            agent.backend = Some(Backend::new(
+                ProviderKind::Endpoint {
+                    base_url: format!("{}/v1", server.url),
+                    model: "test".into(),
+                    api_key: None,
+                },
+                Default::default(),
+                5,
+            ));
+            let mut ui = StreamSpy::default();
+            let report = agent
+                .turn("Investigate the source files and report findings", &mut ui)
+                .unwrap();
+            assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+            assert_eq!(report.text, answer);
+            assert!(
+                ui.streamed.contains(answer),
+                "final answer not streamed: {}",
+                ui.streamed
+            );
+            assert!(
+                !ui.streamed.contains("Source files carry"),
+                "checkpoint streamed: {}",
+                ui.streamed
+            );
+            assert!(
+                !ui.streamed.contains("\"finding\""),
+                "checkpoint JSON streamed: {}",
+                ui.streamed
+            );
+            for message in agent.session.messages() {
+                let content = message["content"].as_str().unwrap_or_default();
+                assert!(
+                    !content.contains("Source files carry"),
+                    "checkpoint replayed as {}",
+                    message["role"]
+                );
+            }
+            let checkpoint = &agent.session.control_state()["research_checkpoint"];
+            assert_eq!(checkpoint["response"], json!(finding));
+            assert_eq!(checkpoint["verified"], json!(false));
+        },
+    );
+}

@@ -667,6 +667,42 @@ fn lean_local_routes_relevant_mcp_with_a_small_bounded_offer() {
         );
     });
 }
+
+#[test]
+fn lean_research_protects_the_web_pair_from_incidental_mcp_matches() {
+    with_agent("[assistance]\nlean_local=true", |agent| {
+        register(agent, "web_search", "Search the public web for sources");
+        register(agent, "web_fetch", "Fetch a web page by URL");
+        register(agent, "mcp__nuxt__list-blog-posts", "nuxt: List blog posts");
+        register(
+            agent,
+            "mcp__nuxt__list-deploy-providers",
+            "nuxt: List deployment providers",
+        );
+        for query in [
+            "web search research fetch",
+            "web search",
+            "Search the web for Gemma 4 E4B versus Qwen 3.5 9B",
+            "list web search results for Gemma 4 E4B",
+        ] {
+            agent.begin_tool_routing(query);
+            assert!(selected(agent, "web_search"), "{query}");
+            assert!(selected(agent, "web_fetch"), "{query}");
+            assert!(
+                !agent
+                    .tool_routing
+                    .selected
+                    .iter()
+                    .any(|name| name.starts_with("mcp__nuxt__")),
+                "{query}: {:?}",
+                agent.tool_routing.selected
+            );
+            let offer = agent.offered();
+            assert!(offer.iter().any(|name| name == "web_search"), "{query}");
+            assert!(offer.iter().any(|name| name == "web_fetch"), "{query}");
+        }
+    });
+}
 #[test]
 fn restrictions_and_schema_budgets_are_enforced_before_selection() {
     {

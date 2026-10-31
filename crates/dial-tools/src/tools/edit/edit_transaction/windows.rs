@@ -301,7 +301,14 @@ pub(crate) fn read(ws: &Workspace, path: &Path) -> Result<Option<Original>, Stri
     if !parent.exists() {
         return Ok(None);
     }
-    Directory::open(ws, path, false, None)?.read(&name(path)?)
+    let original = Directory::open(ws, path, false, None)?.read(&name(path)?)?;
+    match (original, super::read_bridge(ws, path)) {
+        (Some(mut original), Some(client)) => {
+            original.text = client.read_text(path)?;
+            Ok(Some(original))
+        }
+        (original, _) => Ok(original),
+    }
 }
 impl Change {
     pub fn load(ws: &Workspace, path: PathBuf, after: Option<String>) -> Result<Self, String> {
@@ -407,6 +414,10 @@ pub(crate) fn commit(ws: &Workspace, changes: &[Change]) -> Result<Vec<String>, 
         } else {
             ws.observe_delete(&change.path)?;
         }
+    }
+    // Plain text in a workspace root goes to the editor client: no local stage or rename.
+    if let Some(done) = super::client_commit(ws, changes) {
+        return done;
     }
     let mut parents = ParentCleanup::default();
     let mut staged = Vec::with_capacity(changes.len());

@@ -10,7 +10,7 @@
 
 mod commands;
 
-use crate::agent::Ui;
+use crate::agent::{TurnOutcome, TurnReport, Ui};
 use crate::app::bridge::Bridge;
 use crate::app::core::App;
 use crate::app::display::short;
@@ -19,8 +19,9 @@ use crate::app::overlay::auth::AuthJob;
 use crate::app::overlay::{Which, start_streaming_job};
 use crate::app::selection::{reasoning_changes, reasoning_profile, thinking_label};
 use crate::app::shell::{PAINT_EVERY, Shell};
+use crate::cli::print_output;
 use crate::config::paths::Layout;
-use crate::config::types::Config;
+use crate::config::types::{Approval, Config};
 use crate::learn::auto;
 use crate::repl::{OutputFormat, PrintExit, PrintUi};
 use crate::storage::session::{Session, SessionMeta};
@@ -74,6 +75,12 @@ pub struct Options {
     pub stdin_image: Option<Vec<u8>>,
     /// `--plan`, `--prewalk`, and the other mode flags; `drive` applies the startup arm to the first agent.
     pub mode_flags: crate::cli::mode_flags::ModeFlags,
+    /// `--output-schema`: the parsed schema the final print answer must satisfy (already checked).
+    pub output_schema: Option<serde_json::Value>,
+    /// `-o/--output-last-message`: file that receives the final answer; untouched when there is none.
+    pub output_last_message: Option<std::path::PathBuf>,
+    /// `dial review`: the frozen target and guidance to review read-only, instead of a prompt turn.
+    pub review: Option<crate::cli::review::Run>,
 }
 
 /// Run the inline interface, or answer a single piped message.
@@ -142,9 +149,14 @@ pub fn run_print(
     allowed: Vec<String>,
 ) -> Result<i32> {
     let started = Instant::now();
-    let config = print_config(config);
+    let mut config = print_config(config);
+    if options.review.is_some() {
+        // `dial review` never edits: the approval policy is read-only for the whole run.
+        config.approval = Approval::Readonly;
+    }
     let mut ui = PrintUi::new(format, allowed);
     ui.set_print_thoughts(options.print_thoughts);
+    ui.set_structured_mode(options.output_schema.is_some());
     config.require_model()?;
     // Connect MCP servers while the session, backend and agent are set up; the registry adopts
     // the result instead of waiting for each server on the first request.
@@ -204,7 +216,17 @@ pub fn run_print(
     }
     ui.check_output()?;
     let completed_before = agent.metrics().turns_completed;
-    let result = if image_count == 0 {
+    let result = if let Some(review) = &options.review {
+        agent
+            .review_target(&review.target, &review.guidance, &mut ui)
+            .map(|text| TurnReport {
+                text,
+                outcome: TurnOutcome::Completed,
+                steps: 0,
+                interrupted: false,
+                trajectory: None,
+            })
+    } else if image_count == 0 {
         agent.turn(options.prompt.trim(), &mut ui)
     } else {
         match print_attachments::prepare_turn(
@@ -223,11 +245,38 @@ pub fn run_print(
             Err(error) => Err(error),
         }
     };
-    let completed = agent.metrics().turns_completed > completed_before;
+    let result = match (result, options.output_schema.as_ref()) {
+        (Ok(report), Some(schema)) => {
+            let retries = app.config.task.max_schema_retries;
+            match print_output::enforce(report, schema, retries, |message| {
+                agent.turn(message, &mut ui)
+            }) {
+                Ok(print_output::Checked::Valid(report, value)) => {
+                    ui.set_structured(value);
+                    Ok(report)
+                }
+                Ok(print_output::Checked::Rejected(report, why)) => {
+                    eprintln!("error: the final answer does not match --output-schema: {why}");
+                    Ok(report)
+                }
+                // A failed correction turn still reaches `ui.finish`, so the result event is emitted.
+                Err(error) => Err(error),
+            }
+        }
+        (result, _) => result,
+    };
+    if let (Ok(report), Some(path)) = (&result, &options.output_last_message) {
+        print_output::write_last_message(path, &report.text)?;
+    }
+    let completed = if options.review.is_some() {
+        result.is_ok()
+    } else {
+        agent.metrics().turns_completed > completed_before
+    };
     ui.set_completed(completed);
     // A one-shot run has no idle loop: give the selected memory one bounded pass to retain this
     // turn before exit. Success prints nothing.
-    if completed && result.is_ok() {
+    if completed && result.is_ok() && options.review.is_none() {
         agent.finish_memory_before_exit(&mut ui, PRINT_MEMORY_BUDGET);
     }
     agent.end_local_session();

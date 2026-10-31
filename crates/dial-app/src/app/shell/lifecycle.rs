@@ -118,6 +118,7 @@ impl Shell {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default()
             ),
+            tab_scope: String::new(),
             term_activity: Default::default(),
             awaiting_user: false,
             accept_all_turn_drafts: false,
@@ -130,6 +131,7 @@ impl Shell {
             deferred_approval_cycle: false,
             held: Default::default(),
             live_tasks: None,
+            peer_sender: None,
             workers: Default::default(),
             recent_worker: None,
             background_control: None,
@@ -345,6 +347,7 @@ impl Shell {
     /// Home screen and, for a resumed session, its earlier conversation.
     pub(in crate::app) fn begin(&mut self, app: &App, session: &Session, resumed: bool) {
         self.session_id = session.id().to_owned();
+        self.set_scope(&session.title());
         if self.ui.welcome {
             let (sessions, recent): (Vec<String>, Vec<(String, String)>) =
                 Session::list_newest(&app.layout, 24)

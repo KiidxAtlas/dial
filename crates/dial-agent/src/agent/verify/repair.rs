@@ -12,7 +12,14 @@ pub(in crate::agent) struct Pending {
 }
 
 impl Pending {
-    pub(in crate::agent) fn new(mut context: Vec<Value>) -> Self {
+    /// Keep the failed request as `form` sent it, so a recovery example trains on the context the
+    /// model actually saw. Dispatch already applied this projection successfully; if it somehow
+    /// fails here, the conversation's own layout is kept.
+    pub(in crate::agent) fn new(context: Vec<Value>, form: llm::messages::WireForm) -> Self {
+        let mut context = match form.apply(&context) {
+            Ok(std::borrow::Cow::Owned(sent)) => sent,
+            _ => context,
+        };
         for message in &mut context {
             llm::messages::canonicalize(message);
         }

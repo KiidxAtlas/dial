@@ -53,6 +53,10 @@ pub(in crate::agent) struct Escalation {
     pub(in crate::agent) stage: u8,
     reached: u8,
     strikes: u32,
+    /// Whether the latest observed edit or write failed; this is not a per-file resolution check.
+    last_edit_failed: bool,
+    /// Bound how long intervening successful rounds can retain an edit-failure streak.
+    recovery_rounds: u8,
     seeded: bool,
 }
 
@@ -105,6 +109,14 @@ impl LocalRoute {
         )
     }
 
+    /// The server reports that the model has no native tool support (llama.cpp: the chat template
+    /// cannot render tools; Ollama and LM Studio: no `tools`/`tool_use` capability), so tool calls
+    /// ride a generic prompt format and fail more often. Only a reported absence counts; a server
+    /// that reports nothing, including an older build, is not a lack.
+    fn lacks_native_tools(&self) -> bool {
+        self.base_url.is_some() && self.facts().native_tools == Some(false)
+    }
+
     fn facts(&self) -> ServerFacts {
         local_server::facts(
             &self.provider,
@@ -140,13 +152,18 @@ pub(in crate::agent) struct LocalSession {
     /// The next request retries a repetition loop with penalties; the last one did.
     penalty_next: bool,
     penalty_sent: bool,
+    /// Replies this session whose tool calls Dial read out of text (the server did not parse them).
+    text_calls: u32,
     /// One-time notices already shown this session.
     shown: BTreeSet<&'static str>,
     /// Whether the main model was loaded when this session first asked (`None`: unknown).
     loaded_at_start: Option<bool>,
-    /// Whether this model's saved reliability record passed the two-call batch fixture, read once
-    /// per session so the one-call decision (and the prompt that states it) cannot change mid-session.
-    batch_record_passed: std::cell::OnceCell<bool>,
+    /// The saved record read at this turn's start (`None`: no valid record). The prompt's one-call
+    /// rule, the offered contract and the escalation seed all read this one value, so they cannot
+    /// disagree.
+    turn_record: Option<serde_json::Value>,
+    /// Set when `refresh_turn_record` has read this turn's record and `begin_turn` has not taken it.
+    refreshed: bool,
 }
 
 /// A worker's llama.cpp slot: the main session keeps `MAIN_SLOT`; with fewer than two slots there is
@@ -239,16 +256,52 @@ impl Agent<'_> {
         self.local_escalation.stage >= 1 && self.local_profile_active()
     }
 
-    /// One tool call per response: the small tier, unless this model's saved reliability record
-    /// (`dial reliability check`) passed the two-call batch fixture. Uses the reliability one-call
-    /// interface; `reliability.enabled = false` turns it off with the rest of that interface.
+    /// One tool call per response: the small tier, unless this turn's saved reliability record
+    /// (`dial reliability check`) passed the two-call batch fixture. Reads only the turn's record, so
+    /// the prompt, the offer and `begin_turn` agree; `reliability.enabled = false` turns it off with
+    /// the rest of that interface.
     pub(in crate::agent) fn local_one_call(&self) -> bool {
         self.local_tier() == Some(Tier::Small)
             && self.config.reliability.enabled
-            && !*self.local_session.batch_record_passed.get_or_init(|| {
-                crate::reliability::measured(self.config)
-                    .is_some_and(|record| record["batch_passed"] == true)
-            })
+            && !self
+                .local_session
+                .turn_record
+                .as_ref()
+                .is_some_and(crate::reliability::batch_permitted)
+    }
+
+    /// Reads the saved record for the turn that is starting. The turn start calls this before it
+    /// rebuilds the prompt, so the prompt and the contract come from one read.
+    pub(in crate::agent) fn refresh_turn_record(&mut self) {
+        // Calibration measures the base model. Apply the same exclusion before every consumer
+        // (prompt, escalation seed, contract and diagnostics), not only inside begin_turn.
+        self.local_session.turn_record = if self.hermetic
+            || self.version.adapter.is_some()
+            || self.config.steering.enabled
+            || crate::llm::steering::specification(self.config, &self.config.model)
+                .ok()
+                .flatten()
+                .is_some()
+        {
+            None
+        } else {
+            crate::reliability::measured(self.config)
+        };
+        self.local_session.refreshed = true;
+    }
+
+    /// The turn's record for `begin_turn`, which takes it: the next turn reads again.
+    pub(in crate::agent) fn take_turn_record(&mut self) -> Option<serde_json::Value> {
+        self.ensure_turn_record();
+        self.local_session.refreshed = false;
+        self.local_session.turn_record.clone()
+    }
+
+    /// Reads the record unless this turn already has one.
+    fn ensure_turn_record(&mut self) {
+        if !self.local_session.refreshed {
+            self.refresh_turn_record();
+        }
     }
 
     /// The edit grammar after the second escalation step, unless a pin decides it.
@@ -333,21 +386,42 @@ impl Agent<'_> {
     /// earlier turn. Only here do steps change the prompt, offer and grammar, so a turn never sees
     /// them change.
     pub(in crate::agent) fn seed_local_escalation(&mut self) {
-        if !std::mem::replace(&mut self.local_escalation.seeded, true)
-            && self.local_profile_active()
-        {
+        // An inactive profile neither seeds nor consumes the once-per-session seed.
+        if !self.local_profile_active() {
+            return;
+        }
+        if !std::mem::replace(&mut self.local_escalation.seeded, true) {
+            self.ensure_turn_record();
             self.local_session.recorded = local_evidence::read(&self.config.user_dir)
                 .ok()
                 .and_then(|mut records| records.remove(&self.local_model_key()))
                 .unwrap_or_default();
             if self.config.assistance.local.escalate_after > 0 {
+                // A model the server reports as lacking native tool support starts at the minimal tool
+                // set instead of waiting for failing rounds. This is derived from the server on every
+                // session and is not written to the model's evidence record.
+                let lacking =
+                    LocalRoute::of(self.config).is_some_and(|route| route.lacks_native_tools());
+                // A saved fixture case the model could not call starts the minimal step at any window,
+                // but only while reliability and its measured interfaces are on. Only the minimal step
+                // changes here; the edit grammar and every pin stay as they are.
+                let fixture_interfaces =
+                    self.config.reliability.enabled && self.config.reliability.measured_interfaces;
+                let failed_fixture = fixture_interfaces
+                    && self.config.local_main_model()
+                    && self
+                        .local_session
+                        .turn_record
+                        .as_ref()
+                        .is_some_and(crate::reliability::native_failure);
                 let state = &mut self.local_escalation;
                 state.reached = state
                     .reached
-                    .max(self.local_session.recorded.stage.min(MAX_STAGE));
+                    .max(self.local_session.recorded.stage.min(MAX_STAGE))
+                    .max(u8::from(lacking || failed_fixture));
             }
         }
-        if !self.local_profile_active() || self.config.assistance.local.escalate_after == 0 {
+        if self.config.assistance.local.escalate_after == 0 {
             return;
         }
         let state = &mut self.local_escalation;
@@ -357,12 +431,55 @@ impl Agent<'_> {
         }
     }
 
+    /// Replies that must be lifted from text before the server's tool-call parser is called into
+    /// question: one can be a model quirk, repeats are the server's configuration.
+    const TEXT_CALL_NOTICE_AFTER: u32 = 2;
+
+    /// What to change when the server returns tool calls as plain text, by server.
+    fn text_call_advice(server: Option<LocalServer>) -> &'static str {
+        match server {
+            Some(LocalServer::Vllm) => {
+                "start vLLM with --enable-auto-tool-choice and a --tool-call-parser that matches this model"
+            }
+            Some(LocalServer::Sglang) => {
+                "start SGLang with a --tool-call-parser that matches this model"
+            }
+            Some(LocalServer::LlamaCpp) => {
+                "start llama-server with --jinja and a chat template that supports tools"
+            }
+            Some(LocalServer::LmStudio) => "use a model that LM Studio lists with tool use",
+            Some(LocalServer::Ollama) => {
+                "use a model whose template supports tools (`ollama show` lists them under capabilities)"
+            }
+            _ => "enable the server's tool-call parser for this model",
+        }
+    }
+
+    /// Once per session, after repeated replies whose tool calls came back as text: Dial recovered
+    /// them, but a server-side parser is more reliable (arguments arrive validated, and nothing
+    /// depends on the text forms Dial recognises).
+    fn note_text_calls(&mut self, ui: &mut dyn Ui) {
+        if self.local_session.text_calls < Self::TEXT_CALL_NOTICE_AFTER
+            || !self.local_session.shown.insert("text-calls")
+        {
+            return;
+        }
+        let how = Self::text_call_advice(self.local_session.server);
+        ui.notice(&format!(
+            "The local server returned tool calls as plain text {} times; Dial recovered them, but \
+             calls are more reliable parsed by the server. To fix, {how}.",
+            self.local_session.text_calls
+        ));
+    }
+
     /// Counts one tool round. `failed` is a malformed tool call or a failed edit or write. After
-    /// `escalate_after` failing rounds in a row the session reaches one step stricter and remembers
-    /// it for this model; the step takes effect at the next turn (`seed_local_escalation`). Returns
-    /// whether a step was reached.
+    /// `escalate_after` failing rounds the session reaches one step stricter and remembers it for
+    /// this model; the step takes effect at the next turn. If the latest edit failed, one successful
+    /// intervening round preserves the streak; a second clears it. A later successful edit or write
+    /// also permits the next successful round to clear it. This is not per-file recovery tracking.
     pub(in crate::agent) fn observe_local_round(&mut self, failed: bool, ui: &mut dyn Ui) -> bool {
         if self.local_profile_active() {
+            self.note_text_calls(ui);
             self.local_session.pending.rounds.add(!failed);
             // Planning and recovery think; a step after a successful round is mechanical.
             self.local_session.think_next =
@@ -384,9 +501,16 @@ impl Agent<'_> {
         };
         let state = &mut self.local_escalation;
         if !failed {
-            state.strikes = 0;
+            if state.last_edit_failed && state.strikes > 0 && state.recovery_rounds == 0 {
+                state.recovery_rounds = 1;
+            } else {
+                state.strikes = 0;
+                state.recovery_rounds = 0;
+                state.last_edit_failed = false;
+            }
             return false;
         }
+        state.recovery_rounds = 0;
         state.strikes += 1;
         if state.strikes < after || !stricter {
             return false;
@@ -402,7 +526,7 @@ impl Agent<'_> {
         ui.event(&crate::agent::ui::ui_event::UiEvent::new(
             crate::agent::ui::ui_event::EventKind::Model,
             format!(
-                "Local model: {after} failing tool rounds in a row; from the next turn, {what}"
+                "Local model: {after} failing tool rounds without a sustained recovery; from the next turn, {what}"
             ),
         ));
         self.local_session.pending.stage = self.local_session.pending.stage.max(stage);
@@ -416,7 +540,11 @@ impl Agent<'_> {
 
     /// Counts one edit or write outcome under the edit grammar in effect.
     pub(in crate::agent) fn observe_local_edit(&mut self, ok: bool) {
-        if !self.local_profile_active() || !self.config.assistance.local.suggestions {
+        if !self.local_profile_active() {
+            return;
+        }
+        self.local_escalation.last_edit_failed = !ok;
+        if !self.config.assistance.local.suggestions {
             return;
         }
         let grammar = serde_json::to_value(self.edit_mode())
@@ -727,6 +855,10 @@ impl Agent<'_> {
                 }
             }
         }
+        if reply.text_calls_lifted {
+            evidence.text_calls += 1;
+            session.text_calls += 1;
+        }
         if let Some(rate) = reply.prefill_tokens_per_second {
             evidence.prefill_tps.add(rate);
             session.prefill.add(rate);
@@ -857,6 +989,9 @@ impl Agent<'_> {
             Some(LocalServer::Ollama) => {
                 "Dial asks Ollama for the configured window on every request; if it stays small, \
                  set OLLAMA_CONTEXT_LENGTH or check the model's memory fit"
+            }
+            Some(LocalServer::Vllm | LocalServer::Sglang) => {
+                "restart the server with a larger --max-model-len (vLLM) or --context-length (SGLang)"
             }
             _ => "raise the context length in the server's model settings",
         };

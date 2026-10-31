@@ -12,8 +12,9 @@ use crate::config::compaction::CompactionOptions;
 use crate::config::compaction::CompactionReason;
 use crate::config::compaction::CompactionStrategy;
 use crate::config::compaction::NativeCompactionCapability;
+use crate::config::snapcompact::ImageTokenization;
 use crate::llm::provider::NativeCompactionRequest;
-use crate::llm::wire::estimate;
+use crate::llm::wire::{WireParts, estimate, json_bytes, wire_parts};
 
 use crate::storage::transcript::{complete_boundary, is_history};
 mod summary;
@@ -162,10 +163,9 @@ fn cut_with_policy(
     policy: &CompactionConfig,
     identity: CompactionIdentity<'_>,
 ) -> Option<usize> {
-    let fallback = crate::config::snapcompact::ImageTokenization::PixelCeiling;
-    let billing = match_selector(&policy.snapcompact_models, identity).unwrap_or(&fallback);
+    let billing = billing_for(policy, identity);
     cut_with(messages, budget, |message| {
-        image_message_tokens(message, billing)
+        snapcompact_image_tokens(message, billing).unwrap_or_else(|| estimate(message))
     })
 }
 
@@ -277,55 +277,130 @@ pub fn request_tokens_with_policy(
     policy: &CompactionConfig,
     identity: CompactionIdentity<'_>,
 ) -> u64 {
-    let fallback = crate::config::snapcompact::ImageTokenization::PixelCeiling;
-    let billing = match_selector(&policy.snapcompact_models, identity).unwrap_or(&fallback);
+    let billing = billing_for(policy, identity);
     request
         .messages
         .iter()
-        .map(|m| image_message_tokens(m, billing))
+        .map(|message| {
+            snapcompact_image_tokens(message, billing).unwrap_or_else(|| estimate(message))
+        })
         .sum::<u64>()
-        .saturating_add(request.tools.iter().map(estimate).sum::<u64>())
+        .saturating_add(
+            request
+                .tools
+                .iter()
+                .map(|tool| wire_tokens(tool, wire_parts(tool)))
+                .sum::<u64>(),
+        )
 }
-fn image_message_tokens(
-    message: &Value,
-    billing: &crate::config::snapcompact::ImageTokenization,
-) -> u64 {
+
+/// Token estimate and reusable wire parts of one request, from one pass over its messages.
+/// `tokens` equals `request_tokens_with_policy` for the same request.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RequestAccounting {
+    pub tokens: u64,
+    /// Wire parts of each message, index-aligned with `request.messages`.
+    pub messages: Vec<WireParts>,
+    /// Serialized JSON bytes of each tool schema, index-aligned with `request.tools`.
+    pub tool_bytes: Vec<usize>,
+}
+
+pub fn request_accounting_with_policy(
+    request: &Chat,
+    policy: &CompactionConfig,
+    identity: CompactionIdentity<'_>,
+) -> RequestAccounting {
+    let billing = billing_for(policy, identity);
+    let mut out = RequestAccounting {
+        tokens: 0,
+        messages: Vec::with_capacity(request.messages.len()),
+        tool_bytes: Vec::with_capacity(request.tools.len()),
+    };
+    for message in &request.messages {
+        let (tokens, parts) = message_accounting(message, billing);
+        out.tokens = out.tokens.saturating_add(tokens);
+        out.messages.push(parts);
+    }
+    for tool in &request.tools {
+        out.tokens = out
+            .tokens
+            .saturating_add(wire_tokens(tool, wire_parts(tool)));
+        out.tool_bytes.push(json_bytes(tool));
+    }
+    out
+}
+
+impl RequestAccounting {
+    /// Accounts one message appended after measurement (for example pressure guidance) and returns
+    /// the updated token estimate. Only the appended message is traversed.
+    pub fn push_message(
+        &mut self,
+        message: &Value,
+        policy: &CompactionConfig,
+        identity: CompactionIdentity<'_>,
+    ) -> u64 {
+        let (tokens, parts) = message_accounting(message, billing_for(policy, identity));
+        self.tokens = self.tokens.saturating_add(tokens);
+        self.messages.push(parts);
+        self.tokens
+    }
+}
+
+static PIXEL_CEILING: ImageTokenization = ImageTokenization::PixelCeiling;
+
+fn billing_for<'a>(
+    policy: &'a CompactionConfig,
+    identity: CompactionIdentity<'_>,
+) -> &'a ImageTokenization {
+    match_selector(&policy.snapcompact_models, identity).unwrap_or(&PIXEL_CEILING)
+}
+
+/// Tokens and wire parts of one message; the snapcompact image policy overrides the wire tokens.
+fn message_accounting(message: &Value, billing: &ImageTokenization) -> (u64, WireParts) {
+    let parts = wire_parts(message);
+    let tokens =
+        snapcompact_image_tokens(message, billing).unwrap_or_else(|| wire_tokens(message, parts));
+    (tokens, parts)
+}
+
+/// Same rounding as `llm::wire::estimate`, computed from already-measured parts.
+fn wire_tokens(message: &Value, parts: WireParts) -> u64 {
+    (parts.total().div_ceil(4) as u64).max(
+        message["dial_compaction_output_tokens"]
+            .as_u64()
+            .unwrap_or(0),
+    )
+}
+
+/// Image-aware tokens of a snapcompact frame message, or `None` when the wire estimate applies.
+fn snapcompact_image_tokens(message: &Value, billing: &ImageTokenization) -> Option<u64> {
     use base64::Engine;
     if !message["dial_snapcompact"].is_object() {
-        return estimate(message);
+        return None;
     }
-    let Some(parts) = message["content"].as_array() else {
-        return estimate(message);
-    };
+    let parts = message["content"].as_array()?;
     let mut total = 64u64;
     for part in parts {
         if part["type"] != "image_url" {
             total = total.saturating_add(estimate(part));
             continue;
         }
-        let Some(encoded) = part["image_url"]["url"]
-            .as_str()
-            .and_then(|s| s.strip_prefix("data:image/png;base64,"))
-        else {
-            return estimate(message);
-        };
-        let Some(header) = encoded.get(..44) else {
-            return estimate(message);
-        };
-        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(header) else {
-            return estimate(message);
-        };
+        let encoded = part["image_url"]["url"]
+            .as_str()?
+            .strip_prefix("data:image/png;base64,")?;
+        let header = encoded.get(..44)?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(header)
+            .ok()?;
         if bytes.len() < 24 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" || &bytes[12..16] != b"IHDR" {
-            return estimate(message);
+            return None;
         }
         let width = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
         let height = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
-        let Ok(tokens) = billing.token_upper_bound(width, height) else {
-            return estimate(message);
-        };
+        let tokens = billing.token_upper_bound(width, height).ok()?;
         total = total.saturating_add(tokens).saturating_add(16);
     }
-    total
+    Some(total)
 }
 
 pub fn replacement_request(source: &Chat, history: &[Value]) -> Chat {

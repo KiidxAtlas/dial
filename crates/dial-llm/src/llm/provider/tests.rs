@@ -281,12 +281,32 @@ fn repair_retry_carries_json_schema_only_on_a_detected_llama_server() {
     assert_eq!(body["response_format"]["type"], "json_schema");
     assert!(body.get("tools").is_none());
 
-    let plain = fake::serve(vec![fake::json(404, &json!({})), ok("{}")]);
-    let mut remote = backend(endpoint(&format!("{}/v1", plain.url))).with_profile(repair);
+    // `/props` and `/v1/models` (vLLM/SGLang detection) both answer 404.
+    let plain = fake::serve(vec![
+        fake::json(404, &json!({})),
+        fake::json(404, &json!({})),
+        ok("{}"),
+    ]);
+    let mut remote = backend(endpoint(&format!("{}/v1", plain.url))).with_profile(repair.clone());
     remote.chat(None, &req, 5, None).unwrap();
-    let body = fake::body(&plain.requests()[1]);
+    let body = fake::body(&plain.requests()[2]);
     assert!(body.get("response_format").is_none(), "{body}");
     assert!(body.get("tools").is_some());
+
+    // A vLLM server (its model list names it) gets the same json_schema retry.
+    let vllm = fake::serve(vec![
+        fake::json(404, &json!({})),
+        fake::json(
+            200,
+            &json!({"data": [{"id": "gpt-x", "owned_by": "vllm", "max_model_len": 8192}]}),
+        ),
+        ok("{}"),
+    ]);
+    let mut remote = backend(endpoint(&format!("{}/v1", vllm.url))).with_profile(repair);
+    remote.chat(None, &req, 5, None).unwrap();
+    let body = fake::body(&vllm.requests()[2]);
+    assert_eq!(body["response_format"]["type"], "json_schema");
+    assert!(body.get("tools").is_none());
 }
 
 /// A first attempt on a detected llama-server sends `tools` with no `response_format`, `grammar`,
@@ -1486,6 +1506,66 @@ fn local_chat_projects_system_messages_without_rewriting_the_request() {
     assert_eq!(req.messages, original);
 }
 
+/// A loopback Chat Completions endpoint (LM Studio, llama-server) gets the same local projection
+/// as a managed local model: one merged initial system prefix, later instructions as users at
+/// their original boundary, tool history untouched, and the canonical request unmodified. Plain
+/// and streaming dispatch both go through the projection.
+#[test]
+fn local_endpoint_chat_projects_system_messages_on_plain_and_streaming_requests() {
+    let tool_call = json!({
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [{"id": "call_1", "type": "function",
+            "function": {"name": "read", "arguments": "{\"path\":\"a.rs\"}"}}]
+    });
+    let tool_result = json!({"role": "tool", "tool_call_id": "call_1", "content": "file body"});
+    let mut req = request();
+    req.messages = vec![
+        json!({"role":"system","content":"policy"}),
+        json!({"role":"developer","content":"workspace"}),
+        json!({"role":"user","content":"hello"}),
+        json!({"role":"system","content":"guidance","dial_transient":true}),
+        tool_call.clone(),
+        tool_result.clone(),
+        json!({"role":"system","content":"late note"}),
+    ];
+    let original = req.messages.clone();
+    let expected = json!([
+        {"role":"system","content":"policy\n\nworkspace"},
+        {"role":"user","content":"hello"},
+        {"role":"user","content":"guidance"},
+        tool_call,
+        tool_result,
+        {"role":"user","content":"late note"},
+    ]);
+    let ok_stream = format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        json!({"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]})
+    );
+    for streaming in [false, true] {
+        let script = if streaming {
+            Script::Sse(ok_stream.clone())
+        } else {
+            ok("ok")
+        };
+        let server = fake::serve(vec![script]);
+        let mut remote = backend(endpoint(&format!("{}/v1", server.url)));
+        let mut on_text = |_: &str| true;
+        let reply = remote
+            .chat(None, &req, 5, streaming.then_some(&mut on_text))
+            .unwrap();
+        assert_eq!(reply.text, "ok");
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1, "streaming={streaming}: one dispatch");
+        assert_eq!(
+            fake::body(&requests[0])["messages"],
+            expected,
+            "streaming={streaming}"
+        );
+        assert_eq!(req.messages, original, "streaming={streaming}");
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn a_rebuilt_backend_adopts_the_resident_server_without_reloading_the_model() {
@@ -1805,6 +1885,32 @@ fn costs_require_complete_usage_supported_prices_and_remote_provider() {
     );
 }
 
+/// A hangup before any response is a connection failure: with the production 300 s interval the
+/// first retry still follows after `CONNECTION_RETRY` on a fresh connection.
+#[test]
+fn a_connection_failure_gets_a_prompt_first_retry() {
+    let server = fake::serve(vec![Script::Hangup, ok("recovered")]);
+    let mut remote = backend(endpoint(&server.url));
+    remote.retry_backoff = Duration::from_secs(300);
+    let mut notices = Vec::new();
+    let started = Instant::now();
+    let reply = remote
+        .chat_with_control(
+            None,
+            &request(),
+            5,
+            None,
+            &mut |notice| notices.push(notice.to_owned()),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+    assert_eq!(reply.text, "recovered");
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(notices[0].contains("retrying in 2.0s"), "{notices:?}");
+    assert!(started.elapsed() < Duration::from_secs(60));
+    assert_eq!(server.requests().len(), 2);
+}
+
 #[test]
 fn bad_record_mac_alerts_retry_on_fresh_tls_connections_and_stop_at_the_bound() {
     use std::io::{Read, Write};
@@ -1959,8 +2065,9 @@ fn manual_retry_skips_five_minute_waits_without_leaking_into_other_attempts() {
         },
         ok("recovered"),
     ]);
-    // Exercise the production default, not the test helper's short backoff.
+    // Exercise the production interval; test builds default to a short one.
     let mut remote = Backend::new(endpoint(&server.url), PathBuf::new(), 5);
+    remote.retry_backoff = Duration::from_secs(300);
     let control = remote.retry_control();
     assert!(!control.request_now());
     let mut notices = Vec::new();

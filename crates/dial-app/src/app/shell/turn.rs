@@ -120,6 +120,8 @@ impl Shell {
         self.stop_speech();
         self.live_tasks = Some(agent.live_task_control());
         self.background_control = agent.background_control();
+        // Joins the project registry now, so even the first turn can send peer letters at once.
+        self.peer_sender = agent.peer_sender();
         let started = Instant::now();
         self.status.elapsed_secs = 0.0;
         if automatic {
@@ -190,6 +192,7 @@ impl Shell {
             (result, bridge.failed, bridge.shell.turn_output_tokens)
         };
         app.interrupt.store(false, Ordering::SeqCst);
+        self.peer_sender = None;
         self.side.end_turn();
         crate::collab::room::sync_host(agent.session());
         self.composer.set_busy(false);
@@ -236,8 +239,9 @@ impl Shell {
                 format!("Could not record turn outcome: {error:#}"),
             );
         }
-        let summary = agent.session().control_state()["turn_summary"].clone();
-        if let Some(report) = turn_report::render(&summary) {
+        let control = agent.session().control_state();
+        let latency = control["efficiency"]["inference_latency"].clone();
+        if let Some(report) = turn_report::render(&control["turn_summary"], &latency) {
             self.note("Turn report", report);
         }
         if let Some(notice) =
@@ -246,6 +250,8 @@ impl Shell {
             crate::ui::termcaps::notify(notice.kind, "Dial", notice.body, &self.session_id);
         }
         self.term_activity = crate::ui::term_state::Activity::after_turn(outcome);
+        // The first message names an untitled session, so the tab learns its scope here.
+        self.set_scope(&agent.session().title());
         self.transcript.finish_turn();
         if matches!(&result, Ok(report) if !report.interrupted) {
             self.auto_speak(app, agent);

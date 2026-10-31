@@ -306,6 +306,10 @@ pub struct Registry {
     origins: BTreeMap<String, crate::tools::surface::catalog::Origin>,
     /// MCP tools mirrored from the connected servers; [`Registry::sync_mcp`] applies their changes.
     mcp: super::mcp::Live,
+    /// Configured servers still connecting at startup; [`Registry::adopt_mcp`] mounts them.
+    pending_mcp: Option<Arc<super::mcp::Connecting>>,
+    /// Set when servers were adopted, so the next [`Registry::sync_mcp`] reports a change.
+    mcp_adopted: bool,
 }
 
 impl Registry {
@@ -402,13 +406,16 @@ impl Registry {
             mcp_instructions: self.mcp_instructions.clone(),
             origins: self.origins.clone(),
             mcp: self.mcp.clone(),
+            pending_mcp: self.pending_mcp.clone(),
+            mcp_adopted: self.mcp_adopted,
         }
     }
 
     /// Every tool dial ships, configured from `config`. `native` carries the tool groups owned by
     /// layers above `tools` (computer use); they register with the built-in groups, before MCP
-    /// servers. MCP servers connect here (concurrently, with a startup budget); a server that
-    /// fails only adds a notice.
+    /// servers. MCP servers connect concurrently with a startup budget; a server that fails only
+    /// adds a notice. Servers a startup prefetch is still connecting are not waited for here: see
+    /// [`Registry::adopt_mcp`].
     pub fn standard(config: &Config, native: Vec<Arc<dyn Tool>>) -> Self {
         let mut registry = Self::new();
         let groups = [
@@ -485,13 +492,51 @@ impl Registry {
             }
             Err(_) => {}
         }
-        let mut mcp = super::mcp::load(config);
-        registry.register_native(mcp.inventory_tool(config));
-        registry.mcp = std::mem::take(&mut mcp.live);
-        registry.sync_mcp();
-        registry.notices = registry.notices.into_iter().chain(mcp.notices).collect();
-        registry.mcp_instructions = mcp.instructions;
+        registry.attach_mcp(config, super::mcp::start(config));
         registry
+    }
+
+    /// Mounts the configured servers as startup finds them: connected ones now, a pass still
+    /// connecting later through [`Registry::adopt_mcp`].
+    pub(crate) fn attach_mcp(&mut self, config: &Config, startup: super::mcp::Startup) {
+        match startup {
+            super::mcp::Startup::Ready(loaded) => self.mount_mcp(config, loaded),
+            super::mcp::Startup::Connecting(connecting) => {
+                self.register_native(connecting.inventory_tool());
+                self.pending_mcp = Some(connecting);
+            }
+        }
+    }
+
+    fn mount_mcp(&mut self, config: &Config, mut loaded: super::mcp::McpLoad) {
+        self.register_native(loaded.inventory_tool(config));
+        self.mcp = std::mem::take(&mut loaded.live);
+        self.sync_mcp();
+        self.notices.extend(loaded.notices);
+        self.mcp_instructions = loaded.instructions;
+    }
+
+    /// Names of the enabled MCP servers still connecting, so the prompt can say they are coming.
+    pub fn mcp_connecting(&self) -> Option<Vec<String>> {
+        self.pending_mcp.as_ref().map(|pending| pending.servers())
+    }
+
+    /// Mounts servers that were still connecting at startup once they finished, or waiting for
+    /// their startup budget when `wait` is set (a capability that needs them was requested).
+    /// Returns whether servers were adopted; the next [`Registry::sync_mcp`] then reports a change
+    /// so the offered schemas and system prompt are rebuilt.
+    pub fn adopt_mcp(&mut self, wait: bool) -> bool {
+        let Some(pending) = self
+            .pending_mcp
+            .take_if(|pending| wait || pending.is_finished())
+        else {
+            return false;
+        };
+        let loaded = pending.wait().clone();
+        let config = pending.config().clone();
+        self.mount_mcp(&config, loaded);
+        self.mcp_adopted = true;
+        true
     }
 
     /// Startup diagnostics (for example an MCP server that failed to connect). Returned once, then cleared.
@@ -621,7 +666,7 @@ impl Registry {
                 .insert(name.clone(), crate::tools::surface::catalog::Origin::Mcp);
             self.tools.insert(name, tool);
         }
-        changed
+        std::mem::take(&mut self.mcp_adopted) || changed
     }
 
     /// Whether `name` was an MCP tool its server withdrew and has not returned.

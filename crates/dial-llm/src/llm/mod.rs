@@ -68,6 +68,7 @@ pub mod steering;
 mod stream;
 pub mod template_options;
 mod text_tool_calls;
+pub use text_tool_calls::mentions_call_markup;
 pub mod thinking_loop;
 pub mod tool_repair;
 mod transports;
@@ -76,6 +77,7 @@ pub mod usage_report;
 mod vertex;
 mod vertex_adc;
 pub mod wire;
+mod ws_proxy;
 pub(crate) use cancel::Patience;
 #[cfg(any(test, feature = "test-support"))]
 pub mod fake;
@@ -299,6 +301,11 @@ pub struct Reply {
     pub decode_tokens_per_second: Option<f64>,
     /// Seconds the server spent loading the model for this request, when reported (Ollama).
     pub load_secs: Option<f64>,
+    /// The tool calls were read out of the reply's text or reasoning by Dial instead of arriving
+    /// structured: the server's own tool-call parser did not handle this model's format.
+    pub text_calls_lifted: bool,
+    /// The message layout dispatch actually sent for this reply's request.
+    pub wire_form: messages::WireForm,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -400,12 +407,6 @@ pub enum StreamEvent {
     },
 }
 
-/// Agent for loopback calls: no proxy from the environment, no redirects, and
-/// HTTP error statuses are returned as responses so bodies can be inspected.
-pub(crate) fn agent(timeout_secs: u64) -> ureq::Agent {
-    agent_with(timeout_secs, false, None, None)
-}
-
 /// Ceiling on one streamed reply. Not a policy: silence is bounded by [`Patience`]; this only keeps a stream
 /// that never ends from running forever.
 const STREAM_CEILING: Duration = Duration::from_secs(6 * 3600);
@@ -467,7 +468,8 @@ pub fn cancellable_agent_with_resolver(
 }
 
 /// Hosts that are reachable only locally: loopback, RFC 1918 / link-local /
-/// unique-local addresses, `localhost` and mDNS `.local` names.
+/// unique-local addresses, `localhost`, mDNS `.local` names and Docker's
+/// `*.docker.internal` names (`host.docker.internal`, `model-runner.docker.internal`).
 pub(crate) fn is_local_host(host: &str) -> bool {
     let host = host
         .trim_start_matches('[')
@@ -483,7 +485,10 @@ pub(crate) fn is_local_host(host: &str) -> bool {
             }
         };
     }
-    host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local")
+    host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host.ends_with(".docker.internal")
 }
 
 pub(crate) fn host_of(url: &str) -> Option<String> {
@@ -668,7 +673,7 @@ fn chat_at_controlled(
         return Err(Interrupted.into());
     }
     if !req.tools.is_empty() {
-        text_tool_calls::apply(&mut reply);
+        lift_text_calls(&mut reply, url, &req.tools);
     }
     Ok(reply)
 }
@@ -822,9 +827,30 @@ fn chat_stream_at_controlled(
         return Err(Interrupted.into());
     }
     if !req.tools.is_empty() {
-        text_tool_calls::apply(&mut reply);
+        lift_text_calls(&mut reply, url, &req.tools);
     }
     Ok(reply)
+}
+
+/// Lifts tool calls the server returned as text. On loopback/private endpoints only, a call that
+/// ends the reasoning of a reply with no answer text is lifted too, and so is a reply that is
+/// nothing but pythonic calls to an offered tool.
+fn lift_text_calls(reply: &mut Reply, url: &str, tools: &[Value]) {
+    let structured = !reply.tool_calls.is_empty();
+    lift_calls(reply, url, tools);
+    reply.text_calls_lifted = !structured && !reply.tool_calls.is_empty();
+}
+
+fn lift_calls(reply: &mut Reply, url: &str, tools: &[Value]) {
+    text_tool_calls::apply(reply);
+    if host_of(url).is_some_and(|host| is_local_host(&host)) {
+        let offered: Vec<String> = tools
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_owned))
+            .collect();
+        text_tool_calls::apply_pythonic(reply, &offered);
+        text_tool_calls::apply_from_reasoning(reply);
+    }
 }
 
 fn apply_local_reasoning(
@@ -910,10 +936,43 @@ pub(super) fn send_prepared_with_headers(
     interrupt: Option<Arc<AtomicBool>>,
     headers: &[(&str, &str)],
 ) -> Result<ureq::http::Response<ureq::Body>> {
-    let mut request = post_with_headers(url, auth, timeout_secs, patience, interrupt, headers)?;
-    if !headers
-        .iter()
-        .any(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+    let streaming = patience.is_some();
+    let agent = agent_for(url, timeout_secs, interrupt, patience);
+    send_prepared_request(
+        post_on(&agent, url, auth, streaming, headers)?,
+        url,
+        auth,
+        body,
+    )
+}
+
+/// A non-streaming [`send_prepared_with_headers`] on a caller-owned agent from [`agent_for`]
+/// with a per-request whole-call deadline, so a series of requests to one host reuses the
+/// agent's pooled connection instead of opening a new one each time.
+pub(super) fn send_prepared_on(
+    agent: &ureq::Agent,
+    url: &str,
+    auth: Option<&str>,
+    body: &[u8],
+    timeout_secs: u64,
+    headers: &[(&str, &str)],
+) -> Result<ureq::http::Response<ureq::Body>> {
+    let request = post_on(agent, url, auth, false, headers)?
+        .config()
+        .timeout_global((timeout_secs > 0).then(|| Duration::from_secs(timeout_secs)))
+        .build();
+    send_prepared_request(request, url, auth, body)
+}
+
+fn send_prepared_request(
+    mut request: ureq::RequestBuilder<ureq::typestate::WithBody>,
+    url: &str,
+    auth: Option<&str>,
+    body: &[u8],
+) -> Result<ureq::http::Response<ureq::Body>> {
+    if !request
+        .headers_ref()
+        .is_some_and(|headers| headers.contains_key("content-type"))
     {
         request = request.header("Content-Type", "application/json");
     }
@@ -924,12 +983,36 @@ pub(super) fn send_prepared_with_headers(
         .map_err(|error| transport_error(error, url, auth))
 }
 
+/// The agent [`send_prepared_with_headers`] uses for `url`: the environment proxy only for
+/// remote hosts.
+pub(super) fn agent_for(
+    url: &str,
+    timeout_secs: u64,
+    interrupt: Option<Arc<AtomicBool>>,
+    patience: Option<Patience>,
+) -> ureq::Agent {
+    let local = host_of(url).is_some_and(|host| is_local_host(&host));
+    agent_with(timeout_secs, !local, interrupt, patience)
+}
+
 fn post_with_headers(
     url: &str,
     auth: Option<&str>,
     timeout_secs: u64,
     patience: Option<Patience>,
     interrupt: Option<Arc<AtomicBool>>,
+    headers: &[(&str, &str)],
+) -> Result<ureq::RequestBuilder<ureq::typestate::WithBody>> {
+    let streaming = patience.is_some();
+    let agent = agent_for(url, timeout_secs, interrupt, patience);
+    post_on(&agent, url, auth, streaming, headers)
+}
+
+fn post_on(
+    agent: &ureq::Agent,
+    url: &str,
+    auth: Option<&str>,
+    streaming: bool,
     headers: &[(&str, &str)],
 ) -> Result<ureq::RequestBuilder<ureq::typestate::WithBody>> {
     if let Some(token) = auth {
@@ -948,9 +1031,8 @@ fn post_with_headers(
             "provider request header contains invalid characters"
         );
     }
-    let local = host_of(url).is_some_and(|host| is_local_host(&host));
-    let mut request = agent_with(timeout_secs, !local, interrupt, patience.clone()).post(url);
-    if patience.is_some()
+    let mut request = agent.post(url);
+    if streaming
         && !headers
             .iter()
             .any(|(name, _)| name.eq_ignore_ascii_case("accept"))
@@ -1016,8 +1098,9 @@ fn transport_error(error: ureq::Error, url: &str, auth: Option<&str>) -> anyhow:
     })
 }
 
-/// The URL without userinfo, query or fragment, safe for messages.
-pub(crate) fn display_url(url: &str) -> String {
+/// The URL's scheme, host and path only: userinfo, query and fragment are dropped, so the result
+/// is safe to show in diagnostics and messages.
+pub fn display_url(url: &str) -> String {
     match url.parse::<ureq::http::Uri>() {
         Ok(uri) => match (uri.scheme_str(), uri.authority()) {
             (Some(scheme), Some(authority)) => {
@@ -1152,6 +1235,14 @@ fn http_error(
         .is_some_and(|m| errors::LLAMA_NO_JINJA.is_match(m))
     {
         excerpt.push_str(" — this llama-server has Jinja chat templates disabled, so it cannot accept tool calls; restart it with --jinja.");
+    }
+    if status == 400
+        && message.as_deref().is_some_and(|message| {
+            message.contains("Failed to initialize samplers")
+                && message.contains("failed to parse grammar")
+        })
+    {
+        excerpt.push_str(" — the backend rejected its generation grammar before inference; this is a server/schema compatibility fault, not a failed tool execution. If this endpoint is Docker Model Runner, use the docker-model-runner provider for its wire-schema compatibility policy. If that provider is already selected, inspect the server build and rejected tool schema. Do not retry an unchanged request or disable runtime argument validation.");
     }
     // Validation errors often list every allowed content type, including "image". Only an
     // explicit capability rejection justifies suggesting another model, not malformed history,

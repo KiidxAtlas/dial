@@ -30,7 +30,7 @@ failures (including checkpoint failures) are not reset by this recovery.
   time and token counts. Unknown or invalid rates are omitted; `ui.show_turn_stats = false` hides
   the footer. Historical rates are not reconstructed from message timestamps.
 - New conversations open on a centered launch screen: a braille knob and wordmark (the needle turns
-  into place at start-up when `ui.motion` allows) above a compact input card near the window
+  into place at start-up, then breathes and catches a passing glint, when `ui.motion` allows) above a compact input card near the window
   midpoint. One line beneath shows the model, current directory and Git branch, then a quiet
   shortcut hint; setup and unsafe-mode warnings appear only when relevant. `Down` reveals suggested
   requests or recent sessions; `Enter` opens a request for editing or resumes a session. Small
@@ -134,8 +134,8 @@ failures (including checkpoint failures) are not reset by this recovery.
   response before any of its tool calls run. A tool already running may finish (only waits that
   are safe to interrupt are interrupted); unstarted actions are skipped and completed results are
   retained. The latest instruction takes precedence over conflicting older plans.
-  **Independent worker** starts a separate worker for exactly that message while the current task
-  continues; it never steers the running task and no model classifies it. If a worker cannot
+  **Independent worker** starts a separate worker for exactly that message right away (even mid-reply or
+  while tools run) while the current task continues; it never steers the running task and no model classifies it. If a worker cannot
   start (spawning disabled, capacity, interruption) the message is queued as a follow-up instead.
   Explicit messages are shown above the composer, one row each (`○ Steer  pending · acts at the
   next safe point  “message”`, with ● received and ✓ applied), with the stage Dial actually reported:
@@ -193,7 +193,7 @@ failures (including checkpoint failures) are not reset by this recovery.
 - **Images** lists discovered image-generation models, including compatible checkpoints already downloaded for MLX serve. Enter assigns an image model to the `image` role rather than replacing main. Choose the role from **Roles**, or use `Ctrl+A` on a compatible model. When unassigned the image role displays **follows main**; a vision-input model is not automatically an image generator. **Get models → Images** browses Hugging Face MLX text-to-image repositories; searching reads metadata only, and Enter explicitly downloads a chosen result with the normal cancellation controls. Downloaded image models are kept out of chat and embedding role choices.
 - **Get models** follows Images in `/models` (`/model local` and `/models local` open it directly). Its **MLX**, **GGUF**, **Memory**, **Images**, **Embeddings** and **Curated** shelves switch with `Tab` or `Right`; `Left` and `Esc` return to groups. Suggestions precede installed models. Type a query and press Enter to search Hugging Face; Enter on a result lists its files and explicitly downloads it in the background (GGUF asks which quantization first). Installed chat models assign main, or `memory` on the Memory shelf. Images downloads go to the Hugging Face cache and require a compatible image server/pack; they do not run through Dial's chat runner. Serve/import them, then F5 rescan and choose their endpoint in Images. The Embeddings shelf browses Hugging Face embedders; Curated lists discovered embedding endpoints and curated Ollama setup choices. Esc cancels a running download first. Downloads keep running while browsing other groups; closing `/models` cancels them. See [model-downloads.md](model-downloads.md) and [model-embeddings.md](model-embeddings.md).
   Opening `/models` loads no model, starts no Python or MLX process and makes no network call; the installed list is read when it opens. Search, listing and downloads run only after an explicit key press, in the background. Switching to the Embedding shelf reads Ollama's model list from localhost. The same installed data is printed by `dial models status` (`--json` for the machine-readable form, with identical field names). On short panels the details give way to rows, and the list always keeps at least one row.
-  - **Speed** is output tokens per second of request wall time from the recorded stats, the same measure as
+  - **Speed** is labelled end-to-end: output tokens per second of request wall time from the recorded stats, the same measure as
     `dial stats`. It uses the newest 40 successful requests with output and timing: a median, the median of the
     newest 20, and a trend (`up` or `down` when that median moves more than 10% from the 20 before them, else
     `flat`). It includes prompt processing time, so it is not a pure decode rate.
@@ -405,7 +405,9 @@ bindings are rejected, and the editor keeps a way to confirm and close panels. Y
 
 `/settings` is the configuration hub. Type to search labels, descriptions and configuration paths
 across every category; search words can appear in any order. Exact configuration paths rank before
-fuzzy matches. `Left`/`Right` change categories and `Tab`/`Shift-Tab` jump sections.
+fuzzy matches. `Left`/`Right` change categories and `Tab`/`Shift-Tab` jump sections. A `● n` beside a
+section name counts the settings you have overridden there. Category and section order is described in
+[Settings layout](configuration.md#settings-layout).
 `Enter` toggles a two-state switch or opens an editor/choice list.
 Settings with an automatic mode open an explicit **Auto / On / Off** picker at the current value
 instead of cycling and saving immediately. Choices save only when confirmed; `Esc` cancels without
@@ -542,14 +544,14 @@ known to implement it, detected from `TERM_PROGRAM`, `LC_TERMINAL` and similar v
 | --- | --- | --- |
 | Links (OSC 8) | iTerm2, Ghostty, kitty, WezTerm, VS Code, foot, Rio | URLs and file paths that exist, resolved against the project, are clickable in scrollback. In iTerm2, `path:line[:col]` opens at that line through Semantic History (⌘-click, using the editor set in Profiles → Advanced). The live region and text that is not a real URL or path are never linked. |
 | Working directory (OSC 7) | iTerm2, Ghostty, kitty, WezTerm, foot, tmux | New tabs and splits start in the project. |
-| Tab color (OSC 6) | iTerm2 | Amber while working, red when an approval or question waits or a turn failed, green when a turn finished. A key press clears it. |
+| Tab circle | any terminal that shows titles | A colored circle leads the tab title: orange while working, red when an approval or question waits or a turn failed, green when a turn finished. A key press clears it. The rest of the title is `dial · <project> · <session title>`, where the session title is its name (`/rename`) or its first message. Off with `ui.terminal_integration = false`; omitted with ASCII glyphs. |
 | Attention | iTerm2 | The dock icon bounces while an approval or question waits. |
 | Progress (OSC 9;4) | iTerm2 3.6+, Ghostty 1.2+ | Prompt processing percentage, an indeterminate bar while generating, paused while waiting for you. |
 | User variables | iTerm2, WezTerm | `user.dialState` (`idle`, `working`, `waiting`, `done`, `failed`), `user.dialModel` and `user.dialContext` (context used, such as `42%`) for status bar components, badges (`\(user.dialState)`) and tab titles. |
 
 Under tmux, terminal-only sequences go through passthrough, which needs `set -g allow-passthrough on`.
 Links are off there because tmux does not keep them by default. Zellij and GNU screen get none of
-these. Dial restores tab color, progress and variables when it exits, suspends or crashes. The older
+these. Dial restores progress and variables when it exits, suspends or crashes. The older
 `ui.hyperlinks` key is still accepted but ignored.
 
 ### Live side pane

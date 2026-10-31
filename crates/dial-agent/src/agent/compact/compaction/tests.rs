@@ -338,7 +338,8 @@ fn summary_planning_reserves_commit_overhead_and_keeps_complete_tool_groups() {
     ];
     for i in 0..40 {
         messages.push(json!({"role":"assistant","content":"","tool_calls":[{"id":format!("c{i}"),"function":{"name":"read","arguments":"{}"}}]}));
-        messages.push(json!({"role":"tool","tool_call_id":format!("c{i}"),"content":"x".repeat(4000)}));
+        messages
+            .push(json!({"role":"tool","tool_call_id":format!("c{i}"),"content":"x".repeat(4000)}));
     }
     let request = Chat {
         messages,
@@ -392,20 +393,29 @@ fn summary_planning_reserves_commit_overhead_and_keeps_complete_tool_groups() {
         .unwrap_or_else(|error| panic!("window {window}, overhead {overhead}: {error:#}"));
         let history = prepared.history(&request);
         let candidate = replacement_request(&request, &history);
-        assert!(calls > 0, "window {window}: the summary route was exercised");
+        assert!(
+            calls > 0,
+            "window {window}: the summary route was exercised"
+        );
         assert!(
             request_tokens_with_policy(&candidate, &policy, identity) + overhead
                 <= prompt_budget(&policy, window, backend.output_budget(request.max_tokens)),
             "window {window}: the summary and tail must leave room for commit-time context"
         );
-        assert!(complete_boundary(&history, history.len()), "window {window}");
+        assert!(
+            complete_boundary(&history, history.len()),
+            "window {window}"
+        );
         assert_eq!(
             &history[history.len() - 2..],
             &request.messages[request.messages.len() - 2..],
             "window {window}: preserve the newest call/result group verbatim"
         );
         if window == 32_768 {
-            assert!(calls > 1, "an oversized summary requires an incremental fold");
+            assert!(
+                calls > 1,
+                "an oversized summary requires an incremental fold"
+            );
             assert!(
                 summary_requests.last().unwrap() < summary_requests.first().unwrap(),
                 "the fold must not replay the full original prefix"
@@ -519,4 +529,120 @@ fn compaction_backend() -> Backend {
         std::path::PathBuf::from("/nonexistent/python"),
         5,
     )
+}
+
+fn png_header(width: u32, height: u32) -> String {
+    use base64::Engine;
+    let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+    bytes.extend_from_slice(&13u32.to_be_bytes());
+    bytes.extend_from_slice(b"IHDR");
+    bytes.extend_from_slice(&width.to_be_bytes());
+    bytes.extend_from_slice(&height.to_be_bytes());
+    bytes.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+#[test]
+fn request_accounting_matches_token_policy_for_tools_replay_images_and_guidance() {
+    let policy = CompactionConfig::default();
+    let identity = CompactionIdentity {
+        provider: "test",
+        model: "model",
+        agent: None,
+    };
+    let png = png_header(640, 480);
+    let snapcompact = json!({
+        "role": "user",
+        "dial_snapcompact": {"frames": 1},
+        "content": [
+            {"type": "text", "text": "archived"},
+            {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{png}")}}
+        ],
+    });
+    let mut request = Chat {
+        messages: vec![
+            json!({"role": "system", "content": "rules"}),
+            json!({"role": "user", "content": "look", "dial_images": [{"path": "a.png"}]}),
+            json!({"role": "assistant", "content": "a", "dial_provider_content": [{"type": "opaque", "data": "x".repeat(500)}]}),
+            snapcompact.clone(),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "out"}),
+        ],
+        tools: vec![
+            json!({"type": "function", "function": {"name": "bash", "parameters": {"type": "object"}}}),
+            json!({"type": "function", "function": {"name": "read"}}),
+        ],
+        temperature: 0.0,
+        max_tokens: 8192,
+        seed: None,
+    };
+    let mut accounting = request_accounting_with_policy(&request, &policy, identity);
+    let expected_tools: u64 = request.tools.iter().map(estimate).sum();
+    assert_eq!(
+        accounting.tokens,
+        request_tokens_with_policy(&request, &policy, identity)
+    );
+    assert_eq!(accounting.messages.len(), request.messages.len());
+    assert_eq!(
+        accounting.tool_bytes,
+        request.tools.iter().map(json_bytes).collect::<Vec<_>>()
+    );
+    assert!(expected_tools > 0);
+
+    // Snapcompact frame: text at its wire estimate plus the PNG pixel ceiling and fixed overheads.
+    let frame_only = Chat {
+        messages: vec![snapcompact.clone()],
+        tools: vec![],
+        ..request.clone()
+    };
+    let text_part = json!({"type": "text", "text": "archived"});
+    assert_eq!(
+        request_tokens_with_policy(&frame_only, &policy, identity),
+        64 + estimate(&text_part) + 640 * 480 + 16
+    );
+
+    // Pressure guidance appended after measurement is priced by the appended message only.
+    let guidance = json!({"role": "user", "content": "pressure guidance", "dial_transient": true});
+    let updated = accounting.push_message(&guidance, &policy, identity);
+    request.messages.push(guidance);
+    assert_eq!(
+        updated,
+        request_tokens_with_policy(&request, &policy, identity)
+    );
+    assert_eq!(accounting.tokens, updated);
+    assert_eq!(accounting.messages.len(), request.messages.len());
+}
+
+#[test]
+fn request_accounting_preserves_wire_fallbacks_and_retained_output_floors() {
+    let policy = CompactionConfig::default();
+    let identity = CompactionIdentity {
+        provider: "test",
+        model: "model",
+        agent: None,
+    };
+    let messages = vec![
+        json!({"role":"assistant","content":"small","dial_compaction_output_tokens":9000}),
+        json!({"role":"user","dial_snapcompact":{},"content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,malformed"}}]}),
+        json!({"role":"user","dial_snapcompact":{},"content":"not an image array"}),
+        json!({"role":"assistant","content":"portable","dial_provider_content":[{"opaque":"雪".repeat(200)}]}),
+    ];
+    let expected = messages.iter().map(estimate).sum::<u64>();
+    assert!(expected >= 9000);
+    let request = Chat {
+        messages,
+        tools: vec![],
+        temperature: 0.0,
+        max_tokens: 1024,
+        seed: None,
+    };
+    assert_eq!(
+        request_tokens_with_policy(&request, &policy, identity),
+        expected
+    );
+    let accounting = request_accounting_with_policy(&request, &policy, identity);
+    assert_eq!(accounting.tokens, expected);
+    assert_eq!(
+        accounting.messages,
+        request.messages.iter().map(wire_parts).collect::<Vec<_>>()
+    );
 }

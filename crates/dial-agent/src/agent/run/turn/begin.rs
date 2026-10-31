@@ -128,6 +128,12 @@ impl Agent<'_> {
         if self.restore_primary_if_due(backend, ui) {
             turn.max_tokens = backend.output_budget(turn.harness.max_tokens);
         }
+        // Servers still connecting at startup join at a turn's first request, so the system
+        // prompt and its cached prefix do not change between the requests of one turn; tool
+        // discovery waits for them sooner when it needs them.
+        if step == 0 {
+            self.ext.adopt_mcp(false);
+        }
         self.sync_mcp_tools(schemas, ui)?;
         Ok(ControlFlow::Continue(step))
     }

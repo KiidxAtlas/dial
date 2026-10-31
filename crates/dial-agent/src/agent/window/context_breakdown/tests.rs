@@ -23,6 +23,19 @@ fn tokens_of(breakdown: &ContextBreakdown, label: &str) -> Option<u64> {
         .map(|row| row.tokens)
 }
 
+fn breakdown_of(chat: &Chat) -> ContextBreakdown {
+    let accounting = crate::agent::compact::compaction::request_accounting_with_policy(
+        chat,
+        &crate::config::compaction::CompactionConfig::default(),
+        crate::config::compaction::CompactionIdentity {
+            provider: "test",
+            model: "test",
+            agent: None,
+        },
+    );
+    overhead(chat, &accounting).breakdown
+}
+
 #[test]
 fn total_equals_the_wire_estimate_of_the_same_request() {
     let chat = request(
@@ -36,7 +49,7 @@ fn total_equals_the_wire_estimate_of_the_same_request() {
         ],
         vec![json!({"type":"function","function":{"name":"bash"}})],
     );
-    let breakdown = overhead(&chat).breakdown;
+    let breakdown = breakdown_of(&chat);
     assert_eq!(
         breakdown.total_tokens(),
         estimate_parts(&chat.messages, &chat.tools)
@@ -53,7 +66,7 @@ fn tool_outputs_are_grouped_by_the_tool_that_produced_them() {
         ],
         vec![],
     );
-    let breakdown = overhead(&chat).breakdown;
+    let breakdown = breakdown_of(&chat);
     let expected = wire_parts(&result).portable.div_ceil(4) as u64;
     assert_eq!(tokens_of(&breakdown, "tool output: bash"), Some(expected));
 }
@@ -64,7 +77,7 @@ fn tool_result_without_a_known_call_is_grouped_as_unknown() {
         vec![json!({"role":"tool","tool_call_id":"missing","content":"out"})],
         vec![],
     );
-    let breakdown = overhead(&chat).breakdown;
+    let breakdown = breakdown_of(&chat);
     assert!(tokens_of(&breakdown, "tool output: unknown").is_some());
 }
 
@@ -76,7 +89,7 @@ fn instruction_files_are_separated_from_the_system_prompt() {
         ],
         vec![],
     );
-    let breakdown = overhead(&chat).breakdown;
+    let breakdown = breakdown_of(&chat);
     assert!(tokens_of(&breakdown, "context files").is_some());
     assert_eq!(tokens_of(&breakdown, "system prompt"), None);
 }
@@ -89,7 +102,7 @@ fn images_cost_the_fixed_image_estimate_not_their_bytes() {
         ],
         vec![],
     );
-    let breakdown = overhead(&chat).breakdown;
+    let breakdown = breakdown_of(&chat);
     assert_eq!(
         tokens_of(&breakdown, "images (estimated)"),
         Some(2 * IMAGE_ESTIMATE_TOKENS as u64)
@@ -106,7 +119,7 @@ fn provider_native_replay_is_counted_as_opaque_size_only() {
     let chat = request(vec![message.clone()], vec![]);
     let parts = wire_parts(&message);
     assert!(parts.native > parts.portable);
-    let breakdown = overhead(&chat).breakdown;
+    let breakdown = breakdown_of(&chat);
     assert_eq!(
         tokens_of(&breakdown, "provider replay (size only)"),
         Some(parts.native.div_ceil(4) as u64)
@@ -123,6 +136,6 @@ fn tool_names_are_stripped_of_control_characters() {
         ],
         vec![],
     );
-    let breakdown = overhead(&chat).breakdown;
+    let breakdown = breakdown_of(&chat);
     assert!(tokens_of(&breakdown, "tool output: bash").is_some());
 }

@@ -358,13 +358,16 @@ impl Shell {
                 timeout
             };
             let animating = self.home.as_ref().is_some_and(welcome::Home::animating);
+            let ambient = self.home.as_ref().is_some_and(welcome::Home::ambient);
             let timeout = if animating {
                 timeout.min(crate::ui::fx::FRAME)
+            } else if ambient {
+                timeout.min(crate::ui::fx::AMBIENT)
             } else {
                 timeout
             };
             if self.held.is_empty() && !poll(timeout)? {
-                dirty = animating;
+                dirty = animating || ambient;
                 if self.pending_favorite.is_some() {
                     self.catalog.collect();
                     let effective = &app.config;

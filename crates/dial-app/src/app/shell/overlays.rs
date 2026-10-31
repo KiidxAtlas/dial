@@ -394,6 +394,7 @@ impl Shell {
         which: Which,
     ) -> Result<OverlayOutcome> {
         let compute = matches!(which, Which::Compute);
+        let peers = matches!(which, Which::Peers(_));
         self.term.set_overlay_mouse(self.ui.mouse);
         let mut overlay = self.make_overlay(app, which)?;
         let Shell {
@@ -414,7 +415,11 @@ impl Shell {
             ..
         } = self;
         // Browsing panels keep resident models loaded; only an explicit compute action releases them.
-        let mut release = overlay_compute_release(app, agent);
+        // The peers board and the compute release both need the agent, and no panel uses both.
+        let (release_agent, peer_agent) = if peers { (None, agent) } else { (agent, None) };
+        let mut release = overlay_compute_release(app, release_agent);
+        let mut peer_source =
+            peer_agent.map(|agent| move || crate::app::commands::peers::snapshot(agent));
         let mut env = OverlayEnv {
             app,
             themes,
@@ -427,6 +432,9 @@ impl Shell {
             next: None,
             verify_lora: None,
             release_compute: release.as_mut().map(|release| release as &mut dyn FnMut()),
+            peer_source: peer_source.as_mut().map(|source| {
+                source as &mut dyn FnMut() -> Option<crate::ui::overlay::peers::PeersView>
+            }),
             seen_generation: 0,
             auth_job,
             background_control: background_control.as_ref(),
@@ -519,6 +527,7 @@ impl Shell {
             scope,
             dark: *dark,
             release_compute: None,
+            peer_source: None,
         };
         refresh_overlay(&mut env, &mut state.overlay);
         let redraw = event.is_none();

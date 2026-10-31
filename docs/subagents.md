@@ -14,6 +14,13 @@ blockers, acceptance/audit details and isolation/merge warnings remain visible. 
 `task status` with an `id` recovers the full existing preview; `artifact_read` retrieves the complete
 canonical report. Polling never labels a running worker complete or counts a report as verification.
 
+When the foreground agent has no independent work left, it can state what is pending and yield
+without tools. The harness suspends inference until owned workers or side questions settle, a
+worker message arrives, or user input/cancellation/turn limits require attention. Results retain
+their ordinary exactly-once delivery; a wait is not verification. Explicit `task wait` and
+`side_request wait` use the platform wake channel and keep their existing timeout meanings.
+See [event-driven continuation](agent-loop.md#event-driven-continuation).
+
 ### Tool-free side questions
 
 `side_request` lets the main agent ask a reasoning question while a command or independent task
@@ -115,7 +122,7 @@ The reviewer supports both change reviews (defects introduced by the supplied ch
 
 `spawns` limits which child roles a definition may start. `task.max_recursion_depth` bounds nested task creation (the main agent is depth zero; the default depth of two permits a child level). `task.max_concurrency` bounds active foreground and background worker branches in this process, shared by project. Batches accept up to 64 tasks and run within that ceiling. Serial descendants borrow their waiting parent’s slot, so a ceiling of one still permits nesting. Live launches also obey `subagent_max_live_jobs`. If another launch already occupies the shared capacity, a new branch reports incomplete without starting; the owner can process existing workers and retry. Descendants use synchronous `run` only. `task.provider_concurrency` limits simultaneous model requests by provider; slots apply to requests, not whole runs, so nested workers do not hold resources while waiting for children. Local model requests (Dial's own runtime, or an endpoint on a loopback, private-range or `.local` host) are serialized per server unless `task.provider_concurrency.<provider>` raises the limit for a multi-slot server.
 
-Provider-slot waits remain cancellable. Child memory-helper requests also check their operation's cancellation, deadline, and session/branch authority while queued and again before starting transport, so an expired helper does not wait for an unrelated request to release capacity.
+Provider-slot waits remain cancellable. When a child worker's model request waits for a limited provider slot, it emits one waiting notice for that request. Child memory-helper requests also check their operation's cancellation, deadline, and session/branch authority while queued and again before starting transport, so an expired helper does not wait for an unrelated request to release capacity.
 
 Output-limit recovery has its own no-progress bound, even when `max_steps = 0`. After finite output-budget increases, eight nonproductive continuation nudges stop the run as incomplete without discarding completed effects. Empty output and incomplete tool calls count as nonproductive. Partial text uses constant-space periodic-cycle detection; once a cycle is detected, further truncated output cannot reset the stall count. Distinct advancing text can continue, and usable completed output or new steering resets recovery. This does not detect every semantically nonproductive prose stream.
 
@@ -181,6 +188,10 @@ Synchronous task results retain the complete typed job report before creating te
 
 Use `action: "start"` to start a live task, then `status`, `wait`, or `cancel` with its id. Live workers and the parent talk through the `message` tool, offered whenever `task` is (it reports an empty roster or an unknown recipient when no worker is live): `to` takes a live job id or label, `parent` (from a worker), or `all` (a broadcast to the other live workers); omit `to` to list reachable recipients. Each message is at most 32 KiB. A recipient's mailbox holds at most `[task].inbox_limit` undelivered messages (default 256); a full mailbox refuses the message explicitly, and a broadcast reports each refusal. Messages are plain text with no authority: they never approve actions or widen a worker's tools. A recipient receives a message, labelled with its sender, at its next model request. The `message` result is a receipt per recipient: `{"receipts":[{"to":"task-1","status":"queued"}]}`. `queued` means the recipient's mailbox accepted the message and it will be read at the recipient's next model step (the sender cannot know that synchronously, so `delivered` is never claimed); `refused` carries a `reason` (only a broadcast reports a full mailbox this way, since a single full mailbox fails the send). A message to a finished or unknown worker fails the call with that reason; Dial never revives a finished worker, and messages still unread when a worker finishes are discarded. A worker's message to `parent` follows the same policy as worker completion notices and background-job completions: it never starts an unrequested turn. While the parent is idle (for example waiting for your input in the TUI), the controller's regular pump (about every two seconds when nothing else is animating) shows `Message from <worker> to parent: <first line>` in the transcript and queues the full text, marked as peer text rather than instructions, for the parent's next request; while a turn runs it surfaces at the next model step. `task_message` remains the RPC form of the same send. Completed task records and transcripts may be retained in the state directory according to `[task].persist`; do not put secrets in task prompts or messages.
 
+### Slow and stalled workers
+
+A running worker's `status` includes `running_secs`, `idle_secs` (time since its last progress or tool start, or since launch if it has not progressed) and `health`. `health` is `stalled` once `idle_secs` reaches `[task].stall_secs` (default 300, matching the remote model idle timeout; 0 disables monitoring), `slow` once the worker has run three times that long while still progressing, and `active` otherwise. Settled workers carry none of these. A newly stalled worker raises one background notice and ends a parent `task` `wait` early (nothing is cancelled); decide to keep waiting, `message` it, `peek`/`status` it, or `cancel` it and tell the user. A worker that resumes and stalls again is reported again. A long model call or tool counts as silence, so raise `stall_secs` for workloads with slow single steps.
+
 Worker messages to `parent` are not held back by the parent's own waiting. While workers are running, the idle terminal pumps at least every quarter second, so the message notice appears promptly. A parent `task` `wait` stops early when a worker message arrives: nothing is cancelled, the workers keep running, the result says why the wait ended, and the message arrives with the parent's next request.
 
 Worker outcome payloads carry the shared `runtime::Phase` rather than a separate status enum. Incompletion stays incomplete in runtime nodes, cards and protocol events. Task-tool results preserve legacy `done`/`cancelled` spellings for compatibility; new execution nodes use `completed`/`interrupted`. Archived child tool results persist tool-owned presentation and the complete redacted evidence separately from model-facing retrieval pointers.
@@ -237,6 +248,7 @@ For Git projects the copy gets an independent filtered-source baseline, so `git 
 [task]
 max_concurrency = 32
 max_recursion_depth = 2
+stall_secs = 300                       # 0 disables stall detection
 isolation_dependencies = true
 isolation_git = true
 isolation_dependency_bytes = 4294967296 # 4 GiB
@@ -292,6 +304,16 @@ worker. Ordinary letters, including `x`, are text there, not hub cancellation sh
 message clears only after delivery/start acknowledgement; a failed submission keeps the draft.
 
 Activity tab (`2`, or Tab on a wide layout): `f` cycles the kind filter (all, errors, responses, tools, messages); `s` cycles the scope (all, selected worker, selected subtree); Space toggles follow; `/` searches; Enter opens the entry in its transcript.
+
+Refreshes follow complete appended transcript records instead of reparsing the full history. Each
+view retains at most 300 activity events for each of the 12 newest transcripts, reading at most one
+4 MiB activity chunk per transcript per refresh. Large histories fill in across successive refreshes
+instead of blocking a frame to catch up. A partial final line waits for completion; oversized records
+are skipped without retaining their bodies. Entry links use absolute message indices, not positions
+in the recent activity window. File replacement, truncation or a changed prefix/tail anchor resets
+that transcript's projection; a read failure drops its cached activity until a later successful read
+rebuilds it. Header reads are capped at 1 MiB. These limits do not remove messages from the durable
+transcript.
 
 Below 96 columns the hub shows only the roster; Tab opens the full-width inspector. `1`/`2` or ←/→ switch tabs. Esc clears a search, then leaves the inspector, then closes the hub; the footer's Esc hint names whichever comes next.
 

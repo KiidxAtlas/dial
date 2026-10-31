@@ -174,7 +174,7 @@ fn config_file(path: &str) -> bool {
 }
 /// Environment, credential and key material is never expanded automatically, even when a symbol
 /// name matches; an explicit search or `read` remains the only way to look at such files.
-fn sensitive_path(path: &str) -> bool {
+pub(super) fn sensitive_path(path: &str) -> bool {
     path.split('/').any(|part| {
         let lower = part.to_ascii_lowercase();
         lower == ".env"
@@ -334,7 +334,12 @@ pub(super) fn render(ws: &Workspace, scope: &Path, targets: &[Target], max_bytes
                     continue;
                 }
                 let mut hits = Vec::new();
-                if let Some(name) = plan.name.as_deref().filter(|n| text.contains(*n)) {
+                let has_room = if is_config {
+                    plan.config.len() < 8
+                } else {
+                    plan.refs.len() < 40
+                };
+                if has_room && let Some(name) = plan.name.as_deref().filter(|n| text.contains(*n)) {
                     let all = lines.get_or_insert_with(|| text.lines().collect());
                     for (index, line) in all.iter().enumerate() {
                         let number = index + 1;
@@ -351,7 +356,6 @@ pub(super) fn render(ws: &Workspace, scope: &Path, targets: &[Target], max_bytes
                 }
                 for (number, call) in hits.into_iter().take(12) {
                     let all = lines.as_ref().expect("lines loaded for hits");
-                    let spans = decls.get_or_insert_with(|| declarations(path, &text));
                     if is_config {
                         if plan.config.len() < 8 {
                             plan.config.push(span_row(
@@ -365,6 +369,7 @@ pub(super) fn render(ws: &Workspace, scope: &Path, targets: &[Target], max_bytes
                             ));
                         }
                     } else if plan.refs.len() < 40 {
+                        let spans = decls.get_or_insert_with(|| declarations(path, &text));
                         let label = if call { "call-site" } else { "mention" };
                         let row = span_row(&rel, &sha256, spans, number, all, label, call);
                         if !plan

@@ -59,8 +59,9 @@ Ollama) or hosted providers, with approvals, sandboxing and checkpoints included
 
 ## Install
 
-Prebuilt releases target **macOS 13+ (Apple Silicon or Intel)**, **Linux x86-64 (Ubuntu 22.04 or
-newer, also under WSL2)** and **native Windows x86-64**. You do not need a Rust toolchain to install a release.
+Prebuilt releases target **macOS 13+ (Apple Silicon or Intel)**, **Linux x86-64 and arm64 (glibc or
+musl; Ubuntu 22.04 or newer, also under WSL2)** and **native Windows x86-64 and arm64**. You do not
+need a Rust toolchain to install a release.
 
 **macOS and Linux**
 
@@ -83,7 +84,8 @@ You can also run the Linux commands inside WSL2. [docs/windows.md](docs/windows.
 versions and next steps.
 
 **Homebrew, Nix and Docker** are also published; see
-[docs/release-and-install.md](docs/release-and-install.md#other-distribution-channels).
+[docs/release-and-install.md](docs/release-and-install.md#other-distribution-channels) and, for
+containers and Docker Model Runner, [docs/docker.md](docs/docker.md).
 
 **Updating.** Run `dial update` in a terminal, or `/update` inside Dial (then `/restart`). It
 updates the way Dial was installed: installer copies get the latest signed release (or
@@ -173,6 +175,7 @@ This README is an overview. Detailed documentation lives in [`docs/`](docs/), an
 **Getting started and everyday use**
 
 - [Release and installation](docs/release-and-install.md): installers, manual platform setup, signing, building from source, publishing releases
+- [Docker](docs/docker.md): run Dial in a container (`docker run`, Compose), sandbox options, Docker Model Runner
 - [Optional dependencies and one-key setup](docs/setup.md): `/settings` Ctrl+L, `/setup`, `dial doctor --fix`, verified runtime downloads
 - [Configuration](docs/configuration.md): layers, unlimited execution defaults, annotated example
 - [Terminal interface](docs/terminal-interface.md): composer, slash commands, steering and queueing, shortcuts, `/settings`, model settings, themes, image previews

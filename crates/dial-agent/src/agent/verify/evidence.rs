@@ -267,6 +267,13 @@ impl Ledger {
         Ok(None)
     }
 
+    /// Withdraw a reproduction entirely: no registration, history or latest evidence remains.
+    pub fn withdraw_repro(&mut self, command: &str) {
+        self.repros.retain(|check| check.command != command);
+        self.reproductions.remove(command);
+        self.latest.remove(command);
+    }
+
     pub fn repros(&self) -> &[FocusedCheck] {
         &self.repros
     }

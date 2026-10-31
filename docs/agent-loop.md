@@ -145,25 +145,60 @@ calls that never started as not run. A panicking read-only tool is a failure wit
 failed; a cancelled one settles nothing. Calls repeating in an exact short cycle (period 2 or 3)
 get an advisory note.
 
+Both the foreground turn and child workers decide how to recover from a reply in
+`agent/run/reply_triage.rs`. A reply cut off at the output limit with no text or tool call uses the
+single per-turn reasoning-gate recovery (a second hit stops). Otherwise the limit is raised, the
+partial answer is kept with a continuation request, or recovery stops as incomplete. A dropped tool
+call with invalid JSON, or a tool call written as plain text, is a form failure. It is never run,
+and it gets one shared correction. Each loop keeps its own UI, journaling and message placement.
+Each request's tail is assembled once by `run::guidance::assemble`: advisory notes are curated to
+one by priority, then plain harness notes merge into one message. Marked context stays separate.
+
+Completion guidance honors a user's requested final-response format when work is complete and no
+blocker, unverified check or safety-relevant gap requires disclosure. This is model guidance, not
+an enforced output guarantee; completion gates and inference labels remain unchanged.
+
 When a configured fallback is ready, failures it accepts (`retry.fallback_on`) get two attempts
 and at most a 10 s wait on the primary before failing over. A primary that cannot be rebuilt when
 the fallback's cooldown ends keeps the fallback and is retried 5 minutes later. With `retry.fallback_revert = "never"` the session does not return at cooldown end at all; see [model routing](model-routing.md).
 
-Different successful lookups also have a shared foreground/worker synthesis boundary. After 12
+Different successful lookups also have a shared foreground/worker synthesis boundary. After twelve
 observation-bearing model rounds without a novel committed change or accepted task resolution,
 Dial requests synthesis; after 24 it reserves a tool-free checkpoint request. Batches count as one
-round. The checkpoint must return JSON with a new nonempty `finding`, `evidence` containing actual
-returned observation tool-call IDs, and a nonempty `next_action`. It does not complete the task or
-verify the claims. Referenced IDs establish provenance only; Dial cannot prove that a paraphrased
-finding is substantively new or that it follows from the cited result.
+round. Successful skill, memory (`recall` and `codebase_memory` read actions), capability discovery
+(`tool_search`) and peer-list lookups count too; remembering findings, loading tools or sending peer
+messages do not. The checkpoint must return JSON with a new nonempty `finding`, `evidence` containing
+actual returned observation tool-call IDs, and a nonempty `next_action`. It does not complete the
+task or verify the claims. Referenced IDs establish provenance only; Dial cannot prove that a
+paraphrased finding is substantively new or that it follows from the cited result.
 
 A valid synthesis renews the research window, including for read-only agents with no working-state
-tool. There is no total research cap and no requirement to edit files or manufacture todos. Tool
-schemas remain for provider-history compatibility, but structured calls, inline edits and completion
-handling cannot execute on a checkpoint response. Three invalid checkpoint responses leave the work
-incomplete with earlier effects preserved. No-op edits, todo polling, state bookkeeping, failures,
-automatic continuation and compaction do not reset the window; new user steering/worker coordination
-does. A worker's final reserved summary request still takes precedence over research synthesis.
+tool. Dial keeps the accepted finding and concrete next action in request-tail follow-through
+guidance until a novel committed change, accepted task resolution or new instruction. Advisory
+work should answer from the established evidence; further retrieval should address a specific
+remaining question or contradiction rather than restart a broad survey. These are model claims
+and guidance, not verification or a semantic proof that a lookup is necessary. There is no total
+research cap and no requirement to edit files or manufacture todos.
+
+Focused full and lean prompts also connect discovery to action: once a likely target is supported,
+state the concrete defect or hypothesis and run the smallest check that distinguishes it before a
+reversible implementation. Reopen discovery for contradictory evidence or a specific missing fact,
+not simply to reconfirm the same target. A focused question is appropriate when ambiguity changes
+scope or correctness; advisory questions still require an answer, not an edit.
+
+Checkpoint text and reasoning are not streamed as an answer. Accepted JSON is retained in the
+session's internal `research_checkpoint` control record with `verified: false`, rather than as an
+ordinary assistant message, so it does not replay as a user-facing answer. Tool schemas remain
+for provider-history compatibility, but structured calls, speculative streaming dispatch, inline
+edits and completion handling cannot execute on a checkpoint response. A valid checkpoint is
+accepted even when the reply also requested tools (the calls are discarded, never run), and one
+surrounding Markdown code fence is tolerated; small local models often do both. A reply that only
+calls tools gets a correction naming those tools and showing the expected JSON shape with a real
+evidence ID. Three invalid checkpoint
+responses leave the work incomplete with earlier effects preserved. No-op edits, todo polling,
+state bookkeeping, failures, automatic continuation and compaction do not reset the window; new
+user steering/worker coordination does. A worker's final reserved summary request still takes
+precedence over research synthesis.
 
 Completed edit-preview rejections also consume bounded no-progress recovery, even with an unlimited
 task budget. Exhaustion returns an incomplete result with the preview diagnosis and executes no
@@ -215,13 +250,47 @@ and first known workspace-change-result latency are observations, not proof of a
 tool-free turns leave these fields unknown. Semantic reranking has a bounded index-only response;
 busy-input routing avoids inference when either concurrency limit leaves no worker slot.
 
+Request telemetry counts controller phases (`requests_by_phase`), admitted requests before the
+first observed workspace change, prefix invalidations, and stable/changed serialized message
+bytes. These observations do not establish that a request was avoidable. Prefix identity is
+provider-neutral after hooks; system and developer messages share an instruction identity.
+Changed developer instructions now count as `system_changed` rather than `history_changed`, so
+historical invalidation categories are not directly comparable. Schema-array bytes include JSON
+separators. Stability is not a provider cache-hit claim.
+Decoded reply text and serialized argument byte counters exclude hidden reasoning and failures
+without a decoded reply. Recovery counters do not change recovery limits.
+
+`projection_bytes.backend_operations` reports calls and inclusive elapsed microseconds for check
+input capture, refresh/reuse, verification source hashing and native-edit preflight. `storage_io`
+reports process-local write/sync counter deltas from inner-turn admission to efficiency-report
+construction, excluding publication of the report itself and outer-turn cleanup. Nested costs
+overlap and must not be added as a wall-time partition. Equal-state control publications still
+advance memory-authority revisions, and sync acknowledgements and input freshness remain intact.
+
 Session history is append-only; tree navigation selects an abandoned branch without deleting it, and branch summaries are optional context for navigation.
 
-Task-tool routing is local, deterministic and turn-scoped. The first request selects native specialists by workflow intent and MCP tools by indexed capabilities/domain relevance. Unique tool-name capabilities can also match explicit inspection requests without a server name; ambiguous and generic matches remain conservative. Complete single-target reads of `package.json`, `Cargo.toml` and `pyproject.toml` can add bounded dependency-domain signals; unsupported requirement forms are skipped. Successful MCP discovery can expose matching same-server consumers for the following model request, including one additional tool slot when the count budget is full. Both serial and parallel results feed the same observer. Selection never executes tools or changes permissions; pinned harnesses, child allowlists and ordinary approval policy remain authoritative. Automatic additions are monotonic within the turn, capped at six tools and 24 KiB of schemas (seven tools after a successful discovery). Lean and minimal local profiles route only MCP tools, capped at two tools and 8 KiB (three tools after discovery); the byte caps remain unchanged and overflow fallback disables automatic additions to preserve headroom. Explicit unloads suppress reactivation until the next external request. Selection introduces no extra inference or project reads.
+Task-tool routing is local, deterministic and turn-scoped. The first request selects native specialists by workflow intent and MCP tools by indexed capabilities/domain relevance. Unique tool-name capabilities can also match explicit inspection requests without a server name; ambiguous and generic matches remain conservative. Complete single-target reads of `package.json`, `Cargo.toml` and `pyproject.toml` can add bounded dependency-domain signals; unsupported requirement forms are skipped. Successful MCP discovery can expose matching same-server consumers for the following model request, including one additional tool slot when the count budget is full. Both serial and parallel results feed the same observer. Selection never executes tools or changes permissions; pinned harnesses, child allowlists and ordinary approval policy remain authoritative. Automatic additions are monotonic within the turn, capped at six tools and 24 KiB of schemas (seven tools after a successful discovery). Lean and minimal local profiles route MCP tools and the native web pair, capped at two tools and 8 KiB (three tools after discovery). Clear web/research intent prioritizes eligible `web_search` and `web_fetch` ahead of incidental MCP matches; ordinary coding turns still omit them. The byte caps remain unchanged and overflow fallback disables automatic additions to preserve headroom. Explicit unloads suppress reactivation until the next external request. Selection introduces no extra inference or project reads.
 
 Lean and one-call prompts also include a bounded set of short, untrusted MCP capability descriptions alongside the loadable names. Some descriptions can be omitted when the hint budget is full; `tool_search` can discover other eligible tools. A server being connected does not guarantee selection or permission to execute a tool.
 
 When tool discovery is available, model guidance prefers relevant eligible native or MCP specialists already offered over generic shell/web substitutes. If a needed capability is missing, it asks for task/domain discovery and use of the returned next-round schemas, not rediscovery of offered tools. This guidance is not gated on an MCP inventory, does not require calls for tool-free answers and grants no execution permission. It is prompt guidance, not evidence of increased live-model tool use; routing limits and approval policy are unchanged.
+Discovery entries retain `enabled_next_round` and add `status` (`loaded_next_request` or
+`not_loaded`) plus `next`. An eligible result below the automatic activation cutoff explicitly
+points to `tool_load`; an activated result points to its exact tool name on the next request,
+never the current batch. Explicit loads survive compact/minimal offer budgets, subject to the
+existing mode and allowlist restrictions. Tools outside the eligible catalog are not advertised.
+An empty search keeps its original result and receives a controller note: no tool was loaded;
+use an already offered tool or an exact loadable name if known, otherwise narrow the capability
+query with new information or report the current configuration limit. It is not permission to
+fall back to an unapproved shell command or invent research results.
+
+If a simple Bash command invokes a registered Dial tool name and a completed process returns
+exit 127 with a matching `command not found` diagnostic, the result explains that the name is
+a tool rather than an executable. It points to the offered schema or an exact `tool_load` call
+for the next request. Dial does not reinterpret or execute the shell arguments as a tool call,
+install a similarly named program, or release the unchanged-call retry barrier. Missing programs
+not in Dial's catalog, incomplete processes, compound commands, and policy denials retain their
+ordinary diagnostics; this coaching never grants filesystem, network or execution permission.
 
 Duplicate recovery withholds only the exact repeated call, including reads. Different ranges and files remain available, changed source identities clear the affected restriction, and new user steering resets the turn's recovery state. A withheld call is reported explicitly as unexecuted; its cached observation still contributes to the shared repetition bound rather than being misclassified as a new execution failure.
 
@@ -237,7 +306,7 @@ Steer now bypasses classification and cancels stale inference through the existi
 started edits and tools retain their effects and only interruptible waits are stopped. The composer
 shows pending, received, then applied after the steering journal accepts the direction. If the turn
 ends before application, the direction is preserved as follow-up input. Independent worker bypasses
-classification without changing the foreground instruction; failed admission preserves the message
+classification and starts at once, during streaming or tool execution, without changing the foreground instruction; failed admission preserves the message
 as follow-up input rather than silently steering the foreground task. These choices do not grant
 worker permissions or bypass isolation, approval, or concurrency limits.
 
@@ -246,6 +315,31 @@ Any routable queued message (not only Steer now) also stops the current wait ear
 background. The awaited work keeps running and its result still arrives at a later request
 boundary; the wait reports that it stopped for a new message, and the message is routed at the
 next step boundary. Input deferred until after the turn does not stop waits.
+
+### Event-driven continuation
+
+When a live foreground agent yields without tool calls, or requests `finish completed`, Dial
+suspends inference if session-owned completion-blocking work is still running. This includes
+shell/eval work adopted by `bg`, live workers and tool-free side questions. The next model
+request waits for a terminal result or worker message, new routable user input, cancellation,
+or a turn deadline/cost boundary. The final step-limit wrap-up request is never suspended.
+Explicit blockers and requests for human input still end normally. Hermetic evaluation keeps
+its existing step behavior.
+
+The wait uses the existing platform wake channel. Background output/exit, worker control
+events and side-question completion notify it; registration precedes state inspection to avoid
+losing a completion between checking and sleeping. Spurious wakes and ordinary progress do not
+trigger inference. A local check at most every 250 ms keeps legacy host input, UI heartbeats,
+approvals and budget checks responsive; it does not send model polling requests. Explicit
+`task wait` and `side_request wait` also use this wake channel and preserve their timeout
+meanings. `bg wait` retains its existing event-driven exit/regex/readiness conditions.
+
+Completion only resumes the existing turn: results keep their ordinary delivery and trust
+framing, and must be incorporated before completion is accepted. Waiting is not verification
+or proof that a child succeeded. New input is handled by ordinary step admission, not consumed
+by the wait. Explicit `bg start` services do not block task completion. Waits are process-local,
+do not grant permissions, and are not automatically replayed after session restart.
+These runtime guarantees do not establish measured token or latency savings with live models.
 
 Live-steering receipt settlement keeps its original acknowledgement deadlines but polls while
 servicing heartbeats, workers, aborts and newer steering. Replanning journals the accepted prefix
@@ -277,18 +371,28 @@ bypasses or replay of uncertain effects.
 
 Tool failures carry a single recovery-state summary from shared parent/worker settlement:
 the observed tool status, effect certainty, count of recorded committed paths, retained output
-coverage, and the cause-specific next action. Zero recorded paths does not assert that nothing
-changed; interrupted output remains partial evidence. The original diagnostic stays intact.
-These summaries neither replay operations nor grant permission. Unknown effects still stop
-automatic continuation, and earlier completed work is not rolled back by a later failure.
+coverage, and the cause-specific next action. A typed recovery value is derived from execution
+facts; the same decision is rendered in model-visible text because provider adapters can omit
+internal annotations. It distinguishes correction before retry, inspection before retry, waiting
+for user direction after interruption, and respecting a withheld permission/policy boundary.
+Zero recorded paths does not assert that nothing changed; interrupted output remains partial
+evidence. The original diagnostic stays intact. These summaries neither replay operations nor
+grant permission. Unknown effects still stop automatic continuation, and earlier completed work
+is not rolled back by a later failure.
 
 An executed failed tool result immediately arms an execution-side **failed-operation retry barrier** in
 the shared parent/worker engine. The same tool with the same normalized arguments is refused
 before execution; changing a call ID, intent annotation or bash timeout does not evade it.
-Corrected arguments and different diagnostic calls remain available. Successful reads, todo
-updates, compaction and automatic/directed continuation do not release this barrier. A
-successful novel committed source mutation releases failed-call identities so the same check
-can verify a repair; new steering or coordination starts a new recovery context. A failed
+Corrected arguments and different diagnostic calls remain available. Todo updates, compaction
+and automatic/directed continuation do not release this barrier, and neither do successful reads,
+with one exception: a successful `read` of a file that a failed `edit` or `write` targeted
+releases that call, because the read supplies the line witnesses the call lacked (for example a
+tag from an earlier session). When directory access is approved, a `read` that failed at the
+workspace access boundary may be retried if the workspace now resolves its target. This does not
+release unrelated failures or bypass tool approvals and protected-storage restrictions. A retry
+that fails again re-arms the barrier. A successful novel committed source mutation releases
+failed-call identities so the same check can verify a repair; new steering or coordination starts
+a new recovery context. A failed
 post-commit operation retains its effects but does not release the barrier. This is a
 normalized-call guard, not semantic equivalence checking: changed scripts can still repeat
 the same underlying mistake, and any successful novel source mutation can release it.
@@ -492,6 +596,9 @@ of A; only a current successful execution or valid declared-input reuse of A cle
 isolated Python AST check on recognized Unix CPython installations. Dial tracks the source,
 environment and installed runtime identity; unsupported layouts and unknown dependencies fall
 back to execution (see [configuration.md](configuration.md) for limits and host-runtime assumptions).
+The runtime identity is observed afresh before and after each check run; one revalidation pass
+observes it once for all of its checks. Its files are identified by metadata alone (no content is
+read), so capturing a stdlib of about 8,500 entries costs tens of milliseconds.
 Other built-in checks remain conservative. Operators can enable reuse for configured
 `[[verification.commands]]` checks with `[verification.inputs."check-name"]` (`paths`, optional
 `environment`). This explicitly asserts that the check is deterministic and side-effect free,
@@ -559,6 +666,9 @@ stay open and are disclosed in the report/evidence rather than implicitly called
 visual evidence remains an honest limitation, not a fabricated screenshot or a bypass of browser
 approval. Automatic behavioral learning credit additionally requires no outstanding obligations or
 missing required pixels. Native, shell, and extension effect revisions invalidate old visual evidence.
+Explicit requests for visual inspection or verification also mark visual evidence as required; a
+capture counts only after its pixels are delivered to a subsequent model request. This records
+observation, not proof that the surface is correct.
 
 Recovery transitions have explicit lifetimes. Automatic and directed continuations reset transient
 reply/narration recovery but retain evidence restrictions and committed-content edit-cycle history;
@@ -600,12 +710,20 @@ limits, reasoning budgets, approvals or verification requirements:
   names their work (symbol references, commits or pull requests, MCP servers, an earlier
   session). Every catalog tool not offered is
   listed in the system prompt under "Loadable tools" with the first sentence of its description (at most 110 characters), so the model
-  loads it with `tool_load` in one round; schemas and recorded tool contracts are unchanged. The
-  list changes only when a tool is loaded or unloaded, and the offer never reads live-worker state,
-  so the provider's cached prefix survives ordinary rounds.
+  loads it with `tool_load` in one round. With compact guidance (efficiency on) and `tool_search`
+  offered, built-in loadable tools are listed by name only, since `tool_search` returns their
+  descriptions; a placeholder family such as `dap_<adapter>` keeps the list of real names. Schemas
+  and recorded tool contracts are unchanged. The list changes only when a tool is loaded or unloaded,
+  and the offer never reads live-worker state, so the provider's cached prefix survives ordinary rounds.
+  When `tool_search` is offered, query `*` to list the eligible catalog in bounded pages and follow
+  `next_query` until it is null. Listing does not activate tools; use `tool_load` for an exact name.
+  It reflects the current eligible catalog, which may change between pages, not a permission grant
+  or proof that an external capability works. Ordinary capability searches still rank and activate matches.
   MCP schemas remain deferred unless selected for the current task or explicitly loaded. Routing
   is disabled for pinned harnesses, hermetic runs and the context-overflow fallback; selection-only
   offers do not inherit task-selected tools.
+  Plan mode can expose `computer` for read-only actions; each call still passes plan and approval
+  policy. Enabling the integration does not establish that capture succeeded or pixels reached the model.
   `assistance.compact_tools=true` switches to discovery mode for small local models: a core set
   bounded by `assistance.initial_tool_limit` (default 16) plus `tool_search`/`tool_load`.
   `assistance.lean_local` defaults to `true`, which enables a lean profile whenever the main model
@@ -637,9 +755,14 @@ limits, reasoning budgets, approvals or verification requirements:
     one-call interface (`parallel_tool_calls: false` where the protocol accepts it, a per-request
     one-call contract, and a batch of several calls rejected unexecuted), and its prompt says one
     call per response instead of asking for batches. A saved `dial reliability check` record for
-    this model that passed the two-call batch fixture keeps batching; `reliability.enabled = false`
-    turns the one-call default off. The record is read once per session, so the mode and prompt do
-    not change mid-session. Its offer is not simplified further.
+    this exact configuration keeps batching only when its two-call batch fixture and all recorded
+    fixture cases pass; `reliability.enabled = false` turns the one-call default off. The record is
+    read once at each turn boundary, so the prompt and contract use the same snapshot and a record
+    replaced or invalidated during a turn takes effect only on the next turn. Binding includes the
+    configured context window and sampling policy. Fixture success is a contract/execution
+    measurement, not a coding-quality score or proof that a larger offer is optimal.
+    This small-tier default and its passing-batch exception are independent of the broader
+    `measured_interfaces` opt-in. Base-model fixture evidence is not reused with LoRA or steering.
   - Worked example: when the small tier uses its one-call default, built-in guidance ends with one
     compact example loop (targeted `grep`, ranged `read`, one `edit` in the active grammar's argument
     shape, `check` when offered or otherwise a focused `bash` check, then a short answer). It is fixed
@@ -667,14 +790,27 @@ limits, reasoning budgets, approvals or verification requirements:
     explicit limit still applies. When the cap is hit, the existing reasoning guard discards that
     generation and retries once; requests to Dial's own runtime also carry the `dial_reasoning`
     budget (3/4 of the cap). 0 disables it.
-  - Escalation: `escalate_after` consecutive failing rounds (malformed tool calls, or failed `edit`
+  - Escalation: `escalate_after` failing rounds (malformed tool calls, or failed `edit`
     or `write` calls) step the session up. Step 1 switches to the minimal tool set and lean prompt;
     step 2 switches to the `replace` edit grammar unless a pin chooses otherwise (it is skipped when
-    the grammar is pinned or already `replace`). A reached step takes effect at the next user turn,
+    the grammar is pinned or already `replace`). When the latest edit or write failed, one successful
+    intervening round preserves the streak; a second clears it. A successful edit or write allows the
+    next successful round to clear it. This is not tracked per file. A reached step takes effect at the next user turn,
     so the prompt, tool offer and edit grammar never change within a turn (and at most twice per
     session). The reached step is remembered per model in the user directory file
     `local-profile.json` as soon as it is reached and applied at the first turn of the next session.
-    0 disables escalation.
+    A llama.cpp server whose `/props` reports that the model's chat template cannot render tools
+    natively (`chat_template_caps`) starts every session at step 1 instead of waiting for failures;
+    that step comes from the server, not from the record, so it is not saved. Ollama (`capabilities` without `tools`) and LM Studio (a `capabilities` list without `tool_use`) start there the same way. When replies come back with tool calls as plain text twice in a session, a notice names the parser setting for the detected server (vLLM `--enable-auto-tool-choice --tool-call-parser`, SGLang `--tool-call-parser`, llama-server `--jinja`); the count is also kept in `local-profile.json`. vLLM and SGLang are recognised from `owned_by` in `/v1/models`, receive the thinking switch and penalties, and their `max_model_len` is the planned window. 0 disables escalation.
+    With `reliability.enabled` and `reliability.measured_interfaces` enabled, a bound fixture record
+    with a failed native-tool case (including a call recovered from plain text) also seeds step 1,
+    even above the small-window threshold. It does not select another edit grammar or override pins.
+  - Route diagnostics: `dial reliability` separates declared capabilities, server-reported facts,
+    saved fixture measurements and the selected interface. Configured context and sampling are
+    policy, not measurements; effective context is shown only when a session supplies it. The CLI
+    may probe local-server metadata, never inference. `/reliability` uses the turn's existing
+    snapshot without disk reads or server probes; an unmeasured CLI interface is unknown, not a
+    guessed capability score.
   - Benchmark lever: `ablate-local_profile` in `dial benchmark --ablate-assistance` turns the
     profile off (`assistance.local.enabled = false`) against the `dial` row.
   - Thinking (`assistance.local.thinking`, default `model`): leaves thinking to the model, server
@@ -854,10 +990,15 @@ two check-before-change aids, `fault_witness` (on) and `repro_first` (`advise`).
   Both counterfactual settings are evidence only: they never change check status or the real
   workspace. Copies exclude dependency and build directories, so compiled checks rebuild from
   cold, and shell effects outside checkpoints are not reverted.
-- `experimental.repro_first` (`off`, `advise`, `gate`; default `advise`): on a debugging task, the first edit to a
-  non-test, non-documentation source file before any reproduction failed this turn (a failing
-  `bash` test command or a `code_failed` `check`) gets a note (`advise`) or is refused once
-  (`gate`). It fires at most once per turn; the next attempt proceeds.
+- `experimental.repro_first` (`off`, `advise`, `gate`; default `advise`): on a debugging task whose
+  request explicitly asks for verification (a word starting with "verif", such as "verify" or
+  "verification"), the first edit to a non-test, non-documentation source file before any
+  reproduction failed this turn (a failing `bash` test command or a `code_failed` `check`) gets a
+  note (`advise`) or is refused once (`gate`). The `advise` note follows an edit that already
+  applied, so it asks for a focused check of the reported behavior rather than a reproduction;
+  `gate` asks for the reproduction before the edit. It fires at most once per turn; the next
+  attempt proceeds. A fix request that does not ask for verification is not steered toward a
+  reproduction.
 - `experimental.outcome_gradient_rounds` (0–10, 0 = off): after this many consecutive checked
   rounds with edits in which the error count (failing checks plus failing libtest, pytest, Go or
   Jest tests) does not drop below its best, a loop note suggests changing hypothesis.
@@ -1062,8 +1203,10 @@ dial policy "Investigate why the build fails" --json
 ```
 
 A CLI preview uses the configured baseline; an active session may use a different evaluated harness
-version. The live session report is the record of what that session requested. Capability-unverified
-sampling is labelled unverified, rather than claiming the provider applied a temperature.
+version. The live session report is the record of what that session requested, not confirmation
+that the backend enforced it. Unset numeric overrides are labelled `unset`, rather than claiming
+a measured server default or proving a field was absent from the wire request. Sampling selection
+and server enforcement are labelled separately; capability-unverified sampling stays unverified.
 
 Initial phase comes from the task. Observed source reads select investigation, successful edits
 select editing, recognized checks select verification, and errors or reasoning interceptions select

@@ -81,7 +81,7 @@ fn overloaded_with_short_retry_after_and_long_window_reset_retries() {
     let class = ErrorClass::RateLimited {
         retry_after: hints.delay,
     };
-    match decide(&class, hints.delay, 1, &policy()) {
+    match decide(&class, hints.delay, 1, false, &policy()) {
         Decision::Retry { delay, .. } => {
             assert!(delay >= Duration::from_secs(1) && delay < Duration::from_secs(2))
         }
@@ -94,17 +94,17 @@ fn quota_exhaustion_fails_fast_unless_waiting_is_opted_in() {
     let reset = Some(SystemTime::now() + Duration::from_secs(30));
     let class = ErrorClass::QuotaExhausted { reset_at: reset };
     assert!(matches!(
-        decide(&class, None, 1, &policy()),
+        decide(&class, None, 1, false, &policy()),
         Decision::Stop(None)
     ));
     let mut waiting = policy();
     waiting.wait_for_quota_reset = true;
     assert!(
-        matches!(decide(&class, None, 1, &waiting), Decision::Retry { delay, .. } if delay >= Duration::from_secs(29))
+        matches!(decide(&class, None, 1, false, &waiting), Decision::Retry { delay, .. } if delay >= Duration::from_secs(29))
     );
     waiting.max_delay = Duration::from_secs(10);
     assert!(matches!(
-        decide(&class, None, 1, &waiting),
+        decide(&class, None, 1, false, &waiting),
         Decision::Stop(Some(_))
     ));
 }
@@ -113,11 +113,17 @@ fn quota_exhaustion_fails_fast_unless_waiting_is_opted_in() {
 fn attempts_and_delay_ceiling_bound_retries() {
     let policy = policy();
     assert!(matches!(
-        decide(&ErrorClass::Transient, None, 1, &policy),
+        decide(&ErrorClass::Transient, None, 1, false, &policy),
         Decision::Retry { .. }
     ));
     assert!(matches!(
-        decide(&ErrorClass::Transient, None, policy.max_attempts, &policy),
+        decide(
+            &ErrorClass::Transient,
+            None,
+            policy.max_attempts,
+            false,
+            &policy
+        ),
         Decision::Stop(Some(_))
     ));
     let long = Some(Duration::from_secs(301));
@@ -126,20 +132,21 @@ fn attempts_and_delay_ceiling_bound_retries() {
             &ErrorClass::RateLimited { retry_after: long },
             long,
             1,
+            false,
             &policy
         ),
         Decision::Stop(Some(_))
     ));
     assert!(matches!(
-        decide(&ErrorClass::Fatal, None, 1, &policy),
+        decide(&ErrorClass::Fatal, None, 1, false, &policy),
         Decision::Stop(None)
     ));
     assert!(matches!(
-        decide(&ErrorClass::ContextOverflow, None, 1, &policy),
+        decide(&ErrorClass::ContextOverflow, None, 1, false, &policy),
         Decision::Stop(None)
     ));
     assert!(matches!(
-        decide(&ErrorClass::Auth, None, 1, &policy),
+        decide(&ErrorClass::Auth, None, 1, false, &policy),
         Decision::Stop(None)
     ));
 }
@@ -154,20 +161,20 @@ fn a_ready_fallback_shortens_only_the_failures_it_accepts() {
     .with_failover(Some(FallbackOn::UsageLimit));
     let throttled = ErrorClass::RateLimited { retry_after: None };
     assert!(matches!(
-        decide(&throttled, None, 1, &failover),
+        decide(&throttled, None, 1, false, &failover),
         Decision::Retry { delay, .. } if delay == Duration::from_secs(1)
     ));
     assert!(
-        matches!(decide(&throttled, None, FAILOVER_ATTEMPTS, &failover), Decision::Stop(Some(why)) if why.contains("fallback"))
+        matches!(decide(&throttled, None, FAILOVER_ATTEMPTS, false, &failover), Decision::Stop(Some(why)) if why.contains("fallback"))
     );
     let long = Some(FAILOVER_MAX_WAIT + Duration::from_secs(1));
     assert!(
-        matches!(decide(&throttled, long, 1, &failover), Decision::Stop(Some(why)) if why.contains("fallback")),
+        matches!(decide(&throttled, long, 1, false, &failover), Decision::Stop(Some(why)) if why.contains("fallback")),
         "a long wait fails over instead"
     );
     // A failure the fallback does not take keeps every configured attempt.
     assert!(matches!(
-        decide(&ErrorClass::Transient, None, FAILOVER_ATTEMPTS, &failover),
+        decide(&ErrorClass::Transient, None, FAILOVER_ATTEMPTS, false, &failover),
         Decision::Retry { delay, .. } if delay == Duration::from_secs(300)
     ));
     assert_eq!(
@@ -185,19 +192,49 @@ fn automatic_retry_interval_is_fixed_and_respects_limits_and_server_minimums() {
     );
     for attempt in [1, 2, 9] {
         assert!(matches!(
-            decide(&ErrorClass::Transient, None, attempt, &policy),
+            decide(&ErrorClass::Transient, None, attempt, false, &policy),
             Decision::Retry { delay, .. } if delay == Duration::from_secs(300)
         ));
     }
     policy.max_delay = Duration::from_secs(120);
     assert!(matches!(
-        decide(&ErrorClass::Transient, None, 1, &policy),
+        decide(&ErrorClass::Transient, None, 1, false, &policy),
         Decision::Retry { delay, .. } if delay == Duration::from_secs(120)
     ));
     policy.max_delay = Duration::from_secs(600);
     assert!(matches!(
-        decide(&ErrorClass::Transient, Some(Duration::from_secs(500)), 1, &policy),
+        decide(&ErrorClass::Transient, Some(Duration::from_secs(500)), 1, false, &policy),
         Decision::Retry { delay, .. } if delay == Duration::from_secs(500)
+    ));
+}
+
+#[test]
+fn a_connection_failure_retries_promptly_once_then_uses_the_ordinary_interval() {
+    let policy = Policy::new(
+        &crate::config::types::RetryConfig::default(),
+        Duration::from_secs(300),
+    );
+    assert!(matches!(
+        decide(&ErrorClass::Transient, None, 1, true, &policy),
+        Decision::Retry { delay, .. } if delay == CONNECTION_RETRY
+    ));
+    assert!(matches!(
+        decide(&ErrorClass::Transient, None, 2, true, &policy),
+        Decision::Retry { delay, .. } if delay == Duration::from_secs(300)
+    ));
+    // A server-requested minimum still wins over the prompt retry.
+    assert!(matches!(
+        decide(&ErrorClass::Transient, Some(Duration::from_secs(30)), 1, true, &policy),
+        Decision::Retry { delay, .. } if delay == Duration::from_secs(30)
+    ));
+    // A shorter configured interval is never lengthened.
+    let quick = Policy::new(
+        &crate::config::types::RetryConfig::default(),
+        Duration::from_millis(10),
+    );
+    assert!(matches!(
+        decide(&ErrorClass::Transient, None, 1, true, &quick),
+        Decision::Retry { delay, .. } if delay == Duration::from_millis(10)
     ));
 }
 

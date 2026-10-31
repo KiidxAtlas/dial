@@ -1,0 +1,107 @@
+# Running Dial in Docker
+
+The image runs the Linux build of Dial as the non-root user `dial` (uid 10001). It contains
+Dial, Bubblewrap (the Linux command sandbox), Git and CA certificates, and nothing else: no
+Python/MLX runtime, so local MLX models are unavailable inside it. Use a hosted provider, a
+model server on the host, or Docker Model Runner.
+
+## Build
+
+The build context excludes `.git`, so pass the source revision:
+
+```sh
+docker build --build-arg DIAL_BUILD_REVISION="$(git rev-parse HEAD)" -t dial .
+```
+
+Release images are published to `ghcr.io/kiidxatlas/dial`; pin a tag or digest.
+
+## Run
+
+```sh
+docker run --rm -it \
+  --security-opt seccomp=unconfined --security-opt systempaths=unconfined \
+  -v "$PWD":/workspace \
+  -v dial-home:/home/dial/.dial \
+  -e ANTHROPIC_API_KEY \
+  dial
+```
+
+- `-v "$PWD":/workspace` is the project Dial edits. It is the container's working directory.
+- `-v dial-home:/home/dial/.dial` keeps settings, sessions and credentials between runs
+  (`DIAL_HOME` is set to that path). Without it, state disappears with the container.
+- `-e NAME` passes a key from your shell without writing it on the command line. Providers read
+  `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `GROQ_API_KEY`,
+  `MISTRAL_API_KEY` and `DEEPSEEK_API_KEY`.
+- `-it` gives the terminal UI a TTY. Omit it for one-shot use:
+  `docker run --rm -v "$PWD":/workspace -e ANTHROPIC_API_KEY dial -p -y "summarize this repo"`.
+- On Linux, files created in the mount belong to uid 10001. Add `--user "$(id -u):$(id -g)"`
+  to write as yourself, and use a bind mount for state too (`-v "$HOME/.dial-docker":/home/dial/.dial`,
+  created beforehand) so the directory is writable by that uid.
+
+### Docker Compose
+
+`docker-compose.yml` in the repository root wraps the same options:
+
+```sh
+export ANTHROPIC_API_KEY=...        # whichever providers you use
+docker compose run --rm dial                              # terminal UI in the current directory
+docker compose run --rm dial -p -y "summarize this repo"  # one shot
+```
+
+It builds the local checkout when the image is missing (`docker compose build`, with
+`DIAL_BUILD_REVISION=$(git rev-parse HEAD)` exported), otherwise uses
+`ghcr.io/kiidxatlas/dial:latest` (override with `DIAL_IMAGE`). `DIAL_WORKSPACE` selects another
+project directory.
+
+## Sandbox
+
+Dial runs commands under Bubblewrap, which needs unprivileged user namespaces and a fresh `/proc`
+mount. Docker's default seccomp profile blocks the first and its masked `/proc` paths block the
+second, so inside a default container Dial's sandbox probe fails and command execution is
+**disabled** with an error; it never falls back to running unsandboxed. The recipes above pass
+`--security-opt seccomp=unconfined --security-opt systempaths=unconfined`, which lets Bubblewrap
+work without `--privileged` (checked with Docker Desktop on macOS using Dial's own Bubblewrap
+arguments). On hosts that apply an AppArmor profile to containers, such as Ubuntu, add
+`--security-opt apparmor=unconfined` as well. These options relax the container's own syscall and
+`/proc` protections, so the container is a packaging boundary rather than a security boundary:
+Dial's sandbox, not Docker, confines the commands it runs. Tools that do not run commands
+(reading, editing, search, web) work either way.
+
+## Docker Model Runner (Docker AI)
+
+Dial discovers [Docker Model Runner](https://docs.docker.com/ai/model-runner/) as the
+`docker-model-runner` provider, next to LM Studio, Ollama and llama.cpp. Its OpenAI-compatible
+API needs no key. Pull a model with `docker model pull ai/smollm2`; its models then appear in
+`/models` (and `dial models`) with their `docker.io/ai/…` names.
+
+| Where Dial runs | Address Dial uses |
+|---|---|
+| On the host | `http://127.0.0.1:12434/engines/v1` (enable host-side TCP access in Docker Desktop's Model Runner settings first) |
+| In a container (Docker Desktop) | `http://model-runner.docker.internal/engines/v1` |
+| In a container (Docker Engine on Linux) | `http://172.17.0.1:12434/engines/v1` |
+
+Set `DOCKER_MODEL_RUNNER_BASE_URL` to change the discovered address. The compose file already sets
+it to the container address; with `docker run` add
+`-e DOCKER_MODEL_RUNNER_BASE_URL=http://model-runner.docker.internal/engines/v1`. To use it
+without discovery, `dial --endpoint <base-url> -m docker.io/ai/smollm2:latest`. Docker's
+`*.docker.internal` names count as local hosts, so plain `http` is accepted and requests are
+treated as local inference (no proxy, no per-token cost).
+
+Docker Model Runner's llama.cpp backend cannot compile tool grammars with large bounded
+repetitions. For the `docker-model-runner` provider, Dial omits string-length and array-length
+bounds above 1024 from the outbound tool schemas, including constrained tool-call repair.
+The original tool schemas and their runtime validation are unchanged: an out-of-bounds call
+is still rejected before execution. Other providers keep their schemas unchanged.
+If the server returns `Failed to initialize samplers: failed to parse grammar`, Dial identifies
+it as a backend generation-grammar failure rather than a tool execution failure. Use the named
+`docker-model-runner` provider for this compatibility policy; a generic `--endpoint` route does
+not identify the backend as Docker. Do not disable runtime validation to work around it.
+
+The same container setup reaches other servers on the host: the compose file points
+`LM_STUDIO_BASE_URL`, `OLLAMA_BASE_URL` and `LLAMA_CPP_BASE_URL` at `host.docker.internal`. Those
+servers must listen on an address the container can reach, not only on the host's loopback.
+
+## Checks
+
+CI builds the image, runs `dial --version` and `dial --help` from it, and validates the compose
+file (`docker` job in `.github/workflows/ci.yml`).

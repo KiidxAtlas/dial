@@ -116,13 +116,19 @@ pub(in crate::agent) fn retire_delivered(messages: &mut Vec<Value>, delivered: b
     }
 }
 
+/// Index of this request's tail: the first message after the last non-transient one. Notes
+/// before it are stored history and are never reordered or merged.
+pub(in crate::agent) fn tail_start(messages: &[Value]) -> usize {
+    messages
+        .iter()
+        .rposition(|message| message["dial_transient"] != true)
+        .map_or(0, |index| index + 1)
+}
+
 /// Keep only the highest-priority advisory note among this request's trailing transient
 /// messages and return the dropped ones. Stored history before the tail is never touched.
 pub(in crate::agent) fn cap(messages: &mut Vec<Value>) -> Vec<Value> {
-    let tail = messages
-        .iter()
-        .rposition(|message| message["dial_transient"] != true)
-        .map_or(0, |index| index + 1);
+    let tail = tail_start(messages);
     let Some((_, keep)) = (tail..messages.len())
         .filter_map(|index| Priority::of(&messages[index]).map(|priority| (priority, index)))
         .min()
@@ -244,10 +250,7 @@ impl Emissions {
 /// removed note.
 pub(in crate::agent) fn curate(messages: &mut Vec<Value>, emissions: &mut Emissions) -> Vec<Value> {
     emissions.requests += 1;
-    let tail = messages
-        .iter()
-        .rposition(|message| message["dial_transient"] != true)
-        .map_or(0, |index| index + 1);
+    let tail = tail_start(messages);
     let mut seen_now: Vec<String> = Vec::new();
     let mut remove = Vec::new();
     // Forward, so the first assembled note of a duplicate pair is the one kept.
@@ -287,6 +290,52 @@ pub(in crate::agent) fn curate(messages: &mut Vec<Value>, emissions: &mut Emissi
             emissions.delivered.pop_front();
         }
     }
+    dropped
+}
+
+/// Merge this request's plain harness notes (see [`is_plain_note`]) from `start` on into one
+/// message at the first note's position, so the model reads one harness note per request instead
+/// of a stack of competing instructions. Marked context, evidence and non-text messages stay
+/// separate and in place.
+pub(in crate::agent) fn coalesce(messages: &mut Vec<Value>, start: usize) {
+    let Some(first) = (start..messages.len()).find(|&index| is_plain_note(&messages[index])) else {
+        return;
+    };
+    let mut texts = vec![
+        messages[first]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+    ];
+    let mut index = first + 1;
+    while index < messages.len() {
+        if is_plain_note(&messages[index]) {
+            texts.push(
+                messages.remove(index)["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            );
+        } else {
+            index += 1;
+        }
+    }
+    if texts.len() > 1 {
+        messages[first]["content"] = json!(texts.join("\n\n"));
+    }
+}
+
+/// The single request-tail assembly step for every agent loop: curate advisory notes (content-free
+/// and repeat suppression, then one note by priority), then merge the surviving plain notes from
+/// `start` into one message. Returns the dropped advisory notes. Call it once per request, after
+/// every note for that request is queued and before the request is built or captured.
+pub(in crate::agent) fn assemble(
+    messages: &mut Vec<Value>,
+    start: usize,
+    emissions: &mut Emissions,
+) -> Vec<Value> {
+    let dropped = curate(messages, emissions);
+    coalesce(messages, start.min(messages.len()));
     dropped
 }
 

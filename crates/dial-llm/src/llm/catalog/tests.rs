@@ -892,6 +892,46 @@ fn local_resolution_uses_complete_snapshot_without_main_ref() {
 }
 
 #[test]
+fn resolution_inspects_only_the_requested_label() {
+    let cache = tempfile::tempdir().unwrap();
+    for name in ["models--org--wanted", "models--org--other"] {
+        let path = cache.path().join(name).join("snapshots/rev");
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("config.json"), "{}").unwrap();
+        fs::write(path.join("model.safetensors"), "weights").unwrap();
+    }
+    let wanted = |label: &str| label == "org/wanted";
+    let entries = local_models_where(cache.path(), None, &wanted);
+    assert_eq!(
+        entries.iter().map(|e| e.label.as_str()).collect::<Vec<_>>(),
+        ["org/wanted"]
+    );
+    assert_eq!(local_models(cache.path(), None).len(), 2);
+
+    let studio = tempfile::tempdir().unwrap();
+    let mlx = studio.path().join("pub/Model-MLX");
+    fs::create_dir_all(&mlx).unwrap();
+    fs::write(mlx.join("config.json"), "{}").unwrap();
+    fs::write(mlx.join("model.safetensors"), "weights").unwrap();
+    let gguf = studio.path().join("pub/Model-GGUF");
+    fs::create_dir_all(&gguf).unwrap();
+    fs::write(gguf.join("model-Q4_K_M.gguf"), b"GGUF weights").unwrap();
+    assert!(lmstudio_mlx_models_where(studio.path(), None, &wanted).is_empty());
+    assert!(lmstudio_gguf_models_where(studio.path(), &wanted).is_empty());
+    for label in ["pub/Model-MLX", "pub/Model-GGUF"] {
+        let resolved = resolve_local_model_in(label, Some(cache.path()), Some(studio.path()))
+            .unwrap_or_else(|error| panic!("{label}: {error:#}"));
+        assert!(
+            resolved.contains("Model-"),
+            "{label} resolved to {resolved}"
+        );
+    }
+    let resolved =
+        resolve_local_model_in("org/wanted", Some(cache.path()), Some(studio.path())).unwrap();
+    assert!(resolved.contains("models--org--wanted"), "{resolved}");
+}
+
+#[test]
 fn lm_studio_mlx_downloads_are_listed_and_other_formats_skipped() {
     let folder = tempfile::tempdir().unwrap();
     let mlx = folder.path().join("lmstudio-community/Qwen-MLX-8bit");
@@ -1031,7 +1071,7 @@ fn failed_live_probe_retains_cached_and_configured_models_as_unverified() {
     )
     .unwrap();
     let mut configured = BTreeMap::new();
-    for id in ["lm-studio", "ollama", "llama-cpp"]
+    for id in ["lm-studio", "ollama", "llama-cpp", "docker-model-runner"]
         .into_iter()
         .chain(KNOWN.iter().map(|row| row.0))
     {
@@ -1469,6 +1509,49 @@ fn llama_server_is_recognised_by_props_on_local_hosts_only() {
         &[]
     ));
 }
+/// Mocked `/v1/models` rows shaped after vLLM's and SGLang's documented examples (`owned_by`,
+/// `max_model_len`); no live server was available to confirm the fields.
+#[test]
+fn vllm_and_sglang_are_recognised_by_their_model_list_and_report_the_served_length() {
+    let row = |owner: &str| {
+        serde_json::json!({"object":"list","data":[
+            {"id":"other","object":"model","owned_by":owner,"max_model_len":4096},
+            {"id":"qwen","object":"model","owned_by":owner,"max_model_len":32768},
+        ]})
+        .to_string()
+    };
+    let vllm = routed(vec![("/v1/models", row("vllm"))]);
+    assert_eq!(openai_runtime(&vllm, None, &[]), Some(OpenAiRuntime::Vllm));
+    assert_eq!(loaded_context(&vllm, "qwen", None, &[]), Some(32768));
+    assert_eq!(loaded_context(&vllm, "other", None, &[]), Some(4096));
+    assert_eq!(
+        loaded_context(&vllm, "missing", None, &[]),
+        None,
+        "several rows and no match is not a guess"
+    );
+    let sglang = routed(vec![("/v1/models", row("SGLang"))]);
+    assert_eq!(
+        openai_runtime(&sglang, None, &[]),
+        Some(OpenAiRuntime::Sglang)
+    );
+    let single = routed(vec![(
+        "/v1/models",
+        r#"{"data":[{"id":"only","owned_by":"vllm","max_model_len":8192}]}"#.into(),
+    )]);
+    assert_eq!(loaded_context(&single, "alias", None, &[]), Some(8192));
+    let plain = routed(vec![(
+        "/v1/models",
+        r#"{"data":[{"id":"m","owned_by":"organization-owner"}]}"#.into(),
+    )]);
+    assert_eq!(openai_runtime(&plain, None, &[]), None);
+    assert_eq!(loaded_context(&plain, "m", None, &[]), None);
+    assert_eq!(
+        openai_runtime("https://api.example.invalid/v1", Some("secret"), &[]),
+        None,
+        "hosted hosts are never probed"
+    );
+}
+
 #[test]
 fn llama_props_report_the_templates_native_tool_support() {
     let parse = |props: serde_json::Value| LlamaProps::parse(&props);

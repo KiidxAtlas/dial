@@ -79,6 +79,7 @@ pub(super) struct Actor {
     pub worker_query_cache: Arc<Mutex<QueryProjection>>,
     pub worker_live: Arc<Mutex<LiveState>>,
     pub queue: Arc<Mutex<Vec<String>>>,
+    pub worker_fs: Arc<client_fs::ClientFsCalls>,
 }
 
 impl Actor {
@@ -105,6 +106,7 @@ impl Actor {
             worker_query_cache,
             worker_live,
             queue,
+            worker_fs,
         } = self;
         let outcome = (|| -> Result<()> {
             let mut compute = None;
@@ -130,6 +132,16 @@ impl Actor {
                 flag.clone(),
             )?;
             agent.set_launch(launch)?;
+            if acp {
+                // Bridged only for what the client advertises at `initialize` (checked per call).
+                agent
+                    .workspace_mut()
+                    .set_client_files(Arc::new(client_fs::ClientFs::new(
+                        worker_fs,
+                        worker_out.clone(),
+                        flag.clone(),
+                    )));
+            }
             agent.begin_session_lifecycle();
             if let Some(path) = std::env::var_os("DIAL_BENCHMARK_ADAPTER") {
                 agent.set_benchmark_adapter(std::path::Path::new(&path))?;

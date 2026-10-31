@@ -33,6 +33,24 @@ drivers, `make test-python` for Python code, `make test-bench-offline` for bench
 - Adding a dependency: declare it in the root `[workspace.dependencies]` and make sure
   `cargo deny check` still passes (licenses and advisories are configured in `deny.toml`).
 
+### Prompt wording, thresholds and recovery limits
+
+Changes to model-facing wording (system prompt sections, harness notes, recovery and correction
+text) or to tuning constants (recovery limits, stall and loop thresholds, research windows,
+escalation and budget defaults) change model outcomes that unit tests cannot observe. Such a PR
+must state its evidence in the description:
+
+- **Outcome evidence:** a before/after `dial benchmark` comparison on the same suite, fixture
+  revision and model (see [docs/benchmarks.md](docs/benchmarks.md)), with the repetitions and
+  the suite named; or
+- **No outcome change claimed:** the change is a correctness or safety fix, or a refactor that
+  keeps the model-visible text and decisions, and the PR says so.
+
+Without one of these, keep the current value. A new tuning knob ships disabled or at the current
+behaviour until a measurement justifies a different default. Passing assembly or routing tests
+does not establish a live-model improvement. The `[Unreleased]` CHANGELOG entry names the
+measurement or says the effect is unmeasured.
+
 ## Releases
 
 Maintainers cut releases with `scripts/release.sh <version>`; see

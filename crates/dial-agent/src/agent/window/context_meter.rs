@@ -1,13 +1,8 @@
 //! Display-only context telemetry. Provider accounting remains separate from estimates.
+use crate::agent::compact::compaction::RequestAccounting;
 use crate::agent::window::context_breakdown::ContextBreakdown;
 use crate::agent::workflow::evidence;
-use crate::{
-    llm::{
-        Chat,
-        wire::{json_bytes, wire_parts},
-    },
-    storage::session::Session,
-};
+use crate::{llm::Chat, storage::session::Session};
 
 #[derive(Default)]
 pub(in crate::agent) struct ContextMeter {
@@ -49,14 +44,26 @@ impl RequestOverhead {
     }
 }
 
-pub(in crate::agent) fn overhead(request: &Chat) -> RequestOverhead {
+pub(in crate::agent) fn overhead(
+    request: &Chat,
+    accounting: &RequestAccounting,
+) -> RequestOverhead {
+    assert_eq!(
+        request.messages.len(),
+        accounting.messages.len(),
+        "accounting must cover every message"
+    );
+    assert_eq!(
+        request.tools.len(),
+        accounting.tool_bytes.len(),
+        "accounting must cover every tool"
+    );
     let mut out = RequestOverhead {
-        tool_schema_bytes: request.tools.iter().map(json_bytes).sum(),
+        tool_schema_bytes: accounting.tool_bytes.iter().sum(),
         ..Default::default()
     };
-    out.breakdown.add_tools(&request.tools);
-    for message in &request.messages {
-        let parts = wire_parts(message);
+    out.breakdown.add_tool_bytes(&accounting.tool_bytes);
+    for (message, &parts) in request.messages.iter().zip(&accounting.messages) {
         let bytes = parts.total();
         out.breakdown.add_message(message, parts);
         if matches!(message["role"].as_str(), Some("system" | "developer")) {

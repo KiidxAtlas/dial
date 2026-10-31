@@ -6,13 +6,22 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use ureq::unversioned::{
     resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver},
-    transport::{
-        Buffers, ConnectProxyConnector, ConnectionDetails, Connector, NextTimeout, RustlsConnector,
-        Transport,
-    },
+    transport::{Buffers, ConnectionDetails, Connector, NextTimeout, Transport},
 };
 
+mod reuse;
 mod tcp;
+pub(super) use tcp::keepalive;
+
+/// What the request a connection currently serves may wait for. Each connection owns one cell,
+/// shared by its cancellable layers; the reuse pool rebinds it when it lends the connection to the
+/// next request, so cancellation and silence limits always belong to the request in flight.
+#[derive(Clone, Debug)]
+struct Binding {
+    interrupt: Arc<AtomicBool>,
+    patience: Option<Patience>,
+}
+type Bound = Arc<parking_lot::Mutex<Binding>>;
 
 // Test seam: scale one-second stall-test limits down without leaking into concurrent tests.
 // Each test drives its model call on its own thread; zero preserves production limits. Backends
@@ -114,12 +123,15 @@ impl Patience {
     }
 
     /// Bound draining optional trailing usage after the provider commits a reply.
-    /// Later progress must never extend this terminal grace window.
+    /// A later call may shorten this terminal grace window but never extend it.
     pub(super) fn finish_within(&self, grace: Duration) {
-        self.clock
-            .lock()
-            .terminal_deadline
-            .get_or_insert_with(|| Instant::now() + grace);
+        let deadline = Instant::now() + grace;
+        let mut clock = self.clock.lock();
+        clock.terminal_deadline = Some(
+            clock
+                .terminal_deadline
+                .map_or(deadline, |existing| existing.min(deadline)),
+        );
     }
 
     pub(super) fn remaining(&self) -> Option<Duration> {
@@ -137,6 +149,16 @@ impl Patience {
             (None, Some(deadline)) => Some(deadline.saturating_duration_since(Instant::now())),
             (remaining, None) => remaining,
         }
+    }
+
+    /// Time left before the terminal deadline, if a committed reply set one. Unlike the idle and
+    /// first-event limits, it bounds every read: ureq reports no response phase when no `recv_*`
+    /// timeout is configured (an unlimited `timeout_secs`), and a committed reply must still end.
+    fn terminal_remaining(&self) -> Option<Duration> {
+        self.clock
+            .lock()
+            .terminal_deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
     }
 }
 /// Test-only: the thread-local idle limit set for one model call, restored when the call returns. A backend
@@ -165,15 +187,17 @@ impl Drop for TestIdleLimitScope {
 }
 
 pub(super) fn agent(config: ureq::config::Config, interrupt: Arc<AtomicBool>) -> ureq::Agent {
-    agent_with_resolver(config, interrupt, DefaultResolver::default())
+    build(config, interrupt, DefaultResolver::default(), None, true)
 }
 
+/// A caller's resolver may guard which addresses are reachable, so these agents never borrow a
+/// pooled connection that another resolver approved.
 pub(super) fn agent_with_resolver(
     config: ureq::config::Config,
     interrupt: Arc<AtomicBool>,
     resolver: impl Resolver,
 ) -> ureq::Agent {
-    build(config, interrupt, resolver, None)
+    build(config, interrupt, resolver, None, false)
 }
 
 /// A streaming-chat agent: silence is bounded by `patience`, the stream as a whole is not.
@@ -187,25 +211,27 @@ pub(super) fn patient_agent(
         interrupt,
         DefaultResolver::default(),
         Some(patience),
+        true,
     )
 }
 
+/// `reuse` lets the agent share warm connections with other agents (see [`reuse`]); a proxied
+/// agent never does, because a CONNECT tunnel must not return as a plain connection.
 fn build(
     config: ureq::config::Config,
     interrupt: Arc<AtomicBool>,
     resolver: impl Resolver,
     patience: Option<Patience>,
+    reuse: bool,
 ) -> ureq::Agent {
-    let connector = ()
-        .chain(ConnectProxyConnector::default())
-        .chain(tcp::KeepaliveConnector {
-            interrupt: Arc::clone(&interrupt),
-        })
-        .chain(CancelConnector {
+    let reuse = reuse && config.proxy().is_none();
+    let connector = reuse::ReuseConnector::new(
+        Binding {
             interrupt: Arc::clone(&interrupt),
             patience,
-        })
-        .chain(RustlsConnector::default());
+        },
+        reuse,
+    );
     ureq::Agent::with_parts(
         config,
         connector,
@@ -245,8 +271,7 @@ fn check(interrupt: &AtomicBool) -> Result<(), ureq::Error> {
 
 #[derive(Debug)]
 struct CancelConnector {
-    interrupt: Arc<AtomicBool>,
-    patience: Option<Patience>,
+    bound: Bound,
 }
 impl<T: Transport> Connector<T> for CancelConnector {
     type Out = CancelTransport<T>;
@@ -255,11 +280,10 @@ impl<T: Transport> Connector<T> for CancelConnector {
         _: &ConnectionDetails,
         chained: Option<T>,
     ) -> Result<Option<Self::Out>, ureq::Error> {
-        check(&self.interrupt)?;
+        check(&self.bound.lock().interrupt)?;
         Ok(chained.map(|inner| CancelTransport {
             inner,
-            interrupt: Arc::clone(&self.interrupt),
-            patience: self.patience.clone(),
+            bound: Arc::clone(&self.bound),
             send_closed: false,
             send_failure: None,
         }))
@@ -269,8 +293,7 @@ impl<T: Transport> Connector<T> for CancelConnector {
 #[derive(Debug)]
 struct CancelTransport<T> {
     inner: T,
-    interrupt: Arc<AtomicBool>,
-    patience: Option<Patience>,
+    bound: Bound,
     /// The peer closed the connection while the request was being sent (see [`early_close`]);
     /// the connection is never reused afterwards.
     send_closed: bool,
@@ -279,19 +302,18 @@ struct CancelTransport<T> {
 }
 impl<T: Transport> CancelTransport<T> {
     fn check(&self) -> Result<(), ureq::Error> {
-        check(&self.interrupt)
+        check(&self.bound.lock().interrupt)
     }
 }
 
 /// A server may answer before reading the whole request (a rate limit, an oversized or invalid
 /// body) and then close, which resets the connection under the remaining write. That answer is the
 /// real outcome, so the send stops and the response is read; a close with no answer still fails
-/// with the original send error. The TLS handshake is not a request phase and is never covered.
-fn early_close(io: &std::io::Error, reason: ureq::Timeout) -> bool {
+/// with the original send error. The phase is not checked: ureq may name the overall deadline
+/// instead of the send phase, and a close during the TLS handshake ends the same way, because
+/// the handshake's next read finds no answer and reports the send error.
+fn early_close(io: &std::io::Error) -> bool {
     matches!(
-        reason,
-        ureq::Timeout::SendRequest | ureq::Timeout::SendBody
-    ) && matches!(
         io.kind(),
         std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
     )
@@ -310,7 +332,7 @@ impl<T: Transport> Transport for CancelTransport<T> {
         // A partial write must never be replayed; the TCP transport resumes at the sent offset and
         // checks the interrupt between short write slices.
         match self.inner.transmit_output(amount, timeout) {
-            Err(ureq::Error::Io(io)) if early_close(&io, timeout.reason) => {
+            Err(ureq::Error::Io(io)) if early_close(&io) => {
                 self.send_closed = true;
                 self.send_failure = Some(io);
                 Ok(())
@@ -320,18 +342,24 @@ impl<T: Transport> Transport for CancelTransport<T> {
     }
     fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
         let started = Instant::now();
+        let binding = self.bound.lock().clone();
         // The SSE reader owns the progress clock. A read boundary or keep-alive bytes must never
         // reset it; otherwise a final keep-alive followed by silence grants another full idle budget.
-        let patience = self.patience.as_ref().filter(|_| {
-            matches!(
-                timeout.reason,
-                ureq::Timeout::RecvResponse | ureq::Timeout::RecvBody
-            )
-        });
+        let in_response = matches!(
+            timeout.reason,
+            ureq::Timeout::RecvResponse | ureq::Timeout::RecvBody
+        );
+        let limit = |patience: &Patience| {
+            if in_response {
+                patience.remaining()
+            } else {
+                patience.terminal_remaining()
+            }
+        };
         loop {
-            self.check()?;
+            check(&binding.interrupt)?;
             let mut remaining = timeout.after.saturating_sub(started.elapsed());
-            if let Some(limit) = patience.and_then(Patience::remaining) {
+            if let Some(limit) = binding.patience.as_ref().and_then(limit) {
                 remaining = remaining.min(limit);
             }
             if remaining.is_zero() {
@@ -359,7 +387,9 @@ impl<T: Transport> Transport for CancelTransport<T> {
         }
     }
     fn is_open(&mut self) -> bool {
-        !self.send_closed && !self.interrupt.load(Ordering::SeqCst) && self.inner.is_open()
+        !self.send_closed
+            && !self.bound.lock().interrupt.load(Ordering::SeqCst)
+            && self.inner.is_open()
     }
     fn is_tls(&self) -> bool {
         self.inner.is_tls()

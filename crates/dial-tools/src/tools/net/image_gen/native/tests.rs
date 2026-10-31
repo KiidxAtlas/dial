@@ -1,11 +1,12 @@
 //! Loopback fixtures for the native image transport: origin and download rules, credential
 //! placement, bounded bodies, no redirects and total deadlines. No live service is contacted.
+use super::super::loopback::Server;
 use super::*;
 use crate::llm::model_config::{HeaderValue, RequestHeader};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::thread::JoinHandle;
+use std::sync::atomic::Ordering;
 
 const KEY: &str = "sk-test-key";
 
@@ -100,17 +101,16 @@ fn write_reply(mut stream: TcpStream, reply: Reply) {
     let _ = stream.write_all(&reply.body);
 }
 
-/// Answers the given replies in order on loopback. Returns every request received, including any
-/// connection beyond the scripted ones, so a retry shows up as an extra entry.
-fn serve(replies: Vec<Reply>) -> (String, JoinHandle<Vec<String>>) {
+/// Answers the given replies in order on loopback. The thread stops when the test joins it (or
+/// after a long idle period if it never does); joining returns every request received, including
+/// any connection beyond the scripted ones, so a retry shows up as an extra entry.
+fn serve(replies: Vec<Reply>) -> (String, Server) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    let total = replies.len();
-    let handle = std::thread::spawn(move || {
+    let server = Server::spawn(move |stop| {
         let mut replies = replies.into_iter();
         let mut seen = Vec::new();
-        let mut answered = 0usize;
         let mut last = Instant::now();
         loop {
             match listener.accept() {
@@ -121,16 +121,12 @@ fn serve(replies: Vec<Reply>) -> (String, JoinHandle<Vec<String>>) {
                         .unwrap();
                     seen.push(read_request(&stream));
                     if let Some(reply) = replies.next() {
-                        answered += 1;
                         write_reply(stream, reply);
                     }
                     last = Instant::now();
                 }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                    let idle = last.elapsed();
-                    if idle > Duration::from_secs(3)
-                        || (answered == total && idle > Duration::from_millis(300))
-                    {
+                    if stop.load(Ordering::SeqCst) || last.elapsed() > Duration::from_secs(15) {
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(5));
@@ -140,7 +136,7 @@ fn serve(replies: Vec<Reply>) -> (String, JoinHandle<Vec<String>>) {
         }
         seen
     });
-    (base, handle)
+    (base, server)
 }
 
 /// A loopback address with no server behind it; any connection is recorded by `assert_no_connection`.

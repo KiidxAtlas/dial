@@ -10,6 +10,16 @@
 //! fails its enforcement self-test, [`Sandbox::available`] returns an error and
 //! callers must refuse to run commands.
 //!
+//! Protected Git metadata: in every policy and on both platforms, the `.git` entry at the top
+//! of each writable root (a directory, a `gitdir:` pointer file or a symlink), the resolved
+//! git directory of a linked worktree and its common directory stay read-only when they lie
+//! inside a writable root (see [`git_metadata`]). Hooks and configuration there are executed later by
+//! unsandboxed `git`, so a sandboxed command must not be able to plant them. A `.git` that does
+//! not exist when the command starts is not protected, so `git init` still works, and nested
+//! repositories and submodules below the root are not covered. Listing a protected path (or a
+//! path inside it) in `sandbox.extra_write` opts it out. On Linux a `.git` that is a symlink is
+//! protected through its target only: the link itself can still be replaced.
+//!
 //! Residual limits (see also the tools module docs):
 //! * `sandbox-exec` is deprecated by Apple, though it still ships and enforces.
 //! * World-readable system paths stay readable: `/usr`, `/bin`, `/sbin`,
@@ -54,8 +64,8 @@
 //! * Most Mach services stay reachable: AppleEvents/LaunchServices (`osascript`,
 //!   `open`) can drive other apps that run unsandboxed. Denying them hangs
 //!   `osascript` and risks breaking CoreFoundation tools, so they are not denied.
-//! * Anything the workspace holds is trusted later by unsandboxed tools:
-//!   `.git/hooks`, `.git/config`, package scripts, build scripts.
+//! * Anything else the workspace holds is trusted later by unsandboxed tools:
+//!   package scripts, build scripts, nested repositories' `.git`.
 //! * `mktemp` without a template and `mktemp -t` use the per-user
 //!   `/var/folders` dir (not `$TMPDIR`) and fail; pass it via `extra_write`
 //!   if scripts need it.
@@ -67,6 +77,13 @@
 
 #[cfg(any(target_os = "linux", all(test, unix)))]
 mod linux;
+pub mod netproxy;
+
+/// The filtering proxy a sandboxed command must route through, if any.
+#[cfg(unix)]
+type ProxyRef<'a> = Option<&'a netproxy::Endpoint>;
+#[cfg(not(unix))]
+type ProxyRef<'a> = Option<&'a std::convert::Infallible>;
 
 use std::ffi::OsString;
 use std::io::ErrorKind;
@@ -164,7 +181,7 @@ impl Sandbox {
             allow_network,
             extra_write: Vec::new(),
         };
-        self.command_mode(workspace, &policy, program, args, None)
+        self.command_mode(workspace, &policy, program, args, None, None)
     }
 
     fn command_mode(
@@ -174,13 +191,21 @@ impl Sandbox {
         program: &str,
         args: &[&str],
         owned_terminal: Option<i32>,
+        proxy: ProxyRef<'_>,
     ) -> Result<Command, String> {
         self.available()?;
         #[cfg(target_os = "linux")]
-        return linux::command_mode(workspace, policy, program, args, owned_terminal.is_some());
+        return linux::command_mode(
+            workspace,
+            policy,
+            program,
+            args,
+            owned_terminal.is_some(),
+            proxy,
+        );
         #[cfg(windows)]
         {
-            let _ = (workspace, policy, program, args, owned_terminal);
+            let _ = (workspace, policy, program, args, owned_terminal, proxy);
             Err(
                 "Windows command isolation is unavailable; refusing to run a sandboxed command"
                     .into(),
@@ -196,7 +221,16 @@ impl Sandbox {
             else {
                 return Err("command_mode requires a Strict policy on this platform".into());
             };
-            let mut profile = strict_profile(workspace, deny_read, extra_write, *allow_network)?;
+            let proxy = proxy.filter(|_| *allow_network);
+            let mut profile = strict_profile(
+                workspace,
+                deny_read,
+                extra_write,
+                *allow_network && proxy.is_none(),
+            )?;
+            if let Some(proxy) = proxy {
+                profile.push_str(&proxy_rule(proxy.port()));
+            }
             profile.push_str(&program_rule(program)?);
             if let Some(fd) = owned_terminal {
                 profile.push_str(&owned_terminal_rule(fd)?);
@@ -226,16 +260,21 @@ impl Sandbox {
         self.dev_command(workspace, policy, program, args, std::env::vars_os())
     }
 
-    /// Retain only the caller's freshly allocated private controlling PTY, never a host TTY.
-    /// All filesystem, network, PID namespace and die-with-parent restrictions are unchanged.
-    #[cfg(not(windows))]
-    pub(super) fn command_with_owned_terminal(
+    /// Like [`Sandbox::command_with_policy`], with two optional extensions. `owned_terminal` keeps
+    /// only the caller's freshly allocated private controlling PTY, never a host TTY; all other
+    /// restrictions are unchanged. When `proxy` is set and the policy allows network, the command
+    /// gets no direct network: only the filtering proxy is reachable (see [`netproxy`]). The caller
+    /// must point clients at it with [`netproxy::client_env`] and
+    /// [`netproxy::Endpoint::client_port`] after setting up the environment.
+    #[cfg(unix)]
+    pub(super) fn command_routed(
         &self,
         workspace: &Path,
         policy: &Policy,
+        proxy: ProxyRef<'_>,
         program: &str,
         args: &[&str],
-        terminal_fd: i32,
+        owned_terminal: Option<i32>,
     ) -> Result<Command, String> {
         self.dev_command_mode(
             workspace,
@@ -243,7 +282,8 @@ impl Sandbox {
             program,
             args,
             std::env::vars_os(),
-            Some(terminal_fd),
+            owned_terminal,
+            proxy,
         )
     }
 
@@ -255,9 +295,10 @@ impl Sandbox {
         args: &[&str],
         env: impl Iterator<Item = (OsString, OsString)>,
     ) -> Result<Command, String> {
-        self.dev_command_mode(workspace, policy, program, args, env, None)
+        self.dev_command_mode(workspace, policy, program, args, env, None, None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn dev_command_mode(
         &self,
         workspace: &Path,
@@ -266,11 +307,12 @@ impl Sandbox {
         args: &[&str],
         env: impl Iterator<Item = (OsString, OsString)>,
         owned_terminal: Option<i32>,
+        proxy: ProxyRef<'_>,
     ) -> Result<Command, String> {
         self.available()?;
         let (allow_network, deny_read, extra_write) = match policy {
             Policy::Strict { .. } => {
-                return self.command_mode(workspace, policy, program, args, owned_terminal);
+                return self.command_mode(workspace, policy, program, args, owned_terminal, proxy);
             }
             Policy::Dev {
                 deny_read,
@@ -299,13 +341,24 @@ impl Sandbox {
         let extra_write = &extra_write;
         #[cfg(windows)]
         {
-            let _ = (allow_network, deny_read, extra_write, env);
+            let _ = (allow_network, deny_read, extra_write, env, proxy);
             Err("Windows filesystem/network isolation is unavailable; refusing to run a sandboxed command".into())
         }
         #[cfg(not(windows))]
         {
             #[cfg(not(target_os = "linux"))]
-            let mut profile = dev_profile(workspace, deny_read, extra_write, allow_network)?;
+            let proxy = proxy.filter(|_| allow_network);
+            #[cfg(not(target_os = "linux"))]
+            let mut profile = dev_profile(
+                workspace,
+                deny_read,
+                extra_write,
+                allow_network && proxy.is_none(),
+            )?;
+            #[cfg(not(target_os = "linux"))]
+            if let Some(proxy) = proxy {
+                profile.push_str(&proxy_rule(proxy.port()));
+            }
             #[cfg(not(target_os = "linux"))]
             profile.push_str(&program_rule(program)?);
             #[cfg(target_os = "linux")]
@@ -314,8 +367,14 @@ impl Sandbox {
             std::fs::create_dir_all(&scratch)
                 .map_err(|e| format!("creating scratch directory: {e}"))?;
             #[cfg(target_os = "linux")]
-            let mut command =
-                linux::command_mode(workspace, policy, program, args, owned_terminal.is_some())?;
+            let mut command = linux::command_mode(
+                workspace,
+                policy,
+                program,
+                args,
+                owned_terminal.is_some(),
+                proxy,
+            )?;
             #[cfg(not(target_os = "linux"))]
             let mut command = {
                 if let Some(fd) = owned_terminal {
@@ -438,6 +497,13 @@ pub fn require_for_test() -> bool {
         }
         Err(reason) => panic!("sandbox-exec must work on this Mac: {reason}"),
     }
+}
+
+/// The only network a proxied macOS command keeps: outbound TCP to the filtering proxy's
+/// loopback port. The profile itself was generated without network, so this is the sole grant.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn proxy_rule(port: u16) -> String {
+    format!("(allow network-outbound (remote ip \"localhost:{port}\"))\n")
 }
 
 /// Grants the sandboxed program read and execute access to its own file, plus metadata for each
@@ -573,6 +639,8 @@ pub fn profile(
             quote(root)?
         ));
     }
+    let roots: Vec<PathBuf> = roots.iter().map(|root| root.to_path_buf()).collect();
+    push_read_only(&mut out, &git_metadata(&roots)?)?;
     if allow_network {
         out.push_str("(allow network*)\n");
     }
@@ -617,6 +685,87 @@ fn append_denials(out: &mut String, deny_read: &[PathBuf]) -> Result<(), String>
             "(deny file-read* file-write* (subpath {}))\n",
             quote(&path)?
         ));
+    }
+    Ok(())
+}
+
+/// The largest `.git` pointer file or `commondir` file read; real ones are one short line.
+const GIT_POINTER_LIMIT: u64 = 4096;
+
+/// Git metadata that sandboxed commands may read but never change, even though it lies inside a
+/// writable root (see the module docs). Each root's existing `.git` entry is protected as its
+/// literal path and as its resolved target. A `gitdir:` pointer file also protects the git
+/// directory it names and that directory's `commondir`, which holds the shared hooks and config
+/// of a linked worktree. Paths outside every writable root are omitted because they are already
+/// read-only. A path that is itself granted as a writable root, or that contains one (for
+/// example `sandbox.extra_write = ["<project>/.git"]`), is an explicit opt-out and is omitted.
+/// Fails rather than skipping a path that the sandbox cannot express.
+pub(crate) fn git_metadata(roots: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+    let roots = roots
+        .iter()
+        .map(|root| resolve(root))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut found: Vec<PathBuf> = Vec::new();
+    let mut add = |path: PathBuf| {
+        if !found.contains(&path) {
+            found.push(path);
+        }
+    };
+    for root in &roots {
+        let dot = root.join(".git");
+        if std::fs::symlink_metadata(&dot).is_err() {
+            continue;
+        }
+        add(dot.clone());
+        add(resolve(&dot)?);
+        if !std::fs::metadata(&dot).is_ok_and(|metadata| metadata.is_file()) {
+            continue;
+        }
+        let Some(pointer) = read_git_pointer(&dot) else {
+            continue;
+        };
+        let Some(gitdir) = pointer.strip_prefix("gitdir:") else {
+            continue;
+        };
+        let gitdir = resolve(&root.join(gitdir.trim()))?;
+        add(gitdir.clone());
+        if let Some(common) = read_git_pointer(&gitdir.join("commondir")) {
+            add(resolve(&gitdir.join(common.trim()))?);
+        }
+    }
+    found.retain(|path| {
+        roots
+            .iter()
+            .any(|root| path.starts_with(root) && path != root)
+            && !roots.iter().any(|root| root.starts_with(path))
+    });
+    Ok(found)
+}
+
+/// The first line of a small Git pointer file, or `None` when it is missing or unreadable.
+fn read_git_pointer(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(GIT_POINTER_LIMIT)
+        .read_to_string(&mut text)
+        .ok()?;
+    text.lines().next().map(str::to_owned)
+}
+
+/// Deny writes (including create, rename and unlink) below each path, after the write grants
+/// so that the later rule wins. As in [`append_denials`], unlinking or renaming an ancestor is
+/// denied too, so the protected tree cannot be moved out from under its path rule.
+fn push_read_only(out: &mut String, paths: &[PathBuf]) -> Result<(), String> {
+    for path in paths {
+        for ancestor in path.ancestors().skip(1) {
+            out.push_str(&format!(
+                "(deny file-write-unlink (literal {}))\n",
+                quote(ancestor)?
+            ));
+        }
+        out.push_str(&format!("(deny file-write* (subpath {}))\n", quote(path)?));
     }
     Ok(())
 }
@@ -712,6 +861,7 @@ pub fn dev_profile(
     // `/dev/fd/N` (behind /dev/stdout, /dev/stderr) reopens a descriptor the
     // process already holds; it grants nothing the descriptor didn't.
     out.push_str(" (subpath \"/dev/fd\") (regex #\"^/dev/ttys[0-9]+$\"))\n");
+    push_read_only(&mut out, &git_metadata(&writable)?)?;
     if !allow_network {
         out.push_str("(deny network*)\n");
     }

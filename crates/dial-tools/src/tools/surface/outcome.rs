@@ -78,6 +78,9 @@ pub fn annotate(message: &mut Value, output: &ToolOutput) {
     message["dial_execution_status"] = serde_json::json!(ToolStatus::from_output(output));
     message["dial_effects"] = serde_json::json!(effects(output));
     message["dial_execution"] = serde_json::json!(output.execution);
+    if let Some(recovery) = output.recovery() {
+        message["dial_recovery"] = serde_json::json!(recovery);
+    }
 }
 
 pub fn message(id: &str, output: &ToolOutput) -> Value {

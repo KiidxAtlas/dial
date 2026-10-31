@@ -24,6 +24,8 @@ struct Mounts {
     network: bool,
     denied: Vec<PathBuf>,
     masks: Vec<(PathBuf, bool)>,
+    /// Git metadata inside writable roots, re-bound read-only after the writable binds.
+    read_only: Vec<PathBuf>,
 }
 
 impl Mounts {
@@ -156,12 +158,14 @@ impl Mounts {
                 masks.push((denied.clone(), metadata.is_dir()));
             }
         }
+        let read_only = super::git_metadata(&write)?;
         Ok(Self {
             read,
             write,
             network,
             denied,
             masks,
+            read_only,
         })
     }
 
@@ -260,7 +264,7 @@ pub(super) fn command(
     program: &str,
     args: &[&str],
 ) -> Result<Command, String> {
-    command_mode(workspace, policy, program, args, false)
+    command_mode(workspace, policy, program, args, false, None)
 }
 
 /// Only a caller that first creates a fresh private PTY/session may retain that session.
@@ -271,6 +275,7 @@ pub(super) fn command_mode(
     program: &str,
     args: &[&str],
     owned_terminal: bool,
+    proxy: Option<&super::netproxy::Endpoint>,
 ) -> Result<Command, String> {
     if !Path::new(BWRAP).is_file() {
         return Err("bubblewrap is missing; install it with sudo apt install bubblewrap".into());
@@ -282,6 +287,22 @@ pub(super) fn command_mode(
     check_windows_interop()?;
     let mut mounts = Mounts::new(workspace, policy)?;
     mounts.grant_program(program)?;
+    // Filtered network: a private namespace whose only way out is the proxy socket, reached
+    // through the Dial binary re-executed as a loopback bridge in front of the command.
+    let proxy = proxy.filter(|_| mounts.network);
+    let bridge = match proxy {
+        Some(proxy) => {
+            let exe = std::env::current_exe()
+                .map_err(|e| format!("locating the Dial binary for the network bridge: {e}"))?;
+            let exe = exe
+                .to_str()
+                .ok_or("the Dial binary path is not UTF-8")?
+                .to_owned();
+            mounts.grant_program(&exe)?;
+            Some((exe, proxy.socket().to_path_buf()))
+        }
+        None => None,
+    };
     let mut command = Command::new(BWRAP);
     command.arg("--die-with-parent");
     if !owned_terminal {
@@ -297,7 +318,7 @@ pub(super) fn command_mode(
         "--tmpfs",
         "/",
     ]);
-    if !mounts.network {
+    if !mounts.network || bridge.is_some() {
         command.arg("--unshare-net");
     }
     for (source, target) in mounts.read {
@@ -316,6 +337,12 @@ pub(super) fn command_mode(
     for path in mounts.write {
         command.arg("--bind").arg(&path).arg(path);
     }
+    // Read-only re-binds turn the protected Git paths into mount points: writes fail with EROFS
+    // and renaming or removing them fails with EBUSY. Masks come after, so a private path nested
+    // in Git metadata stays hidden.
+    for path in mounts.read_only {
+        command.arg("--ro-bind").arg(&path).arg(path);
+    }
     for (path, directory) in mounts.masks {
         if directory {
             command.args(["--perms", "000", "--tmpfs"]).arg(&path);
@@ -324,12 +351,25 @@ pub(super) fn command_mode(
             command.args(["--ro-bind", "/dev/null"]).arg(path);
         }
     }
+    // Connecting to a Unix socket needs no write access to its mount, so a read-only bind
+    // exposes the proxy and nothing else from its private directory.
+    if let Some((_, socket)) = &bridge {
+        command.arg("--ro-bind").arg(socket).arg(socket);
+    }
     // Synthetic ancestors created by bwrap must not become writable escape paths.
     // Separate workspace/extra-write mounts stay writable when the root mount is sealed.
     command
         .args(["--remount-ro", "/", "--chdir"])
         .arg(workspace);
-    command.arg("--").arg(program).args(args);
+    command.arg("--");
+    if let Some((exe, socket)) = &bridge {
+        command
+            .arg(exe)
+            .arg(super::netproxy::BRIDGE_ARG)
+            .arg(socket)
+            .arg("--");
+    }
+    command.arg(program).args(args);
     Ok(command)
 }
 

@@ -1,6 +1,6 @@
 //! What the hosting terminal understands beyond plain text, read from its environment: which
 //! notification escape it turns into a desktop toast (OSC 9, OSC 99, OSC 777 or only a bell), and
-//! which optional integrations it offers (hyperlinks, working directory, tab color, attention,
+//! which optional integrations it offers (hyperlinks, working directory, attention,
 //! user variables, progress; see [`Integration`]).
 //! Detection checks the terminal's capabilities; multiplexers (tmux, Zellij, GNU
 //! screen) are accounted for.
@@ -79,8 +79,6 @@ pub struct Integration {
     pub line_fragments: bool,
     /// OSC 7 working directory, so new tabs and splits start in the project.
     pub cwd: bool,
-    /// iTerm2 OSC 6 tab color by state.
-    pub tab_color: bool,
     /// iTerm2 `OSC 1337 ; RequestAttention` (dock bounce) while Dial waits for the user.
     pub attention: bool,
     /// `OSC 1337 ; SetUserVar` (iTerm2, WezTerm) for status bars, badges and tab titles.
@@ -131,7 +129,6 @@ pub fn detect_integration(env: &dyn Fn(&str) -> Option<String>, id: TerminalId) 
         line_fragments: id == T::Iterm2,
         // tmux reads OSC 7 itself (the pane's path), so it is sent unwrapped there.
         cwd: tmux || matches!(id, T::Iterm2 | T::Kitty | T::Ghostty | T::WezTerm | T::Foot),
-        tab_color: id == T::Iterm2,
         attention: id == T::Iterm2,
         user_vars: matches!(id, T::Iterm2 | T::WezTerm),
         progress: match id {

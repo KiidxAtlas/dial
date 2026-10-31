@@ -50,7 +50,7 @@ fn harness_notes_merge_into_one_message_without_touching_history_or_marked_messa
         json!({"role":"user","content":[{"type":"text","text":"image"}],"dial_transient":true}),
         json!({"role":"user","content":"third","dial_transient":true}),
     ];
-    coalesce_harness_notes(&mut messages, 1);
+    crate::agent::run::guidance::coalesce(&mut messages, 1);
     assert_eq!(messages.len(), 4);
     assert_eq!(
         messages[0]["content"], "earlier note",

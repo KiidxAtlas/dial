@@ -1,0 +1,12 @@
+# Focused diagnostic; verify the LM Studio model and its hosting device before use.
+[machine]
+repetitions = 1
+case_timeout_secs = 300
+minimum_correctness = 1.0
+allow_remote = false
+
+[[configurations]]
+name = "gemma-e4b"
+provider = "lm-studio"
+model = "google/gemma-4-e4b"
+context_window = 65536

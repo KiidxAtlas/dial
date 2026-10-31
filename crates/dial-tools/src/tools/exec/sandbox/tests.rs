@@ -88,6 +88,191 @@ fn strict_and_dev_deny_nested_private_state_without_blocking_ordinary_files() {
     }
 }
 
+/// A repository whose `.git` is a directory with a hooks directory and a `HEAD`.
+fn git_dir(root: &Path) -> PathBuf {
+    let git = root.join(".git");
+    std::fs::create_dir_all(git.join("hooks")).unwrap();
+    std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    git
+}
+
+#[test]
+fn git_metadata_covers_dot_git_linked_worktrees_and_opt_out() {
+    let fx = Fixture::new();
+    assert!(
+        git_metadata(std::slice::from_ref(&fx.ws))
+            .unwrap()
+            .is_empty()
+    );
+    let git = git_dir(&fx.ws);
+    assert_eq!(
+        git_metadata(std::slice::from_ref(&fx.ws)).unwrap(),
+        vec![git.clone()]
+    );
+    // Listing the metadata itself as writable is the explicit opt-out.
+    assert!(
+        git_metadata(&[fx.ws.clone(), git.join("hooks")])
+            .unwrap()
+            .is_empty()
+    );
+    // A linked worktree in `extra` points into the main repository's `.git` in `ws`.
+    let linked = git.join("worktrees/feature");
+    std::fs::create_dir_all(&linked).unwrap();
+    std::fs::write(linked.join("commondir"), "../..\n").unwrap();
+    std::fs::write(
+        fx.extra.join(".git"),
+        format!("gitdir: {}\n", linked.display()),
+    )
+    .unwrap();
+    let both = git_metadata(&[fx.ws.clone(), fx.extra.clone()]).unwrap();
+    assert!(both.contains(&git), "{both:?}");
+    assert!(both.contains(&fx.extra.join(".git")), "{both:?}");
+    assert!(both.contains(&linked), "{both:?}");
+    // Metadata outside every writable root is already read-only and is not listed.
+    assert_eq!(
+        git_metadata(std::slice::from_ref(&fx.extra)).unwrap(),
+        vec![fx.extra.join(".git")]
+    );
+}
+
+#[test]
+fn strict_and_dev_profiles_make_git_metadata_read_only_after_write_grants() {
+    let fx = Fixture::new();
+    let git = git_dir(&fx.ws);
+    let rule = format!("(deny file-write* (subpath {}))", quote(&git).unwrap());
+    for text in [
+        strict_profile(&fx.ws, &[], &[], false).unwrap(),
+        dev_profile(&fx.ws, &[], &[], false).unwrap(),
+    ] {
+        let deny = text.find(&rule).expect("git metadata rule");
+        let allow = text.rfind("(allow file-write*").unwrap();
+        assert!(allow < deny, "{text}");
+        assert!(text.contains(&format!(
+            "(deny file-write-unlink (literal {}))",
+            quote(&fx.ws).unwrap()
+        )));
+    }
+    let opted_out = dev_profile(&fx.ws, &[], std::slice::from_ref(&git), false).unwrap();
+    assert!(!opted_out.contains(&rule));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn strict_and_dev_keep_git_metadata_read_only_inside_the_workspace() {
+    if !require_for_test() {
+        return;
+    }
+    let fx = Fixture::new();
+    git_dir(&fx.ws);
+    for policy in [
+        Policy::Strict {
+            deny_read: vec![],
+            extra_write: vec![],
+            allow_network: false,
+        },
+        Policy::Dev {
+            deny_read: vec![],
+            extra_write: vec![],
+            allow_network: false,
+        },
+    ] {
+        let (code, output) = fx.run(
+            &policy,
+            r#"
+                echo ordinary > ordinary || exit 10
+                [ "$(cat .git/HEAD)" = "ref: refs/heads/main" ] || exit 11
+                if echo evil > .git/hooks/pre-commit 2>/dev/null; then exit 12; fi
+                if echo evil >> .git/HEAD 2>/dev/null; then exit 13; fi
+                if mv .git moved 2>/dev/null; then exit 14; fi
+                if rm -rf .git 2>/dev/null; then exit 15; fi
+                [ -d .git/hooks ] || exit 16
+                if mv ../ws ../ws-moved 2>/dev/null; then exit 17; fi
+                echo ok
+            "#,
+        );
+        assert_eq!(code, Some(0), "{output}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn sandboxed_git_init_still_creates_new_metadata() {
+    if !require_for_test() {
+        return;
+    }
+    let fx = Fixture::new();
+    let (code, output) = fx.run(
+        &fx.policy(false),
+        "mkdir -p .git/hooks && echo '[core]' > .git/config && echo ok",
+    );
+    assert_eq!(code, Some(0), "{output}");
+}
+
+/// A sandboxed command under filtered network reaches an allowed host only through the proxy:
+/// bypassing it, or asking it for a denied host, fails. Uses a local upstream, no internet.
+#[cfg(target_os = "macos")]
+#[test]
+fn filtered_network_allows_only_proxied_permitted_hosts() {
+    use std::io::{Read, Write};
+    if !require_for_test() {
+        return;
+    }
+    let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = upstream.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in upstream.incoming().flatten() {
+            let mut stream = stream;
+            let mut buffer = [0u8; 2048];
+            let _ = stream.read(&mut buffer);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nreached",
+            );
+        }
+    });
+    let rules = netproxy::NetworkRules::new(&["127.0.0.1".to_string()], &[])
+        .unwrap()
+        .unwrap();
+    let endpoint = netproxy::endpoint(&rules).unwrap();
+    let fx = Fixture::new();
+    for policy in [
+        fx.policy(true),
+        Policy::Strict {
+            deny_read: vec![],
+            extra_write: vec![],
+            allow_network: true,
+        },
+    ] {
+        let script = format!(
+            r#"[ "$(/usr/bin/curl -sS --max-time 10 http://127.0.0.1:{port}/)" = reached ] || exit 10
+               if /usr/bin/curl -sS --max-time 5 --noproxy '*' http://127.0.0.1:{port}/ 2>/dev/null; then exit 11; fi
+               code=$(/usr/bin/curl -s -o /dev/null -w '%{{http_code}}' --max-time 10 http://localhost:{port}/)
+               [ "$code" = 403 ] || {{ echo "localhost got $code"; exit 12; }}
+               echo ok"#
+        );
+        let mut command = Sandbox::Available
+            .command_routed(
+                &fx.ws,
+                &policy,
+                Some(&endpoint),
+                "/bin/bash",
+                &["-c", &script],
+                None,
+            )
+            .unwrap();
+        command
+            .envs(netproxy::client_env(endpoint.client_port()))
+            .current_dir(&fx.ws)
+            .stdin(Stdio::null());
+        let out = command.output().unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.status.code(), Some(0), "{policy:?}: {text}");
+    }
+}
+
 #[test]
 fn unavailable_sandbox_refuses_to_build_commands() {
     let sandbox = Sandbox::Unavailable("nope".to_string());

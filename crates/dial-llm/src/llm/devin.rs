@@ -77,7 +77,29 @@ pub(super) fn exchange(
         .filter(|token| !token.is_empty())
         .context("Devin requires a session token; sign in to the devin provider")?;
     let base = route.base_url.trim_end_matches('/');
-    let session = authenticate(route, base, api_key, timeout, &interrupt)?;
+    let key = session_key(base, api_key);
+    let session = cached_session(&key, || {
+        authenticate(route, base, api_key, timeout, &interrupt)
+    })?;
+    let result = exchange_in(route, req, timeout, on_text, interrupt, on_event, &session);
+    // A rejected credential may be the cached user JWT: the next attempt authenticates afresh.
+    if let Err(error) = &result
+        && super::errors::classify(error) == ErrorClass::Auth
+    {
+        forget_session(&key);
+    }
+    result
+}
+
+fn exchange_in(
+    route: &Route<'_>,
+    req: &Chat,
+    timeout: u64,
+    on_text: OnText<'_, '_>,
+    interrupt: Arc<AtomicBool>,
+    on_event: &mut dyn FnMut(&StreamEvent) -> bool,
+    session: &Session,
+) -> Result<Reply> {
     let cascade = route
         .session_id
         .filter(|id| !id.is_empty())
@@ -92,14 +114,8 @@ pub(super) fn exchange(
         route.headers,
     );
     let (chat_model_uid, assignment_jwt) = if route.model == ROUTER_MODEL {
-        let (uid, jwt) = assign_model(
-            route,
-            &session,
-            &cascade,
-            &req.messages,
-            timeout,
-            &interrupt,
-        )?;
+        let (uid, jwt) =
+            assign_model(route, session, &cascade, &req.messages, timeout, &interrupt)?;
         (uid, Some(jwt))
     } else {
         (route.model.to_owned(), None)
@@ -107,7 +123,7 @@ pub(super) fn exchange(
     let request = chat_request(
         route.model,
         req,
-        &session,
+        session,
         &cascade,
         &scope,
         &chat_model_uid,
@@ -220,12 +236,67 @@ pub(super) fn exchange(
 }
 
 /// Session credentials resolved by `GetUserJwt`.
+#[derive(Clone)]
 struct Session {
     /// Wire API key echoed in every `Metadata`.
     api_key: String,
     user_jwt: String,
     /// Chat/assign base: the server may name a custom API server.
     base: String,
+}
+
+/// Resolved sessions keyed by [`session_key`], so consecutive exchanges skip the `GetUserJwt`
+/// round trip. Process-local and never persisted.
+static SESSIONS: LazyLock<parking_lot::Mutex<std::collections::HashMap<String, CachedSession>>> =
+    LazyLock::new(Default::default);
+/// A cached user JWT is replaced this long before its `exp`.
+const SESSION_EXPIRY_SKEW_MS: u64 = 60_000;
+/// Reuse bound for a user JWT whose expiry cannot be read.
+const SESSION_FALLBACK_TTL_MS: u64 = 5 * 60_000;
+
+struct CachedSession {
+    session: Session,
+    expires_at_ms: u64,
+}
+
+/// Cache key over everything `authenticate` depends on; a digest, so the secret is never a key.
+fn session_key(base: &str, api_key: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(base.as_bytes());
+    digest.update([0]);
+    digest.update(api_key.as_bytes());
+    hex(&digest.finalize())
+}
+
+/// The cached session for `key` while it is fresh, else the result of `authenticate`, which is
+/// cached only when it succeeds.
+fn cached_session(key: &str, authenticate: impl FnOnce() -> Result<Session>) -> Result<Session> {
+    let now = super::oauth::util::now_ms();
+    if let Some(cached) = SESSIONS
+        .lock()
+        .get(key)
+        .filter(|cached| cached.expires_at_ms > now)
+    {
+        return Ok(cached.session.clone());
+    }
+    let session = authenticate()?;
+    let expires_at_ms =
+        super::oauth::util::jwt_expiry_ms(&session.user_jwt, SESSION_EXPIRY_SKEW_MS)
+            .unwrap_or_else(|| now.saturating_add(SESSION_FALLBACK_TTL_MS));
+    let mut sessions = SESSIONS.lock();
+    sessions.retain(|_, cached| cached.expires_at_ms > now);
+    sessions.insert(
+        key.to_owned(),
+        CachedSession {
+            session: session.clone(),
+            expires_at_ms,
+        },
+    );
+    Ok(session)
+}
+
+fn forget_session(key: &str) {
+    SESSIONS.lock().remove(key);
 }
 
 fn authenticate(

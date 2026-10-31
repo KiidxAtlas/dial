@@ -118,6 +118,37 @@ checkpoint. Do not calculate a success rate from only its completed cases. A cra
 can leave an incomplete final line; preceding complete JSON lines remain readable. Existing
 single-configuration `--checkpoint` / `--resume` behavior is unchanged.
 
+### Offline long-history workloads
+
+```sh
+cargo run --locked --profile local --example runtime_baseline -- target/runtime-baseline.json
+```
+
+The existing runtime baseline now emits schema version 2. It retains the streaming-journal and
+markdown/terminal-encoding observations and adds nine warm-cache workload records:
+
+- A memory-only session flush with one changed runtime node and 0, 256 or 2,048 historical nodes.
+- A roughly 1 MiB request with 256 messages and 32 tool definitions, comparing combined accounting
+  with token estimation followed by a separate wire-size pass.
+- Worker activity projection over 2,048 transcript messages: uncached, unchanged cached, and one
+  appended message per refresh. Checks preserve the absolute transcript entry used by deep links.
+- Ambient retrieval of one named source in a 513-file repository, followed by an external edit
+  that must invalidate the saved outline.
+
+Each record includes its fixture item/byte counts, sample count, median, p95 and summed nanoseconds.
+Workload sampling is capped at 32; setup, warm-up and outcome checks are outside the timed sections.
+All fixtures and private state are disposable. No model, credentials, download or service is needed.
+The session-flush fixture isolates in-memory bookkeeping, not fsync latency. The separate request
+passes are an explicit reference workload, not an old executable or a complete agent request.
+Worker cache population is outside the cached timings; initial loading is represented by the
+uncached workload. Filesystem observations are warm-cache, not cold-disk measurements.
+
+CI retains these observations without host-dependent speed thresholds. Regression tests gate
+content, freshness, revision acknowledgement and entry-index correctness instead. Compare repeated
+runs built with the same profile on an otherwise idle machine; these microbenchmarks do not establish
+model quality, provider latency, token savings or an end-to-end speedup. Continue to use the existing
+independently checked quality suites and repeated-outcome comparator for model-facing changes.
+
 ### Offline workspace-copy measurements
 
 ```sh
@@ -483,13 +514,46 @@ from `dial`:
   `ablate-local_profile` sets `assistance.local.enabled = false`; see the local profile in `agent-loop.md`.
 - `enable-strict_requirements` and `enable-independent_review` turn on the shipped-default-off
   outcome/review policies; their baseline settings and effective values are recorded as above.
+- `ablate-structured_tools` pins `harness.tools` to the bash-only roster (`bash`, `todo`, `check`, `finish`),
+  so the shell does the reading, searching and editing. The `dial` row restores the default roster. Published
+  harness ablations (Fan et al., arXiv 2609.20804) found bash-capable models matched or beat the structured
+  tools at lower cost while weaker models fell sharply, so read this row per model.
+- `enable-shake_before_summary` moves `shake` ahead of `soft` in `compaction.method_order`, so recoverable
+  tool evidence is elided before a summary request is spent. It changes behavior only when a window is
+  tight enough to trigger compaction; pair it with the context-window sweep below.
 
-Machine runs map each single-turn case's zero-exit command assertions without stdout expectations to
-suite-owned verification commands and requirements, identically in strict and non-strict variants.
-The frozen suite and executable contract identify this mapping; effective settings record
-`case_requirement_mapping`. Independent acceptance still executes outside the model-editable copy.
-Strict variants without an applicable contract report unavailable rather than measuring a no-op:
-file-only cases and final-only journey assertions are not invented intermediate obligations.
+A context-window sweep uses the existing machine profiles: one `[[configurations]]` entry per window with
+the same model, plus the lever under test in `[configurations.efficiency]`:
+
+```toml
+[[configurations]]
+name = "32k-summary-first"
+provider = "openai"
+model = "your-model"
+context_window = 32768
+
+[[configurations]]
+name = "32k-shake-first"
+provider = "openai"
+model = "your-model"
+context_window = 32768
+[configurations.efficiency]
+compaction_method_order = ["remote", "shake", "soft", "snapcompact", "handoff"]
+```
+
+Repeat for 64k, 96k and 128k and compare checked success and tokens per window. These rows measure; they
+change no default.
+
+Machine runs never copy suite grader commands into the agent's configuration or context. Command
+assertions, including zero-exit ones without stdout expectations, run separately against the finished
+workspace, identically in strict and non-strict variants. Every child configuration has no suite-owned
+verification commands or requirements, and effective settings record
+`case_requirement_mapping = "none_grader_independent_v2"`. The former
+`single_turn_zero_exit_commands_v1` mapping is retired; treat its reports as not comparable with these.
+Strict variants report unavailable unless an explicit, valid agent-visible verification contract is
+supplied. No per-case schema for that contract exists yet, so strict variants are currently unavailable
+for every suite case rather than measuring a no-op. File-only cases and journey assertions are not
+converted into intermediate obligations.
 Selective review still depends on the configured risk/size threshold; enabling it does not force a
 review of every task. These experiments do not adopt settings automatically.
 
@@ -515,7 +579,11 @@ same runtime schema validation and approvals as any other call, and an unconvert
 before. The retry is sent at most once per malformed sequence, is never used in hermetic sessions, and is
 recorded as a `constrained_repair` event. Its JSON may appear as streamed text before the call runs. Profiles
 can set `capabilities.structured_output` to `json_schema`, `ollama_format`, or `none`. The default is
-`json_schema` for `lm-studio`, `ollama_format` for `ollama`, and `none` for other providers.
+`json_schema` for `lm-studio`, `ollama_format` for `ollama`, and `none` for other providers; an external
+llama.cpp `llama-server` is detected from its `/props`, and a vLLM or SGLang server from `owned_by` in
+its `/v1/models` list; both use `json_schema`. Detection comes from their documented formats and has not
+been run against live servers, so check that yours enforces the schema. Another OpenAI-compatible
+server gets no retry, because a profile can declare `json_schema` only for `lm-studio`.
 
 ## Comparing with other agent CLIs
 
@@ -527,7 +595,7 @@ and for follow-up turns that continue the session, plus a parser for the agent's
 ```sh
 python3 examples/benchmarks/cross_agent.py examples/benchmarks/quality.toml examples/benchmarks/efficiency.toml \
   --agents examples/benchmarks/cross-agent.toml --model claude-sonnet-4-6 --repetitions 3 \
-  --report target/cross-agent/report.json
+  --jobs 1 --seed 0 --report target/cross-agent/report.json
 ```
 
 Each trial runs in a fresh fixture copy with the same prompt and model. The script copies the fixture,
@@ -545,16 +613,212 @@ Each turn's raw stdout and stderr, including partial output on timeouts, are kep
 report in `<report-stem>.logs/<agent>-<case>-r<N>/`. Reports and existing log directories are not
 overwritten. Logs can contain source, commands and provider output: treat them as private artifacts.
 
-Agents run as installed, with their user configuration, sessions and global skills, so the report
-records each agent's command, environment overrides, version and the models it actually used.
-Opt-in features count: for example Dial's `experimental.turn_optimizer` adds one auxiliary request
-per user turn. Every agent receives the same `--thinking` level (default `off`). Without it, Dial
-would apply the model catalog's default thinking for Claude. An agent's `env` table (values expand
-`{work_root}`, `~` and `$VAR`) can isolate state. For example, `DIAL_HOME = "{work_root}/dial-home"`
-with `DIAL_SUBSCRIPTION_AUTH_HOME = "~/.dial"` runs Dial with default configuration on the
-signed-in subscription.
+Dial runs with a default configuration: `cross-agent.toml` sets `DIAL_HOME = "{trial_root}/dial-home"`
+(a directory inside each trial, so no user settings, MCP servers, skills, memory or experimental
+options and no state shared between trials) and `DIAL_SUBSCRIPTION_AUTH_HOME = "~/.dial"`, which shares
+only the signed-in subscription. `{trial_root}` expands to the trial's own directory; `{work_root}` is
+the run-wide directory and is shared by every trial. Remove that `env` entry to measure an installed
+configuration instead; opt-in features then count, for example Dial's `experimental.turn_optimizer`
+adds one auxiliary request per user turn. omp runs as installed, with its user configuration,
+sessions and global skills. The sample does not isolate omp's state per trial; record and match
+configuration/state before attributing differences to the harness.
+
+Diagnostics recorded per run:
+
+- Agent identity is captured before any trial: `version` (the `version` command output) and the
+  resolved `binary_path` with the SHA-256 of that executable (`binary_sha256`). A missing binary
+  records `null` rather than failing silently.
+- Trial order is seeded (`--seed`, default 0). Each repetition and case block lists every agent once,
+  blocks are shuffled, and each block rotates a seeded agent order, so every agent takes each slot
+  equally often when the number of blocks is divisible by the agent count (otherwise counts differ
+  by at most one). The report stores the exact `trial_order` so runs can be reproduced.
+- Wall times compare agents only with `--jobs 1`. Higher job counts share the machine between trials;
+  the script warns and the report sets `timing_comparable` to false.
+  A true `timing_comparable` flag only confirms serial trial scheduling, not matched configuration,
+  provider load, cache state or statistical significance.
+- Dial's per-turn `efficiency` object is parsed as emitted into `efficiency` with four fields: `duration_ms`,
+  `inference_latency` (request timer counters plus an `attribution` string), `storage_io` (inclusive
+  SessionIoMetrics counters) and `projection_bytes`. The count maps `requests_by_phase`,
+  `prefix_invalidations`, `recovery_attempts` and `backend_operations` are nested inside
+  `projection_bytes`, not at the root. Phase keys are `adaptive::Phase` labels (`auto`, `investigation`,
+  `editing`, `verification`, `recovery`, `exploration`, `general`). A trial's `efficiency` sums turns only
+  when every turn reported each field; additive numeric leaves add, strings and first-result latencies
+  stay per turn, and absent dynamic-map labels count as zero. Otherwise that field is `null` (unknown),
+  never zero. Failed trials are unknown.
+  `inference_latency`, `storage_io` and `backend_operations` are inclusive costs that nest inside the
+  turn's duration, so they are not a partition of wall time and must not be added to it.
+- A non-zero exit records the exit code, the stderr log path (`stderr_log`) and a bounded excerpt
+  (`stderr_tail`, last 800 characters) after best-effort redaction of token-like values. Excerpts are
+  not a guarantee against leaking secrets: the raw logs are unredacted private artifacts. The progress
+  line prints the exit code and log path, never the environment.
+- The summary's `trials with efficiency` row counts trials whose four required efficiency fields were all
+  reported (`efficiency_known`); `efficiency_projection_totals` sums `projection_bytes` counters over those
+  trials only.
+
 The results compare these setups on these fixtures. They are not a leaderboard score.
 The stub-agent regressions run with `python3 -m unittest discover -s examples/benchmarks -p 'test_*.py'`.
+
+### Offline Dial/omp overhead comparison (macOS)
+
+`offline_compare.py` runs a baseline Dial binary, a candidate Dial binary and **oh-my-pi (`omp`)**
+serially against the same scripted Anthropic Messages policy on loopback. It does not call a model.
+Use optimized binaries built with the same profile and a fixed source snapshot for each Dial version:
+
+```sh
+python3 -m unittest discover -s examples/benchmarks -p test_offline_compare.py
+python3 examples/benchmarks/offline_compare.py \
+  --baseline /path/to/dial-baseline --candidate /path/to/dial-candidate \
+  --omp /path/to/omp --repetitions 5 --seed 0 --timeout 30 \
+  --report target/offline-comparison/results.json
+```
+
+The eight workloads cover a fixed answer, read/write, three Python-file mutations, positive/negative
+search, code-location search, a parent-directory write refusal and session continuation. Code-location
+search uses Dial's code `find` with `related=false` and omp's content `grep`, not omp's filename `find`.
+The mutation workload reads complete files before rewriting them, exercising verification overhead;
+it does not compare the agents' different edit grammars. Continuation uses single-file reads, so it
+does not establish the separate multi-path-read witness repair. The refusal case compares observed
+tool policy: an accepted parent-directory write is a failed refusal check, not an infrastructure error.
+Do not compare successful-refusal latency with successful-write latency or treat this as a security audit.
+
+Each trial has a fresh `HOME` and agent state directory. Only `PATH`, `LANG`, `LC_ALL` and `TMPDIR`
+are inherited. Placeholder credentials target loopback; an outer macOS `sandbox-exec` policy denies
+non-loopback egress and self-tests that denial before trials. Dial uses `--sandbox off` inside that
+shared network policy because nested macOS sandboxes cannot be applied. This is not filesystem
+isolation. omp disables ambient extensions, skills, rules, context files, title generation, prewalk,
+LSP and PTY; Dial uses its fresh-home defaults. Tool schemas, policies and runtimes still differ.
+
+Reports retain binary/version identities, driver/workload hashes, seeded balanced order, acceptance
+checks, raw logs and workspaces. Normal unsupported localhost discovery GETs return 404 and are
+counted separately from Messages requests; unknown endpoints remain transport failures. Compare
+per-case medians/ranges, not a pooled median across different tasks. Wall time includes CLI startup,
+tool work, persistence and automatic verification. `first_arrival_ms` also includes fixture preparation;
+it is **not** an exact process-spawn-to-first-request metric. Connection counts cover Messages
+connections only, not capability-probe sockets. System/schema lengths are JSON representation
+sizes; body length is received request bytes, not tokenizer output. Usage tokens are synthetic and
+must not be used to claim token, cost or cache-hit savings. Scripted outcomes do not measure model
+quality, provider latency, TLS, CPU, memory, interactive rendering or live cache behavior.
+
+### SWE-bench Verified local comparison
+
+`swe_bench.py` adapts frozen SWE-bench Verified rows to the same CLI runner and usage parsers,
+then grades patches with the official **`swebench==4.1.0`** Docker harness. Version 5 uses a
+different dataset schema; do not silently substitute it for the legacy Verified snapshot.
+This is a host-agent/Docker-test local experiment, not a leaderboard submission.
+
+Install dependencies into a project-local environment, then freeze a selection before running:
+
+```sh
+uv venv --python 3.12 target/swebench-env
+uv pip install --python target/swebench-env/bin/python 'swebench==4.1.0'
+target/swebench-env/bin/python - <<'PY'
+import json, sys
+from pathlib import Path
+from datasets import load_dataset
+from huggingface_hub import HfApi
+sys.path.insert(0, 'examples/benchmarks')
+from swe_bench import select_instances
+name = 'princeton-nlp/SWE-bench_Verified'
+revision = HfApi().dataset_info(name).sha
+rows = select_instances(list(load_dataset(name, revision=revision, split='test')), 10, 0)
+root = Path('target/swebench-selection')
+root.mkdir(mode=0o700, exist_ok=False)
+(root / 'selected.json').write_text(json.dumps(rows))
+(root / 'manifest.json').write_text(json.dumps({
+    'dataset': name, 'revision': revision, 'seed': 0,
+    'instances': [{k: r[k] for k in ('instance_id', 'repo', 'base_commit')} for r in rows],
+}))
+PY
+target/swebench-env/bin/python examples/benchmarks/swe_bench.py prepare \
+  --dataset target/swebench-selection/selected.json \
+  --manifest target/swebench-selection/manifest.json --output target/swebench-pilot
+target/swebench-env/bin/python examples/benchmarks/swe_bench.py run --output target/swebench-pilot
+target/swebench-env/bin/python examples/benchmarks/swe_bench.py grade --output target/swebench-pilot
+```
+
+`prepare` downloads prebuilt AMD64 images, records image/executable identities and exports only
+the base-commit source. AMD64 emulation must work on ARM hosts. Images can use substantial disk;
+dependencies, images and live inference require operator approval. `run` uses balanced serial
+task pairs, Sonnet 4.6 with thinking off by default, one attempt and a 900-second agent deadline.
+Both agents get the issue and the same Docker test helper, not reference patches, hints or hidden
+acceptance tests. The helper sends a working-tree patch into a fresh container without mounting
+the host workspace or Docker socket. Hidden acceptance is applied only by the final grader.
+
+The CLI runner requires POSIX process groups. Dial's default shell sandbox can block the Docker
+socket. Only with explicit operator approval, add `--dial-sandbox-off` to `prepare` for those child
+trials; it is off by default in the adapter and is recorded in the frozen command templates.
+This removes Dial's shell confinement and permits host access, matching omp's auto-approved host
+shell exposure, **not** containerizing either agent. The test containers have networking disabled;
+the host-native agents do not. Grader data and logs are in a separate root from trial workspaces;
+the common prompt forbids inspecting them, but this is not adversarial isolation.
+
+Dial has fresh per-trial configuration. To retain authentication without copying secrets, omp
+uses its installed configuration with ambient extensions, skills, rules, context files and prewalk
+disabled. Main/auxiliary model roles are pinned, but this is **not configuration-matched**;
+report that limitation rather than attributing a score difference purely to the harness.
+
+The run directory retains private logs, trial records, standard prediction JSONL files and the
+final `report.json`. Completed trials are reused only under unchanged runner/dataset/executable
+contracts; an interrupted started trial is refused instead of silently buying another attempt.
+Unavailable grading stays in the selected-task denominator and is reported separately from
+unresolved patches. A partial run is not a completed pilot score. One attempt on ten tasks cannot
+establish repeated-trial reliability or broad superiority. Offline adapter checks are:
+`python3 -m unittest discover -s examples/benchmarks -p test_swe_bench.py -v`.
+
+### Reliability ledger cases (`reliability.toml`)
+
+`examples/benchmarks/reliability.toml` holds three harder offline cases on `reliability-fixture/ledger.py`,
+each starting from a different wrong state: a float-rounding false success (`amount-exact-decimal`), a
+dropped refund serialization branch (`ledger-export-keeps-refunds`), and a silently swallowed malformed
+row (`malformed-row-fails-closed`). Acceptance commands live in the suite file, outside the disposable
+project, so editing visible tests cannot change the verifier. The visible tests (`python3 -m unittest
+test_ledger`) are only a subset of acceptance: passing them is not sufficient.
+`test_reliability_cases.py` runs offline mutant regressions: wrong fixes that pass visible tests must fail
+the acceptance commands, and replacing the visible tests cannot defeat them. These are harness checks,
+not model results.
+
+### Local task-level suite (`local-tasks.toml`)
+
+`local-tasks.toml` is a `BenchmarkSuite` for `dial benchmark`, run over the fixed local
+`local-tasks-fixture` (no web or network sources). It covers five tasks: cited research over
+`source_a.md`/`source_b.md`, deferred tool discovery (`ledger.py`), unavailable-tool recovery
+(`notes.txt`), a read/edit/test repair of `calc.py`, and denial-stop.
+
+Grading is by outcome. The first command check of each case is independent of any file the agent
+can edit: `calc.py` is checked against fixed `add` boundaries, and research must associate each
+figure and direction with its own source line. The visible `test_calc.py` is still run as a
+prompt-level check, but weakening it cannot pass the case. Valid JSON, tool counts and error text
+are never task success. Denial passes only when `../denied_probe.txt` does not exist and the reply
+is `STOPPED`.
+
+`tool_invoked` and `metric` checks are integration-path coverage, reported separately from task
+outcomes. They show that the path was exercised, not that the answer is correct. Deferred discovery
+requires `tool_search`, `tool_load` and `ast_search` (a deferred builtin in `DEFERRED_BY_DEFAULT`,
+`crates/dial-tools/src/tools/mod.rs`); empty-discovery recovery requires a `tool_search` call for
+`zzqxjvkmnop`, absent from builtin names and descriptions (the real-dispatch empty-search test uses
+the same query; these profiles use core integration isolation); denial requires a `write` call and a tool error. The outside-workspace path is rejected
+by the file tool itself, even with automatic ordinary approvals; the prompt forbids requesting
+additional directory access.
+
+Profiles are separate files:
+
+- `local-tasks-profiles.toml`: local-only (`allow_remote = false`, LM Studio). Replace
+  `REPLACE_WITH_LOADED_MODEL_ID` with the exact ID of a model already loaded. No model availability is
+  assumed.
+- `local-tasks-hosted-profiles.toml`: hosted reference (`anthropic`) with `allow_remote = true`. This
+  is an explicit opt-in that sends prompts off the machine and spends provider quota. Run it only
+  deliberately, not in CI.
+
+Usage: `dial benchmark examples/benchmarks/local-tasks.toml --profiles examples/benchmarks/local-tasks-profiles.toml`
+(or the hosted file). These files only select configurations; nothing runs until you invoke
+`dial benchmark`, and no inference was run for this change.
+
+Offline checks: `cd examples/benchmarks && python3 -m unittest test_local_tasks` verifies that each
+starting state fails, each reference fix passes, the mutable-test weakening cannot pass `calc`, and
+swapped or merged research figures are rejected. These checks use no model or network.
+
+The scripted `offline_compare.py` harness is a transport and wrapper regression tool. Its tool
+scripts are not a model benchmark and its results must not be reported as model quality.
 
 ## Recorded runs
 

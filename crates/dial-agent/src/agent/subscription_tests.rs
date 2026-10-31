@@ -62,8 +62,7 @@ fn subscription_stall_is_bounded_retried_and_never_executes_partial_calls() {
     let started = Instant::now();
     let error = agent
         .turn("Create marker.txt", &mut ui)
-        .err()
-        .expect("stalled request must fail");
+        .expect_err("stalled request must fail");
     // A stalled Responses stream made no semantic progress: it is retried as an incomplete
     // stream, within the configured attempts, and never releases the partial tool call.
     assert!(

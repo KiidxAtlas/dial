@@ -16,7 +16,7 @@ use serde_json::{Map, Value, json};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     io::ErrorKind,
-    net::{TcpStream, ToSocketAddrs},
+    net::TcpStream,
     sync::{
         Arc, LazyLock,
         atomic::{AtomicBool, Ordering},
@@ -289,7 +289,10 @@ pub(super) fn exchange(
         endpoint.account_id.unwrap_or(""),
         endpoint.model
     );
-    let cached = match SESSIONS.lock().remove(&socket_key) {
+    // Take the entry in its own statement: a `match` on `lock().remove(..)` would keep the global
+    // session mutex held while an expired socket's close frame is written.
+    let taken = SESSIONS.lock().remove(&socket_key);
+    let cached = match taken {
         Some(mut idle) if idle.idle_since.elapsed() > MAX_IDLE_REUSE => {
             // Replay in full on a fresh socket; any accepted steering is carried as history.
             let _ = idle.socket.close(None);
@@ -805,36 +808,13 @@ fn connect(
     request
         .headers_mut()
         .insert("x-client-request-id", session_id.parse()?);
-    // One elapsed budget spans resolution, all TCP addresses, TLS and HTTP upgrade.
-    // System DNS and an in-flight blocking TCP connect cannot be preempted here.
+    // One elapsed budget spans resolution, all TCP addresses, any proxy tunnel, TLS and HTTP
+    // upgrade. System DNS and an in-flight blocking TCP connect cannot be preempted here.
     let host = url.host_str().context("Codex WebSocket URL has no host")?;
-    let host = host.trim_start_matches('[').trim_end_matches(']');
     let port = url
         .port_or_known_default()
         .context("Codex WebSocket URL has no port")?;
-    let mut tcp = None;
-    let mut last_error = None;
-    let addresses = (host, port).to_socket_addrs();
-    budget.remaining()?;
-    for addr in addresses? {
-        let attempt = match budget.remaining()? {
-            Some(remaining) => TcpStream::connect_timeout(&addr, remaining),
-            None => TcpStream::connect(addr),
-        };
-        budget.remaining()?;
-        match attempt {
-            Ok(stream) => {
-                tcp = Some(stream);
-                break;
-            }
-            Err(error) => last_error = Some(error),
-        }
-    }
-    let tcp = match (tcp, last_error) {
-        (Some(tcp), _) => tcp,
-        (None, Some(error)) => return Err(error.into()),
-        (None, None) => bail!("Codex WebSocket host resolved to no addresses"),
-    };
+    let tcp = super::ws_proxy::open(host, port, &|| budget.remaining())?;
     tcp.set_nodelay(true)?;
     let tcp = setup::Transport::new(tcp, Some(budget));
     let result = tungstenite::client_tls_with_config(request, tcp, None, None);

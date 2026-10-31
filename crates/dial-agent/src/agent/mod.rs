@@ -35,7 +35,7 @@ pub use memory::selfplay::{check_case, check_case_measured, selfplay_run};
 pub use model::backend::{Runtime, make_backend, make_session_backend};
 pub use model::laya;
 pub use run::call_summary::{legacy_tool_presentation, legacy_tool_result, summarize_call};
-pub use run::coordination::{BoardPeer, CoordinationCarry, PeerBoard, PeerMessage};
+pub use run::coordination::{BoardPeer, CoordinationCarry, PeerBoard, PeerMessage, PeerSender};
 pub use safety::approval;
 pub use ui::surface::{Decision, NullUi, RequestPhase, Ui};
 pub use workflow::todo;
@@ -80,6 +80,7 @@ use std::{
 };
 use workflow::todo::TodoList;
 
+#[derive(Debug)]
 pub struct TurnReport {
     pub text: String,
     pub outcome: TurnOutcome,

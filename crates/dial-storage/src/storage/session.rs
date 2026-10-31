@@ -26,7 +26,7 @@ use std::{
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::platform::fs as platform_fs;
@@ -379,6 +379,100 @@ pub struct Session {
     additional_dirs: Vec<PathBuf>,
     /// Load-time findings about this journal; `take_recovery_diagnostics` drains them.
     recovery: Vec<JournalDiagnostic>,
+    /// Process-local write/sync measurements; never journaled and never read by session logic.
+    io: SessionIoMetrics,
+}
+
+/// Process-local, observational counters for one session handle's journal writes and syncs.
+/// `*_attempts` counts calls that reached the operation, `*_failures` those that returned an
+/// error, and `*_micros` sums wall-clock time spent (saturating). Nothing here is journaled,
+/// persisted, or read by session logic, and it carries no message or control content.
+/// Timings are inclusive: control publication can contain runtime flush, which can contain
+/// reclaim sync. Their totals overlap and are not a partition of elapsed wall time.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct SessionIoMetrics {
+    /// `sync_data` acknowledgements in `append_context_entry` (`append_custom_entry`,
+    /// `replace_context_notes`, `reset_context`), not all context-transition sync paths.
+    pub context_sync_attempts: u64,
+    pub context_sync_failures: u64,
+    pub context_sync_micros: u64,
+    /// `flush_runtime` calls, including the flush every `append` performs first.
+    pub runtime_flush_attempts: u64,
+    pub runtime_flush_failures: u64,
+    pub runtime_flush_micros: u64,
+    /// Syncs before stream-journal reclamation; counted only when reclamation is due.
+    pub runtime_reclaim_sync_attempts: u64,
+    pub runtime_reclaim_sync_failures: u64,
+    pub runtime_reclaim_sync_micros: u64,
+    /// `set_control_state` calls.
+    pub control_publication_attempts: u64,
+    pub control_publication_failures: u64,
+    pub control_publication_micros: u64,
+    /// Successful publications whose patch was empty (equal to the merged branch state). They are
+    /// still appended; this only observes them.
+    pub equal_control_publications: u64,
+    pub equal_control_publication_micros: u64,
+}
+
+impl SessionIoMetrics {
+    /// Counter growth from `earlier` to `self`, saturating at zero if the snapshots are reversed.
+    pub fn since(&self, earlier: &SessionIoMetrics) -> SessionIoMetrics {
+        SessionIoMetrics {
+            context_sync_attempts: self
+                .context_sync_attempts
+                .saturating_sub(earlier.context_sync_attempts),
+            context_sync_failures: self
+                .context_sync_failures
+                .saturating_sub(earlier.context_sync_failures),
+            context_sync_micros: self
+                .context_sync_micros
+                .saturating_sub(earlier.context_sync_micros),
+            runtime_flush_attempts: self
+                .runtime_flush_attempts
+                .saturating_sub(earlier.runtime_flush_attempts),
+            runtime_flush_failures: self
+                .runtime_flush_failures
+                .saturating_sub(earlier.runtime_flush_failures),
+            runtime_flush_micros: self
+                .runtime_flush_micros
+                .saturating_sub(earlier.runtime_flush_micros),
+            runtime_reclaim_sync_attempts: self
+                .runtime_reclaim_sync_attempts
+                .saturating_sub(earlier.runtime_reclaim_sync_attempts),
+            runtime_reclaim_sync_failures: self
+                .runtime_reclaim_sync_failures
+                .saturating_sub(earlier.runtime_reclaim_sync_failures),
+            runtime_reclaim_sync_micros: self
+                .runtime_reclaim_sync_micros
+                .saturating_sub(earlier.runtime_reclaim_sync_micros),
+            control_publication_attempts: self
+                .control_publication_attempts
+                .saturating_sub(earlier.control_publication_attempts),
+            control_publication_failures: self
+                .control_publication_failures
+                .saturating_sub(earlier.control_publication_failures),
+            control_publication_micros: self
+                .control_publication_micros
+                .saturating_sub(earlier.control_publication_micros),
+            equal_control_publications: self
+                .equal_control_publications
+                .saturating_sub(earlier.equal_control_publications),
+            equal_control_publication_micros: self
+                .equal_control_publication_micros
+                .saturating_sub(earlier.equal_control_publication_micros),
+        }
+    }
+}
+
+/// Saturating increment and elapsed-micros accumulation for the metric counters above.
+fn bump(counter: &mut u64) {
+    *counter = counter.saturating_add(1);
+}
+
+fn add_elapsed(counter: &mut u64, started: Instant) -> u64 {
+    let micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    *counter = counter.saturating_add(micros);
+    micros
 }
 
 // ---------------------------------------------------------------- time / ids
@@ -981,6 +1075,7 @@ impl Session {
             history_generation_floor: 0,
             additional_dirs: Vec::new(),
             recovery: Vec::new(),
+            io: SessionIoMetrics::default(),
         })
     }
 
@@ -1002,6 +1097,7 @@ impl Session {
             history_generation_floor: 0,
             additional_dirs: Vec::new(),
             recovery: Vec::new(),
+            io: SessionIoMetrics::default(),
         }
     }
 
@@ -1152,6 +1248,7 @@ impl Session {
             history_generation_floor: 0,
             additional_dirs: Vec::new(),
             recovery: Vec::new(),
+            io: SessionIoMetrics::default(),
         };
         let mut header_id: Option<String> = None;
         // A journal without a header marker is legacy (0); its records upgrade in memory.
@@ -2217,8 +2314,24 @@ impl Session {
         let entry_id = self.push(kind)?;
         // The record is already applied when syncing fails. Report that state explicitly;
         // callers must not claim rollback or proceed with an unconfirmed new window.
-        let durability_error = self.file.as_ref().and_then(|file| file.sync_data().err())
-            .map(|error| format!("session entry {entry_id} was appended, but durable acknowledgement failed: {error}"));
+        let sync_error = match self.file.as_ref() {
+            Some(file) => {
+                let started = Instant::now();
+                let synced = file.sync_data();
+                bump(&mut self.io.context_sync_attempts);
+                add_elapsed(&mut self.io.context_sync_micros, started);
+                if synced.is_err() {
+                    bump(&mut self.io.context_sync_failures);
+                }
+                synced.err()
+            }
+            None => None,
+        };
+        let durability_error = sync_error.map(|error| {
+            format!(
+                "session entry {entry_id} was appended, but durable acknowledgement failed: {error}"
+            )
+        });
         Ok(JournalCommit {
             entry_id,
             durability_error,
@@ -2787,6 +2900,11 @@ impl Session {
         self.with_history_generation_floor(state)
     }
 
+    /// Snapshot of this handle's process-local write/sync counters; diff snapshots with `since`.
+    pub fn io_metrics(&self) -> SessionIoMetrics {
+        self.io
+    }
+
     pub fn context_history_generation(&self) -> u64 {
         self.history_generation_floor
     }
@@ -2952,6 +3070,17 @@ impl Session {
     /// Journal typed execution snapshots on the same active branch as messages. Streaming bodies
     /// stay in memory; request/tool boundaries persist changed snapshots without per-token disk I/O.
     pub fn flush_runtime(&mut self) -> Result<()> {
+        let started = Instant::now();
+        let result = self.flush_runtime_journaled();
+        bump(&mut self.io.runtime_flush_attempts);
+        add_elapsed(&mut self.io.runtime_flush_micros, started);
+        if result.is_err() {
+            bump(&mut self.io.runtime_flush_failures);
+        }
+        result
+    }
+
+    fn flush_runtime_journaled(&mut self) -> Result<()> {
         self.runtime
             .check_persistence()
             .map_err(anyhow::Error::msg)?;
@@ -2971,7 +3100,7 @@ impl Session {
         Ok(())
     }
 
-    fn reclaim_streams(&self) -> Result<()> {
+    fn reclaim_streams(&mut self) -> Result<()> {
         let Some(journal) = self
             .runtime
             .stream_writer()
@@ -2982,8 +3111,14 @@ impl Session {
         let Some(file) = &self.file else {
             return Ok(());
         };
-        file.sync_data()
-            .context("syncing runtime snapshots before stream reclamation")?;
+        let started = Instant::now();
+        let synced = file.sync_data();
+        bump(&mut self.io.runtime_reclaim_sync_attempts);
+        add_elapsed(&mut self.io.runtime_reclaim_sync_micros, started);
+        if synced.is_err() {
+            bump(&mut self.io.runtime_reclaim_sync_failures);
+        }
+        synced.context("syncing runtime snapshots before stream reclamation")?;
         let mut acknowledged = std::collections::BTreeMap::<String, u64>::new();
         for entry in &self.entries {
             if let Kind::Runtime(node) = &entry.kind {
@@ -3069,8 +3204,33 @@ impl Session {
     /// Journals only the top-level keys that changed since the merged branch state. A full
     /// snapshot every step made these entries 70-95% of a session file; readers fold both forms.
     pub fn set_control_state(&mut self, state: Value) -> Result<()> {
+        let started = Instant::now();
+        let result = self.publish_control_state(state);
+        bump(&mut self.io.control_publication_attempts);
+        let micros = add_elapsed(&mut self.io.control_publication_micros, started);
+        match result {
+            Ok(equal) => {
+                if equal {
+                    bump(&mut self.io.equal_control_publications);
+                    self.io.equal_control_publication_micros = self
+                        .io
+                        .equal_control_publication_micros
+                        .saturating_add(micros);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                bump(&mut self.io.control_publication_failures);
+                Err(error)
+            }
+        }
+    }
+
+    /// Appends the `dial_state` record; returns whether its patch was empty (state already equal).
+    fn publish_control_state(&mut self, state: Value) -> Result<bool> {
         let state = self.with_history_generation_floor(state);
         let mut message = json!({"role":"dial_state"});
+        let mut equal = false;
         match (self.active.control_state.as_object(), state.as_object()) {
             (Some(previous), Some(next)) if self.active.extendable => {
                 let mut patch = serde_json::Map::new();
@@ -3084,11 +3244,12 @@ impl Session {
                         patch.insert(key.clone(), Value::Null);
                     }
                 }
+                equal = patch.is_empty();
                 message["patch"] = Value::Object(patch);
             }
             _ => message["state"] = state,
         }
-        self.append(message).map(|_| ())
+        self.append(message).map(|_| equal)
     }
 
     /// Entry indices from the root to the leaf, shared by all history readers.

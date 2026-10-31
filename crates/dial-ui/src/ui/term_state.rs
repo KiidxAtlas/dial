@@ -1,8 +1,9 @@
-//! What Dial tells the hosting terminal about the session outside the drawn cells: tab color and
-//! dock attention by state (iTerm2), OSC 9;4 progress, `SetUserVar` values for status bars and
-//! badges, and the working directory (OSC 7). Each paint writes only what changed; [`Signals`]
-//! the terminal does not support are never written, and [`SignalWriter::reset`] puts the tab,
-//! progress, attention and variables back when Dial leaves.
+//! What Dial tells the hosting terminal about the session outside the drawn cells: dock attention
+//! while it waits (iTerm2), OSC 9;4 progress, `SetUserVar` values for status bars and badges, and
+//! the working directory (OSC 7). The tab's state circle lives in the title, see
+//! [`Activity::marker`]. Each paint writes only what changed; [`Signals`] the terminal does not
+//! support are never written, and [`SignalWriter::reset`] puts progress, attention and variables
+//! back when Dial leaves.
 use std::path::PathBuf;
 
 use base64::Engine as _;
@@ -47,12 +48,14 @@ impl Activity {
         }
     }
 
-    fn tab_rgb(self) -> Option<(u8, u8, u8)> {
+    /// The circle that leads the terminal title (and so the tab) for this state, or `""` when
+    /// idle. Emoji circles carry their own color, so any terminal that shows titles shows it.
+    pub fn marker(self) -> &'static str {
         match self {
-            Activity::Idle => None,
-            Activity::Working => Some((245, 166, 35)),
-            Activity::Waiting | Activity::Failed => Some((230, 64, 64)),
-            Activity::Done => Some((76, 186, 96)),
+            Activity::Idle => "",
+            Activity::Working => "\u{1F7E0}",
+            Activity::Waiting | Activity::Failed => "\u{1F534}",
+            Activity::Done => "\u{1F7E2}",
         }
     }
 }
@@ -146,9 +149,6 @@ impl SignalWriter {
     fn diff(&self, want: &Signals) -> String {
         let caps = self.caps;
         let mut out = String::new();
-        if caps.tab_color && want.activity.tab_rgb() != self.sent.activity.tab_rgb() {
-            out.push_str(&caps.wrap(&tab_color(want.activity.tab_rgb())));
-        }
         let waiting = |activity: Activity| activity == Activity::Waiting;
         if caps.attention && waiting(want.activity) != waiting(self.sent.activity) {
             out.push_str(&caps.wrap(&attention(waiting(want.activity))));
@@ -179,7 +179,7 @@ impl SignalWriter {
         out
     }
 
-    /// The bytes that restore tab color, progress, attention and variables, without recording it
+    /// The bytes that restore progress, attention and variables, without recording it
     /// (the panic hook writes this).
     pub fn reset_sequence(&self) -> String {
         self.prepare(None).0
@@ -195,8 +195,9 @@ impl SignalWriter {
     /// `want` with everything this terminal cannot show removed, values sanitized.
     fn supported(&self, want: &Signals) -> Signals {
         let caps = self.caps;
-        // Without tab color the activity matters only for attention, so `Waiting` is all it keeps.
-        let activity = if caps.tab_color || (caps.attention && want.activity == Activity::Waiting) {
+        // The activity matters here only for attention, so `Waiting` is all it keeps; the tab's
+        // circle is drawn in the title (see [`Activity::marker`]), not written as a signal.
+        let activity = if caps.attention && want.activity == Activity::Waiting {
             want.activity
         } else {
             Activity::Idle
@@ -226,15 +227,6 @@ fn bounded(value: &str) -> String {
         .chars()
         .take(VAR_LIMIT)
         .collect()
-}
-
-fn tab_color(rgb: Option<(u8, u8, u8)>) -> String {
-    match rgb {
-        None => "\x1b]6;1;bg;*;default\x07".to_owned(),
-        Some((r, g, b)) => format!(
-            "\x1b]6;1;bg;red;brightness;{r}\x07\x1b]6;1;bg;green;brightness;{g}\x07\x1b]6;1;bg;blue;brightness;{b}\x07"
-        ),
-    }
 }
 
 fn attention(on: bool) -> String {

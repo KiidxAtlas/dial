@@ -1,0 +1,14 @@
+# Hosted reference profile. Remote inference is an explicit opt-in: allow_remote=true sends prompts to the
+# hosted provider and spends its quota. Run it only deliberately, with a configured provider, and not in CI.
+# Usage: dial benchmark examples/benchmarks/local-tasks.toml --profiles examples/benchmarks/local-tasks-hosted-profiles.toml
+[machine]
+repetitions = 1
+case_timeout_secs = 180
+minimum_correctness = 1.0
+allow_remote = true
+
+[[configurations]]
+name = "hosted-reference"
+provider = "anthropic"
+model = "claude-sonnet-4-6"
+context_window = 32768

@@ -199,19 +199,6 @@ fn no_duplicates_and_every_tab_and_section_has_entries() {
             );
         }
     }
-    assert_eq!(
-        tabs.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
-        [
-            "Appearance",
-            "Interaction",
-            "Model",
-            "Memory",
-            "Improvement",
-            "Tools",
-            "Experimental",
-            "Voice"
-        ]
-    );
 }
 
 /// Sibling settings that `Config::validate` reads while `path` takes `value`. Each dependent is
@@ -627,4 +614,78 @@ fn known_list_values_are_accepted_by_their_settings() {
         .map(|m| serde_json::from_value(serde_json::json!(m)).unwrap())
         .collect();
     assert_eq!(methods, Config::default().compaction.method_order);
+}
+
+#[test]
+fn layout_lists_every_registered_section_exactly_once() {
+    for def in registry() {
+        let sections = LAYOUT
+            .iter()
+            .find(|(tab, _)| *tab == def.tab)
+            .unwrap_or_else(|| panic!("tab {} of {} is missing from LAYOUT", def.tab, def.path))
+            .1;
+        assert!(
+            sections.contains(&def.section),
+            "section {}/{} of {} is missing from LAYOUT",
+            def.tab,
+            def.section,
+            def.path
+        );
+    }
+    for (tab, sections) in LAYOUT {
+        let unique: HashSet<_> = sections.iter().collect();
+        assert_eq!(unique.len(), sections.len(), "{tab} repeats a section");
+        for section in *sections {
+            assert!(
+                registry()
+                    .iter()
+                    .any(|def| def.tab == *tab && def.section == *section),
+                "LAYOUT lists {tab}/{section}, which holds no setting"
+            );
+        }
+    }
+}
+
+#[test]
+fn tabs_follow_the_layout_table_not_declaration_order() {
+    let tabs = tabs();
+    let names: Vec<_> = tabs.iter().map(|(tab, _)| *tab).collect();
+    let expected: Vec<_> = LAYOUT.iter().map(|(tab, _)| *tab).collect();
+    assert_eq!(names, expected);
+    for ((tab, sections), (_, listed)) in tabs.iter().zip(LAYOUT) {
+        assert_eq!(
+            sections.as_slice(),
+            *listed,
+            "{tab} sections are out of order"
+        );
+    }
+}
+
+#[test]
+fn web_timeout_keeps_the_historical_default_and_is_bounded() {
+    let setting = registry()
+        .iter()
+        .find(|setting| setting.path == "web.timeout_secs")
+        .expect("web timeout is a setting");
+    assert_eq!(setting.default_value(), Some(Value::Integer(30)));
+    assert_eq!(Config::default().web.timeout_secs, 30);
+    let omitted: Config = toml::from_str("[web]\nsearch_provider = \"brave\"\n").unwrap();
+    assert_eq!(omitted.web.timeout_secs, 30);
+    check_value("web.timeout_secs", &Value::Integer(600)).unwrap();
+    assert!(check_value("web.timeout_secs", &Value::Integer(0)).is_err());
+    assert!(check_value("web.timeout_secs", &Value::Integer(601)).is_err());
+    for seconds in [0, 601] {
+        let mut config = Config::default();
+        config.web.timeout_secs = seconds;
+        assert!(config.validate().is_err(), "{seconds}");
+    }
+}
+
+#[test]
+fn failed_turns_notify_by_default_but_an_explicit_opt_out_is_kept() {
+    assert!(UiConfig::default().notify_errors);
+    let unset: Config = toml::from_str("[ui]\nnotify = true\n").unwrap();
+    assert!(unset.ui.notify_errors);
+    let opted_out: Config = toml::from_str("[ui]\nnotify_errors = false\n").unwrap();
+    assert!(!opted_out.ui.notify_errors);
 }

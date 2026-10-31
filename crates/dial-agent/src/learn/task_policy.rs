@@ -56,6 +56,8 @@ pub struct Policy {
     pub kind: Kind,
     pub initial_reasoning_secs: u64,
     pub lightweight: bool,
+    /// The request explicitly asks for verification ("verify", "verified", "verification").
+    pub verification_requested: bool,
 }
 impl Policy {
     pub fn for_prompt(prompt: &str, configured_secs: u64) -> Self {
@@ -75,8 +77,18 @@ impl Policy {
             kind,
             initial_reasoning_secs,
             lightweight: !complex && prompt.len() <= 600 && kind != Kind::Debugging,
+            verification_requested: asks_for_verification(prompt),
         }
     }
+}
+
+/// Whether a word of `prompt` starts with "verif": verify, verifies, verified, verifying,
+/// verification. Words like "check" or "test" are not an explicit verification request.
+fn asks_for_verification(prompt: &str) -> bool {
+    prompt
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|word| word.starts_with("verif"))
 }
 /// Tools whose failures come from running project code or commands, where a failure is
 /// evidence about behaviour and the hypothesis-revision checkpoint applies.

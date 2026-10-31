@@ -1,3 +1,7 @@
+use std::io::{Read, Write};
+use std::net::SocketAddr;
+use std::sync::mpsc;
+
 use super::*;
 use std::fs;
 
@@ -598,6 +602,75 @@ fn snapshot(repo_dir: &str) -> String {
         .expect("no snapshot")
         .unwrap();
     entry.path().to_str().unwrap().to_string()
+}
+
+/// A loopback server that sends the start of an embedding reply and then stalls until released.
+struct StalledEmbeddings {
+    addr: SocketAddr,
+    arrived: mpsc::Receiver<()>,
+    release: mpsc::Sender<()>,
+    server: std::thread::JoinHandle<()>,
+}
+
+fn stalled_embeddings() -> StalledEmbeddings {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (arrived_tx, arrived) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let server = std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        // Read the request head byte by byte so nothing past it is consumed; an empty or
+        // truncated connection ends here without reporting an arrival.
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            match stream.read(&mut byte) {
+                Ok(1) => head.push(byte[0]),
+                _ => return,
+            }
+        }
+        let _ = arrived_tx.send(());
+        let _ = stream.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100000\r\n\r\n{\"data\":",
+        );
+        let _ = released.recv_timeout(Duration::from_secs(10));
+    });
+    StalledEmbeddings {
+        addr,
+        arrived,
+        release,
+        server,
+    }
+}
+#[test]
+fn cancelled_embedding_warmup_stops_a_stalled_reply_without_a_deadline() {
+    let server = stalled_embeddings();
+    let base = format!("http://{}", server.addr);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel();
+    let flag = cancel.clone();
+    let warm = std::thread::spawn(move || {
+        tx.send(warm_embedding(&base, "embed", 0, Some(flag)))
+            .unwrap();
+    });
+    server
+        .arrived
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the warm-up request reached the server");
+    cancel.store(true, Ordering::SeqCst);
+    let result = rx.recv_timeout(Duration::from_secs(5));
+    let _ = server.release.send(());
+    server.server.join().unwrap();
+    warm.join().unwrap();
+    let error = result
+        .expect("warm-up must return after cancellation, not block on the stalled reply")
+        .expect_err("a cancelled warm-up must fail");
+    assert!(format!("{error:#}").contains("interrupted"), "{error:#}");
 }
 
 #[test]

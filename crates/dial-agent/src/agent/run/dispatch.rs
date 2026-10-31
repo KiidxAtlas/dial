@@ -24,6 +24,91 @@ pub(in crate::agent) fn projected_request(
     })
 }
 
+/// Zero-based page size of the eligible-tool listing that `tool_search` serves for query `*`
+/// (page 0) and `*:N` (page N). Listing only reports descriptions and status; it enables nothing.
+const TOOL_LIST_PAGE: usize = 16;
+/// Listing descriptions are cut to this many characters so every page stays bounded.
+const TOOL_LIST_DESCRIPTION_CHARS: usize = 240;
+
+/// `Ok(None)` for an ordinary capability query. `Ok(Some(page))` for the listing forms `*` and
+/// `*:N`. A malformed or non-numeric page is refused rather than searched as a capability query.
+fn listing_request(query: &str) -> Result<Option<usize>, String> {
+    let query = query.trim();
+    if query == "*" {
+        return Ok(Some(0));
+    }
+    let Some(cursor) = query.strip_prefix("*:") else {
+        return Ok(None);
+    };
+    if cursor.is_empty() || !cursor.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!(
+            "invalid tool listing cursor `{query}`: use `*` for page 0 or `*:N` with a zero-based page number from next_query"
+        ));
+    }
+    cursor
+        .parse::<usize>()
+        .map(Some)
+        .map_err(|_| format!("invalid tool listing cursor `{query}`: page number is out of range"))
+}
+
+/// Status and the exact next action for one discovery entry. Discovery never grants permission.
+fn activation_status(loaded: bool) -> (&'static str, &'static str) {
+    if loaded {
+        (
+            "loaded_next_request",
+            "call this tool by its exact name on the next request",
+        )
+    } else {
+        (
+            "not_loaded",
+            "call tool_load with this exact name; it is callable on the request after that",
+        )
+    }
+}
+
+/// One zero-based page of the eligible catalog. `descriptions` holds only eligible tools, so the
+/// listing never reveals or activates anything outside the caller's eligibility boundary.
+fn listing_output(
+    page: usize,
+    descriptions: &HashMap<String, String>,
+    offered: &[String],
+) -> Result<ToolOutput, String> {
+    let mut names: Vec<&String> = descriptions.keys().collect();
+    names.sort();
+    let total = names.len();
+    if page > 0 && page.saturating_mul(TOOL_LIST_PAGE) >= total {
+        return Err(format!(
+            "invalid tool listing cursor `*:{page}`: only {} page(s) of eligible tools exist; start from `*`",
+            total.div_ceil(TOOL_LIST_PAGE).max(1)
+        ));
+    }
+    let start = page * TOOL_LIST_PAGE;
+    let end = (start + TOOL_LIST_PAGE).min(total);
+    let tools: Vec<Value> = names[start..end]
+        .iter()
+        .map(|name| {
+            let loaded = offered.contains(*name);
+            let (status, next) = activation_status(loaded);
+            let description: String = descriptions[*name]
+                .chars()
+                .take(TOOL_LIST_DESCRIPTION_CHARS)
+                .collect();
+            json!({"name":name,"description":description,"status":status,"enabled_next_round":loaded,"next":next})
+        })
+        .collect();
+    let next_query = if end < total {
+        json!(format!("*:{}", page + 1))
+    } else {
+        Value::Null
+    };
+    Ok(ToolOutput {
+        execution: Default::default(),
+        data: None,
+        text: json!({"listing":true,"page":page,"page_size":TOOL_LIST_PAGE,"total":total,"next_query":next_query,"tools":tools}).to_string(),
+        is_error: false,
+    })
+}
+
 /// Turn a successful tool's PNG `data.artifact` envelope into a compact image reference, so
 /// every tool that renders pixels (browser, computer, github, derived-media `read`, `visual`,
 /// `video`, `evidence`, ...) reaches a vision model through one rule instead of a name list.
@@ -1044,6 +1129,19 @@ impl<'a> Agent<'a> {
                         ),
                     };
                 }
+                if finish.outcome == TurnOutcome::Completed && !self.hermetic {
+                    match self.wait_for_background_event(ui) {
+                        Ok(true) => {
+                            return ToolOutput::ok("Completion deferred: running work produced an event, new input arrived, or a stop boundary was reached. Incorporate worker findings and current user direction; fetch background job output or its artifact if only a terminal notice was delivered. Waiting does not establish success.".into())
+                                .with_effects(crate::tools::surface::outcome::Effects::None);
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            return ToolOutput::err(format!("waiting for running work: {error:#}"))
+                                .with_effects(crate::tools::surface::outcome::Effects::None);
+                        }
+                    }
+                }
                 if finish.outcome == TurnOutcome::Completed
                     && let Err(reason) = self.validate_completion(ui)
                 {
@@ -1063,8 +1161,14 @@ impl<'a> Agent<'a> {
                     Ok(query) => query,
                     Err(error) => return denied(&error),
                 };
+                let listing = match listing_request(query) {
+                    Ok(listing) => listing,
+                    Err(error) => return denied(&error),
+                };
+                // Discovery covers every configured server, so it waits for any still connecting.
+                self.ext.adopt_mcp(true);
                 let mut descriptions = HashMap::new();
-                let candidates = self
+                let candidates: Vec<(String, String)> = self
                     .catalog()
                     .into_iter()
                     .filter_map(|name| {
@@ -1081,6 +1185,14 @@ impl<'a> Agent<'a> {
                         Some((name, indexed))
                     })
                     .collect();
+                if let Some(page) = listing {
+                    // Listing is a read-only view: it never calls `activate_tools`.
+                    let offered = self.offered();
+                    return match listing_output(page, &descriptions, &offered) {
+                        Ok(output) => output,
+                        Err(error) => denied(&error),
+                    };
+                }
                 let matches = crate::agent::model::assistance::discover(query, candidates);
                 let activated: Vec<String> = matches
                     .iter()
@@ -1091,10 +1203,17 @@ impl<'a> Agent<'a> {
                     return denied(&format!("persisting discovered tools: {error:#}"));
                 }
                 let offered = self.offered();
-                let matches: Vec<Value> = matches.into_iter().map(|(name, _, _)| {
-                    let description = descriptions.remove(&name).unwrap_or_default();
-                    json!({"enabled_next_round":offered.contains(&name),"name":name,"description":description})
-                }).collect();
+                let matches: Vec<Value> = matches
+                    .into_iter()
+                    .map(|(name, _, _)| {
+                        let description = descriptions.remove(&name).unwrap_or_default();
+                        let loaded = offered.contains(&name);
+                        // Each entry states whether it is callable on the next request, and the exact
+                        // action that makes it callable. Discovery never grants permission itself.
+                        let (status, next) = activation_status(loaded);
+                        json!({"name":name,"description":description,"status":status,"enabled_next_round":loaded,"next":next})
+                    })
+                    .collect();
                 ToolOutput {
                     execution: Default::default(),
                     data: None,
@@ -1117,6 +1236,13 @@ impl<'a> Agent<'a> {
                     .filter_map(Value::as_str)
                     .map(str::to_owned)
                     .collect();
+                if requested
+                    .iter()
+                    .chain(&unload)
+                    .any(|name| !self.ext.contains(name) && self.ext.mcp_connecting().is_some())
+                {
+                    self.ext.adopt_mcp(true);
+                }
                 let catalog = self.catalog();
                 if (requested.is_empty() && unload.is_empty())
                     || requested
@@ -1153,7 +1279,7 @@ impl<'a> Agent<'a> {
                     execution: Default::default(),
                     data: None,
                     text: format!(
-                        "Next round: enabled [{}]; unloaded [{}]",
+                        "Next round: enabled [{}]; unloaded [{}]. Enabled tools are callable on the next request, not in this batch.",
                         requested.join(", "),
                         unload.join(", ")
                     ),

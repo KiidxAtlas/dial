@@ -561,7 +561,8 @@ impl Glob {
 }
 
 pub(in crate::tools) fn glob_tool(ws: &Workspace, args: &Value) -> Result<String, String> {
-    let glob = Glob::new(req_str(args, "pattern")?)?;
+    let pattern = req_str(args, "pattern")?;
+    let glob = Glob::new(pattern)?;
     let roots = scopes(ws, args)?;
     let resume = cursor(args, ws)?;
     if resume.as_ref().is_some_and(|(_, consumed)| *consumed != 0) {
@@ -609,20 +610,20 @@ pub(in crate::tools) fn glob_tool(ws: &Workspace, args: &Value) -> Result<String
         }
     }
     next = next.or_else(|| walk.next.clone().map(|p| (p, 0)));
-    finish_page(
-        text,
-        ws,
-        next,
-        skip,
-        &if unrepresentable == 0 {
-            format!("results={count}; {}", walk.coverage())
-        } else {
-            format!(
-                "results={count}; non_utf8_filenames_excluded={unrepresentable}; {}",
-                walk.coverage()
-            )
-        },
-    )
+    let mut coverage = if unrepresentable == 0 {
+        format!("results={count}; {}", walk.coverage())
+    } else {
+        format!(
+            "results={count}; non_utf8_filenames_excluded={unrepresentable}; {}",
+            walk.coverage()
+        )
+    };
+    if count == 0 && pattern.contains(char::is_whitespace) {
+        coverage.push_str(
+            "; pattern_hint=whitespace is literal in a glob and does not separate patterns; for alternatives use {a,b} or one glob per call",
+        );
+    }
+    finish_page(text, ws, next, skip, &coverage)
 }
 
 /// Compile once for bounded byte matching, on lines or whole files.

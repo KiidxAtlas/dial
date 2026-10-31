@@ -70,6 +70,8 @@ pub struct Evidence {
     pub load_secs: f64,
     /// Side requests that went to another model on the main model's local server.
     pub side_model_swaps: u64,
+    /// Replies whose tool calls Dial read out of text because the server's parser did not.
+    pub text_calls: u64,
     /// Context overflows, and the window the server served at the last probe.
     pub overflows: u64,
     pub served_context: Option<u32>,
@@ -245,6 +247,7 @@ impl Evidence {
         self.loads = self.loads.saturating_add(delta.loads);
         self.load_secs += delta.load_secs;
         self.side_model_swaps = self.side_model_swaps.saturating_add(delta.side_model_swaps);
+        self.text_calls = self.text_calls.saturating_add(delta.text_calls);
         self.overflows = self.overflows.saturating_add(delta.overflows);
         if delta.served_context.is_some() {
             self.served_context = delta.served_context;

@@ -119,38 +119,60 @@ impl Capture<'_> {
         self.digest.update(value);
     }
 
+    /// A declared path. Symlinks are rejected in *every* component, including parents of a declared
+    /// file; directory members inherit that check and verify only their own entry.
     fn visit(&mut self, relative: &Path) -> Option<()> {
-        if self.started.elapsed() > self.kind.time() {
-            return None;
-        }
-        let name = relative.to_str()?;
-        if self.excluded.contains(name) {
+        if !self.admit(relative)? {
             return Some(());
         }
-        if name.is_empty() || name.contains('\\') {
-            return None;
-        }
-        // Reject symlinks in *every* component, including parents of a declared file.
         let mut path = self.workspace.root().to_path_buf();
+        let mut metadata = None;
         for component in relative.components() {
             if !matches!(component, Component::Normal(_)) {
                 return None;
             }
             path.push(component);
-            if fs::symlink_metadata(&path).ok()?.file_type().is_symlink() {
-                return None;
-            }
+            metadata = Some(real_entry(&path)?);
         }
-        if self.workspace.resolve(name).ok()? != path {
+        if !self.confined(relative, &path) {
             return None;
         }
+        self.entry(relative, &path, metadata?)
+    }
+
+    /// Workspace resolution (symlink, protected and sensitive storage policy) returns `path` itself.
+    fn confined(&self, relative: &Path, path: &Path) -> bool {
+        relative
+            .to_str()
+            .and_then(|name| self.workspace.resolve(name).ok())
+            .is_some_and(|resolved| resolved == path)
+    }
+
+    /// `None` makes the capture unknown; `Some(false)` skips an excluded path.
+    fn admit(&self, relative: &Path) -> Option<bool> {
+        if self.started.elapsed() > self.kind.time() {
+            return None;
+        }
+        let name = relative.to_str()?;
+        if self.excluded.contains(name) {
+            return Some(false);
+        }
+        if name.is_empty() || name.contains('\\') {
+            return None;
+        }
+        Some(true)
+    }
+
+    /// `path` is `relative` under the root, confined and with every component already checked not
+    /// to be a symlink; `before` is the entry's own metadata from that check.
+    fn entry(&mut self, relative: &Path, path: &Path, before: fs::Metadata) -> Option<()> {
+        let name = relative.to_str()?;
         if !self.seen.insert(name.to_owned()) {
             return Some(());
         }
         if self.seen.len() > self.kind.entries() {
             return None;
         }
-        let before = fs::symlink_metadata(&path).ok()?;
         self.field(name.as_bytes());
         #[cfg(unix)]
         {
@@ -164,7 +186,7 @@ impl Capture<'_> {
         if before.is_dir() {
             self.field(b"directory");
             let mut children = Vec::new();
-            for entry in fs::read_dir(&path).ok()? {
+            for entry in fs::read_dir(path).ok()? {
                 if children.len() + self.seen.len() >= self.kind.entries()
                     || self.started.elapsed() > self.kind.time()
                 {
@@ -174,39 +196,55 @@ impl Capture<'_> {
             }
             children.sort();
             for child in children {
-                self.visit(&relative.join(child))?;
+                let relative = relative.join(&child);
+                if !self.admit(&relative)? {
+                    continue;
+                }
+                let path = path.join(&child);
+                let metadata = real_entry(&path)?;
+                // An installed runtime is its own fresh workspace without protected or sensitive
+                // paths, and this member's parents are already confined real directories, so
+                // resolution could only return `path` again. Project members may hold protected
+                // storage and are always resolved.
+                if matches!(self.kind, IdentityKind::Content) && !self.confined(&relative, &path) {
+                    return None;
+                }
+                self.entry(&relative, &path, metadata)?;
             }
         } else if before.is_file() {
             self.field(b"file");
-            if matches!(self.kind, IdentityKind::Content) {
-                if before.len() > MAX_BYTES.saturating_sub(self.bytes) {
-                    return None;
-                }
-                let mut file = fs::File::open(&path).ok()?;
-                let mut hash = Sha256::new();
-                let mut buffer = [0; 8192];
-                let mut size = 0u64;
-                loop {
-                    let count = file.read(&mut buffer).ok()?;
-                    if count == 0 {
-                        break;
-                    }
-                    size += count as u64;
-                    self.bytes += count as u64;
-                    if self.bytes > MAX_BYTES || self.started.elapsed() > self.kind.time() {
-                        return None;
-                    }
-                    hash.update(&buffer[..count]);
-                }
-                if size != before.len() {
-                    return None;
-                }
-                self.field(&hash.finalize());
+            // An installed runtime file's identity is the single metadata observation above. Nothing
+            // is read before a second observation, so one would add no protection, only a syscall.
+            if matches!(self.kind, IdentityKind::InstalledRuntime) {
+                return Some(());
             }
+            if before.len() > MAX_BYTES.saturating_sub(self.bytes) {
+                return None;
+            }
+            let mut file = fs::File::open(path).ok()?;
+            let mut hash = Sha256::new();
+            let mut buffer = [0; 8192];
+            let mut size = 0u64;
+            loop {
+                let count = file.read(&mut buffer).ok()?;
+                if count == 0 {
+                    break;
+                }
+                size += count as u64;
+                self.bytes += count as u64;
+                if self.bytes > MAX_BYTES || self.started.elapsed() > self.kind.time() {
+                    return None;
+                }
+                hash.update(&buffer[..count]);
+            }
+            if size != before.len() {
+                return None;
+            }
+            self.field(&hash.finalize());
         } else {
             return None;
         }
-        let after = fs::symlink_metadata(&path).ok()?;
+        let after = fs::symlink_metadata(path).ok()?;
         if before.file_type() != after.file_type()
             || before.len() != after.len()
             || before.modified().ok()? != after.modified().ok()?
@@ -218,6 +256,12 @@ impl Capture<'_> {
         }
         Some(())
     }
+}
+
+/// The metadata of `path` when it is a real entry, not a symlink.
+fn real_entry(path: &Path) -> Option<fs::Metadata> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    (!metadata.file_type().is_symlink()).then_some(metadata)
 }
 
 /// ctime detects content replacements even when a tool preserves mtime and size. This identity is
@@ -248,7 +292,7 @@ fn runtime_identity(metadata: &fs::Metadata) -> Option<Vec<u8>> {
 }
 
 mod automatic;
-pub(super) use automatic::python_snapshot;
+pub(super) use automatic::{PythonRuntime, python_runtime, python_snapshot};
 
 #[cfg(test)]
 mod tests;

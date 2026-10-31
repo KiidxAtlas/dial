@@ -46,6 +46,7 @@ impl Identity {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct Source {
     text: String,
     folded: String,
@@ -54,10 +55,10 @@ pub(super) struct Source {
     pub(super) postings: BTreeMap<String, Vec<usize>>,
     pub(super) path_terms: BTreeSet<String>,
     pub(super) declarations: Vec<(usize, usize, String)>,
-    decoded_bytes: usize,
+    syntax_indexed: bool,
 }
 impl Source {
-    fn new(path: &Path, relative: &str, text: &str) -> Self {
+    fn new(relative: &str, text: &str) -> Self {
         let mut source = Self {
             text: String::with_capacity(text.len()),
             folded: String::with_capacity(text.len()),
@@ -65,8 +66,8 @@ impl Source {
             folded_starts: Vec::new(),
             postings: BTreeMap::new(),
             path_terms: tokens(relative),
-            declarations: declarations(path, text),
-            decoded_bytes: 0,
+            declarations: Vec::new(),
+            syntax_indexed: false,
         };
         for (index, line) in text.lines().enumerate() {
             if index > 0 {
@@ -81,32 +82,34 @@ impl Source {
                 source.postings.entry(term).or_default().push(index + 1);
             }
         }
+        source
+    }
+    fn decoded_bytes(&self) -> usize {
         // Charge allocated capacities, including conservative BTree node overhead,
         // not compressed file bytes. Oversized indexes remain accurate but uncached.
-        source.decoded_bytes = std::mem::size_of::<Self>()
-            + source.text.capacity()
-            + source.folded.capacity()
-            + (source.starts.capacity() + source.folded_starts.capacity())
+        std::mem::size_of::<Self>()
+            + self.text.capacity()
+            + self.folded.capacity()
+            + (self.starts.capacity() + self.folded_starts.capacity())
                 * std::mem::size_of::<usize>()
-            + source
+            + self
                 .postings
                 .iter()
                 .map(|(term, lines)| {
                     128 + term.capacity() + lines.capacity() * std::mem::size_of::<usize>()
                 })
                 .sum::<usize>()
-            + source
+            + self
                 .path_terms
                 .iter()
                 .map(|term| 128 + term.capacity())
                 .sum::<usize>()
-            + source.declarations.capacity() * std::mem::size_of::<(usize, usize, String)>()
-            + source
+            + self.declarations.capacity() * std::mem::size_of::<(usize, usize, String)>()
+            + self
                 .declarations
                 .iter()
                 .map(|(_, _, kind)| kind.capacity())
-                .sum::<usize>();
-        source
+                .sum::<usize>()
     }
     pub(super) fn lines(&self) -> usize {
         self.starts.len()
@@ -176,26 +179,38 @@ pub(super) fn evidence(
     identity: &Identity,
     revision: [u8; 32],
     text: &str,
-) -> Arc<Source> {
-    if let Ok(mut cache) = CACHE.lock()
-        && let Some(index) = cache
+    accepts: impl FnOnce(&Source) -> bool,
+) -> Option<Arc<Source>> {
+    let cached = CACHE.lock().ok().and_then(|mut cache| {
+        let index = cache
             .entries
             .iter()
-            .position(|((scope, file), _)| scope == root && file == path)
-    {
+            .position(|((scope, file), _)| scope == root && file == path)?;
         let entry = cache.remove(index);
-        if entry.identity == *identity && entry.revision == revision {
-            let source = Arc::clone(&entry.source);
-            cache.bytes += entry.bytes;
-            cache
-                .entries
-                .push(((root.to_path_buf(), path.to_path_buf()), entry));
-            return source;
+        if entry.identity != *identity || entry.revision != revision {
+            return None;
         }
+        let source = Arc::clone(&entry.source);
+        cache.bytes += entry.bytes;
+        cache
+            .entries
+            .push(((root.to_path_buf(), path.to_path_buf()), entry));
+        Some(source)
+    });
+    let was_cached = cached.is_some();
+    let mut source = cached.unwrap_or_else(|| Arc::new(Source::new(relative, text)));
+    let accepted = accepts(&source);
+    if was_cached && (!accepted || source.syntax_indexed) {
+        return accepted.then_some(source);
     }
-    // Poisoning, an eviction or an uncacheable source uses the same evidence algorithm.
-    let source = Arc::new(Source::new(path, relative, text));
-    let bytes = source.decoded_bytes + 256 + root.as_os_str().len() + path.as_os_str().len();
+    // Retain query-independent token indexes even for nonmatches, so the next query
+    // can reuse them. Only matching files need syntax; never cache a negative verdict.
+    if accepted {
+        let source = Arc::make_mut(&mut source);
+        source.declarations = declarations(path, text);
+        source.syntax_indexed = true;
+    }
+    let bytes = source.decoded_bytes() + 256 + root.as_os_str().len() + path.as_os_str().len();
     if bytes <= MAX_CACHE_BYTES
         && let Ok(mut cache) = CACHE.lock()
     {
@@ -221,5 +236,5 @@ pub(super) fn evidence(
             },
         ));
     }
-    source
+    accepted.then_some(source)
 }

@@ -1,0 +1,15 @@
+version = 1
+name = "gemma-e4b-discovery-diagnostic"
+
+[[cases]]
+id = "deferred-tool-discovery"
+project = "examples/benchmarks/local-tasks-fixture"
+prompt = "ast_search is a deferred tool. Use tool_search to find it, tool_load it, then use it to find the function in ledger.py that returns min(sum(rows), 100). Write only that function name to answer.txt, and reply DONE."
+categories = ["deferred_discovery"]
+checks = [
+  {kind="command", command='''python3 -c "assert open('answer.txt').read().strip() == 'bounded_total'"'''},
+  {kind="response_equals", content="DONE"},
+  {kind="tool_invoked", tool="tool_search"},
+  {kind="tool_invoked", tool="tool_load"},
+  {kind="tool_invoked", tool="ast_search"},
+]

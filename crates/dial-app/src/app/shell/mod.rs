@@ -137,7 +137,11 @@ pub(super) struct Shell {
     cfg_approval: Approval,
     pub(super) dark: Option<bool>,
     pub(super) session_id: String,
+    /// The terminal title's base: `dial · <project>`.
     pub(super) title: String,
+    /// The session's title (its name, else its first message), appended to the terminal title so
+    /// each tab says what it is working on. Empty until the session has one.
+    pub(super) tab_scope: String,
     /// What the terminal tab shows between turns (done, failed, waiting); cleared by a key press.
     pub(super) term_activity: crate::ui::term_state::Activity,
     /// A modal question or approval is on screen and waits for the user.
@@ -163,6 +167,8 @@ pub(super) struct Shell {
     pub(super) held: std::collections::VecDeque<crossterm::event::Event>,
     /// Handle to the agent's live jobs, usable while a turn holds the agent.
     pub(super) live_tasks: Option<crate::agent::LiveTaskControl>,
+    /// Sends peer letters while a turn holds the agent; set only for the turn's duration.
+    pub(super) peer_sender: Option<crate::agent::PeerSender>,
     /// Session workers for the pinned block, the `workers` segment and finish notices.
     pub(super) workers: crate::ui::worker_pins::WorkerBoard,
     /// Worker last opened by `Alt+Shift+A`, so repeated presses cycle through the running ones.

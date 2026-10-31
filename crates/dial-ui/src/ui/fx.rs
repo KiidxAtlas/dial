@@ -21,6 +21,8 @@ pub const TURN: Duration = Duration::from_millis(1200);
 pub const REVEAL: Duration = Duration::from_millis(140);
 /// Frame interval while a motion is running (the idle loop otherwise polls far more slowly).
 pub const FRAME: Duration = Duration::from_millis(16);
+/// Frame interval of the slow ambient motion on the resting launch screen (8 frames a second).
+pub const AMBIENT: Duration = Duration::from_millis(125);
 
 /// Whether anything may move: the user's `ui.motion` setting, and a theme that can show it. ASCII
 /// glyph sets and themes without truecolor brand stops (indexed palettes, `mono`, `NO_COLOR`) stay
@@ -117,28 +119,42 @@ pub fn sweep(
 ) -> Vec<Span<'static>> {
     const BAND: f32 = 4.0;
     let mut spans = gradient(theme, text, phase, base);
-    if !(0.0..1.0).contains(&progress) || stops(theme).is_none() {
+    if !(0.0..1.0).contains(&progress) {
         return spans;
     }
-    let peak = rgb(theme.color(Tok::Text)).unwrap_or((255, 255, 255));
     let n = spans.len() as f32;
-    let head = ease_out(progress) * (n + 2.0 * BAND) - BAND;
+    brighten(
+        theme,
+        &mut spans,
+        ease_out(progress) * (n + 2.0 * BAND) - BAND,
+        BAND,
+    );
+    spans
+}
+
+/// Lifts the colored cells within `band` cells of `head` toward the theme's text color, brightest
+/// at the head, which is also bold. Cells without a truecolor foreground (blanks, indexed or mono
+/// themes) are left alone, so this never changes a character or a width.
+pub fn brighten(theme: &Theme, spans: &mut [Span<'static>], head: f32, band: f32) {
+    if stops(theme).is_none() {
+        return;
+    }
+    let peak = rgb(theme.color(Tok::Text)).unwrap_or((255, 255, 255));
     for (i, span) in spans.iter_mut().enumerate() {
         let distance = (i as f32 - head).abs();
-        if distance >= BAND {
+        if distance >= band {
             continue;
         }
         let Some(color) = rgb(span.style.fg) else {
             continue;
         };
-        let lift = (1.0 - distance / BAND).powi(2) * 0.85;
+        let lift = (1.0 - distance / band).powi(2) * 0.85;
         let (r, g, b) = mix(color, peak, lift);
         span.style = span.style.fg(Color::Rgb(r, g, b));
         if distance < 1.0 {
             span.style = span.style.add_modifier(Modifier::BOLD);
         }
     }
-    spans
 }
 
 /// Rows of a `height`-row panel shown at `progress` through its reveal (eased, at least one).

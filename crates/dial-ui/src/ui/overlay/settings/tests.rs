@@ -371,6 +371,38 @@ fn renders_title_tabs_sections_rows_and_footer() {
 }
 
 #[test]
+fn section_list_counts_overridden_settings_so_customised_sections_stand_out() {
+    let rig = Rig::new();
+    let mut o = SettingsOverlay::new(
+        table("[ui]\ntips = false\nmotion = false\nstatus_separator = \"pipe\"\n"),
+        Table::new(),
+        table("[ui]\ntips = false\nmotion = false\nstatus_separator = \"pipe\"\n"),
+        Scope::Global,
+        vec![],
+    );
+    let screen = draw(&mut o, &rig, 130, 40);
+    let section = |name: &str| {
+        screen
+            .lines()
+            .map(|line| line.split('│').next().unwrap_or_default().trim())
+            .find(|left| left.starts_with(name))
+            .unwrap_or_else(|| panic!("no {name} section\n{screen}"))
+            .to_owned()
+    };
+    assert!(section("Display").ends_with('2'), "{}", section("Display"));
+    assert!(
+        section("Status Line").ends_with('1'),
+        "{}",
+        section("Status Line")
+    );
+    assert_eq!(
+        section("Theme"),
+        "Theme",
+        "untouched sections carry no count"
+    );
+}
+
+#[test]
 fn row_shows_modified_marker_and_source_per_layer() {
     let rig = Rig::new();
     let mut o = SettingsOverlay::new(

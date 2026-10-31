@@ -129,3 +129,27 @@ fn bounded_policy_preserves_operator_limits_and_allows_complex_investigation() {
     );
     assert_eq!(Kind::classify("prefixing values"), Kind::General);
 }
+
+#[test]
+fn only_an_explicit_verify_word_is_a_verification_request() {
+    for prompt in [
+        "Fix amount_due and verify its public behavior.",
+        "Fix the bug. Verified behavior matters.",
+        "fix it; include verification",
+    ] {
+        assert!(
+            Policy::for_prompt(prompt, 60).verification_requested,
+            "{prompt}"
+        );
+    }
+    for prompt in [
+        "Fix the arithmetic bug in calc.add; check the result.",
+        "Fix the failing test",
+        "the claim is unverifiable",
+    ] {
+        assert!(
+            !Policy::for_prompt(prompt, 60).verification_requested,
+            "{prompt}"
+        );
+    }
+}

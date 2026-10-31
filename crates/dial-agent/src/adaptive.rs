@@ -340,7 +340,7 @@ pub fn render_request_settings(settings: &Value, compact: bool) -> Option<String
         settings[key]
             .as_number()
             .map(ToString::to_string)
-            .unwrap_or_else(|| "server default".into())
+            .unwrap_or_else(|| "unset".into())
     };
     let thinking = match settings["thinking"].as_bool() {
         Some(true) => "on",
@@ -356,11 +356,13 @@ pub fn render_request_settings(settings: &Value, compact: bool) -> Option<String
         return Some(short);
     }
     Some(format!(
-        "{short}\nTop-p {} · top-k {} · min-p {}\nSampling: {}\nReasoning effort {} · thinking budget {} · loop penalty {}\nReasoning guard: {} bytes · pre-action {}s (0 = unlimited)\nRequested overrides; server defaults are not measured. /policy shows the last request.",
+        "{short}\nTop-p {} · top-k {} · min-p {}\nSampling selection: {}; server enforcement unconfirmed\nReasoning effort {} · thinking budget {} · loop penalty {}\nReasoning guard: {} bytes · pre-action {}s (0 = unlimited)\nDial-side requested controls, not confirmed backend behavior. Unset fields may be provider defaults, not confirmed unsent. /policy shows the last request.",
         number("top_p"),
         number("top_k"),
         number("min_p"),
-        settings["sampling_source"].as_str().unwrap_or("unknown"),
+        settings["sampling_source"]
+            .as_str()
+            .unwrap_or("unconfirmed"),
         settings["reasoning_effort"]
             .as_str()
             .unwrap_or("model default"),
@@ -387,10 +389,14 @@ pub fn render(value: &Value) -> String {
         );
     }
     let effective = render_request_settings(&s["effective"], false)
-        .map(|text| format!("\nLocal request settings:\n{text}"))
+        .map(|text| {
+            format!(
+                "\nLocal request settings (Dial-side requested; backend not confirmed):\n{text}"
+            )
+        })
         .unwrap_or_default();
     format!(
-        "Adaptive policy {} · phase sampling {} · baseline pinned {}\nLast request: {} → {}\n{}\nTemperature {} · top_p {} · output {} tokens · pre-action {}s\nSampling: {}\nReasoning: {} · {}\nLast execution: {}{effective}\n/settings → Model → Adaptive policy: enable, sampling, pin baseline, phase and budgets.\nExperimental phase presets; observed outcomes do not automatically promote sampler settings.",
+        "Adaptive policy {} · phase sampling {} · baseline pinned {}\nLast request: {} → {}\n{}\nTemperature {} · top_p {} · output {} tokens · pre-action {}s\nSampling selection: {} (server enforcement unconfirmed)\nReasoning: {} · {}\nLast execution: {}{effective}\n/settings → Model → Adaptive policy: enable, sampling, pin baseline, phase and budgets.\nExperimental phase presets; observed outcomes do not automatically promote sampler settings.",
         on_off(&value["config"]["enabled"]),
         on_off(&value["config"]["sampling"]),
         yes_no(&value["config"]["pin_sampling"]),
@@ -407,7 +413,7 @@ pub fn render(value: &Value) -> String {
             .unwrap_or("provider default".into()),
         s["max_tokens"],
         s["pre_action_secs"],
-        s["sampling_source"].as_str().unwrap_or("unknown"),
+        s["sampling_source"].as_str().unwrap_or("unconfirmed"),
         s["reasoning_effort"].as_str().unwrap_or("provider default"),
         s["reasoning_source"].as_str().unwrap_or("unknown"),
         last["result"]

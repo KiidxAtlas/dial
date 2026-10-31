@@ -1215,11 +1215,26 @@ fn shell_command_with_state(
             let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
             let sandbox = ws.sandbox.clone().unwrap_or_else(Sandbox::detect);
             let policy = ws.sandbox_policy();
-            let built = if let Some(fd) = owned_terminal {
-                sandbox.command_with_owned_terminal(&ws.root, &policy, &program, &arg_refs, fd)
-            } else {
-                sandbox.command_with_policy(&ws.root, &policy, &program, &arg_refs)
+            let network = match &policy {
+                Policy::Strict { allow_network, .. } | Policy::Dev { allow_network, .. } => {
+                    *allow_network
+                }
             };
+            let proxy = match ws.network_proxy() {
+                Ok(proxy) => proxy.filter(|_| network),
+                Err(error) => {
+                    crate::embedded_shell::discard_script(&args);
+                    return Err(error);
+                }
+            };
+            let built = sandbox.command_routed(
+                &ws.root,
+                &policy,
+                proxy.as_deref(),
+                &program,
+                &arg_refs,
+                owned_terminal,
+            );
             spawn = match built {
                 Ok(spawn) => spawn,
                 Err(error) => {
@@ -1241,6 +1256,12 @@ fn shell_command_with_state(
                 }
             } else {
                 spawn.env("PAGER", "cat").env("GIT_PAGER", "cat");
+            }
+            // After the environment is final, so no inherited proxy setting can bypass it.
+            if let Some(proxy) = &proxy {
+                spawn.envs(crate::tools::exec::sandbox::netproxy::client_env(
+                    proxy.client_port(),
+                ));
             }
         }
         crate::tools::exec::cargo_target::apply(&mut spawn, ws.cargo_target_dir());

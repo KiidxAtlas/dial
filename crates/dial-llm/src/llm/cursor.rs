@@ -120,8 +120,15 @@ pub(super) fn exchange(
             .map(|(name, value)| ((*name).to_owned(), (*value).to_owned())),
     );
 
+    let append_url = format!("{base}{BIDI_APPEND_PATH}");
     let uplink = Uplink::start(UplinkCtx {
-        url: format!("{base}{BIDI_APPEND_PATH}"),
+        agent: super::agent_for(
+            &append_url,
+            APPEND_BASE_TIMEOUT_SECS,
+            Some(Arc::clone(&interrupt)),
+            None,
+        ),
+        url: append_url,
         token: token.to_owned(),
         headers: headers.clone(),
         request_id: request_id.clone(),
@@ -266,6 +273,8 @@ fn bidi_append_body(request_id: &str, seqno: u64, data: &[u8]) -> Vec<u8> {
 }
 
 struct UplinkCtx {
+    /// One agent per exchange: every append and heartbeat reuses its pooled connection.
+    agent: ureq::Agent,
     url: String,
     token: String,
     headers: Vec<(String, String)>,
@@ -360,17 +369,13 @@ fn append(ctx: &UplinkCtx, seqno: u64, message: &[u8]) -> Result<()> {
     let timeout = APPEND_BASE_TIMEOUT_SECS + message.len().div_ceil(APPEND_BYTES_PER_SECOND) as u64;
     let mut headers = as_refs(&ctx.headers);
     headers.push(("content-type", "application/proto"));
-    let mut response = super::send_prepared_with_headers(
-        &ctx.url,
-        None,
-        &body,
-        timeout,
-        None,
-        Some(Arc::clone(&ctx.interrupt)),
-        &headers,
-    )?;
+    let mut response =
+        super::send_prepared_on(&ctx.agent, &ctx.url, None, &body, timeout, &headers)?;
     let status = response.status().as_u16();
     if (200..300).contains(&status) {
+        // Reading the (small) acknowledgement to its end returns the connection to the pool.
+        super::read_bounded(response.body_mut().as_reader(), super::ERROR_EXCERPT_BYTES)
+            .context("reading Cursor BidiAppend response")?;
         return Ok(());
     }
     let hints = super::retry::server_delay(response.headers());

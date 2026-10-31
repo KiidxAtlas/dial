@@ -32,7 +32,14 @@ use std::time::{Duration, Instant};
 
 pub use super::retry::RetryControl;
 
+/// The automatic retry interval. Test builds use a short one: a test whose request fails
+/// unexpectedly then reports its error within seconds instead of sleeping through up to ten
+/// five-minute waits, which looks like a hung suite. Tests of the interval itself set
+/// `Backend::retry_backoff` explicitly.
+#[cfg(not(any(test, feature = "test-support")))]
 const RETRY_BACKOFF: Duration = Duration::from_secs(300);
+#[cfg(any(test, feature = "test-support"))]
+const RETRY_BACKOFF: Duration = Duration::from_millis(20);
 /// `config.json` files larger than this are not read for the context hint.
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 /// Shown once per conversation when llama.cpp's `/props` `chat_template_caps` say the model's chat
@@ -1067,12 +1074,15 @@ impl Backend {
         self
     }
     /// The structured-output mechanism the live endpoint enforces, detected rather than declared: a
-    /// loopback/private OpenAI-compatible endpoint that answers llama.cpp's `/props` enforces
-    /// `json_schema`. Hosted endpoints are never probed; `catalog::is_llama_server` caches per base URL.
+    /// loopback/private OpenAI-compatible endpoint that answers llama.cpp's `/props`, or whose
+    /// `/v1/models` names vLLM or SGLang (documented to accept `response_format` `json_schema`;
+    /// unchecked against a live server), enforces `json_schema`. Hosted endpoints are never probed;
+    /// both probes cache per base URL.
     pub fn endpoint_structured_output(&self) -> Option<llm::profiles::StructuredOutput> {
         let (base_url, api_key) = self.local_chat_completions_endpoint()?;
-        llm::catalog::is_llama_server(base_url, api_key, &self.headers)
-            .then_some(llm::profiles::StructuredOutput::JsonSchema)
+        (llm::catalog::is_llama_server(base_url, api_key, &self.headers)
+            || llm::catalog::openai_runtime(base_url, api_key, &self.headers).is_some())
+        .then_some(llm::profiles::StructuredOutput::JsonSchema)
     }
 
     /// Base URL and key of a Chat Completions endpoint on a loopback/private host, the only routes
@@ -1527,8 +1537,9 @@ impl Backend {
                 )
             }
             ProviderKind::Local { model_dir } => {
+                let wire_form = llm::messages::WireForm::SingleSystemPrefix;
                 let mut req = req.clone();
-                req.messages = llm::messages::local(&req.messages)?;
+                req.messages = wire_form.apply(&req.messages)?.into_owned();
                 if interrupted() {
                     return Err(llm::Interrupted.into());
                 }
@@ -1692,6 +1703,7 @@ impl Backend {
                     {
                         crate::llm::reliability::normalize_reply(&mut reply, &req.tools);
                     }
+                    reply.wire_form = wire_form;
                     reply
                 });
             }
@@ -1859,6 +1871,15 @@ impl Backend {
                     .iter()
                     .map(|(name, value)| (name.as_str(), value.as_str()))
             }));
+            // Strict local templates accept only one initial system message. Decide the layout
+            // once from the resolved route, without rewriting saved history; the reply reports it.
+            let wire_form = if matches!(wire, Wire::ChatCompletions)
+                && llm::host_of(url).is_some_and(|host| llm::is_local_host(&host))
+            {
+                llm::messages::WireForm::SingleSystemPrefix
+            } else {
+                llm::messages::WireForm::Canonical
+            };
             let result = match wire {
                 Wire::Codex => {
                     let endpoint = llm::responses::Endpoint {
@@ -1993,23 +2014,34 @@ impl Backend {
                     profile.as_ref(),
                     on_event,
                 ),
-                Wire::ChatCompletions => exchange(
-                    llm::Endpoint {
-                        headers: &headers,
-                        url,
-                        auth,
-                        model,
-                    },
-                    req,
-                    timeout_secs,
-                    &mut on_text,
-                    llm::Control {
-                        interrupt: Some(Arc::clone(&interrupt)),
-                        profile: profile.as_ref(),
-                        reasoning_guard: None,
-                        on_event,
-                    },
-                ),
+                Wire::ChatCompletions => {
+                    let projected = wire_form.apply(&req.messages)?;
+                    let mut owned;
+                    let req = if let std::borrow::Cow::Owned(messages) = projected {
+                        owned = req.clone();
+                        owned.messages = messages;
+                        &owned
+                    } else {
+                        req
+                    };
+                    exchange(
+                        llm::Endpoint {
+                            headers: &headers,
+                            url,
+                            auth,
+                            model,
+                        },
+                        req,
+                        timeout_secs,
+                        &mut on_text,
+                        llm::Control {
+                            interrupt: Some(Arc::clone(&interrupt)),
+                            profile: profile.as_ref(),
+                            reasoning_guard: None,
+                            on_event,
+                        },
+                    )
+                }
             };
             let result = result.map_err(|error| resolved_headers.redact(error));
             if interrupted() {
@@ -2027,6 +2059,7 @@ impl Backend {
                     {
                         crate::llm::reliability::normalize_reply(&mut reply, &req.tools);
                     }
+                    reply.wire_form = wire_form;
                     return Ok(reply);
                 }
                 Err(error) => error,
@@ -2188,7 +2221,14 @@ impl Backend {
             let hinted = error
                 .downcast_ref::<llm::HttpError>()
                 .and_then(|http| http.retry_after);
-            let delay = match llm::retry::decide(&class, hinted, attempt, &retry_policy) {
+            // A failure before any response (reset, refused, broken pipe) retries promptly once.
+            let connection = error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<llm::TransportError>()
+                    .is_some_and(|transport| transport.connection)
+            });
+            let delay = match llm::retry::decide(&class, hinted, attempt, connection, &retry_policy)
+            {
                 llm::retry::Decision::Retry { delay, reason } => {
                     if error
                         .downcast_ref::<llm::stream::IncompleteStream>()

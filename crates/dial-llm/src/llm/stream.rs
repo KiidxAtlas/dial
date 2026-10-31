@@ -241,6 +241,7 @@ fn read_events_impl(
                 )?;
                 line.clear();
                 if done {
+                    finish_body(&mut reader, &patience);
                     return Ok(());
                 }
             }
@@ -267,6 +268,28 @@ fn read_events_impl(
         )?;
     }
     Ok(())
+}
+
+/// Most bytes read past a finished reply to reach the end of its body.
+const TRAILER_BYTES: usize = 64 << 10;
+/// Longest wait for the end of a body after its reply finished.
+const TRAILER_GRACE: Duration = Duration::from_millis(250);
+
+/// Read what follows a finished reply (a chunked body's terminator, usually already buffered) so
+/// the connection ends cleanly and the next request can reuse it. Bounded in bytes and time, and
+/// best effort: the reply is complete either way, and a connection not read to its end is simply
+/// not reused. The terminal deadline also caps a blocking read in the transport.
+fn finish_body(reader: &mut impl Read, patience: &Patience) {
+    patience.finish_within(TRAILER_GRACE);
+    let started = std::time::Instant::now();
+    let mut chunk = [0u8; 4096];
+    let mut read = 0;
+    while read < TRAILER_BYTES && started.elapsed() < TRAILER_GRACE {
+        match reader.read(&mut chunk) {
+            Ok(0) | Err(_) => return,
+            Ok(count) => read += count,
+        }
+    }
 }
 
 fn dispatch_named(

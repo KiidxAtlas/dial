@@ -101,6 +101,12 @@ fn panel(
     })))
 }
 
+/// A fresh board for the open panel, or `None` when coordination is unavailable (the panel then
+/// keeps what it shows).
+pub(in crate::app) fn snapshot(agent: &mut Agent<'_>) -> Option<PeersView> {
+    agent.peer_board().ok().map(view)
+}
+
 /// The panel's data: claims are marked where they overlap a claim on the other side.
 fn view(board: PeerBoard) -> PeersView {
     let claims = |scopes: Vec<String>, overlapping: &[String]| {

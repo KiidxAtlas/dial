@@ -892,7 +892,6 @@ fn every_integration() -> crate::ui::termcaps::Integration {
         hyperlinks: true,
         line_fragments: true,
         cwd: false,
-        tab_color: true,
         attention: true,
         user_vars: true,
         progress: true,
@@ -965,7 +964,7 @@ fn signals_are_written_on_change_and_restored_on_leave() {
     rig.sync();
     let first = String::from_utf8(std::mem::take(&mut rig.raw)).unwrap();
     assert_eq!(first.matches("\x1b]9;4;1;40\x07").count(), 1, "{first:?}");
-    assert_eq!(first.matches("\x1b]6;1;bg;red;brightness;").count(), 1);
+    assert!(!first.contains("\x1b]6;"), "{first:?}");
     assert_eq!(
         first.matches("SetUserVar=dialState=d29ya2luZw==").count(),
         1
@@ -974,6 +973,9 @@ fn signals_are_written_on_change_and_restored_on_leave() {
     rig.sync();
     let last = String::from_utf8(rig.raw.clone()).unwrap();
     assert!(last.contains("\x1b]9;4;0\x07"), "{last:?}");
-    assert!(last.contains("\x1b]6;1;bg;*;default\x07"));
+    assert!(
+        !last.contains("\x1b]6;"),
+        "no tab color to restore: {last:?}"
+    );
     assert!(last.contains("SetUserVar=dialState=\x07"));
 }

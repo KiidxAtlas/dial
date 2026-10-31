@@ -352,6 +352,9 @@ static OVERFLOW: LazyLock<RegexSet> = LazyLock::new(|| {
         r"(?i)this model's maximum context length", // OpenAI / Mistral / DeepSeek
         r"(?i)prompt too long; exceeded (max )?context length", // Mistral
         r"(?i)input validation error.*(inputs|tokens).*must be <=", // TGI
+        // oMLX refuses a prompt whose prefill would exceed its memory ceiling and names context
+        // reduction as the fix; a smaller (compacted) prompt needs less prefill memory.
+        r"(?i)prefill memory guard rejected this prompt",
     ])
 });
 

@@ -58,8 +58,7 @@ fn rejected_turn_has_fresh_evidence(block_with_hook: bool, keep_receipts: bool) 
             },
             &mut Recorder::default(),
         )
-        .err()
-        .expect("admission must fail");
+        .expect_err("admission must fail");
     assert!(error.to_string().contains(if block_with_hook {
         "fixture policy"
     } else {

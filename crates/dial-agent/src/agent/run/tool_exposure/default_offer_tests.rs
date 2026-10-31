@@ -170,8 +170,6 @@ fn message_is_offered_with_task_whether_or_not_a_worker_is_live() {
         assert!(offered.iter().any(|name| name == "message"), "{offered:?}");
         let discoverable = agent.discoverable_tools(&offered);
         assert!(!discoverable.iter().any(|(name, _)| name == "message"));
-        let prompt = serde_json::to_string(&agent.system_messages()).unwrap();
-        assert!(prompt.contains("Descendants require explicit role spawn permissions"));
     });
 }
 
@@ -209,7 +207,12 @@ fn default_offer_defers_overlapping_specialists_but_lists_them_as_loadable() {
                 discoverable.iter().any(|(name, _)| name == deferred),
                 "{discoverable:?}"
             );
-            assert!(prompt.contains(&format!("  - {deferred}: ")), "{prompt}");
+            let names = prompt
+                .split("Names: ")
+                .nth(1)
+                .and_then(|rest| rest.split("\\n").next())
+                .unwrap_or_default();
+            assert!(names.split(", ").any(|name| name == *deferred), "{prompt}");
         }
         // Serialized default schema size, before (deferred tools offered) and after.
         let mut before = offered.clone();

@@ -55,6 +55,13 @@ pub(in crate::agent) struct Observation {
     pub boundary: &'static str,
     pub invalidation: Invalidation,
     pub stable_message_bytes: usize,
+    pub stable_message_count: usize,
+    /// Full serialized messages outside the reusable leading prefix, not provider cache misses.
+    pub changed_message_bytes: usize,
+    pub system_bytes: usize,
+    /// Serialized tools array, including JSON separators; not a token estimate.
+    pub tool_schema_bytes: usize,
+    pub tool_count: usize,
     pub request_message_bytes: usize,
 }
 
@@ -71,13 +78,15 @@ impl Tracker {
     pub fn observe(&mut self, model: &str, request: &Chat) -> Observation {
         let messages: Vec<_> = request.messages.iter().map(digest).collect();
         let mut system = Sha256::new();
-        for (message, (hash, _)) in request.messages.iter().zip(&messages) {
-            if message["role"] == "system" {
+        let mut system_bytes = 0;
+        for (message, (hash, bytes)) in request.messages.iter().zip(&messages) {
+            if matches!(message["role"].as_str(), Some("system" | "developer")) {
                 system.update(hash);
+                system_bytes += bytes;
             }
         }
         let system = system.finalize().to_vec();
-        let (tools, _) = digest(&request.tools);
+        let (tools, tool_schema_bytes) = digest(&request.tools);
         let common = self
             .messages
             .iter()
@@ -97,11 +106,21 @@ impl Tracker {
         } else {
             0
         };
+        let request_message_bytes = messages.iter().map(|m| m.1).sum::<usize>();
         let observation = Observation {
             boundary: "provider_neutral_after_hooks",
             invalidation,
             stable_message_bytes: stable,
-            request_message_bytes: messages.iter().map(|m| m.1).sum(),
+            request_message_bytes,
+            stable_message_count: if invalidation.keeps_message_prefix() {
+                common
+            } else {
+                0
+            },
+            changed_message_bytes: request_message_bytes - stable,
+            system_bytes,
+            tool_schema_bytes,
+            tool_count: request.tools.len(),
         };
         self.model = Some(model.to_owned());
         self.system = system;

@@ -1,6 +1,10 @@
 //! Protocol lifecycle regressions use the existing local provider fixture, never real accounts.
 use super::*;
 
+/// Upper bound for a spawned RPC process to start or settle. A passing run returns as soon as the
+/// child settles; the bound only has to outlast process startup in a loaded parallel suite.
+const SETTLE: Duration = Duration::from_secs(30);
+
 fn start(env: &Env, server: &Server, args: &[&str]) -> std::process::Child {
     Command::new(env!("CARGO_BIN_EXE_dial"))
         .args(args)
@@ -22,7 +26,7 @@ fn start(env: &Env, server: &Server, args: &[&str]) -> std::process::Child {
 }
 
 fn finish(mut child: std::process::Child) -> Output {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + SETTLE;
     while child.try_wait().unwrap().is_none() {
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
@@ -87,7 +91,7 @@ fn eof_cancels_active_silent_inference_without_discarding_its_response() {
     )
     .unwrap();
     input.flush().unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + SETTLE;
     while server.requests.lock().is_empty() {
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();

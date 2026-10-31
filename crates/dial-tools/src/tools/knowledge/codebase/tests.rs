@@ -1144,3 +1144,249 @@ fn ambient_long_prompts_do_not_admit_an_incidental_path_component() {
             .contains("src/session.rs")
     );
 }
+
+#[test]
+fn ambient_retrieval_reads_only_selected_sources() {
+    let (_home, project, layout, ws) = fixture();
+    fs::write(
+        project.path().join("README.md"),
+        "# Routing notes unrelated to storage\n",
+    )
+    .unwrap();
+    let cache = Codebase::open(&layout).unwrap();
+    cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+    SOURCE_READS.with(|reads| reads.borrow_mut().clear());
+    let context = cache.task_context("src/router.rs", 2000).unwrap();
+    assert!(context.contains("src/router.rs"));
+    let reads = SOURCE_READS.with(|reads| reads.borrow().clone());
+    assert!(reads.iter().any(|path| path == "src/router.rs"));
+    assert!(!reads.iter().any(|path| path == "README.md"));
+}
+
+#[test]
+fn ambient_same_length_external_edit_omits_stale_candidate() {
+    let (_home, project, layout, ws) = fixture();
+    let cache = Codebase::open(&layout).unwrap();
+    cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+    assert!(
+        cache
+            .task_context("route_request", 8000)
+            .unwrap()
+            .contains("src/router.rs")
+    );
+    // Same length, different bytes: a size or mtime check would miss this edit.
+    fs::write(
+        project.path().join("src/router.rs"),
+        "//! Routes incoming requests to deliver.\nuse crate::deliver;\npub fn route_request() {}\n",
+    )
+    .unwrap();
+    assert!(
+        !cache
+            .task_context("route_request", 8000)
+            .unwrap()
+            .contains("src/router.rs")
+    );
+}
+
+const ROUTING_CLAIM: &str = "Saved routing claim.";
+
+fn remember_routing_claim(cache: &Codebase) {
+    cache
+        .remember("routing", ROUTING_CLAIM, &["src/router.rs".into()], "s", 0)
+        .unwrap();
+}
+
+fn ambient_finds_routing_claim(cache: &Codebase) -> bool {
+    cache
+        .task_context("src/router.rs", 8000)
+        .unwrap()
+        .contains(ROUTING_CLAIM)
+}
+
+#[test]
+fn ambient_finding_is_withheld_when_a_sibling_joins_its_cited_directory() {
+    let (_home, project, layout, ws) = fixture();
+    let cache = Codebase::open(&layout).unwrap();
+    cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+    remember_routing_claim(&cache);
+    assert!(ambient_finds_routing_claim(&cache));
+    // The cited file is byte-identical; only the directory's inventory changed.
+    fs::write(
+        project.path().join("src/sibling.rs"),
+        "pub fn sibling() {}\n",
+    )
+    .unwrap();
+    assert!(!ambient_finds_routing_claim(&cache));
+}
+
+#[test]
+fn ambient_finding_is_withheld_when_a_sibling_leaves_its_cited_directory() {
+    let (_home, project, layout, ws) = fixture();
+    fs::write(
+        project.path().join("src/sibling.rs"),
+        "pub fn sibling() {}\n",
+    )
+    .unwrap();
+    let cache = Codebase::open(&layout).unwrap();
+    cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+    remember_routing_claim(&cache);
+    assert!(ambient_finds_routing_claim(&cache));
+    fs::remove_file(project.path().join("src/sibling.rs")).unwrap();
+    assert!(!ambient_finds_routing_claim(&cache));
+}
+
+#[test]
+fn ambient_finding_is_withheld_when_a_scope_dependency_manifest_changes() {
+    let (_home, project, layout, ws) = fixture();
+    let cache = Codebase::open(&layout).unwrap();
+    cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+    remember_routing_claim(&cache);
+    assert!(ambient_finds_routing_claim(&cache));
+    // Manifests are scope dependencies even though the finding never cites them.
+    fs::write(
+        project.path().join("Cargo.toml"),
+        "[package]\nname = \"router\"\nversion = \"1.0.1\"\n",
+    )
+    .unwrap();
+    assert!(!ambient_finds_routing_claim(&cache));
+}
+
+#[test]
+fn ambient_finding_stays_fresh_when_unrelated_directories_change() {
+    let (_home, project, layout, ws) = fixture();
+    let cache = Codebase::open(&layout).unwrap();
+    cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+    remember_routing_claim(&cache);
+    assert!(ambient_finds_routing_claim(&cache));
+    // Negative control: files outside the cited directory and dependency set are not scope.
+    fs::create_dir(project.path().join("tools")).unwrap();
+    fs::write(
+        project.path().join("tools/unrelated.rs"),
+        "pub fn unrelated() {}\n",
+    )
+    .unwrap();
+    assert!(ambient_finds_routing_claim(&cache));
+}
+
+#[test]
+fn ambient_finding_saved_under_partial_scope_stays_unchecked_after_the_scan_completes() {
+    let (_home, project, layout, ws) = fixture();
+    let oversized = project.path().join("big.rs");
+    fs::write(&oversized, "x".repeat(MAX_FILE as usize + 1)).unwrap();
+    let cache = Codebase::open(&layout).unwrap();
+    cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+    // Saved while the scan was partial: the stored scope records `complete: false`.
+    remember_routing_claim(&cache);
+    fs::write(&oversized, "pub fn big() {}\n").unwrap();
+    assert!(!ambient_finds_routing_claim(&cache));
+    // Re-indexing completes the scan, but a partial saved scope is never certified by it.
+    cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+    assert!(!ambient_finds_routing_claim(&cache));
+}
+
+#[test]
+fn ambient_finding_is_withheld_when_its_cited_source_is_removed_or_unadmitted() {
+    let cases = [
+        (
+            "removed",
+            (|root: &Path| fs::remove_file(root.join("src/router.rs")).unwrap()) as fn(&Path),
+        ),
+        ("over the per-file limit", |root| {
+            fs::write(
+                root.join("src/router.rs"),
+                "x".repeat(MAX_FILE as usize + 1),
+            )
+            .unwrap()
+        }),
+    ];
+    for (label, mutate) in cases {
+        let (_home, project, layout, ws) = fixture();
+        let cache = Codebase::open(&layout).unwrap();
+        cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+        remember_routing_claim(&cache);
+        assert!(ambient_finds_routing_claim(&cache), "{label}: baseline");
+        mutate(project.path());
+        // A missing or unobservable source must never fall back to its indexed digest.
+        assert!(!ambient_finds_routing_claim(&cache), "{label}");
+    }
+}
+
+#[test]
+fn observed_digest_shares_one_byte_budget_across_candidates() {
+    let (_home, project, layout, ws) = fixture();
+    fs::write(project.path().join("src/a.rs"), "pub fn a() {}\n").unwrap();
+    fs::write(project.path().join("src/b.rs"), "pub fn b() {}\n").unwrap();
+    let cache = Codebase::open(&layout).unwrap();
+    let text_len = |path: &str| source(project.path(), path).unwrap().0.len();
+    let (a, b) = (text_len("src/a.rs"), text_len("src/b.rs"));
+
+    // Overflow: the first candidate fits, the second exceeds what remains and fails closed.
+    let mut remaining = a + b - 1;
+    SOURCE_READS.with(|reads| reads.borrow_mut().clear());
+    assert!(
+        cache
+            .observed_digest(&ws, "src/a.rs", &mut remaining)
+            .is_some()
+    );
+    assert_eq!(remaining, b - 1);
+    assert!(
+        cache
+            .observed_digest(&ws, "src/b.rs", &mut remaining)
+            .is_none()
+    );
+    assert_eq!(remaining, 0);
+
+    // Exhausted: every later candidate is refused before any source read.
+    SOURCE_READS.with(|reads| reads.borrow_mut().clear());
+    assert!(
+        cache
+            .observed_digest(&ws, "src/a.rs", &mut remaining)
+            .is_none()
+    );
+    assert!(
+        cache
+            .observed_digest(&ws, "src/b.rs", &mut remaining)
+            .is_none()
+    );
+    assert!(SOURCE_READS.with(|reads| reads.borrow().is_empty()));
+
+    // Exact fit: both candidates consume the budget completely, leaving nothing for a third read.
+    let mut remaining = a + b;
+    assert!(
+        cache
+            .observed_digest(&ws, "src/a.rs", &mut remaining)
+            .is_some()
+    );
+    assert!(
+        cache
+            .observed_digest(&ws, "src/b.rs", &mut remaining)
+            .is_some()
+    );
+    assert_eq!(remaining, 0);
+    SOURCE_READS.with(|reads| reads.borrow_mut().clear());
+    assert!(
+        cache
+            .observed_digest(&ws, "src/a.rs", &mut remaining)
+            .is_none()
+    );
+    assert!(SOURCE_READS.with(|reads| reads.borrow().is_empty()));
+
+    // Rejected byte content still consumes the shared budget.
+    for invalid in [b"a\0b".as_slice(), b"\xffab".as_slice()] {
+        fs::write(project.path().join("src/a.rs"), invalid).unwrap();
+        let mut remaining = invalid.len();
+        assert!(
+            cache
+                .observed_digest(&ws, "src/a.rs", &mut remaining)
+                .is_none()
+        );
+        assert_eq!(remaining, 0);
+        SOURCE_READS.with(|reads| reads.borrow_mut().clear());
+        assert!(
+            cache
+                .observed_digest(&ws, "src/b.rs", &mut remaining)
+                .is_none()
+        );
+        assert!(SOURCE_READS.with(|reads| reads.borrow().is_empty()));
+    }
+}

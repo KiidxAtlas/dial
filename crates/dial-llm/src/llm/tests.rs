@@ -267,3 +267,61 @@ fn history_helpers_match_openai_shape() {
     });
     assert_eq!(plain, json!({"role": "assistant", "content": ""}));
 }
+
+#[test]
+fn docker_desktop_names_are_local_hosts() {
+    assert!(is_local_host("model-runner.docker.internal"));
+    assert!(is_local_host("host.docker.internal"));
+    assert!(is_local_host("172.17.0.1"));
+    assert!(!is_local_host("docker.internal.example.com"));
+    assert!(!is_local_host("evildocker.internal"));
+}
+
+#[test]
+fn sampler_grammar_rejection_explains_backend_fault_without_weakening_validation() {
+    for (status, message, grammar_hint) in [
+        (
+            400,
+            "Failed to initialize samplers: failed to parse grammar",
+            true,
+        ),
+        (
+            400,
+            "Failed to initialize samplers: not enough memory",
+            false,
+        ),
+        (
+            500,
+            "Failed to initialize samplers: failed to parse grammar",
+            false,
+        ),
+    ] {
+        let body = json!({"error": {"message": message}}).to_string();
+        let (url, server) = serve_once(status, body.into_bytes());
+        let error = chat(&url, SERVER_MODEL, &request(vec![], None), 5)
+            .unwrap_err()
+            .to_string();
+        server.join().unwrap();
+        assert!(error.contains(message), "{error}");
+        assert_eq!(
+            error.contains("server/schema compatibility fault"),
+            grammar_hint,
+            "{error}"
+        );
+        assert_eq!(
+            error.contains("If this endpoint is Docker Model Runner"),
+            grammar_hint,
+            "Docker-specific advice must be conditional: {error}"
+        );
+        assert_eq!(
+            error.contains("If that provider is already selected"),
+            grammar_hint,
+            "the hint must also cover an already selected Docker route: {error}"
+        );
+        assert_eq!(
+            error.contains("Do not retry an unchanged request"),
+            grammar_hint,
+            "{error}"
+        );
+    }
+}

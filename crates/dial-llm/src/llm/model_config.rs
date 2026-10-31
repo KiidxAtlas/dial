@@ -590,8 +590,9 @@ pub struct UiConfig {
     pub composer_shape: ComposerShape,
     pub welcome: bool,
     pub tips: bool,
-    /// Short, purposeful animation: the start-up sweep across the wordmark and the reveal when a
-    /// panel opens. Off, or on a terminal without truecolor, ASCII glyphs or `NO_COLOR`, nothing moves.
+    /// Short, purposeful animation: the start-up sweep and slow ambient motion on the launch mark,
+    /// and the reveal when a panel opens. Off, or on a terminal without truecolor, ASCII glyphs or
+    /// `NO_COLOR`, nothing moves.
     pub motion: bool,
     /// Reveal a streaming answer gradually, a share of the pending text per frame, not in network
     /// bursts. Finished, tool, and aborted output always appears whole at once.
@@ -619,7 +620,7 @@ pub struct UiConfig {
     pub notify_errors: bool,
     /// Mouse wheel and clicks inside full-screen panels (the inline view never captures the mouse).
     pub mouse: bool,
-    /// Terminal integration where the terminal supports it: tab color and dock attention by state,
+    /// Terminal integration where the terminal supports it: a state circle and session title in the tab, dock attention,
     /// OSC 9;4 progress, `SetUserVar` values, the working directory (OSC 7) and links on URLs and
     /// existing file paths in scrollback.
     pub terminal_integration: bool,
@@ -667,7 +668,7 @@ impl Default for UiConfig {
             autocomplete_items: 12,
             history_limit: 0,
             notify: true,
-            notify_errors: false,
+            notify_errors: true,
             mouse: true,
             terminal_integration: true,
             retired_hyperlinks: None,

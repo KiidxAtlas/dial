@@ -1821,16 +1821,17 @@ fn discovered_spans(entry: &ModelEntry, theme: &Theme, width: usize) -> Vec<Span
     ]
 }
 
-/// One installed-model row: `label  [format]  median tok/s  fit  first waiting item`. The label gives way
+/// One installed-model row: `label  [format]  median e2e tok/s  fit  first waiting item`. The label gives way
 /// first (ellipsized); the format, speed and fit columns keep fixed widths so the verdict survives narrow
-/// panels, and the waiting item is what gets clipped last-resort at the far right.
+/// panels, and the waiting item is what gets clipped last-resort at the far right. The speed is end-to-end
+/// (includes prompt processing), so it is labelled `e2e` rather than as decode throughput.
 fn list_spans(row: &ModelRow, theme: &Theme, width: usize) -> Vec<Span<'static>> {
     const FORMAT_W: usize = 7;
-    const SPEED_W: usize = 13;
+    const SPEED_W: usize = 16;
     const FIT_W: usize = 13;
     let speed = match row.speed.median_tok_per_s {
-        Some(median) => format!("{median:.1} tok/s"),
-        None => "tok/s unknown".into(),
+        Some(median) => format!("{median:.1} tok/s e2e"),
+        None => "e2e unknown".into(),
     };
     let fit_label = match row.memory.fit {
         Fit::Fits => "fits",

@@ -37,9 +37,9 @@ the common policy into model code.
 | Adjustment | Existing selection branch | Assembly/text owner |
 | --- | --- | --- |
 | Lean guidance (`lean`) | `base/lifecycle.rs::rebuild_system`: `lean_tools` (context-overflow fallback), `lean_local()` or `local_escalated()`; local tier/escalation decisions stay in `model/local_profile.rs` | `window/prompt.rs::full_guidance`, `system.rs::LEAN_*` |
-| One-call operation (`one_call`) | `model/local_profile.rs::local_one_call`: small local tier with reliability enabled and no passing saved batch fixture | `window/prompt.rs::full_guidance`: `LEAN_ONE_CALL` replaces `LEAN_BATCHING`; explicit workflow composition selects the standalone todo step. The active request contract overrides batching/todo pairing on every tier, including later reliability recovery |
+| One-call operation (`one_call`) | `model/local_profile.rs::local_one_call`: small local tier with reliability enabled and no passing saved batch fixture | `window/prompt.rs::full_guidance`: `LEAN_ONE_CALL` replaces `LEAN_BATCHING`; the compact workflow has no todo-pairing rule, so it serves both. The active request contract overrides batching/todo pairing on every tier, including later reliability recovery |
 | Worked loop (`worked_example`) | `base/lifecycle.rs::rebuild_system`: `local_one_call()` | `window/prompt.rs::worked_example` / `example_edit`: active edit grammar; requires `grep`, `read`, `edit` and either `check` (preferred) or `bash`; built-in guidance only |
-| Compact guidance (`concise_guidance`) | `base/lifecycle.rs::rebuild_system`: efficiency enabled, non-hermetic run | `window/prompt.rs::full_guidance` / `scoped_guidance`: compact engineering, execution, workflow, delivery and delegation, with full tool policy and visual rules; `environment_prompt` bounds searchable deferred MCP previews without changing eligibility |
+| Compact guidance (`concise_guidance`) | `base/lifecycle.rs::rebuild_system`: efficiency enabled, non-hermetic run | `window/prompt.rs::full_guidance` / `scoped_guidance`: the same compact sections as `lean` (tool policy, locate → change → prove → test → report workflow, delivery, delegation) with tool-gated skill/project-map/LSP rules and `side_request`/`task` clauses; tool mechanics stay in tool descriptions and harness refusals. `environment_prompt` lists built-in loadable tools by name only (`tool_search` returns descriptions) and bounds deferred MCP previews without changing eligibility. A byte-budget test in `window/prompt/tests.rs` guards the size |
 | Capability scoping | Configured tool offer, not transient tool loading | `window/prompt.rs::full_guidance` / `scoped_guidance`: tool-specific rules, visual/preview sections and delegation sections |
 | Delegation preference (`prefer_subagents`) | `base/lifecycle.rs::rebuild_system`: `task.prefer_subagents` | `window/prompt.rs::scoped_guidance`: shared selective/specialist policy, only when `task` is offered |
 
@@ -117,6 +117,8 @@ For runtime contracts, see [agent-loop.md](../../../../../docs/agent-loop.md).
    changes must not overwrite saved user guidance or inject unavailable tools.
 5. Run the relevant behavioral tests. Do not add prose golden tests just to freeze
    wording: test routing, rendering, evidence provenance and runtime boundaries.
+   Wording and threshold changes follow the evidence rule in
+   [CONTRIBUTING.md](../../../../../CONTRIBUTING.md#prompt-wording-thresholds-and-recovery-limits).
 6. Rebuild/restart Dial to use changes. Source edits do not replace an installed binary.
 
 From the repository root:

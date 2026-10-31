@@ -194,3 +194,68 @@ fn singular_and_plural_capabilities_share_evidence_without_activating_unrelated_
     assert_eq!(exact.len(), 1);
     assert_eq!(exact[0].0, "references");
 }
+
+#[test]
+fn research_corpus_activates_web_search_and_never_incidental_nuxt_matches() {
+    let catalog = candidates(&[
+        ("web_search", "Search the public web for sources"),
+        ("web_fetch", "Fetch a web page by URL"),
+        ("mcp__nuxt__list-blog-posts", "nuxt: List blog posts"),
+        (
+            "mcp__nuxt__list-deploy-providers",
+            "nuxt: List deployment providers",
+        ),
+    ]);
+    for query in [
+        "web search research fetch",
+        "web search",
+        "Search the web for Gemma 4 E4B versus Qwen 3.5 9B",
+    ] {
+        let activated: Vec<String> = discover(query, catalog.clone())
+            .into_iter()
+            .filter(|entry| entry.2)
+            .map(|entry| entry.0)
+            .collect();
+        assert!(
+            activated.iter().any(|name| name == "web_search"),
+            "{query}: {activated:?}"
+        );
+        assert!(
+            activated
+                .iter()
+                .all(|name| !name.starts_with("mcp__nuxt__")),
+            "{query}: {activated:?}"
+        );
+    }
+}
+
+#[test]
+fn computer_is_plan_eligible_and_plan_authorization_admits_only_read_only_actions() {
+    use crate::agent::run::tool_exposure::default_offer_tests::with_agent;
+    with_agent("integrations=[\"computer\"]", |agent| {
+        agent.plan_mode = true;
+        assert!(agent.tool_eligible("computer"));
+        let call = |arguments: Value| ToolCall {
+            id: "computer-plan".into(),
+            name: "computer".into(),
+            arguments,
+            malformed_arguments: false,
+        };
+        // Only the read-only screenshot chain is admitted; no capture runs during authorization.
+        let screenshot = call(json!({"action":"call","chain":[{"method":"screenshot","args":[]}]}));
+        assert!(agent.authorize_call(&screenshot, &mut NullUi).is_ok());
+        for arguments in [
+            json!({"action":"call","chain":[{"method":"click","args":[1,2]}]}),
+            json!({"action":"run","code":"1"}),
+            json!({"action":"run","code":"1","read_only":true}),
+        ] {
+            assert!(
+                matches!(
+                    agent.authorize_call(&call(arguments.clone()), &mut NullUi),
+                    Err(crate::agent::safety::approval::Denial::ReadOnly)
+                ),
+                "{arguments}"
+            );
+        }
+    });
+}

@@ -48,7 +48,7 @@ fn text_only_final_arms_exact_request_and_respects_effective_retention() {
                 Backend::new(
                     ProviderKind::AnthropicEndpoint {
                         base_url: format!("{}/v1", server.url),
-                        model: "test".into(),
+                        model: "active-test".into(),
                         api_key: None,
                     },
                     Default::default(),
@@ -56,7 +56,7 @@ fn text_only_final_arms_exact_request_and_respects_effective_retention() {
                 )
                 .with_profile(llm::profiles::ModelProfile {
                     provider: "anthropic".into(),
-                    model: "test".into(),
+                    model: "active-test".into(),
                     cache_retention: match tier {
                         Tier::Short => llm::profiles::CacheRetention::Short,
                         Tier::Long => llm::profiles::CacheRetention::Long,
@@ -64,6 +64,9 @@ fn text_only_final_arms_exact_request_and_respects_effective_retention() {
                     ..Default::default()
                 }),
             );
+            // The live route can differ from the original default (switch/fallback). Turn
+            // entry must preserve this route's worker instead of rebuilding for config.model.
+            agent.auth_config.model = "active-test".into();
             let start = Instant::now();
             let now = Arc::new(Mutex::new(start));
             let clock_now = now.clone();
@@ -77,7 +80,7 @@ fn text_only_final_arms_exact_request_and_respects_effective_retention() {
             agent.cache_warm = Some(CacheWarm {
                 handle,
                 mode: Mode::Idle,
-                model: agent.config.model.clone(),
+                route: WarmRoute::of(&agent.auth_config).unwrap(),
                 pricing: Some(TokenPricing {
                     prompt: 3.0 / 1_000_000.0,
                     completion: 15.0 / 1_000_000.0,
@@ -132,4 +135,147 @@ fn text_only_final_arms_exact_request_and_respects_effective_retention() {
             assert_eq!(sent["max_tokens"], expected["max_tokens"]);
         });
     }
+}
+
+#[test]
+fn replays_are_bounded_even_when_worker_time_is_unlimited() {
+    assert_eq!(replay_timeout(0), REPLAY_TIMEOUT_SECS);
+    assert_eq!(replay_timeout(30), 30);
+    assert_eq!(replay_timeout(86_400), REPLAY_TIMEOUT_SECS);
+}
+
+#[test]
+fn same_model_name_on_another_route_replaces_the_armed_worker() {
+    type Mutate = fn(&mut Config);
+    let cases: [(&str, Mutate); 7] = [
+        ("endpoint", |config| {
+            config.endpoint = Some(EndpointConfig {
+                base_url: "http://127.0.0.1:9/other/v1".into(),
+                api_key_env: None,
+                allow_insecure: false,
+                protocol: None,
+                headers: None,
+                account_id: None,
+            });
+        }),
+        ("provider", |config| {
+            config.provider = Some("other-provider".into())
+        }),
+        ("request header", |config| {
+            config
+                .endpoint
+                .get_or_insert_with(|| EndpointConfig {
+                    base_url: "http://127.0.0.1:9/v1".into(),
+                    api_key_env: None,
+                    allow_insecure: false,
+                    protocol: None,
+                    headers: None,
+                    account_id: None,
+                })
+                .headers = Some(vec![llm::model_config::RequestHeader {
+                name: "x-cache-route".into(),
+                value: llm::model_config::HeaderValue::Literal("alternate".into()),
+            }]);
+        }),
+        ("provider auth", |config| {
+            let provider = config.selection().provider;
+            config.providers.entry(provider).or_default().auth =
+                llm::model_config::AuthMethod::OAuth;
+        }),
+        ("replay timeout", |config| config.worker_timeout_secs = 17),
+        ("explicit profile", |config| {
+            let selection = config.selection();
+            config.model_profile = Some("tuned".into());
+            config.model_profiles.insert(
+                "tuned".into(),
+                llm::profiles::ModelProfile {
+                    provider: selection.provider,
+                    model: selection.model,
+                    context_window: Some(4096),
+                    ..Default::default()
+                },
+            );
+        }),
+        ("auto-selected profile", |config| {
+            let selection = config.selection();
+            config.model_profiles.insert(
+                "auto".into(),
+                llm::profiles::ModelProfile {
+                    provider: selection.provider,
+                    model: selection.model,
+                    context_window: Some(4096),
+                    ..Default::default()
+                },
+            );
+        }),
+    ];
+    with_agent("[cache]\nwarm='idle'\n", |agent| {
+        let live = agent.auth_config.clone();
+        let armed = WarmRoute::of(&live).unwrap();
+        for (name, mutate) in cases {
+            let mut moved = live.clone();
+            mutate(&mut moved);
+            let next = WarmRoute::of(&moved).unwrap();
+            assert_ne!(next, armed, "{name} change must alter route identity");
+            // The captured sender is dropped when the old worker exits. Unlike checking the
+            // copied identity alone, this proves that the old replay factory was retired.
+            let (factory_alive, retired) = mpsc::channel::<()>();
+            let handle = Handle::spawn(
+                Mode::Idle,
+                Box::new(move |_| {
+                    let _keep_alive = &factory_alive;
+                    anyhow::bail!("this test never replays")
+                }),
+                Box::new(Instant::now),
+            )
+            .unwrap();
+            let mut slot = Some(CacheWarm {
+                handle,
+                mode: Mode::Idle,
+                route: WarmRoute::of(&live).unwrap(),
+                pricing: None,
+            });
+            CacheWarm::sync(&mut slot, &live).unwrap();
+            assert_eq!(retired.try_recv(), Err(mpsc::TryRecvError::Empty));
+            CacheWarm::sync(&mut slot, &moved).unwrap();
+            assert_eq!(
+                retired.recv_timeout(Duration::from_secs(2)),
+                Err(mpsc::RecvTimeoutError::Disconnected),
+                "{name}: old worker must exit"
+            );
+            assert_eq!(slot.as_ref().unwrap().route, next, "{name} change");
+            CacheWarm::sync(&mut slot, &live).unwrap();
+        }
+    });
+}
+
+#[test]
+fn an_exited_worker_is_replaced_before_a_later_request_can_arm() {
+    with_agent("[cache]\nwarm='idle'\n", |agent| {
+        let config = &agent.auth_config;
+        let (factory_alive, retired) = mpsc::channel::<()>();
+        let handle = Handle::spawn(
+            Mode::Idle,
+            Box::new(move |_| {
+                let _keep_alive = &factory_alive;
+                anyhow::bail!("this test never replays")
+            }),
+            Box::new(Instant::now),
+        )
+        .unwrap();
+        assert!(handle.send(Event::Shutdown));
+        assert_eq!(
+            retired.recv_timeout(Duration::from_secs(2)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        );
+        assert!(!handle.is_running());
+        let mut slot = Some(CacheWarm {
+            handle,
+            mode: Mode::Idle,
+            route: WarmRoute::of(config).unwrap(),
+            pricing: None,
+        });
+        CacheWarm::sync(&mut slot, config).unwrap();
+        assert!(slot.as_ref().unwrap().handle.is_running());
+    });
 }

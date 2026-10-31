@@ -343,6 +343,13 @@ from other tools and Smithery installs follow the same rule. npm
 and PyPI packages are pinned to the version the registry lists; `npx`, `uvx` or `docker` must be on
 PATH. Config names are the last segment of the listing name (`io.github.acme/notes` → `notes`).
 
+Configured servers start connecting while Dial opens, in parallel with the session and the first
+agent, each within its own startup budget. The first model request does not wait for servers still
+connecting. They join at the first request of a later turn, so the system prompt and its cached prefix stay stable within a turn.
+Meanwhile the prompt names them as still connecting. `tool_search`, `mcp_servers` and loading a tool not yet
+registered wait for them. Exiting before they connect cancels the connection and stops their
+processes.
+
 The agent has the same reach through `mcp_servers`: `list` (default), `search` with optional
 `query` (reads listings only, downloads and starts nothing) and `install` with `id` from a search
 result (`npm:<package>` and `github:<owner>/<repo>` ids resolve as above). Only `install` needs approval. It returns `needs_input` with the variable names when values

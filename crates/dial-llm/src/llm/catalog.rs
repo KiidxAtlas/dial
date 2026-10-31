@@ -1576,6 +1576,9 @@ pub(crate) fn forget_llama_props(origin: &str) {
     if let Ok(mut known) = LLAMA_PROPS.lock() {
         known.retain(|key, _| !super::same_origin(key, origin));
     }
+    if let Ok(mut known) = OPENAI_RUNTIME.lock() {
+        known.retain(|key, _| !super::same_origin(key, origin));
+    }
 }
 
 /// Records a `/props` document fetched elsewhere (`local_server::facts`), so later lookups reuse it.
@@ -1631,6 +1634,83 @@ pub fn is_llama_server(
     headers: &[super::model_config::RequestHeader],
 ) -> bool {
     llama_server_props(base_url, token, headers).is_some()
+}
+
+/// A server that implements the OpenAI API with vLLM's extensions and says so in its model list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenAiRuntime {
+    Vllm,
+    Sglang,
+}
+
+impl OpenAiRuntime {
+    /// The runtime a `/v1/models` document names. Both servers set `owned_by` to their own name on
+    /// every row (`"vllm"`, `"sglang"`); this comes from their documented examples, not from a live
+    /// server, so a server that words it differently is simply not recognised.
+    fn parse(models: &Value) -> Option<Self> {
+        models.get("data")?.as_array()?.iter().find_map(|row| {
+            match row.get("owned_by")?.as_str()?.to_ascii_lowercase().as_str() {
+                "vllm" => Some(Self::Vllm),
+                "sglang" => Some(Self::Sglang),
+                _ => None,
+            }
+        })
+    }
+}
+
+/// `/v1/models` answers per base URL: `Some` for a recognised runtime, `None` for a server that
+/// answered as something else. Failures are not stored.
+static OPENAI_RUNTIME: std::sync::LazyLock<
+    std::sync::Mutex<BTreeMap<String, Option<OpenAiRuntime>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// The vLLM or SGLang runtime behind the loopback/private server at `base_url`, recognised from its
+/// `/v1/models` list. Hosted hosts are never asked (`local_request` refuses them). An answer is
+/// cached per base URL.
+pub fn openai_runtime(
+    base_url: &str,
+    token: Option<&str>,
+    headers: &[super::model_config::RequestHeader],
+) -> Option<OpenAiRuntime> {
+    let key = llama_props_key(base_url);
+    // A server that already answered llama.cpp's `/props` (as llama.cpp or as something else) is
+    // not asked again: vLLM and SGLang have no such route, so the extra request only costs.
+    if LLAMA_PROPS
+        .lock()
+        .ok()
+        .is_some_and(|known| known.contains_key(&key))
+    {
+        return None;
+    }
+    if let Some(known) = OPENAI_RUNTIME
+        .lock()
+        .ok()
+        .and_then(|known| known.get(&key).copied())
+    {
+        return known;
+    }
+    let resolved = super::model_config::resolve_headers(headers).ok()?;
+    let models = local_get(base_url, "/v1/models", token, &resolved)?;
+    let found = OpenAiRuntime::parse(&models);
+    if let Ok(mut known) = OPENAI_RUNTIME.lock() {
+        known.insert(key, found);
+    }
+    found
+}
+
+/// The window vLLM or SGLang serves `model` with: the `max_model_len` of its `/v1/models` row. The
+/// server rejects longer prompts, so unlike a configured window this is exact. Unverified against
+/// a live server: a row without the field yields `None`.
+fn served_model_len(models: &Value, model: &str) -> Option<u32> {
+    let rows = models.get("data")?.as_array()?;
+    let row = rows
+        .iter()
+        .find(|row| row["id"] == model)
+        .or_else(|| (rows.len() == 1).then(|| &rows[0]))?;
+    row["max_model_len"]
+        .as_u64()
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|n| *n > 0)
 }
 
 /// Context window the local server is serving `model` with right now: LM Studio's loaded size,
@@ -1710,7 +1790,9 @@ pub fn loaded_context(
                 .and_then(|(_, value)| positive(Some(value)))
         });
     }
-    None
+    // vLLM and SGLang: the model list carries the length the server accepts.
+    local_get(base_url, "/v1/models", token, &resolved)
+        .and_then(|models| served_model_len(&models, model))
 }
 
 /// Explicit purpose tokens a row declares (`type`, `pipeline_tag`, `task`). Matching is exact: an
@@ -2054,6 +2136,15 @@ fn complete_safetensors(path: &Path) -> Option<()> {
     Some(())
 }
 fn local_models(cache: &Path, trainable: Option<&Path>) -> Vec<ModelEntry> {
+    local_models_where(cache, trainable, &|_| true)
+}
+/// [`local_models`] limited to labels `keep` accepts. Rejected repositories are skipped before their
+/// weights are inspected, so resolving one model does not stat every shard in the cache.
+fn local_models_where(
+    cache: &Path,
+    trainable: Option<&Path>,
+    keep: &dyn Fn(&str) -> bool,
+) -> Vec<ModelEntry> {
     let mut models = Vec::new();
     let Ok(repos) = fs::read_dir(cache) else {
         return models;
@@ -2067,6 +2158,14 @@ fn local_models(cache: &Path, trainable: Option<&Path>) -> Vec<ModelEntry> {
     for repo in repos {
         if models.len() >= MAX_MODELS {
             break;
+        }
+        let label = repo
+            .file_name()
+            .to_string_lossy()
+            .trim_start_matches("models--")
+            .replace("--", "/");
+        if !keep(&label) {
+            continue;
         }
         let root = repo.path();
         let main = fs::File::open(root.join("refs/main"))
@@ -2099,18 +2198,13 @@ fn local_models(cache: &Path, trainable: Option<&Path>) -> Vec<ModelEntry> {
                 None if super::local_format::gguf_file(&path).is_some() => (None, true),
                 None => continue,
             };
-            let label = repo
-                .file_name()
-                .to_string_lossy()
-                .trim_start_matches("models--")
-                .replace("--", "/");
             models.push(ModelEntry {
                 selection: ModelSelection {
                     model: path.to_string_lossy().into_owned(),
                     context_window: window,
                     ..ModelSelection::default()
                 },
-                label,
+                label: label.clone(),
                 source: if gguf {
                     gguf_source("Hugging Face cache")
                 } else {
@@ -2160,12 +2254,14 @@ fn resolve_local_model_in(
             "{model:?} is a Splash bundle, which only LM Studio can run: load it in LM Studio and select it under the LM Studio provider"
         );
     }
+    // Only the requested label is inspected: listing every download stats each shard of every model.
+    let wanted = |label: &str| label == model;
     let mut entries = cache
-        .map(|cache| local_models(cache, None))
+        .map(|cache| local_models_where(cache, None, &wanted))
         .unwrap_or_default();
     if let Some(studio) = studio {
-        entries.extend(lmstudio_mlx_models(studio, None));
-        entries.extend(lmstudio_gguf_models(studio));
+        entries.extend(lmstudio_mlx_models_where(studio, None, &wanted));
+        entries.extend(lmstudio_gguf_models_where(studio, &wanted));
     }
     if let Some(entry) = entries.into_iter().find(|entry| entry.label == model) {
         return Ok(fs::canonicalize(entry.selection.model)?
@@ -2234,6 +2330,14 @@ fn lmstudio_folder() -> Option<PathBuf> {
 /// pass the same check as Hugging Face snapshots (config plus complete safetensors) are listed, so GGUF
 /// downloads and LM Studio-specific bundles are skipped. Entries are labelled `publisher/model`.
 fn lmstudio_mlx_models(folder: &Path, trainable: Option<&Path>) -> Vec<ModelEntry> {
+    lmstudio_mlx_models_where(folder, trainable, &|_| true)
+}
+/// [`lmstudio_mlx_models`] limited to labels `keep` accepts, checked before the weights are read.
+fn lmstudio_mlx_models_where(
+    folder: &Path,
+    trainable: Option<&Path>,
+    keep: &dyn Fn(&str) -> bool,
+) -> Vec<ModelEntry> {
     let sorted = |dir: &Path| -> Vec<fs::DirEntry> {
         let mut entries: Vec<_> = fs::read_dir(dir)
             .map(|it| it.filter_map(Result::ok).take(4096).collect())
@@ -2247,15 +2351,18 @@ fn lmstudio_mlx_models(folder: &Path, trainable: Option<&Path>) -> Vec<ModelEntr
             if models.len() >= MAX_MODELS {
                 return models;
             }
-            let path = repo.path();
-            let Some(window) = snapshot(&path) else {
-                continue;
-            };
             let label = format!(
                 "{}/{}",
                 publisher.file_name().to_string_lossy(),
                 repo.file_name().to_string_lossy()
             );
+            if !keep(&label) {
+                continue;
+            }
+            let path = repo.path();
+            let Some(window) = snapshot(&path) else {
+                continue;
+            };
             models.push(ModelEntry {
                 selection: ModelSelection {
                     model: path.to_string_lossy().into_owned(),
@@ -2278,6 +2385,10 @@ fn lmstudio_mlx_models(folder: &Path, trainable: Option<&Path>) -> Vec<ModelEntr
 /// GGUF models LM Studio downloaded (`<folder>/<publisher>/<model>/*.gguf`), listed by the file
 /// `llama-server` would load. Labelled `publisher/model`.
 fn lmstudio_gguf_models(folder: &Path) -> Vec<ModelEntry> {
+    lmstudio_gguf_models_where(folder, &|_| true)
+}
+/// [`lmstudio_gguf_models`] limited to labels `keep` accepts, checked before the folder is scanned.
+fn lmstudio_gguf_models_where(folder: &Path, keep: &dyn Fn(&str) -> bool) -> Vec<ModelEntry> {
     let sorted = |dir: &Path| -> Vec<fs::DirEntry> {
         let mut entries: Vec<_> = fs::read_dir(dir)
             .map(|it| it.filter_map(Result::ok).take(4096).collect())
@@ -2291,6 +2402,14 @@ fn lmstudio_gguf_models(folder: &Path) -> Vec<ModelEntry> {
             if models.len() >= MAX_MODELS {
                 return models;
             }
+            let label = format!(
+                "{}/{}",
+                publisher.file_name().to_string_lossy(),
+                repo.file_name().to_string_lossy()
+            );
+            if !keep(&label) {
+                continue;
+            }
             let Some(file) = super::local_format::gguf_file(&repo.path()) else {
                 continue;
             };
@@ -2299,11 +2418,7 @@ fn lmstudio_gguf_models(folder: &Path) -> Vec<ModelEntry> {
                     model: file.to_string_lossy().into_owned(),
                     ..ModelSelection::default()
                 },
-                label: format!(
-                    "{}/{}",
-                    publisher.file_name().to_string_lossy(),
-                    repo.file_name().to_string_lossy()
-                ),
+                label,
                 source: gguf_source("LM Studio download"),
                 available: true,
                 metadata: ModelMetadata {
@@ -2704,6 +2819,12 @@ pub fn discover(
             "llama.cpp",
             "LLAMA_CPP_BASE_URL",
             "http://127.0.0.1:8080/v1",
+        ),
+        (
+            "docker-model-runner",
+            "Docker Model Runner",
+            "DOCKER_MODEL_RUNNER_BASE_URL",
+            "http://127.0.0.1:12434/engines/v1",
         ),
     ] {
         let override_url = std::env::var(variable)

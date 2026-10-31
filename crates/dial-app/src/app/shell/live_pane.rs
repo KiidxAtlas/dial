@@ -5,7 +5,8 @@
 //! board, the `bg` tool, the slash-command job slot, side threads and the peer board), so the pane
 //! never shows a second version of anything. Requests go back through the same owners: `bg` kills,
 //! live-task cancellation, the job slot's cancel flag, `/btw cancel` and the `peers` send action.
-//! Peer messages need the idle agent, so a message queued during a turn is sent when it ends.
+//! Peer messages are sent at once: by the idle agent, or during a turn by the sender handle the
+//! shell takes when the turn starts. Only without either (no project registry yet) do they wait.
 use super::Shell;
 use crate::agent::Agent;
 use crate::app::core::App;
@@ -49,7 +50,7 @@ pub(in crate::app) struct LivePane {
     peers: Peers,
     peers_at: Option<Instant>,
     outcomes: VecDeque<String>,
-    /// Peer messages waiting for the idle agent.
+    /// Peer messages waiting for a sender (no project registry joined yet).
     held: Vec<Request>,
 }
 
@@ -146,7 +147,8 @@ impl Shell {
     }
 
     /// Runs queued pane requests and republishes the dashboard when due. `agent` is `None` during a
-    /// turn: peer messages then wait and the peer board keeps its last reading.
+    /// turn: peer messages then go out through the turn's [`PeerSender`], and the peer board keeps
+    /// its last reading.
     pub(in crate::app) fn sync_live_pane(&mut self, app: &App, mut agent: Option<&mut Agent<'_>>) {
         if self.session_id.is_empty() || !watch::enabled(&app.layout, &self.session_id) {
             return;
@@ -166,7 +168,11 @@ impl Shell {
                 .outcome(format!("Cannot read pane requests: {error:#}")),
         }
         for request in std::mem::take(&mut self.live_pane.held) {
-            if matches!(request, Request::MessagePeer { .. }) && agent.is_none() {
+            // Without the agent or a sender (no registry yet) a peer message keeps its place in line.
+            if matches!(request, Request::MessagePeer { .. })
+                && agent.is_none()
+                && self.peer_sender.is_none()
+            {
                 self.live_pane.held.push(request);
                 continue;
             }
@@ -244,18 +250,27 @@ impl Shell {
                 }
             }
             Request::MessagePeer { to, text } => {
-                let Some(agent) = agent else {
-                    return "Peer messages need the idle session".into();
+                // Idle, the agent sends; during a turn the handle taken at its start does. Either
+                // writes only to the peer's inbox, so nothing waits for the turn to end.
+                let sent = match (agent, &self.peer_sender) {
+                    (Some(agent), _) => {
+                        let output = agent.peer_coordination(
+                            &serde_json::json!({"action": "send", "to": to, "text": text}),
+                        );
+                        if output.is_error {
+                            Err(output.text)
+                        } else {
+                            Ok(())
+                        }
+                    }
+                    (None, Some(sender)) => sender.send(&to, &text).map_err(|e| format!("{e:#}")),
+                    (None, None) => return "Peer messages need the idle session".into(),
                 };
-                let output = agent.peer_coordination(
-                    &serde_json::json!({"action": "send", "to": to, "text": text}),
-                );
                 // Republish the board at once, so the chat view shows the message just sent.
                 self.live_pane.peers_at = None;
-                if output.is_error {
-                    format!("Message to {} failed: {}", short(&to), output.text)
-                } else {
-                    format!("Message queued for peer {}", short(&to))
+                match sent {
+                    Ok(()) => format!("Message queued for peer {}", short(&to)),
+                    Err(error) => format!("Message to {} failed: {error}", short(&to)),
                 }
             }
         }

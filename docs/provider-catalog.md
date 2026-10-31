@@ -102,7 +102,7 @@ in `/providers` so they can be configured.
 The catalog finds cached Hugging Face snapshots and models downloaded by LM Studio (its
 `downloadsFolder`, default `~/.lmstudio/models`), listed under **Local models**: MLX checkpoints
 are served by dial's own MLX server (so LoRA training applies), and running LM Studio, Ollama and llama.cpp
-servers on their usual loopback ports. It also discovers OpenAI-compatible endpoints and Anthropic's
+servers on their usual loopback ports, plus Docker Model Runner (`docker-model-runner`, `http://127.0.0.1:12434/engines/v1`, override with `DOCKER_MODEL_RUNNER_BASE_URL`; see [docker.md](docker.md)). It also discovers OpenAI-compatible endpoints and Anthropic's
 Messages API. OpenAI, Anthropic, Google Gemini, OpenRouter, Groq, Mistral and DeepSeek have setup presets.
 
 SambaNova (`SAMBANOVA_API_KEY`, `https://api.sambanova.ai/v1`) and Inception (`INCEPTION_API_KEY`, `https://api.inceptionlabs.ai/v1`) are OpenAI-compatible chat-completions providers with bundled model cards (SambaNova `gpt-oss-120b`; Inception `mercury-2`, `mercury-2.5`, `mercury-3`). Inception's `minimal` reasoning rung is sent on the wire as `instant` (declared per model by the catalog's `m` effort-wire map); `low`, `medium` and `high` send their own names.

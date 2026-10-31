@@ -150,6 +150,13 @@ impl RecoveryCheckpoint {
         )
     }
 
+    /// Release feedback for a call whose missing access was explicitly granted.
+    pub fn release_key(&mut self, key: &str) {
+        self.withheld.remove(key);
+        self.cached_observations.remove(key);
+        self.source_versions.remove(key);
+    }
+
     pub fn rejection(&self, call: &ToolCall) -> Option<String> {
         self.withheld.get(&Self::key(call)).map(|reason| format!(
             "Recovery checkpoint: this `{}` call is temporarily withheld after repeated unsuccessful or unchanged actions. This call was not executed. Other arguments and narrower observations remain available; repair the known problem, reuse existing evidence, or report a blocker. Previous feedback: {reason}", call.name

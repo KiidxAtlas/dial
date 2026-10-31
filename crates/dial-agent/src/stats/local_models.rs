@@ -474,7 +474,7 @@ pub fn duration(secs: u64) -> String {
     }
 }
 
-/// Speed line for humans: `34.1 tok/s median · recent 36.0 (up) · 12 samples`.
+/// Speed line for humans: `34.1 tok/s end-to-end median · recent 36.0 (up) · 12 samples`.
 pub fn speed_text(speed: &DecodeSpeed) -> String {
     let Some(samples) = speed.samples else {
         return "unknown (stats unavailable)".into();
@@ -482,7 +482,7 @@ pub fn speed_text(speed: &DecodeSpeed) -> String {
     let Some(median) = speed.median_tok_per_s else {
         return format!("unknown ({samples} recorded requests with output and timing)");
     };
-    let mut out = format!("{median:.1} tok/s median");
+    let mut out = format!("{median:.1} tok/s end-to-end median");
     if let Some(recent) = speed.recent_median_tok_per_s {
         out.push_str(&format!(" · recent {recent:.1}"));
         if let Some(trend) = speed.trend {

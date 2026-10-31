@@ -2921,7 +2921,7 @@ impl ModelOverlay {
                 let mut parts = vec![match speed.median_tok_per_s {
                     Some(rate) => {
                         let mut text = format!(
-                            "speed {} t/s median of {}",
+                            "speed {} t/s end-to-end median of {}",
                             fmt_rate(rate),
                             speed.samples.unwrap_or(0)
                         );

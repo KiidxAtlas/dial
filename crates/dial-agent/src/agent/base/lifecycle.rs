@@ -2,37 +2,20 @@
 
 use crate::agent::*;
 
-/// System-prompt clauses for the tools they name. A clause is emitted only when its tool is offered
-/// or listed as loadable. With every named tool present the text is the fixed prose, byte for byte.
+/// System-prompt clauses for judgement the tool descriptions do not carry. A clause is emitted only
+/// when its tool is offered or listed as loadable; mechanics (next-round activation, permissions,
+/// batching, live runs) stay in each tool's own description.
 fn capability_prose(offered: &[String], discoverable: &[(String, String)]) -> String {
     let available = |name: &str| {
         offered.iter().any(|tool| tool.as_str() == name)
             || discoverable.iter().any(|(tool, _)| tool.as_str() == name)
     };
-    let mut prose: Vec<&str> = Vec::new();
-    if available("tool_search") {
-        prose.push("tool_search enables up to three strongest matches for the next model round. Prefer relevant eligible native or MCP specialists already offered over generic shell/web substitutes. If a needed capability is missing, search by the task and domain, then use the returned next-round schemas. Do not rediscover offered tools or make calls merely to exercise available tools; answer directly when no tool is needed. Discovery does not grant permissions; normal approvals still apply.");
-    }
-    if available("working_state") {
-        prose.push("working_state preserves goals, decisions, constraints and evidence.");
-    }
-    let task = available("task");
-    match (available("artifact_read"), task) {
-        (true, true) => prose.push("artifact_read retrieves omitted output; task tasks[] batches independent substantial work, and action=start creates live runs controlled by status/wait/message/cancel."),
-        (true, false) => prose.push("artifact_read retrieves omitted output."),
-        (false, true) => prose.push("task tasks[] batches independent substantial work, and action=start creates live runs controlled by status/wait/message/cancel."),
-        (false, false) => {}
-    }
-    if task {
-        prose.push("Descendants require explicit role spawn permissions and obey the configured depth limit.");
-    }
     let mut out = String::new();
-    if !prose.is_empty() {
-        out.push('\n');
-        out.push_str(&prose.join(" "));
+    if available("tool_search") {
+        out.push_str("\nWhen a needed capability is missing, `tool_search` by task or domain; prefer an offered specialist over a shell or web substitute.");
     }
-    // Offered web tools are used directly; only loadable ones need discovery first, so the model
-    // is never told to rediscover a tool already in its schema.
+    // Offered web tools are used directly; only loadable ones need loading first, so the model is
+    // never told to rediscover a tool already in its schema.
     let offered_tool = |name: &str| offered.iter().any(|tool| tool.as_str() == name);
     let (ready, loadable): (Vec<&str>, Vec<&str>) = ["web_search", "web_fetch"]
         .into_iter()
@@ -44,12 +27,9 @@ fn capability_prose(offered: &[String], discoverable: &[(String, String)]) -> St
             steps.push(format!("use {}", ready.join(" and ")));
         }
         if !loadable.is_empty() {
-            steps.push(format!(
-                "discover {} and use their next-round schemas",
-                loadable.join(" and ")
-            ));
+            steps.push(format!("load {} first", loadable.join(" and ")));
         }
-        out.push_str(&format!("\nFor live web research, {}; cite source URLs and report actual search/network failures. Never invent results.", steps.join("; ")));
+        out.push_str(&format!("\nFor live web research, {}; cite source URLs and report real search or network failures. Never invent results.", steps.join("; ")));
     }
     out
 }
@@ -721,6 +701,9 @@ impl<'a> Agent<'a> {
                 // Trust and approval boundaries are stated once in the tool policy; this adds
                 // only what the MCP catalog index does not: configuration is not a connection.
                 system.push_str("\nConfigured MCP servers are not connection evidence; mcp_servers reports actual runtime status and registered tools.");
+            }
+            if let Some(servers) = self.ext.mcp_connecting() {
+                system.push_str(&format!("\nMCP servers still connecting: {}. Their tools are not listed yet; tool_search and mcp_servers wait for them.", servers.join(", ")));
             }
         }
         if self.plan_mode {

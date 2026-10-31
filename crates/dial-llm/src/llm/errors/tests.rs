@@ -72,6 +72,16 @@ fn provider_overflow_messages_are_context_overflow() {
     assert!(is_context_overflow(&anyhow::anyhow!(
         "model server reported a stream error: prompt filled the context window"
     )));
+    // oMLX memory guard, as a stream error event (no status) and as an HTTP body.
+    let omlx = "oMLX prefill memory guard rejected this prompt: Prefill would require ~28.92 GB peak (current 28.20 GB + KV+SDPA 739.43 MB) but the prefill limit is 28.90 GB (dynamic ceiling 31.41 GB - safety margin 2.51 GB). Close other apps to free RAM, raise memory_guard_tier (safe → balanced → aggressive), or reduce context length.";
+    assert_eq!(
+        classify_stream_error(&["server_error"], omlx),
+        ErrorClass::ContextOverflow
+    );
+    assert!(is_context_overflow(&anyhow::anyhow!(
+        "model server reported a stream error: {omlx}"
+    )));
+    assert_eq!(http(500, omlx), ErrorClass::ContextOverflow);
 }
 
 #[test]

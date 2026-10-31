@@ -327,6 +327,42 @@ fn a_reproduction_that_never_failed_is_reported_and_earns_no_behavioral_credit()
 }
 
 #[test]
+fn a_reproduction_that_passes_before_any_change_is_refused_and_not_rerun_by_the_gate() {
+    let root = tempfile::tempdir().unwrap();
+    let config = Config::default();
+    let mut agent = hermetic_agent(&config, root.path());
+    // Inverted exit logic: passes while the bug is present, so the gate would fail it once fixed.
+    let out = agent.check_tool(&repro_args("inverted", "echo bug present"), &mut NullUi);
+    assert!(out.is_error, "{}", out.text);
+    assert!(
+        out.text
+            .contains("Not registered: repro: inverted passed before any change"),
+        "{}",
+        out.text
+    );
+    assert_eq!(
+        out.data.as_ref().unwrap()["results"][0]["registration"],
+        "refused"
+    );
+    assert!(agent.step_checks.evidence.repros().is_empty());
+    assert!(!agent.step_checks.failed);
+    assert!(
+        !agent
+            .current_focused_checks()
+            .iter()
+            .any(|check| check.name.starts_with("repro: "))
+    );
+    // A corrected command that fails before the fix registers normally.
+    let corrected = agent.check_tool(&repro_args("inverted", REPRO), &mut NullUi);
+    assert!(
+        corrected.text.contains("reproduces the bug"),
+        "{}",
+        corrected.text
+    );
+    assert_eq!(agent.step_checks.evidence.repros().len(), 1);
+}
+
+#[test]
 fn reproductions_are_capped_validated_and_cannot_relabel_selected_checks() {
     let root = tempfile::tempdir().unwrap();
     let config = config();
@@ -519,5 +555,25 @@ fn a_top_level_command_is_refused_with_the_repro_contract_and_runs_nothing() {
     assert!(refused.text.contains("repro"), "{}", refused.text);
     assert!(refused.text.contains("non-zero"), "{}", refused.text);
     // No reproduction was registered, so nothing was executed or recorded for this turn.
+    assert!(agent.step_checks.evidence.repros().is_empty());
+}
+
+#[test]
+fn a_repro_that_is_not_an_object_names_the_shape_error_and_runs_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    let config = Config::default();
+    let mut agent = hermetic_agent(&config, root.path());
+    // A JSON-encoded repro with a surplus closing brace, as a model produced in a benchmark run.
+    let malformed = format!("{}}}", json!({"name": "page_count", "command": REPRO}));
+    for repro in [json!(malformed), json!(["page_count", REPRO])] {
+        let refused = agent.check_tool(&json!({ "repro": repro }), &mut NullUi);
+        assert!(refused.is_error, "{}", refused.text);
+        assert!(
+            refused.text.starts_with("repro must be an object"),
+            "{}",
+            refused.text
+        );
+        assert!(!refused.text.contains("repro.name"), "{}", refused.text);
+    }
     assert!(agent.step_checks.evidence.repros().is_empty());
 }

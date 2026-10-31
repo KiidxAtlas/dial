@@ -131,6 +131,14 @@ impl<'a> Agent<'a> {
     pub fn live_task_control(&self) -> LiveTaskControl {
         self.live_tasks.control()
     }
+    /// The harness a spawned child starts from: the parent's, with the tools children may use.
+    /// Walks the tool catalog, so only paths that actually spawn a child build it.
+    fn child_harness(&self) -> crate::config::Harness {
+        let mut harness = self.version.harness.clone();
+        harness.tools = self.offered_for_children();
+        harness
+    }
+
     pub fn start_subagents(&mut self, args: &Value, ui: &mut dyn Ui) -> Result<Value> {
         self.gate_subagent_spawn(args, ui)
             .map_err(anyhow::Error::msg)?;
@@ -147,8 +155,7 @@ impl<'a> Agent<'a> {
         };
         self.authorize_call(&call, ui)
             .map_err(|e| anyhow::anyhow!(e.message()))?;
-        let mut harness = self.version.harness.clone();
-        harness.tools = self.offered_for_children();
+        let harness = self.child_harness();
         let result = self
             .live_tasks
             .start(
@@ -211,11 +218,11 @@ impl<'a> Agent<'a> {
         ui: &mut dyn Ui,
     ) -> ToolOutput {
         self.pump_subagents(ui);
-        if matches!(
+        let spawns = matches!(
             args["action"].as_str().unwrap_or("run"),
             "run" | "start" | "resume" | "create" | "push"
-        ) && let Err(reason) = self.gate_subagent_spawn(args, ui)
-        {
+        );
+        if spawns && let Err(reason) = self.gate_subagent_spawn(args, ui) {
             return ToolOutput {
                 execution: Default::default(),
                 data: None,
@@ -223,10 +230,9 @@ impl<'a> Agent<'a> {
                 is_error: true,
             };
         }
-        let mut harness = self.version.harness.clone();
-        harness.tools = self.offered_for_children();
         match args["action"].as_str().unwrap_or("run") {
             "start" | "resume" | "create" | "push" => {
+                let harness = self.child_harness();
                 let ctx = crate::agent::workers::live_tasks::StartContext {
                     config: &self.auth_config,
                     workspace: &self.workspace,
@@ -318,6 +324,7 @@ impl<'a> Agent<'a> {
                 };
             }
         }
+        let harness = self.child_harness();
         let plan_config = self.plan_mode.then(|| {
             let mut config = self.auth_config.clone();
             config.ask.timeout_seconds = 0;

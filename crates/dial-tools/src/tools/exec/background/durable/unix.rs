@@ -33,6 +33,8 @@ struct Launch {
     deny: Vec<PathBuf>,
     writes: Vec<PathBuf>,
     network: bool,
+    #[serde(default)]
+    network_rules: Option<crate::tools::exec::sandbox::netproxy::NetworkRules>,
     unsandboxed: bool,
     backend: crate::config::types::ShellBackend,
     cargo_session: Option<String>,
@@ -444,6 +446,7 @@ fn start_with_owner(
         deny,
         writes,
         network,
+        network_rules: ws.network_rules().cloned(),
         unsandboxed: ws.unsandboxed,
         backend: ws.shell_backend,
         cargo_session: ws.cargo_session.clone(),
@@ -624,7 +627,8 @@ fn run_owner(launch: Launch) -> Result<()> {
                 allow_network: launch.network,
             }
         })
-        .with_shell_backend(launch.backend);
+        .with_shell_backend(launch.backend)
+        .with_network_rules(launch.network_rules);
     ws.additional_roots = launch.roots;
     ws.cargo_session = launch.cargo_session;
     if let Some(root) = launch.artifacts {

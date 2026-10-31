@@ -18,7 +18,7 @@ pub mod tool_output;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
 };
 
@@ -92,6 +92,13 @@ pub struct Node {
     pub presentation: Option<presentation::Presentation>,
 }
 
+/// Wall-clock milliseconds since the Unix epoch, stamped on a running body's last progress.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis().min(u128::from(u64::MAX)) as u64)
+}
+
 /// Worker shards expose only this UTF-8 tail; complete answers live in result/artifact records.
 pub(super) const WORKER_TAIL_LIMIT: usize = 16 * 1024;
 
@@ -111,8 +118,31 @@ fn append_tail(target: &mut String, text: &str, retain_bytes: usize) {
     target.push_str(text);
 }
 
+/// Node ids whose live revision may differ from the last journal-accepted publication. Body
+/// writers insert while holding their own node lock; this is a leaf lock and is never held while
+/// locking a body, so it cannot invert the Tree -> Body order.
+type Dirty = Arc<Mutex<BTreeSet<String>>>;
+
+/// Leaf-lock insert. The `contains` probe avoids allocating an id for every append or progress
+/// update of a body that is already dirty.
+fn mark_dirty(dirty: &Dirty, id: &str) {
+    let mut set = dirty.lock().unwrap_or_else(|e| e.into_inner());
+    if !set.contains(id) {
+        set.insert(id.to_owned());
+    }
+}
+
+fn unmark_dirty(dirty: &Dirty, id: &str) {
+    dirty.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+}
+
+/// Whether the journal has accepted this exact live revision. Callers hold the body's lock.
+fn is_persisted(persisted: &BTreeMap<String, u64>, node: &Node) -> bool {
+    persisted.get(&node.id) == Some(&node.result.revision)
+}
+
 #[derive(Debug, Clone)]
-pub struct Body(Arc<Mutex<Node>>, Option<stream_journal::Journal>);
+pub struct Body(Arc<Mutex<Node>>, Option<stream_journal::Journal>, Dirty);
 impl Body {
     /// Commit a metadata snapshot before exposing it through any live body handle.
     fn update(&self, edit: impl FnOnce(&mut Node) -> bool) {
@@ -129,9 +159,11 @@ impl Body {
             journal.snapshot(&next);
             if journal.check().is_ok() {
                 *node = next;
+                mark_dirty(&self.2, &node.id);
             }
         } else if edit(&mut node) {
             node.result.revision = node.result.revision.saturating_add(1);
+            mark_dirty(&self.2, &node.id);
         }
     }
     pub fn execution(&self, execution: execution::Execution) {
@@ -158,6 +190,7 @@ impl Body {
             }
             data["phase"] = serde_json::json!(phase);
             data["steps"] = serde_json::json!(steps);
+            data["updated_ms"] = serde_json::json!(now_ms());
             true
         });
     }
@@ -179,6 +212,7 @@ impl Body {
             data["current_tool"] = serde_json::json!(name);
             data["tools"] = serde_json::json!(tools);
             data["steps"] = serde_json::json!(steps);
+            data["updated_ms"] = serde_json::json!(now_ms());
             true
         });
     }
@@ -223,6 +257,7 @@ impl Body {
             node.result.text.push_str(text);
         }
         node.result.revision = revision;
+        mark_dirty(&self.2, &node.id);
     }
     pub fn correlate(&self, call_id: &str) {
         self.update(|node| {
@@ -277,6 +312,7 @@ impl Body {
 #[derive(Debug, Default)]
 struct Inner {
     nodes: BTreeMap<String, Body>,
+    dirty: Dirty,
     next: u64,
     persisted: BTreeMap<String, u64>,
     anchor: Option<String>,
@@ -366,6 +402,7 @@ impl Tree {
                 },
             })),
             tree.journal.clone(),
+            tree.dirty.clone(),
         );
         if let Some(journal) = &body.1 {
             journal.snapshot(&body.snapshot());
@@ -375,6 +412,7 @@ impl Tree {
             .as_ref()
             .is_none_or(|journal| journal.check().is_ok())
         {
+            mark_dirty(&tree.dirty, &id);
             tree.nodes.insert(id, body.clone());
         }
         body
@@ -390,8 +428,12 @@ impl Tree {
         }
         tree.persisted.insert(node.id.clone(), node.result.revision);
         let journal = tree.journal.clone();
-        tree.nodes
-            .insert(node.id.clone(), Body(Arc::new(Mutex::new(node)), journal));
+        let dirty = tree.dirty.clone();
+        unmark_dirty(&dirty, &node.id);
+        tree.nodes.insert(
+            node.id.clone(),
+            Body(Arc::new(Mutex::new(node)), journal, dirty),
+        );
     }
     pub fn snapshots(&self) -> Vec<Node> {
         self.0
@@ -408,25 +450,51 @@ impl Tree {
     pub fn pending_settled(&self) -> Vec<Node> {
         self.pending_where(true)
     }
+    /// Visits only bodies whose revision may be unpersisted, not every node. A clean body leaves
+    /// the dirty set while holding its own lock, so a concurrent change re-marks it atomically.
     fn pending_where(&self, settled_only: bool) -> Vec<Node> {
         let tree = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        tree.nodes
-            .values()
-            .filter(|b| {
-                b.read(|n| {
-                    (!settled_only || n.result.phase != Phase::Running)
-                        && tree.persisted.get(&n.id) != Some(&n.result.revision)
-                })
-            })
-            .map(Body::snapshot)
-            .collect()
-    }
-    pub fn persisted(&self, node: &Node) {
-        self.0
+        let ids: Vec<String> = tree
+            .dirty
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .persisted
-            .insert(node.id.clone(), node.result.revision);
+            .iter()
+            .cloned()
+            .collect();
+        let mut pending = Vec::new();
+        for id in ids {
+            let Some(body) = tree.nodes.get(&id) else {
+                unmark_dirty(&tree.dirty, &id);
+                continue;
+            };
+            body.read(|n| {
+                if is_persisted(&tree.persisted, n) {
+                    unmark_dirty(&tree.dirty, &n.id);
+                } else if !settled_only || n.result.phase != Phase::Running {
+                    pending.push(n.clone());
+                }
+            });
+        }
+        pending
+    }
+    /// Acknowledge only the exact live snapshot. An older publication, including one from a
+    /// replaced body at the same revision, must not clear a newer or different result.
+    pub fn persisted(&self, node: &Node) {
+        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let Inner {
+            nodes,
+            persisted,
+            dirty,
+            ..
+        } = &mut *guard;
+        if let Some(body) = nodes.get(&node.id) {
+            body.read(|current| {
+                if current == node {
+                    persisted.insert(node.id.clone(), node.result.revision);
+                    unmark_dirty(dirty, &node.id);
+                }
+            });
+        }
     }
     /// Interrupts every running body. Each body is settled under its own lock, so a concurrent
     /// `append` or `settle` is never overwritten by a stale snapshot.

@@ -20,6 +20,7 @@ use std::{
 
 mod actor;
 mod auth;
+mod client_fs;
 mod host_tools;
 mod host_uris;
 /// Latest control protocol version this build speaks. A connection starts at
@@ -958,6 +959,8 @@ fn run_control(
     let worker_host = host_bridge.clone();
     let uris = Arc::new(host_uris::HostUris::default());
     let worker_uris = uris.clone();
+    let fs_calls = Arc::new(client_fs::ClientFsCalls::default());
+    let worker_fs = fs_calls.clone();
     let auth_state = Arc::new(auth::AuthState::default());
     let auth_dir = layout.user_dir.clone();
     let (question_tx, question_rx) = mpsc::channel();
@@ -1000,6 +1003,7 @@ fn run_control(
         worker_query_cache,
         worker_live,
         queue,
+        worker_fs,
     };
     let worker = thread::spawn(move || actor.run());
     let (task_control, maintenance_control) = match control_rx.recv() {
@@ -1296,6 +1300,17 @@ fn run_control(
                         auth::logout(&auth_state, &auth_dir, &request["params"])
                     })();
                     out.result(&id, result);
+                }
+                "_fs_result" if acp => {
+                    // Relayed by the ACP adapter from the client's response to an `fs/*` request;
+                    // a stale or unknown call is dropped, since it has no response slot.
+                    let params = &request["params"];
+                    if let (Some(call_id), Some(output)) =
+                        (params["call_id"].as_str(), params["output"].as_str())
+                    {
+                        let is_error = params["is_error"].as_bool().unwrap_or(true);
+                        let _ = fs_calls.complete(call_id, output.to_owned(), is_error);
+                    }
                 }
                 "host_uri_result" => {
                     let result = (|| -> Result<Value> {

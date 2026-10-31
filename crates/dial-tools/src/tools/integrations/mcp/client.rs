@@ -537,14 +537,10 @@ impl Client {
         }
     }
 
-    /// Sends a request with a progress-inactivity `timeout` (zero disables inactivity expiry).
-    /// Every request has a separate one-hour absolute lifetime, including authentication/dispatch.
-    pub fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
-        self.request_with(method, params, timeout, &|| false, None)
-    }
-
-    /// [`Client::request`] that gives up when `cancel` turns true, and reports progress
-    /// notifications to `progress` (asking the server for them by sending a progress token).
+    /// Sends a request with a progress-inactivity `timeout` (zero disables inactivity expiry),
+    /// giving up when `cancel` turns true, and reports progress notifications to `progress`
+    /// (asking the server for them by sending a progress token). Every request has a separate
+    /// one-hour absolute lifetime, including authentication/dispatch.
     pub fn request_with(
         &self,
         method: &str,

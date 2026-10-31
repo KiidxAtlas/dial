@@ -100,7 +100,7 @@ pub struct Totals {
     pub cost_usd: f64,
     pub priced_requests: u64,
     pub duration_ms: u64,
-    /// `output / (duration / 1000)`.
+    /// `output / (duration / 1000)`: end-to-end, so it includes prompt processing time.
     pub tokens_per_second: Option<f64>,
     /// `cache_read / input * 100` (Dial's input counts include cached prompt tokens).
     pub cache_rate: Option<f64>,
@@ -190,8 +190,9 @@ pub struct SyncReport {
     pub removed: u64,
 }
 
-/// Decode speed of one model from recorded requests: output tokens per second of request time, the
-/// same measure as `Totals::tokens_per_second`. `None` is unknown; it is never estimated.
+/// Decode speed of one model from recorded requests: output tokens per second of whole-request
+/// time, including prompt processing (end-to-end), the same measure as `Totals::tokens_per_second`.
+/// `None` is unknown; it is never estimated.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct DecodeSpeed {
     /// `None` when the stats database could not be read; `Some(0)` when no request matched.
@@ -1297,7 +1298,7 @@ pub fn render_text(report: &Report) -> String {
         tokens(o.cache_read), percent(o.cache_rate), tokens(o.cache_write), tokens(o.reasoning)
     ));
     out.push_str(&format!(
-        "Cost {} · model time {} · avg latency {} · {} tok/s\n",
+        "Cost {} · model time {} · avg latency {} · {} tok/s end-to-end\n",
         cost_text(o),
         duration_text(o.duration_ms),
         o.avg_latency_ms
@@ -1319,7 +1320,7 @@ pub fn render_text(report: &Report) -> String {
         for row in rows {
             let t = &row.totals;
             out.push_str(&format!(
-                "  {:<40} {:>6} req  {:>8} in  {:>8} out  cache {:>6}  {:>7} tok/s  {}\n",
+                "  {:<40} {:>6} req  {:>8} in  {:>8} out  cache {:>6}  {:>7} tok/s e2e  {}\n",
                 row.label,
                 t.requests,
                 tokens(t.input),

@@ -390,14 +390,16 @@ fn the_sweep_brightens_the_wordmark_once_then_rests_on_the_gradient() {
         "rest is the plain banner"
     );
     let mut still = Home::new(info(), Vec::new(), false);
-    assert!(!still.animating());
+    assert!(!still.animating() && !still.ambient());
     let mut moving = Home::new(info(), Vec::new(), true);
-    assert!(moving.animating());
+    assert!(moving.animating() && !moving.ambient());
     moving.rows(100, 40, &theme);
     std::thread::sleep(fx::TURN);
     moving.rows(100, 40, &theme);
-    assert!(!moving.animating(), "one sweep, then still");
+    assert!(!moving.animating(), "one sweep, then no fast frames");
+    assert!(moving.ambient(), "then only the slow ambient motion");
     still.rows(100, 40, &theme);
+    assert!(!still.ambient(), "ui.motion off never moves");
 }
 
 #[test]

@@ -22,6 +22,7 @@ use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
 };
+use std::time::{Duration, Instant};
 
 /// One advisory path claim; `overlaps` marks a claim that overlaps one on the other side.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -111,7 +112,12 @@ pub struct PeersOverlay {
     /// The message being typed to the selected peer.
     compose: Option<Editor>,
     message: Option<(String, bool)>,
+    /// When `view` was last built, for [`Self::refresh_due`].
+    refreshed: Instant,
 }
+
+/// How long the board may go without a fresh snapshot while it is open.
+const REFRESH_EVERY: Duration = Duration::from_secs(2);
 
 impl PeersOverlay {
     pub fn new(view: PeersView) -> Self {
@@ -120,6 +126,29 @@ impl PeersOverlay {
             cursor: 0,
             compose: None,
             message: None,
+            refreshed: Instant::now(),
+        }
+    }
+
+    /// Whether the controller should supply a fresh snapshot. Sessions start and stop while the
+    /// board is open, so it follows them without a manual refresh. Never while a message is being
+    /// typed: the list must not shift under the recipient.
+    pub fn refresh_due(&self, now: Instant) -> bool {
+        self.compose.is_none() && now.saturating_duration_since(self.refreshed) >= REFRESH_EVERY
+    }
+
+    /// Take a fresh snapshot, keeping the selected peer when it is still live. `None` (the
+    /// registry was unavailable) keeps the current one; either way the next refresh waits.
+    pub fn update(&mut self, view: Option<PeersView>, now: Instant) {
+        self.refreshed = now;
+        let Some(view) = view else {
+            return;
+        };
+        let selected = self.selected().map(str::to_owned);
+        self.view = view;
+        self.cursor = self.cursor.min(self.view.peers.len().saturating_sub(1));
+        if let Some(id) = selected {
+            self.select(&id);
         }
     }
 

@@ -340,3 +340,14 @@ fn model_usage_sums_requests_and_prices_only_priced_ones_per_model() {
     );
     assert_eq!(local.speed.median_tok_per_s, Some(80.0));
 }
+
+#[test]
+fn speed_text_labels_the_rate_as_end_to_end() {
+    let speed = stats::speed_summary(&[10.0, 20.0, 30.0]);
+    let text = speed_text(&speed);
+    assert_eq!(
+        text,
+        "20.0 tok/s end-to-end median · recent 20.0 · 3 samples"
+    );
+    assert!(!text.contains("decode"), "{text}");
+}

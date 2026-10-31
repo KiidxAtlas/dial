@@ -1,0 +1,55 @@
+version = 1
+name = "coding-reliability-v1"
+
+# Harder offline behavioral cases. Acceptance commands live outside the disposable project,
+# so visible tests cannot change the verifier. Each start state is wrong in a different way:
+# a float-rounding false success, a dropped serialization branch, and a swallowed failure path.
+[[cases]]
+id = "amount-exact-decimal"
+project = "examples/benchmarks/reliability-fixture"
+prompt = "Ledger amounts come in as decimal strings: 19.99 is currently stored as 1998 cents. Make parse_amount exact for non-negative amounts with at most two fractional digits, and raise ValueError for anything else. Keep the integer-cents representation, preserve total_cents, and verify the behavior."
+categories = ["reliability", "partial_implementation", "false_success", "verification"]
+checks = [{kind="command",command='''python3 -c '
+from ledger import parse_amount
+ok = {"0": 0, "0.5": 50, "19.99": 1999, "0.29": 29, "1234.56": 123456, "0.00": 0}
+for text, cents in ok.items():
+    assert parse_amount(text) == cents, (text, parse_amount(text))
+for text in ["", "-1.00", "1.234", "1e3", "abc", "nan", "inf", " 1.00", "1.", ".5"]:
+    try:
+        parse_amount(text)
+    except ValueError:
+        continue
+    raise SystemExit("accepted invalid amount " + repr(text))
+'
+'''}, {kind="command",command="python3 -m unittest test_ledger"}]
+
+[[cases]]
+id = "ledger-export-keeps-refunds"
+project = "examples/benchmarks/reliability-fixture"
+prompt = "The ledger export drops refunds, so downstream reports undercount. export_lines must include every entry in input order, writing refunds as negative cents. total_cents must keep netting refunds exactly as before. Verify both behaviors."
+categories = ["reliability", "serialization", "preserved_behavior", "verification"]
+checks = [{kind="command",command='''python3 -c '
+from ledger import export_lines, total_cents
+entries = [{"kind": "charge", "cents": 500}, {"kind": "refund", "cents": 300}, {"kind": "charge", "cents": 25}]
+assert export_lines(entries) == ["charge:500", "refund:-300", "charge:25"], export_lines(entries)
+assert export_lines([]) == []
+assert total_cents(entries) == 225, total_cents(entries)
+'
+'''}, {kind="command",command="python3 -m unittest test_ledger"}]
+
+[[cases]]
+id = "malformed-row-fails-closed"
+project = "examples/benchmarks/reliability-fixture"
+prompt = "load_rows silently skips malformed rows, so a report built from a damaged file looks complete. A malformed row must raise ValueError instead of returning a partial ledger. Well-formed rows must keep loading exactly as before. Verify the failure path and the success path."
+categories = ["reliability", "failure_path", "partial_implementation", "verification"]
+checks = [{kind="command",command='''python3 -c '
+from ledger import load_rows
+assert load_rows(["charge,5.00", "refund,1.00"]) == [{"kind": "charge", "cents": 500}, {"kind": "refund", "cents": 100}]
+try:
+    load_rows(["charge,5.00", "bogus"])
+except ValueError:
+    pass
+else:
+    raise SystemExit("malformed row was silently dropped")
+'
+'''}, {kind="command",command="python3 -m unittest test_ledger"}]

@@ -10,6 +10,7 @@ fn applies_only_to_unreproduced_debugging_source_edits_once() {
     assert!(applies(
         ReproFirst::Gate,
         Kind::Debugging,
+        true,
         false,
         false,
         &source
@@ -17,6 +18,7 @@ fn applies_only_to_unreproduced_debugging_source_edits_once() {
     assert!(applies(
         ReproFirst::Advise,
         Kind::Debugging,
+        true,
         false,
         false,
         &source
@@ -24,6 +26,7 @@ fn applies_only_to_unreproduced_debugging_source_edits_once() {
     assert!(!applies(
         ReproFirst::Off,
         Kind::Debugging,
+        true,
         false,
         false,
         &source
@@ -31,16 +34,42 @@ fn applies_only_to_unreproduced_debugging_source_edits_once() {
     assert!(!applies(
         ReproFirst::Gate,
         Kind::Editing,
+        true,
         false,
         false,
         &source
     ));
     assert!(
-        !applies(ReproFirst::Gate, Kind::Debugging, true, false, &source),
+        !applies(
+            ReproFirst::Gate,
+            Kind::Debugging,
+            false,
+            false,
+            false,
+            &source
+        ),
+        "the request did not ask for verification"
+    );
+    assert!(
+        !applies(
+            ReproFirst::Gate,
+            Kind::Debugging,
+            true,
+            true,
+            false,
+            &source
+        ),
         "already reproduced"
     );
     assert!(
-        !applies(ReproFirst::Gate, Kind::Debugging, false, true, &source),
+        !applies(
+            ReproFirst::Gate,
+            Kind::Debugging,
+            true,
+            false,
+            true,
+            &source
+        ),
         "fires once"
     );
     for other in [
@@ -51,13 +80,21 @@ fn applies_only_to_unreproduced_debugging_source_edits_once() {
         targets(&[]),
     ] {
         assert!(
-            !applies(ReproFirst::Gate, Kind::Debugging, false, false, &other),
+            !applies(
+                ReproFirst::Gate,
+                Kind::Debugging,
+                true,
+                false,
+                false,
+                &other
+            ),
             "{other:?}"
         );
     }
     assert!(applies(
         ReproFirst::Gate,
         Kind::Debugging,
+        true,
         false,
         false,
         &targets(&["tests/parser.rs", "src/parser.rs"])
@@ -88,7 +125,6 @@ fn the_configured_mode_fires_once_per_turn_and_only_for_native_edits() {
         status: "active".into(),
     };
     let mut agent = Agent::hermetic(&config, backend, &version, root.path(), None, None).unwrap();
-    agent.task_policy.kind = Kind::Debugging;
     let call = |name: &str, arguments: Value| ToolCall {
         id: "call".into(),
         name: name.into(),
@@ -99,6 +135,13 @@ fn the_configured_mode_fires_once_per_turn_and_only_for_native_edits() {
         "write",
         json!({"path":"src/lib.rs","content":"fn fixed() {}"}),
     );
+    agent.task_policy = crate::learn::task_policy::Policy::for_prompt("Fix the parser bug", 60);
+    assert!(
+        !agent.repro_first_fires(&write, ReproFirst::Gate),
+        "a fix request that does not ask for verification is not steered"
+    );
+    agent.task_policy =
+        crate::learn::task_policy::Policy::for_prompt("Fix the parser bug and verify it", 60);
     assert!(!agent.repro_first_fires(&call("bash", json!({"command":"ls"})), ReproFirst::Gate));
     assert!(
         !agent.repro_first_fires(&write, ReproFirst::Advise),
@@ -127,7 +170,8 @@ fn the_configured_mode_fires_once_per_turn_and_only_for_native_edits() {
         None,
     )
     .unwrap();
-    agent.task_policy.kind = Kind::Debugging;
+    agent.task_policy =
+        crate::learn::task_policy::Policy::for_prompt("Fix the parser bug and verify it", 60);
     agent.step_checks.reproduced = true;
     assert!(
         !agent.repro_first_fires(&write, ReproFirst::Gate),

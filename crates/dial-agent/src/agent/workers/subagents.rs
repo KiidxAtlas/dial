@@ -232,7 +232,7 @@ pub fn schema(config: &Config) -> Value {
         format!("{presets}\nCustom agents:{custom}")
     };
     let description = format!(
-        "Delegate self-contained slices to subagents. Batch independent slices in one call: `context` is shared; each item gives `task`, `solution_space`, optional `skills` and `agent`. For test authoring, execution and failure diagnosis prefer test-runner with action=start while you continue independent work; coordinate owned files and let relevant inputs settle before checks. Model-role chains (first configured role, else the conversation model): worker task → coach → small; scout small → task; reviewer, test-runner tester → coach → task → small; planner planner → coach → task → small; custom agents inherit their base role unless overridden. Agent types:{types}{presets}"
+        "Delegate self-contained work to subagents. `tasks[]` runs independent slices in one call with shared `context`; action=start runs them live while you keep working, then wait. Agent types:{types}{presets}"
     );
     let mut entry_properties = json!({
         "agent":{"type":"string","description":"Agent type or preset (default scout)."},
@@ -242,8 +242,8 @@ pub fn schema(config: &Config) -> Value {
         "max_steps":{"type":"integer","minimum":0,"description":"Step limit; 0 means unlimited."},
         "name":{"type":"string","description":"Label shown to the user."},
         "output_schema":{"type":"object","description":"JSON Schema the final answer must satisfy."},
-        "isolation":{"type":"string","enum":["copy"],"description":"Workers only: private copy and native-tool session. Changed files merge on success unless the parent changed them; failed or interrupted edits stay in a recovery copy. Separate isolation metadata reports backend, applied files, conflicts, I/O errors and recovery_location; output_schema data is never altered."},
-        "isolation_backend":{"type":"string","enum":ISOLATION_BACKENDS,"description":"Workers only; implies isolation copy and overrides the [isolation] backend: clone (copy-on-write), worktree (git worktree of HEAD plus uncommitted files), overlay (Linux), projfs (Windows), copy (plain), auto (first available). An unavailable backend fails before any worker starts."}
+        "isolation":{"type":"string","enum":["copy"],"description":"Workers only: work in a private copy. Changes merge on success unless the parent changed the same files; otherwise they stay in a reported recovery copy."},
+        "isolation_backend":{"type":"string","enum":ISOLATION_BACKENDS,"description":"Workers only; implies isolation: clone (copy-on-write), worktree (git), overlay (Linux), projfs (Windows), copy, or auto. An unavailable backend fails before any worker starts."}
     });
     entry_properties.as_object_mut().unwrap().insert("source_session".into(), json!({"type":"string","minLength":1,"description":"seance only: session id prefix or worker id whose record is read."}));
     entry_properties.as_object_mut().unwrap().insert("model".into(), json!({"type":"string","description":"seance only: answering model (default the source session's, else the main model)."}));
@@ -265,7 +265,7 @@ pub fn schema(config: &Config) -> Value {
     let mut properties = serde_json::Map::from_iter([
         (
             "action".into(),
-            json!({"type":"string","enum":["run","start","resume","status","wait","cancel","create","push","peek","close"],"description":"run (default) blocks until every task finishes; for work over a few minutes use start, keep working, then wait. start returns live job IDs. resume continues a retained worker by id with message, only after it stopped safely. create opens a worker pool with first tasks; push adds tasks to a pool id; peek reports it; close (or cancel with a pool id) closes it. Talk to a live worker with the message tool."}),
+            json!({"type":"string","enum":["run","start","resume","status","wait","cancel","create","push","peek","close"],"description":"run (default) waits for every task; start returns live ids for status/wait/message/cancel; resume continues a stopped worker with message; create/push/peek/close manage a worker pool."}),
         ),
         (
             "id".into(),

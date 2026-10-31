@@ -202,13 +202,13 @@ fn assist_variants_change_exactly_one_feature_from_dial() {
     let configurations = assist_configurations(&Config::default(), "openai", "model");
     let names: Vec<_> = configurations.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names[..2], ["raw", "dial"]);
-    assert_eq!(names.len(), 4 + ASSIST_VARIANTS.len() + 7);
+    assert_eq!(names.len(), 5 + ASSIST_VARIANTS.len() + 7);
     assert_eq!(configurations[1].assistance.lean_local, Some(LeanLocal::On));
-    let sections = |c: &MachineConfiguration| json!({"assistance": c.assistance, "policy": c.policy, "experimental": c.experimental});
+    let sections = |c: &MachineConfiguration| json!({"assistance": c.assistance, "policy": c.policy, "experimental": c.experimental, "efficiency": c.efficiency});
     let dial = sections(&configurations[1]);
     for variant in &configurations[2..] {
         let value = sections(variant);
-        let changed = ["assistance", "policy", "experimental"]
+        let changed = ["assistance", "policy", "experimental", "efficiency"]
             .iter()
             .map(|section| {
                 dial[section]
@@ -263,8 +263,52 @@ fn dial_baseline_tracks_shipped_defaults_and_ignores_user_config() {
     assert!(
         configurations
             .iter()
+            .filter(|c| c.name != "enable-shake_before_summary")
             .all(|c| c.efficiency == dial.efficiency)
     );
+    // The structured-tool ablation pins the bash-only roster; the baseline restores the default.
+    assert_eq!(dial.assistance.bash_only, Some(false));
+    let bash = configurations
+        .iter()
+        .find(|c| c.name == "ablate-structured_tools")
+        .unwrap();
+    assert_eq!(bash.assistance.bash_only, Some(true));
+    let shake = configurations
+        .iter()
+        .find(|c| c.name == "enable-shake_before_summary")
+        .unwrap();
+    assert_eq!(
+        shake.efficiency.compaction_method_order.as_ref().unwrap()[..2],
+        [CompactionMethod::Remote, CompactionMethod::Shake]
+    );
+}
+
+#[test]
+fn bash_only_override_pins_the_roster_in_the_isolated_config_and_is_recorded() {
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(root.path(), home.path().to_owned()).unwrap();
+    let base: Config =
+        toml::from_str("[providers.local]\nbase_url = 'https://127.0.0.1:8443/v1'\n").unwrap();
+    let mut configuration = requested(Path::new("model"));
+    configuration.provider = "local".into();
+    configuration.quantization_bits = None;
+    let policy = MachineBenchmarkPolicy::default();
+    configuration.assistance.bash_only = Some(true);
+    let (selected, settings) =
+        select_configuration(&layout, &base, &mut configuration, &policy).unwrap();
+    assert_eq!(selected.harness.tools, ["bash", "todo", "check", "finish"]);
+    assert_eq!(settings["assistance"]["bash_only"], true);
+    // `false` restores the shipped roster; unset keeps the operator's.
+    configuration.assistance.bash_only = Some(false);
+    let (selected, settings) =
+        select_configuration(&layout, &base, &mut configuration, &policy).unwrap();
+    assert_eq!(selected.harness.tools, dial::config::tools::default_tools());
+    assert_eq!(settings["assistance"]["bash_only"], false);
+    // Duplicate compaction methods fail before any inference.
+    configuration.efficiency.compaction_method_order =
+        Some(vec![CompactionMethod::Shake, CompactionMethod::Shake]);
+    assert!(select_configuration(&layout, &base, &mut configuration, &policy).is_err());
 }
 
 #[test]
@@ -292,6 +336,7 @@ fn efficiency_overrides_stay_in_the_isolated_config_and_are_bounded() {
             history_token_cap: Some(65_536),
             compaction_enabled: Some(false),
             keep_recent_tokens: Some(4096),
+            compaction_method_order: None,
         },
         draft_model: None,
         num_draft_tokens: None,
@@ -333,7 +378,7 @@ fn efficiency_overrides_stay_in_the_isolated_config_and_are_bounded() {
 }
 
 #[test]
-fn machine_case_contract_is_identical_across_strict_variants_and_ignores_ambient_requirements() {
+fn suite_grader_commands_never_enter_the_child_configuration() {
     let mut base = Config::default();
     base.verification.requirements.insert(
         "ambient".into(),
@@ -342,31 +387,47 @@ fn machine_case_contract_is_identical_across_strict_variants_and_ignores_ambient
             visual: false,
         },
     );
-    assert!(isolated_config(&base).verification.requirements.is_empty());
-    let case = BenchmarkSuite::parse_toml("version=1\nname='contract'\n[[cases]]\nid='one'\nprompt='test'\nchecks=[{kind='command',command='printf checked'}]\n").unwrap().cases.remove(0);
     let baseline = isolated_config(&base);
-    let mapped = case_contract(&baseline, &case).unwrap();
-    assert_eq!(mapped.verification.commands.len(), 1);
-    assert_eq!(mapped.verification.requirements.len(), 1);
+    assert!(baseline.verification.requirements.is_empty());
+    // The sentinel is only a suite grader command; the agent-visible child must never contain it.
+    let case = BenchmarkSuite::parse_toml("version=1\nname='contract'\n[[cases]]\nid='one'\nprompt='test'\nchecks=[{kind='command',command='printf grader-sentinel-7f3a'}]\n").unwrap().cases.remove(0);
+    assert_eq!(case.checks.len(), 1);
+    let child = case_contract(&baseline, &case).unwrap();
+    assert!(child.verification.commands.is_empty());
+    assert!(child.verification.requirements.is_empty());
+    assert!(
+        !toml::to_string(&child)
+            .unwrap()
+            .contains("grader-sentinel-7f3a")
+    );
+    // Strict variants without an explicit valid contract are unavailable, never a passing no-op.
     let mut strict = baseline.clone();
     strict.verification.strict_requirements = true;
-    let strict = case_contract(&strict, &case).unwrap();
-    assert_eq!(
-        serde_json::to_value(&strict.verification.commands).unwrap(),
-        serde_json::to_value(&mapped.verification.commands).unwrap()
-    );
-    let mut journey = case.clone();
-    journey.turns.push(dial::benchmark::BenchmarkTurn {
-        prompt: "correction".into(),
-        compact_before: true,
-    });
-    let mut empty_strict = baseline;
-    empty_strict.verification.strict_requirements = true;
     assert!(
-        case_contract(&empty_strict, &journey)
+        case_contract(&strict, &case)
             .unwrap_err()
             .is::<dial::benchmark::AgentUnavailable>()
     );
+    // An explicit agent-visible contract satisfies the gate and is passed through unchanged.
+    strict
+        .verification
+        .commands
+        .push(dial::config::types::VerificationCommand {
+            name: "explicit".into(),
+            command: "true".into(),
+            file_extensions: vec![],
+            timeout_secs: 120,
+        });
+    strict.verification.requirements.insert(
+        "explicit".into(),
+        dial::config::types::VerificationRequirement {
+            checks: vec!["explicit".into()],
+            visual: false,
+        },
+    );
+    let explicit = case_contract(&strict, &case).unwrap();
+    assert_eq!(explicit.verification.commands.len(), 1);
+    assert_eq!(explicit.verification.requirements.len(), 1);
 }
 
 #[test]

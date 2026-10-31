@@ -77,6 +77,9 @@ impl Agent<'_> {
         let resolved = session_auth_config(config, &next, &mut self.session)?;
         *backend = next;
         self.auth_config = resolved;
+        // The armed prefix belonged to the previous route. Warming resumes at the next turn's
+        // sync, so a mid-turn fallback or promotion never replays under the old route.
+        self.cache_warm = None;
         self.context_cap = context_cap;
         self.role_backends.clear();
         self.subagent_backend = None;

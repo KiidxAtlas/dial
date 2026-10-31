@@ -198,6 +198,8 @@ pub(in crate::agent) fn discover(
 
 impl Agent<'_> {
     pub(in crate::agent) fn plan_tool_available(&self, name: &str) -> bool {
+        // `computer` is admitted although its arguments are unknown here: `authorize_call` judges
+        // each call with its real arguments, so only read-only actions pass in plan mode.
         !self.plan_mode
             || matches!(
                 name,
@@ -210,6 +212,7 @@ impl Agent<'_> {
                     | "working_state"
                     | "tool_search"
                     | "tool_load"
+                    | "computer"
             )
             || crate::agent::safety::approval::is_read_only(&self.ext, name, &json!({}))
     }

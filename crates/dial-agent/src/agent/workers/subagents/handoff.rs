@@ -278,11 +278,19 @@ fn evidence_status(reference: &str, workspace: &Workspace) -> &'static str {
     if metadata.len() > LINE_CHECK_BYTES {
         return "valid";
     }
-    match std::fs::read(&resolved) {
-        Ok(bytes) if String::from_utf8_lossy(&bytes).lines().count() >= end => "valid",
-        Ok(_) => "stale",
-        Err(_) => "invalid",
+    // Count lines up to the cited end instead of reading the whole file: up to 24 references are
+    // audited on the worker thread before its result is reported.
+    let Ok(file) = std::fs::File::open(&resolved) else {
+        return "invalid";
+    };
+    let mut seen = 0;
+    for line in std::io::BufRead::split(std::io::BufReader::new(file), b'\n').take(end) {
+        if line.is_err() {
+            return "invalid";
+        }
+        seen += 1;
     }
+    if seen >= end { "valid" } else { "stale" }
 }
 
 /// Keep synchronous result bodies intact; expose the typed projection separately on the next

@@ -13,6 +13,7 @@ fn snapshots_retain_actual_context_and_only_the_new_target() {
         &request,
         &[],
         json!({"role":"assistant","content":"new answer"}),
+        Default::default(),
     );
     request[0]["content"] = json!("changed after inference");
     let payload = capture.payload();
@@ -33,6 +34,7 @@ fn bounded_capture_keeps_the_final_target_and_its_schema() {
             &[json!({"role":"user","content":"task"})],
             &[json!({"schema":i})],
             json!({"role":"assistant","content":i.to_string()}),
+            Default::default(),
         );
     }
     assert_eq!(capture.examples.len(), MAX_EXAMPLES);
@@ -45,9 +47,38 @@ fn bounded_capture_keeps_the_final_target_and_its_schema() {
         &[json!({"role":"user","content":"x".repeat(MAX_BYTES)})],
         &[],
         json!({"role":"assistant","content":"oversized"}),
+        Default::default(),
     );
     assert_eq!(capture.examples.len(), MAX_EXAMPLES);
     assert!(capture.bytes <= MAX_BYTES);
+}
+
+#[test]
+fn snapshots_record_the_route_layout_that_was_sent() {
+    use crate::llm::messages::WireForm;
+    let request = [
+        json!({"role":"system","content":"frozen"}),
+        json!({"role":"system","content":"stable"}),
+        json!({"role":"user","content":"task"}),
+        json!({"role":"system","content":"late note","dial_transient":true}),
+    ];
+    let target = json!({"role":"assistant","content":"answer"});
+    let mut capture = Capture::default();
+    capture.record(&request, &[], target.clone(), WireForm::SingleSystemPrefix);
+    capture.record(&request, &[], target, WireForm::Canonical);
+    let payload = capture.payload();
+    let local = payload["examples"][0]["messages"].as_array().unwrap();
+    assert_eq!(
+        local[..3],
+        [
+            json!({"role":"system","content":"frozen\n\nstable"}),
+            json!({"role":"user","content":"task"}),
+            json!({"role":"user","content":"late note"}),
+        ]
+    );
+    let canonical = payload["examples"][1]["messages"].as_array().unwrap();
+    assert_eq!(canonical.len(), 5);
+    assert_eq!(canonical[1], json!({"role":"system","content":"stable"}));
 }
 
 #[test]
@@ -76,6 +107,7 @@ fn session_retention_excludes_nonordinary_unfinished_and_empty_captures() {
                     &[json!({"role":"user","content":"task"})],
                     &[],
                     json!({"role":"assistant","content":"answer"}),
+                    Default::default(),
                 );
             }
             match case {

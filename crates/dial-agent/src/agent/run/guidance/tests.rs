@@ -1,5 +1,4 @@
 use super::*;
-use crate::agent::base::helpers::coalesce_harness_notes;
 
 fn history() -> Vec<Value> {
     vec![
@@ -106,9 +105,34 @@ fn capped_tail_coalesces_into_one_harness_message() {
     messages.push(note(Priority::Failure, "stall warning"));
     messages.push(note(Priority::Loop, "pace advice"));
     cap(&mut messages);
-    coalesce_harness_notes(&mut messages, start);
+    coalesce(&mut messages, start);
     assert_eq!(messages.len(), start + 1);
     assert_eq!(messages[start]["content"], "tool contract\n\nstall warning");
+}
+
+#[test]
+fn assemble_is_the_one_tail_step_for_parent_and_worker() {
+    let mut messages = history();
+    let start = tail_start(&messages);
+    messages.push(
+        json!({"role":"user","content":"rules","dial_transient":true,"dial_portable_rules":true}),
+    );
+    messages.push(json!({"role":"user","content":"Step budget reached","dial_transient":true}));
+    messages.push(note(Priority::Loop, "narration"));
+    messages.push(note(Priority::Review, "review it"));
+    let mut emissions = Emissions::default();
+    let dropped = assemble(&mut messages, start, &mut emissions);
+    assert_eq!(dropped.len(), 1);
+    assert_eq!(dropped[0]["content"], "review it");
+    // Marked context stays separate; plain notes merge into one message at the first one.
+    assert_eq!(messages.len(), start + 2);
+    assert_eq!(messages[start]["dial_portable_rules"], true);
+    assert_eq!(
+        messages[start + 1]["content"],
+        "Step budget reached\n\nnarration"
+    );
+    // A start past the end (stale index) is clamped, not a panic.
+    assemble(&mut messages, usize::MAX, &mut emissions);
 }
 
 #[test]

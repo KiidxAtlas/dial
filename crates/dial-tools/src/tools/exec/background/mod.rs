@@ -61,20 +61,14 @@ const MAX_LISTED_COMMAND: usize = 80;
 const DEFAULT_WAIT_SECS: u64 = 5;
 const MAX_WAIT_SECS: u64 = 300;
 
-const DESCRIPTION: &str = "Session-owned background jobs without persistent shell state. POSIX \
-commands use bash's sandbox, cwd and network policy; Windows uses PowerShell only with explicit \
-unsandboxed opt-in. Output is kept in artifacts plus a 256 KiB ring (PTY: raw bytes, rendered screen \
-snapshot); at most 32 KiB inline. `start`: command, optional unique name/cwd, pty=true (rows/cols) or \
-stdin=true for a pipe, else stdin is null. `input`: name, text (exact UTF-8, no automatic newline, \
-max 64 KiB); `resize`: name, rows/cols; `close_stdin`: pipe EOF or PTY VEOF (raw PTYs cannot \
-half-close); their timeout defaults 0 (unlimited, cancellable) and partial writes are reported. \
-`list`; `output` (pipe: delta; PTY: screen; optional tail); `wait` (until regex, or exit); `kill` \
-(name or all=true). `ready` on named start/wait: log regex and/or numeric host/port, both required if \
-given; port readiness needs network permission and approval and lsof-proven owned listeners (POSIX \
-only). Waits default 5s; 0 is unlimited, positive max 300s. At most 8 live and 8 finished entries. \
-persist=true: Unix-only named finite-lifetime pipe jobs that survive restarts (no PTY/stdin/ready); \
-pass it on every durable call. Session exit kills owned process groups or Windows Job Objects; POSIX \
-descendants that escape with setsid/job control may survive.";
+const DESCRIPTION: &str = "Background jobs owned by this session; ending the session kills them. \
+`start` a command (optional unique `name`, `cwd`; `pty` for a terminal, `stdin` for a pipe). \
+`output` returns new output (`tail` N lines; PTY: the current screen). `wait` blocks until the \
+`until` regex matches or the job exits (default 5 s, max 300, 0 = unlimited). \
+`input`/`close_stdin`/`resize` drive an interactive job; `list`; `kill` (`name` or `all`). `ready` on \
+a named start/wait also waits for a log regex and/or a TCP port. At most 32 KiB of output is inline; \
+the rest stays in artifacts. `persist=true` (Unix, named, pipe only) keeps a finite-lifetime job \
+across restarts; pass it on every call for that job.";
 
 /// Owns every background process; dropping it kills them all (each entry kills its process
 /// group when dropped).
@@ -895,25 +889,25 @@ impl Tool for Background {
             json!({
                 "action": {"type": "string", "enum": ["start", "list", "output", "wait", "input", "close_stdin", "resize", "kill"]},
                 "command": {"type": "string", "description": "start: shell command to run"},
-                "name": {"type": "string", "description": "start: optional unique name (letters, digits, - _ .); output/wait/kill: which process"},
-                "cwd": {"type": "string", "description": "start: working directory relative to the primary workspace root, or absolute inside it or an added workspace root (default: primary root)"},
-                "persist": {"type": "boolean", "description": "Explicit opt-in: Unix pipe-only job owned beyond controller exit; use true on every start/list/output/wait/kill call. Named start required; no PTY/stdin/ready. Default false, ordinary session lifecycle unchanged."},
-                "lifetime": {"type": "integer", "minimum": 1, "maximum": 86400, "description": "persist start only: maximum lifetime in seconds (default 3600); owner stops process at deadline"},
-                "pty": {"type": "boolean", "description": "start: allocate a private controlling terminal (default false); also enables input"},
+                "name": {"type": "string", "description": "start: optional unique name (letters, digits, - _ .); other actions: which job"},
+                "cwd": {"type": "string", "description": "start: working directory (default workspace root)"},
+                "persist": {"type": "boolean", "description": "Unix only: a named pipe job that survives restarts until `lifetime`; pass true on every call for it. No PTY, stdin or ready."},
+                "lifetime": {"type": "integer", "minimum": 1, "maximum": 86400, "description": "persist start: seconds before the job is stopped (default 3600)"},
+                "pty": {"type": "boolean", "description": "start: run in a terminal (default false); enables input"},
                 "stdin": {"type": "boolean", "description": "start without PTY: keep a stdin pipe open (default false)"},
-                "rows": {"type": "integer", "minimum": 1, "maximum": 65535, "description": "PTY start/resize rows (default 24)"},
-                "cols": {"type": "integer", "minimum": 1, "maximum": 65535, "description": "PTY start/resize columns (default 80)"},
-                "text": {"type": "string", "description": "input: exact UTF-8 bytes (max 64 KiB), no automatic newline; can contain terminal control characters"},
-                "ready": {"type": "object", "additionalProperties": false, "description": "named start/wait: log and/or port; both conditions if both supplied", "properties": {
-                    "log": {"type": "string", "description": "regex in this process's retained output"},
-                    "host": {"type": "string", "description": "numeric IP address (default 127.0.0.1), requires port"},
-                    "port": {"type": "integer", "minimum": 1, "maximum": 65535, "description": "owned TCP listener readiness; network permission/approval and lsof required"},
-                    "timeout": {"type": "integer", "minimum": 0, "maximum": 300, "description": "seconds, explicit 0 unlimited (default outer timeout or 5s)"}
+                "rows": {"type": "integer", "minimum": 1, "maximum": 65535, "description": "PTY rows (default 24)"},
+                "cols": {"type": "integer", "minimum": 1, "maximum": 65535, "description": "PTY columns (default 80)"},
+                "text": {"type": "string", "description": "input: exact UTF-8 (max 64 KiB), no newline added; may hold control characters"},
+                "ready": {"type": "object", "additionalProperties": false, "description": "named start/wait: both conditions when both are given", "properties": {
+                    "log": {"type": "string", "description": "regex in the job's output"},
+                    "host": {"type": "string", "description": "numeric IP (default 127.0.0.1); needs port"},
+                    "port": {"type": "integer", "minimum": 1, "maximum": 65535, "description": "TCP listener owned by the job; needs network approval"},
+                    "timeout": {"type": "integer", "minimum": 0, "maximum": 300, "description": "seconds, 0 unlimited (default the outer timeout or 5)"}
                 }},
-                "tail": {"type": "integer", "minimum": 1, "description": "output: return only the last N lines of the new output"},
-                "timeout": {"type": "integer", "minimum": 0, "maximum": 3600, "description": "wait: seconds (default 5, explicit 0 unlimited, positive max 300); input/close_stdin/resize: 0 unlimited cancellable, positive max 3600"},
-                "until": {"type": "string", "description": "wait: regex to wait for in the output; ^ and $ match at line boundaries (default: wait for exit)"},
-                "all": {"type": "boolean", "description": "kill: kill every background process"},
+                "tail": {"type": "integer", "minimum": 1, "description": "output: only the last N lines"},
+                "timeout": {"type": "integer", "minimum": 0, "maximum": 3600, "description": "wait: seconds (default 5, 0 unlimited, max 300); input/close_stdin/resize: 0 unlimited, max 3600"},
+                "until": {"type": "string", "description": "wait: regex to wait for, ^/$ per line (default: exit)"},
+                "all": {"type": "boolean", "description": "kill: every job"},
             }),
             &["action"],
         )

@@ -20,6 +20,11 @@ use std::{
     time::Duration,
 };
 
+/// Shown once in a worker's status when its request waits for a provider slot. Covers every route
+/// with a concurrency limit: a local server, or a remote provider capped by `provider_concurrency`.
+pub(in crate::agent) const QUEUED_NOTICE: &str =
+    "Waiting for a model request slot: this provider is at its concurrency limit.";
+
 struct Slots {
     used: Mutex<HashMap<String, usize>>,
     freed: Condvar,
@@ -85,13 +90,15 @@ pub(in crate::agent) fn try_acquire(config: &Config) -> Option<Slot> {
     }
 }
 
-/// Wait for a request slot while preserving the caller's admission failure cause.
+/// Wait for a request slot while preserving the caller's admission failure cause. `on_queued`
+/// runs once, when this request first finds the slot taken, so the caller can show the wait.
 pub(in crate::agent) fn acquire_checked<E>(
     config: &Config,
     check: impl FnMut() -> Result<(), E>,
+    on_queued: impl FnOnce(),
 ) -> Result<Slot, E> {
     let (key, limit) = route(config);
-    acquire_key_checked(key, limit, check)
+    acquire_key_checked_notify(key, limit, check, on_queued)
 }
 
 /// Nonblocking admission for whole workers. A controller waiting for a worker must
@@ -125,7 +132,16 @@ pub(in crate::agent) fn acquire_key(
 fn acquire_key_checked<E>(
     key: String,
     limit: usize,
+    check: impl FnMut() -> Result<(), E>,
+) -> Result<Slot, E> {
+    acquire_key_checked_notify(key, limit, check, || {})
+}
+
+fn acquire_key_checked_notify<E>(
+    key: String,
+    limit: usize,
     mut check: impl FnMut() -> Result<(), E>,
+    on_queued: impl FnOnce(),
 ) -> Result<Slot, E> {
     if limit == 0 {
         check()?;
@@ -133,12 +149,20 @@ fn acquire_key_checked<E>(
     }
     let slots = slots();
     let mut used = slots.used.lock().unwrap_or_else(|e| e.into_inner());
+    let mut on_queued = Some(on_queued);
     loop {
         check()?;
         let count = used.entry(key.clone()).or_insert(0);
         if *count < limit {
             *count += 1;
             return Ok(Slot { key: Some(key) });
+        }
+        if let Some(notify) = on_queued.take() {
+            // Announce outside the slot mutex, then re-check admission from the top.
+            drop(used);
+            notify();
+            used = slots.used.lock().unwrap_or_else(|e| e.into_inner());
+            continue;
         }
         used = slots
             .freed

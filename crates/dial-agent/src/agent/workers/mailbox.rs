@@ -78,6 +78,7 @@ impl Inbox {
         if let Some(wake) = &self.wake {
             wake();
         }
+        crate::platform::wake::signal();
         Ok(())
     }
 

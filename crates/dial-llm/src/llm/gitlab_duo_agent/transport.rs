@@ -1,7 +1,7 @@
 //! REST and WebSocket I/O for GitLab Duo Agent workflows. Wire shapes live in
 //! `wire.rs`; this module only moves bytes and enforces timeouts/interrupts.
 
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::TcpStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -301,21 +301,10 @@ fn encode_component(text: &str) -> String {
 
 fn open_tcp(base: &url::Url) -> Result<TcpStream> {
     let host = base.host_str().context("GitLab base URL has no host")?;
-    let host = host.trim_start_matches('[').trim_end_matches(']');
     let port = base
         .port_or_known_default()
         .context("GitLab base URL has no port")?;
-    let mut last = None;
-    for addr in (host, port).to_socket_addrs()? {
-        match TcpStream::connect_timeout(&addr, HANDSHAKE_TIMEOUT) {
-            Ok(stream) => return Ok(stream),
-            Err(error) => last = Some(error),
-        }
-    }
-    match last {
-        Some(error) => Err(error.into()),
-        None => bail!("GitLab host resolved to no addresses"),
-    }
+    crate::llm::ws_proxy::open(host, port, &|| Ok(Some(HANDSHAKE_TIMEOUT)))
 }
 
 fn set_poll(socket: &mut Socket) -> Result<()> {

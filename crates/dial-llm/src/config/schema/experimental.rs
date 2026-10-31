@@ -107,7 +107,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         EX,
         "Verification",
         "Reproduce first",
-        "Debugging tasks only: the first edit to a non-test source file before any reproduction has failed gets a note (Advise) or is refused once (Gate). A repeated attempt always proceeds.",
+        "Debugging tasks whose request asks to verify only: the first edit to a non-test source file before any reproduction has failed gets a note (Advise) or is refused once (Gate). A repeated attempt always proceeds.",
         Kind::Enum(REPRO_FIRST),
     ),
     field!(

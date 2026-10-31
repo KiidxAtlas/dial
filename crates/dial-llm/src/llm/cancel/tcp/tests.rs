@@ -55,7 +55,10 @@ fn transport(stream: TcpStream, interrupt: &Arc<AtomicBool>, size: usize) -> Kee
     let mut transport = KeepaliveTransport {
         stream,
         buffers: LazyBuffers::new(1024, size),
-        interrupt: Arc::clone(interrupt),
+        bound: Arc::new(parking_lot::Mutex::new(super::super::Binding {
+            interrupt: Arc::clone(interrupt),
+            patience: None,
+        })),
         read_timeout: None,
     };
     for (index, byte) in transport.buffers.output().iter_mut().enumerate() {

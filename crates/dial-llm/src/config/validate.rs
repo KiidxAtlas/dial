@@ -313,6 +313,10 @@ impl Config {
                 || self.browser.playwright_module.trim() == self.browser.playwright_module,
             "browser.playwright_module must be empty (built-in runtime) or an unpadded module path"
         );
+        ensure!(
+            (1..=600).contains(&self.web.timeout_secs),
+            "web.timeout_secs must be 1..600"
+        );
         self.browser
             .validate_allowed_hosts()
             .map_err(anyhow::Error::msg)?;

@@ -155,3 +155,59 @@ fn strict_extra_write_roots_become_writable_mounts() {
     assert!(mounts.write.contains(&ws.canonicalize().unwrap()));
     assert!(mounts.write.contains(&extra.canonicalize().unwrap()));
 }
+
+#[test]
+fn git_metadata_in_writable_roots_is_rebound_read_only() {
+    let temp = tempfile::tempdir().unwrap();
+    let ws = temp.path().canonicalize().unwrap().join("ws");
+    fs::create_dir_all(ws.join(".git/hooks")).unwrap();
+    for policy in [
+        Policy::Strict {
+            deny_read: Vec::new(),
+            allow_network: false,
+            extra_write: Vec::new(),
+        },
+        Policy::Dev {
+            deny_read: Vec::new(),
+            extra_write: Vec::new(),
+            allow_network: false,
+        },
+    ] {
+        let mounts = Mounts::new(&ws, &policy).unwrap();
+        assert_eq!(mounts.read_only, vec![ws.join(".git")]);
+    }
+    let opted_out = Policy::Dev {
+        deny_read: Vec::new(),
+        extra_write: vec![ws.join(".git")],
+        allow_network: false,
+    };
+    assert!(Mounts::new(&ws, &opted_out).unwrap().read_only.is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_sandbox_keeps_git_metadata_read_only() {
+    let temp = tempfile::tempdir().unwrap();
+    let ws = temp.path().canonicalize().unwrap().join("ws");
+    fs::create_dir_all(ws.join(".git/hooks")).unwrap();
+    fs::write(ws.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    let policy = Policy::Dev {
+        deny_read: Vec::new(),
+        extra_write: Vec::new(),
+        allow_network: false,
+    };
+    let (code, _) = run(
+        &ws,
+        &policy,
+        r#"echo ordinary > ordinary || exit 10
+           [ "$(cat .git/HEAD)" = "ref: refs/heads/main" ] || exit 11
+           if echo evil > .git/hooks/pre-commit 2>/dev/null; then exit 12; fi
+           if mv .git moved 2>/dev/null; then exit 14; fi
+           if rm -rf .git 2>/dev/null; then exit 15; fi
+           exit 0"#,
+        &[],
+    )
+    .unwrap();
+    assert_eq!(code, Some(0));
+    assert!(!ws.join(".git/hooks/pre-commit").exists());
+}

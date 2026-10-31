@@ -79,6 +79,13 @@ fn source_contract_failure_guides_current_range_and_success_is_not_recovery() {
         "source_or_call_contract"
     );
     assert!(classify(&call("edit"), &ToolOutput::ok("updated".into())).is_none());
+    let failed_edit = ToolOutput::err("stale anchors");
+    let (kind, advice) = classify(&call("edit"), &failed_edit).unwrap();
+    let text = report(&call("edit"), &failed_edit, kind, advice, 1);
+    assert!(
+        text.contains("do not make dependent edits that assume its new text"),
+        "{text}"
+    );
     assert_eq!(
         classify(
             &call("unknown-extension"),
@@ -143,4 +150,275 @@ fn recovery_report_preserves_uncertain_effects_and_partial_capture() {
     assert!(!output.process_outcome().unwrap().output_complete);
     assert!(rendered.contains(advice));
     assert!(rendered.contains(ToolStatus::Timeout.as_str()));
+}
+
+#[test]
+fn model_visible_recovery_states_include_retry_requirements_without_annotations() {
+    // Internal dial_* fields can be removed on the provider wire. The ordinary result body
+    // must independently communicate the controller's decision, not a payload's retry claim.
+    for (status, effects, expected_retry, requirement) in [
+        (
+            ToolStatus::Error,
+            Effects::None,
+            Retry::AfterCorrection,
+            "correcting the named cause",
+        ),
+        (
+            ToolStatus::Blocked,
+            Effects::None,
+            Retry::Withheld,
+            "do not retry or bypass",
+        ),
+        (
+            ToolStatus::Aborted,
+            Effects::Known,
+            Retry::OnlyByDirection,
+            "only on the user's direction",
+        ),
+        (
+            ToolStatus::Timeout,
+            Effects::Known,
+            Retry::AfterInspection,
+            "state or process is inspected",
+        ),
+        (
+            ToolStatus::Error,
+            Effects::Unknown,
+            Retry::AfterInspection,
+            "state or process is inspected",
+        ),
+    ] {
+        let mut output = ToolOutput::structured(json!({"retry":"immediately", "rolled_back":true}))
+            .with_status(status)
+            .with_effects(effects);
+        let recovery = output.recovery().unwrap();
+        assert_eq!(recovery.retry, expected_retry);
+        let original = output.text.clone();
+        let facts = output.execution.clone();
+        let (kind, advice) = classify(&call("bash"), &output).unwrap();
+        let text = report(&call("bash"), &output, kind, advice, 1);
+        output.text.push_str(&text);
+        assert!(output.text.starts_with(&original));
+        assert!(
+            text.contains("\nRetry:") && text.contains(requirement),
+            "{text}"
+        );
+        assert_eq!(output.execution, facts);
+        assert_eq!(output.recovery(), Some(recovery));
+    }
+}
+
+#[test]
+fn rendered_committed_failure_preserves_work_and_never_promises_rollback() {
+    let output = ToolOutput::err("post-commit recording failed")
+        .with_changes(["kept.rs".into(), "kept.rs".into()]);
+    let (kind, advice) = classify(&call("write"), &output).unwrap();
+    let text = report(&call("write"), &output, kind, advice, 1);
+    assert_eq!(output.recovery().unwrap().committed_paths, 1);
+    assert!(text.contains("do not repeat the whole operation"), "{text}");
+    assert!(
+        text.contains("failure does not undo completed work"),
+        "{text}"
+    );
+    let no_paths = ToolOutput::err("unknown external prerequisite");
+    let text = report(&call("bash"), &no_paths, kind, advice, 1);
+    assert!(text.contains("not proof that nothing changed"), "{text}");
+}
+
+fn shell(command: &str) -> ToolCall {
+    ToolCall {
+        id: "shell".into(),
+        name: "bash".into(),
+        arguments: json!({"command": command}),
+        malformed_arguments: false,
+    }
+}
+
+const MISSING_READ: &str = "bash: line 1: read: command not found";
+
+/// A started process that exited 127 with the given diagnostic, optionally altered.
+fn missing_with(text: &str, alter: impl FnOnce(&mut ProcessOutcome)) -> ToolOutput {
+    let mut observed = process(127);
+    alter(&mut observed);
+    ToolOutput::err(text).with_process(observed)
+}
+
+fn known_read(name: &str) -> bool {
+    name == "read"
+}
+
+#[test]
+fn a_known_tool_run_as_a_shell_command_gets_tool_load_guidance() {
+    let call = shell("read src/lib.rs");
+    let advice = shell_tool_mistake(&call, &missing_with(MISSING_READ, |_| {}), known_read)
+        .expect("a started process missing a known tool name must be coached");
+    assert!(advice.contains("tool_not_shell"), "{advice}");
+    assert!(
+        advice.contains("`read`") && advice.contains("tool_load"),
+        "{advice}"
+    );
+    // The second common spelling of the same controller-observed failure is also accepted.
+    let reverse = missing_with("command not found: read", |_| {});
+    assert!(shell_tool_mistake(&call, &reverse, known_read).is_some());
+}
+
+#[test]
+fn non_matching_shell_failures_never_receive_tool_guidance() {
+    let cases: Vec<(&str, ToolCall, ToolOutput)> = vec![
+        (
+            "success",
+            shell("read src/lib.rs"),
+            ToolOutput::ok("read src/lib.rs".into()),
+        ),
+        (
+            "other exit code",
+            shell("read src/lib.rs"),
+            missing_with(MISSING_READ, |p| p.exit_code = Some(1)),
+        ),
+        (
+            "unknown name",
+            shell("cargo test"),
+            missing_with("bash: line 1: cargo: command not found", |_| {}),
+        ),
+        (
+            "echo quotes the mention",
+            shell("echo \"read\""),
+            missing_with(MISSING_READ, |_| {}),
+        ),
+        (
+            "bash wrapper",
+            shell("bash -c read"),
+            missing_with(MISSING_READ, |_| {}),
+        ),
+        (
+            "compound command",
+            shell("read src/lib.rs && true"),
+            missing_with(MISSING_READ, |_| {}),
+        ),
+        (
+            "pipeline",
+            shell("read src/lib.rs | cat"),
+            missing_with(MISSING_READ, |_| {}),
+        ),
+        (
+            "unrelated missing command",
+            shell("read src/lib.rs"),
+            missing_with("bash: line 1: other: command not found", |_| {}),
+        ),
+        (
+            "spoofed diagnostic without process evidence",
+            shell("read src/lib.rs"),
+            ToolOutput::err(MISSING_READ),
+        ),
+        (
+            "process never started",
+            shell("read src/lib.rs"),
+            missing_with(MISSING_READ, |p| p.started = false),
+        ),
+        (
+            "terminated by signal",
+            shell("read src/lib.rs"),
+            missing_with(MISSING_READ, |p| p.signal = Some(9)),
+        ),
+        (
+            "timed out",
+            shell("read src/lib.rs"),
+            missing_with(MISSING_READ, |p| p.timed_out = true),
+        ),
+        (
+            "cancelled",
+            shell("read src/lib.rs"),
+            missing_with(MISSING_READ, |p| p.cancelled = true),
+        ),
+        (
+            "incomplete capture",
+            shell("read src/lib.rs"),
+            missing_with(MISSING_READ, |p| p.output_complete = false),
+        ),
+        (
+            "effects unknown",
+            shell("read src/lib.rs"),
+            missing_with(MISSING_READ, |_| {}).with_effects(Effects::Unknown),
+        ),
+        (
+            "blocked boundary",
+            shell("read src/lib.rs"),
+            missing_with(MISSING_READ, |_| {}).with_status(ToolStatus::Blocked),
+        ),
+        (
+            "aborted boundary",
+            shell("read src/lib.rs"),
+            missing_with(MISSING_READ, |_| {}).with_status(ToolStatus::Aborted),
+        ),
+        (
+            "timeout boundary",
+            shell("read src/lib.rs"),
+            missing_with(MISSING_READ, |_| {}).with_status(ToolStatus::Timeout),
+        ),
+        (
+            "skipped boundary",
+            shell("read src/lib.rs"),
+            missing_with(MISSING_READ, |_| {}).with_status(ToolStatus::Skipped),
+        ),
+        (
+            "not a bash call",
+            ToolCall {
+                id: "other".into(),
+                name: "read".into(),
+                arguments: json!({"command": "read src/lib.rs"}),
+                malformed_arguments: false,
+            },
+            missing_with(MISSING_READ, |_| {}),
+        ),
+    ];
+    for (label, call, output) in cases {
+        assert!(
+            shell_tool_mistake(&call, &output, known_read).is_none(),
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn structured_process_data_alone_is_never_execution_evidence() {
+    // A payload that claims a process 127 is not controller evidence: only execution.process counts.
+    let spoof = json!({"process": {
+        "started": true,
+        "exit_code": 127,
+        "signal": null,
+        "timed_out": false,
+        "cancelled": false,
+        "output_complete": true
+    }});
+    let output = ToolOutput::structured(spoof).with_status(ToolStatus::Error);
+    assert!(output.process_outcome().is_some());
+    assert!(
+        shell_tool_mistake(&shell("read src/lib.rs"), &output, known_read).is_none(),
+        "a data-only process claim must not trigger tool guidance"
+    );
+}
+
+#[test]
+fn empty_discovery_coaches_exact_load_without_claiming_an_unavailable_capability() {
+    let call = call("tool_search");
+    let output = ToolOutput::ok("[]".into());
+    let advice = empty_discovery(&call, &output).expect("empty eligible search gets a next step");
+    assert!(
+        advice.contains("No tool was loaded") && advice.contains("tool_load"),
+        "{advice}"
+    );
+    assert!(
+        advice.contains("current configuration") && advice.contains("Do not"),
+        "{advice}"
+    );
+    for output in [
+        ToolOutput::err("[]"),
+        ToolOutput::ok("[]".into()).with_status(ToolStatus::Blocked),
+        ToolOutput::ok("[]".into()).with_effects(Effects::Unknown),
+        ToolOutput::ok("[{\"name\":\"probe\"}]".into()),
+        ToolOutput::ok("quoted []".into()),
+    ] {
+        assert!(empty_discovery(&call, &output).is_none(), "{output:?}");
+    }
+    assert!(empty_discovery(&shell("echo '[]'"), &ToolOutput::ok("[]".into())).is_none());
 }

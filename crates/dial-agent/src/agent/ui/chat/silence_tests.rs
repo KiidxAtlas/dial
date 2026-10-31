@@ -93,6 +93,8 @@ fn live_retry_control_reaches_the_ui_through_state_ui_and_is_unbound_on_finish()
             PathBuf::new(),
             5,
         );
+        // The UI acts during the wait, so it must outlast the heartbeat; test builds default short.
+        backend.retry_backoff = Duration::from_secs(300);
         let request = Chat {
             messages: vec![json!({"role":"user","content":"finish the task"})],
             tools: vec![],
@@ -320,10 +322,21 @@ fn codex_watchdog_retry(cancel: bool) {
         let (mut first, _) = listener.accept().unwrap();
         let original = read_http_request(&mut first);
         started_tx.send(()).unwrap();
-        // A silent upgrade, not a rejected upgrade: only the agent watchdog can recover it.
-        let mut byte = [0];
-        assert_eq!(first.read(&mut byte).unwrap(), 0);
+        // A silent upgrade, not a rejected upgrade: only the agent watchdog can recover it, and
+        // recovering it closes this connection. The close is awaited apart from the retry, with a
+        // bound well past the 1 s watchdog: a loaded parallel suite can delay it for seconds.
+        let closed = std::thread::spawn(move || {
+            first
+                .set_read_timeout(Some(Duration::from_secs(60)))
+                .unwrap();
+            let mut byte = [0];
+            first.read(&mut byte).map(|count| count == 0)
+        });
         if cancel {
+            assert!(
+                closed.join().unwrap().unwrap(),
+                "stalled upgrade was not closed"
+            );
             return (original, None);
         }
         let (mut second, _) = listener.accept().unwrap();
@@ -336,6 +349,10 @@ fn codex_watchdog_retry(cancel: bool) {
             }})
         );
         write!(second, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        assert!(
+            closed.join().unwrap().unwrap(),
+            "stalled upgrade was not closed"
+        );
         (original, Some(retried))
     });
     let dir = tempfile::tempdir().unwrap();

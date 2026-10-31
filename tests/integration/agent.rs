@@ -3235,10 +3235,11 @@ fn finish_completed_waits_for_live_task_results() {
     );
     let report = a.turn("finish investigation", &mut ui).unwrap();
     assert_eq!(report.outcome, TurnOutcome::Blocked);
+    // The completion waited for the live child and was deferred so its result can be used.
     assert!(
         main.requests.lock()[1]["messages"]
             .to_string()
-            .contains("live tasks are running")
+            .contains("Completion deferred: running work produced an event")
     );
     assert_eq!(a.metrics().turns_completed, 0);
 }
@@ -4391,8 +4392,7 @@ fn compaction_that_cannot_help_says_why_instead_of_summarising_again_and_again()
     for instruction in ["one?", "two?", "three?"] {
         let error = a
             .turn(instruction, &mut ui)
-            .err()
-            .expect("immutable context cannot leave the requested response reserve");
+            .expect_err("immutable context cannot leave the requested response reserve");
         assert!(
             error.to_string().contains("reserved for a useful response"),
             "{error:#}"
@@ -4553,8 +4553,7 @@ fn small_window_refuses_to_spend_response_reserve_or_drop_a_pinned_tool() {
     let mut a = agent(&e, &mut backend, None); // Explicitly pins task for delegation.
     let error = a
         .turn("hello", &mut Recorder::default())
-        .err()
-        .expect("response reserve must be preserved");
+        .expect_err("response reserve must be preserved");
     assert!(
         error.to_string().contains("reserved for a useful response"),
         "{error:#}"
@@ -7818,8 +7817,8 @@ fn known_unoffered_tools_load_without_execution_until_the_next_request() {
     e.config.assistance.compact_tools = true;
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     let mut ui = Recorder::default();
-    a.turn("search the web for Rust release notes", &mut ui)
-        .unwrap();
+    // A research prompt now routes web tools eagerly; keep this test on the deferred path.
+    a.turn("Inspect a deferred integration", &mut ui).unwrap();
     assert_eq!(ui.approvals, ["web_search"]);
     let requests = server.requests.lock();
     assert!(
@@ -7858,14 +7857,14 @@ fn web_search_is_discoverable_loadable_and_respects_network_restrictions() {
     e.config.sandbox.allow_network = false;
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     let mut ui = Recorder::default();
-    a.turn("search the web for Rust release notes", &mut ui)
-        .unwrap();
+    // Exercise discovery rather than the research prompt's eager web-tool routing.
+    a.turn("Inspect a deferred integration", &mut ui).unwrap();
     assert_eq!(ui.approvals, ["web_search"]);
     let requests = server.requests.lock();
     assert!(
         requests[0]["messages"]
             .to_string()
-            .contains("For live web research, discover web_search and web_fetch")
+            .contains("For live web research, load web_search and web_fetch first")
     );
     assert!(
         !requests[0]["tools"]
@@ -8840,27 +8839,12 @@ fn live_training_targets_match_actual_requests_across_turns_and_harvest_final_so
                     && text.contains("SQLite uses transactions")
             })
     }));
+    // This loopback Chat Completions route sends one initial system message (frozen guidance,
+    // stable context, the tool-search addendum and the memory guidance joined), and training
+    // records exactly that layout.
     let system_count = messages.iter().filter(|m| m["role"] == "system").count();
-    assert_eq!(
-        system_count,
-        4,
-        "frozen guidance, stable context, the tool-search addendum and the memory guidance: {:?}",
-        messages
-            .iter()
-            .filter(|m| m["role"] == "system")
-            .map(|m| m["content"]
-                .as_str()
-                .unwrap_or_default()
-                .chars()
-                .take(120)
-                .collect::<String>())
-            .collect::<Vec<_>>()
-    );
-    assert!(
-        messages[..system_count]
-            .iter()
-            .all(|m| m["role"] == "system")
-    );
+    assert_eq!(system_count, 1, "{:?}", messages[0]);
+    assert_eq!(messages[0]["role"], "system");
     assert!(messages.iter().any(|m| {
         m["tool_calls"].to_string().contains("working_state")
             && m["tool_calls"]
@@ -9741,7 +9725,9 @@ fn silent_serial_and_parallel_subagents_keep_ui_alive_and_cancel_before_late_too
                 } else {
                     Reply::Think {
                         reasoning: "Considering the request".into(),
-                        pause: Duration::from_secs(3),
+                        // Far beyond the bound below: returning in time proves the cancel did not
+                        // wait for this reply, even when parallel tests slow the turn's setup.
+                        pause: Duration::from_secs(20),
                     }
                 }
             }),
@@ -9764,7 +9750,7 @@ fn silent_serial_and_parallel_subagents_keep_ui_alive_and_cancel_before_late_too
         );
         assert!(ui.ticks >= 3, "silent child must not block the UI owner");
         assert!(
-            started.elapsed() < Duration::from_secs(2),
+            started.elapsed() < Duration::from_secs(10),
             "cancel must not wait for a child reply"
         );
         assert!(

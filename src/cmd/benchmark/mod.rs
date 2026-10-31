@@ -11,6 +11,7 @@ use dial::{
         RunMetrics, clone_project, compare_baseline, named_invalid_runs,
         rank_machine_configurations, score_report,
     },
+    config::compaction::CompactionMethod,
     config::paths::Layout,
     config::types::{
         Approval, Config, EditMode, LEAN_AUTO_MAX_WINDOW, LeanLocal, ReproFirst, SandboxMode,
@@ -345,7 +346,7 @@ const ASSIST_CASE_TIMEOUT_SECS: u64 = 600;
 /// ships off; `ablate-*` turns off or changes a feature that ships on. Either way exactly one
 /// lever differs from `dial`.
 type FeatureVariant = fn(&mut AssistanceOverrides, EditMode);
-const ASSIST_VARIANTS: [(&str, FeatureVariant); 8] = [
+const ASSIST_VARIANTS: [(&str, FeatureVariant); 9] = [
     ("enable-compact_tools", |o, _| o.compact_tools = Some(true)),
     ("enable-repair_hints", |o, _| o.repair_hints = Some(true)),
     // 0 means unlimited: the initial tool budget is removed.
@@ -367,6 +368,8 @@ const ASSIST_VARIANTS: [(&str, FeatureVariant); 8] = [
         o.lean_local = Some(LeanLocal::Off)
     }),
     ("ablate-local_profile", |o, _| o.local_profile = Some(false)),
+    // Removes the structured file and search tools; the shell edits and searches instead.
+    ("ablate-structured_tools", |o, _| o.bash_only = Some(true)),
 ];
 
 /// The shipped assistance and context-economy values, read from `Config` rather than restated, so
@@ -387,12 +390,14 @@ fn shipped_overrides(shipped: &Config) -> (AssistanceOverrides, EfficiencyOverri
             constrained_repair: Some(assistance.constrained_repair),
             lean_local: Some(assistance.lean_local),
             local_profile: Some(assistance.local.enabled),
+            bash_only: Some(false),
         },
         EfficiencyOverrides {
             tool_preview_bytes: Some(shipped.efficiency.tool_preview_bytes),
             history_token_cap: Some(shipped.efficiency.history_token_cap),
             compaction_enabled: Some(shipped.compaction.enabled),
             keep_recent_tokens: Some(shipped.compaction.keep_recent_tokens),
+            compaction_method_order: Some(shipped.compaction.method_order.clone()),
         },
     )
 }
@@ -420,6 +425,7 @@ fn assist_configurations(
         constrained_repair: Some(false),
         lean_local: Some(LeanLocal::Off),
         local_profile: Some(false),
+        bash_only: Some(false),
     };
     let machine = |name: String, assistance: AssistanceOverrides| MachineConfiguration {
         name,
@@ -460,6 +466,16 @@ fn assist_configurations(
         }
         configurations.push(variant);
     }
+    // Elide recoverable tool evidence before paying for a summary request.
+    let mut shake_first = machine("enable-shake_before_summary".into(), dial.clone());
+    shake_first.efficiency.compaction_method_order = Some(vec![
+        CompactionMethod::Remote,
+        CompactionMethod::Shake,
+        CompactionMethod::Soft,
+        CompactionMethod::Snapcompact,
+        CompactionMethod::Handoff,
+    ]);
+    configurations.push(shake_first);
     type ExperimentSwitch = fn(&mut ExperimentalOverrides);
 
     // One row per experimental workflow switch, each a single change from `dial`.
@@ -680,43 +696,15 @@ fn write_benchmark_home(layout: &Layout, isolated: &Config, user_home: &TempDir)
     Ok(())
 }
 
-/// Apply identical suite-owned evidence mappings in strict and non-strict machine variants.
-/// Final-only assertions cannot be required of every intermediate request in a journey.
-fn case_contract(config: &Config, case: &dial::benchmark::BenchmarkCase) -> Result<Config> {
-    let mut selected = config.clone();
-    if case.turns.is_empty() {
-        for (index, assertion) in case.checks.iter().enumerate() {
-            if let dial::benchmark::Assertion::Command {
-                command,
-                expect_exit: 0,
-                expect_stdout: None,
-            } = assertion
-            {
-                let name = format!("suite_check_{}", index + 1);
-                selected
-                    .verification
-                    .commands
-                    .push(dial::config::types::VerificationCommand {
-                        name: name.clone(),
-                        command: command.clone(),
-                        file_extensions: vec![],
-                        timeout_secs: 120,
-                    });
-                selected.verification.requirements.insert(
-                    name.clone(),
-                    dial::config::types::VerificationRequirement {
-                        checks: vec![name],
-                        visual: false,
-                    },
-                );
-            }
-        }
+/// Strict variants need an explicit, agent-visible verification contract. Suite grader commands are
+/// never copied into the child configuration or its context; `run_command_check` runs them separately
+/// against the finished workspace.
+fn case_contract(config: &Config, _case: &dial::benchmark::BenchmarkCase) -> Result<Config> {
+    if config.verification.strict_requirements && config.verification.requirements.is_empty() {
+        return Err(dial::benchmark::AgentUnavailable("strict-contract evaluation unavailable: no explicit agent-visible verification contract; suite grader commands are never supplied to the agent".into()).into());
     }
-    if selected.verification.strict_requirements && selected.verification.requirements.is_empty() {
-        return Err(dial::benchmark::AgentUnavailable("strict-contract evaluation unavailable: requires single-turn zero-exit command assertions; journey final assertions are not intermediate obligations".into()).into());
-    }
-    selected.validate()?;
-    Ok(selected)
+    config.validate()?;
+    Ok(config.clone())
 }
 
 fn run_agent(
@@ -866,6 +854,16 @@ fn apply_assistance(config: &mut Config, overrides: &AssistanceOverrides) {
     if let Some(value) = overrides.local_profile {
         config.assistance.local.enabled = value;
     }
+    if let Some(bash_only) = overrides.bash_only {
+        config.harness.tools = if bash_only {
+            dial::config::tools::BASH_ONLY
+                .iter()
+                .map(|tool| (*tool).to_owned())
+                .collect()
+        } else {
+            dial::config::tools::default_tools()
+        };
+    }
 }
 
 /// Applies per-configuration context-economy overrides on top of the user's config; unset fields keep it.
@@ -881,6 +879,9 @@ fn apply_efficiency(config: &mut Config, overrides: &EfficiencyOverrides) {
     }
     if let Some(tokens) = overrides.keep_recent_tokens {
         config.compaction.keep_recent_tokens = tokens;
+    }
+    if let Some(order) = &overrides.compaction_method_order {
+        config.compaction.method_order = order.clone();
     }
 }
 
@@ -1010,6 +1011,7 @@ fn assistance_settings(config: &Config) -> serde_json::Value {
         "constrained_repair": config.assistance.constrained_repair,
         "lean_local": config.assistance.lean_local,
         "local_profile": config.assistance.local.enabled,
+        "bash_only": config.harness.tools == dial::config::tools::BASH_ONLY,
         "lean_local_within_auto_window": config.context_window <= LEAN_AUTO_MAX_WINDOW,
     })
 }
@@ -1021,6 +1023,7 @@ fn efficiency_settings(config: &Config) -> serde_json::Value {
         "history_token_cap": config.efficiency.history_token_cap,
         "compaction_enabled": config.compaction.enabled,
         "keep_recent_tokens": config.compaction.keep_recent_tokens,
+        "compaction_method_order": config.compaction.method_order,
     })
 }
 
@@ -1152,7 +1155,7 @@ fn select_configuration(
         "policy_contract_version": 1,
         "policy": shipped_policy(&selected),
         "policy_sha256": format!("{:x}", Sha256::digest(serde_json::to_vec(&shipped_policy(&selected))?)),
-        "case_requirement_mapping": "single_turn_zero_exit_commands_v1",
+        "case_requirement_mapping": "none_grader_independent_v2",
         "local_runtime": selected.local_runtime,
     });
     Ok((selected, settings))

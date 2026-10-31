@@ -243,13 +243,65 @@ impl Codebase {
     pub(super) fn freshness_snapshot(&self) -> Result<Snapshot> {
         let mut snapshot = self.source_snapshot()?;
         // Dependency discovery needs the index; behavioral provenance needs only source bytes.
-        snapshot.outlines = self
-            .conn
-            .lock()
+        Self::attach_outlines(&self.conn.lock(), &mut snapshot)?;
+        Ok(snapshot)
+    }
+
+    fn attach_outlines(conn: &Connection, snapshot: &mut Snapshot) -> Result<()> {
+        snapshot.outlines = conn
             .prepare("SELECT path,outline FROM codebase_files")?
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
             .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
-        Ok(snapshot)
+        Ok(())
+    }
+
+    /// Whole-tree scope for a matched finding. Explicit recall supplies it eagerly; ambient
+    /// retrieval builds it at most once, and only when a matched finding reaches the scope check.
+    pub(super) fn finding_scope(
+        &self,
+        conn: &Connection,
+        topic: &str,
+        eager: Option<&Snapshot>,
+        lazy: &mut Option<Snapshot>,
+    ) -> Result<&'static str> {
+        if let Some(snapshot) = eager {
+            return Self::finding_scope_status(conn, topic, snapshot);
+        }
+        if lazy.is_none() {
+            let mut snapshot = self.source_snapshot()?;
+            Self::attach_outlines(conn, &mut snapshot)?;
+            *lazy = Some(snapshot);
+        }
+        Self::finding_scope_status(conn, topic, lazy.as_ref().context("scope snapshot")?)
+    }
+
+    /// One source's current digest, observed without scanning siblings. Uses the same walker
+    /// admission (ignore rules, policy, links, budgets) as the full scan, pruned to this path.
+    /// Partial traversal or an exhausted call-wide byte budget observes nothing.
+    pub(super) fn observed_digest(
+        &self,
+        ws: &Workspace,
+        path: &str,
+        remaining_bytes: &mut usize,
+    ) -> Option<String> {
+        if *remaining_bytes == 0 {
+            return None;
+        }
+        let target = self.root.join(path);
+        let mut walk = Walk::new(ws);
+        let mut admitted = false;
+        walk.run_with_prefix(&self.root, &target, &mut |absolute| {
+            // Siblings outside the prefix are visited too; stop as soon as this path is admitted.
+            if absolute == target.as_path() {
+                admitted = true;
+                return false;
+            }
+            true
+        });
+        if walk.truncated || !admitted {
+            return None;
+        }
+        source_with_budget(&self.root, path, remaining_bytes).map(|(_, digest)| digest)
     }
 
     /// Fresh, bounded source provenance. Never reuse this across checks: external edits count too.

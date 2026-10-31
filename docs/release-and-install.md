@@ -55,7 +55,7 @@ For local use of the source-tree installers, provide the trusted public PEM befo
 
 ## Other distribution channels
 
-The Homebrew formula is in `Formula/dial.rb`. Each release regenerates its checksums from `SHA256SUMS` with `scripts/update-formula.py` and opens a `release-packaging/<tag>` pull request for review; merge it after the release is published. The Nix flake is `flake.nix`; the Docker image is built from `Dockerfile` and published to `ghcr.io/kiidxatlas/dial` on releases. Pin versions or image digests for reproducible deployment. The container is intended for non-interactive use; mount the project directory and persistent Dial state explicitly.
+The Homebrew formula is in `Formula/dial.rb`. Each release regenerates its checksums from `SHA256SUMS` with `scripts/update-formula.py` and opens a `release-packaging/<tag>` pull request for review; merge it after the release is published. The Nix flake is `flake.nix`; the Docker image is built from `Dockerfile` and published to `ghcr.io/kiidxatlas/dial` on releases. Pin versions or image digests for reproducible deployment. The container runs interactively or one-shot; mount the project directory and persistent Dial state explicitly. [`docs/docker.md`](docker.md) has the `docker run` and Compose recipes, the sandbox options Bubblewrap needs, and Docker Model Runner setup.
 
 To build the container locally, pass the source revision explicitly because `.dockerignore`
 excludes Git metadata:

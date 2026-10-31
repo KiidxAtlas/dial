@@ -9,7 +9,7 @@ use crate::runtime::tool_output::ToolOutput;
 use crate::agent::{
     call_form_error, describe, json_text, looks_like_text_call,
     safety::approval,
-    safety::guard::{LengthAction, clip_evidence},
+    safety::guard::clip_evidence,
     summarize,
     window::output_schema,
     workers::subagents::{Approver, ChildConversation, Env, Job, Outcome, Status, toolset},
@@ -791,8 +791,15 @@ fn child_role_chat(
                 }
                 Ok(())
             };
-            let _provider_slot =
-                crate::agent::model::provider_slots::acquire_checked(role_config, check_admission)?;
+            let _provider_slot = crate::agent::model::provider_slots::acquire_checked(
+                role_config,
+                check_admission,
+                || {
+                    observer
+                        .borrow_mut()
+                        .notice(crate::agent::model::provider_slots::QUEUED_NOTICE)
+                },
+            )?;
             check_admission()?;
             let started = std::time::Instant::now();
             let reply = crate::agent::chat_with_ui(
@@ -2238,8 +2245,10 @@ fn run_inner(
                 }
             }
         }
-        // Same advisory cap as the parent request tail.
-        crate::agent::run::guidance::curate(&mut messages, &mut emissions);
+        // The same request-tail assembly as the parent: one advisory note by priority, then one
+        // merged harness message for this request's plain notes.
+        let notes_start = crate::agent::run::guidance::tail_start(&messages);
+        crate::agent::run::guidance::assemble(&mut messages, notes_start, &mut emissions);
         let mut request = Chat {
             messages: std::mem::take(&mut messages),
             tools: if text_only {
@@ -2408,7 +2417,11 @@ fn run_inner(
                 Ok(())
             }
         };
-        let _provider_slot = match crate::agent::model::provider_slots::acquire_checked(env.config, check_admission) {
+        let _provider_slot = match crate::agent::model::provider_slots::acquire_checked(
+            env.config,
+            check_admission,
+            || observer.borrow_mut().notice(crate::agent::model::provider_slots::QUEUED_NOTICE),
+        ) {
             Ok(slot) => slot,
             Err(_) if env.interrupt.load(Ordering::SeqCst) => return Ok(crate::agent::run::engine::Tick::Finished(Outcome::interrupted(steps))),
             Err(_) => {
@@ -2485,7 +2498,7 @@ fn run_inner(
             provider_request,
             crate::agent::ChatOptions {
                 timeout: env.config.worker_timeout_secs,
-                render_text: true,
+                render_text: !research_step,
                 context_tokens: None,
                 policy: Some(&env.config.reasoning_guard),
                 recovery: None,
@@ -2740,69 +2753,66 @@ fn run_inner(
             use crate::agent::workflow::research::Synthesis;
             let message = match engine.synthesize(&reply) {
                 Synthesis::Accepted => {
-                    let assistant = llm::assistant_message(&reply);
-                    if let Err(error) = children.archive_assistant(&messages, &assistant, None) {
+                    // Internal checkpoint records must not become child transcript answers.
+                    let archived = children.archive(&messages).and_then(|()| {
+                        let mut journal = children.journal.borrow_mut();
+                        let mut control = journal.session.control_state();
+                        control["research_checkpoint"] = json!({"response":reply.text,"verified":false});
+                        journal.session.set_control_state(control)
+                    });
+                    if let Err(error) = archived {
                         return Ok(crate::agent::run::engine::Tick::Finished(Outcome::failed(steps, format!("archiving research synthesis: {error:#}"))));
                     }
-                    messages.push(assistant);
-                    "Research checkpoint recorded as unverified model findings. Resume the existing assignment with its tools and permissions unchanged; implement if supported, report findings, or investigate the stated remaining question.".to_owned()
+                    approver.notice("Research checkpoint recorded as unverified findings; following through on the next action.");
+                    None
                 }
-                Synthesis::Retry(message) => message,
+                Synthesis::Retry(message) => Some(message),
                 Synthesis::Incomplete(message) => {
                     return Ok(crate::agent::run::engine::Tick::Finished(Outcome::incomplete(steps, message)));
                 }
             };
-            messages.push(json!({"role":"user","dial_transient":true,"content":message}));
+            if let Some(message) = message {
+                messages.push(json!({"role":"user","dial_transient":true,"content":message}));
+            }
             return Ok(crate::agent::run::engine::Tick::Again);
         }
-        if reply.finish_reason == "length" {
-            if env.config.reasoning_guard.enabled
-                && reply.text.trim().is_empty()
-                && reply.tool_calls.is_empty()
-            {
-                match reasoning_recovery
-                    .intercept("the output token limit was spent without any answer or tool call")
-                {
-                    Ok(message) => {
-                        approver.notice(&message);
-                        messages.push(json!({"role":"user","content":message}));
-                    }
-                    Err(message) => return Ok(crate::agent::run::engine::Tick::Finished(Outcome::failed(steps, message))),
+        let length_facts = crate::agent::run::reply_triage::LengthFacts {
+            reasoning_guard: env.config.reasoning_guard.enabled,
+            // Workers have no todo plan tool to gate on.
+            plan_gate: false,
+            requested_tokens: max_tokens,
+            window: child_window(env, backend),
+            prompt_tokens: reply.prompt_tokens.unwrap_or(0),
+        };
+        if let Some(truncation) = crate::agent::run::reply_triage::truncation(
+            engine,
+            &mut reasoning_recovery,
+            &reply,
+            &length_facts,
+        ) {
+            use crate::agent::run::reply_triage::Truncation;
+            match truncation {
+                Truncation::Reasoning { message, .. } => {
+                    approver.notice(&message);
+                    messages.push(json!({"role":"user","content":message}));
                 }
-                return Ok(crate::agent::run::engine::Tick::Again);
-            }
-            let prompt = reply.prompt_tokens.unwrap_or(0);
-            match engine.length(
-                max_tokens,
-                child_window(env, backend),
-                prompt,
-                &reply,
-            ) {
-                LengthAction::Retry { max_tokens: raised } => {
-                    max_tokens = raised;
-                }
-                LengthAction::Nudge { partial, message } => {
+                Truncation::Raise(raised) => max_tokens = raised,
+                Truncation::Continue { partial, message } => {
                     if let Some(text) = partial {
                         messages.push(json!({"role":"assistant","content":text}));
                     }
                     messages.push(json!({"role":"user","content":message}));
                 }
-                LengthAction::Incomplete(message) => {
-                    return Ok(crate::agent::run::engine::Tick::Finished(Outcome::incomplete(steps, message)));
+                Truncation::Stop(reason) => {
+                    return Ok(crate::agent::run::engine::Tick::Finished(Outcome::incomplete(steps, reason)));
+                }
+                Truncation::ReasoningExhausted(reason) => {
+                    return Ok(crate::agent::run::engine::Tick::Finished(Outcome::failed(steps, reason)));
                 }
             }
             return Ok(crate::agent::run::engine::Tick::Again);
         }
         engine.length_recovered(&reply);
-        let unusable = reply.dropped_tool_call()
-            || (reply.tool_calls.is_empty() && looks_like_text_call(&reply.text, &names));
-        if let Err(reason) = engine.recovery.form(unusable) {
-            return Ok(crate::agent::run::engine::Tick::Finished(Outcome::incomplete(steps, reason)));
-        }
-        if reply.dropped_tool_call() {
-            messages.push(json!({"role":"user","content":"Your tool call was unreadable JSON. Issue it again with valid arguments, or answer directly."}));
-            return Ok(crate::agent::run::engine::Tick::Again);
-        }
         let mut recovered_original = None;
         if reply.finish_reason == "stop"
             && reply.tool_calls.is_empty()
@@ -2823,9 +2833,17 @@ fn run_inner(
             });
             reply.text.clear();
         }
-        if reply.tool_calls.is_empty() && looks_like_text_call(&reply.text, &names) {
-            messages.push(json!({"role":"assistant","content":reply.text}));
-            messages.push(json!({"role":"user","content":"That looked like a tool call written as plain text, so nothing ran. Call the tool through the tool-calling interface, or answer in words."}));
+        // Classified after inline-edit recovery, as in the foreground loop, so a recovered edit
+        // never counts as a form failure.
+        let form_failure = crate::agent::run::reply_triage::FormFailure::of(&reply, &names);
+        if let Err(reason) = engine.recovery.form(form_failure.is_some()) {
+            return Ok(crate::agent::run::engine::Tick::Finished(Outcome::incomplete(steps, reason)));
+        }
+        if let Some(failure) = form_failure {
+            if failure == crate::agent::run::reply_triage::FormFailure::TextCall {
+                messages.push(json!({"role":"assistant","content":reply.text}));
+            }
+            messages.push(json!({"role":"user","content":failure.correction()}));
             return Ok(crate::agent::run::engine::Tick::Again);
         }
         match engine
@@ -2989,7 +3007,7 @@ fn run_inner(
             if call.malformed_arguments {
                 continue;
             }
-            call.name = crate::agent::run::tool_compat::canonical_name(&call.name, &names).to_owned();
+            call.name = crate::agent::run::tool_compat::canonical_name(&call.name, &names).into_owned();
             if let Some(parameters) = schemas
                 .iter()
                 .find(|s| s["function"]["name"] == call.name)
@@ -3260,6 +3278,16 @@ fn run_inner(
             }
             let tool_seconds = seconds.unwrap_or_else(|| started.elapsed().as_secs_f64());
             portable_batch_intercepted |= rule_state.callback_pending();
+            if let Some(advice) = crate::agent::run::failure_guidance::empty_discovery(call, &output) {
+                output.text.push_str(advice);
+            }
+            if let Some(advice) = crate::agent::run::failure_guidance::shell_tool_mistake(
+                call,
+                &output,
+                |name| names.iter().any(|tool| tool == name),
+            ) {
+                output.text.push_str(&advice);
+            }
             let (duplicate, repeat_advice, stop) =
                 engine.settle(env.workspace, call, &mut output, false, false, |id| {
                     superseded.holds_full(id) && messages

@@ -1,0 +1,15 @@
+# Experimental candidate; loopback LM Studio may proxy to another device.
+[machine]
+repetitions = 1
+case_timeout_secs = 300
+minimum_correctness = 1.0
+allow_remote = false
+
+[[configurations]]
+name = "gemma-e4b-compact-tools"
+provider = "lm-studio"
+model = "google/gemma-4-e4b"
+context_window = 65536
+
+[configurations.assistance]
+compact_tools = true

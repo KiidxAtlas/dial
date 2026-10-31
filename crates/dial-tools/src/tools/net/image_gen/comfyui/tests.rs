@@ -1,6 +1,7 @@
 //! Loopback fixtures for ComfyUI: the configured workflow is submitted with only the prompt
 //! replaced, polled through history for the returned id, and its single output downloaded from
 //! `/view` without credentials. Refusals happen before any submission. No live service is used.
+use super::super::loopback::Server;
 use super::super::{Format, Source, Wire};
 use super::*;
 use crate::config::image::{ComfyWorkflow, ImageModelSettings};
@@ -11,7 +12,6 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const KEY: &str = "sk-comfy-key";
@@ -104,13 +104,14 @@ fn respond(mut stream: TcpStream, status: u16, body: &[u8]) {
     let _ = stream.write_all(body);
 }
 
-/// Answers the scripted `(status, body)` replies in order on loopback and returns every request
-/// received. A request beyond the script gets HTTP 404, so an unexpected call is visible.
-fn serve(replies: Vec<(u16, Vec<u8>)>) -> (String, JoinHandle<Vec<String>>) {
+/// Answers the scripted `(status, body)` replies in order on loopback. A request beyond the script
+/// gets HTTP 404, so an unexpected call is visible. The thread stops when the test joins it (or
+/// after a long idle period if it never does); joining returns every request received.
+fn serve(replies: Vec<(u16, Vec<u8>)>) -> (String, Server) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    let handle = std::thread::spawn(move || {
+    let server = Server::spawn(move |stop| {
         let mut replies = replies.into_iter();
         let mut seen = Vec::new();
         let mut last = Instant::now();
@@ -127,7 +128,7 @@ fn serve(replies: Vec<(u16, Vec<u8>)>) -> (String, JoinHandle<Vec<String>>) {
                     last = Instant::now();
                 }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                    if last.elapsed() > Duration::from_millis(1500) {
+                    if stop.load(Ordering::SeqCst) || last.elapsed() > Duration::from_secs(15) {
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(5));
@@ -137,7 +138,7 @@ fn serve(replies: Vec<(u16, Vec<u8>)>) -> (String, JoinHandle<Vec<String>>) {
         }
         seen
     });
-    (base, handle)
+    (base, server)
 }
 
 /// A loopback address with no server; any connection attempt is recorded by `assert_no_connection`.

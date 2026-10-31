@@ -248,3 +248,98 @@ fn ambient_source_rows_do_not_repeat_with_changing_neighbours() {
     assert!(!context.contains("component: router") && !context.contains("router.rs"));
     assert!(context.contains("storage"));
 }
+
+#[test]
+fn request_and_recovery_attribution_is_aggregate_and_stops_counting_at_first_change() {
+    use crate::config::adaptive::Phase;
+    use serde_json::json;
+    let mut metrics = Metrics::default();
+    let overhead = RequestOverhead::default();
+    metrics.request(&overhead, true, Phase::Investigation);
+    metrics.request(&overhead, false, Phase::Recovery);
+    metrics.recovery("truncated output");
+    metrics.recovery("truncated output");
+    metrics.recovery("context overflow");
+    let call = crate::llm::ToolCall {
+        id: "edit-1".into(),
+        name: "edit".into(),
+        arguments: json!({"input":"private source"}),
+        malformed_arguments: false,
+    };
+    metrics.tool_result(&call, true, std::time::Duration::from_millis(42));
+    metrics.request(&overhead, false, Phase::Verification);
+    let mut tracker = crate::agent::window::request_prefix::Tracker::default();
+    let mut request = crate::llm::Chat {
+        messages: vec![json!({"role":"user","content":"private question"})],
+        tools: vec![],
+        temperature: 0.0,
+        max_tokens: 100,
+        seed: None,
+    };
+    let first = tracker.observe("model", &request);
+    metrics.prefix(&first);
+    request
+        .messages
+        .push(json!({"role":"assistant","content":"private answer"}));
+    let second = tracker.observe("model", &request);
+    metrics.prefix(&second);
+    let reply = crate::llm::Reply {
+        text: "private answer".into(),
+        tool_calls: vec![call],
+        ..Default::default()
+    };
+    metrics.generation(&reply);
+    assert_eq!(metrics.requests, 3);
+    assert_eq!(metrics.lightweight_requests, 1);
+    assert_eq!(metrics.requests_by_phase.values().sum::<u64>(), 3);
+    assert_eq!(metrics.requests_before_first_workspace_change_result, 2);
+    assert_eq!(metrics.first_workspace_change_result_ms, Some(42));
+    assert_eq!(metrics.prefix_invalidations["initial"], 1);
+    assert_eq!(metrics.prefix_invalidations["none"], 1);
+    assert_eq!(
+        metrics.stable_message_bytes,
+        first.request_message_bytes as u64
+    );
+    assert_eq!(
+        metrics.changed_message_bytes,
+        (first.request_message_bytes + second.changed_message_bytes) as u64
+    );
+    assert_eq!(metrics.recovery_attempts["truncated output"], 2);
+    assert_eq!(metrics.recovery_attempts["context overflow"], 1);
+    assert_eq!(metrics.observed_reply_text_bytes, reply.text.len() as u64);
+    assert_eq!(
+        metrics.observed_tool_argument_bytes,
+        serde_json::to_vec(&reply.tool_calls[0].arguments)
+            .unwrap()
+            .len() as u64
+    );
+    let report = serde_json::to_string(&metrics).unwrap();
+    assert!(!report.contains("private"));
+}
+
+#[test]
+fn backend_timings_are_inclusive_aggregate_and_saturating() {
+    let metrics = Metrics::default();
+    metrics.backend_operation("check_input_capture", std::time::Duration::from_micros(7));
+    metrics.backend_operation("check_input_capture", std::time::Duration::from_micros(9));
+    metrics.backend_operation("check_reuse", std::time::Duration::from_micros(30));
+    let report = serde_json::to_value(&metrics).unwrap();
+    assert_eq!(
+        report["backend_operations"]["check_input_capture"]["calls"],
+        2
+    );
+    assert_eq!(
+        report["backend_operations"]["check_input_capture"]["elapsed_us"],
+        16
+    );
+    assert_eq!(
+        report["backend_operations"]["check_reuse"]["elapsed_us"],
+        30
+    );
+    metrics.backend_operation("check_reuse", std::time::Duration::MAX);
+    let report = serde_json::to_value(&metrics).unwrap();
+    assert_eq!(
+        report["backend_operations"]["check_reuse"]["elapsed_us"],
+        u64::MAX
+    );
+}

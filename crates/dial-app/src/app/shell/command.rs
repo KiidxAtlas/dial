@@ -317,7 +317,10 @@ impl Shell {
                 }
             }
             "rename" => match agent.session_mut().rename(args) {
-                Ok(()) => self.note("Session", format!("renamed to {}", agent.session().title())),
+                Ok(()) => {
+                    self.set_scope(&agent.session().title());
+                    self.note("Session", format!("renamed to {}", agent.session().title()))
+                }
                 Err(error) => self.note("Session", format!("{error:#}")),
             },
             "export" => {
@@ -543,6 +546,7 @@ impl Shell {
                     agent.set_plan_mode(false);
                     self.stop_loop_for_session_change();
                     self.session_id = id.clone();
+                    self.set_scope(&agent.session().title());
                     self.note("Session", format!("forked into {}", short(&id)));
                 }
                 Err(error) => self.note("Session", format!("error: {error:#}")),

@@ -19,9 +19,12 @@ pub(super) fn generation() -> u64 {
 
 /// Records a state change and wakes every waiter.
 pub(super) fn notify() {
-    let mut generation = GENERATION.lock();
-    *generation = generation.wrapping_add(1);
-    CHANGED.notify_all();
+    {
+        let mut generation = GENERATION.lock();
+        *generation = generation.wrapping_add(1);
+        CHANGED.notify_all();
+    }
+    crate::platform::wake::signal();
 }
 
 /// Blocks while the generation still equals `seen`, until it moves or `deadline` passes.

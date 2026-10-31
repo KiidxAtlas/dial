@@ -23,9 +23,13 @@ work or infer semantic dependencies between tasks.
   Claims last through the next turn and clear when that turn becomes idle; use `clear` to release
   them earlier. Normal same-session settings/model rebuilds retain the peer ID and queued mail.
 - `send` queues guidance for a live peer. Messages and inboxes are bounded; check the returned result
-  rather than assuming delivery. During a turn, guidance reaches the next model-request boundary;
-  it does not interrupt an in-flight model response or tool call. In an open terminal, fresh mail
-  can also wake an eligible idle conversation (see below). Queuing is not acknowledgement.
+  rather than assuming delivery. Sending never waits for the sender's turn: the letter goes straight
+  into the peer's inbox, also from the side pane while a turn runs. On the receiving side, guidance
+  reaches the next model-request boundary; it does not interrupt an in-flight model response or tool
+  call. While a turn is suspended waiting for background jobs, live workers or side questions, fresh
+  mail ends that wait (checked about once per second) so it reaches the model at once, and the
+  awaited work keeps running. In an open terminal, fresh mail can also wake an eligible idle
+  conversation (see below). Queuing is not acknowledgement.
 - `clear` clears this session's claimed scopes, not its conversation or another peer's state.
 
 The subcommands write ordinary transcript notices. During a running turn, `/peers` and its
@@ -54,9 +58,11 @@ Bare `/peers` opens a board of the sessions in this checkout:
 
 Keys: `↑`/`↓` (or `Home`/`End`) select a peer; `Enter` or `m` writes a one-line message to the
 selected peer (`Enter` sends, `Esc` cancels the message); `r` refreshes; `c` clears this
-session's own claims; `Esc` closes. The panel is a snapshot taken when it opens and after each
-action: it does not poll, so press `r` to see newer peer state. Each send or clear reports its
-outcome in the panel. The panel never changes another session's claims.
+session's own claims; `Esc` closes. The panel takes a fresh snapshot when it opens, after each
+action, and about every two seconds while it is open, so sessions that start or end appear without
+pressing anything (the selected peer stays selected, and nothing refreshes while you type a
+message); `r` refreshes at once. If the registry is unavailable the panel keeps what it shows. Each
+send or clear reports its outcome in the panel. The panel never changes another session's claims.
 
 ## Task-scoped guidance and idle wake-ups
 
