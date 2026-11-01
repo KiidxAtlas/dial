@@ -17,6 +17,8 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+## [0.2.10] - 2026-11-01
+
 ### Added
 
 - Experimental **Reasoning strategy** settings offer eight selectable prompt-guidance presets plus an unchanged default. Built-in main-agent prompts and new/resumed workers share the selected approach; custom main prompt replacements/templates opt out. This does not edit private chain of thought, change thinking controls, or relax role, approval, budget or verification boundaries. Outcome and token-cost effects are unmeasured (`docs/agent-loop.md`).
