@@ -26,7 +26,59 @@ pub(in crate::platform) fn spawn(command: &mut Command) -> io::Result<Child> {
     let _spawning = SPAWN
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    command.spawn()
+    #[cfg(target_os = "linux")]
+    {
+        launcher::spawn(command)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        command.spawn()
+    }
+}
+
+/// Linux delivers a parent-death signal (`PR_SET_PDEATHSIG`, used by bubblewrap's
+/// `--die-with-parent`) when the *thread* that forked the child exits, not the process. Tool
+/// calls run on short-lived threads, so a sandboxed background job forked there was killed as
+/// soon as its call returned. Every child is therefore forked by one thread that lives as long as
+/// Dial, and a parent-death signal still means that Dial itself exited.
+#[cfg(target_os = "linux")]
+mod launcher {
+    use std::io;
+    use std::process::{Child, Command};
+    use std::sync::{OnceLock, mpsc};
+
+    type Reply = (Command, io::Result<Child>);
+    type Job = (Command, mpsc::SyncSender<Reply>);
+
+    static LAUNCHER: OnceLock<Option<mpsc::Sender<Job>>> = OnceLock::new();
+
+    fn start() -> Option<mpsc::Sender<Job>> {
+        let (jobs, received) = mpsc::channel::<Job>();
+        std::thread::Builder::new()
+            .name("dial-spawn".to_owned())
+            .spawn(move || {
+                for (mut command, reply) in received {
+                    let child = command.spawn();
+                    let _ = reply.send((command, child));
+                }
+            })
+            .ok()?;
+        Some(jobs)
+    }
+
+    pub(super) fn spawn(command: &mut Command) -> io::Result<Child> {
+        let jobs = LAUNCHER.get_or_init(start).as_ref().ok_or_else(|| {
+            io::Error::other("cannot start the process launcher thread; nothing was spawned")
+        })?;
+        // The command travels to the launcher and back, so callers keep inspecting it afterwards.
+        let job = std::mem::replace(command, Command::new(""));
+        let (reply, result) = mpsc::sync_channel(1);
+        let lost = || io::Error::other("the process launcher thread stopped");
+        jobs.send((job, reply)).map_err(|_| lost())?;
+        let (job, child) = result.recv().map_err(|_| lost())?;
+        *command = job;
+        child
+    }
 }
 
 pub(in crate::platform) fn spawn_group(command: &mut Command) -> io::Result<Child> {

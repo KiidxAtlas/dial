@@ -190,6 +190,8 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 - Bounded subprocesses that are cancelled, time out or exit now signal their process group a second time after the leader exits, while its PID is still reserved. On macOS a descendant forked during the first `killpg` could miss it and hold the output pipes open, so a cancelled command was intermittently reported with incomplete output after a 300 ms drain wait. The test-suite flake was reproduced outside Dial (about 7% of kills under load) and was not seen with the second signal.
 
+- On Linux, sandboxed background jobs (`bg start` and `bash` with `pty: true`) are no longer killed as soon as the tool call that started them returns. bubblewrap's `--die-with-parent` uses a parent-death signal that fires when the forking *thread* exits, and tool calls run on short-lived threads, so a job's first `bg input` found it `killed by signal 9`. Children are now forked by one launcher thread that lives as long as Dial, so the signal still fires when Dial itself exits. The `terminal-launch-recovery` smoke case caught this on Linux CI; a Linux unit regression covers a child spawned from an exited thread.
+
 - OpenAI-compatible zero-output usage reports no longer falsely mark local prompt processing as generation and arm the 30-second silence watchdog. Positive output counts still mark generation, and real stalls remain recoverable. A deterministic parser regression covers zero, positive and missing output counts; live-host reproduction is unmeasured (`docs/llm-transport.md`).
 
 - Tool reliability and usage statistics (`docs/plans/tool-reliability-and-stats.md`):

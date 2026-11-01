@@ -488,7 +488,7 @@ impl Proc {
                     Ok(())
                 });
             }
-            let child = spawn.spawn().map_err(|e| {
+            let child = crate::platform::process::spawn(&mut spawn).map_err(|e| {
                 crate::tools::exec::shell::discard_unspawned_script(&spawn);
                 format!("starting sandboxed PTY shell: {e}")
             })?;
