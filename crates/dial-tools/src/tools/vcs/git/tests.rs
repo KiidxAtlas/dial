@@ -73,6 +73,65 @@ fn read_and_write_flow() {
 }
 
 #[test]
+fn read_actions_neutralize_untrusted_filter_drivers() {
+    let (dir, ws) = repo();
+    let marker = dir.path().join("pwned");
+    let git_raw = |args: &[&str]| {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "{args:?}"
+        )
+    };
+    // A clean filter whose command would run arbitrary code on `git status`/`git diff`.
+    git_raw(&[
+        "config",
+        "filter.evil.clean",
+        &format!("sh -c 'touch {}; cat'", marker.display()),
+    ]);
+    std::fs::write(dir.path().join(".gitattributes"), "* filter=evil\n").unwrap();
+
+    // Baseline: without neutralization the clean filter executes, so the test is meaningful.
+    std::fs::write(dir.path().join("a.txt"), "one\nraw\n").unwrap();
+    assert!(
+        Command::new("git")
+            .args(["diff"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(marker.exists(), "raw git diff should run the clean filter");
+    std::fs::remove_file(&marker).unwrap();
+
+    // Through the git tool, the filter is neutralized but the diff is still produced.
+    std::fs::write(dir.path().join("a.txt"), "one\ntool\n").unwrap();
+    let diff = call(&ws, json!({"action":"diff","path":"a.txt"}));
+    assert!(!diff.is_error, "{}", diff.text);
+    assert!(diff.text.contains("+tool"), "{}", diff.text);
+    assert!(
+        !marker.exists(),
+        "the git tool must not run the clean filter"
+    );
+
+    // `status` is hardened the same way.
+    std::fs::write(dir.path().join("a.txt"), "one\nstatus\n").unwrap();
+    let status = call(&ws, json!({"action":"status"}));
+    assert!(!status.is_error, "{}", status.text);
+    assert!(status.text.contains("a.txt"), "{}", status.text);
+    assert!(
+        !marker.exists(),
+        "the git tool must not run the clean filter on status"
+    );
+}
+
+#[test]
 fn hostile_arguments_are_refused() {
     let (_dir, ws) = repo();
     for rev in ["--output=/tmp/x", "-p", "a..b", "x y", ""] {

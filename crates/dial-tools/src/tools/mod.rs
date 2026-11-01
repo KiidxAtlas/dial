@@ -865,7 +865,47 @@ impl Workspace {
         })
     }
 
+    /// Whether `path` lies in Git metadata under a workspace root that mutating tools must never
+    /// write: any `.git` path component, plus the git directory and common directory of an existing
+    /// linked worktree ([`exec::sandbox::git_metadata`]). Hooks, config and the index there are
+    /// later executed or trusted by unsandboxed `git`, so a native `write`/`edit`/`ast_edit`/
+    /// `notebook_edit` or an LSP workspace edit must not be able to plant them; reads are unaffected.
+    ///
+    /// The cheap `.git`-component test closes the exploit on its own (relocating the git directory
+    /// needs a `.git` pointer file or symlink, itself a write to a `.git` path) and also covers
+    /// nested repositories, as the LSP refusal it replaces did. Unlike the bash sandbox, which lets
+    /// `git init` create a not-yet-existing `.git`, this refuses `.git` paths whether or not they
+    /// exist: native file tools never initialize a repository, so there is nothing to allow. The
+    /// precise set additionally guards an existing linked worktree whose git directory a `gitdir:`
+    /// pointer places outside any `.git/` path.
+    pub(crate) fn is_git_metadata(&self, path: &Path) -> bool {
+        let canonical = Self::canonical_prefix(path);
+        let has_dot_git = |candidate: &Path| {
+            self.roots().any(|root| {
+                candidate
+                    .strip_prefix(root)
+                    .is_ok_and(|rel| rel.components().any(|part| part.as_os_str() == ".git"))
+            })
+        };
+        if has_dot_git(path) || has_dot_git(&canonical) {
+            return true;
+        }
+        let roots: Vec<PathBuf> = self.roots().map(Path::to_path_buf).collect();
+        exec::sandbox::git_metadata(&roots)
+            .map(|dirs| {
+                dirs.iter()
+                    .any(|dir| path.starts_with(dir) || canonical.starts_with(dir))
+            })
+            .unwrap_or(false)
+    }
+
     fn check_protected_mutation(&self, path: &Path) -> Result<(), String> {
+        if self.is_git_metadata(path) {
+            return Err(format!(
+                "mutation of {:?} would change Git metadata, whose hooks and config are later run by unsandboxed git; use the git tool for commits, or list it in sandbox.extra_write for shell writes",
+                self.rel(path)
+            ));
+        }
         if self.protected_paths.is_empty() {
             return Ok(());
         }

@@ -292,12 +292,7 @@ fn target(ws: &Workspace, uri: &str) -> Result<PathBuf, String> {
     if !abs.is_file() {
         return Err(format!("{uri:?} is not a regular file in the workspace"));
     }
-    if abs
-        .strip_prefix(ws.root())
-        .map_err(|_| "edit target is outside the workspace")?
-        .components()
-        .any(|part| part.as_os_str() == ".git")
-    {
+    if ws.is_git_metadata(&abs) {
         return Err("LSP edits to Git internals are refused".into());
     }
     Ok(abs)

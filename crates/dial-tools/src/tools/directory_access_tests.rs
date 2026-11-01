@@ -111,6 +111,75 @@ fn sensitive_nested_root_accepts_relative_paths_but_not_sibling_symlinks() {
 }
 
 #[test]
+fn git_metadata_is_refused_for_native_mutations_but_gitattributes_is_allowed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+    std::fs::write(root.join(".git/config"), "[core]\n").unwrap();
+    let ws = Workspace::new(&root).unwrap();
+
+    // `.git` metadata is protected from native tools, matching the bash sandbox: unsandboxed git
+    // would later run a planted hook or filter command.
+    for target in [".git/config", ".git/hooks/pre-commit", ".git"] {
+        assert!(ws.is_git_metadata(&root.join(target)), "{target}");
+        assert!(
+            ws.check_protected_mutation(&root.join(target)).is_err(),
+            "{target}"
+        );
+    }
+    // A `write` tool call targeting `.git` is blocked and never reaches disk.
+    let blocked = testkit::run(
+        &ws,
+        "write",
+        json!({"path": ".git/config", "content": "[filter \"x\"]\n\tclean = sh -c id\n"}),
+    );
+    assert!(blocked.is_error, "{}", blocked.text);
+    assert_eq!(
+        std::fs::read_to_string(root.join(".git/config")).unwrap(),
+        "[core]\n",
+        "the planted config must not have been written"
+    );
+
+    // `.gitattributes` is an ordinary tracked file: it cannot define a filter command by itself, so
+    // it is not treated as protected metadata and ordinary edits are allowed.
+    assert!(!ws.is_git_metadata(&root.join(".gitattributes")));
+    assert!(
+        ws.check_protected_mutation(&root.join(".gitattributes"))
+            .is_ok()
+    );
+    let attrs = testkit::run(
+        &ws,
+        "write",
+        json!({"path": ".gitattributes", "content": "* text=auto\n"}),
+    );
+    assert!(!attrs.is_error, "{}", attrs.text);
+
+    // Ordinary source files are unaffected, including names that merely begin with `.git`.
+    for ok in [
+        "src/main.rs",
+        ".gitignore",
+        ".gitmodules",
+        ".github/workflows/ci.yml",
+    ] {
+        assert!(!ws.is_git_metadata(&root.join(ok)), "{ok}");
+        assert!(ws.check_protected_mutation(&root.join(ok)).is_ok(), "{ok}");
+    }
+
+    // Native file tools never run `git init`, so `.git` paths are refused whether or not `.git`
+    // already exists — stricter than the shell sandbox, which allows `git init` into an empty dir.
+    let fresh = tempfile::tempdir().unwrap();
+    let fresh = fresh.path().canonicalize().unwrap();
+    let ws2 = Workspace::new(&fresh).unwrap();
+    assert!(ws2.is_git_metadata(&fresh.join(".git/config")));
+    assert!(
+        ws2.check_protected_mutation(&fresh.join(".git/config"))
+            .is_err()
+    );
+    // A nested repository's metadata is refused too, matching the LSP guard.
+    assert!(ws.is_git_metadata(&root.join("vendor/dep/.git/config")));
+}
+
+#[test]
 fn configured_storage_grants_sessions_without_granting_credential_files() {
     let tmp = tempfile::tempdir().unwrap();
     let project = tmp.path().join("project");

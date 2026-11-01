@@ -2,7 +2,10 @@
 //!
 //! Every action builds a fixed argument vector (no shell), validates refs and paths, and runs
 //! with fsmonitor, external diff drivers, textconv and pagers switched off, because repository
-//! configuration is untrusted. Approved commits/pushes honour the repository's hooks and signing
+//! configuration is untrusted. Read actions that inspect the working tree (`status`, `diff`) also
+//! neutralize every configured `filter.*` driver (see [`filter_neutralizers`]), so an untrusted
+//! `filter.<x>.clean`/`process` cannot execute while a modified tracked file is examined.
+//! Approved commits/pushes honour the repository's hooks and signing
 //! unless `git.bypass_hooks` is set, which the output then says. Reads need no approval;
 //! anything that changes the repository or reaches the network does, except the read-only `gh`
 //! queries (`pr_view`, `pr_checks`, `issue_view`), which are in `READS` and run unapproved. There
@@ -142,6 +145,9 @@ struct Invocation<'a> {
     envs: &'a [(&'a str, &'a std::ffi::OsStr)],
     cancel: &'a AtomicBool,
     may_mutate: bool,
+    /// Extra `git -c key=value` overrides inserted before the subcommand, used to neutralize
+    /// untrusted `filter.*` drivers on read actions (see [`filter_neutralizers`]). Empty otherwise.
+    config_overrides: &'a [String],
 }
 
 /// Run `program` with a bounded time. Returns (success, stdout, stderr), each complete up to
@@ -156,6 +162,7 @@ fn run_streams(inv: Invocation<'_>) -> Result<(bool, String, String), String> {
         envs,
         cancel,
         may_mutate,
+        config_overrides,
     } = inv;
     let mut command = Command::new(program);
     if program == "git" {
@@ -174,6 +181,11 @@ fn run_streams(inv: Invocation<'_>) -> Result<(bool, String, String), String> {
             "protocol.ext.allow=never",
             "--no-pager",
         ]);
+        // Caller-supplied overrides (filter neutralization) follow the fixed ones but precede the
+        // subcommand, so `args.first()` stays the action for the status capture-limit check below.
+        for kv in config_overrides {
+            command.arg("-c").arg(kv);
+        }
     } else if program == "jj" {
         command.args(["--no-pager", "--color=never"]);
     }
@@ -245,6 +257,7 @@ fn git_streams(
         envs,
         cancel,
         may_mutate: mutating,
+        config_overrides: &[],
     })
 }
 
@@ -549,6 +562,7 @@ fn jj_dispatch(
             envs: &[],
             cancel,
             may_mutate: !READS.contains(&action),
+            config_overrides: &[],
         })
     };
     match action {
@@ -624,6 +638,46 @@ fn commit_message(args: &Value) -> Result<&str, String> {
         return Err(format!("commit message must be 1..{MAX_MESSAGE} bytes"));
     }
     Ok(message)
+}
+
+/// `git -c` overrides that stop every configured `filter.*` driver from executing during a read.
+///
+/// `git status`/`git diff` run a filter's `clean`/`process` command on modified tracked files, and
+/// that command lives in repository config, which is untrusted. Blanking `clean`, `smudge` and
+/// `process` (and clearing `required`, which would otherwise fail the read) makes each driver a
+/// no-op pass-through: the real diff is still produced, but no external program runs. The driver
+/// names come from `git config --name-only --get-regexp`, a plain config read that never invokes a
+/// driver; an empty or failed enumeration yields no overrides. This complements protecting
+/// `.git/config` from writes: even a pre-existing or globally configured filter cannot run on a read.
+fn filter_neutralizers(root: &Path, cancel: &AtomicBool) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let args = strings(&["config", "--name-only", "--get-regexp", r"^filter\."]);
+    // A clean config read: no exit-status gate, since "no match" reports failure with empty output.
+    let Ok((_, listing, _)) = git_streams(root, &args, false, false, &[], cancel) else {
+        return Vec::new();
+    };
+    let mut drivers: BTreeSet<&str> = BTreeSet::new();
+    for line in listing.lines() {
+        // `filter.<name>.<attr>`; the subsection <name> may itself contain dots.
+        if let Some(rest) = line.trim().strip_prefix("filter.")
+            && let Some(dot) = rest.rfind('.')
+            && matches!(
+                &rest[dot + 1..],
+                "clean" | "smudge" | "process" | "required"
+            )
+            && !rest[..dot].is_empty()
+        {
+            drivers.insert(&rest[..dot]);
+        }
+    }
+    let mut out = Vec::with_capacity(drivers.len() * 4);
+    for name in drivers {
+        out.push(format!("filter.{name}.clean="));
+        out.push(format!("filter.{name}.smudge="));
+        out.push(format!("filter.{name}.process="));
+        out.push(format!("filter.{name}.required=false"));
+    }
+    out
 }
 
 /// Keep the exact porcelain output retrievable, but do not flood context with a file inventory.
@@ -727,6 +781,24 @@ fn dispatch(
             envs: &[],
             cancel,
             may_mutate: !READS.contains(&action),
+            config_overrides: &[],
+        })
+    };
+    // Read actions that inspect the working tree (status, diff) run `filter.*` clean/process
+    // drivers from untrusted repository config; blank each configured driver so none executes
+    // while the diff is still produced. Enumerating the names never runs a driver.
+    let git_read = |a: Vec<String>| {
+        let overrides = filter_neutralizers(root, cancel);
+        run(Invocation {
+            program: "git",
+            args: &a,
+            root,
+            timeout: LOCAL_TIMEOUT,
+            hooks: Hooks::Off,
+            envs: &[],
+            cancel,
+            may_mutate: false,
+            config_overrides: &overrides,
         })
     };
     // Approved repository changes honour hooks/signing unless the operator bypasses them.
@@ -745,6 +817,7 @@ fn dispatch(
             envs: &[],
             cancel,
             may_mutate: !READS.contains(&action),
+            config_overrides: &[],
         })
     };
     let gh = |a: Vec<String>| {
@@ -757,6 +830,7 @@ fn dispatch(
             envs: &[],
             cancel,
             may_mutate: !READS.contains(&action),
+            config_overrides: &[],
         })
     };
     let mut note = None;
@@ -776,7 +850,7 @@ fn dispatch(
                     a.push("--".into());
                     a.push(one_path(ws, path)?);
                 }
-                git(a, LOCAL_TIMEOUT)?
+                git_read(a)?
             }
             "diff" => {
                 let mut a = strings(&["diff", "--no-color", "--no-ext-diff", "--no-textconv"]);
@@ -790,7 +864,7 @@ fn dispatch(
                     a.push("--".into());
                     a.push(one_path(ws, path)?);
                 }
-                git(a, LOCAL_TIMEOUT)?
+                git_read(a)?
             }
             "log" => {
                 let n = opt_u64(args, "limit")?.unwrap_or(20).clamp(1, 50);
@@ -821,7 +895,7 @@ fn dispatch(
                 LOCAL_TIMEOUT,
             )?,
             "blame" => {
-                let mut a = strings(&["blame", "-w", "--date=short"]);
+                let mut a = strings(&["blame", "-w", "--date=short", "--no-textconv"]);
                 let start = opt_u64(args, "start")?;
                 let end = opt_u64(args, "end")?;
                 match (start, end) {

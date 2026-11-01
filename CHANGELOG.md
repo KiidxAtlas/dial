@@ -17,6 +17,12 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+### Fixed
+
+- The native `write`, `edit`, `ast_edit` and `notebook_edit` tools now refuse to mutate Git metadata (any `.git` path component, plus an existing linked worktree's git directory and common directory), closing a path by which a sandboxed command could plant `.git/config`, `.git/hooks/*` or a filter definition that unsandboxed `git` would later execute without any approval prompt. The refusal lives in the shared workspace mutation guard, so LSP workspace edits (which already refused `.git`) go through the same helper. `.gitattributes` stays an ordinary tracked file: on its own it cannot define a filter, textconv or hook command, so it is not treated as protected metadata. See [tools](docs/tools.md).
+
+- The `git` tool's working-tree read actions (`status`, `diff`) now neutralize every configured `filter.*` driver, so an untrusted `filter.<x>.clean`/`process` can no longer run arbitrary code while a modified tracked file is examined; the real diff is still produced. `blame` also runs with `--no-textconv` like `diff` and `show`. Driver names are enumerated with a plain config read that never invokes a driver. A regression covers the filter case, and another covers the native-tool `.git` refusal (both sibling `tests.rs`). See [tools](docs/tools.md).
+
 ## [0.2.10] - 2026-11-01
 
 ### Added
