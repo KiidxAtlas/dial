@@ -1,6 +1,6 @@
 # Portable CI dependencies. Update deliberately through dependency-review pull requests.
 cryptography==50.0.2
 pytest==9.2.0
-fastapi==0.141.1
+fastapi==0.162.0
 pydantic==2.14.2
 uvicorn==0.53.0
