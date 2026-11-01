@@ -35,7 +35,6 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -223,8 +222,6 @@ pub struct EditStore {
     /// Least recently used first.
     lru: Vec<PathBuf>,
     named: HashMap<String, Vec<String>>,
-    /// (hash of the patch, consecutive occurrences) of the last no-op edit.
-    noop: Option<(u64, u32)>,
     observation_id: u64,
     observation_cursor: usize,
     observations: HashMap<PathBuf, DiskObservation>,
@@ -327,6 +324,20 @@ impl EditStore {
         self.files.get(path)?.iter().rev().find(|s| s.tag == tag)
     }
 
+    fn retry_requirement(
+        path: &Path,
+        lf: &str,
+        raw_revision: Option<[u8; 32]>,
+        ranges: &[(usize, usize)],
+    ) -> crate::runtime::execution::NativeWitnessRequirement {
+        crate::runtime::execution::NativeWitnessRequirement {
+            path: path.to_path_buf(),
+            source_sha256: Sha256::digest(lf.as_bytes()).into(),
+            raw_revision,
+            ranges: Seen::from_ranges(ranges).0,
+        }
+    }
+
     pub(crate) fn check_ranges(
         &self,
         path: &Path,
@@ -336,6 +347,21 @@ impl EditStore {
         self.check_version_ranges(path, lf, None, ranges)
     }
     pub(crate) fn check_version_ranges(
+        &self,
+        path: &Path,
+        lf: &str,
+        revision: Option<[u8; 32]>,
+        ranges: &[(usize, usize)],
+    ) -> Result<(), String> {
+        let result = self.validate_version_ranges(path, lf, revision, ranges);
+        if result.is_err() {
+            crate::runtime::execution::native_edit_retry(Self::retry_requirement(
+                path, lf, revision, ranges,
+            ));
+        }
+        result
+    }
+    fn validate_version_ranges(
         &self,
         path: &Path,
         lf: &str,
@@ -390,11 +416,81 @@ impl EditStore {
         );
     }
 
+    /// Prove a unique exact retry against retained source witnesses, not just the
+    /// presence of replacement text somewhere in the current file.
+    pub(crate) fn witnessed_exact_replacement(
+        &self,
+        path: &Path,
+        current: &str,
+        old: &str,
+        new: &str,
+    ) -> bool {
+        self.files.get(path).is_some_and(|snapshots| {
+            snapshots.iter().any(|snapshot| {
+                if snapshot.raw_revision.is_some() {
+                    return false;
+                }
+                let mut matches = snapshot.text.match_indices(old);
+                let Some((at, _)) = matches.next() else {
+                    return false;
+                };
+                if matches.next().is_some() || snapshot.text.replacen(old, new, 1) != current {
+                    return false;
+                }
+                let first = snapshot.text[..at].bytes().filter(|&b| b == b'\n').count() + 1;
+                let end = at + old.len();
+                let last = snapshot.text[..end].bytes().filter(|&b| b == b'\n').count()
+                    + usize::from(!snapshot.text[..end].ends_with('\n'));
+                snapshot.seen.first_unseen(first, last.max(first)).is_none()
+            })
+        })
+    }
+
     pub fn forget(&mut self, path: &Path) {
         self.files.remove(path);
         self.observations.remove(path);
         self.lru.retain(|p| p != path);
     }
+}
+
+/// Readiness comes only from confined current source and complete native store witnesses.
+/// This is admission to retry, not approval or a substitute for any edit validator.
+pub fn native_edit_retry_ready(
+    ws: &Workspace,
+    retry: &crate::runtime::execution::NativeEditRetry,
+) -> bool {
+    !retry.requirements.is_empty()
+        && retry.requirements.iter().all(|required| {
+            let Ok(path) = ws.resolve(&ws.rel(&required.path)) else {
+                return false;
+            };
+            if path != required.path {
+                return false;
+            }
+            let Ok(Some(current)) = super::edit_transaction::read(ws, &path) else {
+                return false;
+            };
+            let Ok(source) = super::edit_source::Source::load(&path, Some(&current.text)) else {
+                return false;
+            };
+            let digest: [u8; 32] = Sha256::digest(source.text.as_bytes()).into();
+            let count = split_lines(&source.text).len();
+            digest == required.source_sha256
+                && source.raw_revision == required.raw_revision
+                && required
+                    .ranges
+                    .iter()
+                    .all(|&(a, b)| a > 0 && a <= b && b <= count)
+                && ws
+                    .store()
+                    .validate_version_ranges(
+                        &path,
+                        &source.text,
+                        source.raw_revision,
+                        &required.ranges,
+                    )
+                    .is_ok()
+        })
 }
 
 pub(crate) fn transition_flags(before: &str, after: &str, prior: &[bool]) -> Vec<bool> {
@@ -605,7 +701,8 @@ fn parse_header(t: &str, line_no: usize) -> Result<Section, String> {
         ));
     };
     let tag = tag.trim();
-    if tag.len() != 4 || !tag.chars().all(|c| c.is_ascii_hexdigit()) {
+    // An empty tag passes the parser; the edit refuses it once it can quote the latest read's tag.
+    if !tag.is_empty() && (tag.len() != 4 || !tag.chars().all(|c| c.is_ascii_hexdigit())) {
         return Err(format!(
             "line {line_no}: tag {tag:?} is not four hex characters; copy it from the [PATH#TAG] header"
         ));
@@ -633,12 +730,35 @@ fn parse_header(t: &str, line_no: usize) -> Result<Section, String> {
 fn close_section(section: Section, out: &mut Vec<Section>) -> Result<(), String> {
     if section.ops.is_empty() && !section.rem && section.mv.is_none() {
         return Err(format!(
-            "line {}: section for {:?} has no operations",
+            "line {}: section for {:?} has no operations; put its `PUT`/`CUT`/`REM`/`MV` lines under that header, or remove the header (one header per file holds all of its operations)",
             section.line_no, section.path
         ));
     }
     out.push(section);
     Ok(())
+}
+
+/// The refusal for a `PUT ...:` with no body rows repeats the operation and its likely intent.
+fn empty_body_error(section: Option<&Section>, lines: &[&str]) -> String {
+    let Some(op) = section.and_then(|s| s.ops.last()) else {
+        return "a `PUT ...:` operation needs at least one `+` row (a blank line is a lone `+`)"
+            .to_owned();
+    };
+    let put = lines.get(op.line_no - 1).map_or("PUT ...:", |l| l.trim());
+    let target = put
+        .strip_prefix("PUT ")
+        .unwrap_or(put)
+        .trim_end_matches(':')
+        .trim();
+    let intent = if target.starts_with(['<', '>']) {
+        "to insert nothing, remove the operation".to_owned()
+    } else {
+        format!("to delete those lines write `CUT {target}`")
+    };
+    format!(
+        "line {}: `{put}` needs at least one `+` row; {intent}; for a blank line write a lone `+`",
+        op.line_no
+    )
 }
 
 /// Submitted literal source fragments for pre-execution structural guidance. This uses the
@@ -721,9 +841,7 @@ fn parse_patch(input: &str) -> Result<Vec<Section>, String> {
             }
             collecting = false;
             if body_is_empty(current.as_ref()) {
-                return Err(format!(
-                    "line {line_no}: a `PUT ...:` operation needs at least one `+` row (a blank line is a lone `+`)"
-                ));
+                return Err(empty_body_error(current.as_ref(), &lines));
             }
         }
         let t = raw.trim();
@@ -791,7 +909,7 @@ fn parse_patch(input: &str) -> Result<Vec<Section>, String> {
         }
     }
     if collecting && body_is_empty(current.as_ref()) {
-        return Err("the last `PUT ...:` operation needs at least one `+` row".to_owned());
+        return Err(empty_body_error(current.as_ref(), &lines));
     }
     if let Some(section) = current.take() {
         close_section(section, &mut sections)?;
@@ -1440,6 +1558,10 @@ struct Job {
     enforce_seen: bool,
     /// All unseen ranges blocked during anchor preflight, for [`show_unseen`].
     unseen: Vec<(usize, usize)>,
+    /// Complete anchor dependencies, including already witnessed rows in a multi-file batch.
+    required: Vec<(usize, usize)>,
+    /// A current tag without retained witnesses keeps its original targeted-read diagnostic.
+    unread_error: Option<String>,
     original: super::edit_transaction::Original,
     syntactic_blocks: Option<std::collections::BTreeMap<usize, Result<usize, String>>>,
     carrier: Option<super::edit_source::Carrier>,
@@ -1467,6 +1589,7 @@ impl Job {
         if !self.enforce_seen {
             return Ok(());
         }
+        self.required.push((a, b));
         let ranges = self.seen.unseen_ranges(a, b);
         let first = ranges.first().copied();
         self.unseen.extend(ranges);
@@ -1538,27 +1661,52 @@ fn load_job(
         digest: Sha256::digest(cur_lf.as_bytes()).into(),
         observation_id: 0,
     };
-    let snap = match store.snapshot(&abs, &sec.tag) {
+    if sec.tag.is_empty() {
+        let latest = store
+            .files
+            .get(&abs)
+            .and_then(|snaps| snaps.iter().max_by_key(|s| s.observation_id));
+        return Err(match latest {
+            Some(snap) if snap.tag == cur_tag => format!(
+                "{rel}: the section header has an empty tag; the latest read of this file returned [{rel}#{cur_tag}] and the file is unchanged, so resend the edit with that header"
+            ),
+            Some(snap) => format!(
+                "{rel}: the section header has an empty tag; the latest read returned #{} but the file has changed since (current {cur_tag}); read the affected lines with `{rel}:START-END` and use the fresh [path#TAG] header",
+                snap.tag
+            ),
+            None => format!(
+                "{rel}: the section header has an empty tag and no read of this file is recorded; read the affected lines with `{rel}:START-END`, then use the [path#TAG] header that read returns"
+            ),
+        });
+    }
+    let mut unread_error = None;
+    let mut snap = match store.snapshot(&abs, &sec.tag) {
         Some(snapshot) => snapshot,
         None if !ws.edit_settings.enforce_seen_lines && cur_tag == sec.tag => &fallback,
+        None if cur_tag == sec.tag => {
+            unread_error = Some(format!(
+                "{rel}#{}: no read of this file is recorded; read the affected lines with a targeted read such as `{rel}:START-END` first, then retry the edit with the fresh [path#TAG] header that read returns",
+                sec.tag
+            ));
+            &fallback
+        }
         None => {
-            return Err(if cur_tag == sec.tag {
-                format!(
-                    "{rel}#{}: no read of this file is recorded; read the affected lines with a targeted read such as `{rel}:START-END` first, then retry the edit with the fresh [path#TAG] header that read returns",
-                    sec.tag
-                )
-            } else {
-                format!(
-                    "{rel}#{}: unknown snapshot tag (current {cur_tag}); the header is stale; read the affected lines with a targeted read such as `{rel}:START-END`, then retry the edit with the fresh [path#TAG] header that read returns",
-                    sec.tag
-                )
-            });
+            return Err(format!(
+                "{rel}#{}: unknown snapshot tag (current {cur_tag}); the header is stale; read the affected lines with a targeted read such as `{rel}:START-END`, then retry the edit with the fresh [path#TAG] header that read returns",
+                sec.tag
+            ));
         }
     };
     if raw_revision.is_some() && snap.raw_revision != raw_revision {
-        return Err(format!(
+        let error = format!(
             "{rel}: notebook raw JSON changed or only a raw view was read; read the editable projection again"
-        ));
+        );
+        if snap.text.as_ref() != cur_lf {
+            return Err(error);
+        }
+        // Only a metadata-only change is witness repair: never reinterpret stale source anchors.
+        unread_error = Some(error);
+        snap = &fallback;
     }
     let stale = snap.text.as_ref() != cur_lf;
     let cur: Vec<String> = split_lines(&cur_lf)
@@ -1591,6 +1739,8 @@ fn load_job(
         seen: snap.seen.clone(),
         enforce_seen: ws.edit_settings.enforce_seen_lines,
         unseen: Vec::new(),
+        required: Vec::new(),
+        unread_error,
         original,
         syntactic_blocks,
         carrier: Some(carrier),
@@ -1834,8 +1984,7 @@ fn mismatch_error(
     )
 }
 
-/// Opens an unseen-lines refusal that displayed every missing anchor line. The refusal itself made
-/// those lines witnesses, so the unchanged edit may be re-issued; retry barriers recognise this.
+/// Human-readable explanation of an unseen-lines refusal. This text carries no retry authority.
 pub const UNSEEN_LINES_NOW_READ: &str =
     "All unread anchor lines are shown below and now count as read";
 
@@ -2046,12 +2195,6 @@ fn finalize(job: &mut Job, store: &mut EditStore) -> Result<Prepared, String> {
     })
 }
 
-fn hash_of(text: &str) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    text.hash(&mut hasher);
-    hasher.finish()
-}
-
 pub(crate) fn targets(input: &str) -> Result<Vec<String>, String> {
     let mut paths = Vec::new();
     for section in parse_patch(input)? {
@@ -2166,16 +2309,40 @@ pub(crate) fn edit_output_with(
                 }
             }
         }
+        if sec.rem
+            && !job.base.is_empty()
+            && let Err(error) = job.check_seen(1, job.base.len())
+        {
+            unseen_failures[ji].get_or_insert(error);
+        }
         job.warnings.clear(); // Actual execution emits fallback warnings once.
     }
     if failures.iter().any(|errors| !errors.is_empty())
         || unseen_failures.iter().any(Option::is_some)
+        || jobs.iter().any(|job| job.unread_error.is_some())
     {
         let mut errors = Vec::new();
+        // Mixed invalid/stale anchors must not become retry-ready merely because a preview
+        // happened to reveal another operation's unread rows.
+        let witness_only = failures.iter().all(Vec::is_empty) && jobs.iter().all(|job| !job.stale);
+        if witness_only {
+            for job in &jobs {
+                // An anchor-free MV still requires a current native source snapshot. Empty
+                // ranges do not waive identity: validate_version_ranges checks that snapshot.
+                crate::runtime::execution::native_edit_retry(EditStore::retry_requirement(
+                    &job.abs,
+                    &job.cur_lf,
+                    job.raw_revision,
+                    &job.required,
+                ));
+            }
+        }
         for ((job, failures), unseen_failure) in jobs.iter_mut().zip(failures).zip(unseen_failures)
         {
             errors.extend(failures);
-            if let Some(error) = unseen_failure {
+            if let Some(error) = job.unread_error.take() {
+                errors.push(error);
+            } else if let Some(error) = unseen_failure {
                 errors.push(show_unseen(job, &mut store, error));
             }
         }
@@ -2290,27 +2457,38 @@ pub(crate) fn edit_output_with(
         ));
     }
     if !multi && !noops.is_empty() {
-        if !commit {
-            return Ok(crate::tools::ToolOutput::ok(format!(
-                "Preview only; no changes would be made to {}",
-                noops[0].rel
-            )));
+        let exact = resolved
+            .iter()
+            .zip(&section_jobs)
+            .all(|((_, section), &ji)| {
+                let job = &jobs[ji];
+                !job.stale
+                    && job.enforce_seen
+                    && !section.ops.is_empty()
+                    && section.ops.iter().all(|op| match &op.kind {
+                        OpKind::Put {
+                            anchor: Anchor::Range(a, b),
+                            src: Src::Body(body),
+                        } => job.base.get(a - 1..*b) == Some(body.as_slice()),
+                        _ => false,
+                    })
+            });
+        if !exact {
+            return Err("unchanged edit is not an exact witnessed desired-state replacement; nothing was written".into());
         }
-        let key = hash_of(input);
-        let count = match store.noop {
-            Some((k, n)) if k == key => n + 1,
-            _ => 1,
-        };
-        store.noop = Some((key, count));
-        let rel = &noops[0].rel;
-        if count >= 3 {
-            return Err(format!(
-                "{rel}: this identical edit has now produced no change {count} times in a row; the file already has the requested content. Re-read it and move on or change approach"
-            ));
-        }
-        return Ok(crate::tools::ToolOutput::ok(format!(
-            "No changes: the edit leaves {rel} identical. Nothing was written."
-        )));
+        let satisfied = super::edit_transaction::Change::existing(
+            noops[0].abs.clone(),
+            noops[0].original.clone(),
+            None,
+        );
+        drop(store);
+        return super::editing::finish_prepared(
+            ws,
+            super::editing::PreparedEdit::AlreadyApplied(Box::new(satisfied)),
+            commit,
+            execution,
+        )
+        .or_else(super::editing::prepare_error_output);
     }
 
     // Destination / size checks before any mutation.
@@ -2462,7 +2640,6 @@ pub(crate) fn edit_output_with(
         for (name, lines, _) in regs.pending {
             store.named.insert(name, lines);
         }
-        store.noop = None;
         drop(store);
         for record in records {
             if let Err(error) = super::syntax::record_blackbox(ws, &record) {
@@ -2496,7 +2673,12 @@ pub(crate) fn edit_output_with(
             }
         }
     }
-    Ok(crate::tools::surface::outcome::edit_projection(out, model))
+    let output = crate::tools::surface::outcome::edit_projection(out, model);
+    Ok(if commit {
+        super::editing::with_outcome(output, super::editing::EditOutcome::Applied)
+    } else {
+        output
+    })
 }
 
 fn describe(p: &Prepared, include_diff: bool) -> String {

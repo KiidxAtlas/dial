@@ -493,10 +493,16 @@ impl Accumulator {
         }
         if event.get("usage").is_some_and(Value::is_object) {
             progress_seen = true;
-            if self.completion_tokens.is_some() {
-                let mut progress = super::ModelProgress::new(super::InferencePhase::Generating);
+            if let Some(output_tokens) = self.completion_tokens {
+                // Usage can arrive during prefill; zero output must not arm generation watchdogs.
+                let phase = if output_tokens == 0 {
+                    super::InferencePhase::Processing
+                } else {
+                    super::InferencePhase::Generating
+                };
+                let mut progress = super::ModelProgress::new(phase);
                 progress.prompt_tokens = self.prompt_tokens;
-                progress.output_tokens = self.completion_tokens;
+                progress.output_tokens = Some(output_tokens);
                 progress.tokens_per_second = event
                     .pointer("/timings/predicted_per_second")
                     .and_then(Value::as_f64);

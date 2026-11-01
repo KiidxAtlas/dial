@@ -210,3 +210,25 @@ fn bridged_files_cannot_be_deleted_locally() {
     assert!(path.exists());
     assert!(editor.written.lock().unwrap().is_empty());
 }
+
+#[test]
+fn already_applied_buffer_edit_never_notifies_the_observer_or_editor_writer() {
+    let editor = editor(true, true);
+    let (_dir, ws, path) = project(Some(editor.clone()));
+    let observed = Arc::new(Observed::default());
+    let ws = ws
+        .with_edit_mode(crate::tools::EditMode::Replace)
+        .with_observer(observed.clone());
+    ws.store().record_all(&path, "buffer\n");
+    let output = crate::tools::edit::editing::edit_output(
+        &ws,
+        &serde_json::json!({"path":"a.txt", "old_string":"buffer", "new_string":"buffer"}),
+    )
+    .unwrap();
+    assert!(!output.is_error, "{}", output.text);
+    assert_eq!(output.data.unwrap()["edit"]["outcome"], "already_applied");
+    assert!(editor.written.lock().unwrap().is_empty());
+    assert!(observed.0.lock().unwrap().is_empty());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "disk\n");
+    assert_eq!(*editor.buffer.lock().unwrap(), "buffer\n");
+}

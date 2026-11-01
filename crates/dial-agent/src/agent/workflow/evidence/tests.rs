@@ -710,3 +710,161 @@ fn supersession_never_expands_small_text_observations() {
         assert!(memo.holds_full("old"));
     }
 }
+#[test]
+fn unique_observations_are_elided_only_when_drop_useless_is_opted_in() {
+    let policy = |drop_useless| Policy {
+        warm_tokens: 0,
+        pressure: true,
+        protect_tokens: 4_000,
+        supersede_reads: true,
+        drop_useless,
+    };
+    let mut off = history();
+    project(&mut off, &mut Supersession::default(), &policy(false));
+    assert_eq!(
+        content(&off, "old-grep").len(),
+        40_000,
+        "a unique result stays verbatim without the opt-in"
+    );
+    assert_eq!(
+        reclaimable_tokens(&history(), &Supersession::default(), &policy(false)),
+        0,
+        "no opt-in means no claimed savings"
+    );
+    assert!(reclaimable_tokens(&history(), &Supersession::default(), &policy(true)) > 0);
+}
+#[test]
+fn opted_in_pruning_never_elides_skill_mutation_failure_or_unknown_effect_results() {
+    let mut m = vec![json!({"role":"user","content":"task"})];
+    m.extend(exchange("skill", "skill", 40_000));
+    m.extend(exchange("edit", "edit", 40_000));
+    m.extend(exchange("bash", "bash", 40_000));
+    let mut failed = exchange("failed", "grep", 40_000);
+    failed[1]["dial_evidence"]["is_error"] = json!(true);
+    m.extend(failed);
+    let mut unknown = exchange("unknown", "grep", 40_000);
+    unknown[1]["dial_effects"] = json!("unknown");
+    m.extend(unknown);
+    m.push(json!({"role":"user","content":"tail"}));
+    let before = m.clone();
+    project(
+        &mut m,
+        &mut Supersession::default(),
+        &Policy {
+            warm_tokens: 0,
+            pressure: true,
+            protect_tokens: 0,
+            supersede_reads: true,
+            drop_useless: true,
+        },
+    );
+    for id in ["skill", "edit", "bash", "failed", "unknown"] {
+        assert_eq!(
+            content(&m, id),
+            content(&before, id),
+            "{id} must stay verbatim"
+        );
+    }
+}
+#[test]
+fn opted_in_savings_are_net_stable_and_do_not_mutate_inputs() {
+    let policy = Policy {
+        warm_tokens: 0,
+        pressure: true,
+        protect_tokens: 4_000,
+        supersede_reads: true,
+        drop_useless: true,
+    };
+    let memo = Supersession::default();
+    let saved = reclaimable_tokens(&history(), &memo, &policy);
+    let raw = history();
+    let base: usize = raw
+        .iter()
+        .map(|m| estimate(&crate::llm::messages::canonical(m)))
+        .sum();
+    let mut projected = history();
+    project(&mut projected, &mut memo.clone(), &policy);
+    let after: usize = projected.iter().map(estimate).sum();
+    assert_eq!(saved, base - after, "the figure is the real net reduction");
+    assert!(
+        memo.holds_full("old-grep"),
+        "the probe leaves the memo untouched"
+    );
+    assert_eq!(
+        reclaimable_tokens(&history(), &memo, &policy),
+        saved,
+        "repeated probes over the same history agree"
+    );
+    let mut again = history();
+    project(&mut again, &mut Supersession::default(), &policy);
+    assert_eq!(projected, again, "repeated projections are byte-identical");
+}
+fn long_pointer(mut message: Value, len: usize) -> Value {
+    message["dial_evidence"]["artifact"] = json!(format!("artifact://{}", "a".repeat(len)));
+    message
+}
+fn pressured() -> Policy {
+    Policy {
+        warm_tokens: 0,
+        pressure: true,
+        protect_tokens: 4_000,
+        supersede_reads: true,
+        drop_useless: true,
+    }
+}
+#[test]
+fn a_pointer_larger_than_the_result_is_never_pruned_or_batched() {
+    // Gross 40k-byte results would clear the batch by size alone, but each placeholder is larger than the
+    // original, so applying it would expand the request.
+    let ids = ["big-a", "big-b", "big-c"];
+    let mut m = vec![json!({"role":"user","content":"task"})];
+    for id in ids {
+        m.extend(exchange(id, "grep", 40_000));
+        let last = m.len() - 1;
+        m[last] = long_pointer(m[last].clone(), 45_000);
+    }
+    m.extend(exchange("tail", "read", 20_000));
+    let before = m.clone();
+    assert_eq!(
+        reclaimable_tokens(&m, &Supersession::default(), &pressured()),
+        0,
+        "no net saving is claimed"
+    );
+    let mut projected = m.clone();
+    let mut memo = Supersession::default();
+    project(&mut projected, &mut memo, &pressured());
+    for id in ids {
+        assert_eq!(
+            content(&projected, id),
+            content(&before, id),
+            "{id} must stay verbatim"
+        );
+        assert!(memo.holds_full(id), "{id} is not recorded as pruned");
+    }
+    let mut again = before.clone();
+    project(&mut again, &mut Supersession::default(), &pressured());
+    assert_eq!(projected, again, "repeated projections are byte-identical");
+}
+#[test]
+fn a_batch_is_credited_only_by_its_net_saving_not_its_gross_size() {
+    // Each 40k-byte result is about 10k gross tokens, but its 30k-byte pointer leaves only about 2.5k net.
+    // Two of them (5k net) stay below PRUNE_BATCH_MIN_TOKENS; four (10k net) clear it.
+    for (count, pruned) in [(2usize, false), (4, true)] {
+        let mut m = vec![json!({"role":"user","content":"task"})];
+        for n in 0..count {
+            m.extend(exchange(&format!("big-{n}"), "grep", 40_000));
+            let last = m.len() - 1;
+            m[last] = long_pointer(m[last].clone(), 30_000);
+        }
+        m.extend(exchange("tail", "read", 20_000));
+        project(&mut m, &mut Supersession::default(), &pressured());
+        for n in 0..count {
+            let id = format!("big-{n}");
+            assert_eq!(
+                content(&m, &id).starts_with("[Older grep result omitted"),
+                pruned,
+                "{count} candidates, {id}"
+            );
+        }
+    }
+}

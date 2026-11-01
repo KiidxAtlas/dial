@@ -48,7 +48,7 @@ impl Activity {
         }
     }
 
-    /// The circle that leads the terminal title (and so the tab) for this state, or `""` when
+    /// The circle that ends the terminal title (and so the tab) for this state, or `""` when
     /// idle. Emoji circles carry their own color, so any terminal that shows titles shows it.
     pub fn marker(self) -> &'static str {
         match self {

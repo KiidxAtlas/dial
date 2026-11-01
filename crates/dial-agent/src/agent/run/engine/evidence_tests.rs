@@ -33,8 +33,7 @@ fn an_identical_reread_after_an_unrelated_edit_gets_a_pointer_without_altering_t
                 &workspace,
                 &read("first", "a.txt"),
                 &mut first,
-                false,
-                false,
+                Default::default(),
                 |_| true
             )
             .0
@@ -49,14 +48,19 @@ fn an_identical_reread_after_an_unrelated_edit_gets_a_pointer_without_altering_t
         arguments: json!({ "path": "b.txt" }),
         malformed_arguments: false,
     };
-    engine.settle(&workspace, &edit_call, &mut edit, false, false, |_| true);
+    engine.settle(
+        &workspace,
+        &edit_call,
+        &mut edit,
+        Default::default(),
+        |_| true,
+    );
     let mut again = output("alpha body");
     let (duplicate, _, _) = engine.settle(
         &workspace,
         &read("second", "a.txt"),
         &mut again,
-        false,
-        false,
+        Default::default(),
         |_| true,
     );
     let pointer = duplicate.expect("an identical re-read is answered with a pointer");
@@ -76,8 +80,7 @@ fn compaction_releases_withheld_repeats_so_the_same_read_runs_in_full() {
         &workspace,
         &read("first", "a.txt"),
         &mut first,
-        false,
-        false,
+        Default::default(),
         |_| true,
     );
     let mut repeat = output("alpha body");
@@ -85,8 +88,7 @@ fn compaction_releases_withheld_repeats_so_the_same_read_runs_in_full() {
         &workspace,
         &read("second", "a.txt"),
         &mut repeat,
-        false,
-        false,
+        Default::default(),
         |_| true,
     );
     assert!(withheld.is_some_and(|advice| advice.contains("Reuse")));
@@ -108,8 +110,7 @@ fn compaction_releases_withheld_repeats_so_the_same_read_runs_in_full() {
         &workspace,
         &read("third", "a.txt"),
         &mut fresh,
-        false,
-        false,
+        Default::default(),
         |_| false,
     );
     assert!(duplicate.is_none() && repeat_advice.is_none() && stop.is_none());
@@ -128,8 +129,7 @@ fn repeated_reads_prefer_the_short_pointer_and_keep_recovery_enforcement() {
             &workspace,
             &read(id, "a.txt"),
             &mut result,
-            false,
-            false,
+            Default::default(),
             |_| true,
         );
         assert_eq!(

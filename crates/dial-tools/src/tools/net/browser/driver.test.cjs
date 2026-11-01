@@ -37,12 +37,14 @@ test('idle pages cannot queue network callbacks',async () => {
 });
 test('missing tab selects one existing tab but never guesses among several', () => {
   const h=harness();
-  assert.throws(()=>h.run('tabFor({})'),/No browser tab is open/);
-  h.run('tabs.set(4,{page:{title:"preview"}}); request={}; tabFor(request)');
+  assert.throws(()=>h.run('tabFor({})'),/No browser tab is open \(tabs do not survive a browser restart/);
+  assert.throws(()=>h.run('tabFor({tab:3})'),/Browser tab 3 is not open \(no tab is open; tabs do not survive/);
+  h.run('tabs.set(4,{page:{title:"preview",url:()=>"http://localhost:3000/"}}); request={}; tabFor(request)');
   assert.equal(h.run('request.tab'),4);
-  h.run('tabs.set(5,{page:{title:"other"}})');
-  assert.throws(()=>h.run('tabFor({})'),/Multiple browser tabs/);
-  assert.throws(()=>h.run('tabFor({tab:999})'),/999 is not open/);
+  h.run('tabs.set(5,{page:{title:"other",url:()=>{throw new Error("closed")}}})');
+  // Errors list the open tabs so the next call can pick one without action=tabs.
+  assert.throws(()=>h.run('tabFor({})'),/Multiple browser tabs are open; pass an explicit tab id \(open tabs: 4 http:\/\/localhost:3000\/, 5 \?\)/);
+  assert.throws(()=>h.run('tabFor({tab:999})'),/Browser tab 999 is not open \(open tabs: 4 http:\/\/localhost:3000\/, 5 \?\)/);
   assert.equal(h.run('tabFor({tab:4}).page.title'),'preview');
 });
 test('pending callbacks and queued requests remain bounded on a flood',async () => {
@@ -217,4 +219,18 @@ test('blocked causes survive ordinary network history eviction with bounded stor
   assert(h.run(`failureMessage(new Error('timeout'),2)`).startsWith('Browser network failure: queue exhausted'));
   h.run(`for(let i=0;i<150;i++) record(tab,'network',{kind:'blocked',error:'bounded'})`);
   assert.equal(h.run('tab.networkFailures.length'),100);
+});
+
+test('native screenshot returns its exact URL and actual captured image, including long locators', async () => {
+  const capture = require('./capture.cjs');
+  const url = 'http://localhost:3000/preview?' + 'q='.repeat(3000);
+  const bytes = Buffer.from('native pixels');
+  const tab = {};
+  const page = { url: () => url, screenshot: async () => bytes };
+  const result = await capture.run({action:'screenshot',tab:1}, {page,tab});
+  assert.equal(result.url, url);
+  assert.equal(result.artifact.data, bytes.toString('base64'));
+  const unchanged = await capture.run({action:'screenshot',tab:1,if_changed:true}, {page,tab});
+  assert.equal(unchanged.changed, false);
+  assert.equal(unchanged.artifact, undefined);
 });

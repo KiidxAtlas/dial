@@ -192,14 +192,20 @@ fn feed(deltas: &[&str]) -> (String, String) {
         out.push_str(s);
         true
     };
-    let mut hider = Hider::new(&mut sink, true);
+    let mut hidden = String::new();
+    let mut hidden_sink = |s: &str| {
+        hidden.push_str(s);
+        true
+    };
+    let mut hider = Hider::new(&mut sink, &mut hidden_sink, true);
     let mut all = String::new();
     for d in deltas {
         all.push_str(d);
-        hider.push(d);
+        assert!(hider.push(d));
     }
-    hider.finish();
+    assert!(hider.finish());
     drop(hider);
+    assert_eq!(format!("{out}{hidden}"), all);
     (out, all)
 }
 
@@ -218,13 +224,80 @@ fn hider_withholds_tag_even_when_split_across_deltas() {
 }
 
 #[test]
+fn hider_reports_split_opener_and_later_hidden_chunks_exactly_once() {
+    let mut visible = String::new();
+    let mut hidden = Vec::new();
+    let mut sink = |s: &str| {
+        visible.push_str(s);
+        true
+    };
+    let mut hidden_sink = |s: &str| {
+        hidden.push(s.to_string());
+        true
+    };
+    let mut hider = Hider::new(&mut sink, &mut hidden_sink, true);
+    assert!(hider.push("Checking <tool"));
+    assert!(hider.push("_ca"));
+    assert!(hider.push("ll>{\"name\":"));
+    assert!(hider.push("\"read\",\"arguments\":{\"path\":\"é.rs\"}}"));
+    assert!(hider.push(""));
+    assert!(hider.push("</tool_call>"));
+    assert!(hider.finish());
+    assert!(hider.finish());
+    drop(hider);
+    assert_eq!(visible, "Checking ");
+    assert_eq!(
+        hidden,
+        [
+            "<tool_call>{\"name\":",
+            "\"read\",\"arguments\":{\"path\":\"é.rs\"}}",
+            "</tool_call>",
+        ]
+    );
+}
+
+#[test]
+fn hider_honors_hidden_cancellation_on_recognition_and_later_suffix() {
+    for cancel_on in [1, 2] {
+        let mut visible = String::new();
+        let mut hidden = Vec::new();
+        let mut sink = |s: &str| {
+            visible.push_str(s);
+            true
+        };
+        let mut hidden_sink = |s: &str| {
+            hidden.push(s.to_string());
+            hidden.len() != cancel_on
+        };
+        let mut hider = Hider::new(&mut sink, &mut hidden_sink, true);
+        assert!(hider.push("Checking <tool"));
+        let mut stopped = false;
+        for delta in ["_call>{", "\"name\":\"read\"}", "</tool_call>"] {
+            if !hider.push(delta) {
+                stopped = true;
+                break;
+            }
+        }
+        assert!(stopped, "hidden callback must cancel on event {cancel_on}");
+        drop(hider);
+        assert_eq!(visible, "Checking ");
+        assert_eq!(hidden.len(), cancel_on);
+        assert_eq!(hidden[0], "<tool_call>{");
+        if cancel_on == 2 {
+            assert_eq!(hidden[1], "\"name\":\"read\"}");
+        }
+    }
+}
+
+#[test]
 fn hider_stops_when_consumer_declines_and_can_be_disabled() {
     let mut calls = 0;
     let mut sink = |_: &str| {
         calls += 1;
         false
     };
-    let mut hider = Hider::new(&mut sink, true);
+    let mut hidden_sink = |_: &str| true;
+    let mut hider = Hider::new(&mut sink, &mut hidden_sink, true);
     assert!(!hider.push("hello"));
     drop(hider);
     assert_eq!(calls, 1);
@@ -234,8 +307,10 @@ fn hider_stops_when_consumer_declines_and_can_be_disabled() {
         out.push_str(s);
         true
     };
-    let mut hider = Hider::new(&mut sink, false);
+    let mut hidden_sink = |_: &str| panic!("disabled hiding must not report hidden output");
+    let mut hider = Hider::new(&mut sink, &mut hidden_sink, false);
     assert!(hider.push("<tool_call>x"));
+    assert!(hider.finish());
     drop(hider);
     assert_eq!(out, "<tool_call>x");
 }

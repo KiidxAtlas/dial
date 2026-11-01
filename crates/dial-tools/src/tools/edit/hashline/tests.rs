@@ -128,7 +128,11 @@ fn unseen_anchor_error_shows_the_lines_so_the_retry_needs_no_read() {
         .store()
         .record(&path, "one\ntwo\nthree\nfour\n", &[(1, 1)]);
     let patch = format!("[a.txt#{tag}]\nPUT 2.=3:\n+TWO\n+THREE\n");
+    let capture = crate::runtime::execution::Capture::begin();
     let error = edit(&ws, &patch).unwrap_err();
+    let retry = capture.finish(false).native_edit_retry.unwrap();
+    assert!(native_edit_retry_ready(&ws, &retry));
+    assert_eq!(retry.requirements[0].ranges, vec![(2, 3)]);
     assert!(error.contains("have not been shown"), "{error}");
     assert!(error.contains("2:two\n3:three\n"), "{error}");
     assert!(!error.contains("4:four"), "{error}");
@@ -141,6 +145,65 @@ fn unseen_anchor_error_shows_the_lines_so_the_retry_needs_no_read() {
         fs::read_to_string(&path).unwrap(),
         "one\nTWO\nTHREE\nfour\n"
     );
+}
+
+#[test]
+fn retry_witnesses_pin_notebook_raw_revision_even_when_source_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::new(dir.path()).unwrap();
+    let path = ws.resolve("a.ipynb").unwrap();
+    let mut notebook = serde_json::json!({
+        "nbformat":4,"nbformat_minor":5,"metadata":{},
+        "cells":[{"id":"cell-one","cell_type":"code","metadata":{},"source":["x = 1\n"],
+            "execution_count":null,"outputs":[]}]
+    });
+    let raw = notebook.to_string();
+    fs::write(&path, &raw).unwrap();
+    let source = super::super::edit_source::Source::load(&path, Some(&raw)).unwrap();
+    let capture = crate::runtime::execution::Capture::begin();
+    assert!(source.check_ranges(&ws, &path, &[(1, 1)]).is_err());
+    let retry = capture.finish(false).native_edit_retry.unwrap();
+    assert!(!native_edit_retry_ready(&ws, &retry));
+    let read = || crate::tools::execute(&ws, "read", &serde_json::json!({"path":"a.ipynb"}), 20);
+    assert!(!read().is_error);
+    assert!(native_edit_retry_ready(&ws, &retry));
+    notebook["metadata"] = serde_json::json!({"changed":true});
+    let raw = notebook.to_string();
+    fs::write(&path, &raw).unwrap();
+    let current = super::super::edit_source::Source::load(&path, Some(&raw)).unwrap();
+    assert_eq!(source.text, current.text);
+    assert!(!native_edit_retry_ready(&ws, &retry));
+    assert!(!read().is_error);
+    assert!(!native_edit_retry_ready(&ws, &retry));
+}
+
+#[test]
+fn missing_snapshots_retain_every_files_required_ranges() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::new(dir.path()).unwrap();
+    for name in ["a.txt", "b.txt"] {
+        fs::write(dir.path().join(name), "one\ntwo\n").unwrap();
+    }
+    let tag = tag_of("one\ntwo\n");
+    let patch = format!("[a.txt#{tag}]\nPUT 1.=1:\n+ONE\n[b.txt#{tag}]\nPUT 1.=1:\n+ONE\n");
+    let capture = crate::runtime::execution::Capture::begin();
+    assert!(
+        edit(&ws, &patch)
+            .unwrap_err()
+            .contains("no read of this file")
+    );
+    let retry = capture.finish(false).native_edit_retry.unwrap();
+    assert_eq!(retry.requirements.len(), 2);
+    assert!(!native_edit_retry_ready(&ws, &retry));
+    for (path, ready) in [
+        ("a.txt:1-1", false),
+        ("b.txt:2-2", false),
+        ("b.txt:1-1", true),
+    ] {
+        let read = crate::tools::execute(&ws, "read", &serde_json::json!({"path":path}), 20);
+        assert!(!read.is_error, "{}", read.text);
+        assert_eq!(native_edit_retry_ready(&ws, &retry), ready, "{path}");
+    }
 }
 
 #[test]
@@ -158,7 +221,11 @@ fn unread_ranges_across_operations_and_files_are_revealed_in_one_retry() {
     let patch = format!(
         "[a.txt#{tag}]\nCUT 6.=6 @saved\nPUT 2.=4:\n+replacement\nPUT >1 @saved\n[b.txt#{btag}]\nPUT 1.=1:\n+OTHER\n"
     );
+    let capture = crate::runtime::execution::Capture::begin();
     let error = edit(&ws, &patch).unwrap_err();
+    let retry = capture.finish(false).native_edit_retry.unwrap();
+    assert_eq!(retry.requirements.len(), 2);
+    assert!(native_edit_retry_ready(&ws, &retry));
     for row in ["2:two\n", "4:four\n", "6:six\n", "1:other\n"] {
         assert!(error.contains(row), "{error}");
     }
@@ -190,7 +257,9 @@ fn invalid_anchors_remain_visible_alongside_unread_previews() {
             format!("{unread}{invalid}")
         };
         let patch = format!("[a.txt#{tag}]\n{operations}");
+        let capture = crate::runtime::execution::Capture::begin();
         let error = edit(&ws, &patch).unwrap_err();
+        assert!(capture.finish(false).native_edit_retry.is_none());
         assert!(
             error.contains("line 99 is beyond the end of the file (3 lines)"),
             "{error}"
@@ -232,7 +301,10 @@ fn unread_preview_does_not_grant_witnesses_to_omitted_lines() {
         "[a.txt#{tag}]\nPUT 1.={}:\n+replacement\n",
         MISMATCH_MAX_ROWS + 2
     );
+    let capture = crate::runtime::execution::Capture::begin();
     let error = edit(&ws, &patch).unwrap_err();
+    let retry = capture.finish(false).native_edit_retry.unwrap();
+    assert!(!native_edit_retry_ready(&ws, &retry));
     assert!(error.contains("preview truncated"), "{error}");
     let flags = ws.store().witness_flags(&path, &original);
     assert!(flags[..MISMATCH_MAX_ROWS].iter().all(|seen| *seen));
@@ -249,7 +321,9 @@ fn stale_unread_anchors_do_not_witness_current_lines() {
     let tag = ws.store().record(&path, "one\ntwo\nthree\n", &[(1, 1)]);
     fs::write(&path, "one\nTWO\nTHREE\n").unwrap();
     let patch = format!("[a.txt#{tag}]\nPUT 2.=2:\n+x\nPUT 3.=3:\n+y\n");
+    let capture = crate::runtime::execution::Capture::begin();
     assert!(edit(&ws, &patch).is_err());
+    assert!(capture.finish(false).native_edit_retry.is_none());
     assert_eq!(
         ws.store().witness_flags(&path, "one\nTWO\nTHREE\n"),
         vec![false; 3]
@@ -339,6 +413,62 @@ fn missing_range_end_teaches_a_valid_retry() {
     assert!(error.contains("PUT >2:"), "{error}");
     assert!(parse_patch("[a.rs#1234]\nPUT 2.=2:\n+fixed\n").is_ok());
     assert!(parse_patch("[a.rs#1234]\nPUT >2:\n+fixed\n").is_ok());
+}
+
+#[test]
+fn empty_put_bodies_and_sections_name_the_corrected_operation() {
+    let mid = parse_patch("[a.rs#1234]\nPUT 3.=5:\n\nPUT >7:\n+x\n").unwrap_err();
+    assert!(
+        mid.contains("line 2: `PUT 3.=5:` needs at least one `+` row"),
+        "{mid}"
+    );
+    assert!(
+        mid.contains("write `CUT 3.=5`") && mid.contains("lone `+`"),
+        "{mid}"
+    );
+    let last = parse_patch("[a.rs#1234]\nPUT 4*:\n").unwrap_err();
+    assert!(
+        last.contains("`PUT 4*:`") && last.contains("`CUT 4*`"),
+        "{last}"
+    );
+    let insert = parse_patch("[a.rs#1234]\nPUT >2:\n").unwrap_err();
+    assert!(insert.contains("remove the operation"), "{insert}");
+    assert!(!insert.contains("CUT"), "{insert}");
+    let empty = parse_patch("[a.rs#1234]\n[b.rs#1234]\nCUT 1.=1\n").unwrap_err();
+    assert!(
+        empty.contains("has no operations") && empty.contains("remove the header"),
+        "{empty}"
+    );
+}
+
+#[test]
+fn an_empty_tag_quotes_the_latest_read_without_applying_the_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::new(dir.path()).unwrap();
+    let path = ws.root().join("a.txt");
+    let patch = "[a.txt#]\nPUT 1.=1:\n+ONE\n";
+    fs::write(&path, "one\n").unwrap();
+    let unread = edit(&ws, patch).unwrap_err();
+    assert!(
+        unread.contains("no read of this file is recorded"),
+        "{unread}"
+    );
+
+    let tag = ws.store().record_all(&path, "one\n");
+    let fresh = edit(&ws, patch).unwrap_err();
+    assert!(fresh.contains(&format!("[a.txt#{tag}]")), "{fresh}");
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        "one\n",
+        "never resolved silently"
+    );
+
+    fs::write(&path, "changed\n").unwrap();
+    let stale = edit(&ws, patch).unwrap_err();
+    assert!(
+        stale.contains(&format!("#{tag}")) && stale.contains(&tag_of("changed\n")),
+        "{stale}"
+    );
 }
 
 #[test]

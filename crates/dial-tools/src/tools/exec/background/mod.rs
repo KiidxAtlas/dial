@@ -16,8 +16,9 @@
 //! Dial's reader, spool or ring alive.
 //! Input is capped at 64 KiB per call, cancellable and optionally deadline-bound; partial bytes
 //! cannot be rolled back. Pipes close explicitly for EOF. Canonical PTYs receive VEOF while
-//! keeping output open; raw PTYs have no half-close. Port readiness is network-approved and
-//! requires lsof-proven owned listeners; Linux sandbox namespace ownership fails closed.
+//! keeping output open; raw PTYs have no half-close. Port readiness requires lsof-proven owned
+//! listeners and network permission, except an unsandboxed job probed on loopback; Linux sandbox
+//! namespace ownership fails closed.
 
 pub mod durable;
 mod input;
@@ -30,7 +31,9 @@ pub use wake::notify_cancel;
 mod tests;
 
 use crate::config::types::Config;
-use crate::runtime::execution::{Completeness, ObservationKind, OutputIntegrity, ProcessOutcome};
+use crate::runtime::execution::{
+    Completeness, ObservationKind, OutputIntegrity, ProcessOutcome, ShellLaunch, ShellStdin,
+};
 use crate::tools::integrations::ext::{JobEntry, JobsView, Tool, ToolContext, ToolEvent};
 use crate::tools::{
     ToolOutput, Workspace, opt_bool, opt_str, opt_u64, present, req_str, tool_schema,
@@ -60,6 +63,13 @@ const MAX_MATCH_LINE: usize = 300;
 const MAX_LISTED_COMMAND: usize = 80;
 const DEFAULT_WAIT_SECS: u64 = 5;
 const MAX_WAIT_SECS: u64 = 300;
+/// Observe a terminal's initial state without turning launch into an unbounded foreground run.
+const PTY_STARTUP: Duration = Duration::from_secs(1);
+
+enum WaitFor {
+    Requested(Option<Ready>),
+    PtyStartup,
+}
 
 const DESCRIPTION: &str = "Background jobs owned by this session; ending the session kills them. \
 `start` a command (optional unique `name`, `cwd`; `pty` for a terminal, `stdin` for a pipe). \
@@ -171,7 +181,13 @@ impl Background {
             "start" => self.start(ws, args, on_event, cancel),
             "list" => Ok(self.list()),
             "output" => self.output(ws, args),
-            "wait" => self.wait(ws, args, on_event, cancel, Ready::parse(args)?),
+            "wait" => self.wait(
+                ws,
+                args,
+                on_event,
+                cancel,
+                WaitFor::Requested(Ready::parse(args)?),
+            ),
             "input" | "close_stdin" | "resize" => self.input(args, cancel),
             "kill" => self.kill(args),
             other => Err(format!(
@@ -204,8 +220,12 @@ impl Background {
             }
             opt_u64(args, "timeout")?;
         }
-        if ready.as_ref().is_some_and(|ready| ready.port.is_some()) && !network_allowed(ws) {
-            return Err("port readiness is denied by the workspace's network policy".into());
+        if let Some(refusal) = ready
+            .as_ref()
+            .and_then(|ready| ready.port)
+            .and_then(|address| port_probe_refusal(ws, address, network_allowed(ws)))
+        {
+            return Err(refusal.into());
         }
         #[cfg(target_os = "linux")]
         if ready.as_ref().is_some_and(|ready| ready.port.is_some()) && !ws.unsandboxed {
@@ -213,7 +233,10 @@ impl Background {
         }
         let pty = opt_bool(args, "pty")?;
         if pty && !self.pty_allowed {
-            return Err("pty is disabled by --no-pty; start without pty=true".into());
+            return Ok(
+                ToolOutput::err("pty is disabled by --no-pty; start without pty=true")
+                    .with_effects(crate::runtime::execution::Effects::None),
+            );
         }
         let stdin = opt_bool(args, "stdin")?;
         let rows = dimension(args, "rows", 24)?;
@@ -240,18 +263,47 @@ impl Background {
                 cols,
             },
         )?;
+        let launch = ShellLaunch {
+            stdin: if pty {
+                ShellStdin::Terminal
+            } else if stdin {
+                ShellStdin::Pipe
+            } else {
+                ShellStdin::Eof
+            },
+            terminal_allocated: pty,
+            job: Some(name.clone()),
+        };
         let started = format!("started {name} (pid {pid}) in {}: {command}", ws.rel(&cwd));
-        if ready.is_some() {
-            let mut wait_args = args.clone();
-            wait_args["name"] = Value::String(name);
-            let mut output = self
-                .wait(ws, &wait_args, on_event, cancel, ready)
-                .map_err(|error| format!("{error}\n{started}; process remains managed by bg"))?;
-            output.text.push_str(&format!("\n{started}"));
-            Ok(output)
+        // Structured so the controller can follow the job without parsing this prose.
+        let job = json!({"name": name, "pid": pid, "terminal": pty});
+        let mut output = if ready.is_some() || pty {
+            let (wait_args, wait_for) = if ready.is_some() {
+                let mut args = args.clone();
+                args["name"] = Value::String(name);
+                (args, WaitFor::Requested(ready))
+            } else {
+                // Startup observation has its own fixed bound, not an implicit readiness regex,
+                // input action, or a caller-supplied wait timeout (including unlimited waits).
+                (json!({"name": name}), WaitFor::PtyStartup)
+            };
+            match self.wait(ws, &wait_args, on_event, cancel, wait_for) {
+                Ok(mut output) => {
+                    output.text.push_str(&format!("\n{started}"));
+                    output
+                }
+                // The job exists either way; keep its identity with the observation failure.
+                Err(error) => {
+                    ToolOutput::err(format!("{error}\n{started}; process remains managed by bg"))
+                }
+            }
         } else {
-            Ok(ToolOutput::ok(started))
+            ToolOutput::ok(started)
+        };
+        if let Some(data) = output.data.get_or_insert_with(|| json!({})).as_object_mut() {
+            data.insert("job".into(), job);
         }
+        Ok(output.with_shell_launch(launch))
     }
 
     fn input(&self, args: &Value, cancel: &AtomicBool) -> Result<ToolOutput, String> {
@@ -324,17 +376,7 @@ impl Background {
         };
         let snap = self.table().snapshot(name)?;
         snap.settle();
-        let (body, lost, integrity) = take_presented(ws, &snap, tail);
-        let is_error = lock(&snap.ring).error.is_some();
-        Ok(ToolOutput {
-            execution: Default::default(),
-            data: None,
-            text: render_output(&snap, body, lost, tail),
-            is_error,
-        }
-        .with_observation(ObservationKind::Snapshot, !is_error)
-        .with_process(process_outcome(&snap))
-        .with_output_integrity(integrity))
+        Ok(snapshot_output(ws, &snap, tail))
     }
 
     fn wait(
@@ -343,9 +385,13 @@ impl Background {
         args: &Value,
         on_event: Option<&(dyn Fn(ToolEvent) + Sync)>,
         cancel: &AtomicBool,
-        ready: Option<Ready>,
+        wait_for: WaitFor,
     ) -> Result<ToolOutput, String> {
         let name = req_str(args, "name")?;
+        let (ready, startup) = match wait_for {
+            WaitFor::Requested(ready) => (ready, false),
+            WaitFor::PtyStartup => (None, true),
+        };
         let secs = match opt_u64(args, "timeout")? {
             Some(0) => 0,
             Some(secs) => secs.min(MAX_WAIT_SECS),
@@ -354,8 +400,12 @@ impl Background {
         if ready.is_some() && present(args, "until") {
             return Err("use either until or ready.log, not both".into());
         }
-        if ready.as_ref().is_some_and(|ready| ready.port.is_some()) && !network_allowed(ws) {
-            return Err("port readiness is denied by the workspace's network policy".into());
+        if let Some(refusal) = ready
+            .as_ref()
+            .and_then(|ready| ready.port)
+            .and_then(|address| port_probe_refusal(ws, address, network_allowed(ws)))
+        {
+            return Err(refusal.into());
         }
         #[cfg(target_os = "linux")]
         if ready.as_ref().is_some_and(|ready| ready.port.is_some()) && !ws.unsandboxed {
@@ -371,11 +421,15 @@ impl Background {
             ),
         };
         let secs = ready_timeout.unwrap_or(secs);
-        let deadline = super::kernel::execution_deadline(Duration::from_secs(secs));
+        let deadline = if startup {
+            Some(Instant::now() + PTY_STARTUP)
+        } else {
+            super::kernel::execution_deadline(Duration::from_secs(secs))
+        };
         let mut scanned = None;
         let mut matched = None;
         let mut next_probe = Instant::now();
-        let initial_pid = self.table().snapshot(name)?.pid;
+        let initial = self.table().snapshot(name)?;
         loop {
             let seen = wake::generation();
             if let Some(on_event) = on_event {
@@ -394,30 +448,38 @@ impl Background {
                 // ending has effects to inspect. Unknown effects would stop the turn with a
                 // misleading "uncertain effects" report and refuse further calls.
                 if !hard_cancel && super::signals::steering_requested() {
-                    return Ok(ToolOutput::ok(format!(
+                    return Ok(initial.with_launch(ToolOutput::ok(format!(
                         "stopped waiting for {name} because a new user message arrived; {name} is still running under bg (use output or wait to check it again)"
                     ))
-                    .with_effects(crate::tools::surface::outcome::Effects::None));
+                    .with_effects(crate::tools::surface::outcome::Effects::None)));
                 }
-                return Ok(ToolOutput::err(format!(
-                    "cancelled waiting for {name}; background process remains managed by bg"
-                ))
-                .with_status(crate::tools::ToolStatus::Aborted)
-                .with_effects(crate::tools::surface::outcome::Effects::None));
+                return Ok(initial.with_launch(
+                    ToolOutput::err(format!(
+                        "cancelled waiting for {name}; background process remains managed by bg"
+                    ))
+                    .with_status(crate::tools::ToolStatus::Aborted)
+                    .with_effects(crate::tools::surface::outcome::Effects::None),
+                ));
             }
             let snap = self.table().snapshot(name)?;
-            if snap.pid != initial_pid {
+            if snap.pid != initial.pid {
                 return Err(format!("not ready: {name} was replaced while waiting"));
             }
-            if port.is_some() && !snap.network {
-                return Err(
-                    "port readiness denied: this job was launched without network permission"
-                        .into(),
-                );
+            if let Some(refusal) =
+                port.and_then(|address| port_probe_refusal(ws, address, snap.network))
+            {
+                return Err(refusal.into());
             }
             let exited = !matches!(snap.state, State::Running);
             if exited {
                 snap.settle();
+            }
+            if startup && (exited || deadline.is_some_and(|end| Instant::now() >= end)) {
+                let mut output = snapshot_output(ws, &snap, None);
+                if let State::Exited { status, .. } = snap.state {
+                    output.is_error |= status.is_none_or(|status| !status.success());
+                }
+                return Ok(output);
             }
             if matched.is_none()
                 && let Some(pattern) = &until
@@ -433,7 +495,7 @@ impl Background {
                     readiness::port_ready(snap.pid, address, deadline, cancel, &self.interrupt)?;
                 next_probe = Instant::now() + Duration::from_millis(250);
                 let current = self.table().snapshot(name)?;
-                if current.pid != initial_pid || !matches!(current.state, State::Running) {
+                if current.pid != initial.pid || !matches!(current.state, State::Running) {
                     return Err(format!(
                         "not ready: {name} exited or was replaced during its port probe"
                     ));
@@ -455,12 +517,11 @@ impl Background {
                     (_, _, Some(address)) => format!("owned listener accepting at {address}"),
                     _ => unreachable!(),
                 };
-                return Ok(ToolOutput::ok(format!(
-                    "ready: {name} {detail}\n[{}]",
-                    snap.state.label()
-                ))
-                .with_observation(ObservationKind::Readiness, true)
-                .with_process(process_outcome(&snap)));
+                return Ok(snap.with_launch(
+                    ToolOutput::ok(format!("ready: {name} {detail}\n[{}]", snap.state.label()))
+                        .with_observation(ObservationKind::Readiness, true)
+                        .with_process(process_outcome(&snap)),
+                ));
             }
             if exited {
                 let state = snap.state.label();
@@ -469,53 +530,57 @@ impl Background {
                 let (body, lost, integrity) = take_presented(ws, &snap, None);
                 let output = render_body(&snap, body, lost, None);
                 let observation_satisfied = !conditions && lock(&snap.ring).error.is_none();
-                return Ok(if conditions {
-                    ToolOutput::err(format!(
-                        "not ready: {name} {state} before {} was established\n{output}",
-                        until.as_ref().map_or_else(
-                            || "port readiness".into(),
-                            |pattern| format!(
-                                "/{pattern}/{}",
-                                if port.is_some() {
-                                    " and port readiness"
-                                } else {
-                                    ""
-                                }
-                            )
-                        )
-                    ))
-                } else {
-                    let text = format!("ready: {name} {state}\n{output}");
-                    if lock(&snap.ring).error.is_some() {
-                        ToolOutput::err(text)
-                    } else {
-                        ToolOutput::ok(text)
-                    }
-                }
-                .with_observation(
+                return Ok(snap.with_launch(
                     if conditions {
-                        ObservationKind::Readiness
+                        ToolOutput::err(format!(
+                            "not ready: {name} {state} before {} was established\n{output}",
+                            until.as_ref().map_or_else(
+                                || "port readiness".into(),
+                                |pattern| format!(
+                                    "/{pattern}/{}",
+                                    if port.is_some() {
+                                        " and port readiness"
+                                    } else {
+                                        ""
+                                    }
+                                )
+                            )
+                        ))
                     } else {
-                        ObservationKind::Wait
-                    },
-                    observation_satisfied,
-                )
-                .with_process(process_outcome(&snap))
-                .with_output_integrity(integrity));
+                        let text = format!("ready: {name} {state}\n{output}");
+                        if lock(&snap.ring).error.is_some() {
+                            ToolOutput::err(text)
+                        } else {
+                            ToolOutput::ok(text)
+                        }
+                    }
+                    .with_observation(
+                        if conditions {
+                            ObservationKind::Readiness
+                        } else {
+                            ObservationKind::Wait
+                        },
+                        observation_satisfied,
+                    )
+                    .with_process(process_outcome(&snap))
+                    .with_output_integrity(integrity),
+                ));
             }
             if deadline.is_some_and(|end| Instant::now() >= end) {
-                return Ok(ToolOutput::ok(format!(
-                    "not ready: timed out after {secs}s; {name} is still running"
-                ))
-                .with_observation(
-                    if conditions {
-                        ObservationKind::Readiness
-                    } else {
-                        ObservationKind::Wait
-                    },
-                    false,
-                )
-                .with_process(process_outcome(&snap)));
+                return Ok(snap.with_launch(
+                    ToolOutput::ok(format!(
+                        "not ready: timed out after {secs}s; {name} is still running"
+                    ))
+                    .with_observation(
+                        if conditions {
+                            ObservationKind::Readiness
+                        } else {
+                            ObservationKind::Wait
+                        },
+                        false,
+                    )
+                    .with_process(process_outcome(&snap)),
+                ));
             }
             let mut wake_at = deadline;
             if port.is_some() {
@@ -551,6 +616,29 @@ fn network_allowed(ws: &Workspace) -> bool {
         Some(super::sandbox::Policy::Strict { allow_network, .. })
         | Some(super::sandbox::Policy::Dev { allow_network, .. }) => *allow_network,
         None => ws.allow_network,
+    }
+}
+
+/// Why a port probe of `address` is refused, given whether the job has network permission.
+/// An unsandboxed job already has unrestricted network, and probing its own loopback listener
+/// (ownership is still proven by lsof first) reaches nothing else, so that needs no approval. A
+/// sandboxed job without network cannot open even a loopback listener (`deny network*`), so
+/// there the probe could never succeed and the refusal says so.
+fn port_probe_refusal(
+    ws: &Workspace,
+    address: std::net::SocketAddr,
+    network: bool,
+) -> Option<&'static str> {
+    if network || (ws.unsandboxed && address.ip().is_loopback()) {
+        None
+    } else if ws.unsandboxed {
+        Some(
+            "port readiness on a non-loopback host needs network permission; probe 127.0.0.1 or ::1, or use ready.log",
+        )
+    } else {
+        Some(
+            "port readiness needs network permission here: without it the sandbox also refuses the job's own listening socket, so the port could never open; use ready.log, or start the job once network is approved",
+        )
     }
 }
 
@@ -810,6 +898,23 @@ fn output_integrity(
     }
 }
 
+/// Render an observed state with the same capture and process facts for reads and PTY startup.
+fn snapshot_output(ws: &Workspace, snap: &Snapshot, tail: Option<usize>) -> ToolOutput {
+    let (body, lost, integrity) = take_presented(ws, snap, tail);
+    let is_error = lock(&snap.ring).error.is_some();
+    snap.with_launch(
+        ToolOutput {
+            execution: Default::default(),
+            data: None,
+            text: render_output(snap, body, lost, tail),
+            is_error,
+        }
+        .with_observation(ObservationKind::Snapshot, !is_error)
+        .with_process(process_outcome(snap))
+        .with_output_integrity(integrity),
+    )
+}
+
 fn render_output(snap: &Snapshot, body: String, lost: u64, tail: Option<usize>) -> String {
     format!(
         "[{}: {}, pid {}]\n{}",
@@ -901,7 +1006,7 @@ impl Tool for Background {
                 "ready": {"type": "object", "additionalProperties": false, "description": "named start/wait: both conditions when both are given", "properties": {
                     "log": {"type": "string", "description": "regex in the job's output"},
                     "host": {"type": "string", "description": "numeric IP (default 127.0.0.1); needs port"},
-                    "port": {"type": "integer", "minimum": 1, "maximum": 65535, "description": "TCP listener owned by the job; needs network approval"},
+                    "port": {"type": "integer", "minimum": 1, "maximum": 65535, "description": "TCP listener owned by the job; needs network approval (not for an unsandboxed job on loopback)"},
                     "timeout": {"type": "integer", "minimum": 0, "maximum": 300, "description": "seconds, 0 unlimited (default the outer timeout or 5)"}
                 }},
                 "tail": {"type": "integer", "minimum": 1, "description": "output: only the last N lines"},
@@ -945,7 +1050,8 @@ impl Tool for Background {
     }
 
     fn interruptible(&self, args: &Value) -> bool {
-        args["action"] == "wait" || (args["action"] == "start" && args.get("ready").is_some())
+        args["action"] == "wait"
+            || (args["action"] == "start" && (args.get("ready").is_some() || args["pty"] == true))
     }
 
     fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
@@ -1002,5 +1108,11 @@ impl Tool for Background {
         let mut table = self.table();
         table.refresh();
         table.awaited()
+    }
+
+    fn session_work(&self) -> Vec<String> {
+        let mut table = self.table();
+        table.refresh();
+        table.session_owned()
     }
 }

@@ -167,6 +167,8 @@ impl<'a> Agent<'a> {
     /// One sweep is one observation of the installed interpreter, shared by its checks.
     pub(in crate::agent) fn refresh_check_inputs(&mut self) {
         let started = Instant::now();
+        self.live_tasks
+            .revalidate_acceptance(&self.config.verification);
         let mut runtime = None;
         for check in self.step_checks.evidence.input_checks() {
             let inputs = self
@@ -431,7 +433,8 @@ impl<'a> Agent<'a> {
                     {
                         self.step_checks.note_repro_run();
                     }
-                    self.run_background_tool("bash", &args, ui, None)
+                    // A check must finish to verify anything; it is never auto-backgrounded.
+                    self.run_foreground_tool("bash", &args, ui)
                         .unwrap_or_else(|| {
                             tools::execute(&self.workspace, "bash", &args, check.timeout_secs)
                         })
@@ -964,24 +967,28 @@ impl<'a> Agent<'a> {
                         .step_checks
                         .evidence
                         .unchanged_unrelated_failure(&check.command);
+                use crate::agent::verify::verification::CheckStatus;
                 let description = if unchanged {
-                    Some("Unchanged baseline failure outside declared behavioral scope; disclosed without automatic repair.")
-                } else { crate::agent::verify::verification::runner_problem(
-                    check,
-                    runner,
-                    &output.text,
-                ) }
-                .unwrap_or(
-                    "Check failed; inspect the diagnostics and repair the observed failure.",
-                );
+                    "Unchanged baseline failure outside declared behavioral scope; disclosed without automatic repair."
+                } else {
+                    match status {
+                        CheckStatus::CodeFailed => "Check failed with a code/test diagnostic; inspect it and repair the observed failure.",
+                        CheckStatus::FailedUnknownCause => "Check exited nonzero, but its cause is unconfirmed. Inspect the retained diagnostics and runner/environment before deciding whether source repair is appropriate.",
+                        CheckStatus::EnvironmentUnavailable => crate::agent::verify::verification::runner_problem(check, runner, &output.text).unwrap_or("Verification environment unavailable; restore the declared runner/environment and rerun without changing application code."),
+                        CheckStatus::PermissionDenied => "Verification permission denied; obtain the required approval before rerunning. This is not a source-code diagnosis.",
+                        CheckStatus::Cancelled => "Verification cancelled; no source-code diagnosis was established.",
+                        CheckStatus::TimedOut => "Verification timed out; inspect the run and its limits before deciding on a cause.",
+                        CheckStatus::Unverified | CheckStatus::Passed => "Verification evidence is incomplete; inspect the run and rerun the same acceptance check when its prerequisites are met.",
+                    }
+                };
                 let message = format!(
                     "{} failed:\n{description}\nCommand: {}\n{}",
                     check.name,
                     check.command,
                     crate::agent::safety::guard::clip_evidence(&output.text, 4096)
                 );
-                // Infrastructure, permission, cancellation, timeout and unverified problems are reported
-                // without sending the model into code repair.
+                // An unexplained failure, infrastructure, permission, cancellation, timeout or
+                // unverified problem is reported without sending the model into source repair.
                 if status.repairable() && !unchanged {
                     actionable.push(message.clone());
                 }
@@ -1069,17 +1076,70 @@ impl<'a> Agent<'a> {
         }
     }
 
-    /// Side-effect-free completion blockers shared by `finish completed` and `goal complete`: explicit
-    /// blockers, running shell or worker jobs, unreadable worker state, and failed checks with no edit
-    /// awaiting a fresh check. Callers decide whether to pump workers or disclose changes.
-    pub(in crate::agent) fn completion_blockers(&self) -> Result<(), String> {
-        let blocked = self
+    /// A recorded external prerequisite halts automation; missing evidence alone is incomplete.
+    /// Classify from controller state rather than a model's explanation or diagnostic prose.
+    pub(in crate::agent) fn completion_rejection_outcome(&self) -> TurnOutcome {
+        let blocked_task = self
             .todo
             .tasks()
             .iter()
             .any(|task| task.status == crate::agent::workflow::todo::Status::Blocked);
-        if blocked {
-            return Err("Explicitly blocked tasks remain. Resolve their prerequisites or report outcome=blocked.".into());
+        let control = self.session.control_state();
+        let blocked_deliverable = control["working_state"]["deliverables"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item["status"] == "blocked"));
+        if blocked_task || blocked_deliverable {
+            TurnOutcome::Blocked
+        } else {
+            TurnOutcome::Incomplete
+        }
+    }
+
+    /// Side-effect-free completion blockers shared by `finish completed` and `goal complete`: explicit
+    /// blockers, running shell or worker jobs, unreadable worker state, and failed checks with no edit
+    /// awaiting a fresh check. Callers decide whether to pump workers or disclose changes.
+    pub(in crate::agent) fn completion_blockers(&self) -> Result<(), String> {
+        let blocked: Vec<_> = self
+            .todo
+            .tasks()
+            .iter()
+            .filter(|task| task.status == crate::agent::workflow::todo::Status::Blocked)
+            .map(|task| {
+                format!(
+                    "{}: {}",
+                    task.content,
+                    task.note
+                        .as_deref()
+                        .unwrap_or("No blocking reason recorded")
+                )
+            })
+            .collect();
+        if !blocked.is_empty() {
+            return Err(format!(
+                "Explicitly blocked tasks remain. Resolve their prerequisites or report outcome=blocked.\n{}",
+                blocked.join("\n")
+            ));
+        }
+        let control = self.session.control_state();
+        let working = &control["working_state"];
+        if let Some(blocker) = crate::agent::workflow::working_state::completion_blocker(working) {
+            return Err(blocker);
+        }
+        let coverage = verify::requirements::snapshot(
+            &self.config.verification,
+            &self.step_checks.evidence,
+            self.step_checks.revision(),
+            &self.step_checks.visual,
+        );
+        if let Some(blocker) = verify::requirements::deliverable_blocker(&coverage, working) {
+            return Err(blocker);
+        }
+        let unpassed = self.unpassed_check_links(working);
+        if !unpassed.is_empty() {
+            return Err(format!(
+                "Satisfied deliverables cite checks that are not currently passing: {}. Run or fix those checks, or cancel or block the deliverables.",
+                unpassed.join(", ")
+            ));
         }
         if !self.side_questions.running_ids().is_empty() {
             return Err("cannot complete while side questions are running; use side_request wait or cancel and collect their results".into());
@@ -1134,7 +1194,25 @@ impl<'a> Agent<'a> {
         {
             return Err(reason);
         }
+        // Obligations exist only for non-hermetic user turns with target evidence enabled; the
+        // tool offer is built only when one is open.
+        if !self.plan_mode
+            && self.step_checks.targets.has_obligations()
+            && let Some(reason) = self.step_checks.targets.blocker(
+                &self.workspace,
+                self.step_checks.effect_epoch(),
+                self.terminal_launch_available(),
+            )
+        {
+            return Err(reason);
+        }
         Ok(())
+    }
+
+    /// Eligible offered or loadable terminal launches, not an execution grant.
+    fn terminal_launch_available(&self) -> bool {
+        self.launch_recovery_capabilities(&self.offered())
+            .terminal_available()
     }
 
     /// The applicable checks when this turn's file edits have no passing check on the current
@@ -1228,6 +1306,10 @@ impl<'a> Agent<'a> {
                 self.run_checks(&required, ui);
             }
         }
+        // `finish` is refused once while an unattended run would silently kill a session service.
+        if let Some(notice) = self.exit_bound_jobs_notice() {
+            return Err(notice);
+        }
         self.completion_blockers()?;
         if !self.hermetic {
             self.disclose_turn_changes(ui);
@@ -1250,6 +1332,12 @@ impl<'a> Agent<'a> {
                         && task.status == crate::agent::workflow::todo::Status::InProgress)
             })
             .collect::<Vec<_>>();
+        let working = self.session.control_state();
+        let declared_open =
+            crate::agent::workflow::working_state::open_deliverables(&working["working_state"]);
+        let unpassed_links = self.unpassed_check_links(&working["working_state"]);
+        let declared_blocker =
+            crate::agent::workflow::working_state::completion_blocker(&working["working_state"]);
         let revision = self.step_checks.revision();
         let checks = self.step_checks.evidence.snapshot(revision);
         let visual = self.step_checks.visual.status(revision);
@@ -1273,17 +1361,119 @@ impl<'a> Agent<'a> {
         json!({
             "version": 1,
             "execution_outcome": outcome,
-            "deliverable_coverage": if !remaining.is_empty() { "open_obligations" } else { requirements["coverage"].as_str().unwrap_or("not_independently_assessed") },
+            "deliverable_coverage": if !remaining.is_empty() || declared_blocker.is_some() || !unpassed_links.is_empty() { "open_obligations" } else { requirements["coverage"].as_str().unwrap_or("not_independently_assessed") },
             "outstanding_tasks": remaining,
+            "declared_deliverables": working["working_state"]["deliverables"],
+            "outstanding_deliverables": declared_open,
+            "deliverable_claim_policy":"model_reported_not_independent_verification",
+            "unpassed_check_links": unpassed_links,
+            "reconciliation": self.deliverable_reconciliation(&working["working_state"]),
             "verification_coverage": verification,
             "visual_evidence": visual,
             "checks": checks,
             "requirements": requirements,
             "uncheckpointed_effects": self.step_checks.has_uncheckpointed_operations(),
             "caller_obligations": self.caller_obligations(),
+            "requested_targets": self.step_checks.targets.evidence(&self.workspace, self.step_checks.effect_epoch()),
             "counterfactual_checks": self.step_checks.counterfactual.evidence(),
             "note": "Observed checks and delivered pixels are evidence, not independent proof of every requested behavior. Undeclared requirements remain unassessed, not complete."
         })
+    }
+
+    /// Resolve evidence per obligation without promoting model claims or arbitrary references.
+    /// A passing linked check establishes that check's result, not complete semantic coverage.
+    pub(in crate::agent) fn deliverable_reconciliation(&self, working: &Value) -> Value {
+        let links = self.deliverable_check_links(working);
+        let coverage = verify::requirements::snapshot(
+            &self.config.verification,
+            &self.step_checks.evidence,
+            self.step_checks.revision(),
+            &self.step_checks.visual,
+        );
+        let items: Vec<Value> = working["deliverables"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .take(32)
+            .map(|item| {
+                let checks: Vec<Value> = links.iter()
+                    .filter(|(id, _, _)| item["id"].as_str() == Some(id.as_str()))
+                    .map(|(_, name, status)| json!({"name":name,"status":status}))
+                    .collect();
+                let evidence_status = if item["status"] != "satisfied" {
+                    "not_claimed_satisfied"
+                } else if checks.is_empty() {
+                    "claim_only"
+                } else if checks.iter().all(|check| check["status"] == "passed") {
+                    "linked_checks_passed"
+                } else {
+                    "linked_checks_unresolved"
+                };
+                json!({
+                    "id":item["id"], "description":item["description"],
+                    "claimed_status":item["status"], "evidence_status":evidence_status,
+                    "acceptance": verify::requirements::deliverable_acceptance(&coverage, item["id"].as_str().unwrap_or_default()),
+                    "recorded_origin":item["origin"], "scope_receipt":item["receipt"],
+                    "checks":checks,
+                    "unverified_refs":item["evidence_refs"].as_array().into_iter().flatten()
+                        .filter(|reference| !reference.as_str().is_some_and(|value| value.starts_with(crate::agent::workflow::working_state::CHECK_REF_PREFIX)))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        json!({
+            "deliverables":items,
+            "omitted_deliverables":working["deliverables"].as_array().map_or(0, |items| items.len().saturating_sub(32)),
+            "last_scope_change":working["last_scope_change"],
+            "undeclared_requirements":"unassessed",
+            "semantic_coverage":"not_independently_verified"
+        })
+    }
+
+    /// `id -> check:name` links without exactly one current passing command. Never executes refs.
+    fn unpassed_check_links(&self, working: &Value) -> Vec<String> {
+        self.deliverable_check_links(working)
+            .into_iter()
+            .filter(|(_, _, status)| status != "passed")
+            .map(|(id, name, status)| format!("{id} -> check:{name} ({status})"))
+            .collect()
+    }
+
+    fn deliverable_check_links(&self, working: &Value) -> Vec<(String, String, String)> {
+        let links = crate::agent::workflow::working_state::check_references(working);
+        if links.is_empty() {
+            return Vec::new();
+        }
+        let revision = self.step_checks.revision();
+        let selection = self.current_focused_checks();
+        links
+            .into_iter()
+            .map(|(id, name)| {
+                let mut commands: Vec<&str> = self
+                    .config
+                    .verification
+                    .commands
+                    .iter()
+                    .filter(|check| check.name == name)
+                    .map(|check| check.command.as_str())
+                    .collect();
+                commands.extend(
+                    selection
+                        .iter()
+                        .chain(self.step_checks.evidence.repros().iter())
+                        .filter(|check| check.name == name)
+                        .map(|check| check.command.as_str()),
+                );
+                commands.sort_unstable();
+                commands.dedup();
+                let status = match commands.as_slice() {
+                    [] => "unknown_check",
+                    [command] => self.step_checks.evidence.current_status(command, revision),
+                    _ => "ambiguous_check",
+                };
+                (id, name, status.to_owned())
+            })
+            .collect()
     }
 }
 

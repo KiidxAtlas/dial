@@ -289,6 +289,7 @@ impl<'a> Agent<'a> {
         let schemas = self.schemas(&names)?;
         let mut catalog =
             crate::tools::surface::catalog::Catalog::from_schemas(&schemas, &self.ext)?;
+        catalog.refresh_readiness(self.config, &self.ext);
         for name in self.config.tools.keys() {
             catalog.set_origin(name, crate::tools::surface::catalog::Origin::Configured);
         }
@@ -596,6 +597,13 @@ impl<'a> Agent<'a> {
                     .into_iter()
                     .map(str::to_owned),
             );
+        }
+        if self.config.compaction.snapcompact.overlay
+            || crate::agent::compact::snapcompact::views::available(&self.session.messages())
+        {
+            // Recovery is a requirement of this opt-in mode. Model tool allowlists
+            // below still apply; compaction refuses if recovery is withheld.
+            names.push("session_search".into());
         }
         if let Some(allowed) = self
             .config

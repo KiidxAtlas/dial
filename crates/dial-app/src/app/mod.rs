@@ -107,6 +107,7 @@ pub fn run_interactive(layout: Layout, config: Config, options: Options) -> Resu
     let outcome = drive(&mut app, &mut shell, options.session, options.restore);
     crate::app::commands::maintenance::stop_relay();
     let resume = shell.finish();
+    crate::stats::sync_after_session(&app.config);
     #[cfg(unix)]
     if shell.restart_requested && outcome.is_ok() {
         let launch: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
@@ -177,11 +178,13 @@ pub fn run_print(
     } else {
         None
     };
+    let mut launch = options.launch;
+    launch.unattended = true;
     let app = App::new(
         layout,
         config,
         options.overlay,
-        options.launch,
+        launch,
         options.add_dirs,
         options.mode_flags,
     )?;

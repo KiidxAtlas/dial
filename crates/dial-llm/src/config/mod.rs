@@ -677,10 +677,20 @@ impl Config {
             }
         }
         table.remove("chatgpt_accounts");
+        let harness_temperature_pinned = table
+            .get("harness")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|harness| harness.contains_key("temperature"));
+        let edit_mode_explicit = table
+            .get("edit")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|edit| edit.contains_key("mode"));
         layout.ensure_project_outside_storage()?;
         let mut config: Config = toml::Value::Table(table)
             .try_into()
             .context("invalid configuration")?;
+        config.harness_temperature_pinned = harness_temperature_pinned;
+        config.edit_mode_explicit = edit_mode_explicit;
         if let Some(mode) = std::env::var_os("DIAL_EDIT_VARIANT") {
             let mode = mode
                 .into_string()
@@ -1572,6 +1582,20 @@ impl Config {
     pub fn base_edit_mode(&self, harness: &Harness) -> types::EditMode {
         self.pinned_edit_mode(harness).unwrap_or(self.edit.mode)
     }
+    /// `(local, configured)` when the local route's `assistance.local.edit_mode` replaces an
+    /// explicitly set `[edit] mode`; `None` when a pin decides, the modes agree, `[edit] mode` is
+    /// unset or the local profile does not apply.
+    pub fn local_edit_mode_replacing_configured(
+        &self,
+        harness: &Harness,
+    ) -> Option<(types::EditMode, types::EditMode)> {
+        if !self.edit_mode_explicit || self.pinned_edit_mode(harness).is_some() {
+            return None;
+        }
+        self.local_edit_mode()
+            .filter(|local| *local != self.edit.mode)
+            .map(|local| (local, self.edit.mode))
+    }
 
     /// `assistance.local.edit_mode` when the local profile applies to the main route.
     fn local_edit_mode(&self) -> Option<types::EditMode> {
@@ -1606,7 +1630,7 @@ impl Config {
         if pins.max_steps != defaults.max_steps {
             effective.max_steps = pins.max_steps;
         }
-        if pins.temperature != defaults.temperature {
+        if self.harness_temperature_pinned || pins.temperature != defaults.temperature {
             effective.temperature = pins.temperature;
         }
         if pins.max_tokens != defaults.max_tokens {

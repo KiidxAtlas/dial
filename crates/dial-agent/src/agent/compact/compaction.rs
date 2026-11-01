@@ -17,6 +17,8 @@ use crate::llm::provider::NativeCompactionRequest;
 use crate::llm::wire::{WireParts, estimate, json_bytes, wire_parts};
 
 use crate::storage::transcript::{complete_boundary, is_history};
+mod execution;
+mod handoff;
 mod summary;
 use crate::agent::Ui;
 use crate::{
@@ -24,6 +26,7 @@ use crate::{
     storage::session::Session,
 };
 use anyhow::{Context, Result, bail, ensure};
+pub(in crate::agent) use execution::{SummaryExecution, SummaryWorker};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::{
@@ -165,7 +168,7 @@ fn cut_with_policy(
 ) -> Option<usize> {
     let billing = billing_for(policy, identity);
     cut_with(messages, budget, |message| {
-        snapcompact_image_tokens(message, billing).unwrap_or_else(|| estimate(message))
+        message_accounting(message, billing, identity).0
     })
 }
 
@@ -281,15 +284,13 @@ pub fn request_tokens_with_policy(
     request
         .messages
         .iter()
-        .map(|message| {
-            snapcompact_image_tokens(message, billing).unwrap_or_else(|| estimate(message))
-        })
+        .map(|message| message_accounting(message, billing, identity).0)
         .sum::<u64>()
         .saturating_add(
             request
                 .tools
                 .iter()
-                .map(|tool| wire_tokens(tool, wire_parts(tool)))
+                .map(|tool| schema_tokens(tool, identity))
                 .sum::<u64>(),
         )
 }
@@ -317,14 +318,12 @@ pub fn request_accounting_with_policy(
         tool_bytes: Vec::with_capacity(request.tools.len()),
     };
     for message in &request.messages {
-        let (tokens, parts) = message_accounting(message, billing);
+        let (tokens, parts) = message_accounting(message, billing, identity);
         out.tokens = out.tokens.saturating_add(tokens);
         out.messages.push(parts);
     }
     for tool in &request.tools {
-        out.tokens = out
-            .tokens
-            .saturating_add(wire_tokens(tool, wire_parts(tool)));
+        out.tokens = out.tokens.saturating_add(schema_tokens(tool, identity));
         out.tool_bytes.push(json_bytes(tool));
     }
     out
@@ -339,7 +338,7 @@ impl RequestAccounting {
         policy: &CompactionConfig,
         identity: CompactionIdentity<'_>,
     ) -> u64 {
-        let (tokens, parts) = message_accounting(message, billing_for(policy, identity));
+        let (tokens, parts) = message_accounting(message, billing_for(policy, identity), identity);
         self.tokens = self.tokens.saturating_add(tokens);
         self.messages.push(parts);
         self.tokens
@@ -356,10 +355,19 @@ fn billing_for<'a>(
 }
 
 /// Tokens and wire parts of one message; the snapcompact image policy overrides the wire tokens.
-fn message_accounting(message: &Value, billing: &ImageTokenization) -> (u64, WireParts) {
+fn message_accounting(
+    message: &Value,
+    billing: &ImageTokenization,
+    identity: CompactionIdentity<'_>,
+) -> (u64, WireParts) {
     let parts = wire_parts(message);
-    let tokens =
-        snapcompact_image_tokens(message, billing).unwrap_or_else(|| wire_tokens(message, parts));
+    let tokens = snapcompact_image_tokens(message, billing).unwrap_or_else(|| {
+        if crate::llm::wire::counting::encoding_for(identity.provider, identity.model).is_some() {
+            crate::llm::wire::counting::message_tokens(identity.provider, identity.model, message)
+        } else {
+            wire_tokens(message, parts)
+        }
+    });
     (tokens, parts)
 }
 
@@ -370,6 +378,18 @@ fn wire_tokens(message: &Value, parts: WireParts) -> u64 {
             .as_u64()
             .unwrap_or(0),
     )
+}
+
+fn schema_tokens(tool: &Value, identity: CompactionIdentity<'_>) -> u64 {
+    if crate::llm::wire::counting::encoding_for(identity.provider, identity.model).is_some() {
+        crate::llm::wire::counting::schema_tokens(
+            identity.provider,
+            identity.model,
+            std::slice::from_ref(tool),
+        )
+    } else {
+        wire_tokens(tool, wire_parts(tool))
+    }
 }
 
 /// Image-aware tokens of a snapcompact frame message, or `None` when the wire estimate applies.
@@ -436,7 +456,28 @@ pub fn compact_history(
     interrupt: Arc<AtomicBool>,
     ui: &mut dyn Ui,
     complete: &mut dyn FnMut(&mut Backend, &Chat, &mut dyn Ui) -> Result<String>,
+    remote_observer: Option<&mut RemoteCompactionObserver<'_>>,
+) -> Result<PreparedCompaction> {
+    compact_history_with_execution(
+        backend,
+        input,
+        interrupt,
+        ui,
+        complete,
+        remote_observer,
+        &mut SummaryExecution::default(),
+    )
+}
+
+/// The same preparation with independently owned, capability-checked auxiliary resources.
+pub(in crate::agent) fn compact_history_with_execution(
+    backend: &mut Backend,
+    input: HistoryCompaction<'_>,
+    interrupt: Arc<AtomicBool>,
+    ui: &mut dyn Ui,
+    complete: &mut dyn FnMut(&mut Backend, &Chat, &mut dyn Ui) -> Result<String>,
     mut remote_observer: Option<&mut RemoteCompactionObserver<'_>>,
+    execution: &mut SummaryExecution,
 ) -> Result<PreparedCompaction> {
     let HistoryCompaction {
         request,
@@ -667,19 +708,43 @@ pub fn compact_history(
                         request_tokens_with_policy(&tail, policy, context.identity) < budget,
                         "newest complete history group and retained context leave no room for a summary; no summary was requested"
                     );
-                    let mut summary = summary::summarize_prefix(
-                        backend,
-                        &request.messages,
-                        keep,
-                        policy,
-                        &context,
-                        method,
-                        &focus,
-                        &interrupt,
-                        ui,
-                        complete,
-                        &mut remote_observer,
-                    )?;
+                    let live = if method == CompactionMethod::Handoff && execution.live_handoff {
+                        let retained = request.messages[keep..]
+                            .iter()
+                            .filter(|m| is_history(m))
+                            .count();
+                        let live_focus = format!(
+                            "{focus}\n\nThe newest {retained} history messages will remain verbatim after this summary. Use them to orient the handoff; prioritize facts from the earlier context being replaced, and avoid needlessly repeating the retained tail."
+                        );
+                        handoff::summarize(
+                            backend,
+                            policy,
+                            &context,
+                            &live_focus,
+                            &interrupt,
+                            ui,
+                            complete,
+                        )?
+                    } else {
+                        None
+                    };
+                    let mut summary = match live {
+                        Some(summary) => summary::finish_handoff(&request.messages, &summary),
+                        None => summary::summarize_prefix_with_worker(
+                            backend,
+                            &request.messages,
+                            keep,
+                            policy,
+                            &context,
+                            method,
+                            &focus,
+                            &interrupt,
+                            ui,
+                            complete,
+                            &mut remote_observer,
+                            &mut execution.parallel,
+                        )?,
+                    };
                     let mut prefix = vec![Session::compaction_message(&summary)];
                     let history = prefix
                         .iter()
@@ -792,10 +857,25 @@ pub fn compact_history(
                         backend.accepts_image_input(),
                         "snapcompact requires a vision-capable model"
                     );
+                    if policy.snapcompact.overlay
+                        || crate::agent::compact::snapcompact::views::available(&request.messages)
+                    {
+                        ensure!(
+                            request.tools.iter().any(|schema| schema["function"]["name"]
+                                == "session_search"
+                                && schema["function"]["parameters"]["properties"]["view"]["enum"]
+                                    .as_array()
+                                    .is_some_and(|values| values
+                                        .iter()
+                                        .any(|value| value == "layers"))),
+                            "layered snapcompact requires the permitted session_search layer recovery tool; no compaction was committed"
+                        );
+                    }
                     let max_frames = (context.window / 1024).clamp(1, 32) as usize;
-                    let renderer = policy
-                        .snapcompact
-                        .resolved_for_provider(backend.compaction_anthropic_family());
+                    let renderer = policy.snapcompact.resolved_for_model(
+                        context.identity.model,
+                        backend.compaction_snapcompact_family(),
+                    );
                     let archive = if let Some(billing) =
                         match_selector(&policy.snapcompact_models, context.identity)
                     {

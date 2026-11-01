@@ -1,7 +1,7 @@
 //! `/goal` and `/guided-goal`: the session's persistent objective. Engine: `agent::modes::goal`.
 
 use crate::agent::Agent;
-use crate::agent::modes::goal::{self, Status};
+use crate::agent::modes::goal::Status;
 use crate::app::{App, Shell, Step};
 use anyhow::Result;
 use serde_json::json;
@@ -31,13 +31,12 @@ pub(super) fn run(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &st
         "resume" => {
             let outcome = agent.goal_mutate(|state| {
                 state.resume()?;
-                let goal = state.goal.as_ref().ok_or("No paused goal.")?;
-                Ok::<_, &'static str>((goal::active_prompt(goal), "Goal resumed.".to_owned()))
+                Ok::<_, &'static str>("Goal resumed.".to_owned())
             })?;
             match outcome {
-                Ok((prompt, note)) => {
+                Ok(note) => {
                     shell.note("Goal", note);
-                    shell.run_turn(app, agent, &prompt)
+                    shell.run_turn(app, agent, "/goal resume")
                 }
                 Err(error) => {
                     shell.note("Goal", error);
@@ -83,7 +82,7 @@ pub(super) fn guided(
         return Ok(Step::Done);
     }
     agent.goal_mutate(|state| state.interview = true)?;
-    shell.run_turn(app, agent, &goal::guided_kickoff(idea))
+    shell.run_turn(app, agent, idea)
 }
 
 fn set(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, objective: &str) -> Result<Step> {
@@ -91,15 +90,9 @@ fn set(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, objective: &str) -> 
         shell.note("Goal", USAGE);
         return Ok(Step::Done);
     }
-    let prompt = agent.goal_mutate(|state| {
-        state.start(objective, None);
-        state
-            .goal
-            .as_ref()
-            .map_or_else(|| objective.to_owned(), goal::active_prompt)
-    })?;
+    agent.goal_mutate(|state| state.start(objective, None))?;
     shell.note("Goal", format!("Goal set: {objective}"));
-    shell.run_turn(app, agent, &prompt)
+    shell.run_turn(app, agent, objective)
 }
 
 fn budget(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, rest: &str) -> Result<Step> {
@@ -129,18 +122,15 @@ fn budget(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, rest: &str) -> Re
             None => "Goal budget cleared.".to_owned(),
             Some(tokens) => format!("Goal budget set to {tokens}."),
         };
-        let resumed = state
-            .running()
-            .then(|| state.goal.as_ref().map(goal::active_prompt))
-            .flatten();
-        Ok((note, resumed))
+        Ok((note, state.running()))
     })?;
     match outcome {
         Ok((note, resumed)) => {
             shell.note("Goal", note);
-            match resumed {
-                Some(prompt) => shell.run_turn(app, agent, &prompt),
-                None => Ok(Step::Done),
+            if resumed {
+                shell.run_turn(app, agent, &format!("/goal budget {rest}"))
+            } else {
+                Ok(Step::Done)
             }
         }
         Err(error) => {

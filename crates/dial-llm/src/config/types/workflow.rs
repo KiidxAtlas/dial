@@ -44,6 +44,8 @@ pub struct ExperimentalConfig {
     pub tool_speculation: bool,
     /// Rewrite each user message with the `turn_drafter` role before the main model sees it.
     pub turn_optimizer: bool,
+    /// Optional prompt guidance, independent of provider thinking controls and permissions.
+    pub reasoning_strategy: ReasoningStrategy,
     /// After a focused check passes on a turn with edits, rerun it once in an isolated copy with
     /// the turn's changed files restored to their turn-start content: a failure there witnesses
     /// that the change mattered; a pass there marks the check vacuous for this change.
@@ -82,6 +84,7 @@ impl Default for ExperimentalConfig {
             profile_matching: false,
             tool_speculation: false,
             turn_optimizer: false,
+            reasoning_strategy: ReasoningStrategy::default(),
             fault_witness: true,
             repro_first: ReproFirst::default(),
             edit_bisection_runs: 0,
@@ -106,6 +109,23 @@ pub enum ReproFirst {
     Advise,
     /// Refuse the first unreproduced source edit once; a repeated attempt proceeds.
     Gate,
+}
+
+/// Experimental reasoning guidance. Default preserves the existing prompt unchanged.
+/// These presets do not expose or replace private reasoning or change inference budgets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningStrategy {
+    #[default]
+    Default,
+    EvidenceFirst,
+    HypothesisDriven,
+    PlanThenAct,
+    Decompose,
+    CompareAlternatives,
+    CritiqueAndRefine,
+    VerificationFirst,
+    MinimalChange,
 }
 
 /// A user-defined subagent built on a built-in type. Writers (`base = "worker"`) are allowed:

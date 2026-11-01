@@ -177,6 +177,53 @@ fn live_progress_is_cancellable_and_never_becomes_answer_or_billed_usage() {
 }
 
 #[test]
+fn usage_progress_requires_output_before_generation() {
+    use crate::llm::{InferencePhase, StreamEvent};
+    // (reported completion_tokens, progress phase expected from the usage chunk)
+    let cases = [
+        (Some(0), Some(InferencePhase::Processing)),
+        (Some(3), Some(InferencePhase::Generating)),
+        (None, None),
+    ];
+    for (completion, expected) in cases {
+        let mut usage = json!({"prompt_tokens": 80});
+        if let Some(n) = completion {
+            usage["completion_tokens"] = json!(n);
+        }
+        let mut acc = Accumulator::default();
+        let mut seen = Vec::new();
+        acc.feed_with_events(
+            &json!({"choices": [], "usage": usage}).to_string(),
+            &mut |_| true,
+            &mut |e| {
+                seen.push(e.clone());
+                true
+            },
+        )
+        .unwrap();
+        let phases: Vec<InferencePhase> = seen
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Progress(p) => Some(p.phase),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            phases,
+            expected.into_iter().collect::<Vec<_>>(),
+            "completion_tokens={completion:?}"
+        );
+        acc.feed("[DONE]", &mut |_| true).unwrap();
+        let reply = acc.finish().unwrap();
+        assert_eq!(
+            (reply.prompt_tokens, reply.completion_tokens),
+            (Some(80), completion),
+            "accounting must be unchanged by progress classification"
+        );
+    }
+}
+
+#[test]
 fn line_and_total_caps() {
     let long = format!("data: {}\n", "x".repeat(100));
     let error = read_events(Cursor::new(long.into_bytes()), 1 << 20, 50, far(), |_| {

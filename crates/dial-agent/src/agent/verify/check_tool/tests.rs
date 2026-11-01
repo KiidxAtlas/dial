@@ -24,7 +24,7 @@ fn hermetic_agent<'a>(config: &'a Config, root: &Path) -> Agent<'a> {
 }
 
 const UNIT: &str = "echo 'test result: ok. 1 passed'";
-const LINT: &str = "test -f fixed || { echo 'error: lint rule broken'; exit 1; }";
+const LINT: &str = "test -f fixed || { echo 'lint.rs:1: error: lint rule broken'; exit 1; }";
 const SETUP: &str = "echo 'No module named pytest'; exit 1";
 
 fn config() -> Config {
@@ -58,7 +58,11 @@ fn reports_typed_statuses_and_records_evidence_final_verification_reads() {
         out.text
     );
     assert!(out.text.contains("code_failed: lint"), "{}", out.text);
-    assert!(out.text.contains("error: lint rule broken"), "{}", out.text);
+    assert!(
+        out.text.contains("lint.rs:1: error: lint rule broken"),
+        "{}",
+        out.text
+    );
     assert!(
         out.text
             .contains("environment_unavailable: python AST: setup"),
@@ -133,6 +137,37 @@ fn failed_only_reruns_code_failures_and_a_pass_clears_the_retained_failure() {
         agent.step_checks.evidence.current_status(LINT, revision),
         "passed"
     );
+}
+
+#[test]
+fn a_check_outlasting_the_auto_background_threshold_finishes_in_the_foreground() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config.shell.auto_background_secs = 1;
+    let command = "sleep 2; echo 'test result: ok. 1 passed'";
+    config
+        .verification
+        .commands
+        .push(crate::config::types::VerificationCommand {
+            name: "slow".into(),
+            command: command.into(),
+            file_extensions: vec![],
+            timeout_secs: 30,
+        });
+    let mut agent = hermetic_agent(&config, root.path());
+    // The off-thread runner, and with it auto-backgrounding, applies only outside hermetic runs.
+    agent.hermetic = false;
+    agent.approval = crate::config::types::Approval::Auto;
+    agent.step_checks.mutations = 1;
+    let out = agent.check_tool(&json!({}), &mut NullUi);
+    assert!(
+        !out.text.contains("background job"),
+        "a check must not move to bg: {}",
+        out.text
+    );
+    assert!(out.text.contains("passed: slow"), "{}", out.text);
+    assert!(!out.is_error, "{}", out.text);
+    assert!(!agent.step_checks.failed);
 }
 
 #[test]
@@ -521,7 +556,7 @@ fn unsafe_reproduction_rerun_cannot_earn_its_own_fix_credit() {
     let root = tempfile::tempdir().unwrap();
     let config = Config::default();
     let mut agent = hermetic_agent(&config, root.path());
-    let command = "if test -f ran; then exit 0; else touch ran; exit 1; fi";
+    let command = "if test -f ran; then exit 0; else touch ran; echo 'AssertionError: first run fails'; exit 1; fi";
     let first = agent.check_tool(&repro_args("stateful", command), &mut NullUi);
     assert!(first.is_error, "{}", first.text);
     assert_eq!(

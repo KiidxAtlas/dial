@@ -79,23 +79,54 @@ impl Backend {
         request: &Chat,
         notice: &mut dyn FnMut(&str),
     ) -> Option<Chat> {
-        llm::images::prepare(
+        llm::images::prepare_for_target(
             request,
             self.image_input_for(self.compaction_profile()),
+            self.snapcompact_image_detail(),
             &self.image_notices,
             notice,
         )
     }
     pub fn compaction_anthropic_family(&self) -> bool {
-        match &self.kind {
-            ProviderKind::AnthropicSubscription { .. } => true,
-            ProviderKind::AnthropicEndpoint { .. } | ProviderKind::Endpoint { .. } => {
-                self.protocol == Some(llm::model_config::ApiProtocol::Anthropic)
-                    || (self.protocol.is_none()
-                        && matches!(self.kind, ProviderKind::AnthropicEndpoint { .. }))
+        matches!(
+            self.compaction_snapcompact_family(),
+            crate::config::snapcompact::SnapcompactFamily::Anthropic
+        )
+    }
+    /// The declared wire family controls image hints; model lineage controls typography.
+    pub fn compaction_snapcompact_family(&self) -> crate::config::snapcompact::SnapcompactFamily {
+        use crate::config::snapcompact::SnapcompactFamily as Family;
+        use llm::model_config::ApiProtocol;
+        let protocol = match self.kind {
+            ProviderKind::ChatGpt { .. } => ApiProtocol::Responses,
+            ProviderKind::AnthropicSubscription { .. } => ApiProtocol::Anthropic,
+            ProviderKind::Endpoint { .. } | ProviderKind::AnthropicEndpoint { .. } => {
+                self.protocol.unwrap_or(
+                    if matches!(self.kind, ProviderKind::AnthropicEndpoint { .. }) {
+                        ApiProtocol::Anthropic
+                    } else {
+                        ApiProtocol::ChatCompletions
+                    },
+                )
             }
-            _ => false,
+            _ => return Family::Unknown,
+        };
+        match protocol {
+            ApiProtocol::Anthropic | ApiProtocol::VertexAnthropic | ApiProtocol::Bedrock => {
+                Family::Anthropic
+            }
+            ApiProtocol::Gemini | ApiProtocol::Vertex | ApiProtocol::CloudCodeAssist => {
+                Family::Google
+            }
+            ApiProtocol::ChatCompletions | ApiProtocol::Responses | ApiProtocol::AzureResponses => {
+                Family::OpenAi
+            }
+            _ => Family::Unknown,
         }
+    }
+    pub(super) fn snapcompact_image_detail(&self) -> crate::config::snapcompact::ImageDetail {
+        crate::config::snapcompact::ImageDetail::Auto
+            .resolved_for_model(self.route_model(), self.compaction_snapcompact_family())
     }
     /// Resolve actual transport identity without sending a model request. Cache routing is not authority.
     pub fn validate_compaction_request(
@@ -372,9 +403,10 @@ impl Backend {
         };
         let headers = llm::model_config::resolve_validated_headers(&self.headers)?;
         let mut notices = Vec::new();
-        let prepared = llm::images::prepare(
+        let prepared = llm::images::prepare_for_target(
             request,
             self.image_input_for(self.compaction_profile()),
+            self.snapcompact_image_detail(),
             &self.image_notices,
             &mut |text| notices.push(text.to_owned()),
         );

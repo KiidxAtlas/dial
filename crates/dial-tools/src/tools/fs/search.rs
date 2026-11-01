@@ -285,7 +285,9 @@ fn scopes(ws: &Workspace, args: &Value) -> Result<Vec<PathBuf>, String> {
                     .next()
                     .is_some_and(|part| part.as_os_str() == crate::workspace_copy::SCRATCH_DIR)
         }) {
-            return Err("search scopes must not enter .git or workspace scratch".into());
+            return Err(format!(
+                "search scopes must not enter .git or workspace scratch ({input:?}); search the workspace without that path, use `read` for a known file under it, or `bash` with `git` for repository metadata"
+            ));
         }
         fs::metadata(&path).map_err(|e| {
             super::suggest::annotate(ws, io_message("searching", input, &e), &[input])
@@ -573,12 +575,10 @@ pub(in crate::tools) fn glob_tool(ws: &Workspace, args: &Value) -> Result<String
         return Err(format!("limit must be 1..={MAX_LIST}"));
     }
     let mut skip = opt_u64(args, "skip")?.unwrap_or(0);
-    let mut walk = SearchWalk::new(
-        ws,
-        bool_default(args, "hidden", true)?,
-        bool_default(args, "gitignore", true)?,
-        resume.map(|(p, _)| p),
-    );
+    let unpaged = skip == 0 && resume.is_none();
+    let hidden = bool_default(args, "hidden", true)?;
+    let gitignore = bool_default(args, "gitignore", true)?;
+    let mut walk = SearchWalk::new(ws, hidden, gitignore, resume.map(|(p, _)| p));
     let mut text = String::new();
     let mut count = 0;
     let mut next = None;
@@ -618,6 +618,12 @@ pub(in crate::tools) fn glob_tool(ws: &Workspace, args: &Value) -> Result<String
             walk.coverage()
         )
     };
+    if count == 0 && unpaged && gitignore && !glob.prefix.as_os_str().is_empty() {
+        coverage.push_str(&format!(
+            "; ignored_hint=the literal directory {prefix} may be excluded by ignore rules or built-in skipped directories, so this empty result does not prove there is no match; read that directory explicitly, or set path={prefix} and keep the workspace-relative pattern (or use a bare filename pattern); use gitignore=false only deliberately for intended ignored descendants; access restrictions still apply",
+            prefix = serde_json::json!(glob.prefix.to_string_lossy())
+        ));
+    }
     if count == 0 && pattern.contains(char::is_whitespace) {
         coverage.push_str(
             "; pattern_hint=whitespace is literal in a glob and does not separate patterns; for alternatives use {a,b} or one glob per call",

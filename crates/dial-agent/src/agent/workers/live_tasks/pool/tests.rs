@@ -112,6 +112,7 @@ fn pool_polling_tracks_delivery_per_item_without_hiding_new_results() {
         tasks.jobs.insert(
             id,
             JobState {
+                control: None,
                 body,
                 interrupt: Arc::new(AtomicBool::new(false)),
                 worker: None,

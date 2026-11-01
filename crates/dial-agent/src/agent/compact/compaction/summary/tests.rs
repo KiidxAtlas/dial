@@ -1,4 +1,14 @@
 use super::*;
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
+    time::Duration,
+};
 
 fn user(text: &str) -> Value {
     json!({"role":"user","content":text})
@@ -37,12 +47,92 @@ fn windows_split_on_message_boundaries_and_keep_oversized_messages_alone() {
 }
 
 #[test]
-fn clamp_truncates_only_single_oversized_windows_on_char_boundaries() {
-    let text = "é".repeat(4_000);
-    assert!(matches!(clamp(&text, 10, 5), Cow::Borrowed(_)));
-    let clamped = clamp(&text, 1_000, text_tokens(&text));
-    assert!(clamped.len() < text.len());
-    assert!(clamped.contains("more characters truncated"));
+fn oversized_text_is_fragmented_in_order_and_its_tail_reaches_a_later_call() {
+    let user_dir = std::env::temp_dir();
+    let context = summary_context(&user_dir);
+    let huge = format!("{}\nTAIL-SENTINEL", "é".repeat(60_000));
+    let mut requests = Vec::new();
+    let mut complete = |_: &mut Backend, request: &Chat, _: &mut dyn Ui| -> Result<String> {
+        requests.push(request.messages[1]["content"].as_str().unwrap().to_owned());
+        Ok("summary".to_owned())
+    };
+    let summary = fold(
+        &mut summary_backend(),
+        &[huge],
+        None,
+        Prompt::Main,
+        &CompactionConfig::default(),
+        &context,
+        CompactionMethod::Soft,
+        "",
+        &Arc::new(AtomicBool::new(false)),
+        &mut crate::agent::NullUi,
+        &mut complete,
+        &mut None,
+    )
+    .unwrap();
+    assert_eq!(summary, "summary");
+    assert!(requests.len() > 1, "an oversized text must be split");
+    for (index, request) in requests.iter().enumerate() {
+        assert!(request.contains(&format!("[fragment {} of {}]", index + 1, requests.len())));
+        assert!(!request.contains("truncated"));
+    }
+    assert!(requests.last().unwrap().contains("TAIL-SENTINEL"));
+}
+
+#[test]
+fn fragment_cover_every_byte_on_char_boundaries_in_order() {
+    let text = format!("{}\n{}", "é".repeat(3_000), "ß".repeat(3_000));
+    let pieces = fragments(&text, 1_000).unwrap();
+    assert!(pieces.len() > 1);
+    let rebuilt: String = pieces
+        .iter()
+        .map(|piece| piece.split_once('\n').unwrap().1)
+        .collect();
+    assert_eq!(rebuilt, text);
+}
+
+#[test]
+fn fragment_generation_refuses_excess_work_before_materializing_unbounded_output() {
+    let room = 3_000 - FRAGMENT_LABEL_BYTES;
+    assert_eq!(
+        fragments(&"x".repeat(room * MAX_SUMMARY_FRAGMENTS), 1_000)
+            .unwrap()
+            .len(),
+        MAX_SUMMARY_FRAGMENTS
+    );
+    let error = fragments(&"x".repeat(room * MAX_SUMMARY_FRAGMENTS + 1), 1_000).unwrap_err();
+    assert!(error.to_string().contains("no summary was committed"));
+}
+
+#[test]
+fn exceeding_the_call_bound_fails_without_committing_a_truncated_summary() {
+    let user_dir = std::env::temp_dir();
+    let context = summary_context(&user_dir);
+    // 100 parts of ~2k tokens: each needs its own window at the ~3k-token budget, so the 65th call is refused.
+    let parts: Vec<String> = (0..100).map(|_| "x".repeat(6_000)).collect();
+    let mut calls = 0usize;
+    let mut complete = |_: &mut Backend, _: &Chat, _: &mut dyn Ui| -> Result<String> {
+        calls += 1;
+        Ok("summary".to_owned())
+    };
+    let error = fold(
+        &mut summary_backend(),
+        &parts,
+        None,
+        Prompt::Main,
+        &CompactionConfig::default(),
+        &context,
+        CompactionMethod::Soft,
+        "",
+        &Arc::new(AtomicBool::new(false)),
+        &mut crate::agent::NullUi,
+        &mut complete,
+        &mut None,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("no summary was committed"));
+    assert_eq!(calls, MAX_SUMMARY_CALLS);
 }
 
 #[test]
@@ -560,4 +650,319 @@ fn supplemental_compaction_data_is_transient_user_input_and_budgeted_before_disp
         &mut None,
     );
     assert!(denied.unwrap_err().to_string().contains("cannot fit"));
+}
+
+/// Bound on every cross-thread wait, so a sequential fallback fails instead of hanging.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct ParentNotices(Vec<String>);
+impl Ui for ParentNotices {
+    fn notice(&mut self, message: &str) {
+        self.0.push(message.to_owned());
+    }
+}
+
+fn remote_backend() -> Backend {
+    Backend::new(
+        crate::llm::provider::ProviderKind::Endpoint {
+            base_url: "https://example.com/v1".to_owned(),
+            model: "summarizer".to_owned(),
+            api_key: None,
+        },
+        PathBuf::from("/nonexistent/python"),
+        5,
+    )
+}
+
+fn route(remote: bool) -> Backend {
+    if remote {
+        remote_backend()
+    } else {
+        summary_backend()
+    }
+}
+
+/// Deterministic stand-in for the model: the reply depends only on the exact request text.
+fn digest(request: &Chat) -> Result<String> {
+    let mut hasher = DefaultHasher::new();
+    request.messages[1]["content"]
+        .as_str()
+        .unwrap()
+        .hash(&mut hasher);
+    Ok(format!("digest-{:016x}", hasher.finish()))
+}
+
+/// Eight messages; a cut at 6 lands inside the second turn, so history is the first turn and the
+/// turn prefix is the second turn's start.
+fn split_turn() -> Vec<Value> {
+    vec![
+        user("first"),
+        assistant_call("a", "read", json!({"path":"a.rs"})),
+        tool("a"),
+        user("second"),
+        assistant_call("b", "read", json!({"path":"b.rs"})),
+        tool("b"),
+        assistant_call("c", "write", json!({"path":"c.rs","content":"new"})),
+        tool("c"),
+    ]
+}
+
+#[test]
+fn turn_prefix_overlaps_the_history_fold_and_matches_the_serial_summary() {
+    let user_dir = std::env::temp_dir();
+    let context = summary_context(&user_dir);
+    let policy = CompactionConfig::default();
+    let messages = split_turn();
+    let interrupt = Arc::new(AtomicBool::new(false));
+
+    let mut serial_ui = ParentNotices::default();
+    let serial = summarize_prefix(
+        &mut remote_backend(),
+        &messages,
+        6,
+        &policy,
+        &context,
+        CompactionMethod::Soft,
+        "",
+        &interrupt,
+        &mut serial_ui,
+        &mut |_, request, _| digest(request),
+        &mut None,
+    )
+    .unwrap();
+
+    // Each side waits for the other with a bound: a sequential fallback fails here instead of hanging.
+    let (main_started, turn_waits_for_main) = mpsc::sync_channel::<()>(1);
+    let (turn_started, main_waits_for_turn) = mpsc::sync_channel::<()>(1);
+    let mut main_waits_for_turn = Some(main_waits_for_turn);
+    let mut main = |_: &mut Backend, request: &Chat, _: &mut dyn Ui| -> Result<String> {
+        if let Some(waiting) = main_waits_for_turn.take() {
+            main_started.send(()).unwrap();
+            waiting
+                .recv_timeout(HANDSHAKE_TIMEOUT)
+                .context("the turn-prefix fold never ran beside the history fold")?;
+        }
+        digest(request)
+    };
+    let worker_calls = Arc::new(AtomicUsize::new(0));
+    let cancel_shared = Arc::new(AtomicBool::new(false));
+    let (counted, shared, parent) = (
+        Arc::clone(&worker_calls),
+        Arc::clone(&cancel_shared),
+        Arc::clone(&interrupt),
+    );
+    let mut worker = Some(SummaryWorker {
+        backend: remote_backend(),
+        complete: Box::new(
+            move |_: &mut Backend,
+                  request: &Chat,
+                  ui: &mut dyn Ui,
+                  cancel: Arc<AtomicBool>|
+                  -> Result<String> {
+                counted.fetch_add(1, Ordering::SeqCst);
+                turn_waits_for_main
+                    .recv_timeout(HANDSHAKE_TIMEOUT)
+                    .context("the history fold never ran beside the turn-prefix fold")?;
+                turn_started.send(()).unwrap();
+                shared.store(Arc::ptr_eq(&cancel, &parent), Ordering::SeqCst);
+                ui.notice("turn-note");
+                digest(request)
+            },
+        ),
+    });
+
+    let mut ui = ParentNotices::default();
+    let parallel = summarize_prefix_with_worker(
+        &mut remote_backend(),
+        &messages,
+        6,
+        &policy,
+        &context,
+        CompactionMethod::Soft,
+        "",
+        &interrupt,
+        &mut ui,
+        &mut main,
+        &mut None,
+        &mut worker,
+    )
+    .unwrap();
+
+    assert_eq!(parallel, serial, "the overlap must not change the summary");
+    assert_eq!(worker_calls.load(Ordering::SeqCst), 1);
+    assert!(
+        cancel_shared.load(Ordering::SeqCst),
+        "the worker shares the parent cancel flag"
+    );
+    assert_eq!(
+        ui.0.iter()
+            .filter(|note| note.as_str() == "turn-note")
+            .count(),
+        1,
+        "buffered worker notices replay once on the parent"
+    );
+    assert!(!interrupt.load(Ordering::SeqCst));
+}
+
+#[test]
+fn a_failed_history_fold_still_joins_the_turn_worker_and_keeps_the_parent_interrupt_clear() {
+    let user_dir = std::env::temp_dir();
+    let context = summary_context(&user_dir);
+    let messages = split_turn();
+    let interrupt = Arc::new(AtomicBool::new(false));
+    let finished = Arc::new(AtomicBool::new(false));
+    let done = Arc::clone(&finished);
+    let mut worker = Some(SummaryWorker {
+        backend: remote_backend(),
+        complete: Box::new(
+            move |_: &mut Backend,
+                  request: &Chat,
+                  _: &mut dyn Ui,
+                  _: Arc<AtomicBool>|
+                  -> Result<String> {
+                done.store(true, Ordering::SeqCst);
+                digest(request)
+            },
+        ),
+    });
+    let error = summarize_prefix_with_worker(
+        &mut remote_backend(),
+        &messages,
+        6,
+        &CompactionConfig::default(),
+        &context,
+        CompactionMethod::Soft,
+        "",
+        &interrupt,
+        &mut crate::agent::NullUi,
+        &mut |_, _, _| Err(anyhow::anyhow!("history fold rejected")),
+        &mut None,
+        &mut worker,
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("history fold rejected"));
+    assert!(
+        finished.load(Ordering::SeqCst),
+        "the worker is joined before the error returns"
+    );
+    assert!(!interrupt.load(Ordering::SeqCst));
+}
+
+#[test]
+fn a_failed_turn_worker_fails_the_summary_without_setting_the_parent_interrupt() {
+    let user_dir = std::env::temp_dir();
+    let context = summary_context(&user_dir);
+    let messages = split_turn();
+    let interrupt = Arc::new(AtomicBool::new(false));
+    let mut worker = Some(SummaryWorker {
+        backend: remote_backend(),
+        complete: Box::new(
+            |_: &mut Backend, _: &Chat, _: &mut dyn Ui, _: Arc<AtomicBool>| -> Result<String> {
+                Err(anyhow::anyhow!("turn worker rejected"))
+            },
+        ),
+    });
+    let error = summarize_prefix_with_worker(
+        &mut remote_backend(),
+        &messages,
+        6,
+        &CompactionConfig::default(),
+        &context,
+        CompactionMethod::Soft,
+        "",
+        &interrupt,
+        &mut crate::agent::NullUi,
+        &mut |_, request, _| digest(request),
+        &mut None,
+        &mut worker,
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("turn worker rejected"));
+    assert!(!interrupt.load(Ordering::SeqCst));
+}
+
+#[test]
+fn the_turn_worker_forks_only_for_two_independent_remote_routes_and_a_nonempty_split() {
+    let user_dir = std::env::temp_dir();
+    let context = summary_context(&user_dir);
+    let policy = CompactionConfig::default();
+    let messages = split_turn();
+    let interrupt = Arc::new(AtomicBool::new(false));
+    let reference = |keep: usize| {
+        summarize_prefix(
+            &mut remote_backend(),
+            &messages,
+            keep,
+            &policy,
+            &context,
+            CompactionMethod::Soft,
+            "",
+            &interrupt,
+            &mut crate::agent::NullUi,
+            &mut |_, request, _| digest(request),
+            &mut None,
+        )
+        .unwrap()
+    };
+    // (label, main remote?, worker remote?, keep, whether the worker may fork).
+    // keep 2 leaves an empty history side and keep 3 is not mid-turn: neither may fork.
+    let cases = [
+        ("remote main, remote worker, split", true, true, 6, true),
+        ("local main, remote worker", false, true, 6, false),
+        ("remote main, local worker", true, false, 6, false),
+        ("local main, local worker", false, false, 6, false),
+        (
+            "remote main, remote worker, empty history",
+            true,
+            true,
+            2,
+            false,
+        ),
+        (
+            "remote main, remote worker, not mid-turn",
+            true,
+            true,
+            3,
+            false,
+        ),
+    ];
+    for (label, main_remote, worker_remote, keep, forks) in cases {
+        let worker_calls = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&worker_calls);
+        let mut worker = Some(SummaryWorker {
+            backend: route(worker_remote),
+            complete: Box::new(
+                move |_: &mut Backend,
+                      request: &Chat,
+                      _: &mut dyn Ui,
+                      _: Arc<AtomicBool>|
+                      -> Result<String> {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    digest(request)
+                },
+            ),
+        });
+        let summary = summarize_prefix_with_worker(
+            &mut route(main_remote),
+            &messages,
+            keep,
+            &policy,
+            &context,
+            CompactionMethod::Soft,
+            "",
+            &interrupt,
+            &mut crate::agent::NullUi,
+            &mut |_, request, _| digest(request),
+            &mut None,
+            &mut worker,
+        )
+        .unwrap_or_else(|error| panic!("{label}: {error:#}"));
+        assert_eq!(summary, reference(keep), "{label}");
+        assert_eq!(
+            worker_calls.load(Ordering::SeqCst),
+            usize::from(forks),
+            "{label}"
+        );
+    }
 }

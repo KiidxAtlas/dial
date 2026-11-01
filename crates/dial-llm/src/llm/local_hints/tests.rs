@@ -192,3 +192,39 @@ fn detect_never_treats_non_local_routes_as_local_servers() {
         LocalServer::MlxRuntime
     );
 }
+
+#[test]
+fn mlx_checkpoint_metadata_selects_the_thinking_wire_without_loading_weights() {
+    for (config, vision) in [(json!({"vision_config": {}}), true), (json!({}), false)] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("config.json"), config.to_string()).unwrap();
+        let model = root.path().to_str().unwrap();
+        let server = LocalServer::detect("mlx", model, None, None, &[]);
+        for thinking in [Some(true), Some(false), None] {
+            let mut body = json!({"model": model});
+            LocalHints {
+                thinking,
+                ..Default::default()
+            }
+            .apply_openai(server, &mut body);
+            let mut expected = json!({"model": model});
+            if let Some(thinking) = thinking {
+                if vision {
+                    expected["enable_thinking"] = json!(thinking);
+                } else {
+                    expected["chat_template_kwargs"] = json!({"enable_thinking": thinking});
+                }
+            }
+            assert_eq!(body, expected, "vision={vision}, thinking={thinking:?}");
+        }
+        if vision {
+            let mut body = json!({"enable_thinking": false});
+            LocalHints {
+                thinking: Some(true),
+                ..Default::default()
+            }
+            .apply_openai(server, &mut body);
+            assert_eq!(body, json!({"enable_thinking": false}));
+        }
+    }
+}

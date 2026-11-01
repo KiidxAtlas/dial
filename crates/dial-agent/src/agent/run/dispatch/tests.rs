@@ -144,7 +144,7 @@ fn rendered_pixels_from_any_tool_become_an_attachment_and_keep_the_description()
         arguments: json!({"action":"inspect","path":"clip.mp4"}),
         malformed_arguments: false,
     };
-    for tool in ["visual", "video", "evidence", "read"] {
+    for tool in ["visual", "video", "evidence", "read", "session_search"] {
         let mut out = output("frame 0 at 0.0s; first frame attached");
         let image = capture_output_image(&workspace, &call(tool), &mut out)
             .unwrap()

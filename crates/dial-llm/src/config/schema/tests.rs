@@ -689,3 +689,79 @@ fn failed_turns_notify_by_default_but_an_explicit_opt_out_is_kept() {
     let opted_out: Config = toml::from_str("[ui]\nnotify_errors = false\n").unwrap();
     assert!(!opted_out.ui.notify_errors);
 }
+
+#[test]
+fn reasoning_strategy_is_opt_in_and_all_settings_options_roundtrip() {
+    use crate::config::types::ReasoningStrategy;
+    let path = "experimental.reasoning_strategy";
+    for source in [
+        "",
+        "[experimental]\n",
+        "[experimental]\nvideo_analysis = true\n",
+    ] {
+        let config: Config = toml::from_str(source).unwrap();
+        assert_eq!(
+            config.experimental.reasoning_strategy,
+            ReasoningStrategy::Default,
+            "{source}"
+        );
+    }
+    let setting = registry()
+        .iter()
+        .find(|setting| setting.path == path)
+        .expect("reasoning strategy is registered");
+    assert_eq!(
+        (setting.tab, setting.section),
+        ("Experimental", "Reasoning")
+    );
+    assert_eq!(
+        setting.default_value(),
+        Some(Value::String("default".into()))
+    );
+    let Kind::Enum(options) = setting.kind else {
+        panic!("reasoning strategy must be a closed enum")
+    };
+    let expected = [
+        ("default", ReasoningStrategy::Default),
+        ("evidence_first", ReasoningStrategy::EvidenceFirst),
+        ("hypothesis_driven", ReasoningStrategy::HypothesisDriven),
+        ("plan_then_act", ReasoningStrategy::PlanThenAct),
+        ("decompose", ReasoningStrategy::Decompose),
+        (
+            "compare_alternatives",
+            ReasoningStrategy::CompareAlternatives,
+        ),
+        ("critique_and_refine", ReasoningStrategy::CritiqueAndRefine),
+        ("verification_first", ReasoningStrategy::VerificationFirst),
+        ("minimal_change", ReasoningStrategy::MinimalChange),
+    ];
+    assert_eq!(
+        options.iter().map(|(raw, _)| *raw).collect::<Vec<_>>(),
+        expected.iter().map(|(raw, _)| *raw).collect::<Vec<_>>()
+    );
+    for (raw, strategy) in expected {
+        let value = Value::String(raw.into());
+        check_value(path, &value).unwrap();
+        let mut settings = default_table();
+        set(&mut settings, path, value.clone());
+        let config: Config = settings.try_into().unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.experimental.reasoning_strategy, strategy, "{raw}");
+        let loaded: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(loaded.experimental.reasoning_strategy, strategy, "{raw}");
+        assert_eq!(
+            get(&Table::try_from(loaded).unwrap(), path),
+            Some(&value),
+            "{raw}"
+        );
+    }
+    for invalid in [Value::String("unknown".into()), Value::Boolean(true)] {
+        assert!(check_value(path, &invalid).is_err(), "accepted {invalid}");
+        let mut settings = default_table();
+        set(&mut settings, path, invalid.clone());
+        assert!(
+            Value::Table(settings).try_into::<Config>().is_err(),
+            "deserialized {invalid}"
+        );
+    }
+}

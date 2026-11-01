@@ -24,6 +24,10 @@ impl ToolRouting {
         self.selected.retain(|name| !names.contains(name));
         self.suppressed.extend(names.iter().cloned());
     }
+    /// Whether the user explicitly unloaded `name`; such a tool is not re-offered by gap routing.
+    pub(in crate::agent) fn is_suppressed(&self, name: &str) -> bool {
+        self.suppressed.contains(name)
+    }
 }
 
 fn words(text: &str) -> BTreeSet<String> {
@@ -43,6 +47,26 @@ fn words(text: &str) -> BTreeSet<String> {
             other => other.to_owned(),
         })
         .collect()
+}
+/// Request prose for intent rules: code spans and identifier-like tokens (`$request_method`,
+/// `server.py`, `/usr/bin`) name things the task touches, not capabilities it asks for. A URL
+/// still signals URL intent.
+fn prose_words(query: &str) -> BTreeSet<String> {
+    let text: String = query
+        .split('`')
+        .step_by(2)
+        .flat_map(str::split_whitespace)
+        .map(|token| token.trim_end_matches(['.', ',', ';', ':', '?', '!', ')']))
+        .filter_map(|token| {
+            if token.contains("://") {
+                Some("url")
+            } else {
+                (!token.contains(['_', '$', '/', '\\', '.', '='])).then_some(token)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    words(&text)
 }
 fn any(terms: &BTreeSet<String>, choices: &[&str]) -> bool {
     choices.iter().any(|term| terms.contains(*term))
@@ -78,66 +102,184 @@ fn coding(terms: &BTreeSet<String>) -> bool {
     )
 }
 
+/// Closing delimiter for a quote that opens a whitespace-separated name, e.g. `"logs, q1.csv"`.
+fn closing_quote(open: char) -> Option<char> {
+    match open {
+        '"' => Some('"'),
+        '\'' => Some('\''),
+        '`' => Some('`'),
+        '“' => Some('”'),
+        '‘' => Some('’'),
+        _ => None,
+    }
+}
+
+fn ends_quote(chunk: &str, close: char) -> bool {
+    chunk
+        .trim_end_matches([',', ';', ':', '?', '!', '(', ')', '.'])
+        .ends_with(close)
+}
+
 /// Source formats in filenames are useful signals; incidental module names (`audio.rs`) are not.
 fn source_tools(query: &str) -> Vec<&'static str> {
+    const INSPECTION_VERBS: &[&str] = &[
+        "inspect",
+        "read",
+        "analyze",
+        "analyse",
+        "summarize",
+        "summarise",
+        "extract",
+        "compare",
+        "verify",
+        "check",
+        "audit",
+        "investigate",
+        "search",
+        "find",
+        "locate",
+        "calculate",
+        "compute",
+        "count",
+        "plot",
+        "measure",
+        "explain",
+        "answer",
+        "query",
+    ];
     let mut source_file = false;
-    let text = query
-        .split_whitespace()
-        .filter_map(|token| {
-            let token = token.trim_matches([
+    let mut supplied_input = false;
+    let mut text = Vec::new();
+    // Inspection elsewhere in a request must not turn a deliverable's format into an input.
+    // Keep this lexical and conservative: explicit tool names are handled separately by select.
+    for clause in query.split(['\n', ';']).flat_map(|line| line.split(". ")) {
+        let mut output_only = false;
+        let mut created_output = false;
+        let mut previous = "";
+        let mut after_comma = false;
+        let mut quote = None;
+        let mut chunks = clause.split_whitespace();
+        while let Some(chunk) = chunks.next() {
+            // Only paired quote delimiters protect a literal name. Apostrophe-led prose such as
+            // "'til noon" must not hide the next output clause, nor may "don't" close a filename.
+            let mut body = chunk.trim_start_matches('(');
+            let mut quoted = quote.is_some();
+            let first = body.chars().next();
+            if let (None, Some(open), Some(close)) = (quote, first, first.and_then(closing_quote)) {
+                let tail = &body[open.len_utf8()..];
+                if ends_quote(tail, close) || chunks.clone().any(|part| ends_quote(part, close)) {
+                    quote = Some(close);
+                    body = tail;
+                    quoted = true;
+                }
+            }
+            if quote.is_some_and(|close| ends_quote(body, close)) {
+                quote = None;
+            }
+            let after_previous_comma =
+                std::mem::replace(&mut after_comma, chunk.ends_with(',') && quote.is_none());
+            let token = chunk.trim_matches([
                 '`', '"', '\'', '“', '”', '‘', '’', ',', ';', ':', '?', '!', '(', ')', '.',
             ]);
-            if let Some((_, extension)) = token.rsplit_once('.') {
-                let format = match extension.to_ascii_lowercase().as_str() {
-                    "pdf" => Some("pdf"),
-                    "docx" => Some("docx"),
-                    "pptx" => Some("pptx"),
-                    "xlsx" => Some("xlsx"),
-                    "csv" => Some("csv"),
-                    "json" | "jsonl" => Some("json"),
-                    "wav" | "mp3" | "m4a" | "flac" | "ogg" => Some("audio"),
-                    "png" | "jpg" | "jpeg" | "webp" | "tiff" => Some("image"),
-                    "har" => Some("har"),
-                    "sqlite" | "sqlite3" | "db" => Some("sqlite"),
-                    "folded" => Some("profile"),
-                    _ => None,
-                };
-                source_file |= format.is_some();
-                return format;
+            if token.is_empty() {
+                continue;
             }
-            (!token.contains(['/', '\\'])).then_some(token)
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-    let terms = words(&text);
-    let inspect = any(
-        &terms,
-        &[
-            "inspect",
-            "read",
-            "analyze",
-            "analyse",
-            "summarize",
-            "summarise",
-            "extract",
-            "compare",
-            "verify",
-            "check",
-            "audit",
-            "investigate",
-            "search",
-            "find",
-            "locate",
-            "calculate",
-            "compute",
-            "count",
-            "plot",
-            "measure",
-            "explain",
-            "answer",
-            "query",
-        ],
-    );
+            let word = token.to_ascii_lowercase();
+            // Creation words can also be nouns ("inspect the export of sales.csv"). Only
+            // clause-leading, connector-led or comma-separated verbs introduce an output target,
+            // and never a word inside a quoted name.
+            let creation_verb = !quoted
+                && [
+                    "write", "export", "save", "create", "generate", "produce", "output",
+                ]
+                .contains(&word.as_str())
+                && (previous.is_empty()
+                    || after_previous_comma
+                    || ["and", "then", "please", "to"]
+                        .iter()
+                        .any(|connector| previous.eq_ignore_ascii_case(connector)));
+            previous = token;
+            if creation_verb {
+                output_only = true;
+                created_output = true;
+                continue;
+            }
+            if created_output && ["as", "in", "into", "to"].contains(&word.as_str()) {
+                output_only = true;
+                continue;
+            }
+            if ["from", "using", "given", "input", "of", "on", "about"].contains(&word.as_str()) {
+                supplied_input |= created_output;
+                output_only = false;
+            }
+            let (extension, filename) = token
+                .rsplit_once('.')
+                .map_or((token, false), |(_, extension)| (extension, true));
+            let format = match extension.to_ascii_lowercase().as_str() {
+                "pdf" => Some("pdf"),
+                "docx" => Some("docx"),
+                "pptx" => Some("pptx"),
+                "xlsx" => Some("xlsx"),
+                "csv" => Some("csv"),
+                "json" | "jsonl" => Some("json"),
+                "wav" | "mp3" | "m4a" | "flac" | "ogg" => Some("audio"),
+                "png" | "jpg" | "jpeg" | "webp" | "tiff" => Some("image"),
+                "har" => Some("har"),
+                "sqlite" | "sqlite3" | "db" => Some("sqlite"),
+                "folded" => Some("profile"),
+                _ => None,
+            };
+            // Suppress only an output target phrase, not the rest of a creation clause:
+            // "write a script to parse sales.csv" must retain its genuine input.
+            if output_only
+                && (format.is_some()
+                    || [
+                        "a",
+                        "an",
+                        "the",
+                        "as",
+                        "in",
+                        "into",
+                        "to",
+                        "new",
+                        "file",
+                        "format",
+                        "named",
+                        "called",
+                        "summary",
+                        "report",
+                        "document",
+                        "spreadsheet",
+                        "workbook",
+                        "presentation",
+                        "slides",
+                        "table",
+                        "chart",
+                        "image",
+                        "audio",
+                        "data",
+                        "dataset",
+                    ]
+                    .contains(&word.as_str()))
+            {
+                if filename {
+                    output_only = false;
+                }
+                continue;
+            }
+            output_only = false;
+            if filename {
+                source_file |= format.is_some();
+                if let Some(format) = format {
+                    text.push(format);
+                }
+            } else if !token.contains(['/', '\\']) {
+                text.push(token);
+            }
+        }
+    }
+    let terms = words(&text.join(" "));
+    let inspect = any(&terms, INSPECTION_VERBS) || (supplied_input && source_file);
     // Questions about supplied captures should not require tool names or inspection jargon.
     // Keep conceptual questions and requests to implement a parser out of this fallback.
     let system_inspect = inspect
@@ -248,19 +390,36 @@ fn native(query: &str, terms: &BTreeSet<String>) -> Vec<&'static str> {
     let mut names = source_tools(query);
     // Web schemas are not a coding core. Offer them directly for web intent rather than
     // making research pay for a discovery round, or every unrelated coding step pay for them.
-    if any(terms, &["web", "online", "internet", "research", "browse"]) {
+    // A web server, app or page is something to build, not a request to search the web.
+    let web = terms.contains("web")
+        && (terms.contains("search")
+            || !any(
+                terms,
+                &[
+                    "server",
+                    "servers",
+                    "app",
+                    "application",
+                    "site",
+                    "page",
+                    "frontend",
+                ],
+            ));
+    if web || any(terms, &["online", "internet", "research", "browse"]) {
         names.extend(WEB_TOOLS);
     } else if any(terms, &["http", "https", "url", "website"]) {
         names.push("web_fetch");
     }
+    // A page alone is too generic ("a custom 404 page", "verify it responds"): it needs a visual
+    // term, while explicit UI surfaces may also be verified or inspected.
+    let visual = any(
+        terms,
+        &["visual", "render", "rendered", "design", "redesign"],
+    );
     if any(terms, &["screenshot", "playwright", "browser"])
-        || (any(terms, &["ui", "frontend", "layout", "css", "page"])
-            && any(
-                terms,
-                &[
-                    "visual", "render", "rendered", "design", "redesign", "verify", "inspect",
-                ],
-            ))
+        || (any(terms, &["ui", "frontend", "layout", "css"])
+            && (visual || any(terms, &["verify", "inspect"])))
+        || (terms.contains("page") && visual)
     {
         names.push("browser");
     }
@@ -347,11 +506,11 @@ fn native(query: &str, terms: &BTreeSet<String>) -> Vec<&'static str> {
     {
         names.push("dap");
     }
-    // Runtime watching, not code that merely mentions servers, logs or watch modes.
+    // Runtime watching, not code that merely mentions servers, logs or watch modes, nor a service
+    // the task asks to keep running.
     let runtime = any(
         terms,
         &[
-            "running",
             "crash",
             "crashes",
             "crashed",
@@ -395,15 +554,24 @@ fn native(query: &str, terms: &BTreeSet<String>) -> Vec<&'static str> {
     names
 }
 
-fn ranked(query: &str, candidates: Vec<(String, String)>) -> Vec<String> {
-    crate::agent::model::assistance::discover(query, candidates)
+fn ranked(
+    query: &str,
+    candidates: Vec<(String, String)>,
+    priority: &impl Fn(&str) -> u8,
+) -> Vec<String> {
+    crate::agent::model::assistance::discover_with_priority(query, candidates, priority)
         .into_iter()
         .filter(|entry| entry.2)
         .map(|entry| entry.0)
         .collect()
 }
 
-fn select(query: &str, context: &BTreeSet<String>, candidates: &[(String, String)]) -> Vec<String> {
+fn select(
+    query: &str,
+    context: &BTreeSet<String>,
+    candidates: &[(String, String)],
+    priority: &impl Fn(&str) -> u8,
+) -> Vec<String> {
     let terms = words(query);
     let mut selected = Vec::new();
     // Explicit tool names are strong evidence even if no workflow rule covers that specialist.
@@ -425,6 +593,9 @@ fn select(query: &str, context: &BTreeSet<String>, candidates: &[(String, String
                         "research",
                         "monitor",
                         "timeline",
+                        "task",
+                        "message",
+                        "goal",
                         "reality",
                         "perception",
                         "video",
@@ -441,7 +612,7 @@ fn select(query: &str, context: &BTreeSet<String>, candidates: &[(String, String
             .map(|entry| entry.0.clone()),
     );
     selected.extend(
-        native(query, &terms)
+        native(query, &prose_words(query))
             .into_iter()
             .filter(|name| candidates.iter().any(|entry| entry.0 == *name))
             .map(str::to_owned),
@@ -472,9 +643,13 @@ fn select(query: &str, context: &BTreeSet<String>, candidates: &[(String, String
             .cloned()
             .collect::<Vec<_>>()
             .join(" ");
-        let matches = ranked(&capability, tools.clone());
+        let matches = ranked(&capability, tools.clone(), priority);
         if matches.is_empty() {
-            if let Some((_, name)) = tools.iter().filter_map(|(name, _)| entrypoint(name)).min() {
+            if let Some((_, name)) = tools
+                .iter()
+                .filter_map(|(name, _)| entrypoint(name))
+                .min_by_key(|(generic, name)| (*generic, priority(name), *name))
+            {
                 selected.push(name.to_owned());
             }
         } else {
@@ -501,10 +676,14 @@ fn select(query: &str, context: &BTreeSet<String>, candidates: &[(String, String
         // Offer both halves of lookup -> query, rather than requiring an extra discovery round
         // solely because the lookup tool's name scores higher than its consumer.
         selected.extend(
-            crate::agent::model::assistance::discover("library documentation", docs)
-                .into_iter()
-                .take(2)
-                .map(|entry| entry.0),
+            crate::agent::model::assistance::discover_with_priority(
+                "library documentation",
+                docs,
+                priority,
+            )
+            .into_iter()
+            .take(2)
+            .map(|entry| entry.0),
         );
     }
     // Domain-neutral MCP routing requires two non-boilerplate task terms. A single shared word
@@ -562,6 +741,7 @@ fn select(query: &str, context: &BTreeSet<String>, candidates: &[(String, String
     selected.extend(ranked(
         &specific.iter().cloned().collect::<Vec<_>>().join(" "),
         relevant,
+        priority,
     ));
     // An explicit inspection request with a distinctive capability in exactly one server's tool
     // names is useful even when the user does not know that server's name. Generic verbs and
@@ -597,7 +777,7 @@ fn select(query: &str, context: &BTreeSet<String>, candidates: &[(String, String
             })
             .cloned()
             .collect();
-        selected.extend(ranked(query, relevant));
+        selected.extend(ranked(query, relevant, priority));
     }
     let mut seen = BTreeSet::new();
     selected.retain(|name| seen.insert(name.clone()));
@@ -606,7 +786,11 @@ fn select(query: &str, context: &BTreeSet<String>, candidates: &[(String, String
 
 /// A successful discovery makes same-server consumers of the discovered resource relevant.
 /// Match schemas, never instructions or tool names supplied in untrusted result prose.
-fn followups(source: &str, candidates: &[(String, String)]) -> Vec<String> {
+fn followups(
+    source: &str,
+    candidates: &[(String, String)],
+    priority: &impl Fn(&str) -> u8,
+) -> Vec<String> {
     let Some((server, action)) = parts(source) else {
         return Vec::new();
     };
@@ -638,6 +822,7 @@ fn followups(source: &str, candidates: &[(String, String)]) -> Vec<String> {
     ranked(
         &resources.into_iter().collect::<Vec<_>>().join(" "),
         candidates,
+        priority,
     )
 }
 
@@ -673,7 +858,9 @@ impl Agent<'_> {
             && self.tool_routing.followed.len() < CONTEXT_LIMIT
             && self.tool_routing.followed.insert(call.name.clone())
         {
-            let matches = followups(&call.name, &self.task_tool_candidates());
+            let matches = followups(&call.name, &self.automatic_candidates(), &|name| {
+                self.tool_readiness(name).routing_priority()
+            });
             changed |= self.add_task_tools(matches, true);
         }
         if changed {
@@ -687,45 +874,32 @@ impl Agent<'_> {
             && self.config.harness.tools == config::tools::default_tools()
     }
 
-    fn task_tool_candidates(&self) -> Vec<(String, String)> {
-        let offered = self.offered();
-        self.catalog()
-            .into_iter()
-            .filter_map(|name| {
-                if offered.contains(&name)
-                    || self.tool_routing.suppressed.contains(&name)
-                    || !self.tool_eligible(&name)
-                {
-                    return None;
-                }
-                let schema = self.schemas(std::slice::from_ref(&name)).ok()?.pop()?;
-                Some((name, super::super::dispatch::search_index::text(&schema)))
-            })
-            .collect()
-    }
-
     fn refresh_task_tools(&mut self) -> bool {
         if !self.automatic_tool_routing() {
             return false;
         }
-        let candidates = self.task_tool_candidates();
+        let candidates = self.automatic_candidates();
         let mut matches = select(
             &self.tool_routing.query,
             &self.tool_routing.context,
             &candidates,
+            &|name| self.tool_readiness(name).routing_priority(),
         );
         // Small contexts keep the core offer and route requested MCP capabilities plus the native
         // web pair. The pair leads, so an incidental MCP match cannot take the bounded slots first.
         if self.lean_local() || self.minimal_tools() {
             matches.retain(|name| parts(name).is_some() || WEB_TOOLS.contains(&name.as_str()));
-            matches.sort_by_key(|name| !WEB_TOOLS.contains(&name.as_str()));
         }
         self.add_task_tools(matches, false)
     }
 
-    fn add_task_tools(&mut self, matches: Vec<String>, followup: bool) -> bool {
+    fn add_task_tools(&mut self, mut matches: Vec<String>, followup: bool) -> bool {
+        let small = self.lean_local() || self.minimal_tools();
+        if small {
+            matches.sort_by_key(|name| !WEB_TOOLS.contains(&name.as_str()));
+        }
         let before = self.tool_routing.selected.len();
-        let (tool_limit, schema_limit) = if self.lean_local() || self.minimal_tools() {
+        let (tool_limit, schema_limit) = if small {
             (LEAN_TOOL_LIMIT, LEAN_SCHEMA_BYTES)
         } else {
             (TOOL_LIMIT, SCHEMA_BYTES)

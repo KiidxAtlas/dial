@@ -128,13 +128,28 @@ impl Agent<'_> {
         if self.restore_primary_if_due(backend, ui) {
             turn.max_tokens = backend.output_budget(turn.harness.max_tokens);
         }
-        // Servers still connecting at startup join at a turn's first request, so the system
-        // prompt and its cached prefix do not change between the requests of one turn; tool
-        // discovery waits for them sooner when it needs them.
+        // Adopt passive server arrivals only at the turn's first request to preserve the cached
+        // prefix during ordinary rounds. Explicit discovery and observed capability gaps may
+        // still refresh the offer and prompt mid-turn when needed.
         if step == 0 {
             self.ext.adopt_mcp(false);
         }
         self.sync_mcp_tools(schemas, ui)?;
+        // A local step reached by failing rounds applies here, after settled calls and before the
+        // request is built, so the offer and edit grammar refresh with the prompt. Pins and gates decide inside.
+        self.local_request_boundary(schemas)?;
+        if !turn.final_step
+            && self.step_checks.visual.status(self.step_checks.revision()) == "missing"
+            && !self
+                .activate_gap_capabilities(
+                    crate::agent::run::tool_exposure::CapabilityGap::MissingVisualEvidence,
+                    &mut turn.capability_gaps,
+                )?
+                .is_empty()
+        {
+            turn.names = self.offered();
+            *schemas = self.schemas(&turn.names)?;
+        }
         Ok(ControlFlow::Continue(step))
     }
 }

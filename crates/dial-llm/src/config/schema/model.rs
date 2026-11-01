@@ -96,7 +96,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         MO,
         "Roles & Sampling",
         "Temperature",
-        "Sampling temperature. The improvement loop may replace the admitted harness, including this value.",
+        "Sampling temperature. An explicitly configured value wins, including 0.2; when unset, local hosts use their own API defaults. Select harness sampling to use the admitted harness instead.",
         Kind::Float {
             min: 0.0,
             max: 2.0,
@@ -109,7 +109,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         MO,
         "Roles & Sampling",
         "Max output tokens",
-        "Output limit per model call; 0 means no operator cap (use the provider's model capacity). Shared by reasoning and the answer.",
+        "Output limit per model call; 0 means no operator cap (local hosts choose their API default). Shared by reasoning and the answer; explicit model-profile limits still apply.",
         Kind::Int {
             min: 0,
             max: 8192,

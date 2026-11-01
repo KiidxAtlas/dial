@@ -10,6 +10,9 @@ pub(super) fn isolate(config: &Config, lane: &IntegrationOverrides) -> Result<Co
     selected.model_roles.clear();
     match lane.mode {
         IntegrationMode::Core => {}
+        IntegrationMode::ManagedShell => {
+            selected.integrations.push("bg".into());
+        }
         IntegrationMode::Delegation => {
             selected.experimental.work_packet_contracts = true;
         }
@@ -57,7 +60,9 @@ pub(super) fn prerequisite(
 ) -> Result<()> {
     let unavailable = |reason: &str| anyhow::Error::new(AgentUnavailable(reason.into()));
     match lane.mode {
-        IntegrationMode::Core | IntegrationMode::Delegation => Ok(()),
+        IntegrationMode::Core | IntegrationMode::Delegation | IntegrationMode::ManagedShell => {
+            Ok(())
+        }
         IntegrationMode::Browser => {
             if config.browser.allow_install {
                 return Err(unavailable(

@@ -56,6 +56,10 @@ impl Agent<'_> {
         {
             selection.sampling_source = format!("local profile: {source}");
         }
+        // Recovery budgets remain explicit; ordinary unlimited requests inherit the host's limit.
+        if !turn.recovering_output && turn.reasoning_budget.is_none() {
+            self.apply_local_output_limit(&mut selection.profile, turn.harness.max_tokens);
+        }
         let mut request_control = self.session.control_state();
         let mut packet_cache = std::mem::take(&mut self.task_packet);
         let mut superseded = std::mem::take(&mut self.superseded);
@@ -91,7 +95,6 @@ impl Agent<'_> {
             turn.names.retain(|name| name == "todo" || name == "finish");
         }
         turn.planning_notice = planning_required;
-        engine.apply(&mut offer, &mut turn.names, &mut messages);
         let measured_single = !self.hermetic
             && crate::reliability::single_call(
                 self.config,
@@ -572,6 +575,7 @@ impl Agent<'_> {
             if let Some(effective) = effective {
                 selected["temperature"] = effective["temperature"].clone();
                 selected["top_p"] = effective["top_p"].clone();
+                selected["max_tokens"] = effective["max_tokens"].clone();
                 selected["effective"] = effective;
             }
             request_selection = Some(selected);
@@ -868,7 +872,14 @@ impl Agent<'_> {
                 record_rejected_reply(&self.usage_scope, backend, repairing)?;
             }
             let discarded = scoped_paths.is_some().then_some("New file-scoped guidance must be delivered before these tools; discarded the entire tool attempt.");
-            return self.regenerate_for_guidance(turn, step, rule_hit, scoped_paths, discarded, ui);
+            return self.regenerate_for_guidance(
+                turn,
+                engine,
+                step,
+                (rule_hit, scoped_paths),
+                discarded,
+                ui,
+            );
         }
         let mut reply = match result {
             Err(error)
@@ -908,10 +919,14 @@ impl Agent<'_> {
                     self.push(json!({"role":"assistant","content":partial}))?;
                     // The partial answer kept in history responded to this request's notes.
                     turn.reply_received();
-                    // After the reply is recorded, so a redirecting note reaches the next request.
-                    if let Some(report) =
-                        self.setback(turn, super::progress::Setback::StreamStall, step, ui)?
-                    {
+                    // Charge shared recovery after retaining the partial answer.
+                    if let Some(report) = self.setback(
+                        turn,
+                        engine,
+                        super::progress::Setback::StreamStall,
+                        step,
+                        ui,
+                    )? {
                         return Ok(crate::agent::run::engine::Tick::Finished(report));
                     }
                     turn.pending_nudges.push(json!({"role":"user","content":crate::agent::safety::stream_guards::render_retry_prompt(crate::agent::safety::stream_guards::STREAM_STALL_CONTINUE, turn.stall_continues, crate::agent::safety::stream_guards::STREAM_STALL_CONTINUE_MAX_RETRIES),"dial_transient":true}));
@@ -1015,7 +1030,7 @@ impl Agent<'_> {
                         != crate::config::compaction::CompactionStrategy::Off =>
             {
                 if let Some(report) =
-                    self.setback(turn, super::progress::Setback::Overflow, step, ui)?
+                    self.setback(turn, engine, super::progress::Setback::Overflow, step, ui)?
                 {
                     return Ok(crate::agent::run::engine::Tick::Finished(report));
                 }
@@ -1279,7 +1294,7 @@ impl Agent<'_> {
                 }
                 Truncation::Raise(raised) => {
                     if let Some(report) =
-                        self.setback(turn, super::progress::Setback::Truncation, step, ui)?
+                        self.setback(turn, engine, super::progress::Setback::Truncation, step, ui)?
                     {
                         return Ok(crate::agent::run::engine::Tick::Finished(report));
                     }
@@ -1293,8 +1308,13 @@ impl Agent<'_> {
                 Truncation::Continue { partial, message } => {
                     // Partial output that keeps advancing is new work, not a failed recovery.
                     if engine.length_stalling()
-                        && let Some(report) =
-                            self.setback(turn, super::progress::Setback::Truncation, step, ui)?
+                        && let Some(report) = self.setback(
+                            turn,
+                            engine,
+                            super::progress::Setback::Truncation,
+                            step,
+                            ui,
+                        )?
                     {
                         return Ok(crate::agent::run::engine::Tick::Finished(report));
                     }
@@ -1356,18 +1376,22 @@ impl Agent<'_> {
                 record_rejected_reply(&self.usage_scope, backend, repairing)?;
                 return self.regenerate_for_guidance(
                     turn,
+                    engine,
                     step,
-                    None,
-                    Some(paths),
+                    (None, Some(paths)),
                     Some("Inline edit requires applicable file guidance before any tool effect."),
                     ui,
                 );
             }
         }
         if let Some(error) = self.completed_edit_preview_error(&reply) {
-            if let Some(report) =
-                self.setback(turn, super::progress::Setback::RejectedPreview, step, ui)?
-            {
+            if let Some(report) = self.setback(
+                turn,
+                engine,
+                super::progress::Setback::RejectedPreview,
+                step,
+                ui,
+            )? {
                 return Ok(crate::agent::run::engine::Tick::Finished(report));
             }
             turn.rejected_edit_previews += 1;
@@ -1412,13 +1436,24 @@ impl Agent<'_> {
             backend,
         ) {
             let form = reply.wire_form;
-            return self.request_constrained_repair(turn, step, kind, context_before, form, ui);
+            return self.request_constrained_repair(
+                turn,
+                engine,
+                step,
+                kind,
+                Pending::new(context_before, form),
+                ui,
+            );
         }
         if let Some(failure) = form_failure {
             use crate::agent::run::reply_triage::FormFailure;
-            if let Some(report) =
-                self.setback(turn, super::progress::Setback::UnusableReply, step, ui)?
-            {
+            if let Some(report) = self.setback(
+                turn,
+                engine,
+                super::progress::Setback::UnusableReply,
+                step,
+                ui,
+            )? {
                 return Ok(crate::agent::run::engine::Tick::Finished(report));
             }
             self.request_phase.recover(match failure {
@@ -1470,7 +1505,7 @@ impl Agent<'_> {
             crate::agent::run::turn_recovery::StopAction::Accept => {}
             crate::agent::run::turn_recovery::StopAction::Continue { reason, message } => {
                 if let Some(report) =
-                    self.setback(turn, super::progress::Setback::NoAnswer, step, ui)?
+                    self.setback(turn, engine, super::progress::Setback::NoAnswer, step, ui)?
                 {
                     return Ok(crate::agent::run::engine::Tick::Finished(report));
                 }
@@ -1556,15 +1591,22 @@ impl Agent<'_> {
             match turn.completion.stopped(&self.todo) {
                 crate::agent::verify::completion::StopAction::Accept => {}
                 crate::agent::verify::completion::StopAction::Blocked(blockers) => {
-                    ui.notice(&blockers);
                     self.disclose_turn_changes(ui);
-                    return Ok(crate::agent::run::engine::Tick::Finished(TurnReport {
-                        text: reply.text,
-                        outcome: TurnOutcome::Blocked,
-                        steps: step + 1,
-                        interrupted: false,
-                        trajectory: None,
-                    }));
+                    let outcome = TurnOutcome::Blocked;
+                    return self
+                        .stop_turn(
+                            ui,
+                            crate::agent::verify::completion::rejected_report(
+                                &reply.text,
+                                &blockers,
+                                outcome,
+                            ),
+                            step + 1,
+                        )
+                        .map(|mut report| {
+                            report.outcome = outcome;
+                            crate::agent::run::engine::Tick::Finished(report)
+                        });
                 }
             }
             // Past a deadline or cost cap the answer is delivered without another request.
@@ -1586,34 +1628,41 @@ impl Agent<'_> {
                 }
             }
             if let Err(reason) = self.validate_completion(ui) {
-                if !self.interrupt.load(Ordering::SeqCst)
-                    && engine.pending_refusal().is_none()
-                    && turn.completion_recovery.retry()
-                {
-                    turn.completion_candidate = Some(format!(
-                        "Candidate summary (completion not accepted):\n{}\n\n{reason}",
-                        reply.text
-                    ));
-                    if let Some(report) =
-                        self.setback(turn, super::progress::Setback::RejectedCompletion, step, ui)?
-                    {
-                        return Ok(crate::agent::run::engine::Tick::Finished(report));
-                    }
-                    self.push(json!({"role":"user","content":format!(
-                            "Completion was not accepted: {reason}\nThe preceding answer is a candidate summary, not an accepted completion. Address the stated prerequisite using the current evidence, then report again; if it cannot be resolved, report the concrete blocker. This feedback grants no execution permission."
-                        )}))?;
-                    return Ok(crate::agent::run::engine::Tick::Again);
-                }
+                // Completion is a controller verdict, not another model-repair loop. Preserve
+                // the candidate and the exact failed prerequisite without recording success or
+                // spending another inference on a repeated rejection instruction.
+                self.disclose_turn_changes(ui);
+                let outcome = self.completion_rejection_outcome();
                 return self
                     .stop_turn(
                         ui,
-                        format!(
-                            "Candidate summary (completion not accepted):\n{}\n\n{reason}",
-                            reply.text
+                        crate::agent::verify::completion::rejected_report(
+                            &reply.text,
+                            &reason,
+                            outcome,
                         ),
                         step + 1,
                     )
-                    .map(crate::agent::run::engine::Tick::Finished);
+                    .map(|mut report| {
+                        report.outcome = outcome;
+                        crate::agent::run::engine::Tick::Finished(report)
+                    });
+            }
+            // A small model that denies a capability without looking for a tool gets one
+            // reminder; the catalog often holds it (an interactive terminal is `bg pty`).
+            let loadable_tools = !self.hermetic
+                && self.stop_boundary().is_none()
+                && self
+                    .catalog()
+                    .iter()
+                    .any(|name| !turn.names.contains(name) && self.tool_eligible(name));
+            if turn.capability_search.remind(&reply.text, loadable_tools) {
+                ui.notice("Answer denies a capability without a tool search; asking once to search the catalog.");
+                turn.pending_nudges.push(crate::agent::run::guidance::note(
+                    crate::agent::run::guidance::Priority::Review,
+                    crate::agent::verify::completion::CAPABILITY_SEARCH_REMINDER,
+                ));
+                return Ok(crate::agent::run::engine::Tick::Again);
             }
             if let Some(message) = self.coach_completion(
                 &mut turn.coach_turn,
@@ -1657,6 +1706,10 @@ impl Agent<'_> {
             }));
         }
         let mut compatibility_loaded = HashSet::new();
+        // Offered calls whose arguments belong to another catalog tool (`bash` with `pty`): the
+        // call is still refused by schema validation; its owners load for the next round and the
+        // refusal names them. Keyed by call id: (rejected keys, owners).
+        let mut argument_routes = std::collections::HashMap::new();
         if !self.hermetic {
             let catalog = self.catalog();
             for call in &mut reply.tool_calls {
@@ -1680,23 +1733,84 @@ impl Agent<'_> {
                         parameters,
                         &mut call.arguments,
                     );
+                    if !planning_required
+                        && !self.plan_mode
+                        && let Some(route) = self.argument_owners(call, &offer)
+                    {
+                        argument_routes.insert(call.id.clone(), route);
+                    }
                 } else if !planning_required
                     && !self.plan_mode
                     && engine.rejection_at(&self.workspace, call).is_none()
                     && catalog.contains(&call.name)
                 {
-                    // Capability discovery is not permission to execute a call whose schema
-                    // was absent. Enable the real tool, then require a fresh call next round.
+                    // The model never saw this schema: enable the real tool, then validate the
+                    // call against the newly loaded schema below; only a valid call runs, through
+                    // normal approval, and an invalid one is refused with that schema.
                     compatibility_loaded.insert(call.name.clone());
                 }
+            }
+            let mut owners: Vec<String> = argument_routes
+                .values()
+                .flat_map(|(_, owners): &(Vec<String>, Vec<String>)| owners.iter().cloned())
+                .collect();
+            owners.sort();
+            owners.dedup();
+            if !owners.is_empty() {
+                self.activate_tools(&owners)?;
+                ui.event(&crate::agent::ui::ui_event::UiEvent::new(
+                    crate::agent::ui::ui_event::EventKind::Tools,
+                    format!(
+                        "Loaded {} for the next round: it accepts arguments the called tool rejected",
+                        owners.join(", ")
+                    ),
+                ));
             }
             if !compatibility_loaded.is_empty() {
                 let mut loaded: Vec<_> = compatibility_loaded.iter().cloned().collect();
                 loaded.sort();
                 self.activate_tools(&loaded)?;
+                // Add only the loaded tools: this request's narrowed offer (single-call
+                // simplification) must not widen to the full offer.
+                let offered = self.offered();
+                let fresh: Vec<String> = loaded
+                    .iter()
+                    .filter(|name| offered.contains(name))
+                    .cloned()
+                    .collect();
+                for (name, schema) in fresh.iter().zip(self.schemas(&fresh)?) {
+                    if !turn.names.contains(name) {
+                        turn.names.push(name.clone());
+                    }
+                    if !schemas
+                        .iter()
+                        .any(|s| s["function"]["name"] == name.as_str())
+                    {
+                        schemas.push(schema);
+                    }
+                }
+                for call in &mut reply.tool_calls {
+                    if !compatibility_loaded.contains(&call.name) || call.malformed_arguments {
+                        continue;
+                    }
+                    if let Some(parameters) = schemas
+                        .iter()
+                        .find(|s| s["function"]["name"] == call.name)
+                        .and_then(|s| s.pointer("/function/parameters"))
+                    {
+                        crate::agent::run::tool_compat::normalize(
+                            &call.name,
+                            parameters,
+                            &mut call.arguments,
+                        );
+                    }
+                }
                 ui.event(&crate::agent::ui::ui_event::UiEvent::new(
                     crate::agent::ui::ui_event::EventKind::Tools,
-                    format!("Enabled {} for the next round", loaded.join(", ")),
+                    format!(
+                        "Loaded {} for this round; its calls are checked against the loaded schema",
+                        loaded.join(", ")
+                    ),
                 ));
             }
         }
@@ -1711,16 +1825,26 @@ impl Agent<'_> {
             }
         }
         // Hermetic turns disable repair; its live endpoint probe is not evaluated either.
+        // Hermetic turns disable repair; its live endpoint probe is not evaluated either. A call
+        // whose arguments were routed to another tool is corrected by naming that tool; forcing
+        // it into some offered schema would pick an unrelated tool that tolerates the stray keys.
         if let Some(kind) = self.constrained_repair_kind(
             turn,
-            true,
+            argument_routes.is_empty(),
             &reply,
             &offer,
             selection.profile.as_ref(),
             backend,
         ) {
             let form = reply.wire_form;
-            return self.request_constrained_repair(turn, step, kind, context_before, form, ui);
+            return self.request_constrained_repair(
+                turn,
+                engine,
+                step,
+                kind,
+                Pending::new(context_before, form),
+                ui,
+            );
         }
         // Compatibility can decode JSON containers and rename arguments. Recheck that exact
         // executable form before journaling any assistant/tool pair or prefetching a read.
@@ -1742,9 +1866,9 @@ impl Agent<'_> {
             record_rejected_reply(&self.usage_scope, backend, repairing)?;
             return self.regenerate_for_guidance(
                 turn,
+                engine,
                 step,
-                normalized_hit,
-                scoped_paths,
+                (normalized_hit, scoped_paths),
                 Some("Applicable portable guidance must be delivered before the normalized tool attempt; no tools executed."),
                 ui,
             );
@@ -1801,6 +1925,7 @@ impl Agent<'_> {
                 max_tokens: request.max_tokens,
                 seed: request.seed,
                 compatibility_loaded,
+                argument_routes,
                 repeat_streak,
                 streamed,
                 outcome: ToolOutcome::default(),
@@ -1815,9 +1940,12 @@ impl Agent<'_> {
     pub(super) fn regenerate_for_guidance(
         &mut self,
         turn: &mut TurnState<'_>,
+        engine: &mut crate::agent::run::engine::Engine,
         step: u32,
-        hit: Option<crate::agent::safety::rules::Hit>,
-        paths: Option<std::collections::BTreeSet<String>>,
+        guidance: (
+            Option<crate::agent::safety::rules::Hit>,
+            Option<std::collections::BTreeSet<String>>,
+        ),
         discarded: Option<&str>,
         ui: &mut dyn Ui,
     ) -> Result<crate::agent::run::engine::Tick<TurnReport>> {
@@ -1835,6 +1963,7 @@ impl Agent<'_> {
         }
         if let Some(report) = self.setback(
             turn,
+            engine,
             super::progress::Setback::GuidanceRegeneration,
             step,
             ui,
@@ -1843,6 +1972,7 @@ impl Agent<'_> {
         }
         turn.rule_regenerations += 1;
         turn.rule_state.set_regenerations(turn.rule_regenerations);
+        let (hit, paths) = guidance;
         if let Some(hit) = hit {
             turn.rule_state
                 .remember(&hit, "main")
@@ -1992,24 +2122,26 @@ impl Agent<'_> {
     fn request_constrained_repair(
         &mut self,
         turn: &mut TurnState<'_>,
+        engine: &mut crate::agent::run::engine::Engine,
         step: u32,
         kind: &'static str,
-        context_before: Vec<Value>,
-        form: llm::messages::WireForm,
+        pending: Pending,
         ui: &mut dyn Ui,
     ) -> Result<crate::agent::run::engine::Tick<TurnReport>> {
-        if let Some(report) =
-            self.setback(turn, super::progress::Setback::UnusableReply, step, ui)?
-        {
+        if let Some(report) = self.setback(
+            turn,
+            engine,
+            super::progress::Setback::UnusableReply,
+            step,
+            ui,
+        )? {
             return Ok(crate::agent::run::engine::Tick::Finished(report));
         }
         let model = self.auth_config.selection();
         self.record(step, "constrained_repair", json!({"phase":"requested","trigger":kind,"provider":model.provider,"model":model.model}))?;
         self.request_phase
             .recover("the previous tool call was malformed");
-        let failed = turn
-            .pending
-            .get_or_insert_with(|| Pending::new(context_before, form));
+        let failed = turn.pending.get_or_insert(pending);
         failed.kinds.push(kind.into());
         turn.repair.request();
         turn.refund_unusable(ui);

@@ -8,6 +8,7 @@ pub(in crate::agent) enum ChatEvent {
     },
     Progress(llm::ModelProgress),
     Activity,
+    HiddenText(String),
     Text(String),
     Reasoning(String),
     ToolArguments {
@@ -403,6 +404,9 @@ pub(in crate::agent) fn chat_attempt_with_ui(
                         llm::StreamEvent::Activity => {
                             let _ = tx.send(ChatEvent::Activity);
                         }
+                        llm::StreamEvent::HiddenText(text) => {
+                            let _ = tx.send(ChatEvent::HiddenText(text.clone()));
+                        }
                         llm::StreamEvent::Reasoning(text) => {
                             let _ = tx.send(ChatEvent::Reasoning(text.clone()));
                         }
@@ -575,6 +579,20 @@ pub(in crate::agent) fn chat_attempt_with_ui(
                 }
                 Ok(ChatEvent::Activity) => {
                     last_progress = Instant::now();
+                }
+                Ok(ChatEvent::HiddenText(text)) => {
+                    if !text.is_empty() {
+                        last_progress = Instant::now();
+                        generating = true;
+                        ui.request_phase(RequestPhase::Generating);
+                        if let Some(progress) = &mut progress {
+                            progress.text(&text, last_progress);
+                            ui.model_progress(&progress.value);
+                        }
+                        if render_text && let Some(context) = &mut context {
+                            ui.context_usage(context.observe(&text), context.estimated());
+                        }
+                    }
                 }
                 Ok(ChatEvent::Text(text) | ChatEvent::Reasoning(text)) if text.is_empty() => {}
                 Ok(ChatEvent::Text(text)) => {

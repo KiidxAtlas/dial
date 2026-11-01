@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "instructions": "Review the goal against the proposed reply and bounded tool evidence. Return ONLY JSON: {\"gaps\":[{\"requirement\":\"specific unmet requirement or unsupported claim\",\"evidence\":0,\"next_check\":\"concrete local check or repair to resolve it\"}]}. Evidence indexes are zero-based in the supplied evidence array. At most three gaps. Use gaps=[] when there is no actionable gap. Missing evidence is uncertainty, not proof of failure; avoid speculative improvements, style commentary, and widening scope. You cannot certify correctness.",
+  "instructions": "Reconcile the user's request with the proposed reply, recorded deliverables and bounded tool evidence. Look for omitted requested outcomes, unsupported satisfaction claims and scope changes not confirmed by the user. Deliverables are the agent's interpretation, not a complete or authoritative rewrite of the request. Linked passing checks establish only those checks; claim-only references and undeclared requirements remain unassessed. Return ONLY JSON: {\"gaps\":[{\"requirement\":\"specific unmet requirement or unsupported claim\",\"evidence\":0,\"next_check\":\"concrete local check or repair to resolve it\"}]}. Evidence indexes are zero-based in the supplied evidence array. At most three gaps. Use gaps=[] when there is no actionable gap. Missing evidence is uncertainty, not proof of failure; avoid speculative improvements, style commentary, and widening scope. You cannot certify correctness or authorize scope changes.",
   "criteria": {},
   "required": []
 }

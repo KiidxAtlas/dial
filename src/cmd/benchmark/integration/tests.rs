@@ -110,6 +110,34 @@ fn delegation_uses_builtin_agents_and_selected_model_not_operator_presets() {
 }
 
 #[test]
+fn managed_shell_lane_retains_only_native_jobs_without_network_or_ambient_tools() {
+    let config = Config::default();
+    let core = isolate(&config, &Default::default()).unwrap();
+    assert!(!core.integrations.contains(&"bg".into()));
+    let lane = IntegrationOverrides {
+        mode: IntegrationMode::ManagedShell,
+        ..Default::default()
+    };
+    let selected = isolate(&config, &lane).unwrap();
+    assert!(selected.integrations.contains(&"bg".into()));
+    assert!(!selected.integrations.contains(&"browser".into()));
+    assert!(!selected.sandbox.allow_network);
+    assert!(selected.mcp.is_empty() && selected.tools.is_empty());
+    let home = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let operator = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(root.path(), operator.path().to_owned()).unwrap();
+    prepare_integration_home(&layout, &selected, &home, &lane).unwrap();
+    let child: Config =
+        toml::from_str(&fs::read_to_string(home.path().join("config.toml")).unwrap()).unwrap();
+    assert!(child.integrations.contains(&"bg".into()));
+    assert!(!child.integrations.contains(&"browser".into()));
+    assert!(!child.sandbox.allow_network);
+    assert!(child.mcp.is_empty() && child.tools.is_empty());
+    assert!(prerequisite(&child, &lane, root.path()).is_ok());
+}
+
+#[test]
 fn browser_lane_is_headless_cache_only_and_does_not_attach_to_operator_sessions() {
     let mut config = Config::default();
     config.browser.profile = Some("private".into());

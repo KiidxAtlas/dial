@@ -363,7 +363,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         TO,
         "Verification",
         "Declared requirement evidence",
-        "TOML map of requirement IDs to checks (configured command names) and optional visual=true. Tracks current observed evidence; does not establish complete task coverage or grant tool permissions.",
+        "TOML map of requirement IDs to checks (configured command names), optional visual=true and exact visual_target locator. Optional deliverables lists IDs whose claimed satisfaction must meet this contract, even without strict_requirements. Tracks observations, not complete semantic coverage; grants no tool permissions.",
         Kind::Table,
     ),
     field!(
@@ -547,5 +547,14 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Domains shell commands may never reach, comma separated (same patterns as the allow list); denials win over allows.",
         Kind::StringList,
         true
+    ),
+    field!(
+        "verification.target_evidence",
+        verification.target_evidence,
+        TO,
+        "Verification",
+        "Require runs of requested paths",
+        "When the latest user request begins with run, launch, start, execute or play and names an existing workspace path, refuse completion until a bash or bg run naming that path was observed to stay running or exit zero after the last edit. Lexical and narrow; process evidence, not behavior verification. Grants no execution permission.",
+        Kind::Bool,
     ),
 ];

@@ -18,23 +18,111 @@ pub fn integration_enabled(name: &str, configured: &[String]) -> bool {
         || configured.iter().any(|entry| entry == name)
 }
 
-/// Platform support is not an execution grant or a probe of the configured interpreter.
+/// Advisory prerequisites for execution, not authorization or a promise that a call succeeds.
+/// Unknown tools remain discoverable; querying readiness must never start a process or probe a service.
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Readiness {
+    Ready,
+    MissingPrerequisite {
+        reason: String,
+    },
+    ApprovalRequired {
+        reason: String,
+    },
+    Unsupported {
+        reason: String,
+    },
+    #[default]
+    Unknown,
+}
+
+impl Readiness {
+    /// Only known execution blockers defer automatic routing. Discovery and explicit loads do not use this.
+    pub fn automatic_candidate(&self) -> bool {
+        !matches!(
+            self,
+            Self::MissingPrerequisite { .. } | Self::Unsupported { .. }
+        )
+    }
+
+    /// Stable preference among otherwise relevant tools. Approval still happens at dispatch.
+    pub fn routing_priority(&self) -> u8 {
+        match self {
+            Self::Ready => 0,
+            Self::Unknown | Self::ApprovalRequired { .. } => 1,
+            Self::MissingPrerequisite { .. } | Self::Unsupported { .. } => 2,
+        }
+    }
+}
+
+/// Recomputed from current configuration and owner-held metadata, without cached absence claims.
+pub fn readiness(
+    name: &str,
+    config: &crate::config::types::Config,
+    registry: &Registry,
+) -> Readiness {
+    if name == "eval"
+        && let Some(reason) = execution_platform(name).reason
+    {
+        return Readiness::Unsupported { reason };
+    }
+    if let Some(adapter) = name
+        .strip_prefix("dap_")
+        .and_then(|name| config.dap.get(name))
+        && adapter.program.as_os_str().is_empty()
+        && adapter.address.is_empty()
+    {
+        return Readiness::MissingPrerequisite {
+            reason: "The configured debug adapter has neither a program nor a connection address"
+                .into(),
+        };
+    }
+    if let Some(tool) = registry.get(name) {
+        return tool.readiness(config);
+    }
+    match name {
+        // These native/controller operations have no service or interpreter prerequisite.
+        "read" | "write" | "edit" | "grep" | "glob" | "tool_search" | "tool_load" => {
+            Readiness::Ready
+        }
+        // Registry absence alone never proves that a controller, deferred or future tool is unsupported.
+        _ => Readiness::Unknown,
+    }
+}
+
+/// Operation-specific prerequisites must not disable unrelated operations of a multi-action tool.
+pub fn operation_readiness(
+    name: &str,
+    config: &crate::config::types::Config,
+) -> BTreeMap<String, Readiness> {
+    if name != "computer" {
+        return BTreeMap::new();
+    }
+    let locate = if crate::tools::vision::grounding::configured(config) {
+        Readiness::Unknown // Assignment is not proof that the model is loaded or reachable.
+    } else {
+        Readiness::MissingPrerequisite {
+            reason: "Locate requires a grounding model; configure the grounding role with /setup grounding".into(),
+        }
+    };
+    BTreeMap::from([("locate".into(), locate)])
+}
+
+/// Static OS support only: no execution grant, containment probe or interpreter health check.
 #[derive(Clone, Debug, Serialize)]
 pub struct PlatformAvailability {
     pub available: bool,
     pub reason: Option<String>,
 }
 pub fn execution_platform(name: &str) -> PlatformAvailability {
-    let reason = if cfg!(target_os = "macos") {
-        crate::tools::exec::sandbox::Sandbox::detect().available().err().map(|error|
-            format!("{name} requires OS process-fork containment even with filesystem sandboxing disabled: {error}"))
-    } else if cfg!(windows) && name == "eval" {
-        None // The trusted Python bootstrap installs the native no-child-process mitigation.
+    let reason = if cfg!(target_os = "macos") || (cfg!(windows) && name == "eval") {
+        None // Actual launch still requires the runtime's containment check.
     } else {
         Some(format!(
             "{name} requires OS process-fork containment; {}",
             if name == "eval" {
-                "only macOS is supported"
+                "only macOS and Windows are supported"
             } else {
                 "no unsandboxed or Linux fallback is provided"
             }
@@ -71,6 +159,9 @@ pub struct Definition {
     pub schema: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub platform: Option<PlatformAvailability>,
+    pub readiness: Readiness,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub operation_readiness: BTreeMap<String, Readiness>,
 }
 #[derive(Clone, Debug, Default)]
 pub struct Catalog {
@@ -107,10 +198,23 @@ impl Catalog {
                     identity,
                     schema: schema.clone(),
                     platform: matches!(name, "eval").then(|| execution_platform(name)),
+                    readiness: Readiness::Unknown,
+                    operation_readiness: BTreeMap::new(),
                 },
             );
         }
         Ok(Self { definitions })
+    }
+    /// Refresh advisory metadata at the observation boundary, never at registration alone.
+    pub fn refresh_readiness(
+        &mut self,
+        config: &crate::config::types::Config,
+        registry: &Registry,
+    ) {
+        for definition in self.definitions.values_mut() {
+            definition.readiness = readiness(&definition.name, config, registry);
+            definition.operation_readiness = operation_readiness(&definition.name, config);
+        }
     }
     pub fn set_origin(&mut self, name: &str, origin: Origin) {
         if let Some(definition) = self.definitions.get_mut(name) {

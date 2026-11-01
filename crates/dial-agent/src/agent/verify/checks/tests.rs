@@ -92,6 +92,54 @@ fn only_confirmed_code_failures_drive_automatic_repair() {
     let empty = agent.run_checks(&[check("echo 'Ran 0 tests'; exit 0")], &mut NullUi);
     assert!(empty.actionable.is_empty());
     assert_eq!(empty.failures.len(), 1);
+
+    let unknown_check = check("echo failed; exit 1");
+    let unknown = agent.run_checks(std::slice::from_ref(&unknown_check), &mut NullUi);
+    assert!(unknown.actionable.is_empty());
+    assert_eq!(unknown.failures.len(), 1);
+    assert!(unknown.failures[0].contains("cause is unconfirmed"));
+    assert_eq!(agent.step_checks.failed_checks.len(), 3);
+    assert!(agent.step_checks.failed_checks.contains(&unknown_check));
+    assert!(agent.step_checks.failed);
+    assert_eq!(
+        agent
+            .step_checks
+            .evidence
+            .latest_status(&unknown_check.command),
+        Some(verify::verification::CheckStatus::FailedUnknownCause)
+    );
+}
+
+#[test]
+fn unknown_cause_reproduction_then_pass_clears_failure_without_fix_credit() {
+    let root = tempfile::tempdir().unwrap();
+    let config = Config::default();
+    let mut agent = hermetic_agent(&config, root.path());
+    let check = verify::verification::FocusedCheck {
+        name: "repro: unknown".into(),
+        command: "test -f fixed || { echo failed; exit 1; }".into(),
+        timeout_secs: 5,
+    };
+    agent
+        .step_checks
+        .evidence
+        .register_repro(check.clone())
+        .unwrap();
+    let failed = agent.run_checks(std::slice::from_ref(&check), &mut NullUi);
+    assert_eq!(failed.failures.len(), 1);
+    assert!(failed.actionable.is_empty());
+    std::fs::write(root.path().join("fixed"), "").unwrap();
+    agent.step_checks.mutations += 1;
+    let passed = agent.run_checks(&[check], &mut NullUi);
+    assert!(passed.failures.is_empty());
+    assert!(!agent.step_checks.failed);
+    assert_eq!(
+        agent
+            .step_checks
+            .evidence
+            .passing_behavioral(agent.step_checks.revision()),
+        0
+    );
 }
 
 #[test]
@@ -130,7 +178,7 @@ fn unchanged_baseline_is_disclosed_without_repair_but_changed_diagnostic_is_acti
     };
     std::fs::write(
         root.path().join("diagnostic"),
-        "FAILED old_test: expected 1 got 2\n",
+        "AssertionError: old_test expected 1 got 2\n",
     )
     .unwrap();
     let baseline = agent.run_checks(std::slice::from_ref(&check), &mut NullUi);
@@ -142,7 +190,7 @@ fn unchanged_baseline_is_disclosed_without_repair_but_changed_diagnostic_is_acti
     assert!(unchanged.actionable.is_empty());
     std::fs::write(
         root.path().join("diagnostic"),
-        "FAILED new_test: expected 1 got 3\n",
+        "AssertionError: new_test expected 1 got 3\n",
     )
     .unwrap();
     let changed = agent.run_checks(&[check], &mut NullUi);
@@ -295,6 +343,7 @@ fn declared_requirement_selects_its_check_and_only_current_observed_runs_cover_i
         VerificationRequirement {
             checks: vec!["contract".into()],
             visual: false,
+            ..Default::default()
         },
     );
     let mut agent = hermetic_agent(&config, root.path());
@@ -354,6 +403,7 @@ fn strict_completion_requires_observed_current_evidence_and_respects_no_auto_mod
         crate::config::types::VerificationRequirement {
             checks: vec!["contract".into()],
             visual: false,
+            ..Default::default()
         },
     );
     let mut agent = hermetic_agent(&config, root.path());
@@ -403,6 +453,7 @@ fn strict_automatic_completion_runs_required_checks_once_and_refuses_permission_
         crate::config::types::VerificationRequirement {
             checks: vec!["contract".into()],
             visual: false,
+            ..Default::default()
         },
     );
     let mut agent = hermetic_agent(&config, root.path());
@@ -447,6 +498,7 @@ fn requirement_mapped_baseline_failure_stays_actionable_without_behavioral_credi
         crate::config::types::VerificationRequirement {
             checks: vec!["boundary-check".into()],
             visual: false,
+            ..Default::default()
         },
     );
     let mut agent = hermetic_agent(&config, root.path());
@@ -690,6 +742,7 @@ fn strict_required_subset_cannot_discharge_an_unrelated_failed_check() {
         VerificationRequirement {
             checks: vec!["required".into()],
             visual: false,
+            ..Default::default()
         },
     );
     let mut agent = hermetic_agent(&config, root.path());
@@ -813,4 +866,295 @@ fn background_check_denial_never_starts_a_process() {
             .latest_status("touch unauthorized"),
         Some(verify::verification::CheckStatus::PermissionDenied)
     );
+}
+
+fn set_deliverables(agent: &mut Agent<'_>, deliverables: Value) {
+    let state = crate::agent::workflow::working_state::apply(
+        &Value::Null,
+        &json!({"action":"update","deliverables":deliverables}),
+    )
+    .unwrap();
+    agent
+        .session_mut()
+        .set_control_state(json!({"working_state": state}))
+        .unwrap();
+}
+
+fn satisfied_by(id: &str, reference: &str) -> Value {
+    json!({"id":id,"description":"deliverable","status":"satisfied","evidence_refs":[reference]})
+}
+
+fn observe_at(
+    agent: &mut Agent<'_>,
+    command: &str,
+    status: crate::agent::verify::verification::CheckStatus,
+) {
+    let revision = agent.step_checks.revision();
+    agent
+        .step_checks
+        .evidence
+        .observe(command, "call", status, revision, false);
+}
+
+fn command(name: &str, command: &str) -> crate::config::types::VerificationCommand {
+    crate::config::types::VerificationCommand {
+        name: name.into(),
+        command: command.into(),
+        file_extensions: vec![],
+        timeout_secs: 5,
+    }
+}
+
+#[test]
+fn unresolved_check_links_block_completion_with_exact_reason() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config
+        .verification
+        .commands
+        .push(command("build", "echo built"));
+    let mut agent = hermetic_agent(&config, root.path());
+    for (reference, label) in [
+        ("check:build", "not_observed"),
+        ("check:nope", "unknown_check"),
+    ] {
+        set_deliverables(&mut agent, json!([satisfied_by("ship", reference)]));
+        let expected = format!("ship -> {reference} ({label})");
+        let blocker = agent.completion_blockers().unwrap_err();
+        assert!(blocker.contains(&expected), "{blocker}");
+        let evidence = agent.completion_evidence(TurnOutcome::Completed);
+        assert_eq!(evidence["unpassed_check_links"], json!([expected]));
+        assert_eq!(evidence["deliverable_coverage"], "open_obligations");
+    }
+}
+
+#[test]
+fn check_link_status_is_the_current_observation_not_a_declaration() {
+    use crate::agent::verify::verification::CheckStatus;
+    let cases = [
+        (Some(CheckStatus::CodeFailed), "code_failed"),
+        (Some(CheckStatus::TimedOut), "timed_out"),
+        (Some(CheckStatus::Unverified), "unverified"),
+        (Some(CheckStatus::PermissionDenied), "permission_denied"),
+        (None, "stale"),
+    ];
+    for (status, label) in cases {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config
+            .verification
+            .commands
+            .push(command("build", "echo built"));
+        let mut agent = hermetic_agent(&config, root.path());
+        match status {
+            Some(status) => observe_at(&mut agent, "echo built", status),
+            None => {
+                observe_at(&mut agent, "echo built", CheckStatus::Passed);
+                agent.step_checks.mutations += 1;
+            }
+        }
+        set_deliverables(&mut agent, json!([satisfied_by("ship", "check:build")]));
+        let blocker = agent.completion_blockers().unwrap_err();
+        assert!(
+            blocker.contains(&format!("ship -> check:build ({label})")),
+            "{label}: {blocker}"
+        );
+    }
+}
+
+#[test]
+fn current_passing_check_link_resolves_without_running_the_command() {
+    use crate::agent::verify::verification::CheckStatus;
+    let root = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config
+        .verification
+        .commands
+        .push(command("build", "touch must-not-exist-build"));
+    let mut agent = hermetic_agent(&config, root.path());
+    agent
+        .step_checks
+        .evidence
+        .register_repro(crate::agent::verify::verification::FocusedCheck {
+            name: "repro".into(),
+            command: "touch must-not-exist-repro".into(),
+            timeout_secs: 5,
+        })
+        .unwrap();
+    observe_at(
+        &mut agent,
+        "touch must-not-exist-build",
+        CheckStatus::Passed,
+    );
+    observe_at(
+        &mut agent,
+        "touch must-not-exist-repro",
+        CheckStatus::Passed,
+    );
+    set_deliverables(
+        &mut agent,
+        json!([
+            satisfied_by("ship", "check:build"),
+            satisfied_by("repro-case", "check:repro")
+        ]),
+    );
+    assert!(agent.completion_blockers().is_ok());
+    let evidence = agent.completion_evidence(TurnOutcome::Completed);
+    assert_eq!(evidence["unpassed_check_links"], json!([]));
+    assert!(!root.path().join("must-not-exist-build").exists());
+    assert!(!root.path().join("must-not-exist-repro").exists());
+}
+
+#[test]
+fn ambiguous_check_name_never_resolves_from_one_passing_command() {
+    use crate::agent::verify::verification::CheckStatus;
+    let root = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config
+        .verification
+        .commands
+        .push(command("build", "echo a"));
+    config
+        .verification
+        .commands
+        .push(command("build", "echo b"));
+    let mut agent = hermetic_agent(&config, root.path());
+    observe_at(&mut agent, "echo a", CheckStatus::Passed);
+    set_deliverables(&mut agent, json!([satisfied_by("ship", "check:build")]));
+    let blocker = agent.completion_blockers().unwrap_err();
+    assert!(
+        blocker.contains("ship -> check:build (ambiguous_check)"),
+        "{blocker}"
+    );
+}
+
+#[test]
+fn file_and_artifact_refs_stay_unverified_and_evidence_separates_declared_from_outstanding() {
+    let root = tempfile::tempdir().unwrap();
+    let config = Config::default();
+    let mut agent = hermetic_agent(&config, root.path());
+    // Historical cancellations lack a runtime scope receipt and must remain outstanding.
+    agent.session_mut().set_control_state(json!({"working_state":{"deliverables":[
+        {"id":"ship","description":"d","status":"satisfied","evidence_refs":["artifact://log","src/lib.rs"]},
+        {"id":"old","description":"d","status":"cancelled"},
+        {"id":"next","description":"d","status":"open"}
+    ]}})).unwrap();
+    assert!(agent.completion_blockers().is_err());
+    let evidence = agent.completion_evidence(TurnOutcome::Completed);
+    assert_eq!(evidence["unpassed_check_links"], json!([]));
+    assert_eq!(
+        evidence["declared_deliverables"].as_array().unwrap().len(),
+        3
+    );
+    assert_eq!(
+        evidence["outstanding_deliverables"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(evidence["outstanding_deliverables"][0]["id"], "old");
+    assert_eq!(evidence["outstanding_deliverables"][1]["id"], "next");
+    assert_eq!(
+        evidence["deliverable_claim_policy"],
+        "model_reported_not_independent_verification"
+    );
+}
+
+#[test]
+fn malformed_stored_deliverables_block_completion_without_panicking() {
+    let root = tempfile::tempdir().unwrap();
+    let config = Config::default();
+    let mut agent = hermetic_agent(&config, root.path());
+    agent
+        .session_mut()
+        .set_control_state(json!({"working_state": {"deliverables": "oops"}}))
+        .unwrap();
+    let blocker = agent.completion_blockers().unwrap_err();
+    assert!(blocker.contains("invalid"), "{blocker}");
+    let _ = agent.completion_evidence(TurnOutcome::Completed);
+}
+
+#[test]
+fn reconciliation_distinguishes_claims_current_checks_and_stale_evidence() {
+    use crate::agent::verify::verification::CheckStatus;
+    let root = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config
+        .verification
+        .commands
+        .push(command("build", "echo built"));
+    let mut agent = hermetic_agent(&config, root.path());
+    set_deliverables(
+        &mut agent,
+        json!([
+            satisfied_by("tested", "check:build"),
+            satisfied_by("claimed", "artifact://unverified"),
+            {"id":"remaining","description":"second outcome","status":"open"}
+        ]),
+    );
+    observe_at(&mut agent, "echo built", CheckStatus::Passed);
+    let evidence = agent.completion_evidence(TurnOutcome::Completed);
+    let reconciliation = &evidence["reconciliation"];
+    assert_eq!(
+        reconciliation["deliverables"][0]["evidence_status"],
+        "linked_checks_passed"
+    );
+    assert_eq!(
+        reconciliation["deliverables"][1]["evidence_status"],
+        "claim_only"
+    );
+    assert_eq!(reconciliation["deliverables"][2]["claimed_status"], "open");
+    assert_eq!(reconciliation["undeclared_requirements"], "unassessed");
+    assert!(agent.completion_blockers().is_err());
+    agent.step_checks.mutations += 1;
+    let stale = agent.completion_evidence(TurnOutcome::Completed);
+    assert_eq!(
+        stale["reconciliation"]["deliverables"][0]["evidence_status"],
+        "linked_checks_unresolved"
+    );
+    assert_eq!(
+        stale["reconciliation"]["deliverables"][0]["checks"][0]["status"],
+        "stale"
+    );
+}
+
+#[test]
+fn deliverable_contract_gates_claims_independently_of_cited_refs_and_strict_mode() {
+    use crate::agent::verify::verification::CheckStatus;
+    let root = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config.verification.commands = vec![
+        command("required", "echo required"),
+        command("unrelated", "echo unrelated"),
+    ];
+    config.verification.requirements.insert(
+        "behavior".into(),
+        crate::config::types::VerificationRequirement {
+            checks: vec!["required".into()],
+            deliverables: vec!["ship".into()],
+            ..Default::default()
+        },
+    );
+    assert!(!config.verification.strict_requirements);
+    let mut agent = hermetic_agent(&config, root.path());
+    observe_at(&mut agent, "echo unrelated", CheckStatus::Passed);
+    for reference in ["src/main.rs", "artifact://claim", "check:unrelated"] {
+        set_deliverables(&mut agent, json!([satisfied_by("ship", reference)]));
+        assert!(agent.completion_blockers().unwrap_err().contains("ship"));
+        let evidence = agent.completion_evidence(TurnOutcome::Completed);
+        assert_eq!(
+            evidence["reconciliation"]["deliverables"][0]["acceptance"]["status"],
+            "needs_verification"
+        );
+    }
+    observe_at(&mut agent, "echo required", CheckStatus::Passed);
+    assert!(agent.completion_blockers().is_ok());
+    assert_eq!(
+        agent.completion_evidence(TurnOutcome::Completed)["reconciliation"]["deliverables"][0]["acceptance"]
+            ["status"],
+        "observed"
+    );
+    agent.step_checks.mutations += 1;
+    assert!(agent.completion_blockers().unwrap_err().contains("ship"));
 }

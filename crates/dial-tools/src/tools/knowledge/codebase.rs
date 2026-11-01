@@ -11,7 +11,7 @@ use crate::tools::{
     fs::walk::Walk,
     integrations::ext::{Tool, ToolContext},
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use ast_grep_core::Language;
 use ast_grep_language::SupportLang;
 use parking_lot::Mutex;
@@ -1581,10 +1581,9 @@ impl Codebase {
             "finding revision changed; recall it and pass expected_revision={revision}"
         );
         let count: i64 = tx.query_row("SELECT count(*) FROM codebase_notes", [], |r| r.get(0))?;
-        ensure!(
-            revision > 0 || count < MAX_NOTES,
-            "codebase finding limit reached; update or forget an existing topic"
-        );
+        if revision == 0 && count >= MAX_NOTES {
+            bail!("{}", limit_reached(&tx)?);
+        }
         tx.execute("INSERT INTO codebase_notes(topic,content,sources,session_id,revision) VALUES(?1,?2,?3,?4,?5)
             ON CONFLICT(topic) DO UPDATE SET content=excluded.content,sources=excluded.sources,session_id=excluded.session_id,revision=excluded.revision",
             params![topic, content, serde_json::to_string(&sources)?, session, revision + 1])?;
@@ -1600,6 +1599,48 @@ impl Codebase {
         }
         Ok(saved)
     }
+}
+
+/// The full-cache refusal, naming findings whose cited sources no longer match the index so the
+/// caller can forget one directly (`forget` needs the exact revision).
+fn limit_reached(tx: &rusqlite::Transaction<'_>) -> Result<String> {
+    let indexed: BTreeMap<String, String> = tx
+        .prepare("SELECT path,digest FROM codebase_files")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut stale = Vec::new();
+    let mut notes =
+        tx.prepare("SELECT topic,revision,sources FROM codebase_notes ORDER BY rowid")?;
+    let rows = notes.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (topic, revision, sources) = row?;
+        let sources: Vec<Source> = serde_json::from_str(&sources).unwrap_or_default();
+        if sources.is_empty()
+            || sources
+                .iter()
+                .any(|s| indexed.get(&s.path) != Some(&s.digest))
+        {
+            stale.push(json!({"topic": topic, "expected_revision": revision}).to_string());
+        }
+    }
+    let mut text = format!(
+        "codebase finding limit reached ({MAX_NOTES} findings); update an existing topic (recall it for its revision) or forget one"
+    );
+    if !stale.is_empty() {
+        let shown = stale.len().min(5);
+        text.push_str(&format!(
+            ". {} saved findings cite changed sources; forget candidates: {}",
+            stale.len(),
+            stale[..shown].join(", ")
+        ));
+    }
+    Ok(text)
 }
 
 pub fn tool(cache: Arc<Codebase>, session: String) -> Arc<dyn Tool> {

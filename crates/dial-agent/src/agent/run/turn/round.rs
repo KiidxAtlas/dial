@@ -108,6 +108,7 @@ impl Agent<'_> {
         } = *round;
         let reply = &round.reply;
         let compatibility_loaded = &round.compatibility_loaded;
+        let argument_routes = &round.argument_routes;
         let repeat_streak = &round.repeat_streak;
         let streamed = &mut round.streamed;
         let narration_warning = engine.narration.observe(reply);
@@ -124,6 +125,9 @@ impl Agent<'_> {
         let mut round_failing_tests = std::collections::BTreeSet::new();
         let mut round_unnamed_failures = 0usize;
         let mut parallel = std::collections::VecDeque::new();
+        let mut prerequisites =
+            crate::agent::run::dependency_dispatch::BatchPrerequisites::default();
+        let mut launch_sources = std::collections::BTreeMap::new();
         let mut stop: Option<String> = None;
         let mut round_succeeded = false;
         let mut last_tool_failure = None;
@@ -336,6 +340,23 @@ impl Agent<'_> {
                 );
                 continue;
             }
+            if parallel.is_empty()
+                && let Some(output) =
+                    prerequisites.rejection(&self.workspace, self.edit_mode(), &self.ext, call)
+            {
+                ui.tool_call_with_args(&call.id, &call.name, &summarize(call), &call.arguments);
+                ui.tool_result_with_id(&call.id, &call.name, &output);
+                self.push(crate::tools::surface::outcome::message(&call.id, &output))?;
+                crate::telemetry::tool(
+                    self.config,
+                    self.hermetic,
+                    self.session.id(),
+                    &call.name,
+                    0.0,
+                    tools::ToolStatus::Skipped,
+                );
+                continue;
+            }
             let todo_before = self.todo.snapshot();
             let observed_sources = self.experience_sources(call, ui);
             // Read-only batch results may already have finished before a prior
@@ -350,6 +371,18 @@ impl Agent<'_> {
                         (kind, format!("{} is temporarily withheld until a plan exists. This request offers only todo and finish. Create a plan with todo before requesting read, grep, bash or other tools; they return in the next round after a valid plan. If the request is already answered, call finish.", call.name))
                     } else if kind == "unknown_tool" && compatibility_loaded.contains(&call.name) {
                         (kind, format!("{} is available and has been loaded for the next request. This call was not executed. Retry using its newly supplied schema; normal approvals and sandbox restrictions still apply.", call.name))
+                    } else if kind == "schema" && let Some((keys, owners)) = argument_routes.get(&call.id) {
+                        let keys = keys.iter().map(|key| format!("`{key}`")).collect::<Vec<_>>().join(", ");
+                        let owners = owners.iter().map(|name| format!("`{name}`")).collect::<Vec<_>>().join(" or ");
+                        (kind, format!("`{}` does not accept {keys} ({why}). {owners} accepts {keys} and has been loaded for the next request; this call was not executed. Call {owners} directly with its own schema; normal approvals and sandbox restrictions still apply.", call.name))
+                    } else if kind == "schema" && compatibility_loaded.contains(&call.name) {
+                        let schema = schemas
+                            .iter()
+                            .find(|s| s["function"]["name"] == call.name)
+                            .and_then(|s| s.pointer("/function/parameters"))
+                            .map(|p| p.to_string())
+                            .unwrap_or_default();
+                        (kind, format!("{} was loaded this round, but these arguments do not match its schema ({why}); this call was not executed. Retry with arguments for this schema: {schema}", call.name))
                     } else {
                         (kind, why)
                     }
@@ -362,6 +395,9 @@ impl Agent<'_> {
                     })
                 });
             let contract_failed = form.is_some();
+            let recovery_blocked = form
+                .as_ref()
+                .is_some_and(|(kind, _)| *kind == "recovery_checkpoint");
             let mut image = None;
             let mut preflight = None;
             if form.is_none() && parallel.is_empty() {
@@ -369,6 +405,21 @@ impl Agent<'_> {
             }
             let controller_blocked = preflight.is_some() || form.is_some();
             let mut tool_seconds = 0.0;
+            // Batched launches retain the snapshot captured before their group was dispatched.
+            // A hook may rewrite the command, so no source identity is credited for that path.
+            let target_sources = launch_sources.remove(&call.id).unwrap_or_else(|| {
+                if crate::agent::safety::hooks::wanted_for_tool(
+                    self.tool_hooks(),
+                    "pre_tool_use",
+                    &call.name,
+                ) {
+                    Default::default()
+                } else {
+                    self.step_checks
+                        .targets
+                        .prepare(&self.workspace, &call.name, &call.arguments)
+                }
+            });
             let mut output = if let Some(output) = preflight {
                 ui.tool_call_with_args(&call.id, &call.name, &summarize(call), &call.arguments);
                 ui.tool_result_with_id(&call.id, &call.name, &output);
@@ -419,6 +470,9 @@ impl Agent<'_> {
                     for candidate in &group {
                         if call_form_error(candidate, schemas, &turn.names).is_some()
                             || engine.rejection_at(&self.workspace, candidate).is_some()
+                            || prerequisites
+                                .rejection(&self.workspace, self.edit_mode(), &self.ext, candidate)
+                                .is_some()
                             || (admitted > 0
                                 && self.native_edit_preflight(turn, candidate, ui).is_some())
                         {
@@ -439,6 +493,22 @@ impl Agent<'_> {
                                 &summarize(candidate),
                                 &candidate.arguments,
                             );
+                        }
+                        for candidate in group.iter().skip(1) {
+                            let sources = if crate::agent::safety::hooks::wanted_for_tool(
+                                self.tool_hooks(),
+                                "pre_tool_use",
+                                &candidate.name,
+                            ) {
+                                Default::default()
+                            } else {
+                                self.step_checks.targets.prepare(
+                                    &self.workspace,
+                                    &candidate.name,
+                                    &candidate.arguments,
+                                )
+                            };
+                            launch_sources.insert(candidate.id.clone(), sources);
                         }
                         let outputs = self.dispatch_dependency_wave(backend, &group, ui);
                         for (candidate, (output, seconds)) in group.iter().zip(&outputs) {
@@ -545,28 +615,43 @@ impl Agent<'_> {
                 }
                 let result_presented = !parallel.is_empty();
                 let (mut out, seconds, executed) = match parallel.pop_front() {
-                        Some(result) => {
-                            // Batched bash skips `dispatch`; record verification evidence as the serial path does.
-                            if call.name == "bash" {
-                                self.note_verification(call, &result.0, ui);
-                            }
-                            (result.0, result.1, true)
+                    Some(result) => {
+                        // Batched bash skips `dispatch`; record verification evidence as the serial path does.
+                        if call.name == "bash" {
+                            self.note_verification(call, &result.0, ui);
                         }
-                        None if call.name == "finish" && call.arguments["outcome"] == "completed" && (execution_failed || !form_kinds.is_empty()) => {
-                            (ToolOutput { execution: Default::default(),  data: None,
-text: "finish completed cannot follow a failed call in the same batch; address its error first".into(), is_error: true }.with_status(tools::ToolStatus::Blocked), 0.0, false)
+                        (result.0, result.1, true)
+                    }
+                    None if call.name == "finish"
+                        && call.arguments["outcome"] == "completed"
+                        && (execution_failed || !form_kinds.is_empty()) =>
+                    {
+                        self.step_checks.finish_accepted = true;
+                        (
+                            ToolOutput::structured(json!({
+                                "accepted_outcome": self.completion_rejection_outcome(),
+                                "reason": "Completion cannot follow a failed or refused call in the same batch.",
+                            })),
+                            0.0,
+                            false,
+                        )
+                    }
+                    None => {
+                        // Anything executed serially may change what an early read observed.
+                        if let Some(streamed) = streamed.as_mut() {
+                            streamed.invalidate();
                         }
-                        None => {
-                            // Anything executed serially may change what an early read observed.
-                            if let Some(streamed) = streamed.as_mut() {
-                                streamed.invalidate();
-                            }
-                            let started = Instant::now(); let out = self.dispatch(backend, call, ui); (out, started.elapsed().as_secs_f64(), true)
-                        }
-                    };
+                        let started = Instant::now();
+                        let out = self.dispatch(backend, call, ui);
+                        (out, started.elapsed().as_secs_f64(), true)
+                    }
+                };
                 // Only admitted calls that reached execution count; rejected, skipped and blocked forms do not.
                 if executed {
                     self.metrics.tool_trace.record_invoked(&call.name);
+                    if matches!(call.name.as_str(), "tool_search" | "tool_load") {
+                        turn.capability_search.searched();
+                    }
                     self.efficiency_metrics.tool_result(
                         call,
                         !out.execution.changed_paths.is_empty(),
@@ -587,6 +672,15 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                                 text: format!("retaining browser screenshot: {e:#}"),
                                 is_error: true,
                             }
+                        }
+                        Err(e)
+                            if call.name == "session_search"
+                                && call.arguments["view"] == "layers"
+                                && call.arguments["format"] == "image" =>
+                        {
+                            out = ToolOutput::err(format!(
+                                "retaining Snapcompact view: {e:#}; use format:text"
+                            ));
                         }
                         // The text result stands on its own; only the attachment is lost.
                         Err(e) => out
@@ -618,6 +712,10 @@ text: "finish completed cannot follow a failed call in the same batch; address i
             if controller_blocked {
                 output.execution.status = Some(status);
                 output.execution.effects = tools::surface::outcome::Effects::None;
+            }
+            // A controller retry/loop refusal did not attempt a native mutation.
+            if !recovery_blocked {
+                prerequisites.observe(&self.workspace, self.edit_mode(), call, &output);
             }
             self.record(step, "tool_outcome", json!({"name":call.name,"id":call.id,"status":status,"effects":tools::surface::outcome::effects(&output),"duration_ms":tool_seconds*1000.0}))?;
             let callback_intercepted = std::mem::take(&mut self.portable_callback_intercepted);
@@ -666,6 +764,7 @@ text: "finish completed cannot follow a failed call in the same batch; address i
             edit_failed |= output.is_error && matches!(call.name.as_str(), "edit" | "write");
             if matches!(call.name.as_str(), "edit" | "write") {
                 self.observe_local_edit(!output.is_error);
+                turn.last_edit_refused = output.is_error;
             }
             if call.name == "todo" && !output.is_error {
                 self.observe_local_plan_change();
@@ -749,6 +848,7 @@ text: "finish completed cannot follow a failed call in the same batch; address i
             let committed = !output.execution.changed_paths.is_empty();
             if committed
                 || (!output.is_error
+                    && output.execution.effects != tools::surface::outcome::Effects::None
                     && matches!(call.name.as_str(), "write" | "edit" | "ast_edit" | "solve"))
             {
                 self.step_checks.mutations += 1;
@@ -799,6 +899,14 @@ text: "finish completed cannot follow a failed call in the same batch; address i
             self.step_checks
                 .evidence
                 .settle_call(&call.id, self.step_checks.revision());
+            self.step_checks.targets.observe(
+                &self.workspace,
+                &call.name,
+                &call.arguments,
+                &output,
+                self.step_checks.effect_epoch(),
+                target_sources,
+            );
             if committed && parallel.is_empty() {
                 self.start_background_check(ui);
             }
@@ -812,33 +920,64 @@ text: "finish completed cannot follow a failed call in the same batch; address i
             };
             turn.enrichment.invalidate(review_stamp);
             if call.name == "finish" && !output.is_error && self.step_checks.finish_accepted {
-                finished = Some(
-                    crate::agent::verify::completion::Finish::parse(&call.arguments)
-                        .map_err(anyhow::Error::msg)?,
-                );
-            }
-            if let Some(advice) =
-                crate::agent::run::failure_guidance::empty_discovery(call, &output)
-            {
-                output.text.push_str(advice);
+                let mut finish = crate::agent::verify::completion::Finish::parse(&call.arguments)
+                    .map_err(anyhow::Error::msg)?;
+                if let Some(data) = output.data.as_ref()
+                    && matches!(
+                        data["accepted_outcome"].as_str(),
+                        Some("incomplete" | "blocked")
+                    )
+                {
+                    let reason = data["reason"]
+                        .as_str()
+                        .unwrap_or("Completion evidence is missing.");
+                    finish.outcome = if data["accepted_outcome"] == "blocked" {
+                        TurnOutcome::Blocked
+                    } else {
+                        TurnOutcome::Incomplete
+                    };
+                    finish.text = crate::agent::verify::completion::rejected_report(
+                        &finish.summary,
+                        reason,
+                        finish.outcome,
+                    );
+                }
+                finished = Some(finish);
             }
             // The catalog identifies the name; shell prose alone cannot invent a tool or
             // authorize a replacement action. Shared foreground/worker settlement keeps the
             // original failure and unchanged-retry barrier intact.
             if call.name == "bash"
-                && let Some(advice) =
-                    crate::agent::run::failure_guidance::shell_tool_mistake(call, &output, |name| {
-                        self.catalog().iter().any(|tool| tool == name)
-                    })
+                && let Some(advice) = crate::agent::run::failure_guidance::shell_tool_recovery(
+                    call,
+                    &mut output,
+                    |name| self.recovery_capability(name, &turn.names),
+                )
             {
                 output.text.push_str(&advice);
+            }
+            if matches!(call.name.as_str(), "bash" | "bg") {
+                let capabilities = self.launch_recovery_capabilities(&turn.names);
+                if let Some(advice) = crate::agent::run::failure_guidance::shell_launch_recovery(
+                    call,
+                    &mut output,
+                    &capabilities,
+                ) {
+                    output.text.push_str(&advice);
+                }
             }
             let (duplicate, repeat_advice, recovery_stop) = engine.settle(
                 &self.workspace,
                 call,
                 &mut output,
-                check_failed,
-                todo_before != self.todo.snapshot(),
+                crate::agent::run::engine::Settlement {
+                    check_failed,
+                    task_changed: todo_before != self.todo.snapshot(),
+                    // A recovery-checkpoint refusal is a controller retry barrier, not a call
+                    // contract mistake; it keeps its boundary guidance.
+                    contract_failed: contract_failed && !recovery_blocked,
+                    tool: self.ext.get(&call.name).map(|tool| tool.as_ref()),
+                },
                 |id| self.holds_full_result(id),
             );
             // Only admit optional work after committed facts have settled. The cache owns a
@@ -863,15 +1002,6 @@ text: "finish completed cannot follow a failed call in the same batch; address i
             if is_duplicate && !is_pointer {
                 self.record(step, "investigation_gate", json!({"name":call.name}))?;
                 ui.diagnostic(&format!("Recovery checkpoint: unchanged observation in this `{}` call; it is withheld while corrected arguments and narrower evidence remain available.", call.name));
-            }
-            // A new, successful result is progress: the recovery ladder starts over.
-            if !output.is_error
-                && !check_failed
-                && !is_duplicate
-                && repeat_advice.is_none()
-                && recovery_stop.is_none()
-            {
-                turn.progress.progressed();
             }
             if stop.is_none() {
                 stop = recovery_stop;
@@ -904,10 +1034,19 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                 && let Some(note) = crate::agent::workflow::todo_recovery::solo_update_note(
                     &reply.tool_calls,
                     planning_required,
+                    single_call,
                     turn.solo_todo_noted,
                 )
             {
                 turn.solo_todo_noted = true;
+                output.text.push_str("\n\n");
+                output.text.push_str(note);
+            }
+            if let Some(note) = crate::agent::workflow::todo_recovery::refused_edit_done_note(
+                call,
+                !output.is_error,
+                turn.last_edit_refused,
+            ) {
                 output.text.push_str("\n\n");
                 output.text.push_str(note);
             }
@@ -1015,6 +1154,7 @@ text: "finish completed cannot follow a failed call in the same batch; address i
             self.efficiency_metrics.result(&output.text, &body);
             let mut message = llm::tool_message(&call.id, &body);
             crate::tools::surface::outcome::annotate(&mut message, &output);
+            crate::agent::compact::snapcompact::views::mark(&mut message, call, &output);
             message["dial_evidence"] = json!({"artifact":artifact,"is_error":output.is_error});
             message["is_error"] = json!(output.is_error);
             if call.name == "ask"
@@ -1060,7 +1200,7 @@ text: "finish completed cannot follow a failed call in the same batch; address i
             if let Some(image) = image {
                 message["dial_images"] = json!([image]);
             }
-            if call.name == "ask"
+            if matches!(call.name.as_str(), "ask" | "eval")
                 && let Some(images) = output
                     .data
                     .as_ref()
@@ -1117,9 +1257,10 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                 && message.get("dial_images").is_some()
                 && backend.accepts_image_input()
             {
-                self.step_checks.visual.captured(
+                self.step_checks.visual.capture_output(
+                    &output,
                     self.step_checks.revision(),
-                    call.name == "browser" || call.name == "computer",
+                    &message["dial_images"],
                 );
             }
             for reference in message["dial_images"].as_array().into_iter().flatten() {

@@ -137,15 +137,61 @@ fn terminal_signals_follow_the_session_state() {
     assert!(terminal_signals(&ui, &status, Activity::Idle, true).is_none());
 }
 
+/// The state circles `tab_title` can add (orange working, green done, red waiting or failed).
+const CIRCLES: [&str; 3] = ["\u{1F7E0}", "\u{1F7E2}", "\u{1F534}"];
+
 #[test]
-fn the_tab_title_leads_with_the_state_circle_and_ends_with_the_session_scope() {
+fn the_tab_title_ends_with_the_state_circle_after_the_session_scope() {
     assert_eq!(tab_title("dial · app", "", ""), "dial · app");
     assert_eq!(
         tab_title("dial · app", "fix the parser", Activity::Working.marker()),
-        "\u{1F7E0} dial · app · fix the parser"
+        "dial · app · fix the parser \u{1F7E0}"
+    );
+    assert_eq!(
+        tab_title("dial · app", "", Activity::Done.marker()),
+        "dial · app \u{1F7E2}"
     );
     let long = "x".repeat(200);
     let title = tab_title("dial · app", &long, Activity::Done.marker());
-    assert!(title.starts_with("\u{1F7E2} dial · app · "), "{title}");
+    assert!(title.starts_with("dial · app · "), "{title}");
+    assert!(title.ends_with("\u{1F7E2}"), "{title}");
     assert!(crate::ui::text::width(&title) < 70, "{title}");
+}
+
+#[test]
+fn an_idle_or_empty_state_adds_no_circle_to_the_tab_title() {
+    for scope in ["", "fix the parser"] {
+        let plain = tab_title("dial · app", scope, "");
+        assert_eq!(
+            tab_title("dial · app", scope, Activity::Idle.marker()),
+            plain
+        );
+        assert!(
+            !CIRCLES.iter().any(|circle| plain.contains(circle)),
+            "{plain}"
+        );
+    }
+}
+
+#[test]
+fn every_active_state_keeps_its_circle_on_selected_and_unselected_tabs() {
+    let long = "x".repeat(200);
+    for activity in [
+        Activity::Working,
+        Activity::Waiting,
+        Activity::Done,
+        Activity::Failed,
+    ] {
+        for scope in ["", "fix the parser", long.as_str()] {
+            let title = tab_title("dial · app", scope, activity.marker());
+            assert!(title.contains(activity.marker()), "selected: {title}");
+            assert_eq!(title.matches(activity.marker()).count(), 1, "{title}");
+            // An unselected tab shows only the end of the title, so the circle must survive there.
+            let unselected = crate::ui::text::ellipsize_start(&title, 30, false);
+            assert!(
+                unselected.contains(activity.marker()),
+                "unselected: {unselected} ({activity:?})"
+            );
+        }
+    }
 }

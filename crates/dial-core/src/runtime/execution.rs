@@ -28,7 +28,77 @@ pub struct Execution {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<OutputIntegrity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_launch: Option<ShellLaunch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub integration: Option<crate::runtime::integration::IntegrationExecution>,
+    /// Native capture receipts, never populated from tool payload or printed claims.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub captures: Vec<NativeCapture>,
+    /// Native source-witness prerequisites for retry, never inferred from diagnostic text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_edit_retry: Option<NativeEditRetry>,
+}
+
+/// A native edit was refused for missing source witnesses. Every requirement must be satisfied
+/// by the current native witness store before the controller releases its retry barrier.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeEditRetry {
+    pub requirements: Vec<NativeWitnessRequirement>,
+}
+
+/// Exact editable-source identity and inclusive, 1-based rows required by the native validator.
+/// Notebook raw revisions additionally bind metadata that is absent from the editable projection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeWitnessRequirement {
+    pub path: PathBuf,
+    pub source_sha256: [u8; 32],
+    pub raw_revision: Option<[u8; 32]>,
+    pub ranges: Vec<(usize, usize)>,
+}
+
+/// How the native execution owner attached the initial shell, not its descendants.
+/// A launch receipt is not process termination or evidence that the requested work succeeded.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellLaunch {
+    pub stdin: ShellStdin,
+    pub terminal_allocated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<String>,
+}
+
+/// The initial shell's controller-provided input attachment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellStdin {
+    Eof,
+    Pipe,
+    Terminal,
+}
+
+/// Identity of actual native-captured image bytes. The agent binds these to its effect revision
+/// and only credits images delivered to the model. Pixels are observations, not correctness proof.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeCapture {
+    pub sha256: String,
+    pub media_type: String,
+    /// Exact locator: `url:<canonical URL>`, `window:<native ID>`, or `display:<native ID>`.
+    /// Unknown/multi-display identity stays absent rather than inventing a target.
+    pub target: Option<String>,
+}
+
+impl NativeCapture {
+    pub fn new(bytes: &[u8], media_type: &str, target: Option<String>) -> Self {
+        use sha2::{Digest, Sha256};
+        Self {
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+            media_type: media_type.to_owned(),
+            target,
+        }
+    }
+
+    pub fn matches(&self, bytes: &[u8], media_type: &str) -> bool {
+        self.media_type == media_type && self.sha256 == Self::new(bytes, media_type, None).sha256
+    }
 }
 
 /// A successful wait/read is not evidence that the observed child succeeded.
@@ -205,6 +275,17 @@ pub fn committed(paths: impl IntoIterator<Item = PathBuf>) {
         }
     });
 }
+/// Called only by native source-witness validators while the tool execution capture is active.
+pub fn native_edit_retry(requirement: NativeWitnessRequirement) {
+    CHANGES.with(|stack| {
+        if let Some(facts) = stack.borrow_mut().last_mut() {
+            let retry = facts.native_edit_retry.get_or_insert_with(Default::default);
+            if !retry.requirements.contains(&requirement) {
+                retry.requirements.push(requirement);
+            }
+        }
+    });
+}
 
 /// The mutation owner could not restore a definite state. This survives callers catching errors.
 pub fn unsettled() {
@@ -262,6 +343,7 @@ impl Capture {
                 && facts.effects != Effects::Unknown
             {
                 facts.status = None;
+                facts.native_edit_retry = None;
             }
             stack.last().cloned().unwrap_or_default()
         });
@@ -277,6 +359,13 @@ impl Drop for Capture {
                 && let Some(parent) = stack.last_mut()
             {
                 parent.changed_paths.extend(changes.changed_paths);
+                if let Some(retry) = changes.native_edit_retry {
+                    parent
+                        .native_edit_retry
+                        .get_or_insert_with(Default::default)
+                        .requirements
+                        .extend(retry.requirements);
+                }
                 if changes.effects == Effects::Unknown {
                     parent.effects = Effects::Unknown;
                 }

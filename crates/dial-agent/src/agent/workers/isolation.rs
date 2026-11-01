@@ -2,14 +2,14 @@
 //!
 //! The worker runs against a private copy of the project (the same copier benchmarks use, so dirty
 //! and untracked files are included and secrets, `.git`, `.dial` and build caches are not). When it
-//! finishes, only the files it changed are merged back, each one only if the project's version is
-//! still the one the copy started from. Files the user or another worker changed in the meantime are
-//! reported as conflicts and never overwritten; the copy is then kept so nothing is lost. Merges go
-//! through the project's checkpoint observer, so `/undo` reverts them like any other edit.
+//! finishes, its complete patch is preflighted before any project file is installed. A conflict
+//! blocks the entire patch; an installation failure rolls back earlier writes without replacing
+//! concurrent user edits. Recovery retains the worker copy and any unrestored preimages. Merges
+//! go through the project's checkpoint observer, so `/undo` reverts them like any other edit.
 //! Failed/interrupted workers never merge. Their changed or unreadable copies remain recoverable;
 //! lifecycle metadata reports applied files, parent conflicts, I/O errors and recovery locations
 //! independently of the worker's schema-validated answer.
-use crate::agent::workflow::solve::{FileState, confined_destination, install};
+use crate::agent::workflow::solve::{FileState, confined_destination, install, read_state};
 use crate::{platform::fs as platform_fs, tools::Workspace};
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
@@ -91,6 +91,8 @@ pub struct Isolated {
 
 #[derive(Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Merge {
+    /// True only after the complete candidate patch is present in the parent.
+    pub integrated: bool,
     pub changed: Vec<PathBuf>,
     pub applied: Vec<PathBuf>,
     pub already_applied: Vec<PathBuf>,
@@ -101,6 +103,9 @@ pub struct Merge {
     pub kept: Option<PathBuf>,
     pub recovery_reason: Option<String>,
     pub interrupted: bool,
+    /// Preimages retained only when rollback could not restore every installed file.
+    pub recovery_backup: Option<PathBuf>,
+    pub rolled_back: Vec<PathBuf>,
     /// Backend that gave the worker its view, with any skipped candidates and why.
     pub backend: String,
 }
@@ -158,6 +163,12 @@ impl Merge {
                     .map(|path| format!(": {}", path.display()))
                     .unwrap_or_default(),
                 error.message
+            ));
+        }
+        if let Some(backup) = &self.recovery_backup {
+            text.push_str(&format!(
+                "\nUnrestored project preimages are kept at {}.",
+                backup.display()
             ));
         }
         if let Some(kept) = &self.kept {
@@ -566,16 +577,31 @@ impl Isolated {
         merge
     }
 
-    /// Merge the copy's changes into `project`, recording I/O failures separately
-    /// from real parent edits. Each changed file alone is materialized for installation.
-    pub fn merge(mut self, project: &Workspace, cancel: &AtomicBool) -> Merge {
+    /// Test fixture for an uncontracted patch; production always supplies its acceptance guard.
+    #[cfg(test)]
+    fn merge(self, project: &Workspace, cancel: &AtomicBool) -> Merge {
+        self.merge_checked(project, cancel, |_| Ok(()))
+    }
+
+    pub(in crate::agent) fn merge_checked(
+        mut self,
+        project: &Workspace,
+        cancel: &AtomicBool,
+        validate: impl FnMut(&Workspace) -> Result<()>,
+    ) -> Merge {
         let link = self._link.take();
-        let mut merge = self.merge_changes(project, cancel);
+        let mut merge = self.merge_changes(project, cancel, install, validate);
         release_link(link, &mut merge);
         merge
     }
 
-    fn merge_changes(self, project: &Workspace, cancel: &AtomicBool) -> Merge {
+    fn merge_changes(
+        self,
+        project: &Workspace,
+        cancel: &AtomicBool,
+        mut install_file: impl FnMut(&Path, Option<&FileState>) -> Result<()>,
+        mut validate: impl FnMut(&Workspace) -> Result<()>,
+    ) -> Merge {
         let mut merge = Merge {
             backend: self.label.clone(),
             ..Merge::default()
@@ -597,9 +623,7 @@ impl Isolated {
         };
         merge.changed = changed(&self.before, &after);
         let _serial = project.serial_operation();
-        // Cancellation before this commit boundary preserves the original project.
-        // Once installation begins, finish the per-file merge rather than cancelling
-        // half a commit and claiming the original workspace is unchanged.
+        // Cancellation before the commit boundary preserves the original project.
         if cancel.load(Ordering::SeqCst) {
             merge.interrupted = true;
             merge.recovery_reason = Some("worker interrupted before merge".into());
@@ -609,59 +633,166 @@ impl Isolated {
             }
             return merge;
         }
-        for relative in &merge.changed {
-            let mut stage = "confinement";
-            let mut already_applied = false;
-            let result = (|| -> Result<bool> {
-                let path = confined_destination(project.root(), relative)?;
-                stage = "read";
-                let current = stamp(&path)?;
-                if same(current.as_ref(), after.get(relative)) {
-                    already_applied = true;
-                    return Ok(true);
+        // Stage candidate bytes and preimages on disk, retaining bounded per-file memory.
+        // No observer or write is allowed until every path has passed preflight.
+        let staging = tempfile::tempdir();
+        let mut prepared = Vec::new();
+        match &staging {
+            Err(error) => merge.errors.push(MergeError {
+                path: None,
+                stage: "stage",
+                message: error.to_string(),
+            }),
+            Ok(staging) => {
+                for (index, relative) in merge.changed.iter().enumerate() {
+                    let mut stage = "confinement";
+                    let result = (|| -> Result<bool> {
+                        let path = confined_destination(project.root(), relative)?;
+                        stage = "read";
+                        let current = stamp(&path)?;
+                        if same(current.as_ref(), after.get(relative)) {
+                            merge.already_applied.push(relative.clone());
+                            return Ok(true);
+                        }
+                        if !same(current.as_ref(), self.before.get(relative)) {
+                            return Ok(false);
+                        }
+                        stage = "confinement";
+                        let worker_path = confined_destination(self.source_root(), relative)?;
+                        stage = "stage";
+                        let candidate =
+                            materialize(&worker_path, after.get(relative), self._mount.is_some())?;
+                        let original = materialize(&path, current.as_ref(), false)?;
+                        let candidate_path = staging.path().join(format!("{index}.candidate"));
+                        let original_path = staging.path().join(format!("{index}.original"));
+                        if let Some(state) = &candidate {
+                            install(&candidate_path, Some(state))?;
+                        }
+                        if let Some(state) = &original {
+                            install(&original_path, Some(state))?;
+                        }
+                        prepared.push((relative.clone(), candidate_path, original_path));
+                        Ok(true)
+                    })();
+                    match result {
+                        Ok(true) => {}
+                        Ok(false) => merge.conflicts.push(relative.clone()),
+                        Err(error) => merge.errors.push(MergeError {
+                            path: Some(relative.clone()),
+                            stage,
+                            message: format!("{error:#}"),
+                        }),
+                    }
                 }
-                if !same(current.as_ref(), self.before.get(relative)) {
-                    return Ok(false);
-                }
-                stage = "confinement";
-                let worker_path = confined_destination(self.source_root(), relative)?;
-                stage = "read";
-                let state = materialize(&worker_path, after.get(relative), self._mount.is_some())?;
-                stage = "observer";
-                if state.is_some() {
-                    project.observe_write(&path)
-                } else {
-                    project.observe_delete(&path)
-                }
-                .map_err(anyhow::Error::msg)?;
-                // Observers can block while a user changes the project. Recheck the
-                // content before installation; do not turn a read error into a conflict.
-                stage = "read";
-                if !same(stamp(&path)?.as_ref(), self.before.get(relative)) {
-                    return Ok(false);
-                }
-                stage = "confinement";
-                ensure!(
-                    confined_destination(project.root(), relative)? == path,
-                    "merge destination changed"
-                );
-                stage = "install";
-                install(&path, state.as_ref())?;
-                Ok(true)
-            })();
-            match result {
-                Ok(true) if already_applied => merge.already_applied.push(relative.clone()),
-                Ok(true) => merge.applied.push(relative.clone()),
-                Ok(false) => merge.conflicts.push(relative.clone()),
-                Err(error) => merge.errors.push(MergeError {
-                    path: Some(relative.clone()),
-                    stage,
-                    message: format!("{error:#}"),
-                }),
             }
         }
-        if !merge.conflicts.is_empty() || !merge.errors.is_empty() {
-            merge.recovery_reason = Some("unmerged changes".into());
+        if merge.conflicts.is_empty() && merge.errors.is_empty() {
+            let mut stage = "observer";
+            let mut active = None;
+            let result = (|| -> Result<()> {
+                stage = "stage";
+                if let Ok(staging) = &staging {
+                    // Numeric stage names avoid path collisions; this manifest maps recovery files.
+                    fs::write(
+                        staging.path().join("paths.json"),
+                        serde_json::to_vec(&merge.changed)?,
+                    )?;
+                }
+                stage = "observer";
+                for (relative, _, _) in &prepared {
+                    active = Some(relative.clone());
+                    let path = confined_destination(project.root(), relative)?;
+                    if after.contains_key(relative) {
+                        project.observe_write(&path)
+                    } else {
+                        project.observe_delete(&path)
+                    }
+                    .map_err(anyhow::Error::msg)?;
+                }
+                stage = "read";
+                // An observer can block while another writer changes any patch input.
+                for relative in &merge.changed {
+                    active = Some(relative.clone());
+                    let path = confined_destination(project.root(), relative)?;
+                    let expected = if merge.already_applied.contains(relative) {
+                        after.get(relative)
+                    } else {
+                        self.before.get(relative)
+                    };
+                    if !same(stamp(&path)?.as_ref(), expected) {
+                        merge.conflicts.push(relative.clone());
+                    }
+                }
+                if !merge.conflicts.is_empty() {
+                    return Ok(());
+                }
+                if cancel.load(Ordering::SeqCst) {
+                    merge.interrupted = true;
+                    return Ok(());
+                }
+                stage = "acceptance";
+                validate(self.workspace())?;
+                for (relative, candidate, _) in &prepared {
+                    active = Some(relative.clone());
+                    stage = "read";
+                    let path = confined_destination(project.root(), relative)?;
+                    if !same(stamp(&path)?.as_ref(), self.before.get(relative)) {
+                        merge.conflicts.push(relative.clone());
+                        anyhow::bail!("project changed during patch installation");
+                    }
+                    let state = read_state(candidate)?;
+                    stage = "install";
+                    install_file(&path, state.as_ref())?;
+                    merge.applied.push(relative.clone());
+                }
+                // Parent dependencies outside the patch may differ from the checked candidate.
+                // Reject inside the transaction so those differences roll the whole patch back.
+                stage = "acceptance";
+                validate(project)?;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                merge.errors.push(MergeError {
+                    path: active,
+                    stage,
+                    message: format!("{error:#}"),
+                });
+                for (relative, _, original) in prepared.iter().rev() {
+                    if !merge.applied.contains(relative) {
+                        continue;
+                    }
+                    let restored = (|| -> Result<()> {
+                        let path = confined_destination(project.root(), relative)?;
+                        ensure!(
+                            same(stamp(&path)?.as_ref(), after.get(relative)),
+                            "concurrent project edit prevents rollback; user work preserved"
+                        );
+                        let state = read_state(original)?;
+                        install(&path, state.as_ref())
+                    })();
+                    match restored {
+                        Ok(()) => {
+                            merge.applied.retain(|path| path != relative);
+                            merge.rolled_back.push(relative.clone());
+                        }
+                        Err(error) => merge.errors.push(MergeError {
+                            path: Some(relative.clone()),
+                            stage: "rollback",
+                            message: format!("{error:#}"),
+                        }),
+                    }
+                }
+                if !merge.applied.is_empty()
+                    && let Ok(staging) = staging
+                {
+                    merge.recovery_backup = Some(staging.keep());
+                }
+            }
+        }
+        merge.integrated =
+            !merge.interrupted && merge.conflicts.is_empty() && merge.errors.is_empty();
+        if merge.interrupted || !merge.conflicts.is_empty() || !merge.errors.is_empty() {
+            merge.recovery_reason = Some("patch not coherently integrated".into());
             let sub = self.kept_subdir();
             merge.kept = Some(self.dir.keep().join(sub));
         }

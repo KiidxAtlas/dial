@@ -76,18 +76,37 @@ impl TodoRecovery {
 
 /// A response whose only calls are `todo` spends a full request (the whole context re-sent)
 /// on bookkeeping. Say so once per turn, in the todo result, so later updates ride along with
-/// real work. Not when only `todo` was offered.
+/// real work. Not when only `todo` was offered or the active contract forbids batching.
 pub(in crate::agent) fn solo_update_note(
     calls: &[ToolCall],
     planning_required: bool,
+    single_call: bool,
     already_noted: bool,
 ) -> Option<&'static str> {
     (!already_noted
         && !planning_required
+        && !single_call
         && !calls.is_empty()
         && calls.iter().all(|call| call.name == "todo"))
     .then_some(
         "[Dial] This response held only `todo`, which costs a full request. Send todo updates in the same response as real work: set with the first reads, done with the next step's first call. Skip closing updates before the final answer; an accepted answer closes only the in-progress task and leaves pending tasks open.",
+    )
+}
+
+/// A todo marked done while the most recent `edit`/`write` of the turn was refused: the step's
+/// change may be missing, since nothing from a refused edit lands. Flags the claim in the todo
+/// result; it does not check the claim itself.
+pub(in crate::agent) fn refused_edit_done_note(
+    call: &ToolCall,
+    succeeded: bool,
+    last_edit_refused: bool,
+) -> Option<&'static str> {
+    (succeeded
+        && last_edit_refused
+        && call.name == "todo"
+        && crate::agent::workflow::todo::requested_op(&call.arguments) == Some("done"))
+    .then_some(
+        "[Dial] The most recent edit/write in this turn was refused, so nothing from it is in the file. If this step depended on it, the work is not done: re-read the file, apply the change, then mark the step done again.",
     )
 }
 

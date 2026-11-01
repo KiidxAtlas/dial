@@ -747,6 +747,8 @@ pub enum IntegrationMode {
     Mcp,
     Browser,
     Delegation,
+    /// Native managed shell jobs only; no browser or network permission.
+    ManagedShell,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

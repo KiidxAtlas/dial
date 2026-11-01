@@ -4,7 +4,7 @@
 //! way (Enter types an exact value), text rows take plain typed text, and anything else is a TOML
 //! literal. Local models add rows read from their own files: each option the chat template accepts,
 //! and the installed draft models that can speed up an MLX model. Every change is validated against
-//! the provider capabilities and saved immediately; an unset value follows the provider default.
+//! the provider capabilities and saved immediately; unset values inherit Dial or provider defaults.
 use super::{
     DrawCtx, OverlayEvent,
     settings::{
@@ -191,7 +191,7 @@ static FIELDS: &[Field] = &[
             &["hashline", "replace", "apply_patch", "patch", "sloppy"],
             true,
         ),
-        "Pin this exact model's edit grammar: replace, hashline, apply_patch, structured patch or sloppy matching.",
+        "Unset inherits Dial's effective edit grammar; this is not adaptive benchmarking. Pin this exact model to hashline, replace, apply_patch, structured patch or sloppy matching.",
     ),
     field(
         "tools",
@@ -392,6 +392,8 @@ fn template_row(option: TemplateOption) -> Field {
 pub struct ModelSettingsOverlay {
     pub name: String,
     profile: ModelProfile,
+    /// Resolved by the application without this profile's edit pin; never saved into the profile.
+    inherited_edit_mode: Option<String>,
     fields: Vec<Field>,
     cursor: usize,
     scroll: usize,
@@ -417,6 +419,7 @@ impl ModelSettingsOverlay {
         Self {
             name,
             profile,
+            inherited_edit_mode: None,
             fields,
             cursor: 0,
             scroll: 0,
@@ -428,6 +431,13 @@ impl ModelSettingsOverlay {
             suggestions: Vec::new(),
             staged_suggestion: None,
         }
+    }
+
+    /// Supplies Dial's effective grammar with this profile's pin cleared. Kept separately so resetting
+    /// or cycling back to inheritance never persists the resolved fallback as a model pin.
+    pub fn with_inherited_edit_mode(mut self, mode: String) -> Self {
+        self.inherited_edit_mode = Some(mode);
+        self
     }
 
     /// Local models only: adds the rows this model's own files offer. Each option its chat template
@@ -849,7 +859,11 @@ impl ModelSettingsOverlay {
         match self.candidate(&field.path, text) {
             Ok(profile) => {
                 let what = if text.trim().is_empty() {
-                    format!("{} reset to default", field.label)
+                    if field.path == "edit_mode" {
+                        "Edit style reset to inherited grammar".to_owned()
+                    } else {
+                        format!("{} reset to default", field.label)
+                    }
                 } else {
                     format!("{} saved", field.label)
                 };
@@ -1109,6 +1123,10 @@ impl ModelSettingsOverlay {
             Some(v) if field.path == "capabilities" => Self::capability_summary(v),
             Some(v) if custom => Self::show_value(v),
             Some(v) if field.path == "cache_retention" => Self::show_value(v),
+            _ if field.path == "edit_mode" => self.inherited_edit_mode.as_ref().map_or_else(
+                || "inherited".to_owned(),
+                |mode| format!("{mode} (inherited)"),
+            ),
             _ => "default".to_owned(),
         };
         let adjustable = !matches!(field.kind, Kind::Toml | Kind::Text);
@@ -1158,7 +1176,7 @@ impl ModelSettingsOverlay {
             w,
         )));
         let summary = match customs {
-            0 => "using provider defaults".to_owned(),
+            0 => "using inherited defaults".to_owned(),
             1 => "1 custom value".to_owned(),
             n => format!("{n} custom values"),
         };
@@ -1339,7 +1357,14 @@ impl ModelSettingsOverlay {
                 ),
                 Kind::Choice { optional, .. } => format!(
                     "Choose: {}",
-                    self.choices(field).join(" · ") + if optional { " · default" } else { "" }
+                    self.choices(field).join(" · ")
+                        + if !optional {
+                            ""
+                        } else if field.path == "edit_mode" {
+                            " · inherit"
+                        } else {
+                            " · default"
+                        }
                 ),
                 Kind::Found(_) => format!(
                     "Choose: {} · default; Enter types another value",

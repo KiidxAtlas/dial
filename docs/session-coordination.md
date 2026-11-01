@@ -38,11 +38,14 @@ subcommands wait for the turn to finish. The model-facing `peers` tool exposes t
 `text`, and `clear`.
 
 Automatic model-facing roster notes are a bounded coordination preview, not a repeated full peer
-inventory: at most eight identities/lifecycle states, overlapping peers first, with at most four
-overlapping scopes per previewed peer and explicit omitted counts. Unrelated peers' changing task
-summaries do not regenerate that note. Explicit `peers list`, slash-command rosters and the panel
-retain the full view; fresh peer messages are delivered independently and are never hidden by roster
-deduplication.
+inventory: at most eight identities, overlapping peers first, with lifecycle/task details and at most
+four overlapping scopes only for overlapping peers, plus explicit omitted counts. Unrelated peers'
+changing task summaries and working/idle transitions do not regenerate that note. Explicit
+`peers list`, slash-command rosters and the panel retain the full view; fresh direct peer messages
+are delivered independently and are never hidden by roster deduplication. The coordination envelope
+asks the model to consider dependencies and interface requests even without overlapping claims,
+while continuing without narrating irrelevant activity. This is guidance, not a semantic relevance
+filter or proof of model compliance.
 
 ### The peers panel
 

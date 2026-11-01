@@ -8,6 +8,9 @@ mod image_question_tests;
 pub(in crate::agent::run) mod search_index;
 #[cfg(test)]
 mod search_tests;
+mod working_state;
+#[cfg(test)]
+mod working_state_tests;
 
 /// The request with its history replaced by a contract projection, or `None` when the projection
 /// changed nothing. Unchanged requests stay borrowed, so the common path copies no history.
@@ -107,6 +110,41 @@ fn listing_output(
         text: json!({"listing":true,"page":page,"page_size":TOOL_LIST_PAGE,"total":total,"next_query":next_query,"tools":tools}).to_string(),
         is_error: false,
     })
+}
+
+/// Attach advisory prerequisites without changing eligibility, activation or approval.
+fn discovery_readiness(
+    entry: &mut Value,
+    config: &Config,
+    registry: &crate::tools::integrations::ext::Registry,
+) {
+    let Some(name) = entry["name"].as_str() else {
+        return;
+    };
+    let readiness = json!(crate::tools::surface::catalog::readiness(
+        name, config, registry
+    ));
+    let operations = json!(crate::tools::surface::catalog::operation_readiness(
+        name, config
+    ));
+    entry["readiness"] = readiness;
+    entry["operation_readiness"] = operations;
+}
+
+fn listing_readiness(
+    mut output: ToolOutput,
+    config: &Config,
+    registry: &crate::tools::integrations::ext::Registry,
+) -> ToolOutput {
+    let mut page: Value =
+        serde_json::from_str(&output.text).expect("listing_output serializes a JSON object");
+    if let Some(entries) = page["tools"].as_array_mut() {
+        for entry in entries {
+            discovery_readiness(entry, config, registry);
+        }
+    }
+    output.text = page.to_string();
+    output
 }
 
 /// Turn a successful tool's PNG `data.artifact` envelope into a compact image reference, so
@@ -929,6 +967,26 @@ impl<'a> Agent<'a> {
                 Err(error) => ToolOutput::err(error.to_string()),
             };
         }
+        if name == "session_search" && args.get("view").is_some() {
+            let selection = self.auth_config.selection();
+            return crate::agent::compact::snapcompact::views::call(
+                &self.session.messages(),
+                args,
+                crate::agent::compact::snapcompact::views::ViewContext {
+                    policy: &self.config.compaction,
+                    identity: crate::config::compaction::CompactionIdentity {
+                        provider: &selection.provider,
+                        model: &selection.model,
+                        agent: None,
+                    },
+                    window: self.budget_window(),
+                    vision: backend.accepts_image_input(),
+                    family: backend.compaction_snapcompact_family(),
+                },
+                &self.interrupt,
+            );
+        }
+
         if name == "session_search"
             && (self.experimental_context_owner() || self.exploration_owner())
         {
@@ -1145,7 +1203,14 @@ impl<'a> Agent<'a> {
                 if finish.outcome == TurnOutcome::Completed
                     && let Err(reason) = self.validate_completion(ui)
                 {
-                    return denied(&reason);
+                    // The candidate is retained, but the controller does not accept completion.
+                    // Ending honestly avoids another inference/retry loop against the same gate.
+                    self.step_checks.finish_accepted = true;
+                    return ToolOutput::structured(json!({
+                        "accepted_outcome": self.completion_rejection_outcome(),
+                        "candidate_summary": finish.summary,
+                        "reason": reason,
+                    }));
                 }
 
                 self.step_checks.finish_accepted = true;
@@ -1169,31 +1234,43 @@ impl<'a> Agent<'a> {
                 self.ext.adopt_mcp(true);
                 let mut descriptions = HashMap::new();
                 let candidates: Vec<(String, String)> = self
-                    .catalog()
+                    .eligible_candidates()
                     .into_iter()
-                    .filter_map(|name| {
-                        if !self.tool_eligible(&name) {
-                            return None;
-                        }
-                        let schema = self.schemas(std::slice::from_ref(&name)).ok()?.pop()?;
-                        let description = schema["function"]["description"]
-                            .as_str()
-                            .unwrap_or("")
-                            .to_owned();
-                        let indexed = search_index::text(&schema);
+                    .map(|(name, description, indexed)| {
                         descriptions.insert(name.clone(), description);
-                        Some((name, indexed))
+                        (name, indexed)
                     })
                     .collect();
                 if let Some(page) = listing {
                     // Listing is a read-only view: it never calls `activate_tools`.
                     let offered = self.offered();
                     return match listing_output(page, &descriptions, &offered) {
-                        Ok(output) => output,
+                        Ok(output) => listing_readiness(output, self.config, &self.ext),
                         Err(error) => denied(&error),
                     };
                 }
-                let matches = crate::agent::model::assistance::discover(query, candidates);
+                let matches = crate::agent::model::assistance::discover_with_priority(
+                    query,
+                    candidates,
+                    &|name| self.tool_readiness(name).routing_priority(),
+                );
+                if matches.is_empty() {
+                    // A ranking miss is not evidence that the capability is absent. Return the
+                    // same bounded eligible catalog page as `*`, without activating anything.
+                    return match listing_output(0, &descriptions, &self.offered()) {
+                        Ok(mut output) => {
+                            let mut page: Value = serde_json::from_str(&output.text)
+                                .expect("listing_output serializes a JSON object");
+                            page["search_matches"] = json!([]);
+                            page["fallback_reason"] = json!(
+                                "No ranked match; inspect the eligible catalog before concluding a capability is unavailable. Listing grants no permission and loads no tools."
+                            );
+                            output.text = page.to_string();
+                            listing_readiness(output, self.config, &self.ext)
+                        }
+                        Err(error) => denied(&error),
+                    };
+                }
                 let activated: Vec<String> = matches
                     .iter()
                     .filter(|entry| entry.2)
@@ -1211,7 +1288,9 @@ impl<'a> Agent<'a> {
                         // Each entry states whether it is callable on the next request, and the exact
                         // action that makes it callable. Discovery never grants permission itself.
                         let (status, next) = activation_status(loaded);
-                        json!({"name":name,"description":description,"status":status,"enabled_next_round":loaded,"next":next})
+                        let mut entry = json!({"name":name,"description":description,"status":status,"enabled_next_round":loaded,"next":next});
+                        discovery_readiness(&mut entry, self.config, &self.ext);
+                        entry
                     })
                     .collect();
                 ToolOutput {
@@ -1222,20 +1301,29 @@ impl<'a> Agent<'a> {
                 }
             }
             "tool_load" => {
-                let requested: Vec<String> = args["names"]
+                let mut requested: Vec<String> = args["names"]
                     .as_array()
                     .into_iter()
                     .flatten()
                     .filter_map(Value::as_str)
                     .map(str::to_owned)
                     .collect();
-                let unload: Vec<String> = args["unload"]
+                let mut unload: Vec<String> = args["unload"]
                     .as_array()
                     .into_iter()
                     .flatten()
                     .filter_map(Value::as_str)
                     .map(str::to_owned)
                     .collect();
+                requested.sort();
+                requested.dedup();
+                unload.sort();
+                unload.dedup();
+                if let Some(name) = requested.iter().find(|name| unload.contains(name)) {
+                    return denied(&format!(
+                        "tool_load cannot load and unload {name} in the same call; no selection changed"
+                    ));
+                }
                 if requested
                     .iter()
                     .chain(&unload)
@@ -1275,13 +1363,45 @@ impl<'a> Agent<'a> {
                 self.enabled_tools = enabled;
                 self.tool_routing.unload(&unload);
                 self.rebuild_system();
+                let offered = self.offered();
+                let mut entries = Vec::new();
+                let mut effective = Vec::new();
+                let mut deferred = Vec::new();
+                for (names, action) in [(&requested, "load"), (&unload, "unload")] {
+                    for name in names {
+                        let loaded = offered.contains(name);
+                        let (status, next) = activation_status(loaded);
+                        let eligible = self.tool_eligible(name);
+                        let next = if eligible {
+                            next
+                        } else {
+                            "unavailable under the current mode or tool allowlist; loading cannot bypass this boundary"
+                        };
+                        let mut entry = json!({
+                            "name": name,
+                            "action": action,
+                            "eligible": eligible,
+                            "status": status,
+                            "enabled_next_round": loaded,
+                            "retained_by_policy": action == "unload" && loaded,
+                            "next": next,
+                        });
+                        discovery_readiness(&mut entry, self.config, &self.ext);
+                        entries.push(entry);
+                        if loaded {
+                            effective.push(name.as_str());
+                        } else {
+                            deferred.push(name.as_str());
+                        }
+                    }
+                }
                 ToolOutput {
                     execution: Default::default(),
-                    data: None,
+                    data: Some(json!({"selection_persisted": true, "tools": entries})),
                     text: format!(
-                        "Next round: enabled [{}]; unloaded [{}]. Enabled tools are callable on the next request, not in this batch.",
-                        requested.join(", "),
-                        unload.join(", ")
+                        "Selection persisted. Next request: offered [{}]; not offered [{}]. Unload removes explicit activation, but policy retains core tools. Loading grants no permission and does not enable calls in this batch.",
+                        effective.join(", "),
+                        deferred.join(", ")
                     ),
                     is_error: false,
                 }
@@ -1302,28 +1422,7 @@ impl<'a> Agent<'a> {
                 }
                 None => denied("artifacts are unavailable in hermetic runs"),
             },
-            "working_state" => {
-                let mut state = self.session.control_state();
-                let working = match crate::agent::workflow::working_state::apply(
-                    &state["working_state"],
-                    args,
-                ) {
-                    Ok(working) => working,
-                    Err(error) => return denied(&format!("{error:#}")),
-                };
-                if args["action"] != "view" {
-                    state["working_state"] = working.clone();
-                    if let Err(e) = self.session.set_control_state(state) {
-                        return denied(&format!("{e:#}"));
-                    }
-                }
-                ToolOutput {
-                    execution: Default::default(),
-                    data: None,
-                    text: working.to_string(),
-                    is_error: false,
-                }
-            }
+            "working_state" => self.working_state_tool(args, ui),
             "skill" | "skill_manage" | "session_search" => match &self.layout {
                 None => denied("unavailable here"),
                 Some(layout) => match name {
@@ -1604,11 +1703,34 @@ impl<'a> Agent<'a> {
                     workers.join("\n")
                 ));
             }
+            if let Some(notice) = self.exit_bound_jobs_notice() {
+                self.background_notices.push(notice);
+            }
         }
         // Finished worker results are queued for the next request: the turn continues to incorporate them.
         !self.background_notices.is_empty()
             || !self.live_tasks.undelivered().is_empty()
             || self.side_questions.has_undelivered()
+    }
+
+    /// An unattended run (`Launch::unattended`) kills its session-owned `bg` jobs when it exits, so
+    /// a service the task needs afterwards would silently disappear. Returns a notice naming the
+    /// running jobs not yet reported, once per job; `None` outside unattended runs.
+    pub(in crate::agent) fn exit_bound_jobs_notice(&mut self) -> Option<String> {
+        if !self.modes.launch.unattended {
+            return None;
+        }
+        let mut jobs = Vec::new();
+        for name in self.ext.names() {
+            if let Some(tool) = self.ext.get(name) {
+                jobs.extend(tool.session_work());
+            }
+        }
+        jobs.retain(|job| self.exit_bound_jobs_noticed.insert(job.clone()));
+        (!jobs.is_empty()).then(|| format!(
+            "[Background jobs end with this run]\n{}\nThis is an unattended run: when it ends, Dial kills these session jobs. If the task needs one after you finish (a server, index or service that a user or check will connect to), stop it with `bg kill`, start it again with `bg` action=start and persist=true (named; it survives this run until `lifetime`, default 3600 s), confirm it serves, then finish. Otherwise stop jobs you no longer need. Never report a session job as still running after the run.",
+            jobs.join("\n")
+        ))
     }
 }
 

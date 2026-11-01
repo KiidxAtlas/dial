@@ -2,7 +2,8 @@
 //!
 //! Patterns are code with metavariables: `$VAR` matches one node, `$$$ARGS` any run of nodes.
 //! A rewrite is a template over the same variables. Every file must be rewritable before
-//! anything is written, then changes are committed atomically. Syntax diagnostics are advisory.
+//! anything is written, then changes are committed atomically. The configured syntax gate runs
+//! before commit; diagnostics otherwise remain advisory.
 
 mod commit;
 mod diff;
@@ -144,12 +145,13 @@ fn edit_schema(with_token: bool) -> Value {
         "lang": {"type": "string", "description": "Language name; omit to infer from file extensions"},
         "path": {"type": "string", "description": "File or directory to rewrite (default: the workspace)"},
         "dry_run": {"type": "boolean", "description": "Preview only (default true); false writes the files"},
+        "allow_syntax_errors": {"type": "boolean", "description": "Set true only when valid code is refused for new syntax errors (parser dialect gap)."},
     });
     let mut description = format!(
         "Structural code rewrite: every match of the ast-grep `pattern` is replaced by `rewrite`, a template that may use the \
          pattern's variables (`$A`, `$$$ARGS`). Use it for renames and API migrations across files. Defaults to a dry run that \
          shows a diff; set `dry_run` to false to apply. Applying is all-or-nothing if any file cannot be rewritten. \
-         Syntax diagnostics are advisory and never veto changes. After applying, `read` files again before using `edit`. {}",
+         Syntax diagnostics are advisory unless configured to block new parser errors; allow_syntax_errors bypasses that syntax gate only. After applying, `read` files again before using `edit`. {}",
         lang_help()
     );
     let mut required: &[&str] = &["pattern", "rewrite"];
@@ -283,8 +285,9 @@ fn plan(
 
 fn edit(ctx: &ToolContext, args: &Value) -> Result<String, String> {
     let ws = ctx.workspace;
+    let refuse_syntax_errors = super::editing::syntax_gate(ws, args)?;
     if let Some(token) = opt_str(args, "apply_token")? {
-        return apply_staged(ctx, args, token);
+        return apply_staged(ctx, args, token, refuse_syntax_errors);
     }
     let pattern = pattern_arg(args)?;
     let rewrite = req_str(args, "rewrite")?;
@@ -331,11 +334,16 @@ fn edit(ctx: &ToolContext, args: &Value) -> Result<String, String> {
             plan.refused.len()
         ));
     }
-    apply(ctx, &plan.files, &coverage.footer())
+    apply(ctx, &plan.files, &coverage.footer(), refuse_syntax_errors)
 }
 
 /// Apply the preview an earlier dry run staged under `token`, exactly as previewed.
-fn apply_staged(ctx: &ToolContext, args: &Value, token: &str) -> Result<String, String> {
+fn apply_staged(
+    ctx: &ToolContext,
+    args: &Value,
+    token: &str,
+    refuse_syntax_errors: bool,
+) -> Result<String, String> {
     for key in ["pattern", "rewrite", "lang", "path"] {
         if present(args, key) {
             return Err(format!(
@@ -352,7 +360,7 @@ fn apply_staged(ctx: &ToolContext, args: &Value, token: &str) -> Result<String, 
     let (files, footer) = staged.get(token).ok_or_else(|| {
         "unknown or expired apply_token; run the ast_edit dry run again for a new one".to_owned()
     })?;
-    let result = apply(ctx, &files, &footer);
+    let result = apply(ctx, &files, &footer, refuse_syntax_errors);
     // A token is single-use: after an attempt that reached the files it is spent or stale.
     // A refused authorization leaves it available.
     if !matches!(&result, Err(message) if message.starts_with(AUTHORIZATION_PREFIX)) {
@@ -370,7 +378,12 @@ fn apply_staged(ctx: &ToolContext, args: &Value, token: &str) -> Result<String, 
 const AUTHORIZATION_PREFIX: &str = "native mutation";
 
 /// Write every planned file atomically after authorization, then describe the result.
-fn apply(ctx: &ToolContext, files: &[Planned], footer: &str) -> Result<String, String> {
+fn apply(
+    ctx: &ToolContext,
+    files: &[Planned],
+    footer: &str,
+    refuse_syntax_errors: bool,
+) -> Result<String, String> {
     let ws = ctx.workspace;
     let total: usize = files.iter().map(|p| p.replacements).sum();
     let targets: Vec<std::path::PathBuf> = files
@@ -384,6 +397,16 @@ fn apply(ctx: &ToolContext, files: &[Planned], footer: &str) -> Result<String, S
     }
     append_previews(&mut out, files);
     let changes: Vec<Change> = files.iter().map(|p| p.change.clone()).collect();
+    // Validate the entire candidate before any transaction/observer can commit a sibling file.
+    if refuse_syntax_errors {
+        for change in &changes {
+            if let Some(refused) =
+                super::syntax::refusal(&change.abs, &change.rel, &change.original, &change.updated)
+            {
+                return Err(refused);
+            }
+        }
+    }
     for note in commit(ws, &changes)? {
         let _ = writeln!(out, "{note}");
     }

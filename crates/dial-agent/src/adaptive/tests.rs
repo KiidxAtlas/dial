@@ -73,6 +73,7 @@ fn local_request_settings_reports_overrides_and_delegation_without_template_data
     assert_eq!(phase["loop_penalty"], true);
     profile.temperature = None;
     profile.capabilities.temperature = false;
+    profile.inherit_output_limit = true;
     let delegated = local_request_settings(
         &request,
         Some(&profile),
@@ -80,11 +81,46 @@ fn local_request_settings_reports_overrides_and_delegation_without_template_data
         "local server defaults",
     );
     assert!(delegated["temperature"].is_null());
-    assert!(
-        render_request_settings(&delegated, true)
-            .unwrap()
-            .contains("temp unset")
+    assert!(delegated["max_tokens"].is_null());
+    assert_eq!(
+        render_request_settings(&delegated, true).unwrap(),
+        "temp provider · think on · out provider"
     );
+    // The server's reported values are shown for the fields Dial omits; sent values stay Dial's.
+    let reported = local_request_settings(
+        &request,
+        Some(&profile),
+        &json!({"server_defaults": {"temperature": 0.6, "top_p": 0.8, "top_k": 20,
+            "min_p": null, "max_tokens": "unlimited"}}),
+        "local server defaults",
+    );
+    assert_eq!(
+        render_request_settings(&reported, true).unwrap(),
+        "temp 0.6 (provider) · think on · out unlimited (provider)"
+    );
+    let detail = render_request_settings(&reported, false).unwrap();
+    assert!(
+        detail.contains("Top-p 0.95 · top-k 20 · min-p 0.05"),
+        "profile values are sent, so they win: {detail}"
+    );
+    let mut bare = profile.clone();
+    bare.top_p = None;
+    bare.local_sampling = None;
+    let reported = local_request_settings(
+        &request,
+        Some(&bare),
+        &json!({"server_defaults": {"top_p": 0.8, "top_k": 20, "max_tokens": 2048}}),
+        "local server defaults",
+    );
+    let detail = render_request_settings(&reported, false).unwrap();
+    assert!(
+        detail.starts_with("temp provider · think model default · out 2048 (provider)\nTop-p 0.8 (provider) · top-k 20 (provider) · min-p unset"),
+        "{detail}"
+    );
+    // An explicit profile allowance turns inheritance off on the wire, so the sent value is shown.
+    profile.max_tokens = Some(256);
+    let capped = local_request_settings(&request, Some(&profile), &json!({}), "local");
+    assert_eq!(capped["max_tokens"], 4096);
     assert!(render_request_settings(&Value::Null, true).is_none());
 }
 

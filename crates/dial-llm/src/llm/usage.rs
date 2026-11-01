@@ -141,11 +141,22 @@ impl Counts {
         }
     }
 }
-#[derive(Clone, Copy)]
-pub(super) enum Billing {
+/// How a request is paid for. Subscription and local requests are never invoice-priced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Billing {
     Api,
     Local,
     Subscription,
+}
+impl Billing {
+    /// Stable name recorded in usage statistics.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Api => "api",
+            Self::Local => "local",
+            Self::Subscription => "subscription",
+        }
+    }
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct Coverage {

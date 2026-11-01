@@ -125,7 +125,7 @@ fn witness_and_bisection_run_in_copies_and_leave_the_workspace_alone() {
     let mut agent = agent(&config, root.path());
     let check = FocusedCheck {
         name: "unit".into(),
-        command: "grep -qx yes fixed && grep -qx ok other".into(),
+        command: "(grep -qx yes fixed && grep -qx ok other) || { echo 'AssertionError: expected fixed=yes and other=ok'; exit 1; }".into(),
         timeout_secs: 30,
     };
     let versions = [version("fixed", Some("no"), Some("yes"))];

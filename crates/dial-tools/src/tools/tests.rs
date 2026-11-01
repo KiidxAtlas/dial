@@ -176,3 +176,24 @@ fn protected_storage_rejects_symlink_aliases_and_missing_tails() {
         "private-canary"
     );
 }
+
+#[test]
+fn protected_session_transcripts_point_to_session_search() {
+    let (dir, ws) = workspace();
+    let outside = tempfile::tempdir().unwrap();
+    let state = fs::canonicalize(outside.path()).unwrap();
+    let ws = ws.with_protected_paths(&[state.clone(), dir.path().join("state")]);
+    let transcript = state.join("projects/p/sessions/20261031T000000Z_abc.jsonl");
+    for path in [
+        transcript.to_string_lossy().into_owned(),
+        "state/sessions/x.jsonl".into(),
+    ] {
+        let error = ws.resolve(&path).unwrap_err();
+        assert!(error.contains("session_search"), "{path}: {error}");
+    }
+    let error = ws
+        .resolve(&state.join("config.toml").to_string_lossy())
+        .unwrap_err();
+    assert!(error.contains("enters protected Dial storage"), "{error}");
+    assert!(!error.contains("session_search"), "{error}");
+}

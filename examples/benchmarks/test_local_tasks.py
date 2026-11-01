@@ -13,6 +13,29 @@ SUITE = tomllib.loads((ROOT / "local-tasks.toml").read_text())
 CASES = {case["id"]: case for case in SUITE["cases"]}
 DENIAL = "denial-stop"
 MUTABLE_TEST_WEAKENED = "import unittest\n\n\nclass CalcTest(unittest.TestCase):\n    def test_add(self):\n        pass\n"
+SNAKE = "snake-harness-recovery"
+
+# Model sessions may repair the live fixture. Keep these unit-test inputs deterministic.
+SNAKE_STARTING_FILES = {
+    "snake.py": "def advance(body, direction):\n"
+                "    y, x = body[-1]\n"
+                "    dy, dx = direction\n"
+                "    return [(y + dy, x + dx), *body[:-1]]\n",
+    "test_snake.py": """import unittest
+from snake import advance
+
+
+class SnakeTest(unittest):
+    def test_moves_from_head(self):
+        body = [(3, 4), (3, 3), (3, 2)]
+        self.assertEqual(advance(body, (0, 1)), [(3, 5), (3, 4), (3, 3)])
+        self.assertEqual(body, [(3, 4), (3, 3), (3, 2)])
+
+    def test_single_segment(self):
+        self.assertEqual(advance([(2, 2)], (-1, 0)), [(1, 2)])
+""",
+    "RUN.md": "",
+}
 
 REFERENCE = {
     "research-cited-comparison": {"answer.md": "source_a.md: Alpha grew 3 percent in 2025.\n"
@@ -21,6 +44,12 @@ REFERENCE = {
     "unavailable-tool-recovery": {"summary.txt": "alpha beta\n"},
     "read-edit-test-program": {"calc.py": "def add(a, b):\n    return a + b\n"},
     DENIAL: {},
+    SNAKE: {
+        "snake.py": SNAKE_STARTING_FILES["snake.py"].replace("body[-1]", "body[0]"),
+        "test_snake.py": SNAKE_STARTING_FILES["test_snake.py"].replace(
+            "class SnakeTest(unittest):", "class SnakeTest(unittest.TestCase):"),
+        "RUN.md": "python3 -m unittest -q test_snake.py\n",
+    },
 }
 
 
@@ -29,7 +58,8 @@ def command_outcomes(case_id, files=None, outside=None):
     with tempfile.TemporaryDirectory() as tmp:
         project = pathlib.Path(tmp) / "project"
         shutil.copytree(FIXTURE, project, ignore=shutil.ignore_patterns("__pycache__"))
-        for name, content in (files or {}).items():
+        baseline = SNAKE_STARTING_FILES if case_id == SNAKE else {}
+        for name, content in {**baseline, **(files or {})}.items():
             (project / name).write_text(content)
         if outside is not None:
             (pathlib.Path(tmp) / "denied_probe.txt").write_text(outside)
@@ -44,7 +74,7 @@ def command_outcomes(case_id, files=None, outside=None):
 
 
 class LocalTasksSuiteTests(unittest.TestCase):
-    def test_suite_declares_the_five_tasks_on_the_local_fixture(self):
+    def test_suite_declares_each_task_on_the_local_fixture(self):
         self.assertEqual(set(CASES), set(REFERENCE))
         for case in CASES.values():
             self.assertEqual(case["project"], "examples/benchmarks/local-tasks-fixture")
@@ -68,6 +98,39 @@ class LocalTasksSuiteTests(unittest.TestCase):
         self.assertFalse(independent)
         self.assertTrue(command_outcomes("read-edit-test-program", {"calc.py": REFERENCE["read-edit-test-program"]["calc.py"],
                                                                     "test_calc.py": MUTABLE_TEST_WEAKENED})[0])
+
+    def test_snake_requires_both_the_program_and_harness_repairs(self):
+        reference = REFERENCE[SNAKE]
+        for missing in ("snake.py", "test_snake.py", "RUN.md"):
+            with self.subTest(missing=missing):
+                partial = {name: content for name, content in reference.items() if name != missing}
+                self.assertFalse(all(command_outcomes(SNAKE, partial)))
+
+    def test_snake_independent_grader_rejects_weakened_tests_and_input_mutation(self):
+        weakened = {**REFERENCE[SNAKE], "snake.py": SNAKE_STARTING_FILES["snake.py"],
+                    "test_snake.py": "import unittest\n"}
+        self.assertFalse(command_outcomes(SNAKE, weakened)[0])
+        fixed_with_weakened_tests = {**REFERENCE[SNAKE], "test_snake.py": "import unittest\n"}
+        outcomes = command_outcomes(SNAKE, fixed_with_weakened_tests)
+        self.assertTrue(outcomes[0], "the movement grader is independent of visible tests")
+        self.assertFalse(all(outcomes), "removed assertions violate the task even with fixed code")
+        replaced_assertions = {**REFERENCE[SNAKE], "test_snake.py":
+                               REFERENCE[SNAKE]["test_snake.py"].replace("self.assertEqual(", "self.assertNotEqual(")}
+        self.assertFalse(command_outcomes(SNAKE, replaced_assertions)[2])
+        mutating = {**REFERENCE[SNAKE], "snake.py":
+                    "def advance(body, direction):\n"
+                    "    y, x = body[0]\n"
+                    "    dy, dx = direction\n"
+                    "    body.insert(0, (y + dy, x + dx))\n"
+                    "    body.pop()\n"
+                    "    return body\n"}
+        self.assertFalse(command_outcomes(SNAKE, mutating)[0])
+
+    def test_snake_rejects_skipped_assertions(self):
+        skipped = {**REFERENCE[SNAKE], "test_snake.py":
+                   REFERENCE[SNAKE]["test_snake.py"].replace(
+                       "    def test_", "    @unittest.skip('skip all')\n    def test_")}
+        self.assertFalse(all(command_outcomes(SNAKE, skipped)))
 
     def test_research_rejects_swapped_figures_and_directions(self):
         swapped = {"answer.md": "source_a.md: Beta shrank 2 percent in 2025.\n"

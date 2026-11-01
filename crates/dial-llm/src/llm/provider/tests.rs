@@ -1568,6 +1568,77 @@ fn local_endpoint_chat_projects_system_messages_on_plain_and_streaming_requests(
 
 #[cfg(unix)]
 #[test]
+fn managed_mlx_template_thinking_reaches_chat_without_local_hints() {
+    for vision in [true, false] {
+        for thinking in [Some(true), Some(false), None] {
+            let root = tempfile::tempdir().unwrap();
+            let model = root.path().join("model");
+            std::fs::create_dir(&model).unwrap();
+            let config = if vision {
+                json!({"vision_config": {}})
+            } else {
+                json!({})
+            };
+            std::fs::write(model.join("config.json"), config.to_string()).unwrap();
+            let model_dir = model.to_string_lossy().into_owned();
+            let mut kwargs = serde_json::Map::from_iter([("other".into(), json!(1))]);
+            if let Some(thinking) = thinking {
+                kwargs.insert("enable_thinking".into(), json!(thinking));
+            }
+            let mut profile = llm::profiles::ModelProfile::minimal("mlx", &model_dir);
+            profile.local_sampling = Some(llm::local_sampling::LocalSampling {
+                chat_template_kwargs: Some(kwargs.clone()),
+                ..Default::default()
+            });
+            let mut local = Backend::new(
+                ProviderKind::Local { model_dir },
+                server::fixtures::fake_python(root.path()),
+                30,
+            )
+            .with_profile(profile);
+            let reply = local.chat(None, &request(), 5, None).unwrap();
+            assert_eq!(reply.text, "pong");
+            let info: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(model.join("info.json")).unwrap()).unwrap();
+            local.release();
+            let requests = info["requests"].as_array().unwrap();
+            assert_eq!(requests.len(), 2, "one warmup and one chat request");
+            let body = &requests[1];
+            if vision {
+                kwargs.remove("enable_thinking");
+            }
+            assert_eq!(
+                body.get("enable_thinking"),
+                thinking.filter(|_| vision).map(|v| json!(v)).as_ref(),
+                "vision={vision}, thinking={thinking:?}"
+            );
+            assert_eq!(body["chat_template_kwargs"], json!(kwargs));
+        }
+    }
+}
+
+#[test]
+fn endpoint_template_thinking_without_hints_does_not_probe_or_translate() {
+    let server = fake::serve(vec![ok("ok")]);
+    let mut profile = llm::profiles::ModelProfile::minimal("mlx", "gpt-x");
+    profile.local_sampling = Some(llm::local_sampling::LocalSampling {
+        chat_template_kwargs: Some(serde_json::Map::from_iter([(
+            "enable_thinking".into(),
+            json!(true),
+        )])),
+        ..Default::default()
+    });
+    let mut remote = backend(endpoint(&format!("{}/v1", server.url))).with_profile(profile);
+    remote.chat(None, &request(), 5, None).unwrap();
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1, "no discovery probes before chat");
+    let body = fake::body(&requests[0]);
+    assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
+    assert!(body.get("enable_thinking").is_none());
+}
+
+#[cfg(unix)]
+#[test]
 fn a_rebuilt_backend_adopts_the_resident_server_without_reloading_the_model() {
     let root = tempfile::tempdir().unwrap();
     let model = root.path().join("model");
@@ -3432,4 +3503,166 @@ fn anthropic_cache_warm_tier_tracks_accepted_ttl_and_latched_fallback() {
         assert_eq!(control["type"], "ephemeral");
         assert_eq!(control["ttl"].as_str(), (!refused).then_some("1h"));
     }
+}
+
+#[test]
+fn snapcompact_wire_family_follows_declared_protocol_not_model_name() {
+    use crate::config::snapcompact::SnapcompactFamily as Family;
+    use crate::llm::model_config::ApiProtocol as Protocol;
+    let endpoint = || ProviderKind::Endpoint {
+        base_url: "https://example.test/v1".into(),
+        model: "claude-opus-4-7".into(),
+        api_key: None,
+    };
+    for (protocol, expected) in [
+        (None, Family::OpenAi),
+        (Some(Protocol::Anthropic), Family::Anthropic),
+        (Some(Protocol::Bedrock), Family::Anthropic),
+        (Some(Protocol::VertexAnthropic), Family::Anthropic),
+        (Some(Protocol::Gemini), Family::Google),
+        (Some(Protocol::Vertex), Family::Google),
+        (Some(Protocol::CloudCodeAssist), Family::Google),
+        (Some(Protocol::Responses), Family::OpenAi),
+        (Some(Protocol::AzureResponses), Family::OpenAi),
+        (Some(Protocol::Ollama), Family::Unknown),
+        (Some(Protocol::Cursor), Family::Unknown),
+    ] {
+        let backend = Backend::new(endpoint(), "python".into(), 10).with_protocol(protocol);
+        assert_eq!(
+            backend.compaction_snapcompact_family(),
+            expected,
+            "{protocol:?}"
+        );
+        assert_eq!(
+            backend.compaction_anthropic_family(),
+            expected == Family::Anthropic
+        );
+    }
+    let local = Backend::new(
+        ProviderKind::Local {
+            model_dir: "gpt-5.5".into(),
+        },
+        "python".into(),
+        10,
+    );
+    assert_eq!(local.compaction_snapcompact_family(), Family::Unknown);
+}
+
+#[test]
+fn live_handoff_is_offered_only_to_stateless_remote_routes() {
+    let cases = [
+        (endpoint("https://example.com/v1"), None, true),
+        (
+            endpoint("https://example.com/v1"),
+            Some(ApiProtocol::Responses),
+            true,
+        ),
+        (
+            endpoint("https://example.com/v1"),
+            Some(ApiProtocol::Anthropic),
+            false,
+        ),
+        (anthropic_endpoint("https://example.com"), None, true),
+        (
+            anthropic_endpoint("https://example.com"),
+            Some(ApiProtocol::Gemini),
+            false,
+        ),
+        (endpoint("http://127.0.0.1:8080/v1"), None, false),
+        (
+            ProviderKind::Local {
+                model_dir: "m".into(),
+            },
+            None,
+            false,
+        ),
+        (ProviderKind::Apple, None, false),
+    ];
+    for (kind, protocol, expected) in cases {
+        let backend = backend(kind).with_protocol(protocol);
+        assert_eq!(backend.supports_live_handoff(), expected, "{protocol:?}");
+    }
+}
+
+#[test]
+fn anthropic_handoff_forces_tool_choice_none_and_keeps_tool_wire() {
+    let req = Chat {
+        messages: vec![
+            json!({"role":"system","content":"sys"}),
+            json!({"role":"user","content":"hi"}),
+        ],
+        tools: vec![
+            json!({"type":"function","function":{"name":"read","description":"r","parameters":{"type":"object","properties":{}}}}),
+        ],
+        temperature: 0.0,
+        max_tokens: 64,
+        seed: None,
+    };
+    for parallel in [None, Some(true), Some(false)] {
+        let mut normal = llm::profiles::ModelProfile::minimal("anthropic", "claude-test");
+        normal.capabilities.parallel_tool_calls = parallel;
+        let plain = anthropic_request_body("claude-test", &req, false, Some(&normal)).unwrap();
+        let mut forced = normal.clone();
+        forced.force_tool_choice_none = true;
+        let handoff = anthropic_request_body("claude-test", &req, false, Some(&forced)).unwrap();
+        assert_eq!(
+            handoff["tool_choice"],
+            json!({"type":"none"}),
+            "{parallel:?}"
+        );
+        assert_eq!(handoff["tools"], plain["tools"]);
+        assert_eq!(handoff["system"], plain["system"]);
+        assert_eq!(handoff["messages"], plain["messages"]);
+    }
+}
+
+#[test]
+fn compaction_handoff_profile_is_bounded_and_copies_only_the_cache_namespace() {
+    let anthropic = backend(anthropic_endpoint("https://example.com"));
+    let profile = anthropic.compaction_handoff_profile(128);
+    assert!(profile.force_tool_choice_none);
+    assert_eq!(profile.provider, "anthropic");
+    assert_eq!(profile.max_tokens, Some(128));
+    let mut main = backend(endpoint("https://example.com/v1"));
+    main.prompt_cache_key = Some("namespace-hash".into());
+    let mut side = backend(endpoint("https://example.com/v1")).with_session_id("sess-1");
+    side.copy_cache_namespace_from(&main);
+    assert_eq!(side.prompt_cache_key(), Some("namespace-hash"));
+    assert_eq!(side.session_id(), Some("sess-1"));
+}
+
+#[test]
+fn ollama_context_is_sent_only_when_the_operator_configures_a_limit() {
+    let mut config = crate::config::types::Config {
+        context_window: 8192,
+        ..Default::default()
+    };
+    let local = ProviderKind::Local {
+        model_dir: "/nonexistent/model".into(),
+    };
+    let automatic = backend(local.clone()).with_steering(&config);
+    // Automatic context (no operator limit) must not force num_ctx on the host.
+    assert_eq!(automatic.explicit_context_cap(), None);
+    config.context_limit = crate::config::types::ContextWindow::Tokens(8192);
+    assert_eq!(
+        backend(local.clone())
+            .with_steering(&config)
+            .explicit_context_cap(),
+        Some(8192)
+    );
+    config.context_limit = crate::config::types::ContextWindow::Auto;
+    config.local_context_window = crate::config::types::ContextWindow::Tokens(4096);
+    config.context_window = 4096;
+    assert_eq!(
+        backend(local).with_steering(&config).explicit_context_cap(),
+        Some(4096)
+    );
+    // No steering config at all: nothing is requested explicitly.
+    assert_eq!(
+        backend(ProviderKind::Local {
+            model_dir: "/x".into()
+        })
+        .explicit_context_cap(),
+        None
+    );
 }

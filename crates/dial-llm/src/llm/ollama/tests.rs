@@ -62,6 +62,28 @@ fn the_planned_window_is_requested_unless_a_profile_sets_its_own() {
 }
 
 #[test]
+fn host_inherited_output_limit_omits_num_predict_unless_the_profile_sets_one() {
+    let mut profile = ModelProfile::minimal("ollama", "m");
+    profile.capabilities.output_limit = OutputLimit::MaxTokens;
+    profile.inherit_output_limit = true;
+    let inherited = request(&ENDPOINT, &chat(), Some(&profile), None, "main").unwrap();
+    assert!(inherited["options"].get("num_predict").is_none());
+    assert!(inherited["options"].get("num_ctx").is_none());
+
+    // A profile cap preserves an explicitly bounded request, even with the runtime flag set.
+    profile.max_tokens = Some(256);
+    let explicit = request(&ENDPOINT, &chat(), Some(&profile), None, "main").unwrap();
+    assert_eq!(explicit["options"]["num_predict"], 64);
+
+    // Unflagged callers keep their existing zero-as-unlimited semantics.
+    let unflagged = ModelProfile::minimal("ollama", "m");
+    let mut zero = chat();
+    zero.max_tokens = 0;
+    let body = request(&ENDPOINT, &zero, Some(&unflagged), None, "main").unwrap();
+    assert_eq!(body["options"]["num_predict"], -1);
+}
+
+#[test]
 fn ollama_sampling_and_keep_alive_reach_options_with_native_names() {
     let mut profile = ModelProfile::minimal("ollama", "m");
     profile.capabilities.output_limit = OutputLimit::MaxTokens;

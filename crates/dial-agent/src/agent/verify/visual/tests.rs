@@ -82,3 +82,78 @@ fn missing_visual_evidence_is_disclosed_in_the_summary() {
     review.delivered();
     assert_eq!(review.summary("done".into(), [0, 0, 0]), "done");
 }
+
+fn capture_fixture(
+    target: Option<&str>,
+) -> (crate::runtime::tool_output::ToolOutput, serde_json::Value) {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aY4cAAAAASUVORK5CYII="
+    ).unwrap();
+    let capture = crate::runtime::execution::NativeCapture::new(
+        &bytes,
+        "image/png",
+        target.map(str::to_owned),
+    );
+    let images = serde_json::json!([crate::llm::images::inline_attachment(&bytes).unwrap()]);
+    (
+        crate::runtime::tool_output::ToolOutput::ok("captured".into()).with_captures(vec![capture]),
+        images,
+    )
+}
+
+#[test]
+fn target_credit_requires_exact_native_identity_delivered_pixels_and_current_revision() {
+    let target = "url:http://localhost:3000/preview";
+    for (captured_target, matches) in [
+        (Some(target), true),
+        (Some("url:http://localhost:3000/unrelated"), false),
+        (Some("window:7"), false),
+        (None, false),
+    ] {
+        let (output, images) = capture_fixture(captured_target);
+        let mut review = Review::default();
+        review.capture_output(&output, [1, 0, 0], &images);
+        assert!(!review.rendered_target_observed([1, 0, 0], target));
+        review.delivered();
+        assert!(review.rendered_observed([1, 0, 0]));
+        assert_eq!(review.rendered_target_observed([1, 0, 0], target), matches);
+        for revision in [[2, 0, 0], [1, 1, 0], [1, 0, 1]] {
+            assert!(!review.rendered_target_observed(revision, target));
+        }
+    }
+}
+
+#[test]
+fn payload_claims_missing_images_and_mismatched_bytes_cannot_supply_rendered_evidence() {
+    let target = "window:7";
+    let (output, images) = capture_fixture(Some(target));
+    for case in ["payload", "empty", "changed", "missing", "mime", "error"] {
+        let mut output = output.clone();
+        let mut images = images.clone();
+        match case {
+            "payload" => {
+                output.data = Some(serde_json::json!({"captures": output.execution.captures}));
+                output.execution.captures.clear();
+            }
+            "empty" => images = serde_json::json!([]),
+            "changed" => output.execution.captures[0].sha256 = "0".repeat(64),
+            "missing" => images[0]["unavailable"] = serde_json::json!("not retained"),
+            "mime" => output.execution.captures[0].media_type = "image/jpeg".into(),
+            "error" => output.is_error = true,
+            _ => unreachable!(),
+        }
+        let mut review = Review::default();
+        review.capture_output(&output, [1, 0, 0], &images);
+        review.delivered();
+        assert!(!review.rendered_observed([1, 0, 0]), "{case}");
+        assert!(
+            !review.rendered_target_observed([1, 0, 0], target),
+            "{case}"
+        );
+    }
+    let mut review = Review::default();
+    review.user_image([1, 0, 0]);
+    review.delivered();
+    assert!(!review.rendered_observed([1, 0, 0]));
+}

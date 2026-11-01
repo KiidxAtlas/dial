@@ -135,13 +135,49 @@ impl Agent<'_> {
             })
     }
 
+    /// Like [`Self::run_background_tool`], but the command is never handed to `bg` at the
+    /// auto-background threshold. Verification needs a finished process: a check that moved to
+    /// the background has no outcome to classify, so it would only ever read as unverified.
+    /// The call's own timeout still bounds it, and hard cancellation still stops it.
+    pub(in crate::agent) fn run_foreground_tool(
+        &mut self,
+        name: &str,
+        args: &Value,
+        ui: &mut dyn Ui,
+    ) -> Option<ToolOutput> {
+        let call = ToolCall {
+            id: String::new(),
+            name: name.to_owned(),
+            arguments: args.clone(),
+            malformed_arguments: false,
+        };
+        self.run_tools_off_thread(std::slice::from_ref(&call), ui, None, true)
+            .map(|outputs| {
+                outputs
+                    .into_iter()
+                    .next()
+                    .expect("one result for one call")
+                    .0
+            })
+    }
+
     /// Shared native worker/event owner. Multi-call admission belongs to dependency dispatch;
     /// each callback still returns to this live controller before its native effect.
     pub(in crate::agent) fn run_background_tools(
         &mut self,
         calls: &[ToolCall],
         ui: &mut dyn Ui,
+        backend: Option<&mut Backend>,
+    ) -> Option<Vec<(ToolOutput, f64)>> {
+        self.run_tools_off_thread(calls, ui, backend, false)
+    }
+
+    fn run_tools_off_thread(
+        &mut self,
+        calls: &[ToolCall],
+        ui: &mut dyn Ui,
         mut backend: Option<&mut Backend>,
+        foreground: bool,
     ) -> Option<Vec<(ToolOutput, f64)>> {
         self.portable_callback_intercepted = false;
         if self.hermetic {
@@ -216,7 +252,7 @@ impl Agent<'_> {
                 tools::EditRepairRequest,
                 mpsc::SyncSender<std::result::Result<String, String>>,
             ),
-            Done(ToolOutput, f64),
+            Done(Box<ToolOutput>, f64),
         }
         let (tx, rx) = mpsc::sync_channel(64);
         struct IndexedSender<T> {
@@ -238,7 +274,10 @@ impl Agent<'_> {
             #[cfg(test)]
             let effect_probe = super::dependency_dispatch::tests::effect_probe();
             let workspace = self.workspace.clone();
-            let config = self.effective_config().clone();
+            let mut config = self.effective_config().clone();
+            if foreground {
+                config.shell.auto_background_secs = 0;
+            }
             let registry = self.ext.clone();
             let mutation_cancel = turn_cancel.mutation();
             let cancel = mutation_cancel.interrupt.flag();
@@ -383,11 +422,11 @@ impl Agent<'_> {
                     custom_tool_output(&tool, &arguments, &cancel)
                 })));
                 started.store(false, Ordering::SeqCst);
-                let _ = tx.send(Event::Done(output, began.elapsed().as_secs_f64()));
+                let _ = tx.send(Event::Done(Box::new(output), began.elapsed().as_secs_f64()));
             }) {
             Ok(worker) => workers.push(worker),
             Err(error) => {
-                let _ = failed_start.send((index, Event::Done(ToolOutput::err(format!("starting tool: {error}")), 0.0)));
+                let _ = failed_start.send((index, Event::Done(Box::new(ToolOutput::err(format!("starting tool: {error}"))), 0.0)));
             }
         };
         }
@@ -614,7 +653,8 @@ impl Agent<'_> {
                             };
                             let _ = reply.send(allowed);
                         }
-                        Event::Done(mut output, seconds) => {
+                        Event::Done(output, seconds) => {
+                            let mut output = *output;
                             if self.edit_preview_intercepted {
                                 output.is_error = true;
                                 output.text.push_str("\n[An authorized edit preview failed; remaining native callbacks/effects were refused. Earlier completed results are retained.]");

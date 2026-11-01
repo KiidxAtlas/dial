@@ -272,15 +272,27 @@ async function initialize(request) {
     throw error;
   }
 }
+function openTabList() {
+  const listed = [...tabs].slice(0, 8).map(([id, t]) => {
+    let url = '';
+    try { url = clip(t.page.url()); } catch { url = '?'; }
+    return `${id} ${url}`;
+  });
+  const more = tabs.size > listed.length ? `; ${tabs.size - listed.length} more` : '';
+  return `open tabs: ${listed.join(', ')}${more}`;
+}
 function tabFor(request) {
   if (request.tab === undefined) {
     if (tabs.size === 1) request.tab = tabs.keys().next().value;
-    else if (tabs.size === 0) throw new Error('No browser tab is open. Use action=open with the actual HTTP(S) URL first, then use the returned tab id.');
-    else throw new Error('Multiple browser tabs are open. Use action=tabs and pass an explicit tab id.');
+    else if (tabs.size === 0) throw new Error('No browser tab is open (tabs do not survive a browser restart or close). Use action=open with the actual HTTP(S) URL first, then use the returned tab id.');
+    else throw new Error(`Multiple browser tabs are open; pass an explicit tab id (${openTabList()}).`);
   }
   const id = request.tab;
   const tab = tabs.get(id);
-  if (!tab) throw new Error(`Browser tab ${id} is not open. Use action=tabs to find an open tab or action=open to create one.`);
+  if (!tab) {
+    const open = tabs.size ? openTabList() : 'no tab is open; tabs do not survive a browser restart or close';
+    throw new Error(`Browser tab ${id} is not open (${open}). Use one of those ids or action=open to create one.`);
+  }
   return tab;
 }
 function required(request, key) {

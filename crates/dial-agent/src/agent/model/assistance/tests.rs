@@ -103,6 +103,34 @@ fn discovery_is_bounded_and_ties_are_independent_of_catalog_order() {
 }
 
 #[test]
+fn readiness_breaks_relevance_ties_before_caps_without_promoting_weaker_matches() {
+    let catalog: Vec<_> = (0..40)
+        .map(|index| (format!("cap_{index:02}"), "Inspect widgets".into()))
+        .collect();
+    let ready_last = |name: &str| u8::from(name != "cap_39");
+    let matches = discover_with_priority("widgets", catalog.clone(), &ready_last);
+    assert_eq!(matches[0].0, "cap_39");
+    assert_eq!(matches.len(), 8);
+    assert_eq!(matches.iter().filter(|entry| entry.2).count(), 3);
+    assert_eq!(discover("widgets", catalog)[0].0, "cap_00");
+
+    let matches = discover_with_priority(
+        "web search",
+        candidates(&[
+            ("web_search", "Search public sources"),
+            ("browser", "Browse and search web pages"),
+        ]),
+        &|name| u8::from(name != "browser"),
+    );
+    assert_eq!(matches[0].0, "web_search");
+    assert!(matches[0].2);
+    assert!(
+        !matches[1].2,
+        "readiness cannot promote a weaker capability match"
+    );
+}
+
+#[test]
 fn empty_filler_and_unknown_queries_activate_nothing() {
     for query in ["", "  ", "I need a tool please", "quuxflorb"] {
         assert!(discover(query, candidates(&[("read", "Read files")])).is_empty());
@@ -258,4 +286,78 @@ fn computer_is_plan_eligible_and_plan_authorization_admits_only_read_only_action
             );
         }
     });
+}
+
+#[test]
+fn recipe_credit_follows_only_the_observed_check_verdict() {
+    use crate::runtime::execution::{Completeness, OutputIntegrity, ProcessOutcome};
+    use crate::runtime::tool_output::ToolOutput;
+    use crate::tools::surface::outcome::Effects;
+    let check = FocusedCheck {
+        name: "unit".into(),
+        command: "cargo test".into(),
+        timeout_secs: 1,
+    };
+    let exited = |code: Option<i32>| ProcessOutcome {
+        started: true,
+        exit_code: code,
+        signal: None,
+        timed_out: false,
+        cancelled: false,
+        output_complete: true,
+    };
+    let pass = "running 2 tests\ntest result: ok. 2 passed; 0 failed\n";
+    let credit = |out: &ToolOutput, cancelled: bool| {
+        recipe_check_earns_credit(&check, None, out, cancelled, None)
+    };
+
+    // Printed success without an observed process is prose, not evidence.
+    assert!(!credit(
+        &ToolOutput::ok(format!("{pass}[exit code: 0]\n")),
+        false
+    ));
+    // Contradictory process outcomes: printed success never overrides the observed exit.
+    let printed_pass = ToolOutput::ok(format!("{pass}[exit code: 0]\n"));
+    assert!(!credit(
+        &printed_pass.clone().with_process(exited(Some(1))),
+        false
+    ));
+    assert!(!credit(
+        &ToolOutput::err(pass).with_process(exited(Some(0))),
+        false
+    ));
+    assert!(!credit(
+        &printed_pass.clone().with_process(exited(None)),
+        false
+    ));
+    // Empty suites and cancellation never earn credit, even with a zero exit.
+    let empty =
+        ToolOutput::ok("Ran 0 tests\n[exit code: 0]\n".into()).with_process(exited(Some(0)));
+    assert!(!credit(&empty, false));
+    assert!(!credit(
+        &printed_pass.clone().with_process(exited(Some(0))),
+        true
+    ));
+    // Unknown effects block credit even when the process exited cleanly.
+    let mut unknown = printed_pass.clone().with_process(exited(Some(0)));
+    unknown.execution.effects = Effects::Unknown;
+    assert!(!credit(&unknown, false));
+    // Retained or truncated evidence is unavailable, not a pass.
+    let mut clipped = printed_pass.with_process(exited(Some(0)));
+    clipped.execution.output = Some(OutputIntegrity {
+        capture: Completeness::Partial,
+        retention: Completeness::Complete,
+        presentation: Completeness::Complete,
+        original_bytes: None,
+        retained_bytes: None,
+        omitted_bytes: None,
+        presented_bytes: None,
+        artifact: None,
+    });
+    assert!(!credit(&clipped, false));
+    // Normal observed pass with non-empty tests earns credit.
+    assert!(credit(
+        &ToolOutput::ok(pass.into()).with_process(exited(Some(0))),
+        false
+    ));
 }

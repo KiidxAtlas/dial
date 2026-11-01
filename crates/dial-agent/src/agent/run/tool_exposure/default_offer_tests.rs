@@ -174,6 +174,41 @@ fn message_is_offered_with_task_whether_or_not_a_worker_is_live() {
 }
 
 #[test]
+fn colored_snapcompact_offers_recovery_even_in_a_lean_request() {
+    with_agent(
+        "[compaction.snapcompact]\noverlay=true\n[assistance]\nlean_local=true",
+        |agent| {
+            let offered = agent.offered();
+            assert!(
+                offered.iter().any(|name| name == "session_search"),
+                "{offered:?}"
+            );
+            let schemas = agent.schemas(&offered).unwrap();
+            let search = schemas
+                .iter()
+                .find(|schema| schema["function"]["name"] == "session_search")
+                .unwrap();
+            assert_eq!(
+                search["function"]["parameters"]["properties"]["view"]["enum"],
+                json!(["layers"])
+            );
+            assert_eq!(
+                search["function"]["parameters"]["properties"]["format"]["enum"],
+                json!(["text", "image"])
+            );
+        },
+    );
+}
+
+#[test]
+fn default_session_search_schema_does_not_enable_layer_views() {
+    with_agent("", |agent| {
+        let schema = agent.schemas(&["session_search".into()]).unwrap().remove(0);
+        assert!(schema["function"]["parameters"]["properties"]["view"].is_null());
+    });
+}
+
+#[test]
 fn default_offer_defers_overlapping_specialists_but_lists_them_as_loadable() {
     with_agent("[assistance]\nlean_local=false", |agent| {
         let offered = agent.offered();
@@ -229,34 +264,232 @@ fn default_offer_defers_overlapping_specialists_but_lists_them_as_loadable() {
 }
 
 #[test]
+fn unattended_launch_defers_session_helpers_but_lists_them_as_loadable() {
+    let helpers = [
+        "task",
+        "message",
+        "working_state",
+        "codebase_memory",
+        "todo",
+        "find",
+    ];
+    with_agent("[assistance]\nlean_local=false", |agent| {
+        let attended = agent.offered();
+        for helper in helpers {
+            assert!(attended.iter().any(|name| name == helper), "{attended:?}");
+        }
+        agent.modes.launch.unattended = true;
+        let offered = agent.offered();
+        let discoverable = agent.discoverable_tools(&offered);
+        for helper in helpers {
+            assert!(!offered.iter().any(|name| name == helper), "{offered:?}");
+        }
+        for loadable in ["task", "working_state", "codebase_memory", "todo", "find"] {
+            assert!(
+                discoverable.iter().any(|(name, _)| name == loadable),
+                "{discoverable:?}"
+            );
+        }
+        for core in [
+            "read",
+            "edit",
+            "bash",
+            "bg",
+            "grep",
+            "glob",
+            "check",
+            "tool_load",
+        ] {
+            assert!(
+                offered.iter().any(|name| name == core),
+                "{core}: {offered:?}"
+            );
+        }
+        let (before, after) = (
+            schema_bytes(agent, &attended),
+            schema_bytes(agent, &offered),
+        );
+        eprintln!("unattended tool schemas: {before} -> {after} bytes");
+        assert!(after < before);
+    });
+    with_agent(
+        "[assistance]\nlean_local=false\n[task]\nprefer_subagents=true",
+        |agent| {
+            agent.modes.launch.unattended = true;
+            let offered = agent.offered();
+            for kept in ["task", "message"] {
+                assert!(offered.iter().any(|name| name == kept), "{offered:?}");
+            }
+            assert!(!offered.iter().any(|name| name == "working_state"));
+        },
+    );
+}
+
+pub(in crate::agent) fn load_tools(agent: &mut Agent<'_>, arguments: Value) -> ToolOutput {
+    struct Quiet;
+    impl Ui for Quiet {}
+    let mut backend = agent.backend.take().unwrap();
+    let output = agent.dispatch(
+        &mut backend,
+        &ToolCall {
+            id: "call-load".into(),
+            name: "tool_load".into(),
+            arguments,
+            malformed_arguments: false,
+        },
+        &mut Quiet,
+    );
+    agent.backend = Some(backend);
+    output
+}
+
+#[test]
 fn tool_load_offers_a_deferred_tool_next_round_and_unload_defers_it_again() {
     with_agent("", |agent| {
-        struct Quiet;
-        impl Ui for Quiet {}
-        let mut backend = agent.backend.take().unwrap();
-        let mut call = |agent: &mut Agent<'_>, arguments: Value| {
-            let call = ToolCall {
-                id: "call-load".into(),
-                name: "tool_load".into(),
-                arguments,
-                malformed_arguments: false,
-            };
-            agent.dispatch(&mut backend, &call, &mut Quiet)
-        };
         let names: Vec<&str> = tools::DEFERRED_BY_DEFAULT.to_vec();
-        let out = call(agent, json!({"names": names}));
+        let out = load_tools(agent, json!({"names": names}));
         assert!(!out.is_error, "{}", out.text);
+        let receipt = out.data.as_ref().unwrap();
+        assert_eq!(receipt["selection_persisted"], true);
+        assert_eq!(receipt["tools"].as_array().unwrap().len(), names.len());
+        for entry in receipt["tools"].as_array().unwrap() {
+            assert_eq!(entry["action"], "load");
+            assert_eq!(entry["status"], "loaded_next_request");
+            assert_eq!(entry["enabled_next_round"], true);
+            assert!(entry["readiness"]["state"].is_string(), "{entry:?}");
+        }
         let offered = agent.offered();
         for deferred in tools::DEFERRED_BY_DEFAULT {
             assert!(offered.iter().any(|name| name == deferred), "{offered:?}");
         }
         let prompt = serde_json::to_string(&agent.system_messages()).unwrap();
         assert!(!prompt.contains("  - memory_update: "), "{prompt}");
-        let out = call(agent, json!({"unload": ["memory_update"]}));
+        let out = load_tools(agent, json!({"unload": ["memory_update"]}));
         assert!(!out.is_error, "{}", out.text);
+        let entry = &out.data.as_ref().unwrap()["tools"][0];
+        assert_eq!(entry["name"], "memory_update");
+        assert_eq!(entry["action"], "unload");
+        assert_eq!(entry["enabled_next_round"], false);
+        assert_eq!(entry["status"], "not_loaded");
+        assert_eq!(entry["retained_by_policy"], false);
+        assert!(entry["next"].as_str().unwrap().contains("tool_load"));
+        assert!(
+            out.text.contains("not offered [memory_update]"),
+            "{}",
+            out.text
+        );
         let offered = agent.offered();
         assert!(!offered.iter().any(|name| name == "memory_update"));
         assert!(offered.iter().any(|name| name == "ast_search"));
+    });
+}
+
+#[test]
+fn tool_load_reports_core_retention_and_deduplicates_selection_receipts() {
+    for overlay in ["", "[assistance]\ncompact_tools=true"] {
+        with_agent(overlay, |agent| {
+            let output = load_tools(agent, json!({"names":["read", "read", "ast_search"]}));
+            assert!(!output.is_error, "{}", output.text);
+            assert_eq!(
+                output.data.as_ref().unwrap()["tools"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                2
+            );
+            let output = load_tools(agent, json!({"unload":["read", "read", "ast_search"]}));
+            assert!(!output.is_error, "{}", output.text);
+            let entries = output.data.as_ref().unwrap()["tools"].as_array().unwrap();
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0]["name"], "ast_search");
+            assert_eq!(entries[0]["enabled_next_round"], false);
+            assert_eq!(entries[1]["name"], "read");
+            assert_eq!(entries[1]["status"], "loaded_next_request");
+            assert_eq!(entries[1]["enabled_next_round"], true);
+            assert_eq!(entries[1]["retained_by_policy"], true);
+            assert!(
+                output
+                    .text
+                    .contains("offered [read]; not offered [ast_search]"),
+                "{}",
+                output.text
+            );
+            assert!(agent.offered().contains(&"read".to_owned()));
+            assert!(!agent.offered().contains(&"ast_search".to_owned()));
+        });
+    }
+}
+
+#[test]
+fn tool_load_refuses_overlap_before_changing_pins_discovery_or_routing() {
+    with_agent("[assistance]\ncompact_tools=true", |agent| {
+        agent.activate_tools(&["ast_search".into()]).unwrap();
+        let before = agent.session.control_state();
+        let offered = agent.offered();
+        for arguments in [
+            json!({"names":["ast_search"], "unload":["ast_search"]}),
+            json!({"names":["read", "ast_search", "read"], "unload":["read", "ast_search"]}),
+        ] {
+            let output = load_tools(agent, arguments);
+            assert!(output.is_error, "{}", output.text);
+            assert!(
+                output.text.contains("cannot load and unload ast_search"),
+                "{}",
+                output.text
+            );
+            assert!(output.data.is_none());
+            assert_eq!(agent.session.control_state(), before);
+            assert_eq!(agent.offered(), offered);
+            assert!(!agent.tool_routing.is_suppressed("ast_search"));
+            assert!(!agent.enabled_tools.contains("read"));
+        }
+    });
+}
+
+#[test]
+fn tool_load_persistence_failure_cannot_report_success_or_change_effective_offer() {
+    with_agent("[assistance]\ncompact_tools=true", |agent| {
+        agent.activate_tools(&["ast_search".into()]).unwrap();
+        let path = agent.session.path().unwrap().to_owned();
+        let snapshot = crate::storage::session::Session::read(&path).unwrap();
+        agent.session = snapshot;
+        let before = agent.session.control_state();
+        let offered = agent.offered();
+        let output = load_tools(agent, json!({"names":["git"], "unload":["ast_search"]}));
+        assert!(output.is_error, "{}", output.text);
+        assert!(
+            output.text.contains("persisting enabled tools"),
+            "{}",
+            output.text
+        );
+        assert!(output.data.is_none());
+        assert_eq!(agent.session.control_state(), before);
+        assert_eq!(agent.offered(), offered);
+        assert!(!agent.enabled_tools.contains("git"));
+        assert!(!agent.tool_routing.is_suppressed("ast_search"));
+    });
+}
+
+#[test]
+fn tool_load_can_unload_ineligible_activation_without_promising_a_reload() {
+    with_agent("[assistance]\ncompact_tools=true", |agent| {
+        let output = load_tools(agent, json!({"names":["ast_search"]}));
+        assert!(!output.is_error, "{}", output.text);
+        agent.modes.launch.tools = Some(["tool_load".to_owned()].into());
+        let output = load_tools(agent, json!({"unload":["ast_search"]}));
+        assert!(!output.is_error, "{}", output.text);
+        let entry = &output.data.as_ref().unwrap()["tools"][0];
+        assert_eq!(entry["eligible"], false);
+        assert_eq!(entry["enabled_next_round"], false);
+        assert_eq!(entry["status"], "not_loaded");
+        assert!(
+            entry["next"]
+                .as_str()
+                .unwrap()
+                .contains("loading cannot bypass this boundary")
+        );
+        assert!(!agent.enabled_tools.contains("ast_search"));
+        assert!(!agent.offered().contains(&"ast_search".to_owned()));
     });
 }
 
@@ -657,9 +890,8 @@ fn local_routes_default_to_replace_edits_unless_pinned() {
 }
 
 /// Failing rounds escalate one step at a time: the minimal set and the short prompt, then the
-/// replace grammar. A success resets the streak. A reached step takes effect at the next turn, so a
-/// turn's prompt and offer never change; it is remembered for the model and a new session starts
-/// from it.
+/// replace grammar. A success resets the streak. A reached step takes effect at a request boundary
+/// or at a later turn start, and is remembered for the model so a new session starts from it.
 #[test]
 fn local_escalation_steps_up_on_failing_rounds_and_is_remembered() {
     use crate::config::types::EditMode;
@@ -675,7 +907,7 @@ fn local_escalation_steps_up_on_failing_rounds_and_is_remembered() {
         assert!(!agent.observe_local_round(false, ui), "a success resets");
         assert!(!agent.observe_local_round(true, ui));
         assert!(agent.observe_local_round(true, ui));
-        // The reached step waits for the turn boundary.
+        // The reached step waits for a request boundary or the next turn start.
         assert!(!agent.minimal_tools());
         assert_eq!(agent.offered(), full);
         assert_eq!(system_text(agent), prompt);
@@ -686,7 +918,11 @@ fn local_escalation_steps_up_on_failing_rounds_and_is_remembered() {
         assert_eq!(agent.edit_mode(), EditMode::Hashline);
         assert!(!agent.observe_local_round(true, ui));
         assert!(agent.observe_local_round(true, ui));
-        assert_eq!(agent.edit_mode(), EditMode::Hashline, "not within the turn");
+        assert_eq!(
+            agent.edit_mode(),
+            EditMode::Hashline,
+            "not before a boundary"
+        );
         agent.seed_local_escalation();
         assert_eq!(agent.edit_mode(), EditMode::Replace);
         assert_eq!(agent.workspace.edit_mode(), EditMode::Replace);
@@ -702,7 +938,7 @@ fn local_escalation_steps_up_on_failing_rounds_and_is_remembered() {
         assert!(agent.minimal_tools());
         assert_eq!(agent.workspace.edit_mode(), EditMode::Replace);
     });
-    // Both steps reached within one turn apply together at the next one.
+    // Both steps reached before a boundary also apply together at a later turn start.
     with_agent(overlay, |agent| {
         let ui = &mut crate::agent::NullUi;
         for _ in 0..4 {
@@ -753,7 +989,10 @@ fn local_sampling_defers_to_the_server_unless_pinned() {
         apply(local, 0.2),
         (Some("local server defaults"), Some(false))
     );
-    assert_eq!(apply(local, 0.7), (None, None));
+    assert_eq!(
+        apply(&format!("{local}\n[harness]\ntemperature=0.7"), 0.7),
+        (None, None)
+    );
     assert_eq!(
         apply(
             &format!("{local}\n[assistance.local]\nsampling='harness'"),
@@ -927,6 +1166,45 @@ fn pending_background_work_returns_to_the_model_without_a_hidden_wait() {
 }
 
 #[test]
+fn unattended_run_is_told_once_that_session_services_end_with_it() {
+    struct Service;
+    impl crate::tools::integrations::ext::Tool for Service {
+        fn name(&self) -> &str {
+            "service_probe"
+        }
+        fn schema(&self) -> Value {
+            json!({"type":"function","function":{"name":"service_probe","description":"service fixture","parameters":{"type":"object","properties":{}}}})
+        }
+        fn needs_approval(&self, _: &Value) -> bool {
+            false
+        }
+        fn call(&self, _: &ToolContext, _: &Value) -> ToolOutput {
+            ToolOutput::ok("unused".into())
+        }
+        fn session_work(&self) -> Vec<String> {
+            vec!["api (python server.py)".into()]
+        }
+    }
+    with_agent("", |agent| {
+        struct Quiet;
+        impl Ui for Quiet {}
+        agent.ext.try_register(Arc::new(Service)).unwrap();
+        // An attended session keeps its services for the next turn: nothing to say.
+        assert!(!agent.await_background_jobs(&mut Quiet));
+        assert!(agent.background_notices.is_empty());
+        agent.modes.launch.unattended = true;
+        assert!(agent.await_background_jobs(&mut Quiet));
+        let notice = agent.background_notices.join("\n");
+        assert!(notice.contains("api (python server.py)"), "{notice}");
+        assert!(notice.contains("persist=true"), "{notice}");
+        // Reported once: the next turn end, or `finish`, is not held again by the same job.
+        agent.background_notices.clear();
+        assert!(!agent.await_background_jobs(&mut Quiet));
+        assert!(agent.exit_bound_jobs_notice().is_none());
+    });
+}
+
+#[test]
 fn live_job_output_reaches_the_ui_without_a_matching_foreground_tool() {
     struct Job;
     impl crate::tools::integrations::ext::Tool for Job {
@@ -1039,7 +1317,7 @@ fn a_worker_message_to_an_idle_parent_is_surfaced_and_queued_for_its_next_reques
 }
 
 #[test]
-fn the_parents_message_tool_reports_receipts_and_refuses_finished_workers() {
+fn the_parents_message_tool_reports_receipts_and_marks_finished_workers() {
     with_agent("", |agent| {
         let team = agent.live_tasks.team().clone();
         team.enlist("task-1", "scout", Box::new(|| {})).unwrap();
@@ -1051,12 +1329,20 @@ fn the_parents_message_tool_reports_receipts_and_refuses_finished_workers() {
             reply,
             json!({"receipts":[{"to":"task-1","status":"queued"}]})
         );
-        team.retire("task-1");
-        let refused = agent
+        team.retire("task-1", "completed");
+        let finished = agent
             .live_tasks
             .message_call(&json!({"to":"task-1","text":"late"}))
+            .unwrap();
+        assert_eq!(finished["receipts"][0]["status"], "finished", "{finished}");
+        let unknown = agent
+            .live_tasks
+            .message_call(&json!({"to":"task-7","text":"late"}))
             .unwrap_err();
-        assert!(refused.contains("unknown or finished"), "{refused}");
+        assert!(
+            unknown.contains("no live recipient named task-7"),
+            "{unknown}"
+        );
     });
 }
 

@@ -59,6 +59,7 @@ impl TurnState<'_> {
             measured: _,
             policy_signature: _,
             enrichment: _,
+            capability_gaps: _,
             // Recomputed by the agent, which owns the inputs.
             names: _,
             rule_state: _,
@@ -67,6 +68,8 @@ impl TurnState<'_> {
             reviewed_paths: _,
             prechecked_paths: _,
             revalidated_paths: _,
+            // Nothing from a refused edit landed, whatever the context or instruction now holds.
+            last_edit_refused: _,
             // Per-reply recovery owned by `reply_received` and the compaction helpers.
             compacted_without_reply: _,
             // Consumed by the step that set it.
@@ -96,10 +99,9 @@ impl TurnState<'_> {
             reliability,
             stall,
             completion,
-            completion_recovery,
             completion_candidate,
+            capability_search,
             enrichment_epoch,
-            progress,
         } = self;
         if steering {
             // A new instruction is a new task: its advice and reviews start over.
@@ -108,17 +110,12 @@ impl TurnState<'_> {
             *solo_todo_noted = false;
             *coach_turn = Default::default();
         }
-        if steering || resumed || transition == Transition::DirectedContinue {
-            // New direction from the user or a verifier: earlier failed recoveries no longer
-            // describe the approach. An automatic continue is itself a recovery attempt.
-            *progress = Default::default();
-        }
         if steering || resumed {
             // The rejected or replaced answer's completion attempt and recovery rounds end. A
             // resumed round keeps the advice already delivered and the coach's repair history.
             completion.reset_for_steering();
-            *completion_recovery = Default::default();
             *completion_candidate = None;
+            *capability_search = Default::default();
             *pending = None;
             crate::agent::run::guidance::reset_for_steering(pending_nudges);
             *rejected_edit_previews = 0;
@@ -185,10 +182,11 @@ impl Agent<'_> {
             Transition::AutomaticContinue => {
                 engine.transition(RecoveryTransition::AutomaticContinue);
             }
-            Transition::DirectedContinue | Transition::Resumed => {
-                // The approach changes; failure streaks and edit-cycle history are kept.
+            Transition::DirectedContinue => {
+                // A continuation choice alone is not fresh evidence or a replacement task.
                 engine.transition(RecoveryTransition::DirectedContinue);
             }
+            Transition::Resumed => {}
             // Returned above: a rewritten context keeps the offered tools.
             Transition::ContextRewritten => return Ok(()),
         }

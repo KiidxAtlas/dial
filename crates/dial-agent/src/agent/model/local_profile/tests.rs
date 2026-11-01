@@ -332,6 +332,27 @@ fn repeated_text_calls_advise_the_servers_tool_parser_once() {
     assert!(lifted(3, None, hosted).is_empty());
 }
 
+/// An `[edit] mode` given on the command line is a pin that wins over the local default, so no
+/// notice is shown; the notice itself is decided by `Config::local_edit_mode_replacing_configured`.
+#[test]
+fn a_pinned_edit_mode_needs_no_local_edit_mode_notice() {
+    #[derive(Default)]
+    struct Notices(Vec<String>);
+    impl crate::agent::Ui for Notices {
+        fn notice(&mut self, message: &str) {
+            self.0.push(message.to_owned());
+        }
+    }
+    for overlay in ["", "[edit]\nmode='hashline'"] {
+        let noted = with_agent(overlay, |agent| {
+            let mut ui = Notices::default();
+            agent.note_local_edit_mode(&mut ui);
+            ui.0
+        });
+        assert!(noted.is_empty(), "{overlay:?}: {noted:?}");
+    }
+}
+
 /// Writes a saved record for this agent's exact binding, as `dial reliability check` would.
 fn write_record(agent: &Agent<'_>, record: serde_json::Value) {
     crate::platform::atomic::private_dir(&agent.config.state_dir).unwrap();
@@ -578,5 +599,310 @@ fn mixed_round_keeps_failure_but_later_success_clears_streak() {
             !agent.observe_local_round(true, ui),
             "success cleared prior streak"
         );
+    });
+}
+
+fn offered_schema_names(schemas: &[serde_json::Value]) -> Vec<String> {
+    schemas
+        .iter()
+        .filter_map(|schema| schema["function"]["name"].as_str().map(str::to_owned))
+        .collect()
+}
+
+fn edit_schema(schemas: &[serde_json::Value]) -> serde_json::Value {
+    schemas
+        .iter()
+        .find(|schema| schema["function"]["name"] == "edit")
+        .cloned()
+        .expect("the edit tool is offered")
+}
+
+/// A step reached by failing rounds waits for the next request boundary, where the offer and the
+/// edit grammar change together; the same step is not applied again at a later boundary.
+#[test]
+fn reached_step_applies_at_the_request_boundary_with_its_offer() {
+    use crate::config::types::EditMode;
+    with_agent(
+        "context_window=65536\n[assistance.local]\nedit_mode='inherit'",
+        |agent| {
+            let ui = &mut crate::agent::NullUi;
+            agent.seed_local_escalation();
+            let mut schemas = agent.schemas(&agent.offered()).unwrap();
+            let (full_names, full_edit) = (offered_schema_names(&schemas), edit_schema(&schemas));
+            assert_eq!(agent.edit_mode(), EditMode::Hashline);
+            for _ in 0..4 {
+                agent.observe_local_round(true, ui);
+            }
+            assert!(
+                !agent.minimal_tools(),
+                "the reached steps wait for the boundary"
+            );
+            assert!(agent.local_request_boundary(&mut schemas).unwrap());
+            assert!(agent.minimal_tools());
+            assert_eq!(agent.edit_mode(), EditMode::Replace);
+            let names = offered_schema_names(&schemas);
+            assert_eq!(names, agent.offered(), "the offer matches the applied step");
+            assert!(names.len() < full_names.len());
+            assert_ne!(
+                edit_schema(&schemas),
+                full_edit,
+                "the offered edit grammar follows the step"
+            );
+            let applied = schemas.clone();
+            assert!(!agent.local_request_boundary(&mut schemas).unwrap());
+            assert_eq!(schemas, applied);
+        },
+    );
+}
+
+/// Each step waits for its own boundary: a stricter step reached later in the turn applies at the
+/// boundary after it, and nothing is stricter than the last step.
+#[test]
+fn later_step_applies_at_its_own_boundary() {
+    use crate::config::types::EditMode;
+    with_agent(
+        "context_window=65536\n[assistance.local]\nedit_mode='inherit'",
+        |agent| {
+            let ui = &mut crate::agent::NullUi;
+            agent.seed_local_escalation();
+            let mut schemas = agent.schemas(&agent.offered()).unwrap();
+            for _ in 0..2 {
+                agent.observe_local_round(true, ui);
+            }
+            assert!(agent.local_request_boundary(&mut schemas).unwrap());
+            assert!(agent.minimal_tools());
+            assert_eq!(agent.edit_mode(), EditMode::Hashline);
+            let stage_one = schemas.clone();
+            for _ in 0..2 {
+                agent.observe_local_round(true, ui);
+            }
+            assert_eq!(
+                agent.edit_mode(),
+                EditMode::Hashline,
+                "the second step waits"
+            );
+            assert!(agent.local_request_boundary(&mut schemas).unwrap());
+            assert_eq!(agent.edit_mode(), EditMode::Replace);
+            assert_ne!(schemas, stage_one);
+            for _ in 0..4 {
+                assert!(!agent.observe_local_round(true, ui));
+            }
+            let stage_two = schemas.clone();
+            assert!(!agent.local_request_boundary(&mut schemas).unwrap());
+            assert_eq!(schemas, stage_two);
+        },
+    );
+}
+
+/// Pins, hosted routes and disabled escalation keep the offer and grammar; the boundary reports no
+/// change. A pinned grammar still takes the minimal offer.
+#[test]
+fn request_boundary_respects_pins_hosted_routes_and_disabled_escalation() {
+    let cases = [
+        (
+            "pinned grammar",
+            "context_window=65536\n[harness]\nedit_mode='hashline'",
+            true,
+        ),
+        (
+            "hosted route",
+            "[endpoint]\nbase_url='https://api.example.com/v1'",
+            false,
+        ),
+        (
+            "escalation disabled",
+            "context_window=65536\n[assistance.local]\nescalate_after=0",
+            false,
+        ),
+    ];
+    for (name, overlay, applied) in cases {
+        with_agent(overlay, |agent| {
+            let ui = &mut crate::agent::NullUi;
+            let before = agent.edit_mode();
+            let mut schemas = agent.schemas(&agent.offered()).unwrap();
+            for _ in 0..4 {
+                agent.observe_local_round(true, ui);
+            }
+            assert_eq!(
+                agent.local_request_boundary(&mut schemas).unwrap(),
+                applied,
+                "{name}"
+            );
+            assert_eq!(agent.minimal_tools(), applied, "{name}");
+            assert_eq!(agent.edit_mode(), before, "{name}");
+        });
+    }
+}
+
+/// A hermetic run never escalates, so no request boundary changes its offer.
+#[test]
+fn hermetic_run_never_applies_a_local_step_at_a_boundary() {
+    with_agent("context_window=65536", |agent| {
+        agent.hermetic = true;
+        let ui = &mut crate::agent::NullUi;
+        let mut schemas = agent.schemas(&agent.offered()).unwrap();
+        let before = schemas.clone();
+        for _ in 0..4 {
+            assert!(!agent.observe_local_round(true, ui));
+        }
+        assert!(!agent.local_request_boundary(&mut schemas).unwrap());
+        assert_eq!(schemas, before);
+        assert!(!agent.minimal_tools());
+    });
+}
+
+/// Local endpoint used by the host-default cases; port 9 is never listened on.
+const LOCAL_HOST: &str = "[endpoint]\nbase_url='http://127.0.0.1:9/v1'";
+
+/// A local external host with no operator pins serves its own temperature and output limit:
+/// Dial omits `temperature` and leaves `num_predict` unset unless the profile sets one.
+#[test]
+fn external_host_defaults_inherit_temperature_and_output_limit() {
+    with_agent(LOCAL_HOST, |agent| {
+        let mut profile = None;
+        assert_eq!(
+            agent.apply_local_sampling(&mut profile, 0.2),
+            Some("local server defaults")
+        );
+        assert!(!profile.as_ref().unwrap().capabilities.temperature);
+        agent.apply_local_output_limit(&mut profile, 0);
+        let profile = profile.unwrap();
+        assert!(profile.inherit_output_limit);
+        assert_eq!(profile.max_tokens, None);
+    });
+}
+
+/// Explicit limits are kept: a Dial harness max and a profile max both disable inheritance.
+#[test]
+fn explicit_output_limits_are_not_inherited() {
+    with_agent(LOCAL_HOST, |agent| {
+        let mut profile = None;
+        agent.apply_local_output_limit(&mut profile, 4096);
+        assert!(profile.is_none(), "a Dial harness max creates no profile");
+
+        let mut profile = Some(ModelProfile::minimal("ollama", "test"));
+        profile.as_mut().unwrap().max_tokens = Some(256);
+        agent.apply_local_output_limit(&mut profile, 0);
+        let profile = profile.unwrap();
+        assert!(!profile.inherit_output_limit);
+        assert_eq!(profile.max_tokens, Some(256));
+    });
+}
+
+/// Explicit temperature sources win over the host: an operator `[harness]` temperature, an
+/// explicit profile temperature and adaptive sampling opt-in all keep Dial's sampling. A learned
+/// harness value passed in without an operator pin does not.
+#[test]
+fn explicit_temperature_sources_win_over_the_host_defaults() {
+    let pinned = format!("{LOCAL_HOST}\n[harness]\ntemperature=0.7");
+    with_agent(&pinned, |agent| {
+        assert!(agent.config.harness_temperature_pinned);
+        assert_eq!(agent.apply_local_sampling(&mut None, 0.7), None);
+    });
+    with_agent(LOCAL_HOST, |agent| {
+        assert!(!agent.config.harness_temperature_pinned);
+        let mut profile = None;
+        assert_eq!(
+            agent.apply_local_sampling(&mut profile, 0.7),
+            Some("local server defaults"),
+            "an unpinned learned harness value is not an operator pin"
+        );
+        assert!(profile.is_some());
+    });
+    with_agent(LOCAL_HOST, |agent| {
+        let mut profile = Some(ModelProfile::minimal("ollama", "test"));
+        profile.as_mut().unwrap().temperature = Some(0.3);
+        assert_eq!(agent.apply_local_sampling(&mut profile, 0.2), None);
+    });
+    with_agent(
+        &format!("{LOCAL_HOST}\n[adaptive]\nenabled=true\nsampling=true"),
+        |agent| {
+            assert_eq!(agent.apply_local_sampling(&mut None, 0.2), None);
+        },
+    );
+}
+
+/// A profile `thinking = true` is a thinking control, not a temperature pin: sampling still
+/// defers to the host.
+#[test]
+fn profile_thinking_does_not_block_host_sampling_defaults() {
+    with_agent(LOCAL_HOST, |agent| {
+        let mut profile = Some(ModelProfile::minimal("ollama", "test"));
+        profile.as_mut().unwrap().thinking = Some(true);
+        assert_eq!(
+            agent.apply_local_sampling(&mut profile, 0.2),
+            Some("local server defaults")
+        );
+        let profile = profile.unwrap();
+        assert_eq!(profile.thinking, Some(true));
+        assert!(!profile.capabilities.temperature);
+    });
+}
+
+/// Hosted routes and hermetic runs keep Dial's own sampling and limits, and the local profile's
+/// master switch does not decide host defaults: a disabled profile still defers to the host.
+#[test]
+fn hosted_and_hermetic_routes_are_unchanged_and_disabled_profile_keeps_host_defaults() {
+    with_agent(
+        "[endpoint]\nbase_url='https://api.example.com/v1'",
+        |agent| {
+            let mut profile = None;
+            assert_eq!(agent.apply_local_sampling(&mut profile, 0.2), None);
+            agent.apply_local_output_limit(&mut profile, 0);
+            assert!(profile.is_none());
+        },
+    );
+    with_agent(LOCAL_HOST, |agent| {
+        agent.hermetic = true;
+        let mut profile = None;
+        assert_eq!(agent.apply_local_sampling(&mut profile, 0.2), None);
+        agent.apply_local_output_limit(&mut profile, 0);
+        assert!(profile.is_none());
+    });
+    with_agent(
+        &format!("{LOCAL_HOST}\n[assistance.local]\nenabled=false"),
+        |agent| {
+            let mut profile = None;
+            assert_eq!(
+                agent.apply_local_sampling(&mut profile, 0.2),
+                Some("local server defaults")
+            );
+            agent.apply_local_output_limit(&mut profile, 0);
+            assert!(profile.unwrap().inherit_output_limit);
+        },
+    );
+}
+
+/// The request record of a default local-host request carries no keep-alive or loop penalty and
+/// adds no context to the profile; the memory estimate is reported only as a suggestion. An
+/// explicit loop-penalty opt-in does send the penalty for the next request.
+#[test]
+fn default_local_host_request_adds_no_hints_or_context_to_the_profile() {
+    with_agent(LOCAL_HOST, |agent| {
+        agent.local_session.probed = true;
+        agent.local_session.server = Some(LocalServer::Ollama);
+        agent.local_session.affordable_context = Some(8192);
+        let mut backend = agent.backend.take().unwrap();
+        let mut profile = None;
+        let record = agent
+            .prepare_local_request(&mut backend, &mut profile)
+            .unwrap();
+        assert_eq!(record["loop_penalty"], json!(false));
+        assert_eq!(record["suggested_context"], json!(8192));
+        assert!(
+            profile.is_none_or(|p| p.context_window.is_none() && p.keep_alive.is_none()),
+            "the memory estimate must not pin the window"
+        );
+    });
+    with_agent("[assistance.local]\nloop_penalty=true", |agent| {
+        agent.local_session.probed = true;
+        agent.local_session.server = Some(LocalServer::Ollama);
+        agent.local_session.penalty_next = true;
+        let mut backend = agent.backend.take().unwrap();
+        let mut profile = None;
+        let record = agent
+            .prepare_local_request(&mut backend, &mut profile)
+            .unwrap();
+        assert_eq!(record["loop_penalty"], json!(true));
     });
 }

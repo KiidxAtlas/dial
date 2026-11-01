@@ -287,6 +287,10 @@ pub(in crate::agent) fn chat(
                     }
                     // Activity keeps the silence watchdog alive, not the pre-action deadline.
                     StreamEvent::Activity => gate.check(config),
+                    StreamEvent::HiddenText(_) => {
+                        gate.begin_generation();
+                        gate.check(config)
+                    }
                     StreamEvent::Reasoning(text) => {
                         gate.begin_generation();
                         gate.reasoning_bytes = gate.reasoning_bytes.saturating_add(text.len());

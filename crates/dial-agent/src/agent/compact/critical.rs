@@ -6,12 +6,26 @@ use serde_json::{Value, json};
 const MAX_CRITICAL_BYTES: usize = 65_536;
 
 pub(super) fn message(control: &Value, todos: &Value) -> Result<Value> {
+    let mut user_intent = control["user_intent"].clone();
+    if user_intent["latest"]["text"].is_string()
+        && user_intent["latest"]["text"] == control["current_instruction"]
+        && let Some(latest) = user_intent["latest"].as_object_mut()
+    {
+        // A lossless in-contract reference avoids halving the existing request-size budget
+        // for ordinary, non-drafted messages. Distinct drafts and originals remain distinct.
+        latest.remove("text");
+        latest.insert(
+            "text_ref".into(),
+            json!("/runtime_user_request/current_instruction"),
+        );
+    }
     let contract = json!({
         "version":1,
         "runtime_user_request":{
             "current_instruction":control["current_instruction"],
             "entry_id":control["current_instruction_entry_id"],
-            "original_goal":control["original_goal"]
+            "original_goal":control["original_goal"],
+            "user_intent":user_intent
         },
         "model_recorded_unverified_state":control["working_state"],
         "todos":todos,
@@ -25,7 +39,7 @@ pub(super) fn message(control: &Value, todos: &Value) -> Result<Value> {
     );
     Ok(
         json!({"role":"user","dial_compaction_critical":true,"dial_critical_state":contract,
-        "content":format!("Exact session-control carry (not summary-derived). User-request fields record the actual request; model state is unverified.\n{encoded}")}),
+        "content":format!("Exact session-control carry (not summary-derived). User-request fields record the actual request; model state is unverified. text_ref is a JSON pointer within this contract, not omitted text.\n{encoded}")}),
     )
 }
 

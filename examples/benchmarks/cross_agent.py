@@ -261,7 +261,7 @@ def projection_totals(trials):
 
 
 def parse_dial_json(stdout):
-    """`dial -p --output-format json`: one result object per invocation."""
+    """Read the terminal result from `dial -p` JSON or stream-JSON; ignore diagnostic events."""
     usage = empty_usage()
     result = None
     for line in stdout.splitlines():

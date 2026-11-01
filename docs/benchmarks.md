@@ -286,7 +286,7 @@ Use a **machine** configuration (`--profiles`, not the legacy named-profile form
 
 ```toml
 [configurations.integration]
-mode = "browser" # or "delegation", "mcp"; default is "core"
+mode = "browser" # or "delegation", "mcp", "managed_shell"; default is "core"
 # mcp_servers = ["fixture"] # required only for mcp mode: exact configured server names
 ```
 
@@ -304,6 +304,9 @@ offline tests**. Remote inference still separately requires `machine.allow_remot
   A configured endpoint is not proof of connection: actual handshake/tool failures remain measured failures.
 - **Delegation:** real builtin task agents use the selected model, with custom presets/agents and role
   routing removed. Work-packet contracts are enabled for the fixture; normal child/tool safety applies.
+- **Managed shell:** retains only native `bg` support in addition to the core tool surface, for
+  real PTY and stdin-pipe recovery. It does not enable network access, browsers, MCP servers or
+  custom tools. `shell.no_pty` and ordinary tool/sandbox restrictions still apply.
 
 Missing static prerequisites yield `AgentUnavailable`, all check indices unavailable, no model request,
 and an invalid run rather than a meaningful zero score. A mismatched/core mode cannot silently run an
@@ -409,6 +412,20 @@ Captures are real terminal text, **not pixel screenshots**. Scripted provider ru
 behavior, **not model quality or a measured model-speed improvement**. Run
 `examples/benchmarks/recovery.toml` through the benchmark CLI with a selected real model to obtain
 model-specific measurements; compare verified task success alongside tool/error counts.
+
+The recovery suite also includes `terminal-launch-recovery` and `stdin-launch-recovery`.
+Both first exercise a default closed-input launch, then require the unchanged `launch_probe.py`
+to receive input through a managed job. The terminal case needs a real PTY; the stdin case must
+complete without one. Checks verify the receipt, the original probe hash and actual `bash`/`bg`
+tool invocations. `smoke.py --suite recovery` supplies scripted decisions; selecting a real local
+model through the benchmark CLI measures that model's decisions instead. Keep failed trials and
+do not interpret a single candidate run as a before/after quality improvement.
+The two launch cases require a machine configuration with
+`[configurations.integration] mode = "managed_shell"`; default core isolation intentionally
+excludes `bg`. `examples/benchmarks/launch-recovery-profiles.toml` is a local-only template;
+replace its model placeholder with an already loaded model and retain its explicit provider
+flag when selecting an endpoint. The recovery smoke driver opts into this lane explicitly.
+The lane changes only the benchmark's isolated tool surface, not the normal agent's permissions.
 
 Benchmark reports include the compiled executable identity (`execution_build`); legacy reports
 without it remain readable. Compare direct reports from the same task suite with:
@@ -645,6 +662,10 @@ Diagnostics recorded per run:
   when every turn reported each field; additive numeric leaves add, strings and first-result latencies
   stay per turn, and absent dynamic-map labels count as zero. Otherwise that field is `null` (unknown),
   never zero. Failed trials are unknown.
+  Request phases are policy labels, not error counts: a recovery phase can persist across later
+  successful shell observations. `recovery_attempts` counts separately instrumented recovery paths;
+  an empty map does not establish that no tool failed. Use `failed_tool_results` and individual
+  `tool_calls[].is_error` records for failure counts, and tool-result diagnostics for their causes.
   `inference_latency`, `storage_io` and `backend_operations` are inclusive costs that nest inside the
   turn's duration, so they are not a partition of wall time and must not be added to it.
 - A non-zero exit records the exit code, the stderr log path (`stderr_log`) and a bounded excerpt
@@ -654,6 +675,11 @@ Diagnostics recorded per run:
 - The summary's `trials with efficiency` row counts trials whose four required efficiency fields were all
   reported (`efficiency_known`); `efficiency_projection_totals` sums `projection_bytes` counters over those
   trials only.
+- For per-call Dial diagnostics, configure `--output-format stream-json` instead of `json`.
+  The same parser reads usage from the terminal `result` event without counting intermediate
+  events twice. Raw stdout additionally retains tool calls and results, including error text
+  bounded by the CLI's event limit. Without a terminal result, usage remains incomplete.
+  These private logs improve attribution; they are not live performance or correctness evidence.
 
 The results compare these setups on these fixtures. They are not a leaderboard score.
 The stub-agent regressions run with `python3 -m unittest discover -s examples/benchmarks -p 'test_*.py'`.
@@ -780,9 +806,9 @@ not model results.
 ### Local task-level suite (`local-tasks.toml`)
 
 `local-tasks.toml` is a `BenchmarkSuite` for `dial benchmark`, run over the fixed local
-`local-tasks-fixture` (no web or network sources). It covers five tasks: cited research over
+`local-tasks-fixture` (no web or network sources). It covers six tasks: cited research over
 `source_a.md`/`source_b.md`, deferred tool discovery (`ledger.py`), unavailable-tool recovery
-(`notes.txt`), a read/edit/test repair of `calc.py`, and denial-stop.
+(`notes.txt`), a read/edit/test repair of `calc.py`, denial-stop, and snake/test-harness recovery.
 
 Grading is by outcome. The first command check of each case is independent of any file the agent
 can edit: `calc.py` is checked against fixed `add` boundaries, and research must associate each
@@ -790,6 +816,13 @@ figure and direction with its own source line. The visible `test_calc.py` is sti
 prompt-level check, but weakening it cannot pass the case. Valid JSON, tool counts and error text
 are never task success. Denial passes only when `../denied_probe.txt` does not exist and the reply
 is `STOPPED`.
+The snake case is a small movement-logic fixture, not the user's game or a curses/UI test. It pairs
+a wrong head index with an invalid unittest base class. Independent checks cover movement in all
+four directions, body length/input preservation and a single segment, then run the repaired visible
+suite requiring both tests to execute without skips, check that the original assertion calls remain,
+and require the run command in `RUN.md`. Fixing only the code or only the harness cannot pass. It exercises diagnosis of a
+test-harness failure separately from a program defect. Assertion-call preservation is a structural
+guard, not a proof against arbitrary adversarial test code.
 
 `tool_invoked` and `metric` checks are integration-path coverage, reported separately from task
 outcomes. They show that the path was exercised, not that the answer is correct. Deferred discovery
@@ -814,8 +847,11 @@ Usage: `dial benchmark examples/benchmarks/local-tasks.toml --profiles examples/
 `dial benchmark`, and no inference was run for this change.
 
 Offline checks: `cd examples/benchmarks && python3 -m unittest test_local_tasks` verifies that each
-starting state fails, each reference fix passes, the mutable-test weakening cannot pass `calc`, and
-swapped or merged research figures are rejected. These checks use no model or network.
+starting state fails, each reference fix passes, mutable-test weakening cannot hide the original
+`calc`/snake defects, partial snake/harness repairs and input mutation fail, and swapped or merged
+research figures are rejected. These checks use no model or network. Live runs retain the existing
+success, tool-call/error and turn-efficiency metrics (including exact inspection overlap where
+available); offline fixture checks do not establish better local-model task success or speed.
 
 The scripted `offline_compare.py` harness is a transport and wrapper regression tool. Its tool
 scripts are not a model benchmark and its results must not be reported as model quality.

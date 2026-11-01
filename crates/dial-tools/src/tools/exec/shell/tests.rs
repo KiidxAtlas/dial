@@ -575,6 +575,43 @@ fn bash_output_is_bounded_and_keeps_head_and_tail() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn failed_builds_lead_with_a_digest_and_silent_grep_misses_are_explained() {
+    if !sandboxed() {
+        return;
+    }
+    let (dir, ws) = workspace();
+    // A stand-in `cargo` whose first error sits under pages of progress.
+    let script = dir.path().join("cargo");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\ni=0; while [ $i -lt 200 ]; do echo \"   Compiling crate$i v0.$i.0\"; i=$((i+1)); done\necho 'error[E0425]: cannot find value `y`'\necho ' --> src/main.rs:4:13'\nexit 101\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let out = bash(&ws, "./cargo build");
+    assert!(out.is_error, "{}", out.text);
+    assert!(
+        out.text.starts_with(
+            "[failure digest: first error lines; the full output follows]\nerror[E0425]: cannot find value `y`\n --> src/main.rs:4:13\n[end of digest]\n"
+        ),
+        "{}",
+        &out.text[..out.text.len().min(400)]
+    );
+    assert!(out.text.contains("Compiling crate199") && out.text.contains("[exit code: 101]"));
+
+    std::fs::write(dir.path().join("empty.txt"), "").unwrap();
+    let out = bash(&ws, "grep needle empty.txt");
+    assert!(out.is_error, "the status stays truthful");
+    assert!(
+        out.text
+            .contains("[exit 1 without output conventionally means no lines matched]"),
+        "{}",
+        out.text
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn bash_keeps_diagnostics_from_the_omitted_middle_within_bounds() {
     if !sandboxed() {
         return;
@@ -1055,4 +1092,154 @@ fn artifact_cap_is_reported_separately_from_capture() {
     assert_eq!(integrity.original_bytes, Some(16));
     assert_eq!(integrity.retained_bytes, Some(8));
     assert_eq!(integrity.omitted_bytes, Some(8));
+}
+
+const TERMINAL_DIAGNOSTIC: &str =
+    "Error: This game requires an interactive terminal (TTY) to run curses.";
+
+/// The launch facts a native shell's initial process reports; `None` when there is none.
+fn launch_facts(output: &ToolOutput) -> Option<&Value> {
+    output.data.as_ref()?.get("shell_launch")
+}
+
+fn launch(ws: &Workspace, command: &str, cancel: &AtomicBool) -> ToolOutput {
+    bash_tool_streaming_with_adopter(
+        ws,
+        &json!({"command": command}),
+        10,
+        0,
+        &|_: &[u8]| {},
+        cancel,
+        &|_job| Err("adoption not expected".into()),
+    )
+    .unwrap()
+}
+
+/// Every backend this build can run without a sandbox, labelled for failure messages.
+fn unsandboxed_backends() -> Vec<(&'static str, ShellBackend)> {
+    let mut backends = vec![("system", ShellBackend::System)];
+    if cfg!(feature = "embedded-shell") {
+        backends.push(("inprocess", ShellBackend::InProcess));
+    }
+    backends
+}
+
+#[test]
+fn launch_zero_exit_after_terminal_diagnostic_stays_successful_with_launch_facts() {
+    // A curses program needs a real terminal on stdin and stdout, finds stdin at EOF, prints why
+    // it cannot run, and exits 0. Each precondition fails with its own status, so a wrong launch
+    // mode cannot hide behind the success exit.
+    let command = format!(
+        "if test -t 0 || test -t 1; then exit 91; fi; if read -r line; then exit 92; fi; echo '{TERMINAL_DIAGNOSTIC}'; exit 0"
+    );
+    let (_dir, base) = workspace();
+    let base = base.without_sandbox();
+    let cancel = AtomicBool::new(false);
+    for interceptor in [false, true] {
+        for (name, backend) in unsandboxed_backends() {
+            let mut ws = base.clone().with_shell_backend(backend);
+            if interceptor {
+                ws = ws.with_bash_interceptor(
+                    crate::config::tools::bash_interceptor::BashInterceptorConfig::default(),
+                    vec!["read".into(), "bg".into()],
+                );
+            }
+            let label = format!("{name} interceptor={interceptor}");
+            let out = launch(&ws, &command, &cancel);
+            assert!(!out.is_error, "{label}: {}", out.text);
+            assert!(
+                out.text.contains(TERMINAL_DIAGNOSTIC),
+                "{label}: {}",
+                out.text
+            );
+            assert_eq!(
+                out.execution.process.as_ref().and_then(|p| p.exit_code),
+                Some(0),
+                "{label}"
+            );
+            let facts = launch_facts(&out)
+                .unwrap_or_else(|| panic!("{label}: no shell_launch: {}", out.text));
+            assert_eq!(
+                facts,
+                &json!({"stdin": "eof", "output": "captured", "terminal_allocated": false}),
+                "{label}"
+            );
+            assert_eq!(
+                out.execution.shell_launch,
+                Some(crate::runtime::execution::ShellLaunch {
+                    stdin: crate::runtime::execution::ShellStdin::Eof,
+                    terminal_allocated: false,
+                    job: None,
+                }),
+                "{label}"
+            );
+            assert!(out.text.contains("[shell launch:"), "{label}: {}", out.text);
+        }
+    }
+}
+
+#[test]
+fn launch_nonzero_exit_is_a_failure_that_still_reports_launch_facts() {
+    let (_dir, ws) = workspace();
+    let ws = ws.without_sandbox();
+    let out = launch(&ws, "echo oops >&2; exit 3", &AtomicBool::new(false));
+    assert!(
+        out.is_error && out.text.contains("[exit code: 3]"),
+        "{}",
+        out.text
+    );
+    assert_eq!(
+        out.execution.process.as_ref().and_then(|p| p.exit_code),
+        Some(3)
+    );
+    assert!(launch_facts(&out).is_some(), "{}", out.text);
+}
+
+#[test]
+fn launch_refused_or_cancelled_before_start_reports_no_launch_facts() {
+    let (_dir, ws) = workspace();
+    let ws = ws.without_sandbox();
+    let refused = launch(&ws, "npm run dev", &AtomicBool::new(false));
+    assert!(
+        refused.is_error && refused.text.contains("Command not started"),
+        "{}",
+        refused.text
+    );
+    assert!(launch_facts(&refused).is_none(), "{}", refused.text);
+    assert!(refused.execution.shell_launch.is_none());
+    let cancelled = launch(&ws, "echo never", &AtomicBool::new(true));
+    assert!(
+        cancelled.is_error && cancelled.text.contains("cancelled before command started"),
+        "{}",
+        cancelled.text
+    );
+    assert!(launch_facts(&cancelled).is_none(), "{}", cancelled.text);
+    assert!(cancelled.execution.shell_launch.is_none());
+}
+
+#[test]
+fn launch_adopted_background_output_reports_launch_facts_without_termination() {
+    let (_dir, ws) = workspace();
+    let ws = ws.without_sandbox();
+    let out = bash_tool_streaming_with_adopter(
+        &ws,
+        &json!({"command": "sleep 5", "background": true}),
+        0,
+        0,
+        &|_: &[u8]| {},
+        &AtomicBool::new(false),
+        &|_job| Ok("bg7".to_owned()),
+    )
+    .unwrap();
+    assert!(out.text.contains("background job bg7"), "{}", out.text);
+    assert_eq!(
+        out.execution.shell_launch,
+        Some(crate::runtime::execution::ShellLaunch {
+            stdin: crate::runtime::execution::ShellStdin::Eof,
+            terminal_allocated: false,
+            job: Some("bg7".into()),
+        })
+    );
+    assert_eq!(launch_facts(&out).unwrap()["job"], "bg7");
+    assert!(out.execution.process.is_none());
 }

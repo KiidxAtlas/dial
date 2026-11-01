@@ -1230,6 +1230,7 @@ fn run_machine(
                         dial::benchmark::IntegrationMode::Mcp => "mcp",
                         dial::benchmark::IntegrationMode::Browser => "browser",
                         dial::benchmark::IntegrationMode::Delegation => "delegation",
+                        dial::benchmark::IntegrationMode::ManagedShell => "managed_shell",
                     };
                     if case.categories.iter().any(|tag| tag == "integration")
                         && (expected == "core" || !case.categories.iter().any(|tag| tag == expected)) {

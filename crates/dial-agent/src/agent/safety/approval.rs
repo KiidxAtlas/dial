@@ -421,7 +421,7 @@ pub(in crate::agent) fn read_only_inspection_batch(command: &str) -> bool {
 }
 
 /// Splits at unquoted `;`, `&&` and newlines. `None` when quoting or a line continuation cannot be followed.
-fn top_level_segments(command: &str) -> Option<Vec<&str>> {
+pub(in crate::agent) fn top_level_segments(command: &str) -> Option<Vec<&str>> {
     let mut segments = Vec::new();
     let mut quote: Option<char> = None;
     let mut start = 0;
@@ -485,7 +485,14 @@ pub fn is_read_only(ext: &Registry, name: &str, args: &Value) -> bool {
         {
             false
         }
-        "bash" => args["command"].as_str().is_some_and(safe_bash),
+        // A terminal may enable pagers, prompts and interactive actions even for an inspection.
+        // Like bg start, it must not inherit the pipe-only safe-command approval exemption.
+        "bash" => {
+            matches!(
+                args.get("pty"),
+                None | Some(Value::Null | Value::Bool(false))
+            ) && args["command"].as_str().is_some_and(safe_bash)
+        }
         "task" => !subagents::launches_worker(args),
         "side_request" => true,
         "context_notes" => crate::agent::window::context_notes::readonly(name, args),
@@ -515,11 +522,12 @@ pub fn needs_approval(ext: &Registry, call: &ToolCall) -> bool {
 /// Stateful reads (background output cursors, memory, todo) remain serial barriers.
 pub fn parallel_read(ext: &Registry, name: &str, args: &Value) -> bool {
     // Read-only shell commands join parallel groups unless they name a stateful or managed form:
-    // a retained `session` (cwd and exports) or a background/async job is a serial barrier.
+    // a retained `session` (cwd and exports), terminal or background/async job is a serial barrier.
     if name == "bash" {
         let flag_off = |key| matches!(args.get(key), None | Some(Value::Null | Value::Bool(false)));
         return flag_off("background")
             && flag_off("async")
+            && flag_off("pty")
             && args["session"].is_null()
             && is_read_only(ext, name, args);
     }

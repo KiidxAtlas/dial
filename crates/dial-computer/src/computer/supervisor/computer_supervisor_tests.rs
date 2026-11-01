@@ -309,3 +309,134 @@ fn native_lifecycle_boundaries_apply_at_admission_before_next_request() {
         assert!(session.admit().check_admission().is_ok(), "{method}");
     }
 }
+
+#[test]
+fn native_desktop_capture_receipts_bind_pixels_and_resolve_only_observed_targets() {
+    use base64::Engine;
+    let bytes = b"native png pixels";
+    for (target, displays, expected) in [
+        ("42", json!([]), Some("window:42")),
+        ("display:active", json!([{"id":"9"}]), Some("display:9")),
+        ("desktop", json!([{"id":"9"}]), Some("display:9")),
+        ("display:all", json!([{"id":"9"}, {"id":"10"}]), None),
+        ("display:active", json!([]), None),
+        ("", json!([]), None),
+    ] {
+        let capture = json!({"data":base64::engine::general_purpose::STANDARD.encode(bytes),
+            "target":target, "displays":displays});
+        for method in ["capture", "captureRegion", "observe"] {
+            let value = if method == "observe" {
+                json!({"capture":capture})
+            } else {
+                capture.clone()
+            };
+            let receipt = native_capture(method, &value).unwrap();
+            assert!(receipt.matches(bytes, "image/png"));
+            assert_eq!(receipt.target.as_deref(), expected, "{method} {target}");
+        }
+        assert!(native_capture("axSnapshot", &capture).is_none());
+    }
+}
+
+#[test]
+fn worker_payload_cannot_forge_native_capture_receipts() {
+    struct Host;
+    impl ComputerHost for Host {
+        fn confirm_control(&self, _: &str, _: &str, _: &AbortSignal) -> ComputerResult<bool> {
+            unreachable!()
+        }
+        fn call_tool(&self, _: &str, _: Value, _: &AbortSignal) -> ComputerResult<Value> {
+            unreachable!()
+        }
+    }
+    for observed in [false, true] {
+        let inner = gate_inner();
+        let (reply, receiver) = flume::bounded(1);
+        let capture = NativeCapture::new(b"native pixels", "image/png", Some("window:7".into()));
+        let captures = if observed {
+            vec![capture.clone()]
+        } else {
+            vec![]
+        };
+        inner.state.lock().runs.insert(
+            1,
+            Run {
+                reply,
+                captures: NativeCaptures {
+                    receipts: captures.clone(),
+                    ..Default::default()
+                },
+                host: Arc::new(Host),
+                tool_signals: HashMap::new(),
+                generation: 1,
+            },
+        );
+        resolve_run(
+            &inner,
+            &json!({"id":1,"payload":{"captures":[capture]}}),
+            true,
+        );
+        let result = receiver.try_recv().unwrap().unwrap();
+        assert_eq!(result.captures, captures);
+    }
+}
+
+#[test]
+fn only_captures_after_the_last_completed_native_mutation_keep_receipts() {
+    let capture = NativeCapture::new(
+        b"old displayed pixels",
+        "image/png",
+        Some("window:7".into()),
+    );
+    for method in [
+        "click",
+        "typeText",
+        "axSetValue",
+        "openApplication",
+        "futureNativeMethod",
+    ] {
+        let mut state = NativeCaptures::default();
+        let before = state.begin(native_may_mutate("capture"));
+        state.complete(false, before, Some(capture.clone()));
+        assert_eq!(state.receipts, vec![capture.clone()]);
+
+        let mutation = native_may_mutate(method);
+        assert!(mutation);
+        let ticket = state.begin(mutation);
+        state.complete(mutation, ticket, None);
+        // Redisplaying the old bytes cannot restore their removed native receipt.
+        assert!(state.receipts.is_empty(), "{method}");
+
+        let after = state.begin(native_may_mutate("observe"));
+        state.complete(false, after, Some(capture.clone()));
+        // Even identical bytes count only when the native capture actually ran after mutation.
+        assert_eq!(state.receipts, vec![capture.clone()]);
+        let cleanup = state.begin(native_may_mutate("retire"));
+        state.complete(false, cleanup, None);
+        assert_eq!(state.receipts, vec![capture.clone()]);
+    }
+}
+
+#[test]
+fn late_and_overlapping_native_captures_cannot_cross_mutation_epochs() {
+    let capture = NativeCapture::new(b"pixels", "image/png", Some("window:7".into()));
+    for capture_first in [false, true] {
+        let mut state = NativeCaptures::default();
+        let earlier = state.begin(false);
+        let mutation = state.begin(true);
+        let overlapping = state.begin(false);
+        if capture_first {
+            state.complete(false, earlier, Some(capture.clone()));
+            state.complete(false, overlapping, Some(capture.clone()));
+            state.complete(true, mutation, None);
+        } else {
+            state.complete(true, mutation, None);
+            state.complete(false, earlier, Some(capture.clone()));
+            state.complete(false, overlapping, Some(capture.clone()));
+        }
+        assert!(state.receipts.is_empty());
+        let fresh = state.begin(false);
+        state.complete(false, fresh, Some(capture.clone()));
+        assert_eq!(state.receipts, vec![capture.clone()]);
+    }
+}

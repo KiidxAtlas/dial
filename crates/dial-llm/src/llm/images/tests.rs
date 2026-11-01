@@ -218,3 +218,60 @@ fn tiny_png() -> Vec<u8> {
         .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aY4cAAAAASUVORK5CYII=")
         .unwrap()
 }
+
+#[test]
+fn model_switch_clamps_generated_original_detail_only_on_the_request_copy() {
+    let image = json!({"type":"image_url","image_url":{"url":"data:image/png;base64,AA==","detail":"original"}});
+    let req = super::super::Chat {
+        messages: vec![
+            json!({"role":"user","dial_snapcompact":{"source_text":"exact", "frames":[]},"content":[image.clone()]}),
+            json!({"role":"tool","dial_snapcompact_view":{},"content":"view", "dial_provider_content":[image.clone()]}),
+            json!({"role":"user","content":[image]}),
+        ],
+        tools: vec![],
+        temperature: 0.0,
+        max_tokens: 100,
+        seed: None,
+    };
+    let original = req.messages.clone();
+    let tracker = NoticeTracker::default();
+    let mut notices = Vec::new();
+    for _ in 0..2 {
+        let prepared = prepare_for_target(&req, true, ImageDetail::High, &tracker, &mut |notice| {
+            notices.push(notice.to_owned())
+        })
+        .unwrap();
+        assert_eq!(
+            prepared.messages[0]["content"][0]["image_url"]["detail"],
+            "high"
+        );
+        assert_eq!(
+            prepared.messages[1]["dial_provider_content"][0]["image_url"]["detail"],
+            "high"
+        );
+        assert_eq!(
+            prepared.messages[2]["content"][0]["image_url"]["detail"], "original",
+            "authored non-archive images are not retargeted"
+        );
+        assert_eq!(
+            prepared.messages[0]["dial_snapcompact"]["source_text"],
+            "exact"
+        );
+    }
+    assert_eq!(
+        notices.len(),
+        1,
+        "one compatibility notice per unchanged route"
+    );
+    assert_eq!(req.messages, original, "stored history is immutable");
+    assert!(
+        prepare_for_target(
+            &req,
+            true,
+            ImageDetail::Original,
+            &tracker,
+            &mut |_| panic!("compatible route")
+        )
+        .is_none()
+    );
+}

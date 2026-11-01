@@ -1,10 +1,17 @@
 use super::*;
 use crate::agent::run::tool_exposure::default_offer_tests::with_agent;
 use crate::tools::integrations::ext::{Tool, ToolContext};
+use crate::tools::surface::catalog::Readiness;
+
+// Existing lexical-routing fixtures have no runtime readiness distinction.
+fn select(query: &str, context: &BTreeSet<String>, candidates: &[(String, String)]) -> Vec<String> {
+    super::select(query, context, candidates, &|_| 1)
+}
 
 struct Capability {
     name: String,
     description: String,
+    readiness: Readiness,
 }
 impl Tool for Capability {
     fn name(&self) -> &str {
@@ -13,6 +20,9 @@ impl Tool for Capability {
     fn schema(&self) -> Value {
         json!({"type":"function","function":{"name":self.name,"description":self.description,
             "parameters":{"type":"object","properties":{}}}})
+    }
+    fn readiness(&self, _: &Config) -> Readiness {
+        self.readiness.clone()
     }
     fn needs_approval(&self, _: &Value) -> bool {
         true
@@ -25,6 +35,7 @@ fn register(agent: &mut Agent<'_>, name: &str, description: &str) {
     agent.ext.register(Arc::new(Capability {
         name: name.into(),
         description: description.into(),
+        readiness: Readiness::Unknown,
     }));
 }
 fn nuxt(agent: &mut Agent<'_>) {
@@ -229,6 +240,159 @@ fn source_routing_ignores_incidental_module_names_and_format_mentions_without_in
 }
 
 #[test]
+fn output_only_formats_do_not_route_source_specialists() {
+    let candidates = [
+        "document",
+        "data",
+        "audio",
+        "visual",
+        "evidence",
+        "evidence_search",
+    ]
+    .map(|name| (name.to_owned(), "Capability".to_owned()));
+    // The named file is the deliverable, not an input. Its format must not pull in a source reader.
+    for query in [
+        "Analyze the plaintext logs in /app/logs and write a CSV file /app/summary.csv",
+        "Analyze the plaintext logs and export the severity counts as JSON to summary.json",
+        "Analyze the plaintext logs and save the severity counts in CSV to summary.csv",
+        "Summarize the plain text notes and create report.pdf",
+        "Analyze the plaintext logs in /app/logs and write a text file /app/summary.txt",
+    ] {
+        assert!(
+            select(query, &BTreeSet::new(), &candidates).is_empty(),
+            "{query}"
+        );
+    }
+    // Source formats keep their specialists; the output file adds none.
+    assert_eq!(
+        select(
+            "Analyze sales.csv and write summary.json",
+            &BTreeSet::new(),
+            &candidates
+        ),
+        ["data", "evidence", "evidence_search"]
+    );
+    assert_eq!(
+        select(
+            "Read report.pdf and write summary.csv",
+            &BTreeSet::new(),
+            &candidates
+        ),
+        ["document", "evidence", "evidence_search"]
+    );
+    // An explicit tool request still routes when the named file is an output.
+    assert!(
+        select(
+            "Use the data tool to write summary.csv from the plaintext logs",
+            &BTreeSet::new(),
+            &candidates
+        )
+        .contains(&"data".to_owned())
+    );
+}
+
+#[test]
+fn output_clauses_and_input_clauses_are_routed_independently() {
+    let candidates = [
+        "document",
+        "data",
+        "audio",
+        "visual",
+        "evidence",
+        "evidence_search",
+    ]
+    .map(|name| (name.to_owned(), "Capability".to_owned()));
+    // Input formats keep their specialist whether the output is named before or after them.
+    assert_eq!(
+        select(
+            "Analyze rows and write summary.json from sales.csv",
+            &BTreeSet::new(),
+            &candidates
+        ),
+        ["data", "evidence", "evidence_search"]
+    );
+    // Case does not change which file is the input and which is the output.
+    assert_eq!(
+        select(
+            "ANALYZE SALES.CSV AND WRITE SUMMARY.JSON",
+            &BTreeSet::new(),
+            &candidates
+        ),
+        ["data", "evidence", "evidence_search"]
+    );
+    // Sentence and semicolon boundaries end the output clause, so a following inspection keeps its own format.
+    let documents = select(
+        "Write summary.csv. Inspect report.pdf",
+        &BTreeSet::new(),
+        &candidates,
+    );
+    assert!(documents.contains(&"document".to_owned()), "{documents:?}");
+    assert!(!documents.contains(&"data".to_owned()), "{documents:?}");
+    let data = select(
+        "Analyze sales.csv; export result.pdf",
+        &BTreeSet::new(),
+        &candidates,
+    );
+    assert!(data.contains(&"data".to_owned()), "{data:?}");
+    assert!(!data.contains(&"document".to_owned()), "{data:?}");
+    // A creation-only request whose only input is a non-source text file routes no source reader.
+    assert!(
+        select(
+            "Create report.pdf using notes.txt",
+            &BTreeSet::new(),
+            &candidates
+        )
+        .is_empty()
+    );
+    // A supplied source named after a creation verb is still an input when it follows `from`.
+    assert_eq!(
+        select(
+            "Write summary.json from sales.csv",
+            &BTreeSet::new(),
+            &candidates
+        ),
+        ["data", "evidence", "evidence_search"]
+    );
+    for query in [
+        "Analyze the export of sales.csv",
+        "Create a summary of sales.csv",
+        "Write a script to parse sales.csv and summarize it",
+        "Write a parser that reads sales.csv and then analyze the results",
+    ] {
+        assert_eq!(
+            select(query, &BTreeSet::new(), &candidates),
+            ["data", "evidence", "evidence_search"],
+            "{query}"
+        );
+    }
+    assert_eq!(
+        select(
+            "Create a deck from report.pdf",
+            &BTreeSet::new(),
+            &candidates
+        ),
+        ["document", "evidence", "evidence_search"]
+    );
+    let runtime = [("runtime_inspect".to_owned(), "Capability".to_owned())];
+    assert_eq!(
+        select(
+            "Write a report on the trace and analyze it",
+            &BTreeSet::new(),
+            &runtime
+        ),
+        ["runtime_inspect"]
+    );
+    // A noun that merely contains an output verb ("output") is still a genuine input file.
+    let read = select(
+        "Read the output file results.csv",
+        &BTreeSet::new(),
+        &candidates,
+    );
+    assert!(read.contains(&"data".to_owned()), "{read:?}");
+    assert!(!read.contains(&"document".to_owned()), "{read:?}");
+}
+
+#[test]
 fn ordinary_words_and_coding_tasks_do_not_route_runtime_or_evidence_specialists() {
     let candidates = [
         "monitor",
@@ -405,6 +569,80 @@ fn plain_system_questions_preserve_real_registry_policy_and_schema_budgets() {
     with_agent("[assistance]\nlean_local=true", |agent| {
         agent.begin_tool_routing("What tables are in exports/app.sqlite?");
         assert!(!selected(agent, "database"));
+    });
+}
+
+/// Real registry schemas: an output-only CSV prompt must not add source specialists or schema bytes
+/// compared with an equivalent plain-text output prompt.
+#[test]
+fn output_only_csv_prompt_offers_no_source_specialists_and_costs_no_extra_schema_bytes() {
+    with_agent("[assistance]\nlean_local=false", |agent| {
+        assert!(agent.catalog().iter().any(|tool| tool == "data"));
+        assert!(agent.catalog().iter().any(|tool| tool == "evidence"));
+        let mut sizes = Vec::new();
+        for query in [
+            "Analyze the plaintext logs in /app/logs and write a CSV file /app/summary.csv with counts per severity",
+            "Analyze the plaintext logs in /app/logs and write a text file /app/summary.txt with counts per severity",
+        ] {
+            agent.begin_tool_routing(query);
+            for specialist in ["data", "document", "evidence", "evidence_search"] {
+                assert!(
+                    !selected(agent, specialist),
+                    "{query}: unexpectedly routed {specialist}: {:?}",
+                    agent.tool_routing.selected
+                );
+            }
+            let offered = agent.offered();
+            let bytes = serde_json::to_string(&agent.schemas(&offered).unwrap())
+                .unwrap()
+                .len();
+            eprintln!("offered schema bytes for {query:?}: {bytes}");
+            sizes.push(bytes);
+        }
+        let [csv, txt] = sizes[..] else {
+            unreachable!()
+        };
+        eprintln!(
+            "output CSV vs TXT schema byte delta: {}",
+            csv as i64 - txt as i64
+        );
+        assert_eq!(csv, txt, "output-only CSV added schema bytes over TXT");
+    });
+}
+
+/// Offline reconstruction, not a measured before/after: the legacy offer is the baseline offer plus
+/// the three source specialists the output-only prompt used to pull in. Its bytes are printed next to
+/// the corrected offer so the saving is visible without a live model.
+#[test]
+fn legacy_offer_reconstruction_is_labelled_offline_and_corrected_offer_is_not_larger() {
+    with_agent("[assistance]\nlean_local=false", |agent| {
+        agent.begin_tool_routing("");
+        let mut legacy = agent.offered();
+        legacy.extend(["data", "evidence", "evidence_search"].map(str::to_owned));
+        legacy.sort();
+        legacy.dedup();
+        agent.begin_tool_routing(
+            "Analyze the plaintext logs in /app/logs and write a CSV file /app/summary.csv with counts per severity",
+        );
+        let corrected = agent.offered();
+        let bytes = |names: &[String]| {
+            serde_json::to_string(&agent.schemas(names).unwrap())
+                .unwrap()
+                .len()
+        };
+        let legacy_bytes = bytes(&legacy);
+        let corrected_bytes = bytes(&corrected);
+        eprintln!(
+            "LEGACY RECONSTRUCTION (offline, not a measured before/after): baseline + data/evidence/evidence_search = {legacy_bytes} schema bytes"
+        );
+        eprintln!(
+            "CORRECTED OFFER (current routing, output CSV prompt) = {corrected_bytes} schema bytes; delta {}",
+            legacy_bytes as i64 - corrected_bytes as i64
+        );
+        assert!(corrected_bytes <= legacy_bytes);
+        for name in ["data", "evidence", "evidence_search"] {
+            assert!(!corrected.iter().any(|tool| tool == name), "{name}");
+        }
     });
 }
 
@@ -907,5 +1145,204 @@ fn successful_discovery_exposes_its_consumer_not_unrelated_tools_or_result_instr
         let before = agent.tool_routing.selected.clone();
         agent.observe_tool_routing(&call, &ToolOutput::ok("/routing".into()));
         assert_eq!(agent.tool_routing.selected, before);
+    });
+}
+
+/// Comma-separated clauses end an output phrase the same way sentences do. Commas inside a
+/// filename or quoted name are not clause separators.
+#[test]
+fn comma_separated_output_formats_preserve_inputs() {
+    let candidates = [
+        "document",
+        "data",
+        "audio",
+        "visual",
+        "evidence",
+        "evidence_search",
+    ]
+    .map(|name| (name.to_owned(), "Capability".to_owned()));
+    // Comma-only output clauses must not pull in source specialists for the deliverable format.
+    for query in [
+        "Analyze text logs, write summary.csv",
+        "Analyze text logs, write summary.json",
+        "Summarize the plain notes, create report.pdf",
+        "Analyze the 'raw logs, write summary.csv",
+        "Analyze logs 'til noon, write summary.csv",
+        "Analyze the ‘raw logs, write summary.csv",
+    ] {
+        assert!(
+            select(query, &BTreeSet::new(), &candidates).is_empty(),
+            "{query}"
+        );
+    }
+    // Genuine inputs keep their specialist on either side of a comma.
+    assert_eq!(
+        select(
+            "Analyze sales.csv, write summary.json",
+            &BTreeSet::new(),
+            &candidates
+        ),
+        ["data", "evidence", "evidence_search"]
+    );
+    assert_eq!(
+        select(
+            "Write summary.json, analyze sales.csv",
+            &BTreeSet::new(),
+            &candidates
+        ),
+        ["data", "evidence", "evidence_search"]
+    );
+    assert_eq!(
+        select(
+            "Read report.pdf, write summary.csv",
+            &BTreeSet::new(),
+            &candidates
+        ),
+        ["document", "evidence", "evidence_search"]
+    );
+    // A comma inside a filename or quoted name is part of the name, not a clause boundary.
+    assert_eq!(
+        select(
+            "Analyze report,final.csv and write summary.json",
+            &BTreeSet::new(),
+            &candidates
+        ),
+        ["data", "evidence", "evidence_search"]
+    );
+    assert_eq!(
+        select(
+            "Read \"logs, q1.csv\" and write summary.json",
+            &BTreeSet::new(),
+            &candidates
+        ),
+        ["data", "evidence", "evidence_search"]
+    );
+    // A comma inside a quoted name is part of the name, even when the quoted text holds a creation
+    // verb and a deliverable-looking filename. The quoted file is still the genuine input.
+    for query in [
+        "Read \"logs, write report.csv\" and write summary.json",
+        "Read 'logs, write report.csv' and write summary.json",
+        "Read `logs, write report.csv` and write summary.json",
+        "Read “logs, write report.csv” and write summary.json",
+        "Read ‘logs, write report.csv’ and write summary.json",
+        "Read (\"logs, write report.csv\") and write summary.json",
+        "Read ('logs, write report.csv') and write summary.json",
+        "Read (`logs, write report.csv`) and write summary.json",
+        "Read (“logs, write report.csv”) and write summary.json",
+        "Read (‘logs, write report.csv’) and write summary.json",
+        "Read 'don't, write report.csv' and write summary.json",
+        "Read ‘don’t, write report.csv’ and write summary.json",
+    ] {
+        assert_eq!(
+            select(query, &BTreeSet::new(), &candidates),
+            ["data", "evidence", "evidence_search"],
+            "{query}"
+        );
+    }
+    // A quoted token after a comma is a literal name, never a creation verb. Its quoted filename is
+    // therefore the genuine input rather than an output target that drops the preceding input.
+    for query in [
+        "Read notes.txt, \"write report.csv\"",
+        "Read notes.txt, 'write report.csv'",
+        "Read notes.txt, `write report.csv`",
+        "Read notes.txt, “write report.csv”",
+        "Read notes.txt, ‘write report.csv’",
+    ] {
+        assert_eq!(
+            select(query, &BTreeSet::new(), &candidates),
+            ["data", "evidence", "evidence_search"],
+            "{query}"
+        );
+    }
+    // An explicit tool request stays eligible when the named file is only an output.
+    assert!(
+        select(
+            "Use the `data` tool, write summary.csv from the plaintext logs",
+            &BTreeSet::new(),
+            &candidates
+        )
+        .contains(&"data".to_owned())
+    );
+}
+
+/// Benchmark-style task prose (servers to build and keep running, a custom error page, config
+/// variables, shell pipelines) names no specialist capability, so it must not add schemas that
+/// every request of the run would carry. Genuine intent in the same vocabulary still routes.
+#[test]
+fn task_prose_does_not_route_specialists_from_incidental_words() {
+    let candidates = [
+        "task",
+        "message",
+        "browser",
+        "lsp",
+        "monitor",
+        "web_search",
+        "web_fetch",
+    ]
+    .map(|name| (name.to_owned(), "Capability".to_owned()));
+    for query in [
+        "Set up an Nginx web server. Your task is to configure a custom 404 error page and verify it's running properly",
+        "Log request methods ($request_method) and add the rate limiting zone definition to nginx.conf",
+        "Create /app/server.py, run the server and keep it running in the background",
+        "Build it with no X server. Test with `pmars -b rave.red | tail -n 1`",
+        "Send the message to the queue when the goal state is reached",
+    ] {
+        assert!(
+            select(query, &BTreeSet::new(), &candidates).is_empty(),
+            "{query}: {:?}",
+            select(query, &BTreeSet::new(), &candidates)
+        );
+    }
+    for (query, expected) in [
+        ("Use the `task` tool to split this work", vec!["task"]),
+        (
+            "Search the web for nginx web server benchmarks",
+            vec!["web_search", "web_fetch"],
+        ),
+        ("Summarize https://example.com/notes", vec!["web_fetch"]),
+        ("Check the rendered landing page design", vec!["browser"]),
+        ("Verify the frontend layout", vec!["browser"]),
+        ("Tail the server log for crashes", vec!["monitor"]),
+        ("Find the definition of the parse method", vec!["lsp"]),
+    ] {
+        assert_eq!(
+            select(query, &BTreeSet::new(), &candidates),
+            expected,
+            "{query}"
+        );
+    }
+}
+
+#[test]
+fn task_routes_ready_before_unknown_and_keeps_blocked_tools_explicitly_loadable() {
+    with_agent("", |agent| {
+        for (name, readiness) in [
+            ("mcp__docs__a_unknown", Readiness::Unknown),
+            ("mcp__docs__b_unknown", Readiness::Unknown),
+            ("mcp__docs__d_unknown", Readiness::Unknown),
+            ("mcp__docs__z_ready", Readiness::Ready),
+            (
+                "mcp__docs__c_missing",
+                Readiness::MissingPrerequisite {
+                    reason: "not configured".into(),
+                },
+            ),
+        ] {
+            agent.ext.register(Arc::new(Capability {
+                name: name.into(),
+                description: "Retrieve quasar astronomy documentation".into(),
+                readiness,
+            }));
+        }
+        agent.begin_tool_routing("Find quasar astronomy documentation");
+        let names = &agent.tool_routing.selected;
+        assert_eq!(
+            names.first().map(String::as_str),
+            Some("mcp__docs__z_ready")
+        );
+        assert!(selected(agent, "mcp__docs__a_unknown"));
+        assert!(!selected(agent, "mcp__docs__c_missing"));
+        load(agent, json!({"names":["mcp__docs__c_missing"]}));
+        assert!(agent.offered().contains(&"mcp__docs__c_missing".into()));
     });
 }

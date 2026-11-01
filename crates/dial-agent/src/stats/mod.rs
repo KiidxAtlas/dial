@@ -39,6 +39,17 @@ pub fn db_path(user_dir: &Path) -> PathBuf {
     user_dir.join("stats.sqlite3")
 }
 
+/// Best-effort catch-up of the transcript index when an interactive session ends, so `sessions`
+/// covers sessions that never opened `/stats`. Unchanged files cost one `stat` each.
+pub fn sync_after_session(config: &crate::config::Config) {
+    if !config.stats.enabled || !config.user_dir.is_absolute() {
+        return;
+    }
+    if let Ok(mut db) = Db::open_default(&config.user_dir) {
+        let _ = db.sync_sessions(&config.user_dir);
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RequestRecord {
     pub ts_ms: i64,
@@ -57,6 +68,8 @@ pub struct RequestRecord {
     pub finish_reason: String,
     pub error: bool,
     pub wire: Option<WireRecord>,
+    /// `api`, `local` or `subscription`; `None` when the reply's billing was not known.
+    pub billing: Option<String>,
 }
 
 /// Cache diagnostics for one request: `invalidation` is `none`/`transport_changed` when the
@@ -99,6 +112,8 @@ pub struct Totals {
     /// Sum over priced requests only; see `priced_requests`.
     pub cost_usd: f64,
     pub priced_requests: u64,
+    /// Requests billed through a subscription: never priced, so they are not "unknown cost".
+    pub subscription_requests: u64,
     pub duration_ms: u64,
     /// `output / (duration / 1000)`: end-to-end, so it includes prompt processing time.
     pub tokens_per_second: Option<f64>,
@@ -281,7 +296,7 @@ pub fn read_model_usage(user_dir: &Path) -> BTreeMap<String, ModelUsage> {
 
 const TOTALS_SQL: &str =
     "SUM(requests), SUM(errors), SUM(reported), SUM(input), SUM(output), SUM(cache_read),
-    SUM(cache_write), SUM(reasoning), SUM(cost), SUM(priced), SUM(duration_ms)";
+    SUM(cache_write), SUM(reasoning), SUM(cost), SUM(priced), SUM(duration_ms), SUM(subscription)";
 
 /// Reads the [`TOTALS_SQL`] columns starting at column `at`.
 fn read_totals(r: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<Totals> {
@@ -300,6 +315,7 @@ fn read_totals(r: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<Totals> {
         cost_usd: r.get::<_, Option<f64>>(at + 8)?.unwrap_or(0.0),
         priced_requests: n(9)?,
         duration_ms: n(10)?,
+        subscription_requests: n(11)?,
         ..Default::default()
     }
     .finish())
@@ -327,6 +343,7 @@ CREATE TABLE IF NOT EXISTS request_hourly(hour INTEGER NOT NULL, project TEXT NO
   requests INTEGER NOT NULL, errors INTEGER NOT NULL, reported INTEGER NOT NULL, input INTEGER NOT NULL,
   output INTEGER NOT NULL, cache_read INTEGER NOT NULL, cache_write INTEGER NOT NULL, reasoning INTEGER NOT NULL,
   cost REAL NOT NULL, priced INTEGER NOT NULL, duration_ms INTEGER NOT NULL,
+  subscription INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY(hour, project, model)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS tool_hourly(hour INTEGER NOT NULL, project TEXT NOT NULL, tool TEXT NOT NULL,
   calls INTEGER NOT NULL, errors INTEGER NOT NULL, duration_ms INTEGER NOT NULL,
@@ -338,6 +355,8 @@ CREATE TABLE IF NOT EXISTS sessions(path TEXT PRIMARY KEY, size INTEGER NOT NULL
 CREATE INDEX IF NOT EXISTS sessions_last ON sessions(last);
 CREATE TABLE IF NOT EXISTS session_tools(path TEXT NOT NULL, tool TEXT NOT NULL, calls INTEGER NOT NULL,
   PRIMARY KEY(path, tool)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS worker_sessions(session TEXT PRIMARY KEY, agent TEXT NOT NULL, ts INTEGER NOT NULL)
+  WITHOUT ROWID;
 ";
 
 fn private_dir(dir: &Path) -> Result<()> {
@@ -345,25 +364,35 @@ fn private_dir(dir: &Path) -> Result<()> {
         .with_context(|| format!("creating private directory {}", dir.display()))
 }
 
-/// Columns added after the first release; NULL on rows recorded before them.
-const REQUEST_COLUMNS: [(&str, &str); 4] = [
-    ("transport", "TEXT"),
-    ("invalidation", "TEXT"),
-    ("common_prompt_bytes", "INTEGER"),
-    ("prompt_bytes", "INTEGER"),
+/// Columns added after the first release; NULL (or the default) on rows recorded before them.
+const ADDED_COLUMNS: [(&str, &str, &str); 6] = [
+    ("requests", "transport", "TEXT"),
+    ("requests", "invalidation", "TEXT"),
+    ("requests", "common_prompt_bytes", "INTEGER"),
+    ("requests", "prompt_bytes", "INTEGER"),
+    ("requests", "billing", "TEXT"),
+    (
+        "request_hourly",
+        "subscription",
+        "INTEGER NOT NULL DEFAULT 0",
+    ),
 ];
 
 /// Idempotent and safe against a concurrent opener: the write lock is held across check and alter.
 fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| {
-        let existing = conn
-            .prepare("SELECT name FROM pragma_table_info('requests')")?
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<HashSet<_>>>()?;
-        for (name, kind) in REQUEST_COLUMNS {
-            if !existing.contains(name) {
-                conn.execute_batch(&format!("ALTER TABLE requests ADD COLUMN {name} {kind}"))?;
+        let mut existing = HashSet::new();
+        for table in ["requests", "request_hourly"] {
+            let names = conn
+                .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))?
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            existing.extend(names.into_iter().map(|name| (table, name)));
+        }
+        for (table, name, kind) in ADDED_COLUMNS {
+            if !existing.contains(&(table, name.to_owned())) {
+                conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {name} {kind}"))?;
             }
         }
         Ok(())
@@ -460,28 +489,33 @@ impl Db {
     pub fn record_request(&mut self, r: &RequestRecord) -> Result<()> {
         let tx = self.conn.transaction()?;
         let cost = r.cost_usd.filter(|c| c.is_finite() && *c >= 0.0);
+        let subscription = r.billing.as_deref() == Some("subscription");
         tx.execute(
             "INSERT INTO requests(ts, session, project, model, input, output, cache_read, cache_write, reasoning, reported, cost, duration_ms, finish, error,
-               transport, invalidation, common_prompt_bytes, prompt_bytes)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+               transport, invalidation, common_prompt_bytes, prompt_bytes, billing)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![r.ts_ms, r.session, r.project, r.model, sql_u64(r.input), sql_u64(r.output),
                 sql_u64(r.cache_read), sql_u64(r.cache_write), sql_u64(r.reasoning), r.reported,
                 cost, sql_u64(r.duration_ms), r.finish_reason, r.error,
                 r.wire.as_ref().map(|w| &w.transport), r.wire.as_ref().map(|w| &w.invalidation),
                 r.wire.as_ref().map(|w| sql_u64(w.common_prompt_bytes)),
-                r.wire.as_ref().map(|w| sql_u64(w.prompt_bytes))],
+                r.wire.as_ref().map(|w| sql_u64(w.prompt_bytes)), r.billing],
         )?;
         tx.execute(
-            "INSERT INTO request_hourly VALUES(?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            "INSERT INTO request_hourly(hour, project, model, requests, errors, reported, input, output,
+               cache_read, cache_write, reasoning, cost, priced, duration_ms, subscription)
+             VALUES(?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(hour, project, model) DO UPDATE SET requests = requests + 1,
                errors = errors + excluded.errors, reported = reported + excluded.reported,
                input = input + excluded.input, output = output + excluded.output,
                cache_read = cache_read + excluded.cache_read, cache_write = cache_write + excluded.cache_write,
                reasoning = reasoning + excluded.reasoning, cost = cost + excluded.cost,
-               priced = priced + excluded.priced, duration_ms = duration_ms + excluded.duration_ms",
+               priced = priced + excluded.priced, duration_ms = duration_ms + excluded.duration_ms,
+               subscription = subscription + excluded.subscription",
             params![r.ts_ms.div_euclid(HOUR_MS), r.project, r.model, r.error as i64, r.reported as i64,
                 sql_u64(r.input), sql_u64(r.output), sql_u64(r.cache_read), sql_u64(r.cache_write),
-                sql_u64(r.reasoning), cost.unwrap_or(0.0), cost.is_some() as i64, sql_u64(r.duration_ms)],
+                sql_u64(r.reasoning), cost.unwrap_or(0.0), cost.is_some() as i64, sql_u64(r.duration_ms),
+                subscription as i64],
         )?;
         tx.commit()?;
         Ok(())
@@ -520,6 +554,16 @@ impl Db {
             ],
         )?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Marks a private worker session so its `requests`/`tool_calls` rows can be told apart from
+    /// top-level sessions (`session IN (SELECT session FROM worker_sessions)`).
+    pub fn record_worker_session(&mut self, session: &str, agent: &str, ts_ms: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO worker_sessions(session, agent, ts) VALUES(?1, ?2, ?3)",
+            params![session, agent, ts_ms],
+        )?;
         Ok(())
     }
 
@@ -836,6 +880,8 @@ pub struct TraceRequest {
     pub duration_ms: u64,
     pub finish_reason: String,
     pub error: bool,
+    /// `api`, `local` or `subscription`; `None` for rows recorded before billing was kept.
+    pub billing: Option<String>,
 }
 
 /// One runtime tool call recorded for a session (`/api/trace`).
@@ -921,7 +967,7 @@ impl Db {
         let mut totals = Totals::default();
         let mut requests = Vec::new();
         let mut stmt = self.conn.prepare(
-            "SELECT ts, model, input, output, cache_read, cache_write, reasoning, reported, cost, duration_ms, finish, error
+            "SELECT ts, model, input, output, cache_read, cache_write, reasoning, reported, cost, duration_ms, finish, error, billing
              FROM requests WHERE session = ?1 ORDER BY ts, id",
         )?;
         let rows = stmt.query_map([&session], |r| {
@@ -940,6 +986,7 @@ impl Db {
                 duration_ms: r.get::<_, i64>(9)?.max(0) as u64,
                 finish_reason: r.get(10)?,
                 error: r.get(11)?,
+                billing: r.get(12)?,
             })
         })?;
         for request in rows {
@@ -956,6 +1003,9 @@ impl Db {
             if let Some(cost) = request.cost_usd {
                 totals.cost_usd += cost;
                 totals.priced_requests += 1;
+            }
+            if request.billing.as_deref() == Some("subscription") {
+                totals.subscription_requests += 1;
             }
             requests.push(request);
         }
@@ -1263,14 +1313,30 @@ fn percent(value: Option<f64>) -> String {
     value.map_or("-".into(), |v| format!("{v:.1}%"))
 }
 
+/// Subscription requests are reported as such: they have no per-request cost, which is different
+/// from an API request whose price is unknown.
 fn cost_text(totals: &Totals) -> String {
-    if totals.priced_requests == 0 {
-        "unpriced".into()
-    } else if totals.priced_requests < totals.requests - totals.errors.min(totals.requests) {
-        format!(
-            "${:.4} ({} of {} priced)",
-            totals.cost_usd, totals.priced_requests, totals.requests
-        )
+    let billable = totals.requests - totals.errors.min(totals.requests);
+    let subscription = totals.subscription_requests;
+    let priced = totals.priced_requests;
+    if priced == 0 {
+        match subscription {
+            0 => "unpriced".into(),
+            s if s >= billable => "subscription".into(),
+            s => format!("unpriced ({s} subscription)"),
+        }
+    } else if priced + subscription < billable {
+        let mut text = format!(
+            "${:.4} ({} of {} priced",
+            totals.cost_usd, priced, totals.requests
+        );
+        if subscription > 0 {
+            text.push_str(&format!(", {subscription} subscription"));
+        }
+        text.push(')');
+        text
+    } else if subscription > 0 {
+        format!("${:.4} + {subscription} subscription", totals.cost_usd)
     } else {
         format!("${:.4}", totals.cost_usd)
     }

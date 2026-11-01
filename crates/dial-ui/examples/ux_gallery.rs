@@ -670,6 +670,39 @@ fn main() -> anyhow::Result<()> {
             terminal.backend().buffer(),
             light,
         );
+        let mut reasoning_settings = SettingsOverlay::new(
+            toml::Table::new(),
+            toml::Table::new(),
+            toml::Table::new(),
+            Scope::Global,
+            vec!["dark".into(), "light".into()],
+        )
+        .coding_only();
+        reasoning_settings.handle(
+            &crossterm::event::Event::Paste("experimental.reasoning_strategy".into()),
+            &keys,
+        );
+        terminal.draw(|f| reasoning_settings.draw(f, &ctx))?;
+        screen(
+            &mut out,
+            &format!("Reasoning strategy setting / {name}"),
+            terminal.backend().buffer(),
+            light,
+        );
+        reasoning_settings.handle(
+            &crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            )),
+            &keys,
+        );
+        terminal.draw(|f| reasoning_settings.draw(f, &ctx))?;
+        screen(
+            &mut out,
+            &format!("Reasoning strategy choices / {name}"),
+            terminal.backend().buffer(),
+            light,
+        );
         let entries = [
             ("model", "Select a model"),
             ("providers", "Connect a provider"),

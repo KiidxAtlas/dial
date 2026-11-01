@@ -171,8 +171,10 @@ pub(crate) fn refusal(path: &Path, rel: &str, before: &str, after: &str) -> Opti
         .map(|n| format!("{n}:{}", new_lines.get(n - 1).copied().unwrap_or("")))
         .collect::<Vec<_>>()
         .join("\n");
+    let changed_old = old_lines.len().saturating_sub(prefix + suffix);
+    let changed_new = &new_lines[prefix..new_lines.len().saturating_sub(suffix).max(prefix)];
     Some(format!(
-        "Edit refused: it would add {lang} syntax errors to {rel} ({} before, {} after); nothing was written. First new error at {line}:{column} ({}). Would-be result:\n{window}\nFix the edit text and retry; earlier reads and tags stay valid. If the code is valid, retry with allow_syntax_errors: true.",
+        "Edit refused: it would add {lang} syntax errors to {rel} ({} before, {} after); nothing was written. First new error at {line}:{column} ({}). Would-be result:\n{window}\n{} {} Earlier reads and tags stay valid. If the code is valid, retry with allow_syntax_errors: true.",
         old.len(),
         new.len(),
         if missing {
@@ -180,7 +182,64 @@ pub(crate) fn refusal(path: &Path, rel: &str, before: &str, after: &str) -> Opti
         } else {
             "unexpected text"
         },
+        not_landed(before, changed_new),
+        refusal_advice(old_lines.len(), changed_old, changed_new.len()),
     ))
+}
+
+/// Lines an edit may change before a refusal suggests splitting it.
+const LARGE_EDIT_LINES: usize = 40;
+
+/// State that the refused edit added nothing, naming identifiers it would have introduced so a
+/// later call does not rely on them.
+fn not_landed(before: &str, changed: &[&str]) -> String {
+    let words = |text: &str| -> Vec<String> {
+        text.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .filter(|word| {
+                word.len() >= 3 && word.starts_with(|c: char| c.is_alphabetic() || c == '_')
+            })
+            .map(str::to_owned)
+            .collect()
+    };
+    let existing: std::collections::HashSet<String> = words(before).into_iter().collect();
+    let mut new_names = Vec::new();
+    for word in changed.iter().flat_map(|line| words(line)) {
+        if !existing.contains(&word) && !new_names.contains(&word) {
+            new_names.push(word);
+        }
+    }
+    let names = match new_names.len() {
+        0 => String::new(),
+        n => format!(
+            ", including the new name{} {}{}",
+            if n == 1 { "" } else { "s" },
+            new_names
+                .iter()
+                .take(6)
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            if n > 6 { " and others" } else { "" }
+        ),
+    };
+    format!(
+        "Nothing from this edit exists in the file{names}; code that uses it will fail until an edit containing it is applied."
+    )
+}
+
+/// Retry advice scaled to the refused change: a whole-file rewrite belongs in `write`, and a large
+/// edit is easier to get right in smaller pieces.
+fn refusal_advice(file_lines: usize, changed_old: usize, changed_new: usize) -> String {
+    if file_lines >= LARGE_EDIT_LINES && changed_old * 5 >= file_lines * 4 {
+        "This edit replaces most of the file: send the complete new content once with `write` instead of repeating the old text in an edit, or make smaller edits.".to_owned()
+    } else if changed_old.max(changed_new) >= LARGE_EDIT_LINES {
+        format!(
+            "This edit changes {} lines: split it into smaller edits (one function or block each) and check each result before the next.",
+            changed_old.max(changed_new)
+        )
+    } else {
+        "Fix the edit text and retry.".to_owned()
+    }
 }
 /// Grammar for block and context resolution: the extension's language, or bash for shell rc files
 /// whose names carry none. zsh has no linked grammar and is never guessed.

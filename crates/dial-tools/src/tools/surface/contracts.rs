@@ -23,16 +23,30 @@ pub struct HistoricalCall {
 /// Optional built-in properties added after release whose absence keeps the old meaning, so
 /// history recorded before them stays valid. Removing a pinned property recovers that identity.
 const ADDITIVE_PROPERTIES: &[(&str, &[&str])] = &[
-    ("bash", &["session"]),
+    ("bash", &["session", "pty"]),
     ("bg", &["persist", "lifetime"]),
     ("monitor", &["run"]),
     ("grep", &["output"]),
     ("edit", &["allow_syntax_errors"]),
-    ("task", &["source_session", "model", "isolation_backend"]),
+    ("write", &["allow_syntax_errors"]),
+    ("ast_edit", &["allow_syntax_errors"]),
+    (
+        "task",
+        &[
+            "source_session",
+            "model",
+            "isolation_backend",
+            "acceptance_checks",
+        ],
+    ),
     ("find", &["related"]),
     ("lsp", &["payload"]),
     ("eval", &["background", "title"]),
     ("web_search", &["domains", "exclude_domains"]),
+    (
+        "session_search",
+        &["view", "layer", "record", "offset", "start", "format"],
+    ),
     ("image_gen", &["image"]),
     (
         "data",
@@ -321,7 +335,24 @@ fn native_compatible(old: &Identity, new: &Identity, registry: &Registry) -> boo
                 options.retain(|value| !value.as_str().is_some_and(|s| values.contains(&s)));
             }
         }
-        [schema, before, narrowed]
+        // Optional properties can be introduced in separate releases. Preserve intermediate
+        // identities too, not only the schema with every additive property removed.
+        let mut variants = vec![schema];
+        for property in additive {
+            for index in 0..variants.len() {
+                let mut variant = variants[index].clone();
+                if variant
+                    .pointer_mut("/function/parameters/properties")
+                    .and_then(Value::as_object_mut)
+                    .and_then(|properties| properties.remove(*property))
+                    .is_some()
+                {
+                    variants.push(variant);
+                }
+            }
+        }
+        variants.push(narrowed);
+        variants
     })
     .filter_map(|schema| identities(&[schema], &Registry::new()).remove(&old.name))
     .collect();
@@ -433,6 +464,20 @@ fn controller_compatible(
         });
     }
     let mut before = schema.clone();
+    if old.name == "working_state" {
+        let Some(properties) = before
+            .pointer_mut("/function/parameters/properties")
+            .and_then(Value::as_object_mut)
+        else {
+            return false;
+        };
+        // Admit the revisioned schema immediately preceding optional deliverables too,
+        // not just the older replacement-only schema below.
+        properties.remove("deliverables");
+        if identities(std::slice::from_ref(&before), &Registry::new()).get(&old.name) == Some(old) {
+            return true;
+        }
+    }
     let Some(properties) = before
         .pointer_mut("/function/parameters/properties")
         .and_then(Value::as_object_mut)
@@ -456,7 +501,11 @@ fn controller_compatible(
 
 /// Optional `task` properties added since the prior release, each present at the top level and in
 /// `tasks[]` items. Their absence keeps the old meaning.
-const TASK_ADDITIVE: &[&[&str]] = &[&["source_session", "model"], &["isolation_backend"]];
+const TASK_ADDITIVE: &[&[&str]] = &[
+    &["source_session", "model"],
+    &["isolation_backend"],
+    &["acceptance_checks"],
+];
 
 /// Every prior shape of the current `task` schema: with or without the pool actions and
 /// `concurrency`, and with or without each group in [`TASK_ADDITIVE`]. `None` unless the current

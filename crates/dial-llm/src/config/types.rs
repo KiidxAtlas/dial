@@ -54,6 +54,14 @@ pub struct Config {
     pub chatgpt_pinned_accounts: std::collections::BTreeSet<String>,
     #[serde(skip)]
     pub provider_cache_namespace: Option<String>,
+    /// Runtime only: the merged layers set `[harness] temperature`, so that value pins over a learned
+    /// harness even when it equals the default. Never serialized.
+    #[serde(skip)]
+    pub harness_temperature_pinned: bool,
+    /// Runtime only: the merged layers set `[edit] mode`, even to its default. A local route's
+    /// `assistance.local.edit_mode` still wins; this only lets Dial say so once. Never serialized.
+    #[serde(skip)]
+    pub edit_mode_explicit: bool,
     /// Python with mlx-lm for local models; defaults to the environment `dial setup` creates.
     pub python: PathBuf,
     pub worker: PathBuf,
@@ -219,6 +227,8 @@ impl Default for Config {
             chatgpt_allowed_accounts: None,
             chatgpt_pinned_accounts: Default::default(),
             provider_cache_namespace: None,
+            harness_temperature_pinned: false,
+            edit_mode_explicit: false,
             python: PathBuf::new(),
             worker: PathBuf::new(),
             model: String::new(),

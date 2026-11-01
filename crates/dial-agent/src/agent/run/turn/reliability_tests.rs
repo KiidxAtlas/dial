@@ -292,8 +292,9 @@ fn the_portable_guidance_regeneration_limit_stops_the_turn_instead_of_failing_it
             .begin_turn(&mut backend, &names, 0, "goal", &mut NullUi)
             .unwrap();
         turn.rule_regenerations = agent.config.portable_rules.max_regenerations;
+        let mut engine = crate::agent::run::engine::Engine::default();
         let tick = agent
-            .regenerate_for_guidance(&mut turn, 0, None, None, None, &mut NullUi)
+            .regenerate_for_guidance(&mut turn, &mut engine, 0, (None, None), None, &mut NullUi)
             .expect("the limit must not surface as an error");
         let crate::agent::run::engine::Tick::Finished(report) = tick else {
             panic!("the limit must end the turn");
@@ -401,6 +402,209 @@ fn a_write_and_known_check_in_one_response_run_in_order() {
     assert_eq!(completion_requests(&server).len(), 2);
 }
 
+#[test]
+fn a_native_write_refusal_skips_dependent_work_but_keeps_completed_reads_and_disjoint_writes() {
+    let server = llm::fake::serve(vec![
+        calls(&[
+            (
+                "write",
+                json!({"path":"source.txt","content":"unseen overwrite\n"}),
+            ),
+            ("read", json!({"path":"evidence.txt"})),
+            (
+                "write",
+                json!({"path":"source.txt","content":"dependent overwrite\n"}),
+            ),
+            ("bash", json!({"command":"printf ran > run-started.txt"})),
+            ("check", json!({"names":["candidate"]})),
+            (
+                "write",
+                json!({"path":"independent.txt","content":"independent change\n"}),
+            ),
+            (
+                "write",
+                json!({"path":"source.txt","content":"must not join the disjoint wave\n"}),
+            ),
+            ("read", json!({"path":"source.txt"})),
+        ]),
+        slots(),
+        response(
+            "The source overwrite was refused; independent work is retained.",
+            None,
+        ),
+    ]);
+    with_agent(
+        "approval='auto'\n[compaction]\nenabled=false\n[verification]\nenabled=false\n[[verification.commands]]\nname='candidate'\ncommand='printf ran > check-started.txt'\n[edit]\nenforce_seen_lines=true\n[harness]\nedit_mode='hashline'\n[experimental]\ndependency_dispatch=true\n[task]\nmax_concurrency=4\n",
+        |agent| {
+            connect(agent, &server.url);
+            agent.activate_tools(&["check".into()]).unwrap();
+            let root = agent.workspace.root().to_path_buf();
+            std::fs::write(root.join("source.txt"), "original source\n").unwrap();
+            std::fs::write(root.join("evidence.txt"), "completed sibling evidence\n").unwrap();
+            let report = agent
+                .turn(
+                    "Attempt the batch, retaining diagnostic evidence",
+                    &mut NullUi,
+                )
+                .unwrap();
+            assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+            let results: Vec<Value> = agent
+                .session
+                .messages()
+                .into_iter()
+                .filter(|message| message["role"] == "tool")
+                .collect();
+            assert_eq!(results.len(), 8, "{results:?}");
+            assert_eq!(
+                results[0]["is_error"], true,
+                "native overwrite must be refused: {results:?}"
+            );
+            assert_ne!(results[0]["dial_execution_status"], "skipped");
+            assert!(
+                !agent.edit_preview_intercepted,
+                "write must reach the native validator, not preview interception"
+            );
+            for index in [2, 3, 4, 6] {
+                assert_eq!(
+                    results[index]["dial_execution_status"], "skipped",
+                    "{results:?}"
+                );
+                assert_eq!(results[index]["dial_effects"], "none", "{results:?}");
+            }
+            for (index, evidence) in [(1, "completed sibling evidence"), (7, "original source")] {
+                assert_eq!(results[index]["is_error"], false, "{results:?}");
+                assert!(
+                    results[index]["content"]
+                        .as_str()
+                        .unwrap()
+                        .contains(evidence),
+                    "{results:?}"
+                );
+            }
+            assert_eq!(results[5]["is_error"], false, "{results:?}");
+            assert_eq!(
+                std::fs::read_to_string(root.join("source.txt")).unwrap(),
+                "original source\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("independent.txt")).unwrap(),
+                "independent change\n"
+            );
+            for marker in ["run-started.txt", "check-started.txt"] {
+                assert!(
+                    !root.join(marker).exists(),
+                    "skipped action executed: {marker}"
+                );
+            }
+        },
+    );
+    assert_eq!(completion_requests(&server).len(), 2);
+}
+
+#[test]
+fn an_observational_native_edit_does_not_advance_the_mutation_epoch() {
+    let server = llm::fake::serve(vec![
+        calls(&[
+            ("read", json!({"path":"unchanged.txt"})),
+            (
+                "edit",
+                json!({"path":"unchanged.txt","old_string":"same source","new_string":"same source"}),
+            ),
+        ]),
+        slots(),
+        response("The source already has the requested content.", None),
+    ]);
+    with_agent(
+        "approval='auto'\n[compaction]\nenabled=false\n[verification]\nenabled=false\n[harness]\nedit_mode='replace'\n[edit]\nstreaming_abort=false\n",
+        |agent| {
+            connect(agent, &server.url);
+            std::fs::write(
+                agent.workspace.root().join("unchanged.txt"),
+                "same source\n",
+            )
+            .unwrap();
+            let report = agent
+                .turn("Keep the requested content", &mut NullUi)
+                .unwrap();
+            assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+            let results: Vec<Value> = agent
+                .session
+                .messages()
+                .into_iter()
+                .filter(|message| message["role"] == "tool")
+                .collect();
+            assert_eq!(results.len(), 2, "{results:?}");
+            assert_eq!(results[1]["is_error"], false, "{results:?}");
+            assert_eq!(results[1]["dial_effects"], "none", "{results:?}");
+            assert_eq!(
+                agent.step_checks.mutations, 0,
+                "a successful no-op cannot stale check evidence"
+            );
+        },
+    );
+}
+
+fn tool_results(request: &Value) -> Vec<String> {
+    request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .filter_map(|message| message["content"].as_str().map(str::to_owned))
+        .collect()
+}
+
+#[test]
+fn a_valid_call_to_an_unloaded_deferred_tool_runs_in_the_same_round() {
+    let server = llm::fake::serve(vec![
+        calls(&[("git", json!({"action":"status"}))]),
+        slots(),
+        response("Status read.", None),
+    ]);
+    with_agent("[compaction]\nenabled=false\n", |agent| {
+        connect(agent, &server.url);
+        assert!(
+            !agent.offered().iter().any(|name| name == "git"),
+            "git starts deferred"
+        );
+        let report = agent.turn("Show the git status", &mut NullUi).unwrap();
+        assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+        assert!(
+            agent.offered().iter().any(|name| name == "git"),
+            "and stays loaded"
+        );
+    });
+    let requests = completion_requests(&server);
+    assert_eq!(requests.len(), 2);
+    let results = tool_results(&requests[1]);
+    assert_eq!(results.len(), 1);
+    assert!(!results[0].contains("invalid tool call"), "{}", results[0]);
+}
+
+#[test]
+fn an_invalid_call_to_an_unloaded_deferred_tool_is_refused_with_its_schema() {
+    let server = llm::fake::serve(vec![
+        calls(&[("git", json!({"action":"frobnicate"}))]),
+        slots(),
+        response("Will retry.", None),
+    ]);
+    with_agent("[compaction]\nenabled=false\n", |agent| {
+        connect(agent, &server.url);
+        agent.turn("Show the git status", &mut NullUi).unwrap();
+    });
+    let requests = completion_requests(&server);
+    let results = tool_results(&requests[1]);
+    assert_eq!(results.len(), 1);
+    assert!(
+        results[0]
+            .contains("git was loaded this round, but these arguments do not match its schema")
+            && results[0].contains("this call was not executed")
+            && results[0].contains("\"branch_create\""),
+        "{}",
+        results[0]
+    );
+}
+
 const FAILING_NOTE_CHECK: &str = "[compaction]\nenabled=false\n[[verification.commands]]\nname=\"notes\"\ncommand=\"echo note check failed; exit 1\"\nfile_extensions=[\"txt\"]\ntimeout_secs=5\n";
 
 #[test]
@@ -494,36 +698,41 @@ fn text_call() -> llm::fake::Script {
 }
 
 #[test]
-fn alternating_recoveries_without_progress_are_redirected_then_stopped() {
-    // Each unusable reply is followed by a failing tool call, which resets the unusable-reply
-    // cap without being progress. Only the shared ledger sees the loop.
+fn alternating_recoveries_without_progress_stop_without_a_redirect_prompt() {
+    // Each unusable reply is followed by a failing tool call. Both consume one shared
+    // recovery attempt; resetting the unusable-reply cap cannot conceal the failed-tool rounds.
     let mut scripts = vec![text_call(), slots()];
-    for index in 0..15 {
+    for index in 0..8 {
         scripts.push(response(
             "",
             Some(("read", json!({"path":format!("missing-{index}.txt")}))),
         ));
-        scripts.push(text_call());
+        if index < 7 {
+            scripts.push(text_call());
+        }
     }
     let server = llm::fake::serve(scripts);
     let report = with_agent("[compaction]\nenabled=false\n", |agent| {
         connect(agent, &server.url);
         agent.turn("Read the file", &mut NullUi).unwrap()
     });
-    assert_eq!(report.outcome, TurnOutcome::Incomplete, "{}", report.text);
+    assert_eq!(report.outcome, TurnOutcome::Blocked, "{}", report.text);
     assert!(
         report.text.contains("16 recovery attempts in a row")
-            && report.text.contains("unusable tool call ×16"),
+            && report.text.contains("unusable tool call ×8")
+            && report
+                .text
+                .contains("tool round without productive progress ×8"),
         "{}",
         report.text
     );
     let requests = completion_requests(&server);
-    assert_eq!(requests.len(), 31, "no request after the ladder stops");
+    assert_eq!(requests.len(), 16, "no request after the ladder stops");
     assert!(
         requests
             .iter()
-            .any(|request| mentions(request, "6 recovery attempts in a row")),
-        "the redirecting note reaches the model"
+            .all(|request| !mentions(request, "6 recovery attempts in a row")),
+        "the progress allowance must not inject a redirect instruction"
     );
 }
 
@@ -838,7 +1047,7 @@ fn file_handles_are_projected_for_the_model_but_expanded_for_approval_and_ui() {
 }
 
 #[test]
-fn a_known_tool_typed_into_bash_gets_tool_load_guidance_and_the_unchanged_retry_stays_withheld() {
+fn a_known_tool_typed_into_bash_gets_direct_coaching_and_the_unchanged_retry_stays_withheld() {
     // `todo` is a Dial tool name that is not a shell program, so the real shell reports it missing.
     let typed = json!({"command":"todo list"});
     let server = llm::fake::serve(vec![
@@ -854,6 +1063,14 @@ fn a_known_tool_typed_into_bash_gets_tool_load_guidance_and_the_unchanged_retry_
     assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
     let requests = completion_requests(&server);
     assert_eq!(requests.len(), 3);
+    assert!(
+        requests[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["function"]["name"] == "todo"),
+        "direct coaching requires the tool's supplied schema"
+    );
     let tool_results = |request: &Value| -> Vec<String> {
         request["messages"]
             .as_array()
@@ -866,7 +1083,9 @@ fn a_known_tool_typed_into_bash_gets_tool_load_guidance_and_the_unchanged_retry_
     let first = tool_results(&requests[1]);
     assert_eq!(first.len(), 1, "{first:?}");
     assert!(
-        first[0].contains("tool_not_shell") && first[0].contains("tool_load"),
+        first[0].contains("tool_not_shell")
+            && first[0].contains("Call it directly with its supplied schema")
+            && !first[0].contains("tool_load"),
         "{}",
         first[0]
     );
@@ -881,10 +1100,23 @@ fn a_known_tool_typed_into_bash_gets_tool_load_guidance_and_the_unchanged_retry_
         "the identical retry must stay withheld: {}",
         second[1]
     );
+    let original: String = first[0]
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap()
+        .chars()
+        .take(60)
+        .collect();
+    assert!(
+        second[1].contains("Its original error was:") && second[1].contains(&original),
+        "the barrier quotes the original error: {}",
+        second[1]
+    );
 }
 
 #[test]
-fn an_empty_tool_search_keeps_the_raw_result_and_enables_no_new_capability() {
+fn an_empty_tool_search_returns_catalog_without_enabling_a_capability() {
     let server = llm::fake::serve(vec![
         response("", Some(("tool_search", json!({"query":"zzqxjvkmnop"})))),
         slots(),
@@ -926,14 +1158,10 @@ fn an_empty_tool_search_keeps_the_raw_result_and_enables_no_new_capability() {
         .as_str()
         .unwrap()
         .to_owned();
-    assert!(
-        result.starts_with("[]"),
-        "the raw empty result stays: {result}"
-    );
-    assert!(
-        result.contains("No tool was loaded") && result.contains("current configuration"),
-        "the next request carries the no-eligible note: {result}"
-    );
+    let page: Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(page["search_matches"], json!([]));
+    assert_eq!(page["listing"], true);
+    assert!(page["tools"].as_array().unwrap().len() <= 16);
     assert_eq!(
         offered(&requests[0]),
         offered(&requests[1]),

@@ -93,11 +93,7 @@ The response announced further action but stopped. If that action is still neede
 Attempt #{{retryCount}}/{{maxRetries}}
 </system-injection>"#;
 
-/// Full diagnose-first contract, attached once a failure repeats (and to uncertain effects). The
-/// diagnostic remains evidence, not authority to change scope, install dependencies or bypass a
-/// boundary.
-pub(in crate::agent) const DIAGNOSE_FIRST: &str = "Before the next action, briefly tell the user what failed, the cause supported by this result (or explicitly say it is not yet known), and what you will change to address it. Use a diagnostic that names the failing code or prerequisite directly; do not rerun merely to confirm it. If the cause is unknown, obtain the smallest missing evidence instead of guessing. Retry only after correcting the cause or identifying evidence that makes a retry appropriate; changing wording or repeating an equivalent failed call is not recovery. Preserve the requested outcome and report a concrete blocker when correction needs permission or unavailable resources.";
-/// Compact line for the first failure of a kind, so a simple slip costs one sentence.
+/// Compact failure feedback; controller-owned barriers and budgets enforce recovery.
 pub(in crate::agent) const FIRST_FAILURE: &str = "Correct the cause before retrying; unchanged retries require new evidence and understood prior effects.";
 /// Inference failed before the response could enter tool dispatch. This describes only that
 /// response, never earlier operations in the turn or billing at the provider.
@@ -112,6 +108,9 @@ pub(crate) const PERMISSION_OR_POLICY: &str = "Respect the reported boundary. Do
 pub(crate) const INTERRUPTED: &str = "Preserve completed effects. Do not automatically replay the interrupted operation; follow the user's direction and inspect state if continuation is requested.";
 pub(crate) const TIMEOUT: &str = "Inspect the recorded process/task state and completed output. Continue with a narrower bounded operation only when its effects are understood; a timeout is not a code diagnosis.";
 pub(crate) const NOT_EXECUTED: &str = "Resolve the reported ordering, cancellation or prerequisite before making a new call. Do not report this operation as executed.";
+/// A call the offered contract refused before execution: unknown tool, missing or mistyped arguments,
+/// malformed JSON. This is a correctable mistake, never a permission boundary.
+pub(crate) const CALL_CONTRACT: &str = "This is not a permission boundary: the call did not match the offered tool contract and was not executed. Fix the named arguments, or use an offered tool (tool_search/tool_load for an eligible one), then retry. Do not resend the same arguments.";
 pub(crate) const VERIFICATION_ENVIRONMENT: &str = "Diagnose the named runner or environment prerequisite; do not edit application code to hide this failure or install dependencies without approval. Use an already available equivalent check or report the coverage gap.";
 pub(crate) const VERIFICATION_CODE: &str = "Use the observed failing assertion/compiler diagnostic to repair the affected behavior, then rerun that check after the final edit. Do not change the acceptance criterion to obtain a pass. Untouched code can still fail because of a change; establish causality before calling a failure pre-existing. Report confirmed unrelated failures without repairing them.";
 pub(crate) const VERIFICATION_FAILED_UNCLASSIFIED: &str = "The process failed, but its runner has no controller-selected setup classification. Inspect the diagnostic to distinguish an environment prerequisite from a code defect before editing application code; preserve the failing acceptance criterion. Untouched code can still fail because of a change; establish causality before calling a failure pre-existing.";
@@ -119,11 +118,25 @@ pub(crate) const VERIFICATION_UNAVAILABLE: &str = "This result does not establis
 pub(crate) const SOURCE_OR_CALL_CONTRACT: &str = "Use the returned diagnostic to correct the call. For stale or unseen source, use complete current lines and fresh anchors already returned; read only the affected ranges still missing. Do not repeat guessed replacements or split a patch without addressing the reported cause. Do not assume a failed edit applied: inspect any recorded effects and do not make dependent edits that assume its new text, symbols or file exist. If the change is still needed, correct it before building on it; otherwise choose an approach supported by the current source.";
 pub(crate) const TOOL_FAILURE: &str = "Inspect the original diagnostic and execution status. Correct the named arguments, prerequisite or affected code before retrying. If this result does not establish a cause, use a targeted observation to distinguish causes; do not invent a diagnosis, substitute a different acceptance criterion, or treat failure as permission to bypass safeguards.";
 
-pub(crate) fn shell_tool_mistake(name: &str) -> String {
-    let load = serde_json::json!({"names": [name]});
+pub(crate) fn shell_tool_mistake(name: &str, next: &str) -> String {
     format!(
-        "\n[Dial recovery: tool_not_shell] `{name}` is a Dial tool name, not a shell executable. Do not repeat this Bash command or install a program with that name. If `{name}` is already offered, call it directly with its supplied schema. Otherwise use tool_load with {load}, wait for the next request, then call it directly. If unavailable under current policy, report that limit; loading grants no execution, network or filesystem permission."
+        "\n[Dial recovery: tool_not_shell] `{name}` is a Dial tool name, not a shell executable. Do not repeat this Bash command or install a program with that name. {next} Loading or a suggestion grants no execution, network or filesystem permission."
     )
 }
 
-pub(crate) const EMPTY_DISCOVERY: &str = "\n[Dial discovery: no eligible matches] No tool was loaded. This search found no eligible match, not proof that all capabilities are absent. To check the full eligible list, call tool_search with query \"*\", then each returned next_query (\"*:N\") while present; the listing loads nothing and shows descriptions only. If the needed tool is already offered, call it directly. If its exact name is in Loadable tools, use tool_load with that name and wait for the next request. Otherwise make one more specific capability query only if it adds new information, or report that the capability is unavailable under the current configuration. Do not invoke tool names through Bash, invent search results, or bypass a refusal.";
+pub(crate) fn launch_diagnostic_advice(facts: &str, next: &str) -> String {
+    format!(
+        "\n[Dial launch advisory] {facts} Output prose is diagnostic evidence only; tool status and process success are unchanged. {next} Preserve prior effects, approvals and scope; never install dependencies or bypass a refusal based on this hint."
+    )
+}
+
+pub(crate) fn managed_launch_observation(failed: bool, next: &str) -> String {
+    let state = if failed {
+        "The observed process exited unsuccessfully, even if this bg observation has tool status ok. Inspect its retained output and original launch before any corrected run."
+    } else {
+        "The recorded job has no observed exit yet. Observe/control that existing job; do not launch a duplicate merely to change input mode."
+    };
+    format!(
+        "\n[Dial launch advisory] {state} {next} This note grants no execution permission and does not change status, retry rules or effects."
+    )
+}

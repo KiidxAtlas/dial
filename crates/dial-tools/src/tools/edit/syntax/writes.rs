@@ -242,3 +242,39 @@ fn allow_syntax_errors_is_valid_in_every_edit_grammar() {
         crate::tools::edit::editing::validate_shape(mode, &args).unwrap();
     }
 }
+
+#[test]
+fn lean_write_refuses_new_errors_before_commit_and_preserves_the_witness() {
+    let root = tempfile::tempdir().unwrap();
+    let ws = lean(root.path(), EditMode::Hashline);
+    let path = root.path().join("a.rs");
+    let original = "fn a() {}\n";
+    std::fs::write(&path, original).unwrap();
+    let read = execute(&ws, "read", &json!({"path":"a.rs"}), 5);
+    assert!(!read.is_error, "{}", read.text);
+    let breaking = json!({"path":"a.rs","content":"fn a( {"});
+    let out = execute(&ws, "write", &breaking, 5);
+    assert!(out.is_error, "{}", out.text);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    assert!(out.execution.changed_paths.is_empty());
+    let corrected = execute(
+        &ws,
+        "write",
+        &json!({"path":"a.rs","content":"fn b() {}\n"}),
+        5,
+    );
+    assert!(!corrected.is_error, "{}", corrected.text);
+    let mut allowed = breaking;
+    allowed["allow_syntax_errors"] = json!(true);
+    let out = execute(&ws, "write", &allowed, 5);
+    assert!(!out.is_error, "{}", out.text);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "fn a( {");
+    let out = execute(
+        &ws,
+        "write",
+        &json!({"path":"new.py","content":"def broken(:\n"}),
+        5,
+    );
+    assert!(out.is_error, "{}", out.text);
+    assert!(!root.path().join("new.py").exists());
+}

@@ -1,7 +1,7 @@
 //! The result value every tool returns: model-facing text, optional structured data, and the
 //! execution facts the controller decides from. Tool implementations and the storage layer both
 //! produce and consume it, so it lives with the other core execution types.
-use super::execution::{Effects, Execution, ToolStatus};
+use super::execution::{Effects, Execution, ShellLaunch, ShellStdin, ToolStatus};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -76,6 +76,50 @@ impl ToolOutput {
         }
         self
     }
+    /// Attach native launch facts, retaining the compatibility payload and factual model note.
+    /// Neither diagnostic prose nor a payload claim can populate these execution facts.
+    pub fn with_shell_launch(mut self, launch: ShellLaunch) -> Self {
+        let already_noted = self
+            .execution
+            .shell_launch
+            .as_ref()
+            .is_some_and(|previous| {
+                previous.stdin == launch.stdin
+                    && previous.terminal_allocated == launch.terminal_allocated
+            });
+        let mut data_launch = serde_json::json!({
+            "stdin": launch.stdin,
+            "output": "captured",
+            "terminal_allocated": launch.terminal_allocated,
+        });
+        if let Some(job) = &launch.job {
+            data_launch["job"] = Value::String(job.clone());
+        }
+        let data = self.data.get_or_insert_with(|| serde_json::json!({}));
+        if let Some(data) = data.as_object_mut() {
+            data.insert("shell_launch".into(), data_launch);
+        }
+        if !already_noted {
+            let stdin = match launch.stdin {
+                ShellStdin::Eof => "EOF",
+                ShellStdin::Pipe => "pipe",
+                ShellStdin::Terminal => "terminal",
+            };
+            let terminal = if launch.terminal_allocated {
+                "terminal allocated"
+            } else {
+                "no terminal allocated"
+            };
+            if !self.text.ends_with('\n') {
+                self.text.push('\n');
+            }
+            self.text.push_str(&format!(
+                "[shell launch: stdin={stdin}; output=captured; {terminal}]\n"
+            ));
+        }
+        self.execution.shell_launch = Some(launch);
+        self
+    }
     pub fn with_status(mut self, status: ToolStatus) -> Self {
         self.execution.status = Some(status);
         self.is_error |= status != ToolStatus::Ok;
@@ -93,6 +137,11 @@ impl ToolOutput {
 
     pub fn with_output_integrity(mut self, output: super::execution::OutputIntegrity) -> Self {
         self.execution.output = Some(output);
+        self
+    }
+
+    pub fn with_captures(mut self, captures: Vec<super::execution::NativeCapture>) -> Self {
+        self.execution.captures.extend(captures);
         self
     }
 

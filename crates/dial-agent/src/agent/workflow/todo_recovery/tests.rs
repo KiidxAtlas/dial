@@ -11,6 +11,28 @@ fn call(op: &str) -> ToolCall {
 }
 
 #[test]
+fn a_done_after_a_refused_edit_is_flagged_including_shorthand() {
+    let shorthand = ToolCall {
+        arguments: json!({"done": true, "task": 2}),
+        ..call("start")
+    };
+    for (todo, succeeded, refused, expected) in [
+        (call("done"), true, true, true),
+        (shorthand, true, true, true),
+        (call("done"), true, false, false),
+        (call("done"), false, true, false),
+        (call("start"), true, true, false),
+    ] {
+        assert_eq!(
+            refused_edit_done_note(&todo, succeeded, refused).is_some(),
+            expected,
+            "{} succeeded={succeeded} refused={refused}",
+            todo.arguments
+        );
+    }
+}
+
+#[test]
 fn todo_only_responses_are_noted_once_and_not_when_forced() {
     let read = ToolCall {
         id: "r".into(),
@@ -18,11 +40,28 @@ fn todo_only_responses_are_noted_once_and_not_when_forced() {
         arguments: json!({"path":"a.rs"}),
         malformed_arguments: false,
     };
-    assert!(solo_update_note(&[call("done")], false, false).is_some());
-    assert!(solo_update_note(&[call("done"), call("start")], false, false).is_some());
-    assert!(solo_update_note(&[call("done"), read], false, false).is_none());
-    assert!(solo_update_note(&[call("done")], false, true).is_none());
-    assert!(solo_update_note(&[call("set")], true, false).is_none());
+    for (planning_required, single_call, already_noted, expected) in [
+        (false, false, false, true),
+        (true, false, false, false),
+        (false, true, false, false),
+        (true, true, false, false),
+        (false, false, true, false),
+    ] {
+        assert_eq!(
+            solo_update_note(
+                &[call("set")],
+                planning_required,
+                single_call,
+                already_noted
+            )
+            .is_some(),
+            expected,
+            "planning_required={planning_required}, single_call={single_call}, already_noted={already_noted}"
+        );
+    }
+    assert!(solo_update_note(&[call("done"), call("start")], false, false, false).is_some());
+    assert!(solo_update_note(&[call("done"), read], false, false, false).is_none());
+    assert!(solo_update_note(&[], false, false, false).is_none());
 }
 
 #[test]

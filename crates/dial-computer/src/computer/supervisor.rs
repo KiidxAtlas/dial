@@ -13,6 +13,22 @@ use serde_json::{Value, json};
 use crate::computer::desktop::types::DesktopSessionOptions;
 use crate::computer::desktop::{CancelReason, DesktopSession};
 use crate::computer::rpc::{ComputerError, ComputerResult, desktop_error, dispatch};
+use crate::runtime::execution::NativeCapture;
+
+/// Worker payload and host-observed native capture facts travel separately.
+pub struct RunOutput {
+    pub value: Value,
+    pub captures: Vec<NativeCapture>,
+}
+
+impl RunOutput {
+    pub(super) fn plain(value: Value) -> Self {
+        Self {
+            value,
+            captures: Vec::new(),
+        }
+    }
+}
 
 const MAX_FRAME: usize = crate::runtime::json_transport::MAX_FRAME;
 #[cfg(unix)]
@@ -108,11 +124,57 @@ impl Worker {
 }
 
 struct Run {
-    reply: flume::Sender<ComputerResult<Value>>,
+    reply: flume::Sender<ComputerResult<RunOutput>>,
+    captures: NativeCaptures,
     host: Arc<dyn ComputerHost>,
     tool_signals: HashMap<String, AbortSignal>,
     /// Generation of the worker that admitted this run; replies bind to it.
     generation: u64,
+}
+
+/// Native RPCs are threaded. Bind captures to a quiet effect epoch, not reply arrival order.
+#[derive(Default)]
+struct NativeCaptures {
+    epoch: u64,
+    mutations: usize,
+    receipts: Vec<NativeCapture>,
+}
+
+impl NativeCaptures {
+    fn begin(&mut self, mutation: bool) -> Option<u64> {
+        if mutation {
+            self.epoch += 1;
+            self.mutations += 1;
+            self.receipts.clear();
+        }
+        (self.mutations == 0).then_some(self.epoch)
+    }
+
+    fn complete(&mut self, mutation: bool, epoch: Option<u64>, capture: Option<NativeCapture>) {
+        if mutation {
+            self.mutations -= 1;
+            self.epoch += 1;
+            self.receipts.clear();
+        } else if self.mutations == 0
+            && epoch == Some(self.epoch)
+            && let Some(capture) = capture
+        {
+            self.receipts.push(capture);
+        }
+    }
+}
+
+/// An evidence invalidation policy, not an approval grant. Unknown native methods fail closed.
+fn native_may_mutate(method: &str) -> bool {
+    !matches!(
+        method,
+        "capture" | "captureRegion" | "observe" | "capabilities" | "listDisplays"
+        | "listWindows" | "getWindow" | "listApplications" | "menuItems" | "controlState"
+        | "axSnapshot" | "axQuery" | "axElementAt" | "axFocused" | "axNode"
+        | "axAttributes" | "axChildren" | "axParent" | "clipboardRead"
+        // Successful run cleanup retires outstanding requests; it does not send desktop input.
+        | "retire"
+    )
 }
 
 struct State {
@@ -213,7 +275,7 @@ impl ComputerSupervisor {
         request: &RunRequest,
         host: Arc<dyn ComputerHost>,
         signal: &AbortSignal,
-    ) -> ComputerResult<Value> {
+    ) -> ComputerResult<RunOutput> {
         let inner = &self.inner;
         if signal.is_aborted() {
             return Err(ComputerError::abort(ABORTED));
@@ -247,6 +309,7 @@ impl ComputerSupervisor {
                     host,
                     tool_signals: HashMap::new(),
                     generation,
+                    captures: NativeCaptures::default(),
                 },
             );
             id
@@ -740,7 +803,10 @@ fn resolve_run(inner: &Arc<Inner>, message: &Value, ok: bool) {
         return;
     };
     let result = if ok {
-        Ok(message.get("payload").cloned().unwrap_or(Value::Null))
+        Ok(RunOutput {
+            value: message.get("payload").cloned().unwrap_or(Value::Null),
+            captures: run.captures.receipts,
+        })
     } else {
         Err(payload_error(message))
     };
@@ -867,15 +933,24 @@ fn spawn_native(inner: &Arc<Inner>, generation: u64, message: &Value) {
         .unwrap_or_default()
         .to_owned();
     let args = message.get("args").cloned().unwrap_or(Value::Null);
-    let (session, stopped) = {
-        let st = inner.state.lock();
-        let Some(worker) = st.worker.as_ref().filter(|w| w.generation == generation) else {
+    let mutation = native_may_mutate(&method);
+    let (session, stopped, capture_scope) = {
+        let mut st = inner.state.lock();
+        let Some(stopped) = st
+            .worker
+            .as_ref()
+            .filter(|w| w.generation == generation)
+            .map(|worker| worker.stopped.clone())
+        else {
             return;
         };
-        (
-            st.session.as_ref().map(|session| session.admit()),
-            worker.stopped.clone(),
-        )
+        let session = st.session.as_ref().map(|session| session.admit());
+        let capture_scope = st
+            .runs
+            .iter_mut()
+            .find(|(_, run)| run.generation == generation)
+            .map(|(id, run)| (*id, run.captures.begin(mutation)));
+        (session, stopped, capture_scope)
     };
     // These boundaries only invalidate tokens/revoke control; they never wait
     // for the native worker. Apply them in protocol order before admitting the
@@ -894,6 +969,16 @@ fn spawn_native(inner: &Arc<Inner>, generation: u64, message: &Value) {
             Some(session) => dispatch(&session, &method, args),
             None => Err(ComputerError::tool(NO_SESSION)),
         });
+        if let Some((run_id, epoch)) = capture_scope
+            && let Some(run) = inner.state.lock().runs.get_mut(&run_id)
+            && run.generation == generation
+        {
+            let capture = result
+                .as_ref()
+                .ok()
+                .and_then(|value| native_capture(&method, value));
+            run.captures.complete(mutation, epoch, capture);
+        }
         let reply = match result {
             Ok(value) => json!({"type": "native-result", "id": id, "ok": true, "value": value}),
             Err(error) => json!({
@@ -905,6 +990,38 @@ fn spawn_native(inner: &Arc<Inner>, generation: u64, message: &Value) {
         };
         let _ = send_reply(&inner, generation, &reply);
     });
+}
+
+/// Called only on the Rust desktop RPC result, never on worker-authored displays/return values.
+fn native_capture(method: &str, value: &Value) -> Option<NativeCapture> {
+    use base64::Engine;
+    let value = match method {
+        "capture" | "captureRegion" => value,
+        "observe" => &value["capture"],
+        _ => return None,
+    };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(value["data"].as_str()?)
+        .ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let target = value["target"]
+        .as_str()
+        .filter(|target| !target.is_empty())
+        .and_then(|target| {
+            if target == "desktop" || target.starts_with("display:") {
+                // Resolve selectors only from the actual capture's single-display metadata.
+                let displays = value["displays"].as_array()?;
+                if displays.len() != 1 {
+                    return None;
+                }
+                Some(format!("display:{}", displays[0]["id"].as_str()?))
+            } else {
+                Some(format!("window:{target}"))
+            }
+        });
+    Some(NativeCapture::new(&bytes, "image/png", target))
 }
 
 /// Writes a reply to the issuing generation only; fails once that worker is no longer current.

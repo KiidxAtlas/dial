@@ -3,16 +3,6 @@ use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[test]
-fn exit_codes_survive_artifact_footers() {
-    assert_eq!(
-        exit_code("ok\n[exit code: 0]\n[complete output: artifact://abc]\n"),
-        Some(0)
-    );
-    assert_eq!(exit_code("failed\n[exit code: 3]\n"), Some(3));
-    assert_eq!(exit_code("[exit code: nope]\n"), None);
-}
-
-#[test]
 fn a_timed_out_or_killed_check_failed_but_a_cancelled_one_settles_nothing() {
     let run = |exit_code, signal, timed_out, cancelled| {
         check_failed(

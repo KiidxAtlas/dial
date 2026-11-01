@@ -120,21 +120,31 @@ fn a_resumed_round_ends_the_rejected_attempt_but_keeps_delivered_advice_and_revi
 }
 
 #[test]
-fn only_new_direction_starts_the_recovery_ladder_over() {
-    use super::super::progress::{REDIRECT_AT, Rung, Setback};
+fn only_a_fresh_instruction_starts_the_engine_recovery_allowance_over() {
+    use super::super::progress::{Rung, STOP_AT, Setback};
     for (transition, starts_over) in [
         (Transition::Steering, true),
-        (Transition::DirectedContinue, true),
-        (Transition::Resumed, true),
+        (Transition::DirectedContinue, false),
+        (Transition::Resumed, false),
         (Transition::AutomaticContinue, false),
         (Transition::ContextRewritten, false),
     ] {
-        with_turn(|turn| {
-            for _ in 1..REDIRECT_AT {
-                assert_eq!(turn.progress.setback(Setback::NoAnswer), Rung::Retry);
+        with_agent("[compaction]\nenabled=false\n", |agent| {
+            connect(agent, "http://127.0.0.1:9");
+            let mut backend = agent.backend.take().unwrap();
+            let names = agent.offered();
+            let mut schemas = agent.schemas(&names).unwrap();
+            let mut turn = agent
+                .begin_turn(&mut backend, &names, 0, "goal", &mut NullUi)
+                .unwrap();
+            let mut engine = crate::agent::run::engine::Engine::default();
+            for _ in 1..STOP_AT {
+                assert_eq!(engine.setback(Setback::NoAnswer), Rung::Retry);
             }
-            turn.reset(transition);
-            let rung = turn.progress.setback(Setback::NoAnswer);
+            agent
+                .transition_turn(&mut turn, &mut engine, transition, &backend, &mut schemas)
+                .unwrap();
+            let rung = engine.setback(Setback::NoAnswer);
             assert_eq!(rung == Rung::Retry, starts_over, "{transition:?}: {rung:?}");
         });
     }

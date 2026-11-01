@@ -238,14 +238,54 @@ impl<'a> Agent<'a> {
         self.prepare_compaction_memory(ui, Some(backend));
         let mut snapshot = self.compaction_snapshot(template)?;
         snapshot.native_profile = backend.compaction_profile().cloned();
+        let completion_context =
+            crate::agent::compact::compaction_runtime::PortableSummaryContext {
+                config: snapshot
+                    .role_config
+                    .clone()
+                    .unwrap_or_else(|| snapshot.main_config.clone()),
+                layout: self.layout.clone(),
+                root: self.workspace.root().to_path_buf(),
+                control_state: self.session.control_state(),
+                session_id: snapshot.session_id.clone(),
+                hermetic: self.hermetic,
+            };
+        let mut execution = crate::agent::compact::compaction_runtime::summary_execution(
+            &snapshot,
+            completion_context.clone(),
+            self.tool_hooks(),
+            backend,
+            self.maintenance_has_live_work(),
+        )?;
+        let summary_scope = self
+            .usage_scope
+            .worker()
+            .for_purpose(llm::usage::Purpose::Compaction);
+        if let Some(parallel) = &mut execution.parallel {
+            parallel
+                .backend
+                .set_usage_scope(Some(summary_scope.clone()));
+        }
+        let summary_expires = Instant::now()
+            .checked_add(Duration::from_secs(
+                crate::agent::compact::compaction_runtime::maintenance_timeout(
+                    snapshot.timeout_secs,
+                ),
+            ))
+            .context("summary deadline overflow")?;
+        let mut live_complete =
+            crate::agent::compact::compaction_runtime::portable_summary_completion(
+                completion_context,
+                self.tool_hooks().to_vec(),
+            );
         let cancel = self.interrupt.clone();
         let namespace =
             crate::agent::compact::compaction_runtime::side_request_namespace(self.session.id())?;
         let previous_cache = backend.swap_cache_namespace(&namespace, &self.auth_config)?;
-        let previous_namespace = self.active_side_namespace.replace(namespace);
+        let previous_namespace = self.active_side_namespace.replace(namespace.clone());
         let mut context = snapshot.context();
         context.supplemental_context = supplemental_context.as_deref();
-        let prepared = crate::agent::compact::compaction::compact_history(
+        let prepared = crate::agent::compact::compaction::compact_history_with_execution(
             backend,
             crate::agent::compact::compaction::HistoryCompaction {
                 request: &snapshot.source,
@@ -256,15 +296,61 @@ impl<'a> Agent<'a> {
             cancel,
             ui,
             &mut |backend, request, ui| {
-                self.role_chat(
-                    backend,
-                    "small",
-                    llm::usage::Purpose::Compaction,
-                    request,
-                    ui,
-                )
+                if request
+                    .messages
+                    .iter()
+                    .any(|m| m["dial_compaction_handoff"] == true)
+                {
+                    let remaining = summary_expires.saturating_duration_since(Instant::now());
+                    ensure!(!remaining.is_zero(), "summary deadline expired");
+                    // Borrow only the cache key. The live session/account and canonical branch never move.
+                    let private_cache =
+                        backend.swap_cache_namespace(&namespace, &self.auth_config)?;
+                    backend.restore_cache_namespace(previous_cache.clone());
+                    let old_scope = backend.set_usage_scope(Some(summary_scope.clone()));
+                    let result = live_complete(
+                        backend,
+                        request,
+                        ui,
+                        self.interrupt.clone(),
+                        remaining.as_secs().max(1),
+                    );
+                    backend.set_usage_scope(old_scope);
+                    backend.restore_cache_namespace(private_cache);
+                    result
+                } else {
+                    let config = snapshot
+                        .role_config
+                        .as_ref()
+                        .unwrap_or(&snapshot.main_config);
+                    let _slot = crate::agent::model::provider_slots::acquire_checked(
+                        config,
+                        || -> Result<()> {
+                            if self.interrupt.load(Ordering::SeqCst) {
+                                return Err(llm::Interrupted.into());
+                            }
+                            ensure!(
+                                Instant::now() < summary_expires,
+                                "summary deadline expired while waiting for a provider slot"
+                            );
+                            Ok(())
+                        },
+                        || ui.notice(crate::agent::model::provider_slots::QUEUED_NOTICE),
+                    )?;
+                    let remaining = summary_expires.saturating_duration_since(Instant::now());
+                    ensure!(!remaining.is_zero(), "summary deadline expired");
+                    self.bounded_role_chat(
+                        backend,
+                        "small",
+                        llm::usage::Purpose::Compaction,
+                        request,
+                        ui,
+                        remaining.as_secs().max(1),
+                    )
+                }
             },
             None,
+            &mut execution,
         );
         self.active_side_namespace = previous_namespace;
         backend.restore_cache_namespace(previous_cache);

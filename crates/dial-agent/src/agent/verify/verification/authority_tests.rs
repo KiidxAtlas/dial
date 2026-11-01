@@ -17,7 +17,10 @@ fn printed_success_cannot_replace_observed_process_termination() {
         cancelled: false,
         output_complete: true,
     });
-    assert_eq!(classify(&check, &failed, false), CheckStatus::CodeFailed);
+    assert_eq!(
+        classify(&check, &failed, false),
+        CheckStatus::FailedUnknownCause
+    );
 }
 
 #[test]
@@ -39,10 +42,12 @@ fn repair_exits_use_typed_completion_and_invalidate_unknown_runs() {
         output_complete: true,
     };
     let passed = ToolOutput::ok("[exit code: 9]".into()).with_process(process.clone());
-    let failed = ToolOutput::err("[exit code: 0]").with_process(ProcessOutcome {
-        exit_code: Some(7),
-        ..process.clone()
-    });
+    let failed = ToolOutput::err("AssertionError: expected 7, got 0\n[exit code: 0]").with_process(
+        ProcessOutcome {
+            exit_code: Some(7),
+            ..process.clone()
+        },
+    );
     for (output, expected) in [(&passed, Some(0)), (&failed, Some(7))] {
         let verdict = classify(&check, output, false);
         assert_eq!(verdict.repair_exit_code(output), expected);
@@ -50,6 +55,10 @@ fn repair_exits_use_typed_completion_and_invalidate_unknown_runs() {
     let unknowns = [
         ToolOutput::ok("[exit code: 0]".into()),
         ToolOutput::err("[exit code: 7]"),
+        ToolOutput::err("check failed").with_process(ProcessOutcome {
+            exit_code: Some(7),
+            ..process.clone()
+        }),
         ToolOutput::ok("partial\n[exit code: 0]".into()).with_process(ProcessOutcome {
             output_complete: false,
             ..process.clone()
@@ -153,7 +162,7 @@ fn declared_runner_diagnosis_requires_launch_facts_and_preserves_app_errors() {
             &failed("python3: No module named pytest"),
             false
         ),
-        CheckStatus::CodeFailed
+        CheckStatus::FailedUnknownCause
     );
     let app = FocusedCheck {
         command: "python3 app.py".into(),
@@ -166,8 +175,84 @@ fn declared_runner_diagnosis_requires_launch_facts_and_preserves_app_errors() {
             &failed("python3: No module named pytest"),
             false
         ),
-        CheckStatus::CodeFailed
+        CheckStatus::FailedUnknownCause
     );
+}
+
+#[test]
+fn nonzero_exit_requires_affirmative_diagnostic_before_source_repair() {
+    use crate::runtime::{execution::ProcessOutcome, tool_output::ToolOutput};
+    for (text, expected) in [
+        ("", CheckStatus::FailedUnknownCause),
+        ("failed", CheckStatus::FailedUnknownCause),
+        ("FAILED", CheckStatus::FailedUnknownCause),
+        ("FAIL network setup", CheckStatus::FailedUnknownCause),
+        (
+            "error: network unavailable",
+            CheckStatus::FailedUnknownCause,
+        ),
+        (
+            "PermissionError: access denied",
+            CheckStatus::FailedUnknownCause,
+        ),
+        (
+            "warning: unused variable\n --> src/lib.rs:2:1",
+            CheckStatus::FailedUnknownCause,
+        ),
+        (
+            "bash: tool: command not found",
+            CheckStatus::FailedUnknownCause,
+        ),
+        ("AssertionError: expected 1, got 2", CheckStatus::CodeFailed),
+        ("error[E0308]: mismatched types", CheckStatus::CodeFailed),
+        (
+            "app.c:3:2: error: incompatible pointer type",
+            CheckStatus::CodeFailed,
+        ),
+        ("app/main.go:3: undefined: answer", CheckStatus::CodeFailed),
+        ("test regression ... FAILED", CheckStatus::CodeFailed),
+        ("--- FAIL: TestRegression (0.00s)", CheckStatus::CodeFailed),
+        (
+            "FAIL: test_regression (tests.Regression)",
+            CheckStatus::CodeFailed,
+        ),
+        (
+            "FAILED tests/test_app.py::test_regression - wrong answer",
+            CheckStatus::CodeFailed,
+        ),
+        ("  ● regression returns answer", CheckStatus::CodeFailed),
+    ] {
+        let output = ToolOutput::err(text).with_process(ProcessOutcome {
+            started: true,
+            exit_code: Some(1),
+            signal: None,
+            timed_out: false,
+            cancelled: false,
+            output_complete: true,
+        });
+        // A named focused check does not itself establish the cause of its nonzero exit.
+        for check in [
+            None,
+            Some(&FocusedCheck {
+                name: "focused".into(),
+                command: "runner check".into(),
+                timeout_secs: 1,
+            }),
+        ] {
+            let status = classify_output(check, &output, false);
+            assert_eq!(status, expected, "{text:?}");
+            assert_eq!(
+                status.repairable(),
+                expected == CheckStatus::CodeFailed,
+                "{text:?}"
+            );
+            assert_eq!(
+                status.repair_exit_code(&output),
+                (expected == CheckStatus::CodeFailed).then_some(1),
+                "{text:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -215,45 +300,56 @@ fn clipped_checks_use_complete_artifacts_and_never_infer_from_missing_evidence()
     };
     let root = tempfile::tempdir().unwrap();
     let store = crate::storage::artifact::ArtifactStore::new(root.path()).unwrap();
-    for (raw, expected) in [
+    for (raw, exit, expected) in [
         (
             format!(
                 "{}\nRan 0 tests\n{}",
                 "prefix\n".repeat(4000),
                 "suffix\n".repeat(4000)
             ),
+            0,
             CheckStatus::Unverified,
         ),
         (
             "running 1 test\nrunning 0 tests\n".into(),
+            0,
             CheckStatus::Passed,
         ),
         (
             "? pkg [no test files]\nok other 0.01s\n".into(),
+            0,
             CheckStatus::Passed,
         ),
-        ("build complete\n".into(), CheckStatus::Passed),
-        ("x".repeat(1024 * 1024 + 1), CheckStatus::Unverified),
+        ("build complete\n".into(), 0, CheckStatus::Passed),
+        ("x".repeat(1024 * 1024 + 1), 0, CheckStatus::Unverified),
+        (
+            "AssertionError: regression\n".into(),
+            1,
+            CheckStatus::CodeFailed,
+        ),
+        ("failed\n".into(), 1, CheckStatus::FailedUnknownCause),
     ] {
         let (uri, mut integrity) = store.retain_with_integrity(&raw).unwrap();
         integrity.capture = Completeness::Complete;
         integrity.presentation = Completeness::Partial;
         integrity.artifact = Some(uri);
-        let display = if expected == CheckStatus::Unverified {
-            "prefix\n[... clipped ...]\nsuffix\n[exit code: 0]"
-        } else {
-            "running 0 tests\n[exit code: 0]"
+        let display = match expected {
+            CheckStatus::FailedUnknownCause => "AssertionError: not present in complete output",
+            CheckStatus::CodeFailed => "failed\n[... clipped ...]",
+            CheckStatus::Unverified => "prefix\n[... clipped ...]\nsuffix\n[exit code: 0]",
+            _ => "running 0 tests\n[exit code: 0]",
         };
         let mut output = ToolOutput::ok(display.into())
             .with_process(ProcessOutcome {
                 started: true,
-                exit_code: Some(0),
+                exit_code: Some(exit),
                 signal: None,
                 timed_out: false,
                 cancelled: false,
                 output_complete: true,
             })
             .with_output_integrity(integrity);
+        output.is_error = exit != 0;
         assert_eq!(
             classify_with_artifacts(None, None, &output, false, Some(&store)),
             expected

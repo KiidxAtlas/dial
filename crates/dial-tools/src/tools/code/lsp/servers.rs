@@ -352,9 +352,73 @@ fn find_program(
             }
         }
     }
+    let root = roots.first().copied().unwrap_or(ws_root);
     dirs.iter()
         .map(|dir| dir.join(program))
-        .find(|candidate| is_executable(candidate))
+        .filter(|candidate| is_executable(candidate))
+        .find_map(|candidate| match pyenv_shim(&candidate, dirs) {
+            Some(pyenv) => command_path(&pyenv, &["which", &program.to_string_lossy()], root),
+            None => Some(candidate),
+        })
+        .or_else(|| toolchain_program(program, root, dirs))
+}
+
+/// The `pyenv` that owns `candidate` when it is a pyenv shim. A shim exists for every version
+/// that installed the command and fails at startup under any other, so it must be resolved.
+fn pyenv_shim(candidate: &Path, dirs: &[PathBuf]) -> Option<PathBuf> {
+    let shims = candidate.parent()?;
+    if shims.file_name()? != "shims" {
+        return None;
+    }
+    std::iter::once(shims.with_file_name("bin"))
+        .chain(dirs.iter().cloned())
+        .map(|dir| dir.join("pyenv"))
+        .find(|pyenv| is_executable(pyenv))
+        .filter(|_| shims.with_file_name("versions").is_dir())
+}
+
+/// The absolute executable `program args` prints when run in `root`, without stdin or
+/// auto-installs; `None` when it fails or prints anything else.
+fn command_path(program: &Path, args: &[&str], root: &Path) -> Option<PathBuf> {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .current_dir(root)
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let path = PathBuf::from(String::from_utf8(output.stdout).ok()?.trim());
+    (output.status.success() && path.is_absolute() && is_executable(&path)).then_some(path)
+}
+
+/// Components rustup manages but may not expose as a proxy on `PATH` (Homebrew's `rustup`
+/// installs none). `rustup which` runs in the server's root so `rust-toolchain.toml` is honored;
+/// `RUSTUP_AUTO_INSTALL=0` keeps it from downloading a missing toolchain.
+fn toolchain_program(program: &Path, root: &Path, dirs: &[PathBuf]) -> Option<PathBuf> {
+    if program != Path::new("rust-analyzer") {
+        return None;
+    }
+    let rustup = dirs
+        .iter()
+        .map(|dir| dir.join("rustup"))
+        .find(|candidate| is_executable(candidate))?;
+    command_path(&rustup, &["which", "rust-analyzer"], root)
+}
+
+/// The searched directories, for a not-found error: at most eight, then a count.
+fn searched(dirs: &[PathBuf]) -> String {
+    const SHOWN: usize = 8;
+    let mut text = dirs
+        .iter()
+        .take(SHOWN)
+        .map(|dir| dir.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if dirs.len() > SHOWN {
+        text.push_str(&format!(" and {} more", dirs.len() - SHOWN));
+    }
+    if text.is_empty() { "none".into() } else { text }
 }
 
 /// TypeScript 7's native `tsc` speaks LSP and no longer ships `lib/tsserver.js`, which
@@ -584,10 +648,11 @@ impl Servers {
                 .map(|e| format!("{}: {}", e.name, install_hint(&e.program.to_string_lossy())))
                 .collect();
             return Err(format!(
-                "no language server for {} found in project bin directories or on PATH (looked for {}); {}; \
+                "no language server for {} found in project bin directories or on PATH (looked for {}; searched {}); {}; \
                  or point [lsp.<name>] program at one in dial's config",
                 file,
                 names.join(", "),
+                searched(dirs),
                 hints.join("; ")
             ));
         }

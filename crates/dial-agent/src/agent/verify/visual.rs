@@ -46,9 +46,9 @@ pub use crate::agent::prompts::recovery::INITIAL_GUIDANCE;
 pub struct Review {
     required: bool,
     render_required: bool,
-    browser_pixels: Option<Revision>,
+    rendered_pixels: Vec<(Revision, Option<String>)>,
     image_pixels: Option<Revision>,
-    pending_browser: Option<Revision>,
+    pending_rendered: Vec<(Revision, Option<String>)>,
     pending_image: Option<Revision>,
 }
 
@@ -66,7 +66,17 @@ impl Review {
     }
 
     pub fn rendered_observed(&self, revision: Revision) -> bool {
-        self.browser_pixels == Some(revision)
+        self.rendered_pixels
+            .iter()
+            .any(|(seen, _)| *seen == revision)
+    }
+
+    pub fn rendered_target_observed(&self, revision: Revision, target: &str) -> bool {
+        !target.is_empty()
+            && self
+                .rendered_pixels
+                .iter()
+                .any(|(seen, locator)| *seen == revision && locator.as_deref() == Some(target))
     }
 
     pub fn changed(&mut self, path: &Path) {
@@ -76,10 +86,41 @@ impl Review {
         }
     }
 
-    pub fn captured(&mut self, revision: Revision, browser: bool) {
+    /// User-supplied/source images never establish rendered-target evidence.
+    pub fn user_image(&mut self, revision: Revision) {
         self.pending_image = Some(revision);
-        if browser {
-            self.pending_browser = Some(revision);
+    }
+
+    pub fn capture_output(
+        &mut self,
+        output: &crate::runtime::tool_output::ToolOutput,
+        revision: Revision,
+        images: &serde_json::Value,
+    ) {
+        if output.is_error {
+            return;
+        }
+        for image in images.as_array().into_iter().flatten() {
+            let Ok((bytes, media_type)) = crate::llm::images::verified_bytes(image) else {
+                continue;
+            };
+            self.pending_image = Some(revision);
+            for capture in &output.execution.captures {
+                if capture.matches(&bytes, media_type) {
+                    let observed = (revision, capture.target.clone());
+                    if !self.pending_rendered.contains(&observed) {
+                        self.pending_rendered.push(observed);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn captured(&mut self, revision: Revision, rendered: bool) {
+        self.user_image(revision);
+        if rendered {
+            self.pending_rendered.push((revision, None));
         }
     }
 
@@ -88,18 +129,29 @@ impl Review {
         if let Some(revision) = self.pending_image.take() {
             self.image_pixels = Some(revision);
         }
-        if let Some(revision) = self.pending_browser.take() {
-            self.browser_pixels = Some(revision);
+        if !self.pending_rendered.is_empty() {
+            let latest = self.pending_rendered.last().unwrap().0;
+            self.rendered_pixels
+                .retain(|(revision, _)| *revision == latest);
+            for observed in self
+                .pending_rendered
+                .drain(..)
+                .filter(|(revision, _)| *revision == latest)
+            {
+                if !self.rendered_pixels.contains(&observed) {
+                    self.rendered_pixels.push(observed);
+                }
+            }
         }
     }
 
     fn missing(&self, revision: Revision) -> bool {
         self.required
-            && (if self.render_required {
-                self.browser_pixels
+            && if self.render_required {
+                !self.rendered_observed(revision)
             } else {
-                self.image_pixels
-            }) != Some(revision)
+                self.image_pixels != Some(revision)
+            }
     }
 
     /// Evidence is delivered pixels for the latest effect revision, not a correctness verdict.

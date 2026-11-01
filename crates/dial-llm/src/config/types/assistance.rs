@@ -201,8 +201,8 @@ pub struct LocalAssistance {
     pub prompt_cache: bool,
     /// Side requests to another model on the same local server: `warn`, `reuse_main` or `allow`.
     pub side_models: LocalSideModels,
-    /// One actionable notice when the server serves a smaller window than configured, and an Ollama
-    /// window bounded by the model's memory estimate when no window is pinned.
+    /// One actionable notice when the server serves a smaller window than configured. Dial does not
+    /// raise the server's window on its own; the window comes from the server, a model profile or `context_window`.
     pub context_advice: bool,
     /// Retry a generation the repetition detector stopped with a presence/repetition penalty.
     pub loop_penalty: bool,
@@ -224,11 +224,11 @@ impl Default for LocalAssistance {
             reasoning_share: 50,
             escalate_after: 2,
             thinking: LocalThinking::Model,
-            keep_loaded_secs: 1800,
-            prompt_cache: true,
+            keep_loaded_secs: 0,
+            prompt_cache: false,
             side_models: LocalSideModels::Warn,
             context_advice: true,
-            loop_penalty: true,
+            loop_penalty: false,
             suggestions: true,
             time_budget: true,
         }

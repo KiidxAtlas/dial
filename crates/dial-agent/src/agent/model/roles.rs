@@ -577,7 +577,11 @@ pub(in crate::agent) fn with_request_deadline<T>(
 
 /// Auxiliary replies must be complete, tool-free text. A received reply that is rejected remains
 /// physical usage, so it is recorded as a discarded attempt under the purpose that requested it.
-fn accept_auxiliary_reply(backend: &Backend, role: &str, reply: llm::Reply) -> Result<String> {
+pub(in crate::agent) fn accept_auxiliary_reply(
+    backend: &Backend,
+    role: &str,
+    reply: llm::Reply,
+) -> Result<String> {
     if reply.finish_reason == "length" || !reply.tool_calls.is_empty() || reply.dropped_tool_call()
     {
         backend.record_discarded_response()?;

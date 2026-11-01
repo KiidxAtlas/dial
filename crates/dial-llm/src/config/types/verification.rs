@@ -21,6 +21,9 @@ pub struct VerificationConfig {
     pub requirements: BTreeMap<String, VerificationRequirement>,
     /// Refuse completion while operator-declared requirement evidence is missing or stale.
     pub strict_requirements: bool,
+    /// When the latest user request begins with a run verb and names an existing workspace path,
+    /// refuse completion until a run naming that path was observed to stay up or exit zero.
+    pub target_evidence: bool,
     /// Optional runner identity for configured checks; never an installation or execution grant.
     pub runners: BTreeMap<String, VerificationRunner>,
     /// Operator assertion, keyed by configured check name, that a deterministic, side-effect-free
@@ -41,6 +44,7 @@ impl Default for VerificationConfig {
             python_command: Vec::new(),
             requirements: BTreeMap::new(),
             strict_requirements: false,
+            target_evidence: true,
             runners: BTreeMap::new(),
             inputs: BTreeMap::new(),
             review: IndependentReviewConfig::default(),
@@ -93,8 +97,13 @@ impl Default for IndependentReviewConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct VerificationRequirement {
     pub checks: Vec<String>,
-    /// Require delivered browser pixels for the latest effect revision.
+    /// Require delivered native rendered pixels for the latest effect revision.
     pub visual: bool,
+    /// Optional exact native capture target; never inferred from model claims.
+    pub visual_target: Option<String>,
+    /// Deliverable IDs whose claimed satisfaction must meet this operator-owned contract.
+    /// Empty preserves the legacy requirement-only mapping.
+    pub deliverables: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

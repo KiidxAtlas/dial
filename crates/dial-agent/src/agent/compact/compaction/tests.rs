@@ -646,3 +646,234 @@ fn request_accounting_preserves_wire_fallbacks_and_retained_output_floors() {
         request.messages.iter().map(wire_parts).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn explicit_openai_accounting_counts_and_unknown_routes_keep_estimates() {
+    let policy = CompactionConfig::default();
+    let request = Chat {
+        messages: vec![
+            json!({"role":"system","content":"rules"}),
+            json!({"role":"user","content":"雪 café ".repeat(300)}),
+        ],
+        tools: vec![
+            json!({"type":"function","function":{"name":"read","description":"Read a file","parameters":{"type":"object"}}}),
+        ],
+        temperature: 0.0,
+        max_tokens: 64,
+        seed: None,
+    };
+    let unknown = CompactionIdentity {
+        provider: "p",
+        model: "unknown",
+        agent: None,
+    };
+    let openai = CompactionIdentity {
+        provider: "openai",
+        model: "gpt-4o",
+        agent: None,
+    };
+    let estimated: u64 = request
+        .messages
+        .iter()
+        .chain(&request.tools)
+        .map(estimate)
+        .sum();
+    assert_eq!(
+        request_tokens_with_policy(&request, &policy, unknown),
+        estimated
+    );
+    assert_eq!(
+        request_accounting_with_policy(&request, &policy, unknown).tokens,
+        estimated
+    );
+    let counted = crate::llm::wire::counting::request_tokens(
+        "openai",
+        "gpt-4o",
+        &request.messages,
+        &request.tools,
+    );
+    assert_eq!(
+        request_tokens_with_policy(&request, &policy, openai),
+        counted
+    );
+    assert_eq!(
+        request_accounting_with_policy(&request, &policy, openai).tokens,
+        counted
+    );
+    assert_ne!(
+        counted, estimated,
+        "a documented tokenizer must not reuse the byte estimate"
+    );
+}
+
+#[test]
+fn known_model_push_message_matches_a_full_recount() {
+    let policy = CompactionConfig::default();
+    let openai = CompactionIdentity {
+        provider: "openai",
+        model: "gpt-4o",
+        agent: None,
+    };
+    let mut request = Chat {
+        messages: vec![json!({"role":"user","content":"history 雪"})],
+        tools: vec![],
+        temperature: 0.0,
+        max_tokens: 64,
+        seed: None,
+    };
+    let mut accounting = request_accounting_with_policy(&request, &policy, openai);
+    let guidance = json!({"role":"user","content":"pressure guidance","dial_transient":true});
+    let updated = accounting.push_message(&guidance, &policy, openai);
+    request.messages.push(guidance);
+    assert_eq!(
+        updated,
+        request_tokens_with_policy(&request, &policy, openai)
+    );
+    assert_eq!(accounting.tokens, updated);
+    assert_eq!(accounting.messages.len(), request.messages.len());
+}
+
+#[test]
+fn cut_with_known_model_counts_tokens_and_never_splits_a_tool_pair() {
+    let policy = CompactionConfig::default();
+    let openai = CompactionIdentity {
+        provider: "openai",
+        model: "gpt-4o",
+        agent: None,
+    };
+    let mut m = vec![json!({"role":"user","content":"do the task"})];
+    for i in 0..20 {
+        m.push(json!({"role":"assistant","content":"","tool_calls":[{"id":format!("c{i}"),"function":{"name":"read","arguments":"{}"}}]}));
+        m.push(json!({"role":"tool","tool_call_id":format!("c{i}"),"content":"lorem ipsum dolor ".repeat(400)}));
+    }
+    let boundary = cut_with_policy(&m, 3_000, &policy, openai)
+        .expect("a long single turn must be compactable");
+    assert!(
+        boundary > 0 && boundary < m.len() - 1,
+        "cut {boundary} of {}",
+        m.len()
+    );
+    assert_ne!(
+        m[boundary]["role"], "tool",
+        "the tail may not start on an orphaned tool result"
+    );
+    assert_eq!(cut_with_policy(&m[..1], 3_000, &policy, openai), None);
+}
+
+#[test]
+fn live_handoff_keeps_the_exact_recent_tail_and_portable_fallback_is_non_destructive() {
+    use crate::llm::provider::ProviderKind;
+    for rejected in [false, true] {
+        let request = Chat {
+            messages: vec![
+                json!({"role":"system","content":"stable rules"}),
+                json!({"role":"user","content":"earlier task"}),
+                json!({"role":"assistant","content":"earlier evidence ".repeat(1_000)}),
+                json!({"role":"user","content":"latest exact request"}),
+            ],
+            tools: vec![
+                json!({"type":"function","function":{"name":"read","parameters":{"type":"object"}}}),
+            ],
+            temperature: 0.0,
+            max_tokens: 64,
+            seed: None,
+        };
+        let original = (
+            request.messages.clone(),
+            request.tools.clone(),
+            request.temperature,
+            request.max_tokens,
+            request.seed,
+        );
+        let mut backend = Backend::new(
+            ProviderKind::Endpoint {
+                base_url: "https://example.com/v1".into(),
+                model: "test".into(),
+                api_key: None,
+            },
+            Default::default(),
+            5,
+        );
+        let policy = CompactionConfig::default();
+        let options = CompactionOptions {
+            method: Some(CompactionMethod::Handoff),
+            require_method: true,
+            keep_recent_tokens: Some(64),
+            ..Default::default()
+        };
+        let mut calls = 0;
+        let prepared = compact_history_with_execution(
+            &mut backend,
+            HistoryCompaction {
+                request: &request,
+                policy: &policy,
+                options: &options,
+                context: CompactionContext {
+                    identity: CompactionIdentity {
+                        provider: "p",
+                        model: "m",
+                        agent: None,
+                    },
+                    window: 32_000,
+                    summary_window: 32_000,
+                    summary_output_limit: Some(128),
+                    timeout_secs: 5,
+                    user_dir: std::path::Path::new("."),
+                    native_request: Some(&request),
+                    retained_overhead_tokens: 0,
+                    supplemental_context: None,
+                },
+            },
+            Arc::new(AtomicBool::new(false)),
+            &mut crate::agent::NullUi,
+            &mut |_, summary_request, _| {
+                calls += 1;
+                let live = summary_request
+                    .messages
+                    .iter()
+                    .any(|m| m["dial_compaction_handoff"] == true);
+                if calls == 1 {
+                    assert!(live);
+                    assert_eq!(
+                        summary_request.messages[..request.messages.len()],
+                        request.messages
+                    );
+                    assert_eq!(summary_request.tools, request.tools);
+                    assert!(
+                        summary_request.messages.last().unwrap()["content"]
+                            .as_str()
+                            .unwrap()
+                            .contains("remain verbatim")
+                    );
+                    if rejected {
+                        anyhow::bail!("provider rejects tool_choice none");
+                    }
+                } else {
+                    assert!(!live);
+                    assert!(summary_request.tools.is_empty());
+                }
+                Ok("earlier compact context".into())
+            },
+            None,
+            &mut SummaryExecution {
+                live_handoff: true,
+                parallel: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, if rejected { 2 } else { 1 });
+        let history = prepared.history(&request);
+        assert_eq!(history.last(), request.messages.last());
+        assert!(prepared.outcome.tokens_after < prepared.outcome.tokens_before);
+        assert_eq!(
+            (
+                request.messages,
+                request.tools,
+                request.temperature,
+                request.max_tokens,
+                request.seed
+            ),
+            original
+        );
+    }
+}

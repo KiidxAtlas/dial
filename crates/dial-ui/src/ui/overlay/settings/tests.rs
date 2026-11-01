@@ -2197,3 +2197,52 @@ fn voice_choices_reuse_ready_backends_and_explain_manual_setup() {
     assert_eq!(path, "voice.tts.backend");
     assert_eq!(value.as_str(), Some("espeak"));
 }
+
+#[test]
+fn reasoning_strategy_picker_browses_cancels_and_confirms_raw_values_including_default() {
+    let rig = Rig::new();
+    let path = "experimental.reasoning_strategy";
+    let mut o = overlay().coding_only();
+    goto(&mut o, &rig.keys, path);
+    assert_eq!(o.current_path(path), Value::String("default".into()));
+    assert!(matches!(
+        send(&mut o, &rig.keys, key(KeyCode::Enter)),
+        OverlayEvent::None
+    ));
+    assert!(matches!(
+        send(&mut o, &rig.keys, key(KeyCode::Down)),
+        OverlayEvent::None
+    ));
+    assert!(o.pending.is_empty(), "browsing must not save");
+    assert!(matches!(
+        send(&mut o, &rig.keys, key(KeyCode::Esc)),
+        OverlayEvent::None
+    ));
+    assert!(matches!(o.mode, Mode::Browse));
+    assert!(o.global.is_empty() && o.project.is_empty());
+    assert_eq!(o.current_path(path), Value::String("default".into()));
+
+    for (keycode, raw) in [
+        (KeyCode::Down, "evidence_first"),
+        (KeyCode::Home, "default"),
+    ] {
+        send(&mut o, &rig.keys, key(KeyCode::Enter));
+        assert!(matches!(
+            send(&mut o, &rig.keys, key(keycode)),
+            OverlayEvent::None
+        ));
+        assert!(o.pending.is_empty());
+        let (written, value, scope) = expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
+        assert_eq!(
+            (written.as_str(), value.as_str(), scope),
+            (path, Some(raw), Scope::Global)
+        );
+        o.settled(path, Ok(value.clone()));
+        assert_eq!(crate::config::schema::get(&o.global, path), Some(&value));
+        assert_eq!(o.current_path(path), value);
+    }
+    assert!(
+        o.project.is_empty(),
+        "global selection must not alter project settings"
+    );
+}

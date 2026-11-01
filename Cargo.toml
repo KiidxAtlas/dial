@@ -72,6 +72,7 @@ pulldown-cmark = { version = "0.12", default-features = false }
 quick-xml = "0.41"
 regex = "1.13.1"
 fancy-regex = "0.16"
+tiktoken-rs = "0.12"
 ast-grep-core = "0.45.3"
 ast-grep-language = "0.45.3"
 ignore = "0.4.33"

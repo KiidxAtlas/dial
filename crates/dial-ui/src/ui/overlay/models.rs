@@ -2936,6 +2936,7 @@ impl ModelOverlay {
                 }];
                 parts.push(match usage.avg_cost_usd() {
                     Some(cost) => format!("avg {}/request", fmt_usd(cost)),
+                    None if usage.totals.subscription_requests > 0 => "subscription".to_owned(),
                     None => "avg cost -".to_owned(),
                 });
                 let requests = usage.totals.requests;

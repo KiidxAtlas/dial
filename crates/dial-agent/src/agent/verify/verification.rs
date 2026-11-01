@@ -21,6 +21,8 @@ pub struct RelatedTestPlan {
 pub enum CheckStatus {
     Passed,
     CodeFailed,
+    /// A completed nonzero exit with no affirmative source/test-defect diagnostic.
+    FailedUnknownCause,
     EnvironmentUnavailable,
     PermissionDenied,
     Cancelled,
@@ -29,8 +31,8 @@ pub enum CheckStatus {
 }
 
 impl CheckStatus {
-    /// Only an observed code failure may be sent to the repair loop. Infrastructure, permission,
-    /// cancellation, timeout and unverifiable runs are reported without editing application code.
+    /// Only an observed code diagnostic may be sent to the repair loop. An unexplained nonzero
+    /// exit, infrastructure, permission, cancellation, timeout or unverifiable run is not one.
     pub fn repairable(self) -> bool {
         self == CheckStatus::CodeFailed
     }
@@ -137,7 +139,58 @@ pub(in crate::agent) fn classify_with_artifacts(
     if empty || process.exit_code.is_none() || process.exit_code == Some(0) {
         return CheckStatus::Unverified;
     }
-    CheckStatus::CodeFailed
+    if code_failure_diagnostic(&text) {
+        CheckStatus::CodeFailed
+    } else {
+        CheckStatus::FailedUnknownCause
+    }
+}
+
+/// Diagnostic recognition is shared with output clipping, but a useful line to retain is not
+/// necessarily a code diagnosis (for example `error: network unavailable` or a warning location).
+/// Require affirmative compiler, assertion, application exception or native test-runner evidence.
+fn code_failure_diagnostic(output: &str) -> bool {
+    use regex::Regex;
+    use std::sync::LazyLock;
+
+    static CODE_DIAGNOSTIC: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(concat!(
+            r"^\s*(fatal error|error|fatal)\[[A-Z]*\d+\]:",
+            r"|:\d+(:\d+)?:\s*(fatal )?error\b",
+            r"|^\s*(Assertion|Syntax|Indentation|Tab|Type|Name|UnboundLocal|Attribute|Index|Key|Value|ZeroDivision|Import|ModuleNotFound|Reference|Range)Error(:|$)",
+            r"|^E {3}\S",
+            r"|^(FAIL|ERROR): test\w*\b|^FAILED\s+\S+::\S+",
+            r"|^--- FAIL:|\.\.\. FAILED$|^\s*● \S",
+            r"|\bpanicked at\b",
+            r"|^\s*error: (expected\b|unexpected\b|mismatched\b|cannot find\b|unresolved import\b|failed to select a version for the requirement\b)",
+        ))
+        .expect("code diagnostic pattern is valid")
+    });
+    output.lines().any(|line| {
+        (crate::tools::code::diagnostics::is_diagnostic(line) && CODE_DIAGNOSTIC.is_match(line))
+            // These runner/compiler forms are not part of the clipping recognizer.
+            || line.contains("assertion failed")
+            || (line.contains("assertion `") && line.contains(" failed"))
+            || line.starts_with("Cannot find module '")
+            || (line.starts_with("error: no matching package named `")
+                && output.contains("location searched: /"))
+            || go_compiler_diagnostic(line)
+    })
+}
+
+fn go_compiler_diagnostic(line: &str) -> bool {
+    let Some((_, diagnostic)) = line.split_once(".go:") else {
+        return false;
+    };
+    let Some((number, diagnostic)) = diagnostic.split_once(':') else {
+        return false;
+    };
+    !number.is_empty()
+        && number.bytes().all(|byte| byte.is_ascii_digit())
+        && (diagnostic.contains("undefined:")
+            || diagnostic.contains("syntax error:")
+            || diagnostic.contains("cannot use ")
+            || diagnostic.contains("declared and not used"))
 }
 
 /// Presentation is not exhaustive evidence. Recover complete retained bytes through the bounded
@@ -303,16 +356,6 @@ fn scoped_python(root: &Path, owner: &Path, fallback: &Path, override_argv: &[St
     }
 }
 
-/// Shell evidence may include an artifact link after the exit-code row.
-pub(crate) fn exit_code(output: &str) -> Option<i32> {
-    output.lines().rev().find_map(|line| {
-        line.strip_prefix("[exit code: ")?
-            .strip_suffix(']')?
-            .parse()
-            .ok()
-    })
-}
-
 /// A shell check that failed: a nonzero exit, a timeout, a kill by signal, or an explicitly
 /// empty suite. A user cancellation, or a run adopted into the background, settles nothing.
 pub(in crate::agent) fn check_failed(output: &crate::runtime::tool_output::ToolOutput) -> bool {
@@ -390,10 +433,15 @@ pub(in crate::agent) fn runner_problem(
     }
     // A launch failure has one diagnostic, not an application traceback/assertion plus a
     // missing dependency somewhere in its log. Ambiguous mixed output remains actionable.
+    // The exit-code and shell launch notes are Dial's annotations, not program output.
     let diagnostics: Vec<_> = output
         .lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with("[exit code: "))
+        .filter(|line| {
+            !line.is_empty()
+                && !line.starts_with("[exit code: ")
+                && *line != crate::tools::exec::shell::LAUNCH_NOTE
+        })
         .collect();
     if diagnostics.len() != 1 {
         return None;

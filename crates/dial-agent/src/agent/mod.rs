@@ -195,6 +195,8 @@ struct StepChecks {
     empty_searches: run::search_frontier::EmptySearches,
     /// Workspace-relative files successfully read this turn; they clear caller obligations.
     visited_paths: std::collections::BTreeSet<String>,
+    /// Paths the latest admitted request asks to run, and the runs observed for them.
+    targets: verify::targets::Targets,
     /// A bash test command failed or a `check` result was `code_failed` this turn.
     reproduced: bool,
     /// `experimental.repro_first` already advised or refused once this turn.
@@ -211,6 +213,11 @@ impl StepChecks {
             self.uncheckpointed_shell_commands,
             self.uncheckpointed_extension_calls,
         ]
+    }
+    /// Monotonic count of every effect generation in `revision`: a checkpointed edit, an opaque
+    /// shell command or a possibly-modifying extension call each advance it.
+    fn effect_epoch(&self) -> u64 {
+        self.revision().iter().sum()
     }
     fn fix_revision(&self) -> verify::evidence::Revision {
         let mut revision = self.revision();
@@ -313,6 +320,8 @@ pub struct Agent<'a> {
     /// `bash` job completions not yet delivered to the model; sent once as a transient message
     /// in the next request (see `pump_subagents`, `run_loop`).
     background_notices: Vec<String>,
+    /// Session `bg` jobs an unattended run was already told end with it, so the notice is not repeated.
+    exit_bound_jobs_noticed: std::collections::BTreeSet<String>,
     /// Bounded `additional_context` notes from lifecycle hooks, delivered once as transient
     /// notes in the next request (see `queue_hook_context`).
     hook_context: Vec<String>,

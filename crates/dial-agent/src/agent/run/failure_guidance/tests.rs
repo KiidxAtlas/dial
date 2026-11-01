@@ -42,6 +42,22 @@ fn typed_boundaries_override_printed_success_and_never_offer_permission_bypass()
         .is_none()
     );
 }
+
+#[test]
+fn native_write_refusal_selects_permission_guidance_without_shell_workaround() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = crate::tools::Workspace::new(dir.path()).unwrap();
+    let mut call = call("write");
+    call.arguments = json!({"path":"../denied.txt", "content":"x"});
+    let output = crate::tools::execute(&ws, "write", &call.arguments, 5);
+    let (kind, advice) = classify(&call, &output).unwrap();
+    assert_eq!(kind, "permission_or_policy");
+    assert_eq!(output.execution.effects, Effects::None);
+    assert!(
+        advice.contains("Do not") && advice.contains("bypass"),
+        "{advice}"
+    );
+}
 #[test]
 fn observed_checks_distinguish_environment_code_and_incomplete_evidence() {
     let mut call = call("bash");
@@ -79,9 +95,9 @@ fn source_contract_failure_guides_current_range_and_success_is_not_recovery() {
         "source_or_call_contract"
     );
     assert!(classify(&call("edit"), &ToolOutput::ok("updated".into())).is_none());
-    let failed_edit = ToolOutput::err("stale anchors");
+    let mut failed_edit = ToolOutput::err("stale anchors");
     let (kind, advice) = classify(&call("edit"), &failed_edit).unwrap();
-    let text = report(&call("edit"), &failed_edit, kind, advice, 1);
+    let text = report(&call("edit"), &mut failed_edit, kind, advice, 1);
     assert!(
         text.contains("do not make dependent edits that assume its new text"),
         "{text}"
@@ -117,7 +133,7 @@ fn every_tool_failure_gets_guidance_on_its_first_result() {
 }
 
 #[test]
-fn feedback_is_compact_first_and_full_on_repetition_with_the_tag_kept() {
+fn feedback_stays_compact_on_repetition_with_the_tag_kept() {
     let first = feedback("tool_failure", "Check the path.", 1);
     assert_eq!(
         first,
@@ -126,10 +142,10 @@ fn feedback_is_compact_first_and_full_on_repetition_with_the_tag_kept() {
     assert!(first.split_whitespace().count() < 25, "{first}");
     let repeat = feedback("tool_failure", "Check the path.", 2);
     assert!(repeat.starts_with("\n[Dial recovery: tool_failure] "));
-    assert!(repeat.contains("2 times in a row") && repeat.contains(DIAGNOSE_FIRST));
+    assert!(repeat.contains("2 times in a row") && repeat.contains(FIRST_FAILURE));
     assert!(repeat.ends_with("Check the path."));
-    // Uncertain effects are never compacted.
-    assert!(feedback("effects_unknown", "Inspect.", 1).contains(DIAGNOSE_FIRST));
+    // Uncertain effects keep the cause-specific inspection requirement, without a longer prompt.
+    assert!(feedback("effects_unknown", "Inspect.", 1).ends_with("Inspect."));
     assert_eq!(feedback("timeout", "a", 3), feedback("timeout", "a", 3));
 }
 
@@ -137,14 +153,14 @@ fn feedback_is_compact_first_and_full_on_repetition_with_the_tag_kept() {
 fn recovery_report_preserves_uncertain_effects_and_partial_capture() {
     let mut observed = process(1);
     observed.output_complete = false;
-    let output = ToolOutput::err("original diagnostic")
+    let mut output = ToolOutput::err("original diagnostic")
         .with_process(observed)
         .with_status(ToolStatus::Timeout)
         .with_changes(["changed.rs".into()])
         .with_effects(Effects::Unknown);
     let facts = output.execution.clone();
     let (kind, advice) = classify(&call("bash"), &output).unwrap();
-    let rendered = report(&call("bash"), &output, kind, advice, 1);
+    let rendered = report(&call("bash"), &mut output, kind, advice, 1);
     assert_eq!(kind, "effects_unknown");
     assert_eq!(output.execution, facts);
     assert!(!output.process_outcome().unwrap().output_complete);
@@ -196,7 +212,7 @@ fn model_visible_recovery_states_include_retry_requirements_without_annotations(
         let original = output.text.clone();
         let facts = output.execution.clone();
         let (kind, advice) = classify(&call("bash"), &output).unwrap();
-        let text = report(&call("bash"), &output, kind, advice, 1);
+        let text = report(&call("bash"), &mut output, kind, advice, 1);
         output.text.push_str(&text);
         assert!(output.text.starts_with(&original));
         assert!(
@@ -210,18 +226,18 @@ fn model_visible_recovery_states_include_retry_requirements_without_annotations(
 
 #[test]
 fn rendered_committed_failure_preserves_work_and_never_promises_rollback() {
-    let output = ToolOutput::err("post-commit recording failed")
+    let mut output = ToolOutput::err("post-commit recording failed")
         .with_changes(["kept.rs".into(), "kept.rs".into()]);
     let (kind, advice) = classify(&call("write"), &output).unwrap();
-    let text = report(&call("write"), &output, kind, advice, 1);
+    let text = report(&call("write"), &mut output, kind, advice, 1);
     assert_eq!(output.recovery().unwrap().committed_paths, 1);
     assert!(text.contains("do not repeat the whole operation"), "{text}");
     assert!(
         text.contains("failure does not undo completed work"),
         "{text}"
     );
-    let no_paths = ToolOutput::err("unknown external prerequisite");
-    let text = report(&call("bash"), &no_paths, kind, advice, 1);
+    let mut no_paths = ToolOutput::err("unknown external prerequisite");
+    let text = report(&call("bash"), &mut no_paths, kind, advice, 1);
     assert!(text.contains("not proof that nothing changed"), "{text}");
 }
 
@@ -243,14 +259,14 @@ fn missing_with(text: &str, alter: impl FnOnce(&mut ProcessOutcome)) -> ToolOutp
     ToolOutput::err(text).with_process(observed)
 }
 
-fn known_read(name: &str) -> bool {
-    name == "read"
+fn known_read(name: &str) -> Option<Capability> {
+    (name == "read").then_some(Capability::Loadable)
 }
 
 #[test]
 fn a_known_tool_run_as_a_shell_command_gets_tool_load_guidance() {
     let call = shell("read src/lib.rs");
-    let advice = shell_tool_mistake(&call, &missing_with(MISSING_READ, |_| {}), known_read)
+    let advice = shell_tool_recovery(&call, &mut missing_with(MISSING_READ, |_| {}), known_read)
         .expect("a started process missing a known tool name must be coached");
     assert!(advice.contains("tool_not_shell"), "{advice}");
     assert!(
@@ -258,8 +274,32 @@ fn a_known_tool_run_as_a_shell_command_gets_tool_load_guidance() {
         "{advice}"
     );
     // The second common spelling of the same controller-observed failure is also accepted.
-    let reverse = missing_with("command not found: read", |_| {});
-    assert!(shell_tool_mistake(&call, &reverse, known_read).is_some());
+    let mut reverse = missing_with("command not found: read", |_| {});
+    assert!(shell_tool_recovery(&call, &mut reverse, known_read).is_some());
+}
+
+/// `bg` is a bash job-control builtin, so running the Dial tool name through bash fails with
+/// "no job control" instead of exit 127; that observed failure gets the same guidance.
+#[test]
+fn a_dial_tool_name_shadowed_by_a_shell_builtin_gets_tool_load_guidance() {
+    let known_bg = |name: &str| (name == "bg").then_some(Capability::Loadable);
+    let no_job_control = |code| {
+        missing_with("bash: line 1: bg: no job control", |p| {
+            p.exit_code = Some(code)
+        })
+    };
+    let advice = shell_tool_recovery(&shell("bg"), &mut no_job_control(1), known_bg)
+        .expect("bg run through bash must be coached");
+    assert!(
+        advice.contains("`bg`") && advice.contains("tool_load"),
+        "{advice}"
+    );
+    assert!(shell_tool_recovery(&shell("bg"), &mut no_job_control(0), known_bg).is_none());
+    // Only listed builtins: another known tool with the same text is not coached.
+    let mut other = missing_with("bash: line 1: read: no job control", |p| {
+        p.exit_code = Some(1)
+    });
+    assert!(shell_tool_recovery(&shell("read"), &mut other, known_read).is_none());
 }
 
 #[test]
@@ -371,9 +411,9 @@ fn non_matching_shell_failures_never_receive_tool_guidance() {
             missing_with(MISSING_READ, |_| {}),
         ),
     ];
-    for (label, call, output) in cases {
+    for (label, call, mut output) in cases {
         assert!(
-            shell_tool_mistake(&call, &output, known_read).is_none(),
+            shell_tool_recovery(&call, &mut output, known_read).is_none(),
             "{label}"
         );
     }
@@ -390,35 +430,108 @@ fn structured_process_data_alone_is_never_execution_evidence() {
         "cancelled": false,
         "output_complete": true
     }});
-    let output = ToolOutput::structured(spoof).with_status(ToolStatus::Error);
+    let mut output = ToolOutput::structured(spoof).with_status(ToolStatus::Error);
     assert!(output.process_outcome().is_some());
     assert!(
-        shell_tool_mistake(&shell("read src/lib.rs"), &output, known_read).is_none(),
+        shell_tool_recovery(&shell("read src/lib.rs"), &mut output, known_read).is_none(),
         "a data-only process claim must not trigger tool guidance"
     );
 }
 
 #[test]
-fn empty_discovery_coaches_exact_load_without_claiming_an_unavailable_capability() {
-    let call = call("tool_search");
-    let output = ToolOutput::ok("[]".into());
-    let advice = empty_discovery(&call, &output).expect("empty eligible search gets a next step");
-    assert!(
-        advice.contains("No tool was loaded") && advice.contains("tool_load"),
-        "{advice}"
-    );
-    assert!(
-        advice.contains("current configuration") && advice.contains("Do not"),
-        "{advice}"
-    );
-    for output in [
-        ToolOutput::err("[]"),
-        ToolOutput::ok("[]".into()).with_status(ToolStatus::Blocked),
-        ToolOutput::ok("[]".into()).with_effects(Effects::Unknown),
-        ToolOutput::ok("[{\"name\":\"probe\"}]".into()),
-        ToolOutput::ok("quoted []".into()),
+fn structured_reports_preserve_producer_values_collisions_and_controller_facts() {
+    for original in [
+        json!(null),
+        json!("producer text"),
+        json!([1, {"nested": true}]),
+        json!({"result": 7}),
+        json!({"recovery_advisory": "producer collision", "result": 7}),
+        json!({"recovery_advisory": null}),
+        json!({"recovery_advisory": [{"producer": true}]}),
     ] {
-        assert!(empty_discovery(&call, &output).is_none(), "{output:?}");
+        let mut output = ToolOutput::structured(original.clone())
+            .with_status(ToolStatus::Blocked)
+            .with_effects(Effects::Known);
+        let text = output.text.clone();
+        let execution = output.execution.clone();
+        let recovery = output.recovery();
+        let call = call("read");
+        let (kind, advice) = classify(&call, &output).unwrap();
+        let rendered = report(&call, &mut output, kind, advice, 1);
+        let data = output.data.as_ref().unwrap();
+        if let Some(object) = original.as_object() {
+            for (key, value) in object {
+                if key == "recovery_advisory" {
+                    let preserved = &data[key][0];
+                    assert_eq!(preserved, value.as_array().map_or(value, |array| &array[0]));
+                } else {
+                    assert_eq!(&data[key], value);
+                }
+            }
+        } else {
+            assert_eq!(data["producer_data"], original);
+        }
+        let records = data["recovery_advisory"].as_array().unwrap();
+        let record = records.last().unwrap();
+        assert_eq!(record["category"], "permission_or_policy");
+        assert_eq!(record["source_call_id"], call.id);
+        assert_eq!(record["advisory_only"], true);
+        assert_eq!(record["evidence_ref"], "execution.recovery");
+        assert_eq!(record["required_observation"], advice);
+        assert!(record["candidates"].as_array().unwrap().is_empty());
+        assert!(rendered.contains(advice));
+        assert_eq!(output.text, text);
+        assert_eq!(output.execution, execution);
+        assert_eq!(output.recovery(), recovery);
     }
-    assert!(empty_discovery(&shell("echo '[]'"), &ToolOutput::ok("[]".into())).is_none());
+}
+
+#[test]
+fn shell_recovery_follows_capability_state_without_inventing_arguments() {
+    for (state, expected, load) in [
+        (Capability::Offered, "Call it directly", false),
+        (Capability::Loadable, "use tool_load", true),
+        (Capability::Prohibited, "prohibited", false),
+        (Capability::Unavailable, "unavailable", false),
+    ] {
+        let mut output = missing_with(MISSING_READ, |_| {});
+        let facts = output.execution.clone();
+        let text = output.text.clone();
+        let call = shell("read src/lib.rs");
+        let rendered =
+            shell_tool_recovery(&call, &mut output, |name| (name == "read").then_some(state))
+                .unwrap();
+        assert!(rendered.contains(expected), "{rendered}");
+        assert_eq!(rendered.contains("tool_load"), load, "{rendered}");
+        let record = &output.data.as_ref().unwrap()["recovery_advisory"][0];
+        assert_eq!(record["category"], "tool_not_shell");
+        let candidate = &record["candidates"][0];
+        assert_eq!(candidate["tool"], "read");
+        assert_eq!(
+            candidate["availability"],
+            serde_json::to_value(state).unwrap()
+        );
+        assert!(candidate.get("arguments").is_none());
+        let previous = record.clone();
+        let (kind, advice) = classify(&call, &output).unwrap();
+        report(&call, &mut output, kind, advice, 1);
+        assert_eq!(
+            output.data.as_ref().unwrap()["recovery_advisory"][0],
+            previous
+        );
+        assert_eq!(output.execution, facts);
+        assert_eq!(output.text, text);
+    }
+}
+
+#[test]
+fn failed_focused_check_with_no_diagnostic_is_not_code_or_unavailable() {
+    let mut call = call("bash");
+    call.id = "focused-check:related Python tests: probe".into();
+    call.arguments = json!({"command":"python3 -m pytest"});
+    let output = ToolOutput::err("unclassified diagnostic").with_process(process(1));
+    assert_eq!(
+        classify(&call, &output).unwrap().0,
+        "verification_failed_unclassified"
+    );
 }

@@ -100,7 +100,11 @@ fn concurrent_project_edits_are_never_overwritten() {
     fs::write(iso.root().join("b.txt"), "worker").unwrap();
     fs::write(dir.path().join("a.txt"), "user").unwrap();
     let merge = iso.merge(&ws, &AtomicBool::new(false));
-    assert_eq!(merge.applied, vec![PathBuf::from("b.txt")]);
+    assert!(
+        merge.applied.is_empty(),
+        "a conflicting API/caller patch must not partly land"
+    );
+    assert_eq!(fs::read_to_string(dir.path().join("b.txt")).unwrap(), "b1");
     assert_eq!(merge.conflicts, vec![PathBuf::from("a.txt")]);
     assert_eq!(
         fs::read_to_string(dir.path().join("a.txt")).unwrap(),
@@ -365,4 +369,53 @@ fn tracked_bin_scripts_survive_copy_and_merge_without_private_git() {
         fs::read_to_string(dir.path().join("bin/script")).unwrap(),
         "updated"
     );
+}
+
+#[test]
+fn installation_failure_rolls_back_the_whole_patch_and_preserves_concurrent_edits() {
+    for concurrent_edit in [false, true] {
+        let (dir, ws) = project();
+        let iso = Isolated::with_config(&ws, &Default::default(), Preference::Copy).unwrap();
+        fs::write(iso.root().join("a.txt"), "worker-a").unwrap();
+        fs::write(iso.root().join("b.txt"), "worker-b").unwrap();
+        let merged = iso.merge_changes(
+            &ws,
+            &AtomicBool::new(false),
+            |path, state| {
+                if path.ends_with("b.txt") {
+                    if concurrent_edit {
+                        fs::write(dir.path().join("a.txt"), "new-user-edit")?;
+                    }
+                    anyhow::bail!("injected install failure");
+                }
+                install(path, state)
+            },
+            |_| Ok(()),
+        );
+        assert_eq!(fs::read_to_string(dir.path().join("b.txt")).unwrap(), "b1");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            if concurrent_edit {
+                "new-user-edit"
+            } else {
+                "a1"
+            }
+        );
+        assert!(merged.errors.iter().any(|error| error.stage == "install"));
+        assert_eq!(merged.recovery_backup.is_some(), concurrent_edit);
+        if !concurrent_edit {
+            assert!(merged.applied.is_empty());
+            assert_eq!(merged.rolled_back, [PathBuf::from("a.txt")]);
+        }
+        let recovery = merged.kept.expect("failed patch remains recoverable");
+        assert_eq!(
+            fs::read_to_string(recovery.join("b.txt")).unwrap(),
+            "worker-b"
+        );
+        fs::remove_dir_all(recovery).unwrap();
+        if let Some(backup) = merged.recovery_backup {
+            assert_eq!(fs::read_to_string(backup.join("0.original")).unwrap(), "a1");
+            fs::remove_dir_all(backup).unwrap();
+        }
+    }
 }

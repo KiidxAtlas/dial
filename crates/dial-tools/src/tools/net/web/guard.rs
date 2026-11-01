@@ -141,8 +141,9 @@ impl Resolver for GuardedResolver {
         for addr in addrs.iter() {
             if let Some(reason) = self.check(addr.ip()) {
                 let host = uri.host().unwrap_or("?");
+                // Intentional SSRF guard; local servers have their own routes.
                 let refusal = format!(
-                    "refusing to connect to {host}: it resolves to a {reason} address ({})",
+                    "refusing to connect to {host}: it resolves to a {reason} address ({}); for a local dev server use `browser` (open http://localhost:PORT) or `bash` with curl",
                     addr.ip()
                 );
                 return Err(Error::Io(io::Error::new(

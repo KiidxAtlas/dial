@@ -200,6 +200,8 @@ fn bounded_text(text: &str, max: usize, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Scopes are workspace-relative paths. A leading `./` and a trailing `/` are dropped; parent
+/// traversal, absolute paths and non-portable separators are refused.
 fn normalized_scopes(scopes: &[String]) -> Result<Vec<String>> {
     ensure!(scopes.len() <= 32, "too many coordination scopes");
     let mut result = Vec::new();
@@ -219,9 +221,13 @@ fn normalized_scopes(scopes: &[String]) -> Result<Vec<String>> {
         }
         ensure!(!parts.is_empty(), "scope must name a relative path");
         let normalized = parts.join("/");
+        let trimmed = scope
+            .strip_prefix("./")
+            .unwrap_or(scope)
+            .trim_end_matches('/');
         ensure!(
-            scope == &normalized,
-            "scope must be a canonical relative path"
+            trimmed == normalized,
+            "scope must be a canonical relative path such as {normalized:?}"
         );
         if !result.contains(&normalized) {
             result.push(normalized);

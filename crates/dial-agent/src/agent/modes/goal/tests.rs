@@ -488,9 +488,7 @@ fn guided_goal_asks_questions_before_any_goal_exists() {
     let mut agent = new_agent(&config, &server.url, dir.path());
     agent.goal_mutate(|goal| goal.interview = true).unwrap();
 
-    let question = agent
-        .turn(&guided_kickoff("ship the parser"), &mut NullUi)
-        .unwrap();
+    let question = agent.turn("ship the parser", &mut NullUi).unwrap();
 
     assert_eq!(question.text, "What command proves success?");
     assert!(
@@ -515,6 +513,9 @@ fn guided_goal_asks_questions_before_any_goal_exists() {
         "question, create, follow-up, continuation that completes, final reply"
     );
     assert!(messages(&requests[0]).contains("ship the parser"));
+    // Mode guidance travels as ambient context, not inside the admitted user text.
+    let guided = json!(GUIDED_RULES).to_string();
+    assert!(messages(&requests[0]).contains(&guided[1..guided.len() - 1]));
 }
 
 #[test]
@@ -563,4 +564,207 @@ fn paused_goal_cannot_be_completed_without_resuming() {
     state.resume().unwrap();
     state.tool(&json!({"op": "complete"})).unwrap();
     assert_eq!(state.goal.as_ref().unwrap().status, Status::Complete);
+}
+
+#[test]
+fn unchanged_boundary_is_advisory_and_leaves_the_repeated_activity_stall_rule_intact() {
+    let mut state = State::default();
+    state.start("ship the parser", None);
+    let todo = TodoList::new();
+    let ok = ToolOutput::ok("ok".to_owned());
+    let mut previous = None;
+    state.observe_progress(json!({"deliverables":[]}));
+    state.record("read", &json!({"path":"a"}), &ok);
+    let first = state
+        .follow_up(false, true, &mut previous, &todo)
+        .unwrap()
+        .0;
+    assert!(!first.contains(crate::agent::prompts::modes::goal::UNCHANGED_PROGRESS));
+
+    // Same boundary with distinct activity: advisory notice, and the continuation still runs.
+    state.observe_progress(json!({"deliverables":[]}));
+    state.record("read", &json!({"path":"b"}), &ok);
+    let second = state
+        .follow_up(false, true, &mut previous, &todo)
+        .unwrap()
+        .0;
+    assert!(second.ends_with(crate::agent::prompts::modes::goal::UNCHANGED_PROGRESS));
+
+    // Identical activity after an unchanged boundary is still the existing stall stop.
+    state.observe_progress(json!({"deliverables":[]}));
+    state.record("read", &json!({"path":"b"}), &ok);
+    assert!(state.follow_up(false, true, &mut previous, &todo).is_none());
+
+    // A changed boundary clears the advisory notice.
+    state.observe_progress(json!({"deliverables":["parser passes"]}));
+    state.record("read", &json!({"path":"c"}), &ok);
+    let changed = state
+        .follow_up(false, true, &mut previous, &todo)
+        .unwrap()
+        .0;
+    assert!(!changed.contains(crate::agent::prompts::modes::goal::UNCHANGED_PROGRESS));
+}
+
+#[test]
+fn legacy_serialized_goal_state_restores_without_newer_fields() {
+    let empty: State = serde_json::from_value(json!({})).unwrap();
+    assert!(empty.goal.is_none() && !empty.interview);
+
+    let legacy = json!({"goal":{"id":"goal-1","objective":"ship the parser","status":"active",
+        "token_budget":null,"tokens_used":3,"time_used_secs":1}});
+    let state: State = serde_json::from_value(legacy).unwrap();
+    assert!(state.running());
+    assert!(!state.interview);
+    assert!(state.budget_reported_for.is_none());
+    assert_eq!(state.goal.as_ref().unwrap().tokens_used, 3);
+    let again: State = serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+    assert_eq!(again.goal, state.goal);
+}
+
+#[test]
+fn goal_continuations_carry_the_admitted_instruction_as_context_not_as_a_new_instruction() {
+    let server = fake::serve(vec![
+        sse_reply("started"),
+        sse_tool_call("goal", json!({"op": "complete"})),
+        sse_reply("done"),
+    ]);
+    let config = Config::default();
+    let dir = workspace();
+    let mut agent = new_agent(&config, &server.url, dir.path());
+    agent
+        .goal_mutate(|goal| goal.start("ship the parser", None))
+        .unwrap();
+
+    agent.turn("begin", &mut NullUi).unwrap();
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 3);
+    let continuation = messages(&requests[1]);
+    assert!(continuation.contains("Continue active goal."));
+    assert!(continuation.contains("Runtime-recorded admitted user messages"));
+    assert!(continuation.contains("user_turn"));
+    let control = agent.session.control_state();
+    assert_eq!(control["current_instruction"], "begin");
+    assert_eq!(control["user_intent"]["latest"]["text"], "begin");
+    assert_eq!(control["user_intent"]["latest"]["kind"], "user_turn");
+    assert!(
+        !control["user_intent"]
+            .to_string()
+            .contains("Continue active goal.")
+    );
+}
+
+#[derive(Default)]
+struct AmendOnFirstPoll {
+    amendment: Option<String>,
+}
+impl Ui for AmendOnFirstPoll {
+    fn take_steering(&mut self) -> Vec<String> {
+        self.amendment.take().into_iter().collect()
+    }
+}
+
+#[test]
+fn admitted_steering_amendment_stays_latest_through_goal_continuations_and_keeps_the_original() {
+    let server = fake::serve(vec![
+        sse_reply("started"),
+        sse_reply("continuing with the amendment"),
+    ]);
+    let config = Config::default();
+    let dir = workspace();
+    let mut agent = new_agent(&config, &server.url, dir.path());
+    agent
+        .goal_mutate(|goal| goal.start("ship the parser", None))
+        .unwrap();
+    // Explicit steering is polled after the original user turn is admitted, including for
+    // this hermetic agent, which does not emit streaming request-finished callbacks.
+    let mut ui = AmendOnFirstPoll {
+        amendment: Some("use the v2 parser instead".into()),
+    };
+
+    agent.turn("ship the parser", &mut ui).unwrap();
+
+    let control = agent.session.control_state();
+    let intent = &control["user_intent"];
+    assert_eq!(intent["latest"]["text"], "use the v2 parser instead");
+    assert_eq!(intent["latest"]["kind"], "user_steering");
+    assert_eq!(intent["earlier"][0]["text"], "ship the parser");
+    assert_eq!(intent["earlier"][0]["kind"], "user_turn");
+    assert_eq!(control["current_instruction"], "use the v2 parser instead");
+    assert!(!intent.to_string().contains("Continue active goal."));
+
+    // The continuation that follows the amendment carries both the original and the amendment.
+    let continuation = server
+        .requests()
+        .into_iter()
+        .map(|request| messages(&request))
+        .find(|body| body.contains("Continue active goal."))
+        .expect("a goal continuation was sent");
+    assert!(continuation.contains("ship the parser"));
+    assert!(continuation.contains("use the v2 parser instead"));
+    assert!(continuation.contains("user_steering"));
+}
+
+#[test]
+fn active_goal_keeps_raw_literal_admitted_text_and_sends_goal_context_separately() {
+    let server = fake::serve(vec![
+        sse_reply("working"),
+        sse_tool_call("goal", json!({"op": "complete"})),
+        sse_reply("done"),
+    ]);
+    let config = Config::default();
+    let dir = workspace();
+    let mut agent = new_agent(&config, &server.url, dir.path());
+    agent
+        .goal_mutate(|goal| goal.start("ship A & B < C > D", None))
+        .unwrap();
+
+    agent.turn("ship A & B < C > D", &mut NullUi).unwrap();
+
+    // The admitted message is recorded verbatim: no escaping, no rendered harness prompt.
+    let control = agent.session.control_state();
+    assert_eq!(
+        control["user_intent"]["latest"]["text"],
+        "ship A & B < C > D"
+    );
+    assert_eq!(control["current_instruction"], "ship A & B < C > D");
+
+    // The active goal context is sent as its own (escaped) objective block alongside the message.
+    let requests = server.requests();
+    let first = messages(&requests[0]);
+    assert!(first.contains("ship A & B < C > D"));
+    assert!(first.contains("ship A &amp; B &lt; C &gt; D"));
+}
+
+#[test]
+fn inactive_goals_do_not_attach_active_work_guidance_to_a_new_user_turn() {
+    for status in [Status::Paused, Status::BudgetLimited] {
+        let server = fake::serve(vec![sse_reply("Here is the status.")]);
+        let config = Config::default();
+        let dir = workspace();
+        let mut agent = new_agent(&config, &server.url, dir.path());
+        agent
+            .goal_mutate(|state| {
+                state.start("ship the parser", Some(20));
+                let goal = state.goal.as_mut().unwrap();
+                goal.status = status;
+                // A budget wrap-up already ran; this turn answers a new user question.
+                state.budget_reported_for = Some(goal.id.clone());
+            })
+            .unwrap();
+
+        agent.turn("What changed?", &mut NullUi).unwrap();
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1, "{status:?}");
+        assert!(
+            !messages(&requests[0]).contains("Goal mode active."),
+            "{status:?}"
+        );
+        assert_eq!(agent.modes().goal.goal.as_ref().unwrap().status, status);
+        assert_eq!(
+            agent.session.control_state()["user_intent"]["latest"]["text"],
+            "What changed?"
+        );
+    }
 }

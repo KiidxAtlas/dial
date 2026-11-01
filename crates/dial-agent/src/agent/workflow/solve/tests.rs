@@ -96,6 +96,87 @@ fn verifier_checks_real_exit_status_and_cannot_modify_candidate_or_source() {
     );
 }
 #[test]
+fn candidate_verdict_follows_observed_process_not_printed_success() {
+    use crate::runtime::{execution::ProcessOutcome, tool_output::ToolOutput};
+    use crate::tools::surface::outcome::Effects;
+    use verification::CheckStatus;
+    let check = Check {
+        command: "cargo test".into(),
+        timeout_secs: 5,
+    };
+    let exited = |code: Option<i32>| ProcessOutcome {
+        started: true,
+        exit_code: code,
+        signal: None,
+        timed_out: false,
+        cancelled: false,
+        output_complete: true,
+    };
+    let pass = "running 2 tests\ntest result: ok. 2 passed; 0 failed\n";
+    let printed = format!("{pass}[exit code: 0]\n");
+    // Printed success without an observed process is prose, not evidence.
+    assert_eq!(
+        check_verdict(&check, &ToolOutput::ok(printed.clone()), false),
+        CheckStatus::Unverified
+    );
+    // Contradictory process outcomes: printed success never overrides the observed exit.
+    assert_eq!(
+        check_verdict(
+            &check,
+            &ToolOutput::ok(format!("{printed}AssertionError: regression\n"))
+                .with_process(exited(Some(1))),
+            false
+        ),
+        CheckStatus::CodeFailed
+    );
+    assert_ne!(
+        check_verdict(
+            &check,
+            &ToolOutput::err(pass).with_process(exited(Some(0))),
+            false
+        ),
+        CheckStatus::Passed
+    );
+    assert_eq!(
+        check_verdict(
+            &check,
+            &ToolOutput::ok(printed.clone()).with_process(exited(None)),
+            false
+        ),
+        CheckStatus::Unverified
+    );
+    // Empty suites, cancellation and unknown effects never earn a candidate pass.
+    assert_eq!(
+        check_verdict(
+            &check,
+            &ToolOutput::ok("Ran 0 tests\n[exit code: 0]\n".into()).with_process(exited(Some(0))),
+            false
+        ),
+        CheckStatus::Unverified
+    );
+    assert_eq!(
+        check_verdict(
+            &check,
+            &ToolOutput::ok(printed.clone()).with_process(exited(Some(0))),
+            true
+        ),
+        CheckStatus::Cancelled
+    );
+    let mut unknown = ToolOutput::ok(printed).with_process(exited(Some(0)));
+    unknown.execution.effects = Effects::Unknown;
+    assert_ne!(check_verdict(&check, &unknown, false), CheckStatus::Passed);
+    // A normal observed pass with non-empty tests is the only credit.
+    assert_eq!(
+        check_verdict(
+            &check,
+            &ToolOutput::ok(pass.into()).with_process(exited(Some(0))),
+            false
+        ),
+        CheckStatus::Passed
+    );
+}
+
+#[test]
 fn zero_limits_allow_candidates_and_snapshot_bytes_without_relaxing_paths() {
     let source = tempfile::tempdir().unwrap();
     fs::write(source.path().join("file"), "content").unwrap();

@@ -45,6 +45,8 @@ pub struct Request {
     pub end: SystemTime,
     /// Final-wire fingerprint: separates client prompt changes from provider cache misses.
     pub wire: Option<crate::llm::wire::Observation>,
+    /// How the reply was billed; subscription requests have no cost by design, not by omission.
+    pub billing: Option<crate::llm::usage::Billing>,
 }
 
 #[derive(Debug, Clone)]
@@ -70,11 +72,23 @@ pub struct Turn {
     pub end: SystemTime,
 }
 
+/// A private worker session began. Its usage rows carry this id, so stats can separate worker
+/// usage from top-level sessions without a transcript lookup.
+#[derive(Debug, Clone)]
+pub struct WorkerSession {
+    pub session: String,
+    pub project: String,
+    /// Agent type or preset (`scout`, `worker`, …).
+    pub agent: String,
+    pub end: SystemTime,
+}
+
 #[derive(Debug, Clone)]
 pub enum Event {
     Request(Box<Request>),
     Tool(Box<Tool>),
     Turn(Turn),
+    WorkerSession(WorkerSession),
 }
 
 impl Event {
@@ -83,6 +97,7 @@ impl Event {
             Event::Request(r) => r.end,
             Event::Tool(t) => t.end,
             Event::Turn(t) => t.end,
+            Event::WorkerSession(s) => s.end,
         }
     }
     fn duration(&self) -> Duration {
@@ -90,8 +105,22 @@ impl Event {
             Event::Request(r) => r.duration,
             Event::Tool(t) => t.duration,
             Event::Turn(t) => t.duration,
+            Event::WorkerSession(_) => Duration::ZERO,
         }
     }
+}
+
+/// Marks `session` as a worker's private session (see [`WorkerSession`]).
+pub fn worker_session(config: &Config, session: &str, agent: &str) {
+    emit(
+        config,
+        Event::WorkerSession(WorkerSession {
+            session: session.into(),
+            project: project_key(config),
+            agent: agent.into(),
+            end: SystemTime::now(),
+        }),
+    );
 }
 
 // ---------------------------------------------------------------- agent-facing API
@@ -127,6 +156,7 @@ pub fn request(
             error: false,
             end: SystemTime::now(),
             wire: reply.wire.clone(),
+            billing: reply.billing,
         })),
     );
 }
@@ -162,6 +192,7 @@ pub fn request_failed(
             error: true,
             end: SystemTime::now(),
             wire: None,
+            billing: None,
         })),
     );
 }
@@ -271,13 +302,17 @@ pub fn turn(
 }
 
 /// Stats rows are keyed like session directories (`projects/<name>-<hash>`), so runtime usage
-/// joins the transcripts of the same project.
+/// joins the transcripts of the same project. A loaded config's `state_dir` is the model-specific
+/// learning directory beneath that project directory (`projects/<name>-<hash>/models/<digest>`),
+/// so the key is the path component directly under `<user_dir>/projects`. A config that was never
+/// loaded for a project (such as `Config::default()` in tests) has no key.
 fn project_key(config: &Config) -> String {
     config
         .state_dir
-        .file_name()
-        .or_else(|| config.project_root.file_name())
-        .map(|name| name.to_string_lossy().into_owned())
+        .strip_prefix(config.user_dir.join("projects"))
+        .ok()
+        .and_then(|rest| rest.components().next())
+        .map(|name| name.as_os_str().to_string_lossy().into_owned())
         .unwrap_or_default()
 }
 
@@ -311,9 +346,14 @@ struct Route {
 
 impl Route {
     fn from_config(config: &Config) -> Self {
+        // Usage rows without a project cannot belong to a real session: they come from configs
+        // that were never loaded for a project, which in practice means tests. Keep them out of
+        // the user's private stats database.
         Self {
-            stats: (config.stats.enabled && config.user_dir.is_absolute())
-                .then(|| crate::stats::db_path(&config.user_dir)),
+            stats: (config.stats.enabled
+                && config.user_dir.is_absolute()
+                && !project_key(config).is_empty())
+            .then(|| crate::stats::db_path(&config.user_dir)),
             otlp: OtlpSettings::resolve(&config.telemetry),
         }
     }
@@ -498,6 +538,7 @@ fn record_stats(db: &mut crate::stats::Db, event: &Event) -> Result<()> {
                 common_prompt_bytes: w.common_prompt_bytes as u64,
                 prompt_bytes: w.prompt_bytes as u64,
             }),
+            billing: r.billing.map(|billing| billing.label().to_owned()),
         }),
         Event::Tool(t) => db.record_tool(&crate::stats::ToolRecord {
             facts: t.facts.clone(),
@@ -510,6 +551,7 @@ fn record_stats(db: &mut crate::stats::Db, event: &Event) -> Result<()> {
             error: t.error,
         }),
         Event::Turn(_) => Ok(()),
+        Event::WorkerSession(s) => db.record_worker_session(&s.session, &s.agent, unix_ms(s.end)),
     }
 }
 
@@ -1141,6 +1183,8 @@ impl Exporter {
                     ));
                 }
             }
+            // Session attribution lives in the stats database; it is not a span or a metric.
+            Event::WorkerSession(_) => {}
         }
     }
 

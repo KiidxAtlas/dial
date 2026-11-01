@@ -7,7 +7,7 @@ use crate::agent::*;
 
 mod begin;
 pub(in crate::agent) mod cost_warn;
-mod progress;
+pub(in crate::agent) mod progress;
 mod round;
 mod settle;
 mod step;
@@ -28,6 +28,9 @@ struct Round {
     seed: Option<u64>,
     /// Tools loaded for compatibility this round; calls to them are retried next request.
     compatibility_loaded: HashSet<String>,
+    /// Offered calls refused for arguments another catalog tool declares, by call id: the
+    /// rejected keys and the tools loaded for the next round that accept them.
+    argument_routes: std::collections::HashMap<String, (Vec<String>, Vec<String>)>,
     repeat_streak: Option<crate::agent::safety::guard::RepeatedToolCall>,
     streamed: Option<crate::agent::run::streaming_dispatch::StreamingDispatch>,
     outcome: ToolOutcome,
@@ -107,6 +110,8 @@ pub(in crate::agent) struct TurnState<'a> {
     // Guidance, coaching and planning.
     todo_recovery: crate::agent::workflow::todo_recovery::TodoRecovery,
     solo_todo_noted: bool,
+    /// The most recent `edit`/`write` this turn failed, so nothing from it landed.
+    last_edit_refused: bool,
     pending_nudges: Vec<Value>,
     emissions: crate::agent::run::guidance::Emissions,
     coach_turn: modes::advisor::CoachTurn,
@@ -120,12 +125,13 @@ pub(in crate::agent) struct TurnState<'a> {
     policy_signature: String,
     stall: crate::agent::safety::guard::StallGuard,
     pace: crate::agent::safety::guard::PaceGuard,
+    /// Automatic discovery is attempted once per observed gap, never on every failed round.
+    capability_gaps: std::collections::BTreeSet<crate::agent::run::tool_exposure::CapabilityGap>,
+    /// One catalog-search reminder before an answer that denies a capability.
+    capability_search: crate::agent::verify::completion::CapabilitySearch,
     // Completion acceptance.
     completion: crate::agent::verify::completion::CompletionGuard,
-    completion_recovery: crate::agent::verify::completion::CompletionRecovery,
     completion_candidate: Option<String>,
-    /// Recovery attempts since the last progress, across every recovery mechanism.
-    progress: progress::ProgressLedger,
     // Background enrichment and steering.
     enrichment: crate::agent::run::enrichment::Enrichment,
     enrichment_epoch: u64,
@@ -251,6 +257,19 @@ impl Agent<'_> {
     ) -> Result<TurnReport> {
         let driven = engine.drive(|engine| self.turn_step(turn, engine, backend, schemas, ui));
         let driven = match driven {
+            Err(error)
+                if error
+                    .downcast_ref::<crate::agent::run::engine::StalledRefusal>()
+                    .is_some() =>
+            {
+                let reason = match turn.completion_candidate.take() {
+                    Some(candidate) => format!("{candidate}\n\n{error}"),
+                    None => error.to_string(),
+                };
+                let mut report = self.stop_turn(ui, reason, turn.iteration)?;
+                report.outcome = TurnOutcome::Blocked;
+                return Ok(report);
+            }
             Err(error)
                 if error
                     .downcast_ref::<crate::agent::run::engine::UncertainRefusal>()
@@ -406,6 +425,7 @@ impl Agent<'_> {
             pending_thinking,
             todo_recovery: Default::default(),
             solo_todo_noted: false,
+            last_edit_refused: false,
             pending_nudges: Vec::new(),
             emissions: Default::default(),
             coach_turn: Default::default(),
@@ -418,10 +438,10 @@ impl Agent<'_> {
             policy_signature: String::new(),
             stall: Default::default(),
             pace: Default::default(),
+            capability_gaps: Default::default(),
+            capability_search: Default::default(),
             completion: Default::default(),
-            completion_recovery: Default::default(),
             completion_candidate: None,
-            progress: Default::default(),
             enrichment: Default::default(),
             enrichment_epoch: 0,
             steering_pending: false,

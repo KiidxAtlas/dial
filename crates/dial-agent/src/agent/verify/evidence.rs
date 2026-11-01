@@ -339,6 +339,7 @@ impl Ledger {
             Some(observation) => match observation.status {
                 CheckStatus::Passed => "passed",
                 CheckStatus::CodeFailed => "code_failed",
+                CheckStatus::FailedUnknownCause => "failed_unknown_cause",
                 CheckStatus::EnvironmentUnavailable => "environment_unavailable",
                 CheckStatus::PermissionDenied => "permission_denied",
                 CheckStatus::Cancelled => "cancelled",

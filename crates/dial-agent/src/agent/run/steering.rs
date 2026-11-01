@@ -94,13 +94,31 @@ impl<'a> Agent<'a> {
 
     /// Append a steering message to the journal and make `text` the current instruction.
     pub(in crate::agent) fn journal_steering(&mut self, message: Value, text: &str) -> Result<()> {
+        let original = message[crate::storage::session::TURN_DRAFT_KEY]["original"]
+            .as_str()
+            .unwrap_or(text)
+            .to_owned();
         self.push(message)?;
         self.task_policy = crate::learn::task_policy::Policy::for_prompt(
             text,
             self.config.reasoning_guard.max_pre_action_secs,
         );
         self.request_phase = crate::adaptive::State::begin(self.task_policy.kind, text);
+        if !self.hermetic
+            && self.config.verification.enabled
+            && self.config.verification.target_evidence
+        {
+            self.step_checks
+                .targets
+                .retarget(&self.workspace, &original);
+        }
         let mut control = self.session.control_state();
+        crate::agent::run::intent::record(
+            &mut control,
+            &original,
+            json!(self.session.branch_leaf()),
+            crate::agent::run::intent::Kind::Steering,
+        );
         control["current_instruction_entry_id"] = json!(self.session.branch_leaf());
         control["current_instruction"] = json!(text);
         control["steering_active"] = json!(true);

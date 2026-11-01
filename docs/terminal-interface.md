@@ -58,6 +58,12 @@ failures (including checkpoint failures) are not reset by this recovery.
   counter and tokens/second in the composer. Dial's MLX runners report engine counts, including
   reasoning and tool tokens; the text runner also reports prompt processing progress. Other local
   servers use estimates marked `~` until reported usage arrives. Counters reset for each request.
+  Text-embedded tool syntax stays hidden from the transcript, but its streamed bytes still advance
+  estimated counts and reset the generation-silence timer. Engine-reported counts remain authoritative.
+- Built-in guidance asks for brief user-facing findings, decisions, changed plans and blockers,
+  even alongside tools, without narrating each routine call. This is a model instruction, not a
+  synthetic progress message or a guarantee of prose on every reply. Reasoning is shown only when
+  the provider emits it; tool-only replies do not imply that hidden reasoning was received.
 - Active work has a dedicated row above the composer: the current operation, elapsed **turn** time,
   and a compact activity track. Reported prompt counts fill the track; unknown progress uses a
   travelling marker, not a guessed percentage. The metadata border stays stable and the row
@@ -111,6 +117,9 @@ failures (including checkpoint failures) are not reset by this recovery.
 - Questions and approvals quarantine input queued before the dialog opens, so a buffered Enter
   cannot approve an unseen action. A question opened over a nonempty draft starts with draft
   focus: Enter edits that draft, Tab/Escape moves to the choices, and Ctrl+C cancels the question.
+  If a question or approval arrives while a full-screen menu is open during a turn, the menu
+  temporarily yields to the inline prompt. Its state is kept and it reopens after the prompt;
+  menu navigation and any composer draft are preserved.
 - In question dialogs, Enter in **Other/custom input** submits the answer (or advances to the next
   question). Shift+Enter inserts a newline. Enter in **Note** saves the note and returns to the
   choices without submitting.
@@ -544,7 +553,7 @@ known to implement it, detected from `TERM_PROGRAM`, `LC_TERMINAL` and similar v
 | --- | --- | --- |
 | Links (OSC 8) | iTerm2, Ghostty, kitty, WezTerm, VS Code, foot, Rio | URLs and file paths that exist, resolved against the project, are clickable in scrollback. In iTerm2, `path:line[:col]` opens at that line through Semantic History (⌘-click, using the editor set in Profiles → Advanced). The live region and text that is not a real URL or path are never linked. |
 | Working directory (OSC 7) | iTerm2, Ghostty, kitty, WezTerm, foot, tmux | New tabs and splits start in the project. |
-| Tab circle | any terminal that shows titles | A colored circle leads the tab title: orange while working, red when an approval or question waits or a turn failed, green when a turn finished. A key press clears it. The rest of the title is `dial · <project> · <session title>`, where the session title is its name (`/rename`) or its first message. Off with `ui.terminal_integration = false`; omitted with ASCII glyphs. |
+| Tab circle | any terminal that shows titles | A colored circle ends the tab title so it stays visible when iTerm2 shortens an unselected tab from the left: orange while working, red when an approval or question waits or a turn failed, green when a turn finished. A key press clears it. The title is `dial · <project> · <session title> <circle>`, where the session title is its name (`/rename`) or its first message. Off with `ui.terminal_integration = false`; omitted with ASCII glyphs. |
 | Attention | iTerm2 | The dock icon bounces while an approval or question waits. |
 | Progress (OSC 9;4) | iTerm2 3.6+, Ghostty 1.2+ | Prompt processing percentage, an indeterminate bar while generating, paused while waiting for you. |
 | User variables | iTerm2, WezTerm | `user.dialState` (`idle`, `working`, `waiting`, `done`, `failed`), `user.dialModel` and `user.dialContext` (context used, such as `42%`) for status bar components, badges (`\(user.dialState)`) and tab titles. |

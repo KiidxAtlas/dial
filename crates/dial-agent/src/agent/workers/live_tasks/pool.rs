@@ -14,6 +14,7 @@ const SHARED_KEYS: &[&str] = &[
     "isolation",
     "model_profile",
     "work_packet",
+    "acceptance_checks",
 ];
 const MAX_ITEMS: usize = 512;
 const MAX_POOLS: usize = 64;
@@ -333,7 +334,10 @@ impl LiveTasks {
 
     /// The pool's state and item outcomes. `settled_only` omits items that are still queued or running.
     pub fn pool_report(&self, id: &str, settled_only: bool) -> Result<Value, String> {
-        self.report_from(id, settled_only, 0)
+        self.report_from(id, settled_only, 0).map(|mut report| {
+            self.refresh_acceptance_report(&mut report);
+            report
+        })
     }
 
     /// Like `pool_report`, limited to items at or after index `from`.

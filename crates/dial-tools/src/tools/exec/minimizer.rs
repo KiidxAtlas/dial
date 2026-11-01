@@ -426,5 +426,85 @@ fn classify_go_test(line: &str) -> Class {
     }
 }
 
+// -------------------------------------------------------------------------------- failure digest
+
+/// Outputs shorter than this already show their first error near the top.
+const DIGEST_MIN_BYTES: usize = 4 * 1024;
+/// A first error this close to the start is visible without a digest.
+const DIGEST_VISIBLE_BYTES: usize = 1024;
+const DIGEST_LINES: usize = 12;
+const DIGEST_LINE_CHARS: usize = 200;
+
+pattern!(
+    FAILURE_HEAD,
+    r"^(error(\[E\d+\])?:|thread '.*' panicked at |test \S.* \.\.\. FAILED$|FAILED |E {3}|--- FAIL: |FAIL\s+\S+|npm (ERR!|error) |\S+\.\w+:\d+(:\d+)?: (fatal )?error)"
+);
+pattern!(LOCATION, r"^\s*--> \S+:\d+(:\d+)?\s*$");
+
+/// For a failed build or test run of a recognized command (cargo, pytest, go test, package
+/// installs), its first error lines with their `file:line` locations, to show before output
+/// whose first error sits far below the start. `None` for other commands, short outputs, an
+/// error already near the top, or no recognizable error line.
+pub fn failure_digest(command: &str, text: &str) -> Option<String> {
+    if text.len() < DIGEST_MIN_BYTES {
+        return None;
+    }
+    filter_for(command)?;
+    let cleaned = clean_terminal(text);
+    let mut digest = String::new();
+    let mut lines = 0;
+    let mut offset = 0;
+    let mut first = None;
+    let mut after_head = false;
+    for line in cleaned.lines() {
+        let start = offset;
+        offset += line.len() + 1;
+        let head = FAILURE_HEAD.is_match(line);
+        let location = after_head && LOCATION.is_match(line);
+        after_head = head;
+        if !head && !location {
+            continue;
+        }
+        first.get_or_insert(start);
+        let shown: String = line.chars().take(DIGEST_LINE_CHARS).collect();
+        digest.push_str(&shown);
+        digest.push('\n');
+        lines += 1;
+        if lines == DIGEST_LINES {
+            break;
+        }
+    }
+    (first? >= DIGEST_VISIBLE_BYTES).then_some(digest)
+}
+
+/// The conventional meaning of a nonzero exit `code` that printed nothing, for simple commands
+/// whose status reports a result rather than a failure (grep 1 = no match).
+pub fn silent_exit_meaning(command: &str, code: i32) -> Option<&'static str> {
+    if code != 1 {
+        return None;
+    }
+    let sole = bash_interceptor::sole_command(command)?;
+    let words = crate::runtime::arguments::split_words(&sole);
+    let (program, args) = words.split_first()?;
+    match program.rsplit('/').next()? {
+        "git" => {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            match git_subcommand(&args)? {
+                "grep" => Some("no lines matched"),
+                "diff" if args.iter().any(|a| matches!(*a, "--exit-code" | "--quiet")) => {
+                    Some("there are differences")
+                }
+                _ => None,
+            }
+        }
+        "grep" | "egrep" | "fgrep" | "rg" | "ag" => Some("no lines matched"),
+        "diff" | "cmp" => Some("the inputs differ"),
+        "test" | "[" | "[[" => Some("the condition is false"),
+        "pgrep" => Some("no process matched"),
+        "which" => Some("the program is not on PATH"),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests;

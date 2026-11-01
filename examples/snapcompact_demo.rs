@@ -1,116 +1,135 @@
-//! Demo: generate snapcompact PNG frames for visual inspection.
-//! Run with: cargo run --example snapcompact_demo
+//! Demo: write synthetic snapcompact PNG frames resolved per model route for visual inspection.
+//!
+//! Run with: `cargo run --locked --example snapcompact_demo -- [OUTPUT_DIR]`
+//! The default output is `scratch/snapcompact-tuned-preview` under the workspace root.
+//! Inputs are synthetic; no private session data, network or model is used.
 
-use serde_json::json;
-use std::sync::atomic::AtomicBool;
+use dial_agent::agent::compact::snapcompact::{Archive, archive_with_options};
+use dial_llm::config::snapcompact::{SnapcompactConfig, SnapcompactFamily};
+use serde_json::{Value, json};
+use std::{
+    path::{Path, PathBuf},
+    sync::atomic::AtomicBool,
+};
+
+/// Route name, model id used to resolve `auto`, and wire family.
+const ROUTES: &[(&str, &str, SnapcompactFamily)] = &[
+    (
+        "claude-older",
+        "claude-3-5-sonnet-20241022",
+        SnapcompactFamily::Anthropic,
+    ),
+    (
+        "claude-newer",
+        "claude-opus-4-7",
+        SnapcompactFamily::Anthropic,
+    ),
+    ("gemini", "gemini-3.5-flash", SnapcompactFamily::Google),
+    ("gpt", "gpt-5.5", SnapcompactFamily::OpenAi),
+];
 
 fn main() -> anyhow::Result<()> {
-    let messages = vec![
-        json!({
-            "role": "user",
-            "content": "Hello! Can you help me understand how snapcompact works?"
-        }),
-        json!({
-            "role": "assistant",
-            "content": "Snapcompact is a conversation-to-PNG rasterizer. It takes LLM conversation messages and renders them as pixel-perfect bitmap images using embedded fonts like 5x8, 8x8, 6x12, 8x13, and Silver TrueType. Each frame is a PNG that can be fed back into an LLM as visual context."
-        }),
-        json!({
-            "role": "user",
-            "content": "That's interesting! What shapes are available?"
-        }),
-        json!({
-            "role": "assistant",
-            "content": "There are 17 shape variants: 8x8r-bw, 8x8r-sent, 8x8u-bw, 8x8u-sent, 6x6u-bw, 6x6u-sent, 5x8-bw, 5x8-sent, 6x12-dim, 8x13-bw, 8on16-bw, 8on22-bw, 11on16-bw, silver16-bw, doc-8on16-bw, doc-8on16-sent, and doc-8on16-sent-dim. The 'bw' shapes use black-and-white ink, while 'sent' shapes color-code sentences with six hues (red, amber, green, teal, blue, violet). The 'doc' shapes render in two columns."
-        }),
-    ];
-
+    let out_dir = match std::env::args_os().nth(1) {
+        Some(path) => PathBuf::from(path),
+        None => Path::new(env!("CARGO_MANIFEST_DIR")).join("scratch/snapcompact-tuned-preview"),
+    };
+    std::fs::create_dir_all(&out_dir)?;
+    let messages = sample_messages();
     let cancel = AtomicBool::new(false);
+    let base = SnapcompactConfig::default();
 
-    // Shape 1: 8x13-bw (classic black & white)
-    let config_bw = dial_llm::config::snapcompact::SnapcompactConfig {
-        shape: "8x13-bw".to_string(),
-        ..dial_llm::config::snapcompact::SnapcompactConfig::default()
-    };
-    let archive_bw = dial_agent::agent::compact::snapcompact::archive_with_options(
-        &messages, &config_bw, 64, &cancel,
-    )?;
-    save_first_png(&archive_bw, "/tmp/snapcompact_8x13bw.png")?;
-    println!(
-        "Saved 8x13-bw: {}x{} pixels",
-        archive_bw.frames[0].width, archive_bw.frames[0].height
-    );
-
-    // Shape 2: 8x8r-sent (sentence-hued, 8x8 bitmap)
-    let config_sent = dial_llm::config::snapcompact::SnapcompactConfig {
-        shape: "8x8r-sent".to_string(),
-        ..dial_llm::config::snapcompact::SnapcompactConfig::default()
-    };
-    let archive_sent = dial_agent::agent::compact::snapcompact::archive_with_options(
-        &messages,
-        &config_sent,
-        64,
-        &cancel,
-    )?;
-    save_first_png(&archive_sent, "/tmp/snapcompact_8x8r_sent.png")?;
-    println!(
-        "Saved 8x8r-sent: {}x{} pixels",
-        archive_sent.frames[0].width, archive_sent.frames[0].height
-    );
-
-    // Shape 3: doc-8on16-sent (two-column doc layout)
-    let config_doc = dial_llm::config::snapcompact::SnapcompactConfig {
-        shape: "doc-8on16-sent".to_string(),
-        ..dial_llm::config::snapcompact::SnapcompactConfig::default()
-    };
-    let archive_doc = dial_agent::agent::compact::snapcompact::archive_with_options(
-        &messages,
-        &config_doc,
-        64,
-        &cancel,
-    )?;
-    save_first_png(&archive_doc, "/tmp/snapcompact_doc_8on16_sent.png")?;
-    println!(
-        "Saved doc-8on16-sent: {}x{} pixels",
-        archive_doc.frames[0].width, archive_doc.frames[0].height
-    );
-
-    // Shape 4: 5x8-bw (tiny bitmap)
-    let config_5x8 = dial_llm::config::snapcompact::SnapcompactConfig {
-        shape: "5x8-bw".to_string(),
-        ..dial_llm::config::snapcompact::SnapcompactConfig::default()
-    };
-    let archive_5x8 = dial_agent::agent::compact::snapcompact::archive_with_options(
-        &messages,
-        &config_5x8,
-        64,
-        &cancel,
-    )?;
-    save_first_png(&archive_5x8, "/tmp/snapcompact_5x8bw.png")?;
-    println!(
-        "Saved 5x8-bw: {}x{} pixels",
-        archive_5x8.frames[0].width, archive_5x8.frames[0].height
-    );
-
-    println!("\nAll PNGs saved to /tmp/");
+    for (route, model, family) in ROUTES {
+        let resolved = base.resolved_for_model(model, *family);
+        let archive = archive_with_options(&messages, &resolved, 64, &cancel)?;
+        println!(
+            "route={route} model={model} family={family:?} shape={} frame_size={} detail={} frames={}",
+            resolved.shape,
+            resolved
+                .frame_size
+                .map_or_else(|| "default".to_owned(), |size| size.to_string()),
+            resolved.image_detail.as_str(),
+            archive.frames.len(),
+        );
+        save_pages(route, &archive, &out_dir)?;
+    }
+    println!("PNG output directory: {}", out_dir.display());
     Ok(())
 }
 
-fn save_first_png(
-    archive: &dial_agent::agent::compact::snapcompact::Archive,
-    path: &str,
-) -> anyhow::Result<()> {
-    let content = &archive.messages[0];
-    let content_arr = content["content"].as_array().unwrap();
-
-    for item in content_arr {
-        if let Some(img) = item.get("image_url")
-            && let Some(url) = img["url"].as_str()
-            && let Some(base64_data) = url.strip_prefix("data:image/png;base64,")
-        {
-            let png_bytes =
-                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, base64_data)?;
-            std::fs::write(path, &png_bytes)?;
-        }
+/// Writes each generated frame to `<route>-page<N>.png` (one file per page) and prints its
+/// decoded geometry from the PNG header.
+fn save_pages(route: &str, archive: &Archive, out_dir: &Path) -> anyhow::Result<()> {
+    let content = archive.messages[0]["content"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("archive content is not an array"))?;
+    let mut page = 0usize;
+    for part in content.iter().filter(|part| part["type"] == "image_url") {
+        let png = decode_data_url(part)?;
+        let info = png_header(&png)?;
+        page += 1;
+        let path = out_dir.join(format!("{route}-page{page}.png"));
+        std::fs::write(&path, &png)?;
+        println!(
+            "  {} {}x{} bit_depth={} color_type={} detail={} bytes={}",
+            path.display(),
+            info.width,
+            info.height,
+            info.bit_depth,
+            info.color_type,
+            part["image_url"]["detail"].as_str().unwrap_or("?"),
+            png.len(),
+        );
     }
     Ok(())
+}
+
+fn decode_data_url(part: &Value) -> anyhow::Result<Vec<u8>> {
+    let url = part["image_url"]["url"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("image part has no url"))?;
+    let data = url
+        .strip_prefix("data:image/png;base64,")
+        .ok_or_else(|| anyhow::anyhow!("image part is not an embedded PNG"))?;
+    Ok(base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        data,
+    )?)
+}
+
+struct PngHeader {
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    color_type: u8,
+}
+
+/// Reads the fixed IHDR fields directly, so the example needs no extra decoder dependency.
+fn png_header(png: &[u8]) -> anyhow::Result<PngHeader> {
+    anyhow::ensure!(
+        png.len() >= 26 && &png[..8] == b"\x89PNG\r\n\x1a\n" && &png[12..16] == b"IHDR",
+        "generated bytes are not a PNG with IHDR"
+    );
+    Ok(PngHeader {
+        width: u32::from_be_bytes(png[16..20].try_into()?),
+        height: u32::from_be_bytes(png[20..24].try_into()?),
+        bit_depth: png[24],
+        color_type: png[25],
+    })
+}
+
+fn sample_messages() -> Vec<Value> {
+    vec![
+        json!({
+            "role": "user",
+            "content": "Synthetic preview: please keep the archived constraint that frames are read oldest-first."
+        }),
+        json!({
+            "role": "assistant",
+            "content": "Acknowledged. Model-aware routes choose a shape, frame size and image detail, then render exact source text into PNG frames without truncation."
+        }),
+        json!({
+            "role": "user",
+            "content": "Check the boundary: lines of ordinary prose, numbers 0123456789, and symbols []{}()<>=+-*/ should remain legible."
+        }),
+    ]
 }

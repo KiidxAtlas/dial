@@ -37,7 +37,9 @@ fn unlimited_step_budget_still_stops_truncation_and_keeps_completed_effects() {
     ] {
         let mut engine = Engine::default();
         let mut output = ToolOutput::ok("written".into()).with_effects(Effects::Known);
-        engine.settle(&workspace, &call, &mut output, false, false, |_| false);
+        engine.settle(&workspace, &call, &mut output, Default::default(), |_| {
+            false
+        });
         let mut budget = StepBudget::new(0, StepBudget::FREE_RETRIES);
         let mut attempts = 0;
         let report = engine

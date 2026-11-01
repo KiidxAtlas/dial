@@ -1,4 +1,5 @@
 //! Bounded assistance from observed work. No training labels or admission decisions live here.
+use crate::agent::verify::verification::{CheckStatus, FocusedCheck, classify_with_artifacts};
 use crate::agent::*;
 use crate::storage::experience::{self, Recipe, Step};
 use serde::{Deserialize, Serialize};
@@ -80,9 +81,20 @@ fn discovery_words(text: &str) -> HashSet<String> {
 }
 
 /// Rank only the caller's eligible catalog; discovery cannot widen that boundary.
+#[cfg(test)]
 pub(in crate::agent) fn discover(
     query: &str,
+    candidates: Vec<(String, String)>,
+) -> Vec<(String, String, bool)> {
+    discover_with_priority(query, candidates, &|_| 0)
+}
+
+/// Routing and explicit discovery prefer readiness only after capability relevance ties, before
+/// result and activation caps. Exact-name access remains authoritative regardless of readiness.
+pub(in crate::agent) fn discover_with_priority(
+    query: &str,
     mut candidates: Vec<(String, String)>,
+    priority: &impl Fn(&str) -> u8,
 ) -> Vec<(String, String, bool)> {
     let query = query.trim();
     if let Some(index) = candidates
@@ -184,7 +196,11 @@ pub(in crate::agent) fn discover(
             (matched >= total * 0.5).then_some((name, description, matched + name_score * 2.0))
         })
         .collect();
-    ranked.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    ranked.sort_by(|a, b| {
+        b.2.total_cmp(&a.2)
+            .then_with(|| priority(&a.0).cmp(&priority(&b.0)))
+            .then_with(|| a.0.cmp(&b.0))
+    });
     let best = ranked.first().map_or(0.0, |entry| entry.2);
     ranked
         .into_iter()
@@ -194,6 +210,19 @@ pub(in crate::agent) fn discover(
             (name, description, index < 3 && score >= best * 0.85)
         })
         .collect()
+}
+
+/// Recipe credit comes only from the shared check verdict: an observed, complete, passing run.
+/// Printed `[exit code: 0]` text, zero-test reports, cancellation, unknown effects, and incomplete
+/// or unretained evidence all fail closed, exactly as they do for focused checks.
+fn recipe_check_earns_credit(
+    check: &FocusedCheck,
+    runner: Option<(&str, Option<&str>)>,
+    out: &ToolOutput,
+    cancelled: bool,
+    artifacts: Option<&crate::storage::artifact::ArtifactStore>,
+) -> bool {
+    classify_with_artifacts(Some(check), runner, out, cancelled, artifacts) == CheckStatus::Passed
 }
 
 impl Agent<'_> {
@@ -748,20 +777,24 @@ impl Agent<'_> {
                         }
                     }
                     let mut passed = true;
+                    let config = self.config;
                     for (index, command) in recipe.checks.iter().enumerate() {
-                        ensure!(
-                            self.config
-                                .verification
-                                .commands
-                                .iter()
-                                .any(|c| &c.command == command
-                                    && self
-                                        .config
-                                        .verification
-                                        .behavioral_checks
-                                        .contains(&c.name)),
-                            "recipe check is no longer configured as behavioral"
-                        );
+                        let Some(configured) = config.verification.commands.iter().find(|c| {
+                            &c.command == command
+                                && config.verification.behavioral_checks.contains(&c.name)
+                        }) else {
+                            bail!("recipe check is no longer configured as behavioral");
+                        };
+                        let check = FocusedCheck {
+                            name: configured.name.clone(),
+                            command: configured.command.clone(),
+                            timeout_secs: configured.timeout_secs,
+                        };
+                        let runner = config
+                            .verification
+                            .runners
+                            .get(&configured.name)
+                            .map(|runner| (runner.program.as_str(), runner.module.as_deref()));
                         let nested = ToolCall {
                             id: format!("recipe-check:{id}:{index}"),
                             name: "bash".into(),
@@ -777,9 +810,13 @@ impl Agent<'_> {
                         let out = self.dispatch(backend, &nested, ui);
                         self.record(self.cur_step, "tool_result", json!({"name":nested.name,"output":out.text,"is_error":out.is_error,"recipe":id}))?;
                         ui.tool_result("bash", &out);
-                        passed &= !out.is_error
-                            && crate::agent::verify::verification::exit_code(&out.text) == Some(0)
-                            && !crate::agent::verify::verification::zero_tests(&out.text);
+                        passed &= recipe_check_earns_credit(
+                            &check,
+                            runner,
+                            &out,
+                            self.interrupt.load(Ordering::SeqCst),
+                            self.workspace.artifacts(),
+                        );
                         if !passed {
                             break;
                         }

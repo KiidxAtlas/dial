@@ -320,10 +320,13 @@ fn request_inner(
         body["tools"] = json!([{"type":"namespace","name":"dial","description":"Tools executed locally by Dial.","tools":functions}]);
     }
     if let Some(profile) = profile {
-        if !chat.tools.is_empty()
-            && let Some(parallel) = profile.capabilities.parallel_tool_calls
-        {
-            body["parallel_tool_calls"] = json!(parallel);
+        if !chat.tools.is_empty() {
+            // A forced Handoff replaces the parallel setting: no tool call is requested at all.
+            if profile.force_tool_choice_none {
+                body["tool_choice"] = json!("none");
+            } else if let Some(parallel) = profile.capabilities.parallel_tool_calls {
+                body["parallel_tool_calls"] = json!(parallel);
+            }
         }
         profile.validate_responses_request(chat)?;
         ensure!(

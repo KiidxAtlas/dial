@@ -59,6 +59,19 @@ fn aliases_and_scalars_preserve_conflicts_and_bounds() {
 }
 
 #[test]
+fn grep_limit_is_read_as_max_results_unless_both_are_given() {
+    let parameters = &json!({"type":"object","properties":{"pattern":{"type":"string"},"max_results":{"type":"integer","minimum":1,"maximum":1000}},"required":["pattern"],"additionalProperties":false});
+    let mut args = json!({"pattern":"fn","limit":5});
+    normalize("grep", parameters, &mut args);
+    assert_eq!(args, json!({"pattern":"fn","max_results":5}));
+    assert!(crate::agent::run::calls::validate(parameters, &args).is_ok());
+    let mut both = json!({"pattern":"fn","limit":5,"max_results":7});
+    normalize("grep", parameters, &mut both);
+    assert_eq!(both["max_results"], 7);
+    assert!(crate::agent::run::calls::validate(parameters, &both).is_err());
+}
+
+#[test]
 fn extension_scalars_are_recursive_but_strings_are_not_array_guesses() {
     let schema = json!({"type":"object","properties":{"tasks":{"type":"array","items":{"type":"object","properties":{"investigation":{"type":"boolean"}}}},"evidence":{"type":"array","items":{"type":"string"}}}});
     let mut args = json!({"tasks":[{"investigation":"true"}],"evidence":"a:1"});

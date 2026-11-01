@@ -24,7 +24,8 @@ fn dial_runtime_reads_the_thinking_switch_from_the_mlx_template() {
         ServerFacts {
             slots: None,
             thinking_switch: Some(true),
-            native_tools: None
+            native_tools: None,
+            ..Default::default()
         }
     );
     let without = template_dir(Some("{{ messages }}"));
@@ -65,7 +66,8 @@ fn llama_cpp_props_report_slots_and_the_template_switch() {
         ServerFacts {
             slots: Some(4),
             thinking_switch: Some(true),
-            native_tools: None
+            native_tools: None,
+            ..Default::default()
         }
     );
     let plain = routed(vec![(
@@ -79,7 +81,8 @@ fn llama_cpp_props_report_slots_and_the_template_switch() {
         ServerFacts {
             slots: Some(1),
             thinking_switch: Some(false),
-            native_tools: None
+            native_tools: None,
+            ..Default::default()
         }
     );
     let not_llama = routed(vec![]);
@@ -101,7 +104,8 @@ fn ollama_capabilities_report_the_thinking_switch_and_lm_studio_reports_none() {
         ServerFacts {
             slots: None,
             thinking_switch: Some(true),
-            native_tools: Some(false)
+            native_tools: Some(false),
+            ..Default::default()
         }
     );
     let plain = routed(vec![(
@@ -136,6 +140,67 @@ fn ollama_capabilities_report_the_thinking_switch_and_lm_studio_reports_none() {
     assert_eq!(native("silent"), ServerFacts::default());
     assert_eq!(native("absent"), ServerFacts::default());
     assert_eq!(native("tools").thinking_switch, None);
+}
+
+#[test]
+fn servers_report_the_generation_defaults_an_omitted_field_gets() {
+    // Current llama.cpp nests sampling under `params` and widens its f32 values.
+    let current = routed(vec![(
+        "/props",
+        r#"{"total_slots":1,"default_generation_settings":{"n_ctx":4096,"params":{
+            "temperature":0.800000011920929,"top_p":0.949999988079071,"top_k":40,
+            "min_p":0.05000000074505806,"n_predict":-1}}}"#
+            .into(),
+    )]);
+    let defaults = facts("llama-cpp", "m", Some(&current), None, &[]).defaults;
+    assert_eq!(
+        defaults,
+        ServerDefaults {
+            temperature: Some(0.8),
+            top_p: Some(0.95),
+            top_k: Some(40),
+            min_p: Some(0.05),
+            output: Some(OutputDefault::Unlimited),
+        }
+    );
+    assert_eq!(defaults.to_json()["max_tokens"], "unlimited");
+    assert_eq!(defaults.to_json()["temperature"], 0.8);
+    // Older builds keep them at the top level.
+    let older = routed(vec![(
+        "/props",
+        r#"{"default_generation_settings":{"temperature":0.2,"n_predict":512}}"#.into(),
+    )]);
+    let defaults = facts("llama-cpp", "m", Some(&older), None, &[]).defaults;
+    assert_eq!(defaults.temperature, Some(0.2));
+    assert_eq!(defaults.output, Some(OutputDefault::Tokens(512)));
+    assert_eq!(defaults.to_json()["max_tokens"], 512);
+
+    // Ollama reports the Modelfile parameters; unreported ones stay unknown, not Ollama's built-ins.
+    let ollama = routed(vec![(
+        "/api/show",
+        r#"{"capabilities":["completion"],
+            "parameters":"temperature                    0.6\ntop_k                          20\nstop                           \"<|im_end|>\"\nnum_predict                    4096"}"#
+            .into(),
+    )]);
+    let defaults = facts("ollama", "qwen3", Some(&ollama), None, &[]).defaults;
+    assert_eq!(
+        defaults,
+        ServerDefaults {
+            temperature: Some(0.6),
+            top_k: Some(20),
+            output: Some(OutputDefault::Tokens(4096)),
+            ..Default::default()
+        }
+    );
+    assert!(defaults.to_json()["top_p"].is_null());
+    let bare = routed(vec![(
+        "/api/show",
+        r#"{"capabilities":["completion"]}"#.into(),
+    )]);
+    assert_eq!(
+        facts("ollama", "llama3", Some(&bare), None, &[]).defaults,
+        ServerDefaults::default()
+    );
 }
 
 #[test]

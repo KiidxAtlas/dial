@@ -238,12 +238,14 @@ fn tool_results_and_encrypted_reasoning_roundtrip_after_session_resume() {
 }
 #[test]
 fn images_convert_to_responses_input_without_sending_bookkeeping() {
-    let mut c = chat();
-    c.messages[1] = json!({"role":"user","content":[{"type":"text","text":"look"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AA==","detail":"low"}}],"dial_evidence":{"secret":"never sent"}});
-    let body = request("account-model", &c, None).unwrap();
-    assert_eq!(body["input"][1]["content"][1]["type"], "input_image");
-    assert_eq!(body["input"][1]["content"][1]["detail"], "low");
-    assert!(!body.to_string().contains("never sent"));
+    for detail in ["auto", "low", "high", "original"] {
+        let mut c = chat();
+        c.messages[1] = json!({"role":"user","content":[{"type":"text","text":"look"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AA==","detail":detail}}],"dial_evidence":{"secret":"never sent"}});
+        let body = request("account-model", &c, None).unwrap();
+        assert_eq!(body["input"][1]["content"][1]["type"], "input_image");
+        assert_eq!(body["input"][1]["content"][1]["detail"], detail);
+        assert!(!body.to_string().contains("never sent"));
+    }
 }
 #[test]
 fn empty_terminal_output_replays_finished_items_only_after_successful_completion() {
@@ -912,5 +914,28 @@ fn done_only_call_signals_completion_before_response_and_honors_cancellation() {
             if name == "write" && arguments == call()["arguments"].as_str().unwrap())
         );
         assert!(acc.finish().is_err());
+    }
+}
+
+#[test]
+fn forced_tool_choice_none_keeps_responses_tool_namespace_and_input() {
+    use super::super::profiles::{ModelCapabilities, ModelProfile};
+    let mut profile = ModelProfile {
+        provider: "openai".into(),
+        model: "gpt-x".into(),
+        capabilities: ModelCapabilities {
+            parallel_tool_calls: Some(true),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let normal = request("gpt-x", &chat(), Some(&profile)).unwrap();
+    assert_eq!(normal["parallel_tool_calls"], serde_json::json!(true));
+    profile.force_tool_choice_none = true;
+    let handoff = request("gpt-x", &chat(), Some(&profile)).unwrap();
+    assert_eq!(handoff["tool_choice"], "none");
+    assert!(handoff.get("parallel_tool_calls").is_none());
+    for key in ["model", "tools", "input", "store", "stream"] {
+        assert_eq!(handoff[key], normal[key], "{key} changed");
     }
 }

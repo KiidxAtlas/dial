@@ -87,6 +87,13 @@ pub trait Tool: Send + Sync {
     /// OpenAI-style function schema: `{"type":"function","function":{...}}`.
     fn schema(&self) -> Value;
 
+    /// Current advisory execution prerequisites. Implementations may inspect configuration and
+    /// already-held runtime state only: no startup, installation, network or execution probes.
+    /// This never grants permission, and unknown is preferable to guessing from missing metadata.
+    fn readiness(&self, _config: &Config) -> crate::tools::surface::catalog::Readiness {
+        crate::tools::surface::catalog::Readiness::Unknown
+    }
+
     /// Semantic behavior revision, independent of the extension SDK and schema fingerprint.
     /// Increment when identical arguments can acquire a different meaning.
     fn contract_revision(&self) -> u32 {
@@ -213,6 +220,12 @@ pub trait Tool: Send + Sync {
     /// Names of `bash`-started jobs this session still awaits. A turn ending while any remain
     /// waits for them (see `await_work`), and `finish completed` is refused.
     fn awaited_work(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// Running jobs this session owns but does not await, as `name (command)`: named services
+    /// and watchers started explicitly. They end with the session, so an unattended run is told
+    /// about them before it ends (see `Agent::await_background_jobs`).
+    fn session_work(&self) -> Vec<String> {
         Vec::new()
     }
     /// Interrupt an active blocking operation without acquiring its session mutex.

@@ -17,6 +17,9 @@ pub(super) fn pack_state(state: &Value, budget: usize) -> String {
     };
     let priority = [
         "revision",
+        "latest",
+        "omitted_messages",
+        "earlier",
         "constraints",
         "goal",
         "open_work",
@@ -49,6 +52,59 @@ pub(super) fn pack_state(state: &Value, budget: usize) -> String {
         }
     }
     packed.to_string()
+}
+
+/// The parent's user-message trail without the texts a brief already carries: entries equal to
+/// the current request or the session-start goal (within `budget`, so the brief holds them
+/// unclipped) become `text_ref`s. `None` when no distinct or omitted message remains.
+pub(super) fn intent_trail(control: &Value, budget: usize) -> Option<Value> {
+    let mut intent = control["user_intent"].clone();
+    let fields = intent.as_object_mut()?;
+    let carried = [
+        (
+            control["current_instruction"].as_str(),
+            "parent_current_request",
+        ),
+        (control["original_goal"].as_str(), "session_start_context"),
+    ];
+    let reference = |entry: &mut Value| {
+        let label = entry["text"].as_str().and_then(|text| {
+            carried
+                .iter()
+                .find(|(known, _)| text.len() <= budget && *known == Some(text))
+                .map(|(_, label)| *label)
+        });
+        if let (Some(label), Some(entry)) = (label, entry.as_object_mut()) {
+            entry.remove("text");
+            entry.insert("text_ref".into(), json!(label));
+        }
+    };
+    if let Some(latest) = fields.get_mut("latest") {
+        reference(latest);
+    }
+    for entry in fields
+        .get_mut("earlier")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        reference(entry);
+    }
+    if fields.get("legacy_context").is_some_and(Value::is_null) {
+        fields.remove("legacy_context");
+    }
+    let has_text = |entry: Option<&Value>| entry.is_some_and(|entry| entry["text"].is_string());
+    let distinct = has_text(fields.get("latest"))
+        || has_text(fields.get("legacy_context"))
+        || fields
+            .get("earlier")
+            .and_then(Value::as_array)
+            .is_some_and(|earlier| earlier.iter().any(|entry| has_text(Some(entry))))
+        || fields
+            .get("omitted_messages")
+            .and_then(Value::as_u64)
+            .is_some_and(|omitted| omitted > 0);
+    distinct.then_some(intent)
 }
 
 /// Separate, conservative result envelope. Only explicit JSON statuses count as worker claims;

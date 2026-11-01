@@ -410,3 +410,93 @@ fn a_full_background_table_keeps_the_cell_in_the_foreground_with_a_notice() {
     let killed = bg.call(&ctx, &json!({"action":"kill","all":true}));
     assert!(!killed.is_error, "{}", killed.text);
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn native_callback_receipts_and_image_references_survive_eval_without_trusting_payload_claims() {
+    use crate::runtime::execution::NativeCapture;
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = unsandboxed(&dir);
+    let config = threshold_config(0);
+    let tool = EvalTool::new(config.eval.clone(), config.kernel.clone());
+    let ctx = context(&workspace, &config);
+    let capture = NativeCapture::new(b"pixels", "image/png", Some("window:7".into()));
+    let reference = json!({"sha256":capture.sha256,"inline":"cGl4ZWxz"});
+    for native in [false, true] {
+        let out = tool.call_with_dispatch(
+            &ctx,
+            &json!({"code":"tool.capture({}); 'done'", "background":false}),
+            &|_| {},
+            &AtomicBool::new(false),
+            &no_background,
+            &mut |callback| {
+                assert!(matches!(callback, ToolCallback::Call { name, .. } if name == "capture"));
+                let output = ToolOutput::structured(json!({"captures":[capture],
+                    "images":[{"reference":reference}]}));
+                if native {
+                    output.with_captures(vec![capture.clone()])
+                } else {
+                    output
+                }
+            },
+        );
+        assert!(!out.is_error, "{}", out.text);
+        if native {
+            assert_eq!(out.execution.captures, vec![capture.clone()]);
+            assert_eq!(out.data.unwrap()["dial_images"], json!([reference]));
+        } else {
+            assert!(out.execution.captures.is_empty());
+            assert!(out.data.unwrap().get("dial_images").is_none());
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn eval_cannot_relabel_pixels_from_before_a_later_callback_as_current() {
+    use crate::runtime::execution::NativeCapture;
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = unsandboxed(&dir);
+    let config = threshold_config(0);
+    let tool = EvalTool::new(config.eval.clone(), config.kernel.clone());
+    let ctx = context(&workspace, &config);
+    let capture = NativeCapture::new(b"pixels", "image/png", Some("window:7".into()));
+    let reference = json!({"sha256":capture.sha256,"inline":"cGl4ZWxz"});
+    for (code, current) in [
+        ("var old = tool.capture({}); tool.mutate({}); old", false),
+        ("tool.mutate({}); tool.capture({})", true),
+        ("tool.capture({}); tool.mutate({}); tool.capture({})", true),
+        ("tool.capture({}); tool.schemas", true),
+    ] {
+        let out = tool.call_with_dispatch(
+            &ctx,
+            &json!({"code":code, "background":false}),
+            &|_| {},
+            &AtomicBool::new(false),
+            &no_background,
+            &mut |callback| match callback {
+                ToolCallback::Call { name, .. } if name == "capture" => {
+                    ToolOutput::structured(json!({"images":[{"reference":reference}]}))
+                        .with_captures(vec![capture.clone()])
+                }
+                ToolCallback::Call { name, .. } if name == "mutate" => {
+                    ToolOutput::ok("changed".into())
+                }
+                ToolCallback::Schemas => ToolOutput::structured(json!([])),
+                other => panic!("unexpected callback: {other:?}"),
+            },
+        );
+        assert!(!out.is_error, "{}", out.text);
+        if current {
+            assert_eq!(out.execution.captures, vec![capture.clone()], "{code}");
+            assert_eq!(
+                out.data.unwrap()["dial_images"],
+                json!([reference]),
+                "{code}"
+            );
+        } else {
+            assert!(out.execution.captures.is_empty(), "{code}");
+            assert!(out.data.unwrap().get("dial_images").is_none(), "{code}");
+        }
+    }
+}

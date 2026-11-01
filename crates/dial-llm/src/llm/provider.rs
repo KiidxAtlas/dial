@@ -908,6 +908,14 @@ impl Backend {
             .filter(|n| *n > 0)
             .unwrap_or(32768)
     }
+
+    /// The window to send as an explicit Ollama `num_ctx` request. Only an operator-configured
+    /// context limit counts; the automatic window is for budgeting and never overrides the host.
+    fn explicit_context_cap(&self) -> Option<u32> {
+        let config = self.steering_config.as_ref()?;
+        (config.context_limit.tokens().is_some() || config.local_context_window.tokens().is_some())
+            .then_some(config.context_window)
+    }
     pub fn model_profile(&self) -> Option<&llm::profiles::ModelProfile> {
         self.profile.as_ref()
     }
@@ -1072,6 +1080,52 @@ impl Backend {
     pub fn with_profile(mut self, profile: llm::profiles::ModelProfile) -> Self {
         self.profile = Some(profile);
         self
+    }
+    /// Whether a compaction Handoff may keep the live request prefix: only stateless, non-local
+    /// chat-completions, Responses or Anthropic Messages routes. Codex/ChatGPT subscription,
+    /// WebSocket, local, Gemini, Ollama and transport-shaped routes answer `false`.
+    pub fn supports_live_handoff(&self) -> bool {
+        if self.local_inference() {
+            return false;
+        }
+        match &self.kind {
+            ProviderKind::Endpoint { .. } => matches!(
+                self.protocol.unwrap_or(ApiProtocol::ChatCompletions),
+                ApiProtocol::ChatCompletions | ApiProtocol::Responses
+            ),
+            ProviderKind::AnthropicEndpoint { .. } => {
+                self.protocol.unwrap_or(ApiProtocol::Anthropic) == ApiProtocol::Anthropic
+            }
+            _ => false,
+        }
+    }
+    /// Request controls for a live-context Handoff: the bounded existing profile (or a minimal one
+    /// for the route), with the runtime-only `tool_choice: none` flag set. Call only after
+    /// `supports_live_handoff` returned `true`.
+    pub fn compaction_handoff_profile(&self, max_tokens: u32) -> llm::profiles::ModelProfile {
+        let mut profile = self
+            .bounded_request_profile(None, max_tokens)
+            .unwrap_or_else(|| {
+                let provider = match &self.kind {
+                    ProviderKind::AnthropicEndpoint { .. } => "anthropic",
+                    _ => self.local_provider(None),
+                };
+                let mut minimal =
+                    llm::profiles::ModelProfile::minimal(provider, self.route_model());
+                minimal.max_tokens = (max_tokens > 0).then_some(max_tokens);
+                minimal
+            });
+        profile.force_tool_choice_none = true;
+        profile
+    }
+    /// Side backends copy only the one-way cache namespace hash of a source route. Credentials
+    /// and the sticky session identity are never copied.
+    pub fn copy_cache_namespace_from(&mut self, source: &Backend) {
+        self.prompt_cache_key = source.prompt_cache_key.clone();
+    }
+    /// The current one-way prompt-cache namespace; `None` before one is bound.
+    pub fn prompt_cache_key(&self) -> Option<&str> {
+        self.prompt_cache_key.as_deref()
     }
     /// The structured-output mechanism the live endpoint enforces, detected rather than declared: a
     /// loopback/private OpenAI-compatible endpoint that answers llama.cpp's `/props`, or whose
@@ -1360,6 +1414,7 @@ impl Backend {
         };
         if let Ok(reply) = &mut result {
             reply.wire = self.wire.lock().latest();
+            reply.billing = Some(billing);
         }
         transport.settle(result.is_ok())?;
         if let Some(scope) = scope {
@@ -1409,7 +1464,13 @@ impl Backend {
         let interrupted = || interrupt.load(Ordering::SeqCst);
         let timeout_secs = self.response_timeout(timeout_secs);
         let vision = self.image_input_for(profile.as_ref());
-        let prepared = llm::images::prepare(req, vision, &self.image_notices, on_notice);
+        let prepared = llm::images::prepare_for_target(
+            req,
+            vision,
+            self.snapcompact_image_detail(),
+            &self.image_notices,
+            on_notice,
+        );
         let req = prepared.as_ref().unwrap_or(req);
         let mut resolved;
         let req = if req.max_tokens == 0 {
@@ -1465,13 +1526,21 @@ impl Backend {
             return llm::apple::chat(req, timeout_secs, &interrupt, on_text, on_event);
         }
         // Local hints ride the profile as request-scoped carriers; a hosted route never gets any.
-        // Detection (which may probe a local server) runs only when there is something to send.
+        // Probe endpoints only for hints; managed runtimes also need the wire for template thinking.
         let merged_hints = self
             .next_local_hints
             .take()
             .unwrap_or_default()
             .over(&self.local_hints);
-        let local_server = if merged_hints.is_empty() {
+        let managed_template_thinking = matches!(self.kind, ProviderKind::Local { .. })
+            && profile
+                .as_ref()
+                .and_then(|p| p.local_sampling.as_ref())
+                .and_then(|sampling| sampling.chat_template_kwargs.as_ref())
+                .and_then(|kwargs| kwargs.get("enable_thinking"))
+                .and_then(serde_json::Value::as_bool)
+                .is_some();
+        let local_server = if merged_hints.is_empty() && !managed_template_thinking {
             None
         } else {
             self.detect_local(
@@ -1985,7 +2054,7 @@ impl Backend {
                             &mut on_text,
                             Arc::clone(&interrupt),
                             profile.as_ref(),
-                            Some(self.context_capacity()),
+                            self.explicit_context_cap(),
                             on_event,
                         )
                     }
@@ -2856,6 +2925,9 @@ fn anthropic_request_body(
         {
             body["tool_choice"] =
                 serde_json::json!({"type":"auto","disable_parallel_tool_use":!parallel});
+        }
+        if profile.force_tool_choice_none && !req.tools.is_empty() {
+            body["tool_choice"] = serde_json::json!({"type":"none"});
         }
         if profile.capabilities.strict_tools {
             for tool in body

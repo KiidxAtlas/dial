@@ -116,9 +116,10 @@ fn arguments(raw: &Value) -> Result<Value> {
     Ok(value)
 }
 
-/// `context_window` is the window Dial plans against. Ollama loads a model with a small default
-/// context and silently truncates longer prompts, so the window is always requested explicitly
-/// (`num_ctx`); a profile's own `context_window` takes precedence.
+/// `context_window` is the window Dial plans against. An explicit requested window (`Some`, from
+/// a configured context limit) is sent as `num_ctx`, because Ollama otherwise loads a small
+/// default context and silently truncates longer prompts. `None` leaves `num_ctx` to the server,
+/// which uses its own automatic loaded context. A profile's own `context_window` takes precedence.
 fn request(
     endpoint: &Endpoint<'_>,
     req: &Chat,
@@ -268,12 +269,15 @@ fn request(
         "Ollama requires conversation messages"
     );
     let mut options = json!({});
-    // num_predict:-1 explicitly means unlimited, rather than 0 (no generation).
-    options["num_predict"] = if req.max_tokens == 0 {
-        json!(-1)
-    } else {
-        json!(req.max_tokens)
-    };
+    // num_predict:-1 explicitly means unlimited, rather than 0 (no generation). A host-inherited
+    // allowance (`inherit_output_limit` with no profile max) sends no num_predict at all.
+    if !profile.is_some_and(|p| p.inherit_output_limit && p.max_tokens.is_none()) {
+        options["num_predict"] = if req.max_tokens == 0 {
+            json!(-1)
+        } else {
+            json!(req.max_tokens)
+        };
+    }
     if profile.is_none_or(|profile| profile.capabilities.temperature) {
         let temperature = profile
             .and_then(|profile| profile.temperature)

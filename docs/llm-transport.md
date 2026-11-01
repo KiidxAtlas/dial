@@ -102,19 +102,40 @@ name them:
 - Dial's MLX runtime (`mlx_lm.server`): `chat_template_kwargs.enable_thinking` (when the model's chat
   template reads it), `presence_penalty` and `repetition_penalty`. Source: `mlx_lm/server.py` in
   [mlx-lm v0.32.0](https://github.com/ml-explore/mlx-lm/blob/v0.32.0/mlx_lm/server.py).
+- Dial's MLX vision runtime (`mlx_vlm.server`, selected from the checkpoint's vision metadata):
+  top-level `enable_thinking`. Dial translates a boolean profile
+  `local_sampling.chat_template_kwargs.enable_thinking` to that wire field; MLX-LM keeps the nested
+  field. Explicit profile reasoning controls and an existing native request field retain priority.
+  An unset choice stays unset, so the server's default still applies. This mapping does not force
+  reasoning or create prose the model did not emit. Source: the installed mlx-vlm 0.7.6
+  `server/request_normalization.py` and `server/generation.py`.
 - LM Studio (OpenAI-compatible API): `ttl` (`keep_loaded_secs`; LM Studio applies it to
   just-in-time loaded models), `presence_penalty` and `repeat_penalty`. No request-level thinking
   switch is documented, so none is sent. Source: [LM Studio docs](https://lmstudio.ai/docs/developer).
-- Ollama native `/api/chat`: `keep_alive` (`keep_loaded_secs`), `think` (models with the `thinking`
-  capability), `options.presence_penalty` / `options.repeat_penalty`, and `options.num_ctx` limited
-  to the memory estimate when no window is pinned. At exit, a model this session loaded is unloaded
-  with an empty `/api/generate` request carrying `keep_alive: 0`. Source:
+- Ollama native `/api/chat`: `keep_alive` (`keep_loaded_secs`, opt-in), `think` (models with the
+  `thinking` capability), and opt-in `options.presence_penalty` / `options.repeat_penalty`.
+  Automatic context uses the host's loaded window without sending `options.num_ctx`; explicit
+  Dial context limits still send it. Memory estimates are advisory only. Model unloading at exit
+  applies only when Dial was explicitly asked to extend residency and loaded the model itself.
+  Source:
   [Ollama API](https://github.com/ollama/ollama/blob/main/docs/api.md); the `thinking` capability
   name is from `types/model/capability.go`. Reply durations (`load_duration`,
   `prompt_eval_duration`, `eval_duration`, nanoseconds) supply load time and speed.
 
 None of these fields has been measured against a live server by Dial's tests; the tests check the
 request bodies built for each server.
+
+For ordinary local-host agent requests, unset generation controls inherit the serving API's defaults
+by omission, not by copying guessed values. This includes temperature, output allowance, thinking,
+residency and cache/penalty overrides. Explicit Dial settings still win; internal bounded requests
+can retain their own limits. A host's API defaults need not be identical to every GUI chat preset.
+For a field Dial omits, the status bar (`temp … · out …`) and the `/policy` local request settings
+show the value the server reports applying to it, marked `(provider)`: llama.cpp's `/props`
+`default_generation_settings` and Ollama's `/api/show` Modelfile `parameters` (temperature, top-p,
+top-k, min-p, output allowance; a negative count shows as `unlimited`). They are read once per
+session. LM Studio's API reports no sampling defaults and an Ollama model without a `PARAMETER`
+line reports none, so those fields show only `provider`; Dial does not substitute a server's
+undocumented built-in value.
 
 ## Tool calls on local servers
 
@@ -174,6 +195,7 @@ state, requests report `registry_default` routing.
 - Sockets opened by the cancellable HTTP transport and WebSocket TCP connector enable TCP keepalive probes after 30 seconds of silence (every 10 seconds, 3 probes). For WebSockets this includes the socket underneath an HTTP CONNECT tunnel. A path that dies while the model is silent (sleep/wake, a network or VPN switch, an expired NAT mapping) can fail sooner than the model idle limit and retry on a fresh connection. A live server answers probes however long the model takes, so slow replies keep the full limit. These are kernel probes, not billed requests or prompt-cache refreshes, and they do not renew model-progress deadlines. Retry notices show how long the failed attempt ran.
 - Local model servers (localhost or LAN) keep an unlimited first-event wait. `worker_timeout_secs` (default `0`) still governs local workers. `0` on `remote_model_idle_timeout_secs` is an explicit opt-out.
 - The agent's silence-recovery watchdog does not interrupt local model loading or prompt processing before generation begins. It still bounds silent generation and remote requests. Loading/prefill may remain silent when an engine cannot report measured progress; user cancellation and configured transport/startup limits remain active.
+- OpenAI-compatible usage reports with `completion_tokens: 0` are processing telemetry, not evidence that generation has begun. They cannot arm the local generation-silence watchdog before output; positive output counts still report generation. Token accounting is unchanged.
 - The silence watchdog requires advancing telemetry (phase or token-count high-water marks), nonempty text/reasoning, or tool argument progress. Repeated status/rate reports and notices do not renew its deadline. Once generation starts, stale loading/prefill reports cannot disarm it; a provider retry resets the attempt's watchdog state.
 - A failed or cancelled request to a Dial-managed server stops that server and its descendants before reuse. The next request starts a fresh process rather than queueing behind abandoned inference. External servers are never killed. Non-cancellation failures include a bounded stderr tail from the failed request, preserving the original error classification.
 - Local startup health checks and embedding warm-up observe cancellation, including when the startup timeout is unlimited. The supervised server's one-shot generation/embedding warm-up is distinct from optional `preparation.local_prefix` and paid hosted prompt-cache refresh.

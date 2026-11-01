@@ -127,6 +127,13 @@ fn glob_patterns_sort_and_cap() {
     assert_eq!(text("nothing*"), "no matches");
     assert!(run(&ws, "glob", json!({"pattern": "../*"})).is_error);
     assert!(run(&ws, "glob", json!({"pattern": "/etc/*"})).is_error);
+    let refused = run(&ws, "grep", json!({"pattern": "x", "path": ".git"}));
+    assert!(refused.is_error);
+    assert!(
+        refused.text.contains("\".git\"") && refused.text.contains("`read`"),
+        "{}",
+        refused.text
+    );
     for i in 0..(MAX_LIST + 20) {
         fs::write(dir.path().join(format!("many_{i:04}.dat")), "").unwrap();
     }
@@ -502,6 +509,79 @@ fn anchored_globs_preserve_ignore_and_symlink_boundaries() {
         )),
         "src/deep/mod.rs:1:needle\n"
     );
+}
+
+#[test]
+fn anchored_glob_no_match_hints_at_the_named_directory_without_naming_hidden_files() {
+    let (dir, ws) = workspace();
+    fs::write(dir.path().join(".gitignore"), "private work/\n").unwrap();
+    for path in ["private work/report.md", "docs/report.md"] {
+        let file = dir.path().join(path);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, "x\n").unwrap();
+    }
+    // Successful matches never carry the hint, even when an ignored file also matches.
+    let found = run(&ws, "glob", json!({"pattern": "**/report.md"})).text;
+    assert_eq!(body(&found), "docs/report.md\n", "{found}");
+    assert!(!found.contains("ignored_hint="), "{found}");
+    // The anchored root glob stays excluded; the hint says the target may be ignored and names
+    // the directory to inspect, without disclosing the hidden descendant.
+    let root = run(&ws, "glob", json!({"pattern": "private work/**/*.md"})).text;
+    assert_eq!(body(&root), "no matches\n", "{root}");
+    assert!(
+        root.contains("ignored_hint=") && root.contains("may be excluded"),
+        "{root}"
+    );
+    assert!(
+        root.contains("private work") && root.contains("path="),
+        "{root}"
+    );
+    assert!(!root.contains("report.md"), "{root}");
+    // An explicit scope inside the ignored directory finds the intended file.
+    let scoped = run(
+        &ws,
+        "glob",
+        json!({"pattern": "*.md", "path": "private work"}),
+    )
+    .text;
+    assert_eq!(body(&scoped), "private work/report.md\n", "{scoped}");
+    assert!(!scoped.contains("ignored_hint="), "{scoped}");
+    // gitignore=false includes the directory directly, so no hint is needed.
+    let included = run(
+        &ws,
+        "glob",
+        json!({"pattern": "private work/**/*.md", "gitignore": false}),
+    )
+    .text;
+    assert_eq!(body(&included), "private work/report.md\n", "{included}");
+    assert!(!included.contains("ignored_hint="), "{included}");
+}
+
+#[test]
+fn glob_ignored_hint_is_limited_to_anchored_unpaged_gitignored_no_match() {
+    let (dir, ws) = workspace();
+    fs::write(dir.path().join(".gitignore"), "private work/\n").unwrap();
+    fs::create_dir_all(dir.path().join("private work")).unwrap();
+    fs::write(dir.path().join("private work/report.md"), "x\n").unwrap();
+    // Each boundary has no matches; only the anchored, unpaged, gitignore=true case is hinted.
+    let cases = [
+        (json!({"pattern": "**/report.md"}), false),
+        (json!({"pattern": "**/absent.md"}), false),
+        (
+            json!({"pattern": "private work/**/absent.md", "skip": 1}),
+            false,
+        ),
+        (
+            json!({"pattern": "private work/**/absent.md", "gitignore": false}),
+            false,
+        ),
+        (json!({"pattern": "private work/**/absent.md"}), true),
+    ];
+    for (args, hinted) in cases {
+        let text = run(&ws, "glob", args.clone()).text;
+        assert_eq!(text.contains("ignored_hint="), hinted, "{args}: {text}");
+        assert!(!text.contains("report.md"), "{args}: {text}");
+    }
 }
 
 #[test]

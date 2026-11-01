@@ -88,6 +88,77 @@ fn handoff_brief_leads_with_the_current_request_and_labels_the_first_goal_as_his
 }
 
 #[test]
+fn worker_handoff_preserves_original_intent_separately_from_effective_draft() {
+    let config = config(&[]);
+    let mut request = parse(
+        &json!({"task":"inspect parser", "solution_space":"read only"}),
+        &config,
+    )
+    .expect("valid worker assignment");
+    let intent = json!({"latest":{"text":"inspect, do not edit", "entry_id":"u2"},
+        "earlier":[{"text":"fix parser", "entry_id":"u1"}], "omitted_messages":0});
+    let control =
+        json!({"current_instruction":"## Objective\nInspect the parser", "user_intent":intent});
+    Handoff::capture(&control, &[]).apply(&mut request.jobs);
+    let brief = request.jobs[0].brief();
+    assert!(brief.contains("Inspect the parser"));
+    assert!(brief.contains("inspect, do not edit"));
+    assert!(brief.contains("u2"));
+    let oversized = Handoff::capture(
+        &json!({"user_intent":{"latest":{"text":"x".repeat(10_000)}}}),
+        &[],
+    );
+    let carried: Value =
+        serde_json::from_str(oversized.user_intent.as_deref().expect("intent snapshot"))
+            .expect("overflow remains valid JSON");
+    assert_eq!(carried["critical_context_incomplete"], true);
+    assert!(
+        carried["omitted_fields"]
+            .as_array()
+            .expect("omitted fields")
+            .contains(&json!("latest"))
+    );
+}
+
+#[test]
+fn handoff_intent_trail_references_texts_the_brief_already_carries() {
+    let config = config(&[]);
+    let (current, goal) = ("ship the parser fix", "audit the parser");
+    let entry = |text: &str, id: &str| json!({"text":text,"entry_id":id,"kind":"user_turn"});
+    for (earlier, distinct) in [
+        // Only repeats of the current request and the session goal: no provenance block.
+        (vec![entry(goal, "u1")], None),
+        // A distinct older message stays verbatim next to the references.
+        (
+            vec![entry(goal, "u1"), entry("also keep the CLI flag", "u2")],
+            Some("also keep the CLI flag"),
+        ),
+    ] {
+        let mut request = parse(
+            &json!({"task":"edit parser.rs", "solution_space":"s"}),
+            &config,
+        )
+        .unwrap();
+        let control = json!({"current_instruction":current, "original_goal":goal,
+            "user_intent":{"latest":entry(current, "u3"),"earlier":earlier,"omitted_messages":0,"legacy_context":null}});
+        Handoff::capture(&control, &[]).apply(&mut request.jobs);
+        let brief = request.jobs[0].brief();
+        assert_eq!(brief.matches(current).count(), 1, "{brief}");
+        assert_eq!(brief.matches(goal).count(), 1, "{brief}");
+        assert_eq!(
+            brief.contains("user-message provenance"),
+            distinct.is_some(),
+            "{brief}"
+        );
+        if let Some(text) = distinct {
+            assert!(brief.contains(text));
+            assert!(brief.contains("parent_current_request"));
+            assert!(brief.contains("session_start_context"));
+        }
+    }
+}
+
+#[test]
 fn reviewer_preserves_read_only_permissions_and_optional_schema() {
     let config = config(&[]);
     let mut args =
@@ -130,6 +201,13 @@ fn read_only_children_are_told_their_limits_before_the_first_call() {
             .system(root, &["read".into(), "bash".into()])
             .contains("READ-ONLY")
     );
+    // Workers recall saved codebase context; the parent saves findings after integration.
+    let memory = worker.jobs[0].system(root, &["read".into(), "codebase_memory".into()]);
+    assert!(
+        memory.contains("do not save findings with remember"),
+        "{memory}"
+    );
+    assert!(!memory.contains("Save reusable architectural findings"));
 }
 
 #[test]
@@ -1180,4 +1258,30 @@ fn task_schema_offers_isolation_backend_for_single_tasks_and_batch_items() {
         );
     }
     assert_eq!(properties["isolation"]["enum"], json!(["copy"]));
+}
+
+#[test]
+fn acceptance_contract_only_resolves_configured_checks_and_isolates_mutating_jobs() {
+    let mut config = config(&[]);
+    config
+        .verification
+        .commands
+        .push(crate::config::types::VerificationCommand {
+            name: "behavior".into(),
+            command: "operator-command".into(),
+            file_extensions: vec![],
+            timeout_secs: 10,
+        });
+    for agent in ["worker", "scout"] {
+        let request = parse(&json!({"agent":agent,"task":"work","solution_space":"s","acceptance_checks":["behavior"]}), &config).unwrap();
+        assert_eq!(request.jobs[0].isolated, agent == "worker");
+        assert_eq!(request.jobs[0].acceptance_checks, ["behavior"]);
+    }
+    for checks in [
+        json!([]),
+        json!(["behavior", "behavior"]),
+        json!(["echo arbitrary-command"]),
+    ] {
+        assert!(parse(&json!({"agent":"worker","task":"work","solution_space":"s","acceptance_checks":checks}), &config).is_err());
+    }
 }

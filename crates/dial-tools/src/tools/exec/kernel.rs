@@ -540,10 +540,17 @@ pub(crate) fn code_output(result: Result<Value, String>) -> ToolOutput {
 }
 
 pub(crate) fn require_fork_containment(label: &str) -> Result<(), String> {
-    match crate::tools::surface::catalog::execution_platform(label).reason {
-        Some(reason) => Err(reason),
-        None => Ok(()),
+    if let Some(reason) = crate::tools::surface::catalog::execution_platform(label).reason {
+        return Err(reason);
     }
+    // Discovery reports static OS support without executing a sandbox probe. Admission must still
+    // test real containment here, including when filesystem sandboxing is explicitly disabled.
+    if cfg!(target_os = "macos") {
+        crate::tools::exec::sandbox::Sandbox::detect().available().map_err(|error| {
+            format!("{label} requires OS process-fork containment even with filesystem sandboxing disabled: {error}")
+        })?;
+    }
+    Ok(())
 }
 
 /// Cell deadline with host-callback time excluded. A controller callback runs on the caller's

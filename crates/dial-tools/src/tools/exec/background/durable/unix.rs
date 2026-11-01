@@ -200,6 +200,23 @@ fn forget(directory: &Path) -> Result<()> {
 }
 
 fn request(directory: &Path, ws: &Workspace, args: &Value) -> Result<ToolOutput> {
+    let mut output = request_inner(directory, ws, args)?;
+    if let Some(mut launch) = output.execution.shell_launch.clone() {
+        // The private owner uses a fixed internal table name. Only the validated external
+        // directory identity is callable by this controller, including after owner exit.
+        launch.job = Some(
+            directory
+                .file_name()
+                .context("job name")?
+                .to_string_lossy()
+                .into_owned(),
+        );
+        output = output.with_shell_launch(launch);
+    }
+    Ok(output)
+}
+
+fn request_inner(directory: &Path, ws: &Workspace, args: &Value) -> Result<ToolOutput> {
     private_dir(directory)?;
     let record: Record = read_json(&directory.join("owner.json"))?;
     ensure!(record.root == ws.root, "job belongs to another workspace");
@@ -331,7 +348,7 @@ pub(super) fn dispatch(
             !cancel.load(Ordering::Acquire) && !interrupt.load(Ordering::Acquire),
             "wait cancelled; durable job remains owned"
         );
-        let output = request(&directory, ws, &forwarded)?;
+        let mut output = request(&directory, ws, &forwarded)?;
         let record: Record = read_json(&directory.join("owner.json"))?;
         if output.is_error
             || !record.owner.alive()
@@ -342,10 +359,8 @@ pub(super) fn dispatch(
             return Ok(output);
         }
         if Instant::now() >= end {
-            return Ok(ToolOutput::ok(format!(
-                "wait timed out; job remains owned\n{}",
-                output.text
-            )));
+            output.text = format!("wait timed out; job remains owned\n{}", output.text);
+            return Ok(output);
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -647,6 +662,10 @@ fn run_owner(launch: Launch) -> Result<()> {
         .start(&ws, &launch.args, None, &cancel)
         .map_err(anyhow::Error::msg)?;
     ensure!(!started.is_error, "command was refused: {}", started.text);
+    let launch_context = started
+        .execution
+        .shell_launch
+        .context("native shell launch receipt missing")?;
     publish(&launch.directory.join("ready.json"), &true)?;
     let end = Instant::now() + Duration::from_secs(launch.lifetime);
     let mut killed_output = None;
@@ -677,7 +696,7 @@ fn run_owner(launch: Launch) -> Result<()> {
                 let result = (|| -> Result<ToolOutput> {
                     let args: Value = serde_json::from_reader((&mut stream).take(4096))?;
                     match args["action"].as_str() {
-                        Some("list") => Ok(bg.list()),
+                        Some("list") => Ok(bg.list().with_shell_launch(launch_context.clone())),
                         Some("output") => snapshot(&bg, &ws),
                         Some("kill") => {
                             let output = stop(&bg, &ws, "durable job killed")?;

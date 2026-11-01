@@ -151,15 +151,20 @@ fn unique_instances_canonical_scopes_and_layout_isolation() {
         "src/../secret",
         "C:\\src",
         "",
-        "./src",
+        ".",
         "src//parser.rs",
-        "src/",
+        "src/./parser.rs",
     ] {
         assert!(
             first.publish("", "", &[bad.into()]).is_err(),
             "accepted {bad:?}"
         );
     }
+    // A leading `./` and a trailing `/` are normalized, not refused.
+    second
+        .publish("", "", &["./src/".into(), "src/lexer.rs/".into()])
+        .unwrap();
+    assert_eq!(first.peers().unwrap()[0].scopes, ["src", "src/lexer.rs"]);
     assert!(first.publish(&"x".repeat(1025), "", &[]).is_err());
     assert!(first.publish("", "", &vec!["a".into(); 33]).is_err());
     drop(second);

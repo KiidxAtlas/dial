@@ -8,6 +8,8 @@ Jobs are session-owned unless a call explicitly supplies `persist: true`: use `l
 
 Readers settle for at most 300 ms after leader exit. On cleanup they drain for at most another 300 ms, with a bounded join wait; a descendant retaining an output descriptor cannot hold the controller's readers indefinitely. Incomplete captures are marked partial. POSIX descendants that escape their process group remain a residual cleanup limitation (Linux's sandbox PID namespace adds containment).
 
+PTY starts without explicit `ready` automatically observe the newly started job for up to one second after spawn, returning its rendered initial screen and controller-owned process/capture status. Observed exit ends the observation sooner; a nonzero or signal exit is reported as an error while retaining the job handle for inspection. The existing reader-settlement allowance can add up to 300 ms, plus spawn/scheduling overhead. The wait is interruptible and never sends input or starts a replacement process. A running screen is neither explicit readiness nor behavioral verification. Explicit readiness retains its existing wait path; ordinary pipe starts remain asynchronous. The same observation applies to `bash` with `pty: true`.
+
 ## Explicit restart-surviving pipe jobs (Unix only)
 
 No saved setting is changed or enabled. On Unix, an explicitly approved start can instead use:

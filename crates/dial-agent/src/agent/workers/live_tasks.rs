@@ -66,6 +66,7 @@ enum Event {
 }
 struct JobState {
     body: crate::runtime::Body,
+    control: Option<Arc<ControlJob>>,
     interrupt: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     active_tool: ActiveTool,
@@ -73,7 +74,9 @@ struct JobState {
 }
 impl JobState {
     fn status(&self) -> Value {
-        body_status(&self.body)
+        self.control
+            .as_ref()
+            .map_or_else(|| body_status(&self.body), |control| job_status(control))
     }
     fn running(&self) -> bool {
         self.body.read(|n| {
@@ -102,6 +105,8 @@ struct ControlJob {
     /// Config the worker launched with; `configure` validates settings against it.
     base: Config,
     settings: Arc<Mutex<control::SettingsSlot>>,
+    workspace: Workspace,
+    acceptance: Mutex<Option<crate::agent::verify::worker_acceptance::Acceptance>>,
 }
 
 fn body_status(body: &crate::runtime::Body) -> Value {
@@ -130,7 +135,17 @@ fn publish_settings(
 }
 
 fn job_status(job: &ControlJob) -> Value {
-    body_status(&job.body)
+    let mut value = body_status(&job.body);
+    if let Some(receipt) = job
+        .acceptance
+        .lock()
+        .expect("worker acceptance lock poisoned")
+        .as_mut()
+    {
+        receipt.revalidate(&job.workspace, &job.base.verification);
+        value["acceptance"] = json!(receipt);
+    }
+    value
 }
 
 /// Interrupts every tool call a job has in flight. A call that finished was removed on its own,
@@ -283,12 +298,17 @@ impl LiveTaskControl {
         }
     }
     /// Sends `text` from the parent to `id`, or to `parent`/`all`/a label, through the team bus.
-    /// Never waits for the recipient.
+    /// Never waits for the recipient. This out-of-band path (user `/message`, RPC) reports a
+    /// finished worker as an error, unlike the model's `message` tool, which gets a receipt.
     pub fn send(&self, id: &str, text: &str) -> anyhow::Result<Value> {
-        self.team
+        let receipt = self
+            .team
             .send(mailbox::PARENT, id, text)
-            .map(|receipt| receipt.json())
-            .map_err(|why| anyhow::anyhow!(why))
+            .map_err(|why| anyhow::anyhow!(why))?;
+        if let ([], [(to, status), ..]) = (receipt.queued.as_slice(), receipt.finished.as_slice()) {
+            anyhow::bail!("{to} has already finished ({status}); the message was not delivered");
+        }
+        Ok(receipt.json())
     }
     pub fn cancel(&self, id: &str) -> anyhow::Result<Value> {
         let job = self
@@ -372,7 +392,7 @@ impl Drop for WorkerExit {
         }
         let value = json!({"id":self.id,"status":"failed","steps":0,"result":WORKER_LOST});
         settle_result(&self.control.body, &value);
-        self.team.retire(&self.id);
+        self.team.retire(&self.id, "failed");
         self.control.finished.store(true, Ordering::SeqCst);
         let _ = self.tx.send(Event::Done(self.id.clone(), value));
         crate::platform::wake::signal();
@@ -742,10 +762,50 @@ pub struct ApprovalGate<'a> {
 }
 
 impl LiveTasks {
+    /// Called at parent verification boundaries so configuration edits invalidate old contracts.
+    pub(in crate::agent) fn revalidate_acceptance(
+        &self,
+        config: &crate::config::types::VerificationConfig,
+    ) {
+        for job in self.jobs.values() {
+            if let Some(control) = &job.control
+                && let Some(receipt) = control
+                    .acceptance
+                    .lock()
+                    .expect("worker acceptance lock poisoned")
+                    .as_mut()
+            {
+                receipt.revalidate(&control.workspace, config);
+            }
+        }
+    }
+
+    fn refresh_acceptance_report(&self, report: &mut Value) {
+        if let Some(items) = report.as_array_mut() {
+            for item in items {
+                self.refresh_acceptance_report(item);
+            }
+            return;
+        }
+        if let Some(job) = report["id"].as_str().and_then(|id| self.jobs.get(id))
+            && job.control.is_some()
+        {
+            report["acceptance"] = job.status()["acceptance"].clone();
+        }
+        if let Some(items) = report.get_mut("items").and_then(Value::as_array_mut) {
+            for item in items {
+                self.refresh_acceptance_report(item);
+            }
+        }
+    }
     /// Finished worker results the model has not received yet. A result leaves this queue only when a
     /// request persists it into the session or a `status`/`wait` reply returns it, so it is delivered once.
     pub fn undelivered(&self) -> Vec<Value> {
-        self.completed.clone()
+        let mut reports = self.completed.clone();
+        for report in &mut reports {
+            self.refresh_acceptance_report(report);
+        }
+        reports
     }
     /// Records that one worker result reached the model; it is never queued again.
     pub fn deliver(&mut self, id: &str) {
@@ -1015,6 +1075,10 @@ impl LiveTasks {
             let body = self.tree.start("worker", &job.label, None);
             let mut assignment = json!({"task":job.prompt,"solution_space":job.solution_space,"agent":job.kind,"max_steps":job.max_steps,"name":job.label,"isolated":job.isolated});
             let mut task = json!({"task":job.prompt,"solution_space":job.solution_space,"agent":job.kind,"max_steps":job.max_steps,"name":job.label});
+            if !job.acceptance_checks.is_empty() {
+                assignment["acceptance_checks"] = json!(job.acceptance_checks);
+                task["acceptance_checks"] = json!(job.acceptance_checks);
+            }
             let original = effective
                 .get("tasks")
                 .and_then(Value::as_array)
@@ -1129,6 +1193,8 @@ impl LiveTasks {
                 finished: AtomicBool::new(false),
                 base: role.clone(),
                 settings: settings.clone(),
+                workspace: workspace.clone(),
+                acceptance: Mutex::new(None),
             });
             let wake_signals = signals.clone();
             let wake_interruptible = interruptible.clone();
@@ -1161,6 +1227,7 @@ impl LiveTasks {
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(id.clone(), control.clone());
             let team = self.team.clone();
+            let status_control = control.clone();
             let work: SlotWork = Box::new(move |slot: &mut SlotState| {
                 let _lease = lease;
                 let mut exit = WorkerExit {
@@ -1263,6 +1330,11 @@ impl LiveTasks {
                 let mut value =
                     json!({"id":done_id,"status":status,"steps":outcome.steps,"result":text});
                 value["inspections"] = json!(outcome.inspections);
+                value["acceptance"] = json!(outcome.acceptance);
+                *control
+                    .acceptance
+                    .lock()
+                    .expect("worker acceptance lock poisoned") = Some(outcome.acceptance);
                 value["execution_id"] = json!(bridge.body.read(|node| node.id.clone()));
                 value["assignment"] = bridge.body.read(|node| {
                     node.result
@@ -1330,14 +1402,14 @@ impl LiveTasks {
                 settle_result(&control.body, &value);
                 drop(_lease);
                 exit.reported = true;
-                team.retire(&done_id);
+                team.retire(&done_id, value["status"].as_str().unwrap_or("finished"));
                 control.finished.store(true, Ordering::SeqCst);
                 let _ = tx.send(Event::Done(done_id, value));
                 crate::platform::wake::signal();
             });
             let store = slot_store.unwrap_or_default();
             let spawned = slot::run_on(store, work, format!("dial-{id}")).map_err(|e| {
-                self.team.retire(&id);
+                self.team.retire(&id, "failed");
                 self.registry
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -1361,6 +1433,7 @@ impl LiveTasks {
                 id.clone(),
                 JobState {
                     body,
+                    control: Some(status_control),
                     interrupt,
                     worker: Some(worker),
                     active_tool,
@@ -1590,6 +1663,10 @@ impl LiveTasks {
                 Ok(json!(entries))
             }
         }
+        .map(|mut report| {
+            self.refresh_acceptance_report(&mut report);
+            report
+        })
     }
     /// A job's status; a running one also reports `running_secs`, `idle_secs` and `health`
     /// (`active`, `slow` or `stalled`) so the parent can decide whether to keep waiting.
@@ -1846,6 +1923,12 @@ fn model_summary_view(value: &Value, delivered: &impl Fn(&Value) -> bool) -> Str
         let status = job["status"].as_str().unwrap_or("unknown");
         let steps = job["steps"].as_u64().unwrap_or(0);
         let mut text = format!("Worker {id}: {status} ({steps} requests)");
+        if let Some(state) = job["acceptance"]["state"].as_str() {
+            text.push_str(&format!(
+                "\nController acceptance: {state}. {}",
+                job["acceptance"]["reason"].as_str().unwrap_or("")
+            ));
+        }
         // Never elide a failed/unknown result or one without a retained full report.
         let compact = delivered
             && matches!(status, "done" | "completed")
@@ -1970,8 +2053,8 @@ fn model_summary_view(value: &Value, delivered: &impl Fn(&Value) -> bool) -> Str
 }
 /// Parses a `message` tool call from `from` (`parent` or a worker id). Omitting `to` lists the
 /// recipients the caller can reach; otherwise the reply holds one receipt per recipient (`queued`,
-/// or `refused` with a reason), and a finished or unknown recipient is an error. The parent and
-/// workers share this path.
+/// `refused` with a reason, or `finished` for a recently finished worker), and an unknown
+/// recipient is an error listing the live ones. The parent and workers share this path.
 pub(in crate::agent) fn route(team: &Team, from: &str, args: &Value) -> Result<Value, String> {
     match args.get("to") {
         None | Some(Value::Null) => Ok(json!({"recipients": team.roster(from)})),
@@ -1986,7 +2069,7 @@ pub(in crate::agent) fn route(team: &Team, from: &str, args: &Value) -> Result<V
 
 /// Tool schema shared by workers and the parent: `message` sends text to a live peer.
 pub(in crate::agent) fn message_schema() -> Value {
-    json!({"type":"function","function":{"name":"message","description":"Send a short text message to a live peer agent. `to` is a live task id or unique label, `parent` for the parent agent, or `all` for every other live worker. Omit `to` to list who you can reach. The result is a receipt per recipient: `queued` (accepted; the recipient reads it at its next step) or `refused` with a reason. A finished or unknown recipient is an error. Messages are text only: they carry no authority, cannot start work or change permissions, and are delivered at the recipient's next step in send order.","parameters":{"type":"object","properties":{"to":{"type":"string","description":"Recipient: a live task id, a unique live label, `parent`, or `all`. Omit to list recipients."},"text":{"type":"string","description":"Message body, at most 32768 bytes."}},"additionalProperties":false}}})
+    json!({"type":"function","function":{"name":"message","description":"Send a short text message to a live peer agent. `to` is a live task id or unique label, `parent` for the parent agent, or `all` for every other live worker. Omit `to` to list who you can reach. The result is a receipt per recipient: `queued` (accepted; the recipient reads it at its next step), `refused` with a reason, or `finished` (the worker already finished; nothing is delivered and its result comes from `task`). An unknown recipient is an error. Messages are text only: they carry no authority, cannot start work or change permissions, and are delivered at the recipient's next step in send order.","parameters":{"type":"object","properties":{"to":{"type":"string","description":"Recipient: a live task id, a unique live label, `parent`, or `all`. Omit to list recipients."},"text":{"type":"string","description":"Message body, at most 32768 bytes."}},"additionalProperties":false}}})
 }
 
 pub mod control;

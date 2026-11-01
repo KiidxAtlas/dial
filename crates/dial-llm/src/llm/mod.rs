@@ -306,6 +306,9 @@ pub struct Reply {
     pub text_calls_lifted: bool,
     /// The message layout dispatch actually sent for this reply's request.
     pub wire_form: messages::WireForm,
+    /// How the backend that produced this reply bills it; `None` for replies that did not come
+    /// from a provider request (fixtures, synthesized replies).
+    pub billing: Option<usage::Billing>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -391,6 +394,9 @@ pub enum StreamEvent {
     /// Validated provider activity without displayable content (e.g. signed thinking or block
     /// transitions). Not a keepalive, token estimate, or evidence that generation has started.
     Activity,
+    /// Generated text withheld from the visible callback while tool syntax is being collected.
+    /// Counts as output and liveness, but is neither prose nor an executable tool call.
+    HiddenText(String),
     Reasoning(String),
     ToolArguments {
         index: u64,
@@ -757,7 +763,9 @@ fn chat_stream_at_controlled(
         .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"));
     let callback = std::cell::RefCell::new(on_event);
     let mut markup = markup::Healer::default();
-    let mut hider = text_tool_calls::Hider::new(on_text, !req.tools.is_empty());
+    let mut hidden =
+        |text: &str| (callback.borrow_mut())(&StreamEvent::HiddenText(text.to_owned()));
+    let mut hider = text_tool_calls::Hider::new(on_text, &mut hidden, !req.tools.is_empty());
     let mut reply = if is_sse {
         let mut accumulator = stream::Accumulator::with_patience(patience.clone());
         let mut forward = |piece: &str| {

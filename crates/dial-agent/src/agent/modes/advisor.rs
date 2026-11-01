@@ -169,7 +169,7 @@ impl CoachTurn {
         self.evidence.iter().cloned().collect()
     }
 
-    fn question(&self, goal: &str, reply: &str) -> Value {
+    fn question(&self, goal: &str, reply: &str, reconciliation: &Value) -> Value {
         let mut evidence = vec![format!(
             "Proposed final reply (not proof):\n{}",
             guard::clip_middle(reply, 1500)
@@ -177,7 +177,9 @@ impl CoachTurn {
         evidence.extend(self.evidence());
         json!({
             "goal": guard::clip_middle(goal, 1500),
-            "question": crate::judgment::resources::instructions("completion-review"),
+            "question": format!("{}\nController reconciliation (claims are not proof):\n{}",
+                crate::judgment::resources::instructions("completion-review"),
+                guard::clip_middle(&reconciliation.to_string(), 6000)),
             "evidence": evidence,
             "rejected_hypotheses": []
         })
@@ -312,12 +314,11 @@ impl Agent<'_> {
             && !self.plan_mode
     }
 
-    /// Live steering is authoritative over the goal with which the loop originally started.
+    /// Review evolving user intent, not a harness continuation or the latest amendment alone.
     fn current_goal(&self, goal: &str) -> String {
-        self.session.control_state()["current_instruction"]
-            .as_str()
-            .unwrap_or(goal)
-            .to_owned()
+        let control = self.session.control_state();
+        let current = control["current_instruction"].as_str().unwrap_or(goal);
+        crate::agent::run::intent::continuation(current, &control, &[])
     }
 
     /// One advice-only coach request through escalation's approval, disclosure and accounting.
@@ -532,7 +533,9 @@ impl Agent<'_> {
             }
         }
         let current = self.current_goal(goal);
-        let question = state.question(&current, reply);
+        let reconciliation =
+            self.deliverable_reconciliation(&self.session.control_state()["working_state"]);
+        let question = state.question(&current, reply, &reconciliation);
         let before = self.session_cost;
         let outcome = self
             .ask_coach(backend, format!("coach-review-{step}"), &question, ui)

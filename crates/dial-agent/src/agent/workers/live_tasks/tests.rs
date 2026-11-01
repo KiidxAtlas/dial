@@ -39,6 +39,7 @@ fn polling_reports_are_compact_only_after_delivery_and_remain_recoverable() {
     tasks.jobs.insert(
         "task-1".into(),
         JobState {
+            control: None,
             body: body.clone(),
             interrupt: Arc::new(AtomicBool::new(false)),
             worker: None,
@@ -95,6 +96,7 @@ fn polling_never_elides_failures_or_unretained_reports() {
         tasks.jobs.insert(
             "task-1".into(),
             JobState {
+                control: None,
                 body,
                 interrupt: Arc::new(AtomicBool::new(false)),
                 worker: None,
@@ -133,6 +135,7 @@ fn rebinding_cancels_old_workers_without_projecting_them_into_the_new_session() 
     tasks.jobs.insert(
         "task-1".into(),
         JobState {
+            control: None,
             body: old.clone(),
             interrupt: cancel.clone(),
             worker: None,
@@ -237,6 +240,7 @@ fn completion_is_visible_before_pumping_and_an_early_ack_is_not_redelivered() {
     tasks.jobs.insert(
         "task-1".into(),
         JobState {
+            control: None,
             body: body.clone(),
             interrupt: Arc::new(AtomicBool::new(false)),
             worker: None,
@@ -390,7 +394,8 @@ fn isolated_conflict_publishes_incomplete_and_preserves_candidate_and_parent_byt
             plan_mode: false,
             agents_messages: &[],
         };
-        let candidate = json!({"answer":"candidate", "count":7});
+        let candidate = json!({"answer":"candidate", "count":7,
+            "acceptance":{"state":"accepted"}, "evidence_refs":["artifact://obsolete-or-unrelated"]});
         let outcome = subagents::run_job(env, &request.jobs[0], &mut NoTools, |env, _| {
             std::fs::write(env.workspace.root().join("source.txt"), b"worker\0bytes").unwrap();
             if conflict {
@@ -404,6 +409,11 @@ fn isolated_conflict_publishes_incomplete_and_preserves_candidate_and_parent_byt
         let expected = if conflict { "incomplete" } else { "done" };
         assert_eq!(outcome.status.wire(), expected);
         assert_eq!(outcome.data.as_ref(), Some(&candidate));
+        assert_ne!(
+            outcome.acceptance.state,
+            crate::agent::verify::worker_acceptance::State::Accepted,
+            "worker claims and references never grant controller acceptance"
+        );
         let isolation = outcome.isolation.as_ref().unwrap();
         assert!(isolation.errors.is_empty());
         assert_eq!(isolation.conflicts.is_empty(), !conflict);
@@ -430,6 +440,7 @@ fn isolated_conflict_publishes_incomplete_and_preserves_candidate_and_parent_byt
         tasks.jobs.insert(
             "task-1".into(),
             JobState {
+                control: None,
                 body: body.clone(),
                 interrupt: interrupt.clone(),
                 worker: None,
@@ -625,6 +636,7 @@ fn a_worker_message_to_the_parent_ends_a_wait_early_and_stays_queued() {
     tasks.jobs.insert(
         "task-1".into(),
         JobState {
+            control: None,
             body,
             interrupt: Arc::new(AtomicBool::new(false)),
             worker: None,
@@ -688,6 +700,7 @@ fn event_wait_wakes_for_a_worker_terminal_result_without_delivering_it_twice() {
         agent.live_tasks.jobs.insert(
             "task-1".into(),
             JobState {
+                control: None,
                 body,
                 interrupt: Arc::new(AtomicBool::new(false)),
                 worker: None,
@@ -735,6 +748,7 @@ fn running_job(tasks: &mut LiveTasks, id: &str, data: Value) -> crate::runtime::
     tasks.jobs.insert(
         id.into(),
         JobState {
+            control: None,
             body: body.clone(),
             interrupt: Arc::new(AtomicBool::new(false)),
             worker: None,
@@ -876,4 +890,72 @@ fn a_wait_ends_early_when_a_worker_stalls_and_leaves_it_running() {
     assert_eq!(status["status"], "running", "nothing is cancelled");
     assert_eq!(status["health"], "stalled");
     assert!(WaitStop::Stalled.note().contains("no progress"));
+}
+
+#[test]
+fn contracted_candidate_without_declared_inputs_stays_unmerged_and_unverified() {
+    struct NoExecution;
+    impl Approver for NoExecution {
+        fn authorize(&mut self, _: &ToolCall, _: &str, _: bool) -> Result<(), Denial> {
+            panic!("missing input contract cannot reach execution authorization")
+        }
+    }
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("source.txt"), "original").unwrap();
+    let workspace = Workspace::new(project.path()).unwrap();
+    let mut config = Config::default();
+    config.isolation.backend = crate::config::isolation::Preference::Copy;
+    config
+        .verification
+        .commands
+        .push(crate::config::types::VerificationCommand {
+            name: "behavior".into(),
+            command: "configured-check".into(),
+            file_extensions: vec![],
+            timeout_secs: 10,
+        });
+    let request = subagents::parse(&json!({"agent":"worker","task":"edit","solution_space":"s","acceptance_checks":["behavior"]}), &config).unwrap();
+    let registry = Registry::new();
+    let harness = Harness::default();
+    let interrupt = Arc::new(AtomicBool::new(false));
+    let env = Env {
+        config: &config,
+        workspace: &workspace,
+        ext: &registry,
+        layout: None,
+        harness: &harness,
+        interrupt: &interrupt,
+        usage: None,
+        context_cap: None,
+        memory: None,
+        plan_mode: false,
+        agents_messages: &[],
+    };
+    let outcome = subagents::run_job(env, &request.jobs[0], &mut NoExecution, |env, _| {
+        std::fs::write(env.workspace.root().join("source.txt"), "candidate").unwrap();
+        let mut result = Outcome::incomplete(1, "unused");
+        result.status = subagents::Status::done("all checks passed; artifact://unrelated".into());
+        result
+    });
+    assert_eq!(
+        outcome.status.wire(),
+        "done",
+        "execution completed independently of acceptance"
+    );
+    assert_eq!(
+        outcome.acceptance.state,
+        crate::agent::verify::worker_acceptance::State::NeedsVerification
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("source.txt")).unwrap(),
+        "original"
+    );
+    let isolation = outcome.isolation.unwrap();
+    assert!(!isolation.integrated);
+    let kept = isolation.kept.expect("unaccepted candidate retained");
+    assert_eq!(
+        std::fs::read_to_string(kept.join("source.txt")).unwrap(),
+        "candidate"
+    );
+    std::fs::remove_dir_all(kept).unwrap();
 }

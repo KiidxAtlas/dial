@@ -1,6 +1,28 @@
 //! Experimental setting declarations. Defaults derive from typed configuration fields.
 use super::*;
+
+const REASONING_STRATEGIES: EnumValues = &[
+    ("default", "Default (unchanged)"),
+    ("evidence_first", "Evidence first"),
+    ("hypothesis_driven", "Hypothesis driven"),
+    ("plan_then_act", "Plan then act"),
+    ("decompose", "Decompose"),
+    ("compare_alternatives", "Compare alternatives"),
+    ("critique_and_refine", "Critique and refine"),
+    ("verification_first", "Verification first"),
+    ("minimal_change", "Minimal change"),
+];
+
 pub(super) static DECLARATIONS: &[SettingDef] = &[
+    field!(
+        "experimental.reasoning_strategy",
+        experimental.reasoning_strategy,
+        EX,
+        "Reasoning",
+        "Reasoning strategy",
+        "Experimental prompt guidance for the main agent and new workers; not private chain-of-thought editing. Default leaves guidance unchanged. Does not change thinking effort, permissions or verification. Custom replacement prompts/templates opt out. Applies between turns; outcome and token-cost effects are unmeasured.",
+        Kind::Enum(REASONING_STRATEGIES),
+    ),
     field!(
         "experimental.batch_approvals",
         experimental.batch_approvals,

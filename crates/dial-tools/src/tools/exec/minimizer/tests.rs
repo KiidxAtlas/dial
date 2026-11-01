@@ -62,6 +62,47 @@ fn a_passing_line_that_mentions_failure_is_never_collapsed() {
 }
 
 #[test]
+fn a_cargo_failure_buried_under_progress_gets_a_digest_of_its_first_errors() {
+    let mut text = big((0..200).map(|i| format!("   Compiling crate{i} v0.{i}.0")));
+    text.push_str("warning: unused variable: `x`\n --> src/lib.rs:3:9\n");
+    text.push_str("error[E0308]: mismatched types\n --> src/main.rs:7:5\n  |\n7 |     1u8\n");
+    text.push_str("error: could not compile `app` (bin \"app\") due to 1 previous error\n");
+    let digest = failure_digest("cargo build", &text).expect("digest");
+    assert_eq!(
+        digest,
+        "error[E0308]: mismatched types\n --> src/main.rs:7:5\nerror: could not compile `app` (bin \"app\") due to 1 previous error\n"
+    );
+    // Warnings' locations are not errors; unknown commands and visible errors get none.
+    assert!(!digest.contains("src/lib.rs"));
+    assert!(failure_digest("./run.sh", &text).is_none());
+    let top = format!("error: bad flag\n{text}");
+    assert!(failure_digest("cargo build", &top).is_none());
+    assert!(failure_digest("cargo build", "error: short\n").is_none());
+}
+
+#[test]
+fn silent_exit_codes_with_a_conventional_meaning_are_explained() {
+    for (command, meaning) in [
+        ("grep -rn needle src", "no lines matched"),
+        ("rg needle", "no lines matched"),
+        ("git grep needle", "no lines matched"),
+        ("git diff --quiet", "there are differences"),
+        ("diff a b", "the inputs differ"),
+        ("test -f missing", "the condition is false"),
+    ] {
+        assert_eq!(silent_exit_meaning(command, 1), Some(meaning), "{command}");
+    }
+    for (command, code) in [
+        ("grep needle src", 2),
+        ("git diff", 1),
+        ("cargo build", 1),
+        ("grep a | wc -l", 1),
+    ] {
+        assert_eq!(silent_exit_meaning(command, code), None, "{command} {code}");
+    }
+}
+
+#[test]
 fn only_a_single_simple_command_is_filtered() {
     let text = big((0..60).map(|i| format!("   Compiling crate{i} v1.0.{i}")));
     for command in [

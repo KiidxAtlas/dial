@@ -486,6 +486,18 @@ fn scoped_patch(before: &Tree, after: &Tree, allowed: &[PathBuf]) -> Result<Vec<
     Ok(paths)
 }
 
+/// The one verdict for an isolated candidate check, shared with focused checks. Printed success
+/// text never counts: only an observed completed process without a zero-test report passes. The copy has
+/// no artifact store, so output clipped by presentation stays unverified rather than inferred.
+fn check_verdict(check: &Check, result: &ToolOutput, cancelled: bool) -> verification::CheckStatus {
+    let focused = verification::FocusedCheck {
+        name: check.command.clone(),
+        command: check.command.clone(),
+        timeout_secs: check.timeout_secs,
+    };
+    verification::classify_with_artifacts(Some(&focused), None, result, cancelled, None)
+}
+
 fn verify(
     candidate: &Path,
     expected: &Tree,
@@ -516,9 +528,10 @@ fn verify(
             interrupt,
             ui,
         )?;
-        let ok = !result.is_error && verification::exit_code(&result.text) == Some(0);
+        let verdict = check_verdict(check, &result, interrupt.load(Ordering::SeqCst));
+        let ok = verdict == verification::CheckStatus::Passed;
         passed &= ok;
-        evidence.push(json!({"command":check.command,"passed":ok,"output":subagents::clip(&result.text, 2000)}));
+        evidence.push(json!({"command":check.command,"passed":ok,"verdict":verdict,"output":subagents::clip(&result.text, 2000)}));
     }
     ensure!(passed, "explicit checks failed: {}", json!(evidence));
     Ok(evidence)

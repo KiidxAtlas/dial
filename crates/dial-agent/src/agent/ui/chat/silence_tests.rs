@@ -1,6 +1,104 @@
 use super::*;
 
 #[test]
+fn hidden_tool_text_keeps_live_generation_counts() {
+    #[derive(Default)]
+    struct RecordingUi {
+        counts: Vec<u64>,
+        text: String,
+    }
+    impl Ui for RecordingUi {
+        fn model_progress(&mut self, value: &llm::ModelProgress) {
+            if let Some(tokens) = value.output_tokens {
+                self.counts.push(tokens);
+            }
+        }
+        fn text_delta(&mut self, text: &str) {
+            self.text.push_str(text);
+        }
+    }
+    let chunks = [
+        "Checking ",
+        "<tool",
+        "_call>{\"name\":\"read\",",
+        "\"arguments\":{\"path\":\"notes.txt\"}}",
+        "</tool_call>",
+    ];
+    let mut pieces: Vec<String> = chunks
+        .iter()
+        .map(|text| {
+            format!(
+                "data: {}\n\n",
+                json!({"choices":[{"delta":{"content":text}}]})
+            )
+        })
+        .collect();
+    pieces.push(
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+            .into(),
+    );
+    // The full stream exceeds the watchdog limit, but each hidden delta is real progress.
+    let server = llm::fake::serve(vec![llm::fake::Script::SseSlow {
+        pieces,
+        pause: Duration::from_millis(300),
+    }]);
+    let mut backend = Backend::new(
+        ProviderKind::Endpoint {
+            base_url: format!("{}/v1", server.url),
+            model: "test".into(),
+            api_key: None,
+        },
+        PathBuf::new(),
+        5,
+    );
+    let request = Chat {
+        messages: vec![json!({"role":"user","content":"read notes"})],
+        tools: vec![
+            json!({"type":"function","function":{"name":"read","parameters":{"type":"object"}}}),
+        ],
+        temperature: 0.0,
+        max_tokens: 128,
+        seed: None,
+    };
+    let mut ui = RecordingUi::default();
+    let recovery = crate::config::types::RequestRecoveryConfig {
+        silence_secs: 1,
+        retry_once: false,
+    };
+    let reply = chat_with_ui(
+        &mut backend,
+        None,
+        &request,
+        ChatOptions {
+            timeout: 5,
+            render_text: true,
+            context_tokens: None,
+            policy: None,
+            recovery: Some(&recovery),
+        },
+        Arc::new(AtomicBool::new(false)),
+        &mut ui,
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(ui.text, "Checking ", "raw tool syntax stays hidden");
+    assert_eq!(reply.tool_calls[0].arguments, json!({"path":"notes.txt"}));
+    let mut bytes = chunks[0].len();
+    // The split opener is held briefly; after recognition every hidden chunk must advance.
+    for chunk in &chunks[1..] {
+        bytes += chunk.len();
+        if bytes > chunks[0].len() + chunks[1].len() {
+            assert!(
+                ui.counts.contains(&(bytes as u64).div_ceil(4)),
+                "generation froze while tool text streamed: {:?}",
+                ui.counts
+            );
+        }
+    }
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[test]
 fn provider_backoff_is_not_a_silent_stall() {
     let idle = Duration::from_secs(150);
     // Genuine remote silence past the limit is still bounded.

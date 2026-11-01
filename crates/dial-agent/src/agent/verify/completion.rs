@@ -195,6 +195,82 @@ pub(in crate::agent) fn awaiting_input(text: &str) -> bool {
     .any(|prefix| last.starts_with(prefix))
 }
 
+/// Whether an answer says a capability is unavailable to the agent ("I cannot provide an
+/// interactive terminal", "a browser is not available in this environment"): one sentence pairs a
+/// denial with a capability noun. Code is ignored. A heuristic for one search reminder per turn,
+/// never a reason to reject an answer outright.
+pub(in crate::agent) fn denies_capability(text: &str) -> bool {
+    const DENIALS: &[&str] = &[
+        "cannot",
+        "can't",
+        "can not",
+        "unable to",
+        "not available",
+        "isn't available",
+        "don't have",
+        "do not have",
+        "no access",
+        "not possible",
+        "isn't possible",
+        "not supported",
+        "lack ",
+    ];
+    const CAPABILITIES: &[&str] = &[
+        "tool",
+        "environment",
+        "terminal",
+        "tty",
+        "access to",
+        "capabilit",
+        "ability",
+        "interactive",
+        "browser",
+        "internet",
+        "network",
+        "display",
+        "screen",
+        "gui",
+    ];
+    text.split("```")
+        .step_by(2)
+        .flat_map(|prose| prose.split(['.', '!', '?', '\n']))
+        .map(str::to_lowercase)
+        .any(|sentence| {
+            DENIALS.iter().any(|denial| sentence.contains(denial))
+                && CAPABILITIES
+                    .iter()
+                    .any(|capability| sentence.contains(capability))
+        })
+}
+
+/// One reminder per instruction to search the tool catalog before an answer says a capability is
+/// unavailable. Spent once the model searched or loaded tools itself, or after one reminder.
+#[derive(Default)]
+pub(in crate::agent) struct CapabilitySearch {
+    searched: bool,
+    reminded: bool,
+}
+
+impl CapabilitySearch {
+    /// The model called `tool_search` or `tool_load` during this instruction.
+    pub(in crate::agent) fn searched(&mut self) {
+        self.searched = true;
+    }
+
+    /// Whether `answer` earns the reminder: it denies a capability, unoffered tools exist, and
+    /// neither a search nor an earlier reminder happened. Spends the reminder when it does.
+    pub(in crate::agent) fn remind(&mut self, answer: &str, loadable_tools: bool) -> bool {
+        if self.searched || self.reminded || !loadable_tools || !denies_capability(answer) {
+            return false;
+        }
+        self.reminded = true;
+        true
+    }
+}
+
+/// The reminder `CapabilitySearch::remind` sends back with the rejected answer.
+pub(in crate::agent) const CAPABILITY_SEARCH_REMINDER: &str = "Your answer says something is not possible or not available, but you have not searched the tool catalog this turn. Tools you were not offered may provide it (an interactive terminal, a browser, a debugger and more are loadable). Call `tool_search` with the capability you need, load a match with `tool_load` and use it; if nothing fits, give the same answer again and name what you searched for.";
+
 /// One reminder for edits that no passing check covers, per round of a turn. Unstarted todos earn
 /// none: an answer may cover them without another request, and the turn discloses open items.
 #[derive(Default)]
@@ -251,22 +327,21 @@ pub fn with_gate_failures(note: String, failures: &[String]) -> String {
     )
 }
 
-/// Plain reports receive actionable rejection feedback, just as explicit finish calls do.
-/// This allowance is independent of max_steps, so unlimited work cannot loop on rejected finals.
-#[derive(Default)]
-pub(in crate::agent) struct CompletionRecovery {
-    attempts: u8,
-}
-
-impl CompletionRecovery {
-    pub fn retry(&mut self) -> bool {
-        const ATTEMPTS: u8 = 3;
-        if self.attempts >= ATTEMPTS {
-            return false;
-        }
-        self.attempts += 1;
-        true
-    }
+/// Preserve a candidate as unaccepted work alongside the controller's exact missing prerequisite.
+/// This is a terminal report for the user, never feedback injected into another model request.
+pub(in crate::agent) fn rejected_report(
+    candidate: &str,
+    reason: &str,
+    outcome: crate::agent::TurnOutcome,
+) -> String {
+    let label = if outcome == crate::agent::TurnOutcome::Blocked {
+        "Blocked"
+    } else {
+        "Incomplete"
+    };
+    format!(
+        "{label}: completion requirements were not met. No completion was recorded.\n\nCandidate summary (not accepted as completed):\n{candidate}\n\nUnmet prerequisite:\n{reason}"
+    )
 }
 
 #[cfg(test)]

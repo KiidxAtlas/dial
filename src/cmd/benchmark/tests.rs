@@ -385,6 +385,7 @@ fn suite_grader_commands_never_enter_the_child_configuration() {
         dial::config::types::VerificationRequirement {
             checks: vec!["missing".into()],
             visual: false,
+            ..Default::default()
         },
     );
     let baseline = isolated_config(&base);
@@ -423,6 +424,7 @@ fn suite_grader_commands_never_enter_the_child_configuration() {
         dial::config::types::VerificationRequirement {
             checks: vec!["explicit".into()],
             visual: false,
+            ..Default::default()
         },
     );
     let explicit = case_contract(&strict, &case).unwrap();

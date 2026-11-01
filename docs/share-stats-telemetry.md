@@ -6,7 +6,7 @@ Set `[share].server_url` or `DIAL_SHARE_SERVER`, then run `dial share [session-p
 
 ## Statistics
 
-`dial stats [--json] [--range 7d]` reports cross-project requests, tokens, model/tool counts, duration, and costs from the private local SQLite ledger. Transcript synchronization counts sessions/messages/tools without retaining message bodies. `dial stats --serve [--port 3847]` serves a loopback-only local dashboard; it does not listen on external interfaces.
+`dial stats [--json] [--range 7d]` reports cross-project requests, tokens, model/tool counts, duration, and costs from the private local SQLite ledger. Requests billed through a subscription (ChatGPT, Claude subscription, subscription OAuth) are counted separately and shown as `subscription` instead of `unpriced`; rows recorded before this was tracked stay `unpriced`. Transcript synchronization counts sessions/messages/tools without retaining message bodies. `dial stats --serve [--port 3847]` serves a loopback-only local dashboard; it does not listen on external interfaces.
 
 The dashboard answers only loopback `Host` names and serves these JSON routes (all GET). `/api/stats`, `/api/models`, `/api/tools`, `/api/requests` and `/api/frustration` take an optional `range` of `24h`, `7d`, `2w`, `30d` or `all` (default `all`). `/api/version` gives build info, `/api/live` the most recently active session (404 when none), `/api/request/<id>` one request row, and `/api/trace?session=` one session. `/api/requests?limit=` returns the newest requests (default 50, max 500). Invalid `range`, `limit` or `id` values return 400.
 

@@ -25,6 +25,8 @@ const MAX_QUEUED_BYTES: usize = 256 * 1024;
 const TRAFFIC_KEEP: usize = 6;
 /// Characters of a message shown in its traffic preview.
 const PREVIEW_CHARS: usize = 80;
+/// Finished workers remembered so a late send gets a receipt instead of an error.
+const TOMBSTONES_KEEP: usize = 64;
 
 /// One delivered message: who sent it, shown to the recipient, and its text.
 pub struct Letter {
@@ -94,11 +96,20 @@ struct Member {
     inbox: Arc<Inbox>,
 }
 
+/// A retired worker: its label and final status (`completed`, `failed`, ...).
+struct Tombstone {
+    id: String,
+    label: String,
+    status: String,
+}
+
 struct Room {
     limit: usize,
     parent: Arc<Inbox>,
     workers: BTreeMap<String, Member>,
     traffic: BTreeMap<String, VecDeque<Traffic>>,
+    /// Oldest first, at most [`TOMBSTONES_KEEP`].
+    retired: VecDeque<Tombstone>,
 }
 
 /// Every open team, keyed by team id. A team lives while some [`Team`] handle does.
@@ -131,15 +142,19 @@ pub struct Refusal {
 /// Per-recipient outcome of a send. A letter a mailbox accepted is `queued`: it is delivered when
 /// the recipient drains its mailbox at its next model step, which the sender cannot know
 /// synchronously, so `delivered` is never claimed. A recipient that could not take the letter
-/// (full mailbox) is listed with its reason. Finished or unknown recipients fail the whole send.
+/// (full mailbox) is listed with its reason. A recently finished worker is reported `finished`
+/// with its final status and nothing is delivered; unknown recipients fail the whole send.
 #[derive(Debug)]
 pub struct Receipt {
     pub queued: Vec<String>,
     pub refused: Vec<Refusal>,
+    /// (worker id, final status) of a finished recipient the letter was not delivered to.
+    pub finished: Vec<(String, String)>,
 }
 
 impl Receipt {
-    /// One `{to, status}` row per recipient, `status` being `queued` or `refused` (with `reason`).
+    /// One `{to, status}` row per recipient, `status` being `queued`, `refused` (with `reason`) or
+    /// `finished` (with the worker's final status and a note).
     pub fn json(&self) -> Value {
         let rows: Vec<Value> = self
             .queued
@@ -150,6 +165,10 @@ impl Receipt {
                     .iter()
                     .map(|r| json!({"to": r.to, "status": "refused", "reason": r.reason})),
             )
+            .chain(self.finished.iter().map(|(to, status)| {
+                json!({"to": to, "status": "finished", "worker_status": status,
+                    "note": "not delivered: this worker has already finished; read its result with `task` (status or wait) instead of messaging it"})
+            }))
             .collect();
         json!({"receipts": rows})
     }
@@ -166,6 +185,7 @@ impl Team {
                 parent: Inbox::new(None),
                 workers: BTreeMap::new(),
                 traffic: BTreeMap::new(),
+                retired: VecDeque::new(),
             },
         );
         Self(Arc::new(Seat(id)))
@@ -218,10 +238,24 @@ impl Team {
         json!(rows)
     }
 
-    /// Removes a finished worker. Letters still queued for it are dropped; later sends to it fail.
-    pub fn retire(&self, id: &str) {
+    /// Removes a finished worker. Letters still queued for it are dropped; a later send to it gets
+    /// a `finished` receipt naming `status` while its tombstone is kept.
+    pub fn retire(&self, id: &str, status: &str) {
         if let Some(room) = rooms().get_mut(&self.id()) {
-            room.workers.remove(id);
+            let label = room
+                .workers
+                .remove(id)
+                .map(|member| member.label)
+                .unwrap_or_default();
+            room.retired.retain(|tomb| tomb.id != id);
+            if room.retired.len() == TOMBSTONES_KEEP {
+                room.retired.pop_front();
+            }
+            room.retired.push_back(Tombstone {
+                id: id.to_owned(),
+                label,
+                status: status.to_owned(),
+            });
         }
     }
 
@@ -274,12 +308,22 @@ impl Team {
                     .ok_or("sender is no longer a live worker")?;
                 display(from, &member.label)
             };
-            (room.limit, sender, resolve(room, from, to)?)
+            match resolve(room, from, to)? {
+                Resolved::Live(targets) => (room.limit, sender, targets),
+                Resolved::Finished(id, status) => {
+                    return Ok(Receipt {
+                        queued: Vec::new(),
+                        refused: Vec::new(),
+                        finished: vec![(id, status)],
+                    });
+                }
+            }
         };
         let broadcast = to == ALL;
         let mut receipt = Receipt {
             queued: Vec::new(),
             refused: Vec::new(),
+            finished: Vec::new(),
         };
         for (id, inbox) in targets {
             let letter = Letter {
@@ -370,9 +414,34 @@ fn is_peer_id(to: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// Where a send goes: live mailboxes, or a recently finished worker (id, final status).
+enum Resolved {
+    Live(Vec<(String, Arc<Inbox>)>),
+    Finished(String, String),
+}
+
+/// Live recipients `from` can address, for an unknown-recipient error.
+fn live_names(room: &Room, from: &str) -> String {
+    let mut names: Vec<String> = Vec::new();
+    if from != PARENT {
+        names.push(PARENT.to_owned());
+    }
+    names.extend(
+        room.workers
+            .iter()
+            .filter(|(id, _)| id.as_str() != from)
+            .map(|(id, member)| display(id, &member.label)),
+    );
+    if names.is_empty() {
+        "none".to_owned()
+    } else {
+        names.join(", ")
+    }
+}
+
 /// Maps a recipient name to its mailboxes. `all` is a broadcast, `parent` is the parent mailbox,
-/// and anything else is a worker id, or else a unique worker label.
-fn resolve(room: &Room, from: &str, to: &str) -> Result<Vec<(String, Arc<Inbox>)>, String> {
+/// and anything else is a worker id, or else a unique worker label, or else a finished worker.
+fn resolve(room: &Room, from: &str, to: &str) -> Result<Resolved, String> {
     if to == ALL {
         let targets: Vec<_> = room
             .workers
@@ -385,13 +454,16 @@ fn resolve(room: &Room, from: &str, to: &str) -> Result<Vec<(String, Arc<Inbox>)
                 "no other live worker to receive a broadcast. {PEERS_HINT}"
             ));
         }
-        return Ok(targets);
+        return Ok(Resolved::Live(targets));
     }
     if to == PARENT {
         if from == PARENT {
             return Err("an agent cannot message itself".into());
         }
-        return Ok(vec![(PARENT.to_owned(), room.parent.clone())]);
+        return Ok(Resolved::Live(vec![(
+            PARENT.to_owned(),
+            room.parent.clone(),
+        )]));
     }
     let id = match room.workers.get(to) {
         Some(_) => to.to_owned(),
@@ -404,14 +476,23 @@ fn resolve(room: &Room, from: &str, to: &str) -> Result<Vec<(String, Arc<Inbox>)
                 .collect();
             match matches.as_slice() {
                 [id] => (*id).clone(),
-                [] if is_peer_id(to) => {
-                    return Err(format!(
-                        "{to} is not a live worker; it looks like a project peer id. {PEERS_HINT}"
-                    ));
-                }
                 [] => {
+                    // Newest tombstone first: an id, or a label no live worker holds.
+                    if let Some(tomb) =
+                        room.retired.iter().rev().find(|tomb| {
+                            tomb.id == to || (!tomb.label.is_empty() && tomb.label == to)
+                        })
+                    {
+                        return Ok(Resolved::Finished(tomb.id.clone(), tomb.status.clone()));
+                    }
+                    if is_peer_id(to) {
+                        return Err(format!(
+                            "{to} is not a live worker; it looks like a project peer id. {PEERS_HINT}"
+                        ));
+                    }
                     return Err(format!(
-                        "no live recipient named {to} (unknown or finished); use parent, all, a live task id, or a live task label. {PEERS_HINT}"
+                        "no live recipient named {to}; live recipients: {}. Use parent, all, a live task id, or a live task label. {PEERS_HINT}",
+                        live_names(room, from)
                     ));
                 }
                 _ => {
@@ -426,7 +507,7 @@ fn resolve(room: &Room, from: &str, to: &str) -> Result<Vec<(String, Arc<Inbox>)
         return Err("an agent cannot message itself".into());
     }
     let inbox = room.workers[&id].inbox.clone();
-    Ok(vec![(id, inbox)])
+    Ok(Resolved::Live(vec![(id, inbox)]))
 }
 
 #[cfg(test)]

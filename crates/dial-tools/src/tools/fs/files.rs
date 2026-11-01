@@ -686,7 +686,11 @@ pub(crate) fn write_with(
     args: &Value,
     execution: &crate::tools::edit::editing::Execution<'_>,
 ) -> Result<String, String> {
-    crate::tools::edit::editing::finish_with(ws, write_plan(ws, args)?, true, execution)
+    let execution = crate::tools::edit::editing::Execution {
+        refuse_syntax_errors: crate::tools::edit::editing::syntax_gate(ws, args)?,
+        ..*execution
+    };
+    crate::tools::edit::editing::finish_with(ws, write_plan(ws, args)?, true, &execution)
 }
 
 #[cfg(test)]

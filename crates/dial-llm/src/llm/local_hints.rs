@@ -5,9 +5,9 @@
 /// One request's local hints. `None`/`false` sends nothing.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LocalHints {
-    /// Template thinking switch: `chat_template_kwargs.enable_thinking` on llama.cpp and Dial's MLX
-    /// runtime, `think` on Ollama. Set only when the server exposes a switch for this model and no
-    /// explicit profile setting decides it.
+    /// Template thinking switch: `chat_template_kwargs.enable_thinking` on llama.cpp and MLX-LM,
+    /// top-level `enable_thinking` on MLX-VLM, `think` on Ollama. Set only when the server exposes a
+    /// switch for this model and no explicit profile setting decides it.
     pub thinking: Option<bool>,
     /// Keep the model loaded this long after the request: Ollama `keep_alive` (seconds), LM Studio
     /// `ttl`. An explicit profile `keep_alive` wins.
@@ -79,6 +79,16 @@ impl LocalHints {
             // Dial's mlx_lm.server takes the same names LocalSampling::apply sends.
             LocalServer::MlxRuntime => {
                 put_thinking(object, self.thinking);
+                put_penalties(object, self, "repetition_penalty");
+            }
+            // mlx_vlm.server normalizes thinking from the top-level flag, not template kwargs.
+            LocalServer::MlxVlmRuntime => {
+                if !object.contains_key("reasoning_effort")
+                    && !object.contains_key("reasoning")
+                    && let Some(thinking) = self.thinking
+                {
+                    put_absent(object, "enable_thinking", thinking.into());
+                }
                 put_penalties(object, self, "repetition_penalty");
             }
             // LM Studio's OpenAI-compatible API documents `ttl` (idle seconds before unload, applies to
@@ -182,6 +192,13 @@ impl LocalServer {
             ("mlx", None) if crate::llm::local_format::serves_with_llama_cpp(model) => {
                 Self::LlamaCpp
             }
+            ("mlx", None)
+                if crate::llm::catalog::local_model_metadata(std::path::Path::new(model))
+                    .vision
+                    == Some(true) =>
+            {
+                Self::MlxVlmRuntime
+            }
             ("mlx", None) => Self::MlxRuntime,
             ("lm-studio", _) => Self::LmStudio,
             ("ollama", _) => Self::Ollama,
@@ -204,6 +221,8 @@ impl LocalServer {
 pub enum LocalServer {
     /// Dial's own `mlx_lm.server` runtime.
     MlxRuntime,
+    /// Dial's own `mlx_vlm.server` runtime, selected by the checkpoint's vision metadata.
+    MlxVlmRuntime,
     /// llama.cpp `llama-server`: Dial-launched for GGUF models, the `llama-cpp` provider, or an
     /// endpoint recognised by `catalog::is_llama_server`.
     LlamaCpp,

@@ -11,6 +11,7 @@ pub(in crate::agent) mod engine;
 pub(in crate::agent) mod enrichment;
 pub(in crate::agent) mod failure_guidance;
 pub(in crate::agent) mod guidance;
+pub(in crate::agent) mod intent;
 pub(in crate::agent) mod monitoring;
 pub(in crate::agent) mod outcome_gradient;
 pub(in crate::agent) mod reply_triage;

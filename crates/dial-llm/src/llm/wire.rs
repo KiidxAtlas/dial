@@ -242,5 +242,7 @@ pub fn estimate(message: &Value) -> u64 {
     )
 }
 
+pub mod counting;
+
 #[cfg(test)]
 mod tests;

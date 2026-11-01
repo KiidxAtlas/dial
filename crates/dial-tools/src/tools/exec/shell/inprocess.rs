@@ -178,7 +178,12 @@ pub(super) fn run(
             && eof
             && integrity.retention == crate::runtime::execution::Completeness::Complete,
     })
-    .with_output_integrity(integrity);
+    .with_output_integrity(integrity)
+    .with_shell_launch(crate::runtime::execution::ShellLaunch {
+        stdin: crate::runtime::execution::ShellStdin::Eof,
+        terminal_allocated: false,
+        job: None,
+    });
     Ok(if cancelled {
         output
             .with_status(crate::tools::ToolStatus::Aborted)

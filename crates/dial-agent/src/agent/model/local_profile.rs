@@ -46,8 +46,8 @@ const LOOP_REPETITION_PENALTY: f64 = 1.1;
 const TIME_BUDGET_MIN_SAMPLES: u64 = 3;
 
 /// Session escalation state. `reached` grows as failing rounds accumulate; `stage` is the step in
-/// effect and catches up only at a user-turn boundary, so the prompt, tool offer and edit grammar
-/// stay stable within a turn.
+/// effect and catches up at a turn start or at the request boundary after the failing rounds, so the
+/// prompt, tool offer and edit grammar never change within one request.
 #[derive(Debug, Clone, Copy, Default)]
 pub(in crate::agent) struct Escalation {
     pub(in crate::agent) stage: u8,
@@ -217,6 +217,81 @@ pub(crate) fn time_budget_secs(
     ((prefill + decode) * 1.5 + 60.0).clamp(120.0, 3600.0) as u64
 }
 
+/// Host-default sampling for a request sent on `auth_config`'s route. The main turn and child
+/// requests both call this, so they apply one policy. `hermetic` is the run's hermetic flag.
+pub(in crate::agent) fn host_default_sampling(
+    config: &crate::config::types::Config,
+    auth_config: &crate::config::types::Config,
+    hermetic: bool,
+    profile: &mut Option<ModelProfile>,
+    harness_temperature: f64,
+) -> Option<&'static str> {
+    let adaptive = &config.adaptive;
+    if hermetic
+        || !auth_config.local_main_model()
+        || config.assistance.local.sampling != LocalSamplingSource::Model
+        || config.harness_temperature_pinned
+        || config.harness.temperature != Harness::default().temperature
+        || (adaptive.enabled && (adaptive.sampling || adaptive.pin_sampling))
+        || profile.as_ref().is_some_and(|p| p.temperature.is_some())
+    {
+        return None;
+    }
+    let selection = auth_config.selection();
+    if auth_config.endpoint.is_none() {
+        if !config.local_profile_applies()
+            || harness_temperature != Harness::default().temperature
+            || profile.as_ref().is_some_and(|p| p.thinking == Some(true))
+        {
+            return None;
+        }
+        let shipped = crate::llm::model_sampling::recommended_sampling(&config.model)?;
+        let p = profile
+            .get_or_insert_with(|| ModelProfile::minimal(&selection.provider, &selection.model));
+        if p.capabilities.temperature {
+            p.temperature = shipped.temperature;
+        }
+        if p.top_p.is_none() && shipped.top_p.is_some() {
+            p.capabilities.top_p = true;
+            p.top_p = shipped.top_p;
+        }
+        if p.provider == "mlx" && (shipped.top_k.is_some() || shipped.min_p.is_some()) {
+            let local = p.local_sampling.get_or_insert_with(Default::default);
+            local.top_k = local.top_k.or(shipped.top_k);
+            local.min_p = local.min_p.or(shipped.min_p);
+        }
+        return Some(shipped.source);
+    }
+    let p =
+        profile.get_or_insert_with(|| ModelProfile::minimal(&selection.provider, &selection.model));
+    p.capabilities.temperature = false;
+    Some("local server defaults")
+}
+
+/// Host-default output limit: a default/unlimited operator limit on an external local host
+/// leaves the host's own output setting intact. Callers skip this for recovery budgets.
+pub(in crate::agent) fn host_default_output_limit(
+    auth_config: &crate::config::types::Config,
+    hermetic: bool,
+    profile: &mut Option<ModelProfile>,
+    harness_max_tokens: u32,
+) {
+    let inherit = !hermetic
+        && auth_config.local_main_model()
+        && auth_config.endpoint.is_some()
+        && harness_max_tokens == 0;
+    if !inherit {
+        if let Some(profile) = profile {
+            profile.inherit_output_limit = false;
+        }
+        return;
+    }
+    let selection = auth_config.selection();
+    let profile =
+        profile.get_or_insert_with(|| ModelProfile::minimal(&selection.provider, &selection.model));
+    profile.inherit_output_limit = profile.max_tokens.is_none();
+}
+
 impl Agent<'_> {
     /// The local profile applies: a non-hermetic run whose main model is served locally, with
     /// `assistance.local.enabled` on.
@@ -334,57 +409,41 @@ impl Agent<'_> {
         )
     }
 
-    /// Applies `assistance.local.sampling = "model"` to one request's profile and names the source it
-    /// used. Any pinned temperature wins: `[harness]`, a learned harness value or a model profile (all
-    /// reach `harness_temperature`), an explicit profile temperature, or operator-owned adaptive
-    /// sampling. Dial's own runtime gets the model's shipped settings when its files declare them; a
-    /// local server gets no `temperature`, so its own per-model defaults apply.
+    /// Choose local sampling without replacing a serving host's defaults. Explicit operator
+    /// temperature/profile/adaptive controls win; a learned harness is not an operator pin. Dial's
+    /// own runtime can still use the model's shipped sampling metadata.
     pub(in crate::agent) fn apply_local_sampling(
         &self,
         profile: &mut Option<ModelProfile>,
         harness_temperature: f64,
     ) -> Option<&'static str> {
-        let adaptive = &self.config.adaptive;
-        if !self.local_profile_active()
-            || self.config.assistance.local.sampling != LocalSamplingSource::Model
-            || harness_temperature != Harness::default().temperature
-            || (adaptive.enabled && (adaptive.sampling || adaptive.pin_sampling))
-            || profile
-                .as_ref()
-                .is_some_and(|p| p.temperature.is_some() || p.thinking == Some(true))
-        {
-            return None;
-        }
-        let selection = self.auth_config.selection();
-        if self.auth_config.endpoint.is_none() {
-            let shipped = crate::llm::model_sampling::recommended_sampling(&self.config.model)?;
-            let p = profile.get_or_insert_with(|| {
-                ModelProfile::minimal(&selection.provider, &selection.model)
-            });
-            if p.capabilities.temperature {
-                p.temperature = shipped.temperature;
-            }
-            if p.top_p.is_none() && shipped.top_p.is_some() {
-                p.capabilities.top_p = true;
-                p.top_p = shipped.top_p;
-            }
-            if p.provider == "mlx" && (shipped.top_k.is_some() || shipped.min_p.is_some()) {
-                let local = p.local_sampling.get_or_insert_with(Default::default);
-                local.top_k = local.top_k.or(shipped.top_k);
-                local.min_p = local.min_p.or(shipped.min_p);
-            }
-            return Some(shipped.source);
-        }
-        let p = profile
-            .get_or_insert_with(|| ModelProfile::minimal(&selection.provider, &selection.model));
-        p.capabilities.temperature = false;
-        Some("local server defaults")
+        host_default_sampling(
+            self.config,
+            &self.auth_config,
+            self.hermetic,
+            profile,
+            harness_temperature,
+        )
+    }
+
+    /// A default/unlimited operator limit leaves the external host's own output setting intact.
+    /// Keep Dial's finite planning budget separate from what is explicitly sent on the wire.
+    pub(in crate::agent) fn apply_local_output_limit(
+        &self,
+        profile: &mut Option<ModelProfile>,
+        harness_max_tokens: u32,
+    ) {
+        host_default_output_limit(
+            &self.auth_config,
+            self.hermetic,
+            profile,
+            harness_max_tokens,
+        );
     }
 
     /// Turn start: restores the step this model reached in earlier sessions (once per session,
-    /// keeping its record for the draft-model trial), then puts into effect a step reached during an
-    /// earlier turn. Only here do steps change the prompt, offer and grammar, so a turn never sees
-    /// them change.
+    /// keeping its record for the draft-model trial), then puts into effect a step reached earlier.
+    /// A step reached during the turn is applied at a request boundary by `local_request_boundary`.
     pub(in crate::agent) fn seed_local_escalation(&mut self) {
         // An inactive profile neither seeds nor consumes the once-per-session seed.
         if !self.local_profile_active() {
@@ -421,14 +480,37 @@ impl Agent<'_> {
                     .max(u8::from(lacking || failed_fixture));
             }
         }
-        if self.config.assistance.local.escalate_after == 0 {
-            return;
+        self.apply_reached_local_stage();
+    }
+
+    /// Puts a reached step into effect when it is stricter than the one in effect: the edit grammar
+    /// reaches the workspace, then the prompt is rebuilt. Returns whether anything changed.
+    pub(in crate::agent) fn apply_reached_local_stage(&mut self) -> bool {
+        if !self.local_profile_active() || self.config.assistance.local.escalate_after == 0 {
+            return false;
         }
         let state = &mut self.local_escalation;
-        if state.reached > state.stage {
-            state.stage = state.reached;
-            self.apply_local_stage();
+        if state.reached <= state.stage {
+            return false;
         }
+        state.stage = state.reached;
+        self.apply_local_stage();
+        true
+    }
+
+    /// The request boundary of a local main model: applies a step reached since the last request, then
+    /// refreshes the offer so its tools and edit grammar match the prompt. Called after settled calls
+    /// and before a request is built, so no tool effect is replayed. Returns whether anything changed.
+    pub(in crate::agent) fn local_request_boundary(
+        &mut self,
+        schemas: &mut Vec<serde_json::Value>,
+    ) -> Result<bool> {
+        if !self.apply_reached_local_stage() {
+            return Ok(false);
+        }
+        let names = self.offered();
+        *schemas = self.schemas(&names)?;
+        Ok(true)
     }
 
     /// Replies that must be lifted from text before the server's tool-call parser is called into
@@ -474,7 +556,7 @@ impl Agent<'_> {
 
     /// Counts one tool round. `failed` is a malformed tool call or a failed edit or write. After
     /// `escalate_after` failing rounds the session reaches one step stricter and remembers it for
-    /// this model; the step takes effect at the next turn. If the latest edit failed, one successful
+    /// this model; the step takes effect at the next request boundary. If the latest edit failed, one successful
     /// intervening round preserves the streak; a second clears it. A later successful edit or write
     /// also permits the next successful round to clear it. This is not per-file recovery tracking.
     pub(in crate::agent) fn observe_local_round(&mut self, failed: bool, ui: &mut dyn Ui) -> bool {
@@ -526,13 +608,13 @@ impl Agent<'_> {
         ui.event(&crate::agent::ui::ui_event::UiEvent::new(
             crate::agent::ui::ui_event::EventKind::Model,
             format!(
-                "Local model: {after} failing tool rounds without a sustained recovery; from the next turn, {what}"
+                "Local model: {after} failing tool rounds without a sustained recovery; from the next request, {what}"
             ),
         ));
         self.local_session.pending.stage = self.local_session.pending.stage.max(stage);
         if let Err(error) = self.flush_local_evidence() {
             ui.diagnostic(&format!(
-                "Local profile step not remembered ({error:#}); it still applies from the next turn of this session."
+                "Local profile step not remembered ({error:#}); it still applies from the next request of this session."
             ));
         }
         true
@@ -624,6 +706,7 @@ impl Agent<'_> {
         self.local_session.think_next = true;
         self.local_session.penalty_next = false;
         self.local_session.plan_changed = false;
+        self.note_local_edit_mode(ui);
         if self.config.assistance.local.side_models == LocalSideModels::Warn {
             for role in ["small", "coach"] {
                 if !self.local_side_swap(role) || !self.local_session.shown.insert("side") {
@@ -643,6 +726,32 @@ impl Agent<'_> {
                 ));
             }
         }
+    }
+
+    /// Say once per session that the local route's `assistance.local.edit_mode` replaces an
+    /// explicitly configured `[edit] mode`, and how to follow the configured mode instead.
+    fn note_local_edit_mode(&mut self, ui: &mut dyn Ui) {
+        let Some((local, configured)) = self
+            .config
+            .local_edit_mode_replacing_configured(&self.version.harness)
+        else {
+            return;
+        };
+        if !self.local_session.shown.insert("edit-mode") {
+            return;
+        }
+        let name = |mode: EditMode| {
+            serde_json::to_value(mode)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_else(|| format!("{mode:?}"))
+        };
+        ui.notice(&format!(
+            "Local model: editing uses the \"{}\" grammar from assistance.local.edit_mode instead of \
+             [edit] mode = \"{}\". Set assistance.local.edit_mode = \"inherit\" to use [edit] mode.",
+            name(local),
+            name(configured)
+        ));
     }
 
     /// Mean measured model-load time, as a parenthetical, when known.
@@ -730,9 +839,8 @@ impl Agent<'_> {
         })
     }
 
-    /// Prepares one main request on a local route: base and per-request hints on the backend, and an
-    /// Ollama window bounded by the memory estimate when no window is pinned. Returns a short label of
-    /// what this request carries, for the request record.
+    /// Prepares explicit local hints for one main request. Context estimates remain advice, never
+    /// an automatic override of the serving host's loaded context.
     pub(in crate::agent) fn prepare_local_request(
         &mut self,
         backend: &mut Backend,
@@ -768,18 +876,12 @@ impl Agent<'_> {
             hints.repetition_penalty = Some(LOOP_REPETITION_PENALTY);
         }
         self.local_session.penalty_sent = penalty;
-        if let Some(tokens) = self.local_session.affordable_context
-            && profile.as_ref().is_none_or(|p| p.context_window.is_none())
-        {
-            let selection = self.auth_config.selection();
-            profile
-                .get_or_insert_with(|| ModelProfile::minimal(&selection.provider, &selection.model))
-                .context_window = Some(tokens);
-        }
         let record = json!({
             "thinking": hints.thinking,
             "loop_penalty": penalty,
-            "num_ctx": self.local_session.affordable_context,
+            "suggested_context": self.local_session.affordable_context,
+            // What the server applies to any generation field this request omits.
+            "server_defaults": self.local_session.facts.defaults.to_json(),
         });
         backend.next_local_hints(hints);
         Some(record)
@@ -911,14 +1013,6 @@ impl Agent<'_> {
         self.local_session.plan_changed = true;
     }
 
-    /// Ollama: the window this machine's memory affords the model, when it is below the configured
-    /// window and `assistance.local.context_advice` is on.
-    pub(in crate::agent) fn local_affordable_context(&self) -> Option<u32> {
-        self.local_session
-            .affordable_context
-            .filter(|_| self.local_profile_active())
-    }
-
     /// `assistance.local.time_budget`: the pre-action time limit for one request from this model's
     /// measured speed, when the configured limit is 0 (unlimited) and enough samples exist.
     pub(in crate::agent) fn local_time_budget(
@@ -967,16 +1061,13 @@ impl Agent<'_> {
             && self.local_session.shown.insert("ollama-memory")
         {
             ui.notice(&format!(
-                "Ollama: this machine's memory fits about {affordable} tokens of context for {}; Dial \
-                 requests num_ctx = {affordable} instead of {configured} so the model is not \
-                 offloaded or swapped. Set context_window in /model settings to choose another size.",
+                "Ollama: this machine's memory is estimated to fit about {affordable} tokens of \
+                 context for {}. Dial leaves the host's loaded context unchanged; adjust the \
+                 model's host settings if needed.",
                 self.auth_config.model
             ));
         }
-        if served >= configured
-            || self.local_session.affordable_context == Some(served)
-            || !self.local_session.shown.insert("served-context")
-        {
+        if served >= configured || !self.local_session.shown.insert("served-context") {
             return;
         }
         let how = match self.local_session.server {
@@ -987,8 +1078,7 @@ impl Agent<'_> {
                 "start llama-server with a larger -c (it is divided across --parallel slots)"
             }
             Some(LocalServer::Ollama) => {
-                "Dial asks Ollama for the configured window on every request; if it stays small, \
-                 set OLLAMA_CONTEXT_LENGTH or check the model's memory fit"
+                "adjust the model's context in Ollama or set OLLAMA_CONTEXT_LENGTH and reload it"
             }
             Some(LocalServer::Vllm | LocalServer::Sglang) => {
                 "restart the server with a larger --max-model-len (vLLM) or --context-length (SGLang)"

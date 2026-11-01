@@ -351,3 +351,76 @@ fn interactive_adapter_without_review_support_cannot_silently_accept() {
     });
     assert_eq!(server.requests().len(), 1);
 }
+
+#[test]
+fn drafted_turn_keeps_the_raw_request_in_user_intent_beside_the_effective_draft() {
+    let typed = "fix the parser pls";
+    let drafted = "## Objective\nFix the parser.";
+    let server = llm::fake::serve(vec![reply(drafted), reply("Done.")]);
+    with_agent(ON, |agent| {
+        agent.backend = Some(backend(&server.url));
+        agent.turn(typed, &mut NullUi).unwrap();
+        let control = agent.session.control_state();
+        assert_eq!(control["current_instruction"], drafted);
+        assert_eq!(control["user_intent"]["latest"]["text"], typed);
+        assert_eq!(control["user_intent"]["latest"]["kind"], "user_turn");
+        assert_eq!(
+            control["user_intent"]["latest"]["entry_id"],
+            control["current_instruction_entry_id"]
+        );
+    });
+}
+
+#[test]
+fn drafted_steering_records_raw_intent_while_the_draft_becomes_current() {
+    let server = llm::fake::serve(vec![reply("## Objective\nUse version 2.")]);
+    with_agent(ON, |agent| {
+        let mut ui = Applied::default();
+        agent
+            .accept_steering(vec!["use v2".into()], &mut ui)
+            .unwrap();
+        agent
+            .draft_deferred_steering(&mut backend(&server.url), &mut ui)
+            .unwrap();
+        let control = agent.session.control_state();
+        assert_eq!(
+            control["current_instruction"],
+            "## Objective\nUse version 2."
+        );
+        assert_eq!(control["user_intent"]["latest"]["text"], "use v2");
+        assert_eq!(control["user_intent"]["latest"]["kind"], "user_steering");
+    });
+}
+
+#[test]
+fn harness_peer_and_monitor_turns_never_replace_the_admitted_instruction() {
+    let server = llm::fake::serve(vec![
+        reply("First."),
+        reply("Continuing."),
+        reply("Peer note."),
+        reply("Watch note."),
+    ]);
+    with_agent("", |agent| {
+        // As in the wake/monitor fixtures, isolate runtime message admission from endpoint
+        // discovery: every fake connection here is an inference, not a context-window probe.
+        agent.hermetic = true;
+        agent.backend = Some(backend(&server.url));
+        agent.turn("first request", &mut NullUi).unwrap();
+        let before = agent.session.control_state();
+        for origin in [TurnOrigin::Harness, TurnOrigin::Peer, TurnOrigin::Monitor] {
+            agent
+                .turn_with_state("runtime-generated text", &mut NullUi, true, None, origin)
+                .unwrap();
+            let after = agent.session.control_state();
+            assert_eq!(
+                after["current_instruction"], before["current_instruction"],
+                "{origin:?}"
+            );
+            assert_eq!(
+                after["current_instruction_entry_id"], before["current_instruction_entry_id"],
+                "{origin:?}"
+            );
+            assert_eq!(after["user_intent"], before["user_intent"], "{origin:?}");
+        }
+    });
+}

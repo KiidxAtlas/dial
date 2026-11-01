@@ -8,6 +8,7 @@
 use super::input;
 use super::input::{Handle, Input};
 use super::wake;
+use crate::runtime::execution::{ShellLaunch, ShellStdin};
 use crate::storage::artifact::ArtifactSpool;
 use crate::tools::Workspace;
 use crate::tools::exec::shell::session::SessionClaim;
@@ -402,6 +403,7 @@ pub(super) struct Proc {
     reader: Option<JoinHandle<()>>,
     pub(super) input: Option<Arc<Input>>,
     pub(super) terminal: bool,
+    shell_launch: Option<ShellLaunch>,
     network: bool,
     minimize_output: bool,
     notice_cursor: u64,
@@ -588,7 +590,7 @@ impl Proc {
         let pid = group.id();
         wake::watch_exit(pid);
         Ok(Proc {
-            name,
+            name: name.clone(),
             command: command.to_owned(),
             pid,
             group,
@@ -599,6 +601,17 @@ impl Proc {
             reader: Some(reader),
             input,
             terminal,
+            shell_launch: Some(ShellLaunch {
+                stdin: if terminal {
+                    ShellStdin::Terminal
+                } else if stdin {
+                    ShellStdin::Pipe
+                } else {
+                    ShellStdin::Eof
+                },
+                terminal_allocated: terminal,
+                job: Some(name.clone()),
+            }),
             network: super::network_allowed(ws),
             minimize_output: ws.minimizing_output(),
             notice_cursor: 0,
@@ -847,9 +860,18 @@ pub(super) struct Snapshot {
     pub(super) network: bool,
     /// Whether `ring` is a terminal screen (PTY) rather than a byte stream.
     pub(super) terminal: bool,
+    pub(super) shell_launch: Option<ShellLaunch>,
 }
 
 impl Snapshot {
+    /// Retain immutable launch context even after the input handle closes or the child exits.
+    pub(super) fn with_launch(&self, output: crate::tools::ToolOutput) -> crate::tools::ToolOutput {
+        match &self.shell_launch {
+            Some(launch) => output.with_shell_launch(launch.clone()),
+            None => output,
+        }
+    }
+
     /// After an exit, give the reader a moment to drain what the process wrote last.
     pub(super) fn settle(&self) {
         let State::Exited { at, .. } = self.state else {
@@ -923,6 +945,15 @@ impl Table {
         self.procs
             .iter()
             .filter(|p| p.is_running() && p.adopted)
+            .map(|p| format!("{} ({})", p.name, p.command))
+            .collect()
+    }
+
+    /// Running jobs started explicitly with `bg` (not adopted from `bash`), as `name (command)`.
+    pub(super) fn session_owned(&self) -> Vec<String> {
+        self.procs
+            .iter()
+            .filter(|p| p.is_running() && !p.adopted)
             .map(|p| format!("{} ({})", p.name, p.command))
             .collect()
     }
@@ -1043,6 +1074,11 @@ impl Table {
             reader: Some(reader),
             input: None,
             terminal: false,
+            shell_launch: Some(ShellLaunch {
+                stdin: ShellStdin::Eof,
+                terminal_allocated: false,
+                job: Some(name.clone()),
+            }),
             network: super::network_allowed(&workspace),
             minimize_output: workspace.minimizing_output(),
             notice_cursor: 0,
@@ -1101,6 +1137,7 @@ impl Table {
             reader: Some(reader),
             input: None,
             terminal: false,
+            shell_launch: None,
             network: job.network,
             minimize_output: false,
             notice_cursor: 0,
@@ -1142,6 +1179,7 @@ impl Table {
             state: proc.state.clone(),
             network: proc.network,
             terminal: proc.terminal,
+            shell_launch: proc.shell_launch.clone(),
         })
     }
 

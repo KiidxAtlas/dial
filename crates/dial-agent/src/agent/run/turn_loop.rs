@@ -416,6 +416,16 @@ impl<'a> Agent<'a> {
             } else {
                 crate::agent::verify::visual::Review::new(user_text)
             },
+            // Autonomous and peer continuations are not user requests to run anything.
+            targets: if self.hermetic
+                || !matches!(origin, TurnOrigin::User)
+                || !self.config.verification.enabled
+                || !self.config.verification.target_evidence
+            {
+                crate::agent::verify::targets::Targets::default()
+            } else {
+                crate::agent::verify::targets::Targets::resolve(&self.workspace, user_text)
+            },
             ..StepChecks::default()
         };
         if self
@@ -434,7 +444,7 @@ impl<'a> Agent<'a> {
                 .as_ref()
                 .is_some_and(Backend::accepts_image_input)
         {
-            self.step_checks.visual.captured([0, 0, 0], false);
+            self.step_checks.visual.user_image([0, 0, 0]);
         }
         for reference in message["dial_images"].as_array().into_iter().flatten() {
             ui.image(reference);
@@ -476,6 +486,28 @@ impl<'a> Agent<'a> {
         // Recomputing them on every request (or putting them in the system prompt, as hints once were) would
         // change the text in front of the whole conversation and discard the provider's prompt cache.
         let mut context = self.experience_context(user_text, ui);
+        if matches!(origin, TurnOrigin::User) {
+            // Goal commands submit their original text, not a rendered harness prompt.
+            // Keep mode guidance in ambient context so drafting and provenance see only
+            // the admitted user input, including literal XML characters.
+            let goal_context = if self.modes.goal.interview {
+                Some(crate::agent::prompts::modes::goal::GUIDED_RULES.to_owned())
+            } else {
+                self.modes
+                    .goal
+                    .goal
+                    .as_ref()
+                    .filter(|goal| goal.status == crate::agent::modes::goal::Status::Active)
+                    .map(crate::agent::modes::goal::active_prompt)
+            };
+            if let Some(goal_context) = goal_context {
+                crate::agent::workflow::efficiency::append_ambient(
+                    &mut context,
+                    &goal_context,
+                    &self.session.messages(),
+                );
+            }
+        }
         self.invalidate_exploration(
             "new external user turn superseded the retained checkpoint",
             ui,
@@ -679,7 +711,14 @@ impl<'a> Agent<'a> {
             memory.bind(memory_authority(&self.session, 0));
         }
         let mut state = self.session.control_state();
-        if !matches!(origin, TurnOrigin::Peer | TurnOrigin::Monitor) {
+        // Autonomous/peer/monitor continuations are not new user instructions.
+        if matches!(origin, TurnOrigin::User) {
+            crate::agent::run::intent::record(
+                &mut state,
+                typed_text,
+                json!(self.session.branch_leaf()),
+                crate::agent::run::intent::Kind::Turn,
+            );
             state["current_instruction_entry_id"] = json!(self.session.branch_leaf());
             if state["original_goal"].is_null() {
                 state["original_goal"] = json!(crate::agent::window::prompt::truncate_chars(

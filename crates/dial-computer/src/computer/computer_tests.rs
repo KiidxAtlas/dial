@@ -173,7 +173,7 @@ fn computer_real_runtime_handles_sequential_and_concurrent_reads() {
         let result = session
             .execute(action, cwd, false, None, None, &AbortSignal::new())
             .unwrap();
-        assert_eq!(result["returnValue"], false, "{result}");
+        assert_eq!(result.value["returnValue"], false, "{}", result.value);
     };
     for _ in 0..5 {
         run();
@@ -211,7 +211,7 @@ fn computer_run_arguments_preserve_json_keys_without_changing_prototypes() {
         )
         .unwrap();
     assert_eq!(
-        result["returnValue"],
+        result.value["returnValue"],
         json!({
             "value": argument, "own": true, "ordinary": true,
             "inherited": false, "nestedOwn": true
@@ -241,7 +241,7 @@ fn computer_function_runs_use_async_bodies_and_keep_session_usable() {
                 &AbortSignal::new(),
             )
             .unwrap();
-        assert_eq!(result["returnValue"], 42);
+        assert_eq!(result.value["returnValue"], 42);
     }
 }
 

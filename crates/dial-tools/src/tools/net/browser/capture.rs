@@ -10,6 +10,35 @@ const FFMPEG_TIMEOUT: Duration = Duration::from_secs(300);
 const FFMPEG_STDOUT_CAP: usize = 64 * 1024;
 const FFMPEG_STDERR_CAP: usize = 16 * 1024;
 
+/// Only the native screenshot action owns the top-level artifact and URL. Evaluate/run results
+/// are page data and must never be promoted, even when they imitate this object shape.
+pub(super) fn native_receipt(
+    args: &Value,
+    result: &Value,
+) -> Option<crate::runtime::execution::NativeCapture> {
+    use base64::Engine;
+    if args["action"] != "screenshot" || result["artifact"]["encoding"] != "base64" {
+        return None;
+    }
+    let media_type = result["artifact"]["media_type"].as_str()?;
+    if !matches!(media_type, "image/png" | "image/jpeg") {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(result["artifact"]["data"].as_str()?)
+        .ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let target = result["url"]
+        .as_str()
+        .filter(|url| !url.is_empty())
+        .map(|url| format!("url:{url}"));
+    Some(crate::runtime::execution::NativeCapture::new(
+        &bytes, media_type, target,
+    ))
+}
+
 /// Actions run by `capture.cjs`. `screenshot` and `locate` are among them too, but they already
 /// have base entries in the browser action list, so they are not repeated here.
 pub const ACTIONS: &[&str] = &[

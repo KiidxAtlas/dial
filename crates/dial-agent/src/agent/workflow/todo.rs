@@ -420,8 +420,9 @@ impl TodoList {
         Ok(())
     }
 
-    /// Accept the lenient shapes models send: `findings` is `finding`, a missing `op` is inferred from
-    /// `tasks`, and unknown keys fail with a corrected call instead of the generic schema guide.
+    /// Accept the lenient shapes models send: `findings` is `finding`, `task` is `index`,
+    /// `done: true` is `op: done`, a missing `op` is inferred from `tasks`, and unknown keys fail
+    /// with a corrected call (keeping the given task number) instead of the generic schema guide.
     fn normalize(&self, args: &Value) -> Result<Value, String> {
         let Some(map) = args.as_object() else {
             return Err(format!("todo arguments must be a JSON object. {OPS_HINT}"));
@@ -431,10 +432,30 @@ impl TodoList {
         if let Some(value) = map.remove("findings") {
             map.entry("finding".to_string()).or_insert(value);
         }
+        if !map.contains_key("index")
+            && map.get("task").is_some_and(Value::is_u64)
+            && let Some(value) = map.remove("task")
+        {
+            map.insert("index".to_string(), value);
+        }
+        if map.get("done") == Some(&Value::Bool(true))
+            && map.get("op").is_none_or(|op| op == "done")
+        {
+            map.remove("done");
+            map.insert("op".to_string(), json!("done"));
+        }
         if let Some(key) = map.keys().find(|key| !TOP_KEYS.contains(&key.as_str())) {
             let op = map.get("op").and_then(Value::as_str).unwrap_or("done");
+            let mut corrected = json!({ "op": op });
+            if let Some(index) = map
+                .get("index")
+                .or_else(|| map.get("task"))
+                .filter(|v| v.is_u64())
+            {
+                corrected["index"] = index.clone();
+            }
             return Err(format!(
-                "unknown key {key:?}. Allowed keys: op, tasks, index, reason, finding, evidence. Corrected call: {{\"op\":\"{op}\"}}; put findings in \"finding\" and evidence in \"evidence\"."
+                "unknown key {key:?}. Allowed keys: op, tasks, index, reason, finding, evidence. Corrected call: {corrected}; put findings in \"finding\" and evidence in \"evidence\"."
             ));
         }
         if !map.contains_key("op") {
@@ -656,6 +677,14 @@ fn prune_closed(tasks: &mut Vec<Task>) {
             false
         }
     });
+}
+
+/// The operation a todo call requests, including the accepted `done: true` shorthand. Guards that
+/// classify raw todo calls use this so shorthand and canonical calls are treated alike.
+pub fn requested_op(args: &Value) -> Option<&str> {
+    args.get("op")
+        .and_then(Value::as_str)
+        .or_else(|| (args.get("done") == Some(&Value::Bool(true))).then_some("done"))
 }
 
 pub fn schema() -> Value {

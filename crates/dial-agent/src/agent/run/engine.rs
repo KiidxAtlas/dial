@@ -13,24 +13,78 @@ use crate::{
     },
 };
 
+/// Reuse operation contracts rather than treating every successful tool receipt as evidence.
+/// Scheduling/read-only declarations describe observation eligibility, never authorization.
+fn progress_observation(
+    call: &ToolCall,
+    tool: Option<&dyn crate::tools::integrations::ext::Tool>,
+) -> bool {
+    use crate::tools::integrations::ext::{Concurrency, Tool};
+    if matches!(
+        call.name.as_str(),
+        "todo" | "working_state" | "finish" | "check" | "tool_load" | "task" | "message"
+    ) {
+        return false;
+    }
+    if call.name == "git" {
+        // Git's fixed action vectors already define read-only versus mutating operations.
+        return !crate::tools::vcs::git::Git::default().needs_approval(&call.arguments);
+    }
+    crate::agent::workflow::research::is_observation(call)
+        || tool.is_some_and(|tool| {
+            tool.name() == call.name
+                && (tool.read_only_hint()
+                    || tool.concurrency(&call.arguments) == Concurrency::Shared)
+        })
+}
+
+/// Controller observations and the current operation contract for settling one tool result.
+#[derive(Default)]
+pub(in crate::agent) struct Settlement<'a> {
+    pub check_failed: bool,
+    pub task_changed: bool,
+    /// The controller refused the call against the offered contract before executing it.
+    pub contract_failed: bool,
+    pub tool: Option<&'a dyn crate::tools::integrations::ext::Tool>,
+}
+
 #[derive(Default)]
 pub(in crate::agent) struct Engine {
     checkpoint: recovery_checkpoint::RecoveryCheckpoint,
-    /// Failed normalized calls stay withheld across continuations and compaction, until a
-    /// successful novel source mutation or new instruction changes the recovery context.
+    /// Failed normalized calls stay withheld across continuations and compaction. Each failure is
+    /// released only by its own dependency: a committed change to its known files, a changed shell
+    /// tree, a matching grant, or a new instruction. Unknown dependencies keep the whole-turn rule.
     failed: std::collections::BTreeSet<[u8; 32]>,
     /// Tree a failed shell command ran against. Another session can repair the checkout, so a
     /// later tree (different HEAD or uncommitted content) releases that command's barrier.
     failed_trees: std::collections::HashMap<[u8; 32], String>,
-    /// Files a failed `edit`/`write` targeted. A later successful read of one of them supplies the
-    /// witnesses those tools require, so it releases that call's barrier.
+    /// Known files a failed `edit`/`write` targeted; committed/external source repairs release
+    /// their barriers independently of native witness readiness.
     failed_writes: std::collections::HashMap<[u8; 32], Vec<std::path::PathBuf>>,
+    /// Only native validators can declare missing witnesses. Reads of a path, prose and payload
+    /// claims never substitute for exact current source and all required complete rows.
+    failed_witnesses:
+        std::collections::HashMap<[u8; 32], crate::runtime::execution::NativeEditRetry>,
+    /// Known files a failed `read` targeted. Re-reading is not new evidence, so only a committed
+    /// change to one of them releases the barrier.
+    failed_reads: std::collections::HashMap<[u8; 32], Vec<std::path::PathBuf>>,
+    /// File identities at a failed file operation's settlement. External repairs release only
+    /// calls whose own inputs changed, without treating an unrelated edit as recovery.
+    failed_versions: std::collections::HashMap<[u8; 32], Vec<Option<[u8; 32]>>>,
     /// Read targets refused by workspace confinement, tracked until a grant admits them.
     failed_access: std::collections::HashMap<[u8; 32], (String, Vec<String>)>,
+    /// First line of each withheld call's original error, quoted when the barrier refuses it.
+    failed_errors: std::collections::HashMap<[u8; 32], String>,
     repeats: guard::RepeatGuard,
     investigation: investigation::InvestigationGuard,
     returned_reads: investigation::ReturnedReads,
     research: crate::agent::workflow::research::Research,
+    /// Turn-wide evidence identities survive compaction: bookkeeping cannot make old evidence new.
+    progress_observations: std::collections::BTreeSet<u64>,
+    progress_checks: std::collections::BTreeSet<String>,
+    progress_captures: std::collections::BTreeSet<(String, Option<String>)>,
+    round_progress: RoundProgress,
+    progress: super::turn::progress::ProgressLedger,
     pub narration: guard::NarrationGuard,
     pub recovery: turn_recovery::Recovery,
     uncertain: bool,
@@ -44,15 +98,24 @@ pub(in crate::agent) struct Engine {
     length_power: u64,
     length_distance: u64,
     length_cycle: bool,
-    /// Consecutive failures per (tool, recovery kind); a tool's success clears its entries. The
-    /// first failure gets compact feedback, a repeat the full diagnose-first contract. Kept across
-    /// continuations and compaction, like the other failure counters.
+    /// Consecutive failures per (tool, recovery kind). Feedback stays compact on repeats;
+    /// controller admission and the shared stall budget enforce recovery, not longer prompts.
+    /// Kept across continuations and compaction, like the other failure counters.
     failures: std::collections::BTreeMap<(String, &'static str), u32>,
 }
 
 /// Bound on distinct (tool, kind) failure streaks; past it the streaks are cleared and a repeat
 /// is simply treated as a first failure again.
 const MAX_FAILURE_STREAKS: usize = 64;
+
+/// Aggregate execution progress for one assistant batch, independent of its call count.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::agent) enum RoundProgress {
+    #[default]
+    Neutral,
+    Stalled,
+    Productive,
+}
 
 /// State lifetimes are explicit: new instructions release old call restrictions; retries do not.
 #[derive(Clone, Copy, Debug, serde::Serialize)]
@@ -88,6 +151,17 @@ impl std::fmt::Display for UncertainRefusal {
 
 impl std::error::Error for UncertainRefusal {}
 
+#[derive(Debug)]
+pub(in crate::agent) struct StalledRefusal(String);
+
+impl std::fmt::Display for StalledRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for StalledRefusal {}
+
 impl Engine {
     pub fn research_prompt(&self) -> Option<serde_json::Value> {
         self.research.prompt()
@@ -106,6 +180,35 @@ impl Engine {
 
     pub fn research_round(&mut self) {
         self.research.round();
+    }
+
+    /// Drain raw batch observations once. The parent adjusts admission failures before charging;
+    /// the shared driver charges worker batches before another request can begin.
+    pub fn take_round_progress(&mut self) -> RoundProgress {
+        std::mem::take(&mut self.round_progress)
+    }
+
+    pub fn setback(&mut self, kind: super::turn::progress::Setback) -> super::turn::progress::Rung {
+        self.progress.setback(kind)
+    }
+
+    pub fn record_progress(&mut self, progress: RoundProgress) -> super::turn::progress::Rung {
+        use super::turn::progress::Rung;
+        if let Some(kind) = self.progress.tool_round(progress) {
+            self.progress.setback(kind)
+        } else {
+            self.progress.stop_reason().map_or(Rung::Retry, Rung::Stop)
+        }
+    }
+
+    /// Settle a worker batch before any subsequent inference or final publication. A second drain
+    /// is neutral, so parent settlement and the driver cannot charge the same batch twice.
+    pub fn finish_tool_round(&mut self) -> anyhow::Result<()> {
+        let progress = self.take_round_progress();
+        match self.record_progress(progress) {
+            super::turn::progress::Rung::Retry => Ok(()),
+            super::turn::progress::Rung::Stop(reason) => Err(StalledRefusal(reason).into()),
+        }
     }
 
     pub fn length(
@@ -186,6 +289,9 @@ impl Engine {
         mut advance: impl FnMut(&mut Self) -> anyhow::Result<Tick<R>>,
     ) -> anyhow::Result<Option<R>> {
         loop {
+            // Adapters may publish before returning Finished, so enforce the shared budget before
+            // entering them, never by rewriting a success after it was streamed or persisted.
+            self.finish_tool_round()?;
             match advance(self)? {
                 Tick::Finished(mut result) => {
                     if self.uncertain {
@@ -198,6 +304,7 @@ impl Engine {
                     if self.pending_refusal().is_some() {
                         return Err(UncertainRefusal.into());
                     }
+                    self.finish_tool_round()?;
                 }
             }
         }
@@ -222,9 +329,18 @@ impl Engine {
     }
     pub fn rejection_at(&mut self, workspace: &Workspace, call: &ToolCall) -> Option<String> {
         let identity = failed_identity(call);
-        if self.failed.contains(&identity) && !self.tree_changed_since_failure(workspace, call) {
+        if self.failed.contains(&identity)
+            && !self.tree_changed_since_failure(workspace, call)
+            && !self.sources_changed_since_failure(workspace, &identity)
+            && !self.witnesses_ready_since_failure(workspace, &identity)
+        {
+            let original = self
+                .failed_errors
+                .get(&identity)
+                .map(|error| format!(" Its original error was: {error}"))
+                .unwrap_or_default();
             return Some(format!(
-                "Failed-operation retry barrier: this unchanged `{}` call already failed and was not executed again. Inspect the retained diagnostic, use a different targeted observation, correct the arguments or repair the source before retrying. Todo updates and compaction do not release this barrier.",
+                "Failed-operation retry barrier: this unchanged `{}` call already failed and was not executed again.{original} Inspect the retained diagnostic, use a different targeted observation, correct the arguments or repair the source before retrying. Todo updates and compaction do not release this barrier.",
                 call.name
             ));
         }
@@ -236,6 +352,35 @@ impl Engine {
         }
         self.checkpoint.rejection_at(workspace, call)
     }
+    /// Release only failures whose own file content changed outside this controller.
+    fn sources_changed_since_failure(
+        &mut self,
+        workspace: &Workspace,
+        identity: &[u8; 32],
+    ) -> bool {
+        if self.failed_access.contains_key(identity) {
+            return false;
+        }
+        let Some(previous) = self.failed_versions.get(identity) else {
+            return false;
+        };
+        let Some(targets) = self
+            .failed_writes
+            .get(identity)
+            .or_else(|| self.failed_reads.get(identity))
+        else {
+            return false;
+        };
+        let current: Vec<_> = targets
+            .iter()
+            .map(|path| workspace.read_identity(&workspace.rel(path)))
+            .collect();
+        if current == *previous {
+            return false;
+        }
+        self.forget_failure(identity);
+        true
+    }
     /// A failed shell command whose tree has since changed (for example another session fixed the
     /// file that broke the build) may run again; its barrier is released.
     fn tree_changed_since_failure(&mut self, workspace: &Workspace, call: &ToolCall) -> bool {
@@ -245,22 +390,13 @@ impl Engine {
         };
         let changed = shell_tree(workspace, call).is_some_and(|now| &now != before);
         if changed {
-            self.failed.remove(&identity);
-            self.failed_trees.remove(&identity);
+            self.forget_failure(&identity);
         }
         changed
     }
     /// Snapshot admission restrictions before experimental early reads can start.
     pub fn failed_calls(&self) -> std::collections::BTreeSet<[u8; 32]> {
         self.failed.clone()
-    }
-    pub fn apply(
-        &self,
-        schemas: &mut Vec<serde_json::Value>,
-        names: &mut Vec<String>,
-        messages: &mut Vec<serde_json::Value>,
-    ) {
-        self.checkpoint.apply(schemas, names, messages);
     }
     pub fn arm(&mut self, call: &ToolCall, advice: &str) {
         self.checkpoint.arm(call, advice);
@@ -274,11 +410,21 @@ impl Engine {
         workspace: &Workspace,
         call: &ToolCall,
         output: &mut ToolOutput,
-        check_failed: bool,
-        task_changed: bool,
+        settlement: Settlement<'_>,
         holds_result: impl Fn(&str) -> bool,
     ) -> (Option<String>, Option<String>, Option<String>) {
-        match crate::agent::run::failure_guidance::classify(call, output) {
+        let Settlement {
+            check_failed,
+            task_changed,
+            contract_failed,
+            tool,
+        } = settlement;
+        let classified = if contract_failed && outcome::effects(output) != Effects::Unknown {
+            Some(crate::agent::run::failure_guidance::CALL_CONTRACT)
+        } else {
+            crate::agent::run::failure_guidance::classify(call, output)
+        };
+        match classified {
             Some((kind, advice)) => {
                 if self.failures.len() >= MAX_FAILURE_STREAKS
                     && !self.failures.contains_key(&(call.name.clone(), kind))
@@ -300,6 +446,7 @@ impl Engine {
         }
         if outcome::effects(output) == Effects::Unknown {
             self.uncertain = true;
+            self.round_progress = RoundProgress::Stalled;
             return (
                 None,
                 None,
@@ -325,7 +472,10 @@ impl Engine {
         let resolved = !output.is_error
             && task_changed
             && call.name == "todo"
-            && matches!(call.arguments["op"].as_str(), Some("done" | "block"));
+            && matches!(
+                crate::agent::workflow::todo::requested_op(&call.arguments),
+                Some("done" | "block")
+            );
         self.research.observe(call, output, mutated || resolved);
         if mutated || resolved {
             self.narration.progress();
@@ -335,54 +485,80 @@ impl Engine {
             !output.is_error && !check_failed,
             task_changed,
             mutated,
+            &output.execution.changed_paths,
         );
         if mutated && !output.is_error && !check_failed {
-            self.failed.clear();
-            self.failed_trees.clear();
-            self.failed_writes.clear();
-            self.failed_access.clear();
+            self.release_for_change(&output.execution.changed_paths);
         }
-        // An edit refused only because its anchors were unread shows those lines and makes them
-        // witnesses, so the identical edit is now valid and must not be withheld.
-        let witnessed = call.name == "edit"
-            && output
-                .text
-                .contains(crate::tools::edit::hashline::UNSEEN_LINES_NOW_READ);
+        // Native refusals can themselves return complete source rows. Reuse those witnesses;
+        // neither a marker in prose nor a successful read receipt grants retry readiness.
+        let native_retry = matches!(call.name.as_str(), "edit" | "write")
+            .then_some(output.execution.native_edit_retry.as_ref())
+            .flatten();
         let status = crate::runtime::execution::ToolStatus::from_output(output);
+        let witnessed = status == crate::runtime::execution::ToolStatus::Error
+            && native_retry.is_some_and(|retry| {
+                crate::tools::edit::hashline::native_edit_retry_ready(workspace, retry)
+            });
         if status.failed() && !witnessed {
             let identity = failed_identity(call);
+            self.failed_witnesses.remove(&identity);
+            if let Some(retry) =
+                native_retry.filter(|_| status == crate::runtime::execution::ToolStatus::Error)
+            {
+                self.failed_witnesses.insert(identity, retry.clone());
+            }
             let targets = inaccessible_read_targets(workspace, call, &output.text);
             if !targets.is_empty() {
                 self.failed_access
                     .insert(identity, (call_identity(call), targets));
             }
             self.failed.insert(identity);
+            if let Some(line) = output.text.lines().map(str::trim).find(|l| !l.is_empty()) {
+                self.failed_errors.insert(
+                    identity,
+                    crate::agent::window::prompt::truncate_chars(line, 300),
+                );
+            }
             if let Some(tree) = shell_tree(workspace, call) {
                 self.failed_trees.insert(identity, tree);
             }
             output.text.push_str("\nFailed-operation retry barrier: unchanged arguments are now withheld. Correct the arguments, inspect a different source, or repair the source before retrying; completed effects are retained.");
-            let targets = write_targets(workspace, call);
+            let targets = recovery_checkpoint::declared_targets(workspace, call);
             if !targets.is_empty() {
-                output
-                    .text
-                    .push_str(" Reading the target file releases this call.");
-                self.failed_writes.insert(identity, targets);
+                self.failed_versions.insert(
+                    identity,
+                    targets
+                        .iter()
+                        .map(|path| workspace.read_identity(&workspace.rel(path)))
+                        .collect(),
+                );
+                if call.name == "read" {
+                    self.failed_reads.insert(identity, targets);
+                } else {
+                    if native_retry.is_some() {
+                        output.text.push_str(" Complete native witnesses for every required current source range release this call.");
+                    }
+                    self.failed_writes.insert(identity, targets);
+                }
             }
         } else if status == crate::runtime::execution::ToolStatus::Ok {
-            if call.name == "read" {
-                self.release_read_targets(workspace, call);
-            } else if call.name == "request_directory" {
-                let checkpoint = &mut self.checkpoint;
-                self.failed_access.retain(|identity, (key, targets)| {
-                    let released = targets
-                        .iter()
-                        .any(|target| workspace.resolve(target).is_ok());
-                    if released {
-                        self.failed.remove(identity);
-                        checkpoint.release_key(key);
-                    }
-                    !released
-                });
+            self.release_ready_witnesses(workspace);
+            if call.name == "request_directory" {
+                let released: Vec<([u8; 32], String)> = self
+                    .failed_access
+                    .iter()
+                    .filter(|(_, (_, targets))| {
+                        targets
+                            .iter()
+                            .any(|target| workspace.resolve(target).is_ok())
+                    })
+                    .map(|(identity, (key, _))| (*identity, key.clone()))
+                    .collect();
+                for (identity, key) in released {
+                    self.forget_failure(&identity);
+                    self.checkpoint.release_key(&key);
+                }
             }
         }
         // Duplicate memory may only cite results the model still sees in full.
@@ -400,7 +576,75 @@ impl Engine {
         let pointer =
             self.returned_reads
                 .pointer(call, &output.text, output.is_error, holds_result);
-        (pointer.or(duplicate), repeat, stop)
+        let duplicate = pointer.or(duplicate);
+        let shell_check = call.name == "bash"
+            && call.arguments["command"]
+                .as_str()
+                .is_some_and(crate::agent::memory::selfplay::is_check_command);
+        let successful = status == crate::runtime::execution::ToolStatus::Ok
+            && !output.is_error
+            && !check_failed
+            && (!shell_check
+                || crate::agent::verify::verification::classify_output(None, output, false)
+                    == crate::agent::verify::verification::CheckStatus::Passed);
+        if mutated {
+            // A new committed version permits real verification of that version, even if a check
+            // returns the same success text. A revert/no-op does not reopen the evidence window.
+            self.progress_observations.clear();
+            self.progress_checks.clear();
+        }
+        let observation = progress_observation(call, tool);
+        let observed = successful
+            && output.execution.changed_paths.is_empty()
+            && duplicate.is_none()
+            && repeat.is_none()
+            && observation
+            && output.execution.captures.is_empty()
+            && self
+                .progress_observations
+                .insert(investigation::observation_key(call, &output.text));
+        // Native receipts identify the pixels and target, not changing labels, timestamps or
+        // model arguments. A successful input action may also return a genuine new observation.
+        let mut captured = false;
+        if successful {
+            for capture in &output.execution.captures {
+                captured |= self
+                    .progress_captures
+                    .insert((capture.sha256.clone(), capture.target.clone()));
+            }
+        }
+        // Only the focused-check owner's actual passing runs count, not a no-op selection or
+        // reused receipt. Changing prediction arguments or prose cannot make the same check new.
+        let mut verified = false;
+        if successful && call.name == crate::agent::verify::check_tool::NAME {
+            for result in output
+                .data
+                .as_ref()
+                .and_then(|data| data["results"].as_array())
+                .into_iter()
+                .flatten()
+            {
+                if result["status"] == "passed"
+                    && result["ran"] == true
+                    && result["reused"] == false
+                    && let Some(command) = result["command"].as_str()
+                {
+                    verified |= self.progress_checks.insert(command.to_owned());
+                }
+            }
+        }
+        if mutated || observed || verified || captured {
+            self.round_progress = RoundProgress::Productive;
+        } else if self.round_progress != RoundProgress::Productive
+            && (!successful
+                || duplicate.is_some()
+                || repeat.is_some()
+                || observation
+                || !output.execution.captures.is_empty())
+        {
+            self.round_progress = RoundProgress::Stalled;
+        }
+        (duplicate, repeat, stop)
     }
 
     /// Compaction releases duplicate observations and pointers so successful reads can return
@@ -412,26 +656,70 @@ impl Engine {
         self.checkpoint.forget_evidence();
     }
 
-    /// A read of a file a failed edit or write targeted is the observation that edit lacked
-    /// (for example a tag whose witnesses did not survive a restart), so the unchanged call may be
-    /// issued again. A retry that still fails re-arms the barrier.
-    fn release_read_targets(&mut self, workspace: &Workspace, call: &ToolCall) {
-        if self.failed_writes.is_empty() {
-            return;
+    /// Witness readiness may come from any native source owner (including an error preview),
+    /// not just a `read` call. Every file/range is checked against the current confined source.
+    fn witnesses_ready_since_failure(
+        &mut self,
+        workspace: &Workspace,
+        identity: &[u8; 32],
+    ) -> bool {
+        if self.failed_access.contains_key(identity) {
+            return false;
         }
-        let read: Vec<std::path::PathBuf> =
-            crate::agent::verify::caller_obligations::read_targets(workspace, &call.arguments)
-                .iter()
-                .filter_map(|path| workspace.resolve(path).ok())
-                .collect();
-        let failed = &mut self.failed;
-        self.failed_writes.retain(|identity, targets| {
-            let released = targets.iter().any(|target| read.contains(target));
-            if released {
-                failed.remove(identity);
-            }
-            !released
+        let ready = self.failed_witnesses.get(identity).is_some_and(|retry| {
+            crate::tools::edit::hashline::native_edit_retry_ready(workspace, retry)
         });
+        if ready {
+            self.forget_failure(identity);
+        }
+        ready
+    }
+
+    fn release_ready_witnesses(&mut self, workspace: &Workspace) {
+        let identities: Vec<_> = self.failed_witnesses.keys().copied().collect();
+        for identity in identities {
+            self.witnesses_ready_since_failure(workspace, &identity);
+        }
+    }
+
+    /// Releases failures that a novel successful mutation can repair. A failure whose known files
+    /// were not changed stays barred. An unknown-dependency failure (for example an arbitrary shell
+    /// command) keeps the conservative rule: any such mutation releases it. Access refusals are
+    /// never released here; only a matching grant does that.
+    fn release_for_change(&mut self, changed: &[std::path::PathBuf]) {
+        let released: Vec<[u8; 32]> = self
+            .failed
+            .iter()
+            .copied()
+            .filter(|identity| {
+                if self.failed_access.contains_key(identity) {
+                    return false;
+                }
+                match self
+                    .failed_writes
+                    .get(identity)
+                    .or_else(|| self.failed_reads.get(identity))
+                {
+                    Some(targets) => targets.iter().any(|target| changed.contains(target)),
+                    None => true,
+                }
+            })
+            .collect();
+        for identity in released {
+            self.forget_failure(&identity);
+        }
+    }
+
+    /// Drops every record of one failed operation; other failures keep their own barriers.
+    fn forget_failure(&mut self, identity: &[u8; 32]) {
+        self.failed.remove(identity);
+        self.failed_trees.remove(identity);
+        self.failed_writes.remove(identity);
+        self.failed_witnesses.remove(identity);
+        self.failed_reads.remove(identity);
+        self.failed_versions.remove(identity);
+        self.failed_access.remove(identity);
+        self.failed_errors.remove(identity);
     }
 }
 
@@ -488,23 +776,6 @@ fn shell_tree(workspace: &Workspace, call: &ToolCall) -> Option<String> {
         call.arguments["command"].as_str().unwrap_or_default(),
         call.arguments["cwd"].as_str().unwrap_or_default(),
     )
-}
-
-/// Resolved files an `edit` or `write` call declares; empty for other tools or unparsable input.
-fn write_targets(workspace: &Workspace, call: &ToolCall) -> Vec<std::path::PathBuf> {
-    let declared = match call.name.as_str() {
-        "edit" => crate::tools::declared_edit_targets(&call.arguments).unwrap_or_default(),
-        "write" => call.arguments["path"]
-            .as_str()
-            .map(str::to_owned)
-            .into_iter()
-            .collect(),
-        _ => Vec::new(),
-    };
-    declared
-        .iter()
-        .filter_map(|path| workspace.resolve(path).ok())
-        .collect()
 }
 
 #[cfg(test)]

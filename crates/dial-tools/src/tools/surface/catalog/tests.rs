@@ -47,19 +47,25 @@ fn integration_defaults_and_legacy_registration_share_metadata() {
 }
 
 #[test]
-fn execution_platform_reason_matches_launch_gate() {
-    {
-        let name = "eval";
-        let platform = execution_platform(name);
-        assert_eq!(platform.available, platform.reason.is_none());
+fn static_platform_support_does_not_replace_launch_containment() {
+    let name = "eval";
+    let platform = execution_platform(name);
+    assert_eq!(platform.available, platform.reason.is_none());
+    if cfg!(target_os = "macos") {
+        assert!(platform.available);
+        let expected = crate::tools::exec::sandbox::Sandbox::detect().available().err().map(|error| {
+            format!("{name} requires OS process-fork containment even with filesystem sandboxing disabled: {error}")
+        });
+        assert_eq!(
+            crate::tools::exec::kernel::require_fork_containment(name).err(),
+            expected
+        );
+    } else {
         assert_eq!(
             crate::tools::exec::kernel::require_fork_containment(name).err(),
             platform.reason
         );
-        #[cfg(target_os = "linux")]
-        assert!(!platform.available);
-        #[cfg(windows)]
-        assert!(platform.available);
+        assert_eq!(platform.available, cfg!(windows));
     }
 }
 #[test]
@@ -94,4 +100,72 @@ fn status_and_discovery_report_the_same_execution_platform() {
             );
         }
     }
+}
+
+#[test]
+fn readiness_tracks_config_without_probing_or_claiming_registry_absence() {
+    let registry = Registry::new();
+    let mut config = crate::config::types::Config::default();
+    assert_eq!(
+        readiness("mcp__offline__unknown", &config, &registry),
+        Readiness::Unknown
+    );
+    assert_eq!(
+        readiness("dap_unregistered", &config, &registry),
+        Readiness::Unknown
+    );
+    assert!(matches!(
+        operation_readiness("computer", &config)["locate"],
+        Readiness::MissingPrerequisite { .. }
+    ));
+    assert_eq!(
+        readiness("computer", &config, &registry),
+        Readiness::Unknown
+    );
+    config.model_roles.insert(
+        "grounding".into(),
+        crate::llm::model_config::ModelSelection::new("openai", "unreachable-test-model"),
+    );
+    assert_eq!(
+        operation_readiness("computer", &config)["locate"],
+        Readiness::Unknown
+    );
+    config.model_roles.remove("grounding");
+    assert!(matches!(
+        operation_readiness("computer", &config)["locate"],
+        Readiness::MissingPrerequisite { .. }
+    ));
+
+    let mut adapter = crate::config::tools::dap::defaults().remove("gdb").unwrap();
+    adapter.program.clear();
+    adapter.address.clear();
+    config.dap.insert("test".into(), adapter);
+    assert!(matches!(
+        readiness("dap_test", &config, &registry),
+        Readiness::MissingPrerequisite { .. }
+    ));
+    config.dap.get_mut("test").unwrap().address = "127.0.0.1:1".into();
+    // A configured address is not proof a server is reachable, and no connection is attempted.
+    assert_eq!(
+        readiness("dap_test", &config, &registry),
+        Readiness::Unknown
+    );
+}
+
+#[test]
+fn catalog_readiness_refresh_is_advisory_and_preserves_contract_identity() {
+    let registry = Registry::new();
+    let config = crate::config::types::Config::default();
+    let schema = crate::tools::schema("read", crate::config::types::EditMode::Replace).unwrap();
+    let mut catalog = Catalog::from_schemas(&[schema], &registry).unwrap();
+    let before = serde_json::to_value(&catalog.get("read").unwrap().identity).unwrap();
+    catalog.refresh_readiness(&config, &registry);
+    let definition = catalog.get("read").unwrap();
+    assert_eq!(definition.readiness, Readiness::Ready);
+    assert_eq!(serde_json::to_value(&definition.identity).unwrap(), before);
+    assert_eq!(
+        serde_json::to_value(&definition.readiness).unwrap(),
+        json!({"state":"ready"})
+    );
+    assert!(catalog.validate("read", &json!({})).is_err());
 }

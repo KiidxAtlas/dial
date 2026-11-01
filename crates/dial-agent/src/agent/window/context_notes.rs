@@ -588,6 +588,7 @@ impl crate::agent::Agent<'_> {
             "raw_history":{"tool":"session_search","arguments":{"query":"","history":true}},
             "todos":control["todo"],
             "working_state":control["working_state"],
+            "user_intent":control["user_intent"],
             "portable_rules_and_reminders":&*state,
             "coordination":coordination,
         });

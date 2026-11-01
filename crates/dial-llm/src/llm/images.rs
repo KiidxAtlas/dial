@@ -1,5 +1,6 @@
 //! Compact image references. Tool reads stay project-confined; users may explicitly supply external
 //! images. Bytes are verified and encoded only for inference.
+use crate::config::snapcompact::ImageDetail;
 use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
@@ -370,11 +371,23 @@ pub fn prepare(
     notices: &NoticeTracker,
     notice: &mut dyn FnMut(&str),
 ) -> Option<super::Chat> {
-    if !req
-        .messages
-        .iter()
-        .any(|message| message.get("dial_images").is_some())
-    {
+    prepare_for_target(req, vision, ImageDetail::Original, notices, notice)
+}
+
+/// Extend the normal image projection with the current route's supported generated-frame hint.
+/// Retained pixels and the canonical journal are never rewritten on a model switch.
+pub(crate) fn prepare_for_target(
+    req: &super::Chat,
+    vision: bool,
+    supported_detail: ImageDetail,
+    notices: &NoticeTracker,
+    notice: &mut dyn FnMut(&str),
+) -> Option<super::Chat> {
+    if !req.messages.iter().any(|message| {
+        message.get("dial_images").is_some()
+            || (supported_detail != ImageDetail::Original
+                && has_original_snapcompact_image(message))
+    }) {
         return None;
     }
     let mut prepared = super::Chat {
@@ -389,6 +402,20 @@ pub fn prepare(
     for original in &req.messages {
         let mut message = original.clone();
         let is_tool = message["role"] == "tool";
+        if supported_detail != ImageDetail::Original && has_original_snapcompact_image(&message) {
+            for field in ["content", "dial_provider_content"] {
+                if let Some(parts) = message[field].as_array_mut() {
+                    for part in parts {
+                        if part["type"] == "image_url" && part["image_url"]["detail"] == "original"
+                        {
+                            part["image_url"]["detail"] = json!("high");
+                        }
+                    }
+                }
+            }
+            let reason = "Snapcompact image detail original is not declared for this route; sending high detail on the request copy. Stored PNGs and sources are unchanged.";
+            failures.push((Sha256::digest(reason.as_bytes()).into(), reason.to_owned()));
+        }
         if !is_tool && !pending.is_empty() {
             prepared
                 .messages
@@ -461,6 +488,17 @@ pub fn prepare(
     }
     notices.report(failures, notice);
     Some(prepared)
+}
+
+fn has_original_snapcompact_image(message: &Value) -> bool {
+    (message["dial_snapcompact"].is_object() || message["dial_snapcompact_view"].is_object())
+        && ["content", "dial_provider_content"].iter().any(|field| {
+            message[*field].as_array().is_some_and(|parts| {
+                parts.iter().any(|part| {
+                    part["type"] == "image_url" && part["image_url"]["detail"] == "original"
+                })
+            })
+        })
 }
 
 fn failure_key(reference: &Value, reason: &str) -> [u8; 32] {

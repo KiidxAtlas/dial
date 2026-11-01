@@ -695,6 +695,7 @@ fn parse_harmony(s: &str, index: usize) -> Option<(ToolCall, usize)> {
 /// `<|message|>` shows whether it names a function.
 pub(super) struct Hider<'a> {
     out: &'a mut dyn FnMut(&str) -> bool,
+    hidden: &'a mut dyn FnMut(&str) -> bool,
     held: String,
     hiding: bool,
     /// False passes every delta through untouched.
@@ -702,9 +703,14 @@ pub(super) struct Hider<'a> {
 }
 
 impl<'a> Hider<'a> {
-    pub(super) fn new(out: &'a mut dyn FnMut(&str) -> bool, hide_tags: bool) -> Self {
+    pub(super) fn new(
+        out: &'a mut dyn FnMut(&str) -> bool,
+        hidden: &'a mut dyn FnMut(&str) -> bool,
+        hide_tags: bool,
+    ) -> Self {
         Hider {
             out,
+            hidden,
             held: String::new(),
             hiding: false,
             hide_tags,
@@ -717,11 +723,12 @@ impl<'a> Hider<'a> {
             return (self.out)(delta);
         }
         if self.hiding {
-            return true;
+            return delta.is_empty() || (self.hidden)(delta);
         }
         self.held.push_str(delta);
         if let Some((at, hide)) = self.decisive() {
-            let keep_going = at == 0 || (self.out)(&self.held[..at]);
+            let keep_going = (at == 0 || (self.out)(&self.held[..at]))
+                && (!hide || (self.hidden)(&self.held[at..]));
             if hide {
                 self.held.clear();
                 self.hiding = true;

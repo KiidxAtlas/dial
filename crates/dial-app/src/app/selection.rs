@@ -384,6 +384,22 @@ pub(super) fn local_suggestion_base(config: &Config) -> crate::llm::local_eviden
     }
 }
 
+/// Resolve the grammar that resetting this profile will inherit, without changing any saved pin.
+pub(super) fn model_settings_inherited_edit_mode(
+    config: &Config,
+    profile: &str,
+    raw_harness: &crate::config::types::Harness,
+) -> Result<String> {
+    let mut inherited = config.clone();
+    if let Some(profile) = inherited.model_profiles.get_mut(profile) {
+        profile.edit_mode = None;
+    }
+    let harness = inherited.effective_harness(raw_harness)?;
+    let mode = serde_json::to_value(inherited.resolved_edit_mode(&harness))
+        .expect("edit mode is serializable");
+    Ok(mode.as_str().expect("edit mode is a string").to_owned())
+}
+
 pub(super) fn model_settings_profile(
     config: &Config,
 ) -> (String, crate::llm::profiles::ModelProfile) {

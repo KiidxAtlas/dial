@@ -260,7 +260,10 @@ impl Tool for BrowserTool {
     }
     fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
         match self.run(ctx, args) {
-            Ok(v) => ToolOutput::structured(v),
+            Ok(v) => {
+                let captures = capture::native_receipt(args, &v).into_iter().collect();
+                ToolOutput::structured(v).with_captures(captures)
+            }
             Err(e) => ToolOutput::err(e),
         }
     }

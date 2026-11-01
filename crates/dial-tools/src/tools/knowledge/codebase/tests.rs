@@ -685,6 +685,56 @@ fn changed_or_removed_sources_withhold_old_findings_before_any_refresh() {
 }
 
 #[test]
+fn a_full_cache_names_stale_findings_to_forget_and_still_accepts_updates() {
+    let (_home, project, layout, ws) = fixture();
+    let cache = Codebase::open(&layout).unwrap();
+    cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+    for i in 0..MAX_NOTES {
+        cache
+            .remember_current(
+                &format!("topic-{i}"),
+                "router routes.",
+                &["src/router.rs".into()],
+                "one",
+                0,
+            )
+            .unwrap();
+    }
+    let full = cache
+        .remember_current("new", "router routes.", &["src/router.rs".into()], "one", 0)
+        .unwrap_err()
+        .to_string();
+    assert!(full.contains("limit reached (128 findings)"), "{full}");
+    assert!(
+        !full.contains("forget candidates"),
+        "nothing is stale yet: {full}"
+    );
+
+    // Once the cited source changes, the refusal names exact `forget` arguments.
+    fs::write(project.path().join("src/router.rs"), "pub fn moved() {}\n").unwrap();
+    cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+    let full = cache
+        .remember_current("new", "router moved.", &["src/router.rs".into()], "one", 0)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        full.contains(r#"128 saved findings cite changed sources; forget candidates: {"expected_revision":1,"topic":"topic-0"}"#),
+        "{full}"
+    );
+    // Updating an existing topic is not limited.
+    let updated = cache
+        .remember_current(
+            "topic-0",
+            "router moved.",
+            &["src/router.rs".into()],
+            "one",
+            1,
+        )
+        .unwrap();
+    assert_eq!(updated["revision"], 2);
+}
+
+#[test]
 fn remember_reindexes_edited_workspace_sources_and_names_unusable_ones() {
     let (_home, project, layout, ws) = fixture();
     let cache = Codebase::open(&layout).unwrap();

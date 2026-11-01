@@ -28,5 +28,63 @@ class SummaryWindowTests(unittest.TestCase):
                 "BENCH_CASE=goal-compaction phase=finish"}]}, 1)
 
 
+class RecoveryConversationTests(unittest.TestCase):
+    def setUp(self):
+        self.handler = Handler.__new__(Handler)
+
+    def request(self, case, exchanges=(), tools=()):
+        prompt = "BENCH_CASE=" + case
+        messages = [{"role": "user", "content": prompt}]
+        for index, (name, output) in enumerate(exchanges):
+            call_id = "observed-" + str(index)
+            messages.extend([
+                {"role": "assistant", "tool_calls": [{"id": call_id,
+                    "function": {"name": name, "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": call_id, "content": output},
+                {"role": "user", "dial_task_context": True,
+                    "content": "Latest admitted user request: " + prompt},
+            ])
+        return {"messages": messages, "tools": [
+            {"function": {"name": name}} for name in tools]}
+
+    def next_call(self, request):
+        message, finish = self.handler.reply(request, 99)
+        self.assertEqual(finish, "tool_calls")
+        return message["tool_calls"][0]["function"]
+
+    def test_runtime_reminder_retains_failed_selector_evidence(self):
+        import json
+        call = self.next_call(self.request("selector-recovery", [
+            ("read", 'Invalid line selector "1- many": use numeric 1-based lines')]))
+        self.assertEqual(call["name"], "read")
+        self.assertEqual(json.loads(call["arguments"]), {"path": "calc.py:1-4"})
+
+    def test_real_later_turn_still_resets_prior_tool_evidence(self):
+        import json
+        request = self.request("selector-recovery", [("read", "invalid selector")])
+        request["messages"].append({"role": "user", "content": "BENCH_CASE=reuse-evidence"})
+        call = self.next_call(request)
+        self.assertEqual(call["name"], "read")
+        self.assertEqual(json.loads(call["arguments"]), {"path": "calc.py:1-4"})
+
+    def test_launch_discovery_precedes_loading_and_does_not_repeat(self):
+        import json
+        for case in ("terminal-launch-recovery", "stdin-launch-recovery"):
+            with self.subTest(case=case):
+                exchanges = [("bash", "[exit code: 1]")]
+                call = self.next_call(self.request(case, exchanges))
+                self.assertEqual(call["name"], "tool_search")
+                self.assertEqual(json.loads(call["arguments"]), {"query": "bg"})
+                exchanges.append(("tool_search", "bg available"))
+                call = self.next_call(self.request(case, exchanges))
+                self.assertEqual(call["name"], "tool_load")
+                self.assertEqual(json.loads(call["arguments"]), {"names": ["bg"]})
+                exchanges.append(("tool_load", "unavailable"))
+                reply, finish = self.handler.reply(self.request(case, exchanges), 99)
+                self.assertEqual(finish, "stop")
+                self.assertNotIn("tool_calls", reply)
+                self.assertIn("Blocked:", reply["content"])
+
+
 if __name__ == "__main__":
     unittest.main()

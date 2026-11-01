@@ -889,16 +889,23 @@ impl Workspace {
     /// primary root; absolute paths must fall under some root. The target need not
     /// exist; existing components are resolved through symlinks and re-checked.
     pub fn resolve(&self, input: &str) -> Result<PathBuf, String> {
-        let expanded = self.expand_file_handle(input)?;
+        self.resolve_checked(input)
+            .map_err(|error| error.to_string())
+    }
+
+    fn resolve_checked(&self, input: &str) -> io::Result<PathBuf> {
+        let expanded = self.expand_file_handle_checked(input)?;
         if file_handles::is_handle_with_selector(input) {
-            return Err("read selectors are not accepted by path resolution".into());
+            return Err(io::Error::other(
+                "read selectors are not accepted by path resolution",
+            ));
         }
         self.resolve_literal(&expanded)
     }
 
-    fn resolve_literal(&self, input: &str) -> Result<PathBuf, String> {
+    fn resolve_literal(&self, input: &str) -> io::Result<PathBuf> {
         if input.contains('\0') {
-            return Err("path contains a NUL byte".to_string());
+            return Err(io::Error::other("path contains a NUL byte"));
         }
         let path = Path::new(input);
         // An explicit sensitive root may be nested beneath the primary workspace.
@@ -924,6 +931,9 @@ impl Workspace {
             within(path)
                 .or_else(|| within(&Self::canonical_prefix(path)))
                 .ok_or_else(|| {
+                    if self.is_protected(&Self::canonical_prefix(path)) {
+                        return io::Error::new(io::ErrorKind::PermissionDenied, Self::protected_refusal(input));
+                    }
                     // Name the directory to add, so the model can ask for it instead of giving up.
                     let project = path
                         .ancestors()
@@ -931,17 +941,20 @@ impl Workspace {
                         .find(|dir| dir.join(".git").exists())
                         .or_else(|| path.parent())
                         .unwrap_or(path);
-                    format!(
+                    io::Error::new(io::ErrorKind::PermissionDenied, format!(
                         "path {input:?} is outside the workspace; call request_directory with path {:?} to ask for a yes/no access approval, then retry the tool. Normal directory access does not unlock protected Dial storage; that requires a separate sensitive request.",
                         project.display()
-                    )
+                    ))
                 })?
         } else {
             (self.root.as_path(), path.to_path_buf())
         };
         let mut current = root.to_path_buf();
         if self.is_protected(&current) {
-            return Err(format!("path {input:?} enters protected Dial storage"));
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                Self::protected_refusal(input),
+            ));
         }
         let mut missing = false;
         for component in relative.components() {
@@ -949,43 +962,81 @@ impl Workspace {
                 Component::CurDir => {}
                 Component::ParentDir => {
                     if missing || current.as_path() == root {
-                        return Err(format!("path {input:?} escapes the workspace"));
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            format!("path {input:?} escapes the workspace"),
+                        ));
                     }
                     current.pop();
                 }
                 Component::Normal(name) => {
                     current.push(name);
                     if self.is_protected(&current) {
-                        return Err(format!("path {input:?} enters protected Dial storage"));
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            Self::protected_refusal(input),
+                        ));
                     }
                     if missing {
                         continue;
                     }
                     match std::fs::symlink_metadata(&current) {
                         Ok(meta) if meta.file_type().is_symlink() => {
-                            current = std::fs::canonicalize(&current).map_err(|_| {
-                                format!("path {input:?} goes through a dangling symlink")
+                            current = std::fs::canonicalize(&current).map_err(|error| {
+                                io::Error::new(
+                                    error.kind(),
+                                    format!("path {input:?} goes through a dangling symlink"),
+                                )
                             })?;
                             if !current.starts_with(root) {
-                                return Err(format!(
-                                    "path {input:?} follows a symlink out of the workspace"
+                                return Err(io::Error::new(
+                                    io::ErrorKind::PermissionDenied,
+                                    format!(
+                                        "path {input:?} follows a symlink out of the workspace"
+                                    ),
                                 ));
                             }
                         }
                         Ok(_) => {}
                         Err(e) if e.kind() == io::ErrorKind::NotFound => missing = true,
-                        Err(e) => return Err(format!("cannot access {input:?}: {e}")),
+                        Err(e) => {
+                            return Err(io::Error::new(
+                                e.kind(),
+                                format!("cannot access {input:?}: {e}"),
+                            ));
+                        }
                     }
                 }
                 Component::RootDir | Component::Prefix(_) => {
-                    return Err(format!("path {input:?} is not a valid workspace path"));
+                    return Err(io::Error::other(format!(
+                        "path {input:?} is not a valid workspace path"
+                    )));
                 }
             }
             if self.is_protected(&current) {
-                return Err(format!("path {input:?} enters protected Dial storage"));
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    Self::protected_refusal(input),
+                ));
             }
         }
         Ok(current)
+    }
+
+    /// The refusal for a path in protected Dial storage, judged by the requested `input` (the
+    /// walk may stop at a protected ancestor). Session transcripts are the usual target, and
+    /// `session_search` reads them under Dial's own authority.
+    fn protected_refusal(input: &str) -> String {
+        let path = Path::new(input);
+        let transcript = path.extension().is_some_and(|ext| ext == "jsonl")
+            && path.components().any(|part| part.as_os_str() == "sessions");
+        if transcript {
+            format!(
+                "path {input:?} is a Dial session transcript in protected Dial storage; search past sessions with the session_search tool instead"
+            )
+        } else {
+            format!("path {input:?} enters protected Dial storage")
+        }
     }
 
     /// Attach extra directories the session may read and write alongside the primary
@@ -1073,11 +1124,17 @@ impl Workspace {
         }
     }
 
+    /// Resolve a native read path, including selectors, even when its target is missing.
+    /// Missing targets remain confined paths; this does not grant read access or a witness.
+    pub fn resolve_read_target(&self, input: &str) -> Result<PathBuf, String> {
+        let (path, _) = fs::select::split_target(self, input)?;
+        self.resolve(path)
+    }
+
     /// Bounded, workspace-confined identity for a read observation, including selectors.
     /// Used only to expire recovery feedback; this is not verification evidence.
     pub fn read_identity(&self, input: &str) -> Option<[u8; 32]> {
-        let (path, _) = fs::select::split_target(self, input).ok()?;
-        self.file_identity(Path::new(path))
+        self.file_identity(&self.resolve_read_target(input).ok()?)
             .map(|(_, digest)| digest)
     }
 
@@ -1189,6 +1246,7 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
             json!({
                 "path": {"type": "string", "description": "Workspace-relative file path or an `ssh://host/path` remote file (requires approval)."},
                 "content": {"type": "string", "description": "Full file content."},
+                "allow_syntax_errors": {"type": "boolean", "description": "Set true only when valid code is refused for new syntax errors (parser dialect gap)."},
             }),
             &["path", "content"],
         ),
@@ -1200,7 +1258,7 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
              next_cursor/remaining_skip to continue. .git, scratch and symlinks are never listed.",
             json!({
                 "pattern": {"type": "string", "description": "Glob such as `src/**/*.rs` or `*.py`, relative to the workspace root."},
-                "path": {"type": "string", "description": "Scope: file, directory or semicolon-separated scopes (default workspace root)."},
+                "path": {"type": "string", "description": "Scope: file, directory or semicolon-separated scopes (default workspace root). Scopes inside .git or the workspace scratch directory are refused."},
                 "hidden": {"type": "boolean", "description": "Include hidden entries (default true)."},
                 "gitignore": {"type": "boolean", "description": "Honor ignore rules and skip dependency/build directories (default true)."},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Paths per page (default 500)."},
@@ -1217,7 +1275,7 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
             json!({
                 "pattern": {"type": "string", "description": "Non-empty Rust regex such as `fn \\w+\\(` or `TODO|FIXME`; set fixed_string for literal text."},
                 "fixed_string": {"type": "boolean", "description": "Treat pattern as literal text (default false)."},
-                "path": {"type": "string", "description": "File, directory or semicolon-separated scopes, or one `ssh://host/path` file (approval required)."},
+                "path": {"type": "string", "description": "File, directory or semicolon-separated scopes, or one `ssh://host/path` file (approval required). Scopes inside .git or the workspace scratch directory are refused."},
                 "glob": {"type": "string", "description": "Only files whose workspace-relative path matches this glob."},
                 "ignore_case": {"type": "boolean", "description": "Case-insensitive (default false)."},
                 "context": {"type": "integer", "minimum": 0, "description": "Lines before and after each match (default 0, max 10)."},
@@ -1234,14 +1292,15 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
         "bash" => tool_schema(
             "bash",
             if cfg!(windows) {
-                "Run a bash command in the workspace root, or in `cwd`. It runs in Git for Windows bash when installed, otherwise in Dial's built-in bash-compatible shell; only with `shell.backend = \"powershell\"` is it PowerShell source. Windows has no filesystem/network isolation: execution requires `sandbox.mode = \"off\"` and runs with the user's privileges. stdout and stderr are merged; long output keeps its start and end. No controlling terminal. A command still running after `shell.auto_background_secs` (default 15) becomes a `bg` job whatever its timeout: do independent work, then `bg wait` for the result."
+                "Run a bash command in the workspace root, or in `cwd`. It runs in Git for Windows bash when installed, otherwise in Dial's built-in bash-compatible shell; only with `shell.backend = \"powershell\"` is it PowerShell source. Windows has no filesystem/network isolation: execution requires `sandbox.mode = \"off\"` and runs with the user's privileges. stdout and stderr are merged; long output keeps its start and end. No terminal by default; `pty=true` immediately starts a managed terminal job controlled with `bg`. A pipe command still running after `shell.auto_background_secs` (default 15) becomes a `bg` job whatever its timeout: do independent work, then `bg wait` for the result."
             } else {
-                "Run a command with `/bin/bash -c` in the workspace root, or in `cwd`. It may be sandboxed: writes confined to the project and added directories, some outside paths unreadable, network possibly blocked; temporary files go in `$TMPDIR`. stdout and stderr are merged; long output keeps its start and end. No controlling terminal, but GUI programs still open on the user's desktop (macOS, or Linux with a display), so run the real command before concluding otherwise. A command still running after `shell.auto_background_secs` (default 15) becomes a `bg` job whatever its timeout: do independent work, then `bg wait` for the result."
+                "Run a command with `/bin/bash -c` in the workspace root, or in `cwd`. It may be sandboxed: writes confined to the project and added directories, some outside paths unreadable, network possibly blocked; temporary files go in `$TMPDIR`. stdout and stderr are merged; long output keeps its start and end. No terminal by default; `pty=true` immediately starts a managed terminal job controlled with `bg`. GUI programs still open on the user's desktop (macOS, or Linux with a display), so run the real command before concluding otherwise. A pipe command still running after `shell.auto_background_secs` (default 15) becomes a `bg` job whatever its timeout: do independent work, then `bg wait` for the result."
             },
             json!({
                 "command": {"type": "string", "description": "Shell command to run."},
                 "cwd": {"type": "string", "description": "Working directory: relative to the workspace root, or absolute in an added root. Defaults to the root; do not prefix `cd <root> &&`."},
                 "session": {"type":"string", "description":"Embedded backend only: keep cwd and exported string variables across completed foreground commands with the same session name. A cancelled or timed-out command resets it."},
+                "pty": {"type": "boolean", "description": "Allocate a terminal at launch and return a managed bg job immediately (default false). Use bg input/output/wait/resize/kill with the returned name. Incompatible with session and timeout; respects --no-pty."},
                 "timeout": {"type": "integer", "minimum": 1, "description": "Seconds before the command is killed: an upper bound, not a way to stay in the foreground."},
                 "background": {"type": "boolean", "description": "Start as a `bg` job immediately (servers, watchers, work to overlap)."},
                 "async": {"type": "boolean", "description": "Alias of background."},
@@ -1336,7 +1395,11 @@ pub fn preview_edit(ws: &Workspace, args: &Value) -> ToolOutput {
             .and_then(|input| edit::hashline::edit_with(&preview, input, false, &execution))
     } else {
         edit::editing::prepare_with_preview(&preview, args, Some(&no_change))
-            .and_then(|changes| edit::editing::finish_with(&preview, changes, false, &execution))
+            .and_then(|prepared| {
+                edit::editing::finish_prepared(&preview, prepared, false, &execution)
+            })
+            .map(|output| output.text)
+            .map_err(|error| error.to_string())
     };
     let mut output = match result {
         Ok(text) => ToolOutput::ok(text),
@@ -1363,7 +1426,11 @@ pub fn preview_edit_streaming(ws: &Workspace, args: &Value) -> ToolOutput {
             .and_then(|input| edit::hashline::edit_with(&preview, input, false, &execution))
     } else {
         edit::editing::prepare_streaming_preview(&preview, args, Some(&no_change))
-            .and_then(|changes| edit::editing::finish_with(&preview, changes, false, &execution))
+            .and_then(|prepared| {
+                edit::editing::finish_prepared(&preview, prepared, false, &execution)
+            })
+            .map(|output| output.text)
+            .map_err(|error| error.to_string())
     };
     let mut output = match result {
         Ok(text) => ToolOutput::ok(text),
@@ -1381,14 +1448,27 @@ pub fn preview_edit_should_abort(output: &ToolOutput) -> bool {
             .and_then(|data| data["edit_preview"]["no_change"].as_bool())
             .unwrap_or(false)
 }
+/// Preserve the resolver's permission classification before any mutation is attempted. Other
+/// binding errors remain ordinary call errors, never guessed from diagnostic text or path shape.
+fn path_refusal(error: io::Error) -> ToolOutput {
+    let blocked = error.kind() == io::ErrorKind::PermissionDenied;
+    let output = ToolOutput::err(error.to_string());
+    if blocked {
+        output
+            .with_status(ToolStatus::Blocked)
+            .with_effects(surface::outcome::Effects::None)
+    } else {
+        output
+    }
+}
 fn bind_edit_targets(
     ws: &Workspace,
     paths: Vec<String>,
-) -> Result<Vec<(String, PathBuf, PathBuf)>, String> {
+) -> io::Result<Vec<(String, PathBuf, PathBuf)>> {
     paths
         .into_iter()
         .map(|literal| {
-            let canonical = ws.resolve(&literal)?;
+            let canonical = ws.resolve_checked(&literal)?;
             let path = Path::new(&literal);
             let lexical = if path.is_absolute() {
                 path.to_path_buf()
@@ -1479,10 +1559,11 @@ fn edit_for_workspace(
     cancel: &std::sync::atomic::AtomicBool,
 ) -> ToolOutput {
     let bound = match edit::editing::targets(workspace.edit_mode, args)
+        .map_err(io::Error::other)
         .and_then(|paths| bind_edit_targets(workspace, paths))
     {
         Ok(bound) => bound,
-        Err(error) => return ToolOutput::err(error),
+        Err(error) => return path_refusal(error),
     };
     if let Err(error) = authorize_source_targets(ctx, &bound) {
         return ToolOutput::err(error);
@@ -1521,10 +1602,9 @@ fn edit_for_workspace(
                 ToolOutput::err(fs::suggest::annotate_edit(workspace, args, error))
             });
     }
-    let result = edit::editing::prepare(workspace, args)
-        .and_then(|changes| edit::editing::finish_with(workspace, changes, true, &execution));
+    let result = edit::editing::execute_prepared(workspace, args, &execution);
     match result {
-        Ok(text) => ToolOutput::ok(text),
+        Ok(output) => output,
         Err(error) => ToolOutput::err(fs::suggest::annotate_edit(workspace, args, error)),
     }
 }
@@ -1563,10 +1643,11 @@ pub fn write_with_context(
         };
     }
     let bound = match req_str(args, "path")
+        .map_err(io::Error::other)
         .and_then(|path| bind_edit_targets(ctx.workspace, vec![path.to_owned()]))
     {
         Ok(bound) => bound,
-        Err(error) => return ToolOutput::err(error),
+        Err(error) => return path_refusal(error),
     };
     let authorize = |paths: &[PathBuf]| authorize_edit_targets(ctx, "write", &bound, paths);
     let guarded_repair = |request: &EditRepairRequest| {
@@ -1612,7 +1693,15 @@ fn dispatch(
             Some(result) => result,
             None => fs::files::read_tool(ws, args).map(ToolOutput::ok),
         },
-        "write" => fs::files::write_tool(ws, args).map(ToolOutput::ok),
+        "write" => {
+            if let Err(error) = req_str(args, "path")
+                .map_err(io::Error::other)
+                .and_then(|path| ws.resolve_checked(path))
+            {
+                return Ok(path_refusal(error));
+            }
+            fs::files::write_tool(ws, args).map(ToolOutput::ok)
+        }
         "edit" => edit::editing::edit_output(ws, args)
             .map_err(|error| fs::suggest::annotate_edit(ws, args, error)),
         "glob" => fs::search::glob_tool(ws, args).map(ToolOutput::ok),

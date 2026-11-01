@@ -15,9 +15,13 @@ use std::{
     sync::atomic::AtomicBool,
 };
 
+mod overlay;
 mod renderer;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tuning_tests;
+pub(in crate::agent) mod views;
 
 const MAX_SOURCE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
@@ -51,7 +55,8 @@ struct Shape {
     columns: usize,
     stopword_dim: bool,
 }
-fn shape(name: &str) -> Result<Shape> {
+fn shape(config: &SnapcompactConfig) -> Result<Shape> {
+    let name = config.shape.as_str();
     if !SHAPE_VARIANTS.contains(&name) {
         bail!("unsupported snapcompact shape {name}");
     }
@@ -78,7 +83,9 @@ fn shape(name: &str) -> Result<Shape> {
     };
     Ok(Shape {
         font,
-        size: if font == "5x8" { 2576 } else { 1568 },
+        size: config
+            .frame_size
+            .unwrap_or(if font == "5x8" { 2576 } else { 1568 }),
         cell_width,
         cell_height,
         stretch,
@@ -111,6 +118,7 @@ pub fn archive_with_billing(
     cancel: &AtomicBool,
     billing: &ImageTokenization,
 ) -> Result<Archive> {
+    config.validate()?;
     // Standalone rendering has no transport: use the standard family. Agent callers resolve their actual family first.
     let resolved = config.resolved_for_provider(false);
     let config = resolved.as_ref();
@@ -120,7 +128,14 @@ pub fn archive_with_billing(
         bail!("snapcompact max_frames must be 1..={MAX_FRAMES}");
     }
     renderer::check_cancel(cancel)?;
-    let shape = shape(&config.shape)?;
+    if config.overlay
+        || messages.iter().any(|message| {
+            message["dial_snapcompact"]["version"] == crate::storage::snapcompact::VERSION
+        })
+    {
+        return overlay::archive(messages, config, max_frames, cancel, billing);
+    }
+    let shape = shape(config)?;
     let mut source = BoundedText::new(MAX_SOURCE_BYTES, cancel);
     let mut images = Vec::new();
     let mut omitted = 0;
@@ -285,10 +300,10 @@ pub fn archive_with_billing(
             content_index,
             width: rendered.width,
             height: rendered.height,
-            detail: "high".into(),
+            detail: config.image_detail.as_str().into(),
             token_upper_bound: billing.token_upper_bound(rendered.width, rendered.height)?,
         });
-        content.push(json!({"type":"image_url","image_url":{"url":format!("data:image/png;base64,{}",STANDARD.encode(rendered.png)),"detail":"high"}}));
+        content.push(image_part(&rendered.png, config));
     }
     let mut source_image_indices = Vec::new();
     for (index, image) in images.into_iter().enumerate() {
@@ -325,6 +340,8 @@ pub fn archive_with_billing(
     let mut metadata = serde_json::Map::new();
     metadata.insert("version".into(), json!(1));
     metadata.insert("shape".into(), json!(config.shape));
+    metadata.insert("frame_size".into(), json!(shape.size));
+    metadata.insert("image_detail".into(), json!(config.image_detail));
     metadata.insert("frames".into(), serde_json::to_value(&frames)?);
     metadata.insert("source_text".into(), Value::String(source_text));
     metadata.insert(
@@ -344,6 +361,20 @@ pub fn archive_with_billing(
         frames,
         source_bytes,
     })
+}
+
+/// Generated frames share the resolved route hint, including retained layer masks.
+fn image_part(png: &[u8], config: &SnapcompactConfig) -> Value {
+    json!({"type":"image_url","image_url":{"url":format!("data:image/png;base64,{}",STANDARD.encode(png)),"detail":config.image_detail.as_str()}})
+}
+
+/// Render one bounded, high-contrast software view without blended layers.
+pub fn render_view(
+    text: &str,
+    config: &SnapcompactConfig,
+    cancel: &AtomicBool,
+) -> Result<(Vec<u8>, u32, u32)> {
+    overlay::render_view(text, config, cancel)
 }
 
 fn reader_instruction(omitted: usize) -> String {

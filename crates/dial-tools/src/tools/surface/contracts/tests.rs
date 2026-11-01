@@ -211,6 +211,44 @@ fn bash_history_before_named_sessions_stays_valid_without_rewriting_calls() {
     assert_eq!(history, original);
 }
 
+#[test]
+fn bash_history_before_pty_stays_valid_with_or_without_the_session_property() {
+    let registry = Registry::new();
+    let current = crate::tools::schema("bash", crate::config::types::EditMode::Replace).unwrap();
+    for had_session in [false, true] {
+        let mut before = current.clone();
+        let properties = before["function"]["parameters"]["properties"]
+            .as_object_mut()
+            .unwrap();
+        assert!(properties.remove("pty").is_some());
+        if !had_session {
+            assert!(properties.remove("session").is_some());
+        }
+        let old = identities(std::slice::from_ref(&before), &registry)["bash"].clone();
+        let arguments = if had_session {
+            json!({"command":"pwd", "session":"build"})
+        } else {
+            json!({"command":"pwd"})
+        };
+        let history = vec![
+            json!({"role":"assistant","tool_calls":[{"id":"call","type":"function","function":{"name":"bash","arguments":arguments.to_string()}}],"dial_tool_contracts":{"call":old}}),
+            json!({"role":"tool","tool_call_id":"call","content":"recorded output"}),
+        ];
+        let original = history.clone();
+        assert!(
+            project_history(&history, std::slice::from_ref(&current), &registry)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(history, original);
+        before["function"]["parameters"]["properties"]["command"]["type"] = json!("integer");
+        let mut incompatible = history;
+        incompatible[0]["dial_tool_contracts"]["call"] =
+            json!(identities(&[before], &registry)["bash"]);
+        assert!(project_history(&incompatible, std::slice::from_ref(&current), &registry).is_err());
+    }
+}
+
 /// `edit` gained the optional `allow_syntax_errors`; sessions recorded before it resume in every
 /// edit grammar.
 #[test]
@@ -238,6 +276,33 @@ fn edit_history_recorded_before_allow_syntax_errors_stays_valid() {
         let history = vec![json!({"role":"assistant","dial_tool_contracts":{"edit":old}})];
         validate_history(&history, &[current], &registry)
             .unwrap_or_else(|e| panic!("{mode:?}: {e}"));
+    }
+}
+
+#[test]
+fn write_and_ast_history_before_syntax_override_remains_compatible() {
+    let registry = Registry::new();
+    for current in [
+        crate::tools::schema("write", crate::config::types::EditMode::default()).unwrap(),
+        crate::tools::edit::ast::tools(&crate::config::types::Config::default())
+            .into_iter()
+            .find(|tool| tool.name() == "ast_edit")
+            .unwrap()
+            .schema(),
+    ] {
+        let name = current["function"]["name"].as_str().unwrap();
+        let mut before = current.clone();
+        assert!(
+            before["function"]["parameters"]["properties"]
+                .as_object_mut()
+                .unwrap()
+                .remove("allow_syntax_errors")
+                .is_some(),
+            "{name}"
+        );
+        let old = identities(&[before], &registry)[name].clone();
+        let history = vec![json!({"role":"assistant","dial_tool_contracts":{name:old}})];
+        validate_history(&history, &[current], &registry).unwrap();
     }
 }
 
@@ -605,4 +670,59 @@ fn data_interpretation_additions_preserve_prior_table_history() {
     let mut incompatible = current;
     incompatible["function"]["parameters"]["properties"]["path"]["type"] = json!("integer");
     assert!(validate_history(&history, &[incompatible], &registry).is_err());
+}
+
+#[test]
+fn session_search_layer_views_preserve_pre_overlay_contracts() {
+    let registry = Registry::new();
+    for before in [
+        crate::storage::session::session_search_tool::schema(),
+        crate::storage::session::session_search_tool::schema_owned(),
+    ] {
+        let mut current = before.clone();
+        crate::storage::snapcompact::schema(&mut current["function"]["parameters"]);
+        let old = identities(&[before], &registry)["session_search"].clone();
+        let history = vec![json!({"role":"assistant","dial_tool_contracts":{"id":old}})];
+        validate_history(&history, std::slice::from_ref(&current), &registry).unwrap();
+        assert!(
+            project_history(&history, std::slice::from_ref(&current), &registry)
+                .unwrap()
+                .is_none(),
+            "additive views must not rewrite settled history"
+        );
+        current["function"]["parameters"]["properties"]["query"]["type"] = json!("integer");
+        assert!(
+            validate_history(&history, &[current], &registry).is_err(),
+            "unrelated contract changes must still be refused"
+        );
+    }
+}
+
+#[test]
+fn task_acceptance_contract_is_additive_at_both_call_shapes() {
+    let registry = Registry::new();
+    let mut before = task_schema(
+        &[
+            "run", "start", "resume", "status", "wait", "cancel", "create", "push", "peek", "close",
+        ],
+        true,
+    );
+    before["function"]["parameters"]["properties"]["tasks"] = json!({"type":"array",
+        "items":{"type":"object","properties":{"task":{"type":"string"}}}});
+    let old = identities(&[before.clone()], &registry)["task"].clone();
+    let history = vec![json!({"role":"assistant","dial_tool_contracts":{"call":old}})];
+    let mut current = before;
+    let properties = &mut current["function"]["parameters"]["properties"];
+    let checks =
+        json!({"type":"array","minItems":1,"maxItems":16,"items":{"type":"string","minLength":1}});
+    properties["acceptance_checks"] = checks.clone();
+    properties["tasks"]["items"]["properties"]["acceptance_checks"] = checks;
+    assert!(
+        project_history(&history, std::slice::from_ref(&current), &registry)
+            .unwrap()
+            .is_none()
+    );
+    current["function"]["parameters"]["properties"]["tasks"]["items"]["properties"]["task"]["type"] =
+        json!("integer");
+    assert!(project_history(&history, &[current], &registry).is_err());
 }

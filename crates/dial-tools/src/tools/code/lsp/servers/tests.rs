@@ -164,6 +164,104 @@ fn missing_default_names_what_to_install() {
 }
 
 #[test]
+fn rust_analyzer_falls_back_to_rustup_which_in_the_server_root() {
+    let tools = tempfile::tempdir().unwrap();
+    let toolchain = tools.path().join("toolchains/pinned/bin");
+    fs::create_dir_all(&toolchain).unwrap();
+    let ra = fake_bin(&toolchain, "rust-analyzer");
+    let ws = project(&["Cargo.toml"]);
+    let root = fs::canonicalize(ws.path()).unwrap();
+    // The fake rustup answers only when run in the project root with auto-install disabled.
+    let rustup = tools.path().join("rustup");
+    fs::write(
+        &rustup,
+        format!(
+            "#!/bin/sh\n[ \"$1 $2\" = 'which rust-analyzer' ] && [ \"$(pwd -P)\" = '{}' ] && [ \"$RUSTUP_AUTO_INSTALL\" = 0 ] && echo '{}' && exit 0\nexit 1\n",
+            root.display(),
+            ra.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&rustup, fs::Permissions::from_mode(0o755)).unwrap();
+    let dirs = [tools.path().to_path_buf()];
+    let servers = Servers::new(&LspConfig::default());
+    let got = servers.select(&root, &root.join("lib.rs"), &dirs).unwrap();
+    assert_eq!((got.language.as_str(), got.program), ("rust-analyzer", ra));
+    assert!(
+        servers
+            .installable(&root, &root.join("lib.rs"), &dirs)
+            .is_empty()
+    );
+
+    // Without a toolchain answer, the error lists the directories searched.
+    fs::write(&rustup, "#!/bin/sh\nexit 1\n").unwrap();
+    let error = servers
+        .select(&root, &root.join("lib.rs"), &dirs)
+        .unwrap_err();
+    assert!(
+        error.contains(&format!("searched {}", tools.path().display())),
+        "{error}"
+    );
+}
+
+#[test]
+fn pyenv_shims_resolve_to_the_active_version_or_are_skipped() {
+    let pyenv_root = tempfile::tempdir().unwrap();
+    let shims = pyenv_root.path().join("shims");
+    let real_dir = pyenv_root.path().join("versions/3.14/bin");
+    fs::create_dir_all(&shims).unwrap();
+    fs::create_dir_all(&real_dir).unwrap();
+    fs::create_dir_all(pyenv_root.path().join("bin")).unwrap();
+    fake_bin(&shims, "pyright-langserver");
+    let real = fake_bin(&real_dir, "pyright-langserver");
+    let pyenv = pyenv_root.path().join("bin/pyenv");
+    let answer = |active: bool| {
+        let body = if active {
+            format!(
+                "[ \"$1 $2\" = 'which pyright-langserver' ] && echo '{}' && exit 0\nexit 1",
+                real.display()
+            )
+        } else {
+            "echo 'pyenv: pyright-langserver: command not found' >&2\nexit 127".to_owned()
+        };
+        fs::write(&pyenv, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&pyenv, fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    let ws = project(&["pyproject.toml"]);
+    let root = fs::canonicalize(ws.path()).unwrap();
+    let file = root.join("a.py");
+    let servers = Servers::new(&LspConfig::default());
+
+    answer(true);
+    let got = servers
+        .select(&root, &file, std::slice::from_ref(&shims))
+        .unwrap();
+    assert_eq!(
+        (got.language.as_str(), got.program),
+        ("pyright", real.clone())
+    );
+
+    // The active version lacks the command: the shim is skipped, so a later directory wins and
+    // otherwise the server counts as missing instead of failing at initialize.
+    answer(false);
+    let later = tempfile::tempdir().unwrap();
+    let fallback = fake_bin(later.path(), "pyright-langserver");
+    let got = servers
+        .select(&root, &file, &[shims.clone(), later.path().to_path_buf()])
+        .unwrap();
+    assert_eq!(got.program, fallback);
+    let missing = servers
+        .select_all(&root, &file, std::slice::from_ref(&shims))
+        .map(|all| all.into_iter().map(|s| s.program).collect::<Vec<_>>());
+    assert!(
+        missing
+            .as_ref()
+            .is_err_and(|error| error.contains("pyright")),
+        "{missing:?}"
+    );
+}
+
+#[test]
 fn unknown_and_missing_extensions_explain_how_to_configure() {
     let servers = Servers::new(&LspConfig::default());
     assert!(

@@ -17,7 +17,7 @@ fn failing(name: &str) -> ToolCall {
 
 #[test]
 fn first_failure_preserves_the_diagnostic_and_adds_compact_recovery_for_any_tool() {
-    use crate::agent::run::failure_guidance::{DIAGNOSE_FIRST, FIRST_FAILURE};
+    use crate::agent::run::failure_guidance::FIRST_FAILURE;
     let dir = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(dir.path()).unwrap();
     for (name, output) in [
@@ -35,20 +35,21 @@ fn first_failure_preserves_the_diagnostic_and_adds_compact_recovery_for_any_tool
         let mut engine = Engine::default();
         let diagnostic = output.text.clone();
         let mut output = output;
-        let (_, _, stop) = engine.settle(&workspace, &call, &mut output, false, false, |_| false);
+        let (_, _, stop) =
+            engine.settle(&workspace, &call, &mut output, Default::default(), |_| {
+                false
+            });
         assert!(output.text.starts_with(&diagnostic));
         assert!(output.text.contains("[Dial recovery:"));
         let uncertain = output.execution.effects == Effects::Unknown;
-        // Uncertain effects always carry the full contract; other first failures stay short.
-        assert_eq!(output.text.contains(DIAGNOSE_FIRST), uncertain, "{name}");
-        assert_eq!(output.text.contains(FIRST_FAILURE), !uncertain, "{name}");
+        assert!(output.text.contains(FIRST_FAILURE), "{name}");
         assert_eq!(stop.is_some(), uncertain);
     }
 }
 
 #[test]
-fn repeated_failure_carries_the_full_contract_and_success_resets_it() {
-    use crate::agent::run::failure_guidance::{DIAGNOSE_FIRST, FIRST_FAILURE};
+fn repeated_failure_keeps_feedback_compact_and_success_resets_the_counter() {
+    use crate::agent::run::failure_guidance::FIRST_FAILURE;
     let dir = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(dir.path()).unwrap();
     let mut engine = Engine::default();
@@ -58,15 +59,13 @@ fn repeated_failure_carries_the_full_contract_and_success_resets_it() {
             &workspace,
             &failing(name),
             &mut output,
-            false,
-            false,
+            Default::default(),
             |_| false,
         );
         output.text
     };
     let first = settle("read", ToolOutput::err("missing file: a.rs"));
     assert!(first.contains("[Dial recovery: tool_failure] ") && first.contains(FIRST_FAILURE));
-    assert!(!first.contains(DIAGNOSE_FIRST));
     // Another tool's failure is its own first failure.
     assert!(settle("grep", ToolOutput::err("bad regex")).contains(FIRST_FAILURE));
     let second = settle("read", ToolOutput::err("missing file: b.rs"));
@@ -74,13 +73,13 @@ fn repeated_failure_carries_the_full_contract_and_success_resets_it() {
         second.contains("[Dial recovery: tool_failure] "),
         "{second}"
     );
-    assert!(second.contains(DIAGNOSE_FIRST) && !second.contains(FIRST_FAILURE));
+    assert!(second.contains(FIRST_FAILURE));
     assert!(second.contains("2 times in a row"), "{second}");
     assert!(settle("read", ToolOutput::err("missing")).contains("3 times in a row"));
     // A success of the tool ends its streak.
     settle("read", ToolOutput::ok("1:fn main() {}".into()));
     let again = settle("read", ToolOutput::err("missing file: c.rs"));
-    assert!(again.contains(FIRST_FAILURE) && !again.contains(DIAGNOSE_FIRST));
+    assert!(again.contains(FIRST_FAILURE) && !again.contains("times in a row"));
 }
 
 #[test]
@@ -99,8 +98,7 @@ fn parent_and_worker_settlement_produce_identical_feedback_bytes() {
                     &workspace,
                     &failing(name),
                     &mut output,
-                    false,
-                    false,
+                    Default::default(),
                     |_| false,
                 );
                 output.text
@@ -124,7 +122,9 @@ fn shared_driver_cannot_publish_a_completed_report_after_uncertain_effects() {
     };
     let mut engine = Engine::default();
     let mut output = ToolOutput::err("execution disappeared").with_effects(Effects::Unknown);
-    engine.settle(&workspace, &call, &mut output, false, false, |_| false);
+    engine.settle(&workspace, &call, &mut output, Default::default(), |_| {
+        false
+    });
     let report = engine
         .drive(|_| {
             Ok(Tick::Finished(crate::agent::TurnReport {
@@ -155,7 +155,9 @@ fn shared_driver_refuses_automatic_retry_after_an_uncertain_effect() {
     let result = engine.drive::<()>(|engine| {
         cycles += 1;
         let mut output = ToolOutput::err("process vanished").with_effects(Effects::Unknown);
-        engine.settle(&workspace, &call, &mut output, false, false, |_| false);
+        engine.settle(&workspace, &call, &mut output, Default::default(), |_| {
+            false
+        });
         Ok(Tick::Again)
     });
     assert!(result.is_err());
@@ -225,7 +227,13 @@ impl Edits {
         output.execution.changed_paths = changed;
         let stop = self
             .engine
-            .settle(&self.workspace, call, &mut output, false, false, |_| false)
+            .settle(
+                &self.workspace,
+                call,
+                &mut output,
+                Default::default(),
+                |_| false,
+            )
             .2;
         (output.text, stop)
     }
@@ -264,12 +272,25 @@ impl Edits {
         // A successful read and a resolved todo used to clear recovery state.
         let read = self.call("read", serde_json::json!({"path": "other.txt"}));
         let mut output = ToolOutput::ok("1:other".to_owned());
-        self.engine
-            .settle(&self.workspace, &read, &mut output, false, false, |_| false);
+        self.engine.settle(
+            &self.workspace,
+            &read,
+            &mut output,
+            Default::default(),
+            |_| false,
+        );
         let todo = self.call("todo", serde_json::json!({"op": "done"}));
         let mut output = ToolOutput::ok("done".to_owned());
-        self.engine
-            .settle(&self.workspace, &todo, &mut output, false, true, |_| false);
+        self.engine.settle(
+            &self.workspace,
+            &todo,
+            &mut output,
+            Settlement {
+                task_changed: true,
+                ..Default::default()
+            },
+            |_| false,
+        );
     }
 }
 
@@ -613,7 +634,9 @@ fn no_recovery_transition_releases_an_uncertain_effect_barrier() {
     ] {
         let mut engine = Engine::default();
         let mut output = ToolOutput::err("lost execution").with_effects(Effects::Unknown);
-        engine.settle(&workspace, &call, &mut output, false, false, |_| false);
+        engine.settle(&workspace, &call, &mut output, Default::default(), |_| {
+            false
+        });
         engine.transition(reason);
         assert!(engine.pending_refusal().is_some(), "{reason:?}");
         let report = engine
@@ -640,12 +663,63 @@ fn shared_settlement_delivers_cause_specific_advice_without_changing_execution_f
         .with_status(ToolStatus::Blocked)
         .with_effects(Effects::None);
     let facts = output.execution.clone();
-    let (_, _, stop) = engine.settle(&workspace, &call, &mut output, false, false, |_| false);
+    let (_, _, stop) = engine.settle(&workspace, &call, &mut output, Default::default(), |_| {
+        false
+    });
     assert!(stop.is_none());
     assert_eq!(output.execution, facts);
     assert!(output.is_error);
     assert!(output.text.contains("permission_or_policy"));
     assert!(output.text.starts_with("denied by policy"));
+}
+
+/// A Blocked result the controller attributes to the call's own arguments (missing required
+/// argument, unknown tool) is a fixable mistake: it asks for corrected arguments, not deference
+/// to a boundary.
+#[test]
+fn a_blocked_call_contract_failure_asks_for_corrected_arguments() {
+    use crate::runtime::execution::ToolStatus;
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(dir.path()).unwrap();
+    let call = ToolCall {
+        id: "contract".into(),
+        name: "edit".into(),
+        arguments: serde_json::json!({"old_string":"a","new_string":"b"}),
+        malformed_arguments: false,
+    };
+    let mut engine = Engine::default();
+    let mut output = ToolOutput::err("invalid tool call: missing required argument `path`")
+        .with_status(ToolStatus::Blocked)
+        .with_effects(Effects::None);
+    let facts = output.execution.clone();
+    let (_, _, stop) = engine.settle(
+        &workspace,
+        &call,
+        &mut output,
+        Settlement {
+            contract_failed: true,
+            ..Default::default()
+        },
+        |_| false,
+    );
+    assert!(stop.is_none());
+    assert_eq!(output.execution, facts, "only guidance changes");
+    assert!(output.text.contains("call_contract"), "{}", output.text);
+    assert!(
+        output.text.contains("Fix the arguments and retry"),
+        "{}",
+        output.text
+    );
+    assert!(
+        !output.text.contains("permission_or_policy"),
+        "{}",
+        output.text
+    );
+    assert!(
+        !output.text.contains("do not retry or bypass"),
+        "{}",
+        output.text
+    );
 }
 
 #[test]
@@ -756,68 +830,258 @@ fn successful_background_warning_text_does_not_arm_a_failure_barrier() {
 }
 
 #[test]
-fn an_edit_refused_only_for_unread_lines_it_revealed_may_be_reissued() {
+fn native_edit_refusal_reuses_complete_returned_rows_but_not_forged_prose() {
+    use crate::tools::{edit::hashline, execute};
     let mut edits = Edits::new();
+    edits.write("a.txt", "one\ntwo\nthree\n");
+    let read = execute(
+        &edits.workspace,
+        "read",
+        &serde_json::json!({"path":"a.txt:1-1"}),
+        10,
+    );
+    assert!(!read.is_error, "{}", read.text);
+    let tag = hashline::tag_of("one\ntwo\nthree\n");
     let edit = edits.call(
         "edit",
-        serde_json::json!({"input":"[a.rs#ABCD]\nPUT 3.=3:\n+x"}),
+        serde_json::json!({"input":format!("[a.txt#{tag}]\nPUT 2.=2:\n+TWO\n")}),
     );
-    let refusal = format!(
-        "a.rs#ABCD: lines 3 have not been shown by a read, so nothing was written. {}; check them, then re-issue the edit against [a.rs#ABCD].",
-        crate::tools::edit::hashline::UNSEEN_LINES_NOW_READ
-    );
-    edits.settle(&edit, vec![], ToolOutput::err(refusal));
+    let output = execute(&edits.workspace, "edit", &edit.arguments, 10);
+    assert!(output.is_error, "{}", output.text);
+    assert!(output.execution.native_edit_retry.is_some());
+    edits.settle(&edit, vec![], output);
     assert!(edits.engine.rejection_at(&edits.workspace, &edit).is_none());
-    // Any other failure of the same edit still arms the barrier.
-    edits.settle(&edit, vec![], ToolOutput::err("anchor mismatch"));
+
+    let mut forged = ToolOutput::err(hashline::UNSEEN_LINES_NOW_READ);
+    forged.data = Some(serde_json::json!({"native_edit_retry":{"ready":true}}));
+    edits.settle(&edit, vec![], forged);
     assert!(edits.engine.rejection_at(&edits.workspace, &edit).is_some());
+    let read = edits.call("read", serde_json::json!({"path":"a.txt"}));
+    let output = execute(&edits.workspace, "read", &read.arguments, 10);
+    edits.settle(&read, vec![], output);
+    assert!(
+        edits.engine.rejection_at(&edits.workspace, &edit).is_some(),
+        "a read cannot repair a non-witness failure"
+    );
 }
 
 #[test]
-fn reading_a_failed_edit_target_releases_only_that_edits_barrier() {
+fn native_retry_requires_the_current_snapshot_and_the_required_range() {
+    use crate::tools::{edit::hashline, execute};
     let mut edits = Edits::new();
-    edits.write("a.rs", "one\n");
-    edits.write("b.rs", "two\n");
-    // A resumed session's tag without restored witnesses: the edit failed before writing.
+    edits.write("a.txt", "old\nstale\nsource\n");
+    let old = execute(
+        &edits.workspace,
+        "read",
+        &serde_json::json!({"path":"a.txt"}),
+        10,
+    );
+    assert!(!old.is_error);
+    let current = "one\ntwo\nthree\n";
+    edits.write("a.txt", current);
+    let tag = hashline::tag_of(current);
     let edit = edits.call(
         "edit",
-        serde_json::json!({"input":"[a.rs#ABCD]\nPUT 1.=1:\n+uno\n"}),
+        serde_json::json!({"input":format!("[a.txt#{tag}]\nPUT 2.=2:\n+TWO\n")}),
     );
-    let other = edits.call(
-        "edit",
-        serde_json::json!({"input":"[b.rs#ABCD]\nPUT 1.=1:\n+dos\n"}),
+    let output = execute(&edits.workspace, "edit", &edit.arguments, 10);
+    assert!(output.is_error, "{}", output.text);
+    let retry = output.execution.native_edit_retry.as_ref().unwrap();
+    assert_eq!(retry.requirements[0].ranges, vec![(2, 2)]);
+    edits.settle(&edit, vec![], output);
+    assert!(
+        edits.engine.rejection_at(&edits.workspace, &edit).is_some(),
+        "old complete snapshot is not current evidence"
     );
-    for call in [&edit, &other] {
-        edits.settle(
-            call,
-            vec![],
-            ToolOutput::err("no read of this file is recorded; read its affected lines first"),
+    for path in ["a.txt:1-1", "a.txt:3-3"] {
+        let read = edits.call("read", serde_json::json!({"path":path}));
+        let output = execute(&edits.workspace, "read", &read.arguments, 10);
+        assert!(!output.is_error, "{}", output.text);
+        edits.settle(&read, vec![], output);
+        assert!(
+            edits.engine.rejection_at(&edits.workspace, &edit).is_some(),
+            "wrong range {path}"
         );
     }
-    let unrelated = edits.call("read", serde_json::json!({"path": "b.rs:9-12"}));
-    let failed_read = edits.call("read", serde_json::json!({"path": "a.rs"}));
-    edits.settle(&failed_read, vec![], ToolOutput::err("permission denied"));
-    assert!(edits.engine.rejection_at(&edits.workspace, &edit).is_some());
-    let read = edits.call("read", serde_json::json!({"paths": ["a.rs:1-1"]}));
-    edits.settle(&read, vec![], ToolOutput::ok("1:one".to_owned()));
+    let read = edits.call("read", serde_json::json!({"path":"a.txt:2-2"}));
+    let output = execute(&edits.workspace, "read", &read.arguments, 10);
+    edits.settle(&read, vec![], output);
     assert!(edits.engine.rejection_at(&edits.workspace, &edit).is_none());
-    assert!(
-        edits
-            .engine
-            .rejection_at(&edits.workspace, &other)
-            .is_some(),
-        "a read of another file is not this edit's missing evidence"
+    let applied = execute(&edits.workspace, "edit", &edit.arguments, 10);
+    assert!(!applied.is_error, "{}", applied.text);
+    assert_eq!(
+        std::fs::read_to_string(edits.path("a.txt")).unwrap(),
+        "one\nTWO\nthree\n"
     );
-    edits.settle(&unrelated, vec![], ToolOutput::ok("[b.rs#ABCD]".to_owned()));
-    assert!(
-        edits
-            .engine
-            .rejection_at(&edits.workspace, &other)
-            .is_none()
+}
+
+#[test]
+fn clipped_native_previews_require_complete_rows_for_every_file() {
+    use crate::tools::{edit::hashline, execute};
+    let mut edits = Edits::new();
+    let current = format!("one\n{}\nthree\n", "x".repeat(300));
+    for file in ["a.txt", "b.txt"] {
+        edits.write(file, &current);
+        let read = execute(
+            &edits.workspace,
+            "read",
+            &serde_json::json!({"path":format!("{file}:1-1")}),
+            10,
+        );
+        assert!(!read.is_error);
+    }
+    let tag = hashline::tag_of(&current);
+    let edit = edits.call("edit", serde_json::json!({"input":format!("[a.txt#{tag}]\nPUT 2.=2:\n+TWO\n[b.txt#{tag}]\nPUT 2.=2:\n+TWO\n")}));
+    let output = execute(&edits.workspace, "edit", &edit.arguments, 10);
+    assert!(output.is_error);
+    assert_eq!(
+        output
+            .execution
+            .native_edit_retry
+            .as_ref()
+            .unwrap()
+            .requirements
+            .len(),
+        2
     );
-    // The released retry fails again: the barrier re-arms until the next read.
-    edits.settle(&edit, vec![], ToolOutput::err("unknown snapshot tag"));
+    edits.settle(&edit, vec![], output);
+    assert!(
+        edits.engine.rejection_at(&edits.workspace, &edit).is_some(),
+        "clipped rows do not count"
+    );
+    for (path, blocked) in [
+        ("a.txt:2-2", true),
+        ("b.txt:1-1", true),
+        ("b.txt:2-2", false),
+    ] {
+        let read = edits.call("read", serde_json::json!({"path":path}));
+        let output = execute(&edits.workspace, "read", &read.arguments, 10);
+        edits.settle(&read, vec![], output);
+        assert_eq!(
+            edits.engine.rejection_at(&edits.workspace, &edit).is_some(),
+            blocked,
+            "{path}"
+        );
+    }
+}
+
+#[test]
+fn native_whole_write_retry_requires_every_source_row() {
+    use crate::tools::execute;
+    let mut edits = Edits::new();
+    let current = "row\n".repeat(201);
+    edits.write("a.txt", &current);
+    let write = edits.call(
+        "write",
+        serde_json::json!({"path":"a.txt", "content":"replacement\n"}),
+    );
+    let output = execute(&edits.workspace, "write", &write.arguments, 10);
+    assert!(output.is_error);
+    assert_eq!(
+        output
+            .execution
+            .native_edit_retry
+            .as_ref()
+            .unwrap()
+            .requirements[0]
+            .ranges,
+        vec![(1, 201)]
+    );
+    edits.settle(&write, vec![], output);
+    for (path, blocked) in [("a.txt:1-200", true), ("a.txt:201-201", false)] {
+        let read = edits.call("read", serde_json::json!({"path":path}));
+        let output = execute(&edits.workspace, "read", &read.arguments, 10);
+        edits.settle(&read, vec![], output);
+        assert_eq!(
+            edits
+                .engine
+                .rejection_at(&edits.workspace, &write)
+                .is_some(),
+            blocked,
+            "{path}"
+        );
+    }
+}
+
+#[test]
+fn metadata_only_notebook_refusal_releases_after_current_projection_read() {
+    use crate::tools::execute;
+    let mut edits = Edits::new();
+    let mut notebook = serde_json::json!({
+        "nbformat":4,"nbformat_minor":5,"metadata":{},
+        "cells":[{"id":"cell-a","cell_type":"code","metadata":{},"source":["x = 1\n"],
+            "execution_count":null,"outputs":[]}]
+    });
+    edits.write("a.ipynb", &notebook.to_string());
+    let read = execute(
+        &edits.workspace,
+        "read",
+        &serde_json::json!({"path":"a.ipynb"}),
+        20,
+    );
+    assert!(!read.is_error, "{}", read.text);
+    let header = read
+        .text
+        .lines()
+        .find(|line| line.starts_with("[a.ipynb#"))
+        .unwrap();
+    notebook["metadata"] = serde_json::json!({"changed":true});
+    edits.write("a.ipynb", &notebook.to_string());
+    let edit = edits.call(
+        "edit",
+        serde_json::json!({"input":format!("{header}\nPUT 2.=2:\n+x = 2\n")}),
+    );
+    let output = execute(&edits.workspace, "edit", &edit.arguments, 20);
+    assert!(output.is_error, "{}", output.text);
+    assert!(output.execution.native_edit_retry.is_some());
+    edits.settle(&edit, vec![], output);
     assert!(edits.engine.rejection_at(&edits.workspace, &edit).is_some());
+    let read = edits.call("read", serde_json::json!({"path":"a.ipynb:1-2"}));
+    let output = execute(&edits.workspace, "read", &read.arguments, 20);
+    assert!(!output.is_error, "{}", output.text);
+    edits.settle(&read, vec![], output);
+    assert!(edits.engine.rejection_at(&edits.workspace, &edit).is_none());
+    let output = execute(&edits.workspace, "edit", &edit.arguments, 20);
+    assert!(!output.is_error, "{}", output.text);
+    let changed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(edits.path("a.ipynb")).unwrap()).unwrap();
+    assert_eq!(changed["metadata"], notebook["metadata"]);
+    assert_eq!(
+        changed["cells"][0]["source"],
+        serde_json::json!(["x = 2\n"])
+    );
+}
+
+#[test]
+fn anchor_free_moves_require_a_current_native_snapshot_after_store_loss() {
+    use crate::tools::{edit::hashline, execute};
+    for original in ["one\ntwo\n", ""] {
+        let mut edits = Edits::new();
+        edits.write("a.txt", original);
+        let tag = hashline::tag_of(original);
+        let edit = edits.call(
+            "edit",
+            serde_json::json!({"input":format!("[a.txt#{tag}]\nMV b.txt\n")}),
+        );
+        let output = execute(&edits.workspace, "edit", &edit.arguments, 20);
+        assert!(output.is_error, "{}", output.text);
+        let retry = output.execution.native_edit_retry.as_ref().unwrap();
+        assert!(retry.requirements[0].ranges.is_empty());
+        edits.settle(&edit, vec![], output);
+        assert!(edits.engine.rejection_at(&edits.workspace, &edit).is_some());
+        let read = edits.call("read", serde_json::json!({"path":"a.txt"}));
+        let output = execute(&edits.workspace, "read", &read.arguments, 20);
+        assert!(!output.is_error, "{}", output.text);
+        edits.settle(&read, vec![], output);
+        assert!(edits.engine.rejection_at(&edits.workspace, &edit).is_none());
+        let output = execute(&edits.workspace, "edit", &edit.arguments, 20);
+        assert!(!output.is_error, "{}", output.text);
+        assert!(!edits.path("a.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(edits.path("b.txt")).unwrap(),
+            original
+        );
+    }
 }
 
 #[test]
@@ -883,6 +1147,61 @@ fn a_post_commit_failure_does_not_release_the_failed_operation() {
             .is_some()
     );
     assert!(edits.engine.rejection_at(&edits.workspace, &edit).is_some());
+}
+
+#[test]
+fn unrelated_committed_edits_keep_failed_file_barriers_until_their_own_file_changes() {
+    let mut edits = Edits::new();
+    edits.write("a.rs", "one\n");
+    edits.write("b.rs", "two\n");
+    let read = edits.call("read", serde_json::json!({"path": "a.rs"}));
+    edits.settle(&read, vec![], ToolOutput::err("boom"));
+    let edit = edits.call(
+        "edit",
+        serde_json::json!({"input":"[a.rs#ABCD]\nPUT 1.=1:\n+uno\n"}),
+    );
+    edits.settle(&edit, vec![], ToolOutput::err("anchor mismatch"));
+    assert!(barred(&mut edits, &read));
+    assert!(barred(&mut edits, &edit));
+    edits.commit("b.rs", "three");
+    assert!(
+        barred(&mut edits, &read),
+        "a change to another file does not repair this read"
+    );
+    assert!(
+        barred(&mut edits, &edit),
+        "a change to another file does not repair this edit"
+    );
+    edits.commit("a.rs", "four");
+    assert!(!barred(&mut edits, &read));
+    assert!(!barred(&mut edits, &edit));
+}
+
+#[test]
+fn an_access_barrier_survives_unrelated_commits_until_its_grant() {
+    let outside = tempfile::tempdir().unwrap();
+    let base = outside.path().join("notes.md").display().to_string();
+    let mut edits = Edits::new();
+    edits.write("a.rs", "one\n");
+    let error = edits
+        .workspace
+        .resolve(&base)
+        .expect_err("outside the workspace");
+    let read = read_of(&mut edits, &base, "");
+    edits.settle(&read, vec![], ToolOutput::err(error));
+    edits.commit("a.rs", "two");
+    assert!(
+        barred(&mut edits, &read),
+        "a committed edit elsewhere is not access evidence"
+    );
+    assert!(edits.workspace.add_root(outside.path()).unwrap());
+    let grant = grant_of(&mut edits, outside.path());
+    edits.settle(
+        &grant,
+        vec![],
+        ToolOutput::ok("Added the directory. Retry the original tool.".into()),
+    );
+    assert!(!barred(&mut edits, &read));
 }
 
 #[test]
@@ -1180,4 +1499,474 @@ fn a_sensitive_request_outside_protected_storage_is_refused_and_releases_nothing
     );
     assert!(barred(&mut edits, &read));
     assert!(edits.workspace.resolve(&base).is_err());
+}
+
+#[test]
+fn productive_rounds_aggregate_batches_without_bookkeeping_forgiving_failure() {
+    for batch in [1, 8] {
+        let mut edits = Edits::new();
+        for index in 0..batch {
+            let call = edits.call(
+                "read",
+                serde_json::json!({"path": format!("missing{index}")}),
+            );
+            edits.settle(&call, vec![], ToolOutput::err("missing file"));
+            let todo = edits.call("todo", serde_json::json!({"op": "done"}));
+            edits.engine.settle(
+                &edits.workspace,
+                &todo,
+                &mut ToolOutput::ok(format!("completed item {index}")),
+                Settlement {
+                    task_changed: true,
+                    ..Default::default()
+                },
+                |_| false,
+            );
+        }
+        assert_eq!(edits.engine.take_round_progress(), RoundProgress::Stalled);
+        assert_eq!(edits.engine.take_round_progress(), RoundProgress::Neutral);
+        let todo = edits.call("working_state", serde_json::json!({"action": "update"}));
+        edits.settle(&todo, vec![], ToolOutput::ok("updated task claims".into()));
+        assert_eq!(edits.engine.take_round_progress(), RoundProgress::Neutral);
+    }
+}
+
+#[test]
+fn productive_rounds_accept_new_observations_not_replayed_or_compacted_receipts() {
+    for name in ["read", "dep_source", "web_search", "artifact_read"] {
+        let mut edits = Edits::new();
+        for (text, expected) in [
+            ("first finding", RoundProgress::Productive),
+            ("first finding", RoundProgress::Stalled),
+            ("a new finding", RoundProgress::Productive),
+        ] {
+            let call = edits.call(name, serde_json::json!({"path": "source"}));
+            edits.settle(&call, vec![], ToolOutput::ok(text.into()));
+            assert_eq!(
+                edits.engine.take_round_progress(),
+                expected,
+                "{name}: {text}"
+            );
+            edits.engine.evidence_compacted();
+        }
+    }
+}
+
+#[test]
+fn productive_rounds_preserve_real_work_in_mixed_batches_and_reject_reverts() {
+    let mut edits = Edits::new();
+    edits.commit("a.txt", "A");
+    assert_eq!(
+        edits.engine.take_round_progress(),
+        RoundProgress::Productive
+    );
+    edits.commit("a.txt", "B");
+    let failed = edits.call("read", serde_json::json!({"path": "missing"}));
+    edits.settle(&failed, vec![], ToolOutput::err("missing file"));
+    assert_eq!(
+        edits.engine.take_round_progress(),
+        RoundProgress::Productive
+    );
+    edits.commit("a.txt", "A");
+    assert_ne!(
+        edits.engine.take_round_progress(),
+        RoundProgress::Productive
+    );
+    edits.commit("a.txt", "A");
+    assert_ne!(
+        edits.engine.take_round_progress(),
+        RoundProgress::Productive
+    );
+}
+
+#[test]
+fn productive_rounds_require_new_actual_verification_not_reuse_or_claims() {
+    let mut edits = Edits::new();
+    for (ran, reused, status, expected) in [
+        (false, false, "passed", RoundProgress::Neutral),
+        (false, true, "passed", RoundProgress::Neutral),
+        (true, false, "unverified", RoundProgress::Neutral),
+        (true, false, "passed", RoundProgress::Productive),
+        (true, false, "passed", RoundProgress::Neutral),
+    ] {
+        let call = edits.call("check", serde_json::json!({}));
+        let mut output = ToolOutput::ok("check receipt".into());
+        output.data = Some(serde_json::json!({"results": [{
+            "command": "cargo test", "status": status, "ran": ran, "reused": reused
+        }]}));
+        edits.settle(&call, vec![], output);
+        assert_eq!(edits.engine.take_round_progress(), expected);
+    }
+    edits.commit("a.txt", "fixed");
+    edits.engine.take_round_progress();
+    let call = edits.call("check", serde_json::json!({}));
+    let mut output = ToolOutput::ok("check receipt".into());
+    output.data = Some(serde_json::json!({"results": [{
+        "command": "cargo test", "status": "passed", "ran": true, "reused": false
+    }]}));
+    edits.settle(&call, vec![], output);
+    assert_eq!(
+        edits.engine.take_round_progress(),
+        RoundProgress::Productive
+    );
+}
+
+#[test]
+fn productive_rounds_include_novel_git_observations_not_mutating_receipts() {
+    let mut edits = Edits::new();
+    for action in ["status", "diff", "log", "show", "blame"] {
+        for (text, expected) in [
+            ("original evidence", RoundProgress::Productive),
+            ("original evidence", RoundProgress::Stalled),
+            ("new evidence", RoundProgress::Productive),
+        ] {
+            let call = edits.call("git", serde_json::json!({"action": action}));
+            edits.settle(&call, vec![], ToolOutput::ok(text.into()));
+            assert_eq!(edits.engine.take_round_progress(), expected, "{action}");
+        }
+    }
+    for action in ["add", "commit", "push", "switch"] {
+        let call = edits.call("git", serde_json::json!({"action": action}));
+        edits.settle(&call, vec![], ToolOutput::ok("successful operation".into()));
+        assert_eq!(edits.engine.take_round_progress(), RoundProgress::Neutral);
+    }
+}
+
+#[test]
+fn productive_rounds_native_captures_use_pixels_and_target_not_receipt_prose() {
+    use crate::runtime::execution::NativeCapture;
+    for name in ["browser", "computer"] {
+        let mut edits = Edits::new();
+        for (index, (pixels, target, expected)) in [
+            (
+                b"first".as_slice(),
+                "url:https://example.test/",
+                RoundProgress::Productive,
+            ),
+            (
+                b"first".as_slice(),
+                "url:https://example.test/",
+                RoundProgress::Stalled,
+            ),
+            (
+                b"changed".as_slice(),
+                "url:https://example.test/",
+                RoundProgress::Productive,
+            ),
+            (
+                b"changed".as_slice(),
+                "window:other",
+                RoundProgress::Productive,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let call = edits.call(name, serde_json::json!({"action": "screenshot"}));
+            let output = ToolOutput::ok(format!("screenshot receipt {index}")).with_captures(vec![
+                NativeCapture::new(pixels, "image/png", Some(target.into())),
+            ]);
+            edits.settle(&call, vec![], output);
+            assert_eq!(
+                edits.engine.take_round_progress(),
+                expected,
+                "{name}: {index}"
+            );
+            edits.engine.evidence_compacted();
+        }
+        let call = edits.call(name, serde_json::json!({"action": "screenshot"}));
+        let output = ToolOutput::ok("unsettled capture".into())
+            .with_captures(vec![NativeCapture::new(b"new", "image/png", None)])
+            .with_effects(Effects::Unknown);
+        let (_, stop) = edits.settle(&call, vec![], output);
+        assert!(stop.is_some());
+        assert_eq!(edits.engine.take_round_progress(), RoundProgress::Stalled);
+    }
+}
+
+struct ObservationContract {
+    name: &'static str,
+    read_only: bool,
+}
+
+impl crate::tools::integrations::ext::Tool for ObservationContract {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({})
+    }
+    fn needs_approval(&self, _: &serde_json::Value) -> bool {
+        true
+    }
+    fn read_only_hint(&self) -> bool {
+        self.read_only
+    }
+    fn concurrency(
+        &self,
+        args: &serde_json::Value,
+    ) -> crate::tools::integrations::ext::Concurrency {
+        use crate::tools::integrations::ext::Concurrency;
+        if args["action"] == "inspect" {
+            Concurrency::Shared
+        } else {
+            Concurrency::Exclusive
+        }
+    }
+    fn call(
+        &self,
+        _: &crate::tools::integrations::ext::ToolContext,
+        _: &serde_json::Value,
+    ) -> ToolOutput {
+        panic!("progress accounting must never execute the tool")
+    }
+}
+
+#[test]
+fn productive_rounds_respect_operation_contracts_and_bookkeeping_neutrality() {
+    for (name, read_only, action, effects, expected) in [
+        (
+            "external",
+            false,
+            "inspect",
+            Effects::None,
+            RoundProgress::Productive,
+        ),
+        (
+            "external",
+            true,
+            "lookup",
+            Effects::Known,
+            RoundProgress::Productive,
+        ),
+        (
+            "external",
+            false,
+            "mutate",
+            Effects::None,
+            RoundProgress::Neutral,
+        ),
+        (
+            "external",
+            true,
+            "lookup",
+            Effects::Unknown,
+            RoundProgress::Stalled,
+        ),
+        (
+            "working_state",
+            true,
+            "inspect",
+            Effects::None,
+            RoundProgress::Neutral,
+        ),
+        (
+            "todo",
+            true,
+            "inspect",
+            Effects::None,
+            RoundProgress::Neutral,
+        ),
+    ] {
+        let mut edits = Edits::new();
+        let contract = ObservationContract { name, read_only };
+        let call = edits.call(name, serde_json::json!({"action": action}));
+        let mut output = ToolOutput::ok("operation result".into()).with_effects(effects);
+        edits.engine.settle(
+            &edits.workspace,
+            &call,
+            &mut output,
+            Settlement {
+                tool: Some(&contract),
+                ..Default::default()
+            },
+            |_| false,
+        );
+        assert_eq!(
+            edits.engine.take_round_progress(),
+            expected,
+            "{name}: {action}: {effects:?}"
+        );
+    }
+}
+
+#[test]
+fn shared_driver_bounds_stalled_rounds_across_compaction_and_continuations() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(dir.path()).unwrap();
+    for parent_drain in [false, true] {
+        let mut engine = Engine::default();
+        let mut rounds = 0;
+        let error = engine
+            .drive::<()>(|engine| {
+                rounds += 1;
+                // A changing diagnostic/call spelling is not successful recovery.
+                let mut call = failing("read");
+                call.arguments = serde_json::json!({"path": format!("missing-{rounds}")});
+                engine.settle(
+                    &workspace,
+                    &call,
+                    &mut ToolOutput::err(format!("missing file {rounds}")),
+                    Default::default(),
+                    |_| false,
+                );
+                // Multiple failing calls are still one assistant batch.
+                engine.settle(
+                    &workspace,
+                    &call,
+                    &mut ToolOutput::err("another failure in the same batch"),
+                    Default::default(),
+                    |_| false,
+                );
+                if parent_drain {
+                    let progress = engine.take_round_progress();
+                    engine.record_progress(progress);
+                }
+                engine.evidence_compacted();
+                engine.transition(RecoveryTransition::AutomaticContinue);
+                engine.transition(RecoveryTransition::DirectedContinue);
+                Ok(Tick::Again)
+            })
+            .expect_err("stalled parent and worker adapters must stop");
+        assert!(
+            error.downcast_ref::<StalledRefusal>().is_some(),
+            "{error:#}"
+        );
+        assert_eq!(
+            rounds, 16,
+            "a batch must be charged once, not per adapter drain"
+        );
+    }
+}
+
+#[test]
+fn productive_evidence_rearms_stall_budget_but_bookkeeping_does_not() {
+    let mut edits = Edits::new();
+    let failed = edits.call("read", serde_json::json!({"path": "missing"}));
+    for _ in 0..15 {
+        edits.settle(&failed, vec![], ToolOutput::err("missing file"));
+        edits.engine.finish_tool_round().unwrap();
+    }
+    let bookkeeping = edits.call("todo", serde_json::json!({"op":"done"}));
+    edits.engine.settle(
+        &edits.workspace,
+        &bookkeeping,
+        &mut ToolOutput::ok("task resolved".into()),
+        Settlement {
+            task_changed: true,
+            ..Default::default()
+        },
+        |_| false,
+    );
+    edits.engine.finish_tool_round().unwrap();
+    let new_evidence = edits.call("read", serde_json::json!({"path":"other"}));
+    edits.settle(
+        &new_evidence,
+        vec![],
+        ToolOutput::ok("a new finding".into()),
+    );
+    edits.engine.finish_tool_round().unwrap();
+    let mut rounds = 0;
+    let result = edits.engine.drive::<()>(|engine| {
+        rounds += 1;
+        engine.settle(
+            &edits.workspace,
+            &failed,
+            &mut ToolOutput::err("missing file"),
+            Default::default(),
+            |_| false,
+        );
+        Ok(Tick::Again)
+    });
+    assert!(
+        result
+            .unwrap_err()
+            .downcast_ref::<StalledRefusal>()
+            .is_some()
+    );
+    assert_eq!(rounds, 16);
+    edits.engine.transition(RecoveryTransition::Steering);
+    assert!(
+        edits
+            .engine
+            .drive(|_| Ok(Tick::Finished(())))
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn shared_budget_stops_before_the_next_final_request_or_publication() {
+    use super::super::turn::progress::{Rung, STOP_AT, Setback};
+    for parent_settlement in [false, true] {
+        let mut engine = Engine::default();
+        let mut requests = 0;
+        let mut published = false;
+        let error = engine
+            .drive(|engine| {
+                requests += 1;
+                if requests > STOP_AT {
+                    published = true;
+                    return Ok(Tick::Finished(completed_report()));
+                }
+                // Mixed mechanisms must share one allowance, even for alternating call-free
+                // recovery and tool batches. Neutral bookkeeping and compaction repay no debt.
+                if requests % 2 == 0 {
+                    engine.round_progress = RoundProgress::Stalled;
+                    if parent_settlement {
+                        engine.finish_tool_round()?;
+                    }
+                } else {
+                    let rung = engine.setback(Setback::UnusableReply);
+                    assert_eq!(rung, Rung::Retry);
+                }
+                engine.evidence_compacted();
+                Ok(Tick::Again)
+            })
+            .expect_err("the cap must stop before asking for a final answer");
+        assert!(
+            error.downcast_ref::<StalledRefusal>().is_some(),
+            "{error:#}"
+        );
+        assert_eq!(requests, STOP_AT);
+        assert!(!published);
+    }
+}
+
+#[test]
+fn terminal_batch_is_checked_by_the_adapter_before_publication() {
+    use super::super::turn::progress::{STOP_AT, Setback};
+    let mut engine = Engine::default();
+    for _ in 1..STOP_AT {
+        engine.setback(Setback::NoAnswer);
+    }
+    let mut published = false;
+    let error = engine
+        .drive(|engine| {
+            engine.round_progress = RoundProgress::Stalled;
+            engine.finish_tool_round()?;
+            published = true;
+            Ok(Tick::Finished(completed_report()))
+        })
+        .expect_err("a terminal batch cannot publish a completed candidate at the cap");
+    assert!(
+        error.downcast_ref::<StalledRefusal>().is_some(),
+        "{error:#}"
+    );
+    assert!(!published);
+}
+
+#[test]
+fn external_source_repair_releases_only_the_matching_failed_operation() {
+    let mut edits = Edits::new();
+    let read = edits.call("read", serde_json::json!({"path":"created.txt"}));
+    edits.settle(&read, vec![], ToolOutput::err("missing file"));
+    assert!(edits.engine.rejection_at(&edits.workspace, &read).is_some());
+    edits.write("other.txt", "unrelated");
+    assert!(edits.engine.rejection_at(&edits.workspace, &read).is_some());
+    edits.write("created.txt", "repaired externally");
+    assert!(edits.engine.rejection_at(&edits.workspace, &read).is_none());
+    // A second failure against the new source is a new barrier, not a blanket retry grant.
+    edits.settle(&read, vec![], ToolOutput::err("still fails"));
+    assert!(edits.engine.rejection_at(&edits.workspace, &read).is_some());
 }

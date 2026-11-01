@@ -783,3 +783,35 @@ fn full_dry_run_false_call_still_applies_and_old_schema_history_stays_valid() {
             .clone();
     assert_ne!(old, current, "the token property is a real schema change");
 }
+
+#[test]
+fn configured_syntax_block_is_atomic_for_ast_direct_and_token_apply() {
+    for token_apply in [false, true] {
+        let (dir, ws) = workspace();
+        let ws = ws.with_syntax_guard(true).with_syntax_block(true);
+        let rs = put(&dir, "a.rs", "fn f() { foo(x); }\n");
+        let py = put(&dir, "b.py", "foo(x)\n");
+        let args = json!({"pattern":"foo($A)","rewrite":"$A?","dry_run":false});
+        let mut apply = if token_apply {
+            let preview = edit(&ws, json!({"pattern":"foo($A)","rewrite":"$A?"}));
+            assert!(!preview.is_error, "{}", preview.text);
+            json!({"apply_token":token_of(&preview.text)})
+        } else {
+            args.clone()
+        };
+        let refused = edit(&ws, apply.clone());
+        assert!(refused.is_error, "{}", refused.text);
+        assert_eq!(fs::read_to_string(&rs).unwrap(), "fn f() { foo(x); }\n");
+        assert_eq!(fs::read_to_string(&py).unwrap(), "foo(x)\n");
+        // A refused token is single-use, so obtain a fresh preview before explicit override.
+        if token_apply {
+            let preview = edit(&ws, json!({"pattern":"foo($A)","rewrite":"$A?"}));
+            apply = json!({"apply_token":token_of(&preview.text)});
+        }
+        apply["allow_syntax_errors"] = json!(true);
+        let allowed = edit(&ws, apply);
+        assert!(!allowed.is_error, "{}", allowed.text);
+        assert_eq!(fs::read_to_string(&rs).unwrap(), "fn f() { x?; }\n");
+        assert_eq!(fs::read_to_string(&py).unwrap(), "x?\n");
+    }
+}

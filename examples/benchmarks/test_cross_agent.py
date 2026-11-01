@@ -77,6 +77,31 @@ class ParserTests(unittest.TestCase):
             self.assertTrue(usage["usage_complete"])
             self.assertEqual(usage["models"], ["anthropic/claude-sonnet-4-6"])
 
+    def test_dial_stream_diagnostics_do_not_double_count_final_usage(self):
+        result = {**DIAL_RESULT, "efficiency": DIAL_EFFICIENCY}
+        events = [
+            {"type": "system", "session_id": "test-only"},
+            {"type": "tool_call", "call_id": "probe", "name": "bash", "summary": "probe"},
+            {"type": "tool_result", "call_id": "probe", "name": "bash", "is_error": True,
+             "text": "probe failed", "seconds": 0.1},
+            {"type": "usage", "prompt_tokens": 1000, "output_tokens": 50},
+            {"type": "efficiency", "report": DIAL_EFFICIENCY},
+            result,
+        ]
+        stream = "\n".join(json.dumps(event) for event in events)
+        text, usage = cross_agent.parse_dial_json(stream)
+        self.assertEqual(text, "4")
+        self.assertTrue(usage["usage_complete"])
+        self.assertEqual((usage["requests"], usage["input_total"], usage["tool_calls"],
+                          usage["tool_errors"]), (3, 1000, 2, 1))
+        self.assertEqual(usage["efficiency"]["projection_bytes"], DIAL_EFFICIENCY["projection_bytes"])
+        self.assertEqual((text, usage), cross_agent.parse_dial_json(json.dumps(result)))
+        # Diagnostics without a terminal result never establish complete usage or an answer.
+        incomplete = "\n".join(json.dumps(event) for event in events[:-1])
+        answer, incomplete_usage = cross_agent.parse_dial_json(incomplete)
+        self.assertIsNone(answer)
+        self.assertFalse(incomplete_usage["usage_complete"])
+
     def test_missing_output_is_incomplete_not_zero_usage(self):
         for parse in (cross_agent.parse_dial_json, cross_agent.parse_omp_json, cross_agent.parse_text):
             self.assertFalse(parse("not json")[1]["usage_complete"])

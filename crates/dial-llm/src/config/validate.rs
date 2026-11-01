@@ -757,6 +757,39 @@ impl Config {
                 "invalid verification requirement name"
             );
             ensure!(
+                requirement.visual_target.as_ref().is_none_or(|target| {
+                    requirement.visual
+                        && !target.trim().is_empty()
+                        && target.len() <= 4096
+                        && !target.chars().any(char::is_control)
+                        && match target.split_once(':') {
+                            Some(("url", value)) => {
+                                url::Url::parse(value).is_ok_and(|url| url.as_str() == value)
+                            }
+                            Some(("window" | "display", value)) => {
+                                !value.trim().is_empty()
+                                    && value.trim() == value
+                                    && !matches!(value, "active" | "all")
+                            }
+                            _ => false,
+                        }
+                }),
+                "verification requirement {name} visual_target needs visual=true and an exact url:<canonical URL>, window:<ID> or display:<ID> locator"
+            );
+            let deliverables: std::collections::HashSet<_> =
+                requirement.deliverables.iter().collect();
+            ensure!(
+                requirement.deliverables.len() <= 32
+                    && deliverables.len() == requirement.deliverables.len()
+                    && requirement.deliverables.iter().all(|id| {
+                        !id.trim().is_empty()
+                            && id.len() <= 128
+                            && !id.chars().any(char::is_control)
+                    })
+                    && (requirement.deliverables.is_empty() || self.verification.enabled),
+                "verification requirement {name} deliverables must be unique bounded IDs and require verification.enabled"
+            );
+            ensure!(
                 requirement.visual || !requirement.checks.is_empty(),
                 "verification requirement {name} needs checks or visual evidence"
             );

@@ -1056,14 +1056,13 @@ fn capability_search_enables_real_history_retrieval_in_the_next_round() {
 }
 
 #[test]
-fn discovery_does_not_authorize_an_absent_tool_in_the_same_batch() {
+fn discovery_and_a_valid_call_to_the_absent_tool_run_in_the_same_batch() {
     let server = serve(vec![
         Reply::Calls(vec![
             ("tool_search", json!({"query":"session_search"})),
             ("session_search", json!({"query":"DISCOVERY-KEY","limit":3})),
         ]),
-        Reply::Call("session_search", json!({"query":"DISCOVERY-KEY","limit":3})),
-        Reply::Text("Retrieved with the next-round contract."),
+        Reply::Text("Retrieved in the same round."),
     ]);
     let mut e = env(&server.url, "auto");
     e.config.assistance.compact_tools = true;
@@ -1076,16 +1075,14 @@ fn discovery_does_not_authorize_an_absent_tool_in_the_same_batch() {
         .iter()
         .filter(|(name, _, _)| name == "session_search")
         .collect();
-    assert_eq!(results.len(), 2);
+    assert_eq!(results.len(), 1);
     assert!(
-        results[0].2,
-        "the old request contract still forbids the first call"
+        !results[0].2,
+        "a valid call is checked against the newly loaded schema and executed: {}",
+        results[0].1
     );
-    assert!(
-        !results[1].2,
-        "a fresh request may execute the enabled tool"
-    );
-    assert!(results[1].1.contains("DISCOVERY-KEY"));
+    assert!(results[0].1.contains("DISCOVERY-KEY"));
+    assert_eq!(server.requests.lock().len(), 2);
 }
 
 #[test]
@@ -7805,9 +7802,8 @@ fn compatible_read_aliases_execute_with_canonical_arguments() {
 }
 
 #[test]
-fn known_unoffered_tools_load_without_execution_until_the_next_request() {
+fn known_unoffered_tools_load_and_a_valid_call_runs_through_approval_in_the_same_request() {
     let server = serve(vec![
-        Reply::Call("search_web", json!({"search_query":"Rust release notes"})),
         Reply::Call("search_web", json!({"search_query":"Rust release notes"})),
         Reply::Text("Network access is disabled."),
     ]);
@@ -7819,8 +7815,10 @@ fn known_unoffered_tools_load_without_execution_until_the_next_request() {
     let mut ui = Recorder::default();
     // A research prompt now routes web tools eagerly; keep this test on the deferred path.
     a.turn("Inspect a deferred integration", &mut ui).unwrap();
+    // Loading is not approval: the call still asks, and the sandbox still refuses the network.
     assert_eq!(ui.approvals, ["web_search"]);
     let requests = server.requests.lock();
+    assert_eq!(requests.len(), 2);
     assert!(
         !requests[0]["tools"]
             .to_string()
@@ -7833,11 +7831,6 @@ fn known_unoffered_tools_load_without_execution_until_the_next_request() {
     );
     assert!(
         requests[1]["messages"]
-            .to_string()
-            .contains("This call was not executed")
-    );
-    assert!(
-        requests[2]["messages"]
             .to_string()
             .contains("network access is disabled")
     );
@@ -7894,7 +7887,7 @@ fn web_search_is_discoverable_loadable_and_respects_network_restrictions() {
 }
 
 #[test]
-fn discovery_enables_only_next_round_and_rejects_invalid_names_atomically() {
+fn a_tool_loaded_and_called_in_one_batch_runs_and_invalid_load_names_are_rejected_atomically() {
     let server = serve(vec![
         Reply::Calls(vec![
             ("tool_load", json!({"names":["web_fetch"]})),
@@ -7910,9 +7903,15 @@ fn discovery_enables_only_next_round_and_rejects_invalid_names_atomically() {
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     a.turn("discover specialist tools", &mut Recorder::default())
         .unwrap();
-    assert_eq!(a.metrics().tool_contract_errors, 1);
+    // The web_fetch call matched its newly loaded schema, so it is not a contract error.
+    assert_eq!(a.metrics().tool_contract_errors, 0);
     assert!(a.tool_names().iter().any(|n| n == "web_fetch"));
     assert!(!a.tool_names().iter().any(|n| n == "web_search"));
+    assert!(
+        server.requests.lock()[1]["messages"]
+            .to_string()
+            .contains("network access is disabled")
+    );
 }
 
 #[test]
@@ -9482,9 +9481,9 @@ fn isolated_search_applies_smallest_verified_patch_without_touching_other_files(
                     })
                 });
             if main {
-                // The first call only loads the deferred tool; the retry executes it.
+                // The deferred tool is loaded and, its arguments being valid, run at once.
                 return match main_step.fetch_add(1, Ordering::SeqCst) {
-                    0 | 1 => Reply::Call(
+                    0 => Reply::Call(
                         "solve",
                         json!({
                             "goal":"Make value.txt begin with fixed", "allowed_paths":["value.txt"],

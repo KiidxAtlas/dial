@@ -26,8 +26,15 @@ impl<'a> Agent<'a> {
         superseded: &mut crate::agent::workflow::evidence::Supersession,
         rule_state: Option<&mut crate::agent::safety::rules::State>,
     ) -> Result<usize> {
+        crate::agent::compact::snapcompact::views::project(messages);
         let economy = self.config.efficiency.enabled && !self.hermetic;
-        let raw_estimate = crate::llm::wire::estimate_parts(messages, schemas);
+        let identity = self.auth_config.selection();
+        let raw_estimate = crate::llm::wire::counting::request_tokens(
+            &identity.provider,
+            &identity.model,
+            messages,
+            schemas,
+        );
         let pressure_fraction = if economy {
             u64::from(self.config.efficiency.cache_pressure_percent)
         } else {
@@ -106,25 +113,36 @@ impl<'a> Agent<'a> {
             .filter(|m| m["role"] == "tool")
             .filter(|_| packet.is_none())
             .and_then(|_| self.todo.focus());
-        // A bare todo reminder is the lowest-priority advisory note; packets and steering are not.
-        let todo_only = focus.is_some() && control["steering_active"] != true;
-        let mut task_context = focus.unwrap_or_default();
+        // The optimizer's reviewed draft is the model-facing instruction. Keep originals in
+        // durable provenance, but do not bypass that boundary through a raw request-tail note.
+        let latest_request = if self.hermetic || self.turn_optimizer_enabled() {
+            None
+        } else {
+            crate::agent::run::intent::request_context(&control)
+        };
+        // Keep a bare todo focus advisory even when admitted user context is also present.
+        if let Some(focus) = focus {
+            let mut message = json!({"role":"user","content":focus,"dial_transient":true,"dial_task_context":true});
+            crate::agent::run::guidance::tag(
+                &mut message,
+                crate::agent::run::guidance::Priority::Todo,
+            );
+            messages.push(message);
+        }
+        let mut task_context = String::new();
         if let Some(packet) = packet {
             task_context.push_str(&format!(
                 "\n[Current task evidence packet; harness context]\n{packet}"
             ));
         }
-        if control["steering_active"] == true {
+        if let Some(latest_request) = latest_request {
+            task_context.push('\n');
+            task_context.push_str(&latest_request);
+        } else if control["steering_active"] == true {
             task_context.push_str("\n[User steering from Dial] Follow the latest user instruction before taking another action. New user corrections take precedence over conflicting older plans, todos, original goals and summaries. Keep compatible unfinished work, but revise or drop conflicting todos instead of continuing the old task. The user's full messages are authoritative; task packets are context, not permission to ignore them.");
         }
         if !task_context.is_empty() {
-            let mut message = json!({"role":"user","content":task_context,"dial_transient":true,"dial_task_context":true});
-            if todo_only {
-                crate::agent::run::guidance::tag(
-                    &mut message,
-                    crate::agent::run::guidance::Priority::Todo,
-                );
-            }
+            let message = json!({"role":"user","content":task_context,"dial_transient":true,"dial_task_context":true});
             messages.push(message);
         }
         Ok(sent_messages)
@@ -300,3 +318,6 @@ impl<'a> Agent<'a> {
         (!text.is_empty()).then_some(text)
     }
 }
+
+#[cfg(test)]
+mod tests;

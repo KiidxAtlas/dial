@@ -162,6 +162,77 @@ fn choices_toggles_and_typed_numbers_save_valid_profiles() {
 }
 
 #[test]
+fn uncustomized_profiles_do_not_claim_dial_controls_are_provider_defaults() {
+    let rig = Rig::new();
+    let ctx = DrawCtx {
+        theme: &rig.theme,
+        keys: &rig.keys,
+        status: &rig.status,
+        preview_status: &status_preview,
+    };
+    let mut overlay = ModelSettingsOverlay::new("local".into(), mlx());
+    let text = screen(&render(100, 32, |frame| overlay.draw(frame, &ctx)));
+    assert!(text.contains("using inherited defaults"), "{text}");
+    assert!(!text.contains("using provider defaults"), "{text}");
+}
+
+#[test]
+fn edit_style_renders_inheritance_and_pin_changes_without_persisting_the_fallback() {
+    let rig = Rig::new();
+    let ctx = DrawCtx {
+        theme: &rig.theme,
+        keys: &rig.keys,
+        status: &rig.status,
+        preview_status: &status_preview,
+    };
+    for inherited in ["replace", "hashline", "apply_patch"] {
+        let mut overlay = ModelSettingsOverlay::new("local".into(), mlx())
+            .with_inherited_edit_mode(inherited.into());
+        go(&mut overlay, &rig, "edit_mode");
+        let inherited_label = format!("{inherited} (inherited)");
+        let text = screen(&render(100, 32, |frame| overlay.draw(frame, &ctx)));
+        assert!(text.contains(&inherited_label), "{text}");
+        assert!(
+            text.contains("Unset inherits Dial's effective edit grammar"),
+            "{text}"
+        );
+        assert!(text.contains("not adaptive benchmarking"), "{text}");
+
+        let saved = press(&mut overlay, &rig, KeyCode::Right);
+        assert_eq!(saved["edit_mode"].as_str(), Some("hashline"));
+        let text = screen(&render(100, 32, |frame| overlay.draw(frame, &ctx)));
+        assert!(!text.contains("(inherited)"), "{text}");
+        assert!(text.contains("1 custom value"), "{text}");
+
+        let saved = press(&mut overlay, &rig, KeyCode::Char('r'));
+        assert!(!saved.contains_key("edit_mode"));
+        let text = screen(&render(100, 32, |frame| overlay.draw(frame, &ctx)));
+        assert!(text.contains(&inherited_label), "{text}");
+        assert!(text.contains("using inherited defaults"), "{text}");
+
+        // The optional slot reached by cycling also clears the pin, not stores the fallback.
+        let saved = press(&mut overlay, &rig, KeyCode::Left);
+        assert_eq!(saved["edit_mode"].as_str(), Some("sloppy"));
+        let saved = press(&mut overlay, &rig, KeyCode::Right);
+        assert!(!saved.contains_key("edit_mode"));
+        let text = screen(&render(100, 32, |frame| overlay.draw(frame, &ctx)));
+        assert!(text.contains(&inherited_label), "{text}");
+
+        assert!(matches!(
+            overlay.event(&key(KeyCode::Right), &rig.keys),
+            OverlayEvent::Set { .. }
+        ));
+        overlay.settled(Err("save refused".into()));
+        let text = screen(&render(100, 32, |frame| overlay.draw(frame, &ctx)));
+        assert!(
+            text.contains(&inherited_label) && text.contains("save refused"),
+            "{text}"
+        );
+        assert!(overlay.profile.edit_mode.is_none());
+    }
+}
+
+#[test]
 fn page_shows_sections_values_and_help_and_survives_tiny_terminals() {
     let rig = Rig::new();
     let ctx = DrawCtx {

@@ -318,9 +318,11 @@ LM Studio's own resource limits to allow them; Dial cannot override those.
 **llama.cpp and Ollama.** The same runtime check covers them: llama.cpp's `/props` reports the per-slot
 context it serves (`-c` divided by `--parallel`; its `/v1/models` lists only the training context), and
 Ollama's `/api/ps` reports the context a running model was loaded with. For a model Ollama has not loaded
-yet, `/api/show` supplies its trained context as the bound. Ollama's own default context is small and it
-truncates oversized prompts silently, so Dial always sends the window it plans against as `options.num_ctx`
-(a model profile's `context_window` takes precedence); `OLLAMA_CONTEXT_LENGTH` is no longer needed.
+yet, `/api/show` supplies its trained context as a planning bound, not a measured loaded capacity.
+Automatic context leaves `options.num_ctx` absent so the host retains its own loaded/default window;
+an explicit Dial `context_window`, `local_context_window`, or model-profile context limit sends it.
+Adjust Ollama's model configuration or `OLLAMA_CONTEXT_LENGTH` when the host's default is too small.
+Memory-fit advice never silently replaces that host setting.
 
 **Ollama model profiles.** A `provider = "ollama"` profile accepts `local_sampling` keys `top_k`, `min_p`,
 `seed`, `repetition_penalty` (sent as `repeat_penalty`), `repetition_context_size` (`repeat_last_n`),

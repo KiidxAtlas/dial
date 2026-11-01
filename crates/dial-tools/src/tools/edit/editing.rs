@@ -473,11 +473,38 @@ fn line_range(text: &str, start: usize, end: usize) -> (usize, usize) {
     let total = hashline::split_lines(text).len().max(1);
     (first.min(total), last.min(total).max(first.min(total)))
 }
+/// A satisfied edit is observational: it must never enter the write transaction.
+#[derive(Debug)]
+pub(crate) enum PreparedEdit {
+    Changes(Vec<Change>),
+    AlreadyApplied(Box<Change>),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PrepareError {
+    #[error("{0}")]
+    Refused(String),
+    #[error("{0}")]
+    SourceChanged(String),
+    #[error("{0}")]
+    TargetNotFound(String),
+}
+impl From<String> for PrepareError {
+    fn from(message: String) -> Self {
+        Self::Refused(message)
+    }
+}
+impl From<&str> for PrepareError {
+    fn from(message: &str) -> Self {
+        Self::Refused(message.into())
+    }
+}
+
 fn replace_plan(
     ws: &Workspace,
     args: &Value,
     preview_no_change: Option<&std::cell::Cell<bool>>,
-) -> Result<Vec<Change>, String> {
+) -> Result<PreparedEdit, PrepareError> {
     use super::edit_native::{
         error::EditError,
         fuzzy::{self, ReplaceOutcome},
@@ -491,14 +518,47 @@ fn replace_plan(
     if old.is_empty() {
         return Err("old_string must not be empty".into());
     }
-    if old == new {
-        if let Some(flag) = preview_no_change {
-            flag.set(true);
-        }
-        return Err("old_string and new_string are identical; no change".into());
-    }
     let source = super::edit_source::Source::load(&change.path, Some(text))?;
     let lf = &source.text;
+    // Desired text alone is not a retry receipt. Require a unique exact target and
+    // current witnesses, plus a witnessed prior source that yields this whole file.
+    // Deletions, replace_all and normalized/fuzzy retries remain unsupported.
+    let desired = if !all && !new.is_empty() {
+        let mut matches = lf.match_indices(new);
+        matches.next().filter(|_| matches.next().is_none())
+    } else {
+        None
+    };
+    if let Some((at, _)) = desired {
+        let identical = old == new;
+        let retry = !lf.contains(old)
+            && source.raw_revision.is_none()
+            && ws
+                .store()
+                .witnessed_exact_replacement(&change.path, lf, old, new);
+        if identical || retry {
+            ws.store().check_version_ranges(
+                &change.path,
+                lf,
+                source.raw_revision,
+                &[line_range(lf, at, at + new.len())],
+            )?;
+            generated_guard(ws, &change.path, Some(lf))?;
+            if let Some(flag) = preview_no_change {
+                flag.set(true);
+            }
+            return Ok(PreparedEdit::AlreadyApplied(Box::new(change)));
+        }
+    }
+    // Identical old and new text that the file lacks describes code the model believes landed
+    // (typically from a refused earlier edit). Searching for it only yields misleading hints.
+    if old == new && !lf.contains(old) {
+        let (located, _) = diagnose_miss(lf, old);
+        return Err(PrepareError::TargetNotFound(format!(
+            "old_string and new_string are identical, and that text is not in {}: the edit describes code the file does not contain. If an earlier edit was meant to add it, that edit was refused and nothing from it landed. Read the current source and edit from what is actually there.{located}",
+            super::edit_source::display_path(ws.rel(&change.path))
+        )));
+    }
     let witness = |start, end| {
         source
             .check_ranges(ws, &change.path, &[line_range(lf, start, end)])
@@ -572,15 +632,34 @@ fn replace_plan(
                     )
                 )
             };
-            return Err(format!("{detail}.{}", diagnose_miss(lf, old)));
+            let (miss, located) = diagnose_miss(lf, old);
+            // Lead with an exact location for the block when one exists; the fuzzy closest
+            // match can point at an unrelated low-similarity line.
+            let message = if located && count.is_none() {
+                format!("old_string not found as written.{miss}\n{detail}.")
+            } else {
+                format!("{detail}.{miss}")
+            };
+            let message = match whole_file_hint(lf, old) {
+                Some(hint) => format!("{message}\n{hint}"),
+                None => message,
+            };
+            return Err(if count.is_none() {
+                PrepareError::TargetNotFound(message)
+            } else {
+                PrepareError::Refused(message)
+            });
         }
     };
+    let hint = whole_file_hint(lf, old)
+        .map(|hint| format!("\n{hint}"))
+        .unwrap_or_default();
     let flags = hashline::transition_flags(lf, &replaced.content, &source.flags(ws, &change.path));
     let persisted = source.persist_checked(ws, replaced.content, &change.path, &flags)?;
     change.projection = persisted.projection;
     change.seen_after = Some(flags);
     change.report = Some(format!(
-        "replaced {} occurrence{} in {}{}",
+        "replaced {} occurrence{} in {}{}{hint}",
         replaced.count,
         if replaced.count == 1 { "" } else { "s" },
         super::edit_source::display_path(ws.rel(&change.path)),
@@ -588,12 +667,24 @@ fn replace_plan(
             String::new()
         } else {
             format!("\n{}", replaced.notes.join("\n"))
-        }
+        },
     ));
     change.after = Some(persisted.raw);
-    Ok(vec![change])
+    Ok(PreparedEdit::Changes(vec![change]))
 }
-fn diagnose_miss(text: &str, old: &str) -> String {
+
+/// Lines a file needs before an edit covering most of it is steered to `write`.
+const WHOLE_FILE_MIN_LINES: usize = 40;
+
+/// Steer a whole-file rewrite to `write`: repeating the old text doubles what the model must
+/// reproduce exactly, and any slip refuses the whole edit.
+fn whole_file_hint(file: &str, old: &str) -> Option<&'static str> {
+    (file.lines().count() >= WHOLE_FILE_MIN_LINES && old.len() * 5 >= file.len() * 4).then_some(
+        "old_string covers most of the file: to rewrite a whole file, send the complete new content once with `write` instead of repeating the old text in `edit`.",
+    )
+}
+/// Explain a missed `old_string`; `true` when the explanation names where the block is.
+fn diagnose_miss(text: &str, old: &str) -> (String, bool) {
     let content: Vec<_> = old.lines().filter(|line| !line.trim().is_empty()).collect();
     if !content.is_empty()
         && content.iter().all(|line| {
@@ -602,8 +693,10 @@ fn diagnose_miss(text: &str, old: &str) -> String {
             n > 0 && line[n..].starts_with(['\t', ':'])
         })
     {
-        return " old_string copied a read line number; copy only source after the tab/colon."
-            .into();
+        return (
+            " old_string copied a read line number; copy only source after the tab/colon.".into(),
+            false,
+        );
     }
     let file: Vec<_> = text.lines().collect();
     let pattern: Vec<_> = old.lines().map(str::trim).collect();
@@ -622,10 +715,13 @@ fn diagnose_miss(text: &str, old: &str) -> String {
             .enumerate()
             .map(|(n, line)| format!("{}:{line}\n", at + n + 1))
             .collect::<String>();
-        return format!(
-            " The text exists at lines {}-{} with different whitespace. Actual text:\n{rows}",
-            at + 1,
-            at + pattern.len()
+        return (
+            format!(
+                " The text exists at lines {}-{} with different whitespace. Actual text:\n{rows}",
+                at + 1,
+                at + pattern.len()
+            ),
+            true,
         );
     }
     let Some(anchor) = content
@@ -633,25 +729,37 @@ fn diagnose_miss(text: &str, old: &str) -> String {
         .map(|line| line.trim())
         .filter(|line| line.len() >= 4)
     else {
-        return " Read the affected source and copy its exact text.".into();
+        return (
+            " Read the affected source and copy its exact text.".into(),
+            false,
+        );
     };
     let nearby = file
         .iter()
         .enumerate()
         .filter(|(_, line)| line.contains(anchor))
         .take(3)
-        .map(|(n, line)| format!("{}:{line}", n + 1))
         .collect::<Vec<_>>();
-    if nearby.is_empty() {
-        format!(
-            " Not even its first line ({}) occurs; read again.",
-            crate::runtime::presentation::truncate(anchor, 80)
-        )
-    } else {
-        format!(
-            " Its first line occurs in the file but the following lines differ:\n{}",
-            nearby.join("\n")
-        )
+    match nearby.first() {
+        None => (
+            format!(
+                " Not even its first line ({}) occurs; read again.",
+                crate::runtime::presentation::truncate(anchor, 80)
+            ),
+            false,
+        ),
+        Some((first, _)) => (
+            format!(
+                " Its first line occurs in the file at line {}, but the following lines differ; read from there:\n{}",
+                first + 1,
+                nearby
+                    .iter()
+                    .map(|(n, line)| format!("{}:{line}", n + 1))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+            true,
+        ),
     }
 }
 fn apply_hunks(
@@ -903,27 +1011,33 @@ fn sloppy_plan(
     }
     Ok(changes)
 }
-pub(crate) fn prepare(ws: &Workspace, args: &Value) -> Result<Vec<Change>, String> {
+pub(crate) fn prepare(ws: &Workspace, args: &Value) -> Result<PreparedEdit, PrepareError> {
     prepare_with_preview(ws, args, None)
 }
 pub(crate) fn prepare_with_preview(
     ws: &Workspace,
     args: &Value,
     preview_no_change: Option<&std::cell::Cell<bool>>,
-) -> Result<Vec<Change>, String> {
+) -> Result<PreparedEdit, PrepareError> {
     ws.edit_settings.validate()?;
     validate_shape(ws.edit_mode, args)?;
     match ws.edit_mode {
         EditMode::Replace => replace_plan(ws, args, preview_no_change),
-        EditMode::Patch => entries_plan(ws, patch_entries(args)?, true),
+        EditMode::Patch => entries_plan(ws, patch_entries(args)?, true)
+            .map(PreparedEdit::Changes)
+            .map_err(Into::into),
         EditMode::ApplyPatch => {
             entries_plan(ws, apply_entries(req_str(args, "input")?, false)?, false)
+                .map(PreparedEdit::Changes)
+                .map_err(Into::into)
         }
         EditMode::Sloppy => sloppy_plan(
             ws,
             sloppy_sections(req_str(args, "input")?)?,
             preview_no_change,
-        ),
+        )
+        .map(PreparedEdit::Changes)
+        .map_err(Into::into),
         EditMode::Hashline => Err("hashline preparation uses its snapshot engine".into()),
     }
 }
@@ -933,13 +1047,15 @@ pub(crate) fn prepare_streaming_preview(
     ws: &Workspace,
     args: &Value,
     preview_no_change: Option<&std::cell::Cell<bool>>,
-) -> Result<Vec<Change>, String> {
+) -> Result<PreparedEdit, PrepareError> {
     if ws.edit_mode != EditMode::ApplyPatch {
         return prepare_with_preview(ws, args, preview_no_change);
     }
     ws.edit_settings.validate()?;
     validate_shape(ws.edit_mode, args)?;
     entries_plan(ws, apply_entries(req_str(args, "input")?, true)?, false)
+        .map(PreparedEdit::Changes)
+        .map_err(Into::into)
 }
 /// Authorizes the paths an edit is about to touch.
 type PathAuthorizer<'a> = &'a dyn Fn(&[PathBuf]) -> Result<(), String>;
@@ -952,8 +1068,8 @@ pub(crate) struct Execution<'a> {
     /// Refuse, before commit, a change that adds parser errors (see [`syntax_gate`]).
     pub refuse_syntax_errors: bool,
 }
-/// Whether this edit call refuses new parser errors: the workspace blocks them (small/lean local
-/// tiers) and the call did not pass `allow_syntax_errors: true`. Write and ast_edit never refuse.
+/// Whether a native mutation refuses new parser errors: the workspace blocks them (small/lean
+/// local tiers) and the call did not pass `allow_syntax_errors: true`.
 pub(crate) fn syntax_gate(ws: &Workspace, args: &Value) -> Result<bool, String> {
     let allow = opt_bool(args, "allow_syntax_errors")?;
     Ok(ws.syntax_blocking() && !allow)
@@ -982,6 +1098,112 @@ impl Execution<'_> {
         }
     }
 }
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum EditOutcome {
+    Applied,
+    AlreadyApplied,
+    SourceChanged,
+    TargetNotFound,
+}
+
+pub(crate) fn with_outcome(
+    mut output: crate::tools::ToolOutput,
+    outcome: EditOutcome,
+) -> crate::tools::ToolOutput {
+    if !matches!(outcome, EditOutcome::Applied) {
+        output = output.with_effects(crate::runtime::execution::Effects::None);
+    }
+    let data = output.data.get_or_insert_with(|| json!({}));
+    data["edit"] = json!({"outcome": outcome});
+    output
+}
+
+/// Finish only changed proposals through the existing transaction owner.
+pub(crate) fn finish_prepared(
+    ws: &Workspace,
+    prepared: PreparedEdit,
+    commit: bool,
+    execution: &Execution<'_>,
+) -> Result<crate::tools::ToolOutput, PrepareError> {
+    match prepared {
+        PreparedEdit::Changes(changes) => finish_with(ws, changes, commit, execution)
+            .map(|text| {
+                let output = crate::tools::ToolOutput::ok(text);
+                if commit {
+                    with_outcome(output, EditOutcome::Applied)
+                } else {
+                    output
+                }
+            })
+            .map_err(Into::into),
+        PreparedEdit::AlreadyApplied(change) => {
+            let _lease = super::document_transaction::Lease::acquire([change.path.clone()])?;
+            execution.check_cancel()?;
+            let current = edit_transaction::read(ws, &change.path)?;
+            if current.as_ref().map(|source| source.text.as_str())
+                != change.before.as_ref().map(|source| source.text.as_str())
+            {
+                return Err(PrepareError::SourceChanged(format!(
+                    "{} changed while validating the satisfied edit; nothing was written",
+                    ws.rel(&change.path)
+                )));
+            }
+            generated_guard(
+                ws,
+                &change.path,
+                change.before.as_ref().map(|source| source.text.as_str()),
+            )?;
+            execution.check_cancel()?;
+            execution.mark_no_change();
+            Ok(with_outcome(
+                crate::tools::ToolOutput::ok(format!(
+                    "{}Already applied: {} has the witnessed requested content. Nothing was written.",
+                    if commit { "" } else { "Preview only; " },
+                    ws.rel(&change.path),
+                )),
+                EditOutcome::AlreadyApplied,
+            ))
+        }
+    }
+}
+
+/// Preserve known native outcomes without interpreting diagnostic prose.
+pub(crate) fn execute_prepared(
+    ws: &Workspace,
+    args: &Value,
+    execution: &Execution<'_>,
+) -> Result<crate::tools::ToolOutput, String> {
+    let prepared =
+        match prepare(ws, args) {
+            Ok(prepared) => prepared,
+            Err(PrepareError::Refused(message)) => {
+                // Preparation cannot have published changes. Keep this distinct from a
+                // finishing failure, whose transaction may carry its own effects.
+                return Ok(crate::tools::ToolOutput::err(
+                    crate::tools::fs::suggest::annotate_edit(ws, args, message),
+                )
+                .with_effects(crate::runtime::execution::Effects::None));
+            }
+            Err(error) => return prepare_error_output(error),
+        };
+    finish_prepared(ws, prepared, true, execution).or_else(prepare_error_output)
+}
+
+pub(crate) fn prepare_error_output(
+    error: PrepareError,
+) -> Result<crate::tools::ToolOutput, String> {
+    let (message, outcome) = match error {
+        PrepareError::Refused(message) => return Err(message),
+        PrepareError::SourceChanged(message) => (message, EditOutcome::SourceChanged),
+        PrepareError::TargetNotFound(message) => (message, EditOutcome::TargetNotFound),
+    };
+    Ok(with_outcome(
+        crate::tools::ToolOutput::err(message),
+        outcome,
+    ))
+}
+
 #[cfg(test)]
 pub(crate) fn finish(ws: &Workspace, changes: Vec<Change>, commit: bool) -> Result<String, String> {
     finish_with(ws, changes, commit, &Execution::default())
@@ -1018,7 +1240,7 @@ pub(crate) fn finish_with(
             generated_guard(ws, &change.path, Some(projected_before))?;
         }
         if let Some(after) = &change.after {
-            if before == Some(after.as_str()) && !change.authored_whole {
+            if before == Some(after.as_str()) {
                 execution.mark_no_change();
                 return Err(format!(
                     "{} would not change; nothing was written",
@@ -1060,7 +1282,7 @@ pub(crate) fn finish_with(
                 if let Some(record) = source.blackbox {
                     records.push(record);
                 }
-                if before == change.after.as_deref() && !change.authored_whole {
+                if before == change.after.as_deref() {
                     execution.mark_no_change();
                     return Err(format!(
                         "{} has no change after parse repair; nothing was written\n{}",
@@ -1186,18 +1408,6 @@ pub(crate) fn finish_with(
     }
     Ok(output)
 }
-/// The `edit` tool without an owner context (tests, `tools::execute`), in any grammar.
-pub(crate) fn edit(ws: &Workspace, args: &Value) -> Result<String, String> {
-    let execution = Execution {
-        refuse_syntax_errors: syntax_gate(ws, args)?,
-        ..Default::default()
-    };
-    if ws.edit_mode == EditMode::Hashline {
-        validate_shape(ws.edit_mode, args)?;
-        return hashline::edit_with(ws, hashline::input_arg(args)?, true, &execution);
-    }
-    finish_with(ws, prepare(ws, args)?, true, &execution)
-}
 
 /// Keep the built-in hashline model projection separate from the raw transcript result.
 pub(crate) fn edit_output(
@@ -1212,6 +1422,13 @@ pub(crate) fn edit_output(
         };
         hashline::edit_output_with(ws, hashline::input_arg(args)?, true, &execution)
     } else {
-        edit(ws, args).map(crate::tools::ToolOutput::ok)
+        let execution = Execution {
+            refuse_syntax_errors: syntax_gate(ws, args)?,
+            ..Default::default()
+        };
+        execute_prepared(ws, args, &execution)
     }
 }
+
+#[cfg(test)]
+mod tests;

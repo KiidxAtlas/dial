@@ -81,6 +81,16 @@ fn owner_survives_controller_drop_reconnects_and_never_replays() {
     for _ in 0..2 {
         let output = request(&directory, &reattached, &json!({"action":"output"})).unwrap();
         assert!(output.text.contains("readydone"), "{}", output.text);
+        assert_eq!(
+            output
+                .execution
+                .shell_launch
+                .as_ref()
+                .unwrap()
+                .job
+                .as_deref(),
+            Some("survive")
+        );
     }
     assert_eq!(
         fs::read(root.join("once")).unwrap(),
@@ -98,7 +108,14 @@ fn owner_survives_controller_drop_reconnects_and_never_replays() {
 fn explicit_kill_and_deadline_stop_owned_jobs() {
     for (name, lifetime, kill) in [("kill", 3, true), ("deadline", 1, false)] {
         let (_temp, ws, registry) = fixture();
-        start(&ws, &json!({"action":"start","name":name,"command":"printf ready; sleep 30; printf unexpected > late", "lifetime":lifetime}), &registry, &AtomicBool::new(false)).unwrap();
+        let started = start(&ws, &json!({"action":"start","name":name,"command":"printf ready; sleep 30; printf unexpected > late", "lifetime":lifetime}), &registry, &AtomicBool::new(false)).unwrap();
+        let launch = crate::runtime::execution::ShellLaunch {
+            stdin: crate::runtime::execution::ShellStdin::Eof,
+            terminal_allocated: false,
+            job: Some(name.into()),
+        };
+        assert_eq!(started.execution.shell_launch.as_ref(), Some(&launch));
+        assert!(started.execution.process.is_none());
         let directory = registry.join(name);
         if kill {
             request(&directory, &ws, &json!({"action":"kill"})).unwrap();
@@ -110,6 +127,7 @@ fn explicit_kill_and_deadline_stop_owned_jobs() {
             "{}",
             output.text
         );
+        assert_eq!(output.execution.shell_launch.as_ref(), Some(&launch));
         assert!(
             !ws.root.join("late").exists(),
             "terminated command must not finish its later write"

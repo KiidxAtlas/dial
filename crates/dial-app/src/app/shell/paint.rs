@@ -160,19 +160,18 @@ fn side_rows(
 /// Longest session title the terminal title carries, in cells.
 const TAB_SCOPE_WIDTH: usize = 40;
 
-/// The terminal title: the state circle (when there is one), `dial · <project>`, then the
-/// session's scope clipped to [`TAB_SCOPE_WIDTH`] so a tab strip stays readable.
+/// The terminal title: `dial · <project>`, the session's scope clipped to [`TAB_SCOPE_WIDTH`],
+/// then the state circle. Keep the circle last so left-truncated, unselected tabs still show it.
 pub(super) fn tab_title(base: &str, scope: &str, marker: &str) -> String {
-    let mut title = String::new();
-    if !marker.is_empty() {
-        title.push_str(marker);
-        title.push(' ');
-    }
-    title.push_str(base);
+    let mut title = base.to_owned();
     let scope = crate::ui::text::clip(scope, TAB_SCOPE_WIDTH);
     if !scope.is_empty() {
         title.push_str(" · ");
         title.push_str(&scope);
+    }
+    if !marker.is_empty() {
+        title.push(' ');
+        title.push_str(marker);
     }
     title
 }
@@ -194,6 +193,11 @@ impl Shell {
     }
 
     pub(in crate::app) fn paint(&mut self, panel: Option<Rows>) -> Result<()> {
+        if panel.is_some() && self.busy_overlay.is_some() {
+            // Approvals and questions paint inline, even when a turn has a menu open. Yield the
+            // alternate screen without discarding the menu; its next step reopens and redraws it.
+            self.term.close_overlay()?;
+        }
         if self.term.output_backlogged() {
             self.term.defer_paint();
             return Ok(());

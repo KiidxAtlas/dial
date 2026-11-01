@@ -1,4 +1,5 @@
 use super::*;
+use crate::agent::run::tool_exposure::default_offer_tests::with_agent;
 
 #[test]
 fn review_drives_only_one_repair_and_tracks_local_checks() {
@@ -185,4 +186,49 @@ fn content_free_coach_notes_neither_block_nor_reach_the_model() {
     let real = parse_round(r#"{"severity":"blocker","note":"Stop: the migration drops a column"}"#)
         .unwrap();
     assert!(state.apply_round(&real).is_some());
+}
+
+#[test]
+fn advisor_goal_review_falls_back_to_legacy_instruction_and_shows_original_plus_amendment() {
+    use crate::agent::run::intent::{Kind, record};
+    with_agent("", |agent| {
+        // Legacy session: only the effective instruction exists; the review sees it unchanged.
+        agent
+            .session
+            .set_control_state(json!({"current_instruction":"legacy request"}))
+            .unwrap();
+        assert_eq!(agent.current_goal("goal"), "legacy request");
+
+        // Admitted original, then a steering amendment: both reach the review, latest is labelled.
+        let mut control = agent.session.control_state();
+        record(&mut control, "ship the parser", json!("turn-1"), Kind::Turn);
+        record(
+            &mut control,
+            "use the v2 parser",
+            json!("steer-1"),
+            Kind::Steering,
+        );
+        control["current_instruction"] = json!("use the v2 parser");
+        agent.session.set_control_state(control).unwrap();
+        let review = agent.current_goal("goal");
+        assert!(review.starts_with("use the v2 parser\n\n"));
+        assert!(review.contains("ship the parser"));
+        assert!(review.contains("\"latest\""));
+        assert!(review.contains("use the v2 parser"));
+    });
+}
+
+#[test]
+fn completion_review_receives_reconciliation_without_promoting_claims() {
+    let state = CoachTurn::default();
+    let reconciliation = json!({"deliverables":[
+        {"id":"remaining","claimed_status":"open"},
+        {"id":"claim","evidence_status":"claim_only"}
+    ],"undeclared_requirements":"unassessed"});
+    let question = state.question("Implement both requirements", "Done", &reconciliation);
+    assert_eq!(question["goal"], "Implement both requirements");
+    let prompt = question["question"].as_str().unwrap();
+    assert!(prompt.contains(&reconciliation.to_string()));
+    assert!(question["evidence"][0].as_str().unwrap().contains("Done"));
+    assert!(state.parse(r#"{"gaps":[{"requirement":"remaining outcome","evidence":0,"next_check":"inspect second outcome"}]}"#).is_ok());
 }

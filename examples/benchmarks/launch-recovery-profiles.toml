@@ -1,0 +1,19 @@
+# Local-only launch/input recovery evaluation. Choose an already loaded model ID;
+# this profile never downloads or loads model weights.
+# dial benchmark examples/benchmarks/recovery.toml --provider lm-studio \
+#   --endpoint http://127.0.0.1:1234/v1 --profiles examples/benchmarks/launch-recovery-profiles.toml \
+#   --report target/launch-recovery-local.json
+[machine]
+repetitions = 3
+case_timeout_secs = 180
+minimum_correctness = 1.0
+allow_remote = false
+
+[[configurations]]
+name = "local-launch-recovery"
+provider = "lm-studio"
+model = "REPLACE_WITH_LOADED_MODEL_ID"
+context_window = 32768
+
+[configurations.integration]
+mode = "managed_shell"

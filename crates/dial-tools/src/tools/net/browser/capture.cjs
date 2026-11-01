@@ -60,7 +60,7 @@ async function screenshot(ctx) {
   }
   if (bytes.length > MAX_SCREENSHOT_BYTES) fail('screenshot exceeds the provider attachment limit of 5 MiB; use a viewport screenshot');
   const result = {
-    tab: ctx.id, url: clip(page.url()),
+    tab: ctx.id, url: page.url(),
     ...(annotations ? { annotations: annotations.map(({ label, role, name, selector }) => ({ label, role, name, selector })) } : {}),
   };
   // if_changed compares the encoded image with the previous capture of the same tab and options.

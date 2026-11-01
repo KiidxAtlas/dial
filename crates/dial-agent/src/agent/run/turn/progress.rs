@@ -1,27 +1,25 @@
 //! One shared count of recovery attempts since the turn last made progress. Each recovery
-//! mechanism (stream stalls, truncation, overflow, unusable replies, rejected previews and
-//! completions, portable-guidance regenerations, automatic continues) keeps its own cap, but those
+//! mechanism (stream stalls, truncation, overflow, unusable replies, rejected previews,
+//! portable-guidance regenerations, automatic continues) keeps its own cap, but those
 //! caps reset independently: a model that alternates failure classes, or interleaves them with
 //! failing tool calls, never reaches any single one. The ledger bounds the combination with a
-//! fixed ladder: retry within each mechanism's own cap, then one redirecting note, then a
-//! graceful stop that keeps the candidate answer. Coaching and model failover stay with their
-//! existing owners (automatic escalation and the fallback chain).
+//! graceful stop. It never injects a redirect into the model context. Coaching and model failover
+//! stay with their existing configured owners (automatic escalation and the fallback chain).
 //!
-//! Progress is a tool result that is new and not an error: productive work is never capped.
+//! Only novel observations and committed mutations repay recovery debt. Tool rounds are charged
+//! once, not once per failed call; successful bookkeeping neither advances nor forgives recovery.
 use super::*;
 
 #[cfg(test)]
 mod tests;
 
-/// Recovery attempts since the last progress before the model is told to change approach.
-pub(super) const REDIRECT_AT: u32 = 6;
-/// Recovery attempts since the last progress before the turn stops. Above every single
-/// mechanism's own cap, so the ledger only ends loops that cross mechanisms.
-const STOP_AT: u32 = 16;
+/// Total recovery debt before the turn stops, including failed tool rounds. This bounds both
+/// repeated tool failures and recovery loops that alternate between mechanisms.
+pub(in crate::agent) const STOP_AT: u32 = 16;
 
 /// A recovery attempt: the harness retries or corrects instead of moving the task forward.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) enum Setback {
+pub(in crate::agent) enum Setback {
     StreamStall,
     Truncation,
     Overflow,
@@ -29,8 +27,8 @@ pub(super) enum Setback {
     NoAnswer,
     RejectedPreview,
     GuidanceRegeneration,
-    RejectedCompletion,
     AutomaticContinue,
+    UnproductiveTools,
 }
 
 impl Setback {
@@ -43,51 +41,63 @@ impl Setback {
             Self::NoAnswer => "reply without an answer or action",
             Self::RejectedPreview => "rejected edit preview",
             Self::GuidanceRegeneration => "portable-guidance regeneration",
-            Self::RejectedCompletion => "rejected completion",
             Self::AutomaticContinue => "automatic continue",
+            Self::UnproductiveTools => "tool round without productive progress",
         }
     }
 }
 
-/// The ladder's answer to one more setback.
+/// Whether another setback remains within the shared recovery allowance.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum Rung {
+pub(in crate::agent) enum Rung {
     /// The mechanism's own recovery proceeds.
     Retry,
-    /// Recovery proceeds, and this note asks for a different approach.
-    Redirect(String),
     /// Recovery is not converging; end the turn with this explanation.
     Stop(String),
 }
 
 #[derive(Default)]
-pub(super) struct ProgressLedger {
+pub(in crate::agent) struct ProgressLedger {
     since_progress: std::collections::BTreeMap<Setback, u32>,
-    redirected: bool,
 }
 
 impl ProgressLedger {
-    /// A new, successful tool result: every recovery so far did its job.
-    pub(super) fn progressed(&mut self) {
+    /// Productive execution repays the debt; bookkeeping alone never calls this.
+    pub(in crate::agent) fn progressed(&mut self) {
         *self = Self::default();
     }
 
-    pub(super) fn setback(&mut self, kind: Setback) -> Rung {
-        *self.since_progress.entry(kind).or_default() += 1;
-        let total: u32 = self.since_progress.values().sum();
-        if total >= STOP_AT {
-            return Rung::Stop(format!(
-                "Stopped with incomplete work: {total} recovery attempts in a row made no progress ({}). No partial tool calls were executed; completed effects and the conversation are kept; no completion was recorded. Send a direction or say \"continue\" to resume.",
-                self.summary()
-            ));
+    pub(in crate::agent) fn tool_round(
+        &mut self,
+        progress: crate::agent::run::engine::RoundProgress,
+    ) -> Option<Setback> {
+        use crate::agent::run::engine::RoundProgress;
+        match progress {
+            RoundProgress::Productive => {
+                self.progressed();
+                None
+            }
+            RoundProgress::Stalled => Some(Setback::UnproductiveTools),
+            RoundProgress::Neutral => None,
         }
-        if total >= REDIRECT_AT && !std::mem::replace(&mut self.redirected, true) {
-            return Rung::Redirect(format!(
-                "[Dial] {total} recovery attempts in a row made no progress ({}). Retrying the same way is not working. Change approach: make one small tool call known to work, answer directly from the evidence you have, or report the concrete blocker.",
-                self.summary()
-            ));
-        }
-        Rung::Retry
+    }
+
+    pub(in crate::agent) fn setback(&mut self, kind: Setback) -> Rung {
+        let count = self.since_progress.entry(kind).or_default();
+        *count = count.saturating_add(1);
+        self.stop_reason().map_or(Rung::Retry, Rung::Stop)
+    }
+
+    pub(in crate::agent) fn stop_reason(&self) -> Option<String> {
+        let total = self
+            .since_progress
+            .values()
+            .copied()
+            .fold(0_u32, u32::saturating_add);
+        (total >= STOP_AT).then(|| format!(
+            "Blocked: {total} recovery attempts in a row made no progress ({}). Completed effects and the conversation are kept; no completion was recorded. Send a direction or say \"continue\" to resume.",
+            self.summary()
+        ))
     }
 
     fn summary(&self) -> String {
@@ -105,27 +115,50 @@ impl Agent<'_> {
     pub(super) fn setback(
         &mut self,
         turn: &mut TurnState<'_>,
+        engine: &mut crate::agent::run::engine::Engine,
         kind: Setback,
         step: u32,
         ui: &mut dyn Ui,
     ) -> Result<Option<TurnReport>> {
         self.efficiency_metrics.recovery(kind.label());
-        match turn.progress.setback(kind) {
+        self.recovery_report(turn, engine.setback(kind), step, ui)
+    }
+
+    /// Parent settlement adjusts raw tool progress for admission failures before charging it.
+    pub(super) fn tool_progress(
+        &mut self,
+        turn: &mut TurnState<'_>,
+        engine: &mut crate::agent::run::engine::Engine,
+        progress: crate::agent::run::engine::RoundProgress,
+        step: u32,
+        ui: &mut dyn Ui,
+    ) -> Result<Option<TurnReport>> {
+        if progress == crate::agent::run::engine::RoundProgress::Stalled {
+            self.efficiency_metrics
+                .recovery(Setback::UnproductiveTools.label());
+        }
+        self.recovery_report(turn, engine.record_progress(progress), step, ui)
+    }
+
+    fn recovery_report(
+        &mut self,
+        turn: &mut TurnState<'_>,
+        rung: Rung,
+        step: u32,
+        ui: &mut dyn Ui,
+    ) -> Result<Option<TurnReport>> {
+        match rung {
             Rung::Retry => Ok(None),
-            Rung::Redirect(note) => {
-                turn.pending_nudges.push(crate::agent::run::guidance::note(
-                    crate::agent::run::guidance::Priority::Loop,
-                    note,
-                ));
-                Ok(None)
-            }
             Rung::Stop(mut message) => {
                 self.record(step, "recovery_ladder", json!({"stopped":message}))?;
                 if let Some(candidate) = turn.completion_candidate.take() {
                     message.push_str("\n\n");
                     message.push_str(&candidate);
                 }
-                self.stop_turn(ui, message, step + 1).map(Some)
+                self.stop_turn(ui, message, step + 1).map(|mut report| {
+                    report.outcome = TurnOutcome::Blocked;
+                    Some(report)
+                })
             }
         }
     }

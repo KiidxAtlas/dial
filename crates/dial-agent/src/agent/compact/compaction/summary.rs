@@ -5,7 +5,8 @@
 use crate::agent::Ui;
 use crate::agent::compact::compaction::{
     CompactionContext, CompactionControlDenied, MAX_SUMMARY_TOKENS, RemoteCompactionObserver,
-    estimate, interrupted, public_transcript, summary_instructions, summary_output, with_ui,
+    SummaryWorker, estimate, interrupted, public_transcript, summary_instructions, summary_output,
+    with_ui,
 };
 use crate::agent::prompts::compaction::{
     BRANCH_PREAMBLE, BRANCH_PROMPT, FILE_TARGETS_NOTE, HANDOFF_UPDATE, SYSTEM_PROMPT,
@@ -35,6 +36,12 @@ const MIN_SUMMARY_INPUT_TOKENS: u64 = 16_384;
 const EVIDENCE_NOTES_MARKER: &str = "\n\nOriginal user goal: ";
 const FILE_LIST_LIMIT: usize = 16;
 const FILE_LIST_BYTES: usize = 4_096;
+/// Hard bounds on one fold: model attempts (retries included) and oversized-text fragments. Exceeding
+/// either fails before anything is committed; the summary never pretends to cover what it did not send.
+const MAX_SUMMARY_CALLS: usize = 64;
+const MAX_SUMMARY_FRAGMENTS: usize = 256;
+/// Bytes reserved for a fragment label, so a labelled fragment still fits its token budget.
+const FRAGMENT_LABEL_BYTES: usize = 96;
 // Keep legacy tag names for stored-summary and branch consumers; the lists are not result evidence.
 const READ_FILES: &str = "read-files";
 const LEGACY_FILE_TARGETS_NOTE: &str = "File-operation lists below are attempted targets observed in tool-call arguments, not evidence of successful reads or modifications. Calls may have failed, been denied, or never executed; consult retained results for outcomes.";
@@ -148,25 +155,88 @@ fn plan(sizes: &[u64], range: Range<usize>, budget: u64) -> Vec<Range<usize>> {
     windows
 }
 
-/// Only reachable when a single message exceeds the budget: truncate rather than send a request no retry can fit.
-fn clamp(text: &str, budget: u64, tokens: u64) -> Cow<'_, str> {
-    if tokens <= budget || tokens == 0 {
-        return Cow::Borrowed(text);
+/// One summarizer window: whole message texts, or one labelled fragment of an oversized text.
+struct Window {
+    units: Vec<String>,
+    budget: u64,
+}
+
+/// Split one oversized text into ordered, labelled fragments that each fit `budget` tokens. A cut
+/// lands on a line break in the window's second half when one exists, otherwise on a UTF-8 boundary,
+/// so every byte reaches exactly one fragment.
+fn fragments(text: &str, budget: u64) -> Result<Vec<String>> {
+    let room = usize::try_from(budget.saturating_mul(3))
+        .unwrap_or(usize::MAX)
+        .saturating_sub(FRAGMENT_LABEL_BYTES)
+        .max(4);
+    let mut pieces = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        ensure!(
+            pieces.len() < MAX_SUMMARY_FRAGMENTS,
+            "transcript needs more than {MAX_SUMMARY_FRAGMENTS} summary fragments; no summary was committed"
+        );
+        if rest.len() <= room {
+            pieces.push(rest);
+            break;
+        }
+        let mut end = room;
+        while !rest.is_char_boundary(end) {
+            end -= 1;
+        }
+        let cut = rest[..end]
+            .rfind('\n')
+            .filter(|&at| at >= end / 2)
+            .map_or(end, |at| at + 1);
+        pieces.push(&rest[..cut]);
+        rest = &rest[cut..];
     }
-    let keep = ((text.len() as u128 * u128::from(budget) * 95 / 100 / u128::from(tokens)) as usize)
-        .max(1_024);
-    if keep >= text.len() {
-        return Cow::Borrowed(text);
+    let count = pieces.len();
+    Ok(pieces
+        .into_iter()
+        .enumerate()
+        .map(|(index, piece)| format!("[fragment {} of {count}]\n{piece}", index + 1))
+        .collect())
+}
+
+/// Queue `units` at `budget`, in order. A lone text that cannot fit alone is split into labelled
+/// fragments instead of being truncated; fragments then travel through the same fold as any window.
+fn replan(
+    pending: &mut VecDeque<Window>,
+    units: Vec<String>,
+    budget: u64,
+    made: &mut usize,
+) -> Result<()> {
+    let mut next = Vec::new();
+    if let [only] = units.as_slice()
+        && text_tokens(only) > budget
+    {
+        let pieces = fragments(only, budget)?;
+        *made = made.saturating_add(pieces.len());
+        ensure!(
+            *made <= MAX_SUMMARY_FRAGMENTS,
+            "transcript needs more than {MAX_SUMMARY_FRAGMENTS} summary fragments; no summary was committed"
+        );
+        next.extend(pieces.into_iter().map(|piece| Window {
+            units: vec![piece],
+            budget,
+        }));
+    } else {
+        let sizes: Vec<u64> = units
+            .iter()
+            .map(|unit| text_tokens(unit).saturating_add(1))
+            .collect();
+        for range in plan(&sizes, 0..units.len(), budget) {
+            next.push(Window {
+                units: units[range].to_vec(),
+                budget,
+            });
+        }
     }
-    let mut end = keep;
-    while !text.is_char_boundary(end) {
-        end -= 1;
+    for window in next.into_iter().rev() {
+        pending.push_front(window);
     }
-    Cow::Owned(format!(
-        "{}\n\n[... {} more characters truncated]",
-        &text[..end],
-        text.len() - end
-    ))
+    Ok(())
 }
 
 fn escape_boundaries(text: &str) -> Cow<'_, str> {
@@ -446,6 +516,68 @@ pub(super) fn summarize_prefix(
     complete: &mut dyn FnMut(&mut Backend, &Chat, &mut dyn Ui) -> Result<String>,
     remote_observer: &mut Option<&mut RemoteCompactionObserver<'_>>,
 ) -> Result<String> {
+    summarize_prefix_with_worker(
+        backend,
+        messages,
+        keep,
+        policy,
+        context,
+        method,
+        focus,
+        interrupt,
+        ui,
+        complete,
+        remote_observer,
+        &mut None,
+    )
+}
+
+/// Carry the previous summary's file lists forward. Historical read inventories are navigation noise,
+/// not current edit witnesses: keep mutation targets, and let new reads repopulate the recent list.
+fn carry_forward(ops: &mut FileOps, carried: FileOps) {
+    ops.merge(carried);
+    ops.read.clear();
+    ops.recent.retain(|path| ops.modified.contains(path));
+}
+
+/// Finish a live Handoff summary over the full projected request. File targets are attempted
+/// operations across every message in the request, including any prior committed summary.
+pub(super) fn finish_handoff(messages: &[Value], summary: &str) -> String {
+    let mut ops = FileOps::default();
+    let mut seen_history = false;
+    for message in messages {
+        let history = is_history(message);
+        if history
+            && !seen_history
+            && let Some((_, carried)) = previous_summary(message)
+        {
+            seen_history = true;
+            carry_forward(&mut ops, carried);
+            continue;
+        }
+        seen_history |= history;
+        ops.observe(message);
+    }
+    ops.upsert(summary)
+}
+
+/// Summarize with an optional independently owned cloud route for the independent turn-prefix fold.
+/// Incremental folds stay sequential, and both results settle before the prepared summary is used.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn summarize_prefix_with_worker(
+    backend: &mut Backend,
+    messages: &[Value],
+    keep: usize,
+    policy: &CompactionConfig,
+    context: &CompactionContext<'_>,
+    method: CompactionMethod,
+    focus: &str,
+    interrupt: &Arc<AtomicBool>,
+    ui: &mut dyn Ui,
+    complete: &mut dyn FnMut(&mut Backend, &Chat, &mut dyn Ui) -> Result<String>,
+    remote_observer: &mut Option<&mut RemoteCompactionObserver<'_>>,
+    worker: &mut Option<SummaryWorker>,
+) -> Result<String> {
     let keep = keep.min(messages.len());
     let mut ops = FileOps::default();
     let mut previous: Option<&str> = None;
@@ -468,11 +600,7 @@ pub(super) fn summarize_prefix(
             && let Some((text, carried)) = previous_summary(message)
         {
             seen_history = true;
-            ops.merge(carried);
-            // Historical read inventories are navigation noise, not current edit witnesses.
-            // Keep mutation targets across folds; new reads repopulate the bounded recent inventory.
-            ops.read.clear();
-            ops.recent.retain(|path| ops.modified.contains(path));
+            carry_forward(&mut ops, carried);
             previous = Some(text).filter(|text| !text.is_empty());
             continue;
         }
@@ -492,14 +620,97 @@ pub(super) fn summarize_prefix(
     };
     let summary = if let Some(at) = turn_split(messages, &source, keep) {
         let (history, prefix) = source.split_at(at);
-        let earlier = if history.is_empty() {
-            previous.map_or_else(|| "No prior history.".to_owned(), str::to_owned)
+        let history = parts(history)?;
+        let prefix = parts(prefix)?;
+        let fork = if !history.is_empty()
+            && !backend.local_inference()
+            && method != CompactionMethod::Remote
+            && remote_observer.is_none()
+            && worker
+                .as_ref()
+                .is_some_and(|worker| !worker.backend.local_inference())
+        {
+            worker.take()
         } else {
-            fold(
+            None
+        };
+        let (earlier, turn) = if let Some(worker) = fork {
+            std::thread::scope(|scope| -> Result<(String, String)> {
+                let (mut worker_ui, replay) =
+                    crate::agent::compact::compaction_runtime::buffer_progress();
+                let child_interrupt = interrupt.clone();
+                let child = std::thread::Builder::new()
+                    .name("dial-summary-turn-prefix".into())
+                    .spawn_scoped(scope, move || {
+                        let SummaryWorker {
+                            mut backend,
+                            mut complete,
+                        } = worker;
+                        let result = fold(
+                            &mut backend,
+                            &prefix,
+                            None,
+                            Prompt::TurnPrefix,
+                            policy,
+                            context,
+                            method,
+                            focus,
+                            &child_interrupt,
+                            &mut worker_ui,
+                            &mut |backend, request, ui| {
+                                complete(backend, request, ui, child_interrupt.clone())
+                            },
+                            &mut None,
+                        );
+                        (result, replay)
+                    })
+                    .context("start independent split-summary worker")?;
+                // Store errors until after join: no return can detach a sibling request.
+                let earlier = fold(
+                    backend,
+                    &history,
+                    previous,
+                    Prompt::Main,
+                    policy,
+                    context,
+                    method,
+                    focus,
+                    interrupt,
+                    ui,
+                    complete,
+                    remote_observer,
+                );
+                let (turn, replay) = child.join().map_err(|_| {
+                    anyhow::anyhow!("split-summary worker panicked; no summary was committed")
+                })?;
+                replay(ui);
+                interrupted(interrupt)?;
+                Ok((earlier?, turn?))
+            })?
+        } else {
+            let earlier = if history.is_empty() {
+                previous.map_or_else(|| "No prior history.".to_owned(), str::to_owned)
+            } else {
+                fold(
+                    backend,
+                    &history,
+                    previous,
+                    Prompt::Main,
+                    policy,
+                    context,
+                    method,
+                    focus,
+                    interrupt,
+                    ui,
+                    complete,
+                    remote_observer,
+                )?
+            };
+            let turn = fold(
                 backend,
-                &parts(history)?,
-                previous,
-                Prompt::Main,
+                &prefix,
+                None,
+                Prompt::TurnPrefix,
                 policy,
                 context,
                 method,
@@ -508,22 +719,9 @@ pub(super) fn summarize_prefix(
                 ui,
                 complete,
                 remote_observer,
-            )?
+            )?;
+            (earlier, turn)
         };
-        let turn = fold(
-            backend,
-            &parts(prefix)?,
-            None,
-            Prompt::TurnPrefix,
-            policy,
-            context,
-            method,
-            focus,
-            interrupt,
-            ui,
-            complete,
-            remote_observer,
-        )?;
         format!("{earlier}\n\n---\n\n**Turn Context (split turn):**\n\n{turn}")
     } else {
         fold(
@@ -641,6 +839,8 @@ pub fn summarize_branch(
 }
 
 /// Summarize `parts` as a fold: each window updates the summary carried out of the previous one.
+/// Oversized texts are fragmented, never truncated; a provider rejection re-plans at a learned
+/// ceiling; the call and fragment counts are bounded so an oversized transcript fails explicitly.
 #[allow(clippy::too_many_arguments)]
 fn fold(
     backend: &mut Backend,
@@ -669,45 +869,58 @@ fn fold(
         .iter()
         .map(|part| text_tokens(part).saturating_add(1))
         .collect();
-    let mut pending: VecDeque<(Range<usize>, u64)> = if sizes.iter().sum::<u64>() <= budget {
-        VecDeque::from([(0..parts.len(), budget)])
+    let mut made = 0usize;
+    let mut pending: VecDeque<Window> = VecDeque::new();
+    if sizes.iter().sum::<u64>() <= budget {
+        pending.push_back(Window {
+            units: parts.to_vec(),
+            budget,
+        });
     } else {
-        plan(&sizes, 0..parts.len(), budget)
-            .into_iter()
-            .map(|range| (range, budget))
-            .collect()
-    };
-    let replan = |pending: &mut VecDeque<(Range<usize>, u64)>, range: Range<usize>, budget: u64| {
-        for range in plan(&sizes, range, budget).into_iter().rev() {
-            pending.push_front((range, budget));
+        for range in plan(&sizes, 0..parts.len(), budget) {
+            pending.push_back(Window {
+                units: parts[range].to_vec(),
+                budget,
+            });
         }
-    };
+    }
     let mut carried = previous.map(str::to_owned);
     // The largest window the provider is still believed to accept. A rejection lowers it for every
     // remaining sibling window, so one compaction never relearns the same limit window by window.
     let mut ceiling = budget;
-    while let Some((range, window_budget)) = pending.front().cloned() {
+    let mut calls = 0usize;
+    while let Some(Window {
+        units,
+        budget: window_budget,
+    }) = pending.pop_front()
+    {
         if window_budget > ceiling {
-            pending.pop_front();
-            replan(&mut pending, range, ceiling);
+            replan(&mut pending, units, ceiling, &mut made)?;
+            continue;
+        }
+        let joined = units.join("\n");
+        let tokens = text_tokens(&joined);
+        if tokens > window_budget {
+            replan(&mut pending, units, window_budget, &mut made)?;
             continue;
         }
         interrupted(interrupt)?;
-        let joined = parts[range.clone()].join("\n");
-        let tokens = text_tokens(&joined);
         let halved = window_budget.min(tokens) / 2;
-        let text = clamp(&joined, window_budget, tokens);
         let instructions = prompt_text(prompt, method, focus, carried.is_some());
-        let request = summary_request(&text, carried.as_deref(), &instructions, output, context);
+        let request = summary_request(&joined, carried.as_deref(), &instructions, output, context);
         if request_estimate(&request).saturating_add(u64::from(output)) > window {
             ensure!(
                 halved >= floor && halved < window_budget,
                 "compaction role window ({window} tokens) cannot fit one summary window plus the carried summary and {output} output tokens"
             );
-            pending.pop_front();
-            replan(&mut pending, range, halved);
+            replan(&mut pending, units, halved, &mut made)?;
             continue;
         }
+        ensure!(
+            calls < MAX_SUMMARY_CALLS,
+            "compaction summary needs more than {MAX_SUMMARY_CALLS} model calls to cover the transcript; no summary was committed"
+        );
+        calls += 1;
         let result = if method == CompactionMethod::Remote {
             (|| -> Result<String> {
                 let endpoint = policy
@@ -742,7 +955,6 @@ fn fold(
                     "compaction model produced an empty summary"
                 );
                 carried = Some(summary.trim().to_owned());
-                pending.pop_front();
             }
             Err(error) => {
                 interrupted(interrupt)?;
@@ -755,9 +967,8 @@ fn fold(
                     return Err(error);
                 }
                 ui.event(&crate::agent::ui::ui_event::UiEvent::new(crate::agent::ui::ui_event::EventKind::Recovery, format!("Summary window of about {tokens} tokens exceeded the compaction model's accepted input; re-planning at {halved} tokens.")));
-                pending.pop_front();
                 ceiling = ceiling.min(halved);
-                replan(&mut pending, range, halved);
+                replan(&mut pending, units, halved, &mut made)?;
             }
         }
     }

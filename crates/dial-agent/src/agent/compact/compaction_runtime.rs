@@ -11,7 +11,7 @@ use crate::config::compaction::{
     CompactionStrategy,
 };
 use crate::llm::{self, Chat, provider::Backend, usage::Scope};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use std::{
     sync::{
         Arc, Condvar, Mutex, Weak,
@@ -22,6 +22,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[derive(Clone)]
 /// Session state a portable summary request needs to rebuild its guidance loop.
 pub struct PortableSummaryContext {
     pub config: crate::config::types::Config,
@@ -80,7 +81,15 @@ pub fn portable_summary_completion(
             .checked_add(Duration::from_secs(timeout))
             .ok_or_else(|| anyhow::anyhow!("compaction summary deadline overflow"))?;
         let mut request = source.clone();
-        let profile = backend.compaction_summary_profile(request.max_tokens);
+        let profile = if source
+            .messages
+            .iter()
+            .any(|m| m["dial_compaction_handoff"] == true)
+        {
+            Some(backend.compaction_handoff_profile(request.max_tokens))
+        } else {
+            backend.compaction_summary_profile(request.max_tokens)
+        };
         loop {
             if cancel.load(Ordering::SeqCst) {
                 return Err(llm::Interrupted.into());
@@ -108,6 +117,22 @@ pub fn portable_summary_completion(
                 &cancel,
                 &mut |notice| ui.notice(notice),
             )?;
+            let provider_slot = crate::agent::model::provider_slots::acquire_checked(
+                &telemetry_config,
+                || -> Result<()> {
+                    if cancel.load(Ordering::SeqCst) {
+                        return Err(llm::Interrupted.into());
+                    }
+                    ensure!(
+                        Instant::now() < expires,
+                        "compaction summary deadline expired while waiting for a provider slot"
+                    );
+                    Ok(())
+                },
+                || ui.notice(crate::agent::model::provider_slots::QUEUED_NOTICE),
+            )?;
+            let remaining = expires.saturating_duration_since(Instant::now());
+            let _deadline = Deadline::start(generation_cancel.clone(), remaining)?;
             let started = Instant::now();
             let result = crate::agent::chat_with_ui_inner(
                 backend,
@@ -131,6 +156,7 @@ pub fn portable_summary_completion(
                 },
                 Some(&mut monitor),
             );
+            drop(provider_slot);
             match &result {
                 Ok(reply) => crate::telemetry::request(
                     &telemetry_config,
@@ -182,16 +208,99 @@ pub fn portable_summary_completion(
                 );
                 continue;
             }
-            let reply = result?;
-            ensure!(
-                reply.finish_reason != "length"
-                    && reply.tool_calls.is_empty()
-                    && !reply.text.trim().is_empty(),
-                "compaction response was truncated, empty or contained tool calls; original context is unchanged"
-            );
-            return Ok(reply.text);
+            let text =
+                crate::agent::model::roles::accept_auxiliary_reply(backend, "compaction", result?)
+                    .context("compaction response was rejected; original context is unchanged")?;
+            if text.trim().is_empty() {
+                backend.record_discarded_response()?;
+                anyhow::bail!("compaction response was empty; original context is unchanged");
+            }
+            return Ok(text);
         }
     }
+}
+
+/// Live Handoff may borrow the live cache lane; a portable fallback has a different prefix and
+/// always uses its own lane. Restore even on failure, before any backend is reused or released.
+fn scoped_summary_completion<C>(
+    mut complete: C,
+    side_namespace: Option<String>,
+) -> impl FnMut(&mut Backend, &Chat, &mut dyn Ui, Arc<AtomicBool>, u64) -> Result<String>
+where
+    C: FnMut(&mut Backend, &Chat, &mut dyn Ui, Arc<AtomicBool>, u64) -> Result<String>,
+{
+    move |backend, request, ui, cancel, timeout| {
+        let original = backend.prompt_cache_key().map(str::to_owned);
+        if !request
+            .messages
+            .iter()
+            .any(|message| message["dial_compaction_handoff"] == true)
+        {
+            backend.restore_cache_namespace(side_namespace.clone());
+        }
+        let result = complete(backend, request, ui, cancel, timeout);
+        backend.restore_cache_namespace(original);
+        result
+    }
+}
+
+/// Local inference, provider-request hooks and active work keep their existing exclusive owner.
+/// Only independent split summaries may use this second cloud route; incremental folds stay serial.
+pub(in crate::agent) fn summary_execution(
+    snapshot: &CompactionSnapshot,
+    context: PortableSummaryContext,
+    hooks: &[crate::config::types::HookConfig],
+    main: &Backend,
+    busy: bool,
+) -> Result<compaction::SummaryExecution> {
+    let mut execution = compaction::SummaryExecution {
+        live_handoff: snapshot.role_config.is_none()
+            && !snapshot.archive_migration
+            && main.supports_live_handoff()
+            && !hooks
+                .iter()
+                .any(|hook| hook.event == "before_provider_request")
+            && !snapshot
+                .native_request
+                .messages
+                .iter()
+                .any(|m| m["dial_portable_rules"] == true),
+        parallel: None,
+    };
+    if busy
+        || main.local_inference()
+        || snapshot.main_config.task.max_concurrency < 2
+        || hooks
+            .iter()
+            .any(|hook| hook.event == "before_provider_request")
+    {
+        return Ok(execution);
+    }
+    let config = snapshot
+        .role_config
+        .as_ref()
+        .unwrap_or(&snapshot.main_config);
+    let namespace = side_request_namespace(&snapshot.session_id)?;
+    let backend = crate::agent::make_backend(config)?
+        .without_steering()
+        .with_cache_namespace(&format!("{namespace}:turn-prefix"), config)?;
+    if backend.local_inference() {
+        return Ok(execution);
+    }
+    let timeout = maintenance_timeout(snapshot.timeout_secs);
+    let expires = Instant::now()
+        .checked_add(Duration::from_secs(timeout))
+        .ok_or_else(|| anyhow::anyhow!("split summary deadline overflow"))?;
+    let mut complete = portable_summary_completion(context, hooks.to_vec());
+    execution.parallel = Some(compaction::SummaryWorker {
+        backend,
+        complete: Box::new(move |backend, request, ui, cancel| {
+            let remaining = expires.saturating_duration_since(Instant::now());
+            ensure!(!remaining.is_zero(), "split summary deadline expired");
+            complete(backend, request, ui, cancel, remaining.as_secs().max(1))
+        }),
+    });
+    Ok(execution)
 }
 
 const PROGRESS_CAPACITY: usize = 32;
@@ -199,7 +308,7 @@ const PROGRESS_BYTES: usize = 4_096;
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MAINTENANCE_TIMEOUT_SECS: u64 = 300;
 
-fn maintenance_timeout(configured: u64) -> u64 {
+pub(in crate::agent) fn maintenance_timeout(configured: u64) -> u64 {
     if configured == 0 {
         MAINTENANCE_TIMEOUT_SECS
     } else {
@@ -553,6 +662,22 @@ impl Ui for WorkerUi {
     }
 }
 
+/// The same bounded progress sink for independently owned split summaries. Replay only after join,
+/// on the controller thread; neither an interactive UI nor an approval surface crosses the fork.
+pub(in crate::agent::compact) fn buffer_progress()
+-> (impl Ui + Send, impl FnOnce(&mut dyn Ui) + Send) {
+    let (progress, receiver) = mpsc::sync_channel(PROGRESS_CAPACITY);
+    let replay = move |ui: &mut dyn Ui| {
+        for progress in receiver.try_iter() {
+            match progress {
+                Progress::Notice(text) => ui.notice(&text),
+                Progress::Diagnostic(text) => ui.diagnostic(&text),
+            }
+        }
+    };
+    (WorkerUi { progress }, replay)
+}
+
 /// The deadline watcher never holds Backend's transport or the controller's compute mutex.
 /// Completion wakes it immediately instead of retaining a sleeping thread for the entire timeout.
 struct Deadline {
@@ -880,13 +1005,39 @@ impl CompactionRuntime {
     /// `complete` is the owner's real portable-rule/role-model callback. It must obey the supplied
     /// independent cancel and remaining deadline, and reject tool calls/truncated summary replies.
     /// `settled` may publish accounting, never mutate the live branch. It runs even after Drop.
+    #[cfg(test)]
     pub fn start<C, L>(
+        &mut self,
+        backends: WorkerBackends,
+        snapshot: CompactionSnapshot,
+        work: CompactionWork,
+        complete: C,
+        settled: L,
+    ) -> Result<Launch>
+    where
+        C: FnMut(&mut Backend, &Chat, &mut dyn Ui, Arc<AtomicBool>, u64) -> Result<String>
+            + Send
+            + 'static,
+        L: FnOnce(WorkerSettlement) + Send + 'static,
+    {
+        self.start_with_execution(
+            backends,
+            snapshot,
+            work,
+            complete,
+            settled,
+            compaction::SummaryExecution::default(),
+        )
+    }
+
+    fn start_with_execution<C, L>(
         &mut self,
         mut backends: WorkerBackends,
         mut snapshot: CompactionSnapshot,
         work: CompactionWork,
         mut complete: C,
         settled: L,
+        mut execution: compaction::SummaryExecution,
     ) -> Result<Launch>
     where
         C: FnMut(&mut Backend, &Chat, &mut dyn Ui, Arc<AtomicBool>, u64) -> Result<String>
@@ -969,6 +1120,9 @@ impl CompactionRuntime {
         if let Some(summary) = &mut backends.summary {
             summary.set_usage_scope(Some(ledger_scope.clone()));
         }
+        if let Some(parallel) = &mut execution.parallel {
+            parallel.backend.set_usage_scope(Some(ledger_scope.clone()));
+        }
         let worker = thread::Builder::new()
             .name("dial-compaction".into())
             .spawn(move || {
@@ -985,15 +1139,24 @@ impl CompactionRuntime {
                             !remaining.is_zero(),
                             "background compaction deadline expired"
                         );
+                        let target = if request
+                            .messages
+                            .iter()
+                            .any(|m| m["dial_compaction_handoff"] == true)
+                        {
+                            backend
+                        } else {
+                            backends.summary.as_mut().unwrap_or(backend)
+                        };
                         complete(
-                            backends.summary.as_mut().unwrap_or(backend),
+                            target,
                             request,
                             ui,
                             worker_cancel.clone(),
                             remaining.as_secs().max(1),
                         )
                     };
-                    compaction::compact_history(
+                    compaction::compact_history_with_execution(
                         &mut backends.main,
                         compaction::HistoryCompaction {
                             request: &worker_snapshot.source,
@@ -1005,6 +1168,7 @@ impl CompactionRuntime {
                         &mut ui,
                         &mut callback,
                         None,
+                        &mut execution,
                     )
                 }));
                 let panicked = result.is_err();
@@ -1263,7 +1427,7 @@ impl crate::agent::Agent<'_> {
         &mut self,
         ui: &mut dyn Ui,
         request: BackgroundCompactionRequest<'_>,
-        live_backend: Option<&mut Backend>,
+        mut live_backend: Option<&mut Backend>,
     ) -> Result<Launch> {
         let BackgroundCompactionRequest {
             template,
@@ -1285,7 +1449,7 @@ impl crate::agent::Agent<'_> {
         if self.compaction_runtime.has_slot() || self.compaction_runtime.has_live_worker() {
             return Ok(Launch::Busy);
         }
-        self.prepare_compaction_memory(ui, live_backend);
+        self.prepare_compaction_memory(ui, live_backend.as_deref_mut());
         let mut snapshot = self.compaction_snapshot(template)?;
         snapshot.native_profile = native_profile.cloned().or(snapshot.native_profile.take());
         let namespace = side_request_namespace(&snapshot.session_id)?;
@@ -1326,16 +1490,32 @@ impl crate::agent::Agent<'_> {
             .role_config
             .clone()
             .unwrap_or_else(|| snapshot.main_config.clone());
-        let complete = portable_summary_completion(
-            PortableSummaryContext {
-                config: completion_config,
-                layout: self.layout.clone(),
-                root: self.workspace.root().to_path_buf(),
-                control_state: self.session.control_state(),
-                session_id: snapshot.session_id.clone(),
-                hermetic: self.hermetic,
-            },
-            self.tool_hooks().to_vec(),
+        let completion_context = PortableSummaryContext {
+            config: completion_config,
+            layout: self.layout.clone(),
+            root: self.workspace.root().to_path_buf(),
+            control_state: self.session.control_state(),
+            session_id: snapshot.session_id.clone(),
+            hermetic: self.hermetic,
+        };
+        let mut execution = summary_execution(
+            &snapshot,
+            completion_context.clone(),
+            self.tool_hooks(),
+            &main,
+            self.maintenance_has_live_work(),
+        )?;
+        let side_cache_namespace = main.prompt_cache_key().map(str::to_owned);
+        if execution.live_handoff {
+            if let Some(live) = live_backend {
+                main.copy_cache_namespace_from(live);
+            } else {
+                execution.live_handoff = false;
+            }
+        }
+        let complete = scoped_summary_completion(
+            portable_summary_completion(completion_context, self.tool_hooks().to_vec()),
+            side_cache_namespace,
         );
         let scope = if kind == WorkKind::Idle {
             self.usage_scope.next_turn(0)?
@@ -1350,7 +1530,7 @@ impl crate::agent::Agent<'_> {
             },
             snapshot.branch_leaf.clone(),
         );
-        let result = self.compaction_runtime.start(
+        let result = self.compaction_runtime.start_with_execution(
             WorkerBackends { main, summary },
             snapshot,
             CompactionWork {
@@ -1365,6 +1545,7 @@ impl crate::agent::Agent<'_> {
             },
             complete,
             settle_into_runtime(body.clone()),
+            execution,
         );
         if !matches!(&result, Ok(Launch::Started)) {
             body.settle(

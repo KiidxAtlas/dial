@@ -646,6 +646,16 @@ fn scripted_worker_with_tools(
     max_steps: u32,
     resume: Vec<Value>,
 ) -> (Outcome, Vec<Value>, usize, Vec<String>) {
+    scripted_worker_with_config(enabled, scripts, max_steps, resume, |_| {})
+}
+
+fn scripted_worker_with_config(
+    enabled: &[&str],
+    scripts: Vec<llm::fake::Script>,
+    max_steps: u32,
+    resume: Vec<Value>,
+    configure: impl FnOnce(&mut Config),
+) -> (Outcome, Vec<Value>, usize, Vec<String>) {
     use std::sync::atomic::AtomicUsize;
     struct Counted(Arc<AtomicUsize>);
     impl Tool for Counted {
@@ -679,6 +689,21 @@ fn scripted_worker_with_tools(
         ) -> Result<(), approval::Denial> {
             Ok(())
         }
+        fn authorize_mutation(
+            &mut self,
+            _: &llm::ToolCall,
+            _: &str,
+            _: &[std::path::PathBuf],
+            _: bool,
+            cancel: &Arc<AtomicBool>,
+            _: subagents::MutationScope,
+        ) -> Result<(), String> {
+            if cancel.load(Ordering::SeqCst) {
+                Err("fixture mutation cancelled".into())
+            } else {
+                Ok(())
+            }
+        }
         fn tool_started(&mut self, _call_id: &str, name: &str, _: &Registry) {
             self.0.push(name.into());
         }
@@ -697,6 +722,7 @@ fn scripted_worker_with_tools(
     config.codebase.enabled = false;
     config.memory.autolearn = false;
     config.edit.recover_inline_edits = true;
+    configure(&mut config);
     let workspace = Workspace::new(dir.path())
         .unwrap()
         .with_edit_settings(config.edit.clone())
@@ -1302,6 +1328,198 @@ fn a_worker_refuses_a_failed_read_retry_but_can_read_a_corrected_path() {
 }
 
 #[test]
+fn a_worker_native_write_refusal_skips_dependent_actions_but_allows_diagnostics_and_disjoint_work()
+{
+    let batch = [
+        (
+            "write",
+            json!({"path":"source-0.txt","content":"unseen overwrite\n"}),
+        ),
+        (
+            "write",
+            json!({"path":"source-0.txt","content":"dependent overwrite\n"}),
+        ),
+        ("bash", json!({"command":"printf ran > run-started.txt"})),
+        ("check", json!({"names":["candidate"]})),
+        ("read", json!({"path":"source-0.txt"})),
+        ("read", json!({"path":"source-1.txt"})),
+        (
+            "write",
+            json!({"path":"independent.txt","content":"independent change\n"}),
+        ),
+    ];
+    let calls: Vec<Value> = batch.iter().enumerate().map(|(index, (name, args))| {
+        json!({"index":index,"id":format!("prerequisite-{index}"),"type":"function","function":{"name":name,"arguments":args.to_string()}})
+    }).collect();
+    let event = json!({"choices":[{"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}]});
+    let scripts = vec![
+        llm::fake::Script::Sse(format!("data: {event}\n\ndata: [DONE]\n\n")),
+        scripted_reply("", Some(("read", json!({"path":"independent.txt"})))),
+        scripted_reply(
+            "The refused overwrite was not applied; diagnostic and independent work completed.",
+            None,
+        ),
+    ];
+    let (outcome, requests, _, started) = scripted_worker_with_config(
+        &["write", "read", "bash", "check"],
+        scripts,
+        0,
+        vec![],
+        |config| {
+            config.edit.enforce_seen_lines = true;
+        },
+    );
+    assert_eq!(
+        outcome.status.phase,
+        crate::runtime::Phase::Completed,
+        "{}",
+        outcome.status.text
+    );
+    assert_eq!(
+        started
+            .iter()
+            .filter(|name| name.as_str() == "write")
+            .count(),
+        2,
+        "only the refused native write and independent write may start: {started:?}"
+    );
+    assert_eq!(
+        started
+            .iter()
+            .filter(|name| name.as_str() == "read")
+            .count(),
+        3,
+        "{started:?}"
+    );
+    assert!(
+        !started
+            .iter()
+            .any(|name| matches!(name.as_str(), "bash" | "check")),
+        "{started:?}"
+    );
+    assert_eq!(requests.len(), 3, "{requests:?}");
+    let results: Vec<&Value> = requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .collect();
+    assert_eq!(results.len(), batch.len(), "{results:?}");
+    assert_eq!(
+        results[0]["is_error"], true,
+        "native unseen overwrite must fail: {results:?}"
+    );
+    for index in [1, 2, 3] {
+        assert_eq!(
+            results[index]["dial_recovery"]["status"], "skipped",
+            "{results:?}"
+        );
+        assert_eq!(
+            results[index]["dial_recovery"]["effects"], "none",
+            "{results:?}"
+        );
+    }
+    for (index, expected) in [(4, "source evidence 0"), (5, "source evidence 1")] {
+        assert_eq!(results[index]["is_error"], false, "{results:?}");
+        assert!(
+            results[index]["content"]
+                .as_str()
+                .unwrap()
+                .contains(expected),
+            "{results:?}"
+        );
+    }
+    assert_eq!(results[6]["is_error"], false, "{results:?}");
+    let retained = requests[2]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "tool")
+        .unwrap();
+    assert_eq!(retained["is_error"], false, "{retained:?}");
+    assert!(
+        retained["content"]
+            .as_str()
+            .unwrap()
+            .contains("independent change"),
+        "{retained:?}"
+    );
+}
+
+#[test]
+fn unlimited_worker_mixed_empty_replies_and_failed_tools_share_the_recovery_limit() {
+    let mut scripts = Vec::new();
+    for _ in 0..8 {
+        scripts.push(scripted_reply("", None));
+        scripts.push(scripted_reply(
+            "",
+            Some(("read", json!({"path":"missing.txt"}))),
+        ));
+    }
+    let (outcome, requests, _, started) = scripted_worker(scripts, 0, vec![]);
+    assert_ne!(outcome.status.phase, crate::runtime::Phase::Completed);
+    assert_eq!(requests.len(), 16, "{}", outcome.status.text);
+    assert!(
+        outcome.status.text.contains("16 recovery attempts"),
+        "{}",
+        outcome.status.text
+    );
+    assert_eq!(
+        started,
+        ["read"],
+        "unchanged failed reads must stay behind the retry barrier"
+    );
+}
+
+#[test]
+fn worker_overflow_at_the_shared_recovery_limit_stops_before_context_maintenance() {
+    for notes_backed in [false, true] {
+        let mut scripts = Vec::new();
+        for index in 0..15 {
+            scripts.push(if index % 2 == 0 {
+                scripted_reply("", None)
+            } else {
+                scripted_reply("", Some(("read", json!({"path":"missing.txt"}))))
+            });
+        }
+        scripts.push(llm::fake::json(
+            400,
+            &json!({"error":{"message":"This model's maximum context length is 8192 tokens. However, your messages resulted in 9000 tokens.","code":"context_length_exceeded"}}),
+        ));
+        let (outcome, requests, calls, started) = scripted_worker_with_config(
+            &["read", "context_notes", "new_context", "session_search"],
+            scripts,
+            0,
+            vec![],
+            |config| {
+                config.compaction.enabled = true;
+                config.compaction.experimental_context_management = notes_backed;
+                config.retry.max_attempts = 1;
+            },
+        );
+        assert_ne!(
+            outcome.status.phase,
+            crate::runtime::Phase::Completed,
+            "notes_backed={notes_backed}: {}",
+            outcome.status.text
+        );
+        assert!(
+            outcome.status.text.contains("16 recovery attempts"),
+            "notes_backed={notes_backed}: {}",
+            outcome.status.text
+        );
+        assert_eq!(
+            requests.len(),
+            16,
+            "notes_backed={notes_backed}: no compaction, memory or continuation inference is permitted after the cap"
+        );
+        assert_eq!(calls, 0);
+        assert_eq!(started, ["read"], "notes_backed={notes_backed}");
+    }
+}
+
+#[test]
 fn queued_settings_switch_only_the_next_worker_request() {
     use crate::agent::workers::live_tasks::control::WorkerSettings;
 
@@ -1364,109 +1582,155 @@ fn queued_settings_switch_only_the_next_worker_request() {
         }
     }
 
-    let server = llm::fake::serve(vec![
-        scripted_reply("", Some(("fixture_lookup", json!({})))),
-        scripted_reply("done", None),
-    ]);
-    let dir = tempfile::tempdir().unwrap();
-    let base_url = format!("{}/v1", server.url);
-    let mut config = Config {
-        model: "default-model".into(),
-        ..Config::default()
-    };
-    config.compaction.enabled = false;
-    config.codebase.enabled = false;
-    config.memory.autolearn = false;
-    config.endpoint = Some(crate::config::types::EndpointConfig {
-        headers: None,
-        base_url: base_url.clone(),
-        api_key_env: None,
-        allow_insecure: false,
-        protocol: None,
-        account_id: None,
-    });
-    let mut second = config.selection();
-    second.model = "second-model".into();
-    config.model_roles.insert("small".into(), second);
-    let workspace = Workspace::new(dir.path()).unwrap();
-    let harness = Harness {
-        tools: vec!["fixture_lookup".into()],
-        ..Harness::default()
-    };
-    let mut ext = Registry::new();
-    ext.register(Arc::new(Lookup));
-    let interrupt = Arc::new(AtomicBool::new(false));
-    let env = Env {
-        config: &config,
-        workspace: &workspace,
-        ext: &ext,
-        layout: None,
-        harness: &harness,
-        interrupt: &interrupt,
-        usage: None,
-        context_cap: None,
-        memory: None,
-        agents_messages: &[],
-        plan_mode: false,
-    };
-    let parsed = subagents::parse(
-        &json!({"agent":"worker","task":"Inspect source","solution_space":"fixtures","max_steps":2}),
-        &config,
-    )
-    .unwrap();
-    let children = ChildBackends::new(env, None).unwrap();
-    let mut backend = Backend::new(
-        llm::provider::ProviderKind::Endpoint {
-            base_url,
+    for (pinned, recovering) in [(false, false), (true, false), (false, true)] {
+        let mut scripts = Vec::new();
+        if recovering {
+            let event = json!({"choices":[{"delta":{"content":"partial answer"},"finish_reason":"length"}]});
+            scripts.push(llm::fake::Script::Sse(format!(
+                "data: {event}\n\ndata: [DONE]\n\n"
+            )));
+        }
+        scripts.extend([
+            scripted_reply("", Some(("fixture_lookup", json!({})))),
+            scripted_reply("done", None),
+        ]);
+        let server = llm::fake::serve(scripts);
+        let dir = tempfile::tempdir().unwrap();
+        let base_url = format!("{}/v1", server.url);
+        let mut config = Config {
             model: "default-model".into(),
-            api_key: None,
-        },
-        std::path::PathBuf::new(),
-        5,
-    );
-    backend
-        .bind_session(&config, &mut children.journal.borrow_mut().session)
+            ..Config::default()
+        };
+        config.harness_temperature_pinned = pinned;
+        config.compaction.enabled = false;
+        config.codebase.enabled = false;
+        config.memory.autolearn = false;
+        config.endpoint = Some(crate::config::types::EndpointConfig {
+            headers: None,
+            base_url: base_url.clone(),
+            api_key_env: None,
+            allow_insecure: false,
+            protocol: None,
+            account_id: None,
+        });
+        let mut second = config.selection();
+        second.model = "second-model".into();
+        config.model_roles.insert("small".into(), second);
+        let workspace = Workspace::new(dir.path()).unwrap();
+        let harness = Harness {
+            tools: vec!["fixture_lookup".into()],
+            max_tokens: if pinned { 256 } else { 0 },
+            ..Harness::default()
+        };
+        let mut ext = Registry::new();
+        ext.register(Arc::new(Lookup));
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let env = Env {
+            config: &config,
+            workspace: &workspace,
+            ext: &ext,
+            layout: None,
+            harness: &harness,
+            interrupt: &interrupt,
+            usage: None,
+            context_cap: None,
+            memory: None,
+            agents_messages: &[],
+            plan_mode: false,
+        };
+        let parsed = subagents::parse(
+            &json!({
+                "agent": "worker",
+                "task": "Inspect source",
+                "solution_space": "fixtures",
+                "max_steps": if recovering { 3 } else { 2 },
+            }),
+            &config,
+        )
         .unwrap();
-    let mut approver = Queued::default();
-    let outcome = run_inner(
-        env,
-        &parsed.jobs[0],
-        &mut backend,
-        None,
-        &mut approver,
-        &mut crate::agent::safety::rules::State::default(),
-        &children,
-    );
+        let children = ChildBackends::new(env, None).unwrap();
+        let mut backend = Backend::new(
+            llm::provider::ProviderKind::Endpoint {
+                base_url,
+                model: "default-model".into(),
+                api_key: None,
+            },
+            std::path::PathBuf::new(),
+            5,
+        );
+        backend
+            .bind_session(&config, &mut children.journal.borrow_mut().session)
+            .unwrap();
+        let mut approver = Queued::default();
+        let outcome = run_inner(
+            env,
+            &parsed.jobs[0],
+            &mut backend,
+            None,
+            &mut approver,
+            &mut crate::agent::safety::rules::State::default(),
+            &children,
+        );
 
-    assert_eq!(outcome.status.phase, crate::runtime::Phase::Completed);
-    let models: Vec<String> = server
-        .requests()
-        .iter()
-        .map(|raw| {
-            llm::fake::body(raw)["model"]
-                .as_str()
-                .unwrap_or_default()
-                .to_owned()
-        })
-        .collect();
-    assert_eq!(
-        models,
-        ["default-model", "second-model"],
-        "actual worker history: {:?}",
-        outcome
-            .conversation
-            .as_ref()
-            .map(|conversation| &conversation.messages)
-    );
-    assert_eq!(approver.applied.len(), 1);
-    assert_eq!(
-        config.model, "default-model",
-        "the launched config stays unchanged"
-    );
+        assert_eq!(outcome.status.phase, crate::runtime::Phase::Completed);
+        let requests = server.requests();
+        for (index, raw) in requests.iter().enumerate() {
+            let body = llm::fake::body(raw);
+            if pinned {
+                assert_eq!(body["temperature"], json!(0.2));
+                assert_eq!(body["max_tokens"], json!(256));
+            } else {
+                assert!(
+                    body.get("temperature").is_none(),
+                    "worker must inherit host sampling: {body}"
+                );
+                if recovering && index == 1 {
+                    assert!(
+                        body["max_tokens"].as_u64().is_some_and(|limit| limit > 0),
+                        "recovery must keep its finite output allowance: {body}"
+                    );
+                } else {
+                    assert!(
+                        body.get("max_tokens").is_none(),
+                        "worker must inherit host output limit: {body}"
+                    );
+                    assert!(body.get("max_completion_tokens").is_none());
+                }
+            }
+        }
+        let models: Vec<String> = requests
+            .iter()
+            .map(|raw| {
+                llm::fake::body(raw)["model"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect();
+        let expected_models: &[&str] = if recovering {
+            &["default-model", "default-model", "second-model"]
+        } else {
+            &["default-model", "second-model"]
+        };
+        assert_eq!(
+            models,
+            expected_models,
+            "actual worker history: {:?}",
+            outcome
+                .conversation
+                .as_ref()
+                .map(|conversation| &conversation.messages)
+        );
+        assert_eq!(approver.applied.len(), 1);
+        assert_eq!(
+            config.model, "default-model",
+            "the launched config stays unchanged"
+        );
+    }
 }
 
 #[test]
-fn a_known_tool_typed_into_a_workers_bash_gets_load_coaching_and_never_runs() {
+fn a_known_tool_typed_into_a_workers_bash_gets_direct_coaching_and_never_runs() {
     let typed = json!({"command":"fixture_lookup list"});
     let (outcome, requests, calls, started) = scripted_worker_with_tools(
         &["fixture_lookup", "bash"],
@@ -1486,6 +1750,19 @@ fn a_known_tool_typed_into_a_workers_bash_gets_load_coaching_and_never_runs() {
     assert_eq!(calls, 0, "the known tool must not execute through any path");
     assert_eq!(started, ["bash"], "only the typed bash call starts");
     assert_eq!(requests.len(), 2);
+    let offered = requests[0]["tools"].as_array().unwrap();
+    assert!(
+        offered
+            .iter()
+            .any(|tool| tool["function"]["name"] == "fixture_lookup"),
+        "direct coaching requires the tool's supplied schema"
+    );
+    assert!(
+        !offered
+            .iter()
+            .any(|tool| tool["function"]["name"] == "tool_load"),
+        "the worker has a fixed surface without a loader"
+    );
     let results: Vec<String> = requests[1]["messages"]
         .as_array()
         .unwrap()
@@ -1495,8 +1772,101 @@ fn a_known_tool_typed_into_a_workers_bash_gets_load_coaching_and_never_runs() {
         .collect();
     assert_eq!(results.len(), 1, "{results:?}");
     assert!(
-        results[0].contains("tool_not_shell") && results[0].contains("tool_load"),
+        results[0].contains("tool_not_shell")
+            && results[0].contains("Call it directly with its supplied schema")
+            && !results[0].contains("tool_load"),
         "the next worker request carries the coaching: {}",
         results[0]
     );
+}
+
+#[test]
+fn child_reasoning_strategy_is_inherited_on_initial_and_resumed_requests_without_changing_scope() {
+    use crate::config::types::ReasoningStrategy;
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(dir.path()).unwrap();
+    let harness = Harness::default();
+    let ext = Registry::new();
+    let interrupt = Arc::new(AtomicBool::new(false));
+    let operator = [
+        json!({"role":"developer","content":"Operator constraint: parser only; approvals remain mandatory."}),
+    ];
+    let names = vec!["read".into()];
+    let retained = vec![
+        json!({"role":"user","content":"Inspect parser without changing public APIs."}),
+        json!({"role":"assistant","content":"Prior observation: parser has an unchecked boundary."}),
+    ];
+    for resume in [false, true] {
+        let build = |strategy| {
+            let mut parent = Config::default();
+            parent.experimental.reasoning_strategy = strategy;
+            let config = parent.for_role("small");
+            assert_eq!(config.experimental.reasoning_strategy, strategy);
+            let env = Env {
+                config: &config,
+                workspace: &workspace,
+                ext: &ext,
+                layout: None,
+                harness: &harness,
+                interrupt: &interrupt,
+                usage: None,
+                context_cap: None,
+                memory: None,
+                agents_messages: &operator,
+                plan_mode: false,
+            };
+            let mut parsed = subagents::parse(
+                &json!({
+                    "agent":"reviewer", "task":"Inspect parser without changing public APIs.",
+                    "solution_space":"Only parser module", "output_schema":{"type":"object"}
+                }),
+                &config,
+            )
+            .unwrap();
+            parsed.jobs[0].preloaded = "Parser conventions: keep byte offsets stable.".into();
+            if resume {
+                parsed.jobs[0].resume_messages = retained.clone();
+            }
+            initial_messages(env, &parsed.jobs[0], &names)
+        };
+        let baseline = build(ReasoningStrategy::Default);
+        let selected = build(ReasoningStrategy::VerificationFirst);
+        let guidance =
+            crate::agent::prompts::reasoning::guidance(ReasoningStrategy::VerificationFirst)
+                .unwrap();
+        assert_eq!(
+            &selected[..2],
+            &baseline[..2],
+            "resume={resume}: frozen/operator instructions changed"
+        );
+        assert_eq!(
+            &selected[3..],
+            &baseline[3..],
+            "resume={resume}: assignment/history changed"
+        );
+        assert_eq!(
+            selected[2]["content"].as_str().unwrap(),
+            format!("{}{guidance}", baseline[2]["content"].as_str().unwrap()),
+            "resume={resume}: role, scope, schema and skills must be retained"
+        );
+        assert_eq!(
+            selected
+                .iter()
+                .filter_map(|m| m["content"].as_str())
+                .map(|text| text.matches(guidance).count())
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(selected[1], operator[0]);
+        if resume {
+            assert_eq!(&selected[3..5], retained.as_slice());
+        } else {
+            assert!(
+                selected.last().unwrap()["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Inspect parser without changing public APIs.")
+            );
+        }
+    }
 }

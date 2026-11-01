@@ -12,6 +12,7 @@ impl Agent<'_> {
         ui: &mut dyn Ui,
         round: Round,
     ) -> Result<crate::agent::run::engine::Tick<TurnReport>> {
+        let mut progress = engine.take_round_progress();
         let Round {
             step,
             single_call,
@@ -42,6 +43,14 @@ impl Agent<'_> {
             steering: round_steering,
             portable_batch_intercepted,
         } = outcome;
+        if progress != crate::agent::run::engine::RoundProgress::Productive
+            && (short_circuited
+                || execution_failed
+                || observed_check_failure
+                || !form_kinds.is_empty())
+        {
+            progress = crate::agent::run::engine::RoundProgress::Stalled;
+        }
         if let Some(reason) = engine.pending_refusal() {
             self.accept_steering(round_steering, ui)?;
             return self
@@ -69,6 +78,14 @@ impl Agent<'_> {
             turn.steering_pending = true;
             ui.event(&crate::agent::ui::ui_event::UiEvent::new(crate::agent::ui::ui_event::EventKind::Steering, "Kept completed tool results and skipped unstarted old actions; replanning with your new instruction."));
             return Ok(crate::agent::run::engine::Tick::Again);
+        }
+        if let Some(finish) = finished.as_ref() {
+            // A terminal batch can itself reach the recovery cap; retain its candidate before
+            // the shared policy returns the blocked report instead of publishing completion.
+            turn.completion_candidate = Some(finish.text.clone());
+        }
+        if let Some(report) = self.tool_progress(turn, engine, progress, step, ui)? {
+            return Ok(crate::agent::run::engine::Tick::Finished(report));
         }
         if portable_batch_intercepted {
             if !turn.rule_state.callback_retry() {
@@ -181,7 +198,8 @@ impl Agent<'_> {
         // A reached escalation step takes effect at the next turn, so this turn's prompt and
         // offer stay as they are.
         self.observe_local_round(!form_kinds.is_empty() || edit_failed, ui);
-        let tool_round_failed = !form_kinds.is_empty()
+        let tool_round_failed = progress == crate::agent::run::engine::RoundProgress::Stalled
+            || !form_kinds.is_empty()
             || execution_failed
             || observed_check_failure
             || self.request_phase.phase == crate::config::adaptive::Phase::Recovery;
@@ -342,8 +360,15 @@ impl Agent<'_> {
             if turn.auto_continues < self.config.reliability.auto_continue_rounds
                 && !self.interrupt.load(Ordering::SeqCst)
             {
-                if let Some(report) =
-                    self.setback(turn, super::progress::Setback::AutomaticContinue, step, ui)?
+                // A failed batch already paid for this recovery round, regardless of its size.
+                if progress != crate::agent::run::engine::RoundProgress::Stalled
+                    && let Some(report) = self.setback(
+                        turn,
+                        engine,
+                        super::progress::Setback::AutomaticContinue,
+                        step,
+                        ui,
+                    )?
                 {
                     return Ok(crate::agent::run::engine::Tick::Finished(report));
                 }
@@ -407,6 +432,12 @@ impl Agent<'_> {
         if !form_kinds.is_empty() || execution_failed || observed_check_failure {
             self.request_phase
                 .recover("tool round failed; correct its observed diagnostics");
+        }
+        if !turn.final_step && observed_check_failure && self.stop_boundary().is_none() {
+            self.activate_gap_capabilities(
+                crate::agent::run::tool_exposure::CapabilityGap::DiagnosticFailure,
+                &mut turn.capability_gaps,
+            )?;
         }
         turn.names = self.offered();
         *schemas = self.schemas(&turn.names)?;

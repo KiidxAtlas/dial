@@ -1,4 +1,5 @@
 use super::testkit::*;
+use crate::tools::{ToolStatus, surface::outcome::Effects};
 use serde_json::json;
 
 #[test]
@@ -78,4 +79,103 @@ fn file_tools_read_and_write_under_an_added_root() {
     let write = run(&ws, "write", json!({"path": created, "content": "made\n"}));
     assert!(!write.is_error, "{}", write.text);
     assert_eq!(std::fs::read_to_string(&created).unwrap(), "made\n");
+}
+
+/// An absolute path outside every root is a structural boundary refusal: `Blocked` with no
+/// effects, so recovery names the permission boundary instead of a malformed call.
+#[test]
+fn write_outside_every_root_is_blocked_with_no_effects() {
+    let (_dir, mut ws) = workspace();
+    let other = tempfile::tempdir().unwrap();
+    let target = other.path().join("out.txt");
+    let output = run(&ws, "write", json!({"path": target, "content": "x"}));
+    assert!(output.is_error, "{}", output.text);
+    assert_eq!(
+        output.execution.status,
+        Some(ToolStatus::Blocked),
+        "{}",
+        output.text
+    );
+    assert_eq!(output.execution.effects, Effects::None);
+    assert!(output.text.contains("request_directory"), "{}", output.text);
+    assert!(!target.exists());
+    ws.add_root(other.path()).unwrap();
+    let output = run(&ws, "write", json!({"path": target, "content": "x"}));
+    assert!(!output.is_error, "{}", output.text);
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "x");
+}
+
+/// Relative escapes and symlink escapes use the same resolver classification as absolute paths.
+#[test]
+fn relative_write_escape_is_blocked_and_malformed_outside_path_is_not() {
+    let (_dir, ws) = workspace();
+    let output = run(&ws, "write", json!({"path":"../denied.txt", "content":"x"}));
+    assert_eq!(
+        output.execution.status,
+        Some(ToolStatus::Blocked),
+        "{}",
+        output.text
+    );
+    assert_eq!(output.execution.effects, Effects::None);
+    let malformed = format!("{}/a\0b", ws.root().parent().unwrap().display());
+    let output = run(&ws, "write", json!({"path":malformed, "content":"x"}));
+    assert_ne!(
+        output.execution.status,
+        Some(ToolStatus::Blocked),
+        "{}",
+        output.text
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_write_escape_is_blocked_with_no_effects() {
+    let (_dir, ws) = workspace();
+    let other = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(other.path(), ws.root().join("link")).unwrap();
+    let output = run(&ws, "write", json!({"path":"link/out.txt", "content":"x"}));
+    assert_eq!(
+        output.execution.status,
+        Some(ToolStatus::Blocked),
+        "{}",
+        output.text
+    );
+    assert_eq!(output.execution.effects, Effects::None);
+    assert!(!other.path().join("out.txt").exists());
+}
+
+/// A malformed path inside the workspace stays an ordinary error, not a boundary refusal.
+#[test]
+fn in_root_malformed_write_path_stays_an_error_not_blocked() {
+    let (_dir, ws) = workspace();
+    let malformed = ws.root().join("a\0b").display().to_string();
+    let output = run(&ws, "write", json!({"path": malformed, "content": "x"}));
+    assert!(output.is_error, "{}", output.text);
+    assert_ne!(
+        output.execution.status,
+        Some(ToolStatus::Blocked),
+        "{}",
+        output.text
+    );
+}
+
+#[test]
+fn protected_write_is_blocked_with_no_effects() {
+    let (_dir, ws) = workspace();
+    let protected = ws.root().join("private");
+    std::fs::create_dir(&protected).unwrap();
+    let ws = ws.with_protected_paths(std::slice::from_ref(&protected));
+    let output = run(
+        &ws,
+        "write",
+        json!({"path":"private/out.txt", "content":"x"}),
+    );
+    assert_eq!(
+        output.execution.status,
+        Some(ToolStatus::Blocked),
+        "{}",
+        output.text
+    );
+    assert_eq!(output.execution.effects, Effects::None);
+    assert!(!protected.join("out.txt").exists());
 }

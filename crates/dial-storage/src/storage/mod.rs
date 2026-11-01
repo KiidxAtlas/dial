@@ -24,6 +24,7 @@ pub mod session_pins;
 pub mod share;
 pub mod side_thread;
 pub mod skills;
+pub mod snapcompact;
 pub mod store;
 pub mod subagent;
 pub mod transcript;

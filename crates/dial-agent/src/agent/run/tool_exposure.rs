@@ -3,6 +3,7 @@ use crate::config;
 
 use crate::agent::*;
 use crate::config::types::{LEAN_AUTO_MAX_WINDOW, LeanLocal};
+use std::collections::BTreeSet;
 
 mod task_context;
 mod task_routing;
@@ -35,11 +36,6 @@ impl<'a> Agent<'a> {
             token.as_deref(),
             config.request_headers(),
         );
-        // Ollama: a window this machine's memory cannot hold is planned at what it can.
-        let loaded = match (loaded, self.local_affordable_context()) {
-            (Some(loaded), Some(affordable)) => Some(loaded.min(affordable)),
-            (loaded, affordable) => loaded.or(affordable),
-        };
         if let Some(loaded) = loaded {
             let profile = (self.lean_local(), self.minimal_tools());
             self.context_cap = Some(loaded);
@@ -69,6 +65,15 @@ impl<'a> Agent<'a> {
 
     /// Initial tool budget under the lean local profile. A configured 0 (unlimited) becomes this bound.
     const LEAN_INITIAL_TOOL_LIMIT: usize = 8;
+
+    /// Helpers for a long, steerable session that an unattended run (`Launch::unattended`) keeps
+    /// loadable: delegation (`message` follows `task`), the compaction-surviving working record,
+    /// saved project understanding, progress bookkeeping and `find` (which `grep`/`glob` cover).
+    /// In a Terminal-Bench pilot, print runs never called `find`, and `todo` updates often took a
+    /// request of their own. Together about 13 KB of schemas and prompt sections per request; a
+    /// run that needs one pays a single `tool_load` round, as for other deferred tools.
+    const UNATTENDED_DEFERRED: &[&str] =
+        &["task", "working_state", "codebase_memory", "todo", "find"];
 
     /// Lean local profile (`assistance.lean_local`): compact tool interface, a bounded initial tool
     /// budget, omitted optional prompt sections and, on a single-request server, no up-front delegation.
@@ -256,6 +261,17 @@ impl<'a> Agent<'a> {
         out
     }
 
+    /// `bg` is in the catalog and eligible but not in the current offer, and `tool_load` is, so
+    /// text that names `bg` must say it is a Dial tool to load first.
+    pub(in crate::agent) fn bg_loadable(&self) -> bool {
+        let offered = self.offered();
+        !self.hermetic
+            && self.catalog().iter().any(|name| name == "bg")
+            && self.tool_eligible("bg")
+            && !offered.iter().any(|name| name == "bg")
+            && offered.iter().any(|name| name == "tool_load")
+    }
+
     /// The tool list a child agent's allowlist is intersected with: the harness selection plus
     /// explicitly loaded tools, as before catalog-wide offers. Read-only children must not inherit
     /// every registered integration just because the parent can call it.
@@ -360,10 +376,16 @@ impl<'a> Agent<'a> {
         }
         // Specialists most turns never call stay loadable rather than costing schema bytes on every
         // request; an explicit load, a pinned selection, hermetic runs and the selection lent to
-        // children keep them offered.
+        // children keep them offered. An unattended run also defers the long-session helpers,
+        // unless the operator prefers delegation.
+        let unattended = |name: &str| {
+            self.modes.launch.unattended
+                && Self::UNATTENDED_DEFERRED.contains(&name)
+                && !(name == "task" && self.config.task.prefer_subagents)
+        };
         let deferred = |name: &str| {
             !(pinned || self.hermetic || selection_only)
-                && tools::DEFERRED_BY_DEFAULT.contains(&name)
+                && (tools::DEFERRED_BY_DEFAULT.contains(&name) || unattended(name))
                 && !loaded.contains(name)
         };
         names.retain(|name| !deferred(name));
@@ -420,7 +442,9 @@ impl<'a> Agent<'a> {
             || crate::agent::workflow::exploration::TOOL_NAMES
                 .iter()
                 .any(|tool| names.iter().any(|name| name == tool));
-        if (self.experimental_context_owner()
+        if (self.config.compaction.snapcompact.overlay
+            || crate::agent::compact::snapcompact::views::available(&self.session.messages())
+            || self.experimental_context_owner()
             || (self.exploration_owner() && (exploring || !deferred("session_search"))))
             && catalog.iter().any(|name| name == "session_search")
             && self.plan_tool_available("session_search")
@@ -513,6 +537,15 @@ impl<'a> Agent<'a> {
                 "request_directory" => crate::agent::run::directory_access::schema(),
                 "context_notes" | "new_context" => crate::agent::window::context_notes::schema(name).expect("known context tool"),
                 "checkpoint" | "rewind" => crate::agent::workflow::exploration::schema(name).expect("known exploration tool"),
+                "session_search" if self.config.compaction.snapcompact.overlay
+                    || crate::agent::compact::snapcompact::views::available(&self.session.messages()) =>
+                    crate::agent::compact::snapcompact::views::schema(
+                        if self.experimental_context_owner() || self.exploration_owner() {
+                            session::session_search_tool::schema_owned()
+                        } else {
+                            session::session_search_tool::schema()
+                        }
+                    ),
                 "session_search" if self.experimental_context_owner() || self.exploration_owner() => session::session_search_tool::schema_owned(),
                 n if crate::storage::memory_backend::schema(&self.config.memory, n).is_some() =>
                     crate::storage::memory_backend::schema(&self.config.memory, n).expect("selected memory tool has a schema"),
@@ -538,7 +571,7 @@ impl<'a> Agent<'a> {
                 "session_search" => session::session_search_tool::schema(),
                 "artifact_read" => crate::storage::artifact::schema(),
                 "working_state" => crate::agent::workflow::evidence::working_schema(),
-                "tool_search" => json!({"type":"function","function":{"name":"tool_search","description":"Rank eligible tools by capability or exact name and enable up to three strongest matches for the next model round. Returns names, descriptions and activation status. Never executes tools, grants permission or enables same-batch calls; do not rediscover tools already offered. To list eligible tools when a search finds nothing, call query \"*\" for page 0, then the returned next_query (\"*:N\", zero-based) while present. Listing pages show descriptions and status only and enable nothing.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}}),
+                "tool_search" => json!({"type":"function","function":{"name":"tool_search","description":"Rank eligible tools by capability or exact name and enable up to three strongest matches for the next model round. Returns names, descriptions and activation status. Never executes tools, grants permission or enables same-batch calls; do not rediscover tools already offered. If nothing matches, the result is a bounded listing of eligible tools (page 0) with empty search_matches and a fallback_reason; nothing is enabled. Continue a listing with the returned next_query (\"*:N\", zero-based) while present. Listing pages show descriptions and status only and enable nothing.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}}),
                 "tool_load" => json!({"type":"function","function":{"name":"tool_load","description":"Explicitly enable or unload exact eligible tool names. Search already enables its strongest matches; use this for exact control. Changes take effect next round, never in this batch, and grant no permissions.","parameters":{"type":"object","properties":{"names":{"type":"array","maxItems":32,"items":{"type":"string"}},"unload":{"type":"array","maxItems":32,"items":{"type":"string"}}},"additionalProperties":false}}}),
                 "exit_plan" => json!({"type":"function","function":{"name":"exit_plan","description":"Ask the user to approve this plan and leave plan mode.","parameters":{"type":"object","properties":{"plan":{"type":"string","minLength":1}},"required":["plan"],"additionalProperties":false}}}),
                 other => {
@@ -575,6 +608,18 @@ impl<'a> Agent<'a> {
                 if let Some(description) = description {
                     schemas.last_mut().unwrap()["function"]["description"] = json!(description);
                 }
+            }
+            // The shell text names `bg` for background jobs; when the offer does not include it,
+            // say it is a Dial tool to load, so `bg` is not mistaken for the shell builtin.
+            if name == "bash" && self.bg_loadable() {
+                let schema = schemas.last_mut().expect("schema was just inserted");
+                let description = schema["function"]["description"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                schema["function"]["description"] = json!(format!(
+                    "{description} `bg` is a Dial tool, not a shell command, and is not loaded yet: load it with `tool_load` to read, wait for or stop background jobs."
+                ));
             }
             if self.plan_mode {
                 let schema = schemas.last_mut().expect("schema was just inserted");
@@ -681,6 +726,181 @@ impl<'a> Agent<'a> {
         Ok(())
     }
 }
+/// A capability gap the controller observed during a turn. Each gap maps to one fixed query owned
+/// here; no tool output or model text feeds routing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(in crate::agent) enum CapabilityGap {
+    /// A required visual check has no rendered evidence yet.
+    MissingVisualEvidence,
+    /// A check or command failed and its diagnostic is not yet inspected.
+    DiagnosticFailure,
+}
+
+impl CapabilityGap {
+    fn query(self) -> &'static str {
+        match self {
+            Self::MissingVisualEvidence => "browser rendered screenshot",
+            Self::DiagnosticFailure => "debugger runtime diagnostics",
+        }
+    }
+}
+
+impl Agent<'_> {
+    /// Every eligible catalog tool with its description and search-index text, in catalog order.
+    /// This is the candidate set `tool_search` ranks, so dispatch and gap routing share one boundary.
+    pub(in crate::agent) fn eligible_candidates(&self) -> Vec<(String, String, String)> {
+        let mut out = Vec::new();
+        for name in self.catalog() {
+            if !self.tool_eligible(&name) {
+                continue;
+            }
+            let Some(schema) = self
+                .schemas(std::slice::from_ref(&name))
+                .ok()
+                .and_then(|mut schemas| schemas.pop())
+            else {
+                continue;
+            };
+            let description = schema["function"]["description"]
+                .as_str()
+                .unwrap_or("")
+                .to_owned();
+            let indexed = super::dispatch::search_index::text(&schema);
+            out.push((name, description, indexed));
+        }
+        out
+    }
+
+    /// Fresh, side-effect-free advisory metadata. Explicit discovery does not filter on readiness.
+    pub(in crate::agent) fn tool_readiness(
+        &self,
+        name: &str,
+    ) -> tools::surface::catalog::Readiness {
+        tools::surface::catalog::readiness(name, self.config, &self.ext)
+    }
+
+    /// Automatic routing shares discovery's eligibility boundary, then removes only known execution
+    /// blockers and explicit unloads. Unknown prerequisites cannot silently hide a capability.
+    fn automatic_candidates(&self) -> Vec<(String, String)> {
+        let offered = self.offered();
+        self.eligible_candidates()
+            .into_iter()
+            .filter(|(name, _, _)| {
+                !offered.contains(name)
+                    && !matches!(name.as_str(), "tool_search" | "tool_load")
+                    && !self.tool_routing.is_suppressed(name)
+                    && self.tool_readiness(name).automatic_candidate()
+            })
+            .map(|(name, _, indexed)| (name, indexed))
+            .collect()
+    }
+
+    /// Offer the eligible tools that match an observed gap, for the next round only. The caller keeps
+    /// `spent`, so one gap activates at most once per turn and a repeated gap cannot churn the working
+    /// set. No model call, no execution and no permission change; pinned, hermetic and explicitly
+    /// unloaded tools are left alone. Returns the names newly offered.
+    pub(in crate::agent) fn activate_gap_capabilities(
+        &mut self,
+        gap: CapabilityGap,
+        spent: &mut BTreeSet<CapabilityGap>,
+    ) -> Result<Vec<String>> {
+        if self.hermetic
+            || self.config.harness.tools != config::tools::default_tools()
+            || spent.contains(&gap)
+        {
+            return Ok(Vec::new());
+        }
+        spent.insert(gap);
+        let activated: Vec<String> = crate::agent::model::assistance::discover_with_priority(
+            gap.query(),
+            self.automatic_candidates(),
+            &|name| self.tool_readiness(name).routing_priority(),
+        )
+        .into_iter()
+        .filter(|entry| entry.2)
+        .map(|entry| entry.0)
+        .collect();
+        if activated.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.activate_tools(&activated)?;
+        let after = self.offered();
+        Ok(activated
+            .into_iter()
+            .filter(|name| after.contains(name))
+            .collect())
+    }
+
+    /// Catalog tools that accept the arguments an offered tool just rejected, e.g. `pty` on `bash`
+    /// names `bg`. Returns the rejected keys and the owners: only tools that are eligible, not
+    /// offered and not unloaded by the user, whose schema declares every rejected key, ranked by how
+    /// many of the call's keys they declare. An ambiguous match (more than three tied) returns no
+    /// owner. No tool runs and no permission changes; the caller loads the owners for the next round.
+    pub(in crate::agent) fn argument_owners(
+        &self,
+        call: &ToolCall,
+        offer: &[Value],
+    ) -> Option<(Vec<String>, Vec<String>)> {
+        let schema = offer
+            .iter()
+            .find(|schema| schema["function"]["name"] == call.name.as_str())?;
+        let arguments = call.arguments.as_object()?;
+        if crate::tools::surface::catalog::validate_arguments(schema, &call.arguments).is_ok() {
+            return None;
+        }
+        let declared = |schema: &Value, key: &str| {
+            schema
+                .pointer("/function/parameters/properties")
+                .and_then(Value::as_object)
+                .is_some_and(|properties| properties.contains_key(key))
+        };
+        let rejected: Vec<String> = arguments
+            .iter()
+            .filter(|(key, value)| !value.is_null() && !declared(schema, key))
+            .map(|(key, _)| key.clone())
+            .collect();
+        if rejected.is_empty() {
+            return None;
+        }
+        let offered = self.offered();
+        let mut ranked: Vec<(usize, String)> = Vec::new();
+        for name in self.catalog() {
+            if offered.contains(&name)
+                || matches!(name.as_str(), "tool_search" | "tool_load")
+                || !self.tool_eligible(&name)
+                || self.tool_routing.is_suppressed(&name)
+            {
+                continue;
+            }
+            let Some(candidate) = self
+                .schemas(std::slice::from_ref(&name))
+                .ok()
+                .and_then(|mut schemas| schemas.pop())
+            else {
+                continue;
+            };
+            if !rejected.iter().all(|key| declared(&candidate, key)) {
+                continue;
+            }
+            let score = arguments
+                .keys()
+                .filter(|key| declared(&candidate, key))
+                .count();
+            ranked.push((score, name));
+        }
+        let best = ranked.iter().map(|(score, _)| *score).max()?;
+        let owners: Vec<String> = ranked
+            .into_iter()
+            .filter(|(score, _)| *score == best)
+            .map(|(_, name)| name)
+            .collect();
+        (owners.len() <= 3).then_some((rejected, owners))
+    }
+}
 
 #[cfg(test)]
 pub(crate) mod default_offer_tests;
+#[cfg(test)]
+mod discovery_tests;
+#[cfg(test)]
+mod gap_tests;

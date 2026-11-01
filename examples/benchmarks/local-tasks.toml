@@ -67,3 +67,18 @@ checks = [
   {kind="tool_invoked", tool="write"},
   {kind="metric", metric="tool_errors", min=1},
 ]
+
+# Snake-session regression: a real movement defect and an independent test-harness TypeError.
+# The first command grades movement without importing the editable test harness.
+[[cases]]
+id = "snake-harness-recovery"
+project = "examples/benchmarks/local-tasks-fixture"
+prompt = "Fix head movement in snake.py: body index 0 is the head, each move preserves body length and does not mutate the input. Run test_snake.py, repair its invalid unittest base class if necessary without removing or weakening assertions, and verify the tests pass. Write RUN.md containing only the verified command python3 -m unittest -q test_snake.py, then reply DONE. Work only in this fixture; do not search outside it."
+categories = ["repair", "verification", "recovery"]
+checks = [
+  {kind="command", command='''python3 -c "import snake as s; b = [(3, 4), (3, 3), (3, 2)]; before = list(b); assert all(s.advance(b, d) == [(b[0][0] + d[0], b[0][1] + d[1]), *b[:-1]] for d in [(0, 1), (0, -1), (1, 0), (-1, 0)]); assert b == before; assert s.advance([(0, 0)], (-1, 0)) == [(-1, 0)]"'''},
+  {kind="command", command='''python3 -c "import unittest; suite = unittest.defaultTestLoader.loadTestsFromName('test_snake'); result = unittest.TextTestRunner().run(suite); assert result.testsRun == 2 and not result.skipped and result.wasSuccessful()"'''},
+  {kind="command", command='''python3 -c "import ast; from pathlib import Path; tree = ast.parse(Path('test_snake.py').read_text()); calls = {ast.dump(n) for n in ast.walk(tree) if isinstance(n, ast.Call)}; required = ['self.assertEqual(advance(body, (0, 1)), [(3, 5), (3, 4), (3, 3)])', 'self.assertEqual(body, [(3, 4), (3, 3), (3, 2)])', 'self.assertEqual(advance([(2, 2)], (-1, 0)), [(1, 2)])']; assert all(ast.dump(ast.parse(expr, mode='eval').body) in calls for expr in required)"'''},
+  {kind="command", command='''python3 -c "from pathlib import Path; assert Path('RUN.md').read_text().strip() == 'python3 -m unittest -q test_snake.py'"'''},
+  {kind="response_equals", content="DONE"},
+]

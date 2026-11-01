@@ -29,7 +29,53 @@ fn request_event(session: &str, error: bool) -> Event {
         error,
         end: SystemTime::now(),
         wire: None,
+        billing: None,
     }))
+}
+
+#[test]
+fn stats_are_keyed_by_project_directory_and_skip_unloaded_configs() {
+    let user = tempfile::tempdir().unwrap();
+    let mut config = Config {
+        user_dir: user.path().to_path_buf(),
+        ..Config::default()
+    };
+    // `Config::default()` (what tests build) has no project, so nothing reaches stats.
+    assert_eq!(project_key(&config), "");
+    assert_eq!(Route::from_config(&config).stats, None);
+
+    // A loaded config's state_dir is the model learning directory below the project directory.
+    config.state_dir = user
+        .path()
+        .join("projects")
+        .join("dial-62a7d4f9")
+        .join("models")
+        .join("0123456789abcdef");
+    assert_eq!(project_key(&config), "dial-62a7d4f9");
+    assert_eq!(
+        Route::from_config(&config).stats,
+        Some(crate::stats::db_path(user.path()))
+    );
+
+    // State outside the user's project tree (an isolated child archive) is not a project.
+    config.state_dir = std::env::temp_dir().join("dial-child-x").join("state");
+    assert_eq!(project_key(&config), "");
+}
+
+#[test]
+fn the_replys_billing_reaches_the_stats_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = crate::stats::Db::open(&crate::stats::db_path(dir.path())).unwrap();
+    let mut event = request_event("s1", false);
+    if let Event::Request(request) = &mut event {
+        request.cost_usd = None;
+        request.billing = Some(crate::llm::usage::Billing::Subscription);
+    }
+    record_stats(&mut db, &event).unwrap();
+    let models = db.models(None).unwrap();
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0].totals.subscription_requests, 1);
+    assert_eq!(models[0].totals.priced_requests, 0);
 }
 
 #[test]

@@ -18,6 +18,8 @@ pub mod session;
 use session::{SessionClaim, admit, read_published};
 
 const DEFAULT_BASH_TIMEOUT_SECS: u64 = 300;
+/// Appended to every completed native launch; consumers that count diagnostic lines skip it.
+pub const LAUNCH_NOTE: &str = "[shell launch: stdin=EOF; output=captured; no terminal allocated]";
 
 /// The command's working directory: the primary root by default, or `cwd` / a leading simple
 /// `cd path && ...` resolved through [`Workspace::resolve`], so explicitly added roots work and
@@ -554,15 +556,11 @@ pub fn bash_tool_streaming_with_adopter(
     cancel: &AtomicBool,
     on_adopt: &(dyn Fn(ForegroundJob) -> Result<String, String> + Sync),
 ) -> Result<ToolOutput, String> {
-    let command = req_str(args, "command")?;
-    if command.trim().is_empty() {
-        return Err("command must not be empty".to_string());
+    if opt_bool(args, "pty")? {
+        return Err("bash pty=true requires the managed bg registry; use the native execution boundary or bg start with pty=true".into());
     }
-    if command.len() > MAX_COMMAND {
-        return Err(format!("command is longer than {MAX_COMMAND} bytes"));
-    }
-    let Some((config, offered)) = ws.bash_interceptor() else {
-        return run_bash(
+    with_bash_interceptor(ws, args, |command| {
+        run_bash(
             ws,
             args,
             command,
@@ -571,28 +569,47 @@ pub fn bash_tool_streaming_with_adopter(
             on_output,
             cancel,
             on_adopt,
-        );
-    };
+        )
+    })
+}
+
+/// Validate and decorate both launch modes at the same bash interceptor boundary.
+fn with_bash_interceptor(
+    ws: &Workspace,
+    args: &Value,
+    run: impl FnOnce(&str) -> Result<ToolOutput, String>,
+) -> Result<ToolOutput, String> {
+    let command = req_str(args, "command")?;
+    if command.trim().is_empty() {
+        return Err("command must not be empty".to_string());
+    }
+    if command.len() > MAX_COMMAND {
+        return Err(format!("command is longer than {MAX_COMMAND} bytes"));
+    }
     use crate::tools::exec::bash_interceptor::{self, Verdict};
-    let offered: Vec<&str> = offered.iter().map(String::as_str).collect();
-    let hint = match bash_interceptor::check(config, &offered, command) {
-        Some(Verdict::Block(message)) => return Ok(ToolOutput::err(message)),
-        Some(Verdict::Hint(line)) => Some(line),
+    let interceptor = ws.bash_interceptor().map(|(config, offered)| {
+        (
+            config,
+            offered.iter().map(String::as_str).collect::<Vec<_>>(),
+        )
+    });
+    let hint = match &interceptor {
+        Some((config, offered)) => match bash_interceptor::check(config, offered, command) {
+            Some(Verdict::Block(message)) => {
+                return Ok(
+                    ToolOutput::err(message).with_effects(crate::runtime::execution::Effects::None)
+                );
+            }
+            Some(Verdict::Hint(line)) => Some(line),
+            None => None,
+        },
         None => None,
     };
-    let mut output = run_bash(
-        ws,
-        args,
-        command,
-        timeout_secs,
-        auto_background_secs,
-        on_output,
-        cancel,
-        on_adopt,
-    )?;
-    if let Some(line) = hint
-        .or_else(|| bash_interceptor::ci_poll_hint(config, &offered, command, &output.text))
-        .or_else(|| bash_interceptor::trim_hint(config, command))
+    let mut output = run(command)?;
+    if let Some((config, offered)) = interceptor
+        && let Some(line) = hint
+            .or_else(|| bash_interceptor::ci_poll_hint(config, &offered, command, &output.text))
+            .or_else(|| bash_interceptor::trim_hint(config, command))
     {
         if !output.text.ends_with('\n') {
             output.text.push('\n');
@@ -600,6 +617,53 @@ pub fn bash_tool_streaming_with_adopter(
         output.text.push_str(&line);
     }
     Ok(output)
+}
+
+/// A PTY always belongs to `bg`; the caller supplies its registry-backed launch, never a runner.
+pub(super) fn bash_tool_pty(
+    ws: &Workspace,
+    args: &Value,
+    start: impl FnOnce(&Value) -> ToolOutput,
+) -> Result<ToolOutput, String> {
+    for field in ["session", "timeout"] {
+        if args.get(field).is_some_and(|value| !value.is_null()) {
+            return Err(format!(
+                "bash pty=true does not accept {field}; it starts a managed bg terminal immediately, controlled with bg input, output, wait, resize or kill"
+            ));
+        }
+    }
+    // These flags cannot delay a PTY launch, but malformed values must not be silently ignored.
+    opt_bool(args, "async")?;
+    opt_bool(args, "background")?;
+    with_bash_interceptor(ws, args, |command| {
+        let (cwd, command) = working_directory(ws, args, command)?;
+        let cwd = cwd.to_str().ok_or("working directory is not UTF-8")?;
+        // Forward only supported launch fields. Explicit stdin keeps ConPTY input and resize
+        // available too; terminal input is implicit in the Unix background runner.
+        let mut output = start(&serde_json::json!({
+            "action": "start", "command": command, "cwd": cwd, "pty": true, "stdin": true
+        }));
+        if output
+            .data
+            .as_ref()
+            .and_then(|data| data.get("job"))
+            .is_some()
+        {
+            let bg_offered = ws
+                .bash_interceptor()
+                .is_none_or(|(_, offered)| offered.iter().any(|tool| tool == "bg"));
+            if !bg_offered {
+                output.text.push_str("\nLoad the Dial `bg` tool with `tool_load` (it is not a shell command) to control this terminal.");
+            }
+            if !output
+                .process_outcome()
+                .is_some_and(|process| process.exit_code.is_some() || process.signal.is_some())
+            {
+                output.text.push_str("\nPTY started as a managed bg job; this is not command completion. Use bg input, output, wait, resize or kill with the returned job name. Continue independent work or use a bounded bg wait.");
+            }
+        }
+        Ok(output)
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -771,13 +835,30 @@ fn run_bash(
                 } else {
                     format!("Output so far:\n{so_far}\n")
                 };
+                // The interceptor carries this request's offer; without it (direct tool use) `bg`
+                // is assumed callable, as before.
+                let offered = |tool: &str| {
+                    ws.bash_interceptor()
+                        .is_none_or(|(_, offered)| offered.iter().any(|name| name == tool))
+                };
+                let manage = if offered("bg") {
+                    " bg wait returns its output when it exits; stop it with bg kill. Do not poll it; continue independent work or use a bounded bg wait."
+                } else if offered("tool_load") {
+                    " To read, wait for or stop it, load the Dial `bg` tool with `tool_load` (it is not a shell command), then call bg wait or bg kill. Do not poll it; continue independent work."
+                } else {
+                    " Do not poll it; continue independent work."
+                };
                 let mut output = ToolOutput::ok(format!(
-                    "command is running as background job {id} (after {}s): {command}\n{so_far}Keep working; you are notified when it finishes. bg wait returns its output when it exits; stop it with bg kill. Do not poll it; continue independent work or use a bounded bg wait.",
+                    "command is running as background job {id} (after {}s): {command}\n{so_far}Keep working; you are notified when it finishes.{manage}",
                     started.elapsed().as_secs()
                 ));
                 // Structured so the controller can follow the job without parsing this prose.
                 output.data = Some(serde_json::json!({"background_job": id}));
-                output
+                output.with_shell_launch(crate::runtime::execution::ShellLaunch {
+                    stdin: crate::runtime::execution::ShellStdin::Eof,
+                    terminal_allocated: false,
+                    job: Some(id),
+                })
             });
         }
         if cancel_now {
@@ -856,6 +937,15 @@ fn run_bash(
         text.push_str("[foreground commands do not survive this timeout; for a dev server/watcher discover/load bg, reuse an existing process or start it with bg, then wait for readiness before browser navigation]\n");
     } else if let Some(code) = status.code() {
         text.push_str(&format!("[exit code: {code}]\n"));
+        if text.starts_with("(no output)\n")
+            && body_len == "(no output)\n".len()
+            && let Some(meaning) = super::minimizer::silent_exit_meaning(&command, code)
+        {
+            // The status is a result, not a failure; the model otherwise reruns or investigates.
+            text.push_str(&format!(
+                "[exit {code} without output conventionally means {meaning}]\n"
+            ));
+        }
     } else if let Some(signal) = crate::platform::process::exit_signal(&status) {
         text.push_str(&format!("[terminated by signal {signal}]\n"));
     }
@@ -870,6 +960,18 @@ fn run_bash(
         &mut text,
         eof && capture_error.is_none() && original == inline_retained,
     );
+    // A failed build or test whose first error sits pages down gets those lines up front; the
+    // full output still follows unchanged (and stays in the artifact).
+    if !success
+        && !cancelled
+        && !timed_out
+        && let Some(digest) = super::minimizer::failure_digest(&command, &text)
+    {
+        text.insert_str(
+            0,
+            &format!("[failure digest: first error lines; the full output follows]\n{digest}[end of digest]\n"),
+        );
+    }
     let integrity = output_integrity(
         original,
         inline_retained,
@@ -917,7 +1019,13 @@ fn run_bash(
             && eof
             && integrity.retention == Completeness::Complete,
     });
-    let output = output.with_output_integrity(integrity);
+    let output = output.with_output_integrity(integrity).with_shell_launch(
+        crate::runtime::execution::ShellLaunch {
+            stdin: crate::runtime::execution::ShellStdin::Eof,
+            terminal_allocated: false,
+            job: None,
+        },
+    );
     // The group was killed and its leader reaped above, so a timeout is a known (failed)
     // outcome the model can inspect and retry; only a user cancel stays uncertain.
     Ok(if cancelled {

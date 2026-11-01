@@ -14,6 +14,7 @@ fn config() -> Config {
         VerificationRequirement {
             checks: vec!["boundary".into()],
             visual: false,
+            ..Default::default()
         },
     );
     config
@@ -202,4 +203,78 @@ fn check_inputs_reject_unknown_ambiguous_or_unsafe_declarations() {
     ] {
         assert!(with_inputs(&["src"], &env).validate().is_err(), "{env:?}");
     }
+}
+
+#[test]
+fn deliverable_and_visual_target_contracts_roundtrip_and_validate() {
+    let mut config = config();
+    let requirement = config
+        .verification
+        .requirements
+        .get_mut("negative-input")
+        .unwrap();
+    requirement.deliverables = vec!["ship".into()];
+    requirement.visual = true;
+    requirement.visual_target = Some("url:http://localhost:3000/".into());
+    config.validate().unwrap();
+    let restored: types::VerificationConfig =
+        toml::from_str(&toml::to_string(&config.verification).unwrap()).unwrap();
+    assert_eq!(
+        restored.requirements["negative-input"].deliverables,
+        ["ship"]
+    );
+    assert_eq!(
+        restored.requirements["negative-input"]
+            .visual_target
+            .as_deref(),
+        Some("url:http://localhost:3000/")
+    );
+    for ids in [
+        vec!["".into()],
+        vec!["ship".into(), "ship".into()],
+        vec!["a\nb".into()],
+    ] {
+        let mut invalid = config.clone();
+        invalid
+            .verification
+            .requirements
+            .get_mut("negative-input")
+            .unwrap()
+            .deliverables = ids;
+        assert!(invalid.validate().is_err());
+    }
+    let mut invalid = config.clone();
+    invalid.verification.enabled = false;
+    assert!(invalid.validate().is_err());
+    let mut invalid = config.clone();
+    invalid
+        .verification
+        .requirements
+        .get_mut("negative-input")
+        .unwrap()
+        .visual = false;
+    assert!(invalid.validate().is_err());
+    for target in [
+        "",
+        "http://localhost:3000/",
+        "url:not a URL",
+        "url:http://localhost:3000",
+        "window:",
+        "display:active",
+        "display:all",
+        "window: x",
+        "url:http://localhost/\n",
+    ] {
+        let mut invalid = config.clone();
+        invalid
+            .verification
+            .requirements
+            .get_mut("negative-input")
+            .unwrap()
+            .visual_target = Some(target.into());
+        assert!(invalid.validate().is_err(), "{target:?}");
+    }
+    let legacy: VerificationRequirement = toml::from_str("visual=true").unwrap();
+    assert!(legacy.deliverables.is_empty());
+    assert!(legacy.visual_target.is_none());
 }

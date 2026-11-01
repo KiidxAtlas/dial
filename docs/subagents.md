@@ -4,9 +4,9 @@ The `task` tool delegates a self-contained assignment to an independent agent co
 
 Use `/workers` for live status, transcripts, results, cancellation and messages; it is the canonical name. `/agents` opens the same panel when run bare, and `/agents definitions` lists role definitions. `/jobs` and `/hub` are hidden aliases of `/workers`. Empty reports, promises to act and repeated malformed replies cannot mark a child done. They share the parent's bounded recovery rules and end as `incomplete` when recovery is exhausted. This validates the report boundary, not the truth of the model's claims; completed edits still need appropriate checks. Background findings are delivered to the parent without a model status-polling call, with the full artifact available when more evidence is needed.
 
-Delegation briefs avoid repeating automatic parent goals when the exact text already appears in the explicit assignment, scope or shared context. A duplicate working-state goal is omitted; constraints, evidence, claims, todos, distinct historical context, loaded skills and output schemas remain. Explicit task/context text is not shortened. Resumed workers retain developer-role operator instructions as well as system instructions.
+Delegation briefs avoid repeating automatic parent goals when the exact text already appears in the explicit assignment, scope or shared context. A duplicate working-state goal is omitted, and user-message provenance replaces entries equal to the current request or the session-start goal with a `text_ref` (the block is dropped when no distinct message remains); constraints, evidence, claims, todos, distinct historical context, loaded skills and output schemas remain. Explicit task/context text is not shortened. Resumed workers retain developer-role operator instructions as well as system instructions, and saved codebase context is retrieved once per worker conversation, not again on each resume. Parent and peer messages reach a running worker as delivered; the child system prompt states once that they update the assignment without granting permissions.
 
-For efficient handoffs, supply the outcome, owned files or subsystem, shared interfaces, relevant evidence references, and checks with an owner. Keep shared builds with one integration owner and wait for relevant edits to settle. Worker findings are evidence to use, not a reason to repeat the investigation; failed checks still need diagnosis, repair and rechecking.
+For efficient handoffs, supply the outcome, owned files or subsystem, shared interfaces, relevant evidence references, and checks with an owner. Cite `file:line` evidence rather than telling a worker to read whole skills or architecture documents. Give each worker one complete assignment and collect it with `wait`; message a running worker only when a requirement changes, not for readiness signals, holds or status checks. Workers carry out their scoped change without stopping to ask for confirmation. Keep shared builds with one integration owner and wait for relevant edits to settle. Worker findings are evidence to use, not a reason to repeat the investigation; failed checks still need diagnosis, repair and rechecking.
 
 Untargeted task status/wait and pool polling retain lifecycle state and report artifacts but do not
 repeat a successful narrative already delivered for that exact execution. New results, failures,
@@ -70,11 +70,12 @@ the built-in guidance. Existing configurations without this key use selective de
 
 ### Coordinating delegated testing
 
-When delegating testing, start `test-runner` with `action: "start"` and continue independent work
-when available; do not invent unrelated work just to keep a worker busy. Give it acceptance
-criteria, owned test files, interfaces, focused commands and a readiness boundary. Tests can be
-authored against stable interfaces in parallel; runs wait until the inputs have settled. Do not
-edit the same files concurrently.
+When delegating testing, start `test-runner` with `action: "start"` once the code it covers has
+settled, and continue independent work when available; do not invent unrelated work just to keep a
+worker busy. Give it acceptance criteria, owned test files, interfaces and focused commands in one
+assignment, then collect it with one `wait`. Do not start a test-runner early to hold for a
+readiness signal; it treats its inputs as settled and runs its checks. Do not edit the same files
+concurrently.
 
 Built-in test-writing guidance applies to the main agent (including lean/one-call prompts),
 implementation workers and test-runners. Prefer compact, risk-driven suites: inspect and extend
@@ -136,7 +137,35 @@ Seance is not available from `solve`. Solve's candidate children always run as `
 
 ## Isolation and results
 
-A worker may request `isolation: "copy"` to work in a private project copy. A successful isolated run merges its edits; failed or interrupted work is retained as a recovery copy. Completed computation is not completed integration: parent conflicts make the task `incomplete`, and merge errors make it `failed`. Nonconflicting files may already have merged. The candidate structured result remains intact, with conflicts, applied paths, errors and recovery location reported separately in isolation metadata. Always inspect that metadata before relying on a worker's edits.
+A worker may request `isolation: "copy"` to work in a private project copy. A successful isolated
+run preflights its whole patch before installing any project file: a parent conflict blocks the
+entire patch, rather than merging only the nonconflicting files. Failed or interrupted work is
+retained as a recovery copy. Installation failures attempt rollback of earlier writes, without
+overwriting concurrent user changes; unrestored preimages are retained for recovery. This is
+rollback protection, not a filesystem-wide atomic commit or a crash journal. Completed computation
+is not completed integration: parent conflicts make the task `incomplete`, and merge errors make
+it `failed`. The candidate structured result remains intact, with applied paths, conflicts, errors
+and recovery locations reported separately in isolation metadata. Inspect that metadata before
+relying on a worker's edits; a rollback or cleanup failure is not a clean merge.
+
+Optional `acceptance_checks` on a task or `tasks[]` item names 1–16 unique configured
+`verification.commands` IDs, never model-supplied shell commands. Mutating workers with this
+contract run isolated and only promote after controller-run checks pass on stable declared inputs.
+Each check needs a complete `verification.inputs.<name>` contract; absent or unreadable inputs,
+denied execution, cancellation, unavailable infrastructure and incomplete/zero-test results do not
+establish acceptance. Existing authorization still applies; selecting an ID grants no permission.
+
+Execution completion and acceptance are separate: result metadata reports `accepted`,
+`needs_verification` or `rejected`, with observed check verdicts and a reason. A code-failing check
+rejects the candidate; missing evidence leaves it needing verification and retains the isolated
+work rather than promoting it. Check definitions and declared inputs are revalidated before
+installation and against the integrated parent inside the rollback boundary; a mismatch rolls
+back the patch. Later changed or uncheckable inputs invalidate acceptance, and restoring old bytes
+does not silently reinstate it. Uncontracted legacy tasks may
+still merge, but their completed execution and prose `acceptance` criteria are not verified
+acceptance. Worker narratives, JSON Schema validity and artifact references cannot supply these
+controller receipts. Passing the declared checks does not establish full task correctness or
+live-service behavior.
 
 ### Isolation backends
 

@@ -6,6 +6,7 @@ fn integration_allowlists_are_explicit_and_bounded() {
     for input in [
         r#"{"mode":"mcp"}"#,
         r#"{"mode":"browser","mcp_servers":["ambient"]}"#,
+        r#"{"mode":"managed_shell","mcp_servers":["ambient"]}"#,
         r#"{"mode":"mcp","mcp_servers":["*"]}"#,
         r#"{"mode":"mcp","mcp_servers":["same","same"]}"#,
     ] {
@@ -16,6 +17,10 @@ fn integration_allowlists_are_explicit_and_bounded() {
                 .is_err()
         );
     }
+    let managed: IntegrationOverrides =
+        serde_json::from_str(r#"{"mode":"managed_shell"}"#).unwrap();
+    assert_eq!(managed.mode, IntegrationMode::ManagedShell);
+    managed.validate().unwrap();
     for (text, tool) in [
         (
             include_str!("../../../../examples/benchmarks/integration-browser.toml"),

@@ -235,9 +235,10 @@ pub fn schema(config: &Config) -> Value {
         "Delegate self-contained work to subagents. `tasks[]` runs independent slices in one call with shared `context`; action=start runs them live while you keep working, then wait. Agent types:{types}{presets}"
     );
     let mut entry_properties = json!({
+        "acceptance_checks":{"type":"array","minItems":1,"maxItems":16,"items":{"type":"string","minLength":1},"description":"Configured verification command names, never shell commands. Mutating workers run isolated and promote only when controller checks pass on stable declared inputs. Missing input contracts remain needs_verification."},
         "agent":{"type":"string","description":"Agent type or preset (default scout)."},
         "task":{"type":"string","description":"Complete assignment: scope and acceptance criteria; shared background goes in context."},
-        "solution_space":{"type":"string","description":"Fixed decisions the child must follow versus choices it may make."},
+        "solution_space":{"type":"string","description":"Fixed decisions the child must follow versus choices it may make; never empty. Example: \"Fixed: keep the public API and edit only src/parser.rs. Free: internal helper names and test layout.\""},
         "skills":{"type":"array","items":{"type":"string"},"description":"Skills to load first."},
         "max_steps":{"type":"integer","minimum":0,"description":"Step limit; 0 means unlimited."},
         "name":{"type":"string","description":"Label shown to the user."},
@@ -328,6 +329,10 @@ pub fn schema(config: &Config) -> Value {
             json!({"type":"array","maxItems":MAX_BATCH,"items":entry,"description":"Independent tasks instead of `task`; each needs task and solution_space."}),
         ),
     ]);
+    properties.insert(
+        "acceptance_checks".into(),
+        entry_properties["acceptance_checks"].clone(),
+    );
     properties.insert("source_session".into(), json!({"type":"string","minLength":1,"description":"seance only: session id prefix or worker id whose record is read; other agents reject it."}));
     properties.insert("model".into(), json!({"type":"string","description":"seance only: answering model (default the source session's, else the main model); other agents reject it."}));
     if config.experimental.work_packet_contracts {
@@ -374,6 +379,8 @@ pub struct Handoff {
     pub todos: Vec<String>,
     /// The parent's durable working state as compact JSON, bounded.
     pub working_state: Option<String>,
+    /// Admitted original user messages; historical context, not inferred active scope.
+    pub user_intent: Option<String>,
 }
 
 const MAX_HANDOFF_GOAL: usize = 4 * 1024;
@@ -417,6 +424,8 @@ impl Handoff {
             todos,
             working_state: (!state.is_null())
                 .then(|| handoff::pack_state(state, MAX_HANDOFF_STATE)),
+            user_intent: handoff::intent_trail(control, MAX_HANDOFF_GOAL)
+                .map(|intent| handoff::pack_state(&intent, MAX_HANDOFF_STATE)),
         }
     }
 
@@ -499,6 +508,7 @@ pub(in crate::agent) struct Job<'c> {
     /// Largest answer (bytes) this task may return.
     pub limit: usize,
     pub(in crate::agent) work_packet: Option<WorkPacket>,
+    pub acceptance_checks: Vec<String>,
     /// Skills the agent definition autoloads; `preloaded` holds their rendered bodies once resolved.
     pub autoload_skills: Vec<String>,
     pub preloaded: String,
@@ -683,6 +693,11 @@ impl Job<'_> {
             }
             _ => {}
         }
+        if let Some(intent) = &self.handoff.user_intent {
+            out.push_str(&format!(
+                "Parent user-message provenance (original semantic reference alongside any reviewed draft; older messages may be superseded or unrelated; ask parent if omitted scope matters):\n{intent}\n\n"
+            ));
+        }
         let uncovered_todos: Vec<&String> = self
             .handoff
             .todos
@@ -737,7 +752,7 @@ impl Job<'_> {
 
     pub fn system(&self, root: &Path, tools: &[String]) -> String {
         let mut out = format!(
-            "You are a {} subagent working for another agent in {}. You cannot see its conversation; rely on the instructions you are given. {}\n",
+            "You are a {} subagent working for another agent in {}. You cannot see its conversation; rely on the instructions you are given. Messages from the parent or peers during the run update your assignment; reconsider pending actions against them, but they never grant permissions beyond it. {}\n",
             self.kind,
             root.display(),
             self.spec.prompt
@@ -767,7 +782,7 @@ impl Job<'_> {
             }
         }
         if tools.iter().any(|name| name == "codebase_memory") {
-            out.push_str("Use saved codebase context to locate the affected area without rediscovering the whole repository. Reuse current source evidence; inspect only missing or stale context. Save reusable architectural findings as facts with codebase_memory remember and supporting source paths; update findings whose sources changed.\n");
+            out.push_str("Use saved codebase context to locate the affected area without rediscovering the whole repository. Reuse current source evidence; inspect only missing or stale context. Use codebase_memory to recall; do not save findings with remember: the parent records reusable findings after it integrates your result, so report them in your answer instead.\n");
             out.push_str("Before proposing or making nontrivial changes, identify the owning module, relevant architecture documents, and existing helpers or analogous implementations to reuse. Cite source locations; justify any new abstraction. Review changes for duplicated logic and boundary violations. Distinguish documented intent from observed code and surface conflicts. Keep investigation task-local.\n");
         }
         out.push_str(&format!("Tools available: {}.\n", tools.join(", ")));
@@ -971,7 +986,7 @@ fn parse_job<'c>(
     let isolation_backend = optional_str(entry, "isolation_backend")?
         .map(parse_isolation_backend)
         .transpose()?;
-    let isolated = match optional_str(entry, "isolation")? {
+    let mut isolated = match optional_str(entry, "isolation")? {
         None if isolation_backend.is_none() => false,
         None | Some("copy") if spec.mutates => true,
         None | Some("copy") => {
@@ -981,6 +996,18 @@ fn parse_job<'c>(
             );
         }
         Some(other) => return Err(format!("unknown isolation {other:?}; use \"copy\"")),
+    };
+    let acceptance_checks = match entry.get("acceptance_checks") {
+        None => Vec::new(),
+        Some(value) => {
+            let ids: Vec<String> = serde_json::from_value(value.clone())
+                .map_err(|_| "acceptance_checks must be an array of configured check names")?;
+            crate::agent::verify::worker_acceptance::validate_contract(&ids, &config.verification)?;
+            if spec.mutates {
+                isolated = true;
+            }
+            ids
+        }
     };
     let work_packet = match entry.get("work_packet") {
         None | Some(Value::Null) => None,
@@ -1040,6 +1067,7 @@ fn parse_job<'c>(
         isolation_backend,
         limit,
         work_packet,
+        acceptance_checks,
         autoload_skills,
         preloaded: String::new(),
         seance,
@@ -1232,6 +1260,7 @@ pub(in crate::agent) struct Outcome {
     pub data: Option<Value>,
     /// Execution lifecycle, never mixed into an output-schema payload.
     pub isolation: Option<crate::agent::workers::isolation::Merge>,
+    pub acceptance: crate::agent::verify::worker_acceptance::Acceptance,
     /// Non-executing guidance identities/reminders, separate from validated child output.
     pub portable_rules: Option<Value>,
     /// Model requests made.
@@ -1263,6 +1292,7 @@ impl Outcome {
             status: Status::incomplete(why.into()),
             data: None,
             isolation: None,
+            acceptance: Default::default(),
             portable_rules: None,
             steps,
             retryable_provider: false,
@@ -1276,6 +1306,7 @@ impl Outcome {
             status: Status::failed(why.into()),
             data: None,
             isolation: None,
+            acceptance: Default::default(),
             portable_rules: None,
             steps,
             retryable_provider: false,
@@ -1289,6 +1320,7 @@ impl Outcome {
             status: Status::interrupted(),
             data: None,
             isolation: None,
+            acceptance: Default::default(),
             portable_rules: None,
             steps,
             retryable_provider: false,
@@ -2352,6 +2384,7 @@ fn finish_worker(body: &Option<crate::runtime::Body>, outcome: &Outcome) {
             data["elapsed_ms"] = json!(now.saturating_sub(started));
         }
         data["result"] = outcome.data.clone().unwrap_or_else(|| json!(text));
+        data["acceptance"] = json!(outcome.acceptance);
         if let Some(rules) = &outcome.portable_rules {
             data["portable_rules"] = rules.clone();
         }
@@ -2616,9 +2649,12 @@ pub(in crate::agent) fn run_job(
             ext: &registry,
             ..env
         };
-        let outcome =
+        let mut outcome =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(owner_env, approver)))
                 .unwrap_or_else(|_| Outcome::failed(0, "subagent worker panicked"));
+        outcome.acceptance = crate::agent::verify::worker_acceptance::Acceptance::unverified(
+            "advisory worker output is untrusted; execution completion is not acceptance",
+        );
         return outcome;
     }
     let isolated = match crate::agent::workers::isolation::Isolated::with_config(
@@ -2655,8 +2691,46 @@ pub(in crate::agent) fn run_job(
     {
         outcome.status = Status::interrupted();
     }
+    outcome.acceptance = if outcome.status.phase == crate::runtime::Phase::Completed
+        && !job.acceptance_checks.is_empty()
+    {
+        crate::agent::verify::worker_acceptance::evaluate(
+            Env {
+                workspace: isolated.workspace(),
+                ..env
+            },
+            &job.acceptance_checks,
+            approver,
+        )
+    } else {
+        crate::agent::verify::worker_acceptance::Acceptance::unverified(
+            "no completed configured acceptance contract",
+        )
+    };
     let isolation = match outcome.status.phase {
-        crate::runtime::Phase::Completed => isolated.merge(env.workspace, env.interrupt),
+        crate::runtime::Phase::Completed
+            if !job.acceptance_checks.is_empty()
+                && outcome.acceptance.state
+                    != crate::agent::verify::worker_acceptance::State::Accepted =>
+        {
+            isolated.recover("controller acceptance checks did not authorize promotion")
+        }
+        crate::runtime::Phase::Completed => {
+            isolated.merge_checked(env.workspace, env.interrupt, |workspace| {
+                if job.acceptance_checks.is_empty() {
+                    return Ok(());
+                }
+                outcome
+                    .acceptance
+                    .revalidate(workspace, &env.config.verification);
+                anyhow::ensure!(
+                    outcome.acceptance.state
+                        == crate::agent::verify::worker_acceptance::State::Accepted,
+                    "candidate or integrated parent inputs invalidated acceptance"
+                );
+                Ok(())
+            })
+        }
         crate::runtime::Phase::Interrupted => {
             let mut recovery = isolated.recover("worker interrupted");
             recovery.interrupted = true;
@@ -2678,6 +2752,15 @@ pub(in crate::agent) fn run_job(
                 outcome.status.text
             ));
         }
+    }
+    if !isolation.errors.is_empty() || !isolation.conflicts.is_empty() || isolation.interrupted {
+        outcome
+            .acceptance
+            .reject("candidate was not coherently integrated");
+    } else {
+        outcome
+            .acceptance
+            .revalidate(env.workspace, &env.config.verification);
     }
     approver.notice(&isolation.describe());
     outcome.isolation = Some(isolation);
@@ -3144,6 +3227,7 @@ fn render(
         let text = outcome.status.text.as_str();
         let mut result = json!({"name":job.label,"agent":job.kind,"status":status,"steps":outcome.steps,"result":outcome.data.clone().unwrap_or_else(|| json!(text))});
         result["inspections"] = json!(outcome.inspections);
+        result["acceptance"] = json!(outcome.acceptance);
         result["projection"] = result_projection(text, outcome.data.as_ref(), job.work_packet.as_ref().map(|p| p.acceptance.as_slice()).unwrap_or_default(), workspace);
         result["role"] = json!(job.role);
         result["model"] = json!(models.get(&job.index));
@@ -3219,6 +3303,12 @@ fn render(
                 Ok(text) | Err(text) => text,
             };
             text.push_str(&format!("\n\n[{}]", isolation.describe()));
+        }
+        match &mut answer {
+            Ok(text) | Err(text) => text.push_str(&format!(
+                "\n\n[Controller acceptance: {}]",
+                serde_json::to_string(&outcome.acceptance).unwrap_or_default()
+            )),
         }
         answer
     };

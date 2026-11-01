@@ -216,3 +216,36 @@ fn explicit_outcomes_require_concrete_nonempty_details() {
     );
     assert!(Finish::parse(&json!({"outcome":"unknown","summary":"Done"})).is_err());
 }
+
+#[test]
+fn capability_denials_are_recognized_in_prose_only() {
+    for denial in [
+        "I cannot run the game here because this environment has no interactive terminal.",
+        "Unfortunately a browser is not available to me.",
+        "I don't have a tool for debugging Python.",
+        "Running curses programs is not possible without a TTY!",
+    ] {
+        assert!(denies_capability(denial), "{denial}");
+    }
+    for answer in [
+        "Fixed the parser; all 12 tests pass.",
+        "The function cannot return null, so the guard was removed.",
+        "```\nerror: terminal not available\n```\nThe flaky test now passes.",
+    ] {
+        assert!(!denies_capability(answer), "{answer}");
+    }
+}
+
+#[test]
+fn capability_search_reminds_once_and_never_after_a_search() {
+    let denial = "I cannot open an interactive terminal in this environment.";
+    let mut search = CapabilitySearch::default();
+    assert!(!search.remind(denial, false), "nothing to load");
+    assert!(!search.remind("Done; tests pass.", true));
+    assert!(search.remind(denial, true));
+    assert!(!search.remind(denial, true), "one reminder per instruction");
+
+    let mut searched = CapabilitySearch::default();
+    searched.searched();
+    assert!(!searched.remind(denial, true));
+}

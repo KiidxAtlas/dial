@@ -171,6 +171,20 @@ pub fn project(messages: &mut [Value], memo: &mut Supersession, policy: &Policy)
     }
 }
 
+/// Net tokens that `project` would free under `policy`, measured by projecting a copy with a fresh memo so the
+/// answer matches a real projection. Both sides are canonicalized. Test-only: production has no duplicate projection.
+#[cfg(test)]
+pub fn reclaimable_tokens(messages: &[Value], memo: &Supersession, policy: &Policy) -> usize {
+    let mut before = messages.to_vec();
+    for message in &mut before {
+        crate::llm::messages::canonicalize(message);
+    }
+    let mut after = messages.to_vec();
+    project(&mut after, &mut memo.clone(), policy);
+    let total = |list: &[Value]| list.iter().map(estimate).sum::<usize>();
+    total(&before).saturating_sub(total(&after))
+}
+
 /// Tools whose results are observations of the project, not changes to it, and whose full text is retrievable from
 /// an artifact. Mutation results, todo and memory updates, and `artifact_read` itself are never dropped. Bounded
 /// read-only investigation tools (data, documents, media, traces, timelines) are observations too: their text is
@@ -199,9 +213,9 @@ const OBSERVATIONS: &[&str] = &[
 ];
 /// A result smaller than this is not worth a placeholder and a retrieval round trip.
 const PRUNE_MIN_TOKENS: usize = 1_000;
-/// New prunes are applied together only once they free at least this much. Context keeps growing
-/// under pressure, so pruning each result the moment it crossed the protected tail rewrote the
-/// cached prefix on nearly every step; batching pays that cache break once per batch.
+/// New prunes are applied together only once the net tokens they remove, pointers included, reach this much.
+/// Context keeps growing under pressure, so pruning each result the moment it crossed the protected tail rewrote
+/// the cached prefix on nearly every step; batching pays that cache break once per batch.
 const PRUNE_BATCH_MIN_TOKENS: usize = 8_000;
 
 fn result_id(message: &Value) -> String {
@@ -363,9 +377,9 @@ fn condense_resolved_failures(
     }
 }
 
-/// Under context pressure, replace old large observation results with a pointer to their full text. Done once per
-/// result, for everything outside the newest `protect_tokens`, so the cached prefix is rewritten a single time at
-/// the moment room is needed rather than shifting on every step.
+/// Under context pressure, replace old large observation results with a pointer to their full text. A result is
+/// pruned only when its pointer is strictly smaller, and only once the net tokens of all candidates clear
+/// `PRUNE_BATCH_MIN_TOKENS`, so the cached prefix is rewritten once per batch and never grows.
 fn prune(
     messages: &mut [Value],
     memo: &mut Supersession,
@@ -380,61 +394,70 @@ fn prune(
         drop_useless,
         ..
     } = *policy;
-    let eligible = |message: &Value| {
-        successful(message)
-            && message["dial_evidence"]["artifact"].is_string()
-            && calls.contains_key(&result_id(message))
-    };
     let fresh = |i: usize, message: &Value| {
         pressure && estimate(message) >= PRUNE_MIN_TOKENS && suffix[i] > protect_tokens
     };
+    // Gross size is not savings: only the reduction from the real replacement counts toward the batch.
     let batch: usize = messages
         .iter()
         .enumerate()
         .filter(|(i, message)| {
             (drop_useless || stale[*i])
-                && eligible(message)
                 && !memo.pruned.contains(&result_id(message))
                 && fresh(*i, message)
         })
-        .map(|(_, message)| estimate(message))
+        .filter_map(|(_, message)| {
+            let pruned = pruned_form(message, calls)?;
+            Some(estimate(message).saturating_sub(estimate(&pruned)))
+        })
         .sum();
     let prune_new = batch >= PRUNE_BATCH_MIN_TOKENS;
     for i in 0..messages.len() {
-        if messages[i]["role"] != "tool" {
-            continue;
-        }
         let id = result_id(&messages[i]);
         let already = memo.pruned.contains(&id);
-        // Preserve failures even for read-only tools.
-        if !successful(&messages[i]) {
+        // Only candidates are measured; the gross history is never copied for every step.
+        if !already && !(prune_new && fresh(i, &messages[i]) && (drop_useless || stale[i])) {
             continue;
         }
-        let Some(artifact) = messages[i]["dial_evidence"]["artifact"]
-            .as_str()
-            .map(str::to_owned)
-        else {
+        let Some(pruned) = pruned_form(&messages[i], calls) else {
             continue;
         };
-        let Some(tool) = calls.get(&id).and_then(|call| call[0].as_str()) else {
-            continue;
-        };
-        let bytes = messages[i]["content"].as_str().map_or(0, str::len);
-        let worth_it = prune_new && fresh(i, &messages[i]) && (drop_useless || stale[i]);
-        if !already && !worth_it {
+        // A new prune must shrink the request, images included. A result already pruned keeps its placeholder.
+        if !already && estimate(&messages[i]) <= estimate(&pruned) {
             continue;
         }
         if !id.is_empty() {
             memo.pruned.insert(id);
         }
-        messages[i]["content"] = json!(format!(
-            "[Older {tool} result omitted to save context ({bytes} bytes). Full output: {artifact}; retrieve with artifact_read]"
-        ));
-        if let Some(object) = messages[i].as_object_mut() {
-            object.remove("dial_images");
-        }
+        messages[i] = pruned;
     }
 }
+
+/// The one placeholder for a pruned result. Eligibility, net-savings measurement and the applied text all go
+/// through `pruned_form`, so a pointer is never counted toward a batch that would not actually be written.
+fn prune_pointer(tool: &str, bytes: usize, artifact: &str) -> String {
+    format!(
+        "[Older {tool} result omitted to save context ({bytes} bytes). Full output: {artifact}; retrieve with artifact_read]"
+    )
+}
+
+/// The message as it would be sent once pruned, or `None` when the result is not prunable at all. Images are
+/// removed with the content they accompany, so their cost counts toward the net saving.
+fn pruned_form(message: &Value, calls: &HashMap<String, Value>) -> Option<Value> {
+    if message["role"] != "tool" || !successful(message) {
+        return None;
+    }
+    let artifact = message["dial_evidence"]["artifact"].as_str()?;
+    let tool = calls.get(&result_id(message))?[0].as_str()?;
+    let bytes = message["content"].as_str().map_or(0, str::len);
+    let mut pruned = message.clone();
+    pruned["content"] = json!(prune_pointer(tool, bytes, artifact));
+    if let Some(object) = pruned.as_object_mut() {
+        object.remove("dial_images");
+    }
+    Some(pruned)
+}
+
 pub fn working_schema() -> Value {
     super::working_state::schema()
 }

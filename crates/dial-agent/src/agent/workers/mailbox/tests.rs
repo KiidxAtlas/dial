@@ -95,13 +95,52 @@ fn oversized_and_empty_text_are_refused() {
 }
 
 #[test]
-fn unknown_and_finished_recipients_fail_clearly() {
+fn unknown_recipients_fail_with_the_live_roster_and_finished_ones_get_a_receipt() {
     let team = Team::open(8);
     team.enlist("task-1", "scout", quiet()).unwrap();
+    team.enlist("task-2", "fixer", quiet()).unwrap();
     let unknown = team.send(PARENT, "task-9", "hi").unwrap_err();
-    assert!(unknown.contains("unknown or finished"), "{unknown}");
-    team.retire("task-1");
-    assert!(team.send(PARENT, "task-1", "late").is_err());
+    assert!(
+        unknown.contains("no live recipient named task-9"),
+        "{unknown}"
+    );
+    assert!(
+        unknown.contains("task-1 (scout)") && unknown.contains("task-2 (fixer)"),
+        "{unknown}"
+    );
+
+    team.retire("task-1", "completed");
+    for to in ["task-1", "scout"] {
+        let receipt = team.send(PARENT, to, "late").unwrap();
+        assert!(receipt.queued.is_empty() && receipt.refused.is_empty());
+        assert_eq!(
+            receipt.finished,
+            [("task-1".to_owned(), "completed".to_owned())]
+        );
+        let row = &receipt.json()["receipts"][0];
+        assert_eq!(row["status"], "finished");
+        assert_eq!(row["worker_status"], "completed");
+        assert!(row["note"].as_str().unwrap().contains("`task`"));
+    }
+    assert!(team.drain("task-1").is_empty(), "nothing is delivered");
+    // A broadcast reaches only live workers.
+    assert_eq!(team.send(PARENT, ALL, "hi").unwrap().queued, ["task-2"]);
+}
+
+#[test]
+fn tombstones_are_bounded_and_a_live_label_wins() {
+    let team = Team::open(8);
+    for n in 0..=TOMBSTONES_KEEP {
+        team.enlist(&format!("task-{n}"), "w", quiet()).unwrap();
+        team.retire(&format!("task-{n}"), "completed");
+    }
+    assert!(team.send(PARENT, "task-0", "x").is_err(), "oldest evicted");
+    assert!(
+        team.send(PARENT, &format!("task-{TOMBSTONES_KEEP}"), "x")
+            .is_ok()
+    );
+    team.enlist("task-new", "w", quiet()).unwrap();
+    assert_eq!(team.send(PARENT, "w", "x").unwrap().queued, ["task-new"]);
 }
 
 #[test]
@@ -273,13 +312,4 @@ fn a_queued_receipt_is_reported_per_recipient_and_never_claims_delivery() {
         1,
         "delivery happens at the drain"
     );
-}
-
-#[test]
-fn a_finished_recipient_is_refused_with_its_reason() {
-    let team = Team::open(8);
-    team.enlist("task-1", "a", quiet()).unwrap();
-    team.retire("task-1");
-    let why = team.send(PARENT, "task-1", "late").unwrap_err();
-    assert!(why.contains("unknown or finished"), "{why}");
 }

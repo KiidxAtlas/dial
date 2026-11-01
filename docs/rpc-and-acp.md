@@ -13,6 +13,12 @@ emits newline-delimited system, text, tool, todo, notice and usage events follow
 JSON modes reserve stdout for JSON. Results include session ID, answer, tool outcomes, usage and duration.
 Use `--allow read,edit` for named tool approval instead of blanket `-y`; read-only mode and deny rules
 still win. With both a prompt argument and piped stdin, stdin is appended as fenced context.
+Print runs offer a smaller tool set than the terminal: `ask` is disabled, and `task`/`message`,
+`working_state`, `codebase_memory`, `todo` and `find` are listed as loadable instead of offered,
+unless `task.prefer_subagents=true` keeps `task`. The model can still `tool_load` any of them.
+Session `bg` jobs end when a print run exits. Before the run ends, Dial tells the model once which
+explicitly started jobs are still running, and refuses `finish` once for them. A server the task
+needs afterwards should be restarted with `bg persist=true`; otherwise the model should stop it.
 Exit status: `0` completed, `1` error, `2` incomplete, blocked, needs input, no answer or interrupted, `3` a required tool approval was denied (takes precedence over 2).
 
 `--output-schema FILE` makes the final answer structured: FILE is a JSON Schema checked before any request

@@ -10,7 +10,7 @@ fn observation(engine: &mut Engine, workspace: &Workspace, index: usize) {
         malformed_arguments: false,
     };
     let mut output = ToolOutput::ok(format!("source evidence {index}"));
-    engine.settle(workspace, &call, &mut output, false, false, |_| true);
+    engine.settle(workspace, &call, &mut output, Default::default(), |_| true);
     engine.research_round();
 }
 

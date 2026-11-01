@@ -483,8 +483,74 @@ fn a_drifted_block_points_at_where_its_first_line_is() {
         err.contains("first line occurs") && err.contains("2:fn target() {"),
         "{err}"
     );
+    // The exact first-line location leads; any fuzzy closest match follows it.
+    let first = err.find("at line 2").expect("first-line location");
+    assert!(
+        err.find("Closest match")
+            .is_none_or(|closest| first < closest),
+        "{err}"
+    );
     let gone = edit_err(&ws, "a.rs", "fn missing_entirely() {}");
     assert!(gone.contains("Not even its first line"), "{gone}");
+}
+
+#[test]
+fn identical_old_and_new_text_absent_from_the_file_is_named_before_any_search() {
+    let (dir, ws) = workspace();
+    let file = dir.path().join("a.py");
+    fs::write(&file, "WIDTH = 10\n\ndef draw(self):\n    pass\n").unwrap();
+    let code = "def draw(self):\n    paint(SIDEBAR_WIDTH)";
+    let out = run(
+        &ws,
+        "edit",
+        json!({"path": "a.py", "old_string": code, "new_string": code}),
+    );
+    assert!(out.is_error, "{}", out.text);
+    assert!(
+        out.text
+            .starts_with("old_string and new_string are identical")
+            && out.text.contains("earlier edit")
+            && out.text.contains("at line 3")
+            && !out.text.contains("Closest match"),
+        "{}",
+        out.text
+    );
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "WIDTH = 10\n\ndef draw(self):\n    pass\n"
+    );
+}
+
+#[test]
+fn an_edit_whose_old_text_covers_most_of_the_file_points_to_write() {
+    let (dir, ws) = workspace();
+    let body: String = (0..50).map(|n| format!("value_{n} = {n}\n")).collect();
+    fs::write(dir.path().join("a.py"), &body).unwrap();
+    assert!(!run(&ws, "read", json!({"path": "a.py"})).is_error);
+    // A whole-file old_string that matches nothing misses and names `write`.
+    let stale: String = (0..50)
+        .map(|n| format!("other_{n} = {}\n", n * 7 + 3))
+        .collect();
+    let err = edit_err(&ws, "a.py", stale.trim_end());
+    assert!(
+        err.contains("covers most of the file") && err.contains("`write`"),
+        "{err}"
+    );
+    // A small miss in the same file keeps the ordinary hint.
+    let small = edit_err(&ws, "a.py", "value_7 = 77");
+    assert!(!small.contains("covers most of the file"), "{small}");
+    // A successful whole-file edit still lands and carries the hint for next time.
+    let out = run(
+        &ws,
+        "edit",
+        json!({"path": "a.py", "old_string": body.trim_end(), "new_string": "done = 1"}),
+    );
+    assert!(!out.is_error, "{}", out.text);
+    assert!(out.text.contains("covers most of the file"), "{}", out.text);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("a.py")).unwrap(),
+        "done = 1\n"
+    );
 }
 
 #[test]

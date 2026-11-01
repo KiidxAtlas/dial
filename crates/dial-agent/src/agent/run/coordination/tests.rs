@@ -206,11 +206,38 @@ fn automatic_roster_hides_routine_intent_but_reacts_to_new_overlaps_and_mail() {
         peer.publish("updated routine detail", "working", &["src/client".into()])
             .unwrap();
         assert!(agent.poll_coordination(&mut NullUi).is_empty());
+        peer.publish("updated routine detail", "idle", &["src/client".into()])
+            .unwrap();
+        assert!(
+            agent.poll_coordination(&mut NullUi).is_empty(),
+            "unrelated lifecycle changes must not interrupt the current task"
+        );
+        let own_id = agent.peer_board().unwrap().id;
+        peer.send(&own_id, "dependency question without overlapping scopes")
+            .unwrap();
+        let notes = agent.poll_coordination(&mut NullUi);
+        assert!(
+            notes[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("dependency question without overlapping scopes"),
+            "direct mail does not require overlapping claims"
+        );
         // A local claim changes relevance even when the remote roster did not change.
         agent.peer_coordination(&json!({"action":"claim","scopes":["src"]}));
         let notes = agent.poll_coordination(&mut NullUi);
         let text = notes[0]["content"].as_str().unwrap();
         assert!(text.contains("src/client") && text.contains("updated routine detail"));
+        peer.publish("updated routine detail", "working", &["src/client".into()])
+            .unwrap();
+        let notes = agent.poll_coordination(&mut NullUi);
+        assert!(
+            notes[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("\"phase\":\"working\""),
+            "overlapping lifecycle changes remain relevant"
+        );
         let own_id = agent.peer_board().unwrap().id;
         peer.send(&own_id, "fresh coordination message").unwrap();
         let notes = agent.poll_coordination(&mut NullUi);
@@ -251,11 +278,13 @@ fn automatic_roster_prioritizes_overlaps_past_the_routine_preview_limit() {
     assert_eq!(roster["omitted"], 2);
     assert_eq!(roster["preview"].as_array().unwrap().len(), 8);
     assert_eq!(roster["preview"][0]["id"], "peer-9");
+    assert_eq!(roster["preview"][0]["phase"], "working");
     assert_eq!(
         roster["preview"][0]["overlapping_scopes"],
         json!(["src/important.rs"])
     );
     assert!(roster["preview"][1].get("summary").is_none());
+    assert!(roster["preview"][1].get("phase").is_none());
 }
 
 #[test]

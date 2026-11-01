@@ -348,7 +348,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         IM,
         "Local model assistance",
         "Local profile",
-        "Locally served models only (no endpoint, or a loopback or LAN host). Master switch for the local profile: tool tiers, default edit grammar, sampling source, reasoning cap and escalation. Explicit pins (CLI edit mode, model profile, harness, model variants) always win. Hosted models are unchanged.",
+        "Locally served models only (no endpoint, or a loopback or LAN host). Controls tool tiers, default edit grammar, reasoning cap and escalation. External-host generation-default inheritance is independent of this assistance switch. Explicit pins always win. Hosted models are unchanged.",
         Kind::Bool,
     ),
     field!(
@@ -918,7 +918,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         IM,
         "Local model assistance",
         "Local prompt cache",
-        "llama.cpp servers only: reuse the prompt cache (cache_prompt) and keep the main session on slot 0 with workers on other slots, so side work does not evict the main prompt.",
+        "llama.cpp servers only: reuse the prompt cache (cache_prompt) and keep the main session on slot 0 with workers on other slots, so side work does not evict the main prompt. Off by default; when off Dial sends no cache setting and the server keeps its own behaviour.",
         Kind::Bool,
     ),
     field!(
@@ -936,7 +936,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         IM,
         "Local model assistance",
         "Context fit advice",
-        "One notice when a local server serves a smaller context window than configured. Ollama without a pinned window also raises num_ctx up to the model's memory estimate.",
+        "One notice when a local server serves a smaller context window than configured. Dial does not raise a server's context window automatically; set context_window or the server's own setting.",
         Kind::Bool,
     ),
     field!(
@@ -945,7 +945,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         IM,
         "Local model assistance",
         "Loop recovery penalty",
-        "When the repetition detector stops a local generation, retry once with a presence and repetition penalty instead of failing the round.",
+        "Off by default. When the repetition detector stops a local generation, retry once with a presence and repetition penalty instead of failing the round.",
         Kind::Bool,
     ),
     field!(

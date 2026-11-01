@@ -270,9 +270,43 @@ impl Tool for EvalTool {
         dispatch: &mut dyn FnMut(ToolCallback) -> ToolOutput,
     ) -> ToolOutput {
         let started = AtomicBool::new(false);
-        let result = self.run(ctx, args, cancel, adopt, dispatch, &started);
+        // Collect native facts before callback presentation/prelude conversion discards metadata.
+        // Neither a cell's return value nor printed JSON can create a capture receipt.
+        let mut captures = Vec::new();
+        let mut images = Vec::new();
+        let result = self.run(
+            ctx,
+            args,
+            cancel,
+            adopt,
+            &mut |callback| {
+                // Callback effect defaults do not certify read-only behavior. Keep only captures
+                // from the final tool callback, rather than relabeling older pixels with the
+                // compound eval's final revision. Schema inspection cannot mutate the target.
+                if matches!(&callback, ToolCallback::Call { .. }) {
+                    captures.clear();
+                    images.clear();
+                }
+                let output = dispatch(callback);
+                if !output.is_error && !output.execution.captures.is_empty() {
+                    for image in output
+                        .data
+                        .as_ref()
+                        .into_iter()
+                        .flat_map(|data| data["images"].as_array().into_iter().flatten())
+                    {
+                        if let Some(reference) = image.get("reference") {
+                            images.push(reference.clone());
+                        }
+                    }
+                }
+                captures.extend(output.execution.captures.iter().cloned());
+                output
+            },
+            &started,
+        );
         let uncertain = result.is_err() && started.load(Ordering::Acquire);
-        match result {
+        let mut output = match result {
             Ok(CellOutcome::Value(value)) => code_output(Ok(value)),
             Ok(CellOutcome::Moved(job)) => ToolOutput::ok(format!(
                 "eval cell moved to the background as job {job}; this runtime stays busy until it finishes. Use the bg tool to read its output, wait for it, or kill it."
@@ -286,7 +320,15 @@ impl Tool for EvalTool {
                     output
                 }
             }
+        }.with_captures(captures);
+        if let Some(data) = output.data.as_mut().and_then(Value::as_object_mut) {
+            // Always overwrite: cell-produced fields are not host attachment provenance.
+            data.remove("dial_images");
+            if !images.is_empty() {
+                data.insert("dial_images".into(), json!(images));
+            }
         }
+        output
     }
 }
 

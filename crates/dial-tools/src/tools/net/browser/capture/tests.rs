@@ -63,3 +63,34 @@ fn located_device_pixels_map_to_viewport_css_pixels() {
     };
     assert_eq!(css_point(&located, 1280.0, 800.0), (980.5, 625.5));
 }
+
+#[test]
+fn screenshot_receipt_binds_native_bytes_and_exact_url_not_evaluation_payload() {
+    use base64::Engine;
+    let bytes = b"native screenshot bytes";
+    let result = json!({
+        "url": "http://localhost:3000/preview?mode=dark#panel",
+        "artifact": {"encoding": "base64", "media_type": "image/png",
+            "data": base64::engine::general_purpose::STANDARD.encode(bytes)}
+    });
+    let receipt = native_receipt(&json!({"action":"screenshot"}), &result).unwrap();
+    assert!(receipt.matches(bytes, "image/png"));
+    assert!(!receipt.matches(b"different", "image/png"));
+    assert_eq!(
+        receipt.target.as_deref(),
+        Some("url:http://localhost:3000/preview?mode=dark#panel")
+    );
+    for action in ["evaluate", "run", "call", "evidence"] {
+        assert!(native_receipt(&json!({"action":action}), &result).is_none());
+    }
+    let mut unknown = result;
+    unknown.as_object_mut().unwrap().remove("url");
+    assert_eq!(
+        native_receipt(&json!({"action":"screenshot"}), &unknown)
+            .unwrap()
+            .target,
+        None
+    );
+    unknown.as_object_mut().unwrap().remove("artifact");
+    assert!(native_receipt(&json!({"action":"screenshot"}), &unknown).is_none());
+}

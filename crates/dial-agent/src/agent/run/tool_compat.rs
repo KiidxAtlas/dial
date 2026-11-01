@@ -104,6 +104,7 @@ pub(in crate::agent) fn normalize(name: &str, schema: &Value, args: &mut Value) 
             ("query", "pattern"),
             ("include", "glob"),
             ("max_matches", "max_results"),
+            ("limit", "max_results"),
         ],
         "glob" => &[("glob", "pattern")],
         "web_fetch" => &[("uri", "url")],

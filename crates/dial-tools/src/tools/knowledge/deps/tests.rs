@@ -138,23 +138,65 @@ fn package_paths_never_leave_the_package_root() {
 #[test]
 fn caches_outside_the_workspace_follow_the_sandbox_read_policy() {
     let (project, home, caches) = cargo_fixture();
-    // Strict (also the default): the shell could not read the cache, so neither may this tool.
+    // Strict (also the default): the resolved registry cache is granted to this tool alone.
     let strict = Workspace::new(project.path()).unwrap();
-    let error = run(&strict, &json!({"name": "demo-crate"}), &caches).unwrap_err();
-    assert!(error.contains("request_directory"), "{error}");
-    // Dev, but the cache is under a denied path.
-    let denied = dev(
-        Workspace::new(project.path()).unwrap(),
-        vec![home.path().to_path_buf()],
-    );
-    let error = run(&denied, &json!({"name": "demo-crate"}), &caches).unwrap_err();
-    assert!(error.contains("denies reading"), "{error}");
-    // An attached root grants the read even under the strict policy.
+    let out = run(&strict, &json!({"name": "demo-crate"}), &caches).unwrap();
+    assert!(out.contains("1.2.0"), "{out}");
+    // A denied path still wins under both policies.
+    for policy in [
+        Policy::Strict {
+            deny_read: vec![home.path().to_path_buf()],
+            allow_network: false,
+            extra_write: Vec::new(),
+        },
+        Policy::Dev {
+            deny_read: vec![home.path().to_path_buf()],
+            extra_write: Vec::new(),
+            allow_network: false,
+        },
+    ] {
+        let denied = Workspace::new(project.path()).unwrap().with_policy(policy);
+        let error = run(&denied, &json!({"name": "demo-crate"}), &caches).unwrap_err();
+        assert!(error.contains("denies reading"), "{error}");
+    }
+    // Strict grants only the configured dependency caches, not the rest of the home.
+    let other = Caches {
+        cargo_home: Some(project.path().join("no-cargo-home")),
+        go_mod_cache: None,
+    };
+    assert!(!other.contain(&fs::canonicalize(home.path()).unwrap()));
+    assert!(caches.contain(&fs::canonicalize(home.path().join("registry/src")).unwrap()));
+    assert!(!caches.contain(&fs::canonicalize(home.path()).unwrap()));
+    // An attached root grants the read as well.
     let added = Workspace::new(project.path())
         .unwrap()
         .with_additional_roots(&[home.path().to_path_buf()])
         .unwrap();
     assert!(run(&added, &json!({"name": "demo-crate"}), &caches).is_ok());
+}
+
+#[test]
+fn the_strict_grant_does_not_cover_home_paths_outside_the_caches() {
+    // The cargo home resolves a registry source, but the only package directory found is
+    // reached through a symlink to elsewhere in the home: refused before any grant applies.
+    let (project, home, caches) = cargo_fixture();
+    let index = home
+        .path()
+        .join("registry/src/index.crates.io-0123456789abcdef");
+    let outside = tempfile::tempdir().unwrap();
+    write(
+        &outside.path().join("demo-crate-1.2.0/Cargo.toml"),
+        "[package]\n",
+    );
+    fs::remove_dir_all(index.join("demo-crate-1.2.0")).unwrap();
+    std::os::unix::fs::symlink(
+        outside.path().join("demo-crate-1.2.0"),
+        index.join("demo-crate-1.2.0"),
+    )
+    .unwrap();
+    let strict = Workspace::new(project.path()).unwrap();
+    let error = run(&strict, &json!({"name": "demo-crate"}), &caches).unwrap_err();
+    assert!(error.contains("refusing to follow"), "{error}");
 }
 
 #[test]

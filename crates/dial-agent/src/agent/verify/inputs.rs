@@ -56,7 +56,7 @@ impl IdentityKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct Snapshot([u8; 32]);
+pub(in crate::agent) struct Snapshot([u8; 32]);
 
 struct Capture<'a> {
     workspace: &'a Workspace,
@@ -70,7 +70,10 @@ struct Capture<'a> {
 
 /// Declarations are operator-owned contracts, not permission grants. Every visited path passes
 /// workspace resolution. Unlike source search, directory membership includes ignored/hidden files.
-pub(super) fn capture(workspace: &Workspace, inputs: &VerificationInputs) -> Option<Snapshot> {
+pub(in crate::agent) fn capture(
+    workspace: &Workspace,
+    inputs: &VerificationInputs,
+) -> Option<Snapshot> {
     capture_excluding(workspace, inputs, BTreeSet::new(), IdentityKind::Content)
 }
 

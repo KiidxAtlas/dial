@@ -17,6 +17,7 @@ fn contract() -> VerificationConfig {
         VerificationRequirement {
             checks: vec!["boundary".into(), "errors".into()],
             visual: false,
+            ..Default::default()
         },
     );
     config
@@ -65,6 +66,7 @@ fn visual_requirement_needs_delivered_current_browser_pixels() {
         VerificationRequirement {
             checks: vec![],
             visual: true,
+            ..Default::default()
         },
     );
     let ledger = Ledger::default();
@@ -138,4 +140,98 @@ fn strict_settlement_is_opt_in_and_rejects_missing_stale_and_unavailable_evidenc
     assert!(strict_blocker(&config, &ledger, [2, 0, 0], &visual).is_some());
     config.requirements.clear();
     assert!(strict_blocker(&config, &ledger, revision, &visual).is_none());
+}
+
+#[test]
+fn mapped_deliverables_require_all_contracts_but_unmapped_work_is_unassessed() {
+    let mut config = contract();
+    config
+        .requirements
+        .get_mut("input-contract")
+        .unwrap()
+        .deliverables = vec!["ship".into()];
+    config.requirements.insert(
+        "another".into(),
+        VerificationRequirement {
+            checks: vec!["errors".into()],
+            deliverables: vec!["ship".into()],
+            ..Default::default()
+        },
+    );
+    let mut ledger = Ledger::default();
+    let visual = Review::default();
+    let working = json!({"deliverables":[
+        {"id":"ship","status":"satisfied","evidence_refs":["real-file.rs"]},
+        {"id":"explanation","status":"satisfied","evidence_refs":["answer"]}
+    ]});
+    let revision = [1, 0, 0];
+    ledger.observe("run-boundaries", "b", CheckStatus::Passed, revision, true);
+    let coverage = snapshot(&config, &ledger, revision, &visual);
+    assert_eq!(
+        deliverable_acceptance(&coverage, "explanation")["status"],
+        "unassessed"
+    );
+    assert_eq!(
+        deliverable_acceptance(&coverage, "ship")["requirements"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(
+        deliverable_blocker(&coverage, &working)
+            .unwrap()
+            .contains("ship")
+    );
+    ledger.observe("run-errors", "c", CheckStatus::Passed, revision, true);
+    let coverage = snapshot(&config, &ledger, revision, &visual);
+    assert!(deliverable_blocker(&coverage, &working).is_none());
+    assert_eq!(
+        deliverable_acceptance(&coverage, "ship")["status"],
+        "observed"
+    );
+    assert!(
+        deliverable_blocker(&snapshot(&config, &ledger, [2, 0, 0], &visual), &working).is_some()
+    );
+}
+
+#[test]
+fn mapped_visual_contract_does_not_accept_an_unrelated_rendered_target() {
+    use base64::Engine;
+    let mut config = VerificationConfig::default();
+    let target = "url:http://localhost:3000/";
+    config.requirements.insert(
+        "appearance".into(),
+        VerificationRequirement {
+            visual: true,
+            visual_target: Some(target.into()),
+            deliverables: vec!["ship".into()],
+            ..Default::default()
+        },
+    );
+    let bytes = base64::engine::general_purpose::STANDARD.decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aY4cAAAAASUVORK5CYII="
+    ).unwrap();
+    let images = json!([crate::llm::images::inline_attachment(&bytes).unwrap()]);
+    let ledger = Ledger::default();
+    let mut visual = Review::default();
+    for (locator, expected) in [
+        ("url:http://localhost:4000/", "needs_verification"),
+        (target, "observed"),
+    ] {
+        let output =
+            crate::runtime::tool_output::ToolOutput::ok("capture".into()).with_captures(vec![
+                crate::runtime::execution::NativeCapture::new(
+                    &bytes,
+                    "image/png",
+                    Some(locator.into()),
+                ),
+            ]);
+        visual.capture_output(&output, [0; 3], &images);
+        visual.delivered();
+        assert_eq!(
+            deliverable_acceptance(&snapshot(&config, &ledger, [0; 3], &visual), "ship")["status"],
+            expected
+        );
+    }
 }

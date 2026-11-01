@@ -14,6 +14,7 @@ silently change permissions, budgets, tool contracts, or completion criteria.
 | [recovery.rs](recovery.rs) | First/repeated failure advice, failure categories, stalled/empty/action-only replies, duplicate-call, research-synthesis and thinking-loop notices, initial visual guidance | [run/failure_guidance.rs](../run/failure_guidance.rs), [workflow/research.rs](../workflow/research.rs), [safety/stream_guards.rs](../safety/stream_guards.rs), [ui/chat.rs](../ui/chat.rs), [verify/visual.rs](../verify/visual.rs) |
 | [modes/](modes/) | Advisor, external-thinking, goal, prewalk and TAN instructions | Corresponding modules under [modes/](../modes/) retain state, activation, rendering and enforcement |
 | [turn_drafter.rs](turn_drafter.rs) | Experimental turn optimizer: rewrites each user message into a structured prompt with optional Mermaid diagrams | [run/turn_draft.rs](../run/turn_draft.rs) decides when drafting runs, frames the message as data, fails closed and keeps the typed text in `dial_turn_draft` |
+| [reasoning.rs](reasoning.rs) | Experimental selectable reasoning-strategy guidance; the default adds no text and presets never request private reasoning disclosure | Built-in [window/prompt.rs](../window/prompt.rs) policy assembly and [workers/child.rs](../workers/child.rs) initial/resumed prefix |
 
 The Rust constants are compiled into the binary: no working-directory-dependent file
 loading, runtime reload, or installation asset copying is required. Existing public
@@ -25,10 +26,10 @@ is crate-internal, not a new public prompt-registry API.
 There are no built-in model-family prompt forks. `system.rs` owns the shared `HEADER`
 (engineering, scope, user work and destructive-operation approval), `TRUST_RULE` (sandbox,
 untrusted data and secrets), and `FOCUSED_WORK` (evidence-driven execution). Its private
-`shared_rule!` fragments supply the write contract, honest reporting and role boundaries to
-both full and lean sections at compile time. Keep identical rules there; retain deliberately
-shorter wording in the full/lean workflow, delivery and delegation sections rather than
-silently expanding the lean budget. These fragments preserve the rendered prompt bytes.
+`shared_rule!` fragments supply edit-tool preference, honest reporting and role boundaries.
+Keep shared rules there; retain deliberately shorter wording in the full/lean workflow,
+delivery and delegation sections rather than silently expanding the lean budget. Whole-file
+write witness mechanics stay in the native validator and tool description, not system policy.
 
 The existing adjustments are named below by their selection inputs. They are not family
 classifications, and each can be removed at its selection/assembly boundary without copying
@@ -92,10 +93,13 @@ here just to make a second catalog. This index is the common navigation entry po
 | Session setup and rebuilding prompts | [base/lifecycle.rs](../base/lifecycle.rs) |
 | Main request loop and inference/tool settlement | [run/turn.rs](../run/turn.rs), [run/engine.rs](../run/engine.rs) |
 | Advisory selection, priorities and delivered-note lifetime | [run/guidance.rs](../run/guidance.rs) |
+| Latest admitted user context and corrected-target reminder | [run/intent.rs](../run/intent.rs) selects runtime-recorded provenance; [window/projection.rs](../window/projection.rs) appends bounded request-only context using [system.rs](system.rs) wording, independently of advisory-note priority |
 | Stream retry limits and detection | [safety/stream_guards.rs](../safety/stream_guards.rs) |
 | Tool admission and permissions | [safety/approval.rs](../safety/approval.rs), [safety/guard.rs](../safety/guard.rs) |
 | Worker execution, report-only final step, isolation and persistence | [workers/](../workers/) |
 | Verification and accepted completion | [verify/](../verify/) |
+| Durable obligations and human-confirmed scope transitions | [workflow/working_state.rs](../workflow/working_state.rs), [run/dispatch/working_state.rs](../run/dispatch/working_state.rs); model notes cannot silently replace obligations |
+| Gap-responsive capability offers and search-miss fallback | [run/tool_exposure.rs](../run/tool_exposure.rs), [run/dispatch.rs](../run/dispatch.rs); routing and catalog pages replace empty-search recovery prose, not permission policy |
 | Context pressure and summary publication | [compact/](../compact/), [window/](../window/) |
 | Planning, progress and working-state records | [workflow/](../workflow/) |
 

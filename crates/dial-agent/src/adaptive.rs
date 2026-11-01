@@ -316,6 +316,13 @@ pub fn local_request_settings(
                 .and_then(Value::as_bool)
         })
     });
+    // An output allowance left to the serving host is not sent (the same condition the wire
+    // builders use), so it is not a Dial value.
+    let max_tokens = if profile.is_some_and(|p| p.inherit_output_limit && p.max_tokens.is_none()) {
+        Value::Null
+    } else {
+        json!(request.max_tokens)
+    };
     json!({
         "temperature": temperature,
         "top_p": profile.and_then(|p| p.top_p),
@@ -324,10 +331,12 @@ pub fn local_request_settings(
         "thinking": thinking,
         "reasoning_effort": profile.and_then(|p| p.reasoning_effort),
         "thinking_budget": profile.and_then(|p| p.thinking_budget),
-        "max_tokens": request.max_tokens,
+        "max_tokens": max_tokens,
         "loop_penalty": local["loop_penalty"],
         "context_window": profile.and_then(|p| p.context_window),
         "sampling_source": source,
+        // Server-reported values for fields this request omits; null entries were not reported.
+        "provider_defaults": local["server_defaults"],
     })
 }
 
@@ -342,6 +351,15 @@ pub fn render_request_settings(settings: &Value, compact: bool) -> Option<String
             .map(ToString::to_string)
             .unwrap_or_else(|| "unset".into())
     };
+    // A null field is omitted from the request, so the provider's own setting applies: shown as the
+    // value the server reported for it, or only as whose setting it is when the server reports none.
+    let provider = &settings["provider_defaults"];
+    let delegated = |key: &str, unreported: &str| match (&settings[key], &provider[key]) {
+        (Value::Number(sent), _) => sent.to_string(),
+        (_, Value::Number(reported)) => format!("{reported} (provider)"),
+        (_, Value::String(reported)) => format!("{reported} (provider)"),
+        _ => unreported.into(),
+    };
     let thinking = match settings["thinking"].as_bool() {
         Some(true) => "on",
         Some(false) => "off",
@@ -349,17 +367,17 @@ pub fn render_request_settings(settings: &Value, compact: bool) -> Option<String
     };
     let short = format!(
         "temp {} · think {thinking} · out {}",
-        number("temperature"),
-        number("max_tokens")
+        delegated("temperature", "provider"),
+        delegated("max_tokens", "provider")
     );
     if compact {
         return Some(short);
     }
     Some(format!(
         "{short}\nTop-p {} · top-k {} · min-p {}\nSampling selection: {}; server enforcement unconfirmed\nReasoning effort {} · thinking budget {} · loop penalty {}\nReasoning guard: {} bytes · pre-action {}s (0 = unlimited)\nDial-side requested controls, not confirmed backend behavior. Unset fields may be provider defaults, not confirmed unsent. /policy shows the last request.",
-        number("top_p"),
-        number("top_k"),
-        number("min_p"),
+        delegated("top_p", "unset"),
+        delegated("top_k", "unset"),
+        delegated("min_p", "unset"),
         settings["sampling_source"]
             .as_str()
             .unwrap_or("unconfirmed"),
@@ -396,7 +414,7 @@ pub fn render(value: &Value) -> String {
         })
         .unwrap_or_default();
     format!(
-        "Adaptive policy {} · phase sampling {} · baseline pinned {}\nLast request: {} → {}\n{}\nTemperature {} · top_p {} · output {} tokens · pre-action {}s\nSampling selection: {} (server enforcement unconfirmed)\nReasoning: {} · {}\nLast execution: {}{effective}\n/settings → Model → Adaptive policy: enable, sampling, pin baseline, phase and budgets.\nExperimental phase presets; observed outcomes do not automatically promote sampler settings.",
+        "Adaptive policy {} · phase sampling {} · baseline pinned {}\nLast request: {} → {}\n{}\nTemperature {} · top_p {} · output {} · pre-action {}s\nSampling selection: {} (server enforcement unconfirmed)\nReasoning: {} · {}\nLast execution: {}{effective}\n/settings → Model → Adaptive policy: enable, sampling, pin baseline, phase and budgets.\nExperimental phase presets; observed outcomes do not automatically promote sampler settings.",
         on_off(&value["config"]["enabled"]),
         on_off(&value["config"]["sampling"]),
         yes_no(&value["config"]["pin_sampling"]),
@@ -411,7 +429,10 @@ pub fn render(value: &Value) -> String {
             .as_f64()
             .map(|x| x.to_string())
             .unwrap_or("provider default".into()),
-        s["max_tokens"],
+        s["max_tokens"]
+            .as_u64()
+            .map(|x| format!("{x} tokens"))
+            .unwrap_or("provider default".into()),
         s["pre_action_secs"],
         s["sampling_source"].as_str().unwrap_or("unconfirmed"),
         s["reasoning_effort"].as_str().unwrap_or("provider default"),

@@ -83,6 +83,77 @@ fn legacy_request_table_gains_wire_columns_and_records_them() {
 }
 
 #[test]
+fn subscription_requests_are_labelled_instead_of_unpriced_and_legacy_rollups_migrate() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = db_path(dir.path());
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE request_hourly(hour INTEGER NOT NULL, project TEXT NOT NULL, model TEXT NOT NULL,
+                  requests INTEGER NOT NULL, errors INTEGER NOT NULL, reported INTEGER NOT NULL, input INTEGER NOT NULL,
+                  output INTEGER NOT NULL, cache_read INTEGER NOT NULL, cache_write INTEGER NOT NULL, reasoning INTEGER NOT NULL,
+                  cost REAL NOT NULL, priced INTEGER NOT NULL, duration_ms INTEGER NOT NULL,
+                  PRIMARY KEY(hour, project, model)) WITHOUT ROWID;
+                 INSERT INTO request_hourly VALUES(0,'proj-0000aaaa','old',1,0,1,10,1,0,0,0,0.0,0,5);",
+        )
+        .unwrap();
+    let mut db = Db::open(&path).unwrap();
+    let billed = |model: &str, cost: Option<f64>, billing: &str| RequestRecord {
+        billing: Some(billing.into()),
+        ..request(HOUR_MS, model, 100, 10, 0, cost, 50)
+    };
+    db.record_request(&billed("sub", None, "subscription"))
+        .unwrap();
+    db.record_request(&billed("sub", None, "subscription"))
+        .unwrap();
+    db.record_request(&billed("api", Some(0.5), "api")).unwrap();
+    db.record_request(&billed("api", None, "subscription"))
+        .unwrap();
+    db.record_request(&billed("api", None, "api")).unwrap();
+
+    let models: BTreeMap<String, Totals> = db
+        .models(None)
+        .unwrap()
+        .into_iter()
+        .map(|group| (group.key, group.totals))
+        .collect();
+    assert_eq!(models["old"].subscription_requests, 0);
+    assert_eq!(cost_text(&models["old"]), "unpriced");
+    assert_eq!(models["sub"].subscription_requests, 2);
+    assert_eq!(cost_text(&models["sub"]), "subscription");
+    assert_eq!(
+        cost_text(&models["api"]),
+        "$0.5000 (1 of 3 priced, 1 subscription)"
+    );
+
+    let only_sub_and_priced = Totals {
+        requests: 2,
+        priced_requests: 1,
+        subscription_requests: 1,
+        cost_usd: 0.25,
+        ..Default::default()
+    };
+    assert_eq!(cost_text(&only_sub_and_priced), "$0.2500 + 1 subscription");
+    let mixed_unpriced = Totals {
+        requests: 3,
+        subscription_requests: 1,
+        ..Default::default()
+    };
+    assert_eq!(cost_text(&mixed_unpriced), "unpriced (1 subscription)");
+
+    let billing: Vec<Option<String>> = db
+        .conn
+        .prepare("SELECT billing FROM requests ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(billing[0].as_deref(), Some("subscription"));
+    assert_eq!(billing[2].as_deref(), Some("api"));
+}
+
+#[test]
 fn tool_statuses_preserve_legacy_rows_and_distinguish_control_outcomes() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = Db::open_default(dir.path()).unwrap();
@@ -273,6 +344,66 @@ fn transcripts_sync_incrementally() {
     fs::remove_file(&file).unwrap();
     assert_eq!(db.sync_sessions(home.path()).unwrap().removed, 1);
     assert_eq!(db.report(None, now_ms()).unwrap().sessions.sessions, 0);
+}
+
+#[test]
+fn worker_sessions_separate_worker_usage_and_session_end_syncs_the_index() {
+    let home = tempfile::tempdir().unwrap();
+    write_fixture_session(home.path());
+    let mut db = Db::open_default(home.path()).unwrap();
+    for (session, error) in [("top", false), ("child", true), ("child", false)] {
+        db.record_tool(&ToolRecord {
+            ts_ms: 1,
+            session: session.into(),
+            project: "demo-1234abcd".into(),
+            tool: "read".into(),
+            error,
+            ..Default::default()
+        })
+        .unwrap();
+    }
+    db.record_worker_session("child", "scout", 1).unwrap();
+    // A repeated start for the same private session keeps the first row.
+    db.record_worker_session("child", "worker", 2).unwrap();
+    let rows: Vec<(i64, i64, i64)> = db
+        .conn
+        .prepare(
+            "SELECT session IN (SELECT session FROM worker_sessions), count(*), sum(error)
+             FROM tool_calls GROUP BY 1 ORDER BY 1",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(rows, vec![(0, 1, 0), (1, 2, 1)]);
+    let agent: String = db
+        .conn
+        .query_row("SELECT agent FROM worker_sessions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(agent, "scout");
+
+    // Ending an interactive session indexes transcripts without opening `/stats`.
+    let mut config = crate::config::Config {
+        user_dir: home.path().to_owned(),
+        ..Default::default()
+    };
+    config.stats.enabled = true;
+    crate::stats::sync_after_session(&config);
+    assert_eq!(db.report(None, now_ms()).unwrap().sessions.sessions, 1);
+    config.stats.enabled = false;
+    let sessions = home.path().join("projects/demo-1234abcd/sessions");
+    fs::copy(
+        sessions.join("20261010T000000000Z_abcd1234.jsonl"),
+        sessions.join("20261011T000000000Z_ef567890.jsonl"),
+    )
+    .unwrap();
+    crate::stats::sync_after_session(&config);
+    assert_eq!(
+        db.report(None, now_ms()).unwrap().sessions.sessions,
+        1,
+        "disabled stats never index"
+    );
 }
 
 fn write_fixture_session(home: &Path) -> PathBuf {

@@ -57,6 +57,11 @@ pub struct State {
     /// Digests of the current turn's tool calls and results.
     #[serde(skip)]
     activity: Vec<u64>,
+    /// Advisory boundary comparison only; never a completion certificate or a new stop rule.
+    #[serde(skip)]
+    progress: Option<Value>,
+    #[serde(skip)]
+    progress_unchanged: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,6 +226,8 @@ impl State {
         });
         self.budget_reported_for = None;
         self.interview = false;
+        self.progress = None;
+        self.progress_unchanged = false;
     }
 
     /// Adds one turn's usage. A goal outside the running loop (paused, complete, dropped) does not count;
@@ -389,6 +396,11 @@ impl State {
         Some(hasher.finish())
     }
 
+    fn observe_progress(&mut self, boundary: Value) {
+        self.progress_unchanged = self.progress.as_ref() == Some(&boundary);
+        self.progress = Some(boundary);
+    }
+
     /// Decides what runs after a finished turn. `halted` says the turn needs the human (see
     /// `TurnReport::halts_automation`); `continued` says whether that turn was a continuation;
     /// `previous` carries the last continuation's activity digest for the stall rule.
@@ -413,7 +425,11 @@ impl State {
                 if all_blocked(todo) {
                     return None;
                 }
-                Some((render(CONTINUATION, &goal), Kind::Continuation))
+                let mut prompt = render(CONTINUATION, &goal);
+                if self.progress_unchanged {
+                    prompt.push_str(crate::agent::prompts::modes::goal::UNCHANGED_PROGRESS);
+                }
+                Some((prompt, Kind::Continuation))
             }
             Status::BudgetLimited
                 if self.budget_reported_for.as_deref() != Some(goal.id.as_str()) =>
@@ -454,6 +470,11 @@ impl Agent<'_> {
             };
             continued = kind == Kind::Continuation;
             // Continuation and budget prompts are written by the harness, not the user.
+            let prompt = crate::agent::run::intent::continuation(
+                &prompt,
+                &self.session.control_state(),
+                &self.session.messages(),
+            );
             report = self.goal_turn(&prompt, ui, TurnOrigin::Harness)?;
         }
         Ok(report)
@@ -463,6 +484,31 @@ impl Agent<'_> {
         let started = Instant::now();
         let report = self.turn_with_state(text, ui, true, None, origin)?;
         if self.modes.goal.goal.is_some() {
+            let checks = self
+                .step_checks
+                .evidence
+                .snapshot(self.step_checks.revision());
+            let check_statuses: std::collections::BTreeMap<_, _> = checks["latest"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(command, _)| {
+                    (
+                        command,
+                        self.step_checks
+                            .evidence
+                            .current_status(command, self.step_checks.revision()),
+                    )
+                })
+                .collect();
+            let control = self.session.control_state();
+            self.modes.goal.observe_progress(json!({
+                "todos":self.todo.tasks(),
+                "deliverables":control["working_state"]["deliverables"],
+                "open_work":control["working_state"]["open_work"],
+                "claims":control["working_state"]["claims"],
+                "checks":check_statuses,
+            }));
             let (_, turn) = self.usage_scope.snapshot();
             self.modes
                 .goal

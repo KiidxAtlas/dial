@@ -37,6 +37,8 @@ pub struct Inputs<'a> {
     pub one_call: bool,
     /// Append a compact worked loop in `edit_mode` (selected by local one-call mode).
     pub worked_example: bool,
+    /// Optional guidance for built-in prompts; replacements and custom templates opt out.
+    pub reasoning_strategy: crate::config::types::ReasoningStrategy,
 }
 
 /// The configured tool offer used for policy assembly. Loading tools does not rewrite it;
@@ -117,7 +119,9 @@ fn full_guidance(presentation: Presentation, has: &dyn Fn(&str) -> bool) -> Stri
     policy.push_str(TRUST_RULE);
     policy.push_str(CALL_CONTRACT_PRECEDENCE);
     if !compact {
-        return format!("{HEADER}{policy}\n\n# Execution\n{FOCUSED_WORK}{RULES}{visual}{DELIVERY}");
+        return format!(
+            "{HEADER}{policy}\n\n# Execution\n{FOCUSED_WORK}{RULES}{TESTING_DECISIONS}{visual}{DELIVERY}"
+        );
     }
     let mut focused = String::from(LEAN_FOCUSED_WORK);
     focused.push_str(LEAN_WAITING);
@@ -133,7 +137,9 @@ fn full_guidance(presentation: Presentation, has: &dyn Fn(&str) -> bool) -> Stri
     if !helpers.is_empty() {
         focused.push_str(&format!(" Meanwhile you may {}.", helpers.join(", or ")));
     }
-    format!("{LEAN_HEADER}{policy}\n\n# Execution\n{focused}{LEAN_RULES}{visual}{LEAN_DELIVERY}")
+    format!(
+        "{LEAN_HEADER}{policy}\n\n# Execution\n{focused}{LEAN_RULES}{TESTING_DECISIONS}{visual}{LEAN_DELIVERY}"
+    )
 }
 
 /// Scope optional workflow prose to the configured catalog, not per-request tool
@@ -251,6 +257,11 @@ fn policy_prompt(
                 {
                     guidance.push_str(&example);
                 }
+                if let Some(strategy) =
+                    crate::agent::prompts::reasoning::guidance(i.reasoning_strategy)
+                {
+                    guidance.push_str(strategy);
+                }
                 guidance
             }
         },
@@ -324,7 +335,7 @@ fn environment_prompt(i: &Inputs<'_>, rendered: Option<&str>, notes: TurnNotes) 
     out.push_str(crate::agent::window::file_handles::GUIDANCE);
     out.push('\n');
     if i.tools.iter().any(|tool| tool == "tool_search") {
-        out.push_str("- Before concluding a needed capability is unavailable, search the eligible tool catalog. If a search misses, query `*` to list eligible tools and follow `next_query`; listing does not load tools or grant permission.\n");
+        out.push_str("- Search the eligible tool catalog before declaring a needed capability unavailable. A miss returns a catalog page; follow its next_query when needed. Discovery grants no permission.\n");
     }
     if !i.discoverable.is_empty() {
         out.push_str("- Loadable tools, not in the schema yet: call `tool_load` with the exact name and use the tool next round. NEVER call one before loading it.\n");
@@ -334,9 +345,10 @@ fn environment_prompt(i: &Inputs<'_>, rendered: Option<&str>, notes: TurnNotes) 
             && i.overrides.0.is_none()
             && i.tools.iter().any(|tool| tool == "tool_search");
         if i.lean || i.one_call {
-            // Keep the existing name inventory, and add bounded capability hints for MCP tools.
+            // Small models invent what a bare name does, so native tools get one bounded line
+            // each; MCP names stay on the `Names:` line with the bounded hints below.
             // Descriptions are third-party data, not instructions or permission grants.
-            out.push_str(&loadable_names(i.discoverable.iter()));
+            out.push_str(&loadable_summaries(i.discoverable.iter()));
             let mut hints = String::new();
             for (name, description) in i.discoverable {
                 if !name.starts_with("mcp__") || description.trim().is_empty() {
@@ -425,6 +437,37 @@ fn loadable_names<'a>(entries: impl Iterator<Item = &'a (String, String)>) -> St
         })
         .collect();
     format!("  Names: {}\n", names.join(", "))
+}
+
+/// Lean inventory: one line with the first sentence of each native loadable tool's description,
+/// within a byte budget. MCP tools, placeholder families and tools past the budget stay on a
+/// `Names:` line, so every loadable name is still listed exactly.
+fn loadable_summaries<'a>(entries: impl Iterator<Item = &'a (String, String)>) -> String {
+    const BUDGET: usize = 1_200;
+    let mut lines = String::new();
+    let mut rest = Vec::new();
+    for entry @ (name, description) in entries {
+        let summary = description
+            .split_terminator(". ")
+            .next()
+            .unwrap_or_default();
+        let summary = truncate_chars(summary, 80);
+        let summary = summary.trim_end_matches('.');
+        let line = format!("  - {name}: {summary}\n");
+        if name.starts_with("mcp__")
+            || name.contains('<')
+            || summary.is_empty()
+            || lines.len() + line.len() > BUDGET
+        {
+            rest.push(entry);
+        } else {
+            lines.push_str(&line);
+        }
+    }
+    if !rest.is_empty() {
+        lines.push_str(&loadable_names(rest.into_iter()));
+    }
+    lines
 }
 
 /// Deferred MCP tools are searchable by name, server and capability. Listing every schema's

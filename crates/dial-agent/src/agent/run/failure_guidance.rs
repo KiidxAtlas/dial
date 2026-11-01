@@ -1,8 +1,6 @@
 //! Safe next actions from observed failures. No retries, installation or permission grants.
 use crate::agent::prompts::recovery as policy;
-pub(in crate::agent) use crate::agent::prompts::recovery::{
-    DIAGNOSE_FIRST, FIRST_FAILURE, PROVIDER_RECOVERY,
-};
+pub(in crate::agent) use crate::agent::prompts::recovery::{FIRST_FAILURE, PROVIDER_RECOVERY};
 use crate::{
     llm::ToolCall,
     runtime::{
@@ -11,30 +9,151 @@ use crate::{
     },
 };
 
+mod launch;
+pub(in crate::agent) use launch::{Capability, LaunchCapabilities, shell_launch_recovery};
+
+use serde::Serialize;
+use serde_json::{Value, json};
+
+/// Diagnostic suggestions only. Dispatch, permissions and retry authority never read this data.
+#[derive(Debug, Serialize)]
+struct Advisory<'a> {
+    advisory_only: bool,
+    category: &'a str,
+    source_call_id: &'a str,
+    evidence_ref: &'static str,
+    required_observation: &'a str,
+    candidates: Vec<Candidate>,
+}
+
+#[derive(Debug, Serialize)]
+struct Candidate {
+    tool: String,
+    availability: Capability,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    arguments: Option<Value>,
+}
+
+impl Candidate {
+    fn new(tool: &str, availability: Capability) -> Self {
+        Self {
+            tool: tool.into(),
+            availability,
+            arguments: None,
+        }
+    }
+
+    /// Exact native arguments only; an oversized or invalid proposal is omitted, never repaired
+    /// by guessing. Shell tool mistakes deliberately carry no reconstructed call arguments.
+    fn native(tool: &str, availability: Capability, arguments: Value) -> Self {
+        let schema = match tool {
+            "bash" => crate::tools::schemas(&["bash"], crate::config::types::EditMode::default())
+                .ok()
+                .and_then(|mut schemas| schemas.pop()),
+            "bg" => crate::tools::exec::background::tools(&crate::config::types::Config::default())
+                .into_iter()
+                .find(|tool| tool.name() == "bg")
+                .map(|tool| tool.schema()),
+            _ => None,
+        };
+        let valid = availability.usable()
+            && arguments.to_string().len() <= 8192
+            && schema.as_ref().is_some_and(|schema| {
+                crate::tools::surface::catalog::validate_arguments(schema, &arguments).is_ok()
+            });
+        Self {
+            tool: tool.into(),
+            availability,
+            arguments: valid.then_some(arguments),
+        }
+    }
+
+    fn load_guidance(&self) -> String {
+        if self.availability == Capability::Loadable {
+            format!(
+                "{} is eligible but not offered: use tool_load with {}, then wait for its schema before any permitted action. ",
+                self.tool,
+                json!({"names":[self.tool]})
+            )
+        } else {
+            String::new()
+        }
+    }
+}
+
+impl<'a> Advisory<'a> {
+    fn new(
+        call: &'a ToolCall,
+        category: &'a str,
+        evidence_ref: &'static str,
+        required_observation: &'a str,
+    ) -> Self {
+        Self {
+            advisory_only: true,
+            category,
+            source_call_id: &call.id,
+            evidence_ref,
+            required_observation,
+            candidates: Vec::new(),
+        }
+    }
+
+    fn attach(&self, output: &mut ToolOutput) {
+        // Each native record is bounded; producer values (including colliding keys) stay intact.
+        // Existing array entries are opaque data, never treated as trusted recovery decisions.
+        let bounded = |text: &str, max: usize| text.chars().take(max).collect::<String>();
+        let record = json!({
+            "advisory_only": self.advisory_only,
+            "category": bounded(self.category, 128),
+            "source_call_id": bounded(self.source_call_id, 256),
+            "evidence_ref": self.evidence_ref,
+            "required_observation": bounded(self.required_observation, 2048),
+            "candidates": self.candidates.iter().take(3).collect::<Vec<_>>(),
+        });
+        let data = output.data.get_or_insert_with(|| json!({}));
+        if !data.is_object() {
+            *data = json!({"producer_data": std::mem::take(data)});
+        }
+        if let Some(object) = data.as_object_mut() {
+            use serde_json::map::Entry;
+            match object.entry("recovery_advisory") {
+                Entry::Vacant(entry) => {
+                    entry.insert(json!([record]));
+                }
+                Entry::Occupied(mut entry) => match entry.get_mut() {
+                    Value::Array(records) => records.push(record),
+                    old => {
+                        let original = std::mem::take(old);
+                        *old = json!([original, record]);
+                    }
+                },
+            }
+        }
+    }
+}
+
 /// Recovery feedback appended to a failed result. `consecutive` counts failures of this tool and
 /// kind in a row, including this one. The text depends only on its inputs, so stored history
 /// stays byte-stable.
 pub(in crate::agent) fn feedback(kind: &str, advice: &str, consecutive: u32) -> String {
-    if consecutive > 1 {
-        format!(
-            "\n[Dial recovery: {kind}] This tool has now failed this way {consecutive} times in a row. {DIAGNOSE_FIRST} {advice}"
-        )
-    } else if kind == "effects_unknown" {
-        format!("\n[Dial recovery: {kind}] {DIAGNOSE_FIRST} {advice}")
+    let repeated = if consecutive > 1 {
+        format!(" Failed {consecutive} times in a row.")
     } else {
-        format!("\n[Dial recovery: {kind}] {FIRST_FAILURE} {advice}")
-    }
+        String::new()
+    };
+    format!("\n[Dial recovery: {kind}] {FIRST_FAILURE}{repeated} {advice}")
 }
 
 /// Render one recovery decision from controller-owned facts, without interpreting diagnostic
 /// prose as proof of rollback or success. The original result remains immediately above it.
 pub(in crate::agent) fn report(
     call: &ToolCall,
-    output: &ToolOutput,
+    output: &mut ToolOutput,
     kind: &str,
     advice: &str,
     consecutive: u32,
 ) -> String {
+    Advisory::new(call, kind, "execution.recovery", advice).attach(output);
     let effects = match output.execution.effects {
         Effects::None => "No effects recorded for this operation.",
         Effects::Known => "Recorded effects are known; failure does not undo completed work.",
@@ -60,6 +179,9 @@ pub(in crate::agent) fn report(
         Retry::OnlyByDirection => {
             "Do not replay automatically; resume only on the user's direction."
         }
+        Retry::Withheld if kind == CALL_CONTRACT.0 => {
+            "Fix the arguments and retry; no permission boundary withholds this call."
+        }
         Retry::Withheld => "A boundary withholds this operation; do not retry or bypass it.",
     };
     let retained = match output.process_outcome() {
@@ -81,6 +203,10 @@ pub(in crate::agent) fn report(
 pub(in crate::agent) fn provider_failure(error: &anyhow::Error) -> String {
     format!("{error:#}\n{PROVIDER_RECOVERY}")
 }
+
+/// Classification for a call the controller refused against the offered contract before
+/// execution. The controller supplies this fact; diagnostic prose never selects it.
+pub(in crate::agent) const CALL_CONTRACT: (&str, &str) = ("call_contract", policy::CALL_CONTRACT);
 
 pub(in crate::agent) fn classify(
     call: &ToolCall,
@@ -127,7 +253,7 @@ pub(in crate::agent) fn classify(
             CheckStatus::CodeFailed if check.is_some() => {
                 Some(("verification_code", policy::VERIFICATION_CODE))
             }
-            CheckStatus::CodeFailed => Some((
+            CheckStatus::CodeFailed | CheckStatus::FailedUnknownCause => Some((
                 "verification_failed_unclassified",
                 policy::VERIFICATION_FAILED_UNCLASSIFIED,
             )),
@@ -141,12 +267,16 @@ pub(in crate::agent) fn classify(
 }
 
 /// Coach a known tool invoked as a shell executable, using both the original call and a
-/// completed process failure. This is advice only: catalog membership grants no permission.
-pub(in crate::agent) fn shell_tool_mistake(
+/// completed process failure: exit 127 "command not found", or a Dial tool name that bash
+/// resolves to a job-control builtin (`bg: no job control`). This is advice only: catalog
+/// membership grants no permission.
+fn shell_tool_mistake(
     call: &ToolCall,
     output: &ToolOutput,
     known: impl Fn(&str) -> bool,
 ) -> Option<String> {
+    /// Dial tool names that bash runs as a builtin failing without job control.
+    const SHADOWED_BUILTINS: &[&str] = &["bg"];
     if call.name != "bash"
         || ToolStatus::from_output(output) != ToolStatus::Error
         || output.execution.effects == Effects::Unknown
@@ -155,7 +285,6 @@ pub(in crate::agent) fn shell_tool_mistake(
     }
     let process = output.execution.process.as_ref()?;
     if !process.started
-        || process.exit_code != Some(127)
         || process.signal.is_some()
         || process.timed_out
         || process.cancelled
@@ -169,27 +298,48 @@ pub(in crate::agent) fn shell_tool_mistake(
         return None;
     }
     let missing = format!("{name}: command not found");
-    let reverse = format!("command not found: {name}");
-    if !output.text.lines().any(|line| {
-        let line = line.trim();
-        line == missing || line.ends_with(&format!(": {missing}")) || line.ends_with(&reverse)
-    }) {
+    let no_job_control = format!("{name}: no job control");
+    let observed = |line: &str| match process.exit_code {
+        Some(127) => {
+            line == missing
+                || line.ends_with(&format!(": {missing}"))
+                || line.ends_with(&format!("command not found: {name}"))
+        }
+        Some(code) if code != 0 && SHADOWED_BUILTINS.contains(&name.as_str()) => {
+            line == no_job_control || line.ends_with(&format!(": {no_job_control}"))
+        }
+        _ => false,
+    };
+    if !output.text.lines().any(|line| observed(line.trim())) {
         return None;
     }
-    Some(policy::shell_tool_mistake(name))
+    Some(name.to_owned())
 }
 
-/// An empty eligible search is not proof that every capability is absent. Keep the raw
-/// search result and offer a bounded next step, without activating fallback tools.
-pub(in crate::agent) fn empty_discovery(
+/// Resolve shell-tool coaching against the actual root or fixed worker surface. Unknown names
+/// are not Dial tools; loadability is supplied only by the existing exposure/readiness owners.
+pub(in crate::agent) fn shell_tool_recovery(
     call: &ToolCall,
-    output: &ToolOutput,
-) -> Option<&'static str> {
-    (call.name == "tool_search"
-        && ToolStatus::from_output(output) == ToolStatus::Ok
-        && output.execution.effects != Effects::Unknown
-        && output.text.trim() == "[]")
-        .then_some(policy::EMPTY_DISCOVERY)
+    output: &mut ToolOutput,
+    state: impl Fn(&str) -> Option<Capability>,
+) -> Option<String> {
+    let name = shell_tool_mistake(call, output, |name| state(name).is_some())?;
+    let candidate = Candidate::new(&name, state(&name)?);
+    let next = match candidate.availability {
+        Capability::Offered => "Call it directly with its supplied schema; do not translate shell words into guessed tool arguments.".to_owned(),
+        Capability::Loadable => candidate.load_guidance(),
+        Capability::Prohibited => "This tool is prohibited by the current surface. Report that limit; do not load it or switch tools to bypass the boundary.".to_owned(),
+        Capability::Unavailable => "This tool is unavailable or has an unmet prerequisite. Inspect the named prerequisite or report the gap; this surface offers no usable loader for it.".to_owned(),
+    };
+    let mut advisory = Advisory::new(
+        call,
+        "tool_not_shell",
+        "execution.process + diagnostic",
+        &next,
+    );
+    advisory.candidates.push(candidate);
+    advisory.attach(output);
+    Some(policy::shell_tool_mistake(&name, &next))
 }
 
 #[cfg(test)]

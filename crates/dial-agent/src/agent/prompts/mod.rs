@@ -6,6 +6,7 @@
 
 pub(crate) mod compaction;
 pub(crate) mod modes;
+pub(crate) mod reasoning;
 pub(crate) mod recovery;
 pub(crate) mod system;
 pub(crate) mod turn_drafter;

@@ -1,13 +1,20 @@
 //! Turn-local enforcement of corrective feedback. Notices alone are not a control plane.
 use crate::llm::ToolCall;
-use serde_json::Value;
 use std::collections::BTreeMap;
 
 #[derive(Default)]
 pub(in crate::agent) struct RecoveryCheckpoint {
-    withheld: BTreeMap<String, String>,
+    withheld: BTreeMap<String, Withheld>,
     cached_observations: BTreeMap<String, u64>,
     source_versions: BTreeMap<String, Vec<Option<[u8; 32]>>>,
+}
+
+/// One withheld call's feedback and the files it depends on. `None` means the dependency is not
+/// known (for example a shell command), so any successful mutation releases it. Known files are
+/// released only by a committed change to one of them.
+struct Withheld {
+    reason: String,
+    targets: Option<Vec<std::path::PathBuf>>,
 }
 
 fn control(name: &str) -> bool {
@@ -15,6 +22,40 @@ fn control(name: &str) -> bool {
         name,
         "todo" | "finish" | "working_state" | "tool_search" | "tool_load" | "artifact_read"
     )
+}
+
+/// Resolved files a call reads, edits or writes. Empty for other tools and whenever any named
+/// path does not resolve, so a partly unknown call keeps the conservative unknown-dependency rule.
+pub(in crate::agent) fn declared_targets(
+    ws: &crate::tools::Workspace,
+    call: &ToolCall,
+) -> Vec<std::path::PathBuf> {
+    let resolved = match call.name.as_str() {
+        "read" => call.arguments["path"]
+            .as_str()
+            .into_iter()
+            .chain(
+                call.arguments["paths"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str),
+            )
+            .map(|path| ws.resolve_read_target(path))
+            .collect::<Result<Vec<_>, _>>(),
+        "edit" => crate::tools::declared_edit_targets(&call.arguments)
+            .unwrap_or_default()
+            .iter()
+            .map(|path| ws.resolve(path))
+            .collect::<Result<Vec<_>, _>>(),
+        "write" => call.arguments["path"]
+            .as_str()
+            .map(|path| ws.resolve(path))
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>(),
+        _ => return Vec::new(),
+    };
+    resolved.unwrap_or_default()
 }
 
 impl RecoveryCheckpoint {
@@ -28,9 +69,15 @@ impl RecoveryCheckpoint {
     ) -> (Option<String>, Option<String>, Option<String>) {
         let result = self.observe(call, output, investigation, repeats);
         let key = Self::key(call);
+        if let Some(entry) = self.withheld.get_mut(&key) {
+            let targets = declared_targets(ws, call);
+            entry.targets = (!targets.is_empty()).then_some(targets);
+        }
         if call.name == "read"
-            && !output.is_error
-            && self.withheld.contains_key(&key)
+            && self
+                .withheld
+                .get(&key)
+                .is_some_and(|entry| entry.targets.is_some())
             && let Some(version) = Self::read_versions(ws, call)
         {
             self.source_versions.insert(key, version);
@@ -133,11 +180,14 @@ impl RecoveryCheckpoint {
             }
             self.withheld.insert(
                 Self::key(call),
-                format!(
-                    "`{}`: {}",
-                    call.name,
-                    advice.chars().take(700).collect::<String>()
-                ),
+                Withheld {
+                    reason: format!(
+                        "`{}`: {}",
+                        call.name,
+                        advice.chars().take(700).collect::<String>()
+                    ),
+                    targets: None,
+                },
             );
         }
     }
@@ -158,42 +208,47 @@ impl RecoveryCheckpoint {
     }
 
     pub fn rejection(&self, call: &ToolCall) -> Option<String> {
-        self.withheld.get(&Self::key(call)).map(|reason| format!(
-            "Recovery checkpoint: this `{}` call is temporarily withheld after repeated unsuccessful or unchanged actions. This call was not executed. Other arguments and narrower observations remain available; repair the known problem, reuse existing evidence, or report a blocker. Previous feedback: {reason}", call.name
+        self.withheld.get(&Self::key(call)).map(|entry| format!(
+            "Recovery checkpoint: this `{}` call is temporarily withheld after repeated unsuccessful or unchanged actions. This call was not executed. Other arguments and narrower observations remain available; repair the known problem, reuse existing evidence, or report a blocker. Previous feedback: {}", call.name, entry.reason
         ))
     }
 
-    pub fn apply(
-        &self,
-        _schemas: &mut Vec<Value>,
-        _names: &mut Vec<String>,
-        messages: &mut Vec<Value>,
+    /// A resolved todo releases all withheld feedback. A novel successful mutation releases only
+    /// feedback with an unknown dependency, or with a known file it changed; feedback about other
+    /// known files stays withheld.
+    pub fn progress(
+        &mut self,
+        call: &ToolCall,
+        success: bool,
+        todo_changed: bool,
+        mutated: bool,
+        changed: &[std::path::PathBuf],
     ) {
-        if self.withheld.is_empty() {
-            return;
-        }
-        // Keep tools discoverable: only the unsuccessful call is withheld, not
-        // legitimate corrected arguments, another file, or a narrower check.
-        let reasons = self
-            .withheld
-            .values()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("\n");
-        // Advisory text only: the withheld calls are refused with their own tool results.
-        messages.push(crate::agent::run::guidance::note(crate::agent::run::guidance::Priority::Loop, format!(
-            "[Recovery checkpoint from Dial]\n{reasons}\nDo not repeat the unchanged calls. The tools remain available with corrected arguments or for genuinely different evidence. Resume the existing task; do not create a new plan or edit merely to restore tool access. If no useful action is available, call finish with a specific blocker or question."
-        )));
-    }
-
-    pub fn progress(&mut self, call: &ToolCall, success: bool, todo_changed: bool, mutated: bool) {
         let task_resolved = call.name == "todo"
             && todo_changed
-            && matches!(call.arguments["op"].as_str(), Some("done" | "block"));
-        if success && (mutated || task_resolved) {
+            && matches!(
+                crate::agent::workflow::todo::requested_op(&call.arguments),
+                Some("done" | "block")
+            );
+        if !success {
+            return;
+        }
+        if task_resolved {
             self.withheld.clear();
             self.cached_observations.clear();
             self.source_versions.clear();
+        } else if mutated {
+            self.withheld.retain(|_, entry| {
+                entry
+                    .targets
+                    .as_ref()
+                    .is_some_and(|targets| !targets.iter().any(|target| changed.contains(target)))
+            });
+            let withheld = &self.withheld;
+            self.cached_observations
+                .retain(|key, _| withheld.contains_key(key));
+            self.source_versions
+                .retain(|key, _| withheld.contains_key(key));
         }
     }
 

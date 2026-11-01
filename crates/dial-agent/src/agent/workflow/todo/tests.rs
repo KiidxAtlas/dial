@@ -607,10 +607,44 @@ fn findings_alias_and_unknown_keys_get_a_corrected_call() {
     let out = list.call(&json!({"op": "done", "findings": "ans", "evidence": ["a.rs:1"]}));
     assert!(!out.is_error, "{}", out.text);
     assert_eq!(list.tasks[0].finding.as_deref(), Some("ans"));
-    let out = list.call(&json!({"op": "done", "done": true}));
+    let out = list.call(&json!({"op": "done", "task": 1, "note": "x"}));
     assert!(out.is_error);
-    assert!(out.text.contains("unknown key \"done\""), "{}", out.text);
-    assert!(out.text.contains("{\"op\":\"done\"}"), "{}", out.text);
+    assert!(out.text.contains("unknown key \"note\""), "{}", out.text);
+    // The corrected call keeps the task number the model gave.
+    assert!(
+        out.text.contains("{\"index\":1,\"op\":\"done\"}"),
+        "{}",
+        out.text
+    );
+}
+
+#[test]
+fn done_true_and_task_number_shorthand_are_accepted() {
+    let mut list = TodoList::new();
+    set(
+        &mut list,
+        json!([{"content":"One"},{"content":"Two"},{"content":"Three"}]),
+    );
+    let out = list.call(&json!({"done": true}));
+    assert!(!out.is_error, "{}", out.text);
+    assert_eq!(
+        statuses(&list),
+        [Status::Completed, Status::InProgress, Status::Pending]
+    );
+    let out = list.call(&json!({"done": true, "task": 3}));
+    assert!(!out.is_error, "{}", out.text);
+    assert_eq!(list.tasks()[2].status, Status::Completed);
+    let out = list.call(&json!({"op": "start", "task": 2}));
+    assert!(!out.is_error, "{}", out.text);
+    // done: true never overrides a different explicit op.
+    let out = list.call(&json!({"op": "view", "done": true}));
+    assert!(
+        out.is_error && out.text.contains("unknown key \"done\""),
+        "{}",
+        out.text
+    );
+    assert_eq!(requested_op(&json!({"done": true})), Some("done"));
+    assert_eq!(requested_op(&json!({"op": "block"})), Some("block"));
 }
 
 #[test]

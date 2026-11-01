@@ -199,3 +199,54 @@ fn disjoint_native_writes_keep_order_and_denials_have_no_effects() {
     assert!(results[0].0.is_error);
     assert!(!root.path().join("denied.txt").exists());
 }
+
+#[test]
+fn failed_mutations_skip_only_dependent_or_opaque_work_not_diagnostics() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(root.path()).unwrap();
+    let registry = crate::tools::integrations::ext::Registry::default();
+    let mode = crate::config::types::EditMode::default();
+    let mut prerequisites = BatchPrerequisites::default();
+    prerequisites.observe(
+        &workspace,
+        mode,
+        &call("write", "a"),
+        &ToolOutput::err("refused").with_effects(tools::surface::outcome::Effects::None),
+    );
+    for (name, args, skipped) in [
+        ("write", json!({"path":"a","content":"x"}), true),
+        ("write", json!({"path":"b","content":"x"}), false),
+        ("read", json!({"path":"a"}), false),
+        ("grep", json!({"pattern":"cause"}), false),
+        ("bash", json!({"command":"python3 a"}), true),
+        ("bash", json!({"command":"python3 --version"}), false),
+        ("check", json!({"names":["build"]}), true),
+        ("bg", json!({"action":"start","command":"python3 a"}), true),
+        ("bg", json!({"action":"output","name":"job"}), false),
+        ("tool_search", json!({"query":"debugger"}), false),
+    ] {
+        let action = ToolCall {
+            id: "later".into(),
+            name: name.into(),
+            arguments: args,
+            malformed_arguments: false,
+        };
+        let result = prerequisites.rejection(&workspace, mode, &registry, &action);
+        assert_eq!(result.is_some(), skipped, "{action:?}");
+        if let Some(output) = result {
+            assert_eq!(output.execution.status, Some(tools::ToolStatus::Skipped));
+            assert_eq!(
+                output.execution.effects,
+                tools::surface::outcome::Effects::None
+            );
+            assert!(output.execution.changed_paths.is_empty());
+        }
+    }
+    assert!(!root.path().join("a").exists());
+    // A fresh model request can deliberately diagnose or correct the failed prerequisite.
+    assert!(
+        BatchPrerequisites::default()
+            .rejection(&workspace, mode, &registry, &call("write", "a"))
+            .is_none()
+    );
+}

@@ -17,7 +17,9 @@ use crate::app::overlay::settings::{
     settings_value_choices,
 };
 use crate::app::overlay::{ActiveOverlay, OverlayOutcome, Which, overlay_destination};
-use crate::app::selection::{local_suggestion_base, model_settings_profile};
+use crate::app::selection::{
+    local_suggestion_base, model_settings_inherited_edit_mode, model_settings_profile,
+};
 use crate::app::shell::Shell;
 use crate::config::types::Config;
 use crate::llm::catalog;
@@ -258,8 +260,33 @@ impl Shell {
             )),
             Which::ModelSettings => {
                 let (name, profile) = model_settings_profile(&effective);
+                // Resolve the selected route's raw admitted harness, not the current agent's
+                // effective version: that version already contains the profile pin being reset.
+                let stored = if effective.teaching() {
+                    let store = app.store.as_ref().filter(|_| {
+                        effective.state_dir == app.config.state_dir
+                            && effective.model == app.config.model
+                            && effective.use_case == app.config.use_case
+                    });
+                    Some(match store {
+                        Some(store) => store.active()?.harness,
+                        None => {
+                            App::open_store(&effective.clone().for_coding())?
+                                .active()?
+                                .harness
+                        }
+                    })
+                } else {
+                    None
+                };
+                let inherited_edit_mode = model_settings_inherited_edit_mode(
+                    &effective,
+                    &name,
+                    stored.as_ref().unwrap_or(&effective.harness),
+                )?;
                 let mut overlay =
                     crate::ui::overlay::model_settings::ModelSettingsOverlay::new(name, profile)
+                        .with_inherited_edit_mode(inherited_edit_mode)
                         .with_model_files();
                 if effective.assistance.local.suggestions {
                     overlay = overlay
@@ -535,7 +562,12 @@ impl Shell {
             overlay_input(&mut env, &mut state.overlay, &mut state.paste_guard, event)
         });
         let draw_result = if redraw && !closed {
-            term.draw_overlay_placed(|frame| draw_overlay_frame(frame, &env, &mut state.overlay))
+            // An inline prompt may have temporarily yielded the screen while retaining this menu.
+            term.open_overlay().and_then(|()| {
+                term.draw_overlay_placed(|frame| {
+                    draw_overlay_frame(frame, &env, &mut state.overlay)
+                })
+            })
         } else {
             Ok(())
         };

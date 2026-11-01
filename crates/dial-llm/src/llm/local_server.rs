@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
 /// What one local server reports about itself and the model it serves.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct ServerFacts {
     /// Parallel decoding slots (llama.cpp `total_slots`), when the server declares them.
     pub slots: Option<u32>,
@@ -27,6 +27,99 @@ pub struct ServerFacts {
     /// `Some(false)` is a reported absence; `None` is unknown, including servers that report no
     /// capability list at all.
     pub native_tools: Option<bool>,
+    /// Generation settings the server applies to a request that omits them.
+    pub defaults: ServerDefaults,
+}
+
+/// Generation defaults a server reports for the model: llama.cpp `/props`
+/// `default_generation_settings`, Ollama `/api/show` `parameters` (the Modelfile). Each applies to a
+/// request field Dial omits. `None` means the server did not report it; LM Studio and Dial's own
+/// runtime report none. Values the server keeps built in but does not report are not guessed.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ServerDefaults {
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub top_k: Option<u64>,
+    pub min_p: Option<f64>,
+    pub output: Option<OutputDefault>,
+}
+
+/// A server's default output allowance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputDefault {
+    /// A negative count (llama.cpp `n_predict`, Ollama `num_predict`): no fixed limit.
+    Unlimited,
+    Tokens(u64),
+}
+
+impl OutputDefault {
+    fn from_count(count: i64) -> Self {
+        u64::try_from(count).map_or(Self::Unlimited, Self::Tokens)
+    }
+}
+
+impl ServerDefaults {
+    /// JSON for request records: numbers, `"unlimited"` for the output allowance, null when unknown.
+    pub fn to_json(&self) -> Value {
+        json!({
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "top_k": self.top_k,
+            "min_p": self.min_p,
+            "max_tokens": match self.output {
+                Some(OutputDefault::Unlimited) => json!("unlimited"),
+                Some(OutputDefault::Tokens(n)) => json!(n),
+                None => Value::Null,
+            },
+        })
+    }
+
+    /// llama.cpp `default_generation_settings`: current builds nest the sampling values under
+    /// `params`, older ones put them at the top level.
+    fn from_llama_props(props: &Value) -> Self {
+        let settings = &props["default_generation_settings"];
+        let params = if settings["params"].is_object() {
+            &settings["params"]
+        } else {
+            settings
+        };
+        Self {
+            temperature: params["temperature"].as_f64().and_then(sampler),
+            top_p: params["top_p"].as_f64().and_then(sampler),
+            top_k: params["top_k"].as_u64(),
+            min_p: params["min_p"].as_f64().and_then(sampler),
+            output: params["n_predict"].as_i64().map(OutputDefault::from_count),
+        }
+    }
+
+    /// Ollama `/api/show` `parameters`: one `name value` line per Modelfile `PARAMETER`.
+    fn from_ollama_parameters(shown: &Value) -> Self {
+        let mut defaults = Self::default();
+        for line in shown["parameters"].as_str().unwrap_or_default().lines() {
+            let mut parts = line.split_whitespace();
+            let (Some(name), Some(value)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            let float = || value.parse::<f64>().ok().and_then(sampler);
+            match name {
+                "temperature" => defaults.temperature = float(),
+                "top_p" => defaults.top_p = float(),
+                "min_p" => defaults.min_p = float(),
+                "top_k" => defaults.top_k = value.parse().ok(),
+                "num_predict" => {
+                    defaults.output = value.parse::<i64>().ok().map(OutputDefault::from_count)
+                }
+                _ => {}
+            }
+        }
+        defaults
+    }
+}
+
+/// A finite, nonnegative sampler value, rounded to four decimals: llama.cpp reports its `f32`
+/// settings widened (`0.800000011920929`), which is not the value an operator set.
+fn sampler(value: f64) -> Option<f64> {
+    (value.is_finite() && value >= 0.0).then(|| (value * 10_000.0).round() / 10_000.0)
 }
 
 /// Template marker of the switch Qwen-style templates read from `enable_thinking`.
@@ -211,6 +304,7 @@ fn dial_runtime_facts(model: &str) -> ServerFacts {
             .then(super::server::dial_llama_slots)
             .flatten(),
         thinking_switch: template.map(|template| template.contains(THINKING_MARKER)),
+        defaults: ServerDefaults::default(),
     }
 }
 
@@ -235,10 +329,12 @@ fn llama_facts(
         thinking_switch: props["chat_template"]
             .as_str()
             .map(|template| template.contains(THINKING_MARKER)),
+        defaults: ServerDefaults::from_llama_props(&props),
     })
 }
 
-/// Ollama `/api/show` `capabilities`: `"thinking"` is the switch Ollama's `think` field reads.
+/// Ollama `/api/show`: `capabilities` (`"thinking"` is the switch Ollama's `think` field reads) and
+/// the Modelfile `parameters`.
 fn ollama_facts(
     base: &str,
     model: &str,
@@ -258,12 +354,13 @@ fn ollama_facts(
         slots: None,
         thinking_switch: Some(has("thinking")),
         native_tools: Some(has("tools")),
+        defaults: ServerDefaults::from_ollama_parameters(&shown),
     })
 }
 
 /// LM Studio `/api/v0/models`: the row's `capabilities` list says whether the model declares native
-/// tool use. LM Studio documents no template thinking switch to read. A row without a capability
-/// list, or no row for `model`, says nothing.
+/// tool use. LM Studio documents no template thinking switch and no sampling defaults to read. A row
+/// without a capability list, or no row for `model`, says nothing.
 fn lm_studio_facts(
     base: &str,
     model: &str,

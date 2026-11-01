@@ -336,6 +336,16 @@ pub struct ModelProfile {
     /// routes, which never receive `local_hints`.
     #[serde(skip)]
     pub local_server: Option<super::local_hints::LocalServer>,
+    /// Runtime-only: a compaction Handoff keeps its tools, system prompt and history (so the cached
+    /// prefix is unchanged) but sends `tool_choice: none`, so the model can only answer in text.
+    /// Set by `Backend::compaction_handoff_profile`; never persisted or accepted from config.
+    #[serde(skip)]
+    pub force_tool_choice_none: bool,
+    /// Runtime-only: set on a local-host main or worker request whose operator left the output
+    /// allowance unset (`max_tokens == 0`), so the serving host's own default applies. Never
+    /// persisted or accepted from config.
+    #[serde(skip)]
+    pub inherit_output_limit: bool,
 }
 impl ModelProfile {
     /// `local_hints` minus whatever an explicit profile setting already decides.
@@ -672,6 +682,15 @@ impl ModelProfile {
             fields.insert("response_format".into(), response_format);
         }
         let object = body.as_object_mut().expect("request body object");
+        if self.force_tool_choice_none
+            && object
+                .get("tools")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|tools| !tools.is_empty())
+        {
+            object.insert("tool_choice".into(), json!("none"));
+            object.remove("parallel_tool_calls");
+        }
         if !self.capabilities.temperature {
             object.remove("temperature");
         }
@@ -683,6 +702,11 @@ impl ModelProfile {
         }
         if let Some(p) = self.top_p {
             object.insert("top_p".into(), json!(p));
+        }
+        // A host-inherited allowance is not written at all, under either wire name.
+        if self.inherit_output_limit && self.max_tokens.is_none() {
+            object.remove("max_tokens");
+            object.remove("max_completion_tokens");
         }
         if self.capabilities.output_limit == OutputLimit::MaxCompletionTokens
             && let Some(n) = object.remove("max_tokens")
@@ -702,6 +726,26 @@ impl ModelProfile {
         // Request-scoped local hints go last: a field the profile or body already wrote stays.
         if let Some(server) = self.local_server {
             let thinking_decided = self.thinking.is_some() || self.reasoning_effort.is_some();
+            if server == super::local_hints::LocalServer::MlxVlmRuntime {
+                // MLX-VLM ignores template kwargs for thinking. Promote only the boolean switch;
+                // retain other template options and never defeat explicit reasoning/native fields.
+                let object = body.as_object_mut().expect("request body object");
+                let thinking = object
+                    .get_mut("chat_template_kwargs")
+                    .and_then(serde_json::Value::as_object_mut)
+                    .and_then(|kwargs| {
+                        let thinking = kwargs.get("enable_thinking")?.as_bool()?;
+                        kwargs.remove("enable_thinking");
+                        Some(thinking)
+                    });
+                if !thinking_decided
+                    && !object.contains_key("reasoning_effort")
+                    && !object.contains_key("reasoning")
+                    && let Some(thinking) = thinking
+                {
+                    object.entry("enable_thinking").or_insert(json!(thinking));
+                }
+            }
             self.effective_local_hints(thinking_decided)
                 .apply_openai(server, body);
         }

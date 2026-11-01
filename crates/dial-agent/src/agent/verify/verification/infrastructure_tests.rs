@@ -90,7 +90,7 @@ fn offline_cargo_cache_absence_is_unavailable() {
         );
         assert_eq!(
             verdict("cargo check", "cargo check", diagnostic),
-            CheckStatus::CodeFailed
+            CheckStatus::FailedUnknownCause
         );
     }
 }
@@ -156,12 +156,12 @@ fn project_defects_are_not_setup_failures() {
         (
             "related Python tests: app",
             "python -m pytest",
-            "bash: cargo: command not found",
+            "AssertionError: missing child runner\nbash: cargo: command not found",
         ),
         (
             "cargo check",
             "echo cargo",
-            "bash: cargo: command not found",
+            "AssertionError: runner invocation failed\nbash: cargo: command not found",
         ),
     ] {
         assert_eq!(

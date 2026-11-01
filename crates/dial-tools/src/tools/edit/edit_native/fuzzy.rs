@@ -1400,6 +1400,9 @@ pub fn replace_text(
             for (at, _) in normalized_content.match_indices(normalized_old.as_ref()) {
                 witness(at, at + normalized_old.len())?;
             }
+            if normalized_old == normalized_new {
+                return Ok(ReplaceOutcome::NoChange);
+            }
             return Ok(ReplaceOutcome::Replaced(ReplaceResult {
                 content: normalized_content
                     .replace(normalized_old.as_ref(), normalized_new.as_ref()),
@@ -1449,6 +1452,11 @@ pub fn replace_text(
                 }
                 break;
             };
+            // Even unchanged matches must pass the source authority boundary.
+            witness(
+                matched.start_index,
+                (matched.start_index + matched.actual_text.len()).min(normalized_content.len()),
+            )?;
             if adjusted == matched.actual_text {
                 if replacements.is_empty() {
                     return Ok(ReplaceOutcome::NoChange);
@@ -1468,10 +1476,6 @@ pub fn replace_text(
                     "replace_all exceeds 4096 fuzzy placements",
                 ));
             }
-            witness(
-                matched.start_index,
-                (matched.start_index + matched.actual_text.len()).min(normalized_content.len()),
-            )?;
             replacements.push(Replacement {
                 start: matched.start_index,
                 end: matched.start_index + matched.actual_text.len(),

@@ -103,8 +103,7 @@ fn failed_reads_are_not_started_early_but_corrected_calls_remain_available() {
         &stream.runner.workspace,
         &failed,
         &mut output,
-        false,
-        false,
+        Default::default(),
         |_| false,
     );
     stream.admission.failed_calls = engine.failed_calls();

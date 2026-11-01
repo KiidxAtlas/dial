@@ -369,6 +369,7 @@ impl<'a> Agent<'a> {
             workspace,
             ext: Registry::standard(config, crate::computer::tools(config)),
             background_notices: Vec::new(),
+            exit_bound_jobs_noticed: Default::default(),
             hook_context: Vec::new(),
             peer_state: Default::default(),
             monitor_state: Default::default(),
@@ -521,6 +522,7 @@ impl<'a> Agent<'a> {
             workspace,
             ext: Registry::new(),
             background_notices: Vec::new(),
+            exit_bound_jobs_noticed: Default::default(),
             hook_context: Vec::new(),
             peer_state: Default::default(),
             monitor_state: Default::default(),
@@ -682,6 +684,11 @@ impl<'a> Agent<'a> {
                 prefer_subagents: self.config.task.prefer_subagents,
                 one_call: self.local_one_call(),
                 worked_example: self.local_one_call(),
+                reasoning_strategy: if self.hermetic {
+                    Default::default()
+                } else {
+                    self.config.experimental.reasoning_strategy
+                },
             });
         let mut messages = match built {
             Ok(messages) => {

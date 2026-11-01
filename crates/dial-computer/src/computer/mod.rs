@@ -75,7 +75,9 @@ pub fn capabilities() -> Result<Value, String> {
         &AbortSignal::new(),
     );
     let _ = session.supervisor.close();
-    result.map_err(|error| error.message)
+    result
+        .map(|output| output.value)
+        .map_err(|error| error.message)
 }
 
 fn current_cwd() -> String {
@@ -314,7 +316,7 @@ impl ComputerSession {
         grounding: Option<&Config>,
         confirm: Option<&dyn Fn(&str) -> bool>,
         signal: &AbortSignal,
-    ) -> ComputerResult<Value> {
+    ) -> ComputerResult<supervisor::RunOutput> {
         // Per run, the session's cwd follows the caller's workspace root.
         *self.cwd.lock() = cwd.to_owned();
         let closed = self.closed.load(Ordering::Acquire);
@@ -322,7 +324,7 @@ impl ComputerSession {
             ComputerAction::Close => {
                 self.closed.store(true, Ordering::Release);
                 self.supervisor.close()?;
-                Ok(json!({ "closed": true }))
+                Ok(supervisor::RunOutput::plain(json!({ "closed": true })))
             }
             ComputerAction::Capabilities => {
                 if closed {
@@ -332,6 +334,7 @@ impl ComputerSession {
                 let snapshot = snapshot_value(&self.snapshot(read_only, coordinate_safe))?;
                 self.supervisor
                     .capabilities(&snapshot, std::path::Path::new(cwd), signal)
+                    .map(supervisor::RunOutput::plain)
             }
             ComputerAction::Run {
                 code,
@@ -389,7 +392,7 @@ impl ComputerSession {
         settings: RunSettings<'_>,
         confirm: Option<&dyn Fn(&str) -> bool>,
         signal: &AbortSignal,
-    ) -> ComputerResult<Value> {
+    ) -> ComputerResult<supervisor::RunOutput> {
         let RunSettings {
             cwd,
             coordinate_safe,
@@ -579,8 +582,8 @@ impl Computer {
                 signal,
             )
         });
-        let value = match result {
-            Ok(value) => value,
+        let supervisor::RunOutput { value, captures } = match result {
+            Ok(result) => result,
             Err(error) if error.is_abort => {
                 return ToolOutput::err(abort_message(may_send_input, &error.message));
             }
@@ -616,6 +619,7 @@ impl Computer {
                 .artifacts()
                 .and_then(|store| store.retain(full).ok())
         })
+        .with_captures(captures)
     }
 }
 
@@ -706,6 +710,7 @@ impl Tool for Computer {
                         "read_only": {"type": "boolean"},
                         "chain": {
                             "type": "array",
+                            "description": "call: ordered helper steps; each item holds its own args, e.g. [{\"method\":\"windows\",\"args\":[]},{\"method\":\"screenshot\",\"args\":[]}]. Top-level `args` belongs to run, not call.",
                             "items": {
                                 "type": "object",
                                 "additionalProperties": false,

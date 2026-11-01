@@ -108,6 +108,72 @@ pub(in crate::agent) fn footprint(
     })
 }
 
+/// Failed native mutations are prerequisites only for actions with overlapping or unknown
+/// resources. Diagnostic reads and proven-disjoint native work remain available in this batch.
+#[derive(Default)]
+pub(in crate::agent) struct BatchPrerequisites {
+    failed: Vec<(String, Option<Footprint>)>,
+}
+
+impl BatchPrerequisites {
+    pub(in crate::agent) fn observe(
+        &mut self,
+        workspace: &Workspace,
+        mode: crate::config::types::EditMode,
+        call: &ToolCall,
+        output: &ToolOutput,
+    ) {
+        if output.is_error
+            && output.execution.status != Some(tools::ToolStatus::Skipped)
+            && matches!(call.name.as_str(), "write" | "edit" | "ast_edit")
+        {
+            self.failed
+                .push((call.name.clone(), footprint(workspace, mode, call)));
+        }
+    }
+
+    pub(in crate::agent) fn rejection(
+        &self,
+        workspace: &Workspace,
+        mode: crate::config::types::EditMode,
+        registry: &crate::tools::integrations::ext::Registry,
+        call: &ToolCall,
+    ) -> Option<ToolOutput> {
+        if self.failed.is_empty() {
+            return None;
+        }
+        // Checks consume the candidate source even though their own approval gate is read-only.
+        // Job observations and cancellation do not start work against that candidate.
+        if (call.name == "bg"
+            && matches!(
+                call.arguments["action"].as_str(),
+                Some("output" | "wait" | "list" | "kill")
+            ))
+            || (call.name != "check"
+                && crate::agent::safety::approval::is_read_only(
+                    registry,
+                    &call.name,
+                    &call.arguments,
+                ))
+        {
+            return None;
+        }
+        let resources = footprint(workspace, mode, call);
+        let (name, _) =
+            self.failed
+                .iter()
+                .find(|(_, failed)| match (failed.as_ref(), resources.as_ref()) {
+                    (Some(failed), Some(resources)) => failed.conflicts(resources),
+                    _ => true,
+                })?;
+        Some(ToolOutput::err(format!(
+            "This call was not executed: an earlier `{name}` mutation failed in this batch and this action has overlapping or unknown source dependencies. Inspect the failure and current source, then replan in the next request. Diagnostic reads and proven-disjoint native actions remain available; completed results are preserved."
+        ))
+        .with_status(tools::ToolStatus::Skipped)
+        .with_effects(tools::surface::outcome::Effects::None))
+    }
+}
+
 impl Agent<'_> {
     /// A maximal independent prefix, bounded by the controller's configured concurrency. A
     /// conflicting resource or unknown effect closes the wave; nothing jumps a serial barrier.

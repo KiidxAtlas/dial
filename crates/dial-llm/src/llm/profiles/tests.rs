@@ -411,3 +411,195 @@ fn reasoning_effort_wire_helper_maps_declared_efforts_and_falls_back_to_dial_nam
     profile.capabilities.reasoning_effort_wire.clear();
     assert_eq!(profile.reasoning_effort_wire(ReasoningEffort::High), "high");
 }
+
+#[test]
+fn forced_tool_choice_none_keeps_tool_wire_and_overrides_parallel_setting() {
+    let tools = serde_json::json!([{"type":"function","function":{"name":"read","parameters":{"type":"object"}}}]);
+    let body_for = |profile: &ModelProfile, tools: &serde_json::Value| {
+        let mut body = serde_json::json!({"model":"gpt-x","messages":[{"role":"user","content":"hi"}],"tools":tools});
+        profile.apply_openai(&mut body);
+        body
+    };
+    let mut normal = ModelProfile::minimal("openai", "gpt-x");
+    normal.capabilities.parallel_tool_calls = Some(true);
+    let plain = body_for(&normal, &tools);
+    assert_eq!(plain["parallel_tool_calls"], serde_json::json!(true));
+    assert!(plain.get("tool_choice").is_none());
+    let mut forced = normal.clone();
+    forced.force_tool_choice_none = true;
+    let handoff = body_for(&forced, &tools);
+    assert_eq!(handoff["tool_choice"], "none");
+    assert!(handoff.get("parallel_tool_calls").is_none());
+    assert_eq!(handoff["tools"], plain["tools"]);
+    assert_eq!(handoff["messages"], plain["messages"]);
+    // No tools to govern: the flag adds no tool_choice field.
+    let none = body_for(&forced, &serde_json::json!([]));
+    assert!(none.get("tool_choice").is_none());
+}
+
+#[test]
+fn forced_tool_choice_is_runtime_only_and_never_serialized() {
+    let profile = ModelProfile {
+        force_tool_choice_none: true,
+        ..ModelProfile::minimal("openai", "gpt-x")
+    };
+    let value = serde_json::to_value(&profile).unwrap();
+    assert!(value.get("force_tool_choice_none").is_none());
+    assert!(
+        serde_json::from_value::<ModelProfile>(serde_json::json!({
+            "provider": "openai",
+            "model": "gpt-x",
+            "force_tool_choice_none": true
+        }))
+        .is_err()
+    );
+}
+
+#[test]
+fn host_inherited_output_limit_is_removed_from_openai_bodies_under_both_names() {
+    let mut profile = ModelProfile::minimal("openai", "gpt-x");
+    profile.inherit_output_limit = true;
+    let mut body = serde_json::json!({"max_tokens": 64, "messages": []});
+    profile.apply_openai(&mut body);
+    assert!(body.get("max_tokens").is_none() && body.get("max_completion_tokens").is_none());
+    profile.capabilities.output_limit = OutputLimit::MaxCompletionTokens;
+    let mut body = serde_json::json!({"max_tokens": 64});
+    profile.apply_openai(&mut body);
+    assert!(body.get("max_tokens").is_none() && body.get("max_completion_tokens").is_none());
+    // An explicit profile allowance and an unflagged profile keep the request's value.
+    profile.max_tokens = Some(256);
+    let mut body = serde_json::json!({"max_tokens": 64});
+    profile.apply_openai(&mut body);
+    assert_eq!(
+        body.get("max_completion_tokens"),
+        Some(&serde_json::json!(64))
+    );
+    let plain = ModelProfile::minimal("openai", "gpt-x");
+    let mut body = serde_json::json!({"max_tokens": 64});
+    plain.apply_openai(&mut body);
+    assert_eq!(body["max_tokens"], 64);
+}
+
+#[test]
+fn inherit_output_limit_is_runtime_only_and_never_serialized() {
+    let profile = ModelProfile {
+        inherit_output_limit: true,
+        ..ModelProfile::minimal("openai", "gpt-x")
+    };
+    let value = serde_json::to_value(&profile).unwrap();
+    assert!(value.get("inherit_output_limit").is_none());
+    assert!(
+        serde_json::from_value::<ModelProfile>(serde_json::json!({
+            "provider": "openai",
+            "model": "gpt-x",
+            "inherit_output_limit": true
+        }))
+        .is_err()
+    );
+}
+
+#[test]
+fn mlx_vlm_template_thinking_reaches_the_wire_without_changing_persisted_profiles() {
+    use crate::llm::local_hints::{LocalHints, LocalServer};
+    use serde_json::json;
+
+    for (config, vision) in [(json!({"vision_config": {}}), true), (json!({}), false)] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("config.json"), config.to_string()).unwrap();
+        let model = root.path().to_str().unwrap();
+        for thinking in [Some(true), Some(false), None] {
+            let mut kwargs = serde_json::Map::from_iter([("other".into(), json!(1))]);
+            if let Some(thinking) = thinking {
+                kwargs.insert("enable_thinking".into(), json!(thinking));
+            }
+            let mut profile = ModelProfile::minimal("mlx", model);
+            profile.local_sampling = Some(crate::llm::local_sampling::LocalSampling {
+                chat_template_kwargs: Some(kwargs.clone()),
+                ..Default::default()
+            });
+            profile.validate().unwrap();
+            let persisted = serde_json::to_value(&profile).unwrap();
+            assert_eq!(
+                persisted["local_sampling"]["chat_template_kwargs"],
+                json!(kwargs)
+            );
+            let mut restored: ModelProfile =
+                toml::from_str(&toml::to_string(&profile).unwrap()).unwrap();
+            assert_eq!(serde_json::to_value(&restored).unwrap(), persisted);
+            restored.local_server = Some(LocalServer::detect("mlx", model, None, None, &[]));
+            // A template option is explicit and must beat a contradictory request hint.
+            restored.local_hints = LocalHints {
+                thinking: thinking.map(|value| !value),
+                ..Default::default()
+            };
+            let mut body = json!({"messages": []});
+            restored.apply_openai(&mut body);
+            let mut expected_kwargs = kwargs;
+            if vision {
+                expected_kwargs.remove("enable_thinking");
+            }
+            assert_eq!(body["chat_template_kwargs"], json!(expected_kwargs));
+            assert_eq!(
+                body.get("enable_thinking"),
+                thinking.filter(|_| vision).map(|v| json!(v)).as_ref()
+            );
+            assert_eq!(serde_json::to_value(&restored).unwrap(), persisted);
+        }
+    }
+}
+
+#[test]
+fn mlx_vlm_explicit_reasoning_and_native_body_controls_beat_template_options_and_hints() {
+    use crate::llm::local_hints::{LocalHints, LocalServer};
+    use serde_json::json;
+
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("config.json"), r#"{"vision_config":{}}"#).unwrap();
+    let model = root.path().to_str().unwrap();
+    for (thinking, effort, template, native, expected_effort) in [
+        (None, None, true, Some(false), None),
+        (None, Some(ReasoningEffort::None), true, None, Some("none")),
+        (None, Some(ReasoningEffort::High), false, None, Some("high")),
+        (Some(false), None, true, None, Some("none")),
+        (
+            Some(true),
+            Some(ReasoningEffort::High),
+            false,
+            None,
+            Some("high"),
+        ),
+    ] {
+        let mut profile = ModelProfile::minimal("mlx", model);
+        profile.capabilities.reasoning = ReasoningApi::OpenaiEffort;
+        profile.capabilities.reasoning_efforts = vec![ReasoningEffort::None, ReasoningEffort::High];
+        profile.thinking = thinking;
+        profile.reasoning_effort = effort;
+        profile.local_sampling = Some(crate::llm::local_sampling::LocalSampling {
+            chat_template_kwargs: Some(serde_json::Map::from_iter([
+                ("enable_thinking".into(), json!(template)),
+                ("other".into(), json!(1)),
+            ])),
+            ..Default::default()
+        });
+        profile.local_hints = LocalHints {
+            thinking: Some(!template),
+            ..Default::default()
+        };
+        profile.local_server = Some(LocalServer::detect("mlx", model, None, None, &[]));
+        profile.validate().unwrap();
+        let mut body = json!({"messages": []});
+        if let Some(native) = native {
+            body["enable_thinking"] = json!(native);
+        }
+        profile.apply_openai(&mut body);
+        assert_eq!(
+            body.get("enable_thinking"),
+            native.map(|v| json!(v)).as_ref()
+        );
+        assert_eq!(
+            body.get("reasoning_effort"),
+            expected_effort.map(|v| json!(v)).as_ref()
+        );
+        assert_eq!(body["chat_template_kwargs"], json!({"other": 1}));
+    }
+}

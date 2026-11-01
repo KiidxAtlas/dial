@@ -3,12 +3,14 @@
 //! module cache or `vendor/`). It never fetches, builds or runs package code.
 //!
 //! Read authority. A package inside a workspace root follows the workspace's protected paths. A
-//! package in a shared cache outside every root (cargo registry, Go module cache) is read only where
-//! the shell sandbox would let `bash` read it as well: the Dev policy, outside every denied
-//! (credential or Dial state) path. Under the strict policy such caches stay unreadable unless the
-//! user attaches them with `/add-dir`. Every read stays inside the resolved package root, which in
-//! turn must lie inside the cache or install directory it was resolved from; symlinks are not
-//! followed out of it.
+//! package in a shared cache outside every root (cargo registry, Go module cache) is read where
+//! the shell sandbox would let `bash` read it as well (the Dev policy), and under the strict
+//! policy too when it lies in one of the resolved dependency caches (`CARGO_HOME/registry/src`,
+//! `CARGO_HOME/git/checkouts`, the Go module cache): a read-only grant for this tool alone. Every
+//! denied (credential or Dial state) path still wins. Other paths stay unreadable under the
+//! strict policy unless the user attaches them with `/add-dir`. Every read stays inside the
+//! resolved package root, which in turn must lie inside the cache or install directory it was
+//! resolved from; symlinks are not followed out of it.
 use crate::config::types::Config;
 use crate::tools::exec::sandbox::Policy;
 use crate::tools::integrations::ext::{Concurrency, Tool, ToolContext};
@@ -169,6 +171,18 @@ impl Caches {
             go_mod_cache: env("GOMODCACHE").or_else(|| gopath.map(|path| path.join("pkg/mod"))),
         }
     }
+
+    /// Whether canonical `base` lies in a dependency cache: the strict-policy read grant.
+    fn contain(&self, base: &Path) -> bool {
+        let cargo = self
+            .cargo_home
+            .iter()
+            .flat_map(|home| [home.join("registry/src"), home.join("git/checkouts")]);
+        cargo
+            .chain(self.go_mod_cache.iter().cloned())
+            .filter_map(|cache| cache.canonicalize().ok())
+            .any(|cache| base.starts_with(cache))
+    }
 }
 
 /// A resolved dependency. `root` (a directory, or one module file) must lie inside `base`, the
@@ -202,7 +216,7 @@ pub(crate) fn run(ws: &Workspace, args: &Value, caches: &Caches) -> Result<Strin
         )?,
         None => infer(ws.root(), name, wanted, caches)?,
     };
-    let root = authorize(ws, &package)?;
+    let root = authorize(ws, &package, caches)?;
     let mut out = format!(
         "{} {} {} (resolved from {})\nroot: {}\n",
         package.ecosystem.label(),
@@ -769,7 +783,7 @@ fn go(root: &Path, name: &str, wanted: Option<&str>, caches: &Caches) -> Result<
 }
 
 /// The canonical package root, once the read is within Dial's read authority (module docs).
-fn authorize(ws: &Workspace, package: &Package) -> Result<PathBuf, String> {
+fn authorize(ws: &Workspace, package: &Package, caches: &Caches) -> Result<PathBuf, String> {
     let canonical = |path: &Path| {
         path.canonicalize()
             .map_err(|error| format!("{}: {error}", path.display()))
@@ -790,26 +804,27 @@ fn authorize(ws: &Workspace, package: &Package) -> Result<PathBuf, String> {
     if ws.roots().any(|workspace| root.starts_with(workspace)) {
         return Ok(root);
     }
-    match ws.sandbox_policy() {
-        Policy::Dev { deny_read, .. } => {
-            let denied = deny_read.iter().any(|denied| {
-                let denied = denied.canonicalize().unwrap_or_else(|_| denied.clone());
-                root.starts_with(&denied) || denied.starts_with(&root)
-            });
-            if denied {
-                Err(format!(
-                    "{} is in a path the sandbox denies reading",
-                    root.display()
-                ))
-            } else {
-                Ok(root)
-            }
-        }
-        Policy::Strict { .. } => Err(format!(
+    let (deny_read, granted) = match ws.sandbox_policy() {
+        Policy::Dev { deny_read, .. } => (deny_read, true),
+        Policy::Strict { deny_read, .. } => (deny_read, caches.contain(&base)),
+    };
+    let denied = deny_read.iter().any(|denied| {
+        let denied = denied.canonicalize().unwrap_or_else(|_| denied.clone());
+        root.starts_with(&denied) || denied.starts_with(&root)
+    });
+    if denied {
+        Err(format!(
+            "{} is in a path the sandbox denies reading",
+            root.display()
+        ))
+    } else if granted {
+        Ok(root)
+    } else {
+        Err(format!(
             "{} is outside the workspace and the strict sandbox grants no reads there; call request_directory with path {:?} for a yes/no approval, then retry",
             root.display(),
             base.display()
-        )),
+        ))
     }
 }
 

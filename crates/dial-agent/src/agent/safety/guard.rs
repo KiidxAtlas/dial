@@ -485,12 +485,24 @@ pub struct RepeatGuard {
 impl RepeatGuard {
     fn key(call: &ToolCall) -> String {
         // Rephrasing a completion claim is not recovery from a rejected step closure.
-        if call.name == "todo" && call.arguments["op"] == "done" {
-            return format!("todo\u{0}done\u{0}{}", call.arguments["index"]);
+        if call.name == "todo"
+            && crate::agent::workflow::todo::requested_op(&call.arguments) == Some("done")
+        {
+            let index = call
+                .arguments
+                .get("index")
+                .or_else(|| call.arguments.get("task"));
+            return format!(
+                "todo\u{0}done\u{0}{}",
+                index.unwrap_or(&serde_json::Value::Null)
+            );
         }
         // Rewording task descriptions cannot fix a plan containing precompleted investigations.
         if call.name == "todo"
-            && matches!(call.arguments["op"].as_str(), Some("set" | "append"))
+            && matches!(
+                crate::agent::workflow::todo::requested_op(&call.arguments),
+                Some("set" | "append")
+            )
             && call.arguments["tasks"].as_array().is_some_and(|tasks| {
                 tasks
                     .iter()
@@ -532,7 +544,9 @@ impl RepeatGuard {
     /// Stronger guidance for an identical call that keeps failing. The identical retry is withheld
     /// rather than run, so the model is told what to do instead. The turn itself is never ended.
     fn escalation(call: &ToolCall, count: u32) -> String {
-        if call.name == "todo" && call.arguments["op"] == "done" {
+        if call.name == "todo"
+            && crate::agent::workflow::todo::requested_op(&call.arguments) == Some("done")
+        {
             return format!(
                 "[Escalation: `todo done` for the same target has failed {count} times this turn. Rewording the completion claim is not recovery. Deliver the report, satisfy the reported check, or block the step with a concrete reason. The turn continues.]"
             );

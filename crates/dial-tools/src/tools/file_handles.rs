@@ -156,6 +156,11 @@ impl Workspace {
     /// Literal paths pass through unchanged; recognized unknown handles always fail closed.
     /// This does not interpolate shell commands, prose, edit bodies or arbitrary strings.
     pub fn expand_file_handle(&self, input: &str) -> Result<String, String> {
+        self.expand_file_handle_checked(input)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(super) fn expand_file_handle_checked(&self, input: &str) -> std::io::Result<String> {
         let Some((token, suffix)) = split_handle(input) else {
             return Ok(input.to_string());
         };
@@ -163,7 +168,8 @@ impl Workspace {
             .file_handles
             .lock()
             .expect("file handle registry poisoned")
-            .lookup(token)?;
+            .lookup(token)
+            .map_err(std::io::Error::other)?;
         // Validate current confinement too: roots may have detached and symlinks may have changed.
         self.resolve_literal(&path)?;
         Ok(format!("{path}{suffix}"))

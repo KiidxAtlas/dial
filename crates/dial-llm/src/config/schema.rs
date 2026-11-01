@@ -272,6 +272,11 @@ const SNAP_SYSTEM: EnumValues = &[
     ("agents-md", "Archive separate AGENTS.md data"),
     ("all", "Archive system copies"),
 ];
+const SNAP_IMAGE_DETAIL: EnumValues = &[
+    ("auto", "Automatic per model and wire"),
+    ("high", "High detail"),
+    ("original", "Original detail"),
+];
 const SNAP_SHAPES: EnumValues = &[
     ("auto", "Automatic provider layout"),
     ("8x8r-bw", "8x8 repeated"),
@@ -958,6 +963,10 @@ static REGISTRY: &[SettingDef] = &[
     compaction::DECLARATIONS[29],
     compaction::DECLARATIONS[30],
     compaction::DECLARATIONS[31],
+    compaction::DECLARATIONS[32],
+    compaction::DECLARATIONS[33],
+    compaction::DECLARATIONS[34],
+    compaction::DECLARATIONS[35],
     tools::DECLARATIONS[23],
     tools::DECLARATIONS[24],
     tools::DECLARATIONS[25],
@@ -1008,6 +1017,7 @@ static REGISTRY: &[SettingDef] = &[
     experimental::DECLARATIONS[13],
     experimental::DECLARATIONS[14],
     experimental::DECLARATIONS[15],
+    experimental::DECLARATIONS[16],
     preparation::DECLARATIONS[0],
     preparation::DECLARATIONS[1],
     preparation::DECLARATIONS[2],
@@ -1036,6 +1046,7 @@ static REGISTRY: &[SettingDef] = &[
     tools::DECLARATIONS[35],
     tools::DECLARATIONS[36],
     tools::DECLARATIONS[37],
+    tools::DECLARATIONS[57],
     tools::DECLARATIONS[38],
     tools::DECLARATIONS[39],
     tools::DECLARATIONS[40],
@@ -1207,6 +1218,7 @@ const LAYOUT: &[(&str, &[&str])] = &[
     (
         EX,
         &[
+            "Reasoning",
             "Execution",
             "Verification",
             "Context",
@@ -1283,6 +1295,10 @@ const ADVANCED: &[&str] = &[
     "compaction.snapcompact.shape",
     "compaction.snapcompact.system_prompt",
     "compaction.snapcompact.tool_results",
+    "compaction.snapcompact.overlay",
+    "compaction.snapcompact.frame_size",
+    "compaction.snapcompact.max_edge",
+    "compaction.snapcompact.image_detail",
     "assistance.initial_tool_limit",
     "assistance.lean_local",
     "assistance.local.small_window",

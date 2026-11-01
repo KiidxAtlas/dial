@@ -104,7 +104,15 @@ fn legacy_execution_deserializes_without_new_facts() {
     assert!(facts.observation.is_none());
     assert!(facts.process.is_none());
     assert!(facts.output.is_none());
+    assert!(facts.shell_launch.is_none());
+    assert!(
+        serde_json::to_value(&facts)
+            .unwrap()
+            .get("shell_launch")
+            .is_none()
+    );
     assert!(facts.integration.is_none());
+    assert!(facts.native_edit_retry.is_none());
 }
 
 #[test]
@@ -123,4 +131,49 @@ fn presentation_clipping_preserves_capture_and_retention() {
     assert_eq!(facts.retained_bytes, Some(20));
     assert_eq!(facts.presentation, Completeness::Partial);
     assert_eq!(facts.presented_bytes, None);
+}
+
+#[test]
+fn shell_launch_execution_round_trips_without_a_process_outcome() {
+    for stdin in [ShellStdin::Eof, ShellStdin::Pipe, ShellStdin::Terminal] {
+        let facts = Execution {
+            shell_launch: Some(ShellLaunch {
+                stdin,
+                terminal_allocated: stdin == ShellStdin::Terminal,
+                job: Some("job-1".into()),
+            }),
+            ..Default::default()
+        };
+        let restored: Execution =
+            serde_json::from_value(serde_json::to_value(&facts).unwrap()).unwrap();
+        assert_eq!(restored, facts);
+        assert!(restored.process.is_none());
+    }
+}
+
+#[test]
+fn native_witness_requirements_survive_nested_failures_but_not_recovered_calls() {
+    let requirement = NativeWitnessRequirement {
+        path: "source.rs".into(),
+        source_sha256: [1; 32],
+        raw_revision: None,
+        ranges: vec![(2, 4)],
+    };
+    let outer = Capture::begin();
+    let inner = Capture::begin();
+    native_edit_retry(requirement.clone());
+    let failed = inner.finish(false);
+    assert_eq!(
+        failed.native_edit_retry.unwrap().requirements,
+        vec![requirement.clone()]
+    );
+    let captured = outer.finish(false);
+    assert_eq!(
+        captured.native_edit_retry.unwrap().requirements,
+        vec![requirement.clone()]
+    );
+
+    let capture = Capture::begin();
+    native_edit_retry(requirement);
+    assert!(capture.finish(true).native_edit_retry.is_none());
 }

@@ -92,7 +92,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             payload = json.loads(str(messages[-1]["content"]))
             chosen = [c["index"] for c in payload["candidates"] if "bounded_transaction_total" in c["source_evidence"]]
             return self.text(json.dumps({"indices": chosen[: payload["max_results"]]})), "stop"
-        user = next((message for message in reversed(messages) if message["role"] == "user" and "BENCH_CASE=" in str(message.get("content", ""))), None)
+        # Runtime reminders repeat the latest prompt after tool results. They are
+        # context, not a new scenario boundary: keep the actual turn's evidence.
+        user = next((message for message in reversed(messages) if message["role"] == "user" and not message.get("dial_task_context") and "BENCH_CASE=" in str(message.get("content", ""))), None)
         if user is None:
             raise ValueError("no benchmark scenario in current conversation")
         prompt = str(user["content"])
@@ -123,6 +125,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if "bash" not in names:
                 return call("bash", {"command": "python3 -c 'from calc import add; assert add(-7,3)==-4; assert add(11,-2)==9'"})
             return self.text("Corrected the arithmetic and verified the requested behavior."), "stop"
+        if case in ("terminal-launch-recovery", "stdin-launch-recovery"):
+            terminal = case == "terminal-launch-recovery"
+            command = "python3 launch_probe.py " + ("terminal" if terminal else "pipe")
+            launches = [output for name, output in outputs if name == "bash"]
+            if not launches:
+                return call("bash", {"command": command})
+            available = {tool["function"]["name"] for tool in request.get("tools", [])}
+            if "bg" not in available:
+                if "tool_search" not in names:
+                    return call("tool_search", {"query": "bg"})
+                if "tool_load" not in names:
+                    return call("tool_load", {"names": ["bg"]})
+                return self.text("Blocked: managed bg remains unavailable after discovery and loading. The probe has not completed; the required launch recovery cannot be verified."), "stop"
+            if (terminal and len(launches) < 2):
+                return call("bash", {"command": command, "pty": True})
+            if not terminal and "bg" not in names:
+                return call("bg", {"action": "start", "name": "input-probe", "command": command, "stdin": True})
+            receipt = next((re.search(r"started ([\w.-]+) ", output) for _, output in outputs
+                            if re.search(r"started ([\w.-]+) ", output)), None)
+            if receipt is None:
+                raise ValueError("managed launch did not return a job identity")
+            name = receipt.group(1)
+            if not any("wrote " in output for tool, output in outputs if tool == "bg"):
+                return call("bg", {"action": "input", "name": name, "text": "confirm\n"})
+            if not any("probe-complete" in output for tool, output in outputs if tool == "bg"):
+                return call("bg", {"action": "wait", "name": name, "timeout": 10})
+            return self.text("Observed the original probe complete after correcting its launch mode and sending input."), "stop"
         if case == "baseline-write":
             return write("answer.txt", "baseline-ok")
         if case == "goal-compaction":
@@ -236,23 +265,34 @@ def main():
             command = [str(binary), "--dir", str(project), "benchmark", str(manifest), "--report", str(report_path)]
             if args.profiles:
                 command += ["--profiles", str(args.profiles.resolve(strict=True))]
-            elif args.machine_repetitions:
+            elif args.machine_repetitions or args.suite == "recovery":
                 profiles = root / "machine.toml"
-                profiles.write_text(
-                    '[machine]\nrepetitions=' + str(args.machine_repetitions) + '\nminimum_correctness=1.0\n'
-                    '[[configurations]]\nname="baseline"\nprovider="openai"\nmodel="scripted"\ncontext_window=32768\n'
-                    '[[configurations]]\nname="compact-tools"\nprovider="openai"\nmodel="scripted"\ncontext_window=32768\n'
-                    '[configurations.assistance]\ncompact_tools=true\ninitial_tool_limit=16\n'
+                lane = '\n[configurations.integration]\nmode="managed_shell"\n' if args.suite == "recovery" else '\n'
+                machine = (
+                    '[machine]\nrepetitions=' + str(args.machine_repetitions or 1) + '\nminimum_correctness=1.0\n'
+                    '[[configurations]]\nname="baseline"\nprovider="openai"\nmodel="scripted"\ncontext_window=32768\n' + lane
                 )
+                if args.machine_repetitions:
+                    machine += (
+                        '[[configurations]]\nname="compact-tools"\nprovider="openai"\nmodel="scripted"\ncontext_window=32768\n' + lane +
+                        '[configurations.assistance]\ncompact_tools=true\ninitial_tool_limit=16\n'
+                    )
+                profiles.write_text(machine)
                 command += ["--profiles", str(profiles)]
             import os
             environment = dict(os.environ, DIAL_HOME=str(home))
             for name in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY"):
                 environment.pop(name, None)
             result = subprocess.run(command, env=environment, text=True, capture_output=True, timeout=300)
+            # Preserve the actual runner report before checking success so failures
+            # remain inspectable after the disposable project has been removed.
+            observed = json.loads(report_path.read_text()) if report_path.exists() else None
+            if args.report and observed is not None:
+                args.report.resolve().write_text(json.dumps(observed, indent=2) + "\n")
             if result.returncode:
                 raise RuntimeError("benchmark process failed:\n" + result.stdout + result.stderr)
-            observed = json.loads(report_path.read_text())
+            if observed is None:
+                raise RuntimeError("benchmark process did not produce a report")
             report = observed.get("machine_benchmark", observed.get("profile_comparison", observed.get("report", observed)))
             reliability = None
             if "configurations" in report:
@@ -265,7 +305,8 @@ def main():
                 reports = [item["report"] for item in report["profiles"]] if "profiles" in report else [report]
                 baseline = next((item["report"] for item in report.get("profiles", []) if item["profile"]["name"] == report.get("baseline_profile")), reports[0])
             if len(baseline["cases"]) != expected_cases or any(not case["passed"] for case in baseline["cases"]):
-                raise RuntimeError("baseline deterministic capability checks failed:\n" + json.dumps(observed, indent=2) + "\nBenchmark diagnostics:\n" + result.stderr)
+                failures = [{"id": case["id"], "checks_passed": case["checks_passed"], "checks_total": case["checks_total"], "evidence": case.get("evidence"), "metrics": {key: case["metrics"].get(key) for key in ("tool_calls", "tool_errors", "tool_contract_errors")}} for case in baseline["cases"] if not case["passed"]]
+                raise RuntimeError("baseline deterministic capability checks failed:\n" + json.dumps(failures, indent=2) + "\nScripted provider errors: " + repr(server.errors[:8]) + "\nBenchmark diagnostics:\n" + result.stderr[:8000])
             for profile in reports:
                 if len(profile["cases"]) != expected_cases:
                     raise RuntimeError("profile omitted benchmark cases")
@@ -276,8 +317,6 @@ def main():
                 raise RuntimeError("scripted provider errors: " + repr(server.errors))
             if not server.requests:
                 raise RuntimeError("no provider requests were exercised")
-            if args.report:
-                args.report.resolve().write_text(json.dumps(observed, indent=2) + "\n")
             summary = {"kind": "scripted-harness-regression", "exercised_cases": sum(len(profile["cases"]) for profile in reports), "passed_cases": sum(case["passed"] for profile in reports for case in profile["cases"]), "provider_requests": len(server.requests), "model_quality_evidence": False}
             if reliability is not None:
                 summary["repeated_checked_tasks"] = sum(item["checked_tasks"] for item in reliability["configurations"])

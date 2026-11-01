@@ -51,6 +51,54 @@ fn default_wait_returns_control_while_the_job_keeps_running() {
 }
 
 #[test]
+fn loopback_port_probes_of_unsandboxed_jobs_need_no_network_permission() {
+    let loopback = "127.0.0.1:8080".parse().unwrap();
+    let remote = "192.0.2.1:8080".parse().unwrap();
+    let (_dir, open) = open_workspace();
+    assert_eq!(port_probe_refusal(&open, loopback, false), None);
+    assert!(
+        port_probe_refusal(&open, remote, false).is_some_and(|why| why.contains("non-loopback"))
+    );
+    assert_eq!(port_probe_refusal(&open, remote, true), None);
+    // Sandboxed without network the job cannot even listen, so the refusal says so.
+    let (_dir, sandboxed) = workspace();
+    let why = port_probe_refusal(&sandboxed, loopback, false).unwrap();
+    assert!(
+        why.contains("could never open") && why.contains("ready.log"),
+        "{why}"
+    );
+    assert_eq!(port_probe_refusal(&sandboxed, loopback, true), None);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn an_unsandboxed_job_without_network_becomes_ready_on_its_own_loopback_port() {
+    if !Path::new("/usr/sbin/lsof").is_file() || !Path::new("/usr/bin/python3").is_file() {
+        return;
+    }
+    let (_dir, ws) = open_workspace();
+    assert!(!network_allowed(&ws));
+    let tool = tool();
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+    let out = bg(
+        &tool,
+        &ws,
+        json!({"action":"start", "name":"server",
+            "command": format!("exec /usr/bin/python3 -c 'import socket,time;s=socket.socket();s.bind((\"127.0.0.1\",{port}));s.listen();time.sleep(30)'"),
+            "ready": {"port": port, "timeout": 20}}),
+    );
+    assert!(
+        !out.is_error && out.text.starts_with("ready:"),
+        "{}",
+        out.text
+    );
+    assert!(out.text.contains("owned listener"), "{}", out.text);
+    assert!(!bg(&tool, &ws, json!({"action":"kill", "name":"server"})).is_error);
+}
+
+#[test]
 fn waits_release_the_workspace_lock_and_readiness_is_steerable() {
     let tool = tool();
     for action in ["wait", "output", "list"] {
@@ -65,6 +113,7 @@ fn waits_release_the_workspace_lock_and_readiness_is_steerable() {
     ));
     assert!(tool.interruptible(&json!({"action":"start", "ready":{"log":"ready"}})));
     assert!(!tool.interruptible(&json!({"action":"start"})));
+    assert!(tool.interruptible(&json!({"action":"start", "pty":true})));
 }
 
 #[test]
@@ -95,6 +144,94 @@ fn pty_notifications_use_job_identity_and_replace_semantics() {
 }
 
 #[test]
+fn pty_start_observes_initial_screen_and_keeps_the_running_job() {
+    let (_dir, ws) = open_workspace();
+    let tool = tool();
+    let began = Instant::now();
+    let out = bg(
+        &tool,
+        &ws,
+        json!({"action":"start", "name":"initial-screen", "pty":true,
+            "command":"printf 'initial-screen-marker\\n'; sleep 30", "timeout":0}),
+    );
+    assert!(!out.is_error, "{}", out.text);
+    assert!(
+        out.text.lines().any(|line| line == "initial-screen-marker"),
+        "{}",
+        out.text
+    );
+    assert!(out.text.contains("running"), "{}", out.text);
+    assert!(!out.text.contains("ready:"), "{}", out.text);
+    assert!(began.elapsed() < Duration::from_secs(5), "{}", out.text);
+    assert_eq!(out.data.as_ref().unwrap()["job"]["name"], "initial-screen");
+    let process = out.process_outcome().unwrap();
+    assert!(process.started);
+    assert_eq!(process.exit_code, None);
+    assert!(!process.timed_out);
+    assert!(!process.output_complete);
+    let integrity = out.execution.output.as_ref().unwrap();
+    assert_eq!(integrity.capture, Completeness::Unknown);
+    assert!(integrity.original_bytes.is_some_and(|bytes| bytes > 0));
+    assert!(
+        tool.jobs_view(None)
+            .jobs
+            .iter()
+            .any(|job| job.name == "initial-screen" && job.running)
+    );
+    assert!(
+        !bg(
+            &tool,
+            &ws,
+            json!({"action":"kill", "name":"initial-screen"})
+        )
+        .is_error
+    );
+}
+
+#[test]
+fn pty_start_reports_early_exit_with_output_and_retains_its_handle() {
+    for (command, code) in [
+        ("printf 'startup-exit-marker\\n'; exit 0", 0),
+        ("printf 'startup-exit-marker\\n' >&2; exit 7", 7),
+    ] {
+        let (_dir, ws) = open_workspace();
+        let tool = tool();
+        let out = bg(
+            &tool,
+            &ws,
+            json!({"action":"start", "name":"early-exit", "pty":true, "command":command}),
+        );
+        assert_eq!(out.is_error, code != 0, "{}", out.text);
+        assert!(
+            out.text.lines().any(|line| line == "startup-exit-marker"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text.contains(&format!("exit code {code}")),
+            "{}",
+            out.text
+        );
+        assert!(!out.text.contains("ready:"), "{}", out.text);
+        assert_eq!(out.data.as_ref().unwrap()["job"]["name"], "early-exit");
+        let process = out.process_outcome().unwrap();
+        assert!(process.started);
+        assert_eq!(process.exit_code, Some(code));
+        assert!(process.output_complete, "{process:?}");
+        let integrity = out.execution.output.as_ref().unwrap();
+        assert_eq!(integrity.capture, Completeness::Complete);
+        assert_eq!(integrity.presentation, Completeness::Partial);
+        let reread = bg(&tool, &ws, json!({"action":"output", "name":"early-exit"}));
+        assert!(
+            reread.text.contains("startup-exit-marker"),
+            "{}",
+            reread.text
+        );
+        assert_eq!(reread.process_outcome().unwrap().exit_code, Some(code));
+    }
+}
+
+#[test]
 fn pty_start_is_refused_when_no_pty_is_configured() {
     let (_dir, ws) = open_workspace();
     let tool = Background {
@@ -110,6 +247,7 @@ fn pty_start_is_refused_when_no_pty_is_configured() {
     assert!(out.is_error, "{}", out.text);
     assert!(out.text.contains("--no-pty"), "{}", out.text);
     assert!(tool.table().procs.is_empty());
+    assert!(out.execution.shell_launch.is_none());
 }
 
 #[test]
@@ -259,11 +397,10 @@ fn tail_returns_last_lines_of_new_output_only() {
         &ws,
         json!({"action": "output", "name": "t", "tail": 2}),
     );
-    assert!(
-        out.text.ends_with("c\nd\n") && !out.text.contains("b\n"),
-        "{}",
-        out.text
-    );
+    // The attachment receipt follows the captured output and is not a tail line.
+    let body: Vec<_> = out.text.lines().skip(1).take(2).collect();
+    assert_eq!(body, ["c", "d"], "{}", out.text);
+    assert!(!out.text.contains("b\n"), "{}", out.text);
     let again = bg(&tool, &ws, json!({"action": "output", "name": "t"}));
     assert!(again.text.contains("(no new output)"), "{}", again.text);
 }
@@ -941,6 +1078,15 @@ fn bash_adopted_job_is_awaited_until_it_is_killed() {
     let awaited = tool.awaited_work();
     assert_eq!(awaited.len(), 1, "{awaited:?}");
     let name = awaited[0].split(' ').next().unwrap_or_default().to_owned();
+    let launch = ShellLaunch {
+        stdin: ShellStdin::Eof,
+        terminal_allocated: false,
+        job: Some(name.clone()),
+    };
+    assert_eq!(out.execution.shell_launch.as_ref(), Some(&launch));
+    assert!(out.execution.process.is_none());
+    let observed = bg(&tool, &ws, json!({"action":"output", "name":name}));
+    assert_eq!(observed.execution.shell_launch.as_ref(), Some(&launch));
     let _ = bg(&tool, &ws, json!({"action": "kill", "name": name}));
     assert!(tool.awaited_work().is_empty());
 }
@@ -1186,6 +1332,7 @@ fn minimizer_snapshot() -> Snapshot {
         },
         network: false,
         terminal: false,
+        shell_launch: None,
     }
 }
 
@@ -1406,4 +1553,126 @@ fn failed_background_minimizer_preserves_failure_and_capture_without_replay() {
     let (again, lost, _) = take_presented(&ws, &snap, None);
     assert!(again.is_empty());
     assert_eq!(lost, 0);
+}
+
+#[test]
+fn native_pipe_launch_context_survives_input_close_and_completion() {
+    let (_dir, ws) = open_workspace();
+    let tool = tool();
+    for stdin in [false, true] {
+        let name = if stdin { "pipe-input" } else { "eof-input" };
+        let command = "test ! -t 0 && test ! -t 1 || exit 9; printf 'input-ready\\n'; if IFS= read -r line; then printf 'reply:%s\\n' \"$line\"; else printf 'eof\\n'; fi";
+        let started = bg(
+            &tool,
+            &ws,
+            json!({"action":"start", "name":name, "command":command, "stdin":stdin}),
+        );
+        assert!(!started.is_error, "{}", started.text);
+        let launch = ShellLaunch {
+            stdin: if stdin {
+                ShellStdin::Pipe
+            } else {
+                ShellStdin::Eof
+            },
+            terminal_allocated: false,
+            job: Some(name.into()),
+        };
+        assert_eq!(started.execution.shell_launch.as_ref(), Some(&launch));
+        assert!(started.execution.process.is_none());
+        if stdin {
+            let ready = bg(
+                &tool,
+                &ws,
+                json!({"action":"wait", "name":name, "until":"input-ready", "timeout":5}),
+            );
+            assert_eq!(ready.execution.shell_launch.as_ref(), Some(&launch));
+            let input = bg(
+                &tool,
+                &ws,
+                json!({"action":"input", "name":name, "text":"roundtrip\n", "timeout":5}),
+            );
+            assert!(!input.is_error, "{}", input.text);
+            let close = bg(
+                &tool,
+                &ws,
+                json!({"action":"close_stdin", "name":name, "timeout":5}),
+            );
+            assert!(!close.is_error, "{}", close.text);
+        }
+        let finished = bg(
+            &tool,
+            &ws,
+            json!({"action":"wait", "name":name, "timeout":5}),
+        );
+        assert!(!finished.is_error, "{}", finished.text);
+        assert_eq!(
+            finished.execution.process.as_ref().unwrap().exit_code,
+            Some(0)
+        );
+        assert_eq!(finished.execution.shell_launch.as_ref(), Some(&launch));
+        assert!(
+            finished
+                .text
+                .contains(if stdin { "reply:roundtrip" } else { "eof" }),
+            "{}",
+            finished.text
+        );
+        let output = bg(&tool, &ws, json!({"action":"output", "name":name}));
+        assert_eq!(output.execution.shell_launch.as_ref(), Some(&launch));
+    }
+}
+
+#[test]
+fn failed_start_readiness_keeps_actual_launch_separate_from_zero_exit() {
+    let (_dir, ws) = open_workspace();
+    let tool = tool();
+    let output = bg(
+        &tool,
+        &ws,
+        json!({"action":"start", "name":"not-ready", "command":"printf 'diagnostic\\n'; exit 0", "ready":{"log":"never", "timeout":5}}),
+    );
+    assert!(output.is_error, "{}", output.text);
+    assert_eq!(
+        output.execution.process.as_ref().unwrap().exit_code,
+        Some(0)
+    );
+    assert_eq!(
+        output.execution.shell_launch,
+        Some(ShellLaunch {
+            stdin: ShellStdin::Eof,
+            terminal_allocated: false,
+            job: Some("not-ready".into()),
+        })
+    );
+    assert!(!output.execution.observation.unwrap().satisfied);
+    assert_eq!(output.data.as_ref().unwrap()["job"]["name"], "not-ready");
+}
+
+#[test]
+fn adopted_cells_do_not_invent_shell_attachments() {
+    let (_dir, ws) = open_workspace();
+    let tool = tool();
+    let name = tool
+        .table()
+        .adopt_cell(CellJob {
+            command: "cell".into(),
+            network: false,
+            work: Box::new(|_| "cell output".into()),
+        })
+        .unwrap();
+    for action in ["wait", "output"] {
+        let output = bg(
+            &tool,
+            &ws,
+            json!({"action":action, "name":name, "timeout":5}),
+        );
+        assert!(!output.is_error, "{}", output.text);
+        assert!(output.execution.shell_launch.is_none());
+        assert!(
+            output
+                .data
+                .as_ref()
+                .is_none_or(|data| data.get("shell_launch").is_none())
+        );
+    }
 }

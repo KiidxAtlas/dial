@@ -17,3 +17,17 @@ project = "examples/benchmarks/efficiency-fixture"
 prompt = "BENCH_CASE=reuse-evidence. Fix the arithmetic bug in calc.add, preserving its public API. Read the relevant source once, reuse that evidence for the edit, and verify the behavior. Avoid unrelated tools and unchanged rereads."
 categories = ["efficiency", "evidence_reuse", "debugging"]
 checks = [{kind="command",command="python3 -c 'from calc import add; assert add(2,3)==5; assert add(-7,3)==-4; assert add(0,0)==0; assert add(11,-2)==9'"}, {kind="metric",metric="tool_errors",max=0}, {kind="metric",metric="tool_calls",max=8}]
+
+[[cases]]
+id = "terminal-launch-recovery"
+project = "examples/benchmarks/efficiency-fixture"
+prompt = "BENCH_CASE=terminal-launch-recovery. Run python3 launch_probe.py terminal once with the default bash launch and inspect the diagnostic. Recover using the appropriate supported launch mode, then send confirm followed by a newline through the managed job's input and observe completion. Do not edit the probe, fabricate its receipt, substitute a different program, or invoke Dial tool names as shell commands. A launch receipt alone is not success."
+categories = ["recovery", "terminal", "launch_context", "managed_input"]
+checks = [{kind="file_equals",path="terminal-receipt.txt",content="confirmed;terminal=true\n"}, {kind="command",command="python3 -c 'import hashlib,pathlib; assert hashlib.sha256(pathlib.Path(\"launch_probe.py\").read_bytes()).hexdigest()==\"c642fe2043706a6bd489e533959011003e227fc62e2bae6968f8a459ccea17e2\"'"}, {kind="tool_invoked",tool="bash"}, {kind="tool_invoked",tool="bg"}, {kind="metric",metric="tool_errors",min=1,max=1}, {kind="metric",metric="tool_calls",max=14}]
+
+[[cases]]
+id = "stdin-launch-recovery"
+project = "examples/benchmarks/efficiency-fixture"
+prompt = "BENCH_CASE=stdin-launch-recovery. Run python3 launch_probe.py pipe once with the default bash launch and inspect the diagnostic. Recover by providing input without allocating a terminal: use a managed pipe job with stdin enabled, send confirm followed by a newline through its input, and observe completion. Do not edit the probe or fabricate its receipt. Closed stdin does not mean terminal support is missing."
+categories = ["recovery", "stdin", "launch_context", "managed_input"]
+checks = [{kind="file_equals",path="pipe-receipt.txt",content="confirmed;terminal=false\n"}, {kind="command",command="python3 -c 'import hashlib,pathlib; assert hashlib.sha256(pathlib.Path(\"launch_probe.py\").read_bytes()).hexdigest()==\"c642fe2043706a6bd489e533959011003e227fc62e2bae6968f8a459ccea17e2\"'"}, {kind="tool_invoked",tool="bash"}, {kind="tool_invoked",tool="bg"}, {kind="metric",metric="tool_errors",min=1,max=1}, {kind="metric",metric="tool_calls",max=14}]

@@ -14,6 +14,11 @@ belong to the process; Ctrl+] detaches. Exited jobs and pipe-output views are re
 `bg wait` reports output-capture failures as errors even when the observed process has exited;
 the exit status and capture diagnostic remain visible together.
 
+`bash` also accepts `pty: true` as a convenience entry point into this same managed terminal
+runner. It returns a `job` handle immediately; use its `name` with the controls above. It does
+not create a second shell-session mechanism. Explicit `timeout` and `session` are incompatible
+with this mode, and `shell.no_pty` remains enforced. See [interactive programs](shell.md#interactive-programs).
+
 Execution metadata separates the observation (`snapshot`, `wait`, `readiness`, `input`, or
 `termination`, plus whether it was satisfied) from the child's exit code/signal. In particular,
 successful `bg wait` observation of exit 3 does not mean the command succeeded. Output metadata

@@ -38,6 +38,10 @@ pub struct Launch {
     pub advisor_completion_only: bool,
     /// `--external-thinking`: private scratchpad reasoning. Never persisted.
     pub external_thinking: bool,
+    /// Print mode (`dial -p`, piped input, `dial review`): nobody can answer or steer during the
+    /// run, so `Agent::offered` keeps the interactive-session helpers loadable instead of sending
+    /// their schemas with every request. Never persisted.
+    pub unattended: bool,
 }
 
 impl Agent<'_> {

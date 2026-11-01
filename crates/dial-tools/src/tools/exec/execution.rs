@@ -148,6 +148,9 @@ fn contained(
         output.is_error = true;
     }
     output.execution.changed_paths.extend(facts.changed_paths);
+    if facts.native_edit_retry.is_some() {
+        output.execution.native_edit_retry = facts.native_edit_retry;
+    }
     output.execution.changed_paths.sort();
     output.execution.changed_paths.dedup();
     // A panic after a recorded commit is uncertain even for a call admitted as a read.
@@ -216,6 +219,21 @@ fn native_with(
     }
     Some(contained(cancel, panic_effects, || match name {
         "bash" => {
+            match crate::tools::opt_bool(args, "pty") {
+                Ok(true) => {
+                    return super::shell::bash_tool_pty(context.workspace, args, |start_args| {
+                        registry.get("bg").map_or_else(
+                            || ToolOutput::err("managed background tool is unavailable; no terminal was started").with_effects(Effects::None),
+                            |background| background.call_streaming(context, start_args, emit, cancel),
+                        )
+                    })
+                    // Helper errors are pre-launch validation; background results retain their
+                    // own execution facts, including uncertainty after a partial launch.
+                    .unwrap_or_else(|error| ToolOutput::err(error).with_effects(Effects::None));
+                }
+                Err(error) => return ToolOutput::err(error).with_effects(Effects::None),
+                Ok(false) => {}
+            }
             let stream = |bytes: &[u8]| {
                 emit(ToolEvent {
                     kind: "output".into(),
