@@ -25,10 +25,10 @@ fn background_generation_is_retried_after_foreground_handoff_without_scoring_a_p
             let request = Request::foreground(&config.user_dir).unwrap();
             let lock =
                 super::super::auto::lock_file(&config.user_dir.join("compute.lock")).unwrap();
-            lock.lock_exclusive().unwrap();
+            lock.lock().unwrap();
             drop(request);
             std::thread::sleep(Duration::from_millis(100));
-            FileExt::unlock(&lock).unwrap();
+            std::fs::File::unlock(&lock).unwrap();
         });
         let reply = background_call(&config, &mut backend, |_, cancel| {
             calls += 1;
@@ -85,5 +85,5 @@ fn stop_interrupts_a_paused_training_wait_and_releases_its_lease() {
     assert!(!can_yield());
     drop(lease);
     let lock = super::super::auto::lock_file(&config.user_dir.join("compute.lock")).unwrap();
-    lock.try_lock_exclusive().unwrap();
+    lock.try_lock().map_err(std::io::Error::from).unwrap();
 }

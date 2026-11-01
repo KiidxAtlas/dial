@@ -205,7 +205,7 @@ impl PythonRuntime {
                                 .env_clear()
                                 .current_dir(ctx.workspace.root());
                             for (key, value) in std::env::vars_os() {
-                                if !super::sandbox::is_secret_env(
+                                if super::sandbox::child_env_allowed(
                                     &key.to_string_lossy(),
                                     &value.to_string_lossy(),
                                 ) {
@@ -366,7 +366,7 @@ fn resolve_python(
         .env_clear()
         .current_dir(scratch.path());
     for (key, value) in std::env::vars_os() {
-        if !super::sandbox::is_secret_env(&key.to_string_lossy(), &value.to_string_lossy()) {
+        if super::sandbox::child_env_allowed(&key.to_string_lossy(), &value.to_string_lossy()) {
             command.env(key, value);
         }
     }

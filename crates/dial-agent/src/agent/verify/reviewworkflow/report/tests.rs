@@ -59,15 +59,23 @@ fn only_an_oversized_file_is_split_by_bytes() {
 
 #[test]
 fn byte_split_respects_character_boundaries() {
-    let text = format!("diff --git a/u b/u\n+{}\n", "é".repeat(50));
-    let chunks = chunk_diff(&text, 31);
-    let mut at = 0;
-    for range in chunks {
-        assert_eq!(range.start, at);
-        assert!(text.is_char_boundary(range.end));
-        at = range.end;
+    for (text, limit) in [
+        (format!("diff --git a/u b/u\n+{}\n", "é".repeat(50)), 31),
+        ("🦀🦀🦀".to_owned(), 1),
+        ("a🦀\né🦀z".to_owned(), 1),
+    ] {
+        let chunks = chunk_diff(&text, limit);
+        let mut at = 0;
+        let mut rebuilt = String::new();
+        for range in chunks {
+            assert_eq!(range.start, at);
+            assert!(!range.is_empty(), "each chunk must make progress");
+            rebuilt.push_str(&text[range.clone()]);
+            at = range.end;
+        }
+        assert_eq!(at, text.len());
+        assert_eq!(rebuilt, text, "limit {limit}");
     }
-    assert_eq!(at, text.len());
 }
 
 #[test]

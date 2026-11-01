@@ -63,6 +63,9 @@ struct State {
     stop: bool,
     /// A read error ended the reader; reported to the next poll or read.
     failure: Option<Failure>,
+    /// Observed only under the same mutex, after a consumer releases it in a Condvar wait.
+    #[cfg(test)]
+    waiting: usize,
 }
 
 pub struct Pump {
@@ -81,6 +84,8 @@ impl Pump {
                 running: false,
                 stop: false,
                 failure: None,
+                #[cfg(test)]
+                waiting: 0,
             }),
             changed: Condvar::new(),
             halt: AtomicBool::new(false),
@@ -195,6 +200,12 @@ impl Pump {
         let deadline = Instant::now() + timeout;
         let mut state = self.state();
         loop {
+            if super::super::term::termination_requested() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "terminal termination requested",
+                ));
+            }
             if !state.events.is_empty() {
                 return Ok(true);
             }
@@ -203,16 +214,39 @@ impl Pump {
             }
             if !state.running {
                 drop(state);
-                return idle.poll(deadline.saturating_duration_since(Instant::now()));
+                loop {
+                    if super::super::term::termination_requested() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "terminal termination requested",
+                        ));
+                    }
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if idle.poll(remaining.min(TICK))? {
+                        return Ok(true);
+                    }
+                    if Instant::now() >= deadline {
+                        return Ok(false);
+                    }
+                }
             }
             let now = Instant::now();
             if now >= deadline {
                 return Ok(false);
             }
-            state = match self.changed.wait_timeout(state, deadline - now) {
+            #[cfg(test)]
+            {
+                state.waiting += 1;
+                self.changed.notify_all();
+            }
+            state = match self.changed.wait_timeout(state, (deadline - now).min(TICK)) {
                 Ok((state, _)) => state,
                 Err(poisoned) => poisoned.into_inner().0,
             };
+            #[cfg(test)]
+            {
+                state.waiting -= 1;
+            }
         }
     }
 
@@ -220,6 +254,12 @@ impl Pump {
     pub fn read_with(&self, idle: &mut dyn EventSource) -> io::Result<Event> {
         let mut state = self.state();
         loop {
+            if super::super::term::termination_requested() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "terminal termination requested",
+                ));
+            }
             if let Some(event) = state.events.pop_front() {
                 self.changed.notify_all();
                 return Ok(event);
@@ -229,9 +269,31 @@ impl Pump {
             }
             if !state.running {
                 drop(state);
-                return idle.read();
+                loop {
+                    if super::super::term::termination_requested() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "terminal termination requested",
+                        ));
+                    }
+                    if idle.poll(TICK)? {
+                        return idle.read();
+                    }
+                }
             }
-            state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
+            #[cfg(test)]
+            {
+                state.waiting += 1;
+                self.changed.notify_all();
+            }
+            state = match self.changed.wait_timeout(state, TICK) {
+                Ok((state, _)) => state,
+                Err(poisoned) => poisoned.into_inner().0,
+            };
+            #[cfg(test)]
+            {
+                state.waiting -= 1;
+            }
         }
     }
 }
@@ -257,11 +319,23 @@ pub fn halt_for_panic() {
 
 /// Wait up to `timeout` for an event; `Ok(true)` when [`read`] will not block.
 pub fn poll(timeout: Duration) -> io::Result<bool> {
+    if super::super::term::termination_requested() {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "terminal termination requested",
+        ));
+    }
     PUMP.poll_with(timeout, &mut CrosstermEvents)
 }
 
 /// Next input event.
 pub fn read() -> io::Result<Event> {
+    if super::super::term::termination_requested() {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "terminal termination requested",
+        ));
+    }
     PUMP.read_with(&mut CrosstermEvents)
 }
 

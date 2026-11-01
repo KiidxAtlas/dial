@@ -25,6 +25,9 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+/// Native path rules are not a shell sandbox or a cross-tool filesystem policy.
+pub(super) const PERMISSION_PATH_SCOPE: &str = "Path rules apply only to native read, write, edit and ast_edit tools. Denying read --path '*.pem' does not block bash cat, grep, glob or other tools. Deny those tools explicitly or use filesystem confinement to protect those files.";
+
 impl Shell {
     /// Favorites only need the saved settings and discovery snapshot. The active agent is optional:
     /// a live switch saves now and is adopted through the existing end-of-turn settings boundary.
@@ -165,68 +168,9 @@ impl Shell {
                 }
             },
             "queue" => self.queue_command(line),
-            "review" => {
-                platform::interrupt::clear_interrupt();
-                self.live_tasks = Some(agent.live_task_control());
-                self.background_control = agent.background_control();
-                self.composer.set_busy(true);
-                self.status.phase = Phase::Working;
-                match self.wait_compute(app).and_then(|ready| if ready { self.prepare_local(app) } else { Ok(false) }) {
-                    Ok(true) => {}
-                    Ok(false) => { self.composer.set_busy(false); return Ok(Step::Done); }
-                    Err(error) => { self.composer.set_busy(false); self.note("Review", format!("{error:#}")); return Ok(Step::Done); }
-                }
-                let guidance = self.commands.iter().find(|def| def.name == "review")
-                    .map(|def| context::expand_command(def, args)).unwrap_or_default();
-                let started = Instant::now();
-                let result = {
-                    let mut bridge = Bridge { app, shell: self, interrupt: app.interrupt.clone(), started,
-                        last_paint: Instant::now() - PAINT_EVERY, failed: false, pending: Vec::new(), next_id: 0 };
-                    bridge.repaint(true);
-                    agent.review_target(args, &guidance, &mut bridge)
-                };
-                app.interrupt.store(false, Ordering::SeqCst);
-                self.composer.set_busy(false);
-                self.status.activity.clear();
-                self.refresh_status(app, agent);
-                if crate::cli::watch::enabled(&app.layout, &self.session_id) {
-                    let body = match &result { Ok(report) => report.clone(), Err(error) => format!("{error:#}") };
-                    if let Err(error) = crate::cli::watch::append(&app.layout, &self.session_id, crate::cli::watch::Event::Text { title: "Review".into(), body }) {
-                        self.note("Live feed", format!("Could not record review: {error:#}"));
-                    }
-                }
-                match result { Ok(report) => self.note("Review", report), Err(error) => self.note("Review", format!("{error:#}")) }
-            }
+            "review" => return self.review_command(app, agent, args),
             "review-file" => self.review_checkpoints(agent, args),
-            "seance" => {
-                let (source, question) = args.split_once(char::is_whitespace).map_or(("", ""), |(source, question)| (source, question.trim()));
-                if source.is_empty() || question.is_empty() {
-                    self.note("Seance", "Usage: /seance <session id prefix or worker id> <question>");
-                    return Ok(Step::Done);
-                }
-                platform::interrupt::clear_interrupt();
-                self.live_tasks = Some(agent.live_task_control());
-                self.background_control = agent.background_control();
-                self.composer.set_busy(true);
-                self.status.phase = Phase::Working;
-                match self.wait_compute(app).and_then(|ready| if ready { self.prepare_local(app) } else { Ok(false) }) {
-                    Ok(true) => {}
-                    Ok(false) => { self.composer.set_busy(false); return Ok(Step::Done); }
-                    Err(error) => { self.composer.set_busy(false); self.note("Seance", format!("{error:#}")); return Ok(Step::Done); }
-                }
-                let started = Instant::now();
-                let result = {
-                    let mut bridge = Bridge { app, shell: self, interrupt: app.interrupt.clone(), started,
-                        last_paint: Instant::now() - PAINT_EVERY, failed: false, pending: Vec::new(), next_id: 0 };
-                    bridge.repaint(true);
-                    agent.run_seance(source, question, &mut bridge)
-                };
-                app.interrupt.store(false, Ordering::SeqCst);
-                self.composer.set_busy(false);
-                self.status.activity.clear();
-                self.refresh_status(app, agent);
-                match result { Ok(answer) => self.note("Seance", answer), Err(error) => self.note("Seance", format!("{error:#}")) }
-            }
+            "seance" => return self.seance_command(app, agent, args),
             "model" if args == "restart" => {
                 if self.ask("Restart managed model?", "Unload only this session's Dial-managed local model. The same model reloads on the next request; files and conversation stay intact. External servers are never restarted.", &[("Restart", 'r'), ("Cancel", 'n')]) == Some(0) {
                     match agent.restart_managed_model() {
@@ -267,28 +211,7 @@ impl Shell {
                 }
                 Err(error) => self.note("Session", format!("error: {error:#}")),
             },
-            "autoresearch" => {
-                let layout = agent.layout().ok_or_else(|| anyhow::anyhow!("agent has no project layout"))?.clone();
-                let state = layout.state_dir.join("autoresearch");
-                let mut words = args.splitn(5, char::is_whitespace).filter(|word| !word.is_empty());
-                let action = words.next().unwrap_or("status");
-                let result = match action {
-                    "init" => match (words.next(), words.next(), words.next(), words.next()) {
-                        (Some(name), Some(metric), Some(direction), Some(benchmark)) => match crate::tools::knowledge::autoresearch::experiment::parse_direction(direction) {
-                            Ok(maximize) => crate::tools::knowledge::autoresearch::experiment::init(&layout.project_root, &state, name, benchmark, metric, maximize).map(|e| format!("Initialized {} on branch {}.{}", e.name, e.branch, if e.origin.is_empty() { String::new() } else { format!("\nLeave with /autoresearch exit; it returns to {}.", e.origin) })),
-                            Err(_) => anyhow::bail!("direction must be max or min. Usage: /autoresearch init <name> <metric> <max|min> <benchmark command>"),
-                        },
-                        _ => anyhow::bail!("Usage: /autoresearch init <name> <metric> <max|min> <benchmark command>"),
-                    },
-                    "run" => crate::tools::knowledge::autoresearch::experiment::run(&layout.project_root, &state).map(|run| format!("{} = {} · {}{}", run.metric, run.commit, if run.kept {"best"} else {"not best"}, if run.output.is_empty(){String::new()}else{format!("\n{}",run.output)})),
-                    "log" => crate::tools::knowledge::autoresearch::experiment::log(&state).map(|runs| runs.into_iter().map(|r| format!("#{} {} {} {}", r.id, r.metric, if r.kept {"best"} else {""}, r.commit)).collect::<Vec<_>>().join("\n")),
-                    "notes" => { let text = args.trim().split_once(char::is_whitespace).map_or("", |(_, rest)| rest.trim()); if text.is_empty() { crate::tools::knowledge::autoresearch::experiment::notes(&state) } else { crate::tools::knowledge::autoresearch::experiment::update_notes(&state, text).map(|()| "Experiment notes updated.".to_owned()) } }
-                    "resume" | "status" | "" => crate::tools::knowledge::autoresearch::experiment::current(&state).map(|experiment| experiment.map(|e| format!("{} · {} · {} ({})\n{}", e.name, e.metric, e.branch, e.benchmark, crate::tools::knowledge::autoresearch::experiment::notes(&state).unwrap_or_default())).unwrap_or_else(|| "No autoresearch experiment. Use /autoresearch init <name> <metric> <max|min> <benchmark command>.".to_owned())),
-                    "exit" => crate::tools::knowledge::autoresearch::experiment::exit(&layout.project_root, &state),
-                    other => anyhow::bail!("Unknown autoresearch action: {other}. Use init, run, log, notes, resume, exit."),
-                };
-                match result { Ok(text) => self.note("Autoresearch", text), Err(error) => self.note("Autoresearch", format!("{error:#}")) }
-            }
+            "autoresearch" => return self.autoresearch_command(agent, args),
             "archive" => self.archive_note(app, args),
             "sessions" | "resume" | "tree" => {
                 // `/tree forks` is the fork browser; its argument is a keyword, not a search.
@@ -369,144 +292,8 @@ impl Shell {
                     },
                 );
             }
-            "permissions" => {
-                if let Some(rest) = args.strip_prefix("remove ") {
-                    let mut words = rest.split_whitespace();
-                    let index = words
-                        .next()
-                        .and_then(|s| s.parse::<usize>().ok())
-                        .and_then(|n| n.checked_sub(1));
-                    let persist = words.any(|s| s == "--persist");
-                    match index {
-                        Some(index) => match agent.remove_permission_rule(index, persist) {
-                            Ok(()) => self.note("Permissions", "rule removed"),
-                            Err(error) => self.note("Permissions", format!("{error:#}")),
-                        },
-                        None => self.note(
-                            "Permissions",
-                            "usage: /permissions remove <number> [--persist]",
-                        ),
-                    }
-                } else if args.starts_with("allow ") || args.starts_with("deny ") {
-                    use crate::agent::safety::approval::{Effect, PermissionRule};
-                    let mut words = args.split_whitespace();
-                    let effect = if words.next() == Some("allow") {
-                        Effect::Allow
-                    } else {
-                        Effect::Deny
-                    };
-                    let first = words.next().unwrap_or("");
-                    let persist = first == "--persist";
-                    let tool = if persist {
-                        words.next().unwrap_or("")
-                    } else {
-                        first
-                    };
-                    // `--path <glob>` (repeatable) scopes file tools; remaining words are a bash command prefix.
-                    let (mut paths, mut command_prefix) = (Vec::new(), Vec::new());
-                    while let Some(word) = words.next() {
-                        if word == "--path" {
-                            paths.extend(words.next().map(|p| p.trim_matches(['\'', '"']).to_owned()));
-                        } else {
-                            command_prefix.push(word.to_owned());
-                        }
-                    }
-                    let prefix = if tool == "bash" {
-                        crate::agent::safety::approval::bash_prefix(&command_prefix)
-                    } else {
-                        Ok(command_prefix)
-                    };
-                    match prefix {
-                        Ok(command_prefix) => {
-                            let rule = PermissionRule {
-                                effect,
-                                tool: tool.into(),
-                                command_prefix,
-                                paths,
-                            };
-                            match agent.add_permission_rule(rule, persist) {
-                                Ok(()) => self.note(
-                                    "Permissions",
-                                    if persist {
-                                        "rule saved"
-                                    } else {
-                                        "session rule added"
-                                    },
-                                ),
-                                Err(error) => self.note("Permissions", format!("{error:#}")),
-                            }
-                        }
-                        Err(error) => self.note("Permissions", error),
-                    }
-                } else if args.is_empty() {
-                    let rules = agent
-                        .permission_rules()
-                        .iter()
-                        .enumerate()
-                        .map(|(i, rule)| {
-                            format!(
-                                "{}: {:?} {} {}{}",
-                                i + 1,
-                                rule.effect,
-                                rule.tool,
-                                rule.command_prefix.join(" "),
-                                rule.paths
-                                    .iter()
-                                    .map(|p| format!(" --path {p}"))
-                                    .collect::<String>()
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    self.note(
-                        "Permissions",
-                        if rules.is_empty() {
-                            "No allow or deny rules yet. /permissions allow <tool> [prefix] adds one; \"Always allow\" in an approval prompt adds one too.".into()
-                        } else {
-                            rules.join("\n")
-                        },
-                    );
-                } else {
-                    self.note("Permissions", "usage: /permissions; /permissions allow|deny [--persist] <tool> [prefix words | --path <glob>…]; /permissions remove <number> [--persist]");
-                }
-            }
-            "cost" => {
-                let (total, turn) = agent.usage();
-                if total.all.requests == 0 {
-                    self.note(
-                        "Cost and usage",
-                        "No model requests yet in this session.\nCost and token counts appear here after the first reply.",
-                    );
-                    return Ok(Step::Done);
-                }
-                // Summary first; the accounting detail (attempts, reports, pricing coverage) follows
-                // per role as `key: value` rows.
-                let describe = |role: &str, c: &usage::Counts| format!(
-                    "{role}\n  cost: {} · requests: {} · retries: {} · failed: {}\n  tokens in: {} · out: {} · cached reads: {} · cache writes: {} · reasoning: {}\n  priced: {} · unpriced: {} · local: {} · subscription: {}\n  attempts: {} · accepted: {} · discarded: {} · without complete usage: {} · usage reports: {} · cache reports: {} · reasoning reports: {}",
-                    c.cost_label(), c.requests, c.retries, c.failed_requests,
-                    c.input, c.output, c.cache_read, c.cache_write, c.reasoning,
-                    c.priced_requests, c.unpriced_requests, c.local_requests, c.subscription_requests,
-                    c.transport_attempts, c.successful_requests, c.discarded_attempts,
-                    c.unreported_attempts, c.reported_responses,
-                    c.cache_reported_responses, c.reasoning_reported_responses,
-                );
-                let turn_label = turn
-                    .coverage
-                    .turn_id
-                    .map_or_else(|| "this turn".to_owned(), |id| format!("turn {id}"));
-                let mut text = format!(
-                    "Session: {} · requests: {} · tokens in: {} · out: {}\nCurrent {turn_label}: {}\nCoverage: {}\n\n{}\n\n{}",
-                    total.all.cost_label(), total.all.requests, total.all.input, total.all.output,
-                    turn.all.cost_label(), total.coverage.history,
-                    describe("Main agent", &total.main), describe("Workers", &total.workers),
-                );
-                for (model, counts) in &total.by_model {
-                    text.push_str(&format!("\n\nModel {model}\n{}\n{}",
-                        describe("  Main agent", &counts.main).replace("\n  ", "\n    "),
-                        describe("  Workers", &counts.workers).replace("\n  ", "\n    ")));
-                }
-                text.push_str("\n\nMissing usage or prices are unknown, not free; local and subscription usage is not an invoice estimate. Caps stop on observed cost before the next step; in-flight workers and discarded attempts can add unobserved charges. Accounting for earlier (resumed) sessions is unavailable.");
-                self.note("Cost and usage", text);
-            }
+            "permissions" => return self.permissions_command(agent, args),
+            "cost" => return self.cost_command(agent),
             "workers" => {
                 let mut bridge = Bridge {
                     app,
@@ -551,76 +338,8 @@ impl Shell {
                 }
                 Err(error) => self.note("Session", format!("error: {error:#}")),
             },
-            "compact" => {
-                let mut options = match crate::config::compaction::CompactionOptions::from_args(args) {
-                    Ok(options) => options,
-                    Err(error) => { self.note("Context", format!("{error:#}")); return Ok(Step::Done); }
-                };
-                options.suppress_continuation = true;
-                if !self.wait_compute(app)? {
-                    return Ok(Step::Done);
-                }
-                self.composer.set_busy(true);
-                self.status.phase = Phase::Compacting;
-                self.status.activity = "compacting".into();
-                let result = {
-                    let mut bridge = Bridge {
-                        app,
-                        shell: self,
-                        interrupt: app.interrupt.clone(),
-                        started: Instant::now(),
-                        last_paint: Instant::now() - PAINT_EVERY,
-                        failed: false,
-                        pending: Vec::new(),
-                        next_id: 0,
-                    };
-                    bridge.repaint(true);
-                    agent.compact_with_options(&mut bridge, options)
-                };
-                self.composer.set_busy(false);
-                if let Err(error) = result {
-                    self.transcript.error(&format!("{error:#}"));
-                }
-            }
-            "undo" => {
-                let Some(turns) = turn_count(args) else {
-                    self.note("Undo", "Usage: /undo [n] with a whole number of turns (default 1).");
-                    return Ok(Step::Done);
-                };
-                let mut lines = Vec::new();
-                if let (Some(trajectory), Some(store)) = (self.last_trajectory, app.store.as_ref())
-                {
-                    let outcome = Outcome {
-                        trajectory,
-                        score: 0.0,
-                        source: "user:undo".into(),
-                        reference: None,
-                    };
-                    match store.outcome(&outcome) {
-                        Ok(()) => self.start_live_monitor("Undo", app.config.clone()),
-                        Err(error) => lines.push(format!("could not record undo feedback: {error:#}")),
-                    }
-                }
-                if let Some(checkpoints) = agent.checkpoints() {
-                    match checkpoints.rollback(turns) {
-                        Ok(report) => lines.push(format!(
-                            "restored {} file(s), removed {}",
-                            report.restored.len(),
-                            report.removed.len()
-                        )),
-                        Err(error) => lines.push(format!("rollback: {error:#}")),
-                    }
-                }
-                agent.cancel_background_compaction();
-                match crate::app::commands::branch::rewind(app, agent, turns) {
-                    Ok(rewound) => {
-                        lines.push(format!("dropped {} message(s)", rewound.dropped));
-                        lines.extend(rewound.note);
-                    }
-                    Err(error) => lines.push(format!("rewind: {error:#}")),
-                }
-                self.note("Undo", lines.join("\n"));
-            }
+            "compact" => return self.compact_command(app, agent, args),
+            "undo" => return self.undo_command(app, agent, args),
             "rollback" => {
                 let Some(turns) = turn_count(args) else {
                     self.note("Rollback", "Usage: /rollback [n] with a whole number of turns.");
@@ -725,130 +444,9 @@ impl Shell {
                 value["runtime"] = agent.steering_runtime();
                 self.note("Activation steering", crate::steering::render(&value));
             }
-            "experience" => {
-                if args == "ledger" {
-                    self.note(
-                        "Investigation",
-                        serde_json::to_string_pretty(
-                            &agent.session().control_state()["investigation_ledger"],
-                        )
-                        .unwrap_or_default(),
-                    );
-                } else {
-                    let result = std::thread::scope(|scope| {
-                        let (tx, rx) = std::sync::mpsc::channel();
-                        let layout = &app.layout;
-                        scope.spawn(move || {
-                            let _ = tx.send(
-                                crate::storage::experience::Experience::open(layout)
-                                    .and_then(|store| store.inspect())
-                                    .map(|report| crate::storage::experience::render(&report)),
-                            );
-                        });
-                        let mut bridge = Bridge {
-                            app,
-                            shell: self,
-                            interrupt: app.interrupt.clone(),
-                            started: Instant::now(),
-                            last_paint: Instant::now() - PAINT_EVERY,
-                            failed: false,
-                            pending: Vec::new(),
-                            next_id: 0,
-                        };
-                        loop {
-                            match rx.recv_timeout(Duration::from_millis(80)) {
-                                Ok(result) => break result,
-                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                                    bridge.heartbeat()
-                                }
-                                Err(_) => {
-                                    break Err(anyhow::anyhow!("experience worker disconnected"));
-                                }
-                            }
-                        }
-                    });
-                    let mut text = result.unwrap_or_else(|error| format!("{error:#}"));
-                    let on = |flag: bool| if flag { "on" } else { "off" };
-                    text.push_str(&format!("\nAssistance {} · syntax guard {} · related tests {} · compact tools {}\nTeacher {} · needs a hosted experience role · {}s budget\nEdit controls in /settings; model role in {} → Roles → experience.",on(app.config.assistance.enabled),on(app.config.assistance.syntax_guard),on(app.config.assistance.selective_verification),on(app.config.assistance.compact_tools),on(app.config.assistance.teacher_enabled),app.config.assistance.teacher_timeout_secs,self.keys.label(Action::ModelSelect)));
-                    self.note("Experience", text);
-                }
-            }
-            "understanding" => {
-                app.interrupt.store(false, Ordering::SeqCst);
-                self.composer.set_busy(true);
-                let result = std::thread::scope(|scope| {
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    let layout = &app.layout;
-                    let cancel = app.interrupt.clone();
-                    scope.spawn(move || {
-                        let _ = tx.send(
-                            crate::tools::knowledge::codebase::Codebase::open(layout)
-                                .and_then(|cache| cache.understanding(args, &cancel))
-                                .map(|report| {
-                                    crate::tools::knowledge::codebase::render_understanding(&report, 40)
-                                }),
-                        );
-                    });
-                    let mut bridge = Bridge {
-                        app,
-                        shell: self,
-                        interrupt: app.interrupt.clone(),
-                        started: Instant::now(),
-                        last_paint: Instant::now() - PAINT_EVERY,
-                        failed: false,
-                        pending: Vec::new(),
-                        next_id: 0,
-                    };
-                    bridge.set_activity("inspecting saved understanding");
-                    loop {
-                        match rx.recv_timeout(Duration::from_millis(80)) {
-                            Ok(result) => break result,
-                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => bridge.heartbeat(),
-                            Err(_) => {
-                                break Err(anyhow::anyhow!("understanding worker disconnected"));
-                            }
-                        }
-                    }
-                });
-                self.composer.set_busy(false);
-                self.note(
-                    "Understanding",
-                    result.unwrap_or_else(|error| format!("{error:#}")),
-                );
-            }
-            "memory" => {
-                app.interrupt.store(false, Ordering::SeqCst);
-                let needs_compute = app.config.memory_uses_local_compute()
-                    && !matches!(args.split_whitespace().next(), None | Some("status" | "queue"));
-                if needs_compute && !self.wait_compute_required(app, true, false)? {
-                    return Ok(Step::Done);
-                }
-                self.composer.set_busy(true);
-                let result = {
-                    let mut bridge = Bridge {
-                        app, shell: self, interrupt: app.interrupt.clone(),
-                        started: Instant::now(), last_paint: Instant::now() - PAINT_EVERY,
-                        failed: false, pending: Vec::new(), next_id: 0,
-                    };
-                    agent.selected_memory_command(args, &mut bridge)
-                        .and_then(|value| {
-                            // `/memory help` answers with text (a `help` field or a bare string).
-                            if let Some(help) = value
-                                .get("help")
-                                .and_then(Value::as_str)
-                                .or_else(|| value.as_str())
-                            {
-                                Ok(help.to_owned())
-                            } else if matches!(args.trim(), "" | "status") && value.get("backend").is_some() {
-                                Ok(memory_status_text(&value))
-                            } else {
-                                serde_json::to_string_pretty(&value).map_err(Into::into)
-                            }
-                        })
-                };
-                self.composer.set_busy(false);
-                self.note("Memory", result.unwrap_or_else(|error| format!("error: {error:#}")));
-            }
+            "experience" => return self.experience_command(app, agent, args),
+            "understanding" => return self.understanding_command(app, args),
+            "memory" => return self.memory_command(app, agent, args),
             "commands" => {
                 let text = if self.commands.is_empty() {
                     "no custom commands (add .dial/commands/<name>.md)".to_owned()
@@ -875,29 +473,7 @@ impl Shell {
                 ),
                 Err(error) => self.note("Search", format!("error: {error:#}")),
             },
-            "context" => {
-                let used = agent.last_prompt_tokens;
-                let window = u64::from(agent.context_window());
-                let percent = (used * 100).checked_div(window).unwrap_or(0);
-                let mut text = format!(
-                    "used: {} of {} tokens ({percent}%) · messages: {}\n/compact summarizes older turns to free room; /new starts fresh.",
-                    group_digits(used),
-                    group_digits(window),
-                    agent.session().messages().len()
-                );
-                if let Some(breakdown) = agent.last_request_breakdown() {
-                    text.push_str("\n\nLast request, estimated tokens (bytes ÷ 4; images at a fixed cost):");
-                    for row in breakdown.rows() {
-                        text.push_str(&format!("\n  {:<32} {:>12}", row.label, group_digits(row.tokens)));
-                    }
-                    text.push_str(&format!(
-                        "\n  {:<32} {:>12}",
-                        "total",
-                        group_digits(breakdown.total_tokens())
-                    ));
-                }
-                self.note("Context", text)
-            }
+            "context" => return self.context_command(agent),
             "approval" => {
                 match args {
                     "ask" => agent.set_approval(Approval::Ask),
@@ -955,4 +531,588 @@ impl Shell {
         }
         Ok(Step::Done)
     }
+
+    fn review_command(&mut self, app: &App, agent: &mut Agent<'_>, args: &str) -> Result<Step> {
+        platform::interrupt::clear_interrupt();
+        self.live_tasks = Some(agent.live_task_control());
+        self.background_control = agent.background_control();
+        self.composer.set_busy(true);
+        self.status.phase = Phase::Working;
+        match self.wait_compute(app).and_then(|ready| {
+            if ready {
+                self.prepare_local(app)
+            } else {
+                Ok(false)
+            }
+        }) {
+            Ok(true) => {}
+            Ok(false) => {
+                self.composer.set_busy(false);
+                return Ok(Step::Done);
+            }
+            Err(error) => {
+                self.composer.set_busy(false);
+                self.note("Review", format!("{error:#}"));
+                return Ok(Step::Done);
+            }
+        }
+        let guidance = self
+            .commands
+            .iter()
+            .find(|def| def.name == "review")
+            .map(|def| context::expand_command(def, args))
+            .unwrap_or_default();
+        let started = Instant::now();
+        let result = {
+            let mut bridge = Bridge {
+                app,
+                shell: self,
+                interrupt: app.interrupt.clone(),
+                started,
+                last_paint: Instant::now() - PAINT_EVERY,
+                failed: false,
+                pending: Vec::new(),
+                next_id: 0,
+            };
+            bridge.repaint(true);
+            agent.review_target(args, &guidance, &mut bridge)
+        };
+        app.interrupt.store(false, Ordering::SeqCst);
+        self.composer.set_busy(false);
+        self.status.activity.clear();
+        self.refresh_status(app, agent);
+        if crate::cli::watch::enabled(&app.layout, &self.session_id) {
+            let body = match &result {
+                Ok(report) => report.clone(),
+                Err(error) => format!("{error:#}"),
+            };
+            if let Err(error) = crate::cli::watch::append(
+                &app.layout,
+                &self.session_id,
+                crate::cli::watch::Event::Text {
+                    title: "Review".into(),
+                    body,
+                },
+            ) {
+                self.note("Live feed", format!("Could not record review: {error:#}"));
+            }
+        }
+        match result {
+            Ok(report) => self.note("Review", report),
+            Err(error) => self.note("Review", format!("{error:#}")),
+        }
+        Ok(Step::Done)
+    }
+
+    fn seance_command(&mut self, app: &App, agent: &mut Agent<'_>, args: &str) -> Result<Step> {
+        let (source, question) = args
+            .split_once(char::is_whitespace)
+            .map_or(("", ""), |(source, question)| (source, question.trim()));
+        if source.is_empty() || question.is_empty() {
+            self.note(
+                "Seance",
+                "Usage: /seance <session id prefix or worker id> <question>",
+            );
+            return Ok(Step::Done);
+        }
+        platform::interrupt::clear_interrupt();
+        self.live_tasks = Some(agent.live_task_control());
+        self.background_control = agent.background_control();
+        self.composer.set_busy(true);
+        self.status.phase = Phase::Working;
+        match self.wait_compute(app).and_then(|ready| {
+            if ready {
+                self.prepare_local(app)
+            } else {
+                Ok(false)
+            }
+        }) {
+            Ok(true) => {}
+            Ok(false) => {
+                self.composer.set_busy(false);
+                return Ok(Step::Done);
+            }
+            Err(error) => {
+                self.composer.set_busy(false);
+                self.note("Seance", format!("{error:#}"));
+                return Ok(Step::Done);
+            }
+        }
+        let started = Instant::now();
+        let result = {
+            let mut bridge = Bridge {
+                app,
+                shell: self,
+                interrupt: app.interrupt.clone(),
+                started,
+                last_paint: Instant::now() - PAINT_EVERY,
+                failed: false,
+                pending: Vec::new(),
+                next_id: 0,
+            };
+            bridge.repaint(true);
+            agent.run_seance(source, question, &mut bridge)
+        };
+        app.interrupt.store(false, Ordering::SeqCst);
+        self.composer.set_busy(false);
+        self.status.activity.clear();
+        self.refresh_status(app, agent);
+        match result {
+            Ok(answer) => self.note("Seance", answer),
+            Err(error) => self.note("Seance", format!("{error:#}")),
+        }
+        Ok(Step::Done)
+    }
+
+    fn autoresearch_command(&mut self, agent: &mut Agent<'_>, args: &str) -> Result<Step> {
+        let layout = agent
+            .layout()
+            .ok_or_else(|| anyhow::anyhow!("agent has no project layout"))?
+            .clone();
+        let state = layout.state_dir.join("autoresearch");
+        let mut words = args
+            .splitn(5, char::is_whitespace)
+            .filter(|word| !word.is_empty());
+        let action = words.next().unwrap_or("status");
+        let result = match action {
+            "init" => match (words.next(), words.next(), words.next(), words.next()) {
+                (Some(name), Some(metric), Some(direction), Some(benchmark)) => match crate::tools::knowledge::autoresearch::experiment::parse_direction(direction) {
+                    Ok(maximize) => crate::tools::knowledge::autoresearch::experiment::init(&layout.project_root, &state, name, benchmark, metric, maximize).map(|e| format!("Initialized {} on branch {}.{}", e.name, e.branch, if e.origin.is_empty() { String::new() } else { format!("\nLeave with /autoresearch exit; it returns to {}.", e.origin) })),
+                    Err(_) => anyhow::bail!("direction must be max or min. Usage: /autoresearch init <name> <metric> <max|min> <benchmark command>"),
+                },
+                _ => anyhow::bail!("Usage: /autoresearch init <name> <metric> <max|min> <benchmark command>"),
+            },
+            "run" => crate::tools::knowledge::autoresearch::experiment::run(&layout.project_root, &state).map(|run| format!("{} = {} · {}{}", run.metric, run.commit, if run.kept {"best"} else {"not best"}, if run.output.is_empty(){String::new()}else{format!("\n{}",run.output)})),
+            "log" => crate::tools::knowledge::autoresearch::experiment::log(&state).map(|runs| runs.into_iter().map(|r| format!("#{} {} {} {}", r.id, r.metric, if r.kept {"best"} else {""}, r.commit)).collect::<Vec<_>>().join("\n")),
+            "notes" => { let text = args.trim().split_once(char::is_whitespace).map_or("", |(_, rest)| rest.trim()); if text.is_empty() { crate::tools::knowledge::autoresearch::experiment::notes(&state) } else { crate::tools::knowledge::autoresearch::experiment::update_notes(&state, text).map(|()| "Experiment notes updated.".to_owned()) } }
+            "resume" | "status" | "" => crate::tools::knowledge::autoresearch::experiment::current(&state).map(|experiment| experiment.map(|e| format!("{} · {} · {} ({})\n{}", e.name, e.metric, e.branch, e.benchmark, crate::tools::knowledge::autoresearch::experiment::notes(&state).unwrap_or_default())).unwrap_or_else(|| "No autoresearch experiment. Use /autoresearch init <name> <metric> <max|min> <benchmark command>.".to_owned())),
+            "exit" => crate::tools::knowledge::autoresearch::experiment::exit(&layout.project_root, &state),
+            other => anyhow::bail!("Unknown autoresearch action: {other}. Use init, run, log, notes, resume, exit."),
+        };
+        match result {
+            Ok(text) => self.note("Autoresearch", text),
+            Err(error) => self.note("Autoresearch", format!("{error:#}")),
+        }
+        Ok(Step::Done)
+    }
+
+    fn permissions_command(&mut self, agent: &mut Agent<'_>, args: &str) -> Result<Step> {
+        self.note("Permissions", PERMISSION_PATH_SCOPE);
+        if let Some(rest) = args.strip_prefix("remove ") {
+            let mut words = rest.split_whitespace();
+            let index = words
+                .next()
+                .and_then(|s| s.parse::<usize>().ok())
+                .and_then(|n| n.checked_sub(1));
+            let persist = words.any(|s| s == "--persist");
+            match index {
+                Some(index) => match agent.remove_permission_rule(index, persist) {
+                    Ok(()) => self.note("Permissions", "rule removed"),
+                    Err(error) => self.note("Permissions", format!("{error:#}")),
+                },
+                None => self.note(
+                    "Permissions",
+                    "usage: /permissions remove <number> [--persist]",
+                ),
+            }
+        } else if args.starts_with("allow ") || args.starts_with("deny ") {
+            use crate::agent::safety::approval::{Effect, PermissionRule};
+            let mut words = args.split_whitespace();
+            let effect = if words.next() == Some("allow") {
+                Effect::Allow
+            } else {
+                Effect::Deny
+            };
+            let first = words.next().unwrap_or("");
+            let persist = first == "--persist";
+            let tool = if persist {
+                words.next().unwrap_or("")
+            } else {
+                first
+            };
+            // `--path <glob>` (repeatable) scopes file tools; remaining words are a bash command prefix.
+            let (mut paths, mut command_prefix) = (Vec::new(), Vec::new());
+            while let Some(word) = words.next() {
+                if word == "--path" {
+                    paths.extend(words.next().map(|p| p.trim_matches(['\'', '"']).to_owned()));
+                } else {
+                    command_prefix.push(word.to_owned());
+                }
+            }
+            let prefix = if tool == "bash" {
+                crate::agent::safety::approval::bash_prefix(&command_prefix)
+            } else {
+                Ok(command_prefix)
+            };
+            match prefix {
+                Ok(command_prefix) => {
+                    let rule = PermissionRule {
+                        effect,
+                        tool: tool.into(),
+                        command_prefix,
+                        paths,
+                    };
+                    match agent.add_permission_rule(rule, persist) {
+                        Ok(()) => self.note(
+                            "Permissions",
+                            if persist {
+                                "rule saved"
+                            } else {
+                                "session rule added"
+                            },
+                        ),
+                        Err(error) => self.note("Permissions", format!("{error:#}")),
+                    }
+                }
+                Err(error) => self.note("Permissions", error),
+            }
+        } else if args.is_empty() {
+            let rules = agent
+                .permission_rules()
+                .iter()
+                .enumerate()
+                .map(|(i, rule)| {
+                    format!(
+                        "{}: {:?} {} {}{}",
+                        i + 1,
+                        rule.effect,
+                        rule.tool,
+                        rule.command_prefix.join(" "),
+                        rule.paths
+                            .iter()
+                            .map(|p| format!(" --path {p}"))
+                            .collect::<String>()
+                    )
+                })
+                .collect::<Vec<_>>();
+            self.note(
+                "Permissions",
+                if rules.is_empty() {
+                    "No allow or deny rules yet. /permissions allow <tool> [prefix] adds one; \"Always allow\" in an approval prompt adds one too.".into()
+                } else {
+                    rules.join("\n")
+                },
+            );
+        } else {
+            self.note("Permissions", "usage: /permissions; /permissions allow|deny [--persist] <tool> [prefix words | --path <glob>…]; /permissions remove <number> [--persist]");
+        }
+        Ok(Step::Done)
+    }
+
+    fn cost_command(&mut self, agent: &Agent<'_>) -> Result<Step> {
+        let (total, turn) = agent.usage();
+        if total.all.requests == 0 {
+            self.note(
+                "Cost and usage",
+                "No model requests yet in this session.\nCost and token counts appear here after the first reply.",
+            );
+            return Ok(Step::Done);
+        }
+        // Summary first; the accounting detail (attempts, reports, pricing coverage) follows
+        // per role as `key: value` rows.
+        let describe = |role: &str, c: &usage::Counts| {
+            format!(
+                "{role}\n  cost: {} · requests: {} · retries: {} · failed: {}\n  tokens in: {} · out: {} · cached reads: {} · cache writes: {} · reasoning: {}\n  priced: {} · unpriced: {} · local: {} · subscription: {}\n  attempts: {} · accepted: {} · discarded: {} · without complete usage: {} · usage reports: {} · cache reports: {} · reasoning reports: {}",
+                c.cost_label(),
+                c.requests,
+                c.retries,
+                c.failed_requests,
+                c.input,
+                c.output,
+                c.cache_read,
+                c.cache_write,
+                c.reasoning,
+                c.priced_requests,
+                c.unpriced_requests,
+                c.local_requests,
+                c.subscription_requests,
+                c.transport_attempts,
+                c.successful_requests,
+                c.discarded_attempts,
+                c.unreported_attempts,
+                c.reported_responses,
+                c.cache_reported_responses,
+                c.reasoning_reported_responses,
+            )
+        };
+        let turn_label = turn
+            .coverage
+            .turn_id
+            .map_or_else(|| "this turn".to_owned(), |id| format!("turn {id}"));
+        let mut text = format!(
+            "Session: {} · requests: {} · tokens in: {} · out: {}\nCurrent {turn_label}: {}\nCoverage: {}\n\n{}\n\n{}",
+            total.all.cost_label(),
+            total.all.requests,
+            total.all.input,
+            total.all.output,
+            turn.all.cost_label(),
+            total.coverage.history,
+            describe("Main agent", &total.main),
+            describe("Workers", &total.workers),
+        );
+        for (model, counts) in &total.by_model {
+            text.push_str(&format!(
+                "\n\nModel {model}\n{}\n{}",
+                describe("  Main agent", &counts.main).replace("\n  ", "\n    "),
+                describe("  Workers", &counts.workers).replace("\n  ", "\n    ")
+            ));
+        }
+        text.push_str("\n\nMissing usage or prices are unknown, not free; local and subscription usage is not an invoice estimate. Caps stop on observed cost before the next step; in-flight workers and discarded attempts can add unobserved charges. Accounting for earlier (resumed) sessions is unavailable.");
+        self.note("Cost and usage", text);
+        Ok(Step::Done)
+    }
+
+    fn compact_command(&mut self, app: &App, agent: &mut Agent<'_>, args: &str) -> Result<Step> {
+        let mut options = match crate::config::compaction::CompactionOptions::from_args(args) {
+            Ok(options) => options,
+            Err(error) => {
+                self.note("Context", format!("{error:#}"));
+                return Ok(Step::Done);
+            }
+        };
+        options.suppress_continuation = true;
+        if !self.wait_compute(app)? {
+            return Ok(Step::Done);
+        }
+        self.composer.set_busy(true);
+        self.status.phase = Phase::Compacting;
+        self.status.activity = "compacting".into();
+        let result = {
+            let mut bridge = Bridge {
+                app,
+                shell: self,
+                interrupt: app.interrupt.clone(),
+                started: Instant::now(),
+                last_paint: Instant::now() - PAINT_EVERY,
+                failed: false,
+                pending: Vec::new(),
+                next_id: 0,
+            };
+            bridge.repaint(true);
+            agent.compact_with_options(&mut bridge, options)
+        };
+        self.composer.set_busy(false);
+        if let Err(error) = result {
+            self.transcript.error(&format!("{error:#}"));
+        }
+        Ok(Step::Done)
+    }
+
+    fn undo_command(&mut self, app: &App, agent: &mut Agent<'_>, args: &str) -> Result<Step> {
+        let Some(turns) = turn_count(args) else {
+            self.note(
+                "Undo",
+                "Usage: /undo [n] with a whole number of turns (default 1).",
+            );
+            return Ok(Step::Done);
+        };
+        let mut lines = Vec::new();
+        if let (Some(trajectory), Some(store)) = (self.last_trajectory, app.store.as_ref()) {
+            let outcome = Outcome {
+                trajectory,
+                score: 0.0,
+                source: "user:undo".into(),
+                reference: None,
+            };
+            match store.outcome(&outcome) {
+                Ok(()) => self.start_live_monitor("Undo", app.config.clone()),
+                Err(error) => lines.push(format!("could not record undo feedback: {error:#}")),
+            }
+        }
+        if let Some(checkpoints) = agent.checkpoints() {
+            match checkpoints.rollback(turns) {
+                Ok(report) => lines.push(format!(
+                    "restored {} file(s), removed {}",
+                    report.restored.len(),
+                    report.removed.len()
+                )),
+                Err(error) => lines.push(format!("rollback: {error:#}")),
+            }
+        }
+        agent.cancel_background_compaction();
+        match crate::app::commands::branch::rewind(app, agent, turns) {
+            Ok(rewound) => {
+                lines.push(format!("dropped {} message(s)", rewound.dropped));
+                lines.extend(rewound.note);
+            }
+            Err(error) => lines.push(format!("rewind: {error:#}")),
+        }
+        self.note("Undo", lines.join("\n"));
+        Ok(Step::Done)
+    }
+
+    fn experience_command(&mut self, app: &App, agent: &Agent<'_>, args: &str) -> Result<Step> {
+        if args == "ledger" {
+            self.note(
+                "Investigation",
+                serde_json::to_string_pretty(
+                    &agent.session().control_state()["investigation_ledger"],
+                )
+                .unwrap_or_default(),
+            );
+        } else {
+            let result = std::thread::scope(|scope| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let layout = &app.layout;
+                scope.spawn(move || {
+                    let _ = tx.send(
+                        crate::storage::experience::Experience::open(layout)
+                            .and_then(|store| store.inspect())
+                            .map(|report| crate::storage::experience::render(&report)),
+                    );
+                });
+                let mut bridge = Bridge {
+                    app,
+                    shell: self,
+                    interrupt: app.interrupt.clone(),
+                    started: Instant::now(),
+                    last_paint: Instant::now() - PAINT_EVERY,
+                    failed: false,
+                    pending: Vec::new(),
+                    next_id: 0,
+                };
+                loop {
+                    match rx.recv_timeout(Duration::from_millis(80)) {
+                        Ok(result) => break result,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => bridge.heartbeat(),
+                        Err(_) => {
+                            break Err(anyhow::anyhow!("experience worker disconnected"));
+                        }
+                    }
+                }
+            });
+            let mut text = result.unwrap_or_else(|error| format!("{error:#}"));
+            let on = |flag: bool| if flag { "on" } else { "off" };
+            text.push_str(&format!("\nAssistance {} · syntax guard {} · related tests {} · compact tools {}\nTeacher {} · needs a hosted experience role · {}s budget\nEdit controls in /settings; model role in {} → Roles → experience.",on(app.config.assistance.enabled),on(app.config.assistance.syntax_guard),on(app.config.assistance.selective_verification),on(app.config.assistance.compact_tools),on(app.config.assistance.teacher_enabled),app.config.assistance.teacher_timeout_secs,self.keys.label(Action::ModelSelect)));
+            self.note("Experience", text);
+        }
+        Ok(Step::Done)
+    }
+
+    fn understanding_command(&mut self, app: &App, args: &str) -> Result<Step> {
+        app.interrupt.store(false, Ordering::SeqCst);
+        self.composer.set_busy(true);
+        let result = std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let layout = &app.layout;
+            let cancel = app.interrupt.clone();
+            scope.spawn(move || {
+                let _ = tx.send(
+                    crate::tools::knowledge::codebase::Codebase::open(layout)
+                        .and_then(|cache| cache.understanding(args, &cancel))
+                        .map(|report| {
+                            crate::tools::knowledge::codebase::render_understanding(&report, 40)
+                        }),
+                );
+            });
+            let mut bridge = Bridge {
+                app,
+                shell: self,
+                interrupt: app.interrupt.clone(),
+                started: Instant::now(),
+                last_paint: Instant::now() - PAINT_EVERY,
+                failed: false,
+                pending: Vec::new(),
+                next_id: 0,
+            };
+            bridge.set_activity("inspecting saved understanding");
+            loop {
+                match rx.recv_timeout(Duration::from_millis(80)) {
+                    Ok(result) => break result,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => bridge.heartbeat(),
+                    Err(_) => {
+                        break Err(anyhow::anyhow!("understanding worker disconnected"));
+                    }
+                }
+            }
+        });
+        self.composer.set_busy(false);
+        self.note(
+            "Understanding",
+            result.unwrap_or_else(|error| format!("{error:#}")),
+        );
+        Ok(Step::Done)
+    }
+
+    fn memory_command(&mut self, app: &App, agent: &mut Agent<'_>, args: &str) -> Result<Step> {
+        app.interrupt.store(false, Ordering::SeqCst);
+        let needs_compute = app.config.memory_uses_local_compute()
+            && !matches!(
+                args.split_whitespace().next(),
+                None | Some("status" | "queue")
+            );
+        if needs_compute && !self.wait_compute_required(app, true, false)? {
+            return Ok(Step::Done);
+        }
+        self.composer.set_busy(true);
+        let result = {
+            let mut bridge = Bridge {
+                app,
+                shell: self,
+                interrupt: app.interrupt.clone(),
+                started: Instant::now(),
+                last_paint: Instant::now() - PAINT_EVERY,
+                failed: false,
+                pending: Vec::new(),
+                next_id: 0,
+            };
+            agent
+                .selected_memory_command(args, &mut bridge)
+                .and_then(|value| {
+                    // `/memory help` answers with text (a `help` field or a bare string).
+                    if let Some(help) = value
+                        .get("help")
+                        .and_then(Value::as_str)
+                        .or_else(|| value.as_str())
+                    {
+                        Ok(help.to_owned())
+                    } else if matches!(args.trim(), "" | "status") && value.get("backend").is_some()
+                    {
+                        Ok(memory_status_text(&value))
+                    } else {
+                        serde_json::to_string_pretty(&value).map_err(Into::into)
+                    }
+                })
+        };
+        self.composer.set_busy(false);
+        self.note(
+            "Memory",
+            result.unwrap_or_else(|error| format!("error: {error:#}")),
+        );
+        Ok(Step::Done)
+    }
+
+    fn context_command(&mut self, agent: &Agent<'_>) -> Result<Step> {
+        let used = agent.last_prompt_tokens;
+        let window = u64::from(agent.context_window());
+        let percent = (used * 100).checked_div(window).unwrap_or(0);
+        let mut text = format!(
+            "used: {} of {} tokens ({percent}%) · messages: {}\n/compact summarizes older turns to free room; /new starts fresh.",
+            group_digits(used),
+            group_digits(window),
+            agent.session().messages().len()
+        );
+        if let Some(breakdown) = agent.last_request_breakdown() {
+            text.push_str(
+                "\n\nLast request, estimated tokens (bytes ÷ 4; images at a fixed cost):",
+            );
+            for row in breakdown.rows() {
+                text.push_str(&format!(
+                    "\n  {:<32} {:>12}",
+                    row.label,
+                    group_digits(row.tokens)
+                ));
+            }
+            text.push_str(&format!(
+                "\n  {:<32} {:>12}",
+                "total",
+                group_digits(breakdown.total_tokens())
+            ));
+        }
+        self.note("Context", text);
+        Ok(Step::Done)
+    }
 }
+
+#[cfg(test)]
+mod tests;

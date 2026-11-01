@@ -2,7 +2,7 @@
 //! through a typed [`Replica`]. Prompts and aborts go to the host only when the host grants write
 //! access in `welcome`; a read-only guest refuses them, and no guest prompt ever runs on the local
 //! agent.
-use super::crypto::RoomKey;
+use super::crypto::{RoomKey, WRITE_TOKEN_BYTES, request_proof, write_proof};
 use super::protocol::{Control, frame, parse_link};
 use super::socket::{Role, Socket, SocketEvent, SocketOptions};
 use anyhow::Result;
@@ -119,6 +119,9 @@ pub struct Guest {
     welcomed: bool,
     ended: bool,
     hello: Value,
+    write_token: Option<[u8; WRITE_TOKEN_BYTES]>,
+    write_challenge: Option<String>,
+    request_sequence: std::cell::Cell<u64>,
     replica: Replica,
     /// Replica entries already shown in the terminal, so each one is projected exactly once.
     projected: usize,
@@ -131,13 +134,16 @@ impl Guest {
         let socket = Socket::connect(SocketOptions {
             ws_url: parsed.ws_url.clone(),
             role: Role::Guest,
-            key: RoomKey::new(&parsed.key)?,
+            key: RoomKey::guest(&parsed.key, parsed.host_public)?,
         })?;
-        let hello = frame::hello(name, parsed.write_token.as_ref().map(|t| &t[..]));
+        let hello = frame::hello(name);
         socket.send(&hello, 0);
         Ok(Self {
             socket,
             hello,
+            write_token: parsed.write_token,
+            write_challenge: None,
+            request_sequence: std::cell::Cell::new(0),
             read_only: true,
             welcomed: false,
             ended: false,
@@ -170,7 +176,7 @@ impl Guest {
         self.send_request(json!({"t": "abort"}))
     }
 
-    fn send_request(&self, request: Value) -> Result<(), &'static str> {
+    fn send_request(&self, mut request: Value) -> Result<(), &'static str> {
         if self.ended {
             return Err("The collab session has ended; /leave to exit");
         }
@@ -179,6 +185,29 @@ impl Guest {
                 "This collab link is read-only, so the request was not sent and nothing ran locally",
             );
         }
+        let token = self
+            .write_token
+            .as_ref()
+            .ok_or("No write authority in this link")?;
+        let challenge = self
+            .write_challenge
+            .as_deref()
+            .ok_or("Host authentication is not complete")?;
+        let sequence = self
+            .request_sequence
+            .get()
+            .checked_add(1)
+            .ok_or("Guest request sequence exhausted; rejoin")?;
+        let proof = request_proof(
+            token,
+            challenge,
+            sequence,
+            request["t"].as_str().unwrap_or(""),
+            request["text"].as_str().unwrap_or(""),
+        );
+        self.request_sequence.set(sequence);
+        request["requestSeq"] = json!(sequence);
+        request["authorization"] = json!(proof);
         if self.socket.send(&request, 0) {
             Ok(())
         } else {
@@ -228,6 +257,19 @@ impl Guest {
             self.project(change, notes);
         }
         match msg["t"].as_str() {
+            Some("challenge") => {
+                if let Some(nonce) = msg["nonce"].as_str() {
+                    self.write_challenge = Some(nonce.to_owned());
+                    self.request_sequence.set(0);
+                    self.read_only = true;
+                    let proof = self
+                        .write_token
+                        .as_ref()
+                        .map(|token| write_proof(token, nonce));
+                    self.socket
+                        .send(&json!({"t":"authenticate","proof":proof}), 0);
+                }
+            }
             Some("welcome") => {
                 // Missing grant data defaults to read-only.
                 self.read_only = msg["readOnly"].as_bool().unwrap_or(true);

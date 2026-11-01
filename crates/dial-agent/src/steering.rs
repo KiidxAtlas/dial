@@ -31,7 +31,8 @@ pub fn pending_path(config: &AppConfig, name: &str) -> Result<PathBuf> {
 pub(crate) fn lock_vector(path: &Path) -> Result<fs::File> {
     crate::platform::atomic::private_dir(path.parent().context("steering directory")?)?;
     let lock = crate::learn::auto::lock_file(&path.with_extension("job.lock"))?;
-    fs2::FileExt::try_lock_exclusive(&lock)
+    std::fs::File::try_lock(&lock)
+        .map_err(std::io::Error::from)
         .context("another steering job already owns this vector")?;
     Ok(lock)
 }

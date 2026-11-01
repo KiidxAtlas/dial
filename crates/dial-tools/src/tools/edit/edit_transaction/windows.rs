@@ -75,10 +75,10 @@ impl Drop for ParentCleanup {
             return;
         }
         for entry in self.entries.iter().rev() {
-            if let Ok(file) = crate::platform::fs::open_beneath_handle(&entry.parent, &entry.name) {
-                if crate::platform::fs::identity(&file).ok() == Some(entry.identity) {
-                    let _ = crate::platform::fs::remove_dir_beneath(&entry.parent, &entry.name);
-                }
+            if let Ok(file) = crate::platform::fs::open_beneath_handle(&entry.parent, &entry.name)
+                && crate::platform::fs::identity(&file).ok() == Some(entry.identity)
+            {
+                let _ = crate::platform::fs::remove_dir_beneath(&entry.parent, &entry.name);
             }
         }
     }
@@ -457,13 +457,13 @@ pub(crate) fn commit(ws: &Workspace, changes: &[Change]) -> Result<Vec<String>, 
         }
         for (stage, change) in staged.iter_mut().zip(changes) {
             stage.dir.validate_location(ws, &change.path)?;
-            if let Some(backup) = &stage.backup {
-                if !matches(&stage.dir.read(backup)?, &change.before, true) {
-                    return Err(format!(
-                        "{} original changed after capture",
-                        ws.rel(&change.path)
-                    ));
-                }
+            if let Some(backup) = &stage.backup
+                && !matches(&stage.dir.read(backup)?, &change.before, true)
+            {
+                return Err(format!(
+                    "{} original changed after capture",
+                    ws.rel(&change.path)
+                ));
             }
             if let Some(new) = &stage.new {
                 stage.dir.link(new, &stage.name)?;
@@ -472,13 +472,13 @@ pub(crate) fn commit(ws: &Workspace, changes: &[Change]) -> Result<Vec<String>, 
         }
         for (stage, change) in staged.iter().zip(changes) {
             stage.dir.validate_location(ws, &change.path)?;
-            if let Some(backup) = &stage.backup {
-                if !matches(&stage.dir.read(backup)?, &change.before, true) {
-                    return Err(format!(
-                        "{} original changed during installation",
-                        ws.rel(&change.path)
-                    ));
-                }
+            if let Some(backup) = &stage.backup
+                && !matches(&stage.dir.read(backup)?, &change.before, true)
+            {
+                return Err(format!(
+                    "{} original changed during installation",
+                    ws.rel(&change.path)
+                ));
             }
         }
         Ok::<(), String>(())
@@ -554,13 +554,13 @@ pub(crate) fn commit(ws: &Workspace, changes: &[Change]) -> Result<Vec<String>, 
     parents.committed = true;
     let mut warnings = Vec::new();
     for stage in &staged {
-        if let Some(backup) = &stage.backup {
-            if let Err(e) = stage.dir.unlink(backup) {
-                warnings.push(format!(
-                    "Edits committed, but original cleanup failed: {e}; retained at {}",
-                    stage.dir.path.join(backup).display()
-                ));
-            }
+        if let Some(backup) = &stage.backup
+            && let Err(e) = stage.dir.unlink(backup)
+        {
+            warnings.push(format!(
+                "Edits committed, but original cleanup failed: {e}; retained at {}",
+                stage.dir.path.join(backup).display()
+            ));
         }
         if let Err(e) = stage.dir.file.sync_all() {
             warnings.push(format!(

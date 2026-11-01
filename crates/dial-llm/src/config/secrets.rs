@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 pub const MIN_SECRET_BYTES: usize = 8;
 
 /// `[secrets]`: provider-bound masking (`llm::secrets`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Replace secrets in provider-bound messages with reversible placeholders.
@@ -15,6 +15,16 @@ pub struct Config {
     pub env: bool,
     /// Extra literal secrets to mask.
     pub values: Vec<String>,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("enabled", &self.enabled)
+            .field("env", &self.env)
+            .field("values", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl Default for Config {
@@ -39,3 +49,6 @@ impl Config {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;

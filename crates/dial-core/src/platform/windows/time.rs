@@ -1,6 +1,7 @@
 pub(in crate::platform) fn local_strftime(fmt: &str) -> String {
     use windows_sys::Win32::{Foundation::SYSTEMTIME, System::SystemInformation::GetLocalTime};
     let mut t = SYSTEMTIME::default();
+    // SAFETY: t is writable, correctly aligned SYSTEMTIME storage for this synchronous query.
     unsafe { GetLocalTime(&mut t) }
     let mut out = String::new();
     let mut i = fmt.chars();

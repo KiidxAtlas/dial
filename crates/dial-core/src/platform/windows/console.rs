@@ -33,6 +33,8 @@ pub struct StdInput {
 impl StdInput {
     fn from_file(file: File, require_console: bool) -> io::Result<Self> {
         let mut mode = 0;
+        // SAFETY: file owns a live handle and mode is writable u32 storage; non-console
+        // handles fail the query without initializing a console mode that we would use.
         let console = unsafe { GetConsoleMode(file.as_raw_handle() as HANDLE, &mut mode) } != 0;
         if require_console && !console {
             return Err(io::Error::new(
@@ -40,6 +42,7 @@ impl StdInput {
                 "CONIN$ is not a console input handle",
             ));
         }
+        // SAFETY: GetFileType only inspects the handle borrowed from file.
         let file_type = unsafe { GetFileType(file.as_raw_handle() as HANDLE) };
         let pipe = !console && file_type == FILE_TYPE_PIPE;
         if !console && !pipe && file_type != FILE_TYPE_DISK {
@@ -64,10 +67,12 @@ impl StdInput {
         }
         let handle = self.file.as_raw_handle() as HANDLE;
         // The console mode can change after open (e.g. a TUI entering raw input), so read it per fill.
+        // SAFETY: self.file keeps handle open and self.mode is writable output storage.
         if unsafe { GetConsoleMode(handle, &mut self.mode) } == 0 {
             return Err(io::Error::last_os_error());
         }
         let mut count = 0;
+        // SAFETY: handle is a live console input handle and count is writable storage.
         if unsafe { GetNumberOfConsoleInputEvents(handle, &mut count) } == 0 {
             return Err(io::Error::last_os_error());
         }
@@ -76,6 +81,8 @@ impl StdInput {
         }
         let mut events = vec![INPUT_RECORD::default(); count as usize];
         let mut peeked = 0;
+        // SAFETY: events contains count initialized INPUT_RECORD slots; peeked is writable,
+        // and the console handle stays live for this synchronous peek.
         if unsafe { PeekConsoleInputW(handle, events.as_mut_ptr(), count, &mut peeked) } == 0 {
             return Err(io::Error::last_os_error());
         }
@@ -86,11 +93,14 @@ impl StdInput {
             if event.EventType != KEY_EVENT as u16 {
                 return false;
             }
+            // SAFETY: the KEY_EVENT discriminator was checked, selecting this union member.
             let key = unsafe { event.Event.KeyEvent };
             key.bKeyDown != 0
                 && if line_mode {
                     key.wVirtualKeyCode == 0x0d
                 } else {
+                    // SAFETY: PeekConsoleInputW produces Unicode KEY_EVENT_RECORD values,
+                    // so the uChar union is interpreted as the UTF-16 UnicodeChar member.
                     (unsafe { key.uChar.UnicodeChar }) != 0
                 }
         });
@@ -98,6 +108,8 @@ impl StdInput {
             if !line_mode {
                 let mut discard = vec![INPUT_RECORD::default(); count as usize];
                 let mut consumed = 0;
+                // SAFETY: discard contains count writable INPUT_RECORD slots and consumed
+                // is writable; the owned console input handle remains live.
                 if unsafe { ReadConsoleInputW(handle, discard.as_mut_ptr(), count, &mut consumed) }
                     == 0
                 {
@@ -108,6 +120,8 @@ impl StdInput {
         }
         let mut units = [0u16; 512];
         let mut got = 0;
+        // SAFETY: units has capacity for the supplied number of UTF-16 code units, got is
+        // writable, and null selects no extended read control for this live console handle.
         if unsafe {
             ReadConsoleW(
                 handle,
@@ -207,6 +221,7 @@ impl StdInput {
             }
             let handle = self.file.as_raw_handle() as HANDLE;
             let mut queued = 0;
+            // SAFETY: self.file keeps the console handle live and queued is writable.
             if unsafe { GetNumberOfConsoleInputEvents(handle, &mut queued) } == 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -216,6 +231,7 @@ impl StdInput {
                 std::thread::sleep(remaining.min(Duration::from_millis(10)));
                 continue;
             }
+            // SAFETY: handle is borrowed from self.file throughout this non-owning wait.
             let result = unsafe {
                 WaitForSingleObject(handle, remaining.as_millis().min(u32::MAX as u128) as u32)
             };
@@ -231,11 +247,14 @@ impl StdInput {
 }
 /// Duplicate the current process stdin and classify its handle for safe nonblocking reads.
 pub fn duplicate_stdin_reader() -> io::Result<StdInput> {
+    // SAFETY: GetStdHandle takes only a standard-handle selector and transfers no ownership.
     let source = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
     if source.is_null() || source == -1isize as HANDLE {
         return Err(io::Error::last_os_error());
     }
     let mut duplicate: HANDLE = std::ptr::null_mut();
+    // SAFETY: source was checked against both invalid sentinels; current-process pseudo
+    // handles are valid and duplicate is writable. The new handle is non-inheritable.
     if unsafe {
         DuplicateHandle(
             GetCurrentProcess(),
@@ -250,6 +269,7 @@ pub fn duplicate_stdin_reader() -> io::Result<StdInput> {
     {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: DuplicateHandle succeeded, giving this scope one new uniquely owned handle.
     StdInput::from_file(unsafe { File::from_raw_handle(duplicate.cast()) }, false)
 }
 impl Read for StdInput {

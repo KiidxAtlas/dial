@@ -42,19 +42,25 @@ struct SpaceSpi {
 
 static SPI: LazyLock<Option<SpaceSpi>> = LazyLock::new(|| {
     skylight::ensure_skylight_loaded()?;
-    Some(SpaceSpi {
-        connection: skylight::symbol(c"SLSMainConnectionID")
-            .or_else(|| skylight::symbol(c"CGSMainConnectionID"))?,
-        active: skylight::symbol(c"SLSGetActiveSpace")
-            .or_else(|| skylight::symbol(c"CGSGetActiveSpace"))?,
-        copy_spaces: skylight::symbol(c"SLSCopySpacesForWindows")?,
-        move_windows: skylight::symbol(c"SLSMoveWindowsToManagedSpace")?,
-        window_owner: skylight::symbol(c"SLSGetWindowOwner")?,
-        connection_pid: skylight::symbol(c"SLSConnectionGetPID")?,
-        space_type: skylight::symbol(c"SLSSpaceGetType")?,
-        copy_displays: skylight::symbol(c"SLSCopyManagedDisplays")?,
-        display_space: skylight::symbol(c"SLSManagedDisplayGetCurrentSpace")?,
-    })
+    // SAFETY: each name is paired with the native alias above, including
+    // Create-rule CFArray returns and the void MoveWindows return. References
+    // to opaque CFArray/CFString have the native pointer ABI. SkyLight is kept
+    // loaded by its process-lived handle; dlsym itself cannot validate this ABI.
+    unsafe {
+        Some(SpaceSpi {
+            connection: skylight::symbol(c"SLSMainConnectionID")
+                .or_else(|| skylight::symbol(c"CGSMainConnectionID"))?,
+            active: skylight::symbol(c"SLSGetActiveSpace")
+                .or_else(|| skylight::symbol(c"CGSGetActiveSpace"))?,
+            copy_spaces: skylight::symbol(c"SLSCopySpacesForWindows")?,
+            move_windows: skylight::symbol(c"SLSMoveWindowsToManagedSpace")?,
+            window_owner: skylight::symbol(c"SLSGetWindowOwner")?,
+            connection_pid: skylight::symbol(c"SLSConnectionGetPID")?,
+            space_type: skylight::symbol(c"SLSSpaceGetType")?,
+            copy_displays: skylight::symbol(c"SLSCopyManagedDisplays")?,
+            display_space: skylight::symbol(c"SLSManagedDisplayGetCurrentSpace")?,
+        })
+    }
 });
 
 pub(super) fn supported() -> bool {

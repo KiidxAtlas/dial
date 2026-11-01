@@ -240,7 +240,9 @@ fn limit(command: &mut Command, deadline: Duration) {
     use std::os::unix::process::CommandExt;
     let cpu = deadline.as_secs().saturating_add(1) as libc::rlim_t;
     let memory = address_space_limit().map(|bytes| bytes as libc::rlim_t);
-    // SAFETY: the closure only calls setrlimit, which is async-signal-safe, and allocates nothing.
+    // SAFETY: the post-fork closure uses only initialized stack rlimit values and
+    // setrlimit's syscall wrapper (plus reading errno on error). It borrows no parent
+    // heap state, allocates nothing, and acquires no inherited Rust locks.
     unsafe {
         command.pre_exec(move || {
             let cpu_limit = libc::rlimit {
@@ -277,6 +279,8 @@ fn address_space_limit() -> Option<u64> {
     const PARSER_ADDRESS_SPACE: u64 = 4 << 30;
     let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
     let pages: u64 = statm.split_whitespace().next()?.parse().ok()?;
+    // SAFETY: _SC_PAGESIZE is a supported sysconf query with no pointer arguments;
+    // a failed or non-positive result is rejected below.
     let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
         .ok()
         .filter(|p| *p > 0)?;

@@ -6,7 +6,6 @@ use dial::config::paths::Layout;
 use dial::config::types::{Config, Outcome, Proposal};
 use dial::learn::{auto, harvest, improve, probe};
 use dial::storage::store::Store;
-use fs2::FileExt;
 use serde_json::{Value, json};
 use std::{fs, io::Write, path::PathBuf, thread, time::Duration};
 
@@ -130,7 +129,7 @@ pub fn run(cmd: Cmd, layout: &Layout, mut config: Config) -> Result<()> {
         }))?,
         Cmd::RegisterTask { manifest, trajectory } => {
             let control = auto::lock_file(&config.state_dir.join("control.lock"))?;
-            control.try_lock_exclusive().context("an improvement cycle is using the task registry")?;
+            control.try_lock().map_err(std::io::Error::from).context("an improvement cycle is using the task registry")?;
             let task = match trajectory {
                 Some(id) => dial::learn::repository::register_repair(&config,&store,&manifest,id)?,
                 None => dial::learn::repository::register(&config,&manifest)?,
@@ -152,13 +151,13 @@ pub fn run(cmd: Cmd, layout: &Layout, mut config: Config) -> Result<()> {
         }
         Cmd::Import { pack } => {
             let control = auto::lock_file(&config.state_dir.join("control.lock"))?;
-            control.try_lock_exclusive().context("an improvement cycle is using the version store")?;
+            control.try_lock().map_err(std::io::Error::from).context("an improvement cycle is using the version store")?;
             let candidate = dial::pack::import_adapter(&config, &store, &pack)?;
             print_json(&json!({"candidate":candidate.id,"status":"pending; run `dial improve evaluate` to gate it"}))?;
         }
         Cmd::Evaluate { candidate } => {
             let control = auto::lock_file(&config.state_dir.join("control.lock"))?;
-            control.try_lock_exclusive().context("an improvement cycle is using the version store")?;
+            control.try_lock().map_err(std::io::Error::from).context("an improvement cycle is using the version store")?;
             let _lease = dial::learn::compute::Background::acquire(&config)?;
             print_json(&improve::evaluate_queued(&mut Runtime::new(), &config, &store, candidate, &mut progress)?)?;
         }
@@ -169,14 +168,14 @@ pub fn run(cmd: Cmd, layout: &Layout, mut config: Config) -> Result<()> {
         }
         Cmd::Rollback => {
             let control = auto::lock_file(&config.state_dir.join("control.lock"))?;
-            control.lock_exclusive()?;
+            control.lock()?;
             let parent = store.active()?.parent.context("initial version has no predecessor")?;
             improve::verify_adapter(&store, &store.version(parent)?)?;
             print_json(&store.rollback()?)?;
         }
         Cmd::Harvest => {
             let control = auto::lock_file(&config.state_dir.join("control.lock"))?;
-            control.lock_exclusive()?;
+            control.lock()?;
             let evaluation = improve::build_evaluation(&config, &store)?;
             print_json(&harvest::harvest(&config, &store, &evaluation.held_out)?)?;
         }
@@ -185,7 +184,7 @@ pub fn run(cmd: Cmd, layout: &Layout, mut config: Config) -> Result<()> {
             loop {
                 if auto::due(&config, &store)? {
                     let control = auto::lock_file(&config.state_dir.join("control.lock"))?;
-                    if control.try_lock_exclusive().is_ok() {
+                    if control.try_lock().map_err(std::io::Error::from).is_ok() {
                         let _compute = if config.uses_local_compute() { Some(dial::learn::compute::Background::acquire(&config)?) } else { None };
                         match auto::execute(&mut config.clone(), &store, false, &mut progress) {
                             Ok(report) => print_json(&report)?,
@@ -198,9 +197,9 @@ pub fn run(cmd: Cmd, layout: &Layout, mut config: Config) -> Result<()> {
         }
         command => {
             let control = auto::lock_file(&config.state_dir.join("control.lock"))?;
-            if control.try_lock_exclusive().is_err() {
+            if control.try_lock().map_err(std::io::Error::from).is_err() {
                 eprintln!("waiting for the running improvement cycle to finish (Ctrl-C to cancel)");
-                control.lock_exclusive()?;
+                control.lock()?;
             }
             let _compute = if config.uses_local_compute() { Some(dial::learn::compute::Background::acquire(&config)?) } else { None };
             if matches!(command, Cmd::Cycle) {

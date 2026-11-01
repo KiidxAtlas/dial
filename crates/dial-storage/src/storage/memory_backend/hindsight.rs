@@ -27,7 +27,12 @@ pub fn open(layout: &Layout, config: &HindsightConfig) -> Result<Box<dyn Driver>
     }
     let directory = PrivateDirectory::open(layout, "hindsight")?;
     let db = directory.database("pending.sqlite3")?;
-    db.execute_batch("CREATE TABLE IF NOT EXISTS pending(id TEXT PRIMARY KEY,endpoint TEXT NOT NULL,bank TEXT NOT NULL,project TEXT NOT NULL,session TEXT NOT NULL,branch TEXT NOT NULL,revision TEXT NOT NULL,payload TEXT NOT NULL,created INTEGER NOT NULL,state TEXT NOT NULL DEFAULT 'queued');CREATE TABLE IF NOT EXISTS transcripts(endpoint TEXT NOT NULL,bank TEXT NOT NULL,project TEXT NOT NULL,session TEXT NOT NULL,branch TEXT NOT NULL,revision TEXT NOT NULL,turns INTEGER NOT NULL,retained INTEGER NOT NULL DEFAULT 0,content TEXT NOT NULL,PRIMARY KEY(endpoint,bank,project,session,branch));")?;
+    crate::storage::sqlite::migrate(
+        &db,
+        &[
+            "CREATE TABLE IF NOT EXISTS pending(id TEXT PRIMARY KEY,endpoint TEXT NOT NULL,bank TEXT NOT NULL,project TEXT NOT NULL,session TEXT NOT NULL,branch TEXT NOT NULL,revision TEXT NOT NULL,payload TEXT NOT NULL,created INTEGER NOT NULL,state TEXT NOT NULL DEFAULT 'queued');CREATE TABLE IF NOT EXISTS transcripts(endpoint TEXT NOT NULL,bank TEXT NOT NULL,project TEXT NOT NULL,session TEXT NOT NULL,branch TEXT NOT NULL,revision TEXT NOT NULL,turns INTEGER NOT NULL,retained INTEGER NOT NULL DEFAULT 0,content TEXT NOT NULL,PRIMARY KEY(endpoint,bank,project,session,branch));",
+        ],
+    )?;
     Ok(Box::new(Hindsight {
         config: config.clone(),
         db,

@@ -1,4 +1,5 @@
 use super::*;
+#[cfg(unix)]
 use crate::config::settings_store::{self, Scope};
 
 #[test]

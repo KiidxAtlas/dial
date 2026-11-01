@@ -196,6 +196,8 @@ fn extract() -> Result<PathBuf> {
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
     let digest = Sha256::digest(HELPER);
     let tag: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+    // SAFETY: getuid has no pointer arguments or caller preconditions and only returns the
+    // calling process's real user ID; no Rust memory or process credentials are mutated.
     let uid = unsafe { libc::getuid() };
     let dir = std::env::temp_dir().join(format!("dial-apple-fm-{uid}-{tag}"));
     match std::fs::DirBuilder::new().mode(0o700).create(&dir) {

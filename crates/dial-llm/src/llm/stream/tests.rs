@@ -83,8 +83,40 @@ fn a_disconnect_inside_gzip_decoding_is_an_incomplete_stream() {
 
 #[test]
 fn sse_framing_tolerates_comments_crlf_and_other_fields() {
-    let raw = b": keepalive\r\n\r\nevent: message\r\nid: 7\r\nretry: 10\r\ndata: {\"a\":1}\r\n\r\ndata:{\"b\":2}\n\n: ping\ndata: [DONE]\n\ndata: ignored-after-done\n";
-    assert_eq!(events(raw).unwrap(), ["{\"a\":1}", "{\"b\":2}", "[DONE]"]);
+    for ending in ["\n", "\r", "\r\n"] {
+        let raw = ": keepalive\n\nevent: message\nid: 7\nretry: 10\ndata: {\"a\":1}\n\ndata:{\"b\":2}\n\n: ping\ndata: [DONE]\n\ndata: ignored-after-done\n".replace('\n', ending);
+        assert_eq!(
+            events(raw.as_bytes()).unwrap(),
+            ["{\"a\":1}", "{\"b\":2}", "[DONE]"],
+            "{ending:?}"
+        );
+    }
+}
+
+#[test]
+fn crlf_split_across_every_read_boundary_remains_one_terminator() {
+    struct ByteReader<'a>(&'a [u8]);
+    impl Read for ByteReader<'_> {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            let count = output.len().min(self.0.len()).min(1);
+            output[..count].copy_from_slice(&self.0[..count]);
+            self.0 = &self.0[count..];
+            Ok(count)
+        }
+    }
+    let mut seen = Vec::new();
+    read_events(
+        ByteReader(b"data: first\r\ndata: second\r\n\r\ndata: [DONE]\r\n\r\n"),
+        1024,
+        1024,
+        far(),
+        |data| {
+            seen.push(data.to_owned());
+            Ok(data == "[DONE]")
+        },
+    )
+    .unwrap();
+    assert_eq!(seen, ["first\nsecond", "[DONE]"]);
 }
 
 #[test]

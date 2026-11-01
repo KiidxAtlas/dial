@@ -97,7 +97,7 @@ fn training_rejects_ineligible_models_and_respects_pause_and_control_lock() {
     );
     store.set_meta("auto_enabled", "true").unwrap();
     let control = lock_file(&state.join("control.lock")).unwrap();
-    control.lock_exclusive().unwrap();
+    control.lock().unwrap();
     assert_eq!(
         start_training(&layout, &config, &store).unwrap(),
         Spawn::Refused(Refusal::Running)
@@ -130,7 +130,7 @@ fn foreground_compute_wait_cancels_while_background_lease_is_held() {
     fs::create_dir(&project).unwrap();
     let layout = Layout::with_user_dir(&project, root.path().join("user")).unwrap();
     let lease = lock_file(&layout.user_dir.join("compute.lock")).unwrap();
-    lease.lock_exclusive().unwrap();
+    lease.lock().unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = cancel.clone();
     let worker_layout = layout.clone();
@@ -176,17 +176,21 @@ fn foreground_sessions_share_compute_but_exclude_background_work() {
     let second = compute_lock(&layout).unwrap();
     let probe = lock_file(&layout.user_dir.join("compute.lock")).unwrap();
     assert_eq!(
-        probe.try_lock_exclusive().unwrap_err().kind(),
+        probe
+            .try_lock()
+            .map_err(std::io::Error::from)
+            .unwrap_err()
+            .kind(),
         std::io::ErrorKind::WouldBlock,
         "background work cannot start while sessions hold compute"
     );
     drop(first);
-    assert!(probe.try_lock_exclusive().is_err());
+    assert!(probe.try_lock().map_err(std::io::Error::from).is_err());
     drop(second);
     // A process forked concurrently by another test can hold an inherited copy of the
     // descriptor until its exec closes it, so wait briefly instead of asserting at once.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while probe.try_lock_exclusive().is_err() {
+    while probe.try_lock().map_err(std::io::Error::from).is_err() {
         assert!(
             std::time::Instant::now() < deadline,
             "sessions released compute"
@@ -214,7 +218,7 @@ fn project_jobs_distinguish_locks_from_stale_status_and_stop_pauses() {
         .unwrap();
     store.set_meta("lora_phase", "paused").unwrap();
     let control = lock_file(&state.join("control.lock")).unwrap();
-    control.lock_exclusive().unwrap();
+    control.lock().unwrap();
     let compute = compute_lock(&layout).unwrap();
     let status = jobs(&layout).unwrap();
     assert_eq!(status["shared_compute_busy"], true);

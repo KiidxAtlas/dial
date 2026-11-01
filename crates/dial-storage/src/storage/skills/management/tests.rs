@@ -125,6 +125,7 @@ fn special_files_do_not_block_source_browsing_or_preferences() {
     fs::create_dir_all(&dir).unwrap();
     let fifo = |path: &Path| {
         let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: path is a live NUL-terminated CString and 0o600 is a valid FIFO mode.
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
     };
     fifo(&dir.join(SKILL_FILE));

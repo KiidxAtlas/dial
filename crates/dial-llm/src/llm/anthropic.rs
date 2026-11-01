@@ -99,6 +99,19 @@ fn claude_sdk_headers() -> [(&'static str, String); 8] {
         ("X-Stainless-Timeout", "600".into()),
     ]
 }
+/// Pinned compatibility identity shared by subscription inference and usage requests.
+pub(super) const CLAUDE_CODE_VERSION: &str = "2.1.280";
+pub(super) const CLAUDE_USER_AGENT: &str = "claude-cli/2.1.280 (external, cli)";
+pub(super) const CLAUDE_OAUTH_BETA: &str = "oauth-2025-04-20";
+const MODEL_BETAS: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,structured-outputs-2025-12-15";
+const MESSAGE_BETAS: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,fallback-credit-2026-06-01";
+pub(super) const USAGE_BETAS: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11";
+pub(super) const CLAUDE_BILLING_PREFIX: &str = "x-anthropic-billing-header:";
+pub(super) const CCH_PLACEHOLDER: &str = "cch=00000";
+pub(super) const CCH_SEED: u64 = 0x4d659218e32a3268;
+pub(super) const BILLING_SALT: &str = "59cf53e54c78";
+pub(super) const SUBSCRIPTION_WARNING: &str = "Claude subscription access uses Claude Code compatibility headers and billing identity. This unofficial integration may break when upstream changes and may carry provider-terms or account risk; use an API key if you do not accept that risk.";
+
 /// Claude OAuth requests use Anthropic's native CLI authentication headers.
 /// Never forward subscription credentials to a proxy or custom endpoint.
 pub(crate) fn auth_headers(url: &str, token: &str) -> Result<Vec<(&'static str, String)>> {
@@ -123,12 +136,12 @@ pub(crate) fn auth_headers(url: &str, token: &str) -> Result<Vec<(&'static str, 
         headers.push(("Authorization", format!("Bearer {token}")));
         headers.extend(claude_sdk_headers());
         let beta = if uri.path() == "/v1/models" {
-            "oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,structured-outputs-2025-12-15"
+            MODEL_BETAS
         } else {
-            "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,fallback-credit-2026-06-01"
+            MESSAGE_BETAS
         };
         headers.push(("anthropic-beta", beta.into()));
-        headers.push(("User-Agent", "claude-cli/2.1.280 (external, cli)".into()));
+        headers.push(("User-Agent", CLAUDE_USER_AGENT.into()));
         headers.push(("anthropic-dangerous-direct-browser-access", "true".into()));
         headers.push(("x-app", "cli".into()));
         headers.push(("Connection", "keep-alive".into()));

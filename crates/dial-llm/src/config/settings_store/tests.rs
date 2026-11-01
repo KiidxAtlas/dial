@@ -371,3 +371,40 @@ fn command_settings_and_history_do_not_wait_for_occupied_records() {
     save_history(&layout, &["/drafter".into()], 10).unwrap();
     assert_eq!(load_history(&layout, 10).unwrap(), ["/drafter"]);
 }
+
+#[cfg(unix)]
+#[test]
+fn record_locks_interoperate_with_native_flock_and_preserve_contention_errors() {
+    use std::os::fd::AsRawFd;
+
+    let (_home, _project, layout) = fixture();
+    let path = layout.user_dir.join("native-lock-test.json");
+    let native = open_lock(&path).unwrap();
+    for mode in [libc::LOCK_SH, libc::LOCK_EX] {
+        // SAFETY: native owns a live descriptor; flock takes no pointers.
+        assert_eq!(unsafe { libc::flock(native.as_raw_fd(), mode) }, 0);
+        let error = try_locked(&path).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "native lock mode {mode} must exclude a private record writer"
+        );
+        // SAFETY: native still owns the same live descriptor.
+        assert_eq!(unsafe { libc::flock(native.as_raw_fd(), libc::LOCK_UN) }, 0);
+    }
+    let writer = try_locked(&path).unwrap();
+    assert_eq!(
+        // SAFETY: native owns a live descriptor; the nonblocking probe cannot hang the test.
+        unsafe { libc::flock(native.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    writer.unlock().unwrap();
+    assert!(
+        try_locked(&path).is_ok(),
+        "explicit unlock releases ownership"
+    );
+}

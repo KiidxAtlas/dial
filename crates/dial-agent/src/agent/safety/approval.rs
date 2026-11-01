@@ -1,4 +1,10 @@
 //! Shared approval policy for the main conversation and delegated tools.
+mod shell;
+mod worker;
+pub(in crate::agent) use worker::{
+    CallProvenance, WorkerPolicy, authorize_recovered_call, authorize_worker_call,
+};
+
 use crate::agent::{Decision, Ui, workers::subagents};
 use crate::{config::types::Approval, llm::ToolCall, tools::integrations::ext::Registry};
 use anyhow::{Context, Result, ensure};
@@ -12,89 +18,28 @@ use std::{
 
 const READ_ONLY: &[&str] = &["read", "glob", "grep", "skill", "session_search"];
 
-/// A deliberately small shell lexer. Unsupported shell syntax always asks, never guesses.
-/// Quoted text is literal: an operator inside single quotes, or inside double quotes other than `$` and
-/// backticks, is an argument. A backslash-newline continuation cannot be followed, so it asks.
+/// One plain argv of literal shell words. Unsupported syntax asks, never guesses.
+/// The shared lexer owns quoting and escaping; this consumer rejects every operator
+/// and expansion (including unquoted globs and tilde).
 pub(in crate::agent) fn shell_words(command: &str) -> Option<Vec<String>> {
-    let mut words = Vec::new();
-    let mut word = String::new();
-    let mut quote: Option<char> = None;
-    let mut active = false;
-    let mut chars = command.chars();
-    while let Some(c) = chars.next() {
-        if quote.is_none() {
-            if matches!(
-                c,
-                '$' | '`' | '\n' | '\r' | '(' | ')' | '{' | '}' | '<' | '>' | '&' | ';' | '|'
-            ) {
-                return None;
-            }
-            if c.is_whitespace() {
-                if active {
-                    words.push(std::mem::take(&mut word));
-                    active = false;
-                }
-                continue;
-            }
-        }
-        active = true;
-        match (quote, c) {
-            (Some('\''), '\'') | (Some('"'), '"') => quote = None,
-            (Some('\''), c) => word.push(c),
-            (Some(_), '$' | '`') => return None,
-            (None, '\'' | '"') => quote = Some(c),
-            (_, '\\') => match chars.next()? {
-                '\n' | '\r' => return None,
-                escaped => word.push(escaped),
-            },
-            (_, c) => word.push(c),
-        }
-    }
-    if quote.is_some() {
-        return None;
-    }
-    if active {
-        words.push(word);
-    }
-    (!words.is_empty()).then_some(words)
+    let words: Option<Vec<_>> = shell::scan(command)?
+        .into_iter()
+        .map(|token| match token.kind {
+            shell::Kind::Word {
+                value,
+                literal: true,
+            } => Some(value),
+            _ => None,
+        })
+        .collect();
+    words.filter(|words| !words.is_empty())
 }
 
-/// Splits `command` at unquoted pipe operators (`|` and `|&`; `||` is not a pipe). `None` when a quote is open.
+/// Split at unquoted pipe operators (`|` and `|&`); `||` is not a pipe.
 fn pipe_stages(command: &str) -> Option<Vec<&str>> {
-    let mut stages = Vec::new();
-    let mut quote: Option<char> = None;
-    let mut start = 0;
-    let mut chars = command.char_indices().peekable();
-    while let Some((index, c)) = chars.next() {
-        match (quote, c) {
-            (Some(q), c) if c == q => quote = None,
-            (Some('\''), _) => {}
-            (Some(_), '\\') => {
-                chars.next();
-            }
-            (Some(_), _) => {}
-            (None, '\'' | '"') => quote = Some(c),
-            (None, '\\') => {
-                chars.next();
-            }
-            (None, '|') if chars.peek().is_some_and(|&(_, next)| next == '|') => {
-                chars.next();
-            }
-            (None, '|') => {
-                stages.push(&command[start..index]);
-                if chars.peek().is_some_and(|&(_, next)| next == '&') {
-                    chars.next();
-                }
-                start = chars.peek().map_or(command.len(), |&(next, _)| next);
-            }
-            (None, _) => {}
-        }
-    }
-    if quote.is_some() {
-        return None;
-    }
-    stages.push(&command[start..]);
-    Some(stages)
+    shell::segments(command, |op| {
+        matches!(op, shell::Operator::Pipe | shell::Operator::PipeBoth)
+    })
 }
 
 /// Programs that fetch remote content; their output is downloaded code when piped onward.
@@ -304,7 +249,7 @@ pub(in crate::agent) const SAFE_BASH_PROGRAMS: &[&str] = &[
 /// The shell policy a read-only agent works under: what `bash` runs without approval.
 pub(in crate::agent) fn safe_bash_rule() -> String {
     format!(
-        "`bash` runs only one plain inspection command per call ({}; `find` without -exec, -ok or -delete; `sed` only as `sed -n 'Np'`). No `cd`, `&&`, `;`, pipes, redirection, `$` expansion or variable assignments: set the `cwd` argument instead of `cd`, and prefer read, grep and glob.",
+        "`bash` runs only one plain inspection command per call ({}; `find` without -exec, -ok or -delete; `sed` only as `sed -n 'Np'`). No `cd`, `&&`, `;`, pipes, redirection, `$` expansion, unquoted globs or `~`, or variable assignments: set the `cwd` argument instead of `cd`, and prefer read, grep and glob.",
         SAFE_BASH_PROGRAMS.join(", ")
     )
 }
@@ -403,55 +348,37 @@ pub fn safe_bash(command: &str) -> bool {
 /// Effect tracking only: a batch of the exact safe Git inspection forms does not
 /// introduce new workspace effects. Approval still uses safe_bash and rejects batches.
 pub(in crate::agent) fn safe_review_batch(command: &str) -> bool {
-    command
-        .split("&&")
-        .flat_map(|part| part.split(';'))
-        .flat_map(|part| part.trim().split('\n'))
-        .all(|part| {
-            let part = part.trim();
-            shell_words(part).is_some_and(|words| words[0] == "git") && safe_bash(part)
+    // Review batches permit newlines around `;` and `&&`, but not missing commands.
+    // Keep that grammar separate from both plain argv approval and inspection batches.
+    shell::segments(command, |op| {
+        matches!(op, shell::Operator::And | shell::Operator::Semicolon)
+    })
+    .is_some_and(|parts| {
+        parts.iter().all(|part| {
+            shell::segments(part.trim(), |op| op == shell::Operator::Newline).is_some_and(|lines| {
+                lines.iter().all(|line| {
+                    shell_words(line).is_some_and(|words| words[0] == "git") && safe_bash(line)
+                })
+            })
         })
+    })
 }
 
 /// Effect tracking only: a `;`, `&&` or newline batch whose every segment passes `safe_bash` runs only
-/// inspections. Separators come from a quote-aware scan that mirrors `shell_words`; anything it cannot
-/// follow (an open quote, a backslash-newline) makes the batch unsafe. Approval never uses this.
+/// inspections. The shared lexer supplies quote-aware boundaries; malformed input is unsafe.
+/// Approval never uses this batch exemption.
 pub(in crate::agent) fn read_only_inspection_batch(command: &str) -> bool {
     top_level_segments(command).is_some_and(|segments| segments.iter().all(|s| safe_bash(s)))
 }
 
-/// Splits at unquoted `;`, `&&` and newlines. `None` when quoting or a line continuation cannot be followed.
+/// Split at unquoted `;`, `&&` and newlines; malformed quoting or escapes fail closed.
 pub(in crate::agent) fn top_level_segments(command: &str) -> Option<Vec<&str>> {
-    let mut segments = Vec::new();
-    let mut quote: Option<char> = None;
-    let mut start = 0;
-    let mut chars = command.char_indices().peekable();
-    while let Some((index, c)) = chars.next() {
-        match (quote, c) {
-            (Some('\''), '\'') | (Some('"'), '"') => quote = None,
-            (Some('\''), _) => {}
-            (None, '\'' | '"') => quote = Some(c),
-            (_, '\\') => match chars.next() {
-                Some((_, '\n' | '\r')) | None => return None,
-                Some(_) => {}
-            },
-            (None, ';' | '\n') => {
-                segments.push(&command[start..index]);
-                start = index + c.len_utf8();
-            }
-            (None, '&') if chars.peek().is_some_and(|&(_, next)| next == '&') => {
-                chars.next();
-                segments.push(&command[start..index]);
-                start = index + 2;
-            }
-            _ => {}
-        }
-    }
-    if quote.is_some() {
-        return None;
-    }
-    segments.push(&command[start..]);
-    Some(segments)
+    shell::segments(command, |op| {
+        matches!(
+            op,
+            shell::Operator::Semicolon | shell::Operator::And | shell::Operator::Newline
+        )
+    })
 }
 
 /// True when a bash command may change the workspace without a checkpoint: it is neither one plain

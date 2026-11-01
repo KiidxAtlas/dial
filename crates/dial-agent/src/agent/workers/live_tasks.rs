@@ -46,6 +46,7 @@ enum Event {
         call: ToolCall,
         summary: String,
         needs: bool,
+        provenance: approval::CallProvenance,
         cancel: Arc<AtomicBool>,
         interrupt: Arc<AtomicBool>,
         answer: mpsc::Sender<Result<(), Denial>>,
@@ -139,10 +140,9 @@ fn job_status(job: &ControlJob) -> Value {
     if let Some(receipt) = job
         .acceptance
         .lock()
-        .expect("worker acceptance lock poisoned")
-        .as_mut()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_ref()
     {
-        receipt.revalidate(&job.workspace, &job.base.verification);
         value["acceptance"] = json!(receipt);
     }
     value
@@ -277,24 +277,31 @@ impl LiveTaskControl {
     /// Status of live jobs in the same shape as [`LiveTasks::status`], readable while a turn runs (no
     /// pump needed: workers update their bodies directly).
     pub fn status(&self, id: Option<&str>) -> Result<Value, String> {
+        // Clone cheap handles under the registry lock; projection never performs filesystem I/O.
         let jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
-        match id {
-            Some(id) => jobs
-                .get(id)
-                .map(|job| job_status(job))
-                .ok_or_else(|| format!("unknown job {id}")),
-            None => {
-                let mut entries: Vec<_> = jobs.iter().collect();
-                entries.sort_by_key(|(id, _)| {
-                    id.trim_start_matches("task-").parse::<u64>().unwrap_or(0)
-                });
-                Ok(json!(
-                    entries
-                        .into_iter()
-                        .map(|(_, job)| job_status(job))
-                        .collect::<Vec<_>>()
-                ))
-            }
+        let mut entries: Vec<_> = match id {
+            Some(id) => vec![(
+                id.to_owned(),
+                jobs.get(id)
+                    .cloned()
+                    .ok_or_else(|| format!("unknown job {id}"))?,
+            )],
+            None => jobs
+                .iter()
+                .map(|(id, job)| (id.clone(), job.clone()))
+                .collect(),
+        };
+        drop(jobs);
+        entries.sort_by_key(|(id, _)| id.trim_start_matches("task-").parse::<u64>().unwrap_or(0));
+        if id.is_some() {
+            Ok(job_status(&entries[0].1))
+        } else {
+            Ok(json!(
+                entries
+                    .iter()
+                    .map(|(_, job)| job_status(job))
+                    .collect::<Vec<_>>()
+            ))
         }
     }
     /// Sends `text` from the parent to `id`, or to `parent`/`all`/a label, through the team bus.
@@ -585,6 +592,22 @@ impl Approver for Bridge {
         needs: bool,
         cancel: &Arc<AtomicBool>,
     ) -> Result<(), Denial> {
+        self.authorize_from(
+            call,
+            summary,
+            needs,
+            approval::CallProvenance::Structured,
+            cancel,
+        )
+    }
+    fn authorize_from(
+        &mut self,
+        call: &ToolCall,
+        summary: &str,
+        needs: bool,
+        provenance: approval::CallProvenance,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<(), Denial> {
         let interrupted = || {
             if self.interrupt.load(Ordering::SeqCst) {
                 // The job's cancellation also ends its currently pending callback approval.
@@ -602,6 +625,7 @@ impl Approver for Bridge {
                 call: call.clone(),
                 summary: summary.to_owned(),
                 needs,
+                provenance,
                 cancel: cancel.clone(),
                 interrupt: self.interrupt.clone(),
                 answer,
@@ -772,7 +796,7 @@ impl LiveTasks {
                 && let Some(receipt) = control
                     .acceptance
                     .lock()
-                    .expect("worker acceptance lock poisoned")
+                    .unwrap_or_else(|error| error.into_inner())
                     .as_mut()
             {
                 receipt.revalidate(&control.workspace, config);
@@ -1334,7 +1358,7 @@ impl LiveTasks {
                 *control
                     .acceptance
                     .lock()
-                    .expect("worker acceptance lock poisoned") = Some(outcome.acceptance);
+                    .unwrap_or_else(|error| error.into_inner()) = Some(outcome.acceptance);
                 value["execution_id"] = json!(bridge.body.read(|node| node.id.clone()));
                 value["assignment"] = bridge.body.read(|node| {
                     node.result
@@ -1493,47 +1517,30 @@ impl LiveTasks {
                     call,
                     summary,
                     needs,
+                    provenance,
                     cancel,
                     interrupt,
                     answer,
                 } => {
-                    let prior_rules = rules.len();
-                    let mut result =
-                        if cancel.load(Ordering::SeqCst) || interrupt.load(Ordering::SeqCst) {
-                            approval::explain(ui, &call, approval::PolicyReason::Cancelled);
-                            Err(Denial::User)
-                        } else if approval::denied_by_rule(rules, &call, root) {
-                            approval::explain_rule(ui, &call, root, rules, approval::Effect::Deny);
-                            Err(Denial::Rule)
-                        } else if read_only && needs {
-                            approval::explain(ui, &call, approval::PolicyReason::ReadOnly);
-                            Err(Denial::ReadOnly)
-                        } else if needs {
-                            approval::authorize_with_cancel(
-                                approval,
-                                rules,
-                                root,
-                                &call,
-                                &summary,
-                                &mut CancelUi {
-                                    inner: ui,
-                                    cancel: &cancel,
-                                    interrupt: &interrupt,
-                                },
-                                &cancel,
-                            )
-                            // Workers cannot save project rules; the grant lasts the session.
-                            .map(|_persist| ())
-                        } else {
-                            approval::explain(ui, &call, approval::PolicyReason::SafeCall);
-                            Ok(())
-                        };
-                    if cancel.load(Ordering::SeqCst) || interrupt.load(Ordering::SeqCst) {
-                        cancel.store(true, Ordering::SeqCst);
-                        rules.truncate(prior_rules);
-                        approval::explain(ui, &call, approval::PolicyReason::Cancelled);
-                        result = Err(Denial::User);
-                    }
+                    let result = approval::authorize_worker_call(
+                        approval::WorkerPolicy {
+                            approval,
+                            rules,
+                            root,
+                            read_only,
+                            cancel: Some(&cancel),
+                            interrupt: Some(&interrupt),
+                        },
+                        &call,
+                        &summary,
+                        needs,
+                        provenance,
+                        &mut CancelUi {
+                            inner: ui,
+                            cancel: &cancel,
+                            interrupt: &interrupt,
+                        },
+                    );
                     let _ = answer.send(result);
                 }
                 Event::NativeMutation {

@@ -23,6 +23,7 @@
 //!   hook is fail-closed (`fail_closed`, default true for `pre_tool_use`), which blocks instead.
 //!
 //! Hooks are trusted programs and run unsandboxed in the project directory, like `[mcp.*]` servers.
+use crate::agent::base::helpers::byte_prefix;
 use crate::config::hooks::canonical;
 
 use crate::config::types::HookConfig;
@@ -203,11 +204,7 @@ fn clip(text: String) -> String {
 
 fn clip_to(mut text: String, max: usize) -> String {
     if text.len() > max {
-        let end = (0..=max)
-            .rev()
-            .find(|&i| text.is_char_boundary(i))
-            .unwrap_or(0);
-        text.truncate(end);
+        text.truncate(byte_prefix(&text, max).len());
         text.push_str(" [cut]");
     }
     text.trim().to_owned()

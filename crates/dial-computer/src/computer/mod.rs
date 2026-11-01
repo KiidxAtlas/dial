@@ -131,13 +131,13 @@ fn action_policy(action: &ComputerAction) -> Policy {
     }
 }
 
-/// Whether an action can deliver input, so an abort needs the partial-effects warning. Read-only
-/// runs cannot: the worker refuses every mutating helper there.
+/// Whether input effects are possible, so an abort needs the partial-effects warning.
+/// `read_only` restricts desktop helpers, not arbitrary Node APIs; runs remain conservative.
 fn action_may_send_input(action: &ComputerAction) -> bool {
     match action {
         ComputerAction::Capabilities | ComputerAction::Close => false,
         ComputerAction::Call { chain, .. } => !is_read_only_computer_call(chain).unwrap_or(false),
-        ComputerAction::Run { read_only, .. } => *read_only != Some(true),
+        ComputerAction::Run { .. } => true,
     }
 }
 
@@ -707,7 +707,7 @@ impl Tool for Computer {
                         "code": {"type": "string"},
                         "fn": {"type": "string"},
                         "args": {"type": "array", "items": {}},
-                        "read_only": {"type": "boolean"},
+                        "read_only": {"type": "boolean", "description": "Disable desktop input helpers only; advisory, not a JavaScript sandbox. Run code still requires execution approval and can use Node APIs."},
                         "chain": {
                             "type": "array",
                             "description": "call: ordered helper steps; each item holds its own args, e.g. [{\"method\":\"windows\",\"args\":[]},{\"method\":\"screenshot\",\"args\":[]}]. Top-level `args` belongs to run, not call.",

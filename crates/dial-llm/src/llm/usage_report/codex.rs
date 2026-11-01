@@ -23,8 +23,7 @@ const USER_AGENT: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     " (coding agent; usage)"
 );
-const ORIGINATOR: &str = "dial";
-const CLIENT_VERSION: &str = "0.159.0";
+use crate::llm::chatgpt::{CLIENT_VERSION, ORIGINATOR};
 const DAY_SECONDS: u64 = 86_400;
 const HOUR_SECONDS: u64 = 3_600;
 /// Plan windows reported on `rate_limit`, with their stable window keys.

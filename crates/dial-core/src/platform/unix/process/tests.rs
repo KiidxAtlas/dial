@@ -30,6 +30,30 @@ fn ordinary_spawn_waits_for_pipe_creation_guard() {
     assert!(completed.recv_timeout(Duration::from_secs(5)).unwrap());
 }
 
+#[test]
+fn spawn_error_preserves_the_callers_command_and_later_spawns_work() {
+    let mut command = Command::new("/definitely-not-a-dial-executable");
+    command
+        .args(["first", "second"])
+        .env("DIAL_TEST_SPAWN", "preserve");
+    assert!(spawn(&mut command).is_err());
+    assert_eq!(command.get_program(), "/definitely-not-a-dial-executable");
+    assert_eq!(command.get_args().collect::<Vec<_>>(), ["first", "second"]);
+    assert!(
+        command
+            .get_envs()
+            .any(|(key, value)| key == "DIAL_TEST_SPAWN"
+                && value == Some(std::ffi::OsStr::new("preserve")))
+    );
+    assert!(
+        spawn(Command::new("/bin/sh").args(["-c", "exit 0"]))
+            .unwrap()
+            .wait()
+            .unwrap()
+            .success()
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn children_outlive_the_short_lived_thread_that_spawned_them() {

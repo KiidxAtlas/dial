@@ -33,7 +33,9 @@ use crate::commit::backend::CommitBackend;
 use crate::commit::changelog::detect::detect_targets;
 use crate::commit::changelog::{apply_changelog_proposals, read_unreleased};
 use crate::commit::commit_types::format_conventional_commit;
-use crate::commit::execute::{commit_with_message, git_output_indexed};
+use crate::commit::execute::{
+    commit_with_message, git_mutation_output_indexed, git_output_indexed,
+};
 use crate::commit::types::CommitCommandArgs;
 use crate::config::types::Config;
 
@@ -166,7 +168,7 @@ fn run_with(
     // private copy for a dry run.
     let mut staged = staged_files(cwd, index)?;
     if staged.is_empty() {
-        git_output_indexed(cwd, index, &["add", "-A"], "Failed to stage changes")?;
+        git_mutation_output_indexed(cwd, index, &["add", "-A"], "Failed to stage changes")?;
         staged = staged_files(cwd, index)?;
     }
     if staged.is_empty() {
@@ -180,6 +182,7 @@ fn run_with(
             "--cached",
             "--no-color",
             "--no-ext-diff",
+            "--no-textconv",
             "--no-renames",
         ],
         "Failed to read staged diff",
@@ -255,7 +258,7 @@ fn run_with(
             if !args.dry_run && !changed.is_empty() {
                 let mut add: Vec<&str> = vec!["add", "--"];
                 add.extend(changed.iter().map(String::as_str));
-                git_output_indexed(cwd, index, &add, "Failed to stage changelog updates")?;
+                git_mutation_output_indexed(cwd, index, &add, "Failed to stage changelog updates")?;
             }
             let message = format_conventional_commit(&proposal.to_message());
             if !args.dry_run {

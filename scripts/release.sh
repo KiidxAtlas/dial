@@ -48,7 +48,7 @@ git fetch -q origin main
 head="$(git rev-parse HEAD)"
 [[ "$head" == "$(git rev-parse origin/main)" ]] || { echo "HEAD must match origin/main; push and let CI pass first" >&2; exit 1; }
 if command -v gh >/dev/null 2>&1; then
-  ci="$(gh run list --workflow ci.yml --commit "$head" --json status,conclusion --jq '[.[] | select(.conclusion == "success")] | length')"
+  ci="$(gh run list --workflow ci.yml --commit "$head" --event push --branch main --json status,conclusion --jq '[.[] | select(.status == "completed" and .conclusion == "success")] | length')"
   [[ "$ci" -gt 0 ]] || { echo "no successful CI run for $head yet; wait for CI (gh run list --commit $head)" >&2; exit 1; }
 else
   echo "gh is not installed; cannot confirm CI passed for $head" >&2

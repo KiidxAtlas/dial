@@ -1,17 +1,10 @@
 use super::*;
-use std::process::Command;
 
 #[test]
 fn watcher_signals_new_file_within_bounded_wait() {
     let dir = tempfile::tempdir().expect("temp dir");
     let root = dir.path().canonicalize().expect("canonical temp dir");
-    let init = Command::new("git")
-        .arg("init")
-        .arg("-q")
-        .current_dir(&root)
-        .status()
-        .expect("run git init");
-    assert!(init.success(), "git init failed");
+    crate::git_panel::testkit::git(&root, &["init", "-q"]);
 
     let watch = Watch::start(&root).expect("watch starts in a git repo");
     std::fs::write(root.join("new.txt"), "hello\n").expect("create file");

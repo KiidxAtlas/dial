@@ -227,6 +227,9 @@ timeout_secs = 0
 case-insensitive on macOS. They apply to `read`, `write`, `edit` and `ast_edit`; hashline patch headers
 are inspected, an undeterminable target is denied by deny rules and never granted by allow rules, and an
 allow rule must cover every file a call touches. They do not cover `bash`, `grep` or `glob`.
+The permissions UI repeats this limitation when adding, listing or removing path rules. A
+native `deny read '*.pem'` is not a shell sandbox and does not prevent `bash` from reading
+that file; choose the appropriate sandbox and approval policy for shell commands.
 
 **Isolated workers.** `task` accepts `isolation: "copy"` for mutating agents (`worker`, `test-runner`, and custom agents that set `mutates`); read-only agents are refused. The worker edits a private
 copy of the project (dirty and untracked files included; `.git`, `.dial`, secrets and build caches

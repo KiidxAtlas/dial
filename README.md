@@ -70,9 +70,10 @@ curl -fsSL https://github.com/KiidxAtlas/dial/releases/latest/download/install.s
 ```
 
 The installer adds `~/.local/bin` to your shell profile if it is not already on `PATH`
-(`DIAL_NO_MODIFY_PATH=1` skips this). It checks the archive's SHA-256 against the release's
-`SHA256SUMS`. When OpenSSL 3 is available (`brew install openssl@3` on macOS), it also verifies that
-file's Ed25519 signature; set `DIAL_REQUIRE_SIGNATURE=1` to make the signature mandatory.
+(`DIAL_NO_MODIFY_PATH=1` skips this). It verifies the signed `SHA256SUMS` manifest using
+OpenSSL 3, Python with `cryptography`, or OpenSSH, then checks the archive's SHA-256.
+Verification is mandatory by default; `DIAL_ALLOW_UNSIGNED_INSTALL=1` explicitly opts into
+checksum-only verification when no signature verifier is available.
 
 **Windows** (PowerShell 5.1 or 7; no OpenSSL or admin rights needed)
 

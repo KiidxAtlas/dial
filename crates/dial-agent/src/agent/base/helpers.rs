@@ -2,6 +2,11 @@
 
 use crate::agent::*;
 
+/// Prefix of at most `max` bytes, ending at a UTF-8 boundary.
+pub(in crate::agent) fn byte_prefix(text: &str, max: usize) -> &str {
+    &text[..text.floor_char_boundary(max.min(text.len()))]
+}
+
 pub(in crate::agent) struct CheckpointObserver(pub(in crate::agent) Arc<Checkpoints>);
 
 impl tools::WriteObserver for CheckpointObserver {

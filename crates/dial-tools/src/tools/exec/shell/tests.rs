@@ -644,6 +644,8 @@ fn bash_keeps_diagnostics_from_the_omitted_middle_within_bounds() {
 
 #[cfg(target_os = "macos")]
 fn alive(pid: i32) -> bool {
+    // SAFETY: signal zero probes existence using scalar arguments, without delivering
+    // a signal, including when the fixture PID no longer names a process.
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
@@ -838,6 +840,9 @@ fn sigint_shell_helper() {
     let root =
         std::env::var("DIAL_TEST_SHELL_SIGINT_ROOT").expect("launched by SIGINT regression test");
     let ws = Workspace::new(Path::new(&root)).unwrap().without_sandbox();
+    // SAFETY: this isolated helper owns SIGINT handling for its process. sigaction
+    // is initialized stack storage with a valid extern C handler and an empty mask;
+    // the handler uses only an atomic store and the async-signal-safe wake path.
     unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
         action.sa_sigaction = cancel_on_sigint as *const () as usize;
@@ -891,6 +896,8 @@ fn sigint_cancellation_kills_shell_and_process_group_promptly() {
         std::thread::sleep(Duration::from_millis(10));
     }
     let started = Instant::now();
+    // SAFETY: child is our still-unreaped SIGINT helper, with a positive PID; kill
+    // uses scalar arguments and targets that child, not this test runner's group.
     assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -911,10 +918,13 @@ fn sigint_cancellation_kills_shell_and_process_group_promptly() {
             .parse()
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
+        // SAFETY: kill with signal zero only probes these fixture PIDs and never
+        // delivers a signal; it remains valid after the child has disappeared.
         while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_ne!(
+            // SAFETY: another scalar-only existence probe; no signal is delivered.
             unsafe { libc::kill(pid, 0) },
             0,
             "{name} survived cancellation"

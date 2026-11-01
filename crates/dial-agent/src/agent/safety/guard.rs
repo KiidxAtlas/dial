@@ -409,14 +409,8 @@ pub fn clip_middle(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_owned();
     }
-    let mut head_end = max / 3;
-    while !text.is_char_boundary(head_end) {
-        head_end -= 1;
-    }
-    let mut tail_start = text.len() - (max - max / 3);
-    while !text.is_char_boundary(tail_start) {
-        tail_start += 1;
-    }
+    let head_end = text.floor_char_boundary(max / 3);
+    let tail_start = text.ceil_char_boundary(text.len() - (max - max / 3));
     format!(
         "{}\n[... {} of {} bytes omitted from the middle; fetch what you need with a narrower call (read a line range, grep, or pipe through head/tail) ...]\n{}",
         &text[..head_end],
@@ -434,14 +428,8 @@ pub fn clip_evidence(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_owned();
     }
-    let floor = |mut at: usize| {
-        while !text.is_char_boundary(at) {
-            at -= 1;
-        }
-        at
-    };
-    let head_end = floor(max / 4);
-    let tail_start = floor(text.len() - max / 2);
+    let head_end = text.floor_char_boundary(max / 4);
+    let tail_start = text.floor_char_boundary(text.len() - max / 2);
     let budget = max - max / 4 - max / 2;
     let middle = &text[head_end..tail_start];
     let (mut kept, mut lines, mut overflow) = (String::new(), 0usize, 0usize);

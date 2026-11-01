@@ -139,3 +139,31 @@ fn read_redirect_gives_up_on_a_client_that_dribbles_bytes() {
     drop(server);
     client.join().unwrap();
 }
+
+#[test]
+fn callback_cancel_and_deadline_take_precedence_over_pending_connections() {
+    for cancelled in [false, true] {
+        let listener = bind_callback("127.0.0.1", 0).unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let cancel = AtomicBool::new(cancelled);
+        let deadline = if cancelled {
+            Instant::now() + Duration::from_secs(10)
+        } else {
+            Instant::now() - Duration::from_secs(1)
+        };
+        let error = wait_callback::<()>(
+            &listener,
+            &cancel,
+            deadline,
+            "callback deadline expired",
+            |_| panic!("must not consume a callback after cancellation or timeout"),
+        )
+        .unwrap_err();
+        if cancelled {
+            assert!(error.is::<crate::llm::Interrupted>(), "{error:#}");
+        } else {
+            assert_eq!(error.to_string(), "callback deadline expired");
+        }
+        assert!(listener.accept().is_ok(), "pending connection was consumed");
+    }
+}

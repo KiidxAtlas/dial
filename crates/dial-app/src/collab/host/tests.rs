@@ -2,18 +2,64 @@ use super::*;
 use crate::collab::protocol::{SNAPSHOT_CHUNK_BYTES, parse_link};
 
 #[test]
+fn relayed_admission_proofs_cannot_forge_or_replay_mutations() {
+    let token = [3; WRITE_TOKEN_BYTES];
+    let mut guest = GuestPeer {
+        name: "writer".into(),
+        writable: true,
+        challenge: "fresh".into(),
+        request_sequence: 0,
+    };
+    let mut prompt = json!({"t":"prompt","text":"safe","requestSeq":1,
+        "authorization":request_proof(&token,"fresh",1,"prompt","safe")});
+    let mut forged = prompt.clone();
+    forged["text"] = json!("unsafe");
+    assert!(!guest.authorize(Some(&token), &forged));
+    forged = prompt.clone();
+    forged["authorization"] = json!(write_proof(&token, "fresh"));
+    assert!(
+        !guest.authorize(Some(&token), &forged),
+        "an admission proof is not a request proof"
+    );
+    assert!(guest.authorize(Some(&token), &prompt));
+    assert!(
+        !guest.authorize(Some(&token), &prompt),
+        "the same signed action runs at most once"
+    );
+    prompt["requestSeq"] = json!(2);
+    assert!(
+        !guest.authorize(Some(&token), &prompt),
+        "a view holder cannot advance a captured action"
+    );
+    prompt["authorization"] = json!(request_proof(&token, "previous", 2, "prompt", "safe"));
+    assert!(
+        !guest.authorize(Some(&token), &prompt),
+        "old connections cannot authorize new actions"
+    );
+    prompt["authorization"] = json!(request_proof(&token, "fresh", 2, "prompt", "safe"));
+    assert!(guest.authorize(Some(&token), &prompt));
+}
+
+#[test]
 fn link_round_trips_room_key_and_write_token() {
     let room = generate_room_id().unwrap();
     let key = [7u8; 32];
     let token = [9u8; WRITE_TOKEN_BYTES];
-    let link = format_link("https://relay.example.com", &room, &key, Some(&token)).unwrap();
+    let link = format_link(
+        "https://relay.example.com",
+        &room,
+        &key,
+        &[8; 32],
+        Some(&token),
+    )
+    .unwrap();
     let parsed = parse_link(&link, "").unwrap();
     assert_eq!(parsed.room_id, room);
     assert_eq!(parsed.key, key);
     assert_eq!(parsed.write_token, Some(token));
     assert!(parsed.ws_url.ends_with(&format!("/r/{room}")));
 
-    let view = format_link("https://relay.example.com", &room, &key, None).unwrap();
+    let view = format_link("https://relay.example.com", &room, &key, &[8; 32], None).unwrap();
     let parsed = parse_link(&view, "").unwrap();
     assert_eq!(parsed.write_token, None);
     assert_eq!(parsed.key, key);
@@ -46,11 +92,20 @@ fn snapshot_splits_into_bounded_chunks_with_one_final_marker() {
 #[test]
 fn write_token_grant_requires_exact_match() {
     let token = [3u8; WRITE_TOKEN_BYTES];
-    let presented = URL_SAFE_NO_PAD.encode(token);
-    assert!(write_grant(Some(&token), Some(&presented)));
-    assert!(!write_grant(Some(&token), None));
-    assert!(!write_grant(Some(&token), Some("bogus")));
-    assert!(!write_grant(None, Some(&presented)));
+    let presented = write_proof(&token, "fresh-challenge");
+    assert!(write_grant(
+        Some(&token),
+        "fresh-challenge",
+        Some(&presented)
+    ));
+    assert!(!write_grant(
+        Some(&token),
+        "different-peer",
+        Some(&presented)
+    ));
+    assert!(!write_grant(Some(&token), "fresh-challenge", None));
+    assert!(!write_grant(Some(&token), "fresh-challenge", Some("bogus")));
+    assert!(!write_grant(None, "fresh-challenge", Some(&presented)));
 }
 
 #[test]

@@ -60,6 +60,9 @@ fn git(dir: &Path, args: &[&str]) -> String {
         "git {args:?} failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    if args.first() == Some(&"init") {
+        crate::commit::testkit::disable_inherited_git_drivers(dir);
+    }
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
@@ -273,4 +276,122 @@ fn dry_run_push_never_publishes_existing_commits() {
     let outcome = run_legacy(&args, repo.path(), &user, &backend).expect("push succeeds");
     assert_eq!(outcome, CommitRunOutcome::NothingToCommit { pushed: true });
     assert_ne!(git(remote.path(), &["rev-parse", "HEAD"]), before);
+}
+
+#[cfg(unix)]
+fn read_canary(root: &Path) -> (&'static str, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let program = root.join(".git/read-canary");
+    let marker = root.join(".git/read-canary-ran");
+    std::fs::write(
+        &program,
+        "#!/bin/sh\nprintf ran > .git/read-canary-ran\ncat\n",
+    )
+    .expect("write canary");
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod canary");
+    // Establish that absence of the marker really means the executable was not invoked.
+    assert!(
+        Command::new(&program)
+            .current_dir(root)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(marker.exists());
+    std::fs::remove_file(&marker).unwrap();
+    ("./.git/read-canary", marker)
+}
+
+#[cfg(unix)]
+#[test]
+fn commit_git_reads_refuse_executable_conversion_config_for_both_indexes() {
+    for key in [
+        "filter.audit.clean",
+        "filter.audit.process",
+        "filter.audit.smudge",
+        "diff.audit.textconv",
+    ] {
+        let repo = repo();
+        let root = repo.path();
+        std::fs::write(
+            root.join(".gitattributes"),
+            "README.md filter=audit diff=audit\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("README.md"), "staged change\n").unwrap();
+        git(root, &["add", "-A"]);
+        let preview = PreviewIndex::capture(root).unwrap();
+        let index_before = std::fs::read(root.join(".git/index")).unwrap();
+        std::fs::write(root.join("README.md"), "unstaged change\n").unwrap();
+        let (program, marker) = read_canary(root);
+        git(root, &["config", "--local", key, program]);
+
+        for index in [None, Some(preview.path())] {
+            for args in [
+                &["diff", "--cached"][..],
+                &["diff"][..],
+                &["status", "--porcelain"][..],
+                &["log", "-1", "--format=%s"][..],
+            ] {
+                let error = git_output_indexed(root, index, args, "Commit read failed")
+                    .expect_err("executable conversion configuration must fail closed");
+                assert!(
+                    matches!(&error, CommitError::Git(message) if message.contains("host-side Git inspection refused")),
+                    "{key} {args:?}: {error}"
+                );
+                assert!(!marker.exists(), "{key} ran during {args:?}");
+            }
+        }
+        assert_eq!(
+            std::fs::read(root.join(".git/index")).unwrap(),
+            index_before
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn commit_git_reads_disable_fsmonitor_and_external_diff_without_hiding_changes() {
+    for (key, args, expected) in [
+        (
+            "core.fsmonitor",
+            &["status", "--porcelain"][..],
+            "README.md",
+        ),
+        ("diff.external", &["diff"][..], "+changed"),
+    ] {
+        let repo = repo();
+        let root = repo.path();
+        std::fs::write(root.join("README.md"), "changed\n").unwrap();
+        let preview = PreviewIndex::capture(root).unwrap();
+        let (program, marker) = read_canary(root);
+        git(root, &["config", "--local", key, program]);
+
+        for index in [None, Some(preview.path())] {
+            let output = git_output_indexed(root, index, args, "Commit read failed").unwrap();
+            assert!(output.contains(expected), "{key}: {output}");
+            assert!(!marker.exists(), "{key} executed");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn approved_staging_retains_repository_filter_semantics() {
+    let repo = repo();
+    let root = repo.path();
+    std::fs::write(root.join(".gitattributes"), "README.md filter=audit\n").unwrap();
+    std::fs::write(root.join("README.md"), "changed\n").unwrap();
+    let (program, marker) = read_canary(root);
+    git(root, &["config", "--local", "filter.audit.clean", program]);
+
+    git_mutation_output_indexed(root, None, &["add", "README.md"], "Staging failed")
+        .expect("approved staging retains the configured filter");
+    assert!(
+        marker.exists(),
+        "mutations must not silently disable repository filters"
+    );
 }

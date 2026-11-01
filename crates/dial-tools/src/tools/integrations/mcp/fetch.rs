@@ -12,13 +12,18 @@ pub(super) struct Reply {
     pub body: String,
 }
 
+/// Shared metadata-client policy. Protocol transports keep their no-redirect policy in `http`.
+pub(super) fn agent(timeout: Duration) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .http_status_as_error(false)
+        .build()
+        .into()
+}
+
 /// One GET with any status returned as-is. `what` names the listing in error messages.
 pub(super) fn get(url: &str, headers: &[(&str, &str)], what: &str) -> Result<Reply> {
-    let config = ureq::Agent::config_builder()
-        .timeout_global(Some(TIMEOUT))
-        .http_status_as_error(false)
-        .build();
-    let agent = ureq::Agent::new_with_config(config);
+    let agent = agent(TIMEOUT);
     let mut request = agent.get(url).header("User-Agent", USER_AGENT);
     for (name, value) in headers {
         request = request.header(*name, *value);

@@ -119,13 +119,30 @@ impl Agent<'_> {
         ui: &mut dyn Ui,
         backend: Option<&mut Backend>,
     ) -> Option<ToolOutput> {
+        self.run_background_tool_from(
+            name,
+            args,
+            ui,
+            backend,
+            crate::agent::safety::approval::CallProvenance::Structured,
+        )
+    }
+
+    pub(in crate::agent) fn run_background_tool_from(
+        &mut self,
+        name: &str,
+        args: &Value,
+        ui: &mut dyn Ui,
+        backend: Option<&mut Backend>,
+        provenance: crate::agent::safety::approval::CallProvenance,
+    ) -> Option<ToolOutput> {
         let call = ToolCall {
             id: String::new(),
             name: name.to_owned(),
             arguments: args.clone(),
             malformed_arguments: false,
         };
-        self.run_background_tools(std::slice::from_ref(&call), ui, backend)
+        self.run_tools_off_thread(std::slice::from_ref(&call), ui, backend, false, provenance)
             .map(|outputs| {
                 outputs
                     .into_iter()
@@ -151,14 +168,20 @@ impl Agent<'_> {
             arguments: args.clone(),
             malformed_arguments: false,
         };
-        self.run_tools_off_thread(std::slice::from_ref(&call), ui, None, true)
-            .map(|outputs| {
-                outputs
-                    .into_iter()
-                    .next()
-                    .expect("one result for one call")
-                    .0
-            })
+        self.run_tools_off_thread(
+            std::slice::from_ref(&call),
+            ui,
+            None,
+            true,
+            crate::agent::safety::approval::CallProvenance::Structured,
+        )
+        .map(|outputs| {
+            outputs
+                .into_iter()
+                .next()
+                .expect("one result for one call")
+                .0
+        })
     }
 
     /// Shared native worker/event owner. Multi-call admission belongs to dependency dispatch;
@@ -169,7 +192,13 @@ impl Agent<'_> {
         ui: &mut dyn Ui,
         backend: Option<&mut Backend>,
     ) -> Option<Vec<(ToolOutput, f64)>> {
-        self.run_tools_off_thread(calls, ui, backend, false)
+        self.run_tools_off_thread(
+            calls,
+            ui,
+            backend,
+            false,
+            crate::agent::safety::approval::CallProvenance::Structured,
+        )
     }
 
     fn run_tools_off_thread(
@@ -178,6 +207,7 @@ impl Agent<'_> {
         ui: &mut dyn Ui,
         mut backend: Option<&mut Backend>,
         foreground: bool,
+        provenance: crate::agent::safety::approval::CallProvenance,
     ) -> Option<Vec<(ToolOutput, f64)>> {
         self.portable_callback_intercepted = false;
         if self.hermetic {
@@ -190,7 +220,9 @@ impl Agent<'_> {
         }) {
             return None;
         }
-        if calls.len() == 1 {
+        if calls.len() == 1
+            && provenance == crate::agent::safety::approval::CallProvenance::Structured
+        {
             let call = &calls[0];
             if let Some(key) = self.speculation_key(&call.name, &call.arguments)
                 && let Some(mut output) = self.workspace.speculation.take_named(
@@ -543,7 +575,14 @@ impl Agent<'_> {
                             } else if let (Some(backend), Some(gate)) =
                                 (backend.as_deref_mut(), callback_gate.as_mut())
                             {
-                                self.code_callback(backend, request, &callback_owner, ui, gate)
+                                self.code_callback(
+                                    backend,
+                                    request,
+                                    &callback_owner,
+                                    ui,
+                                    gate,
+                                    provenance,
+                                )
                             } else {
                                 ToolOutput::err(
                                     "code-mode callbacks require the agent execution controller",

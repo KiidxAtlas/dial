@@ -7,7 +7,7 @@ use std::{
     net::{SocketAddr, TcpListener, TcpStream},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
         mpsc::{self, SyncSender, TryRecvError},
     },
     thread,
@@ -25,6 +25,33 @@ const POLL: Duration = Duration::from_millis(20);
 const PING_EVERY: Duration = Duration::from_secs(20);
 /// A peer that sends nothing (not even a pong) for this long is dropped.
 const SILENCE_LIMIT: Duration = Duration::from_secs(60);
+/// Includes sockets still in their handshake, so slow clients cannot create unbounded threads.
+pub(super) const MAX_CONNECTIONS: usize = 64;
+const MAX_ROOMS: usize = 16;
+
+struct ConnectionPermit(Arc<AtomicUsize>);
+impl ConnectionPermit {
+    fn acquire(active: &Arc<AtomicUsize>) -> Option<Self> {
+        let mut count = active.load(Ordering::Acquire);
+        while count < MAX_CONNECTIONS {
+            match active.compare_exchange_weak(
+                count,
+                count + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self(active.clone())),
+                Err(actual) => count = actual,
+            }
+        }
+        None
+    }
+}
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 struct Connection {
     outgoing: SyncSender<Message>,
     closing: AtomicBool,
@@ -41,12 +68,18 @@ type Rooms = Arc<Mutex<HashMap<String, Room>>>;
 pub fn serve(bind: SocketAddr) -> Result<()> {
     let listener =
         TcpListener::bind(bind).with_context(|| format!("binding collab relay at {bind}"))?;
+    if !bind.ip().is_loopback() {
+        eprintln!(
+            "WARNING: collaboration relay is exposed on {bind}; use a firewall and TLS reverse proxy. Connection and room limits are shared by all clients."
+        );
+    }
     eprintln!(
         "Dial collaboration relay listening on {}",
         listener.local_addr()?
     );
     let rooms: Rooms = Arc::new(Mutex::new(HashMap::new()));
     let next_peer = Arc::new(AtomicU32::new(1));
+    let active = Arc::new(AtomicUsize::new(0));
     for incoming in listener.incoming() {
         let stream = match incoming {
             Ok(stream) => stream,
@@ -55,15 +88,23 @@ pub fn serve(bind: SocketAddr) -> Result<()> {
                 continue;
             }
         };
+        let Some(permit) = ConnectionPermit::acquire(&active) else {
+            eprintln!("collab connection limit reached; refusing connection");
+            continue;
+        };
         let rooms = rooms.clone();
         let next_peer = next_peer.clone();
-        thread::Builder::new()
+        if let Err(error) = thread::Builder::new()
             .name("dial-collab-peer".into())
             .spawn(move || {
+                let _permit = permit;
                 if let Err(error) = peer(stream, rooms, next_peer) {
                     eprintln!("collab peer ended: {error:#}");
                 }
-            })?;
+            })
+        {
+            eprintln!("collab peer thread could not start: {error}");
+        }
     }
     bail!("collab relay listener stopped")
 }
@@ -205,7 +246,9 @@ fn peer(stream: TcpStream, rooms: Rooms, next_peer: Arc<AtomicU32>) -> Result<()
     };
     let refused: Option<(u16, &str)> = {
         let mut all = rooms.lock().unwrap_or_else(|p| p.into_inner());
-        if host {
+        if host && !all.contains_key(&room_id) && all.len() >= MAX_ROOMS {
+            Some((4029, "relay room limit reached"))
+        } else if host {
             let room = all.entry(room_id.clone()).or_default();
             if room.host.is_some() {
                 Some((4009, "room already has a host"))
@@ -367,3 +410,6 @@ fn peer(stream: TcpStream, rooms: Rooms, next_peer: Arc<AtomicU32>) -> Result<()
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

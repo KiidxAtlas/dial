@@ -12,6 +12,61 @@ fn created(saved: Saved) -> Fact {
 }
 
 #[test]
+fn forgetting_erases_text_from_database_and_wal_bytes() {
+    for clear in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("memory.sqlite3");
+        let mut store = Store::new(Connection::open(&path).unwrap()).unwrap();
+        let secret = "uniquelyforgetthisplaintextsample";
+        let fact = created(store.retain(secret, secret, 1).unwrap());
+        if clear {
+            store.enqueue_turn("s", secret, secret, 2).unwrap();
+            store.clear_all(3).unwrap();
+        } else {
+            store.forget(fact.id, fact.revision, 3).unwrap();
+        }
+        for file in [path.clone(), path.with_extension("sqlite3-wal")] {
+            let bytes = std::fs::read(&file).unwrap_or_default();
+            assert!(
+                !bytes
+                    .windows(secret.len())
+                    .any(|window| window == secret.as_bytes()),
+                "forgotten text remains in {}",
+                file.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn busy_reader_reports_incomplete_erasure_instead_of_success() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("memory.sqlite3");
+    let mut store = Store::new(Connection::open(&path).unwrap()).unwrap();
+    store.conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+    let fact = created(
+        store
+            .retain("uniqueforgottenplaintext", "source", 1)
+            .unwrap(),
+    );
+    let reader = Connection::open(&path).unwrap();
+    reader.execute_batch("BEGIN; SELECT * FROM facts;").unwrap();
+    assert!(
+        store
+            .forget(fact.id, fact.revision, 2)
+            .unwrap_err()
+            .to_string()
+            .contains("WAL erasure")
+    );
+    assert!(
+        store.fact(fact.id).unwrap().is_none(),
+        "logical redaction committed"
+    );
+    reader.execute_batch("ROLLBACK;").unwrap();
+    checkpoint_redaction(&store.conn).unwrap();
+}
+
+#[test]
 fn identical_content_is_deduplicated() {
     let mut store = store();
     let first = created(store.retain("ship on fridays", "test", 1).unwrap());

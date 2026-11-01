@@ -235,6 +235,7 @@ impl Store {
         );
         let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         conn.busy_timeout(Duration::from_millis(100))?;
+        super::sqlite::check_version(&conn, 1)?;
         Ok(Self { conn })
     }
 
@@ -268,8 +269,11 @@ impl Store {
         platform_fs::set_owner_only(&path)?;
         let conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(10))?;
-        conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
-            CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+        super::sqlite::check_version(&conn, 1)?;
+        conn.execute_batch(
+            "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;",
+        )?;
+        super::sqlite::migrate(&conn, &["CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS versions(
                 id INTEGER PRIMARY KEY, parent INTEGER REFERENCES versions(id), kind TEXT NOT NULL,
                 harness TEXT NOT NULL, adapter TEXT, status TEXT NOT NULL CHECK(status IN ('active','known_good','candidate','rejected')),
@@ -320,7 +324,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS session_examples(
                 id INTEGER PRIMARY KEY,source_session TEXT NOT NULL,source_turn TEXT NOT NULL,
                 source_model TEXT NOT NULL,payload TEXT NOT NULL,
-                UNIQUE(source_session,source_turn));")?;
+                UNIQUE(source_session,source_turn));"])?;
         let store = Self { conn };
         let tx = store.transaction()?;
         let binding: Option<String> = tx

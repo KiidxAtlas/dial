@@ -88,8 +88,8 @@ mod unix {
     impl Waker {
         pub(in crate::tools::exec::background) fn new() -> io::Result<Self> {
             let (read, write) = io::pipe()?;
-            set_nonblocking(read.as_raw_fd())?;
-            set_nonblocking(write.as_raw_fd())?;
+            crate::platform::io::set_nonblocking(&read)?;
+            crate::platform::io::set_nonblocking(&write)?;
             let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
             POLLERS.lock().push((id, write.as_raw_fd()));
             Ok(Waker {
@@ -160,17 +160,6 @@ mod unix {
         }
     }
 
-    fn set_nonblocking(fd: RawFd) -> io::Result<()> {
-        // SAFETY: plain fcntl calls on a descriptor owned by the caller.
-        unsafe {
-            let flags = libc::fcntl(fd, libc::F_GETFL);
-            if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
-                return Err(io::Error::last_os_error());
-            }
-        }
-        Ok(())
-    }
-
     /// Notifies waiters when `pid` exits. It waits with `WNOWAIT`, so the zombie is left for the
     /// owner to reap and its PID stays reserved. Must be called while the child is still unreaped.
     pub(in crate::tools::exec::background) fn watch_exit(pid: u32) {
@@ -179,9 +168,12 @@ mod unix {
             .name("dial-bg-exit".into())
             .spawn(move || {
                 loop {
-                    // SAFETY: `siginfo_t` is plain data; zeroed is a valid initial value.
+                    // SAFETY: libc's siginfo_t is a C structure of scalar/union fields
+                    // whose all-zero representation is valid; no union payload is read here.
                     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-                    // SAFETY: `info` is a valid out-pointer for the duration of the call.
+                    // SAFETY: info is aligned writable siginfo_t storage. P_PID uses the
+                    // scalar child PID; WNOWAIT leaves reaping to the process owner, and
+                    // ECHILD/EINTR are handled without reading uninitialized output.
                     let rc = unsafe {
                         libc::waitid(
                             libc::P_PID,
@@ -211,7 +203,8 @@ mod windows {
     /// Notifies waiters when `pid` exits. The handle is opened here, while the child is still
     /// unreaped, so the PID cannot have been reused; the thread only waits on that handle.
     pub(in crate::tools::exec::background) fn watch_exit(pid: u32) {
-        // SAFETY: plain OpenProcess call; the result is checked before use.
+        // SAFETY: OpenProcess takes scalar arguments, requests only SYNCHRONIZE with
+        // inheritance disabled, and its failure/null result is checked before adoption.
         let raw = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
         if raw.is_null() {
             return;

@@ -1728,3 +1728,6 @@ mod requirement_tests;
 
 #[cfg(test)]
 mod budget_revert_tests;
+
+#[cfg(test)]
+mod timeout_tests;

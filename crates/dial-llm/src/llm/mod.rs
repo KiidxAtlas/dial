@@ -765,7 +765,11 @@ fn chat_stream_at_controlled(
     let mut markup = markup::Healer::default();
     let mut hidden =
         |text: &str| (callback.borrow_mut())(&StreamEvent::HiddenText(text.to_owned()));
-    let mut hider = text_tool_calls::Hider::new(on_text, &mut hidden, !req.tools.is_empty());
+    let mut hider = text_tool_calls::Hider::new(
+        on_text,
+        &mut hidden,
+        !req.tools.is_empty() && host_of(url).is_some_and(|host| is_local_host(&host)),
+    );
     let mut reply = if is_sse {
         let mut accumulator = stream::Accumulator::with_patience(patience.clone());
         let mut forward = |piece: &str| {
@@ -850,14 +854,25 @@ fn lift_text_calls(reply: &mut Reply, url: &str, tools: &[Value]) {
 }
 
 fn lift_calls(reply: &mut Reply, url: &str, tools: &[Value]) {
-    text_tool_calls::apply(reply);
-    if host_of(url).is_some_and(|host| is_local_host(&host)) {
-        let offered: Vec<String> = tools
+    if !host_of(url).is_some_and(|host| is_local_host(&host)) || !reply.tool_calls.is_empty() {
+        return;
+    }
+    let offered: Vec<String> = tools
+        .iter()
+        .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_owned))
+        .collect();
+    // Parse into a candidate: rejecting an unoffered call must not erase quoted source text.
+    let mut candidate = reply.clone();
+    text_tool_calls::apply(&mut candidate);
+    text_tool_calls::apply_pythonic(&mut candidate, &offered);
+    text_tool_calls::apply_from_reasoning(&mut candidate);
+    if !candidate.tool_calls.is_empty()
+        && candidate
+            .tool_calls
             .iter()
-            .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_owned))
-            .collect();
-        text_tool_calls::apply_pythonic(reply, &offered);
-        text_tool_calls::apply_from_reasoning(reply);
+            .all(|call| offered.contains(&call.name))
+    {
+        *reply = candidate;
     }
 }
 

@@ -141,12 +141,16 @@ fn cancel_stops_the_command() {
 #[cfg(feature = "embedded-shell")]
 #[test]
 fn environment_drops_secrets_and_cwd_is_honoured() {
-    let (dir, ws) = unsandboxed();
-    // Environment is process-global; only this test touches these names.
-    unsafe {
-        std::env::set_var("OPENAI_API_KEY", "sk-inprocess-secret");
-        std::env::set_var("DIAL_INPROCESS_PLAIN", "visible");
+    if !in_env_subprocess(
+        "tools::exec::shell::inprocess_tests::environment_drops_secrets_and_cwd_is_honoured",
+        &[
+            ("OPENAI_API_KEY", "sk-inprocess-secret"),
+            ("DIAL_INPROCESS_PLAIN", "visible"),
+        ],
+    ) {
+        return;
     }
+    let (dir, ws) = unsandboxed();
     fs::create_dir(dir.path().join("sub")).unwrap();
     let out = run_with(
         &ws,
@@ -155,10 +159,6 @@ fn environment_drops_secrets_and_cwd_is_honoured() {
         &AtomicBool::new(false),
     )
     .unwrap();
-    unsafe {
-        std::env::remove_var("OPENAI_API_KEY");
-        std::env::remove_var("DIAL_INPROCESS_PLAIN");
-    }
     assert!(out.text.contains("key=[]"), "{}", out.text);
     assert!(!out.text.contains("sk-inprocess-secret"));
     assert!(out.text.contains("plain=[]") || out.text.contains("plain=[visible]"));

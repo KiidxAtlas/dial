@@ -7,11 +7,6 @@ use crate::tools::{
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-#[cfg(unix)]
-use std::os::{
-    fd::{AsRawFd, FromRawFd},
-    unix::ffi::OsStrExt,
-};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
@@ -519,34 +514,9 @@ impl Notebook {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         let result = (|| -> Result<(), String> {
-            #[cfg(windows)]
             let mut staged =
                 crate::platform::fs::create_new_beneath(&loaded.dir, &stage_name, true)
                     .map_err(|e| format!("staging notebook: {e}"))?;
-            #[cfg(unix)]
-            let mut staged = {
-                let n = std::ffi::CString::new(stage_name.as_os_str().as_bytes())
-                    .map_err(|e| e.to_string())?;
-                let fd = unsafe {
-                    libc::openat(
-                        loaded.dir.as_raw_fd(),
-                        n.as_ptr(),
-                        libc::O_WRONLY
-                            | libc::O_CREAT
-                            | libc::O_EXCL
-                            | libc::O_NOFOLLOW
-                            | libc::O_CLOEXEC,
-                        0o600,
-                    )
-                };
-                if fd < 0 {
-                    return Err(format!(
-                        "staging notebook: {}",
-                        std::io::Error::last_os_error()
-                    ));
-                }
-                unsafe { File::from_raw_fd(fd) }
-            };
             staged.write_all(&bytes).map_err(|e| e.to_string())?;
             staged
                 .set_permissions(
@@ -630,7 +600,7 @@ impl Notebook {
                 ));
                 #[cfg(test)]
                 test_hook("before-capture");
-                at::rename(&loaded.dir, &loaded.name, &backup)
+                crate::platform::fs::replace_beneath(&loaded.dir, &loaded.name, &backup)
                     .map_err(|e| format!("capturing notebook original: {e}"))?;
                 let captured_matches = (|| -> Result<bool, String> {
                     let mut captured =
@@ -645,9 +615,9 @@ impl Notebook {
                     Ok(id == loaded.identity && bytes == loaded.raw.as_bytes())
                 })();
                 let restore = |reason: String| -> String {
-                    match at::link(&loaded.dir, &backup, &loaded.name) {
+                    match crate::platform::fs::link_beneath(&loaded.dir, &backup, &loaded.name) {
                         Ok(()) => {
-                            let _ = at::unlink(&loaded.dir, &backup);
+                            let _ = crate::platform::fs::remove_beneath(&loaded.dir, &backup);
                             reason
                         }
                         Err(restore) => format!(
@@ -667,24 +637,19 @@ impl Notebook {
                 }
                 #[cfg(test)]
                 test_hook("before-install");
-                if let Err(error) = at::link(&loaded.dir, &stage_name, &loaded.name) {
+                if let Err(error) =
+                    crate::platform::fs::link_beneath(&loaded.dir, &stage_name, &loaded.name)
+                {
                     return Err(restore(format!("publishing notebook failed: {error}")));
                 }
-                let _ = at::unlink(&loaded.dir, &stage_name);
-                at::unlink(&loaded.dir, &backup)
+                let _ = crate::platform::fs::remove_beneath(&loaded.dir, &stage_name);
+                crate::platform::fs::remove_beneath(&loaded.dir, &backup)
                     .map_err(|e| format!("notebook committed but backup cleanup failed: {e}"))?;
             }
             Ok(())
         })();
-        #[cfg(windows)]
         if result.is_err() {
             let _ = crate::platform::fs::remove_beneath(&loaded.dir, &stage_name);
-        }
-        #[cfg(unix)]
-        if result.is_err()
-            && let Ok(n) = std::ffi::CString::new(stage_name.as_os_str().as_bytes())
-        {
-            unsafe { libc::unlinkat(loaded.dir.as_raw_fd(), n.as_ptr(), 0) };
         }
         result?;
         // Report the committed path so the turn advances its mutation epoch, as edits do.
@@ -740,45 +705,6 @@ pub fn tools(config: &Config) -> Vec<Arc<dyn Tool>> {
         vec![Arc::new(Notebook::default())]
     } else {
         Vec::new()
-    }
-}
-#[cfg(unix)]
-mod at {
-    //! Name-relative directory operations on a pinned directory handle.
-    use super::*;
-    fn cstr(path: &std::path::Path) -> std::io::Result<std::ffi::CString> {
-        std::ffi::CString::new(path.as_os_str().as_bytes())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
-    }
-    fn check(code: libc::c_int) -> std::io::Result<()> {
-        if code < 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
-    }
-    pub(super) fn rename(
-        dir: &File,
-        from: &std::path::Path,
-        to: &std::path::Path,
-    ) -> std::io::Result<()> {
-        let (from, to) = (cstr(from)?, cstr(to)?);
-        let fd = dir.as_raw_fd();
-        check(unsafe { libc::renameat(fd, from.as_ptr(), fd, to.as_ptr()) })
-    }
-    /// Hard-links `from` as `to`; fails with `AlreadyExists` instead of replacing `to`.
-    pub(super) fn link(
-        dir: &File,
-        from: &std::path::Path,
-        to: &std::path::Path,
-    ) -> std::io::Result<()> {
-        let (from, to) = (cstr(from)?, cstr(to)?);
-        let fd = dir.as_raw_fd();
-        check(unsafe { libc::linkat(fd, from.as_ptr(), fd, to.as_ptr(), 0) })
-    }
-    pub(super) fn unlink(dir: &File, name: &std::path::Path) -> std::io::Result<()> {
-        let name = cstr(name)?;
-        check(unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) })
     }
 }
 #[cfg(test)]

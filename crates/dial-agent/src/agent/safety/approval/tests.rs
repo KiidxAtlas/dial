@@ -49,6 +49,9 @@ fn shell_inspection_is_conservative() {
         "ls 'a b'",
         "cat \"a b\"",
         "find . -name '*.rs'",
+        "cat '*.rs'",
+        r"cat \*.rs",
+        "cat '~'",
         "sed -n '1,10p' file",
         "git -c core.fsmonitor=false -c core.pager=cat --no-pager status --short --untracked-files=all",
         "git -c core.fsmonitor=false -c core.pager=cat --no-pager diff --no-color --no-ext-diff --no-textconv",
@@ -77,6 +80,11 @@ fn shell_inspection_is_conservative() {
         "make -n",
         "rg --pre=sh x",
         "sed -n '1e touch x' f",
+        "find . -delet?",
+        "sed -n 1p [-]i f",
+        "tree [-]o out",
+        "ls *",
+        "cat ~/key.pem",
     ] {
         assert!(!safe_bash(text), "{text}");
     }
@@ -669,8 +677,8 @@ fn read_only_inspection_batches_split_only_at_unquoted_separators() {
         "{git} status --short --untracked-files=all; {git} diff --no-color --no-ext-diff --no-textconv --stat"
     );
     for command in [
-        r#"ls -la "a b"; ls -d */"#,
-        "ls -la\nls -d */",
+        r#"ls -la "a b"; ls -d '*/'"#,
+        "ls -la\nls -d '*/'",
         "ls && pwd",
         r#"ls "a;rm x""#,
         r"ls \;",
@@ -679,6 +687,9 @@ fn read_only_inspection_batches_split_only_at_unquoted_separators() {
         assert!(read_only_inspection_batch(command), "{command}");
     }
     for command in [
+        "ls -d */",
+        "ls; find . -delet?",
+        "ls; cat ~/key.pem",
         "ls > out.txt",
         "ls | wc -l",
         "ls &",
@@ -709,8 +720,9 @@ fn read_only_inspection_batches_split_only_at_unquoted_separators() {
 #[test]
 fn opaque_shell_effect_counts_only_unverified_batches() {
     for (command, opaque) in [
-        (r#"ls -la "a b"; ls -d */"#, false),
-        ("ls -la\nls -d */", false),
+        (r#"ls -la "a b"; ls -d '*/'"#, false),
+        ("ls -la\nls -d '*/'", false),
+        ("ls -la; ls -d */", true),
         ("ls && pwd", false),
         ("ls > out.txt", true),
         ("ls; rm -rf target", true),
@@ -720,5 +732,64 @@ fn opaque_shell_effect_counts_only_unverified_batches() {
         ("ls \\\n; rm x", true),
     ] {
         assert_eq!(opaque_shell_effect(command), opaque, "{command}");
+    }
+}
+
+#[test]
+fn shell_consumers_share_lexical_boundaries_without_sharing_authority() {
+    for command in [r#"echo 'a|b;&&c'"#, r#"echo "a|b;&&c""#, r"echo a\|b\;c\&d"] {
+        assert!(shell_words(command).is_some(), "{command:?}");
+        assert_eq!(pipe_stages(command), Some(vec![command]), "{command:?}");
+        assert_eq!(
+            top_level_segments(command),
+            Some(vec![command]),
+            "{command:?}"
+        );
+        assert!(safe_bash(command), "{command:?}");
+        assert!(read_only_inspection_batch(command), "{command:?}");
+    }
+    for command in [
+        "echo 'open",
+        "echo \"open",
+        "echo trailing\\",
+        "echo a\\\nb",
+        "echo \"a\\\nb\"",
+    ] {
+        assert!(shell_words(command).is_none(), "{command:?}");
+        assert!(pipe_stages(command).is_none(), "{command:?}");
+        assert!(top_level_segments(command).is_none(), "{command:?}");
+        assert!(!read_only_inspection_batch(command), "{command:?}");
+    }
+    for (command, complete) in [
+        ("sh -c \"sh -c 'rm -f x'\"", true),
+        ("env -S 'sh -c \"rm -f x\"'", true),
+        ("sh -c 'echo a\\;b'", true),
+        ("sh -c 'cat \"*.rs\"'", true),
+        ("sh -c 'cat *.rs'", false),
+        ("env sh -c 'cat ~/key.pem'", false),
+        ("sh -c 'ls; rm x'", false),
+        ("sh -c 'echo trailing\\'", false),
+    ] {
+        assert_eq!(shell_argvs(command).1, complete, "{command:?}");
+        assert!(
+            !safe_bash(command),
+            "a wrapper cannot grant inspection authority: {command:?}"
+        );
+    }
+    let status = "git -c core.fsmonitor=false -c core.pager=cat --no-pager status --short --untracked-files=all";
+    let quoted = status.replace("status", "'status'");
+    for separator in [";\n", " &&\n", "\n"] {
+        let batch = format!("{quoted}{separator}{status}");
+        assert!(safe_review_batch(&batch), "{batch:?}");
+        assert!(
+            !safe_bash(&batch),
+            "review effects never grant batch approval: {batch:?}"
+        );
+    }
+    for suffix in [";", " &&", ";;", "\\", "\\\n"] {
+        assert!(
+            !safe_review_batch(&format!("{status}{suffix}")),
+            "{suffix:?}"
+        );
     }
 }

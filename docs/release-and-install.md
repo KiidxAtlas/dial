@@ -45,11 +45,41 @@ The interactive terminal checks the GitHub latest release in the background, at 
 
 The workflow intentionally fails closed until repository signing inputs are configured. Set:
 
-- `DIAL_RELEASE_SIGNING_KEY` as a protected GitHub Actions secret containing an OpenSSL-readable Ed25519 private key in PEM format. Never commit or print it.
+- `DIAL_RELEASE_SIGNING_KEY` as a secret scoped to the **`release-signing` environment**, containing an OpenSSL-readable Ed25519 private key in PEM format. Never commit or print it.
 - `DIAL_RELEASE_PUBLIC_KEY` as a GitHub Actions variable containing the matching raw 32-byte Ed25519 public key, base64 encoded. Release binaries embed this value at compile time.
-- `DIAL_RELEASE_PUBLIC_KEY_PEM` as a GitHub Actions variable containing the matching public key in PEM format. The published installer embeds it; the publish job derives and compares the raw key to the signing key before signing.
+- `DIAL_RELEASE_PUBLIC_KEY_PEM` as a GitHub Actions variable containing the matching public key in PEM format. The published installer embeds it; the signing job derives and compares the raw key to the signing key before signing.
 
-The publish job signs the exact `SHA256SUMS` bytes with Ed25519 and publishes the base64-encoded detached signature as `SHA256SUMS.sig`, plus an OpenSSH-format `SHA256SUMS.sshsig` for `ssh-keygen -Y verify`. Missing or mismatched values fail the release; no example or generated signing key is trusted by production code.
+Configure required reviewers and restrict deployment tags on `release-signing` in GitHub's
+repository settings. The workflow's `environment:` declaration does **not** establish these
+protections by itself. Protect `main` and release tags, require reviewed pull requests and CI,
+and keep signing secrets unavailable to other jobs. Repository-owner configuration is required.
+
+The isolated read-only signing job signs the exact `SHA256SUMS` bytes with Ed25519 and
+publishes the base64-encoded detached signature as `SHA256SUMS.sig`, plus an OpenSSH-format
+`SHA256SUMS.sshsig`. Its temporary private-key file is owner-only and removed on exit. A
+separate least-privilege publishing job publishes the artifacts. Missing or mismatched values
+fail the release; no example or generated signing key is trusted by production code.
+
+Tags must be ancestors of `main`, with a completed successful **push-to-main** CI run for
+the exact tagged SHA; pull-request CI does not authorize publication. Releases are serialized.
+An older stable tag may publish versioned artifacts but cannot move GitHub, Homebrew or
+container `latest` backwards. Container builds request BuildKit provenance and an SBOM,
+then sign and verify the immutable image digest with pinned Cosign using GitHub OIDC.
+The installer action is commit-pinned and verifies its pinned Cosign binary's checksum.
+These workflow steps have not established a successful hosted signing run locally and do not
+provide provenance/SBOM for the standalone release archives.
+
+To verify a published container, resolve its digest and use the exact release tag identity
+(replace `vX.Y.Z` and `sha256:…`):
+
+```sh
+cosign verify --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity 'https://github.com/KiidxAtlas/dial/.github/workflows/release.yml@refs/tags/vX.Y.Z' \
+  'ghcr.io/kiidxatlas/dial@sha256:…'
+```
+
+An attestation or signature is not proof that the image is safe. Verify the expected repository,
+workflow, tag and digest; do not accept an arbitrary GitHub-issued certificate identity.
 
 For local use of the source-tree installers, provide the trusted public PEM before invoking them: `install.sh` reads `DIAL_RELEASE_PUBLIC_KEY`, and `scripts/install.ps1` reads `DIAL_RELEASE_PUBLIC_KEY_PEM`. Each refuses to proceed without it.
 
@@ -61,7 +91,8 @@ To build the container locally, pass the source revision explicitly because `.do
 excludes Git metadata:
 
 ```sh
-docker build --build-arg DIAL_BUILD_REVISION="$(git rev-parse HEAD)" -t dial .
+docker build --build-arg DIAL_BUILD_REVISION="$(git rev-parse HEAD)" \
+  --build-arg SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)" -t dial .
 ```
 
 The release workflow supplies the tagged commit and `DIAL_RELEASE_PUBLIC_KEY` as build arguments
@@ -95,7 +126,7 @@ dial
 When GitHub CLI is installed and signed in, the installer downloads through it; otherwise it uses
 plain HTTPS. Complete the platform prerequisites below before installing.
 
-The installer selects the correct archive, verifies the Ed25519 signature on `SHA256SUMS` against the release public key embedded in the published `install.sh` (when OpenSSL 3 is available; see above), then verifies the archive's SHA-256 before installing. `install.ps1` does the same with the key embedded in it.
+The installer verifies the Ed25519 signature on `SHA256SUMS` against the embedded release public key, using OpenSSL 3, Python `cryptography`, or OpenSSH, then verifies the archive's SHA-256. It refuses to proceed without verification unless `DIAL_ALLOW_UNSIGNED_INSTALL=1` explicitly requests checksum-only installation. `install.ps1` verifies the signed manifest with its embedded key too.
 Run `bash install.sh v0.1.1` to select a specific release. On Windows, run the release's `install.ps1` in PowerShell for the native `dial.exe` (commands in [windows.md](windows.md)), or run the Linux commands in your WSL2 Ubuntu terminal; the PowerShell command in the WSL2 section below installs WSL2 first.
 
 ### macOS (Apple Silicon or Intel)
@@ -309,7 +340,10 @@ commit to `main` and let CI pass before tagging. The jobs then build Apple Silic
 Linux x86-64 and arm64 (glibc and musl) release binaries and smoke-test each extracted archive outside the checkout. Only
 after **all** platform builds (macOS arm64 and Intel, Linux x86-64 and arm64 in glibc and musl, Windows x86-64 and arm64) pass,
 does it create a GitHub release with the archives, bundled MIT license and README, a
-combined `SHA256SUMS` with its `SHA256SUMS.sig` and `SHA256SUMS.sshsig` signatures, and generated notes. CI runs on both
+combined `SHA256SUMS` with its `SHA256SUMS.sig` and `SHA256SUMS.sshsig` signatures, and curated notes
+from the tag's exact version section in `CHANGELOG.md` (missing, duplicate or empty sections refuse publication).
+The container job pins Cosign installer v4.1.2 and Cosign v3.0.6; its OIDC signing and verification still
+require a successful hosted run. CI runs on both
 macOS and Ubuntu without weakening host security. CI builds the `dial` library and its unit-test
 build one after the other: each peaks near 5 GB in rustc, and together they would swap on the
 7 GB macOS arm64 runner. The native Windows Rust contract (`scripts/windows-contract.txt`, which lists its skipped tests with reasons) runs in CI's `windows-rust` job, so the CI requirement above covers it; the release does not repeat it. The Windows release jobs (x86-64 and ARM64) build `dial.exe`, smoke-test the packaged archive (`--version`, `--help`), verify the binary format for the target, and run `scripts/test-install.ps1` under Windows PowerShell 5.1 and PowerShell 7, as does the CI `installer-windows` job. The publish job builds `install.ps1` with the release key embedded and publishes it with `SHA256SUMS`, `SHA256SUMS.sig`, and `SHA256SUMS.sshsig`.

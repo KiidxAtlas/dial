@@ -7,7 +7,6 @@
 //! staging files are reaped on join/list; scans fail closed above 1024 directory entries.
 //! This is advisory coordination, not workspace exclusion or a durable message service.
 use anyhow::{Context, Result, bail, ensure};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
@@ -76,7 +75,7 @@ impl Participant {
             &dir.join(format!("{id}.live")),
         )?;
         atomic::check_file(&live)?;
-        FileExt::try_lock_exclusive(&live)?;
+        std::fs::File::try_lock(&live).map_err(std::io::Error::from)?;
         let participant = Self {
             dir,
             id,
@@ -268,7 +267,7 @@ fn transaction(dir: &Path) -> Result<File> {
     let file = private_open(&dir.join("registry.lock"), true)?;
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
-        match FileExt::try_lock_exclusive(&file) {
+        match std::fs::File::try_lock(&file).map_err(std::io::Error::from) {
             Ok(()) => break,
             Err(error) if contended(&error) => {
                 ensure!(
@@ -285,7 +284,6 @@ fn transaction(dir: &Path) -> Result<File> {
 
 fn contended(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::WouldBlock
-        || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
 }
 
 fn is_live(dir: &Path, id: &str) -> Result<bool> {
@@ -300,7 +298,7 @@ fn is_live(dir: &Path, id: &str) -> Result<bool> {
         }
         Err(error) => return Err(error),
     };
-    match FileExt::try_lock_exclusive(&file) {
+    match std::fs::File::try_lock(&file).map_err(std::io::Error::from) {
         Ok(()) => Ok(false),
         Err(error) if contended(&error) => Ok(true),
         Err(error) => Err(error.into()),

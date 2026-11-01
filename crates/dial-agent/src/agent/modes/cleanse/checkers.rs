@@ -179,10 +179,10 @@ fn run_plan(plan: &Plan, root: &Path, cancelled: &(dyn Fn() -> bool + Sync)) -> 
             };
         }
     };
-    let stdout = group.child.stdout.take().map(read_in_background);
-    let stderr = group.child.stderr.take().map(read_in_background);
+    let stdout = group.take_stdout().map(read_in_background);
+    let stderr = group.take_stderr().map(read_in_background);
     let status = loop {
-        match group.child.try_wait() {
+        match group.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {}
             Err(error) => {

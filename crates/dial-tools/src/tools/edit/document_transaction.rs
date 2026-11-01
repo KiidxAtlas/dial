@@ -70,6 +70,7 @@ impl DocumentLease {
                 _thread: PhantomData,
             });
         }
+        // SAFETY: geteuid takes no pointers and only reads this process's effective user ID.
         #[cfg(unix)]
         let owner = unsafe { libc::geteuid() }.to_string();
         #[cfg(not(unix))]
@@ -91,11 +92,10 @@ impl DocumentLease {
             .map_err(|e| e.to_string())?;
         let started = Instant::now();
         loop {
-            match fs2::FileExt::try_lock_exclusive(&file) {
+            match std::fs::File::try_lock(&file).map_err(std::io::Error::from) {
                 Ok(()) => break,
                 Err(error)
-                    if (error.kind() == std::io::ErrorKind::WouldBlock
-                        || error.raw_os_error() == fs2::lock_contended_error().raw_os_error())
+                    if error.kind() == std::io::ErrorKind::WouldBlock
                         && started.elapsed() < Duration::from_secs(10) =>
                 {
                     std::thread::sleep(Duration::from_millis(10))

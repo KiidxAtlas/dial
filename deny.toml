@@ -7,6 +7,9 @@ targets = [
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
     "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
     "x86_64-pc-windows-msvc",
     "aarch64-pc-windows-msvc",
 ]
@@ -35,8 +38,8 @@ version = 2
 confidence-threshold = 0.93
 # The allow-list anticipates permissive licenses new dependencies commonly use.
 unused-allowed-license = "allow"
-# Permissive licenses compatible with distributing Dial under MIT. Copyleft options are acceptable
-# only where the crate is also offered under one of these (SPDX `OR`).
+# Licenses compatible with distributing Dial under MIT. MPL-2.0 is file-level copyleft:
+# modified MPL dependency files retain their license and source availability obligations.
 allow = [
     "0BSD",
     "Apache-2.0",

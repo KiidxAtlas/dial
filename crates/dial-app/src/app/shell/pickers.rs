@@ -186,7 +186,14 @@ impl Shell {
                         )
                         .trim_end()
                         .to_owned(),
-                        detail: format!("{:?}", rule.effect),
+                        detail: format!(
+                            "{:?}{}",
+                            rule.effect,
+                            rule.paths
+                                .iter()
+                                .map(|path| format!(" --path {path}"))
+                                .collect::<String>()
+                        ),
                         current: false,
                     })
                     .collect();
@@ -201,8 +208,9 @@ impl Shell {
                         (
                             "Filter rules:",
                             format!(
-                                "{count} saved {}; Enter removes the selected one",
-                                if count == 1 { "rule" } else { "rules" }
+                                "{count} saved {}; Enter removes the selected one. {}",
+                                if count == 1 { "rule" } else { "rules" },
+                                super::command::PERMISSION_PATH_SCOPE
                             ),
                         ),
                     )

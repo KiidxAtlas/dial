@@ -710,7 +710,10 @@ fn dev_scrubs_secret_environment() {
     let (code, out) = fx.run_with_env(&fx.policy(false), "/usr/bin/env", env.into_iter());
     assert_eq!(code, Some(0), "{out}");
     let lines: Vec<&str> = out.lines().collect();
-    assert!(lines.contains(&"KEEP_ME=1"), "{out}");
+    assert!(
+        !lines.contains(&"KEEP_ME=1"),
+        "unknown inherited variable leaked: {out}"
+    );
     assert!(lines.contains(&"HOME=/Users/someone"), "{out}");
     assert!(lines.contains(&"PATH=/usr/bin:/bin"), "{out}");
     let tmp = format!(
@@ -794,6 +797,8 @@ fn dev_timeout_kills_the_whole_process_group() {
         "command should still be running"
     );
     let pgid = i32::try_from(child.id()).unwrap();
+    // SAFETY: child was spawned as its own process-group leader and has not been
+    // reaped; pgid is its positive PID, so only this fixture group receives SIGKILL.
     assert_eq!(unsafe { libc::killpg(pgid, libc::SIGKILL) }, 0);
     let status = child.wait().unwrap();
     assert_eq!(status.signal(), Some(libc::SIGKILL));
@@ -862,4 +867,51 @@ fn strict_policy_through_command_with_policy_matches_command() {
         !out.status.success(),
         "strict policy must not read outside the workspace"
     );
+}
+
+#[test]
+fn child_environment_is_allowlisted_not_a_secret_name_guess() {
+    for name in [
+        "PATH",
+        "HOME",
+        "LANG",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "SystemRoot",
+    ] {
+        assert!(
+            child_env_allowed(name, "/runtime"),
+            "runtime variable {name}"
+        );
+    }
+    for name in [
+        "DATABASE_DSN",
+        "SLACK_WEBHOOK_URL",
+        "SERVICE_JWT",
+        "OP_SESSION_personal",
+        "STRIPE_SK_LIVE",
+        "NOT_A_KNOWN_SECRET",
+        "NODE_OPTIONS",
+        "LD_PRELOAD",
+        "BASH_ENV",
+        "GIT_CONFIG_COUNT",
+    ] {
+        assert!(!child_env_allowed(name, "private"), "inherited {name}");
+    }
+    for value in [
+        "https://user@proxy.invalid",
+        "https://user:password@proxy.invalid",
+        "https://user@proxy.invalid?x",
+    ] {
+        assert!(
+            !child_env_allowed("HTTPS_PROXY", value),
+            "proxy userinfo must not be inherited"
+        );
+    }
+    assert!(child_env_allowed(
+        "HTTPS_PROXY",
+        "https://proxy.invalid:8080"
+    ));
 }

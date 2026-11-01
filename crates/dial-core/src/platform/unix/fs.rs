@@ -62,22 +62,132 @@ pub(in crate::platform) fn open_beneath(
     Ok(file)
 }
 
-pub(in crate::platform) fn open_beneath_handle(root: &File, relative: &Path) -> io::Result<File> {
+fn plain_name(relative: &Path) -> io::Result<CString> {
     let mut parts = relative.components();
     let (Some(Component::Normal(name)), None) = (parts.next(), parts.next()) else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "handle-relative open requires one plain name",
+            "handle-relative operation requires one plain name",
         ));
     };
-    let name = CString::new(name.as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
-    // SAFETY: name is NUL-terminated and `root` is an open directory descriptor.
+    CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))
+}
+
+pub(in crate::platform) fn open_beneath_handle(root: &File, relative: &Path) -> io::Result<File> {
+    open_at(root, relative, libc::O_NONBLOCK)
+}
+
+pub(in crate::platform) fn open_dir_beneath_handle(
+    root: &File,
+    relative: &Path,
+) -> io::Result<File> {
+    open_at(root, relative, libc::O_DIRECTORY)
+}
+
+pub(in crate::platform) fn create_dir_beneath(root: &File, relative: &Path) -> io::Result<()> {
+    let name = plain_name(relative)?;
+    // SAFETY: root keeps the parent descriptor live; name is one NUL-terminated component,
+    // and mkdirat reads it synchronously with a valid owner-only permission mask.
+    if unsafe { libc::mkdirat(root.as_raw_fd(), name.as_ptr(), 0o700) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+pub(in crate::platform) fn create_new_beneath(
+    root: &File,
+    relative: &Path,
+    owner_only: bool,
+) -> io::Result<File> {
+    let name = plain_name(relative)?;
+    // SAFETY: root pins the parent and name is NUL-terminated. O_CREAT supplies a valid
+    // variadic mode, and O_EXCL | O_NOFOLLOW prevent adopting any existing entry.
     let fd = unsafe {
         libc::openat(
             root.as_raw_fd(),
             name.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            if owner_only { 0o600 } else { 0o666 },
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful openat returned one fresh descriptor, adopted exactly once.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+pub(in crate::platform) fn link_beneath(
+    root: &File,
+    existing: &Path,
+    new: &Path,
+) -> io::Result<()> {
+    let existing = plain_name(existing)?;
+    let new = plain_name(new)?;
+    // SAFETY: root pins both parent descriptors; both names are live C strings and
+    // flags=0 links the entry itself, never following a source symlink.
+    if unsafe {
+        libc::linkat(
+            root.as_raw_fd(),
+            existing.as_ptr(),
+            root.as_raw_fd(),
+            new.as_ptr(),
+            0,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+pub(in crate::platform) fn replace_beneath(root: &File, from: &Path, to: &Path) -> io::Result<()> {
+    let from = plain_name(from)?;
+    let to = plain_name(to)?;
+    // SAFETY: root pins both parent descriptors and both names are live NUL-terminated
+    // single components. renameat mutates entries without traversing either symlink.
+    if unsafe {
+        libc::renameat(
+            root.as_raw_fd(),
+            from.as_ptr(),
+            root.as_raw_fd(),
+            to.as_ptr(),
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+pub(in crate::platform) fn remove_beneath(root: &File, relative: &Path) -> io::Result<()> {
+    unlink_at(root, relative, 0)
+}
+
+pub(in crate::platform) fn remove_dir_beneath(root: &File, relative: &Path) -> io::Result<()> {
+    unlink_at(root, relative, libc::AT_REMOVEDIR)
+}
+
+fn unlink_at(root: &File, relative: &Path, flags: libc::c_int) -> io::Result<()> {
+    let name = plain_name(relative)?;
+    // SAFETY: root pins the parent and name is a live NUL-terminated single component;
+    // flags is either zero or AT_REMOVEDIR, and unlinkat never traverses the final symlink.
+    if unsafe { libc::unlinkat(root.as_raw_fd(), name.as_ptr(), flags) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn open_at(root: &File, relative: &Path, extra: libc::c_int) -> io::Result<File> {
+    let name = plain_name(relative)?;
+    // SAFETY: root keeps the descriptor live and name is one NUL-terminated component;
+    // these flags never create a file, so openat needs no variadic mode argument.
+    let fd = unsafe {
+        libc::openat(
+            root.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | extra,
         )
     };
     if fd < 0 {
@@ -85,6 +195,69 @@ pub(in crate::platform) fn open_beneath_handle(root: &File, relative: &Path) -> 
     }
     // SAFETY: openat returned a new descriptor owned exactly once.
     Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+pub(in crate::platform) fn read_dir_beneath(root: &File) -> io::Result<Vec<std::ffi::OsString>> {
+    use std::ffi::CStr;
+    use std::os::unix::ffi::OsStringExt;
+    // SAFETY: root remains live and the literal is NUL-terminated. A fresh open description
+    // avoids sharing a directory offset with other readers of root.
+    let fd = unsafe {
+        libc::openat(
+            root.as_raw_fd(),
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fd is uniquely owned; fdopendir takes ownership only on success.
+    let stream = unsafe { libc::fdopendir(fd) };
+    if stream.is_null() {
+        let error = io::Error::last_os_error();
+        // SAFETY: fdopendir failed, so fd still belongs to this function.
+        unsafe { libc::close(fd) };
+        return Err(error);
+    }
+    struct Directory(*mut libc::DIR);
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            // SAFETY: this guard uniquely owns a successful fdopendir result.
+            unsafe { libc::closedir(self.0) };
+        }
+    }
+    let stream = Directory(stream);
+    let mut names = Vec::new();
+    loop {
+        // SAFETY: these libc accessors return this thread's live errno slot.
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "dragonfly"))]
+        let errno = unsafe { libc::__errno_location() };
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+        // SAFETY: __error returns the current thread's writable errno slot.
+        let errno = unsafe { libc::__error() };
+        #[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
+        // SAFETY: libc returns the current thread's live errno slot.
+        let errno = unsafe { libc::__errno() };
+        // SAFETY: errno is the current thread's writable errno slot, valid across readdir.
+        unsafe { *errno = 0 };
+        // SAFETY: stream is live and exclusively used here; copy d_name before the next read.
+        let entry = unsafe { libc::readdir(stream.0) };
+        if entry.is_null() {
+            // SAFETY: errno remains the current thread's live slot.
+            let error = unsafe { *errno };
+            if error != 0 {
+                return Err(io::Error::from_raw_os_error(error));
+            }
+            break;
+        }
+        // SAFETY: readdir returned a live dirent containing a NUL-terminated d_name.
+        let bytes = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if bytes != b"." && bytes != b".." {
+            names.push(std::ffi::OsString::from_vec(bytes.to_vec()));
+        }
+    }
+    Ok(names)
 }
 
 pub(in crate::platform) fn owned_by_current_user(file: &File) -> io::Result<bool> {
@@ -108,6 +281,7 @@ pub(in crate::platform) fn try_lock_journal(file: &File, exclusive: bool) -> io:
         libc::LOCK_SH
     };
     // EWOULDBLOCK decodes to ErrorKind::WouldBlock.
+    // SAFETY: file owns a live descriptor; flock only changes its advisory lock state.
     if unsafe { libc::flock(file.as_raw_fd(), mode | libc::LOCK_NB) } == 0 {
         Ok(())
     } else {
@@ -145,6 +319,7 @@ pub(in crate::platform) fn set_owner_only_file(file: &File) -> io::Result<()> {
     } else {
         0o600
     };
+    // SAFETY: file owns a live descriptor and mode is a valid permission mask.
     if unsafe { libc::fchmod(file.as_raw_fd(), mode) } == -1 {
         return Err(io::Error::last_os_error());
     }
@@ -203,3 +378,6 @@ fn clone_builder(builder: &DirBuilder) -> DirBuilder {
     copy.recursive(format!("{builder:?}").contains("recursive: true"));
     copy
 }
+
+#[cfg(test)]
+mod tests;

@@ -435,7 +435,9 @@ fn ensure_service_with(
     } else {
         config.timeout_secs
     };
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(timeout_secs))
+        .context("Laya startup timeout exceeds the platform clock range")?;
     while current.status != "ok" && Instant::now() < deadline {
         if cancel.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(crate::llm::Interrupted.into());

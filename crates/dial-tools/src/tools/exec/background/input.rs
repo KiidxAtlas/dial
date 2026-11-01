@@ -80,14 +80,6 @@ impl Handle {
     }
 }
 #[cfg(unix)]
-pub(super) fn nonblocking(fd: i32) -> io::Result<()> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-#[cfg(unix)]
 impl AsRawFd for Handle {
     fn as_raw_fd(&self) -> i32 {
         match self {
@@ -253,13 +245,19 @@ impl Input {
         let handle = slot.as_mut().ok_or("background stdin is already closed")?;
         #[cfg(unix)]
         if let Handle::Terminal(file) = handle {
+            // SAFETY: Unix termios contains only integer fields and arrays; zero is a
+            // valid initial representation, replaced by tcgetattr before use.
             let mut term: libc::termios = unsafe { std::mem::zeroed() };
+            // SAFETY: the locked slot keeps the PTY File open and term is an aligned,
+            // writable termios for this call. An error returns before inspecting it.
             if unsafe { libc::tcgetattr(file.as_raw_fd(), &mut term) } == -1 {
                 return Err(format!(
                     "reading PTY EOF settings: {}",
                     io::Error::last_os_error()
                 ));
             }
+            // SAFETY: _PC_VDISABLE queries this live PTY's disabled-control-byte value;
+            // fpathconf takes no pointer argument and negative results are handled below.
             let disabled = unsafe { libc::fpathconf(file.as_raw_fd(), libc::_PC_VDISABLE) };
             if term.c_lflag & libc::ICANON == 0
                 || disabled < 0
@@ -341,6 +339,8 @@ impl Input {
                 ws_xpixel: 0,
                 ws_ypixel: 0,
             };
+            // SAFETY: the locked slot keeps the PTY descriptor alive, and size is the
+            // initialized winsize structure required by TIOCSWINSZ for the whole call.
             if unsafe { libc::ioctl(file.as_raw_fd(), libc::TIOCSWINSZ, &size) } == -1 {
                 return Err(format!("resizing PTY: {}", io::Error::last_os_error()));
             }

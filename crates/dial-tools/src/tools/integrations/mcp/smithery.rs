@@ -49,13 +49,7 @@ struct Reply {
     body: String,
 }
 
-fn new_agent(timeout: Duration) -> ureq::Agent {
-    let config = ureq::Agent::config_builder()
-        .timeout_global(Some(timeout))
-        .http_status_as_error(false)
-        .build();
-    ureq::Agent::new_with_config(config)
-}
+use super::fetch::agent as new_agent;
 
 fn read_reply(mut response: ureq::http::Response<ureq::Body>) -> Result<Reply, ureq::Error> {
     let status = response.status();

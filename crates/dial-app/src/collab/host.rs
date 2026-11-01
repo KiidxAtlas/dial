@@ -1,12 +1,14 @@
 //! Host side of a collab room. Owns the relay socket, admits guests, and replicates the session log.
 //!
-//! Protocol: a guest sends `hello` with an optional write token. The host answers `welcome`
-//! (carrying `readOnly`), streams the full log as `snapshot-chunk` frames to that peer, and then
+//! Protocol: guests prove write authority against a fresh host challenge, without sending a token.
+//! The host replies with a signed `welcome` (carrying `readOnly`), streams the full log as
+//! `snapshot-chunk` frames to that peer, and then
 //! broadcasts each new log entry as a sequence-numbered `entry` frame. Guest `prompt`/`abort`
 //! frames are queued for the host agent, and only from writable guests while `allow_guest_steering`
 //! is on. That queue is bounded: excess prompts get an explicit `error` reply, and aborts coalesce.
 use super::crypto::{
-    RoomKey, WRITE_TOKEN_BYTES, generate_room_key, generate_write_token, secrets_equal,
+    RoomKey, WRITE_TOKEN_BYTES, generate_room_key, generate_write_token, random_bytes,
+    request_proof, secrets_equal, write_proof,
 };
 use super::protocol::{
     COLLAB_PROTO, Control, bounded_json, format_link, frame, generate_room_id,
@@ -87,6 +89,36 @@ pub enum Steer {
 struct GuestPeer {
     name: String,
     writable: bool,
+    challenge: String,
+    request_sequence: u64,
+}
+
+impl GuestPeer {
+    fn authorize(&mut self, token: Option<&[u8; WRITE_TOKEN_BYTES]>, msg: &Value) -> bool {
+        let (Some(token), Some(sequence), Some(proof), Some(kind)) = (
+            token,
+            msg["requestSeq"].as_u64(),
+            msg["authorization"].as_str(),
+            msg["t"].as_str(),
+        ) else {
+            return false;
+        };
+        if !self.writable || sequence <= self.request_sequence {
+            return false;
+        }
+        let expected = request_proof(
+            token,
+            &self.challenge,
+            sequence,
+            kind,
+            msg["text"].as_str().unwrap_or(""),
+        );
+        if !secrets_equal(expected.as_bytes(), proof.as_bytes()) {
+            return false;
+        }
+        self.request_sequence = sequence;
+        true
+    }
 }
 
 /// Update the replicated projection independently of transport. Reconcile the startup snapshot
@@ -128,18 +160,22 @@ pub struct Host {
     entries: Arc<Vec<Arc<str>>>,
     message_cursor: Option<MessageCursor>,
     guests: BTreeMap<u32, GuestPeer>,
+    challenges: BTreeMap<u32, (String, Value)>,
     steering: Vec<Steer>,
     /// Local collab-directory record (user dir, record), kept current with the guest count.
     published: Option<(PathBuf, HostRecord)>,
 }
 
-/// True when `presented` (base64url, from `hello.writeToken`) matches the room's write token.
-pub fn write_grant(expected: Option<&[u8; WRITE_TOKEN_BYTES]>, presented: Option<&str>) -> bool {
-    match (
-        expected,
-        presented.and_then(|t| URL_SAFE_NO_PAD.decode(t).ok()),
-    ) {
-        (Some(expected), Some(token)) => secrets_equal(&token, expected),
+/// Validate a challenge-bound proof without disclosing the write token.
+pub fn write_grant(
+    expected: Option<&[u8; WRITE_TOKEN_BYTES]>,
+    challenge: &str,
+    presented: Option<&str>,
+) -> bool {
+    match (expected, presented) {
+        (Some(token), Some(proof)) => {
+            secrets_equal(write_proof(token, challenge).as_bytes(), proof.as_bytes())
+        }
         _ => false,
     }
 }
@@ -164,16 +200,18 @@ impl Host {
         } else {
             None
         };
+        let (room_key, host_public) = RoomKey::host(&key, &random_bytes::<32>()?)?;
         let link = format_link(
             relay_url,
             &room_id,
             &key,
+            &host_public,
             write_token.as_ref().map(|t| &t[..]),
         )?;
         let socket = Socket::connect(SocketOptions {
             ws_url: format!("{origin}/r/{room_id}"),
             role: Role::Host,
-            key: RoomKey::new(&key)?,
+            key: room_key,
         })?;
         let entries: Vec<Arc<str>> = messages
             .iter()
@@ -187,6 +225,7 @@ impl Host {
             entries: Arc::new(entries),
             message_cursor: None,
             guests: BTreeMap::new(),
+            challenges: BTreeMap::new(),
             steering: Vec::new(),
             published: None,
         })
@@ -226,6 +265,7 @@ impl Host {
                     peer, frame: msg, ..
                 } => self.on_frame(peer, &msg, &mut notes),
                 SocketEvent::Control(Control::PeerLeft(peer)) => {
+                    self.challenges.remove(&peer);
                     if let Some(guest) = self.guests.remove(&peer) {
                         self.socket.drop_peer(peer);
                         notes.push(format!("{} left the collab session", guest.name));
@@ -234,6 +274,7 @@ impl Host {
                 SocketEvent::RoomRecreated => {
                     // The relay dropped every guest with the old room; they rejoin with new peer ids.
                     self.guests.clear();
+                    self.challenges.clear();
                 }
                 SocketEvent::Closed {
                     reason,
@@ -319,8 +360,35 @@ impl Host {
 
     fn on_frame(&mut self, peer: u32, msg: &Value, notes: &mut Vec<String>) {
         match msg["t"].as_str() {
-            Some("hello") => self.admit(peer, msg, notes),
+            Some("hello") => {
+                if self.challenges.len() >= super::server::MAX_CONNECTIONS {
+                    return;
+                }
+                let Ok(bytes) = random_bytes::<32>() else {
+                    return;
+                };
+                let nonce = URL_SAFE_NO_PAD.encode(bytes);
+                self.challenges.insert(peer, (nonce.clone(), msg.clone()));
+                self.guests.remove(&peer);
+                self.socket
+                    .send(&json!({"t":"challenge","nonce":nonce}), peer);
+            }
+            Some("authenticate") => {
+                if let Some((nonce, mut hello)) = self.challenges.remove(&peer) {
+                    let writable =
+                        write_grant(self.write_token.as_ref(), &nonce, msg["proof"].as_str());
+                    hello["writable"] = json!(writable);
+                    self.admit(peer, &hello, nonce, notes);
+                }
+            }
             Some("prompt") => {
+                if !self
+                    .guests
+                    .get_mut(&peer)
+                    .is_some_and(|guest| guest.authorize(self.write_token.as_ref(), msg))
+                {
+                    return;
+                }
                 if let Some(text) = msg["text"]
                     .as_str()
                     .map(str::trim)
@@ -329,12 +397,19 @@ impl Host {
                     self.steer(peer, Steer::Prompt(text.to_owned()))
                 }
             }
-            Some("abort") => self.steer(peer, Steer::Abort),
+            Some("abort")
+                if self
+                    .guests
+                    .get_mut(&peer)
+                    .is_some_and(|guest| guest.authorize(self.write_token.as_ref(), msg)) =>
+            {
+                self.steer(peer, Steer::Abort);
+            }
             _ => {}
         }
     }
 
-    fn admit(&mut self, peer: u32, msg: &Value, notes: &mut Vec<String>) {
+    fn admit(&mut self, peer: u32, msg: &Value, challenge: String, notes: &mut Vec<String>) {
         if msg["proto"].as_u64() != Some(COLLAB_PROTO) {
             self.socket.send(
                 &frame::error(&format!("protocol mismatch: host speaks v{COLLAB_PROTO}")),
@@ -347,7 +422,7 @@ impl Host {
             .map(|n| n.trim().chars().take(NAME_MAX_CHARS).collect::<String>())
             .filter(|n| !n.is_empty())
             .unwrap_or_else(|| format!("guest-{peer}"));
-        let writable = write_grant(self.write_token.as_ref(), msg["writeToken"].as_str());
+        let writable = msg["writable"].as_bool() == Some(true);
         self.socket.send(
             &json!({
                 "t": "welcome",
@@ -376,7 +451,15 @@ impl Host {
         let note = format!("{name} joined the collab session{access}");
         self.socket.send(&frame::notice(&note), 0);
         notes.push(note);
-        self.guests.insert(peer, GuestPeer { name, writable });
+        self.guests.insert(
+            peer,
+            GuestPeer {
+                name,
+                writable,
+                challenge,
+                request_sequence: 0,
+            },
+        );
     }
 
     fn steer(&mut self, peer: u32, action: Steer) {

@@ -4,7 +4,7 @@
 <header><h1>Dial session</h1><div id="status">Connecting…</div></header><main id="transcript"></main>
 <script type="module">
 const status=document.querySelector('#status'), transcript=document.querySelector('#transcript');
-const PROTO=1003, RETRY_BASE_MS=1000, RETRY_MAX_MS=30000;
+const PROTO=1004, RETRY_BASE_MS=1000, RETRY_MAX_MS=30000;
 const b64=s=>{s=s.replace(/-/g,'+').replace(/_/g,'/');return Uint8Array.from(atob(s+'='.repeat((4-s.length%4)%4)),c=>c.charCodeAt(0))};
 function fail(message){status.textContent=message;status.className='error'}
 function setStatus(message){status.textContent=message;status.className=''}
@@ -16,8 +16,9 @@ try {
   const u=new URL(link);
   const match=u.pathname.match(/^\/r\/([A-Za-z0-9_-]+)(?:\.([A-Za-z0-9_-]+))?$/); if(!match)throw Error('Invalid collaboration link.');
   let secret=match[2]||u.hash.slice(1); if(!secret)throw Error('Link is missing its key.');
-  const secretBytes=b64(secret);if(secretBytes.length!==32&&secretBytes.length!==48)throw Error('Invalid room key.');
-  const key=await crypto.subtle.importKey('raw',secretBytes.slice(0,32),{name:'AES-GCM'},false,['encrypt','decrypt']);
+  const secretBytes=b64(secret);if(![65,81].includes(secretBytes.length)||secretBytes[0]!==4)throw Error('Authenticated v1004 link required; create a new link.');
+  const key=await crypto.subtle.importKey('raw',secretBytes.slice(1,33),{name:'AES-GCM'},false,['encrypt','decrypt']);
+  const hostKey=await crypto.subtle.importKey('raw',secretBytes.slice(33,65),{name:'Ed25519'},false,['verify']);
   const socketUrl=`${u.protocol}//${u.host}/r/${match[1]}?role=guest`;
   // Retain replay history across reconnects, but let a recreated host use a fresh epoch.
   const sequences=new Map();
@@ -64,30 +65,37 @@ try {
     window.scrollTo(0,document.body.scrollHeight);
   };
   const receive=async(data,replica)=>{
-    const bytes=new Uint8Array(data);if(bytes.length<32)throw Error('Short frame');
-    const plain=await crypto.subtle.decrypt({name:'AES-GCM',iv:bytes.slice(4,16),tagLength:128},key,bytes.slice(16));
+    const bytes=new Uint8Array(data);if(bytes.length<96)throw Error('Short signed frame');
+    if(!await crypto.subtle.verify('Ed25519',hostKey,bytes.slice(-64),bytes.slice(4,-64)))throw Error('Invalid host signature');
+    const plain=await crypto.subtle.decrypt({name:'AES-GCM',iv:bytes.slice(4,16),tagLength:128},key,bytes.slice(16,-64));
     const frame=JSON.parse(new TextDecoder().decode(plain));
     // Authenticate before touching replay state. One host epoch per connection; sequence
     // history survives reconnects so captured frames cannot restart an old snapshot.
     // transportSeq is never the entry's zero-based log seq (which resets independently).
-    // Legacy frames without transportSeq are intentionally rejected; hello advertises v1003.
+    // Legacy frames without transportSeq are intentionally rejected; hello advertises v1004.
     if(ended||!frame||frame.role!=='host'||typeof frame.epoch!=='string'||!Number.isSafeInteger(frame.transportSeq)||frame.transportSeq<=0)return;
     if(replica.epoch!==null&&frame.epoch!==replica.epoch)return;
     if(frame.transportSeq<=(sequences.get(frame.epoch)??0))return;
     if(!sequences.has(frame.epoch)&&sequences.size>=1024)sequences.delete(sequences.keys().next().value);
     sequences.set(frame.epoch,frame.transportSeq);replica.epoch=frame.epoch;
     retryMissingRoom=false;
+    if(frame.t==='challenge'){
+      // Browser viewer is always read-only, even when opened with a full link.
+      const response=await seal({t:'authenticate',proof:null,role:'guest',epoch:replica.guestEpoch,transportSeq:++replica.guestSeq});
+      if(replica.ws.readyState===WebSocket.OPEN)replica.ws.send(response);
+      return;
+    }
     apply(frame,replica);
   };
   const connect=()=>{
     // Replica state is per connection; the next welcome always supplies a complete snapshot.
-    const replica={epoch:null,staging:null,live:false,entries:[]};
-    const ws=new WebSocket(socketUrl);ws.binaryType='arraybuffer';
+    const replica={epoch:null,staging:null,live:false,entries:[],guestEpoch:randomEpoch(),guestSeq:0};
+    const ws=new WebSocket(socketUrl);ws.binaryType='arraybuffer';replica.ws=ws;
     // Decryption is asynchronous, so every frame joins one chain and is reduced in arrival order.
     let chain=Promise.resolve();
     ws.onopen=async()=>{
       try{
-        const hello=await seal({t:'hello',proto:PROTO,name:'web viewer',role:'guest',epoch:randomEpoch(),transportSeq:1});
+        const hello=await seal({t:'hello',proto:PROTO,name:'web viewer',role:'guest',epoch:replica.guestEpoch,transportSeq:++replica.guestSeq});
         if(ended||ws.readyState!==WebSocket.OPEN)return;
         setStatus('Connected · end-to-end encrypted');ws.send(hello);
       }catch(error){ended=true;fail(String(error));ws.close();}

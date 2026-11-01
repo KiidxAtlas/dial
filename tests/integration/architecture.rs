@@ -443,6 +443,8 @@ fn line_of(code: &str, offset: usize) -> usize {
 /// - bare module references such as `use crate::m;` and `use crate::m as x;` (the module is
 ///   recorded whatever follows its name, so aliases and grouped items are covered);
 /// - `crate::{…}` groups, recording each top-level item of the group (`m::…`, `m as x`, `m`);
+/// - workspace-qualified paths (`dial_llm::config::…`, including grouped imports), which
+///   carry the same module boundary as that module's facade re-export;
 /// - `self::` / `super::` chains, resolved against `module_path` (the file's own module, e.g.
 ///   `["ui", "composer"]`; empty at the crate root). A relative path that stays inside the
 ///   file's own top-level module records that module, which is never a forbidden target of
@@ -461,7 +463,10 @@ fn crate_refs(code: &str, module_path: &[String]) -> Vec<(usize, String)> {
         }
         let word = ident(code, i);
         i += word.len();
-        if !matches!(word, "crate" | "self" | "super") {
+        let external = CRATE_LAYERS
+            .iter()
+            .any(|name| name.replace('-', "_") == word);
+        if !matches!(word, "crate" | "self" | "super") && !external {
             continue;
         }
         if !code[skip_ws(code, i)..].starts_with("::") {
@@ -469,7 +474,7 @@ fn crate_refs(code: &str, module_path: &[String]) -> Vec<(usize, String)> {
         }
         // `base` is the module the path is anchored at: the crate root for `crate::`, the
         // file's module for `self::`/`super::`, which pops one level per `super`.
-        let mut base: Vec<String> = if word == "crate" {
+        let mut base: Vec<String> = if word == "crate" || external {
             Vec::new()
         } else {
             module_path.to_vec()
@@ -611,6 +616,13 @@ fn modules_respect_their_dependency_boundaries() {
                 "config::image",
             ],
         ),
+        // The Git backing service deliberately owns Git/configuration access, but not UI,
+        // agent orchestration or unrelated tool domains.
+        (
+            "git_panel",
+            &["ui", "agent", "learn", "tools", "config"],
+            &["tools::vcs", "config::types"],
+        ),
         ("llm", &["ui", "learn", "tools"], &[]),
         ("tools", &["ui", "learn", "agent"], &[]),
         ("runtime", &["ui", "learn", "agent", "tools", "llm"], &[]),
@@ -713,6 +725,23 @@ fn import_forms_are_recognised() {
 fn lookalikes_and_non_paths_are_not_dependencies() {
     let source = "// use crate::tools;\nlet s = \"crate::tools::x\";\nuse crate::toolsmith::X;\nuse my_crate::tools::Y;\nuse crate::config::tools_like;\npub(crate) mod z {}\n";
     assert!(violations_in(source, &["tools"], &[]).is_empty());
+}
+
+#[test]
+fn workspace_qualified_paths_cannot_bypass_module_rules() {
+    let source = "use dial_llm::config::types::Config;\n\
+        use dial_tools::{tools::EditMode, runtime::ToolOutput};\n\
+        use ::dial_ui::ui::composer::Composer;\n\
+        use other_crate::config::Config;\n\
+        use dial_llm::config::schema::Setting;\n";
+    assert_eq!(
+        violations_in_except(source, &["config", "tools", "ui"], &["config::schema"], &[]),
+        vec![
+            (1, "config".to_owned()),
+            (2, "tools".to_owned()),
+            (3, "ui".to_owned())
+        ],
+    );
 }
 
 #[test]

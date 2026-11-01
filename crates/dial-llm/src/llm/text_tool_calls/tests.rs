@@ -137,11 +137,14 @@ fn structured_calls_win_over_text() {
 
 #[test]
 fn fenced_call_requires_exactly_name_and_arguments() {
-    let r = applied("Sure:\n```json\n{\"name\": \"ls\", \"arguments\": {\"dir\": \".\"}}\n```\nok");
+    let r = applied("```json\n{\"name\": \"ls\", \"arguments\": {\"dir\": \".\"}}\n```");
     assert_eq!(r.tool_calls.len(), 1);
     assert_eq!(r.tool_calls[0].arguments, json!({"dir": "."}));
-    assert_eq!(r.text, "Sure:\nok");
+    assert_eq!(r.text, "");
     assert_eq!(r.finish_reason, "tool_calls");
+    let example = "Sure:\n```json\n{\"name\":\"ls\",\"arguments\":{}}\n```\nok";
+    assert!(applied(example).tool_calls.is_empty());
+    assert_eq!(applied(example).text, example);
 
     let bare = applied("```\n{\"name\": \"ls\", \"arguments\": {}}\n```");
     assert_eq!(bare.tool_calls.len(), 1);
@@ -166,8 +169,8 @@ fn fenced_call_requires_exactly_name_and_arguments() {
 fn fenced_other_languages_and_pairing() {
     let text = "```rust\nlet a = 1;\n```\n```json\n{\"name\":\"x\",\"arguments\":{}}\n```";
     let r = applied(text);
-    assert_eq!(r.tool_calls.len(), 1);
-    assert_eq!(r.text, "```rust\nlet a = 1;\n```");
+    assert!(r.tool_calls.is_empty());
+    assert_eq!(r.text, text);
     // An unclosed fence is not a call.
     assert!(
         applied("```json\n{\"name\":\"x\",\"arguments\":{}}")

@@ -39,15 +39,9 @@ pub(super) fn chunk_diff(text: &str, limit: usize) -> Vec<Range<usize>> {
             }
             let mut at = start;
             while at < end {
-                let mut stop = (at + limit).min(end);
-                while !text.is_char_boundary(stop) {
-                    stop -= 1;
-                }
+                let mut stop = text.floor_char_boundary((at + limit).min(end));
                 if stop == at {
-                    stop = at + 1;
-                    while !text.is_char_boundary(stop) {
-                        stop += 1;
-                    }
+                    stop = text.ceil_char_boundary(at + 1);
                 }
                 chunks.push(at..stop);
                 at = stop;

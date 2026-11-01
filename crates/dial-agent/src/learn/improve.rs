@@ -1002,9 +1002,8 @@ struct LoraPhase<'a> {
 }
 impl<'a> LoraPhase<'a> {
     fn start(config: &Config, store: &'a Store, phase: &str) -> Result<Self> {
-        use fs2::FileExt;
         let lock = super::auto::lock_file(&config.state_dir.join("lora-progress.lock"))?;
-        lock.try_lock_exclusive()?;
+        lock.try_lock().map_err(std::io::Error::from)?;
         store.set_meta("lora_phase", phase)?;
         Ok(Self { store, _lock: lock })
     }
@@ -1014,7 +1013,7 @@ impl Drop for LoraPhase<'_> {
         let _ = self.store.set_meta("lora_phase", "idle");
         // Concurrent process spawning can briefly duplicate this descriptor. End the live
         // phase explicitly so those copies cannot keep a finished job looking active.
-        let _ = fs2::FileExt::unlock(&self._lock);
+        let _ = std::fs::File::unlock(&self._lock);
     }
 }
 
@@ -1037,14 +1036,14 @@ pub fn lora_phase(config: &Config, store: &Store) -> Option<String> {
 }
 
 fn lora_phase_from_lock(lock: &std::fs::File, store: &Store) -> Option<String> {
-    match fs2::FileExt::try_lock_shared(lock) {
+    match std::fs::File::try_lock_shared(lock).map_err(std::io::Error::from) {
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
             store.get_meta("lora_phase").ok().flatten()
         }
         Ok(()) => {
             // A concurrent spawn can duplicate the open descriptor. Releasing the probe explicitly
             // prevents that child from retaining a shared lock after this status read returns.
-            let _ = fs2::FileExt::unlock(lock);
+            let _ = std::fs::File::unlock(lock);
             None
         }
         Err(_) => None,
@@ -1946,7 +1945,10 @@ fn record_monitor(store: &Store, version: i64, parent: i64, status: Value) -> Re
 /// cycle holds the control lock (that cycle runs the monitor itself) or self-improvement is paused.
 pub fn monitor_now(store: &Store, config: &Config) -> Result<Option<String>> {
     let control = super::auto::lock_file(&config.state_dir.join("control.lock"))?;
-    if fs2::FileExt::try_lock_exclusive(&control).is_err() || !super::auto::enabled(config, store)?
+    if std::fs::File::try_lock(&control)
+        .map_err(std::io::Error::from)
+        .is_err()
+        || !super::auto::enabled(config, store)?
     {
         return Ok(None);
     }

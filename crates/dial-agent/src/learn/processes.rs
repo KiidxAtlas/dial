@@ -130,11 +130,14 @@ fn read() -> Result<Vec<Process>> {
             TH32CS_SNAPPROCESS,
         },
     };
-    static SAMPLES: LazyLock<Mutex<HashMap<(i32, u64), (u64, Instant)>>> =
-        LazyLock::new(|| Mutex::new(HashMap::new()));
+    // (PID, creation ticks) identifies a process across PID reuse; values retain its CPU sample.
+    type CpuSamples = HashMap<(i32, u64), (u64, Instant)>;
+    static SAMPLES: LazyLock<Mutex<CpuSamples>> = LazyLock::new(|| Mutex::new(HashMap::new()));
     let owner = native::current_user()?;
     let mut samples = SAMPLES.lock().unwrap_or_else(|poison| poison.into_inner());
     let scan_started = Instant::now();
+    // SAFETY: scalar arguments request an independent snapshot handle; failure is checked before
+    // the handle is transferred to Snapshot, whose Drop closes it exactly once.
     let raw = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     ensure!(
         raw != INVALID_HANDLE_VALUE,
@@ -144,6 +147,7 @@ fn read() -> Result<Vec<Process>> {
     struct Snapshot(windows_sys::Win32::Foundation::HANDLE);
     impl Drop for Snapshot {
         fn drop(&mut self) {
+            // SAFETY: Snapshot owns a successful CreateToolhelp32Snapshot handle exclusively.
             unsafe {
                 CloseHandle(self.0);
             }
@@ -155,6 +159,7 @@ fn read() -> Result<Vec<Process>> {
         ..Default::default()
     };
     ensure!(
+        // SAFETY: the snapshot is live and `entry` is writable with the required dwSize initialized.
         unsafe { Process32FirstW(snapshot.0, &mut entry) } != 0,
         "enumerating live processes: {}",
         std::io::Error::last_os_error()
@@ -162,24 +167,22 @@ fn read() -> Result<Vec<Process>> {
     let mut out = Vec::new();
     loop {
         let pid = entry.th32ProcessID as i32;
-        if let Ok(handle) = native::NativeProcess::open(entry.th32ProcessID, false) {
-            if handle.owned_by(&owner).unwrap_or(false) {
-                if let Ok((mut process, cpu_ticks, born)) =
-                    handle.inspect(pid, entry.th32ParentProcessID as i32)
-                {
-                    let now = Instant::now();
-                    if let Some((previous, at)) = samples.insert((pid, born), (cpu_ticks, now)) {
-                        let elapsed = now.duration_since(at).as_secs_f64();
-                        if elapsed > 0.0 && cpu_ticks >= previous {
-                            process.cpu =
-                                Some((cpu_ticks - previous) as f64 / (elapsed * 100_000.0));
-                        }
-                    }
-                    process.id = ProcId::of(pid);
-                    out.push(process);
+        if let Ok(handle) = native::NativeProcess::open(entry.th32ProcessID, false)
+            && handle.owned_by(&owner).unwrap_or(false)
+            && let Ok((mut process, cpu_ticks, born)) =
+                handle.inspect(pid, entry.th32ParentProcessID as i32)
+        {
+            let now = Instant::now();
+            if let Some((previous, at)) = samples.insert((pid, born), (cpu_ticks, now)) {
+                let elapsed = now.duration_since(at).as_secs_f64();
+                if elapsed > 0.0 && cpu_ticks >= previous {
+                    process.cpu = Some((cpu_ticks - previous) as f64 / (elapsed * 100_000.0));
                 }
             }
+            process.id = ProcId::of(pid);
+            out.push(process);
         }
+        // SAFETY: the same live snapshot and initialized writable entry are retained for the scan.
         if unsafe { Process32NextW(snapshot.0, &mut entry) } == 0 {
             break;
         }
@@ -292,8 +295,11 @@ fn inventory(user: &Path, all: &[Process]) -> Vec<Value> {
 fn footprint(pid: i32) -> Option<u64> {
     // RSS misses compressed and Metal-backed allocations. Use Darwin's process footprint.
     let mut usage = std::mem::MaybeUninit::<libc::rusage_info_v2>::zeroed();
+    // SAFETY: the flavor is RUSAGE_INFO_V2 and `usage` has that flavor's exact writable layout.
+    // Its zeroed integer/array fields are valid even if the syscall fails.
     let result =
         unsafe { libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V2, usage.as_mut_ptr().cast()) };
+    // SAFETY: a successful call initialized the v2 output; zeroed storage was already valid.
     (result == 0).then(|| unsafe { usage.assume_init().ri_phys_footprint })
 }
 #[cfg(not(target_os = "macos"))]

@@ -25,6 +25,8 @@ use windows_sys::{
 fn reject_reparse(file: &File) -> io::Result<()> {
     let mut info = FILE_ATTRIBUTE_TAG_INFO::default();
     // The query checks the opened object, not a path that another process can swap.
+    // SAFETY: file owns the queried handle; info is writable storage with the exact
+    // FILE_ATTRIBUTE_TAG_INFO size required by FileAttributeTagInfo.
     if unsafe {
         GetFileInformationByHandleEx(
             file.as_raw_handle() as HANDLE,
@@ -133,6 +135,9 @@ pub(in crate::platform) fn open_beneath(
         let mut status = IO_STATUS_BLOCK::default();
         let is_dir = index + 1 != parts.len() || directory;
         // FILE_OPEN (1), FILE_SYNCHRONOUS_IO_NONALERT (0x20), FILE_OPEN_REPARSE_POINT (0x200000).
+        // SAFETY: current keeps RootDirectory live; attrs/text/wide remain live and the
+        // counted UTF-16 length fits u16. handle/status are distinct writable outputs;
+        // synchronous IO uses no asynchronous callback or borrowed buffer after return.
         let result = unsafe {
             NtCreateFile(
                 &mut handle,
@@ -149,11 +154,12 @@ pub(in crate::platform) fn open_beneath(
             )
         };
         if result < 0 {
+            // SAFETY: RtlNtStatusToDosError accepts the scalar NTSTATUS returned above.
             return Err(io::Error::from_raw_os_error(unsafe {
                 windows_sys::Win32::Foundation::RtlNtStatusToDosError(result)
             } as i32));
         }
-        // NtCreateFile transferred one owned handle on success.
+        // SAFETY: successful NtCreateFile transferred one fresh owned handle to this scope.
         let next = unsafe { File::from_raw_handle(handle.cast()) };
         reject_reparse(&next)?;
         current = next;
@@ -211,6 +217,9 @@ fn relative_name(
         let mut handle = ptr::null_mut();
         let mut status = IO_STATUS_BLOCK::default();
         let last = index + 1 == parts.len();
+        // SAFETY: current pins RootDirectory, attrs/text/wide retain the validated counted
+        // name, and handle/status are writable outputs. Synchronous non-alert IO finishes
+        // before these local buffers can be dropped; no allocation or EA buffer is supplied.
         let result = unsafe {
             NtCreateFile(
                 &mut handle,
@@ -227,10 +236,12 @@ fn relative_name(
             )
         };
         if result < 0 {
+            // SAFETY: RtlNtStatusToDosError takes only the scalar NTSTATUS result.
             return Err(io::Error::from_raw_os_error(unsafe {
                 windows_sys::Win32::Foundation::RtlNtStatusToDosError(result)
             } as i32));
         }
+        // SAFETY: successful NtCreateFile produced this new handle, adopted exactly once.
         let next = unsafe { File::from_raw_handle(handle.cast()) };
         reject_reparse(&next)?;
         current = next;
@@ -290,6 +301,9 @@ pub(in crate::platform) fn create_new_beneath(
     let mut handle = ptr::null_mut();
     let mut status = IO_STATUS_BLOCK::default();
     let access = FILE_GENERIC_READ | FILE_GENERIC_WRITE | if owner_only { WRITE_DAC } else { 0 };
+    // SAFETY: root, counted wide name and optional security descriptor all remain live;
+    // handle/status are writable, the name's byte length fits u16, and synchronous creation
+    // retains no Rust pointers. FILE_CREATE returns a new handle only on success.
     let result = unsafe {
         NtCreateFile(
             &mut handle,
@@ -306,10 +320,12 @@ pub(in crate::platform) fn create_new_beneath(
         )
     };
     if result < 0 {
+        // SAFETY: RtlNtStatusToDosError accepts the scalar NTSTATUS result.
         return Err(io::Error::from_raw_os_error(unsafe {
             windows_sys::Win32::Foundation::RtlNtStatusToDosError(result)
         } as i32));
     }
+    // SAFETY: successful NtCreateFile returned a fresh handle, uniquely adopted here.
     let file = unsafe { File::from_raw_handle(handle.cast()) };
     reject_reparse(&file)?;
     if owner_only {
@@ -425,6 +441,9 @@ fn set_name(
         }
     }
     let mut status = IO_STATUS_BLOCK::default();
+    // SAFETY: file and root stay open; buffer encodes the class-specific disposition byte
+    // or counted rename/link name and live root handle. Its supplied length covers all bytes,
+    // status is writable, and this synchronous call retains no buffer references.
     let result = unsafe {
         windows_sys::Wdk::Storage::FileSystem::NtSetInformationFile(
             file.as_raw_handle() as HANDLE,
@@ -435,6 +454,7 @@ fn set_name(
         )
     };
     if result < 0 {
+        // SAFETY: RtlNtStatusToDosError takes the scalar NTSTATUS result only.
         return Err(io::Error::from_raw_os_error(unsafe {
             windows_sys::Win32::Foundation::RtlNtStatusToDosError(result)
         } as i32));
@@ -513,6 +533,8 @@ pub(in crate::platform) fn remove_beneath(root: &File, relative: &Path) -> io::R
     };
     let mut handle = ptr::null_mut();
     let mut status = IO_STATUS_BLOCK::default();
+    // SAFETY: root, attrs/text and the validated counted UTF-16 name remain live; handle
+    // and status are writable outputs. Synchronous open retains none of these local pointers.
     let result = unsafe {
         NtCreateFile(
             &mut handle,
@@ -529,10 +551,12 @@ pub(in crate::platform) fn remove_beneath(root: &File, relative: &Path) -> io::R
         )
     };
     if result < 0 {
+        // SAFETY: RtlNtStatusToDosError accepts the scalar NTSTATUS result only.
         return Err(io::Error::from_raw_os_error(unsafe {
             windows_sys::Win32::Foundation::RtlNtStatusToDosError(result)
         } as i32));
     }
+    // SAFETY: NtCreateFile succeeded, yielding one fresh owned handle adopted here.
     let file = unsafe { File::from_raw_handle(handle.cast()) };
     set_name(&file, root, relative, 13, true, false)
 }
@@ -553,6 +577,9 @@ pub(in crate::platform) fn read_dir_beneath(root: &File) -> io::Result<Vec<std::
     let mut restart = true;
     loop {
         let mut status = IO_STATUS_BLOCK::default();
+        // SAFETY: root stays open and storage is a writable, usize-aligned allocation of
+        // the supplied byte capacity. status is writable and synchronous enumeration with
+        // no APC returns before either buffer is read or dropped.
         let result = unsafe {
             windows_sys::Wdk::Storage::FileSystem::NtQueryDirectoryFile(
                 root.as_raw_handle() as HANDLE,
@@ -573,18 +600,23 @@ pub(in crate::platform) fn read_dir_beneath(root: &File) -> io::Result<Vec<std::
             break;
         }
         if result < 0 {
+            // SAFETY: RtlNtStatusToDosError accepts the scalar NTSTATUS result only.
             return Err(io::Error::from_raw_os_error(unsafe {
                 windows_sys::Win32::Foundation::RtlNtStatusToDosError(result)
             } as i32));
         }
         let bytes = storage.as_ptr().cast::<u8>();
+        // SAFETY: storage is initialized and has at least 64 bytes; its usize alignment
+        // also aligns the u32 FileNameLength field at byte 60 of FILE_DIRECTORY_INFORMATION.
         let length = unsafe { *(bytes.add(60).cast::<u32>()) } as usize;
-        if length % 2 != 0 || length > storage.len() * mem::size_of::<usize>() - 64 {
+        if !length.is_multiple_of(2) || length > storage.len() * mem::size_of::<usize>() - 64 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid directory entry returned by Windows",
             ));
         }
+        // SAFETY: the even filename byte length was bounded against storage above; byte
+        // 64 is u16-aligned within the live initialized allocation, copied before reuse.
         let name = unsafe { std::slice::from_raw_parts(bytes.add(64).cast::<u16>(), length / 2) };
         if name != [b'.' as u16] && name != [b'.' as u16, b'.' as u16] {
             entries.push(std::ffi::OsString::from_wide(name));
@@ -597,6 +629,8 @@ struct Allocation(*mut std::ffi::c_void);
 impl Drop for Allocation {
     fn drop(&mut self) {
         if !self.0.is_null() {
+            // SAFETY: Allocation uniquely owns a Windows LocalAlloc-family result from
+            // GetSecurityInfo or a SID/SD conversion, all documented to use LocalFree.
             unsafe {
                 LocalFree(self.0);
             }
@@ -605,11 +639,16 @@ impl Drop for Allocation {
 }
 fn token_information(class: TOKEN_INFORMATION_CLASS) -> io::Result<Vec<usize>> {
     let mut token = ptr::null_mut();
+    // SAFETY: GetCurrentProcess yields a valid pseudo handle; token is writable output
+    // storage for a new query handle, checked for API success before being adopted.
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: successful OpenProcessToken transferred one fresh owned token handle.
     let token = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(token.cast()) };
     let mut length = 0;
+    // SAFETY: the owned token remains live; a null zero-length buffer requests only the
+    // required size, written to length, without accessing any token-information buffer.
     unsafe {
         GetTokenInformation(
             token.as_raw_handle() as HANDLE,
@@ -623,6 +662,8 @@ fn token_information(class: TOKEN_INFORMATION_CLASS) -> io::Result<Vec<usize>> {
         return Err(io::Error::last_os_error());
     }
     let mut bytes = vec![0usize; (length as usize).div_ceil(mem::size_of::<usize>())];
+    // SAFETY: bytes is usize-aligned storage rounded up to at least length bytes; token
+    // and both outputs remain live. The API fails rather than overrunning a short buffer.
     if unsafe {
         GetTokenInformation(
             token.as_raw_handle() as HANDLE,
@@ -641,9 +682,13 @@ fn current_user() -> io::Result<Vec<usize>> {
     token_information(TokenUser)
 }
 fn user_sid(bytes: &[usize]) -> PSID {
+    // SAFETY: callers pass the successful TokenUser result from current_user; its heap
+    // allocation is aligned for TOKEN_USER and retains both the structure and pointed-to SID.
     unsafe { (*(bytes.as_ptr().cast::<TOKEN_USER>())).User.Sid }
 }
 fn default_owner_sid(bytes: &[usize]) -> PSID {
+    // SAFETY: the sole caller passes the successful TokenOwner buffer, aligned for
+    // TOKEN_OWNER and retaining its inline SID allocation for the pointer's lifetime.
     unsafe { (*(bytes.as_ptr().cast::<TOKEN_OWNER>())).Owner }
 }
 /// Windows gives each new object the token's default owner: the user SID, or BUILTIN\Administrators
@@ -651,16 +696,22 @@ fn default_owner_sid(bytes: &[usize]) -> PSID {
 /// owner is foreign.
 fn owned_by_token(owner: PSID) -> io::Result<bool> {
     let user = current_user()?;
+    // SAFETY: owner comes from a live security descriptor; user retains the TokenUser SID
+    // allocation, and EqualSid only reads these two valid SIDs during the call.
     if unsafe { EqualSid(owner, user_sid(&user)) } != 0 {
         return Ok(true);
     }
     let default = token_information(TokenOwner)?;
+    // SAFETY: owner remains in the caller's live security descriptor and default retains
+    // the TokenOwner buffer containing the other SID for the entire comparison.
     Ok(unsafe { EqualSid(owner, default_owner_sid(&default)) } != 0)
 }
 fn security(file: &File) -> io::Result<(Allocation, PSID, *mut ACL)> {
     let mut owner = ptr::null_mut();
     let mut acl = ptr::null_mut();
     let mut descriptor = ptr::null_mut();
+    // SAFETY: file owns the live handle and all requested outputs are writable pointer
+    // slots. On success the returned owner/ACL are backed by descriptor, owned by Allocation.
     let status = unsafe {
         GetSecurityInfo(
             file.as_raw_handle() as HANDLE,
@@ -692,7 +743,11 @@ pub(in crate::platform) fn path_owned_by_system(path: &Path) -> io::Result<bool>
     Ok(!owner.is_null()
         && [WinLocalSystemSid, WinBuiltinAdministratorsSid]
             .into_iter()
-            .any(|kind| unsafe { IsWellKnownSid(owner, kind) } != 0))
+            .any(|kind| {
+                // SAFETY: _sd retains the security descriptor backing the non-null owner
+                // SID; kind is one of the supported WELL_KNOWN_SID_TYPE values above.
+                (unsafe { IsWellKnownSid(owner, kind) }) != 0
+            }))
 }
 pub(in crate::platform) fn is_owner_only(file: &File) -> io::Result<bool> {
     let (_sd, owner, acl) = security(file)?;
@@ -703,16 +758,23 @@ pub(in crate::platform) fn is_owner_only(file: &File) -> io::Result<bool> {
     if owner.is_null() || acl.is_null() || !owned_by_token(owner)? {
         return Ok(false);
     }
+    // SAFETY: security returned a valid ACL backed by live _sd and the null case was rejected.
     for index in 0..unsafe { (*acl).AceCount } as u32 {
         let mut raw = ptr::null_mut();
+        // SAFETY: acl remains in live _sd; index is below its AceCount and raw is writable.
         if unsafe { GetAce(acl, index, &mut raw) } == 0 {
             return Err(io::Error::last_os_error());
         }
+        // SAFETY: successful GetAce returned an aligned ACE within the valid retained ACL.
         let header = unsafe { &*raw.cast::<ACE_HEADER>() };
         match header.AceType {
             0 => {
+                // SAFETY: AceType 0 identifies ACCESS_ALLOWED_ACE; Windows supplies its
+                // fixed header/mask/SidStart followed by the variable-length valid SID.
                 let ace = unsafe { &*raw.cast::<ACCESS_ALLOWED_ACE>() };
                 let principal = (&ace.SidStart as *const u32).cast_mut().cast();
+                // SAFETY: principal points to this allow ACE's inline SID; token retains sid,
+                // and _sd retains the ACE throughout the read-only comparison.
                 if unsafe { EqualSid(principal, sid) } == 0 {
                     return Ok(false);
                 }
@@ -727,20 +789,28 @@ fn private_security_descriptor() -> io::Result<Allocation> {
     let token = current_user()?;
     let sid = user_sid(&token);
     let mut text = ptr::null_mut();
+    // SAFETY: token retains the valid TokenUser SID; text is writable output for a new
+    // LocalAlloc-owned NUL-terminated UTF-16 SID string on success.
     if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
         return Err(io::Error::last_os_error());
     }
     let _text_owner = Allocation(text.cast());
     let mut length = 0;
+    // SAFETY: successful conversion returned a NUL-terminated UTF-16 string retained by
+    // _text_owner; the loop stops at its terminator without stepping beyond the allocation.
     while unsafe { *text.add(length) } != 0 {
         length += 1;
     }
+    // SAFETY: the preceding scan bounded length to the returned live UTF-16 string;
+    // _text_owner still owns its aligned allocation and conversion copies these units.
     let sid_text = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, length) });
     let sddl: Vec<u16> = format!("D:P(A;OICI;FA;;;{sid_text})")
         .encode_utf16()
         .chain(Some(0))
         .collect();
     let mut descriptor = ptr::null_mut();
+    // SAFETY: sddl is a live NUL-terminated UTF-16 buffer, revision 1 is supported, and
+    // descriptor is writable output for a LocalAlloc-owned security descriptor on success.
     if unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
             sddl.as_ptr(),
@@ -759,11 +829,15 @@ fn install_private_acl(file: &File) -> io::Result<()> {
     let mut present = 0;
     let mut defaulted = 0;
     let mut acl = ptr::null_mut();
+    // SAFETY: _owner retains the valid converted security descriptor and all three output
+    // pointers refer to writable slots. Its returned ACL remains backed by _owner.
     if unsafe { GetSecurityDescriptorDacl(_owner.0, &mut present, &mut acl, &mut defaulted) } == 0
         || present == 0
     {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: file keeps the target handle live and _owner retains the ACL returned above;
+    // unused SID/SACL inputs are null and SetSecurityInfo copies the DACL synchronously.
     let result = unsafe {
         SetSecurityInfo(
             file.as_raw_handle() as HANDLE,
@@ -815,6 +889,7 @@ pub(in crate::platform) fn set_owner_only(path: &Path) -> io::Result<()> {
 }
 fn file_info(file: &File) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: file keeps the handle live and info is correctly sized writable output storage.
     if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) } == 0 {
         return Err(io::Error::last_os_error());
     }
@@ -823,6 +898,8 @@ fn file_info(file: &File) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
 /// Beyond any journal's data, and non-negative as NtLockFile's signed offset requires.
 const JOURNAL_LOCK_OFFSET: u64 = i64::MAX as u64 - 1;
 pub(in crate::platform) fn try_lock_journal(file: &File, exclusive: bool) -> io::Result<()> {
+    // SAFETY: OVERLAPPED contains scalar/pointer fields whose zero values are valid;
+    // offsets are set below and the event stays null for this synchronous file handle.
     let mut overlapped: windows_sys::Win32::System::IO::OVERLAPPED = unsafe { mem::zeroed() };
     overlapped.Anonymous.Anonymous.Offset = JOURNAL_LOCK_OFFSET as u32;
     overlapped.Anonymous.Anonymous.OffsetHigh = (JOURNAL_LOCK_OFFSET >> 32) as u32;
@@ -832,6 +909,8 @@ pub(in crate::platform) fn try_lock_journal(file: &File, exclusive: bool) -> io:
         } else {
             0
         };
+    // SAFETY: file owns the handle; overlapped stays writable for the synchronous lock
+    // call and supplies a valid nonnegative byte offset. One byte is locked, not read/written.
     if unsafe {
         LockFileEx(
             file.as_raw_handle() as HANDLE,

@@ -37,23 +37,11 @@ fn endpoint(route: &Route<'_>) -> Result<(String, String)> {
     super::provider::endpoint_url(route.base_url, route.allow_insecure)?;
     let uri: ureq::http::Uri = route.base_url.parse().context("invalid Bedrock endpoint")?;
     let host = uri.host().context("Bedrock endpoint has no host")?;
-    let region = host
-        .split('.')
-        .find(|part| {
-            part.starts_with("us-")
-                || part.starts_with("eu-")
-                || part.starts_with("ap-")
-                || part.starts_with("ca-")
-                || part.starts_with("sa-")
-                || part.starts_with("me-")
-                || part.starts_with("af-")
-                || part.starts_with("il-")
-                || part.starts_with("mx-")
-        })
+    let region = endpoint_region(host)
         .map(str::to_owned)
-        .or_else(|| std::env::var("AWS_REGION").ok())
-        .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
-        .context("Bedrock region must be in endpoint hostname or AWS_REGION")?;
+        .or_else(|| std::env::var("AWS_REGION").ok().filter(|value| !value.trim().is_empty()))
+        .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok().filter(|value| !value.trim().is_empty()))
+        .context("Bedrock region must be in an AWS endpoint hostname or AWS_REGION (required for gateways)")?;
     Ok((
         format!(
             "{}/model/{}/converse-stream",
@@ -63,6 +51,29 @@ fn endpoint(route: &Route<'_>) -> Result<(String, String)> {
         region,
     ))
 }
+// Infer only from AWS service names. A gateway's region-looking DNS label says nothing about
+// its upstream signing region; the operator must supply AWS_REGION in that case.
+fn endpoint_region(host: &str) -> Option<&str> {
+    let labels: Vec<_> = host.split('.').collect();
+    let aws = host.ends_with(".amazonaws.com")
+        || host.ends_with(".amazonaws.com.cn")
+        || host.ends_with(".api.aws");
+    if !aws {
+        return None;
+    }
+    labels.windows(2).find_map(|pair| {
+        matches!(pair[0], "bedrock-runtime" | "bedrock-runtime-fips")
+            .then_some(pair[1])
+            .filter(|region| {
+                region.rsplit_once('-').is_some_and(|(prefix, number)| {
+                    prefix.contains('-')
+                        && !number.is_empty()
+                        && number.bytes().all(|b| b.is_ascii_digit())
+                })
+            })
+    })
+}
+
 fn scope(route: &Route<'_>, credentials: Option<&Credentials>) -> String {
     let identity = route
         .account_id

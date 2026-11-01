@@ -35,11 +35,10 @@ fn clipped(text: &str, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
         return text.to_owned();
     }
-    let mut end = max_bytes.saturating_sub(3).min(text.len());
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}...", &text[..end])
+    format!(
+        "{}...",
+        crate::agent::base::helpers::byte_prefix(text, max_bytes.saturating_sub(3))
+    )
 }
 
 fn add_bounded(packet: &mut Value, field: &str, value: Value, max_bytes: usize) -> bool {

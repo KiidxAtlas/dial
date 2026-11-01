@@ -142,8 +142,11 @@ impl Store {
         let conn =
             Connection::open(&path).with_context(|| format!("opening {}", path.display()))?;
         conn.busy_timeout(Duration::from_secs(10))?;
-        conn.execute_batch(
-            "PRAGMA foreign_keys=ON;
+        super::sqlite::check_version(&conn, 1)?;
+        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        super::sqlite::migrate(
+            &conn,
+            &["
              CREATE TABLE IF NOT EXISTS retention_runs(
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  applied_at_ms INTEGER NOT NULL,
@@ -155,7 +158,7 @@ impl Store {
                  archived_at_ms INTEGER NOT NULL,
                  cwd TEXT NOT NULL,
                  reason TEXT NOT NULL,
-                 run_id INTEGER REFERENCES retention_runs(id));",
+                 run_id INTEGER REFERENCES retention_runs(id));"],
         )?;
         Ok(Self { conn })
     }

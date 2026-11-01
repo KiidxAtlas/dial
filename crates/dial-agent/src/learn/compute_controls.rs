@@ -5,7 +5,6 @@ use crate::config::types::Config;
 use crate::platform::process_record;
 use crate::storage::store::Store;
 use anyhow::{Context, Result, ensure};
-use fs2::FileExt;
 use serde_json::{Value, json};
 #[cfg(unix)]
 use std::process::{Command, Stdio};
@@ -16,9 +15,9 @@ use std::{
 
 pub fn snapshot(user: &Path) -> Result<Value> {
     let lock = super::auto::lock_file(&user.join("compute.lock"))?;
-    let busy = match lock.try_lock_exclusive() {
+    let busy = match lock.try_lock().map_err(std::io::Error::from) {
         Ok(()) => {
-            FileExt::unlock(&lock)?;
+            std::fs::File::unlock(&lock)?;
             false
         }
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => true,
@@ -129,9 +128,9 @@ pub fn action(user: &Path, state: Option<&str>, action: &str) -> Result<String> 
         settings_store::write_private(&state.join("improvement.stop"), b"stop")?;
         // Disable future scheduling, but retain sessions, checkpoints and admitted adapters.
         let lock = super::auto::lock_file(&state.join("control.lock"))?;
-        match lock.try_lock_exclusive() {
+        match lock.try_lock().map_err(std::io::Error::from) {
             Ok(()) => {
-                FileExt::unlock(&lock)?;
+                std::fs::File::unlock(&lock)?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 stop_legacy(user, state.to_str().context("invalid state path")?)?;
@@ -182,7 +181,7 @@ pub fn action(user: &Path, state: Option<&str>, action: &str) -> Result<String> 
 pub fn stop_legacy(user: &Path, state: &str) -> Result<String> {
     let state = state_path(user, state)?;
     let lock = super::auto::lock_file(&state.join("control.lock"))?;
-    match lock.try_lock_exclusive() {
+    match lock.try_lock().map_err(std::io::Error::from) {
         Ok(()) => anyhow::bail!("job is no longer running"),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
         Err(error) => return Err(error.into()),
@@ -248,6 +247,8 @@ pub fn stop_legacy(user: &Path, state: &str) -> Result<String> {
     let mut descendants = Vec::new();
     children(pid, 0, &mut descendants);
     for child in descendants {
+        // SAFETY: these libc functions take only scalar PIDs/signals, no borrowed memory. The
+        // selected descendants are signalled individually unless they lead their own group.
         unsafe {
             if libc::getpgid(child) == child {
                 libc::killpg(child, libc::SIGTERM);
@@ -267,7 +268,7 @@ pub fn stop_legacy(user: &Path, state: &str) -> Result<String> {
 pub fn stop_legacy(user: &Path, state: &str) -> Result<String> {
     let state = state_path(user, state)?;
     let lock = super::auto::lock_file(&state.join("control.lock"))?;
-    match lock.try_lock_exclusive() {
+    match lock.try_lock().map_err(std::io::Error::from) {
         Ok(()) => anyhow::bail!("job is no longer running"),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
         Err(error) => return Err(error.into()),

@@ -38,7 +38,6 @@ thiserror = "2"
 unicode-normalization = "0.1"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
-fs2 = "0.4"
 rand = "0.9"
 libc = "0.2"
 socket2 = { version = "0.6", features = ["all"] }
@@ -56,6 +55,7 @@ safetensors = "0.8"
 half = "2"
 sha1 = "0.10"
 ring = "0.17"
+zeroize = "1"
 # The SDK default HTTPS client would pull aws-lc-rs (a C build); its HTTP client is built on ring instead.
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "credentials-process", "sso"] }
 aws-credential-types = "1"
@@ -137,6 +137,7 @@ dbg_macro = "deny"
 todo = "deny"
 unimplemented = "deny"
 rc_mutex = "deny"
+undocumented_unsafe_blocks = "deny"
 
 [lints]
 workspace = true
@@ -180,7 +181,6 @@ anyhow.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 crossterm.workspace = true
-fs2.workspace = true
 serde.workspace = true
 ureq.workspace = true
 base64.workspace = true

@@ -84,8 +84,6 @@ pub struct RecapQuery {
 }
 
 const SCHEMA: &str = "
-PRAGMA journal_mode=WAL;
-PRAGMA synchronous=NORMAL;
 CREATE TABLE IF NOT EXISTS history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     prompt TEXT NOT NULL UNIQUE,
@@ -198,7 +196,9 @@ impl PromptHistory {
         platform_fs::set_owner_only(path)?;
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         conn.busy_timeout(Duration::from_secs(5))?;
-        conn.execute_batch(SCHEMA)
+        super::sqlite::check_version(&conn, 1)?;
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+        super::sqlite::migrate(&conn, &[SCHEMA])
             .context("creating the prompt history schema (SQLite without FTS5?)")?;
         Ok(Self { conn })
     }

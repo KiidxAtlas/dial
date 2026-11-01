@@ -95,7 +95,12 @@ pub(super) fn apply_from_reasoning(reply: &mut Reply) {
 pub(super) fn extract(text: &str) -> Option<(String, Vec<ToolCall>)> {
     let (segments, calls) = extract_markup(text);
     let (segments, calls) = if calls.is_empty() {
-        extract_fenced(text)
+        let (segments, calls) = extract_fenced(text);
+        // An example embedded in prose is data, not an executable request.
+        if segments.iter().any(|segment| !segment.trim().is_empty()) {
+            return None;
+        }
+        (segments, calls)
     } else {
         (segments, calls)
     };

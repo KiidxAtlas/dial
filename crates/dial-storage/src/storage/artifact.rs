@@ -8,7 +8,6 @@ pub use evidence::StoredEvidence;
 
 use crate::runtime::tool_output::ToolOutput;
 use anyhow::{Context, Result, ensure};
-use fs2::FileExt;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -102,7 +101,7 @@ impl ArtifactStore {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         let file = crate::platform::fs::open_owner_only(&options, &path)?;
-        FileExt::lock_exclusive(&file)?;
+        std::fs::File::lock(&file)?;
         Ok(ArtifactSpool {
             root: self.root.clone(),
             limits: self.limits.clone(),
@@ -399,7 +398,7 @@ impl TailRing {
         let mut options = OpenOptions::new();
         options.read(true).write(true).create_new(true);
         let file = crate::platform::fs::open_owner_only(&options, &path)?;
-        FileExt::lock_exclusive(&file)?;
+        std::fs::File::lock(&file)?;
         Ok(Self {
             path,
             file,

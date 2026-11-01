@@ -187,6 +187,7 @@ fn group_leaders(parent: u32) -> Vec<u32> {
 
 /// Leaders among `ps -o pid=,ppid=,pgid=` rows: processes whose parent is `parent` and that lead
 /// their own process group.
+#[cfg(unix)]
 pub(crate) fn parse_leaders(ps: &str, parent: u32) -> Vec<u32> {
     ps.lines()
         .filter_map(|line| {

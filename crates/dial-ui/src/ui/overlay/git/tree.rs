@@ -227,13 +227,7 @@ impl GitOverlay {
     fn open_cursor(&mut self, delta: isize) {
         self.hunk = if delta < 0 { usize::MAX } else { 0 };
         self.load_shown();
-        let target = if delta < 0 {
-            self.hunk_rows().last()
-        } else {
-            self.hunk_rows().next()
-        };
-        self.cursor_row = target.unwrap_or(0);
-        self.sync_hunk();
+        self.reads.landing = Some(delta < 0);
     }
 }
 

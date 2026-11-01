@@ -295,6 +295,8 @@ fn start(tool: &Background, ws: &Workspace, name: &str, command: &str) -> ToolOu
 }
 
 fn alive(pid: i32) -> bool {
+    // SAFETY: signal zero is an existence query with scalar arguments; it cannot
+    // deliver a signal even if this fixture's PID has already disappeared.
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
@@ -1225,6 +1227,8 @@ fn escaped_writer_is_drained_bounded_and_kill_yields_one_incomplete_artifact() {
     assert!(text.contains("escaped ") && text.contains("kept"), "{text}");
 
     // Reap the fixture explicitly; it is not in any group Dial can signal.
+    // SAFETY: kill takes only scalar arguments; child is the positive PID reported
+    // by our escaped-writer fixture, which intentionally remains alive until cleanup.
     unsafe {
         libc::kill(child, libc::SIGKILL);
     }

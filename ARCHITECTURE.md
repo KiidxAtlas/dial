@@ -112,10 +112,12 @@ Enforced by `tests/integration/architecture.rs`.
   `workspace_crates_and_layer_registry_agree` additionally rejects missing, duplicate or unregistered
   crates and crates not selected by `workspace.members`.
 - **Module rules.** `modules_respect_their_dependency_boundaries` scans the production code (test
-  modules exempt) of every `crates/*/src` root and rejects `crate::<module>` paths that cross these
-  rules, by module name:
+  modules exempt) of every `crates/*/src` root and rejects `crate::<module>`, relative and
+  workspace-crate-qualified paths that cross these rules, by module name:
   - `ui` does not use `learn`, `tools` or `config`, except `config::schema`, `config::settings_store`,
-    `config::paths` and `config::laya`.
+    `config::paths`, `config::laya` and `config::image`.
+  - `git_panel`, the UI's Git backing service, does not use `ui`, `agent` or `learn`; its
+    configuration/tool access is limited to `config::types` and `tools::vcs`.
   - `llm` does not use `ui`, `learn` or `tools`.
   - `tools` does not use `ui`, `learn` or `agent`.
   - `runtime` does not use `ui`, `learn`, `agent`, `tools` or `llm`. Shared argument/schema/template/structural engines and process execution have neutral owners. Journal reclamation uses private storage publication after the session fsync barrier.
@@ -124,9 +126,10 @@ Enforced by `tests/integration/architecture.rs`.
     Evaluation and worker isolation consume this shared policy; benchmark re-exports retain the
     earlier public copy API. Private dependency materialization keeps its narrower allowlist.
 
-Tests never live inline in `src/`: a `#[cfg(test)]` module is declared with `mod tests;` and its body
-sits in the sibling `tests.rs` (`foo.rs` → `foo/tests.rs`). The same test rejects inline test module
-bodies and `#[test]` functions outside such files.
+Tests never live inline in `src/`: declare a `#[cfg(test)]` out-of-line module and keep its body
+in a separate file. Prefer `mod tests;` with the sibling `tests.rs` (`foo.rs` → `foo/tests.rs`);
+domain-named out-of-line test modules and explicit `#[path]` modules are also accepted.
+The guard rejects inline test module bodies and `#[test]` functions outside test-gated files.
 
 `modules_have_one_conventional_definition` rejects ambiguous `foo.rs` plus `foo/mod.rs`
 definitions across the root and all member source trees. Fixture tests cover both accepted Rust

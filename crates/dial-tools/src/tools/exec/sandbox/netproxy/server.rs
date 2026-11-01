@@ -462,7 +462,9 @@ pub fn bridge_main() -> i32 {
     {
         use std::os::unix::process::CommandExt;
         // The command never outlives the bridge that gives it network.
-        // SAFETY: prctl is async-signal-safe and touches only the calling process.
+        // SAFETY: the post-fork closure only invokes Linux's prctl syscall wrapper
+        // with scalar PR_SET_PDEATHSIG/SIGKILL arguments and reads errno on failure;
+        // it neither allocates nor takes a Rust lock inherited from another thread.
         unsafe {
             command.pre_exec(|| {
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {

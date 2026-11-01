@@ -16,7 +16,6 @@ use crate::{
     tools::{code::diagnostics::Collector, exec::shell::ProcessGroup},
 };
 use anyhow::{Context, Result, bail, ensure};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
@@ -438,7 +437,7 @@ impl Store {
             .truncate(false)
             .write(true)
             .open(self.dir.join("schedules.lock"))?;
-        lock.lock_exclusive()?;
+        lock.lock()?;
         let mut entries = self.load()?;
         let value = change(&mut entries)?;
         let mut file = tempfile::NamedTempFile::new_in(&self.dir)?;
@@ -779,8 +778,12 @@ struct ProcessInfo {
 
 #[cfg(target_os = "macos")]
 fn process_info(pid: libc::pid_t) -> Result<Option<ProcessInfo>> {
+    // SAFETY: proc_bsdinfo is a C record of integers and byte arrays, for which all-zero bits
+    // are valid. It remains initialized even if proc_pidinfo fails or writes only part of it.
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of_val(&info);
+    // SAFETY: info is a live, exclusively borrowed proc_bsdinfo; its exact byte capacity is
+    // passed to libproc. The returned size is checked before any fields are used.
     let read = unsafe {
         libc::proc_pidinfo(
             pid,
@@ -872,6 +875,8 @@ fn process_snapshot(
             "owned-process coverage incomplete: process tree exceeds {MAX_PROCESSES}"
         );
         processes.push(info);
+        // SAFETY: pids is a live initialized pid_t buffer, uniquely borrowed during this call.
+        // The byte capacity fits i32 (MAX_PROCESSES is bounded); count is checked before indexing.
         let count = unsafe {
             libc::proc_listchildpids(
                 pid,
@@ -941,6 +946,8 @@ impl OwnedProcess {
     fn claim(info: ProcessInfo) -> Result<Option<Self>> {
         #[cfg(target_os = "linux")]
         let handle = {
+            // SAFETY: pidfd_open takes only integer arguments; flags=0 requests a new descriptor
+            // for this PID. A failure is checked before transferring ownership below.
             let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, info.pid, 0) };
             if fd == -1 {
                 let error = io::Error::last_os_error();
@@ -949,6 +956,8 @@ impl OwnedProcess {
                 }
                 return Err(error).context("scheduler requires pidfd ownership (Linux 5.3+)");
             }
+            // SAFETY: successful pidfd_open returned a fresh owned descriptor, not shared with
+            // another Rust owner. OwnedFd closes it on every return path, including revalidation failure.
             unsafe { OwnedFd::from_raw_fd(fd as RawFd) }
         };
         if process_info(info.pid)?.is_none_or(|current| current.started != info.started) {
@@ -962,6 +971,8 @@ impl OwnedProcess {
     }
     fn signal(&self, signal: i32) -> Result<()> {
         #[cfg(target_os = "linux")]
+        // SAFETY: handle owns a live pidfd for this process identity. A null siginfo with flags=0
+        // requests an ordinary signal and requires no userspace buffer.
         let result = unsafe {
             libc::syscall(
                 libc::SYS_pidfd_send_signal,
@@ -979,6 +990,8 @@ impl OwnedProcess {
             {
                 return Ok(());
             }
+            // SAFETY: kill takes only integer arguments and dereferences no Rust memory. The
+            // positive PID's birth time was revalidated above; OS errors are handled below.
             unsafe { libc::kill(self.info.pid, signal) }
         };
         if result == -1 {
@@ -1153,6 +1166,8 @@ fn poll_pipes(stdout: RawFd, stderr: RawFd) -> io::Result<()> {
             revents: 0,
         },
     ];
+    // SAFETY: pipes contains exactly the initialized pollfd entries counted below and is
+    // exclusively borrowed until poll returns; the timeout is bounded by IO_POLL.
     if unsafe {
         libc::poll(
             pipes.as_mut_ptr(),
@@ -1181,6 +1196,8 @@ fn poll_pipes<A: crate::platform::io::Pipe, B: crate::platform::io::Pipe>(
 fn request_schedule_cancel(pid: u32) -> io::Result<()> {
     #[cfg(unix)]
     {
+        // SAFETY: kill takes integer arguments only and does not access Rust memory. This is
+        // the scheduler child's recorded PID; SIGINT requests its cooperative cancellation.
         if unsafe { libc::kill(pid as libc::pid_t, libc::SIGINT) } == -1 {
             return Err(io::Error::last_os_error());
         }
@@ -1236,14 +1253,14 @@ fn run_entry(
         .with_context(|| format!("starting {}", exe.display()))
         .map_err(RunFailure::Start)?;
     let mut group = ProcessGroup::new(child);
-    let mut stdout = group.child.stdout.take().expect("piped schedule stdout");
-    let mut stderr = group.child.stderr.take().expect("piped schedule stderr");
+    let mut stdout = group.take_stdout().expect("piped schedule stdout");
+    let mut stderr = group.take_stderr().expect("piped schedule stderr");
     let mut out = Capture::new();
     let mut err = Capture::new();
     let mut out_done = false;
     let mut err_done = false;
     let mut failures = Vec::new();
-    let mut tree = match OwnedTree::new(group.child.id() as ProcessId) {
+    let mut tree = match OwnedTree::new(group.id() as ProcessId) {
         Ok(tree) => Some(tree),
         Err(error) => {
             failures.push(format!("claiming scheduled process: {error:#}"));
@@ -1284,7 +1301,7 @@ fn run_entry(
                 break;
             }
             // Ask Dial to cancel its own independent tool groups and write final diagnostics first.
-            if let Err(error) = request_schedule_cancel(group.child.id()) {
+            if let Err(error) = request_schedule_cancel(group.id()) {
                 failures.push(format!("requesting schedule cancellation: {error}"));
                 break;
             }
@@ -1345,8 +1362,10 @@ fn run_entry(
     }
     // Reserve the root PID until all attributed descendants have been stopped and killed.
     #[cfg(unix)]
+    // SAFETY: group owns the unreaped child/process-group identity until cleanup below; killpg
+    // receives that positive group ID and an integer signal, with no borrowed memory.
     unsafe {
-        libc::killpg(group.child.id() as libc::pid_t, libc::SIGSTOP)
+        libc::killpg(group.id() as libc::pid_t, libc::SIGSTOP)
     };
     if let Some(tree) = tree.as_mut() {
         tree.terminate(Instant::now() + TREE_SCAN_GRACE, &mut failures);
@@ -1377,7 +1396,7 @@ fn run_entry(
         if !reaped {
             match group.exited() {
                 Ok(true) => {
-                    match group.child.wait() {
+                    match group.wait() {
                         Ok(exit) => status = Some(exit),
                         Err(error) => failures.push(format!("reaping schedule: {error}")),
                     }
@@ -1637,7 +1656,7 @@ pub fn run(
         .truncate(false)
         .write(true)
         .open(store.dir.join("schedule.lock"))?;
-    lock.try_lock_exclusive().map_err(|_| {
+    lock.try_lock().map_err(std::io::Error::from).map_err(|_| {
         anyhow::anyhow!("another `dial schedule run` is already running for this project")
     })?;
     let exe = std::env::current_exe()?;

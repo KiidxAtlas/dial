@@ -412,7 +412,6 @@ struct InstallLock {
 }
 
 fn lock_install_dir(dir: &Path) -> Result<InstallLock> {
-    use fs2::FileExt;
     let path = dir.join(".dial-update.lock");
     let file = fs::OpenOptions::new()
         .create(true)
@@ -421,7 +420,7 @@ fn lock_install_dir(dir: &Path) -> Result<InstallLock> {
         .truncate(false)
         .open(&path)
         .with_context(|| format!("opening update lock {}", path.display()))?;
-    match file.try_lock_exclusive() {
+    match file.try_lock().map_err(std::io::Error::from) {
         Ok(()) => Ok(InstallLock { _file: file }),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => bail!(
             "another dial update is changing {}; wait for it to finish and retry",

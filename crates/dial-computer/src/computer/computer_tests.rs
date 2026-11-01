@@ -113,7 +113,7 @@ fn computer_abort_warns_about_partial_input_only_for_actions_that_can_send_input
         (json!({"action": "capabilities"}), false),
         (
             json!({"action": "run", "code": "1", "read_only": true}),
-            false,
+            true,
         ),
         (json!({"action": "run", "code": "1"}), true),
         (

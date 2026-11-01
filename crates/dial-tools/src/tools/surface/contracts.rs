@@ -388,43 +388,42 @@ fn registry_additive_compatible(
     else {
         return false;
     };
-    let mut without_properties = current.clone();
-    if let Some(map) = without_properties
-        .pointer_mut("/function/parameters/properties")
-        .and_then(Value::as_object_mut)
-    {
-        for property in properties {
-            map.remove(*property);
-        }
-    }
-    let narrow = |schema: &Value| {
-        let mut narrowed = schema.clone();
-        if let Some(map) = narrowed
-            .pointer_mut("/function/parameters/properties")
-            .and_then(Value::as_object_mut)
+    // Additions are appended in release order. Walking suffixes preserves every intermediate
+    // release without enumerating a browser-sized powerset. Properties and enum groups can
+    // land independently, so match their bounded cross product. Never change required fields,
+    // existing property types, strictness or semantic revisions.
+    let mut property_variant = current.clone();
+    for remaining in (0..=properties.len()).rev() {
+        if remaining < properties.len()
+            && let Some(map) = property_variant
+                .pointer_mut("/function/parameters/properties")
+                .and_then(Value::as_object_mut)
         {
-            for (tool, property, values) in ADDITIVE_ENUM_VALUES {
-                let Some(options) = map
-                    .get_mut(*property)
-                    .filter(|_| *tool == old.name)
-                    .and_then(|property| property.get_mut("enum"))
-                    .and_then(Value::as_array_mut)
-                else {
-                    continue;
-                };
+            map.remove(properties[remaining]);
+        }
+        let mut candidate = property_variant.clone();
+        if identities(std::slice::from_ref(&candidate), registry).get(&old.name) == Some(old) {
+            return true;
+        }
+        for (tool, property, values) in ADDITIVE_ENUM_VALUES.iter().rev() {
+            if *tool != old.name {
+                continue;
+            }
+            if let Some(options) = candidate
+                .pointer_mut("/function/parameters/properties")
+                .and_then(Value::as_object_mut)
+                .and_then(|map| map.get_mut(*property))
+                .and_then(|property| property.get_mut("enum"))
+                .and_then(Value::as_array_mut)
+            {
                 options.retain(|value| !value.as_str().is_some_and(|s| values.contains(&s)));
             }
+            if identities(std::slice::from_ref(&candidate), registry).get(&old.name) == Some(old) {
+                return true;
+            }
         }
-        narrowed
-    };
-    let candidates = [
-        narrow(current),
-        narrow(&without_properties),
-        without_properties,
-    ];
-    candidates.iter().any(|schema| {
-        identities(std::slice::from_ref(schema), registry).get(&old.name) == Some(old)
-    })
+    }
+    false
 }
 
 /// Recognize exact additive changes to controller-owned schemas. Historical calls remain inert,
@@ -728,12 +727,31 @@ fn parameter_shape(value: &Value) -> Value {
     Value::Object(shape)
 }
 
+fn sort_object_keys(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.sort_keys();
+            for value in map.values_mut() {
+                sort_object_keys(value);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                sort_object_keys(value);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub fn identities(schemas: &[Value], registry: &Registry) -> BTreeMap<String, Identity> {
     schemas.iter().filter_map(|schema| {
         let name = schema.pointer("/function/name")?.as_str()?;
         // Documentation/presentation changes do not alter the executable contract. Parameters,
-        // strictness and the tool-owned semantic revision do. serde_json maps are canonical here.
-        let shape = json!({"parameters":parameter_shape(&schema["function"]["parameters"]), "strict":schema["function"]["strict"]});
+        // strictness and the tool-owned semantic revision do. Sort explicitly even when a
+        // downstream dependency enables serde_json's preserve_order feature.
+        let mut shape = json!({"parameters":parameter_shape(&schema["function"]["parameters"]), "strict":schema["function"]["strict"]});
+        sort_object_keys(&mut shape);
         Some((name.to_owned(), Identity {
             name: name.to_owned(),
             revision: registry.get(name).map_or(1, |tool| tool.contract_revision()),

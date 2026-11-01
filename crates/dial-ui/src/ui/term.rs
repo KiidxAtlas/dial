@@ -89,6 +89,18 @@ pub fn write_control(bytes: Vec<u8>) -> io::Result<()> {
     output::write_control(bytes)
 }
 
+/// Termination is handled at safe UI/agent boundaries, never inside a signal handler.
+pub fn termination_requested() -> bool {
+    #[cfg(unix)]
+    {
+        crate::platform::terminal::Signals::pending() != 0
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 /// The live region: rows to repaint, where the hardware cursor goes, and an optional window title.
 pub struct Viewport<'a> {
     pub rows: &'a [Line<'static>],
@@ -142,6 +154,8 @@ pub struct InlineTerminal {
     linker: Option<Linker>,
     /// The last paint asked for integration, so rows flushed on `leave` are linked too.
     linking: bool,
+    #[cfg(unix)]
+    termination: Option<crate::platform::terminal::Signals>,
 }
 
 /// Borrowed drawing surface for a terminal overlay session.
@@ -181,9 +195,12 @@ impl InlineTerminal {
     }
 
     fn enter_active() -> Result<Self> {
+        #[cfg(unix)]
+        let termination = crate::platform::terminal::Signals::install_termination()
+            .context("installing terminal termination handlers")?;
         enable_raw_mode().context("enabling raw mode")?;
-        // Clear the terminal so dial starts at the top.
-        let _ = io::stdout().write_all(b"\x1b[2J\x1b[3J\x1b[H");
+        // Clear only the visible screen. The user's scrollback belongs to their terminal.
+        let _ = io::stdout().write_all(b"\x1b[2J\x1b[H");
         let _ = io::stdout().flush();
         let keyboard_flags = supports_keyboard_enhancement().unwrap_or(false);
         let mut out = Sink::queued(Box::new(io::stdout())).context("starting terminal output")?;
@@ -204,7 +221,14 @@ impl InlineTerminal {
         install_panic_hook();
         let size = crossterm::terminal::size().unwrap_or((80, 24));
         input::start().context("starting terminal input")?;
-        Ok(Self::build(out, size, true, keyboard_flags))
+        let terminal = Self::build(out, size, true, keyboard_flags);
+        #[cfg(unix)]
+        let terminal = {
+            let mut terminal = terminal;
+            terminal.termination = Some(termination);
+            terminal
+        };
+        Ok(terminal)
     }
 
     fn build(out: Sink, size: (u16, u16), real: bool, keyboard_flags: bool) -> Self {
@@ -236,6 +260,8 @@ impl InlineTerminal {
             signals: SignalWriter::new(caps),
             linker: caps.hyperlinks.then(|| Linker::new(caps.line_fragments)),
             linking: false,
+            #[cfg(unix)]
+            termination: None,
         }
     }
 

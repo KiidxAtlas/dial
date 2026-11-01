@@ -259,11 +259,8 @@ fn io_failure(error: io::Error, timeout: NextTimeout) -> ureq::Error {
 
 /// Whether this error is an expired socket timeout (see [`io_failure`]).
 fn expired(error: &io::Error) -> bool {
-    match error.kind() {
-        io::ErrorKind::WouldBlock => true,
-        io::ErrorKind::TimedOut => cfg!(windows),
-        _ => false,
-    }
+    matches!(error.kind(), io::ErrorKind::WouldBlock)
+        || (cfg!(windows) && matches!(error.kind(), io::ErrorKind::TimedOut))
 }
 
 impl Transport for KeepaliveTransport {

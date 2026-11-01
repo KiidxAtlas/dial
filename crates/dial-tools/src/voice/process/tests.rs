@@ -1,4 +1,5 @@
 use super::*;
+#[cfg(unix)]
 use std::{sync::atomic::Ordering, thread, time::Instant};
 
 #[test]

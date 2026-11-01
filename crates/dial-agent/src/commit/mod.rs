@@ -23,6 +23,8 @@ pub mod repo_context;
 pub mod run;
 mod scope;
 mod stage;
+#[cfg(test)]
+mod testkit;
 mod text;
 mod types;
 mod validation;

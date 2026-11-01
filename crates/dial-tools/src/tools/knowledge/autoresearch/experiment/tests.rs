@@ -37,6 +37,7 @@ fn runs_refuse_a_dirty_tree_and_exit_returns_to_the_origin_branch() {
     let state = dir.path().join("state");
     fs::create_dir(&root).unwrap();
     git(&root, &["init", "-q", "-b", "main"]);
+    crate::tools::testkit::disable_inherited_git_filters(&root);
     fs::write(root.join("f.txt"), "1\n").unwrap();
     git(&root, &["add", "f.txt"]);
     git(&root, &["commit", "-q", "-m", "base"]);
@@ -56,4 +57,22 @@ fn runs_refuse_a_dirty_tree_and_exit_returns_to_the_origin_branch() {
             .trim(),
         "main"
     );
+}
+
+#[test]
+fn clean_check_preserves_the_git_inspection_error() {
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-q", "-b", "main"]);
+    crate::tools::testkit::disable_inherited_git_filters(dir.path());
+    git(
+        dir.path(),
+        &["config", "filter.audit.clean", "executable-filter"],
+    );
+    let cause = run_checked(dir.path(), &["status", "--porcelain"], false)
+        .unwrap_err()
+        .to_string();
+    let error = ensure_clean(dir.path(), "benchmark")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(&cause), "cause: {cause}; error: {error}");
 }

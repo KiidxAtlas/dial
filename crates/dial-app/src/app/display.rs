@@ -57,7 +57,9 @@ pub(super) fn local_time(format: &str) -> String {
     let Ok(format) = std::ffi::CString::new(format) else {
         return String::new();
     };
-    // SAFETY: `localtime_r` and `strftime` write only into the zeroed `tm` and the bounded buffer.
+    // SAFETY: time accepts a null output pointer. tm is a zero-valid C record and localtime_r
+    // receives valid, disjoint input/output pointers; its null return is checked before use.
+    // strftime receives a NUL-terminated CString and the actual capacity of a live byte buffer.
     unsafe {
         let now = libc::time(std::ptr::null_mut());
         let mut tm: libc::tm = std::mem::zeroed();

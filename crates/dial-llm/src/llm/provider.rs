@@ -15,6 +15,7 @@
 //! Neither prompts nor the API key appear in any error produced here.
 
 pub(super) mod compaction;
+mod recovery;
 pub use compaction::{NativeCompactionFailure, NativeCompactionReply, NativeCompactionRequest};
 
 use super::model_config::ApiProtocol;
@@ -374,6 +375,7 @@ pub struct Backend {
     image_notices: llm::images::NoticeTracker,
     /// The llama.cpp tool-template notice was shown in this conversation.
     tool_template_noticed: bool,
+    subscription_noticed: bool,
     wire: llm::wire::Shared,
     /// Provider-bound secret masking (`[secrets]`); `None` when off.
     secrets: Option<Arc<llm::secrets::Masker>>,
@@ -463,6 +465,7 @@ impl Backend {
             codex_websocket: false,
             image_notices: Default::default(),
             tool_template_noticed: false,
+            subscription_noticed: false,
             wire: Default::default(),
             secrets: None,
             #[cfg(any(test, feature = "test-support"))]
@@ -1811,6 +1814,7 @@ impl Backend {
                 )
             }
         };
+        let model = model.to_owned();
         let retry_policy = llm::retry::Policy::new(
             &self
                 .steering_config
@@ -1822,20 +1826,20 @@ impl Backend {
         .with_failover(failover);
         // An endpoint that already refused the reasoning parameter is not asked again.
         let reasoning_scope = (url.clone(), model.to_owned());
-        let mut reasoning_stripped = false;
+        let reasoning_stripped = false;
         if llm::reasoning_memory::process_memory()
             .remembered(&reasoning_scope.0, &reasoning_scope.1)
             && let Some(current) = profile.take()
         {
             profile = Some(llm::reasoning_memory::without_reasoning(current));
         }
-        let mut active_account = self.account_id.clone();
-        let mut tried_accounts = active_account
-            .iter()
-            .cloned()
-            .collect::<std::collections::BTreeSet<_>>();
-        // 0: no OAuth refresh requested; 1: refresh before the next attempt; 2: already refreshed.
-        let mut oauth_retry = 0u8;
+        let mut state = recovery::RetryState {
+            profile,
+            reasoning_stripped,
+            oauth_retry: recovery::OAuthRetry::NotRequested,
+            active_account: self.account_id.clone(),
+            tried_accounts: self.account_id.iter().cloned().collect(),
+        };
         let request_id = if self.protocol == Some(ApiProtocol::FactoryDroid) {
             Some(llm::factory_droid::new_request_id()?)
         } else {
@@ -1850,74 +1854,19 @@ impl Backend {
             if attempt > 1 && !on_event(&llm::StreamEvent::Retry { waiting: false }) {
                 return Err(llm::Interrupted.into());
             }
-            // A retry is a fresh dispatch: sign-out/restriction/rotation state remains authoritative.
-            let refreshed_access = if attempt > 1 {
-                match &self.kind {
-                    ProviderKind::ChatGpt { user_dir, .. } => {
-                        Some(llm::chatgpt::scoped_account_access(
-                            user_dir,
-                            active_account
-                                .as_deref()
-                                .context("ChatGPT backend has no pinned account")?,
-                            Arc::clone(&interrupt),
-                        )?)
-                    }
-                    _ => None,
-                }
-            } else {
-                None
-            };
-            // Keep first-dispatch preparation unchanged, but never reuse a key across backoff:
-            // removal must resolve to no auth, not fall back to the previous attempt's key.
-            let retry_endpoint_key = if attempt > 1 {
-                self.endpoint_api_key()?
-            } else {
-                None
-            };
-            let auth = if attempt > 1
-                && matches!(
-                    self.kind,
-                    ProviderKind::Endpoint { .. } | ProviderKind::AnthropicEndpoint { .. }
-                ) {
-                retry_endpoint_key.as_deref()
-            } else {
-                auth
-            };
-            let auth = refreshed_access
-                .as_ref()
-                .map(|(_, token)| token.as_str())
-                .or(auth);
-            let oauth_access = match &self.oauth {
-                Some(binding) if oauth_retry == 1 => {
-                    oauth_retry = 2;
-                    Some(binding.refreshed_access(&interrupt)?)
-                }
-                Some(binding) => Some(binding.access(&interrupt)?),
-                None => None,
-            };
-            let auth = match oauth_access.as_ref() {
-                Some(access) => Some(access.token.as_str()),
-                None => auth,
-            };
-            let oauth_url = match oauth_access
-                .as_ref()
-                .and_then(|access| access.base_url.as_deref())
-            {
-                Some(base) => Some(llm::transports::route_url(
-                    self.protocol.unwrap_or(ApiProtocol::ChatCompletions),
-                    base,
-                    self.allow_insecure,
-                )?),
-                None => None,
-            };
-            let url: &str = oauth_url.as_deref().unwrap_or(url.as_str());
-            if let Some(binding) = &self.oauth {
-                binding.ensure_route(
-                    oauth_url.is_some(),
-                    url,
-                    self.protocol.unwrap_or(ApiProtocol::ChatCompletions),
-                )?;
-            }
+            let prepared_auth = self.prepare_remote_auth(
+                &mut state,
+                recovery::AuthAttempt {
+                    attempt,
+                    interrupt: &interrupt,
+                    fallback_auth: auth,
+                    fallback_url: &url,
+                },
+                on_notice,
+            )?;
+            let auth = prepared_auth.token();
+            let oauth_access = prepared_auth.oauth_access.as_ref();
+            let url = prepared_auth.url.as_deref().unwrap_or(url.as_str());
             let resolved_headers = llm::model_config::resolve_validated_headers(&self.headers)?;
             // The CoreWeave project header is attached only to CoreWeave's own endpoint.
             let coreweave_project = match &self.kind {
@@ -1955,12 +1904,13 @@ impl Backend {
                         url,
                         token: auth.unwrap(),
                         account_id: Some(
-                            active_account
+                            state
+                                .active_account
                                 .as_deref()
                                 .or(codex_account_id)
                                 .context("Codex backend has no pinned account")?,
                         ),
-                        model,
+                        model: &model,
                         headers: &[],
                     };
                     let websocket = if self.codex_websocket {
@@ -1970,7 +1920,7 @@ impl Backend {
                             timeout_secs,
                             &mut on_text,
                             Arc::clone(&interrupt),
-                            profile.as_ref(),
+                            state.profile.as_ref(),
                             self.prompt_cache_key.as_deref(),
                             on_event,
                             self.session_id.as_deref().unwrap_or("codex-default"),
@@ -1988,7 +1938,7 @@ impl Backend {
                                 interrupt: Arc::clone(&interrupt),
                             },
                             &mut on_text,
-                            profile.as_ref(),
+                            state.profile.as_ref(),
                             on_event,
                             llm::responses::CacheKeys {
                                 prompt_cache_key: self.prompt_cache_key.as_deref(),
@@ -2003,13 +1953,13 @@ impl Backend {
                         headers: &headers,
                         url,
                         auth,
-                        model,
+                        model: &model,
                     },
                     req,
                     timeout_secs,
                     &mut on_text,
                     Arc::clone(&interrupt),
-                    profile.as_ref(),
+                    state.profile.as_ref(),
                     on_event,
                 ),
                 Wire::Responses => llm::responses::exchange_api(
@@ -2017,7 +1967,7 @@ impl Backend {
                         headers: &headers,
                         url,
                         auth,
-                        model,
+                        model: &model,
                     },
                     req,
                     llm::Limits {
@@ -2025,7 +1975,7 @@ impl Backend {
                         interrupt: Arc::clone(&interrupt),
                     },
                     &mut on_text,
-                    profile.as_ref(),
+                    state.profile.as_ref(),
                     self.prompt_cache_key.as_deref(),
                     on_event,
                 ),
@@ -2034,7 +1984,7 @@ impl Backend {
                         headers: &headers,
                         url,
                         auth,
-                        model,
+                        model: &model,
                     };
                     if wire == Wire::Gemini {
                         llm::gemini::exchange(
@@ -2043,7 +1993,7 @@ impl Backend {
                             timeout_secs,
                             &mut on_text,
                             Arc::clone(&interrupt),
-                            profile.as_ref(),
+                            state.profile.as_ref(),
                             on_event,
                         )
                     } else {
@@ -2053,7 +2003,7 @@ impl Backend {
                             timeout_secs,
                             &mut on_text,
                             Arc::clone(&interrupt),
-                            profile.as_ref(),
+                            state.profile.as_ref(),
                             self.explicit_context_cap(),
                             on_event,
                         )
@@ -2063,7 +2013,7 @@ impl Backend {
                     &llm::transports::Route {
                         protocol: self.protocol.unwrap_or(ApiProtocol::ChatCompletions),
                         base_url: url,
-                        model,
+                        model: &model,
                         auth,
                         session_id: self.session_id.as_deref(),
                         request_id: request_id.as_deref(),
@@ -2080,7 +2030,7 @@ impl Backend {
                     timeout_secs,
                     &mut on_text,
                     Arc::clone(&interrupt),
-                    profile.as_ref(),
+                    state.profile.as_ref(),
                     on_event,
                 ),
                 Wire::ChatCompletions => {
@@ -2098,14 +2048,14 @@ impl Backend {
                             headers: &headers,
                             url,
                             auth,
-                            model,
+                            model: &model,
                         },
                         req,
                         timeout_secs,
                         &mut on_text,
                         llm::Control {
                             interrupt: Some(Arc::clone(&interrupt)),
-                            profile: profile.as_ref(),
+                            profile: state.profile.as_ref(),
                             reasoning_guard: None,
                             on_event,
                         },
@@ -2113,16 +2063,18 @@ impl Backend {
                 }
             };
             let result = result.map_err(|error| resolved_headers.redact(error));
+            drop(resolved_headers);
             if interrupted() {
                 return Err(llm::Interrupted.into());
             }
             let error = match result {
                 Ok(mut reply) => {
-                    if reasoning_stripped {
+                    if state.reasoning_stripped {
                         llm::reasoning_memory::process_memory()
                             .remember(&reasoning_scope.0, &reasoning_scope.1);
                     }
-                    if profile
+                    if state
+                        .profile
                         .as_ref()
                         .is_some_and(|p| p.capabilities.strict_tools)
                     {
@@ -2133,216 +2085,21 @@ impl Backend {
                 }
                 Err(error) => error,
             };
-            if !reasoning_stripped
-                && attempt < retry_policy.max_attempts
-                && llm::reasoning_memory::rejects_reasoning(&error)
-                && profile
-                    .as_ref()
-                    .is_some_and(|p| p.reasoning_effort.is_some() || p.thinking == Some(false))
-                && let Some(current) = profile.take()
-            {
-                profile = Some(llm::reasoning_memory::without_reasoning(current));
-                reasoning_stripped = true;
-                on_notice(
-                    "Provider rejected the reasoning parameter; retrying without it and remembering this for the session",
-                );
-                continue;
-            }
-            if self.oauth.is_some()
-                && oauth_retry == 0
-                && attempt < retry_policy.max_attempts
-                && error
-                    .downcast_ref::<llm::HttpError>()
-                    .is_some_and(|http| matches!(http.status, 401 | 403))
-            {
-                oauth_retry = 1;
-                on_notice(
-                    "Provider rejected the OAuth access token; refreshing the sign-in and retrying",
-                );
-                continue;
-            }
-            let class = llm::errors::classify(&error);
-            if attempt < retry_policy.max_attempts
-                && let Some(cooldown) = llm::key_pool::cooldown(
-                    &class,
-                    error
-                        .downcast_ref::<llm::HttpError>()
-                        .and_then(|http| http.retry_after),
-                    std::time::SystemTime::now(),
-                )
-                && let (Some(pool), Some(source)) =
-                    (self.key_pool.as_mut(), self.credential.as_ref())
-                && pool
-                    .rotate(
-                        llm::key_pool::process_blocks(),
-                        &source.base_url,
-                        Instant::now(),
-                        cooldown,
-                        |variable| source.has_key(variable),
-                    )
-                    .is_some()
-            {
-                on_notice(
-                    "API key was rate limited or out of quota; retrying with the next configured key",
-                );
-                continue;
-            }
-            // OAuth accounts: a rate limit, quota exhaustion, or rejected credential cools that
-            // account down and moves this session to the next stored one. ChatGPT keeps its own
-            // failover below, with its session-binding guards.
-            if attempt < retry_policy.max_attempts
-                && retry_policy.rotate_accounts
-                && !matches!(self.kind, ProviderKind::ChatGpt { .. })
-                && let Some(binding) = self.oauth.as_mut()
-                && binding.rotate(
-                    &class,
-                    error
-                        .downcast_ref::<llm::HttpError>()
-                        .and_then(|http| http.retry_after),
-                )
-            {
-                on_notice(
-                    "OAuth account was rate limited, out of quota, or rejected; retrying with another signed-in account",
-                );
-                continue;
-            }
-            if attempt < retry_policy.max_attempts
-                && retry_policy.rotate_accounts
-                && matches!(
-                    class,
-                    llm::errors::ErrorClass::Auth | llm::errors::ErrorClass::QuotaExhausted { .. }
-                )
-                && let ProviderKind::ChatGpt { user_dir, .. } = &self.kind
-            {
-                let allowed = self
-                    .steering_config
-                    .as_ref()
-                    .and_then(|config| config.chatgpt_allowed_accounts.as_ref());
-                if let Some(candidate) =
-                    llm::chatgpt::accounts(user_dir)?
-                        .into_iter()
-                        .find(|account| {
-                            account.signed_in
-                                && !tried_accounts.contains(&account.client_id)
-                                && allowed.is_none_or(|set| set.contains(&account.client_id))
-                        })
-                {
-                    // A request does not own the persistent session/role binding. Changing only
-                    // its auth would stamp B-owned history into an A-bound conversation. An
-                    // operator must explicitly select/rebind a clean session instead.
-                    if self.session_bound
-                        || self.prompt_cache_key.is_some()
-                        || llm::responses::has_native_history(req)
-                    {
-                        return Err(error.context(
-                            "ChatGPT account failover refused: this request has a session/cache identity or native replay history; explicitly select another allowed account and start a clean chat (or rebind portable history) before retrying",
-                        ));
-                    }
-                    // The request was prepared using this profile. Failover must not silently
-                    // change capabilities, image handling or token budgets halfway through it.
-                    if self
-                        .steering_config
-                        .as_ref()
-                        .and_then(|config| config.active_model_profile())
-                        .is_none()
-                    {
-                        let candidate_profile = llm::chatgpt::scoped_model_profile(
-                            user_dir,
-                            Some(&candidate.client_id),
-                            model,
-                        )?;
-                        ensure!(
-                            serde_json::to_value(&candidate_profile)?
-                                == serde_json::to_value(&self.profile)?,
-                            "ChatGPT account failover requires a different model profile; explicitly select the account and rebuild the backend before retrying"
-                        );
-                    }
-                    tried_accounts.insert(candidate.client_id.clone());
-                    active_account = Some(candidate.client_id);
-                    // Unbound portable requests have no external identity to reconcile. Pin
-                    // the backend as well as this attempt, even if the next attempt fails:
-                    // the next request must not revert to the rejected account.
-                    self.account_id = active_account.clone();
-                    on_notice(
-                        "ChatGPT credential was rejected or quota exhausted; retrying with another signed-in account",
-                    );
-                    continue;
-                }
-            }
-            if let Some(status @ (401 | 403)) = error
-                .downcast_ref::<llm::HttpError>()
-                .filter(|_| matches!(class, llm::errors::ErrorClass::Auth))
-                .map(|http| http.status)
-            {
-                let host = llm::host_of(url);
-                let key = match host.as_deref() {
-                    Some("api.openai.com") => "OPENAI_API_KEY",
-                    Some("api.anthropic.com") => "ANTHROPIC_API_KEY",
-                    Some("openrouter.ai") => "OPENROUTER_API_KEY",
-                    Some("api.groq.com") => "GROQ_API_KEY",
-                    Some("api.mistral.ai") => "MISTRAL_API_KEY",
-                    Some("api.deepseek.com") => "DEEPSEEK_API_KEY",
-                    _ => "the endpoint's configured API key",
-                };
-                return Err(error.context(format!("provider authentication failed (HTTP {status}); check {key} or sign in through /providers")));
-            }
-            let class = llm::errors::classify(&error);
-            let hinted = error
-                .downcast_ref::<llm::HttpError>()
-                .and_then(|http| http.retry_after);
-            // A failure before any response (reset, refused, broken pipe) retries promptly once.
-            let connection = error.chain().any(|cause| {
-                cause
-                    .downcast_ref::<llm::TransportError>()
-                    .is_some_and(|transport| transport.connection)
-            });
-            let delay = match llm::retry::decide(&class, hinted, attempt, connection, &retry_policy)
-            {
-                llm::retry::Decision::Retry { delay, reason } => {
-                    if error
-                        .downcast_ref::<llm::stream::IncompleteStream>()
-                        .is_some()
-                        || error
-                            .downcast_ref::<llm::anthropic::IncompleteStream>()
-                            .is_some()
-                    {
-                        on_notice(
-                            "Provider stream disconnected or was incomplete; discarding the partial reply and retrying. No partial tool calls will execute.",
-                        );
-                    }
-                    (delay, reason)
-                }
-                llm::retry::Decision::Stop(Some(message)) => return Err(error.context(message)),
-                llm::retry::Decision::Stop(None) => return Err(error),
-            };
-            let (delay, reason) = delay;
-            let cause = format!("{error:#}");
-            let cause = cause.lines().next().unwrap_or("").trim();
-            let cause: String = if cause.chars().count() > 160 {
-                cause
-                    .chars()
-                    .take(159)
-                    .chain(std::iter::once('…'))
-                    .collect()
-            } else {
-                cause.to_owned()
-            };
-            // How long the failed attempt ran, so a full silence limit and a quick refusal read differently.
-            let cause = format!(
-                "{cause} (after {:.1}s)",
-                attempt_started.elapsed().as_secs_f64()
-            );
-            on_notice(&format!(
-                "{reason}: {cause}; retrying in {:.1}s (attempt {}/{})",
-                delay.as_secs_f64(),
-                attempt + 1,
-                retry_policy.attempts(&class)
-            ));
-            let pending = self.retry_control.begin_wait();
-            if !on_event(&llm::StreamEvent::Retry { waiting: true }) {
-                return Err(llm::Interrupted.into());
-            }
-            pending.wait(delay, &interrupt)?;
+            self.recover_remote_attempt(
+                &mut state,
+                recovery::FailedAttempt {
+                    error,
+                    req,
+                    url,
+                    model: &model,
+                    attempt,
+                    retry_policy: &retry_policy,
+                    attempt_started,
+                    interrupt: &interrupt,
+                },
+                on_notice,
+                on_event,
+            )?;
         }
         unreachable!("bounded retries return on the final attempt")
     }
@@ -2948,10 +2705,9 @@ fn anthropic_request_body(
     Ok(body)
 }
 
-const CLAUDE_CODE_VERSION: &str = "2.1.280";
-pub(super) const CLAUDE_BILLING_PREFIX: &str = "x-anthropic-billing-header:";
-pub(super) const CCH_PLACEHOLDER: &str = "cch=00000";
-const CCH_SEED: u64 = 0x4d659218e32a3268;
+use super::anthropic::{
+    BILLING_SALT, CCH_PLACEHOLDER, CCH_SEED, CLAUDE_BILLING_PREFIX, CLAUDE_CODE_VERSION,
+};
 
 fn claude_billing_header(first_user_message: &str) -> String {
     use sha2::Digest;
@@ -2967,7 +2723,7 @@ fn claude_billing_header(first_user_message: &str) -> String {
         .collect();
     let suffix = format!(
         "{:x}",
-        sha2::Sha256::digest(format!("59cf53e54c78{key}{CLAUDE_CODE_VERSION}").as_bytes())
+        sha2::Sha256::digest(format!("{BILLING_SALT}{key}{CLAUDE_CODE_VERSION}").as_bytes())
     );
     format!(
         "{CLAUDE_BILLING_PREFIX} cc_version={CLAUDE_CODE_VERSION}.{}; cc_entrypoint=cli; {CCH_PLACEHOLDER};",

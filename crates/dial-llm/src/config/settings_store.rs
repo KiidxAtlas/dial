@@ -2,7 +2,6 @@
 //! the requested paths survive updates; invalid existing files are never replaced.
 use super::paths::Layout;
 use anyhow::{Context, Result, ensure};
-use fs2::FileExt;
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
@@ -64,7 +63,7 @@ fn open_lock(path: &Path) -> Result<File> {
 
 pub fn locked(path: &Path) -> Result<File> {
     let lock = open_lock(path)?;
-    lock.lock_exclusive()?;
+    lock.lock()?;
     Ok(lock)
 }
 
@@ -77,7 +76,8 @@ fn interactive_lock(path: &Path) -> Result<File> {
 /// A long-running owner must refuse an occupied record rather than overwrite another run.
 pub fn try_locked(path: &Path) -> Result<File> {
     let lock = open_lock(path)?;
-    lock.try_lock_exclusive()
+    lock.try_lock()
+        .map_err(std::io::Error::from)
         .context("private record is owned by another active operation")?;
     Ok(lock)
 }
@@ -99,7 +99,7 @@ pub(crate) fn locked_for(
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
             return Err(crate::llm::Interrupted.into());
         }
-        match lock.try_lock_exclusive() {
+        match lock.try_lock().map_err(std::io::Error::from) {
             Ok(()) => return Ok(lock),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 ensure!(

@@ -341,7 +341,7 @@ enum ManagedProcess {
 impl ManagedProcess {
     fn id(&self) -> u32 {
         match self {
-            Self::Group(group) => group.child.id(),
+            Self::Group(group) => group.id(),
             #[cfg(windows)]
             Self::Pty { child, .. } => child.id(),
             Self::Cell { .. } => 0,
@@ -370,7 +370,7 @@ impl ManagedProcess {
     }
     fn wait(&mut self) -> io::Result<ExitStatus> {
         match self {
-            Self::Group(group) => group.child.wait(),
+            Self::Group(group) => group.wait(),
             Self::Cell { .. } => Err(io::Error::other("cell has no process status")),
             #[cfg(windows)]
             Self::Pty { child, .. } => child.wait(),
@@ -480,6 +480,9 @@ impl Proc {
                 .stdout(slave.try_clone().map_err(|e| format!("cloning PTY: {e}"))?)
                 .stderr(slave)
                 .env("TERM", "xterm-256color");
+            // SAFETY: after fork this closure only calls setsid, the TIOCSCTTY ioctl with
+            // integer arguments, and last_os_error; it neither allocates nor locks Rust state.
+            // Command installs the owned PTY slave at fd 0 before invoking pre_exec.
             unsafe {
                 spawn.pre_exec(|| {
                     if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {

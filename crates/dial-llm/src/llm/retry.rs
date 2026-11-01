@@ -83,9 +83,7 @@ pub(crate) const FAILOVER_ATTEMPTS: usize = 2;
 pub(crate) const FAILOVER_MAX_WAIT: Duration = Duration::from_secs(10);
 /// Keep a ready fallback's brief first retry independent of the ordinary automatic interval.
 const FAILOVER_INTERVAL: Duration = Duration::from_secs(1);
-/// First retry after a connection-level failure (refused, reset, broken pipe, DNS, connect
-/// timeout): the provider never answered, so a fresh connection is tried promptly before the
-/// ordinary interval applies to later attempts.
+/// Base automatic retry interval; subsequent retries grow exponentially with bounded jitter.
 pub(crate) const CONNECTION_RETRY: Duration = Duration::from_secs(2);
 
 /// Server timing hints from one non-2xx response.
@@ -238,7 +236,7 @@ pub(crate) struct Policy {
     pub(crate) max_delay: Duration,
     pub(crate) wait_for_quota_reset: bool,
     pub(crate) rotate_accounts: bool,
-    /// Automatic retry interval, bounded by `max_delay`.
+    /// Initial automatic retry interval, capped at two seconds and bounded by `max_delay`.
     pub(crate) backoff: Duration,
     /// A fallback model is ready for failures of this class (`retry.fallback_on`): such failures
     /// are retried briefly here, then handed to the caller to fail over.
@@ -295,13 +293,13 @@ pub(crate) enum Decision {
 /// Decide whether attempt `attempt` (1-based) that failed with `class` is retried, and after how long.
 /// `hinted` is the server's explicit minimum delay; it is never shortened, and a hint beyond
 /// `max_delay` ends the request rather than waiting longer than the operator allowed.
-/// `connection` marks a failure before any response arrived; its first retry waits only
-/// [`CONNECTION_RETRY`].
+/// Automatic retries back off exponentially with up to 25% positive jitter. Explicit hints
+/// replace the automatic delay; the connection argument is retained for caller compatibility.
 pub(crate) fn decide(
     class: &ErrorClass,
     hinted: Option<Duration>,
     attempt: usize,
-    connection: bool,
+    _connection: bool,
     policy: &Policy,
 ) -> Decision {
     let (reason, minimum) = match class {
@@ -343,13 +341,23 @@ pub(crate) fn decide(
     }
     let interval = if failing_over {
         policy.backoff.min(FAILOVER_INTERVAL)
-    } else if connection && attempt == 1 {
-        policy.backoff.min(CONNECTION_RETRY)
     } else {
-        policy.backoff
+        policy
+            .backoff
+            .min(CONNECTION_RETRY)
+            .saturating_mul(1u32 << attempt.saturating_sub(1).min(10))
     }
     .min(policy.max_delay);
-    let delay = minimum.map_or(interval, |minimum| minimum.max(interval));
+    // Explicit hints replace the automatic interval, rather than being inflated by it.
+    // Unhinted retries use bounded exponential backoff with independent positive jitter.
+    let delay = minimum.unwrap_or_else(|| {
+        if failing_over || interval < Duration::from_millis(100) {
+            interval
+        } else {
+            let jitter = interval.mul_f64(rand::random::<f64>() * 0.25);
+            interval.saturating_add(jitter).min(policy.max_delay)
+        }
+    });
     if failing_over && delay > FAILOVER_MAX_WAIT {
         return Decision::Stop(Some(format!(
             "provider asked to wait {:.0}s; moving to the configured fallback model instead",

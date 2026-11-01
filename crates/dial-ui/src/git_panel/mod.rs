@@ -6,6 +6,9 @@ mod ai;
 mod git;
 mod watch;
 
+#[cfg(test)]
+pub(crate) mod testkit;
+
 pub(crate) use watch::Watch;
 
 /// Unified-diff context lines for the panel's diffs (matches the diff view).
@@ -23,17 +26,21 @@ pub struct Repo {
 
 impl Repo {
     pub fn new(root: &Path, config: &Config) -> Self {
-        // Porcelain status paths are relative to the repository top, and diff/add/restore pathspecs
-        // resolve against the cwd, so every command must run from the top (the overlay root can be a
-        // subdirectory when dial was started there).
-        let root =
-            crate::tools::vcs::git::run_checked(root, &["rev-parse", "--show-toplevel"], false)
-                .map(|top| PathBuf::from(top.trim_end_matches(['\n', '\r'])))
-                .unwrap_or_else(|_| root.to_path_buf());
         Self {
-            root,
+            root: root.to_path_buf(),
             config: config.clone(),
         }
+    }
+
+    /// Resolve porcelain path coordinates on a worker, never from the input thread.
+    pub(crate) fn at_repository_root(mut self) -> Result<Self, String> {
+        let top = crate::tools::vcs::git::run_checked(
+            &self.root,
+            &["rev-parse", "--show-toplevel"],
+            false,
+        )?;
+        self.root = PathBuf::from(top.trim_end_matches(['\n', '\r']));
+        Ok(self)
     }
 
     /// Watches the worktree and git state. Fails when git or the OS watcher cannot start.

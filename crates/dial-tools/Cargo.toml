@@ -22,7 +22,6 @@ csv.workspace = true
 encoding_rs.workspace = true
 fancy-regex.workspace = true
 flate2.workspace = true
-fs2.workspace = true
 futures.workspace = true
 globset.workspace = true
 safetensors.workspace = true

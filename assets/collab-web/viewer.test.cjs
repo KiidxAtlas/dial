@@ -9,7 +9,11 @@ const {webcrypto} = require('node:crypto');
 const source = fs.readFileSync(require('node:path').join(__dirname, 'index.html'), 'utf8').match(/<script type="module">([\s\S]*?)<\/script>/)[1];
 const secret = new Uint8Array(32).fill(7);
 const tick = () => new Promise(resolve => setImmediate(resolve));
-async function harness() {
+async function harness({full=false,legacy=false}={}) {
+  const hostKeys=await webcrypto.subtle.generateKey('Ed25519',true,['sign','verify']);
+  const publicKey=new Uint8Array(await webcrypto.subtle.exportKey('raw',hostKeys.publicKey));
+  const linkSecret=legacy?secret:new Uint8Array(full?81:65);
+  if(!legacy){linkSecret[0]=4;linkSecret.set(secret,1);linkSecret.set(publicKey,33);if(full)linkSecret.fill(9,65);}
   const sockets = [], timers = [], pending = [];
   const status = {textContent:'', className:''};
   const transcript = {children:[], append(el){this.children.push(el);}, replaceChildren(){this.children=[];}};
@@ -21,12 +25,13 @@ async function harness() {
   }
   const crypto = {getRandomValues: bytes => webcrypto.getRandomValues(bytes), subtle:{
     importKey:(...args)=>webcrypto.subtle.importKey(...args),
-    encrypt:(...args)=>webcrypto.subtle.encrypt(...args),
+    encrypt:(...args)=>{const result=webcrypto.subtle.encrypt(...args);pending.push(result.catch(()=>{}));return result;},
     decrypt:(...args)=>{const result=webcrypto.subtle.decrypt(...args);pending.push(result.catch(()=>{}));return result;},
+    verify:(...args)=>{const result=webcrypto.subtle.verify(...args);pending.push(result.catch(()=>{}));return result;},
   }};
   const context = vm.createContext({crypto, Uint8Array, TextEncoder, TextDecoder, URL, atob, btoa,
     document:{querySelector: selector => selector==='#status'?status:transcript, createElement:()=>({textContent:''}), body:{scrollHeight:0}},
-    window:{scrollTo(){}}, WebSocket:Socket, location:{hash:`#wss://relay.invalid/r/fixture.${Buffer.from(secret).toString('base64url')}`},
+    window:{scrollTo(){}}, WebSocket:Socket, location:{hash:`#wss://relay.invalid/r/fixture.${Buffer.from(linkSecret).toString('base64url')}`},
     setTimeout(fn, delay){timers.push({fn,delay});},
   });
   await vm.runInContext(`(async()=>{${source}\n})()`, context);
@@ -34,7 +39,8 @@ async function harness() {
   async function packet(frame) {
     const iv = webcrypto.getRandomValues(new Uint8Array(12));
     const sealed = new Uint8Array(await webcrypto.subtle.encrypt({name:'AES-GCM',iv},key,new TextEncoder().encode(JSON.stringify(frame))));
-    const bytes = new Uint8Array(16+sealed.length);bytes.set(iv,4);bytes.set(sealed,16);return bytes;
+    const bytes = new Uint8Array(16+sealed.length+64);bytes.set(iv,4);bytes.set(sealed,16);
+    bytes.set(new Uint8Array(await webcrypto.subtle.sign('Ed25519',hostKeys.privateKey,bytes.slice(4,-64))),bytes.length-64);return bytes;
   }
   async function flush() {
     await tick();
@@ -110,8 +116,28 @@ test('hello stays encrypted and uses a fresh guest epoch for each connection', a
     return JSON.parse(new TextDecoder().decode(await webcrypto.subtle.decrypt({name:'AES-GCM',iv:bytes.slice(4,16)},h.key,bytes.slice(16))));
   }
   const first=await hello(h.sockets[0]);await h.drop(1006);h.retry();const next=await hello(h.sockets[1]);
-  assert.equal(first.role,'guest');assert.equal(first.proto,1003);assert.equal(first.transportSeq,1);assert.equal(first.seq,undefined);
+  assert.equal(first.role,'guest');assert.equal(first.proto,1004);assert.equal(first.transportSeq,1);assert.equal(first.seq,undefined);
   assert.notEqual(first.epoch,next.epoch);
+});
+test('a full browser link never transmits write authority in hello or authentication', async () => {
+  const h=await harness({full:true}), ws=h.sockets[0];await ws.onopen();
+  await h.send({t:'challenge',nonce:'fresh',role:'host',epoch:'host',transportSeq:1});
+  assert.equal(ws.sent.length,2);
+  const frames=await Promise.all(ws.sent.map(async bytes=>JSON.parse(new TextDecoder().decode(await webcrypto.subtle.decrypt({name:'AES-GCM',iv:bytes.slice(4,16)},h.key,bytes.slice(16))))));
+  assert.equal(frames[0].writeToken,undefined);assert.equal(frames[1].t,'authenticate');
+  assert.equal(frames[1].proof,null);assert.equal(frames[1].writeToken,undefined);
+  assert.equal(frames[1].transportSeq,2);
+});
+test('a view holder with AES key but no host signature cannot inject host frames', async () => {
+  const h=await harness(),ws=h.sockets[0];
+  const bytes=(await h.packet({t:'welcome',role:'host',epoch:'forged',transportSeq:1})).slice(0,-64);
+  ws.onmessage({data:bytes});await h.flush();
+  assert.equal(ws.closed,true);assert.match(h.status.textContent,/Frame unavailable/);
+  assert.equal(h.transcript.children.length,0);
+});
+test('legacy unsigned links fail closed before opening a relay socket', async () => {
+  const h=await harness({legacy:true});assert.equal(h.sockets.length,0);
+  assert.match(h.status.textContent,/Legacy|unsupported|new link/);
 });
 test('entry zero, controls and reset use separate log and transport sequences', async () => {
   const h=await harness();await h.snapshot('host',1,[]);

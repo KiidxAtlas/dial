@@ -5,6 +5,7 @@
 mod help;
 mod image;
 mod lines;
+mod load;
 mod model;
 mod ops;
 mod render;
@@ -82,35 +83,21 @@ pub struct GitOverlay {
     ai_job: Option<Receiver<Result<AiSummary, String>>>,
     /// The instruction typed for AI staging (`A`); `None` when the prompt is closed.
     ai_prompt: Option<String>,
+    /// At most one status and one diff read are active; newer requests replace pending work.
+    reads: load::Reads,
+    revision: Option<String>,
+    loading: bool,
 }
 
 impl GitOverlay {
     /// Opens the panel on the working tree, or on `revision` (read-only) when one is given.
     pub fn open(repo: Repo, revision: Option<&str>) -> Result<Self, String> {
-        let (commit, mut changes) = match revision {
-            None => (None, repo.status()?),
-            Some(rev) => {
-                let sha = repo.resolve(rev)?;
-                let commit = repo.commit_info(&sha)?;
-                let files = repo.commit_files(&sha)?;
-                (Some(commit), files)
-            }
-        };
-        sort_changes(&mut changes);
-        let (watch, watch_error) = if commit.is_none() {
-            match repo.watch() {
-                Ok(watch) => (Some(watch), None),
-                Err(error) => (None, Some(error)),
-            }
-        } else {
-            (None, None)
-        };
         let mut overlay = Self {
             repo,
-            commit,
+            commit: None,
             branch: None,
             head: None,
-            changes,
+            changes: Vec::new(),
             cursor: 0,
             collapsed: HashSet::new(),
             shown: None,
@@ -134,19 +121,18 @@ impl GitOverlay {
             synced: Instant::now(),
             line_sel: None,
             help: false,
-            watch,
-            watch_error,
+            watch: None,
+            watch_error: None,
             area: Cell::new((0, 0)),
             generating: None,
             ai_job: None,
             ai_prompt: None,
+            reads: load::Reads::default(),
+            revision: revision.map(str::to_owned),
+            loading: true,
         };
-        overlay.refresh_meta();
-        overlay.cursor = overlay.first_file_row();
-        overlay.load_shown();
-        if let Some(error) = overlay.watch_error.clone() {
-            overlay.flash(Self::watch_notice(&error), true);
-        }
+        overlay.sync();
+        overlay.flash("Loading repository…", false);
         Ok(overlay)
     }
 
@@ -154,6 +140,7 @@ impl GitOverlay {
     /// start) the panel re-reads every `REFRESH` and keeps the fallback notice in the banner.
     pub fn tick(&mut self) {
         self.poll_jobs();
+        self.poll_reads();
         let due = match self.watch.as_mut() {
             Some(watch) => watch.take_ready(Instant::now()),
             None => self.watch_error.is_some() && self.synced.elapsed() >= REFRESH,
@@ -233,6 +220,14 @@ impl GitOverlay {
     }
 
     pub fn handle(&mut self, event: &Event, keys: &Keymap) -> OverlayEvent {
+        if self.loading || (self.revision.is_some() && self.commit.is_none()) {
+            return match event {
+                Event::Key(key) if pressed(key) && keys.matches(Action::SelectCancel, key) => {
+                    OverlayEvent::Close
+                }
+                _ => OverlayEvent::None,
+            };
+        }
         match event {
             Event::Paste(value) if self.editing => {
                 self.message
@@ -506,42 +501,16 @@ impl GitOverlay {
         };
     }
 
-    /// Reloads status and the selected diff. Keeps the selection on the same path when possible.
+    /// Request status off-thread. Repeated refreshes coalesce while a read is running.
     fn sync(&mut self) {
+        // No old diff may be applied once a newer status snapshot was requested.
+        self.reads.generation = self.reads.generation.wrapping_add(1);
+        self.reads.pending_diff = None;
+        self.shown = None;
+        self.rows.clear();
         self.synced = Instant::now();
-        if self.commit.is_none() {
-            let mut next = match self.repo.status() {
-                Ok(next) => next,
-                Err(error) => {
-                    self.flash(error, true);
-                    return;
-                }
-            };
-            sort_changes(&mut next);
-            if next != self.changes {
-                let key = self.selected().cloned();
-                self.changes = next;
-                let entries = self.entries();
-                self.cursor = key
-                    .and_then(|k| {
-                        entries.iter().position(
-                            |entry| matches!(entry, Entry::File { index, .. } if self.changes[*index] == k),
-                        )
-                    })
-                    .unwrap_or_else(|| self.cursor.min(entries.len().saturating_sub(1)));
-            }
-            self.refresh_meta();
-        }
-        self.load_shown();
-    }
-
-    fn refresh_meta(&mut self) {
-        if self.commit.is_some() {
-            return;
-        }
-        let (branch, head) = self.repo.branch_and_head();
-        self.branch = branch;
-        self.head = head;
+        self.reads.status_pending = true;
+        self.start_status();
     }
 
     fn set_view(&mut self, view: View) {
@@ -558,75 +527,24 @@ impl GitOverlay {
     }
 
     fn load_shown(&mut self) {
-        self.shown = match self.selected().cloned() {
-            Some(change) => match self.load_doc(&change) {
-                Ok(shown) => Some(shown),
-                Err(error) => {
-                    self.flash(error, true);
-                    None
-                }
-            },
-            None => None,
-        };
-        self.rebuild_rows();
-    }
-
-    fn load_doc(&self, change: &Change) -> Result<Shown, String> {
-        let doc = self.git_diff(change, CONTEXT)?;
-        let binary = if view::is_binary_doc(&doc) {
-            let rev = self.commit.as_ref().map(|commit| commit.sha.as_str());
-            let protocol = crate::ui::images::ImageProtocol::detect();
-            Some(view::load_binary(&self.repo, change, rev, protocol)?)
-        } else {
-            None
-        };
-        let full = if self.view == View::File && binary.is_none() {
-            Some(self.git_diff(change, FULL_CONTEXT)?)
-        } else {
-            None
-        };
-        Ok(Shown {
-            change: change.clone(),
-            doc,
-            full,
-            binary,
-        })
-    }
-
-    fn git_diff(&self, change: &Change, context: &str) -> Result<Doc, String> {
-        if change.kind == Kind::Untracked {
-            return self.repo.untracked_doc(&change.path);
+        self.reads.generation = self.reads.generation.wrapping_add(1);
+        self.reads.pending_diff = self.selected().cloned().map(|change| load::DiffRequest {
+            repo: self.repo.clone(),
+            change,
+            revision: self.commit.as_ref().map(|commit| commit.sha.clone()),
+            view: self.view,
+            whitespace: self.whitespace,
+            protocol: crate::ui::images::ImageProtocol::detect(),
+            generation: self.reads.generation,
+        });
+        // A previous file's hunks must not remain actionable while the new diff loads.
+        self.shown = None;
+        self.rows.clear();
+        if self.selected().is_none() {
+            self.cursor_row = 0;
+            self.line_sel = None;
         }
-        let mut args: Vec<&str> = match &self.commit {
-            Some(commit) => vec![
-                "show",
-                "--no-color",
-                "--no-ext-diff",
-                "--no-renames",
-                "--format=",
-                context,
-                commit.sha.as_str(),
-            ],
-            None if change.area == Area::Staged => vec![
-                "diff",
-                "--cached",
-                "--no-color",
-                "--no-ext-diff",
-                "--no-renames",
-                context,
-            ],
-            None => vec![
-                "diff",
-                "--no-color",
-                "--no-ext-diff",
-                "--no-renames",
-                context,
-            ],
-        };
-        args.extend(self.whitespace.git_args().iter().copied());
-        args.push("--");
-        args.push(change.path.as_str());
-        self.repo.diff(&args)
+        self.start_diff();
     }
 
     fn rebuild_rows(&mut self) {

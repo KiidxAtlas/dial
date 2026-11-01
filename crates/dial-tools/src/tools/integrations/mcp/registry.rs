@@ -39,11 +39,7 @@ fn get_page(base: &str, query: &str, cursor: Option<&str>) -> Result<(Vec<Value>
             pairs.append_pair("cursor", cursor);
         }
     }
-    let config = ureq::Agent::config_builder()
-        .timeout_global(Some(TIMEOUT))
-        .http_status_as_error(false)
-        .build();
-    let agent = ureq::Agent::new_with_config(config);
+    let agent = super::fetch::agent(TIMEOUT);
     let mut response = agent
         .get(url.as_str())
         .call()

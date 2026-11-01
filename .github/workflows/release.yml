@@ -10,12 +10,56 @@ permissions:
   actions: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  # Serialize tags so an older release cannot race a newer release's latest pointer.
+  group: release-publish
+  # Retain up to 100 waiting releases instead of replacing the one pending run.
+  queue: max
   cancel-in-progress: false
 
 jobs:
+  gate:
+    name: Require tested main commit
+    runs-on: ubuntu-22.04
+    outputs:
+      epoch: ${{ steps.identity.outputs.epoch }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require main ancestry
+        id: identity
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          echo "epoch=$(git show -s --format=%ct "$GITHUB_SHA")" >> "$GITHUB_OUTPUT"
+      - name: Require successful push CI on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        timeout-minutes: 90
+        run: |
+          set -euo pipefail
+          waited=0
+          while :; do
+            gh run list -R "$GITHUB_REPOSITORY" --workflow ci.yml --commit "$GITHUB_SHA" --event push --branch main --json status,conclusion,event,headBranch,headSha > "$RUNNER_TEMP/ci-runs.json"
+            runs="$(cat "$RUNNER_TEMP/ci-runs.json")"
+            if python3 scripts/release-policy.py ci "$GITHUB_SHA" "$RUNNER_TEMP/ci-runs.json"; then
+              break
+            fi
+            if ! jq -e 'any(.[]; .status != "completed")' <<<"$runs" >/dev/null && { [ "$runs" != '[]' ] || [ "$waited" -ge 300 ]; }; then
+              echo "No successful main push CI for $GITHUB_SHA. Push to main and let CI pass before tagging." >&2
+              exit 1
+            fi
+            sleep 30
+            waited=$((waited + 30))
+          done
+
   build:
     name: Package ${{ matrix.target }}
+    needs: gate
+    env:
+      SOURCE_DATE_EPOCH: ${{ needs.gate.outputs.epoch }}
     strategy:
       fail-fast: false
       matrix:
@@ -52,7 +96,7 @@ jobs:
           rustup show active-toolchain
           rustup target add "${{ matrix.target }}"
       - name: Install installer test dependencies
-        run: python3 -m pip install --disable-pip-version-check cryptography
+        run: python3 -m pip install --disable-pip-version-check -r scripts/requirements-ci.txt
       - name: Select musl C compiler
         if: contains(matrix.target, '-musl')
         env:
@@ -110,11 +154,14 @@ jobs:
 
   windows-build:
     name: Build and package ${{ matrix.target }}
+    needs: gate
+    env:
+      SOURCE_DATE_EPOCH: ${{ needs.gate.outputs.epoch }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: windows-latest
+          - os: windows-2025
             target: x86_64-pc-windows-msvc
           - os: windows-11-arm
             target: aarch64-pc-windows-msvc
@@ -170,82 +217,39 @@ jobs:
         run: python scripts/check-artifact.py --dial "dist/dial-$env:GITHUB_REF_NAME-$env:RELEASE_TARGET/dial.exe" --target "$env:RELEASE_TARGET" --format-only
       - name: Test installer under Windows PowerShell 5.1
         shell: powershell
-        run: ./scripts/test-install.ps1 -ArchivePath "${{ github.workspace }}/dist/dial-${{ github.ref_name }}-${{ matrix.target }}.zip"
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: ./scripts/test-install.ps1 -ArchivePath "$env:GITHUB_WORKSPACE/dist/dial-$env:GITHUB_REF_NAME-$env:RELEASE_TARGET.zip"
       - name: Test installer under PowerShell 7
         shell: pwsh
-        run: ./scripts/test-install.ps1 -ArchivePath "${{ github.workspace }}/dist/dial-${{ github.ref_name }}-${{ matrix.target }}.zip"
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: ./scripts/test-install.ps1 -ArchivePath "$env:GITHUB_WORKSPACE/dist/dial-$env:GITHUB_REF_NAME-$env:RELEASE_TARGET.zip"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-assets-${{ matrix.target }}
           path: dist/*.zip
           if-no-files-found: error
 
-  publish:
-    name: Publish GitHub release
-    # CI's `windows-rust` job runs the same focused Windows contract suite on every push, and the
-    # first publish step requires CI to pass for this commit, so it is not repeated here.
+  sign:
+    name: Sign release manifest
     needs: [build, windows-build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+    # Configure required reviewers and tag deployment rules in repository settings.
+    environment: release-signing
     permissions:
-      contents: write
-      packages: write
-      pull-requests: write
-      # Reads CI's result for the tagged commit.
-      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: release-assets-*
           merge-multiple: true
           path: dist
-      - name: Require passing CI for this commit
-        # CI runs the full suite on these same platforms for every push to main; re-running it
-        # here doubled release time (10-21 min per macOS job). Builds run while CI is still going;
-        # nothing is published until CI has passed for the tagged commit.
+      - name: Prepare installers and manifest (no private key)
         env:
-          GH_TOKEN: ${{ github.token }}
-        timeout-minutes: 90
-        run: |
-          set -euo pipefail
-          waited=0
-          while :; do
-            runs=$(gh run list -R "$GITHUB_REPOSITORY" --workflow ci.yml --commit "$GITHUB_SHA" --json status,conclusion)
-            if jq -e 'any(.[]; .conclusion == "success")' <<<"$runs" >/dev/null; then
-              echo "CI passed for $GITHUB_SHA"
-              break
-            fi
-            pending=$(jq 'any(.[]; .status != "completed")' <<<"$runs")
-            # A tag pushed with its commit can start before CI has registered a run.
-            if [ "$pending" != true ] && { [ "$runs" != '[]' ] || [ "$waited" -ge 300 ]; }; then
-              echo "No successful CI run for $GITHUB_SHA: $runs. Push the commit to main and let CI pass before tagging." >&2
-              exit 1
-            fi
-            sleep 30
-            waited=$((waited + 30))
-          done
-      - name: Validate release signing configuration
-        env:
-          DIAL_RELEASE_SIGNING_KEY: ${{ secrets.DIAL_RELEASE_SIGNING_KEY }}
-          DIAL_RELEASE_PUBLIC_KEY: ${{ vars.DIAL_RELEASE_PUBLIC_KEY }}
-          DIAL_RELEASE_PUBLIC_KEY_PEM: ${{ vars.DIAL_RELEASE_PUBLIC_KEY_PEM }}
-        run: |
-          set -euo pipefail
-          test -n "$DIAL_RELEASE_SIGNING_KEY" || { echo 'Required secret DIAL_RELEASE_SIGNING_KEY is missing' >&2; exit 1; }
-          test -n "$DIAL_RELEASE_PUBLIC_KEY" || { echo 'Required variable DIAL_RELEASE_PUBLIC_KEY (base64 Ed25519 raw public key) is missing' >&2; exit 1; }
-          test -n "$DIAL_RELEASE_PUBLIC_KEY_PEM" || { echo 'Required variable DIAL_RELEASE_PUBLIC_KEY_PEM is missing' >&2; exit 1; }
-          printf '%s\n' "$DIAL_RELEASE_SIGNING_KEY" > "$RUNNER_TEMP/release-key.pem"
-          printf '%s\n' "$DIAL_RELEASE_PUBLIC_KEY_PEM" > "$RUNNER_TEMP/release-public.pem"
-          derived="$(openssl pkey -pubout -outform DER -in "$RUNNER_TEMP/release-key.pem" | tail -c 32 | base64 -w0)"
-          test "$derived" = "$DIAL_RELEASE_PUBLIC_KEY" || { echo 'Public key does not match signing key' >&2; exit 1; }
-          pem_raw="$(openssl pkey -pubin -in "$RUNNER_TEMP/release-public.pem" -outform DER | tail -c 32 | base64 -w0)"
-          test "$pem_raw" = "$DIAL_RELEASE_PUBLIC_KEY" || { echo 'Installer public key does not match embedded update key' >&2; exit 1; }
-      - name: Sign release manifest and publish
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ github.ref_name }}
-          DIAL_RELEASE_SIGNING_KEY: ${{ secrets.DIAL_RELEASE_SIGNING_KEY }}
           DIAL_RELEASE_PUBLIC_KEY_PEM: ${{ vars.DIAL_RELEASE_PUBLIC_KEY_PEM }}
         run: |
           set -euo pipefail
@@ -266,14 +270,84 @@ jobs:
           Path('dist/install.ps1').write_text(embedded, encoding='utf-8', newline='\n')
           PY
           (cd dist && sha256sum -- *.tar.gz *.zip install.sh install.ps1 > SHA256SUMS)
-          printf '%s\n' "$DIAL_RELEASE_SIGNING_KEY" > "$RUNNER_TEMP/release-key.pem"
-          openssl pkeyutl -sign -inkey "$RUNNER_TEMP/release-key.pem" -rawin \
-            -in dist/SHA256SUMS -out "$RUNNER_TEMP/SHA256SUMS.sig"
+      - name: Validate keys and sign manifest
+        env:
+          DIAL_RELEASE_SIGNING_KEY: ${{ secrets.DIAL_RELEASE_SIGNING_KEY }}
+          DIAL_RELEASE_PUBLIC_KEY: ${{ vars.DIAL_RELEASE_PUBLIC_KEY }}
+          DIAL_RELEASE_PUBLIC_KEY_PEM: ${{ vars.DIAL_RELEASE_PUBLIC_KEY_PEM }}
+        run: |
+          set -euo pipefail
+          umask 077
+          key="$(mktemp "$RUNNER_TEMP/release-key.XXXXXX")"
+          public="$(mktemp "$RUNNER_TEMP/release-public.XXXXXX")"
+          trap 'shred -u "$key"; rm -f "$public"' EXIT
+          test -n "$DIAL_RELEASE_SIGNING_KEY" && test -n "$DIAL_RELEASE_PUBLIC_KEY" && test -n "$DIAL_RELEASE_PUBLIC_KEY_PEM"
+          printf '%s\n' "$DIAL_RELEASE_SIGNING_KEY" > "$key"
+          unset DIAL_RELEASE_SIGNING_KEY
+          printf '%s\n' "$DIAL_RELEASE_PUBLIC_KEY_PEM" > "$public"
+          derived="$(openssl pkey -pubout -outform DER -in "$key" | tail -c 32 | base64 -w0)"
+          pem_raw="$(openssl pkey -pubin -in "$public" -outform DER | tail -c 32 | base64 -w0)"
+          test "$derived" = "$DIAL_RELEASE_PUBLIC_KEY" && test "$pem_raw" = "$DIAL_RELEASE_PUBLIC_KEY"
+          openssl pkeyutl -sign -inkey "$key" -rawin -in dist/SHA256SUMS -out "$RUNNER_TEMP/SHA256SUMS.sig"
           base64 -w0 "$RUNNER_TEMP/SHA256SUMS.sig" > dist/SHA256SUMS.sig
-          python3 scripts/make-sshsig.py --openssl openssl --key "$RUNNER_TEMP/release-key.pem" \
-            --input dist/SHA256SUMS --output dist/SHA256SUMS.sshsig
+          python3 scripts/make-sshsig.py --openssl openssl --key "$key" --input dist/SHA256SUMS --output dist/SHA256SUMS.sshsig
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: signed-release-assets
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish signed release
+    needs: sign
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    outputs:
+      latest: ${{ steps.latest.outputs.latest }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: signed-release-assets
+          path: dist
+      - name: Decide whether this is the newest stable release
+        id: latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' > "$RUNNER_TEMP/release-tags"
+          python3 scripts/release-policy.py latest "$RELEASE_TAG" "$RUNNER_TEMP/release-tags" >> "$GITHUB_OUTPUT"
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          IS_LATEST: ${{ steps.latest.outputs.latest }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release-policy.py notes "$RELEASE_TAG" CHANGELOG.md > "$RUNNER_TEMP/release-notes.md"
           gh release create "$RELEASE_TAG" dist/*.tar.gz dist/*.zip dist/SHA256SUMS dist/SHA256SUMS.sig dist/SHA256SUMS.sshsig dist/install.sh dist/install.ps1 \
-            --verify-tag --generate-notes --title "Dial $RELEASE_TAG"
+            --verify-tag --notes-file "$RUNNER_TEMP/release-notes.md" --latest="$IS_LATEST" --title "Dial $RELEASE_TAG"
+
+  packaging:
+    name: Propose package metadata update
+    needs: publish
+    if: needs.publish.outputs.latest == 'true'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: signed-release-assets
+          path: dist
       - name: Open Homebrew formula update PR
         env:
           RELEASE_TAG: ${{ github.ref_name }}
@@ -303,9 +377,19 @@ jobs:
               --title "release: Dial $RELEASE_TAG package metadata" \
               --body "Automated Homebrew formula update for $RELEASE_TAG. Merge once the release is published."
           fi
+
+  container:
+    name: Publish signed container with build provenance and SBOM
+    needs: [publish, gate]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          ref: ${{ github.ref }}
+          persist-credentials: false
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
@@ -318,16 +402,37 @@ jobs:
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ghcr.io/${{ github.repository }}
+          flavor: latest=false
           tags: |
             type=ref,event=tag
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ needs.publish.outputs.latest == 'true' }}
       - name: Publish container
+        id: container-build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           build-args: |
             DIAL_BUILD_REVISION=${{ github.sha }}
             DIAL_RELEASE_PUBLIC_KEY=${{ vars.DIAL_RELEASE_PUBLIC_KEY }}
+            SOURCE_DATE_EPOCH=${{ needs.gate.outputs.epoch }}
+          provenance: mode=max
+          sbom: true
           push: true
           tags: ${{ steps.docker-meta.outputs.tags }}
           labels: ${{ steps.docker-meta.outputs.labels }}
+      - name: Install pinned Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2; verifies pinned bootstrap checksum
+        with:
+          cosign-release: v3.0.6
+      - name: Sign immutable container digest with GitHub OIDC
+        env:
+          IMAGE_REPOSITORY: ghcr.io/${{ github.repository }}
+          IMAGE_DIGEST: ${{ steps.container-build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          image="${IMAGE_REPOSITORY,,}@$IMAGE_DIGEST"
+          cosign sign --yes "$image"
+          cosign verify --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@$GITHUB_REF" \
+            "$image"

@@ -38,7 +38,7 @@ pub mod knowledge;
 pub mod net;
 pub mod surface;
 #[cfg(test)]
-mod testkit;
+pub(crate) mod testkit;
 pub mod vision;
 
 // External `dial::tools::*` paths used by src/main.rs, src/cmd and tests/integration.
@@ -866,6 +866,25 @@ impl Workspace {
     }
 
     fn check_protected_mutation(&self, path: &Path) -> Result<(), String> {
+        // Git configuration and hooks are executed later by host-side Git. Native mutations
+        // respect the same metadata boundary as sandboxed shell commands, including linked
+        // worktrees, aliases, and deleting an ancestor of the metadata directory.
+        let roots: Vec<_> = self.roots().map(Path::to_path_buf).collect();
+        let canonical = Self::canonical_prefix(path);
+        if [path, canonical.as_path()].iter().any(|path| {
+            path.components()
+                .any(|component| component.as_os_str() == ".git")
+        }) {
+            return Err("mutation would affect protected Git metadata; use an approved git operation instead".into());
+        }
+        if sandbox::git_metadata(&roots)?.iter().any(|metadata| {
+            path.starts_with(metadata)
+                || metadata.starts_with(path)
+                || canonical.starts_with(metadata)
+                || metadata.starts_with(&canonical)
+        }) {
+            return Err("mutation would affect protected Git metadata; use an approved git operation instead".into());
+        }
         if self.protected_paths.is_empty() {
             return Ok(());
         }
@@ -1147,11 +1166,11 @@ impl Workspace {
         use std::io::Read;
         const LIMIT: u64 = 16 * 1024 * 1024;
         let path = self.resolve(input.to_str()?).ok()?;
-        let metadata = std::fs::metadata(&path).ok()?;
+        let file = edit::edit_transaction::open_read(self, &path).ok()?;
+        let metadata = file.metadata().ok()?;
         if !metadata.is_file() || metadata.len() > LIMIT {
             return None;
         }
-        let file = std::fs::File::open(&path).ok()?;
         let mut data = Vec::new();
         file.take(LIMIT + 1).read_to_end(&mut data).ok()?;
         (data.len() as u64 <= LIMIT).then(|| (path, Sha256::digest(&data).into()))

@@ -14,4 +14,5 @@ mod isolation;
 mod proposals;
 mod review;
 mod shell_sessions;
+mod terminal_lifecycle;
 mod ui_configuration;

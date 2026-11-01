@@ -23,6 +23,9 @@ fn git(dir: &Path, args: &[&str]) -> String {
         "git {args:?}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    if args.first() == Some(&"init") {
+        crate::commit::testkit::disable_inherited_git_drivers(dir);
+    }
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 

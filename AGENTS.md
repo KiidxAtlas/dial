@@ -11,12 +11,18 @@ crate, and the integration tests (`tests/integration`). Crates under `crates/` a
 `dial-agent` → `dial-ui` → `dial-app`; a crate may depend only on lower layers.
 `tests/integration/architecture.rs` enforces the layering and module rules.
 
-## Rules that the build or tests enforce
+## Repository rules and checks
 
-- Unit tests never live inline in `src/`: write `#[cfg(test)] mod tests;` and put the body in the
-  sibling `tests.rs` (`foo.rs` → `foo/tests.rs`).
+The architecture suite enforces crate layers, module layout and out-of-line test bodies;
+workspace lints enforce the configured Rust/Clippy ratchets. Configuration attributes are a
+review convention backed by owning deserialization/validation tests, not a universal attribute scan.
+
+- Unit tests never live inline in `src/`: prefer `#[cfg(test)] mod tests;` with the body in
+  the sibling `tests.rs` (`foo.rs` → `foo/tests.rs`). Named out-of-line test modules are also
+  supported; the guard follows their declared paths rather than requiring the name `tests`.
 - A module uses either `name.rs` + `name/` or `name/mod.rs`, never both.
-- Configuration structs use `#[serde(default, deny_unknown_fields)]` with a `Default` impl.
+- Default-backed configuration structs use `#[serde(default, deny_unknown_fields)]` with a
+  `Default` impl. Required records and tagged representations retain their appropriate contracts.
   User-visible settings are declared once in `crates/dial-llm/src/config/schema/` and consumed by
   the UI, CLI and validation.
 - Built-in tool parameter schemas are hashed into contract identities

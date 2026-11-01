@@ -9,12 +9,13 @@ use crate::config::settings_store::{locked, write_private};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(test)]
+use std::time::Duration;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     io::Read,
     path::{Path, PathBuf},
-    time::Duration,
 };
 mod bundled;
 pub use bundled::{
@@ -1102,12 +1103,7 @@ fn probe_models(probe: &Probe) -> (ProviderStatus, Vec<ModelEntry>) {
         }
     };
     let local = crate::llm::is_local_host(uri.host().unwrap_or(""));
-    let builder = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(if local { 1 } else { 5 })))
-        .http_status_as_error(false)
-        .max_redirects(0);
-    let builder = if local { builder.proxy(None) } else { builder };
-    let agent = ureq::Agent::new_with_config(builder.build());
+    let agent = super::agent_with(if local { 1 } else { 5 }, !local, None, None);
     let protocol = probe
         .spec
         .protocol
@@ -1351,13 +1347,7 @@ fn verify_and_save_credential_at(
 }
 
 fn verify_openrouter_key_at(url: &str, token: &str) -> Result<()> {
-    let agent = ureq::Agent::new_with_config(
-        ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(5)))
-            .http_status_as_error(false)
-            .max_redirects(0)
-            .build(),
-    );
+    let agent = super::agent_with(5, true, None, None);
     let mut response = agent
         .get(url)
         .header("Authorization", format!("Bearer {token}"))
@@ -1467,12 +1457,7 @@ pub(crate) fn local_request(
         return None;
     }
     let origin = format!("{}://{}", uri.scheme_str()?, uri.authority()?);
-    let builder = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(1)))
-        .http_status_as_error(false)
-        .max_redirects(0)
-        .proxy(None);
-    let agent = ureq::Agent::new_with_config(builder.build());
+    let agent = super::agent_with(1, false, None, None);
     let url = format!("{origin}{path}");
     let mut response = match body {
         None => {

@@ -5,7 +5,6 @@ use crate::platform::{
 };
 use anyhow::{Context, Result, ensure};
 use dial_llm::llm::batch::{Client, Outcome, Plan};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -83,7 +82,8 @@ impl Ledger {
             "unsafe batch ledger lock"
         );
         platform_fs::set_owner_only(&lock_path)?;
-        lock.try_lock_exclusive()
+        lock.try_lock()
+            .map_err(std::io::Error::from)
             .context("batch ledger is busy; try again later")?;
         Ok(Self { dir, _lock: lock })
     }

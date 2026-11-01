@@ -76,7 +76,7 @@ fn migrate_experiment(c: &Connection) -> Result<()> {
 /// Refuses unless the working tree matches HEAD: a benchmark must measure the commit it records.
 fn ensure_clean(root: &Path, why: &str) -> Result<()> {
     let status = run_checked(root, &["status", "--porcelain"], false)
-        .map_err(|_| anyhow::anyhow!("not a git repository"))?;
+        .map_err(|error| anyhow::anyhow!("inspecting the working tree failed: {error}"))?;
     let changed = status.lines().count();
     if changed > 0 {
         bail!(

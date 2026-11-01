@@ -8,6 +8,12 @@ Commands are placed in a dedicated process group. The tool combines stdout and s
 
 The sandbox may deny network access or writes outside the project. Use the command's `$TMPDIR` for temporary files. Do not retry a denied command unchanged; adapt it to the sandbox or explain the limitation.
 
+Dev-policy and unsandboxed child environments use an explicit runtime/toolchain allowlist,
+rather than guessing secrets from variable names. Unknown inherited variables and credential-
+bearing URL values are excluded. MCP operator-configured `env` entries are applied separately
+as explicit grants; do not place credentials there unless the server is trusted to receive them.
+This environment filtering does not turn an approved unsandboxed command into a sandbox.
+
 ## Interactive programs
 
 For a terminal application (curses, a TUI, a REPL or an interactive CLI), call `bash` with `{"command":"<actual command>","pty":true}`. This allocates a terminal at launch through the existing managed `bg` runner. Without explicit readiness, startup observes the existing job for up to one second after spawn (ending sooner on observed exit), then returns its rendered screen and structured `job` data (`name`, `pid`, `terminal`) with process/capture facts. Exit-reader settlement can add up to 300 ms, plus spawn and scheduling overhead. An observed early nonzero or signal exit is an error, not a successful launch receipt. Use the returned name with `bg` `output`, `input`, `wait`, `resize` and `kill`; discover/load `bg` first if it is deferred. For example, `{"action":"input","name":"<returned name>","text":"help\n"}` sends input, and `{"action":"wait","name":"<returned name>","timeout":5}` waits up to five seconds without killing the job.

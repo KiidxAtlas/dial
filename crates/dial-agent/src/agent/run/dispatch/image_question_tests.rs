@@ -1,4 +1,5 @@
 use super::*;
+#[cfg(unix)]
 use crate::agent::run::tool_exposure::default_offer_tests::with_agent;
 
 #[cfg(unix)]

@@ -211,50 +211,44 @@ fn browser(url: &str) -> Result<()> {
 }
 fn read_callback(listener: &TcpListener, state: &str, cancel: &AtomicBool) -> Result<String> {
     let deadline = std::time::Instant::now() + Duration::from_secs(180);
-    loop {
-        cancelled(cancel)?;
-        ensure!(
-            std::time::Instant::now() < deadline,
-            "Anthropic sign-in timed out; try again from /providers"
-        );
-        match listener.accept() {
-            Ok((mut stream, _)) => {
-                // macOS accepted sockets inherit the listener's non-blocking mode, which makes the
-                // callback read fail with WouldBlock before the browser request arrives.
-                stream.set_nonblocking(false)?;
-                stream.set_read_timeout(Some(Duration::from_millis(100)))?;
-                let result = callback_code(&mut stream, state, cancel);
-                let accepted = result.is_ok();
-                let declined = result
-                    .as_ref()
-                    .err()
-                    .is_some_and(|error| error.to_string() == "Anthropic sign-in was declined");
-                let body = if accepted {
-                    "Anthropic authorization received. Return to Dial."
+    super::oauth::util::wait_callback(
+        listener,
+        cancel,
+        deadline,
+        "Anthropic sign-in timed out; try again from /providers",
+        |stream| {
+            // macOS accepted sockets inherit the listener's non-blocking mode, which makes the
+            // callback read fail with WouldBlock before the browser request arrives.
+            stream.set_nonblocking(false)?;
+            stream.set_read_timeout(Some(Duration::from_millis(100)))?;
+            let result = callback_code(stream, state, cancel);
+            let accepted = result.is_ok();
+            let declined = result
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.to_string() == "Anthropic sign-in was declined");
+            let body = if accepted {
+                "Anthropic authorization received. Return to Dial."
+            } else {
+                "This is not the active Anthropic authorization callback."
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {}\r\nContent-Type: text/plain; charset=utf-8\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                if accepted {
+                    "200 OK"
                 } else {
-                    "This is not the active Anthropic authorization callback."
-                };
-                let _ = write!(
-                    stream,
-                    "HTTP/1.1 {}\r\nContent-Type: text/plain; charset=utf-8\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    if accepted {
-                        "200 OK"
-                    } else {
-                        "400 Bad Request"
-                    },
-                    body.len(),
-                    body
-                );
-                if accepted || declined {
-                    return result;
-                }
+                    "400 Bad Request"
+                },
+                body.len(),
+                body
+            );
+            if accepted || declined {
+                return result.map(Some);
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(25))
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
+            Ok(None)
+        },
+    )
 }
 fn request_token(body: Value, cancel: Arc<AtomicBool>) -> Result<Value> {
     request_token_at(TOKEN_URL, body, cancel)
@@ -263,7 +257,7 @@ fn request_token_at(url: &str, body: Value, cancel: Arc<AtomicBool>) -> Result<V
     let mut response = super::agent_with(30, true, Some(cancel), None)
         .post(url)
         .header("Content-Type", "application/json")
-        .header("anthropic-beta", "oauth-2025-04-20")
+        .header("anthropic-beta", super::anthropic::CLAUDE_OAUTH_BETA)
         .header(
             "User-Agent",
             "anthropic-sdk-typescript/0.112.1 userOAuthProvider",
@@ -312,9 +306,8 @@ fn tokens(value: &Value, previous: Option<&Tokens>) -> Result<Tokens> {
     })
 }
 pub fn login(dir: &Path, cancel: Arc<AtomicBool>) -> Result<String> {
-    let listener = TcpListener::bind(("localhost", CALLBACK_PORT))
+    let listener = super::oauth::util::bind_callback("localhost", CALLBACK_PORT)
         .context("Anthropic sign-in callback port 54545 is unavailable")?;
-    listener.set_nonblocking(true)?;
     let redirect = format!("http://localhost:{CALLBACK_PORT}{CALLBACK_PATH}");
     let state = random();
     let verifier = random();

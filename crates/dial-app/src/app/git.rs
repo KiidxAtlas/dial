@@ -228,7 +228,7 @@ pub(super) fn git_output(root: &Path, args: &[&str]) -> Option<String> {
     let mut group = crate::tools::exec::shell::ProcessGroup::new(
         crate::platform::process::spawn_group(&mut command).ok()?,
     );
-    let mut stdout = group.child.stdout.take()?;
+    let mut stdout = group.take_stdout()?;
     crate::platform::io::set_nonblocking(&stdout).ok()?;
     // This already runs on a status worker. Drain here while checking the
     // deadline, rather than waiting for exit with a potentially full pipe.
@@ -265,7 +265,7 @@ pub(super) fn git_output(root: &Path, args: &[&str]) -> Option<String> {
         }
         std::thread::sleep(Duration::from_millis(5));
     }
-    let status = group.child.wait().ok()?;
+    let status = group.wait().ok()?;
     if status.success() {
         String::from_utf8(bytes).ok()
     } else {

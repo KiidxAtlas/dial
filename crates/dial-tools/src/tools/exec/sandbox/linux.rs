@@ -281,6 +281,7 @@ pub(super) fn command_mode(
         return Err("bubblewrap is missing; install it with sudo apt install bubblewrap".into());
     }
     // A root WSL session has a different threat model; never silently run with host root rights.
+    // SAFETY: geteuid has no pointer arguments and only reads the process's effective UID.
     if unsafe { libc::geteuid() } == 0 {
         return Err("run Dial as your normal Linux/WSL user, not root or sudo".into());
     }

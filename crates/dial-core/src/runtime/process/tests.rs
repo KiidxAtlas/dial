@@ -7,6 +7,30 @@ fn sh(script: &str) -> Command {
 }
 
 #[test]
+fn group_wait_apis_reap_once_and_disarm_signalling() {
+    for poll in [false, true] {
+        let child = crate::platform::process::spawn_group(&mut sh("exit 7")).unwrap();
+        let mut group = ProcessGroup::new(child);
+        let status = if poll {
+            while !group.exited().unwrap() {
+                crate::platform::process::wait_exited(&group.child, Duration::from_secs(5))
+                    .unwrap();
+            }
+            group.try_wait().unwrap().unwrap()
+        } else {
+            group.wait().unwrap()
+        };
+        assert_eq!(status.code(), Some(7));
+        assert!(
+            group.terminated,
+            "reaping must disarm PID-based group signalling"
+        );
+        assert_eq!(group.wait().unwrap().code(), Some(7));
+        assert_eq!(group.try_wait().unwrap().unwrap().code(), Some(7));
+    }
+}
+
+#[test]
 fn captures_streams_with_caps_and_stdin() {
     let cancel = AtomicBool::new(false);
     let mut seen = Vec::new();

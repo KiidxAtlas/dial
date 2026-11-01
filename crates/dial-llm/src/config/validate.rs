@@ -252,6 +252,10 @@ impl Config {
 
     fn validate_timeouts_and_windows(&self) -> Result<()> {
         ensure!(
+            (1..=86400).contains(&self.telemetry.flush_interval_secs),
+            "telemetry.flush_interval_secs must be 1..86400"
+        );
+        ensure!(
             self.worker_timeout_secs <= 86400,
             "worker_timeout_secs must be 0 (unlimited) or 1..86400"
         );

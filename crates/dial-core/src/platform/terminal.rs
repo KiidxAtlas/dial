@@ -112,10 +112,11 @@ pub fn open(rows: u16, cols: u16) -> io::Result<(File, File)> {
     for file in [&master, &slave] {
         // SAFETY: fcntl operates on a live descriptor; no pointer arguments.
         let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
-        if flags == -1
-            || unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) }
-                == -1
-        {
+        if flags == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the descriptor is still owned by file; flags came from F_GETFD above.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1 {
             return Err(io::Error::last_os_error());
         }
     }
@@ -215,6 +216,15 @@ extern "C" fn record_signal(signal: i32) {
 pub struct Signals(Vec<(i32, libc::sigaction)>);
 impl Signals {
     pub fn install() -> io::Result<Self> {
+        Self::install_for(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP])
+    }
+
+    /// Scoped TUI termination bridge. Ctrl-C remains owned by the interrupt bridge.
+    pub fn install_termination() -> io::Result<Self> {
+        Self::install_for(&[libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT])
+    }
+
+    fn install_for(signals: &[i32]) -> io::Result<Self> {
         if INSTALLED.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -223,7 +233,7 @@ impl Signals {
         }
         SIGNAL.store(0, std::sync::atomic::Ordering::Relaxed);
         let mut guard = Self(Vec::new());
-        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        for &signal in signals {
             // SAFETY: zeroed sigaction is initialized below and used only with sigaction.
             let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
             // SAFETY: old action is a valid output buffer; empty mask is initialized by libc.
@@ -233,6 +243,7 @@ impl Signals {
             unsafe {
                 libc::sigemptyset(&mut action.sa_mask);
             }
+            // SAFETY: signal is from our fixed list, and both initialized actions outlive the call.
             if unsafe { libc::sigaction(signal, &action, &mut old) } == -1 {
                 return Err(io::Error::last_os_error());
             }
@@ -242,6 +253,15 @@ impl Signals {
     }
     pub fn take(&self) -> i32 {
         SIGNAL.swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Observe without consuming: every UI boundary must see a pending termination.
+    pub fn pending() -> i32 {
+        if INSTALLED.load(std::sync::atomic::Ordering::Acquire) {
+            SIGNAL.load(std::sync::atomic::Ordering::Relaxed)
+        } else {
+            0
+        }
     }
 }
 impl Drop for Signals {

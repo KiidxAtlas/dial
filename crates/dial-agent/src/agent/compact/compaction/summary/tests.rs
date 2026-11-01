@@ -82,14 +82,26 @@ fn oversized_text_is_fragmented_in_order_and_its_tail_reaches_a_later_call() {
 
 #[test]
 fn fragment_cover_every_byte_on_char_boundaries_in_order() {
-    let text = format!("{}\n{}", "é".repeat(3_000), "ß".repeat(3_000));
-    let pieces = fragments(&text, 1_000).unwrap();
-    assert!(pieces.len() > 1);
-    let rebuilt: String = pieces
-        .iter()
-        .map(|piece| piece.split_once('\n').unwrap().1)
-        .collect();
-    assert_eq!(rebuilt, text);
+    for (text, budget) in [
+        (
+            format!("{}\n{}", "é".repeat(3_000), "ß".repeat(3_000)),
+            1_000,
+        ),
+        ("🦀🦀🦀".to_owned(), 1),
+        ("a🦀\né🦀z".to_owned(), 1),
+    ] {
+        let pieces = fragments(&text, budget).unwrap();
+        assert!(pieces.len() > 1);
+        let rebuilt: String = pieces
+            .iter()
+            .map(|piece| {
+                let body = piece.split_once('\n').unwrap().1;
+                assert!(!body.is_empty(), "each fragment must make progress");
+                body
+            })
+            .collect();
+        assert_eq!(rebuilt, text, "budget {budget}");
+    }
 }
 
 #[test]

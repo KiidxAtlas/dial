@@ -48,3 +48,19 @@ fn unlifted_dialect_markup_naming_an_offered_tool_is_a_call() {
         &names()
     ));
 }
+
+#[test]
+fn shared_byte_prefix_preserves_unicode_and_maximum_byte_budget() {
+    let text = "aé🦀z";
+    for (max, expected) in [
+        (0, ""),
+        (1, "a"),
+        (2, "a"),
+        (3, "aé"),
+        (6, "aé"),
+        (7, "aé🦀"),
+        (usize::MAX, text),
+    ] {
+        assert_eq!(byte_prefix(text, max), expected);
+    }
+}

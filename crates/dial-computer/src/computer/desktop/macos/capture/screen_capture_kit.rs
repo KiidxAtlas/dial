@@ -113,12 +113,13 @@ impl CaptureClient {
         control::check()?;
         let directory = HelperDirectory::create("dial-capture")?;
         let executable = directory.write("dial-capture-helper", HELPER, 0o700)?;
-        let mut child = Command::new(executable)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(io_error)?;
+        let mut child = crate::platform::process::spawn(
+            Command::new(executable)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null()),
+        )
+        .map_err(io_error)?;
         let (Some(input), Some(output)) = (child.stdin.take(), child.stdout.take()) else {
             let _ = child.kill();
             let _ = child.wait();

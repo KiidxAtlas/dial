@@ -442,7 +442,7 @@ pub struct Client {
 
 impl Client {
     /// Start `program` with `args` in `root`, run the handshake with `options`, and return the client.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub fn spawn(
         name: &str,
         program: &Path,
@@ -494,7 +494,7 @@ impl Client {
 
     /// Run the handshake over an existing stream pair with `options`. Dropping the client tears the server down:
     /// `shutdown`, `exit`, then a kill of `child` (and its process group) if it lingers.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub fn connect(
         name: &str,
         root: &Path,
@@ -697,7 +697,7 @@ impl Client {
     pub fn status(&self) -> Value {
         json!({
             "name": self.name(), "root": self.root, "alive": self.is_alive(), "busy": self.is_busy(),
-            "process_id": lock(&self.child).as_ref().map(|group| group.child.id()),
+            "process_id": lock(&self.child).as_ref().map(|group| group.id()),
             "open_documents": lock(&self.docs).iter().map(|(path, doc)| {
                 json!({"path": path, "version": doc.version})
             }).collect::<Vec<_>>(),

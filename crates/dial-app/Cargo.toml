@@ -18,7 +18,6 @@ anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true
 crossterm.workspace = true
-fs2.workspace = true
 globset.workspace = true
 ignore.workspace = true
 image.workspace = true

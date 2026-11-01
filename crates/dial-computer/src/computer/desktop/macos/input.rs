@@ -24,36 +24,32 @@ use crate::computer::desktop::{
     types::{DesktopWindow, Target},
 };
 
+// Keep only the public state selector across worker transfers. Native event
+// sources are created and dropped on the calling thread, never asserted Send.
 pub(super) struct MacInput {
-    source: CGEventSource,
+    source_state: CGEventSourceStateID,
 }
-#[allow(
-    clippy::non_send_fields_in_send_ty,
-    reason = "CGEventSource is an immutable CF object; `&mut self` receivers serialize all posting"
-)]
-// SAFETY: Core Graphics event sources are immutable CF objects after setup,
-// and all access through `MacInput` requires `&mut self`, so events are posted
-// serially after ownership moves between threads.
-unsafe impl Send for MacInput {}
 
 impl MacInput {
     pub(super) fn new() -> CoreResult<Self> {
-        Ok(Self { source: source()? })
+        let source_state = CGEventSourceStateID::HIDSystemState;
+        // Preserve the constructor's early failure without retaining its native
+        // object across threads. HIDSystemState uses the shared HID state, not
+        // a private source state that would need to persist between operations.
+        event_source(source_state)?;
+        Ok(Self { source_state })
     }
 
-    #[allow(
-        clippy::needless_pass_by_ref_mut,
-        reason = "`&mut self` exclusivity backs the `Send` safety argument for the CF event source"
-    )]
     pub(super) fn pointer(
-        &mut self,
+        &self,
         target: &Target,
         event: PointerEvent,
         mode: DeliveryMode,
         capture: &MacCapture,
     ) -> CoreResult<()> {
+        let source = event_source(self.source_state)?;
         match target {
-            Target::Desktop | Target::Display(_) => global_pointer(&self.source, event),
+            Target::Desktop | Target::Display(_) => global_pointer(&source, event),
             Target::Window(id) => {
                 let window = capture.window(id)?;
                 let (pid, wid) = window_identity(&window)?;
@@ -63,7 +59,7 @@ impl MacInput {
                         skylight::with_background_guard(pid, || {
                             background_pointer(
                                 BackgroundRoute {
-                                    source: &self.source,
+                                    source: &source,
                                     pid,
                                     wid,
                                     window: &window,
@@ -73,26 +69,23 @@ impl MacInput {
                         })
                     }
                     DeliveryMode::Foreground => {
-                        foreground_pointer(&self.source, &window, pid, wid, event)
+                        foreground_pointer(&source, &window, pid, wid, event)
                     }
                 }
             }
         }
     }
 
-    #[allow(
-        clippy::needless_pass_by_ref_mut,
-        reason = "`&mut self` exclusivity backs the `Send` safety argument for the CF event source"
-    )]
     pub(super) fn type_text(
-        &mut self,
+        &self,
         target: &Target,
         text: &str,
         mode: DeliveryMode,
         capture: &MacCapture,
     ) -> CoreResult<()> {
+        let source = event_source(self.source_state)?;
         match target {
-            Target::Desktop | Target::Display(_) => global_type(&self.source, text),
+            Target::Desktop | Target::Display(_) => global_type(&source, text),
             Target::Window(id) => {
                 let window = capture.window(id)?;
                 let (pid, wid) = window_identity(&window)?;
@@ -107,7 +100,7 @@ impl MacInput {
                         ensure_sole_keyboard_destination(pid, wid)?;
                         skylight::with_background_guard(pid, || {
                             skylight::with_focus_without_raise(pid, wid, || {
-                                background_type(&self.source, pid, text)
+                                background_type(&source, pid, text)
                             })
                         })
                     }
@@ -127,7 +120,7 @@ impl MacInput {
                                     skylight::require_front_window(pid, wid)?;
                                     post_bare_keys(transitions)
                                 }
-                                None => type_text(&self.source, text, |event| {
+                                None => type_text(&source, text, |event| {
                                     post_takeover_key(pid, wid, event)
                                 }),
                             }
@@ -138,19 +131,16 @@ impl MacInput {
         }
     }
 
-    #[allow(
-        clippy::needless_pass_by_ref_mut,
-        reason = "`&mut self` exclusivity backs the `Send` safety argument for the CF event source"
-    )]
     pub(super) fn key_chord(
-        &mut self,
+        &self,
         target: &Target,
         keys: &[KeyName],
         mode: DeliveryMode,
         capture: &MacCapture,
     ) -> CoreResult<()> {
+        let source = event_source(self.source_state)?;
         match target {
-            Target::Desktop | Target::Display(_) => global_chord(&self.source, keys),
+            Target::Desktop | Target::Display(_) => global_chord(&source, keys),
             Target::Window(id) => {
                 let window = capture.window(id)?;
                 let (pid, wid) = window_identity(&window)?;
@@ -167,15 +157,13 @@ impl MacInput {
                         ensure_sole_keyboard_destination(pid, wid)?;
                         skylight::with_background_guard(pid, || {
                             skylight::with_focus_without_raise(pid, wid, || {
-                                background_chord(&self.source, pid, keys)
+                                background_chord(&source, pid, keys)
                             })
                         })
                     }
                     DeliveryMode::Foreground => skylight::with_foreground(pid, wid, |activated| {
                         control::wait(first_key_settle(activated))?;
-                        key_chord(&self.source, keys, |event| {
-                            post_takeover_key(pid, wid, event)
-                        })
+                        key_chord(&source, keys, |event| post_takeover_key(pid, wid, event))
                     }),
                 }
             }
@@ -195,9 +183,10 @@ impl MacInput {
         for &key in keys {
             key_code(key)?;
         }
+        let source = event_source(self.source_state)?;
         match target {
             Target::Desktop | Target::Display(_) => {
-                with_held_keys(&self.source, keys, post_global, || control::wait(duration))
+                with_held_keys(&source, keys, post_global, || control::wait(duration))
             }
             Target::Window(id) => {
                 let window = capture.window(id)?;
@@ -211,7 +200,7 @@ impl MacInput {
                         skylight::with_background_guard(pid, || {
                             skylight::with_focus_without_raise(pid, wid, || {
                                 with_held_keys(
-                                    &self.source,
+                                    &source,
                                     keys,
                                     |event| skylight::post_keyboard(pid, event),
                                     || control::wait(duration),
@@ -222,7 +211,7 @@ impl MacInput {
                     DeliveryMode::Foreground => skylight::with_foreground(pid, wid, |activated| {
                         control::wait(first_key_settle(activated))?;
                         with_held_keys(
-                            &self.source,
+                            &source,
                             keys,
                             |event| post_takeover_key(pid, wid, event),
                             || control::wait(duration),
@@ -454,6 +443,7 @@ unsafe extern "C" {
     ) -> u32;
 }
 
+#[cfg(test)]
 fn source() -> CoreResult<CGEventSource> {
     event_source(CGEventSourceStateID::HIDSystemState)
 }

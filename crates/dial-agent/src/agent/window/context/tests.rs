@@ -15,6 +15,43 @@ fn write(path: impl AsRef<Path>, content: &str) {
 fn layout_at(project: &Path, user: &Path) -> Layout {
     Layout::with_user_dir(project, user.to_path_buf()).unwrap()
 }
+
+#[test]
+fn utf8_context_clipping_charges_only_retained_bytes_before_the_notice() {
+    let root = tempfile::tempdir().unwrap();
+    let user = tempfile::tempdir().unwrap();
+    let layout = layout_at(root.path(), user.path());
+    let path = root.path().join("AGENTS.md");
+    write(&path, "🦀x");
+    let imports = Imports {
+        layout: &layout,
+        home: None,
+        roots: vec![canon(&root)],
+    };
+    for (limit, prefix, remaining, cut) in [
+        (1, "", 1, true),
+        (4, "🦀", 0, true),
+        (5, "🦀x", 0, false),
+        (6, "🦀x", 1, false),
+    ] {
+        let mut budget = limit;
+        let file = load_context_file(
+            &path,
+            "AGENTS.md".into(),
+            &imports,
+            &mut budget,
+            &mut HashSet::new(),
+        )
+        .unwrap();
+        let expected = if cut {
+            format!("{prefix}\n{TRUNCATION_NOTICE}")
+        } else {
+            prefix.to_owned()
+        };
+        assert_eq!(file.content, expected, "budget {limit}");
+        assert_eq!(budget, remaining, "budget {limit}");
+    }
+}
 fn displays(files: &[ContextFile]) -> Vec<String> {
     files.iter().map(|f| f.display.clone()).collect()
 }
@@ -510,15 +547,13 @@ fn explicit_quoted_images_can_be_supplied_outside_the_project() {
         1
     );
     fs::write(outside.path().join("secret.txt"), "private").unwrap();
-    let (message, warnings) = expand_message(
-        root.path(),
-        &format!("@\"{}\"", outside.path().join("secret.txt").display()),
-        &AtomicBool::new(false),
-    );
+    let prompt = format!("@\"{}\"", outside.path().join("secret.txt").display());
+    let (message, warnings) = expand_message(root.path(), &prompt, &AtomicBool::new(false));
     assert_eq!(warnings.len(), 1);
-    assert!(
-        !message.to_string().contains("private"),
-        "external text files stay confined"
+    assert_eq!(
+        message,
+        serde_json::json!({"role":"user", "content":prompt}),
+        "external text files must not add an expanded file block"
     );
     assert!(reference_tokens("@\"unterminated.png").is_empty());
 }

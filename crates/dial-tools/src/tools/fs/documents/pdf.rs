@@ -102,13 +102,13 @@ pub(super) fn read(
         waiter
             .wait(
                 pipe,
-                Some(&process.child),
+                Some(process.child()),
                 Some(deadline.saturating_duration_since(Instant::now())),
             )
             .map_err(|e| format!("waiting for PDF parser: {e}"))?;
     }
     process.terminate();
-    let status = process.child.wait().map_err(|e| e.to_string())?;
+    let status = process.wait().map_err(|e| e.to_string())?;
     if !status.success() {
         return Err(format!(
             "PDF parser failed (exit status {:?}); no text extracted",

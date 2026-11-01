@@ -6,15 +6,30 @@ use std::{sync::atomic::AtomicBool, time::Duration};
 
 use super::commit_types::CommitError;
 
-/// Run `git <args>` in `cwd` and return stdout. A failed command becomes [`CommitError::Git`]
-/// with `context` and the captured stderr (or stdout) so the cause is readable.
+/// Run a host-side Git read through the shared Git safety owner and return stdout.
+/// A failed command becomes [`CommitError::Git`] with `context` and Git's diagnostic.
 pub(crate) fn git_output(cwd: &Path, args: &[&str], context: &str) -> Result<String, CommitError> {
     git_output_indexed(cwd, None, args, context)
 }
 
-/// [`git_output`] with an optional private index. `index` sets `GIT_INDEX_FILE`, so the command
-/// reads and writes that index instead of the repository's own (see [`PreviewIndex`]).
+/// [`git_output`] with an optional private index. Only the explicit index override crosses
+/// the shared read boundary; ambient Git execution configuration is not inherited.
 pub(crate) fn git_output_indexed(
+    cwd: &Path,
+    index: Option<&Path>,
+    args: &[&str],
+    context: &str,
+) -> Result<String, CommitError> {
+    let envs = index
+        .map(|index| vec![("GIT_INDEX_FILE", index.as_os_str())])
+        .unwrap_or_default();
+    crate::tools::vcs::git::run_read(cwd, args, &envs, Duration::from_secs(120))
+        .map_err(|error| CommitError::Git(format!("{context}: {error}")))
+}
+
+/// Approved commit-flow mutations retain repository hooks, signing and filter behavior.
+/// These must not use the host-side read policy, including for a private preview index.
+pub(crate) fn git_mutation_output_indexed(
     cwd: &Path,
     index: Option<&Path>,
     args: &[&str],
@@ -22,6 +37,7 @@ pub(crate) fn git_output_indexed(
 ) -> Result<String, CommitError> {
     let mut command = Command::new("git");
     command
+        .args(crate::tools::vcs::git::safe_git_args())
         .args(args)
         .current_dir(cwd)
         .env("GIT_TERMINAL_PROMPT", "0");
@@ -95,6 +111,7 @@ pub(crate) fn commit_with_message(
 ) -> Result<(), CommitError> {
     const CONTEXT: &str = "Commit failed";
     let mut command = Command::new("git");
+    command.args(crate::tools::vcs::git::safe_git_args());
     if bypass_hooks {
         command.args(crate::tools::vcs::git::hooks_off_args());
     }
@@ -128,7 +145,7 @@ pub(crate) fn push_or_abort(cwd: &Path, bypass_hooks: bool) -> Result<(), Commit
     if bypass_hooks {
         args.push("--no-verify");
     }
-    git_output(cwd, &args, "Push failed").map(|_| ())
+    git_mutation_output_indexed(cwd, None, &args, "Push failed").map(|_| ())
 }
 
 fn check(

@@ -1010,8 +1010,8 @@ fn stream_body_inner(
             vec![
                 ("chatgpt-account-id", id),
                 ("OpenAI-Beta", "responses=experimental"),
-                ("originator", "dial"),
-                ("version", "0.159.0"),
+                ("originator", super::chatgpt::ORIGINATOR),
+                ("version", super::chatgpt::CLIENT_VERSION),
                 ("x-codex-routing-hint", routing_hint.as_str()),
             ]
         })
@@ -1310,8 +1310,8 @@ pub(super) fn compact(
         headers.extend([
             ("chatgpt-account-id", account),
             ("OpenAI-Beta", "responses=experimental"),
-            ("originator", "dial"),
-            ("version", "0.159.0"),
+            ("originator", super::chatgpt::ORIGINATOR),
+            ("version", super::chatgpt::CLIENT_VERSION),
             ("x-codex-routing-hint", routing.as_str()),
         ]);
         if v2 {

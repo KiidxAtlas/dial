@@ -18,11 +18,14 @@ use windows_sys::Win32::{
 };
 
 pub(in crate::platform) fn duplicate_stdout() -> io::Result<File> {
+    // SAFETY: GetStdHandle takes only a selector; the returned handle is borrowed, not closed.
     let source = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
     if source.is_null() || source == -1isize as HANDLE {
         return Err(io::Error::last_os_error());
     }
     let mut duplicate: HANDLE = std::ptr::null_mut();
+    // SAFETY: source was checked against the invalid sentinels; current-process pseudo
+    // handles are valid and duplicate is writable output for a new non-inheritable handle.
     if unsafe {
         DuplicateHandle(
             GetCurrentProcess(),
@@ -37,11 +40,14 @@ pub(in crate::platform) fn duplicate_stdout() -> io::Result<File> {
     {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: DuplicateHandle succeeded and transferred unique ownership of duplicate here.
     Ok(unsafe { File::from_raw_handle(duplicate.cast()) })
 }
 
 fn available(pipe: &impl crate::platform::io::Pipe) -> io::Result<Option<usize>> {
     let mut bytes = 0;
+    // SAFETY: pipe lends a live handle; the only non-null output points to bytes, and
+    // the null data buffer with zero capacity requests a count without reading pipe data.
     if unsafe {
         PeekNamedPipe(
             pipe.as_handle().as_raw_handle() as HANDLE,
@@ -65,6 +71,7 @@ pub(in crate::platform) fn set_nonblocking(
     pipe: &impl crate::platform::io::Pipe,
 ) -> io::Result<()> {
     // We do not change a shared handle's mode; read_nonblocking performs the bounded peek.
+    // SAFETY: pipe lends a live handle; all optional query outputs are null, which is supported.
     if unsafe {
         GetNamedPipeInfo(
             pipe.as_handle().as_raw_handle() as HANDLE,
@@ -113,6 +120,7 @@ pub(in crate::platform) fn wait_readable(
 }
 pub(in crate::platform) fn set_blocking(pipe: &impl crate::platform::io::Pipe) -> io::Result<()> {
     // Windows pipe handles have no shared per-handle blocking flag to toggle.
+    // SAFETY: pipe lends a live handle and GetNamedPipeInfo accepts null for each unused output.
     if unsafe {
         GetNamedPipeInfo(
             pipe.as_handle().as_raw_handle() as HANDLE,

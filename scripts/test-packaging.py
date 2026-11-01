@@ -98,6 +98,7 @@ class ReleaseBuildIdentityTests(unittest.TestCase):
             env.pop("GIT_WORK_TREE", None)
             env.pop("DIAL_BUILD_REVISION", None)
             env.pop("OUT_DIR", None)
+            env.pop("SOURCE_DATE_EPOCH", None)
             for revision, accepted in [(None, False), ("unknown", False), ("not-a-hash", False),
                                        ("0123456789abcdef0123456789abcdef01234567", True)]:
                 with self.subTest(revision=revision):
@@ -109,6 +110,17 @@ class ReleaseBuildIdentityTests(unittest.TestCase):
                     self.assertEqual(result.returncode == 0, accepted, result.stderr)
                     if accepted:
                         self.assertIn(f"cargo:rustc-env=DIAL_BUILD_REVISION={revision}", result.stdout)
+                        self.assertIn("cargo:rustc-env=DIAL_BUILD_EPOCH=0\n", result.stdout)
+                        repeat = subprocess.run([str(executable)], cwd=root, env=case_env,
+                                                capture_output=True, text=True, check=True)
+                        self.assertEqual(repeat.stdout, result.stdout)
+                        for epoch, valid in [("1234567890", True), ("not-an-epoch", False)]:
+                            with self.subTest(epoch=epoch):
+                                stamped = subprocess.run([str(executable)], cwd=root,
+                                    env={**case_env, "SOURCE_DATE_EPOCH": epoch}, capture_output=True, text=True)
+                                self.assertEqual(stamped.returncode == 0, valid, stamped.stderr)
+                                if valid:
+                                    self.assertIn(f"cargo:rustc-env=DIAL_BUILD_EPOCH={epoch}\n", stamped.stdout)
             for profile in ["debug", "local", "profiling", "release"]:
                 for target in [root / "target", root / "target" / "aarch64-apple-darwin"]:
                     with self.subTest(profile=profile, target=target):

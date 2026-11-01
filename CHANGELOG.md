@@ -17,6 +17,43 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+### Security
+
+- Refuse unquoted shell expansion in inspection exemptions, native writes into Git metadata,
+  and host Git reads with executable filters or text-conversion drivers. Git history inspection
+  cannot invoke repository-configured signature verifiers. Remote SSH wrappers no longer depend
+  on the login shell's path-quoting grammar.
+- Authenticate collaboration hosts and writable guest actions without transmitting the write
+  token. Protocol 1004 requires newly generated links and updated clients (`docs/collab.md`).
+- Restrict text-recovered tool calls to offered tools on local/private endpoints and require
+  one-shot human approval throughout parent and worker execution. Saved grants, speculative
+  reads and batch shortcuts cannot authorize recovered calls (`docs/llm-transport.md`).
+- Allowlist inherited child environments, redact secret debug output, zeroize tokens, and
+  warn about the account-policy risk of Anthropic subscription client identity. Existing
+  subscription sign-in remains available without an additional opt-in.
+
+### Fixed
+
+- Recheck session-writer identity after locking, retain locks through removal, version SQLite
+  schemas transactionally, and preserve process-group ownership when waiting for child exit.
+- Load Git-overlay status/diffs off the input thread, reject stale replies and unsafe hunk
+  fallbacks, and route Unix termination signals through normal terminal cleanup without
+  erasing scrollback. Bound relay admission and report actor panics to RPC clients.
+- Honour bounded provider retry hints with exponential backoff/jitter; handle CR-only SSE
+  framing and checked configuration deadlines. Clarify Linux test prerequisites before running
+  the Rust suite, while continuing independent test binaries after failures.
+
+### Changed
+
+- Isolate release signing behind a protected environment, require exact-SHA push-to-main CI,
+  publish curated version-specific changelog notes, and broaden platform lint/feature coverage.
+  Container digest signing uses pinned Cosign with GitHub OIDC. Repository-owner protection
+  settings and outstanding verification/platform limits are tracked in
+  `docs/audit-2026-11-01-follow-up.md`.
+- Replace direct `fs2` locking with standard file locks, consolidate filesystem/HTTP/OAuth
+  and UTF-8 boundary owners, extract orchestration phases, and enforce documented unsafe
+  invariants through the workspace Clippy lint. See the audit follow-up for item dispositions.
+
 ## [0.2.10] - 2026-11-01
 
 ### Added

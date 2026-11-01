@@ -124,7 +124,7 @@ pub(crate) fn append(layout: &Layout, session: &str, event: Event) -> Result<()>
         Err(error) => return Err(error.into()),
     };
     atomic::check_file(&file)?;
-    fs2::FileExt::lock_exclusive(&file)?;
+    std::fs::File::lock(&file)?;
     ensure!(
         file.metadata()?.len() < MAX_FEED,
         "live feed reached its 16 MiB limit"

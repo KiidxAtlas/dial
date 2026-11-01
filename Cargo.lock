@@ -1862,7 +1862,6 @@ dependencies = [
  "dial-tools",
  "dial-ui",
  "flate2",
- "fs2",
  "libc",
  "parking_lot",
  "ring",
@@ -1893,7 +1892,6 @@ dependencies = [
  "fancy-regex 0.16.2",
  "flate2",
  "fontdue",
- "fs2",
  "globset",
  "ignore",
  "libc",
@@ -1935,7 +1933,6 @@ dependencies = [
  "dial-storage",
  "dial-tools",
  "dial-ui",
- "fs2",
  "globset",
  "ignore",
  "image",
@@ -2044,7 +2041,6 @@ dependencies = [
  "crc32fast",
  "dial-core",
  "flate2",
- "fs2",
  "httpdate",
  "image",
  "libc",
@@ -2065,6 +2061,7 @@ dependencies = [
  "ureq",
  "url",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -2076,7 +2073,6 @@ dependencies = [
  "dial-core",
  "dial-llm",
  "flate2",
- "fs2",
  "image",
  "libc",
  "parking_lot",
@@ -2116,7 +2112,6 @@ dependencies = [
  "encoding_rs",
  "fancy-regex 0.16.2",
  "flate2",
- "fs2",
  "futures",
  "globset",
  "half",
@@ -2653,16 +2648,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
-]
-
-[[package]]
-name = "fs2"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
-dependencies = [
- "libc",
- "winapi",
 ]
 
 [[package]]

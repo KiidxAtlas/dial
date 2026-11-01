@@ -180,10 +180,7 @@ fn fragments(text: &str, budget: u64) -> Result<Vec<String>> {
             pieces.push(rest);
             break;
         }
-        let mut end = room;
-        while !rest.is_char_boundary(end) {
-            end -= 1;
-        }
+        let end = rest.floor_char_boundary(room);
         let cut = rest[..end]
             .rfind('\n')
             .filter(|&at| at >= end / 2)

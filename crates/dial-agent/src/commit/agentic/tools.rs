@@ -294,7 +294,7 @@ fn git_index(env: &ToolEnv<'_>, args: &[&str]) -> Result<String, String> {
 
 /// `git diff [--cached] <extra>` arguments.
 fn diff_args<'a>(staged: bool, extra: &[&'a str]) -> Vec<&'a str> {
-    let mut args: Vec<&'a str> = vec!["diff"];
+    let mut args: Vec<&'a str> = vec!["diff", "--no-ext-diff", "--no-textconv"];
     if staged {
         args.push("--cached");
     }

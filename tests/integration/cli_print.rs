@@ -4,11 +4,12 @@ use serde_json::{Value, json};
 use std::{
     collections::VecDeque,
     io::{BufRead, BufReader, Read, Write},
-    net::{TcpListener, TcpStream},
+    net::{SocketAddr, TcpListener, TcpStream},
     process::{Command, Output, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
     thread,
     time::Duration,
@@ -18,39 +19,51 @@ pub(super) struct Server {
     pub(super) url: String,
     requests: Arc<Mutex<Vec<Value>>>,
     stop: Arc<AtomicBool>,
+    address: SocketAddr,
+    stopped: mpsc::Sender<()>,
+    received: mpsc::Receiver<()>,
     worker: Option<thread::JoinHandle<()>>,
 }
 impl Server {
     pub(super) fn new(replies: Vec<Value>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let address = listener.local_addr().unwrap();
+        let url = format!("http://{address}/v1");
+        let (stopped, stopping) = mpsc::channel();
+        let (arrived, received) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let requests = Arc::new(Mutex::new(Vec::new()));
         let (done, seen) = (stop.clone(), requests.clone());
         let worker = thread::spawn(move || {
             let mut replies: VecDeque<_> = replies.into();
             while !done.load(Ordering::Relaxed) {
-                match listener.accept() {
-                    Ok((stream, _)) => respond(stream, &mut replies, &seen, &done),
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(2))
-                    }
-                    Err(e) => panic!("accept: {e}"),
+                let (stream, _) = listener.accept().expect("accept provider request");
+                if done.load(Ordering::Relaxed) {
+                    break;
                 }
+                respond(stream, &mut replies, &seen, &stopping, &arrived);
             }
         });
         Self {
             url,
             requests,
             stop,
+            address,
+            stopped,
+            received,
             worker: Some(worker),
         }
+    }
+    fn wait_for_request(&self, timeout: Duration) -> Result<(), mpsc::RecvTimeoutError> {
+        self.received.recv_timeout(timeout)
     }
 }
 impl Drop for Server {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        let _ = self.stopped.send(());
+        // Wake blocking accept; an unfinished SSE response instead wakes through `stopped`.
+        let _ = TcpStream::connect_timeout(&self.address, Duration::from_secs(1));
         self.worker.take().unwrap().join().unwrap();
     }
 }
@@ -58,7 +71,8 @@ fn respond(
     mut stream: TcpStream,
     replies: &mut VecDeque<Value>,
     requests: &Mutex<Vec<Value>>,
-    stop: &AtomicBool,
+    stopping: &mpsc::Receiver<()>,
+    arrived: &mpsc::Sender<()>,
 ) {
     stream.set_nonblocking(false).unwrap();
     stream
@@ -95,6 +109,7 @@ fn respond(
     let request: Value = serde_json::from_slice(&body).unwrap();
     let streaming = request["stream"] == true;
     requests.lock().push(request);
+    arrived.send(()).expect("notify provider request arrival");
     let delta = replies
         .pop_front()
         .unwrap_or_else(|| json!({"role":"assistant", "content":"done"}));
@@ -105,9 +120,7 @@ fn respond(
         );
         // Request-side EOF is not response cancellation: clients may half-close after sending.
         // Keep this intentionally unfinished SSE response alive until the fixture is dropped.
-        while !stop.load(Ordering::Relaxed) {
-            thread::sleep(Duration::from_millis(5));
-        }
+        let _ = stopping.recv();
         return;
     }
     if delta["http_error"] == true {
@@ -271,8 +284,16 @@ fn ordinary_print_turn_keeps_disabled_learning_and_internal_policy_out_of_output
     assert_eq!(output.status.code(), Some(0));
     let frames = events(&output);
     assert_eq!(frames.last().unwrap()["text"], "4");
+    // Native sleep-inhibition failure is an operational warning, not disabled-learning or
+    // internal-policy chatter. Headless Linux need not have logind/system D-Bus; reject every
+    // other notice and keep the exact answer, JSON-only stdout and empty-stderr contracts.
     assert!(
-        frames.iter().all(|frame| frame["type"] != "notice"),
+        frames.iter().all(|frame| {
+            frame["type"] != "notice"
+                || frame["message"].as_str().is_some_and(|message| {
+                    message.starts_with("Could not prevent automatic sleep during this turn: ")
+                })
+        }),
         "unexpected coding notices: {frames:?}"
     );
     assert!(
@@ -553,33 +574,26 @@ fn sigint_during_inference_emits_an_interrupted_result() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while server.requests.lock().is_empty() {
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let output = child.wait_with_output().unwrap();
-            panic!(
-                "provider request never arrived: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        thread::sleep(Duration::from_millis(5));
+    if let Err(error) = server.wait_for_request(Duration::from_secs(10)) {
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+        panic!(
+            "provider request never arrived ({error}): {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
     assert_eq!(
+        // SAFETY: this unreaped owned child retains the PID; SIGINT targets only that child.
         unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) },
         0
     );
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while child.try_wait().unwrap().is_none() {
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let out = child.wait_with_output().unwrap();
-            panic!(
-                "SIGINT did not stop inference: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-        thread::sleep(Duration::from_millis(5));
+    if !dial::platform::process::wait_exited(&child, Duration::from_secs(10)).unwrap() {
+        let _ = child.kill();
+        let out = child.wait_with_output().unwrap();
+        panic!(
+            "SIGINT did not stop inference: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     let out = child.wait_with_output().unwrap();
     assert_eq!(
@@ -869,11 +883,9 @@ fn rpc_abort_interrupts_silent_inference_and_leaves_session_usable() {
     let server = Server::new(vec![json!({"wait_for_interrupt":true})]);
     let mut rpc = RpcChild::start(&env, &server);
     rpc.send(1, "send", json!({"text":"wait"}));
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while server.requests.lock().is_empty() {
-        assert!(std::time::Instant::now() < deadline);
-        thread::sleep(Duration::from_millis(5));
-    }
+    server
+        .wait_for_request(Duration::from_secs(10))
+        .expect("provider request before abort");
     rpc.send(2, "abort", json!({}));
     rpc.result(2);
     assert_eq!(rpc.result(1)["interrupted"], true);

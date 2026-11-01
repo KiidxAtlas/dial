@@ -7,14 +7,7 @@ pub(crate) fn cp_len(text: &str) -> usize {
 
 /// Longest prefix of `text` that fits in `max_bytes`, cut on a char boundary.
 pub(crate) fn truncate_bytes(text: &str, max_bytes: usize) -> &str {
-    if text.len() <= max_bytes {
-        return text;
-    }
-    let mut end = max_bytes;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
+    &text[..text.floor_char_boundary(max_bytes.min(text.len()))]
 }
 
 /// First `count` code points of `text`.

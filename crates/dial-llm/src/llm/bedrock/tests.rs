@@ -207,3 +207,26 @@ fn closed_tool_signals_completion_before_message_end_and_honors_cancellation() {
         assert!(state.finish("scope").is_err());
     }
 }
+
+#[test]
+fn signing_region_is_inferred_only_from_aws_service_hosts() {
+    for (host, expected) in [
+        ("bedrock-runtime.us-east-1.amazonaws.com", Some("us-east-1")),
+        (
+            "bedrock-runtime.cn-north-1.amazonaws.com.cn",
+            Some("cn-north-1"),
+        ),
+        (
+            "bedrock-runtime.eusc-de-east-1.amazonaws.com",
+            Some("eusc-de-east-1"),
+        ),
+        (
+            "bedrock-runtime-fips.us-gov-west-1.amazonaws.com",
+            Some("us-gov-west-1"),
+        ),
+        ("us-east-1.gateway.example.com", None),
+        ("bedrock-runtime.us-east-1.amazonaws.com.evil.test", None),
+    ] {
+        assert_eq!(endpoint_region(host), expected, "{host}");
+    }
+}

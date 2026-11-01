@@ -45,10 +45,9 @@ pub(in crate::platform) fn spawn(command: &mut Command) -> io::Result<Child> {
 mod launcher {
     use std::io;
     use std::process::{Child, Command};
-    use std::sync::{OnceLock, mpsc};
+    use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
-    type Reply = (Command, io::Result<Child>);
-    type Job = (Command, mpsc::SyncSender<Reply>);
+    type Job = (Arc<Mutex<Command>>, mpsc::SyncSender<io::Result<Child>>);
 
     static LAUNCHER: OnceLock<Option<mpsc::Sender<Job>>> = OnceLock::new();
 
@@ -57,9 +56,17 @@ mod launcher {
         std::thread::Builder::new()
             .name("dial-spawn".to_owned())
             .spawn(move || {
-                for (mut command, reply) in received {
-                    let child = command.spawn();
-                    let _ = reply.send((command, child));
+                for (command, reply) in received {
+                    let mut command = command
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    // Keep the launcher alive: Linux children tie PDEATHSIG to this thread.
+                    let child =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| command.spawn()))
+                            .unwrap_or_else(|_| {
+                                Err(io::Error::other("process launcher panicked while spawning"))
+                            });
+                    let _ = reply.send(child);
                 }
             })
             .ok()?;
@@ -71,12 +78,20 @@ mod launcher {
             io::Error::other("cannot start the process launcher thread; nothing was spawned")
         })?;
         // The command travels to the launcher and back, so callers keep inspecting it afterwards.
-        let job = std::mem::replace(command, Command::new(""));
+        let job = Arc::new(Mutex::new(std::mem::replace(command, Command::new(""))));
         let (reply, result) = mpsc::sync_channel(1);
         let lost = || io::Error::other("the process launcher thread stopped");
-        jobs.send((job, reply)).map_err(|_| lost())?;
-        let (job, child) = result.recv().map_err(|_| lost())?;
-        *command = job;
+        let child = match jobs.send((Arc::clone(&job), reply)) {
+            Ok(()) => result.recv().unwrap_or_else(|_| Err(lost())),
+            Err(_) => Err(lost()),
+        };
+        // Restore even on channel errors: shell callers inspect Command to remove temp scripts.
+        *command = std::mem::replace(
+            &mut *job
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Command::new(""),
+        );
         child
     }
 }
@@ -109,6 +124,7 @@ pub(in crate::platform) fn is_group_leader(target: u32) -> bool {
 pub(in crate::platform) fn exited(child: &Child) -> io::Result<bool> {
     // SAFETY: zeroed siginfo_t is a valid out-parameter; WNOWAIT leaves the child unreaped.
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: child is owned and unreaped; info is valid writable siginfo_t storage.
     let result = unsafe {
         libc::waitid(
             libc::P_PID,

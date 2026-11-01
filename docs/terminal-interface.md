@@ -7,6 +7,18 @@ For independent Dial sessions in the same checkout, `/peers` lists live peers an
 manage advisory path claims through ordinary transcript notices. Commands wait until an active
 turn finishes. See [Session coordination](session-coordination.md) for delivery, safety and opt-out details.
 
+## Terminal shutdown and repository reads
+
+On Unix, SIGTERM, SIGHUP and SIGQUIT request normal UI unwinding so terminal modes and owned
+relay children can be cleaned up. Handlers only record the request; input waits observe it at
+bounded polling boundaries. Ctrl-C retains its turn-interruption behavior. Non-cancellable
+external work can still delay shutdown, and SIGKILL cannot run cleanup. Startup clears the
+visible screen without erasing the user's scrollback.
+
+The Git overlay loads status and diffs on bounded, coalescing background workers. Selection
+generations reject stale replies. While repository reads are pending, mutations are refused;
+an unavailable diff never turns a hunk-stage shortcut into whole-file staging.
+
 ## Recovering from a full disk
 
 If a turn stops with `stream journal failed: … No space left on device`, free space on

@@ -171,11 +171,13 @@ impl Experience {
         platform_fs::set_owner_only(&path)?;
         let conn = Connection::open(&path)?;
         conn.busy_timeout(Duration::from_millis(200))?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS experience (
+        super::sqlite::check_version(&conn, 1)?;
+        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        super::sqlite::migrate(&conn, &["CREATE TABLE IF NOT EXISTS experience (
             id TEXT PRIMARY KEY, kind TEXT NOT NULL, payload TEXT NOT NULL, model TEXT NOT NULL,
             impressions INTEGER NOT NULL DEFAULT 0, uses INTEGER NOT NULL DEFAULT 0,
             verified_uses INTEGER NOT NULL DEFAULT 0, at INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS tool_outcomes(model TEXT NOT NULL,tool TEXT NOT NULL,ok INTEGER NOT NULL DEFAULT 0,errors INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(model,tool));")?;
+            CREATE TABLE IF NOT EXISTS tool_outcomes(model TEXT NOT NULL,tool TEXT NOT NULL,ok INTEGER NOT NULL DEFAULT 0,errors INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(model,tool));"])?;
         Ok(Self {
             conn: Mutex::new(conn),
         })

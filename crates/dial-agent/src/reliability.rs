@@ -486,7 +486,8 @@ fn calibration_chat_with_deadline(
 pub fn check(config: &AppConfig) -> Result<Value> {
     crate::platform::atomic::private_dir(&config.state_dir)?;
     let lock = crate::learn::auto::lock_file(&config.state_dir.join("reliability.lock"))?;
-    fs2::FileExt::try_lock_exclusive(&lock)
+    std::fs::File::try_lock(&lock)
+        .map_err(std::io::Error::from)
         .context("another capability check is already running")?;
     let cancel = crate::platform::interrupt::install_sigint();
     if config.requires_compute_lock() {

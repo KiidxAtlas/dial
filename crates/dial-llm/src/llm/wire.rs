@@ -123,7 +123,7 @@ impl Tracker {
 /// every request by construction. Restore its placeholder before fingerprinting the part, or the
 /// first system block reports a prompt change that never reached the provider's prefix cache.
 fn reset_attestation(encoded: &mut [u8]) {
-    use super::provider::{CCH_PLACEHOLDER, CLAUDE_BILLING_PREFIX};
+    use super::anthropic::{CCH_PLACEHOLDER, CLAUDE_BILLING_PREFIX};
     let Some(start) = encoded
         .windows(CLAUDE_BILLING_PREFIX.len())
         .position(|w| w == CLAUDE_BILLING_PREFIX.as_bytes())

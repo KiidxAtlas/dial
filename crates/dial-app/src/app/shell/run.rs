@@ -27,6 +27,9 @@ impl Shell {
         let mut dirty = true;
         let mut previous_status = None;
         loop {
+            if crate::ui::term::termination_requested() {
+                return Ok(Step::Done);
+            }
             // Actions pressed during a turn run at this boundary, once the turn has unwound.
             if std::mem::take(&mut self.deferred_editor) {
                 self.edit_externally();

@@ -556,16 +556,32 @@ struct KernelLease(std::fs::File);
 #[cfg(unix)]
 impl KernelLease {
     fn acquire() -> CoreResult<Self> {
-        Self::at(&Self::path())
+        #[cfg(test)]
+        let path = Self::path();
+        #[cfg(not(test))]
+        let path = Self::path()?;
+        #[cfg(not(test))]
+        crate::platform::atomic::private_dir(
+            path.parent()
+                .ok_or_else(|| DesktopError::input_failed("desktop lock has no parent"))?,
+        )
+        .map_err(|error| {
+            DesktopError::input_failed(format!(
+                "cannot create private desktop lock directory: {error}"
+            ))
+        })?;
+        Self::at(&path)
     }
 
     /// A fixed per-login-user inode coordinates independently launched hosts.
     /// Never unlink it: unlinking a locked inode would create two lock domains.
     #[cfg(not(test))]
-    fn path() -> std::path::PathBuf {
-        // SAFETY: geteuid has no preconditions.
-        let uid = unsafe { libc::geteuid() };
-        std::path::PathBuf::from(format!("/tmp/dial-desktop-input-{uid}.lock"))
+    fn path() -> CoreResult<std::path::PathBuf> {
+        // Keep the lock in the user's private state, never a shared predictable /tmp inode.
+        let root = crate::config::paths::user_dir().map_err(|error| {
+            DesktopError::input_failed(format!("cannot locate desktop lock directory: {error}"))
+        })?;
+        Ok(root.join("desktop").join("input.lock"))
     }
 
     /// nextest runs every test in its own process; a per-process inode keeps

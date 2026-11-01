@@ -147,6 +147,11 @@ impl Bridge<'_> {
 
     /// Drain pending keys so Ctrl-C/Esc reach the agent and the next draft stays editable.
     pub(super) fn pump(&mut self) {
+        if crate::ui::term::termination_requested() {
+            self.failed = true;
+            self.interrupt.store(true, Ordering::SeqCst);
+            return;
+        }
         // A submitted command owns the next idle dispatch. Leave subsequent input in the
         // terminal until the active operation has unwound, rather than overwriting it.
         if self.shell.startup.is_some() {

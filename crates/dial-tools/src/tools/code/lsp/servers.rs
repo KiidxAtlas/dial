@@ -693,5 +693,4 @@ impl Servers {
 }
 
 #[cfg(all(test, unix))]
-#[allow(unused_imports)]
 mod tests;

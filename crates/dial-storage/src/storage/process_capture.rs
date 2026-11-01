@@ -3,7 +3,6 @@
 use crate::config::paths::Layout;
 use crate::platform::{atomic, fs as platform_fs, procinfo::ProcId};
 use anyhow::{Context, Result, ensure};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
@@ -71,7 +70,9 @@ impl Capture {
         let dir = layout.state_dir.join("runs");
         atomic::private_dir(&dir)?;
         let registry = lock_file(&dir.join("registry.lock"))?;
-        FileExt::try_lock_exclusive(&registry).context("run registry is busy; retry")?;
+        std::fs::File::try_lock(&registry)
+            .map_err(std::io::Error::from)
+            .context("run registry is busy; retry")?;
         // A fixed ceiling bounds retained disk state, including after crashes. Clean up only
         // dead owners while serialized against other launchers. Readers fail closed on removal.
         let entries = fs::read_dir(&dir)?
@@ -99,7 +100,7 @@ impl Capture {
         let mut selected = None;
         for slot in 0..32 {
             let file = lock_file(&dir.join(format!("slot-{slot}.lock")))?;
-            match FileExt::try_lock_exclusive(&file) {
+            match std::fs::File::try_lock(&file).map_err(std::io::Error::from) {
                 Ok(()) => {
                     selected = Some((slot, file));
                     break;
@@ -183,7 +184,7 @@ fn slot_busy(dir: &Path, slot: u8, generation: &str) -> Result<bool> {
         &dir.join(format!("slot-{slot}.lock")),
     )?;
     atomic::check_file(&file)?;
-    match FileExt::try_lock_exclusive(&file) {
+    match std::fs::File::try_lock(&file).map_err(std::io::Error::from) {
         Ok(()) => Ok(false),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
             let mut bytes = Vec::new();

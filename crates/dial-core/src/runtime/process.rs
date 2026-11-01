@@ -9,7 +9,7 @@ use std::{
 
 /// Kills the whole process group on drop so nothing outlives its owning operation.
 pub struct ProcessGroup {
-    pub child: Child,
+    child: Child,
     terminated: bool,
 }
 impl ProcessGroup {
@@ -17,6 +17,41 @@ impl ProcessGroup {
         Self {
             child,
             terminated: false,
+        }
+    }
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+    /// Shared handle for non-reaping observation. Mutable access stays private so callers
+    /// cannot release the leader PID before process-group cleanup.
+    pub fn child(&self) -> &Child {
+        &self.child
+    }
+    pub fn take_stdin(&mut self) -> Option<ChildStdin> {
+        self.child.stdin.take()
+    }
+    pub fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.child.stdout.take()
+    }
+    pub fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+        self.child.stderr.take()
+    }
+    /// Clean up descendants while the leader PID is reserved, then reap the leader.
+    pub fn wait(&mut self) -> io::Result<ExitStatus> {
+        // Observe exit without reaping: signalling after Child::wait would risk PID reuse.
+        while !self.terminated && !self.exited()? {
+            crate::platform::process::wait_exited(&self.child, Duration::from_millis(100))?;
+        }
+        self.terminate();
+        let status = self.child.wait()?;
+        crate::platform::process::forget_group(self.child.id());
+        Ok(status)
+    }
+    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        if self.terminated || self.exited()? {
+            self.wait().map(Some)
+        } else {
+            Ok(None)
         }
     }
     pub fn terminate(&mut self) {
@@ -31,6 +66,7 @@ impl ProcessGroup {
     pub fn release(mut self) -> Child {
         self.terminated = true;
         let group = std::mem::ManuallyDrop::new(self);
+        // SAFETY: ManuallyDrop prevents Drop from running; child is moved exactly once.
         unsafe { std::ptr::read(&group.child) }
     }
     /// The exited leader is not reaped, keeping its PID reserved until cleanup.
