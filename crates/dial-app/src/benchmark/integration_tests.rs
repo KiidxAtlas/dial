@@ -207,7 +207,7 @@ fn local_task_suite_and_both_profile_templates_pass_the_runner_contract() {
         "../../../../examples/benchmarks/local-tasks.toml"
     ))
     .unwrap();
-    assert_eq!(suite.cases.len(), 5);
+    assert_eq!(suite.cases.len(), 6);
     for (text, allow_remote) in [
         (
             include_str!("../../../../examples/benchmarks/local-tasks-profiles.toml"),

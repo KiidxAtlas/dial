@@ -731,7 +731,8 @@ fn a_provider_failure_without_a_fallback_keeps_its_cause_in_the_turn_summary() {
     assert_eq!(server.requests.lock().len(), 1);
 }
 
-/// Request-local contract/task guidance is deliberately outside the reusable history prefix.
+/// Request-local contract/task guidance and the request-tail latest-user note are deliberately
+/// outside the reusable history prefix.
 fn conversation_messages(request: &Value) -> Vec<Value> {
     request["messages"]
         .as_array()
@@ -739,9 +740,12 @@ fn conversation_messages(request: &Value) -> Vec<Value> {
         .iter()
         .filter(|message| {
             !(message["role"] == "user"
-                && message["content"]
-                    .as_str()
-                    .is_some_and(|text| text.contains("[Current executable tool contract]")))
+                && message["content"].as_str().is_some_and(|text| {
+                    text.contains("[Current executable tool contract]")
+                        || text.contains(
+                            "[Latest admitted user request; runtime context, not new permissions]",
+                        )
+                }))
         })
         .cloned()
         .collect()
@@ -2256,8 +2260,9 @@ fn loop_checkpoint_withholds_reads_rejects_ignored_feedback_and_restores_after_p
         "a narrower read must remain available even before a mutation"
     );
     assert!(offered(6, "read"), "an actual repair restores read");
+    // Withheld calls are refused in their own tool result, not by a separate advisory note.
     assert!(
-        requests[3]["messages"]
+        !requests[3]["messages"]
             .to_string()
             .contains("Recovery checkpoint from Dial")
     );
@@ -3134,28 +3139,25 @@ fn unfinished_todos_survive_session_resume_and_finish_with_verification() {
 
 #[test]
 fn failed_call_in_a_batch_prevents_finish_completed() {
-    let server = serve(vec![
-        Reply::Calls(vec![
-            ("read", json!({"path":"missing.txt"})),
-            ("finish", json!({"outcome":"completed","summary":"Done"})),
-        ]),
-        Reply::Call(
-            "finish",
-            json!({"outcome":"blocked","summary":"Source is missing","reason":"Provide missing.txt."}),
-        ),
-    ]);
+    let server = serve(vec![Reply::Calls(vec![
+        ("read", json!({"path":"missing.txt"})),
+        ("finish", json!({"outcome":"completed","summary":"Done"})),
+    ])]);
     let e = env(&server.url, "auto");
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
-    assert_eq!(
-        a.turn("inspect missing.txt", &mut Recorder::default())
-            .unwrap()
-            .outcome,
-        TurnOutcome::Blocked
-    );
+    let report = a
+        .turn("inspect missing.txt", &mut Recorder::default())
+        .unwrap();
+    // The refused completion ends the turn honestly with its unmet prerequisite.
+    assert_eq!(report.outcome, TurnOutcome::Incomplete);
+    assert_eq!(server.requests.lock().len(), 1);
     assert!(
-        server.requests.lock()[1]["messages"]
-            .to_string()
-            .contains("cannot follow a failed call")
+        report
+            .text
+            .contains("Completion cannot follow a failed or refused call")
+            && report.text.contains("No completion was recorded"),
+        "{}",
+        report.text
     );
     assert_eq!(a.metrics().turns_completed, 0);
 }
@@ -3539,7 +3541,7 @@ fn compaction_keeps_recent_turns_and_replaces_older_ones_with_a_summary() {
     let chat = Mutex::new(std::collections::VecDeque::from([
         Reply::Say(format!(
             "first answer {}",
-            (0..150).map(|i| format!("detail{i} ")).collect::<String>()
+            (0..1500).map(|i| format!("detail{i} ")).collect::<String>()
         )),
         Reply::Text("second answer"),
         Reply::Text("third answer"),
@@ -3886,7 +3888,9 @@ fn delegated_task_uses_its_role_and_returns_to_the_main_model() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|m| m["role"] == "tool" && m["content"] == "independent findings")
+            .any(|m| m["role"] == "tool"
+                && m["content"].as_str().is_some_and(|content| content
+                    .starts_with("independent findings\n\n[Controller acceptance: ")))
     );
 }
 
@@ -4144,13 +4148,12 @@ fn automatic_compaction_uses_the_selected_role_during_a_live_turn() {
         ),
         Reply::Text("third"),
     ]);
-    // The summarizer may split a large transcript into several windows; each gets one reply.
-    let side = serve(vec![
-        Reply::Text("summary of earlier project work"),
-        Reply::Text("summary of earlier project work"),
-        Reply::Text("summary of earlier project work"),
-        Reply::Text("summary of earlier project work"),
-    ]);
+    // The summarizer may split a large transcript into several bounded windows; each gets one reply.
+    let side = serve(
+        (0..16)
+            .map(|_| Reply::Text("summary of earlier project work"))
+            .collect(),
+    );
     let mut e = env(&main.url, "auto");
     // Turn two's large reply leaves the estimate above the 65% threshold (~21.3k of a pinned 32k window).
     e.config.context_window = 32768;
@@ -4180,11 +4183,13 @@ fn automatic_compaction_uses_the_selected_role_during_a_live_turn() {
         usage.by_purpose[&dial::llm::usage::Purpose::Compaction].requests,
         side.requests.lock().len() as u64
     );
+    let first = a.session().messages()[0]["content"].clone();
     assert!(
-        a.session().messages()[0]["content"]
+        first
             .as_str()
-            .unwrap()
-            .contains("summary of earlier")
+            .is_some_and(|text| text.contains("summary of earlier")),
+        "first={first} notices={:?}",
+        ui.notices
     );
     assert!(
         ui.notices
@@ -4431,7 +4436,7 @@ fn servers_without_a_native_context_api_keep_the_configured_window() {
 #[test]
 fn automatic_output_ceiling_fits_the_request_window() {
     let mut script = vec![
-        Reply::Say((0..150).map(|i| format!("detail{i} ")).collect()),
+        Reply::Say((0..1500).map(|i| format!("detail{i} ")).collect()),
         Reply::Text("done"),
         Reply::Text("third answer"),
     ];
@@ -4472,20 +4477,12 @@ fn automatic_output_ceiling_fits_the_request_window() {
     let requests = server.requests.lock();
     assert_eq!(requests.len(), 1);
     let request = &requests[0];
-    let output = request
-        .get("max_completion_tokens")
-        .or_else(|| request.get("max_tokens"))
-        .and_then(Value::as_u64)
-        .expect("finite wire output limit");
-    let prompt = dial::llm::wire::estimate_parts(
-        request["messages"].as_array().unwrap(),
-        request["tools"].as_array().unwrap(),
-    );
+    // A local host with an unset operator limit chooses its own output allowance; Dial's
+    // automatic ceiling stays an internal planning budget and is not sent on the wire.
     assert!(
-        prompt + output <= u64::from(e.config.context_window),
-        "prompt={prompt}, output={output}"
+        request.get("max_completion_tokens").is_none() && request.get("max_tokens").is_none(),
+        "{request}"
     );
-    assert!(output >= u64::from(e.config.compaction.reserve(e.config.context_window)));
     assert_eq!(
         e.config.harness.max_tokens, 0,
         "operator configuration remains unchanged"
@@ -4957,17 +4954,35 @@ fn child_rereads_after_an_edit_are_fresh_evidence() {
     assert!(!result.contains("This observation is unchanged"));
 }
 
-/// What the parent's second request carried back from its `task` call.
+/// What the parent's second request carried back from its `task` call: the worker's answer,
+/// without the controller-acceptance suffix that rendered task results carry.
 fn task_result(main: &Scripted) -> String {
     let requests = main.requests.lock();
     let messages = requests[1]["messages"].as_array().unwrap();
-    messages
+    let content = messages
         .iter()
         .rev()
         .find(|m| m["role"] == "tool")
         .and_then(|m| m["content"].as_str())
-        .unwrap()
-        .to_owned()
+        .unwrap();
+    strip_controller_acceptance(content)
+}
+
+/// Remove every `[Controller acceptance: {...}]` suffix (one per rendered job) and keep the rest.
+fn strip_controller_acceptance(content: &str) -> String {
+    const START: &str = "\n\n[Controller acceptance: ";
+    let mut out = String::new();
+    let mut rest = content;
+    while let Some(at) = rest.find(START) {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at + START.len()..];
+        let end = tail
+            .find("}]")
+            .unwrap_or_else(|| panic!("unterminated acceptance suffix: {content}"));
+        rest = &tail[end + 2..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn run_turn(e: &Env, ui: &mut Recorder) -> dial::agent::TurnReport {
@@ -5758,7 +5773,7 @@ fn reasoning_gate_recovers_into_real_work_without_raising_the_token_budget() {
     assert_eq!(a.metrics().reasoning_interceptions, 1);
     let requests = server.requests.lock();
     assert_eq!(requests.len(), 3);
-    assert_eq!(requests[0]["max_tokens"], requests[1]["max_tokens"]);
+    assert_recovery_keeps_the_planned_output_budget(&e, &requests);
     assert!(
         requests[1]["messages"]
             .to_string()
@@ -5803,7 +5818,7 @@ fn stream_repetition_recovers_without_todo_or_replaying_failed_content() {
         assert!(!e.project.path().join("gate-leak.txt").exists());
         let requests = server.requests.lock();
         assert_eq!(requests.len(), 3);
-        assert_eq!(requests[0]["max_tokens"], requests[1]["max_tokens"]);
+        assert_recovery_keeps_the_planned_output_budget(&e, &requests);
         assert!(
             !requests[1]["messages"]
                 .to_string()
@@ -5919,7 +5934,25 @@ fn reasoning_only_length_stops_share_the_one_recovery_budget_with_stream_interce
     assert_eq!(report.outcome, TurnOutcome::Incomplete);
     let requests = server.requests.lock();
     assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0]["max_tokens"], requests[1]["max_tokens"]);
+    assert_recovery_keeps_the_planned_output_budget(&e, &requests);
+}
+
+/// An unlimited local-host request leaves the output allowance to the host; the bounded recovery
+/// request that follows sends Dial's planned budget explicitly, without raising it.
+fn assert_recovery_keeps_the_planned_output_budget(e: &Env, requests: &[Value]) {
+    let planned = make_backend(&e.config)
+        .unwrap()
+        .output_budget(e.config.harness.max_tokens);
+    assert!(
+        requests[0].get("max_tokens").is_none()
+            && requests[0].get("max_completion_tokens").is_none(),
+        "an unlimited local-host request inherits the host's output limit"
+    );
+    assert_eq!(
+        requests[1]["max_tokens"],
+        json!(planned),
+        "recovery keeps Dial's planned budget explicit and does not raise it"
+    );
 }
 
 #[test]
@@ -6634,10 +6667,13 @@ fn steering_between_tools_skips_unstarted_calls_and_keeps_completed_results() {
             .unwrap()
             .contains("not executed")
     );
+    // The steering correction reaches the next request as the latest admitted user request.
+    let tail = requests[1]["messages"].to_string();
     assert!(
-        requests[1]["messages"]
-            .to_string()
-            .contains("latest user instruction")
+        tail.contains("[Latest admitted user request")
+            && tail.contains("user_steering")
+            && tail.contains("Stop writing files and ask me what to do next."),
+        "{tail}"
     );
 }
 
@@ -7167,7 +7203,7 @@ fn failed_focused_check_repairs_boundedly_and_never_reports_success() {
     e.config.verification.automatic_checks = true;
     e.config.verification.commands.push(VerificationCommand {
         name: "always-fails".into(),
-        command: "false".into(),
+        command: "echo 'assertion failed: check always fails'; exit 1".into(),
         file_extensions: vec![],
         timeout_secs: 10,
     });
@@ -7272,7 +7308,7 @@ fn automatic_verification_repairs_share_the_turn_request_budget() {
         e.config.verification.automatic_checks = true;
         e.config.verification.commands.push(VerificationCommand {
             name: "code-failure".into(),
-            command: "false".into(),
+            command: "echo 'assertion failed: check always fails'; exit 1".into(),
             file_extensions: vec![],
             timeout_secs: 5,
         });
@@ -7349,7 +7385,7 @@ fn stop_hook_edits_reenter_verification_and_keep_the_turn_repair_bound() {
         e.config.verification.repair_attempts = 1;
         e.config.verification.commands.push(VerificationCommand {
             name: "marker-fixed".into(),
-            command: "grep -q fixed marker.txt".into(),
+            command: "grep -q fixed marker.txt || { echo 'assertion failed: marker is not fixed'; exit 1; }".into(),
             file_extensions: vec![],
             timeout_secs: 5,
         });
@@ -7454,7 +7490,9 @@ fn todo_updates_do_not_run_checks_but_completion_runs_and_repairs_them() {
     e.config.verification.automatic_checks = true;
     e.config.verification.commands.push(VerificationCommand {
         name: "marker-fixed".into(),
-        command: "grep -q fixed marker.txt".into(),
+        command:
+            "grep -q fixed marker.txt || { echo 'assertion failed: marker is not fixed'; exit 1; }"
+                .into(),
         file_extensions: vec![],
         timeout_secs: 10,
     });
@@ -7504,23 +7542,20 @@ fn todo_updates_cannot_bypass_failed_completion_verification() {
             "finish",
             json!({"outcome":"completed","summary":"Marker written."}),
         ),
-        Reply::Call(
-            "finish",
-            json!({"outcome":"blocked","summary":"Verification failed","reason":"Configured check did not pass."}),
-        ),
     ]);
     let mut e = env(&server.url, "auto");
     e.config.verification.automatic_checks = true;
     e.config.verification.commands.push(VerificationCommand {
         name: "always-fails".into(),
-        command: "false".into(),
+        command: "echo 'assertion failed: check always fails'; exit 1".into(),
         file_extensions: vec![],
         timeout_secs: 10,
     });
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     let mut ui = Recorder::default();
     let report = a.turn("Create marker", &mut ui).unwrap();
-    assert_eq!(report.outcome, TurnOutcome::Blocked);
+    // The repeated completion claim is refused and the turn ends failed, not completed.
+    assert_eq!(report.outcome, TurnOutcome::Failed);
     assert_eq!(
         a.session().control_state()["reliability"]["edit_loop"]["failed_checks"],
         json!(["always-fails"])
@@ -7552,7 +7587,9 @@ fn finish_reruns_failed_checks_after_a_repair_edit() {
     e.config.verification.automatic_checks = true;
     e.config.verification.commands.push(VerificationCommand {
         name: "marker-fixed".into(),
-        command: "grep -q fixed marker.txt".into(),
+        command:
+            "grep -q fixed marker.txt || { echo 'assertion failed: marker is not fixed'; exit 1; }"
+                .into(),
         file_extensions: vec![],
         timeout_secs: 10,
     });
@@ -9593,7 +9630,7 @@ fn behavioral_repairs_retain_failure_and_pass_without_marking_task_success() {
     if skip_without_sandbox() {
         return;
     }
-    let command = "test \"$(cat value.txt)\" = fixed";
+    let command = "test \"$(cat value.txt)\" = fixed || { echo 'assertion failed: value is not fixed'; exit 1; }";
     let server = serve(vec![
         Reply::Call("bash", json!({"command":command})),
         Reply::Call("read", json!({"path":"value.txt"})),
@@ -9648,7 +9685,7 @@ fn harness_records_behavioral_failure_before_the_model_edits() {
     if skip_without_sandbox() {
         return;
     }
-    let command = "test \"$(cat value.txt)\" = fixed";
+    let command = "test \"$(cat value.txt)\" = fixed || { echo 'assertion failed: value is not fixed'; exit 1; }";
     let server = serve(vec![
         Reply::Call("read", json!({"path":"value.txt"})),
         Reply::Call("write", json!({"path":"value.txt","content":"fixed\n"})),
@@ -10259,32 +10296,26 @@ fn finish_cannot_accept_or_reuse_failed_behavioral_verification() {
         Reply::Call("write", json!({"path":"value.txt","content":"broken"})),
         Reply::Call("finish", json!({"outcome":"completed","summary":"Fixed"})),
         Reply::Call("finish", json!({"outcome":"completed","summary":"Fixed"})),
-        Reply::Call(
-            "finish",
-            json!({"outcome":"blocked","summary":"Check fails","reason":"The required value is not established"}),
-        ),
     ]);
     let mut e = env(&server.url, "auto");
     e.config.verification.automatic_checks = true;
     e.config.verification.commands.push(VerificationCommand {
         name: "value_behavior".into(),
-        command: "test \"$(cat value.txt)\" = fixed".into(),
+        command: "test \"$(cat value.txt)\" = fixed || { echo 'assertion failed: value is not fixed'; exit 1; }".into(),
         file_extensions: vec!["txt".into()],
         timeout_secs: 5,
     });
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     let report = a.turn("Fix the value", &mut Recorder::default()).unwrap();
-    assert_eq!(report.outcome, TurnOutcome::Blocked);
+    assert_eq!(report.outcome, TurnOutcome::Failed);
+    let requests = server.requests.lock();
+    assert_eq!(requests.len(), 3);
     assert!(
-        server.requests.lock()[2]["messages"]
+        requests[2]["messages"]
             .to_string()
             .contains("focused verification failed")
     );
-    assert!(
-        server.requests.lock()[3]["messages"]
-            .to_string()
-            .contains("focused checks failed and no new edits are awaiting a fresh check")
-    );
+    drop(requests);
     assert!(
         a.session().control_state()["reliability"]["automatic_failing_checks"]
             .as_u64()
@@ -10891,7 +10922,7 @@ fn completion_evidence_repaired_shell_effects_replace_failing_baseline() {
     if skip_without_sandbox() {
         return;
     }
-    let command = "test \"$(cat value.txt)\" = fixed";
+    let command = "test \"$(cat value.txt)\" = fixed || { echo 'assertion failed: value is not fixed'; exit 1; }";
     let server = serve(vec![
         Reply::Call("bash", json!({"command":"printf 'fixed\\n' > value.txt"})),
         Reply::Text("Repaired the value."),

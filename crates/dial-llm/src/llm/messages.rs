@@ -21,6 +21,9 @@ pub fn canonicalize(message: &mut Value) {
         object.remove("dial_generated_user");
         object.remove("dial_context_request");
         object.remove("dial_prompt_band");
+        // Request-tail markers: task context/latest-user notes and advisory-note priority.
+        object.remove("dial_task_context");
+        object.remove("dial_guidance");
         object.remove("dial_tool_contracts");
         object.remove("dial_execution_status");
         object.remove("dial_execution");

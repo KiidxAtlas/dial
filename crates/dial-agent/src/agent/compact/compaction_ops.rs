@@ -498,7 +498,7 @@ impl<'a> Agent<'a> {
         let previous_tokens = self.projected_tokens(&previous);
         ensure!(
             remaining < previous_tokens,
-            "compaction would not reduce the actual next projected request; no compaction was committed"
+            "compaction would not reduce the actual next projected request (about {remaining} tokens after, {previous_tokens} before); no compaction was committed"
         );
         {
             let backend = live_backend

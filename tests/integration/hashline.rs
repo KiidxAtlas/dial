@@ -599,27 +599,25 @@ fn edits_keep_earlier_seen_lines_editable_and_write_is_immediately_editable() {
 }
 
 #[test]
-fn no_op_edits_report_without_writing_and_the_third_repeat_errors() {
+fn no_op_edits_report_already_applied_without_writing() {
     let (dir, ws) = workspace();
     fs::write(dir.path().join("a.txt"), "a\nb\n").unwrap();
     fs::write(dir.path().join("b.txt"), "x\ny\n").unwrap();
     let ta = read_tag(&ws, "a.txt");
     let same = format!("[a.txt#{ta}]\nPUT 1.=1:\n+a\n");
-    for _ in 0..2 {
+    // An exact witnessed no-op is observational: repeats stay stable successes, never writes.
+    for _ in 0..3 {
         let out = patch(&ws, &same);
         assert!(
-            !out.is_error && out.text.contains("No changes"),
+            !out.is_error
+                && out.text.contains("Already applied")
+                && out.text.contains("Nothing was written"),
             "{}",
             out.text
         );
+        assert_eq!(content(&dir, "a.txt"), "a\nb\n");
     }
-    let third = patch(&ws, &same);
-    assert!(
-        third.is_error && third.text.contains("3 times"),
-        "{}",
-        third.text
-    );
-    // A different edit resets the counter.
+    // A real edit still applies against the same snapshot.
     let real = patch(&ws, &format!("[a.txt#{ta}]\nPUT 2.=2:\n+B\n"));
     assert!(!real.is_error);
     // Multi-section: one no-op rejects the batch and nothing is written.
