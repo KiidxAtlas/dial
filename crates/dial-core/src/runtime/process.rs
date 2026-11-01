@@ -259,6 +259,15 @@ impl OwnedChild {
         let _ = crate::platform::process::kill_group(self.child.id());
         let _ = self.child.kill();
     }
+    /// Kills the group, then signals it again once the leader has exited but is still unreaped
+    /// (its PID, and so the group, stays reserved). A descendant forked while the first
+    /// `killpg` was being delivered can miss it on macOS and keep the output pipes open.
+    fn kill_and_reap(&mut self) -> Option<ExitStatus> {
+        self.kill();
+        let _ = crate::platform::process::wait_exited(&self.child, Duration::from_millis(100));
+        let _ = crate::platform::process::kill_group(self.child.id());
+        self.reap()
+    }
     fn reap(&mut self) -> Option<ExitStatus> {
         let status = self.child.wait().ok();
         self.reaped = status.is_some();
@@ -271,8 +280,7 @@ impl OwnedChild {
 impl Drop for OwnedChild {
     fn drop(&mut self) {
         if !self.reaped {
-            self.kill();
-            let _ = self.reap();
+            let _ = self.kill_and_reap();
         }
     }
 }
@@ -403,8 +411,7 @@ pub fn run_with_control(
         Err(error) => {
             result.io_error = Some(format!("preparing pipes: {error}"));
             result.output_incomplete = true;
-            owner.kill();
-            result.status = owner.reap();
+            result.status = owner.kill_and_reap();
             if policy.may_mutate {
                 super::execution::process_failure(result.tool_status());
             }
@@ -515,14 +522,15 @@ pub fn run_with_control(
         if exited_at.is_none() {
             match crate::platform::process::exited(&owner.child) {
                 Ok(true) => {
-                    // Reserve the leader PID until descendants are cleaned up.
-                    if !policy.retain_descendants {
-                        owner.kill();
-                    }
                     if writer.is_some() && !policy.allow_unconsumed_stdin {
                         result.io_error = Some("process exited before stdin delivery".into());
                     }
-                    result.status = owner.reap();
+                    // Reserve the leader PID until descendants are cleaned up.
+                    result.status = if policy.retain_descendants {
+                        owner.reap()
+                    } else {
+                        owner.kill_and_reap()
+                    };
                     exited_at = Some(Instant::now());
                     writer = None;
                 }
@@ -542,8 +550,7 @@ pub fn run_with_control(
         {
             if failed_at.is_none() {
                 if !owner.reaped {
-                    owner.kill();
-                    result.status = owner.reap();
+                    result.status = owner.kill_and_reap();
                     exited_at = Some(Instant::now());
                 }
                 writer = None;

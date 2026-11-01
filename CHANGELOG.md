@@ -188,6 +188,8 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 - Request-tail task-context and advisory-note markers (`dial_task_context`, `dial_guidance`) are now stripped like other harness bookkeeping before Chat Completions requests and training capture. Previously they reached the provider and made harvested training samples fail validation as malformed (`skipped_invalid`). An offline integration regression covers the harvest path (`docs/improvement.md`).
 
+- Bounded subprocesses that are cancelled, time out or exit now signal their process group a second time after the leader exits, while its PID is still reserved. On macOS a descendant forked during the first `killpg` could miss it and hold the output pipes open, so a cancelled command was intermittently reported with incomplete output after a 300 ms drain wait. The test-suite flake was reproduced outside Dial (about 7% of kills under load) and was not seen with the second signal.
+
 - OpenAI-compatible zero-output usage reports no longer falsely mark local prompt processing as generation and arm the 30-second silence watchdog. Positive output counts still mark generation, and real stalls remain recoverable. A deterministic parser regression covers zero, positive and missing output counts; live-host reproduction is unmeasured (`docs/llm-transport.md`).
 
 - Tool reliability and usage statistics (`docs/plans/tool-reliability-and-stats.md`):
