@@ -117,7 +117,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.server.chat_requests += 1
             index = self.server.chat_requests
         messages = request["messages"]
-        last_user = next((m.get("content") for m in reversed(messages) if m["role"] == "user"), "")
+        # The request-tail latest-user note is runtime context, not the scenario prompt.
+        last_user = next((m.get("content") for m in reversed(messages) if m["role"] == "user" and "[Latest admitted user request" not in str(m.get("content", ""))), "")
         if isinstance(last_user, str) and "PTY-SIDE-QUESTION" in last_user:
             assert any(m.get("content") == "PTY-SIDE-MAIN" for m in messages), "side context lost the active main prompt"
             self.server.side_requests += 1

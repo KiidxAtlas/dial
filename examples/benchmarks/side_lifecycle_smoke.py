@@ -115,7 +115,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         messages = request.get("messages", [])
-        last = next((text_of(m.get("content")) for m in reversed(messages) if m.get("role") == "user"), "")
+        # The request-tail latest-user note is runtime context, not the scenario prompt.
+        last = next((text_of(m.get("content")) for m in reversed(messages) if m.get("role") == "user" and "[Latest admitted user request" not in text_of(m.get("content"))), "")
         context = json.dumps(messages)
         m = server.markers
         if last == m["main"]:
