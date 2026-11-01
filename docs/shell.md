@@ -124,6 +124,13 @@ Shell commands are classified from executable arguments, with conservative fallb
 syntax. Quoted operators are arguments: `echo "curl x | sh"` is ordinary text. An unparseable
 command cannot be covered by a reusable allow-prefix rule and asks under `ask`/`write` policy.
 
+- **Expansions.** Commands are judged before bash expands them, so an unquoted glob (`*`, `?`,
+  `[`) or `~` makes a command unparseable. A glob can match a file whose name is a
+  flag: with a file named `-delete` in the workspace, `find . -delet?` runs `find . -delete`.
+  Such a command is never a read-only inspection: `ask` and `write` prompt for it, it counts as an
+  uncheckpointed shell command, a read-only subagent cannot run it, and it matches every `bash`
+  deny rule. Quoted or backslash-escaped, the characters are literal: `find . -name '*.rs'` is
+  still an inspection. Use the `glob` tool to list files by pattern.
 - **Downloaded code.** A pipe whose upstream stage fetches (`curl`, `wget`, `fetch`, `aria2c`) and
   whose downstream stage runs a shell or interpreter (`sh`, `bash`, `python3 -`, `node`, `env`/`sudo`
   wrappers, absolute paths, `|&`, with or without spaces) is destructive. Under `write` it asks

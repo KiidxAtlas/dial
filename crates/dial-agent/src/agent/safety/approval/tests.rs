@@ -117,6 +117,53 @@ fn the_read_only_shell_rule_matches_the_policy() {
 }
 
 #[test]
+fn words_bash_would_expand_never_skip_approval_or_checkpoints() {
+    let registry = Registry::new();
+    // Bash expands these after the check: with a file named `-delete` in the workspace,
+    // `find . -delet?` runs `find . -delete`, and `[-]i` reaches `sed` as `-i`.
+    for text in [
+        "find . -delet?",
+        "find . -delete*",
+        "find . -de[l]ete",
+        "sed -n 1p [-]i f",
+        "tree [-]o out",
+        "file [-]C",
+        "ls -d */",
+        "cat ~/.ssh/config",
+        "ls ~",
+        "ls a 'b'*",
+    ] {
+        assert!(shell_words(text).is_none(), "{text}");
+        assert!(!safe_bash(text), "{text}");
+        assert!(
+            !is_read_only(&registry, "bash", &json!({ "command": text })),
+            "{text}"
+        );
+        assert!(opaque_shell_effect(text), "{text}");
+        assert!(
+            !read_only_inspection_batch(&format!("pwd; {text}")),
+            "{text}"
+        );
+        // The write tier asks too: the unexpanded words cannot show what runs.
+        assert!(destructive_bash(text), "{text}");
+    }
+    // Quoted or escaped, the same characters are literal arguments.
+    for text in [
+        "find . -name '*.rs'",
+        "find . -name \"*.rs\"",
+        "find . -name \\*.rs",
+        "grep -n 'a[0-9]?' src/main.rs",
+        "ls '~' \\~",
+    ] {
+        assert!(safe_bash(text), "{text}");
+    }
+    assert_eq!(
+        shell_words("find . -name '*.rs' \\?").unwrap(),
+        ["find", ".", "-name", "*.rs", "?"]
+    );
+}
+
+#[test]
 fn review_batches_do_not_rearm_completion_but_still_require_approval() {
     let status = "git -c core.fsmonitor=false -c core.pager=cat --no-pager status --short --untracked-files=all";
     let diff = "git -c core.fsmonitor=false -c core.pager=cat --no-pager diff --no-color --no-ext-diff --no-textconv";
