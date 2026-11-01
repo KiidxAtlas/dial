@@ -34,6 +34,8 @@ impl SecretToken {
         &self.0
     }
 
+    /// Mutable access for in-place edits. Growing the string past its capacity reallocates and
+    /// leaves the old buffer unwiped; callers reserve capacity first when that matters.
     pub fn as_mut_string(&mut self) -> &mut String {
         &mut self.0
     }
@@ -41,7 +43,13 @@ impl SecretToken {
     fn wipe(&mut self) {
         // NUL is valid UTF-8, so overwriting the current contents preserves String's invariant.
         // SAFETY: writing zero bytes cannot create invalid UTF-8.
-        unsafe { self.0.as_mut_vec().fill(0) };
+        let bytes = unsafe { self.0.as_mut_vec() };
+        for byte in bytes.iter_mut() {
+            // SAFETY: `byte` is a valid, aligned, exclusively borrowed `u8`. A volatile store
+            // cannot be elided as a dead write before the buffer is freed, unlike `fill(0)`.
+            unsafe { std::ptr::write_volatile(byte, 0) };
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
     }
 }
 

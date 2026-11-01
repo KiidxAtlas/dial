@@ -275,3 +275,26 @@ fn model_switch_clamps_generated_original_detail_only_on_the_request_copy() {
         .is_none()
     );
 }
+
+#[test]
+fn a_resized_image_is_reused_on_later_requests_instead_of_resized_again() {
+    let (width, height) = (3000u32, 1200u32);
+    let pixels: Vec<u8> = (0..width * height * 3).map(|i| (i % 251) as u8).collect();
+    let mut png = Vec::new();
+    image::RgbImage::from_raw(width, height, pixels)
+        .unwrap()
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    let first = resize_for_model(&png, "image/png").unwrap();
+    let key: ResizeKey = (
+        Sha256::digest(&png).into(),
+        "image/png".into(),
+        super::super::policy::image_edge(),
+    );
+    assert_eq!(resized_cache_get(&key), Some(first.clone()));
+    let started = std::time::Instant::now();
+    let again = resize_for_model(&png, "image/png").unwrap();
+    assert_eq!(again, first);
+    // A cache hit only hashes the source; a fresh Lanczos resize of this image takes far longer.
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+}

@@ -484,3 +484,76 @@ fn name_repeats_are_idempotent_and_pieces_concatenate() {
     ]);
     assert_eq!(reply.unwrap().tool_calls[0].name, "read");
 }
+
+#[test]
+fn bare_carriage_returns_end_sse_lines() {
+    let raw = b"data: {\"a\":1}\r\rdata: {\"b\":2}\r\n\r\ndata: [DONE]\r\r";
+    assert_eq!(events(raw).unwrap(), ["{\"a\":1}", "{\"b\":2}", "[DONE]"]);
+    // A CR-only stream larger than the line limit is still split into lines, not one huge row.
+    let mut many = Vec::new();
+    for _ in 0..400 {
+        many.extend_from_slice(b"data: {\"x\":1}\r\r");
+    }
+    many.extend_from_slice(b"data: [DONE]\r\r");
+    let mut seen = 0;
+    read_events(Cursor::new(many), 1 << 20, 64, far(), |data| {
+        seen += 1;
+        Ok(data == "[DONE]")
+    })
+    .unwrap();
+    assert_eq!(seen, 401);
+}
+
+#[test]
+fn chat_completion_truncation_and_abort_finish_reasons_are_normalized() {
+    for reason in [
+        "length",
+        "max_tokens",
+        "model_length",
+        "model_context_window_exceeded",
+    ] {
+        assert_eq!(
+            normalized_finish_reason(reason).unwrap(),
+            "length",
+            "{reason}"
+        );
+    }
+    for reason in ["stop", "tool_calls", "content_filter", ""] {
+        assert_eq!(normalized_finish_reason(reason).unwrap(), reason);
+    }
+    for reason in ["error", "network_error"] {
+        let error = normalized_finish_reason(reason).unwrap_err();
+        assert!(
+            error.downcast_ref::<IncompleteStream>().is_some(),
+            "{reason}"
+        );
+    }
+}
+
+#[test]
+fn a_reused_index_with_a_new_call_id_starts_a_separate_call() {
+    let mut acc = Accumulator::default();
+    let mut sink = |_: &str| true;
+    for delta in [
+        r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"read","arguments":"{\"path\":"}}]}}]}"#,
+        r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a.rs\"}"}}]}}]}"#,
+        r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"b","function":{"name":"grep","arguments":"{\"pattern\":"}}]}}]}"#,
+        r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"x\"}"}}]}}]}"#,
+        r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+    ] {
+        acc.feed(delta, &mut sink).unwrap();
+    }
+    let reply = acc.finish().unwrap();
+    let calls: Vec<_> = reply
+        .tool_calls
+        .iter()
+        .map(|call| (call.id.as_str(), call.name.as_str(), call.arguments.clone()))
+        .collect();
+    assert_eq!(
+        calls,
+        [
+            ("a", "read", serde_json::json!({"path": "a.rs"})),
+            ("b", "grep", serde_json::json!({"pattern": "x"})),
+        ]
+    );
+}

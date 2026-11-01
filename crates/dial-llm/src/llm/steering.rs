@@ -170,11 +170,16 @@ pub fn local_unsupported_reason(_model: &str) -> Option<&'static str> {
 }
 
 pub fn runtime(base_url: &str) -> Result<Value> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(1)))
-        .build()
-        .into();
+    // The shared builder: no redirects, and no proxy for the local runner, which an
+    // `HTTPS_PROXY`/`ALL_PROXY` environment would otherwise route away from loopback.
+    let local = super::host_of(base_url).is_some_and(|host| super::is_local_host(&host));
+    let agent = super::agent_with(1, !local, None, None);
     let mut response = agent.get(&format!("{base_url}/dial/steering")).call()?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "steering runtime returned HTTP {}",
+        response.status()
+    );
     let raw = response
         .body_mut()
         .with_config()

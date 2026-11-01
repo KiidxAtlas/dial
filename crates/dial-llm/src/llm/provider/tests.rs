@@ -2170,10 +2170,17 @@ fn manual_retry_skips_five_minute_waits_without_leaking_into_other_attempts() {
     assert_eq!(phases, [true, false, true, false]);
     assert_eq!(server.requests().len(), 3);
     assert_eq!(notices.len(), 2);
+    // The five-minute interval varies by up to 10% (never beyond the 300 s default maximum).
     assert!(
-        notices
-            .iter()
-            .all(|notice| notice.contains("retrying in 300.0s"))
+        notices.iter().all(|notice| {
+            notice
+                .split("retrying in ")
+                .nth(1)
+                .and_then(|rest| rest.split('s').next())
+                .and_then(|secs| secs.parse::<f64>().ok())
+                .is_some_and(|secs| (270.0..=300.0).contains(&secs))
+        }),
+        "{notices:?}"
     );
     assert!(
         !control.request_now(),

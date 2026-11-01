@@ -33,24 +33,38 @@ fn encode(value: &str) -> String {
     }
     out
 }
+/// The signing region of an AWS Bedrock runtime hostname: the label after `bedrock-runtime` or
+/// `bedrock-runtime-fips`, as in `bedrock-runtime.us-east-1.amazonaws.com`,
+/// `bedrock-runtime-fips.us-gov-west-1.amazonaws.com`, `bedrock-runtime.cn-north-1.amazonaws.com.cn`
+/// and `vpce-1.bedrock-runtime.eu-west-1.vpce.amazonaws.com`. Any other host (a gateway or proxy)
+/// has no region Dial can trust, so the caller falls back to `AWS_REGION`.
+fn endpoint_region(host: &str) -> Option<String> {
+    let labels: Vec<&str> = host.split('.').collect();
+    labels
+        .windows(2)
+        .find(|pair| matches!(pair[0], "bedrock-runtime" | "bedrock-runtime-fips"))
+        .map(|pair| pair[1])
+        .filter(|region| looks_like_region(region))
+        .map(str::to_owned)
+}
+
+/// `us-east-1`, `us-gov-west-1`, `cn-north-1`, `eusc-de-east-1`: letters-only parts and a number.
+fn looks_like_region(label: &str) -> bool {
+    let parts: Vec<&str> = label.split('-').collect();
+    parts.len() >= 3
+        && parts
+            .last()
+            .is_some_and(|last| !last.is_empty() && last.bytes().all(|b| b.is_ascii_digit()))
+        && parts[..parts.len() - 1]
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_lowercase()))
+}
+
 fn endpoint(route: &Route<'_>) -> Result<(String, String)> {
     super::provider::endpoint_url(route.base_url, route.allow_insecure)?;
     let uri: ureq::http::Uri = route.base_url.parse().context("invalid Bedrock endpoint")?;
     let host = uri.host().context("Bedrock endpoint has no host")?;
-    let region = host
-        .split('.')
-        .find(|part| {
-            part.starts_with("us-")
-                || part.starts_with("eu-")
-                || part.starts_with("ap-")
-                || part.starts_with("ca-")
-                || part.starts_with("sa-")
-                || part.starts_with("me-")
-                || part.starts_with("af-")
-                || part.starts_with("il-")
-                || part.starts_with("mx-")
-        })
-        .map(str::to_owned)
+    let region = endpoint_region(host)
         .or_else(|| std::env::var("AWS_REGION").ok())
         .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
         .context("Bedrock region must be in endpoint hostname or AWS_REGION")?;

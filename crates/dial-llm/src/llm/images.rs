@@ -254,6 +254,12 @@ pub fn resize_for_model(bytes: &[u8], mime: &str) -> Result<(Vec<u8>, String)> {
     if width <= max_dimension && height <= max_dimension && bytes.len() as u64 <= MAX_IMAGE_BYTES {
         return Ok((bytes.to_vec(), mime.to_owned()));
     }
+    // Every request re-sends the whole history, so the same oversized screenshot would otherwise be
+    // decoded, Lanczos-resized and re-encoded again on every tool step.
+    let key: ResizeKey = (Sha256::digest(bytes).into(), mime.to_owned(), max_dimension);
+    if let Some(hit) = resized_cache_get(&key) {
+        return Ok(hit);
+    }
     let mut decoded = decode(bytes)?;
     if width > max_dimension || height > max_dimension {
         decoded = decoded.resize(
@@ -262,7 +268,44 @@ pub fn resize_for_model(bytes: &[u8], mime: &str) -> Result<(Vec<u8>, String)> {
             image::imageops::FilterType::Lanczos3,
         );
     }
-    encode_within_limit(decoded, mime)
+    let resized = encode_within_limit(decoded, mime)?;
+    resized_cache_put(key, &resized);
+    Ok(resized)
+}
+
+type ResizeKey = ([u8; 32], String, u32);
+/// Resized images kept for reuse across requests: few entries, bounded bytes, oldest evicted first.
+const RESIZED_CACHE_ENTRIES: usize = 32;
+const RESIZED_CACHE_BYTES: usize = 64 * 1024 * 1024;
+type Resized = (Vec<u8>, String);
+static RESIZED: std::sync::Mutex<std::collections::VecDeque<(ResizeKey, Resized)>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+fn resized_cache_get(key: &ResizeKey) -> Option<(Vec<u8>, String)> {
+    let mut cache = RESIZED.lock().unwrap_or_else(|e| e.into_inner());
+    let position = cache.iter().position(|(stored, _)| stored == key)?;
+    let entry = cache.remove(position)?;
+    let value = entry.1.clone();
+    cache.push_back(entry);
+    Some(value)
+}
+
+fn resized_cache_put(key: ResizeKey, value: &(Vec<u8>, String)) {
+    if value.0.len() > RESIZED_CACHE_BYTES / 4 {
+        return;
+    }
+    let mut cache = RESIZED.lock().unwrap_or_else(|e| e.into_inner());
+    cache.retain(|(stored, _)| *stored != key);
+    cache.push_back((key, value.clone()));
+    while cache.len() > RESIZED_CACHE_ENTRIES
+        || cache
+            .iter()
+            .map(|(_, (bytes, _))| bytes.len())
+            .sum::<usize>()
+            > RESIZED_CACHE_BYTES
+    {
+        cache.pop_front();
+    }
 }
 
 fn encode_within_limit(mut current: image::DynamicImage, mime: &str) -> Result<(Vec<u8>, String)> {

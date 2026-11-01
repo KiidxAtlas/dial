@@ -87,6 +87,18 @@ const FAILOVER_INTERVAL: Duration = Duration::from_secs(1);
 /// timeout): the provider never answered, so a fresh connection is tried promptly before the
 /// ordinary interval applies to later attempts.
 pub(crate) const CONNECTION_RETRY: Duration = Duration::from_secs(2);
+/// Shortest wait honoured for a server hint; `retry-after: 0` still yields to the server briefly.
+const MIN_HINTED_DELAY: Duration = Duration::from_millis(250);
+
+/// `interval` varied by up to ±10% once it is long enough for synchronized retries to matter.
+fn jittered(interval: Duration) -> Duration {
+    if interval < Duration::from_secs(10) {
+        return interval;
+    }
+    let spread = interval.as_secs_f64() * 0.1;
+    let offset = rand::random_range(-spread..=spread);
+    Duration::from_secs_f64((interval.as_secs_f64() + offset).max(0.0))
+}
 
 /// Server timing hints from one non-2xx response.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -293,10 +305,12 @@ pub(crate) enum Decision {
 }
 
 /// Decide whether attempt `attempt` (1-based) that failed with `class` is retried, and after how long.
-/// `hinted` is the server's explicit minimum delay; it is never shortened, and a hint beyond
+/// `hinted` is the server's explicit retry delay. It replaces the ordinary interval: a server that
+/// says "retry in 1s" is retried after 1s, not after the five-minute default. A hint beyond
 /// `max_delay` ends the request rather than waiting longer than the operator allowed.
-/// `connection` marks a failure before any response arrived; its first retry waits only
-/// [`CONNECTION_RETRY`].
+/// `connection` marks a failure before any response arrived, or a stream that dropped mid-reply;
+/// its first retry waits only [`CONNECTION_RETRY`]. Unhinted waits of ten seconds or more vary by
+/// up to ±10% so workers throttled together do not all retry at the same instant.
 pub(crate) fn decide(
     class: &ErrorClass,
     hinted: Option<Duration>,
@@ -349,7 +363,10 @@ pub(crate) fn decide(
         policy.backoff
     }
     .min(policy.max_delay);
-    let delay = minimum.map_or(interval, |minimum| minimum.max(interval));
+    let delay = match minimum {
+        Some(hinted) => hinted.max(MIN_HINTED_DELAY),
+        None => jittered(interval).min(policy.max_delay),
+    };
     if failing_over && delay > FAILOVER_MAX_WAIT {
         return Decision::Stop(Some(format!(
             "provider asked to wait {:.0}s; moving to the configured fallback model instead",

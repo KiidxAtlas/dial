@@ -30,7 +30,11 @@ impl TerminalFailure {
     pub(super) fn class(&self) -> super::errors::ErrorClass {
         match self.code {
             "rate_limit_exceeded" => super::errors::ErrorClass::RateLimited { retry_after: None },
+            // A request that does not fit never succeeds by resending it: compaction must run.
+            "context_length_exceeded" => super::errors::ErrorClass::ContextOverflow,
             "insufficient_quota"
+            | "usage_not_included"
+            | "usage_limit_reached"
             | "subscription_sharing_usage_limit_exceeded"
             | "subscription_sharing_usage_unavailable" => {
                 super::errors::ErrorClass::QuotaExhausted { reset_at: None }
@@ -676,6 +680,9 @@ impl Accumulator {
                     "previous_response_not_found" => "previous_response_not_found",
                     "rate_limit_exceeded" => "rate_limit_exceeded",
                     "insufficient_quota" => "insufficient_quota",
+                    "context_length_exceeded" => "context_length_exceeded",
+                    "usage_not_included" => "usage_not_included",
+                    "usage_limit_reached" => "usage_limit_reached",
                     "invalid_api_key" => "invalid_api_key",
                     "model_not_found" => "model_not_found",
                     "authentication_error" => "authentication_error",
@@ -722,10 +729,9 @@ impl Accumulator {
             response["output"] = json!(self.finished.values().collect::<Vec<_>>());
         }
         let mut reply = reply_from_output(&response, true)?;
-        ensure!(
-            reply.tool_calls.is_empty(),
-            "Responses output was truncated with tool calls; no tool calls were executed"
-        );
+        // Calls cut off by the output limit never run; `length` lets the agent raise the output
+        // budget and retry, as on the other transports.
+        reply.tool_calls.clear();
         reply.finish_reason = "length".into();
         Ok(reply)
     }
@@ -781,7 +787,15 @@ pub(super) fn has_native_history(chat: &Chat) -> bool {
 }
 
 /// Both transports must verify and stamp the same native-history ownership.
-pub(super) fn validate_history(endpoint: Endpoint<'_>, chat: &Chat) -> Result<String> {
+///
+/// Native items replay only to the account/endpoint (and, for compaction state, the model) that
+/// produced them. Items from any other owner are never sent: those messages fall back to their
+/// portable text and tool calls. A refreshed OAuth token, a rotated pooled key or a model switch
+/// therefore loses native reasoning continuity for earlier turns instead of refusing the chat.
+pub(super) fn validate_history<'a>(
+    endpoint: Endpoint<'_>,
+    chat: &'a Chat,
+) -> Result<(String, std::borrow::Cow<'a, Chat>)> {
     let replay_scope = super::model_config::native_replay_scope(
         "responses",
         endpoint.url,
@@ -795,25 +809,42 @@ pub(super) fn validate_history(endpoint: Endpoint<'_>, chat: &Chat) -> Result<St
             message["dial_anthropic_compaction"].is_null(),
             "Anthropic compaction state cannot be replayed through Responses; start a clean chat or explicitly compact to a portable summary"
         );
-        if let Some(compacted_model) = message["dial_compaction_model"].as_str() {
-            ensure!(
-                compacted_model == endpoint.model,
-                "native compaction state belongs to a different model; start a clean chat"
-            );
+    }
+    let foreign = |message: &Value| {
+        message["dial_compaction_model"]
+            .as_str()
+            .is_some_and(|model| model != endpoint.model)
+            || message["dial_provider_content"]
+                .as_array()
+                .is_some_and(|items| {
+                    items.iter().any(|item| {
+                        item["type"] == "dial_response_item"
+                            && item["scope"].as_str() != Some(replay_scope.as_str())
+                    })
+                })
+    };
+    if !chat.messages.iter().any(foreign) {
+        return Ok((replay_scope, std::borrow::Cow::Borrowed(chat)));
+    }
+    let mut portable = chat.clone();
+    for message in &mut portable.messages {
+        if !foreign(message) {
+            continue;
+        }
+        if let Some(object) = message.as_object_mut() {
+            object.remove("dial_compaction_model");
+            if let Some(items) = object
+                .get_mut("dial_provider_content")
+                .and_then(Value::as_array_mut)
+            {
+                items.retain(|item| item["type"] != "dial_response_item");
+                if items.is_empty() {
+                    object.remove("dial_provider_content");
+                }
+            }
         }
     }
-    for item in chat
-        .messages
-        .iter()
-        .flat_map(|m| m["dial_provider_content"].as_array().into_iter().flatten())
-        .filter(|item| item["type"] == "dial_response_item")
-    {
-        ensure!(
-            item["scope"].as_str() == Some(replay_scope.as_str()),
-            "Responses native history belongs to an unverified or different account/endpoint; start a clean chat"
-        );
-    }
-    Ok(replay_scope)
+    Ok((replay_scope, std::borrow::Cow::Owned(portable)))
 }
 
 pub(super) fn stamp_history(reply: &mut Reply, replay_scope: &str) {
@@ -899,7 +930,8 @@ fn exchange_inner(
         model,
         ..
     } = endpoint;
-    let replay_scope = validate_history(endpoint, chat)?;
+    let (replay_scope, chat) = validate_history(endpoint, chat)?;
+    let chat = &*chat;
     let mut body = if codex_account_id.is_some() {
         request_codex(model, chat, profile)?
     } else {
@@ -1174,37 +1206,10 @@ pub(super) fn compact(
         retained_budget,
     } = options;
     use std::sync::atomic::Ordering;
-    let scope = super::model_config::native_replay_scope(
-        "responses",
-        endpoint.url,
-        None,
-        endpoint.account_id,
-        Some(endpoint.token),
-        endpoint.headers,
-    );
-    for message in &chat.messages {
-        ensure!(
-            message["dial_anthropic_compaction"].is_null(),
-            "Anthropic compaction state cannot be sent to Responses"
-        );
-        ensure!(
-            message["dial_compaction_model"]
-                .as_str()
-                .is_none_or(|model| model == endpoint.model),
-            "Responses compaction state belongs to another model"
-        );
-        for item in message["dial_provider_content"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|item| item["type"] == "dial_response_item")
-        {
-            ensure!(
-                item["scope"].as_str() == Some(scope.as_str()),
-                "Responses history belongs to another account/endpoint; start a clean chat"
-            );
-        }
-    }
+    // The same ownership rule as ordinary requests: foreign native items compact from their
+    // portable form instead of refusing the compaction.
+    let (scope, chat) = validate_history(endpoint, chat)?;
+    let chat = &*chat;
     let supplemental: Vec<_> = chat
         .messages
         .iter()
@@ -1423,6 +1428,9 @@ pub(super) fn compact(
                             "model_error" => "model_error",
                             "rate_limit_exceeded" => "rate_limit_exceeded",
                             "insufficient_quota" => "insufficient_quota",
+                            "context_length_exceeded" => "context_length_exceeded",
+                            "usage_not_included" => "usage_not_included",
+                            "usage_limit_reached" => "usage_limit_reached",
                             "invalid_api_key" => "invalid_api_key",
                             "model_not_found" => "model_not_found",
                             "authentication_error" => "authentication_error",

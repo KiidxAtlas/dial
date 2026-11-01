@@ -123,6 +123,9 @@ fn content(value: &Value, vision: bool) -> Result<Vec<Value>> {
 struct CallContext {
     name: String,
     wire_id: Option<String>,
+    /// Replayed as text: the call came from another model, route or credential, so it has no
+    /// verified function-call signature for this endpoint and its result is sent as text too.
+    textual: bool,
 }
 
 fn record_calls(
@@ -166,7 +169,8 @@ fn record_calls(
                     id.to_owned(),
                     CallContext {
                         name: name.to_owned(),
-                        wire_id
+                        wire_id,
+                        textual: false,
                     }
                 )
                 .is_none(),
@@ -268,11 +272,41 @@ fn request(
                     });
                 // Function-call signatures cannot be reconstructed from ordinary
                 // history, and unknown models must not get invented bypass signatures.
-                // Legacy envelopes without a scope are deliberately unverified.
-                ensure!(
-                    native.is_some() || !has_calls,
-                    "Gemini tool history has no verified replay scope for this endpoint, model, credential and routing headers; start a clean chat before continuing"
-                );
+                // Legacy envelopes without a scope are deliberately unverified: their calls
+                // and results are replayed as plain text, which needs no signature, so a
+                // fallback, model switch or credential change keeps the conversation going.
+                if native.is_none() && has_calls {
+                    let mut parts = content(&message["content"], vision)?;
+                    for call in message["tool_calls"].as_array().into_iter().flatten() {
+                        let id = call["id"]
+                            .as_str()
+                            .filter(|id| !id.is_empty())
+                            .context("Gemini history tool call has no ID")?;
+                        let name = call["function"]["name"]
+                            .as_str()
+                            .filter(|name| !name.is_empty())
+                            .context("Gemini history tool call has no name")?;
+                        parts.push(json!({"text": format!(
+                            "[Earlier tool call {id} from another model or route: {name}({})]",
+                            call["function"]["arguments"].as_str().unwrap_or("{}")
+                        )}));
+                        ensure!(
+                            calls
+                                .insert(
+                                    id.to_owned(),
+                                    CallContext {
+                                        name: name.to_owned(),
+                                        wire_id: None,
+                                        textual: true,
+                                    },
+                                )
+                                .is_none(),
+                            "Gemini history has duplicate tool call IDs"
+                        );
+                    }
+                    contents.push(json!({"role":"model","parts":parts}));
+                    continue;
+                }
                 record_calls(message, native, &mut calls)?;
                 let parts = if let Some(native) = native {
                     let mut parts = native["parts"]
@@ -323,6 +357,30 @@ fn request(
                     } else {
                         pending_images.push(part);
                     }
+                }
+                if context.textual {
+                    let outcome = if message["is_error"] == true {
+                        "failed"
+                    } else {
+                        "returned"
+                    };
+                    let part = json!({"text": format!(
+                        "[Earlier tool call {id} ({}) {outcome}:]\n{text}",
+                        context.name
+                    )});
+                    match contents.last_mut().filter(|last| {
+                        last["role"] == "user"
+                            && last["parts"].as_array().is_some_and(|parts| {
+                                parts.iter().all(|part| part["functionResponse"].is_null())
+                            })
+                    }) {
+                        Some(last) => last["parts"]
+                            .as_array_mut()
+                            .expect("checked parts")
+                            .push(part),
+                        None => contents.push(json!({"role":"user","parts":[part]})),
+                    }
+                    continue;
                 }
                 let mut response = json!({"name":context.name,"response":{"output":text}});
                 if message["is_error"] == true {
@@ -729,8 +787,9 @@ impl Accumulator {
                 "STOP" if !self.reply.tool_calls.is_empty() => "tool_calls",
                 "STOP" => "stop",
                 "MAX_TOKENS" => {
-                    ensure!(self.reply.tool_calls.is_empty(),
-                        "Gemini output limit interrupted a tool-call turn; increase the output budget before retrying");
+                    // Calls cut off by the output limit never run; `length` lets the agent raise
+                    // the output budget and retry, as on the other transports.
+                    self.reply.tool_calls.clear();
                     "length"
                 }
                 "MALFORMED_FUNCTION_CALL" if self.reply.tool_calls.is_empty() => "tool_calls",

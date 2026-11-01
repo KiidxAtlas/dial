@@ -289,6 +289,9 @@ pub struct Reply {
     pub cache_warm_tier: Option<cache_warmer::Tier>,
     /// Native content blocks (including signed/redacted thinking) required for tool-turn replay.
     pub provider_content: Vec<Value>,
+    /// Host whose API produced `provider_content`, when its opaque blocks (signed thinking) are
+    /// only valid there. Stored as `dial_provider_origin` and checked before native replay.
+    pub provider_origin: Option<String>,
     /// Provider credit metering for the turn (Devin `creditCost`, `committedCreditCost`,
     /// `committedAcuCost`). `None` when the provider reported none; each field is set only when
     /// the provider reported it non-zero.
@@ -850,12 +853,12 @@ fn lift_text_calls(reply: &mut Reply, url: &str, tools: &[Value]) {
 }
 
 fn lift_calls(reply: &mut Reply, url: &str, tools: &[Value]) {
-    text_tool_calls::apply(reply);
+    let offered: Vec<String> = tools
+        .iter()
+        .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_owned))
+        .collect();
+    text_tool_calls::apply(reply, &offered);
     if host_of(url).is_some_and(|host| is_local_host(&host)) {
-        let offered: Vec<String> = tools
-            .iter()
-            .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_owned))
-            .collect();
         text_tool_calls::apply_pythonic(reply, &offered);
         text_tool_calls::apply_from_reasoning(reply);
     }
@@ -928,7 +931,7 @@ pub(super) fn send_with_headers(
     // ureq's send_json pretty-prints (indented whitespace is billed as prompt tokens); send compact JSON.
     let bytes = serde_json::to_vec(body)?;
     usage::transport_attempt()?;
-    wire::record(&bytes, "http");
+    wire::record_value(&bytes, body, "http");
     request
         .send(&bytes)
         .map_err(|error| transport_error(error, url, auth))
@@ -1368,11 +1371,12 @@ pub fn parse_reply(body: &[u8]) -> Result<Reply> {
     Ok(Reply {
         text,
         tool_calls,
-        finish_reason: choice
-            .get("finish_reason")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
+        finish_reason: stream::normalized_finish_reason(
+            choice
+                .get("finish_reason")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        )?,
         prompt_tokens: root.pointer("/usage/prompt_tokens").and_then(Value::as_u64),
         completion_tokens: root
             .pointer("/usage/completion_tokens")
@@ -1478,6 +1482,9 @@ pub fn assistant_message(reply: &Reply) -> Value {
             }
         }
         message["dial_provider_content"] = json!(content);
+        if let Some(origin) = &reply.provider_origin {
+            message["dial_provider_origin"] = json!(origin);
+        }
     }
     if !reply.reasoning.is_empty() && reply.provider_content.is_empty() {
         message["reasoning_content"] = json!(reply.reasoning);

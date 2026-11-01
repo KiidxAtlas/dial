@@ -207,3 +207,31 @@ fn closed_tool_signals_completion_before_message_end_and_honors_cancellation() {
         assert!(state.finish("scope").is_err());
     }
 }
+
+#[test]
+fn signing_region_comes_from_the_aws_runtime_hostname_only() {
+    for (host, region) in [
+        ("bedrock-runtime.us-east-1.amazonaws.com", Some("us-east-1")),
+        (
+            "bedrock-runtime-fips.us-gov-west-1.amazonaws.com",
+            Some("us-gov-west-1"),
+        ),
+        (
+            "bedrock-runtime.cn-north-1.amazonaws.com.cn",
+            Some("cn-north-1"),
+        ),
+        (
+            "bedrock-runtime.eusc-de-east-1.amazonaws.eu",
+            Some("eusc-de-east-1"),
+        ),
+        (
+            "vpce-0a1.bedrock-runtime.eu-west-1.vpce.amazonaws.com",
+            Some("eu-west-1"),
+        ),
+        // A gateway whose name merely contains a region-like label is not trusted.
+        ("bedrock.us-east.corp.example", None),
+        ("llm-gateway.us-east-1.example.com", None),
+    ] {
+        assert_eq!(endpoint_region(host).as_deref(), region, "{host}");
+    }
+}

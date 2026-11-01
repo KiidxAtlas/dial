@@ -2,16 +2,31 @@
 
 The shared LLM layer provides bounded streaming, provider-aware error classification, retries, and request budgeting. Context-overflow classifications are kept attached to errors before any header redaction so compaction remains reliable. HTTP 413 is classified as a payload failure unless the body identifies a token/context limit; it must not trigger token compaction merely because its status is 413. oMLX's "prefill memory guard rejected this prompt" refusal (prefill would exceed the server's memory ceiling) is classified as context overflow, as an HTTP body or a stream error, so the turn compacts and retries a smaller prompt instead of failing.
 
-`[retry]` settings bound attempts and delays. Ordinary automatic provider retries wait a fixed
+`[retry]` settings bound attempts and delays. Ordinary automatic provider retries wait about
 300 seconds (five minutes), bounded by `retry.max_delay_secs`, rather than increasing an
-exponential backoff. A connection-level failure before any response arrived (connection refused
-or reset, broken pipe, DNS or connect timeout) is retried once after 2 seconds on a fresh
-connection; later attempts use the ordinary interval. Explicit `retry-after`, `retry-after-ms`, and `x-ratelimit-reset[-ms]`
-delays are still honored as minimum waits; a hint beyond `retry.max_delay_secs` stops the request
+exponential backoff; waits of ten seconds or more vary by up to ±10% so workers throttled at the
+same moment do not all retry together. A connection-level failure before any response arrived
+(connection refused or reset, broken pipe, DNS or connect timeout), or a stream that dropped or
+stalled mid-reply, is retried once after 2 seconds on a fresh connection; later attempts use the
+ordinary interval. An explicit `retry-after`, `retry-after-ms` or `x-ratelimit-reset[-ms]` delay
+replaces the ordinary interval (a server asking for one second is retried after one second, with
+at least 250 ms for `retry-after: 0`); a hint beyond `retry.max_delay_secs` stops the request
 instead of waiting longer than configured. Window-reset headers are treated as quota information,
 not mandatory waits. A throttle (including HTTP 529) remains
 distinct from account quota exhaustion. Incomplete or truncated streams are discarded and retried;
 partial tool calls are never executed. Maximum attempts and failover behavior are unchanged.
+
+Native replay is owner-scoped. Responses items replay only to the account/endpoint/credential (and,
+for compaction state, the model) that produced them, Anthropic signed blocks only to the host that
+produced them, and Gemini function-call parts only with a verified signature for the endpoint and
+model. Anything else is sent in portable form: text and tool calls, with Gemini tool turns from
+another route replayed as plain text so no signature is invented. A tool call cut off by the
+output limit is dropped and reported as `length` on every transport, so the turn raises its output
+budget instead of failing. Chat-completions finish reasons such as `max_tokens`, `model_length`
+and `model_context_window_exceeded` map to `length`; `error` and `network_error` are incomplete
+streams and retried. A streamed Responses `context_length_exceeded` is a context overflow, which
+compacts instead of resending the same prompt. Tool calls written as text in a reply are lifted
+only when every call names an offered tool, and a fenced JSON call only when it is the whole reply.
 
 While a turn is running, `/retry` skips the remaining provider retry wait and requests the next
 attempt immediately, including any remaining server-requested delay. It does not cancel the turn,
@@ -211,7 +226,7 @@ state, requests report `registry_default` routing.
   - `off`: no replays.
   - `streaming`: replays only while an agent run is streaming a reply, for up to 30 minutes from the last settled prefix.
   - `idle`: also replays between runs, for up to 60 minutes from the last settled prefix.
-- A replay is armed only when the economics favor it: the expected savings over the next replay must exceed $0.001 at catalog prices. Without catalog pricing for the model, warming does not start. The successful native request supplies its effective cache lifetime, including cache-control refusal fallback: five-minute prefixes refresh after four minutes; one-hour prefixes after 59 minutes. Unknown or disabled retention disarms the previous prefix rather than guessing.
+- A replay is armed only when the economics favor it: the expected savings over the next replay must exceed $0.001 at catalog prices. All replays after one real turn buy the same single avoided miss, so warming also stops once their combined cost would exceed that expected saving. Without catalog pricing for the model, warming does not start. The successful native request supplies its effective cache lifetime, including cache-control refusal fallback: five-minute prefixes refresh after four minutes; one-hour prefixes after 59 minutes. Unknown or disabled retention disarms the previous prefix rather than guessing.
 - Warming stops when the mode changes to `off`, the active route/configuration changes, the window ends, a replay wrote the cache instead of reading it, or the replay backend is unavailable. Replays are bound to the configuration of the route that actually served the request, including session switches and fallbacks, rather than the initial default model. Accepted tool-call and text-only replies both replace the armed prefix with the request that produced them, not the newly generated reply. Worker stop reports appear as notices at the start of the next turn; route changes discard the old worker. Hermetic evaluation runs never replay.
 - Warming applies to native Anthropic routes only. Other providers and local servers have no equivalent cache control and never replay.
 - Pending invalidations and run-end events are applied before a due replay. If the bounded event queue overflows, warming stops rather than silently losing a stop event; a later request can start a fresh worker. Dropping the session's warmer prevents new replays even if a run guard remains alive. A request already in flight may finish within its bounded replay timeout.

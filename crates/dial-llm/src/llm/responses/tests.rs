@@ -939,3 +939,56 @@ fn forced_tool_choice_none_keeps_responses_tool_namespace_and_input() {
         assert_eq!(handoff[key], normal[key], "{key} changed");
     }
 }
+
+#[test]
+fn a_rotated_credential_replays_earlier_turns_portably_instead_of_refusing() {
+    let endpoint = |token| Endpoint {
+        headers: &[],
+        url: "https://api.example.test/v1/responses",
+        token,
+        account_id: None,
+        model: "gpt",
+    };
+    let (old_scope, _) = validate_history(endpoint("old-token"), &chat()).unwrap();
+    let mut history = chat();
+    history.messages.push(json!({
+        "role":"assistant","content":"done",
+        "dial_provider_content":[{"type":"dial_response_item","scope":old_scope,
+            "item":{"type":"reasoning","encrypted_content":"opaque-old-account"}}]
+    }));
+    // Same credential: native items replay untouched.
+    let (_, same) = validate_history(endpoint("old-token"), &history).unwrap();
+    assert!(matches!(same, std::borrow::Cow::Borrowed(_)));
+    // A refreshed token or rotated pooled key: the request still goes out, without the foreign
+    // encrypted item, and the assistant turn keeps its portable text.
+    let (new_scope, portable) = validate_history(endpoint("new-token"), &history).unwrap();
+    assert_ne!(new_scope, old_scope);
+    let body = request_api("gpt", &portable, None).unwrap();
+    let text = body["input"].to_string();
+    assert!(!text.contains("opaque-old-account"), "{text}");
+    assert!(text.contains("done"), "{text}");
+}
+
+#[test]
+fn streamed_context_overflow_and_plan_limits_are_not_retried_as_transient() {
+    use super::super::errors::ErrorClass;
+    let failure = |code| TerminalFailure {
+        kind: "response.failed",
+        code,
+    };
+    assert_eq!(
+        failure("context_length_exceeded").class(),
+        ErrorClass::ContextOverflow
+    );
+    assert!(!failure("context_length_exceeded").retryable());
+    for code in ["usage_not_included", "usage_limit_reached"] {
+        assert!(matches!(
+            failure(code).class(),
+            ErrorClass::QuotaExhausted { .. }
+        ));
+    }
+    assert_eq!(
+        failure("unclassified_failure").class(),
+        ErrorClass::Transient
+    );
+}

@@ -270,10 +270,11 @@ signed in. Signing into ChatGPT does not change the credentials used by `openai`
 
 `retry.rotate_accounts` permits automatic ChatGPT failover only for unbound requests with
 portable history. A successful account selection stays pinned on that backend for subsequent
-requests. Session/cache identities and native Responses history are account-scoped: Dial refuses
-automatic cross-account replay rather than sending incompatible history or silently discarding it.
-For those conversations, explicitly select another allowed account and start a clean chat (or
-explicitly rebind portable history). Rotation also requires compatible cached model capabilities
+requests. Session/cache identities and native Responses history are account-scoped: native items
+(encrypted reasoning, compaction state) are never replayed to another account, endpoint,
+credential or model. Earlier turns owned by anyone else are sent in their portable form (text and
+tool calls) instead, so a refreshed OAuth token, a rotated pooled key or an account switch keeps
+the conversation going at the cost of native reasoning continuity for those turns. Rotation also requires compatible cached model capabilities
 unless an explicit configured model profile supplies the request contract. Account allowlists and
 native replay validation still apply.
 
