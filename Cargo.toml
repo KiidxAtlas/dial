@@ -65,7 +65,7 @@ crc32fast = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
 toml = "0.9"
 ratatui = "0.29"
-crossterm = "0.28"
+crossterm = "0.29"
 unicode-width = "0.2"
 unicode-segmentation = "1"
 pulldown-cmark = { version = "0.12", default-features = false }
