@@ -6,7 +6,6 @@ license.workspace = true
 publish = false
 
 [dependencies]
-dial-build-info.workspace = true
 dial-core.workspace = true
 dial-llm.workspace = true
 dial-storage.workspace = true

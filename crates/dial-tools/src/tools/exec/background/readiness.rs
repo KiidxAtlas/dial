@@ -131,7 +131,7 @@ pub(super) fn port_ready(
     let local_end = Instant::now() + Duration::from_secs(2);
     let end = deadline.map_or(local_end, |end| end.min(local_end));
     let waker = Waker::new().map_err(|e| format!("configuring listener query: {e}"))?;
-    wake::watch_exit(group.child.id());
+    wake::watch_exit(group.id());
     let mut bytes = Vec::new();
     let mut buffer = [0u8; 4096];
     let mut eof = false;
@@ -179,7 +179,6 @@ pub(super) fn port_ready(
     }
     group.terminate();
     let status = group
-        .child
         .wait()
         .map_err(|e| format!("waiting for listener ownership query: {e}"))?;
     if !status.success() && status.code() != Some(1) {

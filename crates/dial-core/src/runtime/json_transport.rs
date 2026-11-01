@@ -49,23 +49,15 @@ impl JsonProcess {
         .map_err(|e| e.to_string())?;
         // Owned from spawn onward: any later error terminates and reaps the group.
         let mut group = ProcessGroup::new(child);
-        let input = group.child.stdin.take().ok_or("child stdin unavailable")?;
-        let output = group
-            .child
-            .stdout
-            .take()
-            .ok_or("child stdout unavailable")?;
-        let errors = group
-            .child
-            .stderr
-            .take()
-            .ok_or("child stderr unavailable")?;
+        let input = group.take_stdin().ok_or("child stdin unavailable")?;
+        let output = group.take_stdout().ok_or("child stdout unavailable")?;
+        let errors = group.take_stderr().ok_or("child stderr unavailable")?;
         crate::platform::io::set_nonblocking(&input).map_err(|e| e.to_string())?;
         crate::platform::io::set_nonblocking(&output).map_err(|e| e.to_string())?;
         crate::platform::io::set_nonblocking(&errors).map_err(|e| e.to_string())?;
         #[cfg(windows)]
         let input = crate::platform::io::QueuedWriter::new(input, 64 * 1024);
-        pid.store(group.child.id() as i32, Ordering::Release);
+        pid.store(group.id() as i32, Ordering::Release);
         Ok(Self {
             group,
             input,

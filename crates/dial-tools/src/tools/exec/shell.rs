@@ -901,14 +901,11 @@ fn run_bash(
         }
         let limit = Some(limit.map_or(slice, |l| l.min(slice)));
         waiter
-            .wait((!eof).then_some(&reader), Some(&group.child), limit)
+            .wait((!eof).then_some(&reader), Some(group.child()), limit)
             .map_err(|e| format!("waiting for command output: {e}"))?;
     }
     group.terminate();
-    let status = group
-        .child
-        .wait()
-        .map_err(|e| format!("reaping command: {e}"))?;
+    let status = group.wait().map_err(|e| format!("reaping command: {e}"))?;
     // Everything in the group is dead; collect what it wrote.
     drain_after_exit(
         &mut reader,

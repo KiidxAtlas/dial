@@ -8,8 +8,12 @@ use std::{
 };
 
 /// Kills the whole process group on drop so nothing outlives its owning operation.
+///
+/// The leader is reaped only through [`Self::wait`] / [`Self::try_wait`], which signal the group
+/// first: once the leader is reaped its PID (and so the group ID) may be reused, and a later
+/// `killpg` could hit an unrelated process.
 pub struct ProcessGroup {
-    pub child: Child,
+    child: Child,
     terminated: bool,
 }
 impl ProcessGroup {
@@ -18,6 +22,41 @@ impl ProcessGroup {
             child,
             terminated: false,
         }
+    }
+    /// The leader's process ID, which is also the group ID.
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+    /// The leader, for exit observation that does not reap it.
+    pub fn child(&self) -> &Child {
+        &self.child
+    }
+    pub fn take_stdin(&mut self) -> Option<ChildStdin> {
+        self.child.stdin.take()
+    }
+    pub fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.child.stdout.take()
+    }
+    pub fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+        self.child.stderr.take()
+    }
+    /// The leader's status once it has exited. Remaining group members are signalled while the
+    /// unreaped leader still reserves the group ID, then the leader is reaped.
+    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        if !self.terminated && !crate::platform::process::exited(&self.child)? {
+            return Ok(None);
+        }
+        self.terminate();
+        self.child.try_wait()
+    }
+    /// Blocks until the leader exits, then signals the rest of the group and reaps the leader.
+    pub fn wait(&mut self) -> io::Result<ExitStatus> {
+        while !self.terminated
+            && !crate::platform::process::wait_exited(&self.child, Duration::from_secs(60))?
+        {
+        }
+        self.terminate();
+        self.child.wait()
     }
     pub fn terminate(&mut self) {
         if !self.terminated {

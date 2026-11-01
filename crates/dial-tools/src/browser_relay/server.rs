@@ -216,7 +216,7 @@ fn json_version(stream: &mut TcpStream, shared: &Shared) {
             "V8-Version": "",
             "WebKit-Version": "",
             "webSocketDebuggerUrl": format!("ws://127.0.0.1:{}/cdp?token={}", shared.port, shared.token),
-            "dialRelayVersion": crate::build_info::VERSION,
+            "dialRelayVersion": dial_core::build_identity::version(),
             "dialRelayProtocol": PROTOCOL_VERSION,
             "dialExtensionVersion": snapshot.info.version,
         }),
@@ -235,7 +235,7 @@ fn json_list(stream: &mut TcpStream, shared: &Shared) {
 fn respond_not_connected(stream: &mut TcpStream, snapshot: &Snapshot) {
     let mut body = json!({
         "error": NOT_CONNECTED_MESSAGE,
-        "dialRelayVersion": crate::build_info::VERSION,
+        "dialRelayVersion": dial_core::build_identity::version(),
         "dialRelayProtocol": PROTOCOL_VERSION,
         "extensionSeen": snapshot.extension_seen,
         "uptimeMs": snapshot.uptime.as_millis() as u64,

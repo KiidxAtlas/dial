@@ -58,7 +58,15 @@ mod launcher {
             .name("dial-spawn".to_owned())
             .spawn(move || {
                 for (mut command, reply) in received {
-                    let child = command.spawn();
+                    // The launcher outlives every caller and cannot be restarted: a panic while
+                    // spawning one command must fail that command, not every later spawn.
+                    let child =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| command.spawn()))
+                            .unwrap_or_else(|_| {
+                                Err(io::Error::other(
+                                    "spawning the process panicked; nothing was started",
+                                ))
+                            });
                     let _ = reply.send((command, child));
                 }
             })
@@ -74,7 +82,11 @@ mod launcher {
         let job = std::mem::replace(command, Command::new(""));
         let (reply, result) = mpsc::sync_channel(1);
         let lost = || io::Error::other("the process launcher thread stopped");
-        jobs.send((job, reply)).map_err(|_| lost())?;
+        if let Err(mpsc::SendError((job, _))) = jobs.send((job, reply)) {
+            // Hand the command back so callers can still clean up what it names.
+            *command = job;
+            return Err(lost());
+        }
         let (job, child) = result.recv().map_err(|_| lost())?;
         *command = job;
         child

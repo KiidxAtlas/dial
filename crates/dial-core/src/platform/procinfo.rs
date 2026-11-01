@@ -36,7 +36,11 @@ impl ProcId {
     /// The same process still exists, zombie or not. A zombie group leader can still have live
     /// group members, so group signalling uses this rather than `alive`.
     pub fn same_process(&self) -> bool {
-        self.start != 0 && probe(self.pid).is_some_and(|(start, _)| start == self.start)
+        // Fields are public and deserialized: never let a recorded 0, 1 or negative PID reach
+        // `killpg`, where 0 names Dial's own group and 1 names init's.
+        self.pid > 1
+            && self.start != 0
+            && probe(self.pid).is_some_and(|(start, _)| start == self.start)
     }
 
     /// The process is running and not a zombie (exited, zombie or reused PIDs are not).
@@ -44,7 +48,9 @@ impl ProcId {
         Self::of(self.pid).is_some_and(|live| live == *self)
     }
 
-    /// Signal this process's group (`pgid == pid`) only while the identity still matches.
+    /// Signal this process's group (`pgid == pid`) only while the identity still matches. The
+    /// check and `killpg` are separate system calls; a group ID cannot be reused while any member
+    /// lives, so only a group whose last member exits inside that window can be misidentified.
     #[cfg(unix)]
     pub fn signal_group(&self, signal: i32) -> bool {
         self.same_process() && unsafe { libc::killpg(self.pid, signal) } == 0

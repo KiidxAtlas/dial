@@ -1236,14 +1236,14 @@ fn run_entry(
         .with_context(|| format!("starting {}", exe.display()))
         .map_err(RunFailure::Start)?;
     let mut group = ProcessGroup::new(child);
-    let mut stdout = group.child.stdout.take().expect("piped schedule stdout");
-    let mut stderr = group.child.stderr.take().expect("piped schedule stderr");
+    let mut stdout = group.take_stdout().expect("piped schedule stdout");
+    let mut stderr = group.take_stderr().expect("piped schedule stderr");
     let mut out = Capture::new();
     let mut err = Capture::new();
     let mut out_done = false;
     let mut err_done = false;
     let mut failures = Vec::new();
-    let mut tree = match OwnedTree::new(group.child.id() as ProcessId) {
+    let mut tree = match OwnedTree::new(group.id() as ProcessId) {
         Ok(tree) => Some(tree),
         Err(error) => {
             failures.push(format!("claiming scheduled process: {error:#}"));
@@ -1284,7 +1284,7 @@ fn run_entry(
                 break;
             }
             // Ask Dial to cancel its own independent tool groups and write final diagnostics first.
-            if let Err(error) = request_schedule_cancel(group.child.id()) {
+            if let Err(error) = request_schedule_cancel(group.id()) {
                 failures.push(format!("requesting schedule cancellation: {error}"));
                 break;
             }
@@ -1346,7 +1346,7 @@ fn run_entry(
     // Reserve the root PID until all attributed descendants have been stopped and killed.
     #[cfg(unix)]
     unsafe {
-        libc::killpg(group.child.id() as libc::pid_t, libc::SIGSTOP)
+        libc::killpg(group.id() as libc::pid_t, libc::SIGSTOP)
     };
     if let Some(tree) = tree.as_mut() {
         tree.terminate(Instant::now() + TREE_SCAN_GRACE, &mut failures);
@@ -1377,7 +1377,7 @@ fn run_entry(
         if !reaped {
             match group.exited() {
                 Ok(true) => {
-                    match group.child.wait() {
+                    match group.wait() {
                         Ok(exit) => status = Some(exit),
                         Err(error) => failures.push(format!("reaping schedule: {error}")),
                     }

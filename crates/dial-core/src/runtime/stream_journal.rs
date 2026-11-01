@@ -90,7 +90,12 @@ pub fn copy(source: &Path, destination: &Path) -> anyhow::Result<()> {
         )
     })?;
     for node in &nodes {
-        journal.snapshot(node);
+        anyhow::ensure!(
+            journal.snapshot(node),
+            "stream journal {} node {} exceeds the replay row limit; source preserved, not copied",
+            path(source).display(),
+            node.id
+        );
     }
     let durable = journal
         .check()
@@ -233,37 +238,47 @@ impl Journal {
         writers.insert(path, Arc::downgrade(&writer));
         Ok(Self(writer))
     }
-    fn append(&self, frame: Frame) {
+    /// `false` when this one frame was refused without writing anything: it would exceed the
+    /// replay row limit. An oversized frame is a property of that update, not of the journal, so
+    /// it never latches the writer; the caller keeps its previous published state. I/O and
+    /// serialization failures still latch (see [`Self::check`]).
+    fn append(&self, frame: Frame) -> bool {
         let mut writer = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if writer.error.is_some() {
-            return;
+            return true;
         }
-        let result = (|| {
-            let mut bytes = serde_json::to_vec(&frame)?;
-            bytes.push(b'\n');
-            // Replay reads at most MAX_FRAME bytes per row, so a larger frame could never be recovered.
-            if bytes.len() > MAX_FRAME {
-                return Err(std::io::Error::other(
-                    "stream frame exceeds the replay row limit",
-                ));
+        let mut bytes = match serde_json::to_vec(&frame) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                writer.error = Some(format!("stream journal failed: {error}"));
+                return true;
             }
-            let offset = writer.file.metadata()?.len();
+        };
+        bytes.push(b'\n');
+        // Replay reads at most MAX_FRAME bytes per row, so a larger frame could never be recovered.
+        if bytes.len() > MAX_FRAME {
+            return false;
+        }
+        let result = writer.file.metadata().and_then(|metadata| {
+            let offset = metadata.len();
             writer.file.write_all(&bytes).inspect_err(|_| {
                 writer.retry_from = Some(offset);
             })
-        })();
+        });
         if let Err(error) = result {
             writer.error = Some(format!("stream journal failed: {error}"));
         }
+        true
     }
-    pub fn snapshot(&self, node: &Node) {
+    /// `false` when the snapshot was refused as oversized; see [`Self::append`].
+    pub fn snapshot(&self, node: &Node) -> bool {
         self.append(Frame::Snapshot {
             schema_version: 1,
             node: Box::new(node.clone()),
-        });
+        })
     }
-    pub fn text(&self, id: &str, revision: u64, text: &str) {
-        self.text_tail(id, revision, text, None);
+    pub fn text(&self, id: &str, revision: u64, text: &str) -> bool {
+        self.text_tail(id, revision, text, None)
     }
     pub(super) fn text_tail(
         &self,
@@ -271,7 +286,7 @@ impl Journal {
         revision: u64,
         text: &str,
         retain_bytes: Option<usize>,
-    ) {
+    ) -> bool {
         self.append(Frame::Append {
             // Tail retention changes replay semantics: v1 readers must refuse it rather
             // than silently treating the bounded delta as an ordinary append.
@@ -280,7 +295,7 @@ impl Journal {
             revision,
             text: text.into(),
             retain_bytes,
-        });
+        })
     }
     pub fn check(&self) -> Result<(), String> {
         self.0
@@ -391,8 +406,9 @@ impl Journal {
             Ok(true)
         })();
         match &result {
-            Ok(true) => writer.reclaim_after = 0,
-            Ok(false) => {
+            // Retained live baselines can keep the stream above RECLAIM_AT; wait for that much
+            // new growth before scanning and rewriting it again, as after a deferred attempt.
+            Ok(_) => {
                 let len = writer.file.metadata().map_or(0, |metadata| metadata.len());
                 writer.reclaim_after = len.saturating_add(RECLAIM_AT);
             }
@@ -533,3 +549,6 @@ mod reclamation_tests;
 
 #[cfg(test)]
 mod worker_tail_tests;
+
+#[cfg(test)]
+mod tool_stream_tests;

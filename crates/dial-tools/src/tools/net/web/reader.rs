@@ -182,14 +182,10 @@ fn run_external(
     // Owned from spawn onward: every exit path below terminates and reaps the whole group.
     let mut group = ProcessGroup::new(child);
     let mut stdin = group
-        .child
-        .stdin
-        .take()
+        .take_stdin()
         .ok_or_else(|| format!("{program} has no stdin"))?;
     let mut stdout = group
-        .child
-        .stdout
-        .take()
+        .take_stdout()
         .ok_or_else(|| format!("{program} has no stdout"))?;
     let payload = input.as_bytes().to_vec();
     let writer = std::thread::spawn(move || {
@@ -213,7 +209,7 @@ fn run_external(
                 }
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 let slice = remaining.min(INTERRUPT_POLL);
-                if let Err(error) = crate::platform::process::wait_exited(&group.child, slice) {
+                if let Err(error) = crate::platform::process::wait_exited(group.child(), slice) {
                     return Err(format!("could not wait for {program}: {error}"));
                 }
             }
@@ -224,7 +220,6 @@ fn run_external(
     // joining the pipe threads, which would otherwise wait on those members forever.
     group.terminate();
     let status = group
-        .child
         .wait()
         .map_err(|error| format!("could not wait for {program}: {error}"))?;
     let _ = writer.join();

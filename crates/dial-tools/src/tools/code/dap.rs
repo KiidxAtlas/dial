@@ -1040,9 +1040,7 @@ impl Session {
             .unwrap_or_else(|e| e.into_inner())
             .as_mut()
             .unwrap()
-            .child
-            .stderr
-            .take()
+            .take_stderr()
             .ok_or_else(|| DapError::transport("DAP stderr unavailable"))?;
         let (input, output, stderr): (
             Box<dyn Write + Send>,
@@ -1051,14 +1049,12 @@ impl Session {
         ) = match config.transport {
             DapTransport::Stdio => {
                 let mut guard = process.group.lock().unwrap_or_else(|e| e.into_inner());
-                let child = &mut guard.as_mut().unwrap().child;
-                let input = child
-                    .stdin
-                    .take()
+                let group = guard.as_mut().unwrap();
+                let input = group
+                    .take_stdin()
                     .ok_or_else(|| DapError::transport("DAP stdin unavailable"))?;
-                let output = child
-                    .stdout
-                    .take()
+                let output = group
+                    .take_stdout()
                     .ok_or_else(|| DapError::transport("DAP stdout unavailable"))?;
                 nonblocking(&input)?;
                 nonblocking(&output)?;

@@ -697,7 +697,7 @@ impl Client {
     pub fn status(&self) -> Value {
         json!({
             "name": self.name(), "root": self.root, "alive": self.is_alive(), "busy": self.is_busy(),
-            "process_id": lock(&self.child).as_ref().map(|group| group.child.id()),
+            "process_id": lock(&self.child).as_ref().map(|group| group.id()),
             "open_documents": lock(&self.docs).iter().map(|(path, doc)| {
                 json!({"path": path, "version": doc.version})
             }).collect::<Vec<_>>(),

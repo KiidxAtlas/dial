@@ -1,3 +1,4 @@
+pub mod build_identity;
 pub mod credentials;
 pub mod output;
 pub mod platform;
