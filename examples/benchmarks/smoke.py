@@ -93,8 +93,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             chosen = [c["index"] for c in payload["candidates"] if "bounded_transaction_total" in c["source_evidence"]]
             return self.text(json.dumps({"indices": chosen[: payload["max_results"]]})), "stop"
         # Runtime reminders repeat the latest prompt after tool results. They are
-        # context, not a new scenario boundary: keep the actual turn's evidence.
-        user = next((message for message in reversed(messages) if message["role"] == "user" and not message.get("dial_task_context") and "BENCH_CASE=" in str(message.get("content", ""))), None)
+        # context, not a new scenario boundary: keep the actual turn's evidence. Harness
+        # markers are stripped from the wire, so recognize the note by its text.
+        user = next((message for message in reversed(messages) if message["role"] == "user" and "[Latest admitted user request" not in str(message.get("content", "")) and "BENCH_CASE=" in str(message.get("content", ""))), None)
         if user is None:
             raise ValueError("no benchmark scenario in current conversation")
         prompt = str(user["content"])

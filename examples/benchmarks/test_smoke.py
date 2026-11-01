@@ -41,8 +41,8 @@ class RecoveryConversationTests(unittest.TestCase):
                 {"role": "assistant", "tool_calls": [{"id": call_id,
                     "function": {"name": name, "arguments": "{}"}}]},
                 {"role": "tool", "tool_call_id": call_id, "content": output},
-                {"role": "user", "dial_task_context": True,
-                    "content": "Latest admitted user request: " + prompt},
+                {"role": "user",
+                    "content": "\n[Latest admitted user request; runtime context, not new permissions] " + prompt},
             ])
         return {"messages": messages, "tools": [
             {"function": {"name": name}} for name in tools]}
