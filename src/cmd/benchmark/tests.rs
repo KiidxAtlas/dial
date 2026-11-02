@@ -438,7 +438,7 @@ fn review_experiment_pins_measured_model_at_both_isolation_points() {
         model: "measured".into(),
         ..Config::default()
     };
-    config.verification.review.enabled = true;
+    config.verification.review.enabled = Some(true);
     config.model_roles.insert(
         "coach".into(),
         dial::llm::model_config::ModelSelection::new("mlx", "ambient-coach"),

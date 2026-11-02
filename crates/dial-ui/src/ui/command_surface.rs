@@ -160,7 +160,9 @@ pub fn category(name: &str) -> Category {
         "review" | "review-file" | "changes" | "undo" | "rollback" | "commit" | "checks"
         | "code-history" | "plan-review" | "changelog" => Category::Review,
         "workers" | "processes" | "bg" | "jobs" | "agents" | "message" | "cancel" | "queue"
-        | "todo" | "goal" | "guided-goal" | "loop" | "btw" | "tan" | "compute" => Category::Work,
+        | "todo" | "goal" | "guided-goal" | "contract" | "loop" | "btw" | "tan" | "compute" => {
+            Category::Work
+        }
         "plan" | "plan-yolo" | "advisor" | "external-thinking" | "vibe" | "skillful"
         | "prewalk" | "ratchet" | "rule" | "debug" | "fresh" | "handoff" | "shake" | "cleanse" => {
             Category::Modes

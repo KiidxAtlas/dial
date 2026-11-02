@@ -1129,7 +1129,7 @@ fn select_configuration(
         );
         selected.endpoint = Some(endpoint);
     }
-    if selected.verification.review.enabled {
+    if selected.verification.review.enabled == Some(true) {
         selected.escalation.allow_remote = policy.allow_remote;
     }
     integration::configure_review(&mut selected);
@@ -1148,7 +1148,7 @@ fn select_configuration(
         "tool_network_allowed": selected.sandbox.allow_network,
         "integration": requested.integration,
         "automatic_improvement": false,
-        "model_roles": if selected.verification.review.enabled { "coach:selected_model_only" } else { "disabled" },
+        "model_roles": if selected.verification.review.enabled == Some(true) { "coach:selected_model_only" } else { "disabled" },
         "assistance": assistance_settings(&selected),
         "efficiency": efficiency_settings(&selected),
         "experimental": selected.experimental,

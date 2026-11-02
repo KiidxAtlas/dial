@@ -1221,6 +1221,10 @@ fn reasoning_strategies_add_one_bounded_distinct_block_without_replacing_base_po
     use crate::config::types::ReasoningStrategy;
     let strategies = [
         ReasoningStrategy::Default,
+        ReasoningStrategy::GptGoalDirected,
+        ReasoningStrategy::ClaudeGrounded,
+        ReasoningStrategy::GeminiSynthesis,
+        ReasoningStrategy::DeepseekCrossCheck,
         ReasoningStrategy::EvidenceFirst,
         ReasoningStrategy::HypothesisDriven,
         ReasoningStrategy::PlanThenAct,
@@ -1237,7 +1241,7 @@ fn reasoning_strategies_add_one_bounded_distinct_block_without_replacing_base_po
         .collect();
     assert_eq!(
         blocks.len(),
-        8,
+        strategies.len() - 1,
         "each optional approach has distinct guidance"
     );
     for block in &blocks {

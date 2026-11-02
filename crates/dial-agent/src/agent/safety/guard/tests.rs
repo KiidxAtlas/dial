@@ -656,3 +656,37 @@ fn a_long_run_of_single_lookups_is_told_once_per_streak_to_batch() {
         assert!(pace.round(&write).is_none());
     }
 }
+
+#[test]
+fn repeated_edits_to_one_file_without_a_passing_check_are_flagged_and_reset_by_one() {
+    let mut guard = EditChurnGuard::default();
+    let lib = vec!["src/lib.rs".to_owned()];
+    for _ in 1..EDIT_CHURN_WARN {
+        assert!(guard.observe(&lib, false).is_none());
+    }
+    // Edits to other files and calls that change nothing do not count toward `src/lib.rs`.
+    assert!(guard.observe(&["src/main.rs".to_owned()], false).is_none());
+    assert!(guard.observe(&[], false).is_none());
+    let advice = guard.observe(&lib, false).expect("sixth edit is churn");
+    assert!(advice.contains("`src/lib.rs` (6 edits)"), "{advice}");
+    assert!(
+        guard.observe(&lib, false).is_none(),
+        "repeats only at multiples"
+    );
+    // A passing check is progress: every count starts again.
+    assert!(guard.observe(&[], true).is_none());
+    for _ in 1..EDIT_CHURN_WARN {
+        assert!(guard.observe(&lib, false).is_none());
+    }
+    assert!(guard.observe(&lib, false).is_some());
+}
+
+#[test]
+fn one_call_touching_a_path_twice_counts_once() {
+    let mut guard = EditChurnGuard::default();
+    let twice = vec!["a.rs".to_owned(), "a.rs".to_owned()];
+    for _ in 1..EDIT_CHURN_WARN {
+        assert!(guard.observe(&twice, false).is_none());
+    }
+    assert!(guard.observe(&twice, false).is_some());
+}

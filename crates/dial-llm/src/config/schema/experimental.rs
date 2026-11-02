@@ -3,6 +3,10 @@ use super::*;
 
 const REASONING_STRATEGIES: EnumValues = &[
     ("default", "Default (unchanged)"),
+    ("gpt_goal_directed", "GPT-inspired: Goal directed"),
+    ("claude_grounded", "Claude-inspired: Grounded"),
+    ("gemini_synthesis", "Gemini-inspired: Synthesis"),
+    ("deepseek_cross_check", "DeepSeek-inspired: Cross-check"),
     ("evidence_first", "Evidence first"),
     ("hypothesis_driven", "Hypothesis driven"),
     ("plan_then_act", "Plan then act"),
@@ -20,7 +24,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         EX,
         "Reasoning",
         "Reasoning strategy",
-        "Experimental prompt guidance for the main agent and new workers; not private chain-of-thought editing. Default leaves guidance unchanged. Does not change thinking effort, permissions or verification. Custom replacement prompts/templates opt out. Applies between turns; outcome and token-cost effects are unmeasured.",
+        "Advisory workflow presets, including GPT-, Claude-, Gemini- and DeepSeek-inspired approaches from public guidance/research; not model emulation or private chain-of-thought editing. Any backend can use them. Default leaves guidance unchanged; thinking effort, permissions and verification stay unchanged. Custom replacement prompts/templates opt out. Applies between turns; quality and cost effects are unmeasured.",
         Kind::Enum(REASONING_STRATEGIES),
     ),
     field!(

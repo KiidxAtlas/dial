@@ -118,6 +118,14 @@ pub enum ReproFirst {
 pub enum ReasoningStrategy {
     #[default]
     Default,
+    /// Direct goals and explicit success criteria, inspired by OpenAI's public guidance.
+    GptGoalDirected,
+    /// Context-grounded work, inspired by Anthropic's public guidance.
+    ClaudeGrounded,
+    /// Context and example synthesis, inspired by Google's public guidance.
+    GeminiSynthesis,
+    /// Bounded self-verification, inspired by DeepSeek's published reasoning research.
+    DeepseekCrossCheck,
     EvidenceFirst,
     HypothesisDriven,
     PlanThenAct,

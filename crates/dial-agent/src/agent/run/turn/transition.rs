@@ -102,6 +102,7 @@ impl TurnState<'_> {
             plan_after_gate,
             reliability,
             stall,
+            edit_churn,
             completion,
             completion_candidate,
             capability_search,
@@ -141,6 +142,7 @@ impl TurnState<'_> {
         if steering || resumed || continues {
             *todo_recovery = Default::default();
             *stall = Default::default();
+            *edit_churn = Default::default();
             reliability.consecutive_contract_failures = 0;
         }
         if rewritten {

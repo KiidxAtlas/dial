@@ -9,6 +9,7 @@ use anyhow::Result;
 mod btw;
 mod cleanse;
 mod compaction;
+mod contract;
 mod debug;
 mod drafter;
 mod fresh;
@@ -147,6 +148,12 @@ pub(super) const COMMANDS: &[super::CommandSpec] = &[
         subcommands: &[],
     },
     super::CommandSpec {
+        name: "contract",
+        description: "Start a task as a contract: goal, constraints and checkable done-when deliverables",
+        args_hint: "<task>",
+        subcommands: &[],
+    },
+    super::CommandSpec {
         name: "cleanse",
         description: "Run project checkers and repair their diagnostics with worker subagents",
         args_hint: "[request] [--all] [--tests] [-n N] [-m model]",
@@ -178,6 +185,7 @@ pub(super) fn run(
         "loop" => Some(loop_cmd::run(shell, app, agent, args)),
         "goal" => Some(goal::run(shell, app, agent, args)),
         "guided-goal" => Some(goal::guided(shell, app, agent, args)),
+        "contract" => Some(contract::run(shell, app, agent, args)),
         "cleanse" => Some(cleanse::run(shell, app, agent, args)),
         _ => None,
     }

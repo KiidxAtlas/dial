@@ -723,6 +723,13 @@ fn reasoning_strategy_is_opt_in_and_all_settings_options_roundtrip() {
     };
     let expected = [
         ("default", ReasoningStrategy::Default),
+        ("gpt_goal_directed", ReasoningStrategy::GptGoalDirected),
+        ("claude_grounded", ReasoningStrategy::ClaudeGrounded),
+        ("gemini_synthesis", ReasoningStrategy::GeminiSynthesis),
+        (
+            "deepseek_cross_check",
+            ReasoningStrategy::DeepseekCrossCheck,
+        ),
         ("evidence_first", ReasoningStrategy::EvidenceFirst),
         ("hypothesis_driven", ReasoningStrategy::HypothesisDriven),
         ("plan_then_act", ReasoningStrategy::PlanThenAct),

@@ -1833,43 +1833,49 @@ fn child_reasoning_strategy_is_inherited_on_initial_and_resumed_requests_without
             initial_messages(env, &parsed.jobs[0], &names)
         };
         let baseline = build(ReasoningStrategy::Default);
-        let selected = build(ReasoningStrategy::VerificationFirst);
-        let guidance =
-            crate::agent::prompts::reasoning::guidance(ReasoningStrategy::VerificationFirst)
-                .unwrap();
-        assert_eq!(
-            &selected[..2],
-            &baseline[..2],
-            "resume={resume}: frozen/operator instructions changed"
-        );
-        assert_eq!(
-            &selected[3..],
-            &baseline[3..],
-            "resume={resume}: assignment/history changed"
-        );
-        assert_eq!(
-            selected[2]["content"].as_str().unwrap(),
-            format!("{}{guidance}", baseline[2]["content"].as_str().unwrap()),
-            "resume={resume}: role, scope, schema and skills must be retained"
-        );
-        assert_eq!(
-            selected
-                .iter()
-                .filter_map(|m| m["content"].as_str())
-                .map(|text| text.matches(guidance).count())
-                .sum::<usize>(),
-            1
-        );
-        assert_eq!(selected[1], operator[0]);
-        if resume {
-            assert_eq!(&selected[3..5], retained.as_slice());
-        } else {
-            assert!(
-                selected.last().unwrap()["content"]
-                    .as_str()
-                    .unwrap()
-                    .contains("Inspect parser without changing public APIs.")
+        for strategy in [
+            ReasoningStrategy::GptGoalDirected,
+            ReasoningStrategy::ClaudeGrounded,
+            ReasoningStrategy::GeminiSynthesis,
+            ReasoningStrategy::DeepseekCrossCheck,
+            ReasoningStrategy::VerificationFirst,
+        ] {
+            let selected = build(strategy);
+            let guidance = crate::agent::prompts::reasoning::guidance(strategy).unwrap();
+            assert_eq!(
+                &selected[..2],
+                &baseline[..2],
+                "resume={resume}/{strategy:?}: frozen/operator instructions changed"
             );
+            assert_eq!(
+                &selected[3..],
+                &baseline[3..],
+                "resume={resume}/{strategy:?}: assignment/history changed"
+            );
+            assert_eq!(
+                selected[2]["content"].as_str().unwrap(),
+                format!("{}{guidance}", baseline[2]["content"].as_str().unwrap()),
+                "resume={resume}/{strategy:?}: role, scope, schema and skills must be retained"
+            );
+            assert_eq!(
+                selected
+                    .iter()
+                    .filter_map(|m| m["content"].as_str())
+                    .map(|text| text.matches(guidance).count())
+                    .sum::<usize>(),
+                1
+            );
+            assert_eq!(selected[1], operator[0]);
+            if resume {
+                assert_eq!(&selected[3..5], retained.as_slice());
+            } else {
+                assert!(
+                    selected.last().unwrap()["content"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Inspect parser without changing public APIs.")
+                );
+            }
         }
     }
 }

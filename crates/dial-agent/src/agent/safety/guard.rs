@@ -852,6 +852,47 @@ fn only_sets_shell_state(head: &str) -> bool {
     assignment(first) && words.all(assignment)
 }
 
+/// Successful edits to one file, with no passing check in between, before the model is asked to
+/// reconsider its approach. The note repeats at each further multiple.
+const EDIT_CHURN_WARN: u32 = 6;
+
+/// Many small variations of one fix to the same file (a "doom loop"). Each edit is a novel
+/// mutation, so [`RepeatedToolCall`], [`CallCycle`] and the recovery ledger all see progress; this
+/// counts committed edits per path instead, and a passing check clears every count. Advisory only:
+/// nothing is refused and the turn continues.
+#[derive(Default)]
+pub struct EditChurnGuard {
+    edits: std::collections::HashMap<String, u32>,
+}
+
+impl EditChurnGuard {
+    /// Observe one settled call. `changed` holds the workspace-relative paths it committed;
+    /// `check_passed` is true when the call was a passing check.
+    pub fn observe(&mut self, changed: &[String], check_passed: bool) -> Option<String> {
+        if check_passed {
+            self.edits.clear();
+            return None;
+        }
+        let paths: std::collections::BTreeSet<&String> = changed.iter().collect();
+        let churned: Vec<String> = paths
+            .into_iter()
+            .filter_map(|path| {
+                let count = self.edits.entry(path.clone()).or_default();
+                *count += 1;
+                count
+                    .is_multiple_of(EDIT_CHURN_WARN)
+                    .then(|| format!("`{path}` ({count} edits)"))
+            })
+            .collect();
+        (!churned.is_empty()).then(|| {
+            format!(
+                "[Edit churn: {} changed repeatedly this turn with no passing check in between. If each edit adjusts the previous attempt, the approach is probably wrong, not the details: re-read the failing output and the current file, reconsider the plan, or report what you tried and what remains unresolved. If these are planned incremental edits, run a focused check to confirm progress. The turn continues.]",
+                churned.join(", ")
+            )
+        })
+    }
+}
+
 /// What to do after a generation stopped because it hit the output token limit.
 #[derive(Debug, PartialEq, Eq)]
 pub enum LengthAction {

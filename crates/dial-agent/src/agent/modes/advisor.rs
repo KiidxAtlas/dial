@@ -18,22 +18,22 @@ const MAX_ROUND_EVIDENCE: usize = 6;
 const MAX_ROUND_REVIEWS: u32 = 24;
 const MAX_NOTE_CHARS: usize = 600;
 
+/// Whether this change qualifies for completion review. The caller decides whether review is on.
 fn selected_review(
     config: &crate::config::types::IndependentReviewConfig,
     paths: &[String],
     uncheckpointed: bool,
 ) -> bool {
-    config.enabled
-        && (uncheckpointed
-            || paths.len() >= config.min_changed_files
-            || paths.iter().any(|path| {
-                config.sensitive_paths.iter().any(|prefix| {
-                    path == prefix
-                        || path
-                            .strip_prefix(prefix)
-                            .is_some_and(|rest| rest.starts_with('/'))
-                })
-            }))
+    uncheckpointed
+        || paths.len() >= config.min_changed_files
+        || paths.iter().any(|path| {
+            config.sensitive_paths.iter().any(|prefix| {
+                path == prefix
+                    || path
+                        .strip_prefix(prefix)
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
+        })
 }
 
 #[derive(Default)]
@@ -286,8 +286,18 @@ impl Agent<'_> {
         self.modes.launch.advisor
             || (!self.hermetic
                 && !self.plan_mode
-                && self.config.verification.review.enabled
-                && self.modes.launch.allows_tool("escalate"))
+                && self.modes.launch.allows_tool("escalate")
+                && self.completion_review_enabled())
+    }
+
+    /// `verification.review.enabled`: an explicit choice wins; unset reviews only when a `coach`
+    /// role is assigned and its route passes the same privacy gate the review request would use,
+    /// so users without a usable coach never see skipped-review notices.
+    fn completion_review_enabled(&self) -> bool {
+        match self.config.verification.review.enabled {
+            Some(enabled) => enabled,
+            None => solve::coach_route_allowed(&self.auth_config),
+        }
     }
 
     /// Launch-scoped opt-in; never persisted. Turning it on selects the live per-round review.

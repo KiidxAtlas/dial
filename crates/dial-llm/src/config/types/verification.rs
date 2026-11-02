@@ -29,7 +29,8 @@ pub struct VerificationConfig {
     /// Operator assertion, keyed by configured check name, that a deterministic, side-effect-free
     /// check's entire workspace inputs are declared; enables dependency-aware reuse of its result.
     pub inputs: BTreeMap<String, VerificationInputs>,
-    /// Opt-in, bounded independent review of substantial or explicitly sensitive changes.
+    /// Bounded independent review of substantial or explicitly sensitive changes; on by default
+    /// when a usable `coach` role is assigned.
     pub review: IndependentReviewConfig,
 }
 
@@ -74,7 +75,10 @@ pub struct VerificationInputs {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct IndependentReviewConfig {
-    pub enabled: bool,
+    /// `None` (the default) reviews when a `coach` role is assigned and its route passes the
+    /// escalation privacy gate; `Some` is an explicit operator choice either way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
     pub min_changed_files: usize,
     /// Workspace-relative file or directory prefixes. Empty means only the file-count threshold.
     pub sensitive_paths: Vec<String>,
@@ -84,7 +88,7 @@ pub struct IndependentReviewConfig {
 impl Default for IndependentReviewConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: None,
             min_changed_files: 4,
             sensitive_paths: Vec::new(),
             max_rounds: 1,

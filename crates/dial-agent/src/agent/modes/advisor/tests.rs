@@ -52,11 +52,18 @@ fn advisor_flag_is_launch_scoped_and_off_by_default() {
 }
 
 #[test]
-fn selective_review_is_opt_in_and_matches_path_components() {
+fn selective_review_matches_thresholds_and_path_components() {
     use crate::config::types::IndependentReviewConfig;
     let mut config = IndependentReviewConfig::default();
-    assert!(!selected_review(&config, &["src/auth/key.rs".into()], true));
-    config.enabled = true;
+    assert!(
+        config.enabled.is_none(),
+        "unset means auto: on with a usable coach"
+    );
+    assert!(!selected_review(
+        &config,
+        &["src/auth/key.rs".into()],
+        false
+    ));
     config.sensitive_paths = vec!["src/auth".into()];
     assert!(selected_review(&config, &["src/auth/key.rs".into()], false));
     assert!(selected_review(&config, &["src/auth".into()], false));
@@ -215,6 +222,33 @@ fn advisor_goal_review_falls_back_to_legacy_instruction_and_shows_original_plus_
         assert!(review.contains("ship the parser"));
         assert!(review.contains("\"latest\""));
         assert!(review.contains("use the v2 parser"));
+    });
+}
+
+#[test]
+fn unset_completion_review_follows_a_usable_coach_role() {
+    const LOCAL_COACH: &str = "[model_roles.coach]\nprovider='endpoint'\nmodel='coach'\nbase_url='http://127.0.0.1:9/v1'\n";
+    const REMOTE_COACH: &str = "[model_roles.coach]\nprovider='endpoint'\nmodel='coach'\nbase_url='https://coach.example.com/v1'\n";
+    // No coach: nothing to review with, so no skipped-review notices either.
+    with_agent("", |agent| assert!(!agent.completion_review_enabled()));
+    with_agent(LOCAL_COACH, |agent| {
+        assert!(agent.completion_review_enabled())
+    });
+    // A hosted coach still needs the escalation privacy opt-in.
+    with_agent(REMOTE_COACH, |agent| {
+        assert!(!agent.completion_review_enabled())
+    });
+    with_agent(
+        &format!("[escalation]\nallow_remote=true\n{REMOTE_COACH}"),
+        |agent| assert!(agent.completion_review_enabled()),
+    );
+    // An explicit choice wins either way.
+    with_agent(
+        &format!("[verification.review]\nenabled=false\n{LOCAL_COACH}"),
+        |agent| assert!(!agent.completion_review_enabled()),
+    );
+    with_agent("[verification.review]\nenabled=true", |agent| {
+        assert!(agent.completion_review_enabled())
     });
 }
 

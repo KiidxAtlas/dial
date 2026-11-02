@@ -686,6 +686,13 @@ fn rollback(root: &Path, before: &Tree, after: &Tree, applied: &[PathBuf]) -> Re
     Ok(())
 }
 
+/// Whether a review request to the assigned `coach` role would pass the privacy gate that
+/// [`ask`] applies: a local route, or a remote one with `escalation.allow_remote`.
+pub(in crate::agent) fn coach_route_allowed(config: &Config) -> bool {
+    config.model_roles.contains_key("coach")
+        && local_route(config.for_role("coach"), config.escalation.allow_remote).is_ok()
+}
+
 /// Loopback-only, without DNS suffix, private-range or substring guesses. Localhost is pinned
 /// to a numeric loopback before provider dispatch; redirects/proxy are disabled by the provider.
 fn local_route(mut config: Config, allow_remote: bool) -> Result<Config> {

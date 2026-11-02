@@ -45,7 +45,7 @@ pub(super) fn isolate(config: &Config, lane: &IntegrationOverrides) -> Result<Co
 
 /// Explicit review experiments use only the measured model/route, never ambient coach roles.
 pub(super) fn configure_review(config: &mut Config) {
-    if config.verification.review.enabled {
+    if config.verification.review.enabled == Some(true) {
         let coach = config.selection();
         config.model_roles.insert("coach".into(), coach);
     }

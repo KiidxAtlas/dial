@@ -388,6 +388,27 @@ impl Agent<'_> {
             output.text.push_str("\n\n");
             output.text.push_str(&advice);
         }
+        let changed: Vec<String> = output
+            .execution
+            .changed_paths
+            .iter()
+            .map(|path| {
+                path.strip_prefix(self.workspace.root())
+                    .unwrap_or(path)
+                    .display()
+                    .to_string()
+            })
+            .collect();
+        let check_passed = shell_check_passed
+            || (call.name == crate::agent::verify::check_tool::NAME && !output.is_error);
+        if let Some(advice) = turn.edit_churn.observe(&changed, check_passed) {
+            ui.event(&crate::agent::ui::ui_event::UiEvent::new(
+                crate::agent::ui::ui_event::EventKind::Recovery,
+                "Repeated edits to one file without a passing check; asking the model to reconsider",
+            ));
+            output.text.push_str("\n\n");
+            output.text.push_str(&advice);
+        }
         if output.is_error {
             turn.stall.note_error(&call.name, &output.text);
         }

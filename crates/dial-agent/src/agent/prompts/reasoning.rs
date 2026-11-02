@@ -19,6 +19,18 @@ macro_rules! strategy_text {
 pub(in crate::agent) fn guidance(strategy: ReasoningStrategy) -> Option<&'static str> {
     match strategy {
         ReasoningStrategy::Default => None,
+        ReasoningStrategy::GptGoalDirected => Some(strategy_text!(
+            "Use a direct, goal-oriented approach. Identify the requested outcome, explicit constraints and observable success criteria from the request. Resolve only ambiguities that materially affect correctness; otherwise execute the shortest supported path. Stop when the criteria are met and report the result without a reasoning transcript."
+        )),
+        ReasoningStrategy::ClaudeGrounded => Some(strategy_text!(
+            "Ground the work in relevant source context and the purpose of the user's constraints. Inspect the existing owner before proposing changes; use source references to support material claims. Separate supplied reference material from instructions. For substantial work, act on a short plan, make focused changes and verify the result; avoid scope expansion and repeated self-review."
+        )),
+        ReasoningStrategy::GeminiSynthesis => Some(strategy_text!(
+            "Synthesize the relevant supplied context, examples and output requirements into one coherent result. For a complex task, resolve bounded subproblems and reconcile their interfaces and conflicting evidence before integrating. Follow the user's requested format and existing examples without inventing missing facts. Seek more context only for a specific material gap."
+        )),
+        ReasoningStrategy::DeepseekCrossCheck => Some(strategy_text!(
+            "For a substantive reasoning problem, develop a candidate solution and make one bounded cross-check of its decisive claim using an appropriate calculation, invariant, counterexample or existing test. If the evidence contradicts it, revise the approach rather than repeat it. Do not treat self-consistency as proof, require repeated sampling, or claim checks that were not run; state verification limits."
+        )),
         ReasoningStrategy::EvidenceFirst => Some(strategy_text!(
             "Start from available observations. Separate facts from assumptions, resolve only material evidence gaps, and stop investigating when the requested conclusion is supported."
         )),

@@ -399,7 +399,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         TO,
         "Verification",
         "Independent completion review",
-        "Opt-in bounded review for changes meeting min_changed_files or sensitive_paths prefixes. Uses the existing advisor/coach review; findings are advisory evidence, not execution authority or proof.",
+        "Bounded review for changes meeting min_changed_files or sensitive_paths prefixes. Unset enabled reviews when a coach role is assigned and its route is allowed (local, or escalation.allow_remote); true/false is explicit. Uses the existing advisor/coach review; findings are advisory evidence, not execution authority or proof.",
         Kind::Table,
     ),
     def!(

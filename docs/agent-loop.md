@@ -224,7 +224,10 @@ act is challenged once. An interrupt during a tool round keeps finished parallel
 calls that never started as not run. A panicking read-only tool is a failure with no effects
 (except `bash`, or a tool that committed before panicking). A timed-out or killed check counts as
 failed; a cancelled one settles nothing. Calls repeating in an exact short cycle (period 2 or 3)
-get an advisory note.
+get an advisory note. A file changed by six committed edits (counted once per call) with no
+passing check in between gets an advisory edit-churn note asking the model to step back and verify
+or re-plan; the note repeats every six further edits, a passing `check` or recognized shell check
+clears the counts, and the turn always continues.
 
 Both the foreground turn and child workers decide how to recover from a reply in
 `agent/run/reply_triage.rs`. A reply cut off at the output limit with no text or tool call uses the
@@ -694,6 +697,11 @@ claiming that the model captured the whole request. Removing, cancelling or rede
 an explicit human scope confirmation through the existing question surface. Refusal, timeout or an
 unattended surface leaves the whole update unchanged. Confirmed redefinitions reopen the obligation
 and discard old evidence; legacy cancellations without a runtime receipt still block completion.
+`/contract <task>` starts a turn that asks the model to record the task as a contract first:
+`goal`, `constraints`, and one `open` deliverable per observable "done when" condition. It asks
+about ambiguity before starting, and if blocked it stops, records what it tried and marks the
+deliverable `blocked`. It adds no new gate: the existing deliverable and evidence rules below
+decide completion.
 Simple answers need no declaration. A `satisfied` record requires `evidence_refs`, but is still a
 model claim. Explicit `check:<name>` references must resolve exactly one existing selected/configured
 check with a current passing observation; missing, stale, failing, unavailable or unknown links block
@@ -1490,12 +1498,19 @@ public-domain bitmap fonts, Unscii CC0 and Silver by Poppy Works/Wolfgang Woznia
 
 ## Experimental reasoning strategies
 
-Open `/settings` → Experimental → Reasoning → **Reasoning strategy** to select a prompt
-guidance preset. This does not edit or expose a model's private chain of thought, change its
-weights, or change provider thinking/effort controls. **Default (unchanged)** adds no guidance.
+Open `/settings` → Experimental → Reasoning → **Reasoning strategy** to select an advisory
+workflow preset. The frontier-inspired choices are Dial interpretations of public guidance and
+research, not vendor modes, model identities, or replicas of private reasoning. They work with
+any configured backend: selecting a GPT-inspired preset does not select a GPT model. No preset
+edits or exposes private chain of thought, changes weights, or changes provider thinking/effort
+controls. **Default (unchanged)** adds no guidance. Existing saved strategy values keep their meaning.
 
 | Strategy | Approach |
 |---|---|
+| GPT-inspired: Goal directed | Work directly toward explicit goals, constraints and observable success criteria; avoid unnecessary process. |
+| Claude-inspired: Grounded | Inspect relevant source context, ground claims in evidence, and keep implementation and verification focused. |
+| Gemini-inspired: Synthesis | Combine relevant context and examples, resolve bounded subproblems, and reconcile their results in the requested format. |
+| DeepSeek-inspired: Cross-check | Develop a candidate solution and make one bounded check of its decisive claim; report evidence limits. |
 | Evidence first | Establish observations and distinguish them from assumptions before acting. |
 | Hypothesis driven | Use a bounded hypothesis and a discriminating check to resolve uncertainty. |
 | Plan then act | Establish a proportionate plan before implementation and adapt to results. |
@@ -1504,6 +1519,15 @@ weights, or change provider thinking/effort controls. **Default (unchanged)** ad
 | Critique and refine | Review a candidate approach for concrete flaws before finalizing it. |
 | Verification first | Decide what evidence would demonstrate the requested outcome before changing it. |
 | Minimal change | Prefer the smallest complete change at the existing owner, not a partial fix. |
+
+The public sources behind these interpretations are [OpenAI's reasoning best practices](https://developers.openai.com/api/docs/guides/reasoning-best-practices)
+(direct prompts, goals and constraints), [Anthropic's prompting guidance](https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/claude-prompting-best-practices)
+(context and grounded responses), [Google's prompt design strategies](https://ai.google.dev/gemini-api/docs/prompting-strategies)
+(context, examples and output requirements), and [DeepSeek-R1's model summary](https://github.com/deepseek-ai/DeepSeek-R1#2-model-summary)
+(self-verification and reflection). These are bounded workflow adaptations, not copies of each
+vendor's full prompting recipe: they do not inject thinking tags, require reasoning transcripts,
+change sampling settings, or require multiple model samples. DeepSeek's research describes
+trained model behavior; this prompt preset does not reproduce that training or its measured results.
 
 The same bounded guidance is used by built-in main-agent prompts (full, lean and concise)
 and new or resumed workers. A setting saved during a turn applies after that turn; existing

@@ -89,6 +89,21 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 - Replace direct `fs2` locking with standard file locks, consolidate filesystem/HTTP/OAuth
   and UTF-8 boundary owners, extract orchestration phases, and enforce documented unsafe
   invariants through the workspace Clippy lint. See the audit follow-up for item dispositions.
+- `verification.review.enabled` is now unset by default: completion review runs when a `coach`
+  model role is assigned and its route passes the escalation privacy gate (local, or
+  `escalation.allow_remote`). Explicit `true`/`false` keep their meaning; `strict_requirements`
+  stays off (`docs/requirement-verification.md`).
+
+### Added
+
+- GPT-, Claude-, Gemini- and DeepSeek-inspired reasoning workflow presets, adapted from public
+  guidance/research. Existing strategies and the unchanged default remain available; presets do
+  not select models or change provider thinking/effort controls (`docs/agent-loop.md`).
+- Advisory edit-churn note: six committed edits to one file without a passing check prompt the
+  model to verify or re-plan. It never stops the turn (`docs/agent-loop.md`).
+- `/contract <task>` starts a turn that records goal, constraints and checkable "done when"
+  deliverables in `working_state` first, and stops with a recorded `blocked` state when stuck. It
+  reuses the existing completion gates (`docs/agent-loop.md`).
 
 ## [0.2.10] - 2026-11-01
 

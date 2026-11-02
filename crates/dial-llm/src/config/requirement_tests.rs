@@ -73,11 +73,21 @@ fn requirement_contract_rejects_missing_ambiguous_duplicate_or_empty_evidence() 
 fn quality_controls_roundtrip_and_preserve_legacy_defaults() {
     let legacy: types::VerificationConfig = toml::from_str("enabled=true").unwrap();
     assert!(!legacy.strict_requirements);
-    assert!(!legacy.review.enabled);
+    assert_eq!(
+        legacy.review.enabled, None,
+        "unset review follows the coach role"
+    );
+    let explicit_off: types::VerificationConfig =
+        toml::from_str("[review]\nenabled=false").unwrap();
+    assert_eq!(explicit_off.review.enabled, Some(false));
+    assert!(
+        !toml::to_string(&legacy.review).unwrap().contains("enabled"),
+        "an unset review choice is not serialized as an explicit one"
+    );
     assert!(legacy.runners.is_empty());
     let mut config = config();
     config.verification.strict_requirements = true;
-    config.verification.review.enabled = true;
+    config.verification.review.enabled = Some(true);
     config.verification.review.sensitive_paths = vec!["src/auth".into()];
     config.verification.runners.insert(
         "boundary".into(),
@@ -95,6 +105,7 @@ fn quality_controls_roundtrip_and_preserve_legacy_defaults() {
         Some("pytest")
     );
     assert_eq!(restored.review.sensitive_paths, ["src/auth"]);
+    assert_eq!(restored.review.enabled, Some(true));
 }
 
 #[test]
