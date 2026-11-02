@@ -31,6 +31,10 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 - Allowlist inherited child environments, redact secret debug output, zeroize tokens, and
   warn about the account-policy risk of Anthropic subscription client identity. Existing
   subscription sign-in remains available without an additional opt-in.
+- The release signing job also removes its private-key file in an `if: always()` step, so the
+  key is shredded even when the signing step is killed before its exit trap runs. The publish
+  job checks every artifact against `SHA256SUMS` and the signature against the public key before
+  creating the release (`docs/release-and-install.md`).
 
 ### Fixed
 

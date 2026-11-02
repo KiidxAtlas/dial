@@ -56,9 +56,12 @@ and keep signing secrets unavailable to other jobs. Repository-owner configurati
 
 The isolated read-only signing job signs the exact `SHA256SUMS` bytes with Ed25519 and
 publishes the base64-encoded detached signature as `SHA256SUMS.sig`, plus an OpenSSH-format
-`SHA256SUMS.sshsig`. Its temporary private-key file is owner-only and removed on exit. A
-separate least-privilege publishing job publishes the artifacts. Missing or mismatched values
-fail the release; no example or generated signing key is trusted by production code.
+`SHA256SUMS.sshsig`. Its temporary private-key file is owner-only and shredded on exit, and
+again by an `if: always()` step that runs even when the signing step was killed before its exit
+trap. A separate least-privilege publishing job, which never receives the key, checks every
+artifact against `SHA256SUMS` and the signature against `DIAL_RELEASE_PUBLIC_KEY_PEM` before it
+publishes them. Missing or mismatched values fail the release; no example or generated signing
+key is trusted by production code.
 
 Tags must be ancestors of `main`, with a completed successful **push-to-main** CI run for
 the exact tagged SHA; pull-request CI does not authorize publication. Releases are serialized.

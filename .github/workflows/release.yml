@@ -291,6 +291,13 @@ jobs:
           openssl pkeyutl -sign -inkey "$key" -rawin -in dist/SHA256SUMS -out "$RUNNER_TEMP/SHA256SUMS.sig"
           base64 -w0 "$RUNNER_TEMP/SHA256SUMS.sig" > dist/SHA256SUMS.sig
           python3 scripts/make-sshsig.py --openssl openssl --key "$key" --input dist/SHA256SUMS --output dist/SHA256SUMS.sshsig
+      - name: Remove release signing key
+        # The trap above covers failures and ordinary cancellation; this step also runs when the
+        # signing step was killed before its trap could fire.
+        if: always()
+        run: |
+          set -euo pipefail
+          find "$RUNNER_TEMP" -maxdepth 1 -type f -name 'release-key.*' -exec shred -u -- {} +
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: signed-release-assets
@@ -313,6 +320,18 @@ jobs:
         with:
           name: signed-release-assets
           path: dist
+      - name: Verify signed manifest
+        # Fail closed unless every file handed over by `sign` matches SHA256SUMS and the
+        # signature verifies against the public key.
+        env:
+          DIAL_RELEASE_PUBLIC_KEY_PEM: ${{ vars.DIAL_RELEASE_PUBLIC_KEY_PEM }}
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum --strict --check SHA256SUMS)
+          printf '%s\n' "$DIAL_RELEASE_PUBLIC_KEY_PEM" > "$RUNNER_TEMP/release-public.pem"
+          base64 -d dist/SHA256SUMS.sig > "$RUNNER_TEMP/SHA256SUMS.sig"
+          openssl pkeyutl -verify -pubin -inkey "$RUNNER_TEMP/release-public.pem" -rawin \
+            -in dist/SHA256SUMS -sigfile "$RUNNER_TEMP/SHA256SUMS.sig"
       - name: Decide whether this is the newest stable release
         id: latest
         env:
