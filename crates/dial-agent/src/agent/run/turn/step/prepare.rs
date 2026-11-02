@@ -19,6 +19,10 @@ impl Agent<'_> {
         let backend = &mut **backend;
         let schemas = &mut **schemas;
         let ui = &mut **ui;
+        turn.settle_delivered(|mark| {
+            self.session
+                .weigh_from(mark, |message| usize::from(message["role"] == "assistant"))
+        });
         // `schemas` is the turn's full offer. A request narrows its own copy (planning gate,
         // single-call simplification) and the next request starts from the full offer again.
         turn.names = offered_names(schemas);
@@ -33,7 +37,12 @@ impl Agent<'_> {
             ));
         }
         let budget_window = self.budget_window();
+        let route = self.route.generation();
         self.before_request(backend, &turn.names, &mut turn.pending_nudges, ui)?;
+        // A mode hook (prewalk handoff) may have installed another model: size for it.
+        if self.route.generation() != route {
+            turn.max_tokens = backend.output_budget(turn.harness.max_tokens);
+        }
         let mut messages = self.system_messages();
         self.session.extend_messages(&mut messages);
         let pre_action_secs = if step == 0 {

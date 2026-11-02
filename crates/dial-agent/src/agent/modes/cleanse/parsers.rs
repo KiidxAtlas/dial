@@ -377,8 +377,17 @@ fn combined(stdout: &str, stderr: &str) -> String {
     format!("{stdout}\n{stderr}")
 }
 
-fn regex(pattern: &str) -> Regex {
-    Regex::new(pattern).expect("static cleanse parser regex")
+/// Compiles each static parser pattern once. `go_visit` asks for its pattern once per finding while
+/// walking analyzer output, which compiled the same regex thousands of times on a large report.
+fn regex(pattern: &'static str) -> Regex {
+    static COMPILED: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<&'static str, Regex>>,
+    > = std::sync::LazyLock::new(Default::default);
+    let mut compiled = COMPILED.lock().unwrap_or_else(|e| e.into_inner());
+    compiled
+        .entry(pattern)
+        .or_insert_with(|| Regex::new(pattern).expect("static cleanse parser regex"))
+        .clone()
 }
 
 fn group(captures: &regex::Captures, index: usize) -> Option<String> {

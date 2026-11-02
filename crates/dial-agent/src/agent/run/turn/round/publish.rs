@@ -1,6 +1,9 @@
 //! Publish settled evidence, media and file handles in provider conversation order.
 use super::*;
 
+/// Truncated-output artifacts remembered for the recovery metric; older ones are forgotten.
+const TRUNCATED_ARTIFACTS_KEPT: usize = 256;
+
 impl Agent<'_> {
     pub(super) fn publish_call_result(
         &mut self,
@@ -118,18 +121,26 @@ impl Agent<'_> {
                 .as_array()
                 .cloned()
                 .unwrap_or_default();
-            if let Some(uri) = &artifact
-                && !uris.contains(&json!(uri))
+            let before = uris.len();
+            for uri in artifact
+                .iter()
+                .map(String::as_str)
+                .chain(crate::storage::artifact::uris(&output.text))
             {
-                uris.push(json!(uri));
-            }
-            for uri in crate::storage::artifact::uris(&output.text) {
                 if !uris.contains(&json!(uri)) {
                     uris.push(json!(uri));
                 }
             }
-            state["truncated_artifacts"] = json!(uris);
-            self.session.set_control_state(state)?;
+            // Only a recovery metric reads this list. Unbounded, every update journaled the whole
+            // array again (quadratic journal growth over a long session); keep the newest entries
+            // and write nothing when no new artifact appeared.
+            if uris.len() != before {
+                if uris.len() > TRUNCATED_ARTIFACTS_KEPT {
+                    uris.drain(..uris.len() - TRUNCATED_ARTIFACTS_KEPT);
+                }
+                state["truncated_artifacts"] = json!(uris);
+                self.session.set_control_state(state)?;
+            }
         }
         if call.name == "read" && !output.is_error && !is_duplicate {
             let mut observation = call.arguments.clone();

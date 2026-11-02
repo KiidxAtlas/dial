@@ -18,9 +18,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 const ACTIVE_VIEWS: usize = 2;
 
 pub(in crate::agent) fn available(messages: &[Value]) -> bool {
-    messages
-        .iter()
-        .any(|message| message["dial_snapcompact"]["version"] == snapcompact::VERSION)
+    messages.iter().any(is_layer)
+}
+
+fn is_layer(message: &Value) -> bool {
+    message["dial_snapcompact"]["version"] == snapcompact::VERSION
+}
+
+/// [`available`] over the session's visible history without copying it. Tool exposure asks this
+/// several times per round, and cloning a long session's messages each time dominated its cost.
+pub(in crate::agent) fn available_in(session: &crate::storage::session::Session) -> bool {
+    session.weigh_from(0, |message| usize::from(is_layer(message))) > 0
 }
 
 pub(in crate::agent) fn schema(mut base: Value) -> Value {

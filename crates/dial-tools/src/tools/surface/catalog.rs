@@ -168,6 +168,17 @@ pub struct Catalog {
     definitions: BTreeMap<String, Definition>,
 }
 impl Catalog {
+    /// The checks [`Self::from_schemas`] makes (valid definitions, no duplicate names) without
+    /// building the catalog: no contract-identity hashing or schema copies. Request preparation
+    /// validates its offer on every round; only the definitions are needed for that.
+    pub fn validate_schemas(schemas: &[Value]) -> Result<()> {
+        let mut names = std::collections::BTreeSet::new();
+        for schema in schemas {
+            let name = validate_definition(schema)?;
+            ensure!(names.insert(name), "duplicate tool definition {name}");
+        }
+        Ok(())
+    }
     pub fn from_schemas(schemas: &[Value], registry: &Registry) -> Result<Self> {
         let identities = identities(schemas, registry);
         let mut definitions = BTreeMap::new();

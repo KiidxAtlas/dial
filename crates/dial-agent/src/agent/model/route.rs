@@ -35,12 +35,23 @@ pub(in crate::agent) struct ActiveRoute {
     tried: usize,
     fallback: Option<Fallback>,
     promoted: Option<Promoted>,
+    /// Bumped whenever a route is installed, so a turn can resize its output budget for a model
+    /// swapped in by a mode hook.
+    generation: u64,
 }
 
 impl ActiveRoute {
     /// Forgets the route. Used when the primary itself is replaced (model switch, session change).
     pub(in crate::agent) fn reset(&mut self) {
-        *self = Self::default();
+        let generation = self.generation.wrapping_add(1);
+        *self = Self {
+            generation,
+            ..Self::default()
+        };
+    }
+
+    pub(in crate::agent) fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Whether a temporary fallback is installed in place of the primary.
@@ -72,10 +83,25 @@ impl Agent<'_> {
         config: &Config,
         context_cap: Option<u32>,
     ) -> Result<()> {
-        let mut next = make_backend(config)?.with_session_id(self.session.id().to_owned());
+        let next = make_backend(config)?.with_session_id(self.session.id().to_owned());
+        self.install_built_route(backend, next, config, context_cap)
+            .map(drop)
+    }
+
+    /// Installs an already built backend for `config` with everything a route switch must reset:
+    /// the authentication config, context cap, cache warming and role caches. Without these, a
+    /// model handed over mid-turn kept the previous model's window, compaction thresholds and
+    /// cache identity. Returns the replaced backend, unchanged when installation fails.
+    pub(in crate::agent) fn install_built_route(
+        &mut self,
+        backend: &mut Backend,
+        mut next: Backend,
+        config: &Config,
+        context_cap: Option<u32>,
+    ) -> Result<Backend> {
         join_turn_usage(&self.usage_scope, &mut next);
         let resolved = session_auth_config(config, &next, &mut self.session)?;
-        *backend = next;
+        let previous = std::mem::replace(backend, next);
         self.auth_config = resolved;
         // The armed prefix belonged to the previous route. Warming resumes at the next turn's
         // sync, so a mid-turn fallback or promotion never replays under the old route.
@@ -83,7 +109,8 @@ impl Agent<'_> {
         self.context_cap = context_cap;
         self.role_backends.clear();
         self.subagent_backend = None;
-        Ok(())
+        self.route.generation = self.route.generation.wrapping_add(1);
+        Ok(previous)
     }
 
     /// Restores the configured primary once a fallback's cooldown has elapsed. Runs before the

@@ -34,6 +34,10 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ### Fixed
 
+- One-shot notes (background job finished, monitor deliveries, hook context, the 80% wrap-up notice) are no longer lost when a reply is discarded after it arrives: a reply that never reaches history (truncation raise, rejected edit preview, repair, guidance regeneration) leaves its notes queued for the retry.
+- A model that keeps answering in text while an investigation checkpoint is open gets two "call rewind" reminders, then the turn stops as incomplete; previously the reminder repeated without limit (each one a paid request, with the default unlimited step budget).
+- Goal mode counts batched and streamed-reuse tool calls as activity; a continuation turn made of parallel reads is no longer treated as stalled.
+- The prewalk and plan-yolo model handoffs install the new model through the shared route installer (authentication config, context cap, cache identity, role caches) and resize the turn's output budget, so a handoff to a smaller model no longer keeps the planner's context window and compaction thresholds.
 - The patch engine no longer edits the first of several identical blocks when the hunk meant another: exact and whitespace-tolerant passes report how many places match, so a hunk's line number selects the right occurrence and a context-stripped fallback that matches more than one place is refused instead of applied.
 - Patch re-indentation keeps a line the model deliberately re-indented (a dedent, or wrapping lines in a new block) instead of snapping it back to the file's previous indentation when the hunk was matched with different whitespace.
 - A shell command that reaches the automatic background threshold keeps running in the foreground under its own timeout when no background owner can take it (`bg` not enabled, or all eight slots in use); previously the refused hand-off stopped the command and discarded its output.
@@ -65,6 +69,7 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ### Changed
 
+- Request preparation validates the tool offer without rebuilding every tool's contract identity (previously about 12% of CPU in a tool-heavy local turn), checks for Snapcompact layers and user-supplied image references without copying the whole session history, compiles each cleanse parser pattern once, and keeps only the newest 256 truncated-artifact URIs (written only when one is added) instead of re-journaling an ever-growing list.
 - `find` reuses its parsed-source evidence across calls on repositories larger than its cache: entries are indexed by path, the cache holds up to 4096 files (within the existing 32 MiB bound), and eviction never displaces an entry the current retrieval already used, so repeated sweeps hit instead of re-tokenizing every file. Fuzzy edit matching skips windows whose length-based upper bound cannot affect the result and normalizes each file line once instead of once per window. Idle background-job readers back off from 10 ms to 100 ms polling.
 - Isolate release signing behind a protected environment, require exact-SHA push-to-main CI,
   publish curated version-specific changelog notes, and broaden platform lint/feature coverage.

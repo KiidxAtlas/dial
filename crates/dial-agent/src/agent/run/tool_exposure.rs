@@ -443,7 +443,7 @@ impl<'a> Agent<'a> {
                 .iter()
                 .any(|tool| names.iter().any(|name| name == tool));
         if (self.config.compaction.snapcompact.overlay
-            || crate::agent::compact::snapcompact::views::available(&self.session.messages())
+            || crate::agent::compact::snapcompact::views::available_in(&self.session)
             || self.experimental_context_owner()
             || (self.exploration_owner() && (exploring || !deferred("session_search"))))
             && catalog.iter().any(|name| name == "session_search")
@@ -538,7 +538,7 @@ impl<'a> Agent<'a> {
                 "context_notes" | "new_context" => crate::agent::window::context_notes::schema(name).expect("known context tool"),
                 "checkpoint" | "rewind" => crate::agent::workflow::exploration::schema(name).expect("known exploration tool"),
                 "session_search" if self.config.compaction.snapcompact.overlay
-                    || crate::agent::compact::snapcompact::views::available(&self.session.messages()) =>
+                    || crate::agent::compact::snapcompact::views::available_in(&self.session) =>
                     crate::agent::compact::snapcompact::views::schema(
                         if self.experimental_context_owner() || self.exploration_owner() {
                             session::session_search_tool::schema_owned()
@@ -644,7 +644,7 @@ impl<'a> Agent<'a> {
                 }
             }
         }
-        crate::tools::surface::catalog::Catalog::from_schemas(&schemas, &self.ext)?;
+        crate::tools::surface::catalog::Catalog::validate_schemas(&schemas)?;
         Ok(schemas)
     }
 
