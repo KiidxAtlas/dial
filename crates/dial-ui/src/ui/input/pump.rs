@@ -36,10 +36,30 @@ pub struct CrosstermEvents;
 
 impl EventSource for CrosstermEvents {
     fn poll(&mut self, timeout: Duration) -> io::Result<bool> {
+        // crossterm retries a hung-up terminal's end-of-file forever inside one poll, so the
+        // reader would never see a stop request. Wait on stdin here; crossterm only reads ready
+        // input, and a closed terminal ends the reader with an error instead.
+        #[cfg(unix)]
+        {
+            use crate::platform::terminal::input_ready;
+            let stdin = io::stdin();
+            if input_ready(&stdin, Duration::ZERO)?.is_some() {
+                // Events crossterm already parsed, and pending resize signals, come first.
+                if event::poll(Duration::ZERO)? {
+                    return Ok(true);
+                }
+                return match input_ready(&stdin, timeout)? {
+                    Some(true) => event::poll(Duration::ZERO),
+                    _ => Ok(false),
+                };
+            }
+        }
         event::poll(timeout)
     }
 
     fn read(&mut self) -> io::Result<Event> {
+        // Block through the guarded poll so a hang-up is reported rather than spun on.
+        while !self.poll(TICK)? {}
         event::read()
     }
 }

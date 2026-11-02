@@ -1,4 +1,5 @@
 use super::*;
+#[cfg(unix)]
 use crate::agent::Agent;
 use crate::agent::window::context;
 use crate::app::command_registry::{
@@ -13,6 +14,7 @@ use crate::app::git::{StatusCache, parse_file_diffs, parse_status};
 use crate::app::improve_view::improve_summary;
 use crate::app::learning::{Learning, lora_state};
 use crate::app::notices::{memory_age, memory_status_text};
+#[cfg(unix)]
 use crate::app::overlay::compute::{compute_starts, overlay_compute_release};
 use crate::app::overlay::{Which, overlay_destination, work_panel};
 use crate::app::panel::{
@@ -42,7 +44,9 @@ use crate::ui::text;
 use crate::ui::theme::Sym;
 use crossterm::event::{Event, KeyCode};
 use ratatui::text::Line;
-use serde_json::{Value, json};
+#[cfg(unix)]
+use serde_json::Value;
+use serde_json::json;
 use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;

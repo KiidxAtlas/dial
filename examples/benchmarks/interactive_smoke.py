@@ -408,7 +408,24 @@ class Terminal:
                  "exec " + shlex.join([str(self.binary), "--dir", str(self.project), "--restore" if restore else "--continue"]))
 
     def close(self):
+        # Killing the tmux server only signals Dial; wait for it to exit so callers can remove its
+        # project and home directories without racing its final writes.
+        try:
+            pid = int(self.run("display-message", "-p", "-t", "smoke", "#{pane_pid}").strip())
+        except (subprocess.SubprocessError, ValueError):
+            pid = None
         subprocess.run(["tmux", "-L", self.socket, "kill-server"], env=self.environment, capture_output=True, timeout=10)
+        if pid is None:
+            return
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            if time.monotonic() >= deadline:
+                raise AssertionError(f"Dial process {pid} did not exit after tmux kill-server")
+            time.sleep(0.05)
 
 
 def settled(read, quiet=2.0, timeout=30):

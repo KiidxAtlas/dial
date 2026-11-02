@@ -9,9 +9,9 @@ pub mod repl;
 pub mod rpc;
 pub mod schedule;
 
-pub(crate) use dial_agent::{
-    adaptive, agent, commit, learn, reliability, stats, steering, telemetry,
-};
+#[cfg(unix)]
+pub(crate) use dial_agent::telemetry;
+pub(crate) use dial_agent::{adaptive, agent, commit, learn, reliability, stats, steering};
 pub(crate) use dial_build_info::build_info;
 pub(crate) use dial_computer::computer;
 pub(crate) use dial_core::{flush_stdout_on_exit, output, platform, runtime, workspace_copy};
