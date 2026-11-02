@@ -832,6 +832,9 @@ fn strip_comment_prefix(line: &str) -> &str {
     js_trim_start(without)
 }
 
+/// Every pass reports how many places match, so callers can tell a unique match from the first
+/// of several. Treating duplicate exact matches as unique let line hints and context-free
+/// fallbacks silently edit the wrong occurrence.
 fn run_sequence_passes(
     lines: &[&str],
     pattern: &[&str],
@@ -844,7 +847,7 @@ fn run_sequence_passes(
     let exact = collect_indexed_matches(from, to, |index| {
         matches_at(lines, pattern, index, |a, b| a == b)
     });
-    if let Some(result) = sequence_result(&exact, 1.0, SequenceMatchStrategy::Exact, false) {
+    if let Some(result) = sequence_result(&exact, 1.0, SequenceMatchStrategy::Exact, true) {
         return Some(result);
     }
     let trailing = collect_indexed_matches(from, to, |index| {
@@ -853,14 +856,14 @@ fn run_sequence_passes(
         })
     });
     if let Some(result) =
-        sequence_result(&trailing, 0.99, SequenceMatchStrategy::TrimTrailing, false)
+        sequence_result(&trailing, 0.99, SequenceMatchStrategy::TrimTrailing, true)
     {
         return Some(result);
     }
     let trimmed = collect_indexed_matches(from, to, |index| {
         matches_at(lines, pattern, index, |a, b| js_trim(a) == js_trim(b))
     });
-    if let Some(result) = sequence_result(&trimmed, 0.98, SequenceMatchStrategy::Trim, false) {
+    if let Some(result) = sequence_result(&trimmed, 0.98, SequenceMatchStrategy::Trim, true) {
         return Some(result);
     }
     let comments = collect_indexed_matches(from, to, |index| {
@@ -868,12 +871,9 @@ fn run_sequence_passes(
             strip_comment_prefix(a) == strip_comment_prefix(b)
         })
     });
-    if let Some(result) = sequence_result(
-        &comments,
-        0.975,
-        SequenceMatchStrategy::CommentPrefix,
-        false,
-    ) {
+    if let Some(result) =
+        sequence_result(&comments, 0.975, SequenceMatchStrategy::CommentPrefix, true)
+    {
         return Some(result);
     }
     let unicode = collect_indexed_matches(from, to, |index| {
@@ -881,7 +881,7 @@ fn run_sequence_passes(
             normalize_unicode(a) == normalize_unicode(b)
         })
     });
-    if let Some(result) = sequence_result(&unicode, 0.97, SequenceMatchStrategy::Unicode, false) {
+    if let Some(result) = sequence_result(&unicode, 0.97, SequenceMatchStrategy::Unicode, true) {
         return Some(result);
     }
     if !allow_fuzzy {

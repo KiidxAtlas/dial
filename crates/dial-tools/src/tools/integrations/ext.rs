@@ -261,6 +261,12 @@ pub trait Tool: Send + Sync {
     fn kill_job(&self, _name: &str) -> Result<String, String> {
         Err("this tool does not own background jobs".into())
     }
+    /// Whether [`Self::adopt_job`] would currently accept a job (capacity, not job validity).
+    /// A refused hand-off drops, and so stops, the job, so callers check this first.
+    #[doc(hidden)]
+    fn accepts_adoption(&self) -> bool {
+        false
+    }
     /// Transfer a foreground shell command or native cell to a managed background owner.
     #[doc(hidden)]
     fn adopt_job(

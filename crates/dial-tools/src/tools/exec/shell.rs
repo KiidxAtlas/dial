@@ -124,6 +124,22 @@ fn adoption_due(
     asynchronous || steering || deadline.is_some_and(|deadline| elapsed >= deadline)
 }
 
+/// Takes over a foreground command that should keep running in the background.
+pub trait Adopter: Sync {
+    /// Whether a hand-off would currently be accepted. The command is handed over only when this
+    /// holds, because a refused hand-off drops the job and so stops the command.
+    fn available(&self) -> bool {
+        true
+    }
+    fn adopt(&self, job: ForegroundJob) -> Result<String, String>;
+}
+
+impl<F: Fn(ForegroundJob) -> Result<String, String> + Sync> Adopter for F {
+    fn adopt(&self, job: ForegroundJob) -> Result<String, String> {
+        self(job)
+    }
+}
+
 /// Hard cancellation outranks adoption on the same pass: a cancelled command is never transferred.
 fn may_adopt(cancelled: bool, due: bool) -> bool {
     !cancelled && due
@@ -224,7 +240,25 @@ impl Capture {
             self.drop_front(self.tail.len() - BASH_TAIL);
         }
         self.diagnostics.finish();
-        let dropped = self.total - self.head.len() - self.tail.len();
+        let mut dropped = self.total - self.head.len() - self.tail.len();
+        if dropped == 0 {
+            // Head and tail are contiguous: decode them together so a character that straddles
+            // the head cut is not split into replacement characters.
+            let mut all = std::mem::take(&mut self.head);
+            all.extend_from_slice(&self.tail);
+            return String::from_utf8_lossy(&all).into_owned();
+        }
+        // Around an omission, trim each side back to whole characters and count the rest as omitted.
+        let head_end = complete_utf8_prefix(&self.head);
+        let tail_start = self
+            .tail
+            .iter()
+            .take(3)
+            .take_while(|byte| (**byte & 0xC0) == 0x80)
+            .count();
+        dropped += (self.head.len() - head_end) + tail_start;
+        self.head.truncate(head_end);
+        self.tail.drain(..tail_start);
         let mut text = String::from_utf8_lossy(&self.head).into_owned();
         let (kept, lines, overflow) = self.diagnostics.kept();
         if dropped > 0 && lines > 0 {
@@ -239,6 +273,14 @@ impl Capture {
         }
         text.push_str(&String::from_utf8_lossy(&self.tail));
         text
+    }
+}
+
+/// Length of `bytes` without an incomplete UTF-8 sequence at its end.
+fn complete_utf8_prefix(bytes: &[u8]) -> usize {
+    match std::str::from_utf8(bytes) {
+        Err(error) if error.error_len().is_none() => error.valid_up_to(),
+        _ => bytes.len(),
     }
 }
 
@@ -542,7 +584,7 @@ pub fn bash_tool_streaming(
             0,
             on_output,
             cancel,
-            &|mut job| {
+            &|mut job: ForegroundJob| {
                 let _ = crate::platform::process::kill_group(job.child.id());
                 let _ = job.child.wait();
                 Err("managed background adoption is unavailable".into())
@@ -558,7 +600,7 @@ pub fn bash_tool_streaming_with_adopter(
     auto_background_secs: u64,
     on_output: &(dyn Fn(&[u8]) + Sync),
     cancel: &AtomicBool,
-    on_adopt: &(dyn Fn(ForegroundJob) -> Result<String, String> + Sync),
+    on_adopt: &dyn Adopter,
 ) -> Result<ToolOutput, String> {
     if opt_bool(args, "pty")? {
         return Err("bash pty=true requires the managed bg registry; use the native execution boundary or bg start with pty=true".into());
@@ -679,7 +721,7 @@ fn run_bash(
     auto_background_secs: u64,
     on_output: &(dyn Fn(&[u8]) + Sync),
     cancel: &AtomicBool,
-    on_adopt: &(dyn Fn(ForegroundJob) -> Result<String, String> + Sync),
+    on_adopt: &dyn Adopter,
 ) -> Result<ToolOutput, String> {
     let session = crate::tools::opt_str(args, "session")?;
     let asynchronous = opt_bool(args, "async")? || opt_bool(args, "background")?;
@@ -798,20 +840,27 @@ fn run_bash(
     let mut timed_out = false;
     let mut cancelled = false;
     let auto_background = Duration::from_secs(auto_background_secs);
-    let adopt_after = adoption_deadline(auto_background);
+    let mut adopt_after = adoption_deadline(auto_background);
+    // Set once no background owner could take the command (none registered, or every slot in use).
+    // It then stays here under its own timeout: a refused hand-off would drop, and so stop, it.
+    let mut adoption_refused = false;
     let waiter = crate::platform::wake::Waiter::new()
         .map_err(|e| format!("creating command wait channel: {e}"))?;
     loop {
         // Hard cancellation is read once per pass and outranks adoption: a cancelled command stays
         // with this owner, and the group kill below reaps it.
         let cancel_now = cancel.load(Ordering::Acquire);
-        let adoption_wanted = adoption_due(
-            asynchronous,
-            crate::tools::exec::signals::steering_requested(),
-            started.elapsed(),
-            adopt_after,
-        );
-        if may_adopt(cancel_now, adoption_wanted) {
+        let adoption_wanted = !adoption_refused
+            && adoption_due(
+                asynchronous,
+                crate::tools::exec::signals::steering_requested(),
+                started.elapsed(),
+                adopt_after,
+            );
+        if may_adopt(cancel_now, adoption_wanted) && !on_adopt.available() {
+            adoption_refused = true;
+            adopt_after = None;
+        } else if may_adopt(cancel_now, adoption_wanted) {
             crate::platform::io::set_blocking(&reader)
                 .map_err(|e| format!("restoring adopted output pipe mode: {e}"))?;
             let mut captured = capture.retained();
@@ -833,7 +882,7 @@ fn run_bash(
                     .zip(exchange)
                     .map(|(name, exchange)| SessionClaim::new(ws, name, exchange)),
             };
-            return on_adopt(job).map(|id| {
+            return on_adopt.adopt(job).map(|id| {
                 let so_far = if so_far.is_empty() {
                     String::new()
                 } else {

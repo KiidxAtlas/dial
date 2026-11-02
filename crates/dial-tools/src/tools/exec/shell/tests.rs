@@ -1253,3 +1253,71 @@ fn launch_adopted_background_output_reports_launch_facts_without_termination() {
     assert_eq!(launch_facts(&out).unwrap()["job"], "bg7");
     assert!(out.execution.process.is_none());
 }
+
+#[cfg(unix)]
+#[test]
+fn a_command_past_the_threshold_keeps_running_when_no_background_owner_can_take_it() {
+    struct Full;
+    impl Adopter for Full {
+        fn available(&self) -> bool {
+            false
+        }
+        fn adopt(&self, _job: ForegroundJob) -> Result<String, String> {
+            panic!("an unavailable adopter must never be handed the job")
+        }
+    }
+    let (_dir, ws) = workspace();
+    let ws = ws.without_sandbox();
+    let output = bash_tool_streaming_with_adopter(
+        &ws,
+        &json!({"command": "sleep 1.5; printf finished"}),
+        10,
+        1,
+        &|_: &[u8]| {},
+        &AtomicBool::new(false),
+        &Full,
+    )
+    .unwrap();
+    assert!(!output.is_error, "{}", output.text);
+    assert!(output.text.contains("finished"), "{}", output.text);
+    // Without an owner its own timeout still applies.
+    let timed_out = bash_tool_streaming_with_adopter(
+        &ws,
+        &json!({"command": "sleep 30"}),
+        2,
+        1,
+        &|_: &[u8]| {},
+        &AtomicBool::new(false),
+        &Full,
+    )
+    .unwrap();
+    assert!(
+        timed_out.text.contains("timed out") || timed_out.is_error,
+        "{}",
+        timed_out.text
+    );
+}
+
+#[test]
+fn captured_output_never_splits_a_character_at_the_head_cut() {
+    // Fits entirely: one box-drawing character straddles the 6 KiB head boundary.
+    let mut capture = Capture::new();
+    let mut bytes = vec![b'a'; BASH_HEAD - 1];
+    bytes.extend_from_slice("─".repeat(200).as_bytes());
+    capture.push(&bytes);
+    let text = capture.finish();
+    assert!(
+        !text.contains('\u{FFFD}'),
+        "replacement character in fully captured output"
+    );
+    // Larger than head + tail: both sides of the omission end on whole characters.
+    let mut capture = Capture::new();
+    capture.push(&vec![b'a'; BASH_HEAD - 1]);
+    capture.push("é".repeat(BASH_TAIL * 2).as_bytes());
+    let text = capture.finish();
+    assert!(
+        !text.contains('\u{FFFD}'),
+        "replacement character around the omission"
+    );
+    assert!(text.contains("bytes of output omitted"));
+}

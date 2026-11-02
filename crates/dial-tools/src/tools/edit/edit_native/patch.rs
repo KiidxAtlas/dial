@@ -248,6 +248,16 @@ fn adjust_lines_indentation(
     }
     let mut used = std::collections::HashMap::<String, usize>::new();
     let indent = indent_char(actual);
+    // How the model itself indented each old line. A new line whose text matches an old one but
+    // whose indentation differs from it was re-indented on purpose (a dedent, or wrapping in a new
+    // block); it keeps that relative change instead of snapping back to the file's old indentation.
+    let mut pattern_indents = std::collections::HashMap::<String, Vec<usize>>::new();
+    for line in pattern.iter().filter(|line| !is_blank_line(line)) {
+        pattern_indents
+            .entry(js_trim(line).to_owned())
+            .or_default()
+            .push(count_leading_whitespace(line));
+    }
     new_lines
         .iter()
         .enumerate()
@@ -256,6 +266,17 @@ fn adjust_lines_indentation(
                 return line.clone();
             }
             let trimmed = js_trim(line).to_owned();
+            let reindented = pattern_indents
+                .get(&trimmed)
+                .is_some_and(|indents| !indents.contains(&count_leading_whitespace(line)));
+            if reindented {
+                return match delta.filter(|value| *value != 0) {
+                    Some(delta) => {
+                        apply_indent_delta(std::slice::from_ref(line), delta, indent).remove(0)
+                    }
+                    None => line.clone(),
+                };
+            }
             if let Some(matches) = by_content.get(&trimmed) {
                 if matches.len() == 1 {
                     return (*matches[0]).clone();
@@ -1343,3 +1364,6 @@ pub(crate) fn apply_hunks(
     }
     Ok((next, warnings))
 }
+
+#[cfg(test)]
+mod tests;

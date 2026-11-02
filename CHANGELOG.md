@@ -34,6 +34,13 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ### Fixed
 
+- The patch engine no longer edits the first of several identical blocks when the hunk meant another: exact and whitespace-tolerant passes report how many places match, so a hunk's line number selects the right occurrence and a context-stripped fallback that matches more than one place is refused instead of applied.
+- Patch re-indentation keeps a line the model deliberately re-indented (a dedent, or wrapping lines in a new block) instead of snapping it back to the file's previous indentation when the hunk was matched with different whitespace.
+- A shell command that reaches the automatic background threshold keeps running in the foreground under its own timeout when no background owner can take it (`bg` not enabled, or all eight slots in use); previously the refused hand-off stopped the command and discarded its output.
+- Captured shell output never splits a multi-byte character at the head/tail cut (box-drawing `tree` output no longer shows replacement characters when nothing was omitted).
+- A line ending in `\r\r\n` keeps its own carriage return when an edit changes a different line.
+- `grep` and `glob` scoped to a subdirectory honour the `.gitignore` files of its parent directories (build output such as `dist/` no longer consumes the page budget), while an explicitly requested ignored directory is still searched.
+- A wide `grep` page no longer evicts the edit witnesses of files the model read or edited: new search-only witnesses enter at the old end of the store, and superseded snapshots are trimmed before whole files are evicted.
 - A session whose last append was torn by a crash or full disk no longer reports corruption on every later resume: the writer removes the unloaded partial line when it claims the journal, instead of sealing it into a malformed interior line with the next append. A complete final entry that only lost its newline is kept.
 - Checkpoint review diffs are bounded to 500 ms of edit-script search (a coarser but correct diff past that), and compare-before-restore checks the review token without rebuilding the diff while holding the checkpoint lock.
 - Recheck session-writer identity after locking, retain locks through removal, version SQLite
