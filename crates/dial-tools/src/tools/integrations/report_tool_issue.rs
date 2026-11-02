@@ -9,7 +9,6 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow, ensure};
 use serde_json::{Value, json};
 
-use crate::build_info::VERSION;
 use crate::config::types::Config;
 use crate::storage::redact::redact_text;
 use crate::tools::integrations::ext::{Tool, ToolContext};
@@ -179,11 +178,12 @@ fn render(report: &Report) -> String {
     format!(
         "# Tool issue: {tool}\n\n\
          - Category: {category}\n\
-         - Dial: {VERSION}\n\
+         - Dial: {version}\n\
          - Platform: {os} ({arch})\n\n\
          ## Summary\n\n{summary}\n\n{expected}{actual}{steps}",
         tool = report.tool,
         category = report.category,
+        version = dial_core::build_identity::version(),
         os = std::env::consts::OS,
         arch = std::env::consts::ARCH,
         summary = bounded(report.summary, FIELD_LIMIT),

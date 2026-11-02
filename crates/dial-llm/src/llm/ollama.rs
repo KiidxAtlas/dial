@@ -576,8 +576,9 @@ impl Accumulator {
                     None | Some("stop") => if self.calls.is_empty() { "stop" } else { "tool_calls" },
                     Some("tool_calls") => "tool_calls",
                     Some("length") => {
-                        ensure!(self.calls.is_empty(),
-                            "Ollama output limit interrupted a tool-call turn; increase num_predict before retrying");
+                        // Calls cut off by the output limit never run; `length` lets the agent
+                        // raise the output budget and retry, as on the other transports.
+                        self.calls.clear();
                         "length"
                     }
                     Some("load" | "unload") => bail!("Ollama only loaded/unloaded the model instead of generating a reply; include a user turn"),

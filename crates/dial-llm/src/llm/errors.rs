@@ -324,14 +324,15 @@ fn one(pattern: &str) -> Regex {
 /// Token-budget overflow evidence, per provider.
 static OVERFLOW: LazyLock<RegexSet> = LazyLock::new(|| {
     set(&[
-        r"(?i)prompt is too long",                     // Anthropic
-        r"(?i)input is too long for requested model",  // Amazon Bedrock
-        r"(?i)exceeds the context window",             // OpenAI Completions & Responses
+        r"(?i)prompt is too long",                                   // Anthropic
+        r"(?i)input length and `?max_tokens`? exceed context limit", // Anthropic (input + output budget)
+        r"(?i)input is too long for requested model",                // Amazon Bedrock
+        r"(?i)exceeds the context window", // OpenAI Completions & Responses
         r"(?i)input token count.*exceeds the maximum", // Google Gemini
-        r"(?i)maximum prompt length is \d+",           // xAI Grok
-        r"(?i)reduce the length of the messages",      // Groq
-        r"(?i)maximum context length is \d+ tokens",   // OpenRouter, vLLM, OpenAI legacy
-        r"(?i)exceeds the available context size",     // llama.cpp server
+        r"(?i)maximum prompt length is \d+", // xAI Grok
+        r"(?i)reduce the length of the messages", // Groq
+        r"(?i)maximum context length is \d+ tokens", // OpenRouter, vLLM, OpenAI legacy
+        r"(?i)exceeds the available context size", // llama.cpp server
         r"(?i)\bprompt\s*\(\s*\d+\s+tokens\s*\)\s*\+\s*max\s+tokens\s*\(\s*\d+\s*\)\s+exceeds\s+the\s+context\s*\(\s*\d+\s*\)",
         r"(?i)\bprompt\s*\(\s*\d+\s+tokens\s*\)\s+leaves\s+no\s+room\s+to\s+answer\s+in\s+the\s+context\s*\(\s*\d+\s*\)",
         r"(?i)requested tokens?.*exceed.*context (window|length|size)", // llama.cpp / local servers

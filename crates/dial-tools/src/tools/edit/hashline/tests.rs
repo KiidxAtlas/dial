@@ -933,3 +933,40 @@ fn unread_and_stale_headers_direct_a_targeted_read_and_fresh_header() {
     assert!(stale.contains("fresh [path#TAG] header"), "{stale}");
     assert_eq!(fs::read_to_string(dir.path().join("b.py")).unwrap(), "p\n");
 }
+
+#[test]
+fn a_wide_search_page_cannot_evict_the_files_the_model_read() {
+    let mut store = EditStore::default();
+    let read = std::path::PathBuf::from("/w/read.rs");
+    store.record_all(&read, "fn read() {}\n");
+    // One grep page touching more files than the store holds.
+    for index in 0..MAX_FILES + 50 {
+        store.record_search(
+            &std::path::PathBuf::from(format!("/w/hit{index}.rs")),
+            "needle\n",
+            &[(1, 1)],
+        );
+    }
+    assert!(store.files.contains_key(&read), "the read witness survives");
+    // Even a store full of read witnesses keeps them all when a search hit arrives.
+    let mut full = EditStore::default();
+    for index in 0..MAX_FILES {
+        full.record_all(
+            &std::path::PathBuf::from(format!("/w/read{index}.rs")),
+            "x\n",
+        );
+    }
+    full.record_search(
+        &std::path::PathBuf::from("/w/hit.rs"),
+        "needle\n",
+        &[(1, 1)],
+    );
+    assert!(
+        full.files
+            .contains_key(&std::path::PathBuf::from("/w/read0.rs"))
+    );
+    assert!(store.lru.len() <= MAX_FILES);
+    // Searching a file the model already read refreshes it like any other observation.
+    store.record_search(&read, "fn read() {}\n", &[(1, 1)]);
+    assert_eq!(store.lru.last(), Some(&read));
+}

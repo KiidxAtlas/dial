@@ -988,6 +988,7 @@ fn status_polling_does_not_revalidate_or_mutate_acceptance() {
         settings: Default::default(),
         workspace: Workspace::new(root.path()).unwrap(),
         acceptance: Mutex::new(Some(acceptance)),
+        owner_shutdown: AtomicBool::new(false),
     };
     let before = job_status(&job);
     for _ in 0..3 {

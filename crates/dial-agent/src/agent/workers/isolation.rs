@@ -417,6 +417,76 @@ fn materialize(
     }))
 }
 
+/// One backend's private view of the project. Field order is drop order: unmount, then worktree
+/// metadata, then the directory holding them.
+struct Materialized {
+    mount: Option<overlay::Mount>,
+    link: Option<worktree::Link>,
+    projection: Option<projfs::Projection>,
+    dir: tempfile::TempDir,
+    root: PathBuf,
+}
+
+/// Sets up `kind`'s view of `project`. On failure everything it created is dropped.
+fn set_up_backend(
+    project: &Workspace,
+    config: &crate::config::task::TaskConfig,
+    kind: Backend,
+) -> Result<Materialized> {
+    // Declaration order is drop order for the locals below: the overlay is unmounted and the
+    // worktree metadata removed before the directory holding them is deleted.
+    let dir;
+    let root;
+    let mut link = None;
+    let mut mount = None;
+    let mut projection = None;
+    match kind {
+        Backend::Clone => {
+            dir = crate::workspace_copy::clone_project(project.root())?;
+            root = dir.path().canonicalize()?;
+        }
+        Backend::Copy => {
+            dir = crate::workspace_copy::copy_project_plain(project.root())?;
+            root = dir.path().canonicalize()?;
+        }
+        Backend::Worktree => {
+            dir = tempfile::tempdir().context("creating isolation directory")?;
+            let work = dir.path().join("work");
+            link = Some(
+                worktree::populate(
+                    project.root(),
+                    dir.path(),
+                    &work,
+                    config.isolation_dependency_bytes,
+                )
+                .map_err(anyhow::Error::msg)?,
+            );
+            root = work.canonicalize()?;
+        }
+        Backend::Overlay => {
+            dir = tempfile::tempdir().context("creating isolation directory")?;
+            mount = Some(
+                overlay::mount(project.root(), dir.path(), config.isolation_source_files)
+                    .map_err(anyhow::Error::msg)?,
+            );
+            root = dir.path().join("merged").canonicalize()?;
+        }
+        Backend::ProjFs => {
+            dir = tempfile::tempdir().context("creating isolation directory")?;
+            let work = dir.path().join("work");
+            projection = Some(projfs::start(project.root(), &work).map_err(anyhow::Error::msg)?);
+            root = work;
+        }
+    }
+    Ok(Materialized {
+        mount,
+        link,
+        projection,
+        dir,
+        root,
+    })
+}
+
 impl Isolated {
     #[cfg(test)]
     pub fn create(project: &Workspace) -> Result<Self> {
@@ -437,58 +507,43 @@ impl Isolated {
         let source_paths = preflight(project.root(), config).context(
             "isolation preflight failed before any copy was made; no files were copied and the project is unchanged",
         )?;
-        let selection = backend::select(preference, |candidate| {
-            backend::probe(candidate, project.root(), config.isolation_source_files)
-        })
-        .map_err(anyhow::Error::msg)?;
+        // `auto` takes the first backend that both probes and sets up: a probe cannot prove a
+        // mount will succeed (an unprivileged kernel overlay mount fails with EPERM, as does one in
+        // a container without CAP_SYS_ADMIN), so a setup failure moves on to the next candidate
+        // and is reported as the reason that backend was skipped. A named backend still fails.
+        let mut setup_failures: Vec<(Backend, String)> = Vec::new();
+        let (selection, parts) = loop {
+            let failed: Vec<Backend> = setup_failures.iter().map(|(backend, _)| *backend).collect();
+            let mut selection = backend::select(preference, |candidate| {
+                if failed.contains(&candidate) {
+                    return Err("setup failed".into());
+                }
+                backend::probe(candidate, project.root(), config.isolation_source_files)
+            })
+            .map_err(anyhow::Error::msg)?;
+            match set_up_backend(project, config, selection.backend) {
+                Ok(parts) => {
+                    selection
+                        .skipped
+                        .retain(|(backend, _)| !failed.contains(backend));
+                    selection.skipped.splice(0..0, setup_failures);
+                    break (selection, parts);
+                }
+                Err(error) if matches!(preference, Preference::Auto) => {
+                    setup_failures.push((selection.backend, format!("{error:#}")));
+                }
+                Err(error) => return Err(error),
+            }
+        };
         let kind = selection.backend;
         let label = selection.label();
-        // Declaration order is drop order for the locals below: the overlay is unmounted and the
-        // worktree metadata removed before the directory holding them is deleted.
-        let dir;
-        let root;
-        let mut link = None;
-        let mut mount = None;
-        let mut projection = None;
-        match kind {
-            Backend::Clone => {
-                dir = crate::workspace_copy::clone_project(project.root())?;
-                root = dir.path().canonicalize()?;
-            }
-            Backend::Copy => {
-                dir = crate::workspace_copy::copy_project_plain(project.root())?;
-                root = dir.path().canonicalize()?;
-            }
-            Backend::Worktree => {
-                dir = tempfile::tempdir().context("creating isolation directory")?;
-                let work = dir.path().join("work");
-                link = Some(
-                    worktree::populate(
-                        project.root(),
-                        dir.path(),
-                        &work,
-                        config.isolation_dependency_bytes,
-                    )
-                    .map_err(anyhow::Error::msg)?,
-                );
-                root = work.canonicalize()?;
-            }
-            Backend::Overlay => {
-                dir = tempfile::tempdir().context("creating isolation directory")?;
-                mount = Some(
-                    overlay::mount(project.root(), dir.path(), config.isolation_source_files)
-                        .map_err(anyhow::Error::msg)?,
-                );
-                root = dir.path().join("merged").canonicalize()?;
-            }
-            Backend::ProjFs => {
-                dir = tempfile::tempdir().context("creating isolation directory")?;
-                let work = dir.path().join("work");
-                projection =
-                    Some(projfs::start(project.root(), &work).map_err(anyhow::Error::msg)?);
-                root = work;
-            }
-        }
+        let Materialized {
+            mount,
+            link,
+            projection,
+            dir,
+            root,
+        } = parts;
         // Hash the actual worker baseline once. ProjFS must hash the source instead: walking
         // its instance would hydrate every placeholder. Overlay still hashes its mounted view
         // so concurrent source changes cannot silently reuse stale preflight content.
@@ -496,9 +551,12 @@ impl Isolated {
             Backend::ProjFs => snapshot(project.root(), None, config)?,
             _ => snapshot_preserving(&root, None, Some(&source_paths), config)?,
         };
-        // The overlay's lower layer and the worktree's copied ignored files already provide
-        // dependencies, so only the plain copies need the dependency copy.
-        if config.isolation_dependencies && matches!(kind, Backend::Clone | Backend::Copy) {
+        // The overlay's lower layer already provides dependencies. The worktree checkout holds only
+        // tracked files (its sync skips `node_modules`, `.venv`, `vendor` and other dependency
+        // directories), so it needs the dependency copy like the plain copies do.
+        if config.isolation_dependencies
+            && matches!(kind, Backend::Clone | Backend::Copy | Backend::Worktree)
+        {
             crate::agent::workers::development_copy::dependencies(
                 project.root(),
                 &root,

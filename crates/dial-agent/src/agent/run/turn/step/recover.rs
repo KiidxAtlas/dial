@@ -58,9 +58,10 @@ impl Agent<'_> {
                             crate::agent::safety::stream_guards::STREAM_STALL_CONTINUE_MAX_RETRIES
                         ),
                     ));
+                    let history_len = self.session.message_count();
                     self.push(json!({"role":"assistant","content":partial}))?;
                     // The partial answer kept in history responded to this request's notes.
-                    turn.reply_received();
+                    turn.reply_received(history_len);
                     // Charge shared recovery after retaining the partial answer.
                     if let Some(report) = self.setback(
                         turn,
@@ -88,7 +89,7 @@ impl Agent<'_> {
                     .map(ControlFlow::Break);
             }
             Ok(reply) => {
-                turn.reply_received();
+                turn.reply_received(self.session.message_count());
                 self.admit_rule_triggers(turn, &reply, rule_deferred, ui)?;
                 reply
             }

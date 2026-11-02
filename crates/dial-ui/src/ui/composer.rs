@@ -1289,6 +1289,10 @@ impl Composer {
     /// Rebuilds the project vocabulary on a worker thread for `paths`, superseding any scan that
     /// is still running. Does nothing until a project root is set.
     fn scan_vocabulary(&mut self, paths: &[String]) {
+        // Reading up to 32 MB of source only serves ghost-word completion.
+        if !self.word_completion {
+            return;
+        }
         let Some(root) = self.project_root.clone() else {
             return;
         };

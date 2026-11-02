@@ -42,7 +42,16 @@ struct Job {
     cancel: Arc<AtomicBool>,
     events: mpsc::Receiver<Event>,
     streamed: String,
+    /// Length of `streamed` the private store has accepted; only that prefix is shown.
+    saved: usize,
+    saved_at: std::time::Instant,
 }
+
+/// Longest a received side answer waits before its prefix is saved and shown, and the amount of
+/// new text that saves it sooner. Each save rewrites the side file with two fsyncs on the UI
+/// thread, so saving on every refresh tick cost most of a frame on macOS.
+const SIDE_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+const SIDE_SAVE_BYTES: usize = 8 * 1024;
 
 enum Event {
     Text(String),
@@ -107,7 +116,7 @@ impl SideThreadState {
     pub(in crate::app) fn streamed(&self) -> Option<(&str, &str)> {
         self.job
             .as_ref()
-            .map(|job| (job.thread.as_str(), job.streamed.as_str()))
+            .map(|job| (job.thread.as_str(), &job.streamed[..job.saved]))
     }
 
     /// Threads of the bound session, oldest first.
@@ -121,7 +130,7 @@ impl SideThreadState {
             (
                 job.thread.as_str(),
                 job.question.as_str(),
-                job.streamed.as_str(),
+                &job.streamed[..job.saved],
             )
         })
     }
@@ -273,6 +282,8 @@ impl SideThreadState {
             cancel,
             events,
             streamed: String::new(),
+            saved: 0,
+            saved_at: std::time::Instant::now(),
         };
         let started = self.persist_job(Some(&job)).and_then(|()| {
             thread::Builder::new()
@@ -321,7 +332,6 @@ impl SideThreadState {
             job.cancel.store(true, Ordering::SeqCst);
             return Vec::new();
         }
-        let saved_len = job.streamed.len();
         let mut outcome = None;
         loop {
             match job.events.try_recv() {
@@ -340,15 +350,24 @@ impl SideThreadState {
         match outcome {
             Some(result) => vec![self.finish(job, result)],
             None => {
-                if job.streamed.len() != saved_len
-                    && let Err(error) = self.persist_job(Some(&job))
-                {
+                let unsaved = job.streamed.len() - job.saved;
+                // The first text is saved and shown at once; later text at a bounded rate.
+                let due = unsaved > 0
+                    && (job.saved == 0
+                        || unsaved >= SIDE_SAVE_BYTES
+                        || job.saved_at.elapsed() >= SIDE_SAVE_INTERVAL);
+                if due && let Err(error) = self.persist_job(Some(&job)) {
                     // Do not expose a prefix the private store did not accept.
-                    job.streamed.truncate(saved_len);
+                    let saved = job.saved;
+                    job.streamed.truncate(saved);
                     job.cancel.store(true, Ordering::SeqCst);
                     let mut note = self.finish(job, Err("side progress could not be saved".into()));
                     note.text = format!("side stream stopped: {error:#}\n{}", note.text);
                     return vec![note];
+                }
+                if due {
+                    job.saved = job.streamed.len();
+                    job.saved_at = std::time::Instant::now();
                 }
                 self.job = Some(job);
                 Vec::new()

@@ -72,3 +72,35 @@ fn reasoning_effort_wire_reaches_gemini_thinking_level_and_none_keeps_zero_budge
     assert_eq!(thinking["thinkingBudget"], 0);
     assert!(thinking.get("thinkingLevel").is_none());
 }
+
+#[test]
+fn foreign_tool_history_replays_as_text_instead_of_refusing_the_chat() {
+    let chat = Chat {
+        messages: vec![
+            json!({"role":"user","content":"look at a.rs"}),
+            // A call made by another provider: no Gemini native envelope or signature.
+            json!({"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function",
+                "function":{"name":"read","arguments":"{\"path\":\"a.rs\"}"}}]}),
+            json!({"role":"tool","tool_call_id":"call_1","content":"fn main() {}"}),
+            json!({"role":"user","content":"now summarize"}),
+        ],
+        tools: vec![],
+        temperature: 0.2,
+        max_tokens: 64,
+        seed: None,
+    };
+    let endpoint = Endpoint {
+        url: "https://example.test",
+        auth: None,
+        model: "gemini-3.1-pro",
+        headers: &[],
+    };
+    let body = request(&endpoint, &chat, None, "scope").unwrap();
+    let text = body["contents"].to_string();
+    // No function-call part is invented for a call this endpoint never signed.
+    assert!(!text.contains("functionCall"), "{text}");
+    assert!(!text.contains("functionResponse"), "{text}");
+    assert!(text.contains("read({\\\"path\\\":\\\"a.rs\\\"})"), "{text}");
+    assert!(text.contains("fn main() {}"), "{text}");
+    assert_eq!(body["contents"][1]["role"], "model");
+}

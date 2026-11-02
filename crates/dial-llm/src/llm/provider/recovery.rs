@@ -92,6 +92,12 @@ impl Backend {
                     )?
                     .1,
                 ),
+                // Claude subscription tokens expire within hours and a retry can wait minutes:
+                // read the stored sign-in again (it refreshes near expiry) rather than resending
+                // the first attempt's token.
+                ProviderKind::AnthropicSubscription { user_dir, .. } => Some(
+                    llm::anthropic_oauth::access_token(user_dir, Arc::clone(interrupt))?,
+                ),
                 _ => None,
             }
         } else {

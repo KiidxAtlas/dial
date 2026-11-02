@@ -36,6 +36,22 @@ impl std::fmt::Display for IncompleteStream {
 
 impl std::error::Error for IncompleteStream {}
 
+/// Chat-completions servers report truncation and aborted generations with their own finish
+/// reasons. Truncation maps onto `length`, which the agent recovers from by raising the output
+/// budget; an abort is an incomplete stream (retried), so neither is accepted as a complete answer.
+pub(super) fn normalized_finish_reason(reason: &str) -> Result<String> {
+    match reason {
+        "max_tokens" | "model_length" | "model_context_window_exceeded" | "max_output_tokens" => {
+            Ok("length".into())
+        }
+        "error" | "network_error" | "abort" | "aborted" => Err(IncompleteStream(
+            "the server ended the generation with an error finish reason before it completed",
+        )
+        .into()),
+        other => Ok(other.into()),
+    }
+}
+
 /// Providers choose whether an idle timeout is safe to retry.
 #[derive(Debug)]
 pub(super) struct StalledStream;
@@ -363,6 +379,8 @@ struct PartialCall {
 pub(super) struct Accumulator {
     text: String,
     calls: BTreeMap<u64, PartialCall>,
+    /// Server `index` values that a different call id reused, mapped to the slot that call got.
+    reused_indexes: BTreeMap<u64, u64>,
     finish_reason: Option<String>,
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
@@ -612,14 +630,35 @@ impl Accumulator {
     }
 
     /// Calls are keyed by `index`. A delta without one continues the call with
-    /// the same `id`, else the most recent call, else starts a new one.
+    /// the same `id`, else the most recent call, else starts a new one. A delta whose `index`
+    /// names a call with a different `id` starts a new call.
     fn slot(&mut self, delta: &Value) -> Result<(u64, &mut PartialCall)> {
         let id = delta
             .get("id")
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty());
         let key = match delta.get("index").and_then(Value::as_u64) {
-            Some(index) => index,
+            Some(index) => {
+                let key = self.reused_indexes.get(&index).copied().unwrap_or(index);
+                // A different, non-empty id at an index already in use is a new call (some
+                // servers restart indexes per batch); merging would concatenate both calls.
+                match (id, self.calls.get(&key)) {
+                    (Some(id), Some(call)) if !call.id.is_empty() && call.id != id => {
+                        let fresh = self
+                            .calls
+                            .keys()
+                            .next_back()
+                            .copied()
+                            .unwrap_or(0)
+                            .max(key)
+                            .checked_add(1)
+                            .context("chat stream tool call index overflows")?;
+                        self.reused_indexes.insert(index, fresh);
+                        fresh
+                    }
+                    _ => key,
+                }
+            }
             None => {
                 let found = id
                     .and_then(|id| {
@@ -699,6 +738,7 @@ impl Accumulator {
             )
             .into());
         }
+        let finish_reason = normalized_finish_reason(self.finish_reason.as_deref().unwrap_or(""))?;
         let calls: Vec<Value> = self
             .calls
             .into_values()
@@ -712,7 +752,7 @@ impl Accumulator {
         Ok(Reply {
             text: self.text,
             tool_calls: parse_tool_calls(&calls)?,
-            finish_reason: self.finish_reason.unwrap_or_default(),
+            finish_reason,
             prompt_tokens: self.prompt_tokens,
             completion_tokens: self.completion_tokens,
             reasoning: self.reasoning,

@@ -1064,6 +1064,11 @@ impl Tool for Background {
         self.interrupt.store(false, Ordering::Release);
         output
     }
+    fn accepts_adoption(&self) -> bool {
+        let mut table = self.table();
+        table.refresh();
+        table.running() < table::MAX_PROCESSES
+    }
     fn adopt_job(&self, job: AdoptedJob) -> Result<String, String> {
         match job {
             AdoptedJob::Shell(job) => self.table().adopt(*job),

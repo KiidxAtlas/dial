@@ -1522,7 +1522,7 @@ impl GrepState {
                 }
             }
             if ws
-                .record_edit_witnesses(&file.path, &source, &ranges)
+                .record_search_witnesses(&file.path, &source, &ranges)
                 .is_err()
             {
                 witness_failed = true;

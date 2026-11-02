@@ -608,23 +608,62 @@ fn best_fuzzy_match_core(
     excluded_ranges: &[ExcludedRange],
 ) -> BestFuzzyMatch {
     let target_normalized = normalize_lines(target_lines, include_depth);
+    // Without depth prefixes each line normalizes on its own: do it once, not once per window.
+    let content_normalized = (!include_depth).then(|| normalize_lines(content_lines, false));
+    let content_chars: Option<Vec<usize>> = content_normalized
+        .as_ref()
+        .map(|lines| lines.iter().map(|line| line.chars().count()).collect());
+    let target_chars: Vec<usize> = target_normalized
+        .iter()
+        .map(|line| line.chars().count())
+        .collect();
     let mut best = None;
     let mut best_score = -1.0;
     let mut second_best_score = -1.0;
     let mut above_threshold_count = 0;
     let mut above_threshold_lines: Vec<u32> = Vec::new();
-    for start in 0..=content_lines.len() - target_lines.len() {
+    let width = target_lines.len();
+    for start in 0..=content_lines.len() - width {
         let start_index = offsets[start];
-        let end_line = start + target_lines.len() - 1;
+        let end_line = start + width - 1;
         let end_index = (offsets[end_line] + content_lines[end_line].len()).max(start_index + 1);
         if overlaps_excluded(start_index, end_index, excluded_ranges) {
             continue;
         }
-        let window = &content_lines[start..start + target_lines.len()];
-        let window_normalized = normalize_lines(window, include_depth);
+        // Edit distance is at least the length difference, so this bounds the window's score from
+        // above. A window that cannot reach the threshold or the second-best score cannot change
+        // the best match, the second-best score or the above-threshold count: skip the full
+        // Levenshtein comparison.
+        if let Some(chars) = &content_chars {
+            let bound = target_chars
+                .iter()
+                .zip(&chars[start..start + width])
+                .map(|(&a, &b)| {
+                    let longest = a.max(b);
+                    if longest == 0 {
+                        1.0
+                    } else {
+                        1.0 - a.abs_diff(b) as f64 / longest as f64
+                    }
+                })
+                .sum::<f64>()
+                / width as f64;
+            if bound + 1e-9 < threshold && bound + 1e-9 < second_best_score {
+                continue;
+            }
+        }
+        let window = &content_lines[start..start + width];
+        let owned_window;
+        let window_normalized: &[String] = match &content_normalized {
+            Some(all) => &all[start..start + width],
+            None => {
+                owned_window = normalize_lines(window, include_depth);
+                &owned_window
+            }
+        };
         let score = target_normalized
             .iter()
-            .zip(&window_normalized)
+            .zip(window_normalized)
             .map(|(target, actual)| similarity(target, actual))
             .sum::<f64>()
             / target_lines.len() as f64;
@@ -832,6 +871,9 @@ fn strip_comment_prefix(line: &str) -> &str {
     js_trim_start(without)
 }
 
+/// Every pass reports how many places match, so callers can tell a unique match from the first
+/// of several. Treating duplicate exact matches as unique let line hints and context-free
+/// fallbacks silently edit the wrong occurrence.
 fn run_sequence_passes(
     lines: &[&str],
     pattern: &[&str],
@@ -844,7 +886,7 @@ fn run_sequence_passes(
     let exact = collect_indexed_matches(from, to, |index| {
         matches_at(lines, pattern, index, |a, b| a == b)
     });
-    if let Some(result) = sequence_result(&exact, 1.0, SequenceMatchStrategy::Exact, false) {
+    if let Some(result) = sequence_result(&exact, 1.0, SequenceMatchStrategy::Exact, true) {
         return Some(result);
     }
     let trailing = collect_indexed_matches(from, to, |index| {
@@ -853,14 +895,14 @@ fn run_sequence_passes(
         })
     });
     if let Some(result) =
-        sequence_result(&trailing, 0.99, SequenceMatchStrategy::TrimTrailing, false)
+        sequence_result(&trailing, 0.99, SequenceMatchStrategy::TrimTrailing, true)
     {
         return Some(result);
     }
     let trimmed = collect_indexed_matches(from, to, |index| {
         matches_at(lines, pattern, index, |a, b| js_trim(a) == js_trim(b))
     });
-    if let Some(result) = sequence_result(&trimmed, 0.98, SequenceMatchStrategy::Trim, false) {
+    if let Some(result) = sequence_result(&trimmed, 0.98, SequenceMatchStrategy::Trim, true) {
         return Some(result);
     }
     let comments = collect_indexed_matches(from, to, |index| {
@@ -868,12 +910,9 @@ fn run_sequence_passes(
             strip_comment_prefix(a) == strip_comment_prefix(b)
         })
     });
-    if let Some(result) = sequence_result(
-        &comments,
-        0.975,
-        SequenceMatchStrategy::CommentPrefix,
-        false,
-    ) {
+    if let Some(result) =
+        sequence_result(&comments, 0.975, SequenceMatchStrategy::CommentPrefix, true)
+    {
         return Some(result);
     }
     let unicode = collect_indexed_matches(from, to, |index| {
@@ -881,7 +920,7 @@ fn run_sequence_passes(
             normalize_unicode(a) == normalize_unicode(b)
         })
     });
-    if let Some(result) = sequence_result(&unicode, 0.97, SequenceMatchStrategy::Unicode, false) {
+    if let Some(result) = sequence_result(&unicode, 0.97, SequenceMatchStrategy::Unicode, true) {
         return Some(result);
     }
     if !allow_fuzzy {

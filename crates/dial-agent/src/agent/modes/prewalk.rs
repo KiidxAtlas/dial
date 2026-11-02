@@ -249,21 +249,28 @@ impl Agent<'_> {
         let Some(target) = self.modes.prewalk.handoff.clone() else {
             return Ok(());
         };
-        let next = self.prewalk_backend(&target)?;
-        if let Some(mut old) = self.backend.replace(next) {
-            old.release();
-        }
+        self.prewalk_install(&target)
+    }
+
+    /// Installs the handoff model as the session's backend through the shared route installer.
+    fn prewalk_install(&mut self, target: &ModelSelection) -> Result<()> {
+        let next = self.prewalk_backend(target)?;
+        let config = self.effective_config().with_selection(target);
+        let Some(mut current) = self.backend.take() else {
+            self.backend = Some(next);
+            return Ok(());
+        };
+        let installed = self.install_built_route(&mut current, next, &config, None);
+        self.backend = Some(current);
+        installed?.release();
         Ok(())
     }
 
     /// Hands the session to `target` now and keeps it there across turns (plan-yolo execution
     /// handoff). Uses the same handoff slot that `prewalk_resume` rebuilds from.
     pub(crate) fn prewalk_switch(&mut self, target: ModelSelection) -> Result<()> {
-        let next = self.prewalk_backend(&target)?;
+        self.prewalk_install(&target)?;
         self.modes.prewalk.handoff = Some(target);
-        if let Some(mut old) = self.backend.replace(next) {
-            old.release();
-        }
         Ok(())
     }
 
@@ -343,8 +350,9 @@ impl Agent<'_> {
 
         nudges.retain(|m| !is_plan_nudge(m));
         let next = self.prewalk_backend(&target)?;
-        backend.release();
-        *backend = next;
+        let config = self.effective_config().with_selection(&target);
+        self.install_built_route(backend, next, &config, None)?
+            .release();
         self.prewalk_clear();
         self.modes.prewalk.handoff = Some(target.clone());
         self.save_modes()?;

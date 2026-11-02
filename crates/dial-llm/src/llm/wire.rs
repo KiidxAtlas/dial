@@ -44,7 +44,13 @@ impl Tracker {
     pub fn latest(&self) -> Option<Observation> {
         self.latest.clone()
     }
-    fn observe(&mut self, bytes: &[u8], prompt: Option<&Value>, transport: &'static str) {
+    fn observe(
+        &mut self,
+        bytes: &[u8],
+        prompt: Option<&Value>,
+        chained: bool,
+        transport: &'static str,
+    ) {
         let parsed;
         let body = match prompt {
             Some(prompt) => prompt,
@@ -96,7 +102,7 @@ impl Tracker {
         self.latest = Some(Observation {
             boundary: "final_provider_wire",
             transport,
-            chained: prompt.is_some(),
+            chained,
             payload_bytes: bytes.len(),
             payload_sha256: format!("{:x}", Sha256::digest(bytes)),
             common_prompt_bytes: parts[..common].iter().map(|p| p.1).sum(),
@@ -140,13 +146,21 @@ fn reset_attestation(encoded: &mut [u8]) {
     }
 }
 pub(crate) fn record(bytes: &[u8], transport: &'static str) {
-    record_with_prompt(bytes, None, transport);
+    observe(bytes, None, false, transport);
+}
+/// `bytes` is `body` serialized for the wire. Passing the body skips re-parsing the whole request
+/// (megabytes for a long session) just to fingerprint it.
+pub(crate) fn record_value(bytes: &[u8], body: &Value, transport: &'static str) {
+    observe(bytes, Some(body), false, transport);
 }
 /// `bytes` went on the wire; `prompt` is the full logical request a chained delta continues.
 pub(crate) fn record_with_prompt(bytes: &[u8], prompt: Option<&Value>, transport: &'static str) {
+    observe(bytes, prompt, prompt.is_some(), transport);
+}
+fn observe(bytes: &[u8], prompt: Option<&Value>, chained: bool, transport: &'static str) {
     ACTIVE.with(|active| {
         if let Some(tracker) = active.borrow().as_ref() {
-            tracker.lock().observe(bytes, prompt, transport);
+            tracker.lock().observe(bytes, prompt, chained, transport);
         }
     });
 }

@@ -121,7 +121,7 @@ fn route(user_dir: &Path, target: &str) -> Response {
     }
     match path {
         "/" => ("200 OK", HTML, PAGE.to_owned()),
-        "/api/version" => json_response(Ok(dial_build_info::build_info::report())),
+        "/api/version" => json_response(Ok(dial_core::build_identity::report())),
         "/api/stats" => json_response(with_db(user_dir, |db| db.report(None, now_ms()))),
         "/api/live" => optional_json(
             with_db(user_dir, |db| db.live(user_dir, now_ms())),

@@ -21,6 +21,8 @@ fn streaming(
         cancel: cancel.clone(),
         events: events_rx,
         streamed: String::new(),
+        saved: 0,
+        saved_at: std::time::Instant::now(),
     });
     (state, cancel, tx)
 }
@@ -185,4 +187,28 @@ fn a_streamed_prefix_survives_owner_drop_without_reissuing_the_request() {
     assert_eq!(exchange.outcome, Outcome::Interrupted);
     assert_eq!(exchange.question, "why?");
     assert_eq!(exchange.answer, "durable side prefix");
+}
+
+#[test]
+fn streamed_side_text_is_saved_and_shown_at_a_bounded_rate() {
+    let (mut state, _, events) = streaming("s1", vec![Event::Text("first".to_string())]);
+    // The first text is shown at once.
+    assert!(state.drain(Some("s1")).is_empty());
+    assert_eq!(state.streamed().map(|(_, text)| text), Some("first"));
+    // More text within the save interval waits for the next save.
+    events.send(Event::Text(" second".to_string())).unwrap();
+    assert!(state.drain(Some("s1")).is_empty());
+    assert_eq!(state.streamed().map(|(_, text)| text), Some("first"));
+    std::thread::sleep(SIDE_SAVE_INTERVAL);
+    assert!(state.drain(Some("s1")).is_empty());
+    assert_eq!(state.streamed().map(|(_, text)| text), Some("first second"));
+    // A burst larger than the byte threshold is saved immediately.
+    events
+        .send(Event::Text("x".repeat(SIDE_SAVE_BYTES)))
+        .unwrap();
+    assert!(state.drain(Some("s1")).is_empty());
+    assert_eq!(
+        state.streamed().map(|(_, text)| text.len()),
+        Some("first second".len() + SIDE_SAVE_BYTES)
+    );
 }

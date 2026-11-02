@@ -167,3 +167,29 @@ fn unread_pipe_never_claims_complete_output() {
         crate::runtime::execution::Completeness::Partial
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn reaping_the_leader_first_stops_the_rest_of_its_group() {
+    use std::io::BufRead;
+    let mut command = Command::new("/bin/sh");
+    command
+        .args(["-c", "sleep 30 & echo $!; exit 0"])
+        .stdout(Stdio::piped());
+    let mut group = ProcessGroup::new(crate::platform::process::spawn_group(&mut command).unwrap());
+    let mut line = String::new();
+    std::io::BufReader::new(group.take_stdout().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let member: i32 = line.trim().parse().unwrap();
+    let member = crate::platform::procinfo::ProcId::of(member).expect("live group member");
+    assert!(group.wait().unwrap().success());
+    // The member was signalled while the unreaped leader still reserved the group ID.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while member.alive() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!member.alive());
+    // Dropping after the reap never signals the (now reusable) group ID again.
+    drop(group);
+}

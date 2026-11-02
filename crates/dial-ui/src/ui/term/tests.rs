@@ -979,3 +979,28 @@ fn signals_are_written_on_change_and_restored_on_leave() {
     );
     assert!(last.contains("SetUserVar=dialState=\x07"));
 }
+
+#[test]
+fn a_transcript_replay_larger_than_one_frame_is_painted_in_slices() {
+    let bytes = Shared::default();
+    let mut term = with_writer(Box::new(bytes.clone()), (200, 40));
+    // About 20 MiB of committed scrollback: more than the output queue's 16 MiB frame limit.
+    let row = "x".repeat(190);
+    let rows: Vec<Line<'static>> = (0..110_000).map(|_| Line::from(row.clone())).collect();
+    term.commit(rows);
+    let viewport = [Line::from("composer")];
+    let mut paints = 0;
+    while term.history_rows_pending() > 0 {
+        term.paint(&Viewport {
+            rows: &viewport,
+            cursor: None,
+            title: None,
+            signals: None,
+        })
+        .expect("a large replay never fails the paint");
+        bytes.0.lock().clear();
+        paints += 1;
+        assert!(paints < 100, "scrollback drains");
+    }
+    assert!(paints > 1, "the replay was split across frames");
+}

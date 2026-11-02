@@ -1061,6 +1061,7 @@ impl<'a> Agent<'a> {
         if name == "read"
             && !self.hermetic
             && let Some(path) = args["path"].as_str()
+            && llm::images::may_reference_user_image(Path::new(path))
             && let Some(reference) =
                 llm::images::authorized_user_reference(&self.session.messages(), Path::new(path))
         {
@@ -1685,9 +1686,15 @@ impl<'a> Agent<'a> {
         let started = Instant::now();
         let mut output = self.dispatch_from(backend, call, provenance, ui);
         let supplied = if call.name == "read" {
-            call.arguments["path"].as_str().and_then(|path| {
-                llm::images::authorized_user_reference(&self.session.messages(), Path::new(path))
-            })
+            call.arguments["path"]
+                .as_str()
+                .filter(|path| llm::images::may_reference_user_image(Path::new(path)))
+                .and_then(|path| {
+                    llm::images::authorized_user_reference(
+                        &self.session.messages(),
+                        Path::new(path),
+                    )
+                })
         } else {
             None
         };

@@ -687,6 +687,25 @@ impl Workspace {
         source: &str,
         complete_ranges: &[(usize, usize)],
     ) -> Result<(), String> {
+        self.record_witnesses(path, source, complete_ranges, false)
+    }
+    /// [`Self::record_edit_witnesses`] for a broad search page: new files enter at the old end of
+    /// the witness store's eviction order (see `Store::record_search`).
+    pub fn record_search_witnesses(
+        &self,
+        path: &Path,
+        source: &str,
+        complete_ranges: &[(usize, usize)],
+    ) -> Result<(), String> {
+        self.record_witnesses(path, source, complete_ranges, true)
+    }
+    fn record_witnesses(
+        &self,
+        path: &Path,
+        source: &str,
+        complete_ranges: &[(usize, usize)],
+        search: bool,
+    ) -> Result<(), String> {
         if complete_ranges.is_empty() {
             return Ok(());
         }
@@ -713,7 +732,11 @@ impl Workspace {
         if current.text != source {
             return Err("edit witness source changed before publication; not recorded".into());
         }
-        self.store().record(path, &lf, complete_ranges);
+        if search {
+            self.store().record_search(path, &lf, complete_ranges);
+        } else {
+            self.store().record(path, &lf, complete_ranges);
+        }
         Ok(())
     }
     /// Complete source rows returned by the owner-local notebook cell reader.

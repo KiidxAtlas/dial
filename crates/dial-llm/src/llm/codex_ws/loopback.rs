@@ -208,7 +208,8 @@ fn websocket_history_survives_http_fallback_and_token_refresh() {
     chat.messages
         .push(json!({"role":"user","content":"continue"}));
 
-    // Ownership failures must be caught before connecting, on either transport.
+    // Native items never replay to another account, URL or an unverified owner. Both
+    // transports validate before connecting; such history goes out in its portable form.
     let other_url = format!("{url}/other");
     let mut unverified = chat.clone();
     unverified.messages[1]["dial_provider_content"][0]
@@ -232,33 +233,16 @@ fn websocket_history_survives_http_fallback_and_token_refresh() {
         ),
         (endpoint, &unverified),
     ] {
-        let error = exchange(
-            route,
-            history,
-            5,
-            &mut None,
-            Arc::new(AtomicBool::new(false)),
-            None,
-            None,
-            &mut |_| panic!("invalid history must not emit callbacks"),
-            &key,
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("native history belongs"));
-        let error = super::super::responses::exchange_codex(
-            route,
-            history,
-            crate::llm::Limits {
-                timeout_secs: 5,
-                interrupt: Arc::new(AtomicBool::new(false)),
-            },
-            &mut None,
-            None,
-            &mut |_| panic!("invalid history must not emit callbacks"),
-            super::super::responses::CacheKeys::default(),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("native history belongs"));
+        let (_, portable) = super::super::responses::validate_history(route, history).unwrap();
+        assert!(matches!(portable, std::borrow::Cow::Owned(_)));
+        assert!(
+            portable
+                .messages
+                .iter()
+                .all(|message| message.get("dial_provider_content").is_none()),
+            "foreign native items are stripped"
+        );
+        assert_eq!(portable.messages[1]["content"], "first");
     }
     forget(&key);
     let reply = super::super::responses::exchange_codex(

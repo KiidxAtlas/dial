@@ -2443,7 +2443,42 @@ fn probe_cache_key(probe: &Probe) -> String {
         ..Default::default()
     })
 }
+/// Identity of the catalog file's current contents. Writes publish by rename (a new inode on Unix),
+/// so a changed file never matches a cached parse even within one mtime tick.
+fn catalog_stamp(path: &Path) -> Option<(u64, std::time::SystemTime, u64)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    let inode = std::os::unix::fs::MetadataExt::ino(&metadata);
+    #[cfg(not(unix))]
+    let inode = 0;
+    Some((metadata.len(), metadata.modified().ok()?, inode))
+}
+
+type CatalogStamp = (std::path::PathBuf, (u64, std::time::SystemTime, u64));
+type ParsedCatalog = (CatalogStamp, BTreeMap<String, Vec<ModelEntry>>);
+static PARSED: std::sync::Mutex<Option<ParsedCatalog>> = std::sync::Mutex::new(None);
+
+/// The saved catalog, parsed once per file version. Role and backend construction read it on
+/// every request path; reparsing and re-keying every row each time was pure repeated work.
 fn cached(user_dir: &Path) -> BTreeMap<String, Vec<ModelEntry>> {
+    let path = user_dir.join("model-catalog.json");
+    let Some(stamp) = catalog_stamp(&path).map(|stamp| (path.clone(), stamp)) else {
+        return parse_cached(user_dir);
+    };
+    if let Some((seen, parsed)) = PARSED.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+        && *seen == stamp
+    {
+        return parsed.clone();
+    }
+    let parsed = parse_cached(user_dir);
+    // Only remember a parse of the version that was stamped, never one that changed underneath.
+    if catalog_stamp(&path) == Some(stamp.1) {
+        *PARSED.lock().unwrap_or_else(|e| e.into_inner()) = Some((stamp, parsed.clone()));
+    }
+    parsed
+}
+
+fn parse_cached(user_dir: &Path) -> BTreeMap<String, Vec<ModelEntry>> {
     let mut cache: BTreeMap<String, Vec<ModelEntry>> =
         crate::platform::atomic::read_private(&user_dir.join("model-catalog.json"))
             .ok()

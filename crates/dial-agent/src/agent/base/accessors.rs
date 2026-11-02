@@ -599,7 +599,7 @@ impl<'a> Agent<'a> {
             );
         }
         if self.config.compaction.snapcompact.overlay
-            || crate::agent::compact::snapcompact::views::available(&self.session.messages())
+            || crate::agent::compact::snapcompact::views::available_in(&self.session)
         {
             // Recovery is a requirement of this opt-in mode. Model tool allowlists
             // below still apply; compaction refuses if recovery is withheld.

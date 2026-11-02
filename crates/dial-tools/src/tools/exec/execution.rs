@@ -57,6 +57,28 @@ pub fn before_start() -> ToolOutput {
         .with_effects(Effects::None)
 }
 
+/// Whether the managed `bg` owner is registered and has room for another job right now.
+pub fn adoption_available(registry: &Registry) -> bool {
+    registry
+        .get("bg")
+        .is_some_and(|tool| tool.accepts_adoption())
+}
+
+/// The `bg` owner as a shell [`Adopter`](crate::tools::exec::shell::Adopter).
+struct BackgroundAdopter<'a>(&'a Registry);
+
+impl crate::tools::exec::shell::Adopter for BackgroundAdopter<'_> {
+    fn available(&self) -> bool {
+        adoption_available(self.0)
+    }
+    fn adopt(&self, job: crate::tools::exec::shell::ForegroundJob) -> Result<String, String> {
+        adopt_into(
+            self.0,
+            crate::tools::exec::background::AdoptedJob::Shell(Box::new(job)),
+        )
+    }
+}
+
 /// Hands a foreground job to the managed `bg` owner, which keeps it running after its controller
 /// returns.
 pub fn adopt_into(
@@ -242,12 +264,7 @@ fn native_with(
                     artifact: None,
                 })
             };
-            let adopt = |job| {
-                adopt_into(
-                    registry,
-                    crate::tools::exec::background::AdoptedJob::Shell(Box::new(job)),
-                )
-            };
+            let adopt = BackgroundAdopter(registry);
             super::shell::bash_tool_streaming_with_adopter(
                 context.workspace,
                 args,

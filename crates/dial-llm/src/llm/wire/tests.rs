@@ -4,13 +4,18 @@ use serde_json::json;
 fn wire_changes_include_images_tools_and_signed_bytes_without_retaining_content() {
     let mut tracker = Tracker::default();
     let mut body = json!({"model":"fixture", "messages":[{"role":"system","content":"fixed"},{"role":"user","content":[{"image_url":{"url":"data:image/png;base64,AAAA"}}]}],"tools":[]});
-    tracker.observe(&serde_json::to_vec(&body).unwrap(), None, "http");
+    tracker.observe(&serde_json::to_vec(&body).unwrap(), None, false, "http");
     assert_eq!(tracker.latest().unwrap().invalidation, "initial");
-    tracker.observe(&serde_json::to_vec_pretty(&body).unwrap(), None, "http");
+    tracker.observe(
+        &serde_json::to_vec_pretty(&body).unwrap(),
+        None,
+        false,
+        "http",
+    );
     let same = tracker.latest().unwrap();
     assert_eq!(same.common_prompt_bytes, same.prompt_bytes);
     body["messages"][1]["content"][0]["image_url"]["url"] = json!("data:image/png;base64,BBBB");
-    tracker.observe(&serde_json::to_vec(&body).unwrap(), None, "http");
+    tracker.observe(&serde_json::to_vec(&body).unwrap(), None, false, "http");
     let changed = tracker.latest().unwrap();
     assert_eq!(changed.invalidation, "prompt_changed");
     assert!(changed.common_prompt_bytes > 0 && changed.common_prompt_bytes < changed.prompt_bytes);
@@ -20,7 +25,12 @@ fn wire_changes_include_images_tools_and_signed_bytes_without_retaining_content(
 fn transport_switch_and_chained_delta_keep_the_full_prompt_comparison() {
     let mut tracker = Tracker::default();
     let mut body = json!({"model":"m","instructions":"fixed","tools":[],"input":[{"role":"user","content":"a"}]});
-    tracker.observe(&serde_json::to_vec(&body).unwrap(), None, "websocket");
+    tracker.observe(
+        &serde_json::to_vec(&body).unwrap(),
+        None,
+        false,
+        "websocket",
+    );
     body["input"]
         .as_array_mut()
         .unwrap()
@@ -31,6 +41,7 @@ fn transport_switch_and_chained_delta_keep_the_full_prompt_comparison() {
     tracker.observe(
         &serde_json::to_vec(&delta).unwrap(),
         Some(&body),
+        true,
         "websocket",
     );
     let chained = tracker.latest().unwrap();
@@ -40,7 +51,7 @@ fn transport_switch_and_chained_delta_keep_the_full_prompt_comparison() {
         .as_array_mut()
         .unwrap()
         .push(json!({"role":"user","content":"c"}));
-    tracker.observe(&serde_json::to_vec(&body).unwrap(), None, "http");
+    tracker.observe(&serde_json::to_vec(&body).unwrap(), None, false, "http");
     let switched = tracker.latest().unwrap();
     assert_eq!(switched.invalidation, "transport_changed");
     assert!(switched.common_prompt_bytes > 0);
@@ -71,11 +82,13 @@ fn the_per_request_billing_attestation_is_not_a_prompt_change() {
     tracker.observe(
         &serde_json::to_vec(&body("1a2b3", "a")).unwrap(),
         None,
+        false,
         "http",
     );
     tracker.observe(
         &serde_json::to_vec(&body("9f8e7", "a")).unwrap(),
         None,
+        false,
         "http",
     );
     let same = tracker.latest().unwrap();
@@ -84,6 +97,6 @@ fn the_per_request_billing_attestation_is_not_a_prompt_change() {
     // A real change in the system text after the header is still reported.
     let mut changed = body("9f8e7", "a");
     changed["system"][1]["text"] = json!("different");
-    tracker.observe(&serde_json::to_vec(&changed).unwrap(), None, "http");
+    tracker.observe(&serde_json::to_vec(&changed).unwrap(), None, false, "http");
     assert_eq!(tracker.latest().unwrap().invalidation, "prompt_changed");
 }

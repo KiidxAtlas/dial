@@ -12,6 +12,17 @@ Window-reset headers remain quota information, not mandatory waits. A throttle (
 wait policy. Incomplete/truncated streams are discarded and retried within the same attempt
 bounds; partial tool calls are never executed. Claude usage polling shares this retry policy.
 
+Native replay is owner-scoped. Responses items replay only to the account/endpoint/credential (and,
+for compaction state, the model) that produced them, Anthropic signed blocks only to the host that
+produced them, and Gemini function-call parts only with a verified signature for the endpoint and
+model. Anything else is sent in portable form: text and tool calls, with Gemini tool turns from
+another route replayed as plain text so no signature is invented. A tool call cut off by the
+output limit is dropped and reported as `length` on every transport, so the turn raises its output
+budget instead of failing. Chat-completions finish reasons such as `max_tokens`, `model_length`
+and `model_context_window_exceeded` map to `length`; `error` and `network_error` are incomplete
+streams and retried. A streamed Responses `context_length_exceeded` is a context overflow, which
+compacts instead of resending the same prompt.
+
 While a turn is running, `/retry` skips the remaining provider retry wait and requests the next
 attempt immediately, including any remaining server-requested delay. It does not cancel the turn,
 queue a follow-up, or add retry attempts. With no pending provider retry wait, it reports that
@@ -218,7 +229,7 @@ state, requests report `registry_default` routing.
   - `off`: no replays.
   - `streaming`: replays only while an agent run is streaming a reply, for up to 30 minutes from the last settled prefix.
   - `idle`: also replays between runs, for up to 60 minutes from the last settled prefix.
-- A replay is armed only when the economics favor it: the expected savings over the next replay must exceed $0.001 at catalog prices. Without catalog pricing for the model, warming does not start. The successful native request supplies its effective cache lifetime, including cache-control refusal fallback: five-minute prefixes refresh after four minutes; one-hour prefixes after 59 minutes. Unknown or disabled retention disarms the previous prefix rather than guessing.
+- A replay is armed only when the economics favor it: the expected savings over the next replay must exceed $0.001 at catalog prices. All replays after one real turn buy the same single avoided miss, so warming also stops once their combined cost would exceed that expected saving. Without catalog pricing for the model, warming does not start. The successful native request supplies its effective cache lifetime, including cache-control refusal fallback: five-minute prefixes refresh after four minutes; one-hour prefixes after 59 minutes. Unknown or disabled retention disarms the previous prefix rather than guessing.
 - Warming stops when the mode changes to `off`, the active route/configuration changes, the window ends, a replay wrote the cache instead of reading it, or the replay backend is unavailable. Replays are bound to the configuration of the route that actually served the request, including session switches and fallbacks, rather than the initial default model. Accepted tool-call and text-only replies both replace the armed prefix with the request that produced them, not the newly generated reply. Worker stop reports appear as notices at the start of the next turn; route changes discard the old worker. Hermetic evaluation runs never replay.
 - Warming applies to native Anthropic routes only. Other providers and local servers have no equivalent cache control and never replay.
 - Pending invalidations and run-end events are applied before a due replay. If the bounded event queue overflows, warming stops rather than silently losing a stop event; a later request can start a fresh worker. Dropping the session's warmer prevents new replays even if a run guard remains alive. A request already in flight may finish within its bounded replay timeout.

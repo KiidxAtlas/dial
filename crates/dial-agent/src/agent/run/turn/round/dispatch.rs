@@ -299,6 +299,10 @@ impl Agent<'_> {
                     if call.name == "bash" {
                         self.note_verification(call, &result.0, ui);
                     }
+                    // Batched and streamed-reuse calls also skip the mode hooks `dispatch` runs:
+                    // without this, goal mode saw a turn of batched reads as no activity and
+                    // stopped its automation as stalled.
+                    crate::agent::modes::lifecycle::Lifecycle::dispatched(self, call, &result.0);
                     (result.0, result.1, true)
                 }
                 None if call.name == "finish"

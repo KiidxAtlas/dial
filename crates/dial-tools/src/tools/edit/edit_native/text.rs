@@ -71,8 +71,12 @@ pub fn normalize_to_lf(text: &str) -> std::borrow::Cow<'_, str> {
 /// line the edit left alone keeps its own terminator. Lines matched to `original` by a line diff
 /// keep that line's `\r\n`/`\n`; inserted or rewritten lines take `dominant_line_ending`. The
 /// final segment never gets a terminator.
+///
+/// `after` must already be LF-normalized the way the edit pipeline normalizes (only `\r\n` pairs
+/// become `\n`). It is not normalized again: a line ending in `\r\r\n` normalizes to content
+/// `x\r` plus LF, and collapsing that `\r\n` a second time would drop the line's own `\r`.
 pub fn restore_line_endings_like(original: &str, after: &str) -> String {
-    let after = after.replace("\r\n", "\n");
+    let after = after.to_owned();
     let dominant = dominant_line_ending(original);
     let (crlf, lf) = count_line_endings(original);
     if crlf == 0 || lf == 0 {
@@ -511,3 +515,6 @@ pub fn adjust_indentation(old_text: &str, actual_text: &str, new_text: &str) -> 
         .unwrap_or_else(|| detect_indent_char(actual_text));
     apply_indent_delta(new_text, delta, indent_char)
 }
+
+#[cfg(test)]
+mod tests;

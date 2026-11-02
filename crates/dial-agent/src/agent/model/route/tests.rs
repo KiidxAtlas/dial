@@ -9,6 +9,7 @@ fn on_fallback_until(until: Instant) -> ActiveRoute {
             served: false,
         }),
         promoted: None,
+        generation: 0,
     }
 }
 

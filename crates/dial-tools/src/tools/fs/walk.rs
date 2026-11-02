@@ -235,9 +235,46 @@ impl<'a> SearchWalk<'a> {
                 return;
             }
         };
-        if !self.walk_path(start, kind, prefix, 0, &mut Vec::new(), visit) {
+        let mut rules = self.ancestor_rules(start);
+        if !self.walk_path(start, kind, prefix, 0, &mut rules, visit) {
             self.stopped = true;
         }
+    }
+
+    /// `.gitignore` rules from the workspace root down to the scope's parent. A search scoped to
+    /// `packages/web` must still skip the `dist/` its parent ignores. They apply to what lies
+    /// beneath the scope, never to the scope itself, so an explicitly requested ignored directory
+    /// is still searched.
+    fn ancestor_rules(&mut self, start: &Path) -> Vec<ignore::gitignore::Gitignore> {
+        let mut rules = Vec::new();
+        if !self.gitignore {
+            return rules;
+        }
+        let root = self.ws.root.clone();
+        let Some(parent) = start.strip_prefix(&root).ok().and_then(Path::parent) else {
+            return rules;
+        };
+        let mut directory = root;
+        let mut components = parent.components();
+        loop {
+            match bounded_ignore(
+                &directory,
+                &directory.join(".gitignore"),
+                &mut self.ignore_bytes,
+            ) {
+                Ok(Some(rule)) => rules.push(rule),
+                Ok(None) => {}
+                Err(()) => {
+                    self.unreadable += 1;
+                    self.omit(&directory, "unavailable ancestor ignore rules");
+                }
+            }
+            match components.next() {
+                Some(component) => directory.push(component),
+                None => break,
+            }
+        }
+        rules
     }
 
     fn omit(&mut self, path: &Path, reason: &str) {

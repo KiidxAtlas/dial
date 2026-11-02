@@ -84,3 +84,17 @@ fn windows_group_kill_requires_matching_identity() {
         "a dead identity is never signalled"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn recorded_identities_never_name_dials_own_or_inits_group() {
+    let own_start = ProcId::current().expect("current identity").start;
+    for pid in [-1, 0, 1] {
+        let id = ProcId {
+            pid,
+            start: own_start,
+        };
+        assert!(!id.same_process(), "pid {pid}");
+        assert!(!id.signal_group(0), "pid {pid}");
+    }
+}

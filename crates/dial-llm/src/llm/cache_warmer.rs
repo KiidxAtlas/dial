@@ -126,6 +126,9 @@ struct Armed {
     economics: Economics,
     settled_at: Instant,
     last_refresh: Instant,
+    /// Replays sent since the last real turn. They all buy the same single avoided miss, so their
+    /// combined cost, not each one alone, must stay below the expected saving.
+    replays: u32,
 }
 
 impl Armed {
@@ -170,6 +173,7 @@ impl Warmer {
             economics,
             settled_at: now,
             last_refresh: now,
+            replays: 0,
         });
         Ok(())
     }
@@ -192,6 +196,12 @@ impl Warmer {
         if now < armed.refresh_at() {
             return Ok(None);
         }
+        let spent = f64::from(armed.replays + 1) * armed.economics.replay_usd;
+        if armed.mode.continuation() * armed.economics.miss_usd - spent < MIN_NET_SAVINGS_USD {
+            self.armed = None;
+            return Err(Stop::NotWorthIt);
+        }
+        armed.replays += 1;
         armed.last_refresh = now;
         let mut replay = armed.chat.clone();
         replay.max_tokens = 1;

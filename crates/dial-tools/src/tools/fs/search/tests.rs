@@ -1021,3 +1021,36 @@ fn glob_no_match_with_spaces_says_whitespace_is_literal() {
     assert_eq!(body(&spaced), "my game.rs\n", "{spaced}");
     assert!(!spaced.contains("pattern_hint="), "{spaced}");
 }
+
+#[test]
+fn a_search_scoped_to_a_subdirectory_honours_its_ancestors_ignore_rules() {
+    let (dir, ws) = workspace();
+    fs::write(dir.path().join(".gitignore"), "dist/\n").unwrap();
+    fs::create_dir_all(dir.path().join("packages")).unwrap();
+    fs::write(dir.path().join("packages/.gitignore"), "*.gen.js\n").unwrap();
+    for path in [
+        "packages/web/src/app.js",
+        "packages/web/dist/app.js",
+        "packages/web/src/api.gen.js",
+    ] {
+        let full = dir.path().join(path);
+        fs::create_dir_all(full.parent().unwrap()).unwrap();
+        fs::write(full, "needle\n").unwrap();
+    }
+    let found = grep(&ws, json!({"pattern": "needle", "path": "packages/web"}));
+    assert!(found.contains("src/app.js"), "{found}");
+    assert!(
+        !found.contains("dist/app.js"),
+        "root rule applies below the scope: {found}"
+    );
+    assert!(
+        !found.contains("api.gen.js"),
+        "intermediate rule applies too: {found}"
+    );
+    // An ignored directory requested explicitly is still searched.
+    let explicit = grep(
+        &ws,
+        json!({"pattern": "needle", "path": "packages/web/dist"}),
+    );
+    assert!(explicit.contains("app.js"), "{explicit}");
+}

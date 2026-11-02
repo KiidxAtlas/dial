@@ -90,6 +90,10 @@ impl TurnState<'_> {
             todo_recovery,
             solo_todo_noted,
             pending_nudges,
+            delivered_nudges,
+            reply_mark,
+            // Turn-wide: steering or a resumed round cannot reopen the reminder budget.
+            exploration_reminders: _,
             emissions,
             coach_turn,
             automatic_coach_pending,
@@ -103,6 +107,9 @@ impl TurnState<'_> {
             capability_search,
             enrichment_epoch,
         } = self;
+        // Every transition starts from a known history: no earlier reply is left to settle.
+        delivered_nudges.clear();
+        *reply_mark = None;
         if steering {
             // A new instruction is a new task: its advice and reviews start over.
             *enrichment_epoch = enrichment_epoch.wrapping_add(1);

@@ -21,6 +21,7 @@ fn exit_with(code: i32) -> Result<()> {
 
 fn main() {
     dial::install_tls_provider();
+    dial::install_build_identity();
     if std::env::args_os()
         .nth(1)
         .is_some_and(|arg| arg == dial::tools::exec::background::durable::OWNER_ARG)

@@ -2195,3 +2195,54 @@ fn invalid_timestamps_and_nonfinite_token_rates_are_not_displayed() {
         );
     }
 }
+
+#[test]
+fn streaming_with_brackets_and_html_matches_a_full_render_at_every_delta() {
+    let theme = Theme::dark();
+    let reply = "Use a `Vec<T>` and index it with `a[i]`; see [the docs](https://example.com).\n\n\
+        Then compare `x < y` before the loop.\n\n\
+        ```rust\nlet v: Vec<u8> = vec![1, 2];\n```\n\n\
+        Paragraph after the fence with <b>inline</b> HTML.\n\n\
+        <pre>\nblock\n\nstill the same block\n</pre>\n\n\
+        Final paragraph mentioning Option<Box<T>> and [x] items.\n";
+    let mut cache = StreamingRows::default();
+    let mut advanced = false;
+    for end in (1..=reply.len()).filter(|end| reply.is_char_boundary(*end)) {
+        let source = &reply[..end];
+        let streamed = cache.render(source, 80, &theme);
+        assert_eq!(
+            *streamed,
+            answer_rows(source, 80, &theme, true),
+            "streamed rows diverged at byte {end}"
+        );
+        advanced |= cache.cut > 0;
+    }
+    assert!(
+        advanced,
+        "the cache froze a prefix despite brackets in the reply"
+    );
+}
+
+#[test]
+#[ignore = "manual streaming rendering measurement with brackets in the reply"]
+fn streaming_render_bracket_measurement() {
+    let theme = Theme::dark();
+    for (label, early) in [
+        ("plain", "Plain opening sentence for the reply.\n\n"),
+        (
+            "Vec<T> early",
+            "Uses a `Vec<T>` in the first paragraph.\n\n",
+        ),
+    ] {
+        let paragraph = "A streamed answer with **styled words**, a number 42, and ordinary prose that wraps across terminal rows.\n\n";
+        let mut source = String::from(early);
+        source.push_str(&paragraph.repeat(200));
+        let source = &source[..20_000];
+        let mut cache = StreamingRows::default();
+        let before = std::time::Instant::now();
+        for end in (40..=source.len()).step_by(40) {
+            std::hint::black_box(cache.render(&source[..end], 100, &theme));
+        }
+        eprintln!("{label}: 20KB / 40-byte deltas: {:?}", before.elapsed());
+    }
+}

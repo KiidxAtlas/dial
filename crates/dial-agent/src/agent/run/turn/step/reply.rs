@@ -1,6 +1,9 @@
 //! Reconcile a received reply, recover unusable output and accept tool-free completion.
 use super::*;
 
+/// Text answers tolerated while an investigation checkpoint is open before the turn stops.
+const EXPLORATION_REMINDER_LIMIT: u32 = 2;
+
 impl Agent<'_> {
     pub(super) fn process_reply_or_finish(
         &mut self,
@@ -463,6 +466,23 @@ impl Agent<'_> {
                 ));
             }
             if self.exploration.active.is_some() {
+                // Each reminder is a paid request and the default step limit is unbounded: a model
+                // that keeps answering in text (or cannot see `rewind`) must not loop forever.
+                if turn.exploration_reminders >= EXPLORATION_REMINDER_LIMIT {
+                    return Ok(ControlFlow::Break(
+                        crate::agent::run::engine::Tick::Finished(TurnReport {
+                            text: format!(
+                                "{}\n\n[Dial] Stopped: an investigation checkpoint is still open and the model answered without calling rewind after {EXPLORATION_REMINDER_LIMIT} reminders.",
+                                reply.text
+                            ),
+                            outcome: TurnOutcome::Incomplete,
+                            steps: sent.step + 1,
+                            interrupted: false,
+                            trajectory: None,
+                        }),
+                    ));
+                }
+                turn.exploration_reminders += 1;
                 self.push(json!({"role":"user","dial_exploration_reminder":true,
                         "content":"Investigation checkpoint is active. Call rewind with your findings before finishing; the report replaces intermediate context, not actual effects or current user instructions."}))?;
                 return Ok(ControlFlow::Break(crate::agent::run::engine::Tick::Again));
@@ -508,7 +528,11 @@ impl Agent<'_> {
             if self.await_background_jobs(ui) {
                 return Ok(ControlFlow::Break(crate::agent::run::engine::Tick::Again));
             }
+            let route = self.route.generation();
             if self.before_yield(backend, &turn.names, &mut turn.pending_nudges, ui)? {
+                if self.route.generation() != route {
+                    turn.max_tokens = backend.output_budget(turn.harness.max_tokens);
+                }
                 return Ok(ControlFlow::Break(crate::agent::run::engine::Tick::Again));
             }
             match turn.completion.stopped(&self.todo) {

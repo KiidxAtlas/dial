@@ -102,6 +102,55 @@ fn now_ms() -> u64 {
 /// Worker shards expose only this UTF-8 tail; complete answers live in result/artifact records.
 pub(super) const WORKER_TAIL_LIMIT: usize = 16 * 1024;
 
+/// Live text a running tool body retains. Interfaces stream tool output through their own bounded
+/// buffers and the settled result replaces this text, so the body keeps a prefix-stable head
+/// (byte-cursor deltas stay valid) instead of growing without bound with a command's output.
+pub(super) const TOOL_STREAM_LIMIT: usize = 1024 * 1024;
+/// Appended once when a running tool body stops retaining live output.
+pub(super) const TOOL_STREAM_MARKER: &str =
+    "\n[further live output omitted; the tool result reports the outcome]\n";
+/// Text a snapshot keeps when the whole node would exceed the stream journal's row limit.
+const OVERSIZED_TEXT_TAIL: usize = 64 * 1024;
+
+/// The part of `text` a running tool body may still append: everything, a cut prefix followed by
+/// [`TOOL_STREAM_MARKER`], or nothing once the marker has been written.
+fn tool_stream_chunk<'a>(retained: usize, text: &'a str) -> Option<std::borrow::Cow<'a, str>> {
+    let reserve = TOOL_STREAM_LIMIT - TOOL_STREAM_MARKER.len();
+    if retained >= reserve {
+        return None;
+    }
+    let room = reserve - retained;
+    if text.len() <= room {
+        return Some(std::borrow::Cow::Borrowed(text));
+    }
+    let keep = text.floor_char_boundary(room);
+    Some(std::borrow::Cow::Owned(format!(
+        "{}{TOOL_STREAM_MARKER}",
+        &text[..keep]
+    )))
+}
+
+/// Shrinks a node whose snapshot the journal refused as oversized: its text keeps a bounded tail
+/// and oversized structured data is replaced by a note, so the update can still be published.
+fn shrink_for_journal(node: &mut Node) {
+    if node.result.text.len() > OVERSIZED_TEXT_TAIL {
+        let kept = tail(&node.result.text, OVERSIZED_TEXT_TAIL).to_owned();
+        node.result.text =
+            format!("[earlier text omitted: exceeded the runtime journal row limit]\n{kept}");
+    }
+    let oversized_data = node
+        .result
+        .data
+        .as_ref()
+        .and_then(|data| serde_json::to_vec(data).ok())
+        .is_some_and(|bytes| bytes.len() > OVERSIZED_TEXT_TAIL);
+    if oversized_data {
+        node.result.data = Some(serde_json::json!({
+            "omitted": "result data exceeded the runtime journal row limit"
+        }));
+    }
+}
+
 /// Drop complete leading characters until at most `limit` bytes remain.
 fn tail(text: &str, limit: usize) -> &str {
     let mut cut = text.len().saturating_sub(limit);
@@ -156,7 +205,14 @@ impl Body {
                 return;
             }
             next.result.revision = next.result.revision.saturating_add(1);
-            journal.snapshot(&next);
+            if !journal.snapshot(&next) {
+                // One oversized update must not stop the session's journal: publish a bounded
+                // version of it instead. If even that is refused, the live body stays unchanged.
+                shrink_for_journal(&mut next);
+                if !journal.snapshot(&next) {
+                    return;
+                }
+            }
             if journal.check().is_ok() {
                 *node = next;
                 mark_dirty(&self.2, &node.id);
@@ -240,16 +296,23 @@ impl Body {
         let revision = node.result.revision.saturating_add(1);
         let retain_bytes =
             (node.kind == "worker").then(|| WORKER_TAIL_LIMIT.saturating_sub(text.len()));
+        let chunk;
         let text = if retain_bytes.is_some() {
             tail(text, WORKER_TAIL_LIMIT)
+        } else if node.kind == "tool" {
+            let Some(bounded) = tool_stream_chunk(node.result.text.len(), text) else {
+                return;
+            };
+            chunk = bounded;
+            &chunk
         } else {
             text
         };
-        if let Some(journal) = &self.1 {
-            journal.text_tail(&node.id, revision, text, retain_bytes);
-            if journal.check().is_err() {
-                return;
-            }
+        if let Some(journal) = &self.1
+            && (!journal.text_tail(&node.id, revision, text, retain_bytes)
+                || journal.check().is_err())
+        {
+            return;
         }
         if let Some(retain_bytes) = retain_bytes {
             append_tail(&mut node.result.text, text, retain_bytes);

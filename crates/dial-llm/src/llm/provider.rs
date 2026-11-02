@@ -2175,6 +2175,8 @@ pub(super) fn anthropic_exchange_shaped(
         headers,
     );
     validate_anthropic_compaction_scope(req, &replay_scope, model)?;
+    let origin = llm::host_of(url);
+    let req = &*anthropic_replayable_history(req, origin.as_deref());
     let mut body = anthropic_request_body(model, req, claude_code_oauth, profile)?;
     let streaming = on_text.is_some();
     body["stream"] = serde_json::json!(streaming);
@@ -2265,7 +2267,7 @@ pub(super) fn anthropic_exchange_shaped(
         llm::usage::transport_attempt()?;
         // Compact JSON: ureq's send_json pretty-prints and the indentation is billed as prompt tokens.
         let bytes = serde_json::to_vec(&wire)?;
-        llm::wire::record(&bytes, "http");
+        llm::wire::record_value(&bytes, &wire, "http");
         let mut response = request
             .header("Content-Type", "application/json")
             .send(&bytes)
@@ -2348,6 +2350,7 @@ pub(super) fn anthropic_exchange_shaped(
                 }
             }
         }
+        reply.provider_origin = origin;
         return Ok(reply);
     }
     let mut bytes = Vec::new();
@@ -2383,7 +2386,37 @@ pub(super) fn anthropic_exchange_shaped(
     {
         return Err(llm::Interrupted.into());
     }
+    reply.provider_origin = origin;
     Ok(reply)
+}
+
+/// Opaque Anthropic content (signed thinking, server tool blocks) replays only to the host that
+/// produced it. Several providers speak the Anthropic protocol; their signatures are not valid on
+/// each other's APIs, so a turn from another origin is sent as its portable text and tool calls.
+/// Messages stored before origins were recorded keep replaying natively, as before.
+fn anthropic_replayable_history<'a>(
+    req: &'a Chat,
+    origin: Option<&str>,
+) -> std::borrow::Cow<'a, Chat> {
+    let foreign = |message: &serde_json::Value| {
+        message["dial_provider_content"].is_array()
+            && message["dial_provider_origin"]
+                .as_str()
+                .is_some_and(|stored| Some(stored) != origin)
+    };
+    if !req.messages.iter().any(foreign) {
+        return std::borrow::Cow::Borrowed(req);
+    }
+    let mut portable = req.clone();
+    for message in &mut portable.messages {
+        if foreign(message)
+            && let Some(object) = message.as_object_mut()
+        {
+            object.remove("dial_provider_content");
+            object.remove("dial_provider_origin");
+        }
+    }
+    std::borrow::Cow::Owned(portable)
 }
 
 #[cfg(test)]

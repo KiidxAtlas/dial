@@ -249,6 +249,19 @@ impl EditStore {
         raw_revision: Option<[u8; 32]>,
         seen: &[(usize, usize)],
     ) -> String {
+        self.record_placed(path, lf, raw_revision, seen, false)
+    }
+    /// `oldest` places a path the store did not hold at the old end of the eviction order before
+    /// eviction runs, so it can never push out a file that was read or edited.
+    fn record_placed(
+        &mut self,
+        path: &Path,
+        lf: &str,
+        raw_revision: Option<[u8; 32]>,
+        seen: &[(usize, usize)],
+        oldest: bool,
+    ) -> String {
+        let oldest = oldest && !self.files.contains_key(path);
         let digest: [u8; 32] = Sha256::digest(lf.as_bytes()).into();
         let tag = format!("{:02X}{:02X}", digest[0], digest[1]);
         self.observation_id = self.observation_id.wrapping_add(1);
@@ -279,7 +292,11 @@ impl EditStore {
             }
         }
         self.lru.retain(|p| p != path);
-        self.lru.push(path.to_path_buf());
+        if oldest {
+            self.lru.insert(0, path.to_path_buf());
+        } else {
+            self.lru.push(path.to_path_buf());
+        }
         self.evict();
         tag
     }
@@ -306,18 +323,33 @@ impl EditStore {
     }
 
     fn evict(&mut self) {
+        // Over the byte budget, superseded snapshots go first (oldest file first), so a large file
+        // edited many times does not push whole other files out of the store.
+        while self.bytes() > MAX_STORE_BYTES {
+            let Some(path) = self
+                .lru
+                .iter()
+                .find(|path| self.files.get(*path).is_some_and(|snaps| snaps.len() > 1))
+                .cloned()
+            else {
+                break;
+            };
+            if let Some(snaps) = self.files.get_mut(&path) {
+                snaps.remove(0);
+            }
+        }
         while self.lru.len() > MAX_FILES || (self.bytes() > MAX_STORE_BYTES && self.lru.len() > 1) {
             let oldest = self.lru.remove(0);
             self.files.remove(&oldest);
             self.observations.remove(&oldest);
         }
-        // A single huge file keeps only its newest snapshot.
-        while self.bytes() > MAX_STORE_BYTES {
-            let Some(snaps) = self.files.values_mut().find(|s| s.len() > 1) else {
-                break;
-            };
-            snaps.remove(0);
-        }
+    }
+
+    /// Records witnesses that came from a broad search page. A file the store already holds is
+    /// refreshed as usual; a new one enters at the old end of the eviction order, so one wide grep
+    /// page cannot evict the files the model read or edited.
+    pub fn record_search(&mut self, path: &Path, lf: &str, seen: &[(usize, usize)]) -> String {
+        self.record_placed(path, lf, None, seen, true)
     }
 
     fn snapshot(&self, path: &Path, tag: &str) -> Option<&Snapshot> {

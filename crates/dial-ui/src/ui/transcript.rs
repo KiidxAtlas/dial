@@ -443,18 +443,38 @@ impl StreamingRows {
             self.prefix = std::sync::Arc::new(Vec::new());
             return std::sync::Arc::new(answer_rows(source, width, theme, true));
         }
-        if source[self.cut..].contains(['[', '<']) || width == 0 {
+        if width == 0 {
             let rendered = answer_rows(&source[self.cut..], width, theme, self.prefix.is_empty());
             return join_rows(&self.prefix, rendered);
         }
         let tail = &source[self.cut..];
-        let cut = stable_cuts(tail, 0).into_iter().rev().find(|&cut| {
+        let starts_paragraph = |cut: usize| {
             tail[cut..]
                 .trim_start_matches(['\n', '\r'])
                 .chars()
                 .next()
                 .is_some_and(char::is_alphanumeric)
-        });
+        };
+        let cut = if tail.contains(['[', '<']) {
+            // Links, generics, comparisons and inline HTML are in nearly every coding reply. The
+            // line heuristic cannot see HTML blocks that span blank lines, so it used to give up and
+            // re-render the whole remaining reply on every frame. The parser's own top-level block
+            // boundaries are safe for them; block structure does not depend on the width.
+            let clean = text::sanitize(tail);
+            if clean == tail {
+                markdown::render_split(&clean, width, theme)
+                    .1
+                    .map(|(cut, _)| cut)
+                    .filter(|&cut| cut > 0 && starts_paragraph(cut))
+            } else {
+                None
+            }
+        } else {
+            stable_cuts(tail, 0)
+                .into_iter()
+                .rev()
+                .find(|&cut| starts_paragraph(cut))
+        };
         if let Some(cut) = cut {
             let first = self.prefix.is_empty();
             let rows = answer_rows(&tail[..cut], width, theme, first);
@@ -1566,11 +1586,14 @@ impl Transcript {
                         .and_then(|p| p.strip_prefix("tool: "))
                         .filter(|_| running)
                         .map(str::to_owned);
+                    // A running worker's elapsed time is shown in whole seconds; at millisecond
+                    // resolution the row compared unequal on every paint and the whole task card
+                    // re-rendered every frame while any worker ran.
                     let elapsed_ms = d["elapsed_ms"].as_u64().or_else(|| {
                         d["started_ms"]
                             .as_u64()
                             .filter(|_| running)
-                            .map(|s| now_ms.saturating_sub(s))
+                            .map(|s| now_ms.saturating_sub(s) / 1000 * 1000)
                     });
                     let preview = if running {
                         w.result

@@ -108,6 +108,9 @@ struct ControlJob {
     settings: Arc<Mutex<control::SettingsSlot>>,
     workspace: Workspace,
     acceptance: Mutex<Option<crate::agent::verify::worker_acceptance::Acceptance>>,
+    /// Set when the owner stops the worker by going away (quit, rebuild), not by a cancel request:
+    /// its transcript then closes as `interrupted`, which `--restore` resumes, not `cancelled`.
+    owner_shutdown: AtomicBool,
 }
 
 fn body_status(body: &crate::runtime::Body) -> Value {
@@ -1219,6 +1222,7 @@ impl LiveTasks {
                 settings: settings.clone(),
                 workspace: workspace.clone(),
                 acceptance: Mutex::new(None),
+                owner_shutdown: AtomicBool::new(false),
             });
             let wake_signals = signals.clone();
             let wake_interruptible = interruptible.clone();
@@ -1346,7 +1350,11 @@ impl LiveTasks {
                     slot.retire_backend();
                 }
                 let status = if outcome.status.phase == crate::runtime::Phase::Interrupted {
-                    "cancelled"
+                    if control.owner_shutdown.load(Ordering::SeqCst) {
+                        "interrupted"
+                    } else {
+                        "cancelled"
+                    }
                 } else {
                     outcome.status.wire()
                 };
@@ -1864,6 +1872,12 @@ fn watch(status: &mut Value, now_ms: u64, stall_secs: u64) {
 const SLOW_AFTER_STALLS: u64 = 3;
 impl Drop for LiveTasks {
     fn drop(&mut self) {
+        // The owner is going away, not cancelling the work: workers stopped here stay restorable.
+        for job in self.jobs.values() {
+            if let Some(control) = &job.control {
+                control.owner_shutdown.store(true, Ordering::SeqCst);
+            }
+        }
         self.cancel_all();
         for job in self.jobs.values_mut() {
             if let Some(worker) = job.worker.take() {

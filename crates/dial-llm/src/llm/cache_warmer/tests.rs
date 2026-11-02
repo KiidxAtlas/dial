@@ -160,3 +160,29 @@ fn a_new_real_turn_replaces_the_armed_request() {
         .unwrap();
     assert_eq!(warmer.due(), Some(later + Duration::from_secs(240)));
 }
+
+#[test]
+fn idle_replays_stop_once_their_combined_cost_exceeds_the_single_miss_they_prevent() {
+    // 1M-token prefix, short tier: each replay costs ~$0.30, the avoided miss $3.45, and an idle
+    // user returns with probability 0.2, so the expected saving is ~$0.69: two replays, not 14.
+    let mut warmer = Warmer::default();
+    let start = Instant::now();
+    warmer
+        .arm(
+            &chat(),
+            1_000_000,
+            Some(pricing()),
+            Tier::Short,
+            Mode::Idle,
+            start,
+        )
+        .unwrap();
+    let step = SHORT_LIFETIME - REFRESH_LEAD;
+    assert!(warmer.replay(start + step).unwrap().is_some());
+    assert!(warmer.replay(start + step * 2).unwrap().is_some());
+    assert!(matches!(
+        warmer.replay(start + step * 3),
+        Err(Stop::NotWorthIt)
+    ));
+    assert!(warmer.due().is_none(), "the warmer disarmed");
+}
