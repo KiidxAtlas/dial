@@ -65,6 +65,7 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ### Changed
 
+- `find` reuses its parsed-source evidence across calls on repositories larger than its cache: entries are indexed by path, the cache holds up to 4096 files (within the existing 32 MiB bound), and eviction never displaces an entry the current retrieval already used, so repeated sweeps hit instead of re-tokenizing every file. Fuzzy edit matching skips windows whose length-based upper bound cannot affect the result and normalizes each file line once instead of once per window. Idle background-job readers back off from 10 ms to 100 ms polling.
 - Isolate release signing behind a protected environment, require exact-SHA push-to-main CI,
   publish curated version-specific changelog notes, and broaden platform lint/feature coverage.
   Container digest signing uses pinned Cosign with GitHub OIDC. Repository-owner protection

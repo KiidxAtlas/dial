@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 
 pub(super) const MAX_CACHE_BYTES: usize = 32 * 1024 * 1024;
-const MAX_CACHE_ENTRIES: usize = 128;
+const MAX_CACHE_ENTRIES: usize = 4096;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct Identity {
@@ -131,44 +131,90 @@ struct Entry {
     revision: [u8; 32],
     source: Arc<Source>,
     bytes: usize,
+    /// Position in `Cache::order`; larger is more recent.
+    stamp: u64,
+    /// The sweep (one `find` retrieval) that last used this entry.
+    sweep: u64,
 }
+type Key = (PathBuf, PathBuf);
+/// Keyed by (scope, file) with a recency index. Eviction is scan-resistant: a retrieval sweeps
+/// every candidate file in order, which under plain LRU on a repository larger than the cache
+/// evicts each entry just before the next sweep needs it (no hits at all). Entries used in the
+/// current sweep are never evicted to admit new ones, so later sweeps hit what earlier ones kept.
 #[derive(Default)]
 struct Cache {
-    // Oldest first. A tiny fixed entry ceiling makes a linear LRU boring and bounded.
-    entries: Vec<((PathBuf, PathBuf), Entry)>,
+    entries: std::collections::HashMap<Key, Entry>,
+    order: BTreeMap<u64, Key>,
+    next_stamp: u64,
+    sweep: u64,
     bytes: usize,
 }
 impl Cache {
-    fn remove(&mut self, index: usize) -> Entry {
-        let (_, entry) = self.entries.remove(index);
+    fn remove(&mut self, key: &Key) -> Option<Entry> {
+        let entry = self.entries.remove(key)?;
+        self.order.remove(&entry.stamp);
         self.bytes -= entry.bytes;
-        entry
+        Some(entry)
+    }
+    fn insert(&mut self, key: Key, mut entry: Entry) {
+        self.remove(&key);
+        entry.stamp = self.next_stamp;
+        entry.sweep = self.sweep;
+        self.next_stamp += 1;
+        self.bytes += entry.bytes;
+        self.order.insert(entry.stamp, key.clone());
+        self.entries.insert(key, entry);
+    }
+    /// Makes room for `bytes` by evicting entries the current sweep has not used, oldest first.
+    /// `false` when only entries this sweep relies on are left.
+    fn make_room(&mut self, bytes: usize) -> bool {
+        while self.entries.len() >= MAX_CACHE_ENTRIES || self.bytes + bytes > MAX_CACHE_BYTES {
+            let Some(key) = self.order.values().next().cloned() else {
+                return false;
+            };
+            if self
+                .entries
+                .get(&key)
+                .is_some_and(|entry| entry.sweep == self.sweep)
+            {
+                return false;
+            }
+            self.remove(&key);
+        }
+        true
+    }
+    fn keys_where(&self, mut keep: impl FnMut(&Key, &Entry) -> bool) -> Vec<Key> {
+        self.entries
+            .iter()
+            .filter(|(key, entry)| !keep(key, entry))
+            .map(|(key, _)| key.clone())
+            .collect()
     }
 }
 static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(|| Mutex::new(Cache::default()));
 pub(super) fn invalidate(path: &Path) {
     if let Ok(mut cache) = CACHE.lock() {
-        for index in (0..cache.entries.len()).rev() {
-            let (root, file) = &cache.entries[index].0;
-            if file.starts_with(path) || root.starts_with(path) {
-                cache.remove(index);
-            }
+        let stale =
+            cache.keys_where(|(root, file), _| !(file.starts_with(path) || root.starts_with(path)));
+        for key in stale {
+            cache.remove(&key);
         }
     }
 }
+/// Drops entries of `root` whose file changed, and starts a new retrieval sweep.
 pub(super) fn prune(root: &Path) {
     if let Ok(mut cache) = CACHE.lock() {
-        for index in (0..cache.entries.len()).rev() {
-            let ((scope, path), entry) = &cache.entries[index];
-            if scope == root
-                && !fs::symlink_metadata(path).is_ok_and(|meta| {
+        cache.sweep += 1;
+        let stale = cache.keys_where(|(scope, path), entry| {
+            scope != root
+                || fs::symlink_metadata(path).is_ok_and(|meta| {
                     meta.is_file()
                         && !meta.file_type().is_symlink()
                         && Identity::of(&meta) == entry.identity
                 })
-            {
-                cache.remove(index);
-            }
+        });
+        for key in stale {
+            cache.remove(&key);
         }
     }
 }
@@ -181,20 +227,14 @@ pub(super) fn evidence(
     text: &str,
     accepts: impl FnOnce(&Source) -> bool,
 ) -> Option<Arc<Source>> {
+    let key: Key = (root.to_path_buf(), path.to_path_buf());
     let cached = CACHE.lock().ok().and_then(|mut cache| {
-        let index = cache
-            .entries
-            .iter()
-            .position(|((scope, file), _)| scope == root && file == path)?;
-        let entry = cache.remove(index);
+        let entry = cache.remove(&key)?;
         if entry.identity != *identity || entry.revision != revision {
             return None;
         }
         let source = Arc::clone(&entry.source);
-        cache.bytes += entry.bytes;
-        cache
-            .entries
-            .push(((root.to_path_buf(), path.to_path_buf()), entry));
+        cache.insert(key.clone(), entry);
         Some(source)
     });
     let was_cached = cached.is_some();
@@ -215,26 +255,23 @@ pub(super) fn evidence(
         && let Ok(mut cache) = CACHE.lock()
     {
         // A concurrent reader may have installed this path while we parsed it.
-        if let Some(index) = cache
-            .entries
-            .iter()
-            .position(|((scope, file), _)| scope == root && file == path)
-        {
-            cache.remove(index);
+        cache.remove(&key);
+        if cache.make_room(bytes) {
+            cache.insert(
+                key,
+                Entry {
+                    identity: identity.clone(),
+                    revision,
+                    source: Arc::clone(&source),
+                    bytes,
+                    stamp: 0,
+                    sweep: 0,
+                },
+            );
         }
-        while cache.entries.len() >= MAX_CACHE_ENTRIES || cache.bytes + bytes > MAX_CACHE_BYTES {
-            cache.remove(0);
-        }
-        cache.bytes += bytes;
-        cache.entries.push((
-            (root.to_path_buf(), path.to_path_buf()),
-            Entry {
-                identity: identity.clone(),
-                revision,
-                source: Arc::clone(&source),
-                bytes,
-            },
-        ));
     }
     accepted.then_some(source)
 }
+
+#[cfg(test)]
+mod tests;

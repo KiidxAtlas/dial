@@ -189,6 +189,9 @@ impl Ring {
 /// is observed even while an escaped descendant keeps the pipe open. Once stopped, a reader drains
 /// for at most [`DRAIN_GRACE`], closes its read side and finalizes the spool; a stream that never
 /// reached EOF is published as explicitly incomplete.
+const IDLE_POLL_MIN: Duration = Duration::from_millis(10);
+const IDLE_POLL_MAX: Duration = Duration::from_millis(100);
+
 fn spawn_reader<R: Read + Send + 'static>(
     mut pipe: R,
     terminal: bool,
@@ -204,6 +207,9 @@ fn spawn_reader<R: Read + Send + 'static>(
             let mut read_failed = false;
             let mut reached_eof = false;
             let mut stopped_at: Option<Instant> = None;
+            // Idle polling backs off from 10 ms to 100 ms: a quiet long-running job no longer wakes
+            // its reader 100 times a second, while fresh output resets the interval.
+            let mut idle = IDLE_POLL_MIN;
             loop {
                 if stop.load(Ordering::Acquire)
                     && stopped_at.get_or_insert_with(Instant::now).elapsed() >= DRAIN_GRACE
@@ -226,12 +232,14 @@ fn spawn_reader<R: Read + Send + 'static>(
                         }
                         lock(&ring).push(&buffer[..count]);
                         wake::notify();
+                        idle = IDLE_POLL_MIN;
                     }
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                     // Nonblocking readers report "no bytes yet" as WouldBlock. That is not a capture
                     // failure (and must not kill the process); wait briefly and re-check `stop`.
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(10));
+                        std::thread::sleep(idle);
+                        idle = (idle * 2).min(IDLE_POLL_MAX);
                     }
                     // Linux PTY masters report EIO when the last slave is closed.
                     #[cfg(unix)]
