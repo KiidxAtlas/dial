@@ -24,6 +24,10 @@ pub(super) struct Files {
     root: Option<PathBuf>,
     requested: Instant,
     running: bool,
+    /// Digest of the last listing handed out. The 30 s rescan usually finds the same files; an
+    /// unchanged listing is not handed out again, so it neither restarts the composer's vocabulary
+    /// scan nor repeats a "partial" notice.
+    delivered: Option<u64>,
 }
 pub(super) struct Listing {
     pub paths: Vec<String>,
@@ -68,6 +72,7 @@ impl Files {
             root: None,
             requested: Instant::now() - CACHE_TTL,
             running: false,
+            delivered: None,
         }
     }
     pub fn stop(&self) {
@@ -100,6 +105,18 @@ impl Files {
             && generation == self.shared.generation.load(Ordering::Acquire)
         {
             self.running = false;
+            let digest = {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                self.root.hash(&mut hasher);
+                listing.paths.hash(&mut hasher);
+                listing.diagnostic.hash(&mut hasher);
+                hasher.finish()
+            };
+            if self.delivered == Some(digest) {
+                return None;
+            }
+            self.delivered = Some(digest);
             return Some(listing);
         }
         None

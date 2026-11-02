@@ -52,3 +52,33 @@ fn over_cap_discovery_is_bounded_and_disclosed() {
     assert!(listing.paths.len() <= 2);
     assert!(listing.diagnostic.is_some());
 }
+
+#[test]
+fn an_unchanged_rescan_is_not_handed_out_again() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
+    let mut files = Files::new();
+    let wait = |files: &mut Files| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(listing) = files.poll() {
+                return Some(listing);
+            }
+            if !files.running || Instant::now() > deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    files.request(dir.path());
+    assert!(wait(&mut files).is_some(), "the first listing is delivered");
+    // The periodic rescan finds the same files: nothing new reaches the composer.
+    files.requested = Instant::now() - CACHE_TTL - Duration::from_secs(1);
+    files.request(dir.path());
+    assert!(wait(&mut files).is_none());
+    // A new file is a change again.
+    std::fs::write(dir.path().join("b.rs"), "fn b() {}").unwrap();
+    files.requested = Instant::now() - CACHE_TTL - Duration::from_secs(1);
+    files.request(dir.path());
+    assert!(wait(&mut files).is_some_and(|listing| listing.paths.len() == 2));
+}

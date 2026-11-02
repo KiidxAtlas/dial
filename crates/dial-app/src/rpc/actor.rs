@@ -226,6 +226,7 @@ impl Actor {
                     ui,
                     compute: None,
                     projected_messages,
+                    projected_at: std::time::Instant::now(),
                     parked,
                     current,
                 };
@@ -241,6 +242,9 @@ impl Actor {
 
 /// Session and execution state owned by the actor thread. The controller still communicates only
 /// through the existing channels, flags and query projection.
+/// Shortest gap between projection rebuilds driven only by runtime (worker) changes.
+const PROJECTION_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
 struct ActorRuntime<'a> {
     // Fields drop in declaration order: parked sessions and UI before the agent, then its
     // compute lease, matching the former run-local cleanup order on errors and panics.
@@ -262,6 +266,8 @@ struct ActorRuntime<'a> {
     worker_query_cache: Arc<Mutex<QueryProjection>>,
     worker_live: Arc<Mutex<LiveState>>,
     projected_messages: usize,
+    /// When the query projection was last rebuilt.
+    projected_at: std::time::Instant,
     current: bool,
 }
 
@@ -364,7 +370,14 @@ impl ActorRuntime<'_> {
         // Idle work (background workers, compaction) can change state without any actor
         // command. Republish the projection only when runtime or history changed.
         let messages = self.agent.session().message_count();
-        if std::mem::take(&mut self.ui.projection_dirty) || messages != self.projected_messages {
+        // Streaming workers mark the projection dirty on almost every idle tick, and a rebuild
+        // copies the whole execution tree under the cache lock. Runtime-only changes republish at
+        // most every PROJECTION_INTERVAL; a history change still republishes at once.
+        let runtime_due =
+            self.ui.projection_dirty && self.projected_at.elapsed() >= PROJECTION_INTERVAL;
+        if runtime_due || messages != self.projected_messages {
+            self.ui.projection_dirty = false;
+            self.projected_at = std::time::Instant::now();
             self.projected_messages = messages;
             query_snapshot(
                 &self.agent,
