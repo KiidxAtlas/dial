@@ -49,7 +49,17 @@ head="$(git rev-parse HEAD)"
 [[ "$head" == "$(git rev-parse origin/main)" ]] || { echo "HEAD must match origin/main; push and let CI pass first" >&2; exit 1; }
 if command -v gh >/dev/null 2>&1; then
   ci="$(gh run list --workflow ci.yml --commit "$head" --event push --branch main --json status,conclusion --jq '[.[] | select(.status == "completed" and .conclusion == "success")] | length')"
-  [[ "$ci" -gt 0 ]] || { echo "no successful CI run for $head yet; wait for CI (gh run list --commit $head)" >&2; exit 1; }
+  if [[ "$ci" -eq 0 ]]; then
+    echo "no successful CI run for $head yet; wait for CI (gh run list --commit $head)" >&2
+    # Surface every failing job of the latest run so all blockers are visible before a retry.
+    run="$(gh run list --workflow ci.yml --commit "$head" --event push --branch main --limit 1 --json databaseId,status,conclusion,url --jq '.[0] // empty | "\(.databaseId) \(.status) \(.conclusion) \(.url)"')"
+    if [[ -n "$run" ]]; then
+      read -r id status conclusion url <<<"$run"
+      echo "latest CI run: $status/$conclusion $url" >&2
+      gh run view "$id" --json jobs --jq '.jobs[] | select(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out") | "  failed: \(.name) (\(.conclusion)) \(.url)"' >&2 || true
+    fi
+    exit 1
+  fi
 else
   echo "gh is not installed; cannot confirm CI passed for $head" >&2
   exit 1

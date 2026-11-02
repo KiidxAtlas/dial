@@ -223,5 +223,5 @@ pub fn run(
 #[cfg(test)]
 mod tests;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod source_tests;

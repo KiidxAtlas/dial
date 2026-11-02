@@ -9975,6 +9975,8 @@ fn experience_teacher_is_opt_in_and_cannot_replace_recipe_evidence() {
             ..Default::default()
         },
     );
+    // Completion review also uses the coach route; this test isolates the teacher request.
+    e.config.verification.review.enabled = Some(false);
     std::fs::write(e.project.path().join("value.txt"), "old").unwrap();
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     a.turn("repair value", &mut Recorder::default()).unwrap();

@@ -2223,7 +2223,7 @@ fn reasoning_strategy_picker_browses_cancels_and_confirms_raw_values_including_d
     assert_eq!(o.current_path(path), Value::String("default".into()));
 
     for (keycode, raw) in [
-        (KeyCode::Down, "evidence_first"),
+        (KeyCode::Down, "gpt_goal_directed"),
         (KeyCode::Home, "default"),
     ] {
         send(&mut o, &rig.keys, key(KeyCode::Enter));

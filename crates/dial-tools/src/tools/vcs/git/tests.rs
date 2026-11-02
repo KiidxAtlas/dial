@@ -677,35 +677,68 @@ fn global_filter_activated_by_untracked_attributes_is_never_run_by_inspection() 
         "[filter \"global-audit\"]\nclean = touch global-filter-ran; cat\n",
     )
     .unwrap();
-    let root = dir.path().to_string_lossy().replace('\\', "/");
-    assert!(
-        Command::new("git")
-            .args(["config", "--file"])
-            .arg(&global)
-            .arg(format!("includeIf.gitdir:{root}/.path"))
-            .arg(&included)
-            .current_dir(dir.path())
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
+    // macOS temp paths reach Git through a symlink (/var -> /private/var); match either spelling so
+    // the positive control does not depend on how this Git version resolves the include pattern.
+    let mut roots = vec![dir.path().to_path_buf()];
+    if let Ok(real) = dir.path().canonicalize()
+        && real != dir.path()
+        && !real.to_string_lossy().starts_with(r"\\?\")
+    {
+        roots.push(real);
+    }
+    for root in &roots {
+        let root = root.to_string_lossy().replace('\\', "/");
+        assert!(
+            Command::new("git")
+                .args(["config", "--file"])
+                .arg(&global)
+                .arg("--add")
+                .arg(format!("includeIf.gitdir:{root}/.path"))
+                .arg(&included)
+                .current_dir(dir.path())
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
     std::fs::write(dir.path().join(".gitattributes"), "* filter=global-audit\n").unwrap();
     std::fs::write(dir.path().join("a.txt"), "modified\n").unwrap();
     // Establish that this is an execution risk, not merely an unused config entry.
+    let diff = Command::new("git")
+        .args(["diff", "--no-textconv"])
+        .env("GIT_CONFIG_GLOBAL", &global)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
     assert!(
-        Command::new("git")
-            .args(["diff", "--no-textconv"])
+        diff.status.success(),
+        "{}",
+        String::from_utf8_lossy(&diff.stderr)
+    );
+    let canary = dir.path().join("global-filter-ran");
+    if !canary.exists() {
+        let effective = Command::new("git")
+            .args([
+                "config",
+                "--show-origin",
+                "--get-regexp",
+                "filter|includeif",
+            ])
             .env("GIT_CONFIG_GLOBAL", &global)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .current_dir(dir.path())
             .output()
-            .unwrap()
-            .status
-            .success()
-    );
-    let canary = dir.path().join("global-filter-ran");
-    assert!(canary.exists());
+            .unwrap();
+        let version = Command::new("git").arg("--version").output().unwrap();
+        panic!(
+            "positive control: the global filter did not run; {} roots {roots:?}; effective config:\n{}{}",
+            String::from_utf8_lossy(&version.stdout).trim(),
+            String::from_utf8_lossy(&effective.stdout),
+            String::from_utf8_lossy(&effective.stderr)
+        );
+    }
     std::fs::remove_file(&canary).unwrap();
     let mut query = filter_config_query(dir.path());
     query

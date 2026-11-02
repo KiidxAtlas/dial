@@ -49,6 +49,11 @@ jobs:
             fi
             if ! jq -e 'any(.[]; .status != "completed")' <<<"$runs" >/dev/null && { [ "$runs" != '[]' ] || [ "$waited" -ge 300 ]; }; then
               echo "No successful main push CI for $GITHUB_SHA. Push to main and let CI pass before tagging." >&2
+              # List every failing job of the latest run so all blockers are visible at once.
+              latest="$(gh run list -R "$GITHUB_REPOSITORY" --workflow ci.yml --commit "$GITHUB_SHA" --event push --branch main --limit 1 --json databaseId --jq '.[0].databaseId // empty' || true)"
+              if [ -n "$latest" ]; then
+                gh run view "$latest" -R "$GITHUB_REPOSITORY" --json jobs --jq '.jobs[] | select(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out") | "::error title=CI job \(.conclusion)::\(.name) \(.url)"' || true
+              fi
               exit 1
             fi
             sleep 30
