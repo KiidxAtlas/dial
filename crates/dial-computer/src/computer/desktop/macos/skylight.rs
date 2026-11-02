@@ -1,8 +1,6 @@
 use std::{
     ffi::{CStr, c_void},
     mem,
-    os::raw::{c_char, c_int, c_uint},
-    ptr,
     sync::{
         LazyLock,
         atomic::{AtomicBool, Ordering},
@@ -46,6 +44,7 @@ const FOREGROUND_SETTLE: Duration = Duration::from_millis(40);
 
 unsafe extern "C" {
     fn CGEventSourceCounterForEventType(state: i32, event_type: u32) -> u32;
+    fn CGEventPostToPid(pid: pid_t, event: *mut c_void);
 }
 
 #[repr(C)]
@@ -67,12 +66,6 @@ type GetProcessPIDFn = unsafe extern "C" fn(*const ProcessSerialNumber, *mut pid
 type CGEventSetWindowLocationFn = unsafe extern "C" fn(*mut c_void, CGPoint);
 type SLPSSetFrontProcessWithOptionsFn =
     unsafe extern "C" fn(*const ProcessSerialNumber, u32, u32) -> i32;
-type SLEventSetAuthenticationMessageFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
-type ObjcGetClassFn = unsafe extern "C" fn(*const c_char) -> *mut c_void;
-type SelRegisterNameFn = unsafe extern "C" fn(*const c_char) -> *mut c_void;
-type ClassRespondsToSelectorFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> bool;
-type AuthenticationFactoryFn =
-    unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, c_int, c_uint) -> *mut c_void;
 
 #[derive(Clone, Copy)]
 struct PsnLookup {
@@ -113,15 +106,6 @@ struct ForegroundSpi {
     psn: PsnLookup,
 }
 
-#[derive(Clone, Copy)]
-struct AuthenticationSpi {
-    set_message: SLEventSetAuthenticationMessageFn,
-    objc_get_class: ObjcGetClassFn,
-    sel_register_name: SelRegisterNameFn,
-    class_responds: ClassRespondsToSelectorFn,
-    factory: AuthenticationFactoryFn,
-}
-
 /// The front process as `WindowServer` reports it. Unlike
 /// `NSWorkspace.frontmostApplication`, this does not depend on an `AppKit`
 /// run loop in this process observing activation changes.
@@ -132,9 +116,12 @@ struct FrontProcess {
 }
 
 static REQUIRED: LazyLock<Option<RequiredSpi>> = LazyLock::new(resolve_required);
-static AUTHENTICATION: LazyLock<Option<AuthenticationSpi>> = LazyLock::new(resolve_authentication);
 static FOREGROUND: LazyLock<Option<ForegroundSpi>> = LazyLock::new(resolve_foreground);
-static PROCESS_PID: LazyLock<Option<GetProcessPIDFn>> = LazyLock::new(|| symbol(c"GetProcessPID"));
+static PROCESS_PID: LazyLock<Option<GetProcessPIDFn>> = LazyLock::new(|| {
+    // SAFETY: GetProcessPID has the C ABI in GetProcessPIDFn (PSN input,
+    // writable pid_t output, OSStatus return); the system image stays loaded.
+    unsafe { symbol(c"GetProcessPID") }
+});
 
 pub(super) fn is_available() -> bool {
     required().is_ok() && takeover_available()
@@ -155,45 +142,63 @@ fn required() -> CoreResult<&'static RequiredSpi> {
 
 fn resolve_required() -> Option<RequiredSpi> {
     ensure_skylight_loaded()?;
-    let psn = PsnLookup {
-        main_connection: Some(symbol(c"CGSMainConnectionID")?),
-        get_window_owner: symbol(c"SLSGetWindowOwner"),
-        get_connection_psn: symbol(c"SLSGetConnectionPSN"),
-        get_process_for_pid: symbol(c"GetProcessForPID"),
+    // SAFETY: each name is paired with its native C function-pointer alias in
+    // PsnLookup; PSN is the repr(C) pair of u32 fields. SkyLight stays loaded.
+    let psn = unsafe {
+        PsnLookup {
+            main_connection: Some(symbol(c"CGSMainConnectionID")?),
+            get_window_owner: symbol(c"SLSGetWindowOwner"),
+            get_connection_psn: symbol(c"SLSGetConnectionPSN"),
+            get_process_for_pid: symbol(c"GetProcessForPID"),
+        }
     };
     if !psn.can_resolve() {
         return None;
     }
-    let post_to_pid: SLEventPostToPidFn = symbol(c"SLEventPostToPid")?;
-    Some(RequiredSpi {
-        post_to_pid,
-        public_post_to_pid: symbol::<SLEventPostToPidFn>(c"CGEventPostToPid")
-            .filter(|public| *public as usize != post_to_pid as usize),
-        set_integer: symbol(c"SLEventSetIntegerValueField")?,
-        post_record: symbol(c"SLPSPostEventRecordTo")?,
-        get_front: symbol(c"_SLPSGetFrontProcess")?,
-        set_window_location: symbol(c"CGEventSetWindowLocation")?,
-        psn,
-    })
+    // SAFETY: these names use the corresponding native C aliases in
+    // RequiredSpi (including CGPoint by value); all images stay loaded. Symbol
+    // presence is not ABI validation: these private signatures are an OS
+    // compatibility prerequisite, not something dlsym can check at runtime.
+    unsafe {
+        let post_to_pid: SLEventPostToPidFn = symbol(c"SLEventPostToPid")?;
+        Some(RequiredSpi {
+            post_to_pid,
+            public_post_to_pid: symbol::<SLEventPostToPidFn>(c"CGEventPostToPid")
+                .filter(|public| *public as usize != post_to_pid as usize),
+            set_integer: symbol(c"SLEventSetIntegerValueField")?,
+            post_record: symbol(c"SLPSPostEventRecordTo")?,
+            get_front: symbol(c"_SLPSGetFrontProcess")?,
+            set_window_location: symbol(c"CGEventSetWindowLocation")?,
+            psn,
+        })
+    }
 }
 
 fn resolve_foreground() -> Option<ForegroundSpi> {
     ensure_skylight_loaded()?;
-    let psn = PsnLookup {
-        main_connection: symbol(c"CGSMainConnectionID"),
-        get_window_owner: symbol(c"SLSGetWindowOwner"),
-        get_connection_psn: symbol(c"SLSGetConnectionPSN"),
-        get_process_for_pid: symbol(c"GetProcessForPID"),
+    // SAFETY: these names match the native C aliases in PsnLookup, with
+    // repr(C) PSN outputs. The framework handle is never unloaded.
+    let psn = unsafe {
+        PsnLookup {
+            main_connection: symbol(c"CGSMainConnectionID"),
+            get_window_owner: symbol(c"SLSGetWindowOwner"),
+            get_connection_psn: symbol(c"SLSGetConnectionPSN"),
+            get_process_for_pid: symbol(c"GetProcessForPID"),
+        }
     };
     if !psn.can_resolve() {
         return None;
     }
-    Some(ForegroundSpi {
-        set_front: symbol(c"_SLPSSetFrontProcessWithOptions")?,
-        get_front: symbol(c"_SLPSGetFrontProcess")?,
-        post_record: symbol(c"SLPSPostEventRecordTo")?,
-        psn,
-    })
+    // SAFETY: ForegroundSpi pairs each name with its native C alias (PSN
+    // pointers, u32 options and OSStatus returns); SkyLight remains loaded.
+    unsafe {
+        Some(ForegroundSpi {
+            set_front: symbol(c"_SLPSSetFrontProcessWithOptions")?,
+            get_front: symbol(c"_SLPSGetFrontProcess")?,
+            post_record: symbol(c"SLPSPostEventRecordTo")?,
+            psn,
+        })
+    }
 }
 
 pub(super) fn ensure_skylight_loaded() -> Option<()> {
@@ -206,15 +211,26 @@ pub(super) fn ensure_skylight_loaded() -> Option<()> {
     if *LOADED { Some(()) } else { None }
 }
 
-pub(super) fn symbol<T: Copy>(name: &CStr) -> Option<T> {
+/// Resolves one process-lived native function address.
+///
+/// # Safety
+/// T must be a function-pointer type with the exact ABI/signature of `name`.
+/// Its defining image must stay loaded for every use of the returned pointer.
+/// The size assertion alone does not establish T's validity or native ABI.
+pub(super) unsafe fn symbol<T: Copy>(name: &CStr) -> Option<T> {
+    assert_eq!(
+        mem::size_of::<T>(),
+        mem::size_of::<*mut c_void>(),
+        "SkyLight symbols must be pointer-sized"
+    );
     // SAFETY: `name` is NUL-terminated and RTLD_DEFAULT is valid for
     // process-wide lookup.
     let raw = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
     if raw.is_null() {
         return None;
     }
-    // SAFETY: Every callsite requests the exact C signature documented in its
-    // function-pointer alias.
+    // SAFETY: the caller guarantees T is the matching function-pointer type;
+    // the pointer is non-null and its size was checked before copying it.
     Some(unsafe { mem::transmute_copy::<*mut c_void, T>(&raw) })
 }
 
@@ -227,8 +243,8 @@ pub(super) fn set_fields(event: &CGEvent, fields: &[(u32, i64)]) -> CoreResult<(
     let spi = required()?;
     let ptr = event_ptr(event);
     for &(field, value) in fields {
-        // SAFETY: The event is alive for the call and `set_integer` passed the
-        // atomic exact-signature probe.
+        // SAFETY: event stays retained for this synchronous mutation. The
+        // resolver pairs this name with the C (CGEventRef, u32, i64) setter ABI.
         unsafe { (spi.set_integer)(ptr, field, value) };
     }
     Ok(())
@@ -238,8 +254,8 @@ pub(super) fn set_fields(event: &CGEvent, fields: &[(u32, i64)]) -> CoreResult<(
 /// its title bar, for hit-testing a pid-addressed pointer event.
 pub(super) fn set_window_location(event: &CGEvent, location: CGPoint) -> CoreResult<()> {
     let spi = required()?;
-    // SAFETY: The event is alive for the call and the setter passed the atomic
-    // exact-signature probe.
+    // SAFETY: event stays retained for this synchronous mutation; the resolver
+    // pairs the name with the C (CGEventRef, CGPoint) setter ABI.
     unsafe { (spi.set_window_location)(event_ptr(event), location) };
     Ok(())
 }
@@ -282,13 +298,19 @@ pub(super) fn post_keyboard(pid: pid_t, event: &CGEvent) -> CoreResult<()> {
         core_graphics::event::EventField::EVENT_SOURCE_USER_DATA,
         control::SYNTHETIC_EVENT_TAG,
     );
-    let spi = required()?;
-    attach_keyboard_authentication(pid, event);
-    // The authenticated SkyLight route reaches Chromium and AppKit. Posting the
-    // same event through the public per-pid queue as well would deliver every
-    // key twice. SAFETY: `event` remains retained and the exact symbol is part
-    // of the required atomic probe.
-    unsafe { (spi.post_to_pid)(pid, event_ptr(event)) };
+    let foreground = FOREGROUND.as_ref().is_some_and(|spi| {
+        front_process(spi.get_front).is_some_and(|front| front.pid == Some(pid))
+    });
+    if !foreground {
+        return Err(DesktopError::input_failed(
+            "background keyboard input is unavailable: macOS exposes no supported event-authentication ABI; use takeover mode to focus the target window, then retry",
+        ));
+    }
+    // Use the public API only for the foreground target. Never read CGEvent's private layout
+    // or report unsupported background authentication as a successful key delivery.
+    // SAFETY: this is the public CoreGraphics ABI (available since macOS 10.11); `event`
+    // retains a live CGEventRef through this synchronous call, and pid is a scalar target id.
+    unsafe { CGEventPostToPid(pid, event_ptr(event)) };
     Ok(())
 }
 
@@ -881,63 +903,6 @@ fn process_psn(lookup: PsnLookup, pid: pid_t, wid: u32) -> Option<ProcessSerialN
     } else {
         None
     }
-}
-
-fn resolve_authentication() -> Option<AuthenticationSpi> {
-    Some(AuthenticationSpi {
-        set_message: symbol(c"SLEventSetAuthenticationMessage")?,
-        objc_get_class: symbol(c"objc_getClass")?,
-        sel_register_name: symbol(c"sel_registerName")?,
-        class_responds: symbol(c"class_respondsToSelector")?,
-        factory: symbol(c"objc_msgSend")?,
-    })
-}
-
-fn attach_keyboard_authentication(pid: pid_t, event: &CGEvent) {
-    let Some(spi) = AUTHENTICATION.as_ref() else {
-        return;
-    };
-    // SAFETY: Both C strings are static; runtime lookup functions have their
-    // exact Objective-C ABI.
-    let class = unsafe { (spi.objc_get_class)(c"SLSEventAuthenticationMessage".as_ptr()) };
-    // SAFETY: The selector C string is static and NUL-terminated.
-    let selector =
-        unsafe { (spi.sel_register_name)(c"messageWithEventRecord:pid:version:".as_ptr()) };
-    if class.is_null() || selector.is_null() {
-        return;
-    }
-    // SAFETY: This guard is required because macOS 14 has the class but lacks
-    // the macOS 15+ factory selector.
-    if !unsafe { (spi.class_responds)(class, selector) } {
-        return;
-    }
-    // __CGEvent stores its SLSEventRecord pointer after CFRuntimeBase and a
-    // padded u32.
-    let event_raw = event_ptr(event);
-    let mut record = ptr::null_mut();
-    for offset in [24usize, 32, 16] {
-        // SAFETY: These are the known pointer-aligned candidate slots in
-        // __CGEvent; read_unaligned avoids alignment assumptions.
-        let candidate = unsafe {
-            ptr::read_unaligned(event_raw.cast::<u8>().add(offset).cast::<*mut c_void>())
-        };
-        if !candidate.is_null() {
-            record = candidate;
-            break;
-        }
-    }
-    if record.is_null() {
-        return;
-    }
-    // SAFETY: Class response was checked before invoking this exact factory
-    // signature.
-    let message = unsafe { (spi.factory)(class, selector, record, pid, 0) };
-    if message.is_null() {
-        return;
-    }
-    // SAFETY: The event and autoreleased authentication object are alive for the
-    // synchronous attachment.
-    unsafe { (spi.set_message)(event_raw, message) };
 }
 
 #[cfg(test)]

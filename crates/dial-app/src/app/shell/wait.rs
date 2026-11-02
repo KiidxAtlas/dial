@@ -59,7 +59,7 @@ impl Shell {
             {
                 return Ok(false);
             }
-            match fs2::FileExt::try_lock_shared(&lock) {
+            match std::fs::File::try_lock_shared(&lock).map_err(std::io::Error::from) {
                 Ok(()) => {
                     crate::learn::compute::register(
                         &app.layout.user_dir,
@@ -409,7 +409,8 @@ impl Shell {
         }
         let _lease = if app.config.compute_locks {
             let lock = auto::lock_file(&app.layout.user_dir.join("compute.lock"))?;
-            if let Err(error) = fs2::FileExt::try_lock_shared(&lock) {
+            if let Err(error) = std::fs::File::try_lock_shared(&lock).map_err(std::io::Error::from)
+            {
                 self.note("LoRA verification", format!("An improvement or training job holds local compute; retry F6 when it finishes. {error}"));
                 return Ok(());
             }

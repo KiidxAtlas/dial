@@ -73,7 +73,7 @@ fn immediate_stop_rejects_a_foreground_process() {
         )
         .unwrap();
     let lock = super::super::auto::lock_file(&state.join("control.lock")).unwrap();
-    lock.lock_exclusive().unwrap();
+    lock.lock().unwrap();
     let error = stop_legacy(home.path(), state.to_str().unwrap()).unwrap_err();
     assert!(error.to_string().contains("not a detached background"));
     assert!(!state.join("improvement.stop").exists());

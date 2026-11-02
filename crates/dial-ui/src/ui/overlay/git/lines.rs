@@ -312,6 +312,9 @@ impl GitOverlay {
     /// `space`, `s`, `u` (stage or unstage) and `x` (discard) on the marked lines. Stage and unstage act on
     /// the index, discard on the worktree.
     fn apply_lines(&mut self, discard: bool) {
+        if !self.mutation_ready() {
+            return;
+        }
         let Some(sel) = self.active_sel() else {
             return;
         };

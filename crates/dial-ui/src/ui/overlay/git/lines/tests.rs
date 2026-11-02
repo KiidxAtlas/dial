@@ -1,22 +1,8 @@
 use super::super::{GitOverlay, model::*};
 use super::{LineSel, changed_keys, span_bodies};
 use crate::git_panel::parse_diff;
+use crate::git_panel::testkit::git;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use std::path::Path;
-
-fn git(root: &Path, args: &[&str]) -> String {
-    let output = std::process::Command::new("git")
-        .current_dir(root)
-        .args(args)
-        .output()
-        .expect("git runs");
-    assert!(
-        output.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
 
 /// One hunk with two changed pairs: body lines are 0 ` one`, 1 `-two`, 2 `+TWO`, 3 ` three`,
 /// 4 `-four`, 5 `+FOUR`, 6 ` five`.
@@ -110,6 +96,7 @@ fn selection_stages_only_the_marked_line() {
         None,
     )
     .expect("overlay opens");
+    overlay.wait_reads();
     overlay.focus = Focus::Diff;
     overlay.cursor_row = overlay
         .rows
@@ -152,6 +139,7 @@ fn narrow_layouts_keep_the_file_name_files_and_way_out_visible() {
         None,
     )
     .expect("overlay opens");
+    overlay.wait_reads();
     let ascii = Rig::with_theme(
         crate::ui::theme::Theme::dark().with_glyphs(crate::ui::theme::Glyphs::Ascii),
     );
@@ -205,6 +193,7 @@ fn a_clean_tree_says_so_and_does_not_offer_staging() {
         None,
     )
     .expect("overlay opens");
+    overlay.wait_reads();
     let rig = Rig::new();
     let ctx = DrawCtx {
         theme: &rig.theme,

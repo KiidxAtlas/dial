@@ -33,7 +33,7 @@ fn links_roundtrip_full_view_web_and_legacy_forms() {
     let key = [5u8; 32];
     let token = [9u8; 16];
     let id = "AAAAAAAAAAAAAAAAAAAAAA";
-    let full = format_link("wss://relay.example.com", id, &key, Some(&token)).unwrap();
+    let full = format_link("wss://relay.example.com", id, &key, &[6; 32], Some(&token)).unwrap();
     assert!(full.starts_with("relay.example.com/r/AAAAAAAAAAAAAAAAAAAAAA."));
     let parsed = parse_link(&full, "").unwrap();
     assert_eq!(
@@ -43,7 +43,7 @@ fn links_roundtrip_full_view_web_and_legacy_forms() {
     assert_eq!(parsed.key, key);
     assert_eq!(parsed.write_token, Some(token));
 
-    let view = format_link("https://relay.example.com:8443", id, &key, None).unwrap();
+    let view = format_link("https://relay.example.com:8443", id, &key, &[6; 32], None).unwrap();
     let parsed = parse_link(&view, "").unwrap();
     assert_eq!(
         parsed.ws_url,
@@ -51,7 +51,7 @@ fn links_roundtrip_full_view_web_and_legacy_forms() {
     );
     assert_eq!(parsed.write_token, None);
 
-    let local = format_link("http://127.0.0.1:7466", id, &key, Some(&token)).unwrap();
+    let local = format_link("http://127.0.0.1:7466", id, &key, &[6; 32], Some(&token)).unwrap();
     assert!(local.starts_with("ws://127.0.0.1:7466/r/"));
     assert_eq!(
         parse_link(&local, "").unwrap().ws_url,
@@ -62,12 +62,15 @@ fn links_roundtrip_full_view_web_and_legacy_forms() {
         "wss://relay.example.com/r/{id}%23{}",
         URL_SAFE_NO_PAD.encode(key)
     );
-    assert_eq!(parse_link(&legacy, "").unwrap().key, key);
+    assert!(
+        parse_link(&legacy, "").is_err(),
+        "legacy keys lack host authentication"
+    );
 
-    let bare = format!("{id}.{}", URL_SAFE_NO_PAD.encode(key));
-    assert!(parse_link(&bare, "").is_err());
+    let bare = full.split("/r/").nth(1).unwrap();
+    assert!(parse_link(bare, "").is_err());
     assert_eq!(
-        parse_link(&bare, "wss://relay.example.com").unwrap().ws_url,
+        parse_link(bare, "wss://relay.example.com").unwrap().ws_url,
         "wss://relay.example.com/r/AAAAAAAAAAAAAAAAAAAAAA"
     );
 }
@@ -75,7 +78,16 @@ fn links_roundtrip_full_view_web_and_legacy_forms() {
 #[test]
 fn links_refuse_insecure_remote_and_malformed_keys() {
     let key = [1u8; 32];
-    assert!(format_link("ws://relay.example.com", "AAAAAAAAAAAA", &key, None).is_err());
+    assert!(
+        format_link(
+            "ws://relay.example.com",
+            "AAAAAAAAAAAA",
+            &key,
+            &[6; 32],
+            None
+        )
+        .is_err()
+    );
     assert!(parse_link("ws://relay.example.com/r/AAAAAAAAAAAA.AAAA", "").is_err());
     assert!(parse_link("wss://relay.example.com/r/AAAAAAAAAAAA.AAAA", "").is_err());
     assert!(parse_link("wss://relay.example.com/x/AAAAAAAAAAAA", "").is_err());

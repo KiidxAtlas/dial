@@ -1,5 +1,3 @@
-use crate::config;
-
 #[test]
 fn steering_bypass_announces_changes_and_retains_status() {
     let mut backend = super::Backend::new(
@@ -1881,7 +1879,7 @@ fn vision_steering_status_and_notice_respect_manual_automatic_and_disabled_setti
                     model: model.to_string_lossy().into_owned(),
                     user_dir: root.path().join("user"),
                     state_dir: root.path().join("state"),
-                    steering: config::steering::Config {
+                    steering: crate::config::steering::Config {
                         enabled,
                         automatic,
                         strength,
@@ -1956,8 +1954,7 @@ fn costs_require_complete_usage_supported_prices_and_remote_provider() {
     );
 }
 
-/// A hangup before any response is a connection failure: with the production 300 s interval the
-/// first retry still follows after `CONNECTION_RETRY` on a fresh connection.
+/// A hangup before any response gets a fresh connection after the bounded initial backoff.
 #[test]
 fn a_connection_failure_gets_a_prompt_first_retry() {
     let server = fake::serve(vec![Script::Hangup, ok("recovered")]);
@@ -1977,7 +1974,16 @@ fn a_connection_failure_gets_a_prompt_first_retry() {
         .unwrap();
     assert_eq!(reply.text, "recovered");
     assert_eq!(notices.len(), 1, "{notices:?}");
-    assert!(notices[0].contains("retrying in 2.0s"), "{notices:?}");
+    let delay: f64 = notices[0]
+        .split("retrying in ")
+        .nth(1)
+        .unwrap()
+        .split('s')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((2.0..=2.5).contains(&delay), "{notices:?}");
     assert!(started.elapsed() < Duration::from_secs(60));
     assert_eq!(server.requests().len(), 2);
 }
@@ -2126,7 +2132,7 @@ fn transient_failures_retry_with_visible_notices_and_stop_at_the_bound() {
 }
 
 #[test]
-fn manual_retry_skips_five_minute_waits_without_leaking_into_other_attempts() {
+fn manual_retry_skips_automatic_and_explicit_waits_without_leaking_into_other_attempts() {
     let server = fake::serve(vec![
         fake::json(503, &json!({"error":"busy"})),
         Script::HttpHeaders {
@@ -2170,18 +2176,17 @@ fn manual_retry_skips_five_minute_waits_without_leaking_into_other_attempts() {
     assert_eq!(phases, [true, false, true, false]);
     assert_eq!(server.requests().len(), 3);
     assert_eq!(notices.len(), 2);
-    // The five-minute interval varies by up to 10% (never beyond the 300 s default maximum).
-    assert!(
-        notices.iter().all(|notice| {
-            notice
-                .split("retrying in ")
-                .nth(1)
-                .and_then(|rest| rest.split('s').next())
-                .and_then(|secs| secs.parse::<f64>().ok())
-                .is_some_and(|secs| (270.0..=300.0).contains(&secs))
-        }),
-        "{notices:?}"
-    );
+    let automatic_delay: f64 = notices[0]
+        .split("retrying in ")
+        .nth(1)
+        .unwrap()
+        .split('s')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((2.0..=2.5).contains(&automatic_delay), "{notices:?}");
+    assert!(notices[1].contains("retrying in 300.0s"), "{notices:?}");
     assert!(
         !control.request_now(),
         "finished requests cannot be retried by this handle"
@@ -3299,14 +3304,43 @@ fn unrelated_400s_and_requests_without_reasoning_are_not_retried() {
     assert_eq!(server.requests().len(), 1);
 }
 
+// Environment writes are unsafe in a multithreaded test runner, even for unique names: native
+// libraries can enumerate the environment concurrently. Give these fixtures a fresh process's
+// initial environment instead; the child runs only the selected test and never mutates it.
+fn key_pool_subprocess(test: &str, variables: &[(&str, Option<&str>)]) -> bool {
+    const CHILD: &str = "DIAL_KEY_POOL_TEST_CHILD";
+    if std::env::var(CHILD).as_deref() == Ok(test) {
+        return false;
+    }
+    let module = module_path!().split_once("::").unwrap().1;
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command.args(["--exact", &format!("{module}::{test}"), "--nocapture"]);
+    command.env(CHILD, test);
+    for &(name, value) in variables {
+        match value {
+            Some(value) => {
+                command.env(name, value);
+            }
+            None => {
+                command.env_remove(name);
+            }
+        }
+    }
+    assert!(
+        command.status().unwrap().success(),
+        "key-pool child failed: {test}"
+    );
+    true
+}
+
 #[test]
 fn a_throttled_api_key_is_blocked_and_the_next_key_serves_with_affinity() {
-    // Unique variable names: the process environment is shared by every test.
     let (first, second) = ("DIAL_TEST_POOL_KEY_A", "DIAL_TEST_POOL_KEY_B");
-    // SAFETY-free: the variables are unique to this test.
-    unsafe {
-        std::env::set_var(first, "pool-key-a");
-        std::env::set_var(second, "pool-key-b");
+    if key_pool_subprocess(
+        "a_throttled_api_key_is_blocked_and_the_next_key_serves_with_affinity",
+        &[(first, Some("pool-key-a")), (second, Some("pool-key-b"))],
+    ) {
+        return;
     }
     let dir = tempfile::tempdir().unwrap();
     let throttle = Script::HttpHeaders {
@@ -3349,10 +3383,11 @@ fn a_throttled_api_key_is_blocked_and_the_next_key_serves_with_affinity() {
 #[test]
 fn a_pool_with_every_other_key_unavailable_surfaces_the_ordinary_retry() {
     let (only, missing) = ("DIAL_TEST_POOL_ONLY", "DIAL_TEST_POOL_UNSET");
-    // SAFETY-free: the variables are unique to this test.
-    unsafe {
-        std::env::set_var(only, "only-key");
-        std::env::remove_var(missing);
+    if key_pool_subprocess(
+        "a_pool_with_every_other_key_unavailable_surfaces_the_ordinary_retry",
+        &[(only, Some("only-key")), (missing, None)],
+    ) {
+        return;
     }
     let dir = tempfile::tempdir().unwrap();
     let throttle = Script::HttpHeaders {

@@ -2,11 +2,7 @@ name: CI
 on:
   push:
     branches: [main]
-    # Documentation-only changes skip CI. Only root-level and docs/ Markdown is ignored: Markdown
-    # under crates/ is compiled in with include_str! and must still trigger builds.
-    paths-ignore: ['docs/**/*.md', '*.md', '.github/pull_request_template.md']
   pull_request:
-    paths-ignore: ['docs/**/*.md', '*.md', '.github/pull_request_template.md']
 
 permissions:
   contents: read
@@ -55,15 +51,15 @@ jobs:
           # restore main's caches but do not add their own.
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install installer test dependencies
-        run: python3 -m pip install --disable-pip-version-check cryptography
+        run: python3 -m pip install --disable-pip-version-check -r scripts/requirements-ci.txt
       - name: Test terminal installer
         run: bash scripts/test-install.sh
       - name: Test local build and update commands
         run: python3 scripts/test-build.py
       - name: Test focused Windows contract runner
         run: python3 scripts/test-windows-contract.py
-      - name: Check packaging metadata consistency
-        run: python3 scripts/test-packaging.py && python3 scripts/check-packaging.py
+      - name: Check packaging and release policy
+        run: python3 scripts/test-packaging.py && python3 scripts/check-packaging.py && python3 scripts/test-release-policy.py
       - name: Verify Linux sandbox enforcement
         if: runner.os == 'Linux'
         timeout-minutes: 10
@@ -79,15 +75,23 @@ jobs:
           cargo build --locked --profile ci --workspace --lib
           cargo test --locked --profile ci --workspace --lib --no-run
           cargo build --locked --profile ci --workspace --all-targets
-      - name: Install cargo-nextest
-        # Pinned prebuilt binary (Linux x86-64 glibc, macOS universal) from the nextest releases.
+      - name: Install cargo-nextest (verified archive)
+        # SHA-256 pins are from the upstream 0.9.150 release checksum assets.
         env:
           NEXTEST_VERSION: 0.9.150
         run: |
-          platform=linux
-          [[ "$RUNNER_OS" == macOS ]] && platform=mac
+          set -euo pipefail
+          platform=x86_64-unknown-linux-gnu
+          checksum=b0959bc64232974224cf9fb22c915845398c0e8668fa7831eb5b43fb1eef781f
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            platform=universal-apple-darwin
+            checksum=82a759b4d218d38359424196ab244c470e8f7c7d149c814fbbeef4d67c3c301a
+          fi
+          archive="$RUNNER_TEMP/nextest.tar.gz"
+          curl --proto '=https' --tlsv1.2 -fsSL "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$NEXTEST_VERSION/cargo-nextest-$NEXTEST_VERSION-$platform.tar.gz" -o "$archive"
+          printf '%s  %s\n' "$checksum" "$archive" | shasum -a 256 -c -
           mkdir -p "${CARGO_HOME:-$HOME/.cargo}/bin"
-          curl -fsSL "https://get.nexte.st/$NEXTEST_VERSION/$platform" | tar -xzf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
+          tar -xzf "$archive" -C "${CARGO_HOME:-$HOME/.cargo}/bin" cargo-nextest
           cargo nextest --version
       - name: Test
         # cargo-nextest runs every test binary at once, one process per test (.config/nextest.toml
@@ -124,8 +128,12 @@ jobs:
           name: terminal-${{ matrix.os }}
           path: target/pty-captures
   lint:
-    name: Clippy and dependency policy
-    runs-on: ubuntu-22.04
+    name: Clippy (${{ matrix.os }}) and dependency policy
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-15, windows-2025]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Install pinned Rust and Clippy
@@ -134,11 +142,12 @@ jobs:
           rustup component add clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          key: lint
+          key: lint-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        if: runner.os == 'Linux'
         with:
           command: check
           command-arguments: advisories licenses bans sources
@@ -181,7 +190,7 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
-      - run: python -m pip install pytest fastapi==0.141.1 pydantic uvicorn
+      - run: python -m pip install -r scripts/requirements-ci.txt
       - run: make test-python PYTHON=python
       - name: Benchmark graders and repeated-trial reporting
         run: make test-bench-offline PYTHON=python
@@ -212,7 +221,7 @@ jobs:
       fail-fast: false
       matrix:
         shell: [powershell, pwsh]
-    runs-on: windows-latest
+    runs-on: windows-2025
     defaults:
       run:
         shell: ${{ matrix.shell }}
@@ -225,7 +234,7 @@ jobs:
         run: ./scripts/test-install.ps1
   windows-rust:
     name: Windows Rust contract
-    runs-on: windows-latest
+    runs-on: windows-2025
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
@@ -242,3 +251,29 @@ jobs:
       # Focused native suite with a tracked exclusion list: scripts/windows-contract.txt.
       - name: Run focused Windows contract suite
         run: python scripts/windows-contract.py --profile ci
+
+  linux-features:
+    name: Linux feature powerset
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        aws: ['', 'aws']
+        voice: ['', 'voice']
+        shell: ['', 'embedded-shell']
+        desktop: ['', 'desktop']
+        wayland: ['', 'wayland-pipewire']
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Install native feature dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libpipewire-0.3-dev libspa-0.2-dev pkg-config
+      - name: Install pinned Rust
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: features-${{ matrix.aws }}-${{ matrix.voice }}-${{ matrix.shell }}-${{ matrix.desktop }}-${{ matrix.wayland }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Compile feature combination
+        env:
+          CHECK_FEATURES: ${{ format('{0} {1} {2} {3} {4}', matrix.aws, matrix.voice, matrix.shell, matrix.desktop, matrix.wayland) }}
+        run: cargo check --locked --workspace --all-targets --no-default-features --features "$CHECK_FEATURES"

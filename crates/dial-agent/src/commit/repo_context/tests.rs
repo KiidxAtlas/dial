@@ -49,6 +49,7 @@ fn generation_context_without_git_history_is_empty() {
         .status()
         .expect("git init");
     assert!(init.success());
+    crate::commit::testkit::disable_inherited_git_drivers(dir.path());
     let context = generation_context(dir.path());
     assert_eq!(context.recent_commits, None);
     assert_eq!(context.common_scopes, None);

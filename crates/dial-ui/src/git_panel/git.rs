@@ -1,7 +1,7 @@
 //! Git commands behind the `/git` panel: status, commits, diffs, patch application and blob reads.
 
 use super::*;
-use crate::tools::{vcs::git::run_checked, vcs::git_patch::line_patch};
+use crate::tools::vcs::{git::run_checked, git_patch::line_patch};
 use std::{
     io::{Read, Write},
     path::Path,

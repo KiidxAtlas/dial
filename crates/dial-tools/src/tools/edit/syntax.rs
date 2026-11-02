@@ -590,6 +590,8 @@ pub(crate) fn record_blackbox(ws: &crate::tools::Workspace, record: &Value) -> R
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(dir)
         .map_err(|e| e.to_string())?;
+    // SAFETY: lock owns the open directory descriptor throughout flock; LOCK_EX has no
+    // pointer argument and the descriptor stays alive until the records are published.
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } < 0 {
         return Err(format!(
             "locking private edit records: {}",

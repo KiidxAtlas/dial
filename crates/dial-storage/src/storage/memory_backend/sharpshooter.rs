@@ -38,11 +38,11 @@ pub fn open(layout: &Layout, config: &SharpshooterConfig) -> Result<Box<dyn Driv
     );
     let directory = PrivateDirectory::open(layout, "sharpshooter")?.child(&key)?;
     let db = directory.database("decisions.sqlite3")?;
-    db.execute_batch("CREATE TABLE IF NOT EXISTS envelopes(id TEXT PRIMARY KEY,session TEXT NOT NULL,branch TEXT NOT NULL,revision TEXT NOT NULL,prompt TEXT NOT NULL,previous_human TEXT,assistant_context TEXT,created INTEGER NOT NULL,processed INTEGER NOT NULL DEFAULT 0,lease TEXT,lease_until INTEGER NOT NULL DEFAULT 0);
+    crate::storage::sqlite::migrate(&db, &["CREATE TABLE IF NOT EXISTS envelopes(id TEXT PRIMARY KEY,session TEXT NOT NULL,branch TEXT NOT NULL,revision TEXT NOT NULL,prompt TEXT NOT NULL,previous_human TEXT,assistant_context TEXT,created INTEGER NOT NULL,processed INTEGER NOT NULL DEFAULT 0,lease TEXT,lease_until INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS deltas(id TEXT PRIMARY KEY,session TEXT NOT NULL,branch TEXT NOT NULL,revision TEXT NOT NULL,payload TEXT NOT NULL,created INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS files(name TEXT PRIMARY KEY,content TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS state(id INTEGER PRIMARY KEY CHECK(id=1),last_consolidated INTEGER NOT NULL DEFAULT 0,lease TEXT,lease_until INTEGER NOT NULL DEFAULT 0,last_result TEXT,last_error TEXT);
-        INSERT OR IGNORE INTO state(id)VALUES(1);")?;
+        INSERT OR IGNORE INTO state(id)VALUES(1);"])?;
     Ok(Box::new(Sharpshooter {
         layout: layout.clone(),
         config: config.clone(),

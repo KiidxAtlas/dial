@@ -4,8 +4,6 @@
 //! content-addressed artifacts), `archive` (cold sessions moved to `sessions/archive/`), and `wal`
 //! (SQLite WAL checkpoints). With no sweep flag, blobs, archive and wal run; stale is opt-in.
 //! Dry-run is the default and touches nothing; `--apply` takes `gc.sqlite3.lock` first.
-
-use fs2::FileExt;
 use std::{
     collections::HashSet,
     fs,
@@ -492,7 +490,9 @@ fn claim_spool(path: &Path) -> Option<fs::File> {
         path,
     )
     .ok()?;
-    FileExt::try_lock_exclusive(&file).ok()?;
+    std::fs::File::try_lock(&file)
+        .map_err(std::io::Error::from)
+        .ok()?;
     Some(file)
 }
 
@@ -687,7 +687,10 @@ fn sweep_archive(
                 continue;
             }
         };
-        if FileExt::try_lock_exclusive(&claim).is_err() {
+        if std::fs::File::try_lock(&claim)
+            .map_err(std::io::Error::from)
+            .is_err()
+        {
             result.errors.push(format!(
                 "session is still owned by an active writer; archive skipped: {}",
                 candidate.path.display()

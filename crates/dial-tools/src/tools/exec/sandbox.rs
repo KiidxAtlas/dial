@@ -47,8 +47,8 @@
 //!    (symlinks, `..`) before use because the kernel matches resolved paths;
 //!    a symlink inside the workspace to a denied path is therefore refused.
 //!
-//! The Dev environment is rebuilt from the caller's, minus likely secrets
-//! ([`is_secret_env`]), with `TMPDIR` pointing at the scratch dir. Toolchain
+//! The Dev environment is rebuilt from allowlisted runtime variables
+//! ([`child_env_allowed`]), with `TMPDIR` pointing at the scratch dir. Toolchain
 //! caches (`UV_CACHE_DIR`, `PIP_CACHE_DIR`, `npm_config_cache`, `GOCACHE`,
 //! `XDG_CACHE_HOME`) that are not already writable point at a dial-owned
 //! sandbox cache (`~/Library/Caches/dial/sandbox`, `~/.cache/dial/sandbox` on
@@ -246,8 +246,8 @@ impl Sandbox {
     ///
     /// `Strict` behaves exactly like `command` (the caller sets the
     /// environment). `Dev` additionally owns the environment: it is cleared
-    /// and rebuilt from this process's environment minus obvious secrets
-    /// (see [`is_secret_env`]), with `TMPDIR` set to the workspace scratch
+    /// and rebuilt from allowlisted runtime variables
+    /// (see [`child_env_allowed`]), with `TMPDIR` set to the workspace scratch
     /// directory (created here). The caller MUST NOT call `env_clear` on a Dev
     /// command; it may add variables and sets cwd and stdio.
     pub fn command_with_policy(
@@ -406,9 +406,13 @@ impl Sandbox {
     #[cfg(test)]
     pub fn probe_policy(workspace: &Path, policy: &Policy) -> Sandbox {
         #[cfg(windows)]
-        return Sandbox::Unavailable(
-            "Windows command isolation is unavailable; sandboxed execution is disabled".to_string(),
-        );
+        {
+            let _ = (workspace, policy);
+            Sandbox::Unavailable(
+                "Windows command isolation is unavailable; sandboxed execution is disabled"
+                    .to_string(),
+            )
+        }
         #[cfg(target_os = "linux")]
         return linux::probe_policy(workspace, policy);
         #[cfg(not(any(target_os = "linux", windows)))]
@@ -469,7 +473,11 @@ impl Sandbox {
 /// own tests). `sandbox-exec` cannot be nested, so sandboxed tools are unavailable there.
 #[cfg(target_os = "macos")]
 pub fn already_sandboxed() -> bool {
+    // SAFETY: this declaration matches macOS sandbox.h's C variadic sandbox_check ABI.
     unsafe extern "C" {
+        /// # Safety
+        /// `operation` is null for an existence query, or a live C string whose filter
+        /// arguments match the variadic sandbox_check API. This caller uses only null/0.
         fn sandbox_check(
             pid: libc::pid_t,
             operation: *const libc::c_char,
@@ -492,10 +500,10 @@ pub fn require_for_test() -> bool {
     match Sandbox::detect().available() {
         Ok(()) => true,
         Err(_) if already_sandboxed() => {
-            eprintln!("skipping: already inside a sandbox, which macOS cannot nest");
+            eprintln!("skipping: already inside a sandbox and nested sandboxing is unavailable");
             false
         }
-        Err(reason) => panic!("sandbox-exec must work on this Mac: {reason}"),
+        Err(reason) => panic!("OS sandbox must work on {}: {reason}", std::env::consts::OS),
     }
 }
 
@@ -558,6 +566,8 @@ fn quote(path: &Path) -> Result<String, String> {
 #[cfg(not(any(target_os = "linux", windows)))]
 fn owned_terminal_rule(fd: i32) -> Result<String, String> {
     let mut name = [0u8; 1024];
+    // SAFETY: name is a writable buffer of name.len() bytes for the whole call. ttyname_r
+    // only borrows fd and reports invalid/non-terminal descriptors without dereferencing them.
     let result = unsafe { libc::ttyname_r(fd, name.as_mut_ptr().cast(), name.len()) };
     if result != 0 {
         return Err(format!(
@@ -937,6 +947,109 @@ pub fn is_secret_env(name: &str, value: &str) -> bool {
     })
 }
 
+/// Whether an inherited variable belongs in a tool child environment. Unknown names are
+/// excluded, not guessed safe from their spelling. Explicit operator-configured environment
+/// entries (for example MCP `env`) are separate grants applied by the caller afterwards.
+pub fn child_env_allowed(name: &str, value: &str) -> bool {
+    const RUNTIME: &[&str] = &[
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "PWD",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "LANG",
+        "LANGUAGE",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LC_COLLATE",
+        "LC_MESSAGES",
+        "LC_MONETARY",
+        "LC_NUMERIC",
+        "LC_TIME",
+        "TZ",
+        "TERM",
+        "COLORTERM",
+        "NO_COLOR",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "CARGO_TARGET_DIR",
+        "RUSTUP_TOOLCHAIN",
+        "GOPATH",
+        "GOROOT",
+        "GOCACHE",
+        "GOMODCACHE",
+        "GOTOOLCHAIN",
+        "GOPROXY",
+        "VIRTUAL_ENV",
+        "CONDA_PREFIX",
+        "PYENV_ROOT",
+        "PYENV_VERSION",
+        "PYENV_DIR",
+        "NVM_DIR",
+        "NODE_PATH",
+        "npm_config_cache",
+        "PNPM_HOME",
+        "BUN_INSTALL",
+        "UV_CACHE_DIR",
+        "PIP_CACHE_DIR",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_RUNTIME_DIR",
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "XAUTHORITY",
+        "XDG_CURRENT_DESKTOP",
+        "XDG_SESSION_TYPE",
+        "DESKTOP_SESSION",
+        "DEVELOPER_DIR",
+        "SDKROOT",
+        "HOMEBREW_PREFIX",
+        "HOMEBREW_CELLAR",
+        "SystemRoot",
+        "SYSTEMROOT",
+        "WINDIR",
+        "COMSPEC",
+        "ComSpec",
+        "PATHEXT",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "PROGRAMFILES",
+        "ProgramFiles",
+        "PROGRAMFILES(X86)",
+        "ProgramFiles(x86)",
+        "PROGRAMDATA",
+        "ProgramData",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "https_proxy",
+        "http_proxy",
+        "all_proxy",
+        "no_proxy",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "CURL_CA_BUNDLE",
+    ];
+    RUNTIME.contains(&name)
+        && !is_secret_env(name, value)
+        && !value.split_once("://").is_some_and(|(_, rest)| {
+            rest.split(['/', '?', '#'])
+                .next()
+                .is_some_and(|authority| authority.contains('@'))
+        })
+}
+
 /// Cache variables a Dev command gets pointed at [`toolchain_cache_root`] (the empty
 /// subdirectory means the root itself), unless already set to a writable location.
 #[cfg(not(windows))]
@@ -991,13 +1104,13 @@ fn redirect_toolchain_caches(
     }
 }
 
-/// `env` minus secrets and non-UTF-8 entries; `PATH` is inherited (with a
-/// system default when unset) so toolchains resolve, `HOME` is left as is.
+/// Allowlisted inherited runtime variables, without credentials, non-UTF-8 entries or an
+/// inherited `TMPDIR`. `PATH` gets a system default when unset; `HOME` is left as is.
 #[cfg(not(windows))]
 fn scrubbed_env(env: impl Iterator<Item = (OsString, OsString)>) -> Vec<(OsString, OsString)> {
     let mut kept: Vec<(OsString, OsString)> = env
         .filter(|(name, value)| match (name.to_str(), value.to_str()) {
-            (Some(name), Some(value)) => name != "TMPDIR" && !is_secret_env(name, value),
+            (Some(name), Some(value)) => name != "TMPDIR" && child_env_allowed(name, value),
             _ => false,
         })
         .collect();

@@ -644,7 +644,7 @@ impl OtlpSettings {
             logs_url,
             headers,
             resource,
-            flush: Duration::from_secs(config.flush_interval_secs.max(1)),
+            flush: Duration::from_secs(config.flush_interval_secs.clamp(1, 86400)),
             max_batch: config.max_batch.max(1),
             timeout: Duration::from_secs(config.timeout_secs.max(1)),
         })
@@ -889,6 +889,13 @@ fn attributes(pairs: &[(&str, Value)]) -> Value {
     )
 }
 
+fn next_flush(interval: Duration) -> Instant {
+    let now = Instant::now();
+    // Also guard direct callers that did not pass through configuration validation.
+    now.checked_add(interval.min(Duration::from_secs(86400)))
+        .unwrap_or(now)
+}
+
 impl Exporter {
     fn new(settings: OtlpSettings) -> Self {
         let agent: ureq::Agent = ureq::Agent::config_builder()
@@ -897,7 +904,7 @@ impl Exporter {
             .build()
             .into();
         Self {
-            next_flush: Instant::now() + settings.flush,
+            next_flush: next_flush(settings.flush),
             settings,
             agent,
             spans: Vec::new(),
@@ -1320,7 +1327,7 @@ impl Exporter {
     }
 
     fn flush(&mut self) {
-        self.next_flush = Instant::now() + self.settings.flush;
+        self.next_flush = next_flush(self.settings.flush);
         let losses = loss_counters();
         for (sink, now, before) in [
             ("ingress", losses.ingress, self.losses.ingress),

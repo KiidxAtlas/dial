@@ -126,7 +126,7 @@ pub(super) fn port_ready(
         .map_err(|e| format!("starting listener ownership query: {e}"))?;
     let mut output = child.stdout.take().ok_or("listener query has no stdout")?;
     let mut group = ProcessGroup::new(child);
-    super::input::nonblocking(output.as_raw_fd())
+    crate::platform::io::set_nonblocking(&output)
         .map_err(|e| format!("configuring listener query: {e}"))?;
     let local_end = Instant::now() + Duration::from_secs(2);
     let end = deadline.map_or(local_end, |end| end.min(local_end));
@@ -192,10 +192,11 @@ pub(super) fn port_ready(
     let expected = address.to_string();
     for line in text.lines() {
         if let Some(pid) = line.strip_prefix('p') {
-            owned_pid = pid
-                .parse::<libc::pid_t>()
-                .ok()
-                .is_some_and(|pid| unsafe { libc::getpgid(pid) } == group_pid as libc::pid_t);
+            owned_pid = pid.parse::<libc::pid_t>().ok().is_some_and(|pid| {
+                // SAFETY: getpgid only queries the parsed PID; it borrows no memory,
+                // and an absent/forbidden PID returns -1 rather than a matching group.
+                (unsafe { libc::getpgid(pid) }) == group_pid as libc::pid_t
+            });
             family_matches = false;
         } else if let Some(kind) = line.strip_prefix('t') {
             family_matches = matches!(

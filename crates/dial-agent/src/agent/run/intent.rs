@@ -1,5 +1,6 @@
 //! Runtime-recorded user provenance, separate from model-authored working state and turn drafts.
 //! The bounded trail is context, not an inferred decision that an older task remains active.
+use crate::agent::base::helpers::byte_prefix;
 use serde_json::{Value, json};
 
 const MAX_EARLIER_MESSAGES: usize = 8;
@@ -83,15 +84,9 @@ pub(in crate::agent) fn request_context(control: &Value) -> Option<String> {
     let text_truncated = text.len() > MAX_TEXT_BYTES;
     let excerpt = if text_truncated {
         let retained = MAX_TEXT_BYTES - OMITTED.len();
-        let mut head = retained / 2;
-        while !text.is_char_boundary(head) {
-            head -= 1;
-        }
-        let mut tail = text.len() - (retained - head);
-        while !text.is_char_boundary(tail) {
-            tail += 1;
-        }
-        format!("{}{OMITTED}{}", &text[..head], &text[tail..])
+        let head = byte_prefix(text, retained / 2);
+        let tail = text.ceil_char_boundary(text.len() - (retained - head.len()));
+        format!("{head}{OMITTED}{}", &text[tail..])
     } else {
         text.to_owned()
     };

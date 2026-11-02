@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(unix)]
 #[test]
 fn leaders_are_direct_children_that_lead_their_group() {
     let ps = "  10   1  10\n  11  10  11\n  12  10  10\n  13  11  13\n bad row\n";

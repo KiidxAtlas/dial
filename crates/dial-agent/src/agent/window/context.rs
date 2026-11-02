@@ -17,6 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::agent::base::helpers::byte_prefix;
 use crate::config::paths::Layout;
 use crate::runtime::arguments::split_words;
 
@@ -450,11 +451,7 @@ fn load_context_file(
     }
     let mut cut = cut;
     if content.len() > *budget {
-        let mut end = *budget;
-        while !content.is_char_boundary(end) {
-            end -= 1;
-        }
-        content.truncate(end);
+        content.truncate(byte_prefix(&content, *budget).len());
         cut = true;
     }
     *budget -= content.len();

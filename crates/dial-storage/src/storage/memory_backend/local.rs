@@ -11,6 +11,29 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+/// Busy writers are not evidence of lease loss; a zero-row update is.
+fn renew_lease(
+    connection: &Connection,
+    token: &str,
+    at: i64,
+    lease: u64,
+) -> rusqlite::Result<bool> {
+    match connection.execute(
+        "UPDATE consolidation SET lease_until=?1 WHERE id=1 AND lease=?2 AND lease_until>=?3",
+        params![at + lease as i64, token, at],
+    ) {
+        Ok(rows) => Ok(rows == 1),
+        Err(rusqlite::Error::SqliteFailure(error, _))
+            if matches!(
+                error.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            ) =>
+        {
+            Ok(true)
+        }
+        Err(error) => Err(error),
+    }
+}
 struct LeaseHeartbeat {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -49,7 +72,10 @@ impl LeaseHeartbeat {
                     continue;
                 };
                 let at = now();
-                match connection.execute("UPDATE consolidation SET lease_until=?1 WHERE id=1 AND lease=?2 AND lease_until>=?3",params![at+lease as i64,token,at]){Ok(1)=>(),_=>{op.cancel.store(true,Ordering::SeqCst);break;}}
+                if !renew_lease(connection, &token, at, lease).unwrap_or(false) {
+                    op.cancel.store(true, Ordering::SeqCst);
+                    break;
+                }
             }
         });
         Self {
@@ -80,12 +106,12 @@ pub fn open(layout: &Layout, config: &LocalConfig) -> Result<Box<dyn Driver>> {
     );
     let directory = PrivateDirectory::open(layout, "local")?.child(&key)?;
     let db = directory.database("rollouts.sqlite3")?;
-    db.execute_batch("CREATE TABLE IF NOT EXISTS threads(id TEXT PRIMARY KEY,session TEXT NOT NULL,branch TEXT NOT NULL,updated INTEGER NOT NULL,payload TEXT NOT NULL,digest TEXT NOT NULL,processed_digest TEXT,raw TEXT,summary TEXT,slug TEXT,lease TEXT,lease_until INTEGER NOT NULL DEFAULT 0,retry_at INTEGER NOT NULL DEFAULT 0);
+    crate::storage::sqlite::migrate(&db, &["CREATE TABLE IF NOT EXISTS threads(id TEXT PRIMARY KEY,session TEXT NOT NULL,branch TEXT NOT NULL,updated INTEGER NOT NULL,payload TEXT NOT NULL,digest TEXT NOT NULL,processed_digest TEXT,raw TEXT,summary TEXT,slug TEXT,lease TEXT,lease_until INTEGER NOT NULL DEFAULT 0,retry_at INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS artifacts(name TEXT PRIMARY KEY,content TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS consolidation(id INTEGER PRIMARY KEY CHECK(id=1),watermark TEXT NOT NULL DEFAULT '',lease TEXT,lease_until INTEGER NOT NULL DEFAULT 0,retry_at INTEGER NOT NULL DEFAULT 0);
         INSERT OR IGNORE INTO consolidation(id) VALUES(1);
         CREATE TABLE IF NOT EXISTS lessons(id TEXT PRIMARY KEY,content TEXT NOT NULL,context TEXT,source TEXT NOT NULL,session TEXT NOT NULL,branch TEXT NOT NULL,revision TEXT NOT NULL,created INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS scanned_sessions(path TEXT PRIMARY KEY,size INTEGER NOT NULL,mtime INTEGER NOT NULL);")?;
+        CREATE TABLE IF NOT EXISTS scanned_sessions(path TEXT PRIMARY KEY,size INTEGER NOT NULL,mtime INTEGER NOT NULL);"])?;
     Ok(Box::new(Local {
         layout: layout.clone(),
         config: config.clone(),
@@ -555,3 +581,6 @@ impl Driver for Local {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests;

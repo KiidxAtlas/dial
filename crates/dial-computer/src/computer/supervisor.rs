@@ -536,15 +536,21 @@ fn ensure_worker(inner: &Arc<Inner>, cwd: &Path, signal: &AbortSignal) -> Comput
         }
     }
 
-    let mut child = crate::platform::process::spawn_group(
-        Command::new("node")
-            .args(["--input-type=module", "-e", WORKER_SOURCE])
-            .current_dir(cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()),
-    )
-    .map_err(|e| ComputerError::tool(format!("Failed to start computer worker: {e}")))?;
+    let mut command = Command::new("node");
+    command
+        .args(["--input-type=module", "-e", WORKER_SOURCE])
+        .env_clear()
+        .envs(
+            std::env::vars().filter(|(name, value)| {
+                crate::tools::exec::sandbox::child_env_allowed(name, value)
+            }),
+        )
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = crate::platform::process::spawn_group(&mut command)
+        .map_err(|e| ComputerError::tool(format!("Failed to start computer worker: {e}")))?;
     let (Some(stdin), Some(stdout), Some(stderr)) =
         (child.stdin.take(), child.stdout.take(), child.stderr.take())
     else {
@@ -1075,12 +1081,14 @@ fn send_scoped(
         }
     };
     let result = (|| {
-        let mut pipe = loop {
+        let pipe = loop {
             check()?;
             if let Some(pipe) = stdin.try_lock_for(POLL) {
                 break pipe;
             }
         };
+        #[cfg(unix)]
+        let mut pipe = pipe;
         let mut offset = 0;
         while offset < line.len() {
             check()?;

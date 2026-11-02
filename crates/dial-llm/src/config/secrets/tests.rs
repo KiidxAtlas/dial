@@ -1,13 +1,17 @@
 use super::*;
 
 #[test]
-fn debug_output_never_contains_literal_secret_values() {
+fn debug_never_exposes_literal_secrets() {
     let config = Config {
         enabled: true,
-        env: true,
-        values: vec!["sk-live-very-secret-value".into()],
+        values: vec!["private-literal-secret".into()],
+        ..Default::default()
     };
-    let printed = format!("{config:?}");
-    assert!(!printed.contains("very-secret"), "{printed}");
-    assert!(printed.contains("1 redacted"), "{printed}");
+    let debug = format!("{config:?}");
+    assert!(debug.contains("REDACTED"));
+    assert!(!debug.contains(&config.values[0]));
+    assert_eq!(
+        serde_json::to_value(&config).unwrap()["values"][0],
+        config.values[0]
+    );
 }

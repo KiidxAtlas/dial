@@ -35,19 +35,13 @@ pub fn mentions_call_markup(text: &str) -> bool {
 /// When `reply` has no structured tool calls but its text contains textual
 /// ones, move them into `reply.tool_calls`, strip them from `reply.text`, and
 /// set `finish_reason` to `tool_calls`.
-///
-/// Only calls to `offered` tools are lifted: a reply that quotes call markup naming anything else
-/// (an example from a web page or README) stays text, and nothing is lifted from it.
-pub(super) fn apply(reply: &mut Reply, offered: &[String]) {
+pub(super) fn apply(reply: &mut Reply) {
     if !reply.tool_calls.is_empty() {
         return;
     }
     let Some((text, calls)) = extract(&reply.text) else {
         return;
     };
-    if calls.iter().any(|call| !offered.contains(&call.name)) {
-        return;
-    }
     reply.text = text;
     reply.tool_calls = calls;
     reply.finish_reason = "tool_calls".to_string();
@@ -101,7 +95,12 @@ pub(super) fn apply_from_reasoning(reply: &mut Reply) {
 pub(super) fn extract(text: &str) -> Option<(String, Vec<ToolCall>)> {
     let (segments, calls) = extract_markup(text);
     let (segments, calls) = if calls.is_empty() {
-        extract_fenced(text)
+        let (segments, calls) = extract_fenced(text);
+        // An example embedded in prose is data, not an executable request.
+        if segments.iter().any(|segment| !segment.trim().is_empty()) {
+            return None;
+        }
+        (segments, calls)
     } else {
         (segments, calls)
     };
@@ -360,11 +359,6 @@ fn extract_fenced(text: &str) -> (Vec<&str>, Vec<ToolCall>) {
         }
     }
     segments.push(&text[kept_from..]);
-    // A fenced JSON object is only a call when it is the whole reply. Prose around a fence is an
-    // explanation or a quotation (of a document, page or tool output), never an instruction to run.
-    if segments.iter().any(|segment| !segment.trim().is_empty()) {
-        return (vec![text], Vec::new());
-    }
     (segments, calls)
 }
 

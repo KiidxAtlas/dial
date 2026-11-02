@@ -78,7 +78,12 @@ fn asset_path(value: &str) -> Result<()> {
 }
 fn database(directory: &PrivateDirectory) -> Result<rusqlite::Connection> {
     let db = directory.database("skills.sqlite3")?;
-    db.execute_batch("CREATE TABLE IF NOT EXISTS skills(name TEXT PRIMARY KEY,description TEXT NOT NULL,body TEXT NOT NULL,generated INTEGER NOT NULL,files TEXT NOT NULL,revision INTEGER NOT NULL,version TEXT NOT NULL);")?;
+    crate::storage::sqlite::migrate(
+        &db,
+        &[
+            "CREATE TABLE IF NOT EXISTS skills(name TEXT PRIMARY KEY,description TEXT NOT NULL,body TEXT NOT NULL,generated INTEGER NOT NULL,files TEXT NOT NULL,revision INTEGER NOT NULL,version TEXT NOT NULL);",
+        ],
+    )?;
     Ok(db)
 }
 fn manifests_db(db: &rusqlite::Connection) -> Result<BTreeMap<String, (i64, Value)>> {

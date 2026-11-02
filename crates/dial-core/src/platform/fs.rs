@@ -40,12 +40,14 @@ pub fn open_beneath(root: &Path, relative: &Path, directory: bool) -> io::Result
     super::imp::fs::open_beneath(root, relative, directory)
 }
 /// Create a new file relative to an already-open directory handle; fails if the name exists.
-#[cfg(windows)]
+/// Unix requires a single plain name, uses write-only access, and applies mode `0o600` when
+/// `owner_only` is set or `0o666` otherwise (both subject to the process umask).
 pub fn create_new_beneath(root: &File, relative: &Path, owner_only: bool) -> io::Result<File> {
     super::imp::fs::create_new_beneath(root, relative, owner_only)
 }
 
-#[cfg(windows)]
+/// Create a hard link under a pinned directory, failing if the new name already exists.
+/// Unix requires two plain names and links the source itself rather than following a symlink.
 pub fn link_beneath(root: &File, existing: &Path, new: &Path) -> io::Result<()> {
     super::imp::fs::link_beneath(root, existing, new)
 }
@@ -55,7 +57,8 @@ pub fn rename_beneath(root: &File, from: &Path, to: &Path) -> io::Result<()> {
     super::imp::fs::rename_beneath(root, from, to)
 }
 
-#[cfg(windows)]
+/// Rename one entry under a pinned directory, replacing the destination if it exists.
+/// Unix requires two plain names; neither the source nor destination symlink is followed.
 pub fn replace_beneath(root: &File, from: &Path, to: &Path) -> io::Result<()> {
     super::imp::fs::replace_beneath(root, from, to)
 }
@@ -70,17 +73,20 @@ pub fn replace_beneath_file(
     super::imp::fs::replace_beneath_file(root, from, expected, to)
 }
 
-#[cfg(windows)]
+/// Remove a non-directory entry under a pinned directory without following its symlink.
+/// Unix requires a single plain name.
 pub fn remove_beneath(root: &File, relative: &Path) -> io::Result<()> {
     super::imp::fs::remove_beneath(root, relative)
 }
 
-#[cfg(windows)]
+/// Create an owner-only directory under an open directory handle, refusing existing names.
+/// Unix requires a single plain name; no symlink is followed.
 pub fn create_dir_beneath(root: &File, relative: &Path) -> io::Result<()> {
     super::imp::fs::create_dir_beneath(root, relative)
 }
 
-#[cfg(windows)]
+/// Remove an empty directory entry under a pinned parent without following symlinks.
+/// Unix requires a single plain name.
 pub fn remove_dir_beneath(root: &File, relative: &Path) -> io::Result<()> {
     super::imp::fs::remove_dir_beneath(root, relative)
 }
@@ -91,7 +97,8 @@ pub fn open_beneath_handle(root: &File, relative: &Path) -> io::Result<File> {
     super::imp::fs::open_beneath_handle(root, relative)
 }
 
-#[cfg(windows)]
+/// Open a directory relative to an open directory handle without following symlinks.
+/// Unix requires a single plain name.
 pub fn open_dir_beneath_handle(root: &File, relative: &Path) -> io::Result<File> {
     super::imp::fs::open_dir_beneath_handle(root, relative)
 }
@@ -106,7 +113,7 @@ pub fn open_file_beneath(root: &File, relative: &Path, write: bool) -> io::Resul
     super::imp::fs::open_file_beneath(root, relative, write)
 }
 
-#[cfg(windows)]
+/// Snapshot names beneath a pinned directory; callers may mutate only after enumeration ends.
 pub fn read_dir_beneath(root: &File) -> io::Result<Vec<std::ffi::OsString>> {
     super::imp::fs::read_dir_beneath(root)
 }

@@ -1,13 +1,6 @@
-use std::{
-    io::ErrorKind,
-    os::unix::net::UnixListener,
-    sync::{Mutex, mpsc},
-    thread,
-};
+use std::{io::ErrorKind, os::unix::net::UnixListener, sync::mpsc, thread};
 
 use super::*;
-
-static LIBEI_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn backend_without_services() -> WaylandBackend {
     WaylandBackend {
@@ -18,10 +11,19 @@ fn backend_without_services() -> WaylandBackend {
         displays: Vec::new(),
     }
 }
-fn with_fake_libei(action: impl FnOnce(&mut WaylandBackend)) -> bool {
-    let _guard = LIBEI_ENV_LOCK.lock().expect("lock LIBEI_SOCKET test");
-    let socket = std::env::temp_dir().join(format!("dial-libei-test-{}", std::process::id()));
-    let _ = std::fs::remove_file(&socket);
+// Environment setup belongs to Command before exec, not set_var in a parallel
+// Rust test process: libc consumers need not participate in a Rust mutex.
+fn with_fake_libei(expected_connection: bool, action: impl FnOnce(&mut WaylandBackend)) {
+    const CHILD: &str = "DIAL_LIBEI_TEST_CHILD";
+    let current = thread::current();
+    let name = current.name().expect("named test thread");
+    if std::env::var(CHILD).as_deref() == Ok(name) {
+        let mut backend = WaylandBackend::new(DisplaySelector::All);
+        action(&mut backend);
+        return;
+    }
+    let directory = tempfile::tempdir().expect("private libei test directory");
+    let socket = directory.path().join("libei.sock");
     let listener = UnixListener::bind(&socket).expect("bind fake libei socket");
     listener
         .set_nonblocking(true)
@@ -43,37 +45,33 @@ fn with_fake_libei(action: impl FnOnce(&mut WaylandBackend)) -> bool {
             }
         }
     });
-    let previous = std::env::var_os("LIBEI_SOCKET");
-    unsafe { std::env::set_var("LIBEI_SOCKET", &socket) };
-    let mut backend = WaylandBackend::new(DisplaySelector::All);
-    action(&mut backend);
+    let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args(["--exact", name])
+        .env(CHILD, name)
+        .env("LIBEI_SOCKET", &socket)
+        .status()
+        .expect("run isolated libei test");
     let _ = stop_tx.send(());
-    if let Some(previous) = previous {
-        unsafe { std::env::set_var("LIBEI_SOCKET", previous) };
-    } else {
-        unsafe { std::env::remove_var("LIBEI_SOCKET") };
-    }
     let connected = accepted.join().expect("fake libei listener");
-    let _ = std::fs::remove_file(socket);
-    connected
+    assert!(status.success(), "isolated libei test failed: {name}");
+    assert_eq!(
+        connected, expected_connection,
+        "libei connection for {name}"
+    );
 }
 
 #[test]
 fn readonly_backend_creation_does_not_connect_to_libei() {
-    let mut capabilities = None;
-    let connected = with_fake_libei(|backend| capabilities = Some(backend.capabilities()));
-    assert!(
-        !connected,
-        "read-only backend construction connected to libei"
-    );
-    let capabilities = capabilities.expect("Wayland capabilities");
-    assert!(capabilities.input);
-    assert_eq!(capabilities.input_permission, "prompt-or-granted");
+    with_fake_libei(false, |backend| {
+        let capabilities = backend.capabilities();
+        assert!(capabilities.input);
+        assert_eq!(capabilities.input_permission, "prompt-or-granted");
+    });
 }
 
 #[test]
 fn desktop_input_connects_to_libei_lazily() {
-    let connected = with_fake_libei(|backend| {
+    with_fake_libei(true, |backend| {
         let _ = backend.type_text(
             &Target::Desktop,
             "hello",
@@ -81,19 +79,17 @@ fn desktop_input_connects_to_libei_lazily() {
             &control::CancellationSource::default().token(),
         );
     });
-    assert!(connected, "desktop input did not connect to libei");
 }
 
 #[test]
 fn failed_input_request_allows_another_connection_attempt() {
-    let connected = with_fake_libei(|backend| {
-        let socket = std::env::var_os("LIBEI_SOCKET").expect("fake libei socket");
-        unsafe {
-            std::env::set_var(
-                "LIBEI_SOCKET",
-                std::path::Path::new(&socket).with_extension("missing"),
-            )
-        };
+    with_fake_libei(true, |backend| {
+        let socket =
+            std::path::PathBuf::from(std::env::var_os("LIBEI_SOCKET").expect("fake libei socket"));
+        let unavailable = socket.with_extension("unavailable");
+        // Hide this test's private socket, then restore the same listener for
+        // the retry. No process-global environment mutation is necessary.
+        std::fs::rename(&socket, &unavailable).expect("hide fake libei socket");
         let first = backend
             .type_text(
                 &Target::Desktop,
@@ -106,7 +102,7 @@ fn failed_input_request_allows_another_connection_attempt() {
         let caps = backend.capabilities();
         assert!(caps.input);
         assert_eq!(caps.input_permission, "prompt-or-granted");
-        unsafe { std::env::set_var("LIBEI_SOCKET", socket) };
+        std::fs::rename(&unavailable, &socket).expect("restore fake libei socket");
         let _ = backend.type_text(
             &Target::Desktop,
             "hello",
@@ -114,10 +110,6 @@ fn failed_input_request_allows_another_connection_attempt() {
             &control::CancellationSource::default().token(),
         );
     });
-    assert!(
-        connected,
-        "a failed input request prevented the next connection attempt"
-    );
 }
 
 #[test]

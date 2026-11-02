@@ -41,7 +41,7 @@ const WRITER_CLAIM_WAIT: Duration = Duration::from_secs(2);
 /// Claims the exclusive writer lock. A child forked by any thread (tool processes start with
 /// fork+exec) shares the descriptor, and so the `flock`, until it execs; a writer that has just
 /// closed can therefore look busy for a moment. Retry briefly before treating it as a live writer.
-fn claim_writer(file: &File) -> io::Result<()> {
+fn claim_writer(file: &File, path: &Path) -> io::Result<bool> {
     let deadline = std::time::Instant::now() + WRITER_CLAIM_WAIT;
     loop {
         match platform_fs::try_lock_journal(file, true) {
@@ -51,7 +51,13 @@ fn claim_writer(file: &File) -> io::Result<()> {
             {
                 std::thread::sleep(Duration::from_millis(20));
             }
-            result => return result,
+            Ok(()) => {
+                return Ok(
+                    platform_fs::identity(file)? == platform_fs::path_identity(path)?
+                        && platform_fs::link_count(file)? == 1,
+                );
+            }
+            Err(error) => return Err(error),
         }
     }
 }
@@ -1173,25 +1179,35 @@ impl Session {
         crate::config::settings_store::validate_private_path(
             path.parent().context("session path has no parent")?,
         )?;
-        let file = platform_fs::open_nofollow_nonblocking(
-            OpenOptions::new().read(true).append(true),
-            path,
-        )
-        .with_context(|| format!("opening session {}", path.display()))?;
-        let meta = file.metadata()?;
-        ensure!(
-            meta.is_file()
-                && platform_fs::link_count(&file)? == 1
-                && platform_fs::owned_by_current_user(&file)?,
-            "session writer requires an owner-owned regular file without hard links"
-        );
-        match claim_writer(&file) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                return Ok(Claimed::Contended(error));
+        let deadline = Instant::now() + WRITER_CLAIM_WAIT;
+        let file = loop {
+            let file = platform_fs::open_nofollow_nonblocking(
+                OpenOptions::new().read(true).append(true),
+                path,
+            )
+            .with_context(|| format!("opening session {}", path.display()))?;
+            let meta = file.metadata()?;
+            ensure!(
+                meta.is_file()
+                    && platform_fs::link_count(&file)? == 1
+                    && platform_fs::owned_by_current_user(&file)?,
+                "session writer requires an owner-owned regular file without hard links"
+            );
+            match claim_writer(&file, path) {
+                Ok(true) => break file,
+                Ok(false) if Instant::now() < deadline => continue,
+                Ok(false) => {
+                    return Ok(Claimed::Contended(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "session path changed while claiming writer",
+                    )));
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    return Ok(Claimed::Contended(error));
+                }
+                Err(error) => return Err(busy_session_error(path, error)),
             }
-            Err(error) => return Err(busy_session_error(path, error)),
-        }
+        };
         // Parse the claimed inode, not a second path lookup that could have been replaced.
         let mut s = Self::load_file(path, file.try_clone()?)?;
         s.file = Some(file);
@@ -1581,9 +1597,14 @@ impl Session {
             "session {} is a read-only snapshot",
             path.display()
         );
-        drop(self);
+        ensure!(
+            platform_fs::identity(self.file.as_ref().context("session writer unavailable")?)?
+                == platform_fs::path_identity(&path)?,
+            "session path changed before deletion"
+        );
         // The main file goes first: if its removal fails, the session and its companions all survive.
         fs::remove_file(&path).with_context(|| format!("deleting {}", path.display()))?;
+        drop(self);
         crate::runtime::stream_journal::remove(&path).with_context(|| {
             format!(
                 "session {} was deleted but its stream journal could not be removed",
@@ -4140,13 +4161,20 @@ fn query_terms(query: &str) -> Vec<String> {
 fn open_index(layout: &Layout) -> Result<Connection> {
     crate::platform::atomic::private_dir(&layout.state_dir)?;
     let db = layout.state_dir.join("sessions.sqlite3");
+    let _file =
+        platform_fs::open_owner_only(OpenOptions::new().create(true).read(true).write(true), &db)?;
+    ensure!(
+        platform_fs::owned_by_current_user(&_file)? && platform_fs::link_count(&_file)? == 1,
+        "session search index requires an owner-owned file without hard links"
+    );
+    platform_fs::set_owner_only_file(&_file)?;
     let conn = Connection::open(&db).with_context(|| format!("opening {}", db.display()))?;
     conn.busy_timeout(Duration::from_secs(10))?;
-    let _ = platform_fs::set_owner_only(&db);
-    conn.execute_batch(
+    super::sqlite::migrate(&conn, &[
         "CREATE TABLE IF NOT EXISTS indexed(session_id TEXT PRIMARY KEY, bytes INTEGER NOT NULL);
-         CREATE VIRTUAL TABLE IF NOT EXISTS msgs USING fts5(text, session_id UNINDEXED, role UNINDEXED, ts UNINDEXED, tokenize='porter unicode61');",
-    )
+         CREATE VIRTUAL TABLE IF NOT EXISTS msgs USING fts5(text, session_id UNINDEXED, role UNINDEXED, ts UNINDEXED, tokenize='porter unicode61');
+         ALTER TABLE indexed ADD COLUMN identity TEXT NOT NULL DEFAULT '';",
+    ])
     .context("creating the session search index (SQLite without FTS5?)")?;
     Ok(conn)
 }
@@ -4179,10 +4207,13 @@ fn index_text(message: &Value) -> Option<(&str, String)> {
 
 fn sync_index(conn: &mut Connection, dir: &Path) -> Result<()> {
     let files = session_files(dir)?;
-    let known: HashMap<String, u64> = {
-        let mut stmt = conn.prepare("SELECT session_id, bytes FROM indexed")?;
+    let known: HashMap<String, (u64, String)> = {
+        let mut stmt = conn.prepare("SELECT session_id, bytes, identity FROM indexed")?;
         stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+            Ok((
+                r.get::<_, String>(0)?,
+                (r.get::<_, i64>(1)? as u64, r.get::<_, String>(2)?),
+            ))
         })?
         .collect::<rusqlite::Result<_>>()?
     };
@@ -4200,7 +4231,9 @@ fn sync_index(conn: &mut Connection, dir: &Path) -> Result<()> {
         let Ok(len) = fs::metadata(&path).map(|m| m.len()) else {
             continue;
         };
-        if known.get(&sid) != Some(&len) {
+        let identity = platform_fs::path_identity(&path)?;
+        let identity = format!("{}:{}", identity.device, identity.inode);
+        if known.get(&sid) != Some(&(len, identity)) {
             index_session(conn, &sid, &path, len)?;
         }
     }
@@ -4218,23 +4251,22 @@ fn sync_index(conn: &mut Connection, dir: &Path) -> Result<()> {
 /// searching at once never index a line twice.
 fn index_session(conn: &mut Connection, sid: &str, path: &Path, len: u64) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let mut offset = tx
+    let mut file = platform_fs::open_nofollow_nonblocking(OpenOptions::new().read(true), path)?;
+    let identity = platform_fs::identity(&file)?;
+    let identity = format!("{}:{}", identity.device, identity.inode);
+    let previous: Option<(i64, String)> = tx
         .query_row(
-            "SELECT bytes FROM indexed WHERE session_id = ?1",
+            "SELECT bytes, identity FROM indexed WHERE session_id = ?1",
             [sid],
-            |r| r.get::<_, i64>(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
-        .optional()?
-        .unwrap_or(0) as u64;
-    if len < offset {
+        .optional()?;
+    let mut offset = previous.as_ref().map_or(0, |(bytes, _)| *bytes as u64);
+    if len < offset || previous.is_some_and(|(_, old)| old != identity) {
         tx.execute("DELETE FROM msgs WHERE session_id = ?1", [sid])?; // file was replaced
         offset = 0;
     }
     if len > offset {
-        let mut file = match File::open(path) {
-            Ok(f) => f,
-            Err(_) => return Ok(()),
-        };
         file.seek(SeekFrom::Start(offset))?;
         let mut reader = BufReader::new(file.take(len - offset));
         let mut buf = Vec::new();
@@ -4265,8 +4297,8 @@ fn index_session(conn: &mut Connection, sid: &str, path: &Path, len: u64) -> Res
         }
     }
     tx.execute(
-        "INSERT OR REPLACE INTO indexed(session_id, bytes) VALUES(?1, ?2)",
-        params![sid, offset as i64],
+        "INSERT OR REPLACE INTO indexed(session_id, bytes, identity) VALUES(?1, ?2, ?3)",
+        params![sid, offset as i64, identity],
     )?;
     tx.commit()?;
     Ok(())

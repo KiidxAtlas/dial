@@ -17,7 +17,6 @@ ast-grep-language.workspace = true
 base64.workspace = true
 flate2.workspace = true
 fontdue.workspace = true
-fs2.workspace = true
 globset.workspace = true
 ignore.workspace = true
 libc.workspace = true

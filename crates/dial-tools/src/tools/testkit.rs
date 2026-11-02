@@ -17,6 +17,35 @@ pub(crate) fn run(ws: &Workspace, name: &str, args: Value) -> ToolOutput {
     execute(ws, name, &args, 20)
 }
 
+/// Keep ordinary Git fixtures independent of executable filters in the operator's
+/// configuration. Security tests may install their own filters after this baseline.
+pub(crate) fn disable_inherited_git_filters(root: &std::path::Path) {
+    let filters = std::process::Command::new("git")
+        .args([
+            "config",
+            "--null",
+            "--name-only",
+            "--get-regexp",
+            r"^filter\..*\.(clean|smudge|process)$",
+        ])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(filters.status.success() || filters.status.code() == Some(1));
+    for key in filters
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|key| !key.is_empty())
+    {
+        let result = std::process::Command::new("git")
+            .args(["config", "--local", std::str::from_utf8(key).unwrap(), ""])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{result:?}");
+    }
+}
+
 /// Test authority for native mutations: the named tool may touch absolute paths under the
 /// workspace root or an added root, with no permission rules. This is the containment check
 /// the controller applies, reduced to what a tool-level fixture needs.
@@ -50,4 +79,27 @@ pub(crate) fn authorize_in_workspace<'a>(
         }
         Ok(())
     }
+}
+
+/// Run the named test in a fresh process with its environment set before any threads start.
+/// Returns true only in that child; the parent checks its result and skips the test body.
+pub(crate) fn in_env_subprocess(test: &str, env: &[(&str, &str)]) -> bool {
+    const MARKER: &str = "DIAL_ENV_TEST_CHILD";
+    if std::env::var(MARKER).as_deref() == Ok(test) {
+        return true;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture", "--test-threads=1"])
+        .env(MARKER, test)
+        .envs(env.iter().copied())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{test} subprocess failed: {}\n{}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
 }

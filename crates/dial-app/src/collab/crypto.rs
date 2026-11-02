@@ -1,18 +1,20 @@
 //! AES-256-GCM sealing for collab frames.
 //!
 //! The room key lives only in the link fragment; the relay sees opaque bytes.
-//! Sealed layout: `[12B IV][ciphertext+16B tag]`, byte-compatible with WebCrypto
-//! `AES-GCM` so the browser viewer opens what the host seals.
+//! Sealed layout: `[12B IV][ciphertext+16B tag][host-only 64B Ed25519 signature]`.
+//! Guests sign nothing; the room key alone cannot forge a host frame.
 use anyhow::{Result, anyhow, ensure};
+use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use ring::{
     aead::{AES_256_GCM, Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKey},
     rand::{SecureRandom, SystemRandom},
 };
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 /// AES-256-GCM room key; the seal key for every collab frame.
 pub const ROOM_KEY_BYTES: usize = 32;
-/// Random write token appended to the room key in full links (`base64url(key ∥ token)`).
+/// Random write authority carried only by full versioned links, never by wire frames.
 pub const WRITE_TOKEN_BYTES: usize = 16;
 /// Random room id bytes (base64url-encoded in links and relay paths).
 pub const ROOM_ID_BYTES: usize = 16;
@@ -38,6 +40,8 @@ pub fn generate_write_token() -> Result<[u8; WRITE_TOKEN_BYTES]> {
 #[derive(Clone)]
 pub struct RoomKey {
     raw: [u8; ROOM_KEY_BYTES],
+    signer: Option<Arc<Ed25519KeyPair>>,
+    verifier: Option<[u8; 32]>,
 }
 
 impl std::fmt::Debug for RoomKey {
@@ -55,9 +59,30 @@ impl RoomKey {
         );
         let mut key = [0u8; ROOM_KEY_BYTES];
         key.copy_from_slice(raw);
-        Ok(Self { raw: key })
+        Ok(Self {
+            raw: key,
+            signer: None,
+            verifier: None,
+        })
     }
 
+    /// Configure host-only signing authority. The seed must never be included in a link.
+    pub fn host(raw: &[u8], seed: &[u8; 32]) -> Result<(Self, [u8; 32])> {
+        let pair = Ed25519KeyPair::from_seed_unchecked(seed)
+            .map_err(|_| anyhow!("invalid host signing seed"))?;
+        let mut public = [0; 32];
+        public.copy_from_slice(pair.public_key().as_ref());
+        let mut key = Self::new(raw)?;
+        key.signer = Some(Arc::new(pair));
+        Ok((key, public))
+    }
+
+    /// Require every incoming host frame to carry the link's host signature.
+    pub fn guest(raw: &[u8], public: [u8; 32]) -> Result<Self> {
+        let mut key = Self::new(raw)?;
+        key.verifier = Some(public);
+        Ok(key)
+    }
     fn aead(&self) -> LessSafeKey {
         // Length is checked in `new`, so construction cannot fail.
         LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &self.raw).expect("32-byte AES-256 key"))
@@ -78,11 +103,25 @@ impl RoomKey {
             )
             .map_err(|_| anyhow!("collab frame sealing failed"))?;
         out.extend_from_slice(tag.as_ref());
+        if let Some(signer) = &self.signer {
+            let signature = signer.sign(&out);
+            out.extend_from_slice(signature.as_ref());
+        }
         Ok(out)
     }
 
     /// Inverse of [`RoomKey::seal`]. Fails on authentication failure or malformed input.
     pub fn open(&self, sealed: &[u8]) -> Result<Vec<u8>> {
+        let sealed = if let Some(public) = self.verifier {
+            ensure!(sealed.len() >= 64, "missing host signature");
+            let (body, signature) = sealed.split_at(sealed.len() - 64);
+            UnparsedPublicKey::new(&ED25519, public)
+                .verify(body, signature)
+                .map_err(|_| anyhow!("invalid host signature"))?;
+            body
+        } else {
+            sealed
+        };
         ensure!(
             sealed.len() >= NONCE_LEN + TAG_LEN,
             "sealed frame too short"
@@ -106,6 +145,32 @@ pub fn secrets_equal(a: &[u8], b: &[u8]) -> bool {
         return false;
     }
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Proof of write authority bound to a fresh, host-issued per-peer challenge.
+pub fn write_proof(token: &[u8], challenge: &str) -> String {
+    use base64::Engine;
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, token);
+    let message = format!("dial-collab-v1004-write:{challenge}");
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(ring::hmac::sign(&key, message.as_bytes()).as_ref())
+}
+
+/// Authenticate each mutation, not just admission: a relayed admission proof grants no ability
+/// to forge prompts/aborts. JSON tuple encoding makes the authenticated fields unambiguous.
+pub fn request_proof(
+    token: &[u8],
+    challenge: &str,
+    sequence: u64,
+    kind: &str,
+    text: &str,
+) -> String {
+    use base64::Engine;
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, token);
+    let message = serde_json::json!(["dial-collab-v1004-request", challenge, sequence, kind, text])
+        .to_string();
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(ring::hmac::sign(&key, message.as_bytes()).as_ref())
 }
 
 /// Anti-replay window for one sender epoch. Each sequence number is accepted at most once and only

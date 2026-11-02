@@ -196,6 +196,7 @@ fn read_events_impl(
     let mut pending = String::new();
     let mut event_name = String::new();
     let mut total = 0usize;
+    let mut after_cr = false;
     let mut on_data = |data: &str, name: Option<&str>| {
         if is_progress(data, name) {
             patience.mark_event();
@@ -208,8 +209,6 @@ fn read_events_impl(
             .is_some_and(|remaining| remaining.is_zero())
     };
     let stall_error = || StalledStream;
-    // SSE lines end with CRLF, LF or a bare CR; an LF right after a CR belongs to that CRLF.
-    let mut after_cr = false;
     loop {
         let count = match reader.read(&mut chunk) {
             Ok(0) => break,
@@ -243,22 +242,13 @@ fn read_events_impl(
             "chat stream exceeds {total_limit} bytes"
         );
         for &byte in &chunk[..count] {
-            let terminator = match byte {
-                b'\n' if after_cr => {
-                    after_cr = false;
-                    continue;
-                }
-                b'\n' => true,
-                b'\r' => {
-                    after_cr = true;
-                    true
-                }
-                _ => {
-                    after_cr = false;
-                    false
-                }
-            };
-            if !terminator {
+            // SSE accepts CR, LF and CRLF, including CRLF split across reads.
+            if byte == b'\n' && after_cr {
+                after_cr = false;
+                continue;
+            }
+            after_cr = byte == b'\r';
+            if byte != b'\n' && byte != b'\r' {
                 line.push(byte);
                 ensure!(
                     line.len() <= line_limit,

@@ -22,7 +22,7 @@ pub(super) struct ProbeLease(pub(in crate::app) std::fs::File);
 impl Drop for ProbeLease {
     fn drop(&mut self) {
         // Closing our handle alone leaves flock held by any duplicate inherited during spawn.
-        let _ = fs2::FileExt::unlock(&self.0);
+        let _ = std::fs::File::unlock(&self.0);
     }
 }
 

@@ -32,11 +32,13 @@ fn invocation_never_reuses_a_script_path() {
 
 #[test]
 fn host_exe_honours_override() {
-    // Environment is process-global; only this test touches the variable.
-    unsafe { std::env::set_var(HOST_EXE_ENV, "/opt/dial-host") };
-    let resolved = host_exe();
-    unsafe { std::env::remove_var(HOST_EXE_ENV) };
-    assert_eq!(resolved.unwrap(), PathBuf::from("/opt/dial-host"));
+    if !crate::tools::testkit::in_env_subprocess(
+        "embedded_shell::tests::host_exe_honours_override",
+        &[(HOST_EXE_ENV, "/opt/dial-host")],
+    ) {
+        return;
+    }
+    assert_eq!(host_exe().unwrap(), PathBuf::from("/opt/dial-host"));
 }
 
 #[cfg(feature = "embedded-shell")]

@@ -8,7 +8,8 @@ use super::changelog::{ChangelogFlowArgs, run_changelog_flow};
 use super::commit_types::CommitError;
 use super::config::GenerationConfig;
 use super::execute::{
-    PreviewIndex, commit_with_message, git_output, git_output_indexed, push_or_abort, repo_top,
+    PreviewIndex, commit_with_message, git_mutation_output_indexed, git_output, git_output_indexed,
+    push_or_abort, repo_top,
 };
 use super::model_selection::resolve_commit_config;
 use super::repo_context::generation_context;
@@ -173,7 +174,7 @@ fn run_legacy_commit(
         .trim()
         .is_empty()
     {
-        git_output_indexed(cwd, index, &["add", "-A"], CONTEXT)?;
+        git_mutation_output_indexed(cwd, index, &["add", "-A"], CONTEXT)?;
     }
     let diff = git_output_indexed(
         cwd,
@@ -183,6 +184,7 @@ fn run_legacy_commit(
             "--cached",
             "--no-color",
             "--no-ext-diff",
+            "--no-textconv",
             "--no-renames",
         ],
         CONTEXT,
@@ -286,7 +288,7 @@ fn update_changelog(
     }
     let mut add = vec!["add", "--"];
     add.extend(outcome.changed_files.iter().map(String::as_str));
-    git_output(cwd, &add, CONTEXT)?;
+    git_mutation_output_indexed(cwd, None, &add, CONTEXT)?;
     Ok(())
 }
 

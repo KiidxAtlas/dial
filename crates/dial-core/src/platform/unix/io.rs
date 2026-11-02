@@ -7,6 +7,8 @@ pub(in crate::platform) fn set_nonblocking(pipe: &impl Pipe) -> io::Result<()> {
     let fd = pipe.as_fd().as_raw_fd();
     // SAFETY: fcntl only reads/updates status flags of a live descriptor.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    // SAFETY: fd is borrowed from pipe for this call; F_SETFL takes the integer flag word
+    // read successfully above (short-circuiting skips the call on failure).
     if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
         return Err(io::Error::last_os_error());
     }
@@ -16,6 +18,8 @@ pub(in crate::platform) fn set_blocking(pipe: &impl Pipe) -> io::Result<()> {
     let fd = pipe.as_fd().as_raw_fd();
     // SAFETY: fcntl only reads/updates status flags of a live descriptor.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    // SAFETY: fd is borrowed from pipe for this call; clearing O_NONBLOCK preserves all
+    // other status flags, and short-circuiting skips F_SETFL if F_GETFL failed.
     if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } == -1 {
         return Err(io::Error::last_os_error());
     }

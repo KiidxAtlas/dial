@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 /// Shortest secret that is masked. Shorter values collide with ordinary words and numbers.
 pub const MIN_SECRET_BYTES: usize = 8;
 
-/// `[secrets]`: provider-bound masking (`llm::secrets`). `Debug` never prints `values`.
+/// `[secrets]`: provider-bound masking (`llm::secrets`).
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -22,7 +22,7 @@ impl std::fmt::Debug for Config {
         f.debug_struct("Config")
             .field("enabled", &self.enabled)
             .field("env", &self.env)
-            .field("values", &format_args!("<{} redacted>", self.values.len()))
+            .field("values", &"[REDACTED]")
             .finish()
     }
 }

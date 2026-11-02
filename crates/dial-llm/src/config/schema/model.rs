@@ -326,7 +326,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Local service request deadline. 0 means unlimited; cancellation remains available.",
         Kind::Int {
             min: 0,
-            max: 10,
+            max: 86400,
             step: 1
         },
         true

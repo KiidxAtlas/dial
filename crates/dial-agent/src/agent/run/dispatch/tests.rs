@@ -168,3 +168,64 @@ fn rendered_pixels_from_any_tool_become_an_attachment_and_keep_the_description()
             .is_none()
     );
 }
+
+#[test]
+fn recovered_safe_reads_require_human_approval_in_the_main_owner() {
+    use crate::agent::run::tool_exposure::default_offer_tests::with_agent;
+    use crate::agent::{
+        Decision,
+        safety::approval::{CallProvenance, Denial, Effect, PermissionRule},
+    };
+    struct View(usize);
+    impl Ui for View {
+        fn approve(&mut self, _: &str, _: &str) -> Decision {
+            self.0 += 1;
+            Decision::AllowProject
+        }
+    }
+    with_agent("", |agent| {
+        let call = ToolCall {
+            id: "read".into(),
+            name: "read".into(),
+            arguments: json!({"path":"file"}),
+            malformed_arguments: false,
+        };
+        agent.approval = Approval::Auto;
+        let mut view = View(0);
+        assert!(
+            agent
+                .authorize_call_from(&call, CallProvenance::Structured, &mut view)
+                .is_ok()
+        );
+        assert_eq!(
+            view.0, 0,
+            "structured safe reads keep their existing shortcut"
+        );
+        for _ in 0..2 {
+            assert!(
+                agent
+                    .authorize_call_from(&call, CallProvenance::RecoveredText, &mut view)
+                    .is_ok()
+            );
+        }
+        assert_eq!(view.0, 2, "recovered approval never becomes reusable");
+        assert!(agent.always.is_empty());
+        agent.always.push(PermissionRule {
+            effect: Effect::Deny,
+            tool: "read".into(),
+            command_prefix: vec![],
+            paths: vec![],
+        });
+        assert!(matches!(
+            agent.authorize_call_from(&call, CallProvenance::RecoveredText, &mut view),
+            Err(Denial::Rule)
+        ));
+        agent.always.clear();
+        agent.interrupt.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            agent.authorize_call_from(&call, CallProvenance::RecoveredText, &mut view),
+            Err(Denial::User)
+        ));
+        assert_eq!(view.0, 2, "denied and cancelled calls must not prompt");
+    });
+}

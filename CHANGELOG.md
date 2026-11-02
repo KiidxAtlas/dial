@@ -17,6 +17,56 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+### Security
+
+- Refuse unquoted shell expansion in inspection exemptions, native writes into Git metadata,
+  and host Git reads with executable filters or text-conversion drivers. Git history inspection
+  cannot invoke repository-configured signature verifiers. Remote SSH wrappers no longer depend
+  on the login shell's path-quoting grammar.
+- Authenticate collaboration hosts and writable guest actions without transmitting the write
+  token. Protocol 1004 requires newly generated links and updated clients (`docs/collab.md`).
+- Restrict text-recovered tool calls to offered tools on local/private endpoints and require
+  one-shot human approval throughout parent and worker execution. Saved grants, speculative
+  reads and batch shortcuts cannot authorize recovered calls (`docs/llm-transport.md`).
+- Allowlist inherited child environments, redact secret debug output, zeroize tokens, and
+  warn about the account-policy risk of Anthropic subscription client identity. Existing
+  subscription sign-in remains available without an additional opt-in.
+
+### Fixed
+
+- Recheck session-writer identity after locking, retain locks through removal, version SQLite
+  schemas transactionally, and preserve process-group ownership when waiting for child exit.
+- Load Git-overlay status/diffs off the input thread, reject stale replies and unsafe hunk
+  fallbacks, and route Unix termination signals through normal terminal cleanup without
+  erasing scrollback. Bound relay admission and report actor panics to RPC clients.
+- Honour bounded provider retry hints with exponential backoff/jitter; handle CR-only SSE
+  framing and checked configuration deadlines. Clarify Linux test prerequisites before running
+  the Rust suite, while continuing independent test binaries after failures.
+- A refreshed OAuth token, a rotated pooled API key, an account or model switch no longer breaks Responses, Codex WebSocket and native-compaction sessions with "start a clean chat": native items owned by another account, endpoint, credential or model are never replayed, and those turns are sent in portable form instead. Gemini tool history from another model, route or credential is replayed as plain text rather than refused, without inventing function-call signatures.
+- Anthropic signed blocks (thinking, server tool results) are recorded with the host that produced them (`dial_provider_origin`) and replay only there; a turn from another Anthropic-protocol provider (z.ai, MiniMax, Vercel, Cloudflare) is sent as portable text and tool calls. Claude subscription tokens are re-read on every retry attempt, so a retry that outlives the token no longer fails with an authentication error.
+- A streamed Responses `context_length_exceeded` failure is classified as a context overflow (compaction) instead of a transient failure retried with the same prompt; `usage_not_included` and `usage_limit_reached` are quota exhaustion. The Anthropic "input length and `max_tokens` exceed context limit" refusal is recognized as an overflow.
+- Chat-completions finish reasons are normalized: `max_tokens`, `model_length`, `model_context_window_exceeded` and `max_output_tokens` mean `length`, and `error`/`network_error` are incomplete streams, so truncated or aborted replies are no longer accepted as complete answers. A tool call cut off by the output limit on Gemini, Responses or Ollama is dropped and reported as `length` (raising the budget) instead of failing the turn.
+- Idle cache warming stops once the combined cost of its replays would exceed the single cache miss they prevent (previously each replay was judged alone, so long idle windows cost more than the miss).
+- A tool-call delta whose index is reused by a different call id starts a new call instead of concatenating two calls.
+- The steering runtime probe no longer routes loopback requests through an environment proxy.
+- Oversized images are resized once and reused on later requests (bounded cache) instead of being decoded, Lanczos-resized and re-encoded on every request; the saved model catalog is parsed once per file version; and request fingerprinting reuses the built request body instead of re-parsing the serialized request.
+- A running tool's live output no longer grows its runtime body without bound: the body keeps the first 1 MiB (prefix-stable, so RPC byte deltas stay valid) and marks the cut once. A single runtime update too large for the stream journal's replay row limit is now published in a bounded form instead of latching the journal, which previously stopped all session persistence until restart; copying a journal refuses rather than silently dropping such a node.
+- Stream-journal reclamation no longer rescans and rewrites the whole stream on every flush once retained live baselines exceed 4 MiB; it waits for another 4 MiB of growth, as after a deferred attempt.
+- Editing one workspace crate no longer recompiles unrelated crates beneath it: `dial-tools` and `dial-agent` read the executable's build identity registered at startup (`dial_core::build_identity`) instead of linking `dial-build-info`, whose revision/dirty/time values change on every source edit. Touching a `dial-ui` file rebuilt in 27 s before and 11 s after on a 4-core dev build.
+
+### Changed
+
+- Isolate release signing behind a protected environment, require exact-SHA push-to-main CI,
+  publish curated version-specific changelog notes, and broaden platform lint/feature coverage.
+  Container digest signing uses pinned Cosign with GitHub OIDC. Repository-owner protection
+  settings and outstanding verification/platform limits are tracked in
+  `docs/audit-2026-11-01-follow-up.md`.
+- Replace direct `fs2` locking with standard file locks, consolidate filesystem/HTTP/OAuth
+  and UTF-8 boundary owners, extract orchestration phases, and enforce documented unsafe
+  invariants through the workspace Clippy lint. See the audit follow-up for item dispositions.
+
+## [0.2.10] - 2026-11-01
+
 ### Added
 
 - Experimental **Reasoning strategy** settings offer eight selectable prompt-guidance presets plus an unchanged default. Built-in main-agent prompts and new/resumed workers share the selected approach; custom main prompt replacements/templates opt out. This does not edit private chain of thought, change thinking controls, or relax role, approval, budget or verification boundaries. Outcome and token-cost effects are unmeasured (`docs/agent-loop.md`).
@@ -186,21 +236,6 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ### Fixed
 
-- A refreshed OAuth token, a rotated pooled API key, an account or model switch no longer breaks Responses, Codex WebSocket and native-compaction sessions with "start a clean chat": native items owned by another account, endpoint, credential or model are never replayed, and those turns are sent in portable form instead. Gemini tool history from another model, route or credential is replayed as plain text rather than refused, without inventing function-call signatures.
-- Anthropic signed blocks (thinking, server tool results) are recorded with the host that produced them (`dial_provider_origin`) and replay only there; a turn from another Anthropic-protocol provider (z.ai, MiniMax, Vercel, Cloudflare) is sent as portable text and tool calls. Claude subscription tokens are re-read on every retry attempt, so a retry that outlives the token no longer fails with an authentication error.
-- A streamed Responses `context_length_exceeded` failure is classified as a context overflow (compaction) instead of a transient failure retried with the same prompt; `usage_not_included` and `usage_limit_reached` are quota exhaustion. The Anthropic "input length and `max_tokens` exceed context limit" refusal is recognized as an overflow.
-- Chat-completions finish reasons are normalized: `max_tokens`, `model_length`, `model_context_window_exceeded` and `max_output_tokens` mean `length`, and `error`/`network_error` are incomplete streams, so truncated or aborted replies are no longer accepted as complete answers. A tool call cut off by the output limit on Gemini, Responses or Ollama is dropped and reported as `length` (raising the budget) instead of failing the turn.
-- Tool calls written as text in a reply are lifted only when every call names an offered tool, and a fenced `{"name","arguments"}` block only when it is the whole reply, so quoting call markup from a web page or README no longer produces an executable call.
-- A server `retry-after` hint now sets the retry delay instead of only lengthening the fixed five-minute interval (at least 250 ms); a stream that dropped or stalled mid-reply gets the same prompt first retry as a connection failure; and waits of ten seconds or more vary by ±10% so workers throttled together do not retry in lockstep.
-- Idle cache warming stops once the combined cost of its replays would exceed the single cache miss they prevent (previously each replay was judged alone, so long idle windows cost more than the miss).
-- SSE streams that end lines with a bare carriage return are framed correctly instead of growing one line until the size limit. A tool-call delta whose index is reused by a different call id starts a new call instead of concatenating two calls. Bedrock's signing region is read only from AWS runtime hostnames (`bedrock-runtime[-fips].<region>…`, including China, sovereign and VPC endpoints); other hosts use `AWS_REGION` instead of a guessed label.
-- `SecretToken` wipes its buffer with volatile writes the optimizer cannot remove, and `[secrets]` configuration no longer prints literal secret values through `Debug`. The steering runtime probe no longer routes loopback requests through an environment proxy.
-- Oversized images are resized once and reused on later requests (bounded cache) instead of being decoded, Lanczos-resized and re-encoded on every request; the saved model catalog is parsed once per file version; and request fingerprinting reuses the built request body instead of re-parsing the serialized request.
-- A running tool's live output no longer grows its runtime body without bound: the body keeps the first 1 MiB (prefix-stable, so RPC byte deltas stay valid) and marks the cut once. A single runtime update too large for the stream journal's replay row limit is now published in a bounded form instead of latching the journal, which previously stopped all session persistence until restart; copying a journal refuses rather than silently dropping such a node.
-- Stream-journal reclamation no longer rescans and rewrites the whole stream on every flush once retained live baselines exceed 4 MiB; it waits for another 4 MiB of growth, as after a deferred attempt.
-- `ProcessGroup` reaps its leader only through `wait`/`try_wait`, which signal the remaining group members first. Callers that reaped the leader directly let the later drop `killpg` a group ID that could already belong to an unrelated process.
-- The Linux process launcher thread survives a panic while spawning one command, and a failed hand-off returns the command to its caller instead of an empty placeholder (temporary scripts named by it were leaked). Recorded process identities with PID 0, 1 or a negative value are never signalled.
-- Editing one workspace crate no longer recompiles unrelated crates beneath it: `dial-tools` and `dial-agent` read the executable's build identity registered at startup (`dial_core::build_identity`) instead of linking `dial-build-info`, whose revision/dirty/time values change on every source edit. Touching a `dial-ui` file rebuilt in 27 s before and 11 s after on a 4-core dev build.
 - Request-tail task-context and advisory-note markers (`dial_task_context`, `dial_guidance`) are now stripped like other harness bookkeeping before Chat Completions requests and training capture. Previously they reached the provider and made harvested training samples fail validation as malformed (`skipped_invalid`). An offline integration regression covers the harvest path (`docs/improvement.md`).
 
 - Bounded subprocesses that are cancelled, time out or exit now signal their process group a second time after the leader exits, while its PID is still reserved. On macOS a descendant forked during the first `killpg` could miss it and hold the output pipes open, so a cancelled command was intermittently reported with incomplete output after a 300 ms drain wait. The test-suite flake was reproduced outside Dial (about 7% of kills under load) and was not seen with the second signal.

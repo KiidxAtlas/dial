@@ -166,6 +166,7 @@ fn call_with(agent: &str, tool: &str, arguments: Value, allow: bool) -> (ToolOut
             ToolSurface {
                 schemas: &schemas,
                 names: &names,
+                provenance: approval::CallProvenance::Structured,
             },
             &call,
             &mut reviewer,
@@ -375,6 +376,7 @@ fn rewritten_child_reads_recheck_schema_and_path_authority() {
             ToolSurface {
                 schemas: &schemas,
                 names: &names,
+                provenance: approval::CallProvenance::Structured,
             },
             &call,
             &mut reviewer,
@@ -934,6 +936,7 @@ fn cancelled_child_exits_while_workspace_serial_lock_is_still_held() {
                 ToolSurface {
                     schemas: &[schema],
                     names: &["serial_fixture".into()],
+                    provenance: approval::CallProvenance::Structured,
                 },
                 &call,
                 &mut Approved(approved_tx),

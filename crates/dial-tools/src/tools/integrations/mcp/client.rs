@@ -20,7 +20,7 @@ use crate::runtime::integration::{IntegrationFailure, Settlement};
 pub(super) mod lifecycle;
 use crate::config::types::McpServerConfig;
 use crate::runtime::execution::Effects;
-use crate::tools::exec::sandbox::is_secret_env;
+use crate::tools::exec::sandbox::child_env_allowed;
 use anyhow::{Context, Result, anyhow, bail};
 use lifecycle::{MAX_IN_FLIGHT, MAX_REQUEST_LIFETIME, Operation, Outgoing, OwnedSend, Phase};
 use serde_json::{Value, json};
@@ -996,14 +996,14 @@ impl Drop for Client {
     }
 }
 
-/// The server's environment: this process's, minus likely credentials ([`is_secret_env`]), plus the
+/// The server's environment: allowlisted runtime variables ([`child_env_allowed`]), plus the
 /// operator's explicit `env` entries (which win and are passed through untouched).
 pub(super) fn server_env(
     inherited: impl Iterator<Item = (String, String)>,
     explicit: &BTreeMap<String, String>,
 ) -> Vec<(String, String)> {
     let mut env: BTreeMap<String, String> = inherited
-        .filter(|(name, value)| !is_secret_env(name, value))
+        .filter(|(name, value)| child_env_allowed(name, value))
         .collect();
     env.extend(
         explicit

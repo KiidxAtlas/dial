@@ -2,6 +2,22 @@
 
 The built-in tool roster, specialist integrations, safety model, context sources, editing grammars and tool-reliability measurement.
 
+## Repository and execution trust boundaries
+
+Native file mutations refuse Git metadata, including linked-worktree metadata and resolved
+aliases. Host-side Git inspection fails closed when effective repository/global configuration
+contains executable clean, smudge, process or text-conversion drivers; configuration-query failure
+is not treated as absence of drivers. History reads disable signature-verifier execution and
+patch reads disable external diff/text conversion. These guards also cover Git-panel AI and
+CLI commit-generation reads; approved staging, hooks and signing retain their explicit mutation
+policy. Ordinary shell inspection exemptions reject unquoted glob/tilde expansion instead of
+classifying the unexpanded command as safe.
+
+The `computer` worker receives a filtered environment, but its JavaScript runs still have Node
+APIs. `read_only: true` restricts the desktop-helper facade; it is **not** a security boundary
+around arbitrary JavaScript or `require`. Every run still requires the normal approval policy.
+Do not treat that option as permission to execute untrusted code.
+
 ## Compact file references and tool context
 
 Dial automatically gives the model short file references such as `@f7`. Native snapshot

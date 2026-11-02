@@ -22,15 +22,23 @@ use windows_sys::Win32::{
     },
 };
 
-fn token_user(process: HANDLE) -> Result<Vec<usize>> {
+/// An aligned TokenUser allocation, including the SID that its TOKEN_USER header points into.
+/// The allocation is never cloned or resized: moving the owner leaves the SID address stable.
+pub(super) struct UserToken(Vec<usize>);
+
+fn token_user(process: HANDLE) -> Result<UserToken> {
     let mut token = ptr::null_mut();
     ensure!(
+        // SAFETY: `token` is writable; the OS validates the process handle. On success the token
+        // handle is transferred exactly once into OwnedHandle below.
         unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } != 0,
         "{}",
         std::io::Error::last_os_error()
     );
+    // SAFETY: OpenProcessToken succeeded and returned a new owned, non-null token handle.
     let token = unsafe { OwnedHandle::from_raw_handle(token.cast()) };
     let mut length = 0;
+    // SAFETY: the null/zero buffer pair requests only the size; `length` is writable.
     unsafe {
         GetTokenInformation(
             token.as_raw_handle().cast(),
@@ -45,8 +53,12 @@ fn token_user(process: HANDLE) -> Result<Vec<usize>> {
         "reading process token: {}",
         std::io::Error::last_os_error()
     );
+    // TOKEN_USER contains a pointer and u32; usize storage provides its alignment on Windows.
+    // Keep the complete allocation because the returned SID points inside it.
     let mut bytes = vec![0usize; (length as usize).div_ceil(mem::size_of::<usize>())];
     ensure!(
+        // SAFETY: the initialized allocation has at least `length` bytes with TOKEN_USER
+        // alignment; the live token initializes the header and embedded SID on success.
         unsafe {
             GetTokenInformation(
                 token.as_raw_handle().cast(),
@@ -59,10 +71,12 @@ fn token_user(process: HANDLE) -> Result<Vec<usize>> {
         "reading process token: {}",
         std::io::Error::last_os_error()
     );
-    Ok(bytes)
+    Ok(UserToken(bytes))
 }
 
-pub(super) fn current_user() -> Result<Vec<usize>> {
+pub(super) fn current_user() -> Result<UserToken> {
+    // SAFETY: GetCurrentProcess takes no arguments and returns a borrowed pseudo-handle. It is
+    // passed only to OpenProcessToken, never adopted into OwnedHandle or closed.
     token_user(unsafe { GetCurrentProcess() })
 }
 
@@ -71,12 +85,15 @@ impl NativeProcess {
     pub(super) fn open(pid: u32, for_stop: bool) -> Result<Self> {
         let access =
             PROCESS_QUERY_LIMITED_INFORMATION | if for_stop { PROCESS_TERMINATE } else { 0 };
+        // SAFETY: scalar arguments only; the OS validates the PID/access mask. A successful
+        // non-null result is a new handle which is immediately owned below.
         let handle = unsafe { OpenProcess(access, 0, pid) };
         ensure!(
             !handle.is_null(),
             "opening process {pid}: {}",
             std::io::Error::last_os_error()
         );
+        // SAFETY: the non-null handle is owned by this call and has not been adopted elsewhere.
         Ok(Self(unsafe { OwnedHandle::from_raw_handle(handle.cast()) }))
     }
 
@@ -84,10 +101,17 @@ impl NativeProcess {
         self.0.as_handle()
     }
 
-    pub(super) fn owned_by(&self, user: &[usize]) -> Result<bool> {
+    pub(super) fn owned_by(&self, user: &UserToken) -> Result<bool> {
         let target = token_user(self.0.as_raw_handle().cast())?;
-        let user = unsafe { &*user.as_ptr().cast::<TOKEN_USER>() };
-        let target = unsafe { &*target.as_ptr().cast::<TOKEN_USER>() };
+        // SAFETY: only token_user constructs these owners from successful TokenUser queries.
+        // Both aligned allocations retain their headers and embedded SIDs without relocation.
+        let (user, target) = unsafe {
+            (
+                &*user.0.as_ptr().cast::<TOKEN_USER>(),
+                &*target.0.as_ptr().cast::<TOKEN_USER>(),
+            )
+        };
+        // SAFETY: both SID pointers refer to OS-initialized SIDs in the still-live owners above.
         Ok(unsafe { EqualSid(user.User.Sid, target.User.Sid) } != 0)
     }
 
@@ -100,6 +124,7 @@ impl NativeProcess {
             FILETIME::default(),
         );
         ensure!(
+            // SAFETY: this OwnedHandle remains live; all four FILETIME out-pointers are writable.
             unsafe { GetProcessTimes(handle, &mut created, &mut exit, &mut kernel, &mut user) }
                 != 0,
             "reading process times: {}",
@@ -110,6 +135,7 @@ impl NativeProcess {
         let mut image = vec![0u16; 32768];
         let mut length = image.len() as u32;
         ensure!(
+            // SAFETY: `image` has `length` writable UTF-16 units and the process handle is live.
             unsafe { QueryFullProcessImageNameW(handle, 0, image.as_mut_ptr(), &mut length) } != 0,
             "reading executable image: {}",
             std::io::Error::last_os_error()
@@ -121,6 +147,8 @@ impl NativeProcess {
             cb: mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
             ..Default::default()
         };
+        // SAFETY: `counters` is initialized with its exact size and is writable for the call;
+        // the process handle remains live. Failure leaves memory unavailable, not uninitialized.
         let memory = (unsafe {
             GetProcessMemoryInfo(handle, &mut counters, mem::size_of_val(&counters) as u32)
         } != 0)

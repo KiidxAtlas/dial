@@ -25,8 +25,12 @@ fn lora_progress_requires_a_live_lock_and_clears_on_exit() {
     let inherited = probe.try_clone().unwrap();
     assert!(lora_phase_from_lock(&probe, &store).is_none());
     let next = crate::learn::auto::lock_file(&config.state_dir.join("lora-progress.lock")).unwrap();
-    assert!(fs2::FileExt::try_lock_exclusive(&next).is_ok());
-    fs2::FileExt::unlock(&next).unwrap();
+    assert!(
+        std::fs::File::try_lock(&next)
+            .map_err(std::io::Error::from)
+            .is_ok()
+    );
+    std::fs::File::unlock(&next).unwrap();
     drop(inherited);
     drop(probe);
     {

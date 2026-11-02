@@ -617,6 +617,13 @@ fn server_environment_drops_inherited_credentials_but_keeps_explicit_entries() {
             ("PATH", "/usr/bin"),
             ("OPENAI_API_KEY", "sk-inherited"),
             ("GITHUB_TOKEN", "ghp_inherited"),
+            ("DATABASE_DSN", "database-private"),
+            ("SLACK_WEBHOOK_URL", "webhook-private"),
+            ("SERVICE_JWT", "jwt-private"),
+            ("OP_SESSION_personal", "op-private"),
+            ("STRIPE_SK_LIVE", "stripe-private"),
+            ("ARBITRARY_NAME", "unknown-private"),
+            ("HTTPS_PROXY", "https://user@proxy.invalid"),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_owned(), v.to_owned()))
@@ -811,9 +818,13 @@ fn health_check_tells_an_oauth_challenge_apart_from_a_broken_server() {
 
 #[test]
 fn http_servers_handshake_with_a_bearer_token_session_and_sse_replies() {
+    if !crate::tools::testkit::in_env_subprocess(
+        "tools::integrations::mcp::tests::http_servers_handshake_with_a_bearer_token_session_and_sse_replies",
+        &[("DIAL_TEST_MCP_TOKEN", "s3cret")],
+    ) {
+        return;
+    }
     let (url, seen) = http_server("s3cret");
-    // SAFETY-free: the variable is unique to this test.
-    unsafe { std::env::set_var("DIAL_TEST_MCP_TOKEN", "s3cret") };
     let server = McpServerConfig {
         url: Some(url.clone()),
         bearer_env: Some("DIAL_TEST_MCP_TOKEN".into()),
@@ -845,8 +856,13 @@ fn http_servers_handshake_with_a_bearer_token_session_and_sse_replies() {
 
 #[test]
 fn http_credential_failures_are_clear_and_config_needs_exactly_one_transport() {
+    if !crate::tools::testkit::in_env_subprocess(
+        "tools::integrations::mcp::tests::http_credential_failures_are_clear_and_config_needs_exactly_one_transport",
+        &[("DIAL_TEST_MCP_WRONG", "wrong")],
+    ) {
+        return;
+    }
     let (url, _) = http_server("right");
-    unsafe { std::env::set_var("DIAL_TEST_MCP_WRONG", "wrong") };
     let server = McpServerConfig {
         url: Some(url),
         bearer_env: Some("DIAL_TEST_MCP_WRONG".into()),

@@ -642,11 +642,7 @@ struct WorkerUi {
     progress: SyncSender<Progress>,
 }
 fn bounded_text(text: &str) -> String {
-    let mut end = text.len().min(PROGRESS_BYTES);
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text[..end].to_owned()
+    crate::agent::base::helpers::byte_prefix(text, PROGRESS_BYTES).to_owned()
 }
 impl Ui for WorkerUi {
     fn notice(&mut self, text: &str) {

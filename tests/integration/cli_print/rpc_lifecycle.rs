@@ -26,17 +26,13 @@ fn start(env: &Env, server: &Server, args: &[&str]) -> std::process::Child {
 }
 
 fn finish(mut child: std::process::Child) -> Output {
-    let deadline = std::time::Instant::now() + SETTLE;
-    while child.try_wait().unwrap().is_none() {
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let output = child.wait_with_output().unwrap();
-            panic!(
-                "RPC did not settle after EOF: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        thread::sleep(Duration::from_millis(5));
+    if !dial::platform::process::wait_exited(&child, SETTLE).unwrap() {
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+        panic!(
+            "RPC did not settle after EOF: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
     child.wait_with_output().unwrap()
 }
@@ -91,13 +87,13 @@ fn eof_cancels_active_silent_inference_without_discarding_its_response() {
     )
     .unwrap();
     input.flush().unwrap();
-    let deadline = std::time::Instant::now() + SETTLE;
-    while server.requests.lock().is_empty() {
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            panic!("inference did not start");
-        }
-        thread::sleep(Duration::from_millis(5));
+    if let Err(error) = server.wait_for_request(SETTLE) {
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+        panic!(
+            "inference did not start ({error}): {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
     drop(input);
     let output = finish(child);

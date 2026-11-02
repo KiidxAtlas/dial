@@ -140,7 +140,6 @@ print(json.dumps({{'output':str(out),'model_type':'llama','layers':4,'dequantize
 
 #[cfg(unix)]
 fn handoff_fixture(unresponsive: bool) {
-    use fs2::FileExt;
     let root = tempfile::tempdir().unwrap();
     let mut config = Config {
         state_dir: root.path().join("state"),
@@ -206,7 +205,10 @@ else:
             let request = super::super::compute::Request::foreground(&config.user_dir).unwrap();
             let lock =
                 super::super::auto::lock_file(&config.user_dir.join("compute.lock")).unwrap();
-            while fs2::FileExt::try_lock_shared(&lock).is_err() {
+            while std::fs::File::try_lock_shared(&lock)
+                .map_err(std::io::Error::from)
+                .is_err()
+            {
                 assert!(Instant::now() < deadline);
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -218,7 +220,7 @@ else:
             );
             std::thread::sleep(Duration::from_millis(100));
             std::fs::write(&coded, "").unwrap();
-            FileExt::unlock(&lock).unwrap();
+            std::fs::File::unlock(&lock).unwrap();
         });
         let output = root.path().join("adapter");
         assert_eq!(
@@ -501,6 +503,8 @@ time.sleep(30)
         drop(lease);
         assert!(!super::super::compute::background_active());
         let file = super::super::auto::lock_file(&config.user_dir.join("compute.lock")).unwrap();
-        fs2::FileExt::try_lock_exclusive(&file).unwrap();
+        std::fs::File::try_lock(&file)
+            .map_err(std::io::Error::from)
+            .unwrap();
     }
 }

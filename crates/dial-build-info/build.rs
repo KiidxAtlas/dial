@@ -2,7 +2,6 @@ use std::{
     env,
     path::{Path, PathBuf},
     process::Command,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 /// Tracked inputs compiled into the executable: every workspace crate's sources, the manifests and
@@ -143,10 +142,13 @@ fn main() {
                 .expect("SOURCE_DATE_EPOCH must be an integer")
         })
         .unwrap_or_else(|_| {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("clock before Unix epoch")
-                .as_secs()
+            // Stable across rebuilds of a commit. Source archives without Git metadata
+            // use an explicit SOURCE_DATE_EPOCH (release workflow/Nix) or the Unix epoch.
+            git(&["show", "-s", "--format=%ct", "HEAD"])
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .unwrap_or(0)
         });
     for (name, value) in [
         ("REVISION", revision),

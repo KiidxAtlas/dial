@@ -19,7 +19,6 @@ Release images are published to `ghcr.io/kiidxatlas/dial`; pin a tag or digest.
 
 ```sh
 docker run --rm -it \
-  --security-opt seccomp=unconfined --security-opt systempaths=unconfined \
   -v "$PWD":/workspace \
   -v dial-home:/home/dial/.dial \
   -e ANTHROPIC_API_KEY \
@@ -40,7 +39,7 @@ docker run --rm -it \
 
 ### Docker Compose
 
-`docker-compose.yml` in the repository root wraps the same options:
+`docker-compose.yml` preserves Docker's default syscall and `/proc` protections:
 
 ```sh
 export ANTHROPIC_API_KEY=...        # whichever providers you use
@@ -58,14 +57,19 @@ project directory.
 Dial runs commands under Bubblewrap, which needs unprivileged user namespaces and a fresh `/proc`
 mount. Docker's default seccomp profile blocks the first and its masked `/proc` paths block the
 second, so inside a default container Dial's sandbox probe fails and command execution is
-**disabled** with an error; it never falls back to running unsandboxed. The recipes above pass
-`--security-opt seccomp=unconfined --security-opt systempaths=unconfined`, which lets Bubblewrap
-work without `--privileged` (checked with Docker Desktop on macOS using Dial's own Bubblewrap
-arguments). On hosts that apply an AppArmor profile to containers, such as Ubuntu, add
-`--security-opt apparmor=unconfined` as well. These options relax the container's own syscall and
-`/proc` protections, so the container is a packaging boundary rather than a security boundary:
-Dial's sandbox, not Docker, confines the commands it runs. Tools that do not run commands
-(reading, editing, search, web) work either way.
+**disabled** with an error; it never falls back to running unsandboxed. The default recipes
+retain those protections. If you explicitly accept weaker container isolation, use the
+separate override:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.sandbox.yml run --rm dial
+```
+
+It sets `seccomp=unconfined` and `systempaths=unconfined` so Bubblewrap can operate without
+`--privileged`. Docker users can pass the same two `--security-opt` options explicitly.
+Some AppArmor hosts additionally need a reviewed host policy change. These options relax
+the container's security boundary; they are not the default or a substitute for Dial's
+command sandbox. File, search and web tools work with the default protections.
 
 ## Docker Model Runner (Docker AI)
 

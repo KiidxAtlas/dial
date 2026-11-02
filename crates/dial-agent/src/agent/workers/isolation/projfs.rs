@@ -205,7 +205,7 @@ mod native {
             },
             System::{
                 Com::CoCreateGuid,
-                LibraryLoader::{GetProcAddress, LoadLibraryW},
+                LibraryLoader::{GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW},
             },
         },
         core::{GUID, HRESULT, PCSTR, PCWSTR},
@@ -288,26 +288,39 @@ mod native {
 
     fn load() -> Result<Api, String> {
         let name = wide(OsStr::new("ProjectedFSLib.dll"));
-        // SAFETY: `name` is NUL-terminated UTF-16 and outlives the call.
-        let module: HMODULE = unsafe { LoadLibraryW(name.as_ptr()) };
+        // SAFETY: `name` is NUL-terminated UTF-16 and outlives the call; the null file handle is
+        // required for this flag. Search only System32, never a worker/project DLL search path.
+        let module: HMODULE =
+            unsafe { LoadLibraryExW(name.as_ptr(), ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32) };
         if module.is_null() {
             return Err(format!("{UNAVAILABLE} ({})", io::Error::last_os_error()));
         }
-        Ok(Api {
-            mark: symbol(module, b"PrjMarkDirectoryAsPlaceholder\0")?,
-            start: symbol(module, b"PrjStartVirtualizing\0")?,
-            stop: symbol(module, b"PrjStopVirtualizing\0")?,
-            fill: symbol(module, b"PrjFillDirEntryBuffer\0")?,
-            placeholder: symbol(module, b"PrjWritePlaceholderInfo\0")?,
-            write_data: symbol(module, b"PrjWriteFileData\0")?,
-            alloc: symbol(module, b"PrjAllocateAlignedBuffer\0")?,
-            free: symbol(module, b"PrjFreeAlignedBuffer\0")?,
-            matches: symbol(module, b"PrjFileNameMatch\0")?,
+        // The module reference is deliberately retained for the process lifetime: API is static
+        // and copies its function pointers into each Instance/Context.
+        // SAFETY: every name below is NUL-terminated and paired with the exact ProjFS SDK
+        // function pointer signature declared above, including extern "system" and bool ABI.
+        Ok(unsafe {
+            Api {
+                mark: symbol(module, b"PrjMarkDirectoryAsPlaceholder\0")?,
+                start: symbol(module, b"PrjStartVirtualizing\0")?,
+                stop: symbol(module, b"PrjStopVirtualizing\0")?,
+                fill: symbol(module, b"PrjFillDirEntryBuffer\0")?,
+                placeholder: symbol(module, b"PrjWritePlaceholderInfo\0")?,
+                write_data: symbol(module, b"PrjWriteFileData\0")?,
+                alloc: symbol(module, b"PrjAllocateAlignedBuffer\0")?,
+                free: symbol(module, b"PrjFreeAlignedBuffer\0")?,
+                matches: symbol(module, b"PrjFileNameMatch\0")?,
+            }
         })
     }
 
-    /// Resolves one export. `name` is NUL-terminated; `T` must be the matching function pointer type.
-    fn symbol<T>(module: HMODULE, name: &[u8]) -> Result<T, String> {
+    /// Resolves one export.
+    ///
+    /// # Safety
+    /// `module` must stay loaded for every use of the returned pointer; `name` must be
+    /// NUL-terminated. `T` must be a same-sized function pointer with the exact ABI, argument
+    /// and return types of that export. A pointer-sized arbitrary Rust type is not sufficient.
+    unsafe fn symbol<T>(module: HMODULE, name: &[u8]) -> Result<T, String> {
         // SAFETY: `name` is NUL-terminated and `module` is a loaded module handle.
         let proc: FARPROC = unsafe { GetProcAddress(module, name.as_ptr() as PCSTR) };
         let Some(proc) = proc else {
@@ -316,8 +329,7 @@ mod native {
                 String::from_utf8_lossy(&name[..name.len() - 1])
             ));
         };
-        // SAFETY: `T` is a function pointer type with the same size as the pointer returned by
-        // GetProcAddress, and the signature matches the documented ProjFS export.
+        // SAFETY: the caller guarantees T's function-pointer representation and exact export ABI.
         Ok(unsafe { std::mem::transmute_copy::<unsafe extern "system" fn() -> isize, T>(&proc) })
     }
 
@@ -375,15 +387,15 @@ mod native {
         let api = api()?;
         fs::create_dir(root).map_err(|error| format!("creating {}: {error}", root.display()))?;
         let mut instance_id = GUID::default();
-        // SAFETY: `instance_id` is a valid out-pointer.
         check(
+            // SAFETY: `instance_id` is a valid out-pointer.
             unsafe { CoCreateGuid(&mut instance_id) },
             "creating the ProjFS instance id",
         )?;
         let root_w = wide(root.as_os_str());
-        // SAFETY: a NULL target and version info mark the root itself; the pointers are valid for
-        // the call.
         check(
+            // SAFETY: `root_w` is NUL-terminated and `instance_id` was initialized above;
+            // NULL target and version info mark the root itself. All pointers outlive the call.
             unsafe { (api.mark)(root_w.as_ptr(), ptr::null(), ptr::null(), &instance_id) },
             "marking the instance directory for ProjFS",
         )?;
@@ -417,9 +429,9 @@ mod native {
             NotificationMappingsCount: 1,
         };
         let mut handle: PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT = ptr::null_mut();
-        // SAFETY: every pointer outlives the call. `context` lives in the returned Instance until
-        // PrjStopVirtualizing has returned, so the callbacks never see a dangling instance context.
         check(
+            // SAFETY: every pointer outlives the call. `context` lives in the returned Instance
+            // until PrjStopVirtualizing returns, so callbacks retain a live instance context.
             unsafe {
                 (api.start)(
                     root_w.as_ptr(),
@@ -446,18 +458,25 @@ mod native {
         }
     }
 
-    fn context<'a>(data: *const PRJ_CALLBACK_DATA) -> &'a Context {
-        // SAFETY: ProjFS passes the InstanceContext given to PrjStartVirtualizing, which the
-        // Instance keeps alive until virtualization stops.
-        unsafe { &*((*data).InstanceContext as *const Context) }
+    /// Borrows provider state only for the lifetime of this callback's data.
+    ///
+    /// # Safety
+    /// `data` must be from a callback on this provider, with the InstanceContext originally
+    /// registered in start. The owning Instance must not be stopped during this borrow.
+    unsafe fn context(data: &PRJ_CALLBACK_DATA) -> &Context {
+        // SAFETY: the caller guarantees the live Context allocation registered with ProjFS.
+        unsafe { &*(data.InstanceContext as *const Context) }
     }
 
     /// Copies a NUL-terminated UTF-16 string, including the terminator.
-    fn copy_wide(ptr: PCWSTR) -> Vec<u16> {
+    ///
+    /// # Safety
+    /// A non-null pointer must reference a readable, NUL-terminated UTF-16 string for this call.
+    unsafe fn copy_wide(ptr: PCWSTR) -> Vec<u16> {
         if ptr.is_null() {
             return vec![0];
         }
-        // SAFETY: ProjFS passes NUL-terminated strings that stay valid for the callback.
+        // SAFETY: the caller guarantees readable units through the terminator for this call.
         unsafe {
             let mut len = 0;
             while *ptr.add(len) != 0 {
@@ -468,8 +487,12 @@ mod native {
     }
 
     /// The relative path ProjFS reports; the root is the empty path.
-    fn relative(ptr: PCWSTR) -> PathBuf {
-        let units = copy_wide(ptr);
+    ///
+    /// # Safety
+    /// A non-null pointer must reference a readable, NUL-terminated UTF-16 string for this call.
+    unsafe fn relative(ptr: PCWSTR) -> PathBuf {
+        // SAFETY: the caller upholds copy_wide's string lifetime/termination requirements.
+        let units = unsafe { copy_wide(ptr) };
         PathBuf::from(OsString::from_wide(&units[..units.len() - 1]))
     }
 
@@ -540,15 +563,20 @@ mod native {
         Ok(entries)
     }
 
-    extern "system" fn start_enumeration(
+    /// # Safety
+    /// ProjFS must supply live callback data for this provider and a readable enumeration GUID.
+    unsafe extern "system" fn start_enumeration(
         data: *const PRJ_CALLBACK_DATA,
         id: *const GUID,
     ) -> HRESULT {
-        let context = context(data);
+        // SAFETY: ProjFS keeps its callback data and our registered Context live for this call.
+        let data = unsafe { &*data };
+        // SAFETY: the callback's InstanceContext belongs to the active Instance.
+        let context = unsafe { context(data) };
         // SAFETY: ProjFS passes a valid enumeration id for the call.
         let id = unsafe { *id };
-        // SAFETY: `data` is valid for the callback.
-        let directory = relative(unsafe { (*data).FilePathName });
+        // SAFETY: FilePathName is a NUL-terminated name valid for the callback.
+        let directory = unsafe { relative(data.FilePathName) };
         match list(&context.source, &directory, &context.journal) {
             Ok(entries) => {
                 context
@@ -567,8 +595,16 @@ mod native {
         }
     }
 
-    extern "system" fn end_enumeration(data: *const PRJ_CALLBACK_DATA, id: *const GUID) -> HRESULT {
-        let context = context(data);
+    /// # Safety
+    /// ProjFS must supply live callback data for this provider and a readable enumeration GUID.
+    unsafe extern "system" fn end_enumeration(
+        data: *const PRJ_CALLBACK_DATA,
+        id: *const GUID,
+    ) -> HRESULT {
+        // SAFETY: ProjFS keeps its callback data and our registered Context live for this call.
+        let data = unsafe { &*data };
+        // SAFETY: the callback's InstanceContext belongs to the active Instance.
+        let context = unsafe { context(data) };
         // SAFETY: ProjFS passes a valid enumeration id for the call.
         let id = unsafe { *id };
         context
@@ -579,16 +615,22 @@ mod native {
         S_OK
     }
 
-    extern "system" fn get_enumeration(
+    /// # Safety
+    /// ProjFS must supply live callback data, a readable enumeration GUID, a valid entry buffer,
+    /// and either a null search pointer or a NUL-terminated UTF-16 pattern valid for this call.
+    unsafe extern "system" fn get_enumeration(
         data: *const PRJ_CALLBACK_DATA,
         id: *const GUID,
         search: PCWSTR,
         buffer: PRJ_DIR_ENTRY_BUFFER_HANDLE,
     ) -> HRESULT {
-        let context = context(data);
-        // SAFETY: ProjFS passes a valid enumeration id and callback data for the call.
-        let (id, restart) =
-            unsafe { (*id, (*data).Flags & PRJ_CB_DATA_FLAG_ENUM_RESTART_SCAN != 0) };
+        // SAFETY: ProjFS keeps its callback data and our registered Context live for this call.
+        let data = unsafe { &*data };
+        // SAFETY: the callback's InstanceContext belongs to the active Instance.
+        let context = unsafe { context(data) };
+        // SAFETY: ProjFS passes a valid enumeration id for the call.
+        let id = unsafe { *id };
+        let restart = data.Flags & PRJ_CB_DATA_FLAG_ENUM_RESTART_SCAN != 0;
         let mut sessions = context
             .sessions
             .lock()
@@ -603,7 +645,8 @@ mod native {
             session.next = 0;
         }
         if !search.is_null() {
-            session.pattern = Some(copy_wide(search));
+            // SAFETY: search is a NUL-terminated pattern valid for the callback.
+            session.pattern = Some(unsafe { copy_wide(search) });
         }
         while session.next < session.entries.len() {
             let entry = &session.entries[session.next];
@@ -626,11 +669,16 @@ mod native {
         S_OK
     }
 
-    extern "system" fn placeholder_info(data: *const PRJ_CALLBACK_DATA) -> HRESULT {
-        let context = context(data);
-        // SAFETY: `data` is valid for the callback.
-        let (ns, name) = unsafe { ((*data).NamespaceVirtualizationContext, (*data).FilePathName) };
-        let rel = relative(name);
+    /// # Safety
+    /// ProjFS must supply live callback data for this provider, including its UTF-16 path.
+    unsafe extern "system" fn placeholder_info(data: *const PRJ_CALLBACK_DATA) -> HRESULT {
+        // SAFETY: ProjFS keeps its callback data and our registered Context live for this call.
+        let data = unsafe { &*data };
+        // SAFETY: the callback's InstanceContext belongs to the active Instance.
+        let context = unsafe { context(data) };
+        let (ns, name) = (data.NamespaceVirtualizationContext, data.FilePathName);
+        // SAFETY: FilePathName is NUL-terminated and valid for the callback.
+        let rel = unsafe { relative(name) };
         let source = context.source.join(&rel);
         if context.journal.is_removed(&rel) || is_excluded_source_path(&context.source, &source) {
             return E_FILE_NOT_FOUND;
@@ -640,45 +688,56 @@ mod native {
             Err(error) => return hresult_of(&error),
         };
         let time = meta.modified().map(filetime).unwrap_or(0);
-        // SAFETY: a zeroed PRJ_PLACEHOLDER_INFO is valid (plain integers, GUIDs and a byte array);
-        // its basic info is set below and the version info is left empty, as ProjFS allows.
-        let mut info: PRJ_PLACEHOLDER_INFO = unsafe { std::mem::zeroed() };
-        info.FileBasicInfo = basic_info(meta.is_dir(), meta.len() as i64, time);
+        let info = PRJ_PLACEHOLDER_INFO {
+            FileBasicInfo: basic_info(meta.is_dir(), meta.len() as i64, time),
+            ..Default::default()
+        };
         // SAFETY: `info` is valid for the call and its size is passed exactly.
         unsafe {
             (context.api.placeholder)(ns, name, &info, size_of::<PRJ_PLACEHOLDER_INFO>() as u32)
         }
     }
 
-    extern "system" fn file_data(
+    /// # Safety
+    /// ProjFS must supply live callback data for this provider, including its UTF-16 path and
+    /// namespace/stream handles valid until this synchronous callback returns.
+    unsafe extern "system" fn file_data(
         data: *const PRJ_CALLBACK_DATA,
         offset: u64,
         length: u32,
     ) -> HRESULT {
-        let context = context(data);
+        // SAFETY: ProjFS keeps its callback data and our registered Context live for this call.
+        let data = unsafe { &*data };
+        // SAFETY: the callback's InstanceContext belongs to the active Instance.
+        let context = unsafe { context(data) };
         if length == 0 {
             return S_OK;
         }
-        // SAFETY: `data` is valid for the callback.
-        let (ns, stream, name) = unsafe {
-            (
-                (*data).NamespaceVirtualizationContext,
-                (*data).DataStreamId,
-                (*data).FilePathName,
-            )
-        };
-        let rel = relative(name);
+        let (ns, stream, name) = (
+            data.NamespaceVirtualizationContext,
+            data.DataStreamId,
+            data.FilePathName,
+        );
+        // SAFETY: FilePathName is NUL-terminated and valid for the callback.
+        let rel = unsafe { relative(name) };
         if context.journal.is_removed(&rel) {
             return E_FILE_NOT_FOUND;
         }
         let source = context.source.join(&rel);
         let length_usize = length as usize;
+        if length_usize > isize::MAX as usize {
+            return E_INVALIDARG;
+        }
         // SAFETY: the namespace context comes from ProjFS for this callback.
         let buffer = unsafe { (context.api.alloc)(ns, length_usize) };
         if buffer.is_null() {
             return E_OUTOFMEMORY;
         }
-        // SAFETY: `buffer` is a fresh allocation of `length_usize` bytes, used only until it is freed.
+        // SAFETY: the non-null fresh allocation has `length_usize` writable bytes. ProjFS does
+        // not promise initialization; initialize before exposing the buffer to the safe Read API.
+        unsafe { ptr::write_bytes(buffer.cast::<u8>(), 0, length_usize) };
+        // SAFETY: the allocation is now initialized, exclusively borrowed, and used only until
+        // PrjFreeAlignedBuffer below. The slice length was checked against isize::MAX above.
         let bytes = unsafe { std::slice::from_raw_parts_mut(buffer.cast::<u8>(), length_usize) };
         let read = File::open(&source).and_then(|mut file| {
             file.seek(SeekFrom::Start(offset))?;
@@ -694,16 +753,22 @@ mod native {
         hr
     }
 
-    extern "system" fn notification(
+    /// # Safety
+    /// ProjFS must supply live callback data for this provider and a null or NUL-terminated
+    /// destination name valid for this call. The notification parameters are not dereferenced.
+    unsafe extern "system" fn notification(
         data: *const PRJ_CALLBACK_DATA,
         _is_directory: bool,
         kind: PRJ_NOTIFICATION,
         destination: PCWSTR,
         _parameters: *mut PRJ_NOTIFICATION_PARAMETERS,
     ) -> HRESULT {
-        let context = context(data);
-        // SAFETY: `data` is valid for the callback.
-        let rel = relative(unsafe { (*data).FilePathName });
+        // SAFETY: ProjFS keeps its callback data and our registered Context live for this call.
+        let data = unsafe { &*data };
+        // SAFETY: the callback's InstanceContext belongs to the active Instance.
+        let context = unsafe { context(data) };
+        // SAFETY: FilePathName is NUL-terminated and valid for the callback.
+        let rel = unsafe { relative(data.FilePathName) };
         match kind {
             PRJ_NOTIFICATION_NEW_FILE_CREATED
             | PRJ_NOTIFICATION_FILE_OVERWRITTEN
@@ -712,7 +777,8 @@ mod native {
             PRJ_NOTIFICATION_FILE_RENAMED => {
                 context.journal.remove(rel);
                 if !destination.is_null() {
-                    context.journal.touch(relative(destination));
+                    // SAFETY: ProjFS supplies a NUL-terminated destination for this callback.
+                    context.journal.touch(unsafe { relative(destination) });
                 }
             }
             _ => {}

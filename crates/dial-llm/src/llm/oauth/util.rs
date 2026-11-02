@@ -357,7 +357,55 @@ pub fn run_opener(command: &mut Command) -> bool {
     }
 }
 
-/// A loopback listener for an authorization-code redirect.
+/// Bind a nonblocking loopback listener. Provider owners retain their redirect host/port choices.
+pub(crate) fn bind_callback(host: &str, port: u16) -> std::io::Result<TcpListener> {
+    let listener = TcpListener::bind((host, port))?;
+    if !listener.local_addr()?.ip().is_loopback() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "OAuth callbacks require loopback",
+        ));
+    }
+    listener.set_nonblocking(true)?;
+    Ok(listener)
+}
+
+/// Shared callback accept/cancel/deadline lifecycle. A provider validates and answers each
+/// connection, returning `None` for a preconnection or callback that must not consume the grant.
+pub(crate) fn wait_callback<T>(
+    listener: &TcpListener,
+    cancel: &AtomicBool,
+    deadline: Instant,
+    timed_out: &str,
+    mut receive: impl FnMut(&mut TcpStream) -> Result<Option<T>>,
+) -> Result<T> {
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(crate::llm::Interrupted.into());
+        }
+        ensure!(Instant::now() < deadline, "{timed_out}");
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                if let Some(value) = receive(&mut stream)? {
+                    return Ok(value);
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
 pub struct Callback {
     listener: TcpListener,
     port: u16,
@@ -368,9 +416,8 @@ pub struct Callback {
 impl Callback {
     /// Bind `host:port` (port 0 picks a free port). `path` is the expected redirect path.
     pub fn bind(host: &str, port: u16, path: &str) -> Result<Self> {
-        let listener = TcpListener::bind((host, port))
+        let listener = bind_callback(host, port)
             .with_context(|| format!("sign-in callback port {port} on {host} is unavailable"))?;
-        listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
         Ok(Self {
             listener,
@@ -395,69 +442,55 @@ impl Callback {
         timeout: Duration,
     ) -> Result<HashMap<String, String>> {
         let deadline = Instant::now() + timeout;
-        loop {
-            ensure!(!cancel.load(Ordering::SeqCst), "sign-in cancelled");
-            ensure!(
-                Instant::now() < deadline,
-                "sign-in timed out waiting for the browser redirect"
-            );
-            match self.listener.accept() {
-                Ok((mut stream, _)) => {
-                    stream.set_nonblocking(false)?;
-                    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-                    let parsed = read_redirect(&mut stream, &self.path);
-                    let accepted = match &parsed {
-                        Ok(fields) => expected_state
-                            .is_none_or(|state| fields.get("state").is_some_and(|s| s == state)),
-                        Err(_) => false,
-                    };
-                    let declined = accepted
-                        && parsed
-                            .as_ref()
-                            .is_ok_and(|fields| fields.contains_key("error"));
-                    respond(
-                        &mut stream,
-                        accepted && !declined,
-                        if declined {
-                            "Sign-in was declined. You may close this page."
-                        } else if accepted {
-                            "Sign-in received. Return to Dial; you may close this page."
-                        } else {
-                            "This is not the active Dial sign-in callback."
-                        },
-                    );
-                    if accepted {
-                        let fields = parsed?;
-                        if let Some(error) = fields.get("error") {
-                            bail!("sign-in was declined by the provider ({})", sanitize(error));
-                        }
-                        return Ok(fields);
+        wait_callback(
+            &self.listener,
+            cancel,
+            deadline,
+            "sign-in timed out waiting for the browser redirect",
+            |stream| {
+                stream.set_nonblocking(false)?;
+                stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+                let parsed = read_redirect_within(
+                    stream,
+                    &self.path,
+                    REDIRECT_READ_BUDGET.min(deadline.saturating_duration_since(Instant::now())),
+                );
+                let accepted = match &parsed {
+                    Ok(fields) => expected_state
+                        .is_none_or(|state| fields.get("state").is_some_and(|s| s == state)),
+                    Err(_) => false,
+                };
+                let declined = accepted
+                    && parsed
+                        .as_ref()
+                        .is_ok_and(|fields| fields.contains_key("error"));
+                respond(
+                    stream,
+                    accepted && !declined,
+                    if declined {
+                        "Sign-in was declined. You may close this page."
+                    } else if accepted {
+                        "Sign-in received. Return to Dial; you may close this page."
+                    } else {
+                        "This is not the active Dial sign-in callback."
+                    },
+                );
+                if accepted {
+                    let fields = parsed?;
+                    if let Some(error) = fields.get("error") {
+                        bail!("sign-in was declined by the provider ({})", sanitize(error));
                     }
+                    return Ok(Some(fields));
                 }
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::WouldBlock
-                            | std::io::ErrorKind::Interrupted
-                            | std::io::ErrorKind::ConnectionAborted
-                            | std::io::ErrorKind::ConnectionReset
-                    ) =>
-                {
-                    std::thread::sleep(Duration::from_millis(25))
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
+                Ok(None)
+            },
+        )
     }
 }
 
 /// Longest a client may take to deliver its request head. The per-read socket timeout alone lets a
 /// client that dribbles one byte at a time hold [`Callback::wait`] past its own cancel/timeout.
 const REDIRECT_READ_BUDGET: Duration = Duration::from_secs(5);
-
-fn read_redirect(stream: &mut TcpStream, path: &str) -> Result<HashMap<String, String>> {
-    read_redirect_within(stream, path, REDIRECT_READ_BUDGET)
-}
 
 fn read_redirect_within(
     stream: &mut TcpStream,

@@ -606,14 +606,20 @@ fn relay(shell: &mut Shell, app: &App, args: &str) -> Result<()> {
             };
             bind.parse::<std::net::SocketAddr>()
                 .with_context(|| format!("{bind:?} is not an address like 127.0.0.1:7331"))?;
-            let child = Command::new(std::env::current_exe()?)
-                .args(["relay", "--bind", bind])
-                .current_dir(&app.layout.project_root)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .context("starting the relay")?;
+            let mut child = crate::platform::process::spawn(
+                Command::new(std::env::current_exe()?)
+                    .args(["relay", "--bind", bind])
+                    .current_dir(&app.layout.project_root)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped()),
+            )
+            .context("starting the relay")?;
+            if let Err(error) = await_relay_ready(&mut child) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
             *slot = Some((child, bind.to_owned()));
             let configured = &app.config.collab.relay_url;
             shell.note(
@@ -651,6 +657,40 @@ pub(crate) fn stop_relay() {
     {
         let _ = child.kill();
         let _ = child.wait();
+    }
+}
+
+/// Readiness comes from the child after bind, not a racy probe of a possibly unrelated listener.
+fn await_relay_ready(child: &mut Child) -> Result<()> {
+    let stderr = child
+        .stderr
+        .take()
+        .context("relay readiness pipe is missing")?;
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("dial-relay-ready".into())
+        .spawn(move || {
+            use std::io::{BufRead, BufReader};
+            let mut announced = false;
+            let mut diagnostic = String::new();
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if !announced && line.starts_with("Dial collaboration relay listening on ") {
+                    announced = true;
+                    let _ = tx.send(Ok(()));
+                } else if !announced && diagnostic.len() < 4096 {
+                    diagnostic.push_str(&line);
+                    diagnostic.push('\n');
+                }
+            }
+            if !announced {
+                let _ = tx.send(Err(diagnostic));
+            }
+        })
+        .context("starting relay readiness reader")?;
+    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(message)) => bail!("relay failed before listening: {}", message.trim()),
+        Err(error) => bail!("relay did not confirm readiness: {error}"),
     }
 }
 
@@ -692,3 +732,6 @@ fn hooks(shell: &mut Shell, app: &App) -> Result<()> {
 
 #[cfg(test)]
 mod schedule_tests;
+
+#[cfg(test)]
+mod tests;

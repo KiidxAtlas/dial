@@ -186,11 +186,10 @@ pub(in crate::agent) fn clip(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_owned();
     }
-    let end = (0..=max)
-        .rev()
-        .find(|&i| text.is_char_boundary(i))
-        .unwrap_or(0);
-    format!("{} [cut]", &text[..end])
+    format!(
+        "{} [cut]",
+        crate::agent::base::helpers::byte_prefix(text, max)
+    )
 }
 
 /// The `task` tool as offered to the model.
@@ -1397,6 +1396,20 @@ pub(in crate::agent) trait Approver {
             result
         }
     }
+    /// Calls recovered from text must reach an approval owner, never an automatic fallback.
+    fn authorize_from(
+        &mut self,
+        call: &ToolCall,
+        summary: &str,
+        needs_approval: bool,
+        provenance: approval::CallProvenance,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<(), Denial> {
+        if provenance == approval::CallProvenance::RecoveredText {
+            return Err(Denial::User);
+        }
+        self.authorize_with_cancel(call, summary, needs_approval, cancel)
+    }
     /// Recheck computed native targets against the controller's current permissions.
     /// The enclosing operation was already approved; this must never widen its grant.
     fn authorize_mutation(
@@ -1506,30 +1519,21 @@ impl Approver for Direct<'_> {
         summary: &str,
         needs_approval: bool,
     ) -> Result<(), Denial> {
-        if approval::denied_by_rule(self.always, call, self.root) {
-            approval::explain_rule(
-                self.ui,
-                call,
-                self.root,
-                self.always,
-                approval::Effect::Deny,
-            );
-            return Err(Denial::Rule);
-        }
-        if !needs_approval {
-            approval::explain(self.ui, call, approval::PolicyReason::SafeCall);
-            return Ok(());
-        }
-        approval::authorize(
-            self.approval,
-            self.always,
-            self.root,
+        approval::authorize_worker_call(
+            approval::WorkerPolicy {
+                approval: self.approval,
+                rules: self.always,
+                root: self.root,
+                read_only: self.plan_mode,
+                cancel: None,
+                interrupt: None,
+            },
             call,
             summary,
+            needs_approval,
+            approval::CallProvenance::Structured,
             self.ui,
         )
-        // Children cannot save project rules; the grant lasts the session.
-        .map(|_persist| ())
     }
     fn authorize_with_cancel(
         &mut self,
@@ -1538,47 +1542,37 @@ impl Approver for Direct<'_> {
         needs_approval: bool,
         cancel: &Arc<AtomicBool>,
     ) -> Result<(), Denial> {
-        if cancel.load(Ordering::SeqCst) {
-            approval::explain(self.ui, call, approval::PolicyReason::Cancelled);
-            return Err(Denial::User);
-        }
-        if approval::denied_by_rule(self.always, call, self.root) {
-            approval::explain_rule(
-                self.ui,
-                call,
-                self.root,
-                self.always,
-                approval::Effect::Deny,
-            );
-            return Err(Denial::Rule);
-        }
-        if !needs_approval {
-            return if cancel.load(Ordering::SeqCst) {
-                approval::explain(self.ui, call, approval::PolicyReason::Cancelled);
-                Err(Denial::User)
-            } else {
-                approval::explain(self.ui, call, approval::PolicyReason::SafeCall);
-                Ok(())
-            };
-        }
-        let prior_rules = self.always.len();
-        let result = approval::authorize_with_cancel(
-            self.approval,
-            self.always,
-            self.root,
+        self.authorize_from(
             call,
             summary,
-            self.ui,
+            needs_approval,
+            approval::CallProvenance::Structured,
             cancel,
-        );
-        if cancel.load(Ordering::SeqCst) {
-            // Do not retain an AllowAlways grant if cancellation won the UI response race.
-            self.always.truncate(prior_rules);
-            approval::explain(self.ui, call, approval::PolicyReason::Cancelled);
-            Err(Denial::User)
-        } else {
-            result.map(|_persist| ())
-        }
+        )
+    }
+    fn authorize_from(
+        &mut self,
+        call: &ToolCall,
+        summary: &str,
+        needs_approval: bool,
+        provenance: approval::CallProvenance,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<(), Denial> {
+        approval::authorize_worker_call(
+            approval::WorkerPolicy {
+                approval: self.approval,
+                rules: self.always,
+                root: self.root,
+                read_only: self.plan_mode,
+                cancel: Some(cancel),
+                interrupt: None,
+            },
+            call,
+            summary,
+            needs_approval,
+            provenance,
+            self.ui,
+        )
     }
     fn authorize_mutation(
         &mut self,
@@ -1653,6 +1647,7 @@ enum Message {
         call: ToolCall,
         summary: String,
         needs_approval: bool,
+        provenance: approval::CallProvenance,
         cancel: Arc<AtomicBool>,
         reply: mpsc::Sender<Result<(), Denial>>,
     },
@@ -1811,6 +1806,22 @@ impl Approver for Remote {
         needs_approval: bool,
         cancel: &Arc<AtomicBool>,
     ) -> Result<(), Denial> {
+        self.authorize_from(
+            call,
+            summary,
+            needs_approval,
+            approval::CallProvenance::Structured,
+            cancel,
+        )
+    }
+    fn authorize_from(
+        &mut self,
+        call: &ToolCall,
+        summary: &str,
+        needs_approval: bool,
+        provenance: approval::CallProvenance,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<(), Denial> {
         let interrupted = || {
             if self.3.load(Ordering::SeqCst) {
                 // Propagate whole-job interruption into this callback operation's owner flag,
@@ -1827,6 +1838,7 @@ impl Approver for Remote {
             call: call.clone(),
             summary: summary.to_owned(),
             needs_approval,
+            provenance,
             cancel: cancel.clone(),
             reply,
         };
@@ -2514,6 +2526,22 @@ impl Approver for Rebase<'_> {
         needs_approval: bool,
         cancel: &Arc<AtomicBool>,
     ) -> Result<(), Denial> {
+        self.authorize_from(
+            call,
+            summary,
+            needs_approval,
+            approval::CallProvenance::Structured,
+            cancel,
+        )
+    }
+    fn authorize_from(
+        &mut self,
+        call: &ToolCall,
+        summary: &str,
+        needs_approval: bool,
+        provenance: approval::CallProvenance,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<(), Denial> {
         if cancel.load(Ordering::SeqCst) {
             return Err(Denial::User);
         }
@@ -2525,7 +2553,7 @@ impl Approver for Rebase<'_> {
         );
         let summary = format!("[{}] {summary}", self.descendant.unwrap_or("isolated copy"));
         self.inner
-            .authorize_with_cancel(&call, &summary, needs_approval, cancel)
+            .authorize_from(&call, &summary, needs_approval, provenance, cancel)
     }
     fn authorize_mutation(
         &mut self,
@@ -3043,6 +3071,7 @@ fn pump_messages(
                 call,
                 summary,
                 needs_approval,
+                provenance,
                 cancel,
                 reply,
             }) => {
@@ -3051,7 +3080,7 @@ fn pump_messages(
                     if env.interrupt.load(Ordering::SeqCst) || cancel.load(Ordering::SeqCst) {
                         Err(Denial::User)
                     } else {
-                        direct.authorize_with_cancel(&call, &summary, needs_approval, &cancel)
+                        direct.authorize_from(&call, &summary, needs_approval, provenance, &cancel)
                     };
                 if env.interrupt.load(Ordering::SeqCst) || cancel.load(Ordering::SeqCst) {
                     cancel.store(true, Ordering::SeqCst);

@@ -197,3 +197,81 @@ fn protected_session_transcripts_point_to_session_search() {
     assert!(error.contains("enters protected Dial storage"), "{error}");
     assert!(!error.contains("session_search"), "{error}");
 }
+
+#[test]
+fn native_mutations_refuse_git_metadata_but_allow_inspection() {
+    let (dir, ws) = workspace();
+    let ws = ws.with_edit_mode(EditMode::Replace);
+    fs::create_dir_all(dir.path().join(".git/hooks")).unwrap();
+    fs::write(dir.path().join(".git/config"), "original\n").unwrap();
+    assert!(!run(&ws, "read", json!({"path":".git/config"})).is_error);
+    for path in [".git/config", ".git/hooks/pre-commit", "nested/.git/config"] {
+        let out = run(&ws, "write", json!({"path":path,"content":"host code"}));
+        assert!(
+            out.is_error && out.text.contains("protected Git metadata"),
+            "{path}: {}",
+            out.text
+        );
+    }
+    let out = run(
+        &ws,
+        "edit",
+        json!({"path":".git/config","old_string":"original","new_string":"host code"}),
+    );
+    assert!(
+        out.is_error && out.text.contains("protected Git metadata"),
+        "{}",
+        out.text
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join(".git/config")).unwrap(),
+        "original\n"
+    );
+    assert!(ws.observe_delete(ws.root()).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn native_mutations_protect_linked_worktree_metadata_and_aliases() {
+    let (dir, ws) = workspace();
+    let common = dir.path().join("repository-data");
+    let gitdir = common.join("worktrees/linked");
+    fs::create_dir_all(&gitdir).unwrap();
+    fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+    fs::write(
+        dir.path().join(".git"),
+        "gitdir: repository-data/worktrees/linked\n",
+    )
+    .unwrap();
+    symlink(&common, dir.path().join("alias")).unwrap();
+    assert!(!run(&ws, "read", json!({"path":".git"})).is_error);
+    for path in [
+        "repository-data/config",
+        "repository-data/worktrees/linked/config",
+        "alias/hooks/pre-commit",
+        ".git",
+    ] {
+        let out = run(&ws, "write", json!({"path":path,"content":"host code"}));
+        assert!(
+            out.is_error && out.text.contains("protected Git metadata"),
+            "{path}: {}",
+            out.text
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn recovery_identity_obeys_workspace_confinement_and_size_bound() {
+    let (dir, ws) = workspace();
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(outside.path().join("secret"), "not observable").unwrap();
+    fs::write(dir.path().join("file"), "inside").unwrap();
+    symlink(outside.path().join("secret"), dir.path().join("escape")).unwrap();
+    let file = ws.root().join("file");
+    assert!(ws.file_identity(&file).is_some());
+    assert!(ws.file_identity(&ws.root().join("escape")).is_none());
+    assert!(ws.file_identity(ws.root()).is_none());
+    fs::write(&file, vec![b'x'; 16 * 1024 * 1024 + 1]).unwrap();
+    assert!(ws.file_identity(&file).is_none());
+}

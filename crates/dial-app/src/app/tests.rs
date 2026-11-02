@@ -41,7 +41,6 @@ use crate::ui::status::{Lora, StatusData};
 use crate::ui::text;
 use crate::ui::theme::Sym;
 use crossterm::event::{Event, KeyCode};
-use fs2::FileExt;
 use ratatui::text::Line;
 use serde_json::{Value, json};
 use std::cell::RefCell;
@@ -858,7 +857,7 @@ fn disabling_compute_locks_releases_an_existing_session_lease() {
     .unwrap();
     let path = app.layout.user_dir.join("compute.lock");
     let lock = auto::lock_file(&path).unwrap();
-    lock.try_lock_exclusive().unwrap();
+    lock.try_lock().map_err(std::io::Error::from).unwrap();
     let inherited = lock.try_clone().unwrap();
     *app.compute.borrow_mut() = Some(lock);
     crate::learn::compute::register(
@@ -874,7 +873,7 @@ fn disabling_compute_locks_releases_an_existing_session_lease() {
     assert!(app.compute.borrow().is_none());
     assert!(!app.layout.user_dir.join("compute-owner.json").exists());
     let contender = auto::lock_file(&path).unwrap();
-    contender.try_lock_exclusive().unwrap();
+    contender.try_lock().map_err(std::io::Error::from).unwrap();
     drop(inherited);
 }
 
@@ -1047,7 +1046,7 @@ fn idle_handoff_releases_compute_without_closing_the_session() {
     config.use_case = "test".into();
     let lock_path = layout.user_dir.join("compute.lock");
     let lock = auto::lock_file(&lock_path).unwrap();
-    lock.try_lock_exclusive().unwrap();
+    lock.try_lock().map_err(std::io::Error::from).unwrap();
     let app = App {
         launch: Default::default(),
         add_dirs: Vec::new(),
@@ -1072,12 +1071,16 @@ fn idle_handoff_releases_compute_without_closing_the_session() {
     let id = agent.session().id().to_owned();
     let worker = auto::lock_file(&lock_path).unwrap();
     assert_eq!(
-        worker.try_lock_exclusive().unwrap_err().kind(),
+        worker
+            .try_lock()
+            .map_err(std::io::Error::from)
+            .unwrap_err()
+            .kind(),
         std::io::ErrorKind::WouldBlock
     );
     let inherited = app.compute.borrow().as_ref().unwrap().try_clone().unwrap();
     assert!(app.release_idle_compute(&mut agent));
-    worker.try_lock_exclusive().unwrap();
+    worker.try_lock().map_err(std::io::Error::from).unwrap();
     drop(inherited);
     assert!(app.compute.borrow().is_none());
     assert_eq!(agent.session().id(), id);
@@ -1131,7 +1134,7 @@ fn idle_unload_stops_a_resident_server_without_a_background_request() {
     let marker: Value = serde_json::from_slice(&std::fs::read(&config.model).unwrap()).unwrap();
     let pid = marker["pid"].as_i64().unwrap() as i32;
     let lock = auto::lock_file(&layout.user_dir.join("compute.lock")).unwrap();
-    lock.try_lock_exclusive().unwrap();
+    lock.try_lock().map_err(std::io::Error::from).unwrap();
     let app = App {
         launch: Default::default(),
         add_dirs: Vec::new(),
@@ -1171,6 +1174,7 @@ fn idle_unload_stops_a_resident_server_without_a_background_request() {
             .any(|row| row["pid"] == pid)
     );
     assert!(app.release_idle_compute(&mut agent));
+    // SAFETY: signal 0 only probes this test child's PID and does not dereference any memory.
     assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
     assert!(app.compute.borrow().is_none());
     assert_eq!(agent.session().id(), id);
@@ -1222,7 +1226,7 @@ fn compute_action_release_unloads_a_resident_server_only_when_started() {
     let marker: Value = serde_json::from_slice(&std::fs::read(&config.model).unwrap()).unwrap();
     let pid = marker["pid"].as_i64().unwrap() as i32;
     let lock = auto::lock_file(&layout.user_dir.join("compute.lock")).unwrap();
-    lock.try_lock_exclusive().unwrap();
+    lock.try_lock().map_err(std::io::Error::from).unwrap();
     let app = App {
         launch: Default::default(),
         add_dirs: Vec::new(),
@@ -1254,6 +1258,7 @@ fn compute_action_release_unloads_a_resident_server_only_when_started() {
         app.interrupt.clone(),
     )
     .unwrap();
+    // SAFETY: signal 0 only probes process existence; integer PIDs require no memory validity.
     let alive = |pid: i32| unsafe { libc::kill(pid, 0) } == 0;
     // The welcome flow has no agent; panels that only browse never invoke the release.
     assert!(overlay_compute_release(&app, None).is_none());
@@ -1288,12 +1293,12 @@ fn completed_probe_releases_compute_even_when_a_handle_was_inherited() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("compute.lock");
     let lock = auto::lock_file(&path).unwrap();
-    lock.try_lock_exclusive().unwrap();
+    lock.try_lock().map_err(std::io::Error::from).unwrap();
     let lease = ProbeLease(lock);
     let inherited = lease.0.try_clone().unwrap();
     drop(lease);
     let next = auto::lock_file(&path).unwrap();
-    next.try_lock_exclusive().unwrap();
+    next.try_lock().map_err(std::io::Error::from).unwrap();
     drop(inherited);
 }
 

@@ -27,13 +27,17 @@ fn jobs() -> std::sync::MutexGuard<'static, HashMap<u32, OwnedHandle>> {
     JOBS.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 pub(in crate::platform) fn spawn_group(command: &mut Command) -> io::Result<Child> {
+    // SAFETY: null security attributes and name request an unnamed job with default security.
     let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
     if raw.is_null() {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: CreateJobObjectW returned a fresh non-null handle owned only by this scope.
     let job = unsafe { OwnedHandle::from_raw_handle(raw.cast()) };
     let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    // SAFETY: raw stays owned by job; limits is a live initialized structure whose exact
+    // size matches the JobObjectExtendedLimitInformation class supplied here.
     if unsafe {
         SetInformationJobObject(
             raw,
@@ -49,14 +53,19 @@ pub(in crate::platform) fn spawn_group(command: &mut Command) -> io::Result<Chil
         .creation_flags(CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP)
         .spawn()?;
     let handle = child.as_raw_handle() as HANDLE;
+    // SAFETY: job and child own both live handles; the child is still suspended, so
+    // containment is established before it can start descendants.
     if unsafe { AssignProcessToJobObject(raw, handle) } == 0 {
         let error = io::Error::last_os_error();
         let _ = child.kill();
         let _ = child.wait();
         return Err(error);
     }
+    // SAFETY: handle is our suspended child's live process handle; NtResumeProcess
+    // changes its suspend count without borrowing any Rust memory.
     let status = unsafe { NtResumeProcess(handle) };
     if status < 0 {
+        // SAFETY: RtlNtStatusToDosError accepts the scalar NTSTATUS returned above.
         let error = io::Error::from_raw_os_error(unsafe {
             windows_sys::Win32::Foundation::RtlNtStatusToDosError(status)
         } as i32);
@@ -73,7 +82,10 @@ pub(in crate::platform) fn register_group(
 ) -> io::Result<()> {
     use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
     let mut duplicate = std::ptr::null_mut();
+    // SAFETY: GetCurrentProcess has no arguments and returns a non-owning pseudo handle.
     let current = unsafe { GetCurrentProcess() };
+    // SAFETY: job is borrowed for this call; duplicate is writable and both source and
+    // target process pseudo handles refer to this process, so no remote ownership is involved.
     if unsafe {
         DuplicateHandle(
             current,
@@ -88,6 +100,7 @@ pub(in crate::platform) fn register_group(
     {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: DuplicateHandle transferred one fresh handle, now uniquely owned by the map.
     jobs().insert(pid, unsafe {
         OwnedHandle::from_raw_handle(duplicate.cast())
     });
@@ -96,6 +109,7 @@ pub(in crate::platform) fn register_group(
 pub(in crate::platform) fn kill_group(pid: u32) -> io::Result<()> {
     let jobs = jobs();
     if let Some(job) = jobs.get(&pid) {
+        // SAFETY: the jobs guard keeps this owned job handle live during termination.
         if unsafe { TerminateJobObject(job.as_raw_handle() as HANDLE, 1) } == 0 {
             return Err(io::Error::last_os_error());
         }
@@ -114,6 +128,8 @@ pub(in crate::platform) fn terminate_group(pid: u32) -> io::Result<()> {
             "unknown process group",
         ));
     }
+    // SAFETY: this API takes only a scalar event and group ID, with no memory arguments;
+    // the map check above limits the best-effort event to a runtime-owned group ID.
     if unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) } != 0 {
         return Ok(());
     }
@@ -124,6 +140,7 @@ pub(in crate::platform) fn kill_checked(
     process: std::os::windows::io::BorrowedHandle<'_>,
 ) -> io::Result<()> {
     let raw = process.as_raw_handle() as HANDLE;
+    // SAFETY: process lends a live process handle for this query.
     let pid = unsafe { GetProcessId(raw) };
     if pid == 0 {
         return Err(io::Error::last_os_error());
@@ -131,6 +148,7 @@ pub(in crate::platform) fn kill_checked(
     let groups = jobs();
     if let Some(job) = groups.get(&pid) {
         let mut member = 0;
+        // SAFETY: process and the locked map keep both handles live; member is writable.
         if unsafe { IsProcessInJob(raw, job.as_raw_handle() as HANDLE, &mut member) } == 0 {
             return Err(io::Error::last_os_error());
         }
@@ -140,21 +158,29 @@ pub(in crate::platform) fn kill_checked(
                 "process group identity changed",
             ));
         }
+        // SAFETY: the map guard keeps this job handle live and membership was checked
+        // on the same pinned process object immediately above.
         if unsafe { TerminateJobObject(job.as_raw_handle() as HANDLE, 1) } == 0 {
             return Err(io::Error::last_os_error());
         }
-    } else if unsafe { TerminateProcess(raw, 1) } == 0 {
-        return Err(io::Error::last_os_error());
+    } else {
+        // SAFETY: raw remains borrowed from process; TerminateProcess takes no memory pointers.
+        if unsafe { TerminateProcess(raw, 1) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
     }
     Ok(())
 }
 #[cfg(any(test, feature = "test-support"))]
 pub(in crate::platform) fn alive(pid: u32) -> bool {
+    // SAFETY: OpenProcess takes scalar access/ID arguments; null is handled below.
     let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | 0x0010_0000, 0, pid) };
     if raw.is_null() {
         return false;
     }
+    // SAFETY: OpenProcess succeeded and its fresh handle is uniquely owned here.
     let handle = unsafe { OwnedHandle::from_raw_handle(raw.cast()) };
+    // SAFETY: handle stays owned for this zero-time, non-owning wait.
     unsafe { WaitForSingleObject(handle.as_raw_handle() as HANDLE, 0) == WAIT_TIMEOUT }
 }
 pub(in crate::platform) fn is_group_leader(pid: u32) -> bool {
@@ -163,18 +189,22 @@ pub(in crate::platform) fn is_group_leader(pid: u32) -> bool {
         return false;
     };
     // An exited leader is not running, and a reused PID is not a member of this job.
+    // SAFETY: OpenProcess takes scalar access/ID arguments and null is handled before use.
     let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if raw.is_null() {
         return false;
     }
+    // SAFETY: raw is a fresh non-null OpenProcess handle, adopted exactly once.
     let process = unsafe { OwnedHandle::from_raw_handle(raw.cast()) };
     let mut code = 0u32;
+    // SAFETY: process keeps the handle live and code is writable exit-code storage.
     if unsafe { GetExitCodeProcess(process.as_raw_handle() as HANDLE, &mut code) } == 0
         || code != STILL_ACTIVE as u32
     {
         return false;
     }
     let mut in_job = 0;
+    // SAFETY: process and the jobs lock retain both handles; in_job is writable output storage.
     let checked = unsafe {
         IsProcessInJob(
             process.as_raw_handle() as HANDLE,
@@ -185,6 +215,7 @@ pub(in crate::platform) fn is_group_leader(pid: u32) -> bool {
     checked != 0 && in_job != 0
 }
 pub(in crate::platform) fn exited(child: &Child) -> io::Result<bool> {
+    // SAFETY: child owns the live process handle for the entire zero-time query.
     match unsafe { WaitForSingleObject(child.as_raw_handle() as HANDLE, 0) } {
         WAIT_OBJECT_0 => Ok(true),
         WAIT_TIMEOUT => Ok(false),
@@ -197,6 +228,7 @@ pub(in crate::platform) fn wait_exited(
     timeout: std::time::Duration,
 ) -> io::Result<bool> {
     let millis = timeout.as_millis().min(u32::MAX as u128) as u32;
+    // SAFETY: child owns the process handle throughout the bounded, non-owning wait.
     match unsafe { WaitForSingleObject(child.as_raw_handle() as HANDLE, millis) } {
         WAIT_OBJECT_0 => Ok(true),
         WAIT_TIMEOUT => Ok(false),

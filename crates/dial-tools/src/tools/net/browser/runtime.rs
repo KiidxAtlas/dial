@@ -189,7 +189,7 @@ fn dependencies_cached(runtime: &Runtime) -> bool {
 }
 
 /// True when the private runtime and a Chromium build are already cached, so no network is needed.
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 pub(super) fn is_cached() -> bool {
     let Ok(root) = cache_root().map(|base| base.join(digest_dir())) else {
         return false;
@@ -213,7 +213,7 @@ fn ensure_fetchable(cached: bool, reachable: impl FnOnce() -> bool) -> Result<()
 }
 
 /// Whether the hosts that provisioning downloads from accept a TCP connection promptly.
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 pub(super) fn network_reachable() -> bool {
     hosts_reachable(&["registry.npmjs.org:443", "cdn.playwright.dev:443"])
 }

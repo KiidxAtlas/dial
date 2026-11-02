@@ -288,7 +288,9 @@ impl Shell {
                 // The same checks as `dial improve rollback`: no cycle may hold the version store.
                 let control = auto::lock_file(&learning.state_dir.join("control.lock"))?;
                 ensure!(
-                    fs2::FileExt::try_lock_exclusive(&control).is_ok(),
+                    std::fs::File::try_lock(&control)
+                        .map_err(std::io::Error::from)
+                        .is_ok(),
                     "an improvement job is running; stop it with /improve stop first"
                 );
                 crate::learn::improve::verify_adapter(&store, &store.version(parent)?)?;

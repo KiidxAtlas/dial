@@ -34,22 +34,13 @@ impl SecretToken {
         &self.0
     }
 
-    /// Mutable access for in-place edits. Growing the string past its capacity reallocates and
-    /// leaves the old buffer unwiped; callers reserve capacity first when that matters.
     pub fn as_mut_string(&mut self) -> &mut String {
         &mut self.0
     }
 
     fn wipe(&mut self) {
-        // NUL is valid UTF-8, so overwriting the current contents preserves String's invariant.
-        // SAFETY: writing zero bytes cannot create invalid UTF-8.
-        let bytes = unsafe { self.0.as_mut_vec() };
-        for byte in bytes.iter_mut() {
-            // SAFETY: `byte` is a valid, aligned, exclusively borrowed `u8`. A volatile store
-            // cannot be elided as a dead write before the buffer is freed, unlike `fill(0)`.
-            unsafe { std::ptr::write_volatile(byte, 0) };
-        }
-        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+        use zeroize::Zeroize;
+        self.0.zeroize();
     }
 }
 
@@ -80,11 +71,8 @@ fn openrouter_login_with(
     progress: &mut dyn FnMut(&str),
     open: impl FnOnce(&str) -> bool,
 ) -> Result<SecretToken> {
-    let listener = TcpListener::bind(("localhost", CALLBACK_PORT))
+    let listener = super::oauth::util::bind_callback("localhost", CALLBACK_PORT)
         .map_err(|_| anyhow::anyhow!("could not start the OpenRouter sign-in callback listener"))?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|_| anyhow::anyhow!("could not configure the OpenRouter callback listener"))?;
 
     let verifier = SecretToken::new(random_verifier());
     let challenge = pkce_challenge(verifier.as_str());
@@ -131,50 +119,42 @@ fn receive_callback(
     deadline: Instant,
     cancel: &AtomicBool,
 ) -> Result<String> {
-    loop {
-        if cancel.load(Ordering::SeqCst) {
-            return Err(super::Interrupted.into());
-        }
-        match listener.accept() {
-            Ok((mut stream, _)) => {
-                // The listener polls non-blocking and macOS accepted sockets inherit that, which would
-                // ignore the read timeout below and fail instantly if the request has not arrived yet.
-                stream
-                    .set_nonblocking(false)
-                    .and_then(|()| stream.set_read_timeout(Some(CALLBACK_POLL)))
-                    .map_err(|_| {
-                        anyhow::anyhow!("could not configure the sign-in callback connection")
-                    })?;
-                let result = read_callback(&mut stream, deadline, cancel);
-                if result
-                    .as_ref()
-                    .is_err_and(|error| error.downcast_ref::<super::Interrupted>().is_some())
-                {
-                    return result;
-                }
-                let (status, message) = match &result {
-                    Ok(_) => (
-                        "200 OK",
-                        "OpenRouter sign-in complete. You may close this page.",
-                    ),
-                    Err(_) => ("400 Bad Request", "Invalid OpenRouter sign-in callback."),
-                };
-                let response = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{message}",
-                    message.len()
-                );
-                let _ = stream.write_all(response.as_bytes());
-                return result;
+    super::oauth::util::wait_callback(
+        listener,
+        cancel,
+        deadline,
+        "OpenRouter sign-in timed out",
+        |stream| {
+            // The listener polls non-blocking and macOS accepted sockets inherit that, which would
+            // ignore the read timeout below and fail instantly if the request has not arrived yet.
+            stream
+                .set_nonblocking(false)
+                .and_then(|()| stream.set_read_timeout(Some(CALLBACK_POLL)))
+                .map_err(|_| {
+                    anyhow::anyhow!("could not configure the sign-in callback connection")
+                })?;
+            let result = read_callback(stream, deadline, cancel);
+            if result
+                .as_ref()
+                .is_err_and(|error| error.downcast_ref::<super::Interrupted>().is_some())
+            {
+                return result.map(Some);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
-                    bail!("OpenRouter sign-in timed out");
-                }
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            Err(_) => bail!("could not accept the OpenRouter sign-in callback"),
-        }
-    }
+            let (status, message) = match &result {
+                Ok(_) => (
+                    "200 OK",
+                    "OpenRouter sign-in complete. You may close this page.",
+                ),
+                Err(_) => ("400 Bad Request", "Invalid OpenRouter sign-in callback."),
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{message}",
+                message.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            result.map(Some)
+        },
+    )
 }
 
 /// One read that wakes every `CALLBACK_POLL`, so a silent browser connection still honours cancel and the deadline.
@@ -323,14 +303,7 @@ fn exchange_code_at(
     verifier: &str,
     cancel: Arc<AtomicBool>,
 ) -> Result<SecretToken> {
-    let agent = super::cancel::agent(
-        ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(30)))
-            .http_status_as_error(false)
-            .max_redirects(0)
-            .build(),
-        Arc::clone(&cancel),
-    );
+    let agent = super::agent_with(30, true, Some(Arc::clone(&cancel)), None);
     let mut response = agent
         .post(url)
         .header("Content-Type", "application/json")

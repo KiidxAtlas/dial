@@ -13,7 +13,7 @@ fn environment(scratch: &Path, cargo_target: Option<&Path>) -> Vec<(String, Stri
     let mut env: Vec<(String, String)> = std::env::vars_os()
         .filter_map(|(key, value)| {
             let (key, value) = (key.into_string().ok()?, value.into_string().ok()?);
-            (!is_secret_env(&key, &value)).then_some((key, value))
+            child_env_allowed(&key, &value).then_some((key, value))
         })
         .collect();
     let scratch = scratch.display().to_string();

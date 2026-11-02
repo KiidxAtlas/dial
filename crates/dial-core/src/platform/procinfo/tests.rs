@@ -1,5 +1,17 @@
 use super::*;
 
+#[test]
+fn deserialized_invalid_identities_are_never_live() {
+    for pid in [i32::MIN, -1, 0, 1] {
+        let id: ProcId = serde_json::from_value(serde_json::json!({"pid":pid,"start":1})).unwrap();
+        assert!(!id.same_process(), "invalid pid {pid}");
+        assert!(!id.alive(), "invalid pid {pid}");
+        assert!(!id.signal_group(0), "invalid pid {pid}");
+        #[cfg(unix)]
+        assert!(!id.signal(0), "invalid pid {pid}");
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn identity_tracks_exit_and_reaping() {
@@ -16,10 +28,14 @@ fn identity_tracks_exit_and_reaping() {
         .alive(),
         "a different start time is a different process"
     );
+    // SAFETY: id names our unreaped child; kill takes only scalar arguments.
     unsafe { libc::kill(id.pid, libc::SIGKILL) };
     // Until reaped the child is a zombie, which must not count as alive. Block until it exits
     // without reaping it (WNOWAIT), so the zombie state is what `alive()` observes.
+    // SAFETY: siginfo_t contains C scalar/union fields for which all-zero bits are valid.
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: info is writable siginfo_t storage and child is still ours and unreaped;
+    // WNOWAIT observes its exit without relinquishing that ownership.
     let rc = unsafe {
         libc::waitid(
             libc::P_PID,

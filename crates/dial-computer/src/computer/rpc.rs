@@ -397,18 +397,17 @@ fn run_clipboard(
     let failed = |error: std::io::Error| ClipboardFailure::Failed(format!("{program}: {error}"));
     let reading = stdin.is_none();
     let piped_if = |yes: bool| if yes { Stdio::piped() } else { Stdio::null() };
-    let mut child = Command::new(program)
-        .args(args)
-        .stdin(piped_if(!reading))
-        .stdout(piped_if(reading))
-        .stderr(piped_if(reading))
-        .spawn()
-        .map_err(|error| match error.kind() {
-            std::io::ErrorKind::NotFound => {
-                ClipboardFailure::Missing(format!("{program}: {error}"))
-            }
-            _ => failed(error),
-        })?;
+    let mut child = crate::platform::process::spawn(
+        Command::new(program)
+            .args(args)
+            .stdin(piped_if(!reading))
+            .stdout(piped_if(reading))
+            .stderr(piped_if(reading)),
+    )
+    .map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => ClipboardFailure::Missing(format!("{program}: {error}")),
+        _ => failed(error),
+    })?;
     let writer = match (stdin, child.stdin.take()) {
         (Some(text), Some(mut pipe)) => {
             let text = text.to_owned();

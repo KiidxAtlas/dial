@@ -10,8 +10,8 @@ use ashpd::desktop::{
 use futures::StreamExt;
 use reis::{
     ei,
+    event::Connection,
     event::{Device, DeviceCapability, EiEvent, Keymap},
-    tokio::EiConvertEventStream,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -62,22 +62,83 @@ pub(super) struct Libei {
     connection: Option<reis::event::Connection>,
     sequence: u32,
     runtime: &'static tokio::runtime::Runtime,
-    events: Option<EiConvertEventStream>,
+    events: Option<EventReceiver>,
     disconnected: bool,
     portal_session: Option<PortalSession>,
 }
 
-#[allow(
-    clippy::non_send_fields_in_send_ty,
-    reason = "EiConvertEventStream's only non-Send field is a callback map that stays empty"
-)]
-// SAFETY: the reis event stream is exclusively owned. Its sole non-`Send`
-// field is a private callback map which remains empty because
-// `EiConvertEventStream` exposes no callback-registration API.
-unsafe impl Send for Libei {}
+type EventReceiver = tokio::sync::mpsc::Receiver<Result<EiEvent, String>>;
+
+/// Construct and poll reis' !Send converter on one dedicated thread. Only the public,
+/// compiler-checked Send event/connection types cross the channel; no private-layout promise.
+fn event_owner(
+    runtime: &'static tokio::runtime::Runtime,
+    context: ei::Context,
+) -> CoreResult<(Connection, EventReceiver)> {
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("dial-libei-events".into())
+        .spawn(move || {
+            runtime.block_on(async move {
+                let handshake = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    context.handshake_tokio("dial-computer", ei::handshake::ContextType::Sender),
+                )
+                .await;
+                let (connection, mut stream) = match handshake {
+                    Ok(Ok(pair)) => pair,
+                    Ok(Err(error)) => {
+                        let _ = ready_tx.send(Err(format!("libei handshake: {error}")));
+                        return;
+                    }
+                    Err(_) => {
+                        let _ = ready_tx.send(Err("libei handshake timed out".into()));
+                        return;
+                    }
+                };
+                let (tx, rx) = tokio::sync::mpsc::channel(256);
+                if ready_tx.send(Ok((connection, rx))).is_err() {
+                    return;
+                }
+                loop {
+                    let event = tokio::select! {
+                        _ = tx.closed() => break,
+                        event = stream.next() => event,
+                    };
+                    let Some(event) = event else {
+                        break;
+                    };
+                    let event = event.map_err(|error| error.to_string());
+                    let failed = event.is_err();
+                    if tx.send(event).await.is_err() || failed {
+                        break;
+                    }
+                }
+            });
+        })
+        .map_err(|error| {
+            DesktopError::input_failed(format!("starting libei event owner: {error}"))
+        })?;
+    loop {
+        control::check()?;
+        match ready_rx.recv_timeout(Duration::from_millis(10)) {
+            Ok(result) => return result.map_err(DesktopError::input_failed),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(DesktopError::input_failed(
+                    "libei event owner stopped during handshake",
+                ));
+            }
+        }
+    }
+}
 
 impl Drop for Libei {
     fn drop(&mut self) {
+        // Closing the bounded receiver wakes the owner even while its socket is idle.
+        if let Some(events) = self.events.as_mut() {
+            events.close();
+        }
         let serial = self.serial();
         for device in &self.devices {
             if device.resumed {
@@ -161,18 +222,7 @@ impl Libei {
             disconnected: false,
             portal_session,
         };
-        let (connection, mut events) = runtime
-            .block_on(cancellable(async {
-                tokio::time::timeout(
-                    Duration::from_secs(5),
-                    backend
-                        .context
-                        .handshake_tokio("dial-computer", ei::handshake::ContextType::Sender),
-                )
-                .await
-            }))?
-            .map_err(|_| DesktopError::input_failed("libei handshake timed out"))?
-            .map_err(|err| DesktopError::input_failed(format!("libei handshake: {err}")))?;
+        let (connection, mut events) = event_owner(runtime, backend.context.clone())?;
         backend.connection = Some(connection);
         backend.discover_devices(runtime, &mut events, targets)?;
         backend.events = Some(events);
@@ -256,7 +306,7 @@ impl Libei {
     fn discover_devices(
         &mut self,
         runtime: &tokio::runtime::Runtime,
-        events: &mut EiConvertEventStream,
+        events: &mut EventReceiver,
         targets: DiscoveryTargets,
     ) -> CoreResult<()> {
         if targets.is_complete(false, false) {
@@ -269,7 +319,7 @@ impl Libei {
                 control::check()?;
                 let until = drain_deadline.unwrap_or(deadline).min(deadline);
                 let tick = (tokio::time::Instant::now() + Duration::from_millis(10)).min(until);
-                let event = match tokio::time::timeout_at(tick, events.next()).await {
+                let event = match tokio::time::timeout_at(tick, events.recv()).await {
                     Ok(Some(event)) => event.map_err(|err| {
                         DesktopError::input_failed(format!("libei device discovery: {err}"))
                     })?,
@@ -399,7 +449,7 @@ impl Libei {
         let result = runtime.block_on(async {
             for _ in 0..256 {
                 control::check()?;
-                match tokio::time::timeout(Duration::from_millis(1), events.next()).await {
+                match tokio::time::timeout(Duration::from_millis(1), events.recv()).await {
                     Ok(Some(Ok(event))) => self.handle_event(event)?,
                     Ok(Some(Err(err))) => {
                         self.disconnected = true;

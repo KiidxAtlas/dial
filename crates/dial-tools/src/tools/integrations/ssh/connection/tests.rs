@@ -194,5 +194,55 @@ fn refresh_and_compat_rules() {
             ..linux
         }
     ));
-    assert_eq!(PosixShell::Sh.wrap("echo 'a'"), "sh -c 'echo '\\''a'\\'''");
+}
+
+#[cfg(unix)]
+#[test]
+fn wrapped_scripts_keep_shell_metacharacters_literal_and_transfer_stdin_intact() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    for login_shell in ["sh", "csh", "fish"] {
+        let startup: &[&str] = match login_shell {
+            "csh" => &["-f"],
+            "fish" => &["--no-config"],
+            _ => &[],
+        };
+        if login_shell != "sh"
+            && Command::new(login_shell)
+                .args(startup)
+                .args(["-c", "exit 0"])
+                .output()
+                .is_err()
+        {
+            eprintln!(
+                "{login_shell} not installed; optional login-shell compatibility case skipped"
+            );
+            continue;
+        }
+        let script = r#"printf '%s\n' "/x';id;'\q"; cat"#;
+        let wrapped = PosixShell::Sh.wrap(script);
+        // The outer login-shell word contains no quote escapes (fish interprets those
+        // differently from POSIX shells). Script bytes are only interpreted by the inner shell.
+        assert!(!wrapped.contains("\\'"), "{wrapped}");
+        let mut child = Command::new(login_shell)
+            .args(startup)
+            .args(["-c", &wrapped])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"transfer bytes\n")
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{login_shell}: {out:?}");
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            "/x';id;'\\q\ntransfer bytes\n",
+            "{login_shell}"
+        );
+    }
 }

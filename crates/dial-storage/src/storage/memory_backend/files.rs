@@ -1,8 +1,8 @@
-use crate::config::paths::Layout;
+use crate::{config::paths::Layout, platform::fs as platform_fs};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OpenFlags};
 use std::{
-    ffi::{CStr, CString},
+    ffi::CString,
     fs::File,
     io::{Read, Write},
     os::{
@@ -17,10 +17,6 @@ pub struct PrivateDirectory {
     path: PathBuf,
     fd: Arc<File>,
 }
-fn cstring(value: &std::ffi::OsStr) -> Result<CString> {
-    use std::os::unix::ffi::OsStrExt;
-    Ok(CString::new(value.as_bytes())?)
-}
 fn component(value: &str) -> Result<CString> {
     ensure!(
         !value.is_empty()
@@ -32,24 +28,14 @@ fn component(value: &str) -> Result<CString> {
     );
     Ok(CString::new(value)?)
 }
-fn open_dir(parent: RawFd, name: &CString, create: bool) -> Result<File> {
-    if create && unsafe { libc::mkdirat(parent, name.as_ptr(), 0o700) } != 0 {
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::AlreadyExists {
-            return Err(error.into());
-        }
+fn open_dir(parent: &File, name: &Path, create: bool) -> Result<File> {
+    if create
+        && let Err(error) = platform_fs::create_dir_beneath(parent, name)
+        && error.kind() != std::io::ErrorKind::AlreadyExists
+    {
+        return Err(error.into());
     }
-    let fd = unsafe {
-        libc::openat(
-            parent,
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(unsafe { File::from_raw_fd(fd) })
+    Ok(platform_fs::open_dir_beneath_handle(parent, name)?)
 }
 fn missing(error: &anyhow::Error) -> bool {
     error
@@ -93,19 +79,17 @@ impl PrivateDirectory {
         for part in resolved.components() {
             match part {
                 Component::RootDir => {}
-                Component::Normal(name) => {
-                    file = open_dir(file.as_raw_fd(), &cstring(name)?, create)?
-                }
+                Component::Normal(name) => file = open_dir(&file, Path::new(name), create)?,
                 _ => anyhow::bail!("memory storage path must be normalized"),
             }
         }
         ensure!(
-            file.metadata()?.uid() == unsafe { libc::geteuid() },
+            platform_fs::owned_by_current_user(&file)?,
             "memory storage has another owner"
         );
         if create && file.metadata()?.mode() & 0o777 != 0o700 {
             ensure!(
-                unsafe { libc::fchmod(file.as_raw_fd(), 0o700) } == 0,
+                platform_fs::set_owner_only_file(&file).is_ok(),
                 "cannot secure memory directory"
             );
         }
@@ -130,15 +114,16 @@ impl PrivateDirectory {
         }
     }
     pub fn child(&self, name: &str) -> Result<Self> {
-        let fd = open_dir(self.directory_fd(), &component(name)?, true)?;
+        component(name)?;
+        let fd = open_dir(&self.fd, Path::new(name), true)?;
         let meta = fd.metadata()?;
         ensure!(
-            meta.uid() == unsafe { libc::geteuid() },
+            platform_fs::owned_by_current_user(&fd)?,
             "private directory has another owner"
         );
         if meta.mode() & 0o777 != 0o700 {
             ensure!(
-                unsafe { libc::fchmod(fd.as_raw_fd(), 0o700) } == 0,
+                platform_fs::set_owner_only_file(&fd).is_ok(),
                 "cannot secure private directory"
             );
         }
@@ -149,10 +134,11 @@ impl PrivateDirectory {
         })
     }
     pub fn existing_child(&self, name: &str) -> Result<Self> {
-        let fd = open_dir(self.directory_fd(), &component(name)?, false)?;
+        component(name)?;
+        let fd = open_dir(&self.fd, Path::new(name), false)?;
         let meta = fd.metadata()?;
         ensure!(
-            meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o077 == 0,
+            platform_fs::owned_by_current_user(&fd)? && meta.mode() & 0o077 == 0,
             "private read directory has unsafe owner or permissions"
         );
         Ok(Self {
@@ -167,6 +153,7 @@ impl PrivateDirectory {
         self.fd.as_raw_fd()
     }
     fn file(&self, name: &str, flags: i32) -> Result<File> {
+        // SAFETY: self pins the directory; component validates a single NUL-terminated name.
         let fd = unsafe {
             libc::openat(
                 self.directory_fd(),
@@ -178,16 +165,17 @@ impl PrivateDirectory {
         if fd < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
+        // SAFETY: openat returned a fresh descriptor, uniquely owned by this File.
         let file = unsafe { File::from_raw_fd(fd) };
         let meta = file.metadata()?;
         ensure!(
-            meta.is_file() && meta.uid() == unsafe { libc::geteuid() } && meta.nlink() == 1,
+            meta.is_file() && platform_fs::owned_by_current_user(&file)? && meta.nlink() == 1,
             "unsafe memory file"
         );
         if flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT) != 0 {
             if meta.mode() & 0o777 != 0o600 {
                 ensure!(
-                    unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } == 0,
+                    platform_fs::set_owner_only_file(&file).is_ok(),
                     "cannot secure memory file"
                 );
             }
@@ -225,6 +213,7 @@ impl PrivateDirectory {
         let connection = Connection::open(self.checked_database_path(name, &file)?)
             .context("open private backend database")?;
         connection.busy_timeout(std::time::Duration::from_secs(10))?;
+        crate::storage::sqlite::check_version(&connection, 1)?;
         connection.execute_batch(&format!(
             "PRAGMA foreign_keys=ON;PRAGMA journal_mode={journal};PRAGMA synchronous=FULL;"
         ))?;
@@ -241,6 +230,7 @@ impl PrivateDirectory {
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         connection.busy_timeout(std::time::Duration::from_millis(100))?;
+        crate::storage::sqlite::check_version(&connection, 1)?;
         Ok(Some(connection))
     }
     pub fn write(&self, name: &str, bytes: &[u8]) -> Result<()> {
@@ -259,26 +249,18 @@ impl PrivateDirectory {
         result
     }
     pub fn rename(&self, from: &str, to: &str) -> Result<()> {
-        ensure!(
-            unsafe {
-                libc::renameat(
-                    self.directory_fd(),
-                    component(from)?.as_ptr(),
-                    self.directory_fd(),
-                    component(to)?.as_ptr(),
-                )
-            } == 0,
-            "cannot atomically publish memory file: {}",
-            std::io::Error::last_os_error()
-        );
+        component(from)?;
+        component(to)?;
+        platform_fs::replace_beneath(&self.fd, Path::new(from), Path::new(to))
+            .context("cannot publish private memory file")?;
         Ok(())
     }
     pub fn remove(&self, name: &str) -> Result<()> {
-        if unsafe { libc::unlinkat(self.directory_fd(), component(name)?.as_ptr(), 0) } != 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() != std::io::ErrorKind::NotFound {
-                return Err(error.into());
-            }
+        component(name)?;
+        if let Err(error) = platform_fs::remove_beneath(&self.fd, Path::new(name))
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(error.into());
         }
         Ok(())
     }
@@ -289,62 +271,32 @@ impl PrivateDirectory {
             Err(error) if missing(&error) => return Ok(()),
             Err(error) => return Err(error),
         };
-        let duplicate = unsafe { libc::fcntl(child.directory_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-        ensure!(
-            duplicate >= 0,
-            "cannot duplicate private cleanup descriptor"
-        );
-        let stream = unsafe { libc::fdopendir(duplicate) };
-        if stream.is_null() {
-            unsafe { libc::close(duplicate) };
-            return Err(std::io::Error::last_os_error().into());
-        }
-        let result = (|| -> Result<()> {
-            loop {
-                let entry = unsafe { libc::readdir(stream) };
-                if entry.is_null() {
-                    break;
-                }
-                let value = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
-                let bytes = value.to_bytes();
-                if bytes == b"." || bytes == b".." {
-                    continue;
-                }
-                let value = value.to_str().context("private cleanup entry not UTF-8")?;
-                let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-                ensure!(
-                    unsafe {
-                        libc::fstatat(
-                            child.directory_fd(),
-                            component(value)?.as_ptr(),
-                            stat.as_mut_ptr(),
-                            libc::AT_SYMLINK_NOFOLLOW,
-                        )
-                    } == 0,
-                    "private cleanup entry changed"
-                );
-                let stat = unsafe { stat.assume_init() };
-                if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
-                    child.remove_tree(value)?;
-                } else {
-                    child.remove(value)?;
-                }
-            }
-            Ok(())
-        })();
-        unsafe { libc::closedir(stream) };
-        result?;
-        ensure!(
-            unsafe {
-                libc::unlinkat(
-                    self.directory_fd(),
-                    component(name)?.as_ptr(),
-                    libc::AT_REMOVEDIR,
+        // Snapshot before unlinking: mutating an active directory stream may skip entries.
+        for value in crate::platform::fs::read_dir_beneath(&child.fd)? {
+            let value = value.to_str().context("private cleanup entry not UTF-8")?;
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            let name = component(value)?;
+            // SAFETY: child pins the directory; name is NUL-terminated, and stat is writable.
+            let result = unsafe {
+                libc::fstatat(
+                    child.directory_fd(),
+                    name.as_ptr(),
+                    stat.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
                 )
-            } == 0,
-            "cannot remove private staging directory"
-        );
-        self.fd.sync_all()?;
+            };
+            ensure!(result == 0, "private cleanup entry changed");
+            // SAFETY: fstatat succeeded and initialized stat above.
+            let stat = unsafe { stat.assume_init() };
+            if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+                child.remove_tree(value)?;
+            } else {
+                child.remove(value)?;
+            }
+        }
+        component(name)?;
+        platform_fs::remove_dir_beneath(&self.fd, Path::new(name))
+            .context("cannot remove private directory")?;
         Ok(())
     }
     pub fn read_head(&self, name: &str, max: usize) -> Result<(Vec<u8>, bool)> {
@@ -373,3 +325,6 @@ impl PrivateDirectory {
         Ok(Some(text))
     }
 }
+
+#[cfg(test)]
+mod tests;

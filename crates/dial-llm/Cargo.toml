@@ -15,7 +15,6 @@ aws-smithy-http-client = { workspace = true, optional = true }
 base64.workspace = true
 crc32fast.workspace = true
 flate2.workspace = true
-fs2.workspace = true
 httpdate.workspace = true
 image.workspace = true
 libc.workspace = true
@@ -35,6 +34,7 @@ toml.workspace = true
 tungstenite.workspace = true
 ureq.workspace = true
 url.workspace = true
+zeroize.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true

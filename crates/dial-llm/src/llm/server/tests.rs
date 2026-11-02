@@ -525,6 +525,8 @@ fn ensure_reuses_and_restarts() {
     assert!(wait_dead(pid), "old server not stopped on swap");
     let pid = info(&first)["pid"].as_i64().unwrap();
     // A crashed server is replaced even when the configuration is unchanged.
+    // SAFETY: kill takes only integer arguments and has no memory-safety preconditions. `pid`
+    // identifies the fixture child whose deliberate crash exercises supervisor recovery.
     unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
     for _ in 0..200 {
         if !slot.as_ref().unwrap().is_running() {

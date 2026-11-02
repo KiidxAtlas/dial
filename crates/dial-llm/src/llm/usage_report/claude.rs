@@ -5,8 +5,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Map, Value};
@@ -21,11 +21,9 @@ use crate::llm::oauth::util::{self, Body, now_ms};
 
 const PROVIDER: &str = "anthropic";
 const API_ROOT: &str = "https://api.anthropic.com/api/oauth";
-const USER_AGENT: &str = "claude-cli/2.1.280 (external, cli)";
-const USAGE_BETAS: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11";
-const MAX_ATTEMPTS: u32 = 3;
-const BASE_RETRY_DELAY_MS: u64 = 500;
-const MAX_RETRY_AFTER_MS: u64 = 10_000;
+const USER_AGENT: &str = crate::llm::anthropic::CLAUDE_USER_AGENT;
+use crate::llm::anthropic::{CLAUDE_OAUTH_BETA, USAGE_BETAS};
+const MAX_ATTEMPTS: usize = 3;
 const FIVE_HOUR_MS: u64 = 5 * 60 * 60 * 1_000;
 const SEVEN_DAY_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 /// Top-level keys that mark a body as a usage payload (vs. some unrelated JSON document).
@@ -98,6 +96,14 @@ pub(super) fn fetch(user_dir: &Path, cancel: &Arc<AtomicBool>) -> Result<Option<
 /// absent on this host (404/405/410/501, an empty body, or a non-JSON body).
 fn fetch_json(url: &str, token: &str, cancel: &Arc<AtomicBool>) -> Result<Option<Value>> {
     let authorization = format!("Bearer {token}");
+    let policy = crate::llm::retry::Policy {
+        max_attempts: MAX_ATTEMPTS,
+        max_delay: Duration::from_secs(10),
+        wait_for_quota_reset: false,
+        rotate_accounts: false,
+        backoff: Duration::from_millis(500),
+        failover: None,
+    };
     for attempt in 0..MAX_ATTEMPTS {
         let headers = [
             ("accept", "application/json, text/plain, */*"),
@@ -111,14 +117,26 @@ fn fetch_json(url: &str, token: &str, cancel: &Arc<AtomicBool>) -> Result<Option
             bail!("Claude usage request was rate limited");
         }
         if (500..600).contains(&status) && status != 501 {
-            if attempt + 1 == MAX_ATTEMPTS {
-                bail!("Claude usage request failed with HTTP {status}");
-            }
-            let retry_after_ms = response
+            let hinted = response
                 .header("retry-after")
                 .and_then(|value| value.trim().parse::<u64>().ok())
-                .map_or(0, |secs| secs.saturating_mul(1_000).min(MAX_RETRY_AFTER_MS));
-            pause(attempt, retry_after_ms, cancel)?;
+                .map(Duration::from_secs);
+            match crate::llm::retry::decide(
+                &crate::llm::errors::ErrorClass::Transient,
+                hinted,
+                attempt + 1,
+                false,
+                &policy,
+            ) {
+                crate::llm::retry::Decision::Retry { delay, .. } => {
+                    crate::llm::retry::RetryControl::default()
+                        .begin_wait()
+                        .wait(delay, cancel)?;
+                }
+                crate::llm::retry::Decision::Stop(_) => {
+                    bail!("Claude usage request failed with HTTP {status}")
+                }
+            }
             continue;
         }
         if matches!(status, 404 | 405 | 410 | 501) {
@@ -137,7 +155,6 @@ fn fetch_json(url: &str, token: &str, cancel: &Arc<AtomicBool>) -> Result<Option
 
 const CEDAR_PROGRAM: &str = "cedar_ember";
 pub(super) const JUNIPER_PROGRAM: &str = "juniper_tide";
-const CLAUDE_OAUTH_BETA: &str = "oauth-2025-04-20";
 /// Account routes (`/api/organizations/...`) live at the API root, not under `/api/oauth`.
 const CLAUDE_API_HOST: &str = "https://api.anthropic.com";
 
@@ -269,22 +286,6 @@ fn valid_redeem_request_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-}
-
-fn pause(attempt: u32, retry_after_ms: u64, cancel: &AtomicBool) -> Result<()> {
-    let wait = Duration::from_millis((BASE_RETRY_DELAY_MS << attempt).max(retry_after_ms));
-    let end = Instant::now() + wait;
-    loop {
-        if cancel.load(Ordering::Relaxed) {
-            bail!("Claude usage request cancelled");
-        }
-        let now = Instant::now();
-        if now >= end {
-            return Ok(());
-        }
-        // Sleep in short slices so a cancel during a long Retry-After is honored promptly.
-        std::thread::sleep((end - now).min(Duration::from_millis(100)));
-    }
 }
 
 /// Discovery of reset credits when the main payload carries none: Cedar first, then Juniper.

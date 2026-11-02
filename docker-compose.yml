@@ -36,13 +36,9 @@ services:
     extra_hosts:
       # Docker Desktop defines this already; Docker Engine on Linux needs the mapping.
       - "host.docker.internal:host-gateway"
-    # Dial runs commands under Bubblewrap, which needs unprivileged user namespaces and a fresh
-    # /proc mount. Docker's default seccomp profile and masked /proc paths block both; without
-    # these Dial disables command execution rather than running unsandboxed. On hosts that
-    # enforce AppArmor for containers (Ubuntu), also add `apparmor=unconfined`.
-    security_opt:
-      - seccomp=unconfined
-      - systempaths=unconfined
+    # Keep Docker's default syscall and /proc protections. On hosts where these block
+    # Bubblewrap, command tools fail closed; native file/network tools remain available.
+    # Explicit sandbox opt-in: docker compose -f docker-compose.yml -f docker-compose.sandbox.yml run --rm dial
 
 volumes:
   dial-home:

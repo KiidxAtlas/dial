@@ -90,6 +90,7 @@ fn seed_notebook(dir: &tempfile::TempDir) -> PathBuf {
     path
 }
 
+#[cfg(unix)]
 fn dial_files(dir: &tempfile::TempDir) -> Vec<String> {
     std::fs::read_dir(dir.path())
         .unwrap()

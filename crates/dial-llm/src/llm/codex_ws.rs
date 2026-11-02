@@ -795,8 +795,12 @@ fn connect(
     request
         .headers_mut()
         .insert("openai-beta", "responses_websockets=2026-02-06".parse()?);
-    request.headers_mut().insert("originator", "dial".parse()?);
-    request.headers_mut().insert("version", "0.159.0".parse()?);
+    request
+        .headers_mut()
+        .insert("originator", super::chatgpt::ORIGINATOR.parse()?);
+    request
+        .headers_mut()
+        .insert("version", super::chatgpt::CLIENT_VERSION.parse()?);
     request
         .headers_mut()
         .insert("x-session-id", session_id.parse()?);

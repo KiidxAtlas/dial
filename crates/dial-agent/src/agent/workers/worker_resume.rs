@@ -36,7 +36,8 @@ pub fn lease(layout: &Layout, session: &str, id: &str) -> Result<File> {
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     let file = options.open(dir.join(format!("{id}.lock")))?;
-    fs2::FileExt::try_lock_exclusive(&file)
+    std::fs::File::try_lock(&file)
+        .map_err(std::io::Error::from)
         .context("worker is still owned by another running process")?;
     Ok(file)
 }

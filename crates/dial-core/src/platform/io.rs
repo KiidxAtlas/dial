@@ -240,15 +240,17 @@ impl<W: std::io::Write + Send + 'static + std::os::windows::io::AsRawHandle> Que
         if let Some(handle) = worker.as_ref() {
             let deadline = Instant::now() + Duration::from_secs(2);
             while !handle.is_finished() && Instant::now() < deadline {
+                // SAFETY: the JoinHandle remains owned under the worker lock, so its native
+                // thread handle is live; cancellation does not close the handle or its buffers.
                 unsafe {
                     windows_sys::Win32::System::IO::CancelSynchronousIo(handle.as_raw_handle() as _);
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
-            if handle.is_finished() {
-                if let Some(handle) = worker.take() {
-                    let _ = handle.join();
-                }
+            if handle.is_finished()
+                && let Some(handle) = worker.take()
+            {
+                let _ = handle.join();
             }
         }
     }

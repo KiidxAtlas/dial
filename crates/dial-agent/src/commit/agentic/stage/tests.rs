@@ -11,6 +11,9 @@ fn run(dir: &Path, args: &[&str]) -> String {
         .output()
         .expect("run git");
     assert!(output.status.success(), "git {args:?} failed");
+    if args.first() == Some(&"init") {
+        crate::commit::testkit::disable_inherited_git_drivers(dir);
+    }
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
@@ -154,4 +157,21 @@ fn failed_group_restores_remaining_staging_and_reports_progress() {
     assert_eq!(run(root, &["log", "--format=%s"]).lines().count(), 2);
     assert_eq!(run(root, &["diff", "--cached", "--name-only"]), "b.txt\n");
     assert_eq!(fs::read_to_string(root.join("b.txt")).unwrap(), "REJECT\n");
+}
+
+#[test]
+fn head_lookup_distinguishes_unborn_existing_and_failed_inspection() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    run(root, &["init", "-q"]);
+    assert_eq!(head_commit(root).unwrap(), None);
+    let existing = tempfile::tempdir().expect("tempdir");
+    let root = existing.path();
+    init_repo(root);
+    assert_eq!(
+        head_commit(root).unwrap(),
+        Some(run(root, &["rev-parse", "HEAD"]).trim().to_owned())
+    );
+    fs::write(root.join(".git/config"), "[invalid\n").unwrap();
+    assert!(matches!(head_commit(root), Err(CommitError::Git(_))));
 }

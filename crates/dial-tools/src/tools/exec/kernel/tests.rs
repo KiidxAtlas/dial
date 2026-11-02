@@ -163,6 +163,8 @@ fn drop_kills_and_reaps_the_process_group_leader() {
     let p = NativeProcess::start(command, observed_pid.clone()).unwrap();
     let pid = observed_pid.load(Ordering::Acquire) as libc::pid_t;
     drop(p);
+    // SAFETY: signal zero probes the former child's PID without sending any signal;
+    // ESRCH below checks that dropping the owner actually reaped it.
     assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
     assert_eq!(
         std::io::Error::last_os_error().raw_os_error(),
@@ -265,6 +267,8 @@ fn kernel_denies_fork_spawn_and_detached_descendants_even_without_filesystem_san
                 .and_then(|s| s.parse::<i32>().ok())
                 .filter(|pid| *pid > 0)
             {
+                // SAFETY: kill takes scalar arguments and pid is positive (never 0/-1
+                // process-group selectors), reported by this test's escaped-child code.
                 unsafe {
                     libc::kill(pid, libc::SIGKILL);
                 }

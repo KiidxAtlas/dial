@@ -5,6 +5,62 @@ mod relocation_artifacts;
 mod schema;
 mod timing;
 mod tree;
+
+#[test]
+fn writer_claim_rejects_a_replaced_inode() {
+    let e = env();
+    let mut session = new_session(&e);
+    let path = session.path().unwrap().to_owned();
+    // A waiting opener can retain this inode across the writer's atomic header publication.
+    let old =
+        platform_fs::open_nofollow_nonblocking(OpenOptions::new().read(true).append(true), &path)
+            .unwrap();
+    session
+        .set_additional_dirs(&[e._home.path().join("extra")])
+        .unwrap();
+    assert!(!claim_writer(&old, &path).unwrap());
+    assert!(matches!(
+        Session::claim_open(&path).unwrap(),
+        Claimed::Contended(_)
+    ));
+    drop(session);
+    assert!(matches!(
+        Session::claim_open(&path).unwrap(),
+        Claimed::Owned(_)
+    ));
+}
+
+#[test]
+fn header_rewrite_invalidates_search_offsets_and_preserves_indexed_messages() {
+    let e = env();
+    let mut session = new_session(&e);
+    session.append(user("platypus")).unwrap();
+    assert_eq!(Session::search(&e.layout, "platypus", 10).unwrap().len(), 1);
+    session
+        .set_additional_dirs(&[e._home.path().join("long-new-workspace-root")])
+        .unwrap();
+    session.append(user("echidna")).unwrap();
+    assert_eq!(Session::search(&e.layout, "echidna", 10).unwrap().len(), 1);
+    assert_eq!(Session::search(&e.layout, "platypus", 10).unwrap().len(), 1);
+}
+
+#[test]
+fn legacy_search_index_upgrades_without_trusting_old_offsets() {
+    let e = env();
+    crate::platform::atomic::private_dir(&e.layout.state_dir).unwrap();
+    let db = e.layout.state_dir.join("sessions.sqlite3");
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE indexed(session_id TEXT PRIMARY KEY, bytes INTEGER NOT NULL);",
+    )
+    .unwrap();
+    drop(conn);
+    let mut session = new_session(&e);
+    session.append(user("platypus")).unwrap();
+    assert_eq!(Session::search(&e.layout, "platypus", 10).unwrap().len(), 1);
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(super::super::sqlite::check_version(&conn, 1).unwrap(), 1);
+}
 #[test]
 fn streamed_observations_survive_reopen_before_any_final_reply() {
     let e = env();

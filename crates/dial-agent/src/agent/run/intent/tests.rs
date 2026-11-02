@@ -149,3 +149,25 @@ fn changed_provenance_is_readmitted_even_when_earlier_history_shows_the_old_note
     let updated = continuation("Continue.", &control, &visible);
     assert!(updated.contains("use v2 instead"), "{updated}");
 }
+
+#[test]
+fn utf8_request_excerpt_keeps_both_ends_within_the_byte_budget() {
+    for text in ["🦀".repeat(1_400), "a🦀é".repeat(1_000)] {
+        let mut control = json!({});
+        record_turn(&mut control, &text, 0);
+        let context = request_context(&control).unwrap();
+        let (_, payload) = context.split_once('\n').unwrap();
+        let payload: Value = serde_json::from_str(payload).unwrap();
+        let excerpt = payload["text"].as_str().unwrap();
+        let (head, tail) = excerpt
+            .split_once(
+                "\n[... middle omitted; full user message remains in session history ...]\n",
+            )
+            .unwrap();
+        assert!(!head.is_empty() && !tail.is_empty());
+        assert!(text.starts_with(head) && text.ends_with(tail));
+        assert!(excerpt.len() <= 4096 && excerpt.len() >= 4090);
+        assert_eq!(payload["text_truncated"], true);
+        assert_eq!(control["user_intent"]["latest"]["text"], text);
+    }
+}

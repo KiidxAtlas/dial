@@ -47,6 +47,10 @@ impl Default for Config {
 impl Config {
     pub fn validate(&self) -> Result<()> {
         ensure!(
+            self.timeout_secs <= 86400,
+            "laya.timeout_secs must be 0 (unlimited) or 1..86400"
+        );
+        ensure!(
             self.engine == DecisionEngineType::Laya,
             "decision engine `kev` has no implementation in this build; set [laya] engine = \"laya\""
         );

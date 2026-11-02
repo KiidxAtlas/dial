@@ -11,14 +11,24 @@ use std::sync::atomic::AtomicBool;
 #[cfg(unix)]
 #[test]
 fn named_session_restores_cwd_and_env_after_a_job_and_refuses_while_busy() {
-    // Only this suite runs the embedded shell host, so pointing the process-wide override at the
-    // built binary affects nothing else.
-    unsafe {
-        std::env::set_var(
-            dial::embedded_shell::HOST_EXE_ENV,
-            env!("CARGO_BIN_EXE_dial"),
-        )
-    };
+    // Set the embedded-host override before the child test process starts, never by
+    // mutating the environment of this multithreaded integration-test process.
+    const CHILD: &str = "DIAL_TEST_NAMED_SESSION_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "shell_sessions::named_session_restores_cwd_and_env_after_a_job_and_refuses_while_busy", "--nocapture"])
+            .env(CHILD, "1")
+            .env(dial::embedded_shell::HOST_EXE_ENV, env!("CARGO_BIN_EXE_dial"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated named-session test: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("src")).unwrap();
     let ws = Workspace::new(dir.path())

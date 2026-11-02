@@ -11,6 +11,7 @@ fn read_line(reader: &mut impl BufRead) -> String {
     line
 }
 
+#[cfg(unix)]
 fn client(socket_path: &str, password: Option<&str>) -> CmuxClient {
     CmuxClient::new(CmuxClientConfig {
         socket_path: socket_path.to_owned(),

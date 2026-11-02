@@ -17,7 +17,9 @@ use super::state::{
 use crate::commit::CommitError;
 use crate::commit::commit_types::format_conventional_commit;
 use crate::commit::diff::parse_file_diffs;
-use crate::commit::execute::{commit_with_message, git_output, git_output_indexed};
+use crate::commit::execute::{
+    commit_with_message, git_mutation_output_indexed, git_output, git_output_indexed,
+};
 use crate::tools::vcs::git_patch::{file_header_and_hunks, line_patch};
 
 fn text(error: CommitError) -> String {
@@ -26,15 +28,16 @@ fn text(error: CommitError) -> String {
     }
 }
 
-/// `git <args>` with an optional private index, errors as text.
-fn git_in(root: &Path, index: Option<&Path>, args: &[&str]) -> Result<String, String> {
-    git_output_indexed(root, index, args, "Git command failed").map_err(text)
+/// Approved split preparation/mutation with an optional private index, errors as text.
+fn git_mutate_in(root: &Path, index: Option<&Path>, args: &[&str]) -> Result<String, String> {
+    git_mutation_output_indexed(root, index, args, "Git command failed").map_err(text)
 }
 
 /// Run `git <args>` in `root` with `stdin` piped in and `index` as its index. A non-zero exit
 /// becomes the error text.
 fn git_with_stdin(root: &Path, index: &Path, args: &[&str], stdin: &str) -> Result<(), String> {
     let mut child = Command::new("git")
+        .args(crate::tools::vcs::git::safe_git_args())
         .args(args)
         .current_dir(root)
         .env("GIT_INDEX_FILE", index)
@@ -60,14 +63,14 @@ fn git_with_stdin(root: &Path, index: &Path, args: &[&str], stdin: &str) -> Resu
 
 /// The commit `HEAD` names, or `None` on an unborn branch.
 fn head_commit(root: &Path) -> Result<Option<String>, CommitError> {
-    Ok(git_output(
+    // Unlike --verify, --revs-only succeeds with empty output for an unborn HEAD.
+    // Configuration-inspection failures must not be mistaken for an unborn branch.
+    let head = git_output(
         root,
-        &["rev-parse", "--verify", "-q", "HEAD"],
+        &["rev-parse", "--revs-only", "HEAD"],
         "Failed to read HEAD",
-    )
-    .ok()
-    .map(|head| head.trim().to_owned())
-    .filter(|head| !head.is_empty()))
+    )?;
+    Ok((!head.trim().is_empty()).then(|| head.trim().to_owned()))
 }
 
 /// Ensure a patch fragment ends with a newline.
@@ -226,7 +229,7 @@ impl StagedSnapshot {
     ) -> Result<Self, CommitError> {
         let head = head_commit(root)?;
         let index_tree =
-            git_output_indexed(root, index, &["write-tree"], "Failed to read the index")?
+            git_mutation_output_indexed(root, index, &["write-tree"], "Failed to read the index")?
                 .trim()
                 .to_owned();
         let raw = git_output_indexed(
@@ -254,8 +257,9 @@ impl StagedSnapshot {
     /// exactly the bytes written. The mode follows any captured entry, otherwise a regular file.
     pub(crate) fn add_written_file(&mut self, root: &Path, path: &str) -> Result<(), CommitError> {
         let path_arg = format!("--path={path}");
-        let blob = git_output(
+        let blob = git_mutation_output_indexed(
             root,
+            None,
             &["hash-object", "-w", path_arg.as_str(), "--", path],
             "Failed to record changelog update",
         )?
@@ -290,7 +294,7 @@ fn stage_group(
         match change {
             FileChange::All { path } => match snapshot.entry(path)? {
                 Some(entry) => {
-                    git_in(
+                    git_mutate_in(
                         root,
                         Some(index),
                         &[
@@ -304,7 +308,7 @@ fn stage_group(
                     )?;
                 }
                 None => {
-                    git_in(
+                    git_mutate_in(
                         root,
                         Some(index),
                         &["update-index", "--force-remove", "--", path.as_str()],
@@ -339,11 +343,11 @@ fn prepare_trees(
         Some(head) => vec!["read-tree", head.as_str()],
         None => vec!["read-tree", "--empty"],
     };
-    git_in(root, Some(index.as_path()), &base)?;
+    git_mutate_in(root, Some(index.as_path()), &base)?;
     let mut trees = Vec::with_capacity(order.len());
     for group_index in order {
         stage_group(root, &index, snapshot, &plan.commits[*group_index])?;
-        let tree = git_in(root, Some(index.as_path()), &["write-tree"])?;
+        let tree = git_mutate_in(root, Some(index.as_path()), &["write-tree"])?;
         trees.push(tree.trim().to_owned());
     }
     Ok(trees)
@@ -352,9 +356,10 @@ fn prepare_trees(
 /// Verifies that HEAD and the staged content still match the captured state.
 fn verify_unchanged(root: &Path, snapshot: &StagedSnapshot) -> Result<(), CommitError> {
     let head = head_commit(root)?;
-    let index_tree = git_output(root, &["write-tree"], "Failed to read the index")?
-        .trim()
-        .to_owned();
+    let index_tree =
+        git_mutation_output_indexed(root, None, &["write-tree"], "Failed to read the index")?
+            .trim()
+            .to_owned();
     if head != snapshot.head || index_tree != snapshot.index_tree {
         return Err(CommitError::Git(
             "HEAD or the staged changes changed after the split plan was made; nothing was committed. Run the commit again."
@@ -433,16 +438,17 @@ pub(crate) fn execute_split(
     let mut messages = Vec::with_capacity(total);
     for (position, group_index) in order.iter().enumerate() {
         let group = &plan.commits[*group_index];
-        let result = git_in(root, None, &["read-tree", trees[position].as_str()]).and_then(|_| {
-            commit_with_message(
-                root,
-                &format_conventional_commit(&group_message(group)),
-                bypass_hooks,
-            )
-            .map_err(text)
-        });
+        let result =
+            git_mutate_in(root, None, &["read-tree", trees[position].as_str()]).and_then(|_| {
+                commit_with_message(
+                    root,
+                    &format_conventional_commit(&group_message(group)),
+                    bypass_hooks,
+                )
+                .map_err(text)
+            });
         if let Err(error) = result {
-            let restored = git_in(root, None, &["read-tree", snapshot.index_tree.as_str()]);
+            let restored = git_mutate_in(root, None, &["read-tree", snapshot.index_tree.as_str()]);
             let staging = match restored {
                 Ok(_) => format!(
                     "The captured staging of the {} file(s) in the remaining groups was restored; unstaged changes were not modified.",

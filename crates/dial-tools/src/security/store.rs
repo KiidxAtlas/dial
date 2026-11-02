@@ -144,9 +144,9 @@ impl Store {
             .write(true)
             .open(self.dir.join(".lock"))
             .context("opening security store lock")?;
-        fs2::FileExt::lock_exclusive(&file).context("locking security store")?;
+        std::fs::File::lock(&file).context("locking security store")?;
         let result = f();
-        let _ = fs2::FileExt::unlock(&file);
+        let _ = std::fs::File::unlock(&file);
         result
     }
 
@@ -272,7 +272,8 @@ impl Store {
             .write(true)
             .open(dir.join(OWNER_FILE))
             .context("opening security scan owner lock")?;
-        fs2::FileExt::try_lock_exclusive(&file)
+        std::fs::File::try_lock(&file)
+            .map_err(std::io::Error::from)
             .with_context(|| format!("Security scan {id} is already running"))?;
         Ok(ScanClaim(file))
     }
@@ -286,9 +287,9 @@ impl Store {
         let Ok(file) = OpenOptions::new().read(true).open(dir.join(OWNER_FILE)) else {
             return false;
         };
-        match fs2::FileExt::try_lock_exclusive(&file) {
+        match std::fs::File::try_lock(&file).map_err(std::io::Error::from) {
             Ok(()) => {
-                let _ = fs2::FileExt::unlock(&file);
+                let _ = std::fs::File::unlock(&file);
                 false
             }
             Err(_) => true,

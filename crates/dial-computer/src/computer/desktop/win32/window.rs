@@ -118,6 +118,9 @@ pub(super) fn owns_foreground(hwnd: HWND) -> bool {
 
 /// Whether a Chromium or CEF renderer lives in a descendant of `hwnd`.
 pub(super) fn has_chromium_descendant(hwnd: HWND) -> bool {
+    /// # Safety
+    /// EnumChildWindows must pass the live, uniquely borrowed bool address
+    /// supplied below, and must not retain state after synchronous enumeration.
     unsafe extern "system" fn visit(child: HWND, state: LPARAM) -> BOOL {
         // SAFETY: `state` is the exposed address of the flag owned by the
         // enclosing call, which outlives this synchronous enumeration.
@@ -232,6 +235,9 @@ pub(super) fn client_point(hwnd: HWND, screen: POINT) -> Option<POINT> {
 /// wins only within one ancestry chain; ambiguous branches, hidden/disabled
 /// controls and same-thread sibling windows are not usable focus targets.
 pub(super) fn focused_descendant(root: HWND) -> Option<HWND> {
+    /// # Safety
+    /// EnumChildWindows must pass the live Vec<u32> address supplied below.
+    /// Enumeration is synchronous and no other access to the Vec occurs in it.
     unsafe extern "system" fn collect(child: HWND, state: LPARAM) -> BOOL {
         // SAFETY: `state` is the exposed address of the thread list owned by
         // the enclosing call, which outlives this synchronous enumeration.

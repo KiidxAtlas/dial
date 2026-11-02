@@ -2,19 +2,15 @@
 
 The shared LLM layer provides bounded streaming, provider-aware error classification, retries, and request budgeting. Context-overflow classifications are kept attached to errors before any header redaction so compaction remains reliable. HTTP 413 is classified as a payload failure unless the body identifies a token/context limit; it must not trigger token compaction merely because its status is 413. oMLX's "prefill memory guard rejected this prompt" refusal (prefill would exceed the server's memory ceiling) is classified as context overflow, as an HTTP body or a stream error, so the turn compacts and retries a smaller prompt instead of failing.
 
-`[retry]` settings bound attempts and delays. Ordinary automatic provider retries wait about
-300 seconds (five minutes), bounded by `retry.max_delay_secs`, rather than increasing an
-exponential backoff; waits of ten seconds or more vary by up to ±10% so workers throttled at the
-same moment do not all retry together. A connection-level failure before any response arrived
-(connection refused or reset, broken pipe, DNS or connect timeout), or a stream that dropped or
-stalled mid-reply, is retried once after 2 seconds on a fresh connection; later attempts use the
-ordinary interval. An explicit `retry-after`, `retry-after-ms` or `x-ratelimit-reset[-ms]` delay
-replaces the ordinary interval (a server asking for one second is retried after one second, with
-at least 250 ms for `retry-after: 0`); a hint beyond `retry.max_delay_secs` stops the request
-instead of waiting longer than configured. Window-reset headers are treated as quota information,
-not mandatory waits. A throttle (including HTTP 529) remains
-distinct from account quota exhaustion. Incomplete or truncated streams are discarded and retried;
-partial tool calls are never executed. Maximum attempts and failover behavior are unchanged.
+`[retry]` settings bound attempts and delays. Unhinted retries use bounded exponential backoff
+starting at no more than two seconds, with up to 25% positive jitter; every wait is capped by
+`retry.max_delay_secs`. Explicit `retry-after`, `retry-after-ms`, and `x-ratelimit-reset[-ms]`
+delays replace the automatic interval instead of being inflated to five minutes. A hint beyond
+the configured cap stops the request rather than silently retrying earlier than requested.
+Window-reset headers remain quota information, not mandatory waits. A throttle (including HTTP
+529) remains distinct from account quota exhaustion. Configured failover retains its shorter
+wait policy. Incomplete/truncated streams are discarded and retried within the same attempt
+bounds; partial tool calls are never executed. Claude usage polling shares this retry policy.
 
 Native replay is owner-scoped. Responses items replay only to the account/endpoint/credential (and,
 for compaction state, the model) that produced them, Anthropic signed blocks only to the host that
@@ -25,8 +21,7 @@ output limit is dropped and reported as `length` on every transport, so the turn
 budget instead of failing. Chat-completions finish reasons such as `max_tokens`, `model_length`
 and `model_context_window_exceeded` map to `length`; `error` and `network_error` are incomplete
 streams and retried. A streamed Responses `context_length_exceeded` is a context overflow, which
-compacts instead of resending the same prompt. Tool calls written as text in a reply are lifted
-only when every call names an offered tool, and a fenced JSON call only when it is the whole reply.
+compacts instead of resending the same prompt.
 
 While a turn is running, `/retry` skips the remaining provider retry wait and requests the next
 attempt immediately, including any remaining server-requested delay. It does not cancel the turn,
@@ -36,6 +31,14 @@ The command takes no arguments. When idle, `/retry` keeps its existing meaning: 
 failed, unanswered turn.
 
 Streaming reads have bounded raw and line sizes. Reasoning markup leaked into visible text is routed to reasoning events where recognized, and tool-call markup is kept out of user-visible output. Remote model context is taken from configuration or the bundled catalog, falling back to a conservative 32768 tokens. Image inputs are resized to model limits before transmission. Provider-specific OAuth credentials are refreshed per request/retry, without exposing secrets in errors.
+
+Text/reasoning recovery of tool calls is limited to local/private endpoints and names offered
+in that request. A fenced JSON example embedded in prose is not executable. Recovered calls
+carry runtime provenance into the parent and delegated approval paths: they require actual
+one-shot confirmation, cannot consume saved grants or speculative/parallel/batch shortcuts,
+and never save a reusable permission. Denials and cancellation still win; read-only approval
+mode conservatively refuses recovered calls, including recovered reads. Structured tool calls
+retain their ordinary approval policy.
 
 Logical-request recovery preserves one-shot model profiles, local hints and reasoning controls
 across rejected attempts, without making them defaults for later requests. Codex WebSocket streams

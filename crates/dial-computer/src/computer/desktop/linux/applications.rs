@@ -655,6 +655,13 @@ pub(super) fn open(app: Application, activate: bool) -> CoreResult<Application> 
         command.args(&argv[1..]);
         command
     };
+    command.env_clear().envs(
+        std::env::vars()
+            .filter(|(name, value)| crate::tools::exec::sandbox::child_env_allowed(name, value)),
+    );
+    // Desktop applications outlive Dial and must not inherit its cancellation group.
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -668,8 +675,7 @@ pub(super) fn open(app: Application, activate: bool) -> CoreResult<Application> 
     if !activate {
         command.env("DESKTOP_STARTUP_ID", background_startup_id());
     }
-    let mut child = command
-        .spawn()
+    let mut child = crate::platform::process::spawn(&mut command)
         .map_err(|error| invalid(format!("cannot launch {}: {error}", entry.path.display())))?;
     // Reap even daemonizing launchers without blocking the caller or inventing
     // a long-lived PID for their eventual application process.
@@ -699,6 +705,10 @@ fn terminal_command(entry: &Entry, argv: &[String]) -> CoreResult<Command> {
     if let Some(helper) = resolve_executable("xdg-terminal-exec", None) {
         let mut query = Command::new(&helper);
         query
+            .env_clear()
+            .envs(std::env::vars().filter(|(name, value)| {
+                crate::tools::exec::sandbox::child_env_allowed(name, value)
+            }))
             .arg("--print-id")
             .env_remove("XDG_ACTIVATION_TOKEN")
             .env_remove("DESKTOP_STARTUP_ID")

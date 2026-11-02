@@ -5,7 +5,7 @@
 use crate::tools::Workspace;
 #[cfg(unix)]
 use std::os::{
-    fd::{AsRawFd, FromRawFd},
+    fd::AsRawFd,
     unix::{ffi::OsStrExt, fs::MetadataExt},
 };
 use std::{
@@ -92,6 +92,8 @@ impl Drop for ParentCleanup {
         }
         for entry in self.entries.iter().rev() {
             let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: entry.parent keeps the directory fd open, entry.name is a live
+            // NUL-terminated CString, and metadata is aligned writable stat storage.
             if unsafe {
                 libc::fstatat(
                     entry.parent.as_raw_fd(),
@@ -101,6 +103,7 @@ impl Drop for ParentCleanup {
                 )
             } == 0
             {
+                // SAFETY: fstatat returned success, initializing the entire stat output.
                 let metadata = unsafe { metadata.assume_init() };
                 #[cfg(target_os = "macos")]
                 let dev = metadata.st_dev as u64;
@@ -110,14 +113,13 @@ impl Drop for ParentCleanup {
                     && metadata.st_ino == entry.ino
                     && metadata.st_mode & libc::S_IFMT == libc::S_IFDIR
                 {
-                    // Only owned, still-empty scaffolding can disappear; concurrent data wins.
-                    let _ = unsafe {
-                        libc::unlinkat(
-                            entry.parent.as_raw_fd(),
-                            entry.name.as_ptr(),
-                            libc::AT_REMOVEDIR,
-                        )
-                    };
+                    // Best-effort scaffold cleanup: unlink refuses any nonempty directory.
+                    // The identity check is only a snapshot; an empty replacement at this
+                    // name can also be removed if another writer renames it after fstatat.
+                    let _ = crate::platform::fs::remove_dir_beneath(
+                        &entry.parent,
+                        Path::new(std::ffi::OsStr::from_bytes(entry.name.as_bytes())),
+                    );
                 }
             }
         }
@@ -137,35 +139,24 @@ impl Directory {
         let relative = target
             .strip_prefix(base)
             .map_err(|_| "edit target escapes workspace")?;
-        let root = cstr(base.as_os_str())?;
-        let fd = unsafe {
-            libc::open(
-                root.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(err("opening workspace", base));
-        }
-        let mut file = unsafe { File::from_raw_fd(fd) };
+        let mut file = crate::platform::fs::open_dir_nofollow(base)
+            .map_err(|e| format!("opening workspace {}: {e}", base.display()))?;
         let mut path = base.to_owned();
         for part in relative.parent().unwrap_or(Path::new("")).components() {
             let Component::Normal(name) = part else {
                 return Err("edit path has a non-normal component".into());
             };
+            let component = Path::new(name);
             let name = cstr(name)?;
-            let mut next = unsafe {
-                libc::openat(
-                    file.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
-            };
+            let mut next = crate::platform::fs::open_dir_beneath_handle(&file, component);
             let mut created = false;
-            if next < 0
+            if next
+                .as_ref()
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
                 && create
-                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound
             {
+                // SAFETY: file pins the parent directory and name is a live CString
+                // for a single normal component. mkdirat reads no other user memory.
                 let made = unsafe { libc::mkdirat(file.as_raw_fd(), name.as_ptr(), 0o755) };
                 created = made == 0;
                 if made < 0
@@ -173,19 +164,11 @@ impl Directory {
                 {
                     return Err(err("creating edit directory", &path));
                 }
-                next = unsafe {
-                    libc::openat(
-                        file.as_raw_fd(),
-                        name.as_ptr(),
-                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                    )
-                };
+                next = crate::platform::fs::open_dir_beneath_handle(&file, component);
             }
             path.push(std::ffi::OsStr::from_bytes(name.as_bytes()));
-            if next < 0 {
-                return Err(err("opening no-follow edit directory", &path));
-            }
-            let next_file = unsafe { File::from_raw_fd(next) };
+            let next_file = next
+                .map_err(|e| format!("opening no-follow edit directory {}: {e}", path.display()))?;
             if created && let Some(parents) = parents.as_deref_mut() {
                 let metadata = next_file.metadata().map_err(|e| e.to_string())?;
                 parents.entries.push(CreatedParent {
@@ -212,23 +195,19 @@ impl Directory {
         Ok(())
     }
     fn read(&self, name: &CString) -> Result<Option<Original>, String> {
-        let fd = unsafe {
-            libc::openat(
-                self.file.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
-                return Ok(None);
+        let mut file = match crate::platform::fs::open_beneath_handle(
+            &self.file,
+            Path::new(std::ffi::OsStr::from_bytes(name.as_bytes())),
+        ) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(format!(
+                    "opening edit target in {}: {e}",
+                    self.path.display()
+                ));
             }
-            return Err(err(
-                "opening edit target",
-                &self.path.join(std::ffi::OsStr::from_bytes(name.as_bytes())),
-            ));
-        }
-        let mut file = unsafe { File::from_raw_fd(fd) };
+        };
         let meta = file.metadata().map_err(|e| e.to_string())?;
         if !meta.is_file() || meta.len() > MAX_FILE as u64 {
             return Err("edit target must be a regular file no larger than 4 MiB".into());
@@ -252,38 +231,34 @@ impl Directory {
         }))
     }
     pub(super) fn link(&self, from: &CString, to: &CString) -> Result<(), String> {
-        if unsafe {
-            libc::linkat(
-                self.file.as_raw_fd(),
-                from.as_ptr(),
-                self.file.as_raw_fd(),
-                to.as_ptr(),
-                0,
+        crate::platform::fs::link_beneath(
+            &self.file,
+            Path::new(std::ffi::OsStr::from_bytes(from.as_bytes())),
+            Path::new(std::ffi::OsStr::from_bytes(to.as_bytes())),
+        )
+        .map_err(|e| {
+            format!(
+                "exclusively installing edit in {}: {e}",
+                self.path.display()
             )
-        } < 0
-        {
-            return Err(err("exclusively installing edit", &self.path));
-        }
+        })?;
         Ok(())
     }
     pub(super) fn unlink(&self, name: &CString) -> Result<(), String> {
-        if unsafe { libc::unlinkat(self.file.as_raw_fd(), name.as_ptr(), 0) } < 0 {
-            return Err(err("removing transaction entry", &self.path));
-        }
+        crate::platform::fs::remove_beneath(
+            &self.file,
+            Path::new(std::ffi::OsStr::from_bytes(name.as_bytes())),
+        )
+        .map_err(|e| format!("removing transaction entry in {}: {e}", self.path.display()))?;
         Ok(())
     }
     fn rename(&self, from: &CString, to: &CString) -> Result<(), String> {
-        if unsafe {
-            libc::renameat(
-                self.file.as_raw_fd(),
-                from.as_ptr(),
-                self.file.as_raw_fd(),
-                to.as_ptr(),
-            )
-        } < 0
-        {
-            return Err(err("capturing edit original", &self.path));
-        }
+        crate::platform::fs::replace_beneath(
+            &self.file,
+            Path::new(std::ffi::OsStr::from_bytes(from.as_bytes())),
+            Path::new(std::ffi::OsStr::from_bytes(to.as_bytes())),
+        )
+        .map_err(|e| format!("capturing edit original in {}: {e}", self.path.display()))?;
         Ok(())
     }
     fn temp(
@@ -315,32 +290,17 @@ impl Directory {
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ))
             .unwrap();
-            let fd = unsafe {
-                libc::openat(
-                    self.file.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::O_WRONLY
-                        | libc::O_CREAT
-                        | libc::O_EXCL
-                        | libc::O_NOFOLLOW
-                        | libc::O_CLOEXEC,
-                    // A new file gets the umask default like `creat`; existing targets and
-                    // rollback staging are set explicitly or kept private.
-                    if kind == "new" && permissions.is_none() {
-                        0o666
-                    } else {
-                        0o600
-                    },
-                )
+            // A new file gets the umask default like creat; existing targets and rollback
+            // staging are set explicitly or kept private.
+            let file = match crate::platform::fs::create_new_beneath(
+                &self.file,
+                Path::new(std::ffi::OsStr::from_bytes(name.as_bytes())),
+                kind != "new" || permissions.is_some(),
+            ) {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("staging edit in {}: {e}", self.path.display())),
             };
-            if fd < 0 {
-                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::AlreadyExists {
-                    continue;
-                }
-                return Err(err("staging edit", &self.path));
-            }
-            // SAFETY: openat returned a new, exclusively owned descriptor.
-            let file = unsafe { File::from_raw_fd(fd) };
             if let Some(perms) = permissions
                 && let Err(error) = file.set_permissions(perms.clone())
             {
@@ -375,18 +335,9 @@ pub(super) fn stage_binary(
 pub(crate) fn open_read(ws: &Workspace, path: &Path) -> Result<File, String> {
     let dir = Directory::open(ws, path, false, None)?;
     dir.validate_location(ws, path)?;
-    let name = cstr(path.file_name().ok_or("read target has no filename")?)?;
-    let fd = unsafe {
-        libc::openat(
-            dir.file.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(err("opening read target", path));
-    }
-    let file = unsafe { File::from_raw_fd(fd) };
+    let name = path.file_name().ok_or("read target has no filename")?;
+    let file = crate::platform::fs::open_beneath_handle(&dir.file, Path::new(name))
+        .map_err(|e| format!("opening read target {}: {e}", path.display()))?;
     if !file.metadata().map_err(|e| e.to_string())?.is_file() {
         return Err("read target must be a regular file".into());
     }

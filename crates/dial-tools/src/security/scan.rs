@@ -234,11 +234,10 @@ struct ReviewerFinding {
     category: String,
     locations: Vec<ReviewerLocation>,
     #[serde(default)]
-    #[allow(dead_code)]
-    cwe: Vec<String>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    evidence: Vec<Value>,
+    #[serde(rename = "cwe")]
+    _cwe: Vec<String>,
+    #[serde(default, rename = "evidence")]
+    _evidence: Vec<Value>,
     #[serde(default)]
     anchor: Option<String>,
 }
@@ -255,8 +254,8 @@ struct ReviewerLocation {
 
 #[derive(Debug, Deserialize)]
 struct Deferred {
-    #[allow(dead_code)]
-    reason: String,
+    #[serde(rename = "reason")]
+    _reason: String,
 }
 
 #[derive(Debug, Deserialize)]

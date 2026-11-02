@@ -566,7 +566,12 @@ fn worker_policy_provenance_keeps_deny_before_readonly_and_cancel_before_deny() 
             self.0.push(explanation.clone());
         }
     }
-    for cancelled in [false, true] {
+    for (cancelled, provenance) in [
+        (false, approval::CallProvenance::Structured),
+        (true, approval::CallProvenance::Structured),
+        (false, approval::CallProvenance::RecoveredText),
+        (true, approval::CallProvenance::RecoveredText),
+    ] {
         let mut tasks = LiveTasks::default();
         let (answer, reply) = mpsc::channel();
         tasks
@@ -580,6 +585,7 @@ fn worker_policy_provenance_keeps_deny_before_readonly_and_cancel_before_deny() 
                 },
                 summary: "write".into(),
                 needs: true,
+                provenance,
                 cancel: Arc::new(AtomicBool::new(cancelled)),
                 interrupt: Arc::new(AtomicBool::new(false)),
                 answer,
@@ -958,4 +964,95 @@ fn contracted_candidate_without_declared_inputs_stays_unmerged_and_unverified() 
         "candidate"
     );
     std::fs::remove_dir_all(kept).unwrap();
+}
+
+#[test]
+fn status_polling_does_not_revalidate_or_mutate_acceptance() {
+    use crate::agent::verify::worker_acceptance::{Acceptance, State};
+    let root = tempfile::tempdir().unwrap();
+    let tree = crate::runtime::Tree::default();
+    let body = tree.start("worker", "candidate", None);
+    body.settle(
+        "done".into(),
+        Some(json!({"status":"completed"})),
+        crate::runtime::Phase::from_status("done"),
+    );
+    let mut acceptance = Acceptance::unverified("snapshot at explicit verification boundary");
+    acceptance.state = State::Accepted;
+    let job = ControlJob {
+        interrupt: Arc::new(AtomicBool::new(false)),
+        active_tool: Default::default(),
+        body,
+        finished: AtomicBool::new(true),
+        base: Config::default(),
+        settings: Default::default(),
+        workspace: Workspace::new(root.path()).unwrap(),
+        acceptance: Mutex::new(Some(acceptance)),
+    };
+    let before = job_status(&job);
+    for _ in 0..3 {
+        assert_eq!(job_status(&job), before);
+        assert_eq!(
+            job.acceptance.lock().unwrap().as_ref().unwrap().state,
+            State::Accepted
+        );
+    }
+}
+
+#[test]
+fn recovered_safe_reads_prompt_through_the_live_approval_owner() {
+    struct View(usize);
+    impl Ui for View {
+        fn approve(&mut self, _: &str, _: &str) -> crate::agent::Decision {
+            self.0 += 1;
+            crate::agent::Decision::AllowAlways
+        }
+    }
+    let mut tasks = LiveTasks::default();
+    let mut rules = vec![];
+    let mut view = View(0);
+    for provenance in [
+        approval::CallProvenance::Structured,
+        approval::CallProvenance::RecoveredText,
+    ] {
+        let (answer, reply) = mpsc::channel();
+        tasks
+            .tx
+            .send(Event::Approve {
+                call: ToolCall {
+                    id: "read".into(),
+                    name: "read".into(),
+                    arguments: json!({"path":"file"}),
+                    malformed_arguments: false,
+                },
+                summary: "read".into(),
+                needs: false,
+                provenance,
+                cancel: Arc::new(AtomicBool::new(false)),
+                interrupt: Arc::new(AtomicBool::new(false)),
+                answer,
+            })
+            .unwrap();
+        tasks.pump(
+            Approval::Auto,
+            PumpPolicy {
+                read_only: true,
+                rules: &mut rules,
+                root: std::path::Path::new("."),
+                extra_roots: &[],
+            },
+            None,
+            &mut None,
+            &mut view,
+        );
+        assert!(reply.recv().unwrap().is_ok());
+        assert_eq!(
+            view.0,
+            usize::from(provenance == approval::CallProvenance::RecoveredText)
+        );
+        assert!(
+            rules.is_empty(),
+            "a recovered live call must not create grants"
+        );
+    }
 }

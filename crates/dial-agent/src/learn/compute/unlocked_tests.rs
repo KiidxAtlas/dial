@@ -14,7 +14,7 @@ fn disabled_background_ignores_shared_lock_and_requests_but_accounts_usage() {
     let root = tempfile::tempdir().unwrap();
     let config = config(root.path());
     let lock = super::super::auto::lock_file(&config.user_dir.join("compute.lock")).unwrap();
-    lock.try_lock_exclusive().unwrap();
+    lock.try_lock().map_err(std::io::Error::from).unwrap();
     let _foreground = Request::foreground(&config.user_dir).unwrap();
     // Even an owner record belonging to this process must survive the unlocked guard.
     register(
@@ -59,7 +59,11 @@ fn disabled_background_ignores_shared_lock_and_requests_but_accounts_usage() {
     );
     let probe = super::super::auto::lock_file(&config.user_dir.join("compute.lock")).unwrap();
     assert_eq!(
-        probe.try_lock_exclusive().unwrap_err().kind(),
+        probe
+            .try_lock()
+            .map_err(std::io::Error::from)
+            .unwrap_err()
+            .kind(),
         std::io::ErrorKind::WouldBlock
     );
 }

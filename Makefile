@@ -70,7 +70,8 @@ check:
 test: test-rust
 
 test-rust:
-	$(CARGO) test --locked --workspace --profile $(TEST_PROFILE) $(CARGO_FEATURE_FLAGS)
+	$(PYTHON) scripts/test-prerequisites.py
+	$(CARGO) test --locked --workspace --no-fail-fast --profile $(TEST_PROFILE) $(CARGO_FEATURE_FLAGS)
 
 test-lib:
 	$(CARGO) test --locked --workspace --lib $(CARGO_FEATURE_FLAGS)
@@ -84,8 +85,9 @@ test-module:
 	$(CARGO) test --locked --workspace --lib $(CARGO_FEATURE_FLAGS) $(MOD)
 
 test-nextest:
+	$(PYTHON) scripts/test-prerequisites.py
 	@command -v cargo-nextest >/dev/null 2>&1 || { printf '%s\n' 'cargo-nextest is not installed: https://nexte.st (or use make test-rust)' >&2; exit 2; }
-	$(CARGO) nextest run --locked --workspace --cargo-profile $(TEST_PROFILE) $(CARGO_FEATURE_FLAGS)
+	$(CARGO) nextest run --locked --workspace --no-fail-fast --cargo-profile $(TEST_PROFILE) $(CARGO_FEATURE_FLAGS)
 	$(CARGO) test --locked --workspace --doc --profile $(TEST_PROFILE) $(CARGO_FEATURE_FLAGS)
 
 lint:

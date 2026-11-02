@@ -1,20 +1,7 @@
 use super::GitOverlay;
+use crate::git_panel::testkit::git;
 use crate::ui::keys::Keymap;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
-use std::path::Path;
-
-fn git(root: &Path, args: &[&str]) {
-    let output = std::process::Command::new("git")
-        .current_dir(root)
-        .args(args)
-        .output()
-        .expect("git runs");
-    assert!(
-        output.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
 
 fn delete(kind: KeyEventKind) -> Event {
     Event::Key(KeyEvent {
@@ -46,6 +33,7 @@ fn a_held_delete_key_never_confirms_its_own_discard() {
         None,
     )
     .expect("overlay opens");
+    overlay.wait_reads();
     assert!(
         overlay.selected().is_some(),
         "the modified file is selected"

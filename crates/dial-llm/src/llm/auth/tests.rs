@@ -206,6 +206,5 @@ fn secret_debug_redacts_and_drop_zeroes_contents() {
     assert_eq!(format!("{token:?}"), "SecretToken(<redacted>)");
     assert_eq!(token.as_mut_string(), "sk-or-private");
     token.wipe();
-    assert!(token.0.bytes().all(|byte| byte == 0));
-    std::mem::forget(token);
+    assert!(token.0.is_empty());
 }

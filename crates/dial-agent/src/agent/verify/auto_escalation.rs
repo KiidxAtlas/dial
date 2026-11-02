@@ -79,14 +79,7 @@ pub(in crate::agent) fn advice_message(advice: &str) -> Value {
 }
 
 fn clip(text: &str, max: usize) -> &str {
-    if text.len() <= max {
-        return text;
-    }
-    let mut end = max;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
+    crate::agent::base::helpers::byte_prefix(text, max)
 }
 
 #[cfg(test)]

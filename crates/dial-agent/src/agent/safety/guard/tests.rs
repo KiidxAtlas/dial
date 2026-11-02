@@ -127,6 +127,35 @@ fn clipping_keeps_both_ends_and_reports_what_was_dropped() {
 }
 
 #[test]
+fn utf8_middle_clipping_rounds_the_head_down_and_tail_up() {
+    let text = "🦀".repeat(10);
+    for (max, head_chars, tail_chars) in [(0, 0, 0), (1, 0, 0), (5, 0, 1), (13, 1, 2)] {
+        let out = clip_middle(&text, max);
+        let (head, rest) = out.split_once('\n').unwrap();
+        let (notice, tail) = rest.split_once('\n').unwrap();
+        assert_eq!(head, "🦀".repeat(head_chars), "max {max}");
+        assert_eq!(tail, "🦀".repeat(tail_chars), "max {max}");
+        let omitted = text.len() - head.len() - tail.len();
+        assert!(notice.contains(&format!("{omitted} of 40 bytes omitted")));
+        assert_eq!(clip_evidence(&text, max), out, "max {max}");
+    }
+}
+
+#[test]
+fn utf8_evidence_clipping_keeps_diagnostics_and_rounds_tail_down() {
+    let text = format!("{}\nerror: broken\n{}", "🦀".repeat(100), "🦀".repeat(100));
+    for (max, tail_chars) in [(80, 10), (83, 11)] {
+        let out = clip_evidence(&text, max);
+        let (head, _) = out.split_once('\n').unwrap();
+        let (_, tail) = out.rsplit_once('\n').unwrap();
+        assert_eq!(head, "🦀".repeat(5), "max {max}");
+        assert_eq!(tail, "🦀".repeat(tail_chars), "max {max}");
+        assert!(out.contains("1 diagnostic line(s)"), "{out}");
+        assert!(out.contains("\nerror: broken\n"), "{out}");
+    }
+}
+
+#[test]
 fn evidence_clipping_keeps_middle_diagnostics_and_stays_bounded() {
     let noise = |n: usize| {
         (0..n)

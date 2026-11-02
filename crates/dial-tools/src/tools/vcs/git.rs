@@ -122,6 +122,25 @@ pub fn hooks_off_args() -> [&'static str; 2] {
     return ["-c", "core.hooksPath=/dev/null"];
 }
 
+const SAFE_GIT_ARGS: &[&str] = &[
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.pager=cat",
+    "-c",
+    "protocol.ext.allow=never",
+    "-c",
+    "log.showSignature=false",
+    "--no-pager",
+];
+
+/// Common Git overrides for fsmonitor, pager, external protocols and signature display.
+/// This alone is not the host-read boundary: reads must also inspect executable configuration
+/// and clean the environment, as [`run_read`] and [`run_checked`] do.
+pub fn safe_git_args() -> &'static [&'static str] {
+    SAFE_GIT_ARGS
+}
+
 fn combine(out: String, err: String) -> String {
     if err.trim().is_empty() {
         out
@@ -144,6 +163,90 @@ struct Invocation<'a> {
     may_mutate: bool,
 }
 
+/// A read-only Git operation can still execute clean/process filters or text-conversion
+/// drivers. Query effective configuration using Git itself (includes and worktree config
+/// apply), but never run configured programs on this host-side read path.
+fn refuse_read_filters(root: &Path, cancel: &AtomicBool) -> Result<(), String> {
+    inspect_filter_config(filter_config_query(root), cancel)
+}
+
+fn filter_config_query(root: &Path) -> Command {
+    let mut query = Command::new("git");
+    query
+        .args(hooks_off_args())
+        .args(SAFE_GIT_ARGS)
+        .args([
+            "config",
+            "--null",
+            "--get-regexp",
+            r"^(filter\..*\.(clean|smudge|process)|diff\..*\.textconv)$",
+        ])
+        .current_dir(root)
+        .env_clear()
+        .envs(
+            std::env::vars().filter(|(name, value)| {
+                crate::tools::exec::sandbox::child_env_allowed(name, value)
+            }),
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    query
+}
+
+fn inspect_filter_config(query: Command, cancel: &AtomicBool) -> Result<(), String> {
+    let output = crate::runtime::process::run_with_policy(
+        query,
+        None,
+        crate::runtime::process::Policy {
+            may_mutate: false,
+            fail_on_output_limit: true,
+            ..crate::runtime::process::Policy::bounded(LOCAL_TIMEOUT, MAX_CAPTURE)
+        },
+        cancel,
+        &mut |_, _| {},
+    )?;
+    if output.cancelled
+        || output.timed_out
+        || output.io_error.is_some()
+        || output.output_incomplete
+        || output.output_limited
+    {
+        return Err(output.failure("git configuration inspection", LOCAL_TIMEOUT));
+    }
+    if output.success() {
+        // Git emits values in precedence order (including includes). An empty final
+        // command disables a filter, so do not reject an explicitly disabled driver.
+        let mut effective = std::collections::BTreeMap::new();
+        for entry in output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+        {
+            let split = entry
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .ok_or("Git returned malformed filter configuration; host-side read refused")?;
+            effective.insert(&entry[..split], &entry[split + 1..]);
+        }
+        if effective.is_empty() {
+            return Err(
+                "Git returned incomplete filter configuration; host-side read refused".into(),
+            );
+        }
+        if effective.values().any(|command| !command.is_empty()) {
+            return Err("host-side Git inspection refused because executable filter configuration or text-conversion configuration is present; run the operation with approved sandboxed bash instead".into());
+        }
+        return Ok(());
+    }
+    if output.status.and_then(|status| status.code()) != Some(1) {
+        return Err(
+            "Git configuration could not be inspected safely; host-side read refused".into(),
+        );
+    }
+    Ok(())
+}
+
 /// Run `program` with a bounded time. Returns (success, stdout, stderr), each complete up to
 /// `MAX_CAPTURE`; callers clip for display.
 fn run_streams(inv: Invocation<'_>) -> Result<(bool, String, String), String> {
@@ -158,27 +261,40 @@ fn run_streams(inv: Invocation<'_>) -> Result<(bool, String, String), String> {
         may_mutate,
     } = inv;
     let mut command = Command::new(program);
+    if program == "git" && !may_mutate {
+        refuse_read_filters(root, cancel)?;
+        command.env_clear().envs(
+            std::env::vars().filter(|(name, value)| {
+                crate::tools::exec::sandbox::child_env_allowed(name, value)
+            }),
+        );
+    }
     if program == "git" {
-        // Repository config is untrusted: no fsmonitor, pager, external diff or textconv.
+        // Repository config is untrusted. Read-specific driver flags are added below.
         if hooks == Hooks::Off {
             command.args(hooks_off_args());
         }
-        command.args([
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "core.pager=cat",
-            "-c",
-            "diff.external=",
-            "-c",
-            "protocol.ext.allow=never",
-            "--no-pager",
-        ]);
+        command.args(SAFE_GIT_ARGS);
     } else if program == "jj" {
         command.args(["--no-pager", "--color=never"]);
     }
+    if program == "git"
+        && !may_mutate
+        && args
+            .first()
+            .is_some_and(|arg| matches!(arg.as_str(), "diff" | "show" | "log" | "blame"))
+    {
+        // Git treats even an empty textconv value as an executable path. Disable
+        // conversion before any caller-provided `--` path separator.
+        command.arg(&args[0]).arg("--no-textconv");
+        if args[0] != "blame" {
+            command.arg("--no-ext-diff");
+        }
+        command.args(&args[1..]);
+    } else {
+        command.args(args);
+    }
     command
-        .args(args)
         .current_dir(root)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -427,6 +543,33 @@ pub fn worktree_path_for(root: &Path, branch: &str) -> Result<PathBuf, String> {
 /// Run a git command and return stdout, or git's stderr on failure.
 pub fn run_checked(root: &Path, args: &[&str], mutating: bool) -> Result<String, String> {
     git_checked(root, &strings(args), mutating)
+}
+
+/// Run a host-side Git read with a caller-owned deadline and optional private index environment.
+/// Uses the same configuration, environment and 64 MiB capture guards as [`run_checked`].
+///
+/// # Errors
+/// Returns an error for executable repository configuration, process failures or unsuccessful Git
+/// commands. Arguments must describe a read, never a mutation or network operation.
+pub fn run_read(
+    root: &Path,
+    args: &[&str],
+    envs: &[(&str, &std::ffi::OsStr)],
+    timeout: Duration,
+) -> Result<String, String> {
+    match run_streams(Invocation {
+        program: "git",
+        args: &strings(args),
+        root,
+        timeout,
+        hooks: Hooks::Off,
+        envs,
+        cancel: &NEVER_CANCELLED,
+        may_mutate: false,
+    })? {
+        (true, out, _) => Ok(out),
+        (false, out, err) => Err(combine(out, err).trim().to_owned()),
+    }
 }
 
 /// An independent baseline of the filtered development copy: no parent gitdir, remotes,

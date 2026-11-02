@@ -97,6 +97,13 @@ repaired by signing in again, or bypassed by explicitly selecting API key. Sign-
 readable state; it does not discard corrupt files. Providers with zero discovered models remain
 in `/providers` so they can be configured.
 
+**Account-policy warning:** this route identifies itself using Claude Code client metadata and
+billing attestation. It is not an official Dial integration and may violate provider terms, put
+your account at risk, or stop working when upstream changes. Dial warns when using this backend;
+the existing sign-in flow remains available without an additional opt-in. Select API-key
+authentication if you do not accept that risk. A successful local test does not establish
+provider permission or live compatibility.
+
 ## Providers and discovery
 
 The catalog finds cached Hugging Face snapshots and models downloaded by LM Studio (its

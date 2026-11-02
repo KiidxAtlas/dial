@@ -21,3 +21,7 @@ crates/dial-tools/browser
 **/.venv
 **/.pytest_cache
 **/.ruff_cache
+.env
+.env.*
+!.env.example
+!.env.sample

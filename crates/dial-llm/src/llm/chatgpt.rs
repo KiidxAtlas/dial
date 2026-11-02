@@ -33,7 +33,9 @@ const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const SCOPE: &str = "openid profile email offline_access api.connectors.read api.connectors.invoke";
 const REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 const CALLBACK_PORT: u16 = 1455;
-const CLIENT_VERSION: &str = "0.159.0";
+/// Shared Codex compatibility version for model listing, inference, compaction and usage.
+pub(super) const CLIENT_VERSION: &str = "0.159.0";
+pub(super) const ORIGINATOR: &str = "dial";
 const JWT_AUTH_CLAIM: &str = "https://api.openai.com/auth";
 const MAX_JSON: u64 = 256 * 1024;
 // Account catalogs include model instructions and can be much larger than OAuth responses.
@@ -259,7 +261,7 @@ impl Attempt {
             ("code_challenge", &challenge),
             ("id_token_add_organizations", "true"),
             ("codex_cli_simplified_flow", "true"),
-            ("originator", "dial"),
+            ("originator", ORIGINATOR),
         ];
         let mut values = fields
             .iter()
@@ -361,52 +363,46 @@ fn receive(
     cancel: &AtomicBool,
 ) -> Result<(SecretToken, String)> {
     let deadline = Instant::now() + Duration::from_secs(180);
-    loop {
-        cancelled(cancel)?;
-        ensure!(
-            Instant::now() < deadline,
-            "ChatGPT sign-in timed out; start again from /providers"
-        );
-        match listener.accept() {
-            Ok((mut stream, _)) => {
-                let target = read_target(&mut stream, cancel);
-                let declined = target
-                    .as_ref()
-                    .ok()
-                    .and_then(|target| callback_fields(target).ok())
-                    .is_some_and(|fields| {
-                        fields.get("state") == Some(&attempt.state) && fields.contains_key("error")
-                    });
-                let result = target.and_then(|target| attempt.callback(&target));
-                let message = if result.is_ok() {
-                    "ChatGPT authorization received. Return to Dial while it validates sign-in."
-                } else {
-                    "Invalid or declined ChatGPT authorization. Return to Dial."
-                };
-                let status = if result.is_ok() {
-                    "200 OK"
-                } else {
-                    "400 Bad Request"
-                };
-                let _ = stream.set_nonblocking(false);
-                let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
-                let _ = write!(
-                    stream,
-                    "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{message}",
-                    message.len()
-                );
-                if result.is_ok() || declined {
-                    return result;
-                }
-                // Browser preconnections, favicon requests, and callbacks with the wrong state
-                // must not consume the pending authorization attempt.
+    super::oauth::util::wait_callback(
+        listener,
+        cancel,
+        deadline,
+        "ChatGPT sign-in timed out; start again from /providers",
+        |stream| {
+            let target = read_target(stream, cancel);
+            let declined = target
+                .as_ref()
+                .ok()
+                .and_then(|target| callback_fields(target).ok())
+                .is_some_and(|fields| {
+                    fields.get("state") == Some(&attempt.state) && fields.contains_key("error")
+                });
+            let result = target.and_then(|target| attempt.callback(&target));
+            let message = if result.is_ok() {
+                "ChatGPT authorization received. Return to Dial while it validates sign-in."
+            } else {
+                "Invalid or declined ChatGPT authorization. Return to Dial."
+            };
+            let status = if result.is_ok() {
+                "200 OK"
+            } else {
+                "400 Bad Request"
+            };
+            let _ = stream.set_nonblocking(false);
+            let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{message}",
+                message.len()
+            );
+            if result.is_ok() || declined {
+                return result.map(Some);
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(25))
-            }
-            Err(_) => bail!("ChatGPT callback listener failed"),
-        }
-    }
+            // Browser preconnections, favicon requests, and callbacks with the wrong state
+            // must not consume the pending authorization attempt.
+            Ok(None)
+        },
+    )
 }
 fn client(cancel: Arc<AtomicBool>) -> ureq::Agent {
     super::agent_with(25, true, Some(cancel), None)
@@ -701,12 +697,11 @@ fn login_at(
         .transpose()?;
     let hints = selected_account.filter(|account| account.client_id == CLIENT_ID);
     let listener = if callback_port == 0 {
-        TcpListener::bind(("127.0.0.1", 0))
+        super::oauth::util::bind_callback("127.0.0.1", 0)
     } else {
-        TcpListener::bind(("localhost", callback_port))
+        super::oauth::util::bind_callback("localhost", callback_port)
     }
     .context("OpenAI Codex callback port is unavailable")?;
-    listener.set_nonblocking(true)?;
     let redirect = if callback_port == CALLBACK_PORT {
         REDIRECT_URI.into()
     } else {
@@ -966,7 +961,7 @@ fn codex_request(
         .header("Authorization", format!("Bearer {}", token.as_str()))
         .header("chatgpt-account-id", account_id)
         .header("OpenAI-Beta", "responses=experimental")
-        .header("originator", "dial")
+        .header("originator", ORIGINATOR)
         .header("version", CLIENT_VERSION)
         .header("Accept", "application/json")
         .call()

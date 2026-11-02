@@ -8,10 +8,6 @@ use std::{
 };
 
 /// Kills the whole process group on drop so nothing outlives its owning operation.
-///
-/// The leader is reaped only through [`Self::wait`] / [`Self::try_wait`], which signal the group
-/// first: once the leader is reaped its PID (and so the group ID) may be reused, and a later
-/// `killpg` could hit an unrelated process.
 pub struct ProcessGroup {
     child: Child,
     terminated: bool,
@@ -23,11 +19,11 @@ impl ProcessGroup {
             terminated: false,
         }
     }
-    /// The leader's process ID, which is also the group ID.
     pub fn id(&self) -> u32 {
         self.child.id()
     }
-    /// The leader, for exit observation that does not reap it.
+    /// Shared handle for non-reaping observation. Mutable access stays private so callers
+    /// cannot release the leader PID before process-group cleanup.
     pub fn child(&self) -> &Child {
         &self.child
     }
@@ -40,23 +36,23 @@ impl ProcessGroup {
     pub fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
         self.child.stderr.take()
     }
-    /// The leader's status once it has exited. Remaining group members are signalled while the
-    /// unreaped leader still reserves the group ID, then the leader is reaped.
-    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        if !self.terminated && !crate::platform::process::exited(&self.child)? {
-            return Ok(None);
-        }
-        self.terminate();
-        self.child.try_wait()
-    }
-    /// Blocks until the leader exits, then signals the rest of the group and reaps the leader.
+    /// Clean up descendants while the leader PID is reserved, then reap the leader.
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
-        while !self.terminated
-            && !crate::platform::process::wait_exited(&self.child, Duration::from_secs(60))?
-        {
+        // Observe exit without reaping: signalling after Child::wait would risk PID reuse.
+        while !self.terminated && !self.exited()? {
+            crate::platform::process::wait_exited(&self.child, Duration::from_millis(100))?;
         }
         self.terminate();
-        self.child.wait()
+        let status = self.child.wait()?;
+        crate::platform::process::forget_group(self.child.id());
+        Ok(status)
+    }
+    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        if self.terminated || self.exited()? {
+            self.wait().map(Some)
+        } else {
+            Ok(None)
+        }
     }
     pub fn terminate(&mut self) {
         if !self.terminated {
@@ -70,6 +66,7 @@ impl ProcessGroup {
     pub fn release(mut self) -> Child {
         self.terminated = true;
         let group = std::mem::ManuallyDrop::new(self);
+        // SAFETY: ManuallyDrop prevents Drop from running; child is moved exactly once.
         unsafe { std::ptr::read(&group.child) }
     }
     /// The exited leader is not reaped, keeping its PID reserved until cleanup.

@@ -80,8 +80,8 @@ fn pty_wrapper_child() {
         return;
     }
     let mut original = std::mem::MaybeUninit::<libc::termios>::uninit();
-    // SAFETY: stdin is the test driver's live controlling PTY; output buffer is valid.
     assert_eq!(
+        // SAFETY: stdin is the test driver's live controlling PTY; output buffer is valid.
         unsafe { libc::tcgetattr(io::stdin().as_raw_fd(), original.as_mut_ptr()) },
         0
     );
@@ -99,8 +99,8 @@ fn pty_wrapper_child() {
     assert_eq!(unix::execute(&mut command, &mut capture, true).unwrap(), 42);
     capture.finish(None).unwrap();
     let mut restored = std::mem::MaybeUninit::<libc::termios>::uninit();
-    // SAFETY: same live PTY and valid output buffer.
     assert_eq!(
+        // SAFETY: same live PTY and valid output buffer.
         unsafe { libc::tcgetattr(io::stdin().as_raw_fd(), restored.as_mut_ptr()) },
         0
     );

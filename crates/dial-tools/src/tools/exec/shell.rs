@@ -1,6 +1,6 @@
 //! The `bash` tool: platform-native shell execution, process ownership, live output and artifacts.
 
-use super::sandbox::is_secret_env;
+use super::sandbox::child_env_allowed;
 #[cfg(not(windows))]
 use super::sandbox::{Policy, Sandbox};
 use crate::config::types::ShellBackend;
@@ -144,8 +144,12 @@ pub(crate) struct ForegroundParts {
 impl ForegroundJob {
     pub(crate) fn into_parts(self) -> ForegroundParts {
         let job = std::mem::ManuallyDrop::new(self);
-        // The working directory is not handed over; release it here.
+        // SAFETY: ManuallyDrop suppresses ForegroundJob::drop and all field drops. cwd is
+        // read exactly once and dropped here; the remaining fields are moved below, never cwd.
         drop(unsafe { std::ptr::read(&job.cwd) });
+        // SAFETY: job is an initialized, aligned ForegroundJob that will never be dropped or
+        // accessed again. Each non-Copy field below is read once into its sole new owner;
+        // no fallible calls intervene, and the child's kill/reap obligation transfers with it.
         unsafe {
             ForegroundParts {
                 workspace: std::ptr::read(&job.workspace),
@@ -1257,7 +1261,7 @@ fn shell_command_with_state(
         };
         spawn.env_clear();
         for (key, value) in std::env::vars_os() {
-            if !is_secret_env(&key.to_string_lossy(), &value.to_string_lossy()) {
+            if child_env_allowed(&key.to_string_lossy(), &value.to_string_lossy()) {
                 spawn.env(key, value);
             }
         }
@@ -1268,7 +1272,7 @@ fn shell_command_with_state(
             .env("TMP", &scratch)
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GCM_INTERACTIVE", "never");
-        return Ok(spawn);
+        Ok(spawn)
     }
     #[cfg(not(windows))]
     {
@@ -1308,7 +1312,7 @@ fn shell_command_with_state(
             spawn = std::process::Command::new(&program);
             spawn.args(&args).env_clear();
             for (key, value) in std::env::vars_os() {
-                if !is_secret_env(&key.to_string_lossy(), &value.to_string_lossy()) {
+                if child_env_allowed(&key.to_string_lossy(), &value.to_string_lossy()) {
                     spawn.env(key, value);
                 }
             }

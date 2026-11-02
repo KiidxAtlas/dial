@@ -94,6 +94,7 @@ fn bare_conflict_lists_unmerged_git_paths() {
         assert!(status.status.success() || args[0] == "merge", "{status:?}");
     };
     git(&["init", "-q", "-b", "main"]);
+    disable_inherited_git_filters(dir.path());
     fs::write(dir.path().join("f.txt"), "base\n").unwrap();
     git(&["add", "."]);
     git(&["commit", "-qm", "base"]);

@@ -195,3 +195,65 @@ fn a_full_queue_pauses_the_reader_without_losing_events() {
     );
     pump.stop();
 }
+
+#[test]
+fn stopped_poll_preserves_zero_timeout_readiness_and_the_overall_deadline() {
+    struct Idle {
+        ready_on: Option<usize>,
+        polls: Vec<Duration>,
+        quiet: std::sync::mpsc::Receiver<()>,
+    }
+    impl EventSource for Idle {
+        fn poll(&mut self, timeout: Duration) -> io::Result<bool> {
+            self.polls.push(timeout);
+            if self.ready_on == Some(self.polls.len()) {
+                return Ok(true);
+            }
+            assert_eq!(
+                self.quiet.recv_timeout(timeout),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            );
+            Ok(false)
+        }
+        fn read(&mut self) -> io::Result<Event> {
+            panic!("poll must not read the idle source")
+        }
+    }
+    for (label, timeout, ready_on) in [
+        ("zero-ready", Duration::ZERO, Some(1)),
+        ("zero-empty", Duration::ZERO, None),
+        ("later-slice-ready", Duration::from_secs(1), Some(2)),
+        ("whole-deadline", TICK * 3, None),
+    ] {
+        let (_keep_open, quiet) = std::sync::mpsc::channel();
+        let mut idle = Idle {
+            ready_on,
+            polls: Vec::new(),
+            quiet,
+        };
+        let started = Instant::now();
+        assert_eq!(
+            pump().poll_with(timeout, &mut idle).expect(label),
+            ready_on.is_some(),
+            "{label}"
+        );
+        if ready_on.is_none() {
+            assert!(
+                started.elapsed() >= timeout,
+                "{label}: a false result must not shorten the requested wait"
+            );
+        }
+        assert!(
+            !idle.polls.is_empty(),
+            "{label}: even a zero timeout checks readiness"
+        );
+        assert!(
+            idle.polls.iter().all(|slice| *slice <= TICK),
+            "{label}: unbounded slices {:?}",
+            idle.polls
+        );
+    }
+}
+
+#[cfg(unix)]
+mod signals;

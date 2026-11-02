@@ -9,7 +9,7 @@
 
 use super::Settings;
 use super::process::{self, Finished};
-use super::url::{check_destination_part, sh_quote};
+use super::url::check_destination_part;
 use serde::{Deserialize, Serialize};
 #[cfg(any(unix, test))]
 use sha2::{Digest, Sha256};
@@ -128,10 +128,16 @@ impl PosixShell {
         }
     }
 
-    /// `<shell> -c '<command>'`: parse under this shell, not the remote login shell (which may
-    /// be fish, csh or cmd and cannot read `if [ … ]; then`).
+    /// Wrap a script without exposing its bytes to the remote login shell. Only a fixed
+    /// single-quoted bootstrap and base64 alphabet cross that shell; the verified POSIX
+    /// shell decodes and evaluates the script without consuming transfer stdin.
     pub fn wrap(self, command: &str) -> String {
-        format!("{} -c {}", self.name(), sh_quote(command))
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(command);
+        format!(
+            "{} -c 'dial_script=$(printf %s {encoded} | base64 -d) && eval \"$dial_script\"'",
+            self.name()
+        )
     }
 }
 
@@ -217,6 +223,8 @@ pub fn control_dir(settings: &Settings) -> (PathBuf, bool) {
     }
     #[cfg(unix)]
     {
+        // SAFETY: getuid has no pointer arguments; it reads this process's real UID
+        // to namespace the shared temporary control directory.
         let uid = unsafe { libc::getuid() };
         (fallback_control_dir(&canonical, uid), true)
     }
@@ -266,6 +274,8 @@ fn check_owner_private(dir: &Path) -> Result<(), String> {
         use std::os::unix::fs::MetadataExt;
         let meta =
             fs::symlink_metadata(dir).map_err(|e| format!("inspecting {}: {e}", dir.display()))?;
+        // SAFETY: getuid has no pointer arguments and reads the real UID used to
+        // compare ownership of this non-following metadata snapshot.
         let uid = unsafe { libc::getuid() };
         if meta.file_type().is_symlink() || !meta.is_dir() {
             return Err(format!(
@@ -912,6 +922,8 @@ fn register_cleanup() {
             close_all(&settings)
         });
     }
+    // SAFETY: close_at_exit has the required extern C, no-argument ABI, lives for the
+    // process lifetime, and catches Rust unwinding before returning to the C runtime.
     ONCE.call_once(|| unsafe {
         libc::atexit(close_at_exit);
     });

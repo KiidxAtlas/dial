@@ -258,6 +258,7 @@ impl PrivateDirectory {
             "memory database path changed"
         );
         connection.busy_timeout(std::time::Duration::from_secs(10))?;
+        crate::storage::sqlite::check_version(&connection, 1)?;
         connection.execute_batch(&format!(
             "PRAGMA foreign_keys=ON;PRAGMA journal_mode={journal};PRAGMA synchronous=FULL;"
         ))?;
@@ -281,6 +282,7 @@ impl PrivateDirectory {
             "memory database path changed"
         );
         connection.busy_timeout(std::time::Duration::from_millis(100))?;
+        crate::storage::sqlite::check_version(&connection, 1)?;
         Ok(Some(connection))
     }
 

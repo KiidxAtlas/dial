@@ -3,9 +3,11 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use parking_lot::Mutex;
 
 /// Serializes every test that mutates PATH (git fakes and HOME/PATH fixtures).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) static PATH_LOCK: Mutex<()> = Mutex::new(());
 
 thread_local! {

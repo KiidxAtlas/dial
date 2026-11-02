@@ -244,11 +244,24 @@ fn tombstone(conn: &Connection, id: i64, revision: i64, at: i64) -> Result<()> {
     Ok(())
 }
 
+/// Erase historical WAL frames after redaction. A busy reader is reported, not mistaken for erasure.
+fn checkpoint_redaction(conn: &Connection) -> Result<()> {
+    let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+    ensure!(
+        busy == 0,
+        "memory was forgotten but a busy reader prevented WAL erasure; erasure is incomplete until readers close and a TRUNCATE checkpoint succeeds"
+    );
+    Ok(())
+}
+
 impl Store {
     pub fn new(conn: Connection) -> Result<Self> {
         conn.busy_timeout(Duration::from_secs(10))?;
-        conn.execute_batch(
-            "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
+        crate::storage::sqlite::check_version(&conn, 1)?;
+        conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA secure_delete=ON;")?;
+        // FTS5 otherwise retains deleted terms in older index segments.
+        crate::storage::sqlite::migrate(&conn, &[
+            "
             CREATE TABLE IF NOT EXISTS facts(
                 id INTEGER PRIMARY KEY, content TEXT NOT NULL, content_hash TEXT NOT NULL,
                 source TEXT NOT NULL, revision INTEGER NOT NULL, created INTEGER NOT NULL,
@@ -267,6 +280,10 @@ impl Store {
             CREATE TABLE IF NOT EXISTS observed_turns(turn_key TEXT PRIMARY KEY, created INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(content, tokenize='unicode61');",
+        ])?;
+        conn.execute(
+            "INSERT INTO facts_fts(facts_fts, rank) VALUES('secure-delete', 1)",
+            [],
         )?;
         Ok(Self { conn })
     }
@@ -386,6 +403,7 @@ impl Store {
         );
         tombstone(&tx, id, expected_revision, at)?;
         tx.commit()?;
+        checkpoint_redaction(&self.conn)?;
         Ok(())
     }
 
@@ -407,6 +425,7 @@ impl Store {
         }
         tx.execute("DELETE FROM pending_turns", [])?;
         tx.commit()?;
+        checkpoint_redaction(&self.conn)?;
         Ok(live.len())
     }
 

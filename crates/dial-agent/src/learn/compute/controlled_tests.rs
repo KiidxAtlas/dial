@@ -94,6 +94,6 @@ fn budget_expiry_interrupts_background_requests_without_retry() {
         assert!(!can_yield());
         assert!(!background_active());
         let file = super::super::auto::lock_file(&config.user_dir.join("compute.lock")).unwrap();
-        file.try_lock_exclusive().unwrap();
+        file.try_lock().map_err(std::io::Error::from).unwrap();
     }
 }

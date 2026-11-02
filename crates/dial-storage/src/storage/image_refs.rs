@@ -9,7 +9,6 @@
 use crate::platform::fs as platform_fs;
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use fs2::FileExt;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -461,7 +460,7 @@ fn with_lock<T>(dir: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
         &dir.join(LOCK_FILE),
     )
     .with_context(|| format!("opening image store lock in {}", dir.display()))?;
-    lock.lock_exclusive().context("locking image store")?;
+    lock.lock().context("locking image store")?;
     f()
 }
 

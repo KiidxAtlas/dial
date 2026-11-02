@@ -630,7 +630,8 @@ fn node_arch() -> &'static str {
 #[cfg(unix)]
 fn os_release() -> String {
     let mut info = std::mem::MaybeUninit::<libc::utsname>::uninit();
-    // SAFETY: `uname` fills the struct when it returns 0; it is read only in that case.
+    // SAFETY: `uname` fills the writable struct when it returns 0, including a NUL-terminated
+    // release field; it is read only in that case, while the stack allocation remains live.
     unsafe {
         if libc::uname(info.as_mut_ptr()) != 0 {
             return String::new();

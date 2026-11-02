@@ -127,7 +127,7 @@ impl App {
             && let Some(lock) = self.compute.get_mut().take()
         {
             crate::learn::compute::clear_owner(&self.layout.user_dir);
-            let _ = fs2::FileExt::unlock(&lock);
+            let _ = std::fs::File::unlock(&lock);
         }
         self.reopen_store();
     }
@@ -213,7 +213,7 @@ impl App {
             crate::learn::compute::clear_owner(&self.layout.user_dir);
             // Closing only our descriptor can leave the lock alive in a duplicate inherited
             // during a concurrent process spawn. Explicitly release the shared lock first.
-            let _ = fs2::FileExt::unlock(&lock);
+            let _ = std::fs::File::unlock(&lock);
         }
         true
     }

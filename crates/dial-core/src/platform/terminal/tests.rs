@@ -69,10 +69,8 @@ fn raw_mode_restores_exact_attributes_without_consuming_pending_input() {
     let attributes = || {
         let mut value = std::mem::MaybeUninit::uninit();
         // SAFETY: live slave descriptor and valid output buffer.
-        assert_eq!(
-            unsafe { libc::tcgetattr(slave.as_raw_fd(), value.as_mut_ptr()) },
-            0
-        );
+        let result = unsafe { libc::tcgetattr(slave.as_raw_fd(), value.as_mut_ptr()) };
+        assert_eq!(result, 0, "read PTY attributes");
         // SAFETY: successful tcgetattr initialized the value.
         unsafe { value.assume_init() }
     };
@@ -101,4 +99,151 @@ fn raw_mode_restores_exact_attributes_without_consuming_pending_input() {
         }
     }
     assert_eq!(bytes, b"pending-input\n");
+}
+
+// Signal dispositions are process-global: run this driver alone in a child harness.
+#[test]
+fn termination_signal_child() {
+    if std::env::var_os("DIAL_TEST_TERMINATION_SIGNALS").is_none() {
+        return;
+    }
+    use std::sync::atomic::{AtomicI32, Ordering};
+    static PREVIOUS: AtomicI32 = AtomicI32::new(0);
+    extern "C" fn previous(signal: i32) {
+        PREVIOUS.store(signal, Ordering::SeqCst);
+    }
+    fn disposition(signal: i32) -> libc::sigaction {
+        let mut action = std::mem::MaybeUninit::uninit();
+        // SAFETY: valid output buffer and a known signal number.
+        let result = unsafe { libc::sigaction(signal, std::ptr::null(), action.as_mut_ptr()) };
+        assert_eq!(result, 0, "query signal {signal}");
+        // SAFETY: successful sigaction initialized the output.
+        unsafe { action.assume_init() }
+    }
+    fn raise(signal: i32) {
+        // SAFETY: the child installed a nonterminating handler for every signal raised here.
+        let result = unsafe { libc::raise(signal) };
+        assert_eq!(result, 0, "raise signal {signal}");
+    }
+    let signals = [libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT, libc::SIGINT];
+    let mut saved = Vec::new();
+    for signal in signals {
+        saved.push((signal, disposition(signal)));
+        // SAFETY: zeroed sigaction is completed before passing it to libc.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = previous as *const () as usize;
+        action.sa_flags = libc::SA_RESTART;
+        // SAFETY: valid writable mask; SIGUSR1 is a valid signal.
+        unsafe {
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaddset(&mut action.sa_mask, libc::SIGUSR1);
+        }
+        // SAFETY: fully initialized action and a known signal number.
+        let result = unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) };
+        assert_eq!(result, 0, "install previous handler for {signal}");
+    }
+    let before: Vec<_> = signals.into_iter().map(disposition).collect();
+    assert_eq!(Signals::pending(), 0, "no bridge before installation");
+    let guard = Signals::install_termination().unwrap();
+    assert!(
+        matches!(Signals::install_termination(), Err(e) if e.kind() == io::ErrorKind::AlreadyExists)
+    );
+    assert!(matches!(Signals::install(), Err(e) if e.kind() == io::ErrorKind::AlreadyExists));
+    for signal in [libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
+        raise(signal);
+        assert_eq!(Signals::pending(), signal, "record signal {signal}");
+        assert_eq!(
+            Signals::pending(),
+            signal,
+            "observation must not consume {signal}"
+        );
+        assert_eq!(guard.take(), signal, "consume signal {signal}");
+        assert_eq!(Signals::pending(), 0, "clear consumed signal {signal}");
+        assert_eq!(
+            PREVIOUS.load(Ordering::SeqCst),
+            0,
+            "previous handler must be scoped out"
+        );
+    }
+    raise(libc::SIGINT);
+    assert_eq!(
+        PREVIOUS.load(Ordering::SeqCst),
+        libc::SIGINT,
+        "Ctrl-C retains its owner"
+    );
+    assert_eq!(
+        Signals::pending(),
+        0,
+        "Ctrl-C is not a TUI termination signal"
+    );
+    raise(libc::SIGTERM);
+    drop(guard);
+    assert_eq!(
+        Signals::pending(),
+        0,
+        "dropped bridge cannot leak a pending termination"
+    );
+    for (signal, before) in signals.into_iter().zip(before) {
+        let after = disposition(signal);
+        assert_eq!(
+            after.sa_sigaction, before.sa_sigaction,
+            "restore handler {signal}"
+        );
+        assert_eq!(after.sa_flags, before.sa_flags, "restore flags {signal}");
+        for member in 1..32 {
+            // SAFETY: both masks came from successful sigaction queries; member is valid on Unix.
+            let (after, before) = unsafe {
+                (
+                    libc::sigismember(&after.sa_mask, member),
+                    libc::sigismember(&before.sa_mask, member),
+                )
+            };
+            assert_eq!(after, before, "restore mask member {member} for {signal}");
+        }
+        PREVIOUS.store(0, Ordering::SeqCst);
+        raise(signal);
+        assert_eq!(
+            PREVIOUS.load(Ordering::SeqCst),
+            signal,
+            "restored handler runs for {signal}"
+        );
+    }
+    let again = Signals::install_termination().unwrap();
+    assert_eq!(
+        Signals::pending(),
+        0,
+        "fresh bridge clears previous termination"
+    );
+    drop(again);
+    for (signal, original) in saved {
+        // SAFETY: restores the original disposition captured in this isolated child.
+        let result = unsafe { libc::sigaction(signal, &original, std::ptr::null_mut()) };
+        assert_eq!(result, 0, "restore original disposition {signal}");
+    }
+}
+
+#[test]
+fn termination_signals_are_scoped_and_restore_previous_handlers() {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "platform::terminal::tests::termination_signal_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("DIAL_TEST_TERMINATION_SIGNALS", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = process::spawn(&mut command).unwrap();
+    let exited = process::wait_exited(&child, Duration::from_secs(5)).unwrap();
+    if !exited {
+        child.kill().unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        exited && output.status.success(),
+        "signal child exited={exited}: {output:?}"
+    );
 }

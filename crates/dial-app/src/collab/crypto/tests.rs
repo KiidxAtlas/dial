@@ -28,6 +28,20 @@ fn open_rejects_wrong_key_tampering_and_short_input() {
 }
 
 #[test]
+fn view_holder_cannot_forge_host_frames() {
+    let raw = [7; 32];
+    let (host, public) = RoomKey::host(&raw, &[9; 32]).unwrap();
+    let guest = RoomKey::guest(&raw, public).unwrap();
+    let signed = host.seal(b"transcript").unwrap();
+    assert_eq!(guest.open(&signed).unwrap(), b"transcript");
+    let forged = guest.seal(b"forged transcript").unwrap();
+    assert!(guest.open(&forged).is_err());
+    assert_eq!(host.open(&forged).unwrap(), b"forged transcript");
+    let (impostor, _) = RoomKey::host(&raw, &[8; 32]).unwrap();
+    assert!(guest.open(&impostor.seal(b"impostor").unwrap()).is_err());
+}
+
+#[test]
 fn known_vector_matches_webcrypto_layout() {
     // NIST GCM test case 13 (256-bit zero key, zero IV, empty plaintext): tag only.
     let key = RoomKey::new(&[0u8; 32]).unwrap();

@@ -3,11 +3,12 @@ use super::auth::SecretToken;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+#[cfg(test)]
+use std::time::Duration;
 use std::{
     collections::{BTreeMap, HashSet},
     io::Read,
     path::Path,
-    time::Duration,
 };
 
 pub const MAX_BYTES: usize = 4 * 1024 * 1024;
@@ -116,12 +117,7 @@ impl Client {
             provider,
             base,
             key: SecretToken::new(key),
-            agent: ureq::Agent::config_builder()
-                .timeout_global(Some(Duration::from_secs(60)))
-                .max_redirects(0)
-                .http_status_as_error(false)
-                .build()
-                .into(),
+            agent: super::agent_with(60, true, None, None),
         }
     }
     fn request(

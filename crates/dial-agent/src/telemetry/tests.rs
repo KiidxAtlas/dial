@@ -509,3 +509,21 @@ fn failed_export_is_observable_and_batch_does_not_accumulate() {
             .is_empty()
     );
 }
+
+#[test]
+fn flush_deadline_is_bounded_even_for_unvalidated_config() {
+    let before = Instant::now();
+    let deadline = next_flush(Duration::from_secs(u64::MAX));
+    assert!(deadline >= before);
+    assert!(deadline.duration_since(before) <= Duration::from_secs(86401));
+    for interval in [0, u64::MAX] {
+        let config = TelemetryConfig {
+            enabled: true,
+            endpoint: Some("http://127.0.0.1:4318".into()),
+            flush_interval_secs: interval,
+            ..Default::default()
+        };
+        let settings = OtlpSettings::resolve_with(&config, |_| None).unwrap();
+        assert!((Duration::from_secs(1)..=Duration::from_secs(86400)).contains(&settings.flush));
+    }
+}

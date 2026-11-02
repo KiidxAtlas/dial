@@ -71,9 +71,13 @@ const fn physical_escape(kind: u32, key: i64, pid: i64, tag: i64) -> bool {
     kind == KEY_DOWN && key == 53 && pid == 0 && tag != SYNTHETIC_EVENT_TAG
 }
 
+/// # Safety
+/// Called only by the tap registered in `start`: `user` points to that worker's
+/// live TapContext and any non-null `event` is borrowed until callback return.
 unsafe extern "C" fn observe(_proxy: Ref, kind: u32, event: Ref, user: Ref) -> Ref {
-    // SAFETY: the monitor thread retains this stack context through
-    // invalidation.
+    // SAFETY: start registers this stack address before running the worker's
+    // run loop. Callbacks execute on that same loop; it is stopped and the tap
+    // invalidated before context leaves scope. No callback retains this borrow.
     let context = unsafe { &*(user.cast::<TapContext>()) };
     if kind == u32::MAX || kind == u32::MAX - 1 {
         context.stop.cancel();
@@ -84,7 +88,8 @@ unsafe extern "C" fn observe(_proxy: Ref, kind: u32, event: Ref, user: Ref) -> R
         return event;
     }
     if !event.is_null() {
-        // SAFETY: documented read-only CGEvent fields.
+        // SAFETY: Quartz lends this non-null CGEvent for the callback duration;
+        // each field is a public integer CGEventField selector, read only here.
         let (key, pid, tag) = unsafe {
             (
                 CGEventGetIntegerValueField(event, KEYBOARD_KEYCODE),
@@ -102,6 +107,9 @@ unsafe extern "C" fn observe(_proxy: Ref, kind: u32, event: Ref, user: Ref) -> R
     event
 }
 
+/// # Safety
+/// Installed only as the monitor's version-zero run-loop source callback; it
+/// must execute on the run loop that owns that source. The info pointer is unused.
 unsafe extern "C" fn stop_loop(_: Ref) {
     // SAFETY: this callback runs on the monitor's own run loop.
     unsafe {
@@ -125,7 +133,9 @@ impl EscapeMonitor {
                     stop: emergency,
                     tap: ptr::null_mut(),
                 };
-                // SAFETY: listen-only tap; context stays live until invalidation.
+                // SAFETY: listen-only CGEventTapCreate uses the declared C ABI.
+                // `context` stays at this stack address until the source is
+                // removed and the tap invalidated on this same worker thread.
                 let tap = unsafe {
                     CGEventTapCreate(
                         1,
@@ -176,9 +186,12 @@ impl EscapeMonitor {
                     let _ = ready.send(None);
                     return;
                 }
-                // SAFETY: all sources remain retained throughout the loop; the
-                // owner gets separate retains for its signal/wakeup
-                // request.
+                // SAFETY: all Create-rule references stay owned through loop
+                // teardown. CFRunLoopSourceCreate copies stop_context; its info
+                // is null. Only this worker dispatches callbacks, and it removes
+                // both sources and invalidates the tap before dropping context.
+                // Separate retains sent to EscapeMonitor keep the loop/source
+                // alive for CoreFoundation's cross-thread signal/wakeup calls.
                 unsafe {
                     let run_loop = CFRunLoopGetCurrent();
                     CFRunLoopAddSource(run_loop, source, kCFRunLoopDefaultMode);

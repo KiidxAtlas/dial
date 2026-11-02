@@ -726,3 +726,74 @@ fn task_acceptance_contract_is_additive_at_both_call_shapes() {
         json!("integer");
     assert!(project_history(&history, &[current], &registry).is_err());
 }
+
+#[test]
+fn registry_contracts_accept_each_intermediate_additive_release_shape() {
+    let config = crate::config::types::Config::default();
+    for tool in crate::tools::net::browser::tools(&config)
+        .into_iter()
+        .chain(crate::tools::exec::eval::tools(&config))
+        .chain(crate::tools::knowledge::data::tools(&config))
+    {
+        let name = tool.name().to_owned();
+        let Some((_, properties)) = ADDITIVE_PROPERTIES.iter().find(|(tool, _)| *tool == name)
+        else {
+            continue;
+        };
+        let current = tool.schema();
+        let mut registry = Registry::new();
+        registry.register(tool);
+        let mut before = current.clone();
+        for remaining in (0..=properties.len()).rev() {
+            if remaining < properties.len() {
+                before["function"]["parameters"]["properties"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(properties[remaining]);
+            }
+            let mut narrowed = before.clone();
+            let groups: Vec<_> = ADDITIVE_ENUM_VALUES
+                .iter()
+                .filter(|(tool, ..)| *tool == name)
+                .collect();
+            for index in (0..=groups.len()).rev() {
+                if index < groups.len() {
+                    let (_, property, values) = groups[index];
+                    if let Some(options) = narrowed["function"]["parameters"]["properties"]
+                        [*property]["enum"]
+                        .as_array_mut()
+                    {
+                        options.retain(|value| !values.contains(&value.as_str().unwrap()));
+                    }
+                }
+                let old = identities(std::slice::from_ref(&narrowed), &registry)[&name].clone();
+                let history = vec![json!({"role":"assistant","dial_tool_contracts":{"id":old}})];
+                validate_history(&history, std::slice::from_ref(&current), &registry)
+                    .unwrap_or_else(|error| {
+                        panic!("{name} properties={remaining}, enum_groups={index}: {error}")
+                    });
+            }
+        }
+        let mut incompatible = current.clone();
+        incompatible["function"]["strict"] = json!(true);
+        let old = identities(&[incompatible], &registry)[&name].clone();
+        assert!(
+            validate_history(
+                &[json!({"role":"assistant","dial_tool_contracts":{"id":old}})],
+                &[current],
+                &registry
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn contract_identity_is_independent_of_nested_object_insertion_order() {
+    let first: Value = serde_json::from_str(r#"{"function":{"name":"test","parameters":{"properties":{"z":{"const":{"b":2,"a":1}},"a":{"type":"string"}},"type":"object"}}}"#).unwrap();
+    let second: Value = serde_json::from_str(r#"{ "function": { "parameters": { "type": "object", "properties": { "a": {"type": "string"}, "z": {"const": {"a": 1, "b": 2}} } }, "name": "test" } }"#).unwrap();
+    assert_eq!(
+        identities(&[first], &Registry::new()),
+        identities(&[second], &Registry::new())
+    );
+}

@@ -3,7 +3,6 @@ use crate::platform::{fs as private_fs, procinfo::ProcId};
 use crate::tools::exec::sandbox::Policy;
 use crate::tools::{ToolOutput, Workspace, opt_bool, opt_str, opt_u64, present, req_str};
 use anyhow::{Context, Result, bail, ensure};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -174,7 +173,7 @@ impl Drop for AdmissionLock {
     fn drop(&mut self) {
         // Explicit unlock releases inherited flock descriptions too: another test/controller
         // can fork concurrently before close-on-exec takes effect in its child.
-        let _ = FileExt::unlock(&self.0);
+        let _ = std::fs::File::unlock(&self.0);
     }
 }
 
@@ -414,7 +413,8 @@ fn start_with_owner(
             .mode(0o600),
         &registry.join(".lock"),
     )?;
-    lock.try_lock_exclusive()
+    lock.try_lock()
+        .map_err(std::io::Error::from)
         .context("another controller is admitting a durable job")?;
     let lock = AdmissionLock(lock);
     let dirs = job_dirs(registry)?;

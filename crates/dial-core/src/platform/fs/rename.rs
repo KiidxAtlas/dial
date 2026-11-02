@@ -12,6 +12,8 @@ pub fn rename_noreplace(source: &Path, target: &Path) -> io::Result<()> {
         use std::os::unix::ffi::OsStrExt;
         let source = CString::new(source.as_os_str().as_bytes())?;
         let target = CString::new(target.as_os_str().as_bytes())?;
+        // SAFETY: both CString buffers are NUL-terminated and live through the syscall;
+        // renameat2 reads the paths and takes the remaining arguments by value.
         #[cfg(target_os = "linux")]
         let result = unsafe {
             // musl does not export the renameat2 wrapper on every supported toolchain.
@@ -26,6 +28,8 @@ pub fn rename_noreplace(source: &Path, target: &Path) -> io::Result<()> {
             )
         };
         #[cfg(target_os = "macos")]
+        // SAFETY: both CString buffers remain live and NUL-terminated; renamex_np only
+        // reads them, and RENAME_EXCL is the supported no-replace flag.
         let result =
             unsafe { libc::renamex_np(source.as_ptr(), target.as_ptr(), libc::RENAME_EXCL) };
         if result == 0 {
@@ -51,6 +55,7 @@ pub fn rename_noreplace(source: &Path, target: &Path) -> io::Result<()> {
         let source = wide(source)?;
         let target = wide(target)?;
         // No REPLACE_EXISTING, and no COPY_ALLOWED: directories and files have the same contract.
+        // SAFETY: both paths are live NUL-terminated UTF-16 buffers; MoveFileExW only reads them.
         if unsafe {
             windows_sys::Win32::Storage::FileSystem::MoveFileExW(
                 source.as_ptr(),

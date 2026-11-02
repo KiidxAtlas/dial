@@ -28,3 +28,7 @@
 /compute.lock
 /package-lock.json
 *.log
+.env
+.env.*
+!.env.example
+!.env.sample

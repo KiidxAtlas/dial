@@ -21,11 +21,10 @@ pub(super) fn lock_root(root: &Path, file: &str, label: &str) -> Result<std::fs:
     let file = crate::platform::fs::open_nofollow(&options, &root.join(file))?;
     let started = std::time::Instant::now();
     loop {
-        match fs2::FileExt::try_lock_exclusive(&file) {
+        match std::fs::File::try_lock(&file).map_err(std::io::Error::from) {
             Ok(()) => return Ok(file),
             Err(error)
-                if (error.kind() == std::io::ErrorKind::WouldBlock
-                    || error.raw_os_error() == fs2::lock_contended_error().raw_os_error())
+                if error.kind() == std::io::ErrorKind::WouldBlock
                     && started.elapsed() < LOCK_WAIT =>
             {
                 std::thread::sleep(std::time::Duration::from_millis(20));

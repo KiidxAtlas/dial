@@ -12,8 +12,8 @@
 //! socket with `role` (`host`|`guest`), a random per-socket `epoch` and a monotonic `transportSeq`,
 //! which receivers check with a replay window before acting (`super::crypto::SenderWindows`).
 //! Entry `seq` remains the zero-based log index, independent of transport/control frames and resets.
-//! Version 1003 requires `transportSeq`; legacy ambiguous `seq` stamps are not accepted. Clients
-//! speaking other protocol versions are refused at `hello` instead of silently misrendering.
+//! Version 1004 requires host signatures and write proofs; older links fail closed.
+//! Peers speaking other versions are refused instead of silently misrendering.
 use super::crypto::{ROOM_ID_BYTES, ROOM_KEY_BYTES, WRITE_TOKEN_BYTES, random_bytes};
 use anyhow::{Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 
 /// Wire protocol version carried in `hello`/`welcome`; the host rejects mismatches.
-pub const COLLAB_PROTO: u64 = 1003;
+pub const COLLAB_PROTO: u64 = 1004;
 /// Plaintext envelope prefix length.
 pub const ENVELOPE_HEADER_LENGTH: usize = 4;
 /// Upper bound for one replicated entry/node payload before shrinking.
@@ -94,16 +94,24 @@ pub fn normalize_relay_origin(relay_url: &str) -> Result<String> {
     Ok(format!("{scheme}://{host}{port}"))
 }
 
-/// Render the shareable link `host[:port]/r/<roomId>.<key>` (`ws://…` kept for localhost).
-/// Full links append the write token to the key; view links carry the bare key.
+/// Render a versioned share link containing the room key and host verification key.
+/// Full links additionally carry write authority, which is never transmitted to the host.
 pub fn format_link(
     relay_url: &str,
     room_id: &str,
     key: &[u8],
+    host_public: &[u8; 32],
     write_token: Option<&[u8]>,
 ) -> Result<String> {
     let origin = normalize_relay_origin(relay_url)?;
-    let mut secret = key.to_vec();
+    ensure!(key.len() == ROOM_KEY_BYTES, "invalid room key length");
+    ensure!(
+        write_token.is_none_or(|token| token.len() == WRITE_TOKEN_BYTES),
+        "invalid write token length"
+    );
+    let mut secret = vec![4u8];
+    secret.extend_from_slice(key);
+    secret.extend_from_slice(host_public);
     if let Some(token) = write_token {
         secret.extend_from_slice(token);
     }
@@ -118,6 +126,7 @@ pub struct ParsedLink {
     pub ws_url: String,
     pub room_id: String,
     pub key: [u8; ROOM_KEY_BYTES],
+    pub host_public: [u8; 32],
     /// Present for full links; absent for read-only (view) links.
     pub write_token: Option<[u8; WRITE_TOKEN_BYTES]>,
 }
@@ -167,22 +176,23 @@ pub fn parse_link(link: &str, default_relay: &str) -> Result<ParsedLink> {
         .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
         .then(|| URL_SAFE_NO_PAD.decode(key_text).ok())
         .flatten();
-    let Some(secret) = secret
-        .filter(|s| s.len() == ROOM_KEY_BYTES || s.len() == ROOM_KEY_BYTES + WRITE_TOKEN_BYTES)
-    else {
-        bail!("collab link key must be 32 (view) or 48 (full) base64url bytes");
+    let Some(secret) = secret.filter(|s| matches!(s.len(), 65 | 81) && s[0] == 4) else {
+        bail!("collab link requires v1004 authenticated key material; create a new link");
     };
     let mut key = [0u8; ROOM_KEY_BYTES];
-    key.copy_from_slice(&secret[..ROOM_KEY_BYTES]);
-    let write_token = (secret.len() > ROOM_KEY_BYTES).then(|| {
+    key.copy_from_slice(&secret[1..33]);
+    let mut host_public = [0u8; 32];
+    host_public.copy_from_slice(&secret[33..65]);
+    let write_token = (secret.len() > 65).then(|| {
         let mut token = [0u8; WRITE_TOKEN_BYTES];
-        token.copy_from_slice(&secret[ROOM_KEY_BYTES..]);
+        token.copy_from_slice(&secret[65..]);
         token
     });
     Ok(ParsedLink {
         ws_url: format!("{origin}/r/{room_id}"),
         room_id: room_id.to_owned(),
         key,
+        host_public,
         write_token,
     })
 }
@@ -236,12 +246,8 @@ impl Control {
 pub mod frame {
     use super::*;
 
-    pub fn hello(name: &str, write_token: Option<&[u8]>) -> Value {
-        let mut frame = json!({"t":"hello","proto":COLLAB_PROTO,"name":name});
-        if let Some(token) = write_token {
-            frame["writeToken"] = json!(URL_SAFE_NO_PAD.encode(token));
-        }
-        frame
+    pub fn hello(name: &str) -> Value {
+        json!({"t":"hello","proto":COLLAB_PROTO,"name":name})
     }
     pub fn notice(message: &str) -> Value {
         json!({"t":"notice","message":message})

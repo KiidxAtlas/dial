@@ -2,7 +2,6 @@
 use crate::config::types::Config;
 use crate::platform::procinfo::ProcId;
 use anyhow::{Result, ensure};
-use fs2::FileExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{cell::RefCell, fs::File, path::Path, time::Duration};
 
@@ -43,7 +42,7 @@ impl Request {
         let file = tempfile::Builder::new()
             .prefix("request-")
             .tempfile_in(directory)?;
-        file.as_file().lock_exclusive()?;
+        file.as_file().lock()?;
         Ok(Self { _file: file })
     }
     pub fn foreground(user: &Path) -> Result<Self> {
@@ -65,9 +64,9 @@ fn pending(user: &Path, kind: &str) -> Result<bool> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error.into()),
         };
-        match file.try_lock_exclusive() {
+        match file.try_lock().map_err(std::io::Error::from) {
             Ok(()) => {
-                FileExt::unlock(&file)?;
+                std::fs::File::unlock(&file)?;
             } // A crashed requester never blocks work.
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(true),
             Err(error) => return Err(error.into()),
@@ -238,13 +237,13 @@ fn acquire(config: &Config, cancel: Option<&AtomicBool>) -> Result<File> {
         );
         super::auto::check_stop(config)?;
         if !should_yield(&config.user_dir)? {
-            match file.try_lock_exclusive() {
+            match file.try_lock().map_err(std::io::Error::from) {
                 Ok(()) => {
                     // Recheck after acquisition so queued foreground requests win the race.
                     if !should_yield(&config.user_dir)? {
                         return Ok(file);
                     }
-                    FileExt::unlock(&file)?;
+                    std::fs::File::unlock(&file)?;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(error) => return Err(error.into()),
@@ -321,7 +320,7 @@ impl Background {
             file.ok_or_else(|| anyhow::anyhow!("training has no background compute lease"))?;
         clear_owner(&config.user_dir);
         settle_usage(&config.user_dir)?;
-        FileExt::unlock(&file)?;
+        std::fs::File::unlock(&file)?;
         drop(file);
         let file = acquire(config, cancel)?;
         register(
@@ -347,7 +346,7 @@ impl Drop for Background {
             if let Err(error) = settle_usage(&self.user) {
                 eprintln!("dial: could not record background compute time: {error:#}");
             }
-            let _ = FileExt::unlock(&file);
+            let _ = std::fs::File::unlock(&file);
         }
     }
 }

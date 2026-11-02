@@ -480,6 +480,9 @@ impl Proc {
                 .stdout(slave.try_clone().map_err(|e| format!("cloning PTY: {e}"))?)
                 .stderr(slave)
                 .env("TERM", "xterm-256color");
+            // SAFETY: after fork this closure only calls setsid, the TIOCSCTTY ioctl with
+            // integer arguments, and last_os_error; it neither allocates nor locks Rust state.
+            // Command installs the owned PTY slave at fd 0 before invoking pre_exec.
             unsafe {
                 spawn.pre_exec(|| {
                     if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {

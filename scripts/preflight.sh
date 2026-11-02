@@ -185,8 +185,7 @@ main() {
   # uv environment rather than whatever python3 this host has.
   local py=()
   if command -v uv >/dev/null 2>&1; then
-    py=(uv run --quiet --no-project --python 3.12 --with pytest --with fastapi==0.141.1
-      --with pydantic --with uvicorn --with cryptography)
+    py=(uv run --quiet --no-project --python 3.12 --with-requirements "$root/scripts/requirements-ci.txt")
   else
     skip python-env "install uv to run Python steps on CI's 3.12 with its packages; using python3"
   fi
@@ -197,6 +196,7 @@ main() {
   step test-build pyrun python3 scripts/test-build.py
   step test-windows-contract pyrun python3 scripts/test-windows-contract.py
   step packaging pyrun sh -c 'python3 scripts/test-packaging.py && python3 scripts/check-packaging.py'
+  step release-policy pyrun python3 scripts/test-release-policy.py
   step test-python pyrun make test-python PYTHON=python3
   step test-bench-offline pyrun make test-bench-offline PYTHON=python3
 

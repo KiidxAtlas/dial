@@ -120,6 +120,7 @@ impl DesktopError {
         Self::new(ErrorCode::AxFailed, message)
     }
 
+    #[cfg(not(dial_desktop_windows))]
     pub(crate) fn unsupported(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::Unsupported, message)
     }

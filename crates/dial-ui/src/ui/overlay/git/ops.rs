@@ -6,8 +6,11 @@ use std::sync::mpsc::TryRecvError;
 impl GitOverlay {
     /// `s`, `u` and `space` in the diff: stage or unstage the hunk under the cursor, or the file.
     pub(super) fn stage_current(&mut self) {
-        if self.commit.is_some() {
-            return self.flash("The commit view is read-only", true);
+        if !self.mutation_ready() {
+            return;
+        }
+        if self.shown.is_none() {
+            return self.flash("Diff unavailable; cannot stage a hunk", true);
         }
         let hunk = if self.view == View::File || !self.hunk_ops_allowed() {
             None
@@ -46,8 +49,8 @@ impl GitOverlay {
 
     /// `x`: discards the hunk under the cursor from the working tree (unstaged text changes only).
     pub(super) fn discard_hunk(&mut self) {
-        if self.commit.is_some() {
-            return self.flash("The commit view is read-only", true);
+        if !self.mutation_ready() {
+            return;
         }
         let Some(change) = self.selected().cloned() else {
             return;
@@ -76,8 +79,8 @@ impl GitOverlay {
 
     /// `space` in the sidebar, or `s` on a file-level diff: stage an unstaged file or unstage a staged one.
     pub(super) fn toggle_file(&mut self) {
-        if self.commit.is_some() {
-            return self.flash("The commit view is read-only", true);
+        if !self.mutation_ready() {
+            return;
         }
         let Some(change) = self.selected().cloned() else {
             return;
@@ -94,24 +97,24 @@ impl GitOverlay {
     }
 
     pub(super) fn stage_all(&mut self) {
-        if self.commit.is_some() {
-            return self.flash("The commit view is read-only", true);
+        if !self.mutation_ready() {
+            return;
         }
         let result = self.repo.stage_all();
         self.finish(result, "Staged all changes");
     }
 
     pub(super) fn unstage_all(&mut self) {
-        if self.commit.is_some() {
-            return self.flash("The commit view is read-only", true);
+        if !self.mutation_ready() {
+            return;
         }
         let result = self.repo.unstage_all();
         self.finish(result, "Unstaged all changes");
     }
 
     pub(super) fn discard_request(&mut self, pending: Option<Change>) {
-        if self.commit.is_some() {
-            return self.flash("The commit view is read-only", true);
+        if !self.mutation_ready() {
+            return;
         }
         let Some(change) = self.selected().cloned() else {
             return;
@@ -129,8 +132,8 @@ impl GitOverlay {
     }
 
     pub(super) fn commit(&mut self) {
-        if self.commit.is_some() {
-            return self.flash("The commit view is read-only", true);
+        if !self.mutation_ready() {
+            return;
         }
         let message = self.message.trim_end().to_owned();
         if message.trim().is_empty() && !self.amend {
@@ -162,8 +165,8 @@ impl GitOverlay {
     /// Ctrl-G in the composer: generates a message for the staged changes on a worker thread.
     /// Only runs on an empty composer, so typed text is never overwritten.
     pub(super) fn generate_message(&mut self) {
-        if self.commit.is_some() {
-            return self.flash("The commit view is read-only", true);
+        if !self.mutation_ready() {
+            return;
         }
         if !self.message.trim().is_empty() {
             return self.flash("Clear the message to generate one", true);
@@ -178,14 +181,17 @@ impl GitOverlay {
 
     /// `A` in the sidebar: opens the prompt that describes what to stage with AI.
     pub(super) fn open_ai_prompt(&mut self) {
-        if self.commit.is_some() {
-            return self.flash("The commit view is read-only", true);
+        if !self.mutation_ready() {
+            return;
         }
         self.ai_prompt = Some(String::new());
     }
 
     /// Enter in the AI staging prompt: classifies the unstaged changes on a worker thread.
     pub(super) fn start_ai_stage(&mut self, instruction: String) {
+        if !self.mutation_ready() {
+            return;
+        }
         if self.ai_job.is_some() {
             return self.flash("AI staging is already running", true);
         }

@@ -1080,7 +1080,12 @@ fn batch_controller_cancellation_reports_final_reason_and_rolls_back_grant() {
             self.reasons.push(explanation.reason);
         }
     }
-    for initially_cancelled in [false, true] {
+    for (initially_cancelled, provenance) in [
+        (false, approval::CallProvenance::Structured),
+        (true, approval::CallProvenance::Structured),
+        (false, approval::CallProvenance::RecoveredText),
+        (true, approval::CallProvenance::RecoveredText),
+    ] {
         let root = tempfile::tempdir().unwrap();
         let workspace = Workspace::new(root.path()).unwrap();
         let config = Config::default();
@@ -1128,6 +1133,7 @@ fn batch_controller_cancellation_reports_final_reason_and_rolls_back_grant() {
             },
             summary: "write".into(),
             needs_approval: true,
+            provenance,
             cancel: cancel.clone(),
             reply,
         })
@@ -1283,5 +1289,90 @@ fn acceptance_contract_only_resolves_configured_checks_and_isolates_mutating_job
         json!(["echo arbitrary-command"]),
     ] {
         assert!(parse(&json!({"agent":"worker","task":"work","solution_space":"s","acceptance_checks":checks}), &config).is_err());
+    }
+}
+
+#[test]
+fn recovered_safe_reads_prompt_through_direct_and_remote_approval_owners() {
+    struct View(usize);
+    impl Ui for View {
+        fn approve(&mut self, _: &str, _: &str) -> crate::agent::Decision {
+            self.0 += 1;
+            crate::agent::Decision::AllowAlways
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(root.path()).unwrap();
+    let config = Config::default();
+    let ext = Registry::new();
+    let harness = Harness::default();
+    let interrupt = Arc::new(AtomicBool::new(false));
+    let env = Env {
+        config: &config,
+        workspace: &workspace,
+        ext: &ext,
+        layout: None,
+        harness: &harness,
+        interrupt: &interrupt,
+        usage: None,
+        context_cap: None,
+        memory: None,
+        plan_mode: true,
+        agents_messages: &[],
+    };
+    let call = ToolCall {
+        id: "read".into(),
+        name: "read".into(),
+        arguments: json!({"path":"file"}),
+        malformed_arguments: false,
+    };
+    for remote in [false, true] {
+        for provenance in [
+            approval::CallProvenance::Structured,
+            approval::CallProvenance::RecoveredText,
+        ] {
+            let mut rules = vec![];
+            let mut cost = None;
+            let mut view = View(0);
+            let cancel = Arc::new(AtomicBool::new(false));
+            let mut direct = Direct {
+                approval: Approval::Auto,
+                always: &mut rules,
+                root: workspace.root(),
+                extra_roots: &[],
+                layout: None,
+                plan_mode: true,
+                cost: &mut cost,
+                ui: &mut view,
+            };
+            if remote {
+                std::thread::scope(|scope| {
+                    let (tx, rx) = mpsc::channel();
+                    let call = &call;
+                    let interrupt = interrupt.clone();
+                    let worker = scope.spawn(move || {
+                        Remote(tx, None, 0, interrupt)
+                            .authorize_from(call, "read", false, provenance, &cancel)
+                    });
+                    pump_messages(&rx, env, &[], &mut direct, &mut []);
+                    assert!(worker.join().unwrap().is_ok());
+                });
+            } else {
+                assert!(
+                    direct
+                        .authorize_from(&call, "read", false, provenance, &cancel)
+                        .is_ok()
+                );
+            }
+            assert_eq!(
+                view.0,
+                usize::from(provenance == approval::CallProvenance::RecoveredText),
+                "remote={remote}, {provenance:?}"
+            );
+            assert!(
+                rules.is_empty(),
+                "a recovered delegated call must not create grants"
+            );
+        }
     }
 }

@@ -175,7 +175,7 @@ fn a_ready_fallback_shortens_only_the_failures_it_accepts() {
     // A failure the fallback does not take keeps every configured attempt.
     assert!(matches!(
         decide(&ErrorClass::Transient, None, FAILOVER_ATTEMPTS, false, &failover),
-        Decision::Retry { delay, .. } if jittered_from(delay, 300)
+        Decision::Retry { delay, .. } if (Duration::from_secs(4)..=Duration::from_secs(5)).contains(&delay)
     ));
     assert_eq!(
         failover.attempts(&ErrorClass::Transient),
@@ -185,56 +185,28 @@ fn a_ready_fallback_shortens_only_the_failures_it_accepts() {
 }
 
 #[test]
-fn automatic_retry_interval_is_fixed_and_respects_limits_and_server_minimums() {
+fn automatic_retries_back_off_with_bounded_jitter_and_honor_short_hints() {
     let mut policy = Policy::new(
         &crate::config::types::RetryConfig::default(),
         Duration::from_secs(300),
     );
-    for attempt in [1, 2, 9] {
+    for attempt in 1..=5 {
+        let base = Duration::from_secs(2 << (attempt - 1));
         assert!(matches!(
             decide(&ErrorClass::Transient, None, attempt, false, &policy),
-            Decision::Retry { delay, .. } if jittered_from(delay, 300)
+            Decision::Retry { delay, .. } if delay >= base && delay <= base.mul_f64(1.25)
         ));
     }
-    policy.max_delay = Duration::from_secs(120);
+    for seconds in [1, 30, 300] {
+        assert!(matches!(
+            decide(&ErrorClass::Transient, Some(Duration::from_secs(seconds)), 1, false, &policy),
+            Decision::Retry { delay, .. } if delay == Duration::from_secs(seconds)
+        ));
+    }
+    policy.max_delay = Duration::from_secs(10);
     assert!(matches!(
-        decide(&ErrorClass::Transient, None, 1, false, &policy),
-        Decision::Retry { delay, .. } if jittered_from(delay, 120)
-    ));
-    policy.max_delay = Duration::from_secs(600);
-    assert!(matches!(
-        decide(&ErrorClass::Transient, Some(Duration::from_secs(500)), 1, false, &policy),
-        Decision::Retry { delay, .. } if delay == Duration::from_secs(500)
-    ));
-}
-
-#[test]
-fn a_connection_failure_retries_promptly_once_then_uses_the_ordinary_interval() {
-    let policy = Policy::new(
-        &crate::config::types::RetryConfig::default(),
-        Duration::from_secs(300),
-    );
-    assert!(matches!(
-        decide(&ErrorClass::Transient, None, 1, true, &policy),
-        Decision::Retry { delay, .. } if delay == CONNECTION_RETRY
-    ));
-    assert!(matches!(
-        decide(&ErrorClass::Transient, None, 2, true, &policy),
-        Decision::Retry { delay, .. } if jittered_from(delay, 300)
-    ));
-    // A server-requested minimum still wins over the prompt retry.
-    assert!(matches!(
-        decide(&ErrorClass::Transient, Some(Duration::from_secs(30)), 1, true, &policy),
-        Decision::Retry { delay, .. } if delay == Duration::from_secs(30)
-    ));
-    // A shorter configured interval is never lengthened.
-    let quick = Policy::new(
-        &crate::config::types::RetryConfig::default(),
-        Duration::from_millis(10),
-    );
-    assert!(matches!(
-        decide(&ErrorClass::Transient, None, 1, true, &quick),
-        Decision::Retry { delay, .. } if delay == Duration::from_millis(10)
+        decide(&ErrorClass::Transient, None, 9, false, &policy),
+        Decision::Retry { delay, .. } if delay == Duration::from_secs(10)
     ));
 }
 
@@ -264,37 +236,4 @@ fn manual_retry_only_releases_the_current_wait_and_cancellation_wins() {
         !control.request_now(),
         "early exits also clear the pending wait"
     );
-}
-
-/// The ordinary interval varies by at most ±10% and never beyond `max_delay` (here the base).
-fn jittered_from(delay: Duration, base_secs: u64) -> bool {
-    let base = Duration::from_secs(base_secs);
-    delay <= base && delay >= base.mul_f64(0.9)
-}
-
-#[test]
-fn a_server_hint_replaces_the_ordinary_interval_instead_of_lengthening_it() {
-    let policy = Policy::new(
-        &crate::config::types::RetryConfig::default(),
-        Duration::from_secs(300),
-    );
-    assert!(matches!(
-        decide(&ErrorClass::Transient, Some(Duration::from_secs(1)), 2, false, &policy),
-        Decision::Retry { delay, .. } if delay == Duration::from_secs(1)
-    ));
-    assert!(matches!(
-        decide(
-            &ErrorClass::RateLimited { retry_after: Some(Duration::from_secs(3)) },
-            None,
-            2,
-            false,
-            &policy
-        ),
-        Decision::Retry { delay, .. } if delay == Duration::from_secs(3)
-    ));
-    // `retry-after: 0` still yields briefly rather than spinning.
-    assert!(matches!(
-        decide(&ErrorClass::Transient, Some(Duration::ZERO), 2, false, &policy),
-        Decision::Retry { delay, .. } if delay == MIN_HINTED_DELAY
-    ));
 }

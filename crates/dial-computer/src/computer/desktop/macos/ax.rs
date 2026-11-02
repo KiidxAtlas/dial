@@ -591,8 +591,8 @@ impl AxBackend for MacAx {
 
 fn element_pid(element: &AXUIElement) -> CoreResult<libc::pid_t> {
     let mut pid = 0;
-    // SAFETY: `pid` is writable and the retained element outlives the query.
     ax_result(
+        // SAFETY: `pid` is writable and the retained element outlives the query.
         unsafe { element.pid(NonNull::from(&mut pid)) },
         "reading AX element owner failed",
     )?;
@@ -1022,9 +1022,9 @@ fn copy_attribute_names(element: &AXUIElement) -> CoreResult<Vec<CFRetained<CFTy
 fn copy_strings_from_action_names(element: &AXUIElement) -> CoreResult<Vec<String>> {
     let mut output: *const CFArray = ptr::null();
     let slot = NonNull::from(&mut output);
-    // SAFETY: `slot` is writable and receives a create-rule retained CFArray on
-    // success.
     ax_result(
+        // SAFETY: `slot` is writable and receives a create-rule retained CFArray on
+        // success.
         unsafe { element.copy_action_names(slot) },
         "reading AX action names failed",
     )?;

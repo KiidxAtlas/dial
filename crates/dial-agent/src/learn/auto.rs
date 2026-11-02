@@ -6,7 +6,6 @@ use crate::config::types::Config;
 use crate::platform::procinfo::ProcId;
 use crate::storage::store::Store;
 use anyhow::{Context, Result, ensure};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -62,7 +61,7 @@ pub fn compute_lock_cancellable(
         if cancelled() {
             return Ok(None);
         }
-        match fs2::FileExt::try_lock_shared(&file) {
+        match std::fs::File::try_lock_shared(&file).map_err(std::io::Error::from) {
             Ok(()) => break,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(std::time::Duration::from_millis(25));
@@ -159,7 +158,7 @@ pub fn jobs(layout: &Layout) -> Result<Value> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error.into()),
         };
-        match file.try_lock_exclusive() {
+        match file.try_lock().map_err(std::io::Error::from) {
             Ok(()) => Ok(false),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
             Err(error) => Err(error.into()),
@@ -450,11 +449,11 @@ fn spawn_job(
         return Ok(Spawn::Refused(Refusal::NotDue));
     }
     let control = lock_file(&config.state_dir.join("control.lock"))?;
-    if control.try_lock_exclusive().is_err() {
+    if control.try_lock().map_err(std::io::Error::from).is_err() {
         return Ok(Spawn::Refused(Refusal::Running));
     }
     let launch = lock_file(&config.state_dir.join("launch.lock"))?;
-    if launch.try_lock_exclusive().is_err()
+    if launch.try_lock().map_err(std::io::Error::from).is_err()
         || (!force && !improve::due(store, "last_background_spawn", 30)?)
     {
         return Ok(Spawn::Refused(Refusal::Launching));
@@ -530,7 +529,7 @@ pub fn background(path: &Path) -> Result<()> {
         &config.harness,
     )?;
     let control = lock_file(&config.state_dir.join("control.lock"))?;
-    control.lock_exclusive()?;
+    control.lock()?;
     let current = Config::load(&layout, None)?;
     config.compute_locks = current.compute_locks;
     if !request.force {

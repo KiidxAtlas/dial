@@ -282,7 +282,12 @@ impl Agent<'_> {
                                 capture.current(self) && ui.maintenance_ready(),
                                 "native capture tool lost its owner"
                             );
-                            let result = self.dispatch(&mut backend, call, ui);
+                            let result = self.dispatch_from(
+                                &mut backend,
+                                call,
+                                crate::agent::safety::approval::CallProvenance::from_reply(&reply),
+                                ui,
+                            );
                             if !result.is_error {
                                 accepted += 1;
                             }

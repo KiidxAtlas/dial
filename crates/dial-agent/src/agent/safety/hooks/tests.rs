@@ -1,6 +1,21 @@
 use crate::config::hooks::validate;
 
 use super::*;
+
+#[test]
+fn utf8_hook_clipping_preserves_marker_and_trim_contract() {
+    for (text, max, expected) in [
+        ("🦀x", 0, "[cut]"),
+        ("🦀x", 1, "[cut]"),
+        ("🦀x", 4, "🦀 [cut]"),
+        ("🦀x", 5, "🦀x"),
+        (" 🦀x ", 5, "🦀 [cut]"),
+        (" 🦀x ", usize::MAX, "🦀x"),
+    ] {
+        assert_eq!(clip_to(text.to_owned(), max), expected, "{text:?}, {max}");
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn presentation_hooks_cannot_clear_execution_uncertainty_or_committed_paths() {
@@ -439,6 +454,7 @@ fn scheduling_ignores_hooks_that_match_other_tools() {
     assert!(wanted_for_tool(&unmatched, "pre_tool_use", "read"));
 }
 
+#[cfg(unix)]
 fn chat(messages: Vec<Value>) -> crate::llm::Chat {
     crate::llm::Chat {
         messages,

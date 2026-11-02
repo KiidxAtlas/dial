@@ -1,4 +1,5 @@
 use crate::config::tools::dap::DapAdapterConfig;
+#[cfg(unix)]
 use crate::config::tools::dap::DapTransport;
 
 use super::*;

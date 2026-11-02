@@ -1,0 +1,7 @@
+# Explicit opt-in to the relaxed Docker boundary required by Bubblewrap on some hosts.
+# Read docs/docker.md before using this override; do not use --privileged.
+services:
+  dial:
+    security_opt:
+      - seccomp=unconfined
+      - systempaths=unconfined

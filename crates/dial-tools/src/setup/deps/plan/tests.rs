@@ -120,12 +120,10 @@ fn npm_recipes_use_the_npm_of_a_dial_installed_node() {
     std::fs::create_dir_all(&bin).unwrap();
     std::fs::write(bin.join("node"), "#!/bin/sh\necho v22.23.3\n").unwrap();
     std::fs::write(bin.join("npm"), "#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
     for path in [bin.join("node"), bin.join("npm")] {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     let bun = plan(recipe("bun").unwrap(), &env).unwrap();
     assert_eq!(bun.steps[0].program, bin.join("npm").display().to_string());

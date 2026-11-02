@@ -21,6 +21,9 @@ use super::{CoreResult, DesktopError, EmergencyStop};
 
 thread_local! { static STOP: RefCell<Option<EmergencyStop>> = const { RefCell::new(None) }; }
 
+/// # Safety
+/// Invoked only as the WH_KEYBOARD_LL hook installed by start. When code >= 0,
+/// data borrows a KBDLLHOOKSTRUCT for this call; forward the original arguments.
 unsafe extern "system" fn observe(code: i32, message: WPARAM, data: LPARAM) -> LRESULT {
     if code >= 0 && (message == WM_KEYDOWN as usize || message == WM_SYSKEYDOWN as usize) {
         // SAFETY: a nonnegative keyboard hook callback provides this structure.
@@ -49,8 +52,9 @@ impl EscapeMonitor {
             .name("desktop-escape".into())
             .spawn(move || {
                 STOP.with_borrow_mut(|slot| *slot = Some(stop));
-                // SAFETY: this hook callback is process-lived and uses no DLL
-                // state.
+                // SAFETY: observe is code in this executable (no DLL handle).
+                // WH_KEYBOARD_LL delivers callbacks on this installing thread
+                // while its message loop runs, so STOP is this worker's TLS.
                 let hook = unsafe {
                     SetWindowsHookExW(WH_KEYBOARD_LL, Some(observe), std::ptr::null_mut(), 0)
                 };

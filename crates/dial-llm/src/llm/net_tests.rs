@@ -737,14 +737,21 @@ fn only_calls_read_from_text_are_marked_lifted() {
     assert!(reply.text_calls_lifted && reply.tool_calls.len() == 1);
 }
 
-/// Reasoning-tail and pythonic recovery are for local endpoints; a hosted URL gets only the marker
-/// forms.
+/// All text-call recovery is limited to local endpoints and tools actually offered.
 #[test]
 fn reasoning_and_pythonic_recovery_are_gated_to_local_hosts() {
     let tools = a_tool();
     let reasoning_call = "<tool_call>{\"name\": \"read_file\", \"arguments\": {}}</tool_call>";
     // A call closing the reasoning of an empty reply, and a reply that is only pythonic calls.
-    let cases = [("", reasoning_call), ("[read_file(path=\"a\")]", "")];
+    let cases = [
+        ("", reasoning_call),
+        ("[read_file(path=\"a\")]", ""),
+        (reasoning_call, ""),
+        (
+            "```json\n{\"name\":\"read_file\",\"arguments\":{}}\n```",
+            "",
+        ),
+    ];
     for (text, reasoning) in cases {
         for (url, expect) in [
             ("http://127.0.0.1:8000/v1", true),
@@ -761,5 +768,23 @@ fn reasoning_and_pythonic_recovery_are_gated_to_local_hosts() {
             assert_eq!(!reply.tool_calls.is_empty(), expect, "{url} {text:?}");
             assert_eq!(reply.text_calls_lifted, expect, "{url} {text:?}");
         }
+    }
+}
+
+#[test]
+fn text_recovery_rejects_unoffered_calls_and_quoted_json_without_erasing_text() {
+    for text in [
+        "<tool_call>{\"name\":\"bash\",\"arguments\":{}}</tool_call>",
+        "Example:\n```json\n{\"name\":\"read_file\",\"arguments\":{}}\n```",
+    ] {
+        let mut reply = Reply {
+            text: text.into(),
+            finish_reason: "stop".into(),
+            ..Default::default()
+        };
+        lift_text_calls(&mut reply, "http://127.0.0.1:8000/v1", &a_tool());
+        assert!(reply.tool_calls.is_empty(), "{text}");
+        assert_eq!(reply.text, text);
+        assert!(!reply.text_calls_lifted);
     }
 }

@@ -107,6 +107,7 @@ pub(crate) fn generate_target(
         "--cached",
         "--no-color",
         "--no-ext-diff",
+        "--no-textconv",
         "--no-renames",
         "--",
     ];

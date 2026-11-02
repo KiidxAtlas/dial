@@ -510,6 +510,19 @@ impl<'a> Agent<'a> {
         call: &ToolCall,
         ui: &mut dyn Ui,
     ) -> std::result::Result<(), crate::agent::safety::approval::Denial> {
+        self.authorize_call_from(
+            call,
+            crate::agent::safety::approval::CallProvenance::Structured,
+            ui,
+        )
+    }
+
+    pub(in crate::agent) fn authorize_call_from(
+        &mut self,
+        call: &ToolCall,
+        provenance: crate::agent::safety::approval::CallProvenance,
+        ui: &mut dyn Ui,
+    ) -> std::result::Result<(), crate::agent::safety::approval::Denial> {
         let once = self
             .pending_batch_approvals
             .iter()
@@ -538,6 +551,7 @@ impl<'a> Agent<'a> {
             );
             Err(crate::agent::safety::approval::Denial::Rule)
         } else if self.plan_mode
+            && !matches!(call.name.as_str(), "request_directory" | "exit_plan")
             && (local_memory_write
                 || !crate::agent::safety::approval::is_read_only(
                     &self.ext,
@@ -551,6 +565,20 @@ impl<'a> Agent<'a> {
                 crate::agent::safety::approval::PolicyReason::PlanMode,
             );
             Err(crate::agent::safety::approval::Denial::ReadOnly)
+        } else if provenance == crate::agent::safety::approval::CallProvenance::RecoveredText {
+            crate::agent::safety::approval::authorize_recovered_call(
+                &crate::agent::safety::approval::WorkerPolicy {
+                    approval: self.approval,
+                    rules: &mut self.always,
+                    root: self.workspace.root(),
+                    read_only: self.plan_mode,
+                    cancel: Some(self.interrupt.as_ref()),
+                    interrupt: None,
+                },
+                call,
+                &describe(call),
+                ui,
+            )
         } else if let Some(allowed) = once {
             crate::agent::safety::approval::authorize_once(
                 self.approval,
@@ -639,7 +667,22 @@ impl<'a> Agent<'a> {
         call: &ToolCall,
         ui: &mut dyn Ui,
     ) -> ToolOutput {
-        let output = self.dispatch_call(backend, call, ui);
+        self.dispatch_from(
+            backend,
+            call,
+            crate::agent::safety::approval::CallProvenance::Structured,
+            ui,
+        )
+    }
+
+    pub(in crate::agent) fn dispatch_from(
+        &mut self,
+        backend: &mut Backend,
+        call: &ToolCall,
+        provenance: crate::agent::safety::approval::CallProvenance,
+        ui: &mut dyn Ui,
+    ) -> ToolOutput {
+        let output = self.dispatch_call(backend, call, provenance, ui);
         modes::lifecycle::Lifecycle::dispatched(self, call, &output);
         output
     }
@@ -697,6 +740,7 @@ impl<'a> Agent<'a> {
         &mut self,
         backend: &mut Backend,
         call: &ToolCall,
+        provenance: crate::agent::safety::approval::CallProvenance,
         ui: &mut dyn Ui,
     ) -> ToolOutput {
         let mut expanded = call.clone();
@@ -779,8 +823,14 @@ impl<'a> Agent<'a> {
         };
         let call = &effective;
         let mut approval_denied = false;
-        let mut out =
-            self.dispatch_inner(backend, call, ui, &mut approval_denied, arguments_changed);
+        let mut out = self.dispatch_inner(
+            backend,
+            call,
+            provenance,
+            ui,
+            &mut approval_denied,
+            arguments_changed,
+        );
         if call.name != "exit_plan"
             && !approval_denied
             && crate::agent::safety::hooks::wanted(self.tool_hooks(), "post_tool_use")
@@ -815,6 +865,7 @@ impl<'a> Agent<'a> {
         &mut self,
         backend: &mut Backend,
         call: &ToolCall,
+        provenance: crate::agent::safety::approval::CallProvenance,
         ui: &mut dyn Ui,
         approval_denied: &mut bool,
         arguments_changed: bool,
@@ -858,6 +909,15 @@ impl<'a> Agent<'a> {
         if self.repro_first_fires(call, crate::config::types::ReproFirst::Gate) {
             return denied(crate::agent::verify::repro_first::GATE);
         }
+        // These control tools have their own execution branch; recovered text must still
+        // pass the same one-shot human boundary before entering it.
+        if provenance == crate::agent::safety::approval::CallProvenance::RecoveredText
+            && matches!(call.name.as_str(), "request_directory" | "exit_plan")
+            && let Err(denial) = self.authorize_call_from(call, provenance, ui)
+        {
+            *approval_denied = true;
+            return denied(denial.message());
+        }
         if call.name == "request_directory" {
             return self.request_directory(call, ui);
         }
@@ -869,7 +929,9 @@ impl<'a> Agent<'a> {
                 return denied("exit_plan requires a nonempty plan");
             };
             self.latest_plan = Some(plan.to_owned());
-            if self.plan_yolo_auto_approves() {
+            if provenance == crate::agent::safety::approval::CallProvenance::Structured
+                && self.plan_yolo_auto_approves()
+            {
                 return match self.plan_yolo_approve(plan, ui) {
                     Ok(()) => ToolOutput { execution: Default::default(),  data: None,
                         text: "Plan approved; implementation is now permitted subject to normal tool approvals.".into(), is_error: false },
@@ -891,7 +953,7 @@ impl<'a> Agent<'a> {
                 }
             }
         }
-        if let Err(denial) = self.authorize_call(call, ui) {
+        if let Err(denial) = self.authorize_call_from(call, provenance, ui) {
             *approval_denied = true;
             if let Err(error) = self.record(self.cur_step, "tool_denied", json!({"name":call.name}))
             {
@@ -1066,7 +1128,8 @@ impl<'a> Agent<'a> {
             backend.release();
             return shared;
         }
-        if let Some(out) = self.run_background_tool(name, args, ui, Some(backend)) {
+        if let Some(out) = self.run_background_tool_from(name, args, ui, Some(backend), provenance)
+        {
             if name == "bash" {
                 self.shared_run_after(&out);
                 self.note_verification(call, &out, ui);
@@ -1524,6 +1587,7 @@ impl<'a> Agent<'a> {
         owner: &str,
         ui: &mut dyn Ui,
         gate: &mut crate::agent::safety::rules::CallbackGate<'_>,
+        provenance: crate::agent::safety::approval::CallProvenance,
     ) -> ToolOutput {
         if self.interrupt.load(Ordering::SeqCst) {
             return interrupted_tool();
@@ -1579,19 +1643,19 @@ impl<'a> Agent<'a> {
         if let Some((_, why)) = call_form_error(&call, &schemas, &names) {
             return ToolOutput::err(format!("invalid code-mode tool call: {why}"));
         }
-        self.execute_callback(backend, ui, &call, &schemas, owner, gate)
+        self.execute_callback_from(backend, ui, &call, &schemas, (owner, provenance), gate)
     }
 
-    /// Executes an admitted native callback through the durable evidence and effect boundary.
-    pub(in crate::agent) fn execute_callback(
+    fn execute_callback_from(
         &mut self,
         backend: &mut Backend,
         ui: &mut dyn Ui,
         call: &ToolCall,
         schemas: &[Value],
-        owner: &str,
+        source: (&str, crate::agent::safety::approval::CallProvenance),
         gate: &mut crate::agent::safety::rules::CallbackGate<'_>,
     ) -> ToolOutput {
+        let (owner, provenance) = source;
         if self.interrupt.load(Ordering::SeqCst) {
             return interrupted_tool();
         }
@@ -1619,7 +1683,7 @@ impl<'a> Agent<'a> {
             return output;
         }
         let started = Instant::now();
-        let mut output = self.dispatch(backend, call, ui);
+        let mut output = self.dispatch_from(backend, call, provenance, ui);
         let supplied = if call.name == "read" {
             call.arguments["path"].as_str().and_then(|path| {
                 llm::images::authorized_user_reference(&self.session.messages(), Path::new(path))
