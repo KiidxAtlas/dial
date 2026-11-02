@@ -34,6 +34,9 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ### Fixed
 
+- `auto` worker isolation falls back to the next backend when one passes its probe but fails to set up (an unprivileged or containerized kernel overlay mount without `fuse-overlayfs`), instead of failing every isolated task; the setup error is shown as that backend's skip reason. The worktree backend now gets the dependency copy, so workers there can run tests that need `node_modules`, virtual environments or `vendor`.
+- A worker's private git snapshot excludes every build-output and dependency directory the copy backends exclude (`target`, `build`, `dist`, `.cache`, `__pycache__`, …); overlay isolation previously added a project's whole `target/` (tens of gigabytes) to a temp-dir repository for every isolated worker.
+- Background workers stopped because their owner went away (quitting, or a settings change that rebuilds the agent) are recorded as `interrupted`, so `--restore` resumes them; only an explicit cancel records `cancelled`.
 - One-shot notes (background job finished, monitor deliveries, hook context, the 80% wrap-up notice) are no longer lost when a reply is discarded after it arrives: a reply that never reaches history (truncation raise, rejected edit preview, repair, guidance regeneration) leaves its notes queued for the retry.
 - A model that keeps answering in text while an investigation checkpoint is open gets two "call rewind" reminders, then the turn stops as incomplete; previously the reminder repeated without limit (each one a paid request, with the default unlimited step budget).
 - Goal mode counts batched and streamed-reuse tool calls as activity; a continuation turn made of parallel reads is no longer treated as stalled.

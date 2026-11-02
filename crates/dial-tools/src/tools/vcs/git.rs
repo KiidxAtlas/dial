@@ -594,23 +594,28 @@ pub fn initialize_private_snapshot(root: &Path) -> Result<(), String> {
         ("GIT_WORK_TREE", root.as_os_str()),
         ("GIT_INDEX_FILE", index.as_os_str()),
     ];
+    // The snapshot holds exactly what the copy backends treat as the worker's source. Overlay
+    // leaves build output visible (`target/` can be tens of gigabytes); `--force` adds ignored
+    // files, so every dependency/build directory is excluded here by the same shared policy.
+    let excludes: Vec<String> = crate::workspace_copy::DEPENDENCY_DIRS
+        .iter()
+        .flat_map(|name| {
+            [
+                format!(":(exclude){name}"),
+                format!(":(glob,exclude)**/{name}/**"),
+            ]
+        })
+        .chain(
+            crate::workspace_copy::ROOT_GENERATED_DIRS
+                .iter()
+                .map(|name| format!(":(exclude){name}")),
+        )
+        .collect();
+    let mut add = vec!["add", "--force", "--all", "--", "."];
+    add.extend(excludes.iter().map(String::as_str));
     for args in [
         vec!["init", "--quiet", "--template="],
-        vec![
-            "add",
-            "--force",
-            "--all",
-            "--",
-            ".",
-            ":(exclude)node_modules",
-            ":(exclude).venv",
-            ":(exclude)venv",
-            ":(exclude)vendor",
-            ":(glob,exclude)**/node_modules/**",
-            ":(glob,exclude)**/.venv/**",
-            ":(glob,exclude)**/venv/**",
-            ":(glob,exclude)**/vendor/**",
-        ],
+        add,
         vec![
             "-c",
             "user.name=Dial",

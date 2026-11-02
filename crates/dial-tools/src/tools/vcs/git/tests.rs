@@ -722,3 +722,30 @@ fn global_filter_activated_by_untracked_attributes_is_never_run_by_inspection() 
         .env("GIT_CONFIG_NOSYSTEM", "1");
     assert!(inspect_filter_config(query, &NEVER_CANCELLED).is_ok());
 }
+
+#[test]
+fn a_worker_snapshot_never_ingests_build_output_or_dependencies() {
+    let dir = tempfile::tempdir().unwrap();
+    for path in [
+        "src/main.rs",
+        "target/debug/huge.rlib",
+        "dist/app.js",
+        "web/node_modules/pkg/index.js",
+        "pkg/build/out.o",
+        "py/__pycache__/m.pyc",
+        ".cache/blob",
+    ] {
+        let full = dir.path().join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, "x").unwrap();
+    }
+    initialize_private_snapshot(dir.path()).unwrap();
+    let listed = std::process::Command::new("git")
+        .args(["ls-files"])
+        .env("GIT_DIR", dir.path().join(".git"))
+        .env("GIT_WORK_TREE", dir.path())
+        .output()
+        .unwrap();
+    let files = String::from_utf8(listed.stdout).unwrap();
+    assert_eq!(files.trim(), "src/main.rs", "{files}");
+}

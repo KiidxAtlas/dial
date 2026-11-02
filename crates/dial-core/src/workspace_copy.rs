@@ -41,7 +41,7 @@ pub const DEPENDENCY_DIRS: &[&str] = &[
 pub const SCRATCH_DIR: &str = ".tmp";
 
 /// Root-only build caches and tool scratch; unlike these, `bin/` often contains real source.
-const ROOT_GENERATED_DIRS: &[&str] = &[".cargo-work", SCRATCH_DIR];
+pub const ROOT_GENERATED_DIRS: &[&str] = &[".cargo-work", SCRATCH_DIR];
 const EXCLUDED_FILES: &[&str] = &[
     ".env",
     ".env.local",
