@@ -34,6 +34,8 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ### Fixed
 
+- A session whose last append was torn by a crash or full disk no longer reports corruption on every later resume: the writer removes the unloaded partial line when it claims the journal, instead of sealing it into a malformed interior line with the next append. A complete final entry that only lost its newline is kept.
+- Checkpoint review diffs are bounded to 500 ms of edit-script search (a coarser but correct diff past that), and compare-before-restore checks the review token without rebuilding the diff while holding the checkpoint lock.
 - Recheck session-writer identity after locking, retain locks through removal, version SQLite
   schemas transactionally, and preserve process-group ownership when waiting for child exit.
 - Load Git-overlay status/diffs off the input thread, reject stale replies and unsafe hunk

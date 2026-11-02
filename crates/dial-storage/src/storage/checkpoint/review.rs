@@ -258,7 +258,7 @@ impl Checkpoints {
                 );
             }
             ensure!(
-                self.review_with(&manifest, path)?.1 == *token,
+                self.review_token(&manifest, path)? == *token,
                 "{path} or its saved checkpoint changed after review; nothing restored"
             );
             picked.push((index, entry, path, token));
@@ -297,7 +297,7 @@ impl Checkpoints {
         // still hold exactly what this revert wrote.
         let mut done: Vec<Written<'_>> = Vec::new();
         for (index, entry, path, token) in &picked {
-            let current = self.review_with(&manifest, path).map(|(_, now)| now).ok();
+            let current = self.review_token(&manifest, path).ok();
             let failure = if current.as_deref() != Some(*token) {
                 Some(anyhow::anyhow!(
                     "{path} changed after review; it was not written"

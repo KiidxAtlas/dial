@@ -2162,3 +2162,48 @@ fn fork_at_an_unknown_entry_is_an_error_and_creates_no_file() {
     assert!(owner.fork_at(&e.layout, Some("no-such-entry")).is_err());
     assert_eq!(session_files(&e), before);
 }
+
+#[test]
+fn a_writer_removes_an_unloaded_torn_tail_so_later_loads_report_nothing() {
+    let e = env();
+    let mut s = new_session(&e);
+    s.append(user("one")).unwrap();
+    let path = s.path().unwrap().to_path_buf();
+    drop(s);
+    let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+    f.write_all(b"{\"type\":\"message\",\"id\":\"zz\"").unwrap();
+    drop(f);
+    let mut owner = Session::open(&path).unwrap();
+    owner.append(assistant("two")).unwrap();
+    drop(owner);
+    let mut reread = Session::read(&path).unwrap();
+    assert_eq!(
+        contents(&reread.messages()),
+        ["one", "two"].map(String::from)
+    );
+    assert!(
+        reread.take_recovery_diagnostics().is_empty(),
+        "the healed tail is not reported as interior corruption"
+    );
+    assert!(!fs::read_to_string(&path).unwrap().contains("\"id\":\"zz\""));
+}
+
+#[test]
+fn a_complete_final_entry_without_its_newline_is_kept() {
+    let e = env();
+    let mut s = new_session(&e);
+    s.append(user("one")).unwrap();
+    let path = s.path().unwrap().to_path_buf();
+    drop(s);
+    // Strip only the trailing newline of a fully written entry.
+    let mut bytes = fs::read(&path).unwrap();
+    assert_eq!(bytes.pop(), Some(b'\n'));
+    fs::write(&path, &bytes).unwrap();
+    let mut owner = Session::open(&path).unwrap();
+    owner.append(assistant("two")).unwrap();
+    drop(owner);
+    assert_eq!(
+        contents(&Session::read(&path).unwrap().messages()),
+        ["one", "two"].map(String::from)
+    );
+}

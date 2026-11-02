@@ -694,6 +694,28 @@ struct RawLine {
 
 /// Reads one line into `buf` (without the newline). Lines over `MAX_LINE` are consumed and flagged
 /// rather than buffered. `None` at EOF.
+/// Cuts the file after its last newline, dropping an unterminated final line, and syncs the cut.
+fn truncate_torn_tail(file: &File) -> io::Result<()> {
+    use std::io::{Seek, SeekFrom};
+    let mut reader = file;
+    let mut end = file.metadata()?.len();
+    let mut chunk = [0u8; 8192];
+    let cut = loop {
+        if end == 0 {
+            break 0;
+        }
+        let n = end.min(chunk.len() as u64) as usize;
+        end -= n as u64;
+        reader.seek(SeekFrom::Start(end))?;
+        reader.read_exact(&mut chunk[..n])?;
+        if let Some(newline) = chunk[..n].iter().rposition(|&byte| byte == b'\n') {
+            break end + newline as u64 + 1;
+        }
+    };
+    file.set_len(cut)?;
+    file.sync_data()
+}
+
 fn read_bounded_line<R: BufRead>(r: &mut R, buf: &mut Vec<u8>) -> io::Result<Option<RawLine>> {
     buf.clear();
     let (mut consumed, mut oversized, mut terminated) = (0usize, false, false);
@@ -1210,6 +1232,18 @@ impl Session {
         };
         // Parse the claimed inode, not a second path lookup that could have been replaced.
         let mut s = Self::load_file(path, file.try_clone()?)?;
+        // A torn final line that was not loaded is an append that never completed. Sealing it with
+        // the next append's newline would turn it into a malformed interior line, reported as
+        // corruption on every later load; the owner removes those bytes instead.
+        if s.pending_newline
+            && s.recovery
+                .iter()
+                .any(|issue| issue.kind == JournalIssueKind::TornTail)
+        {
+            truncate_torn_tail(&file)
+                .with_context(|| format!("removing the torn tail of {}", path.display()))?;
+            s.pending_newline = false;
+        }
         s.file = Some(file);
         s.runtime
             .journal(crate::runtime::stream_journal::Journal::open(path)?);

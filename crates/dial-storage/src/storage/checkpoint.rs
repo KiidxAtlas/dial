@@ -12,7 +12,8 @@
 use crate::platform::atomic::write_checkpoint as atomic_write;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
-use similar::TextDiff;
+/// Longest a review diff may search for a minimal edit script before settling for a coarser one.
+const DIFF_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 use std::{
     fs,
     path::{Component, Path, PathBuf},
@@ -247,6 +248,24 @@ impl Checkpoints {
     }
 
     fn review_with(&self, manifest: &Manifest, path: &str) -> Result<(String, String)> {
+        let (diff, token) = self.review_parts(manifest, path, true)?;
+        Ok((diff.unwrap_or_default(), token))
+    }
+
+    /// The review token alone, for compare-before-restore. It hashes the current content, so any
+    /// change since the operator reviewed the diff is still detected without rebuilding the diff
+    /// while the checkpoint lock is held.
+    fn review_token(&self, manifest: &Manifest, path: &str) -> Result<String> {
+        self.review_parts(manifest, path, false)
+            .map(|(_, token)| token)
+    }
+
+    fn review_parts(
+        &self,
+        manifest: &Manifest,
+        path: &str,
+        with_diff: bool,
+    ) -> Result<(Option<String>, String)> {
         use sha2::{Digest, Sha256};
         let turn = manifest.turn;
         ensure!(
@@ -301,7 +320,14 @@ impl Checkpoints {
             std::str::from_utf8(&before).context("binary file requires manual review")?;
         let after_text =
             std::str::from_utf8(&after).context("binary file requires manual review")?;
-        let diff = TextDiff::from_lines(before_text, after_text)
+        if !with_diff {
+            return Ok((None, token));
+        }
+        // Myers diff is O((N+M)·D); a dense rewrite of a multi-megabyte file could take minutes.
+        // Past the deadline `similar` returns a coarser but still correct diff.
+        let diff = similar::TextDiff::configure()
+            .timeout(DIFF_TIMEOUT)
+            .diff_lines(before_text, after_text)
             .unified_diff()
             .header("checkpoint", path)
             .to_string();
@@ -309,7 +335,7 @@ impl Checkpoints {
             diff.len() <= 24 * 1024,
             "diff exceeds interactive review limit; inspect and restore manually"
         );
-        Ok((diff, token))
+        Ok((Some(diff), token))
     }
 
     /// Compare-before-restore; other checkpoint files and later unrelated work are untouched.
