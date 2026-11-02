@@ -102,6 +102,9 @@ pub fn termination_requested() -> bool {
 }
 
 /// The live region: rows to repaint, where the hardware cursor goes, and an optional window title.
+/// Scrollback bytes committed per frame, well under the output queue's frame limit.
+const HISTORY_FRAME_BYTES: usize = 4 * 1024 * 1024;
+
 pub struct Viewport<'a> {
     pub rows: &'a [Line<'static>],
     /// `(row in rows, column in cells)`. `None` leaves the cursor hidden.
@@ -426,11 +429,21 @@ impl InlineTerminal {
             }
             _ => None,
         };
-        let history: Vec<(String, usize)> = self
-            .pending
-            .iter()
-            .map(|l| render_row_linked(l, width, linker.as_deref_mut()))
-            .collect();
+        // Commit at most a bounded slice of pending scrollback per frame. A Ctrl+O/Ctrl+L replay
+        // holds the whole transcript; as one frame it could exceed the output queue's frame limit,
+        // which refused this and every later paint and ended the session. The remaining rows
+        // follow on the next paints.
+        let mut history: Vec<(String, usize)> = Vec::new();
+        let mut budget = HISTORY_FRAME_BYTES;
+        for line in &self.pending {
+            let row = render_row_linked(line, width, linker.as_deref_mut());
+            let cost = row.0.len() + 8;
+            if !history.is_empty() && cost > budget {
+                break;
+            }
+            budget = budget.saturating_sub(cost);
+            history.push(row);
+        }
 
         let width_changed = cols != self.last_size.0;
         let erase_first = self.force_erase || (cols, rows) != self.last_size;
@@ -543,8 +556,19 @@ impl InlineTerminal {
         self.out.flush()?;
 
         self.history_written += history.len();
-        self.pending.clear();
-        self.pending_images.clear();
+        let committed = history.len();
+        self.pending.drain(..committed);
+        self.pending_images.retain_mut(|(at, _, _)| {
+            if *at < committed {
+                false
+            } else {
+                *at -= committed;
+                true
+            }
+        });
+        if !self.pending.is_empty() {
+            self.deferred_paint = true;
+        }
         self.painted_rows = n as u16;
         self.last_rendered
             .resize_with(rendered.len(), || (String::new(), 0));
@@ -773,6 +797,10 @@ impl InlineTerminal {
             return; // the panic hook already restored the terminal
         }
         let (cols, terminal_rows) = self.size();
+        // Pending rows go out in bounded frames, and the terminal-mode resets as a separate small
+        // frame that is always attempted: if the rows were refused (a long replayed transcript),
+        // the user's shell must still leave raw mode, bracketed paste and the keyboard protocol.
+        let mut frames = Vec::new();
         let mut s = String::new();
         if self.cursor_row > 0 {
             s.push_str(&format!("\x1b[{}A", self.cursor_row));
@@ -789,17 +817,45 @@ impl InlineTerminal {
                 image.write_ansi(&mut s, *protocol);
             }
             s.push_str("\r\n");
+            if s.len() >= HISTORY_FRAME_BYTES {
+                frames.push(std::mem::take(&mut s));
+            }
         }
-        s.push_str(WRAP_ON);
-        s.push_str(CURSOR_SHOW);
+        if !s.is_empty() {
+            frames.push(s);
+        }
+        let mut rows_written = true;
+        for frame in frames {
+            let accepted = self
+                .out
+                .try_write_frame(frame.as_bytes().to_vec())
+                .unwrap_or(false)
+                || (self.out.drain(FLUSH_TIMEOUT).is_ok()
+                    && self
+                        .out
+                        .try_write_frame(frame.into_bytes())
+                        .unwrap_or(false));
+            if !accepted {
+                rows_written = false;
+                break;
+            }
+        }
+        let mut resets = String::new();
+        resets.push_str(WRAP_ON);
+        resets.push_str(CURSOR_SHOW);
         if self.real {
             if self.keyboard_flags {
-                push_command(&mut s, &PopKeyboardEnhancementFlags);
+                push_command(&mut resets, &PopKeyboardEnhancementFlags);
             }
-            push_command(&mut s, &DisableBracketedPaste);
+            push_command(&mut resets, &DisableBracketedPaste);
         }
-        s.push_str(&self.signal_update(None));
-        if self.out.try_write_frame(s.into_bytes()).unwrap_or(false) {
+        resets.push_str(&self.signal_update(None));
+        let resets = resets.into_bytes();
+        if !self.out.try_write_frame(resets.clone()).unwrap_or(false) {
+            let _ = self.out.drain(FLUSH_TIMEOUT);
+            let _ = self.out.try_write_frame(resets);
+        }
+        if rows_written {
             let _ = self.out.flush();
             self.history_written += self.pending.len();
             self.pending.clear();
