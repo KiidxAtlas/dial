@@ -34,8 +34,10 @@ fn key(index: usize) -> Key {
 
 #[test]
 fn a_sweep_larger_than_the_cache_keeps_hitting_what_earlier_sweeps_stored() {
-    let mut cache = Cache::default();
-    cache.sweep = 1;
+    let mut cache = Cache {
+        sweep: 1,
+        ..Cache::default()
+    };
     // First sweep over more files than fit: the cache fills, then stops admitting.
     for index in 0..MAX_CACHE_ENTRIES + 100 {
         if cache.make_room(1) {
@@ -61,8 +63,10 @@ fn a_sweep_larger_than_the_cache_keeps_hitting_what_earlier_sweeps_stored() {
 
 #[test]
 fn entries_unused_in_the_current_sweep_are_evicted_first() {
-    let mut cache = Cache::default();
-    cache.sweep = 1;
+    let mut cache = Cache {
+        sweep: 1,
+        ..Cache::default()
+    };
     for index in 0..MAX_CACHE_ENTRIES {
         let value = entry(&cache);
         cache.insert(key(index), value);
