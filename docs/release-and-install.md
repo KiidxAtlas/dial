@@ -356,7 +356,13 @@ build one after the other: each peaks near 5 GB in rustc, and together they woul
 CI caches compiled dependencies per job with `Swatinem/rust-cache`. Caches are saved only from
 `main`, and also after a failing run, so one red test does not force the next run on that OS to
 rebuild from scratch. The repository's 10 GB cache quota evicts the least recently used entries
-first.
+first, so the Linux feature-powerset jobs share one cache per runner image, saved only by the
+all-features combination; per-combination caches crowded out the macOS test caches.
+
+The Intel macOS CI job (`macos-15-intel`) runs format, build and the full test suite. The
+installed-binary smoke tests, real-terminal lifecycle scripts, slim build check and runtime
+overhead recording run on `macos-15` and Ubuntu only; the release workflow still builds and
+smoke-tests the packaged `x86_64-apple-darwin` archive.
 
 The workflow preserves repository visibility. Dial is MIT licensed; see `LICENSE` for
 permission to use, modify, and redistribute it.
